@@ -5444,6 +5444,15 @@ drops.
 > `Deadlines::reconnect_ns` remains only for the waits on a fleet owner's takeover (a request refused for now held for
 > its resend, the pause between resends, `call_through_transient`), whose own bound, the failover delay, is owed in GAPS.
 
+> **Status (2026-11-20, A-735): a macOS claim made in a replaced daemon's bootstrap object ends.** A daemon that holds
+> its own rendezvous makes the object again at its start (the create unlinks a dead predecessor's), and takes the
+> owner's bootstrap name a claim's life is judged by. A client that opened the predecessor's object (before the
+> successor's start, or between its taking the name and making the object) waited for good on a slot no daemon reads.
+> Each look on the claim's owner now also reads its own slot in the object under the name: a slot that does not name
+> this client by its pid and start (A-522; only the claimant writes them) means the object was made again, and the
+> claim is taken back and refused `DaemonUnavailable`, which a reconnect claims again. An anchor's object outlives its
+> daemon's restarts, so a claim under one keeps waiting (A-114, A-468).
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = F, R9's provisioning floor, 50 µs
@@ -13409,9 +13418,10 @@ engine: the verdict, rebase, position mapping, the register).
 > `update` refusing its own command alone (macOS arm64, Mac Studio, kiln r430: red first, the three push tests failing
 > with the hook path stubbed out; then `git_push::`, `git_hooks::` and `vcs_http::` 52 of 52, slates-git's `receive::`
 > and `protected_fixtures` 49 of 49, fmt clean). The HTTP edge's signal of a client gone ends a hook's run (A-665 part
-> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended). Each hook's run
+> 4a: `vcs_http::ClientGone`, the connection's socket watched for its close once the body has ended), and the SSH
+> edge's since A-736 (`vcs_ssh::site::ClientGone`, the client's bytes taken while a step runs). Each hook's run
 > is held to the bound it learned on the owner shard and teaches it as it ends (A-665 part 4b, `ShardState::hook_times`).
-> Owed: the read-only attachment; the SSH edge's signal; seals kept as derived data.
+> Owed: the read-only attachment; seals kept as derived data.
 >
 > **Status (2026-11-19, A-640 part 3: protocol v0 and v1 behind the same entry point).** `crates/git` (`upload::v0`)
 > answers a v0 or v1 client as git's smart HTTP does. The ref advertisement follows `send_ref`'s order, with git's
@@ -15384,6 +15394,11 @@ and export by landing).
 > (`slates_svn::migration::TextSource`; `WithTexts` pairs the records with one), so the green's content index can
 > serve every text once the records stop holding text bytes (slice 2).
 >
+> **Status (2026-11-20, A-703).** `replay` and `replay-range` serve `svnsync` and `svnrdump`: a revision driven as
+> `svn_repos_replay2` drives it (`slates_svn::report::drive::replay`), streamed over the connection's editor with each
+> range revision's readable properties, the answers held to stock `svnserve`'s recordings of stock `svnsync` and
+> `svnrdump` (`crates/svn/fixtures/replay`).
+>
 > **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
 > UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
 > token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
@@ -15868,7 +15883,23 @@ A principal with read on the whole repository and no rule beneath meets one comp
 > out the post-hook, `locks_finished` ends it), so the connection task runs each hook between them. Held to the
 > listener's tests: a refusing pre-lock answered in `svnserve`'s words with no lock held; pre-lock's arguments and
 > token, post-lock's arguments, standard input and failure after `done`; pre- and post-unlock's arguments and standard
-> input. Owed: `svn+ssh://`, the revprop hooks' calls (A-702 part 2) and DAV's.
+> input. **Part 3:** the `svn+ssh://` tunnel (`svnserve -t`) runs them the same way through the same runner, the
+> repository's policy its record's; no signal of the client gone reaches the SSH edge yet, so a run there ends at its
+> learned bound or by itself.
+>
+> **Status (2026-11-20, A-733: the DAV site runs the hooks).** Built: svn over http(s) runs them where `mod_dav_svn`
+> runs them, through A-730's runner (`HookSite::Http`, the exchange's `ClientGone` and its repository's policy):
+> start-commit as the POST makes the transaction (REPOS, the user, `mergeinfo`, which every stock client announces in its
+> `DAV` header, and the transaction), pre-commit at the MERGE before the verdict (REPOS, the transaction, the presented
+> lock tokens by repository path) and post-commit once the revision stands, its failure the MERGE response's
+> `S:post-commit-err` (`merge.c`); pre-lock before a LOCK is judged (its refusal the LOCK's, "Failed to create new
+> lock.", its standard output the lock's token) and post-lock after it, pre-unlock and post-unlock around an UNLOCK, a
+> post-hook's failure logged and counted, never told (`lock.c`: the lock stands and its answer with it). The svn crate's
+> DAV commit stops at its hooks (`DavCommit::begin_hooked` and `resume_begin`, `merge_hooked` and `resume_merge`), so
+> the exchange runs each between two lends. Held to the daemon edge's tests over HTTPS: a refusing start-commit answers
+> the POST in `svnserve`'s words; a DAV commit's start- and pre-commit given their arguments and post-commit's failure in
+> `S:post-commit-err`; a refusing pre-lock answers the LOCK. Owed: the revprop hooks' calls (A-702 part 2, w-svn), the
+> SSH edge's client-gone signal, REPOS as A-645's FSFS-layout view.
 
 *11. Large files.* No file is held whole anywhere on the path: a commit applies one window at a time, taking the MD5 and
 the content identity as it writes; a read streams windows from chunks; content is chunked and deduplicated (§4.11, D-6),
@@ -54684,6 +54715,12 @@ Applied in the same change to:
   is passed; an index is cut into `2^b` ranges by object id, each range held where rendezvous over `(family, range)`
   ranks first, `b` one integer in the repository's record, a push's rows committed by the owner's one landing record.
   Nothing built yet.
+- **Piece 7, starvation held to the fair share (2026-11-20, main's ruling).** BENCHMARKS.md, "Many repositories on one
+  daemon, held to their fair share": against the fair share of today's placement (a repository's intake on its owner
+  shard) no class is starved (every p99 ratio 0.72 to 0.87); against a repository spread over as many shards as it has
+  pushes, a hot repository's 19 pushes are 7.61 times slower and the small class 2.72 times: the gap A-722's intake off
+  the owner shard closes, w-balance supplying its placement policy. Per-repository lanes on a shard were measured dead
+  even and rejected.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -54970,12 +55007,12 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   `an_unlock_runs_pre_unlock_and_post_unlock_as_svnserve_does` (a file committed from stock `svn`'s recorded delta);
   `slates-svn` `serve::` and `commit::` (stock `svnserve`'s recorded lock sessions replayed through the four calls).
 - **Part 3 (same day): the `svn+ssh://` tunnel.** `vcs_svn::run_hook` takes a `HookSite`: the listener's connection
-  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (no
-  hang-up signal on the SSH edge yet). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
+  (its repository's policy read on the owner shard, `ClientGone` its hang-up) or the tunnel's repository policy (its
+  hang-up the SSH edge's signal since A-736). The tunnel's steps await its hooks: start-commit and pre-commit, post-commit,
   and the lock verbs' through `vcs_svn::pre_lock_hooks` and `post_lock_hook`. Tests:
   `vcs_ssh::svn::tests::a_tunnels_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words`,
   `a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them` (the tunnel driven on a runtime of its own).
-- **Owed.** The SSH edge's signal of the client gone, for a hook's run. The revprop hooks' calls with A-702 part 2
+- **Owed.** The revprop hooks' calls with A-702 part 2
   (w-svn) on `vcs_svn::run_hook`. DAV's commit and lock hooks. REPOS as A-645's read-only FSFS-layout view.
 
 ### A-664 live whole builds, part 1 — A push's whole map built in slices after its answer, the submits that need it parked (2026-11-20, w-shared for UI goal 93; main's ruling (a))
@@ -55072,6 +55109,121 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `slates-vcs` `tests::a_parent_adopts_its_forks_rows_and_refuses_a_stale_fork`.
 - **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-vcs --lib` 92 of 92; fmt clean.
 - **Owed.** The rest of A-722 above.
+### A-725 — A WinFsp drive's receiver is relieved while it is held in a send: a second receiver with its own journal serves in its place, the operation state moved between them (bug, 2026-11-20, w-bugs for goal 87, goal-83 B3; amends A-198's single receiver; §4.6 Windows)
+
+- **Found by use.** fsx seed 1 over the WinFsp drive stopped for good after its shrink (operation 45, `TRUNCATE DOWN`
+  249,552 to 56,848) on every run, on both Windows architectures, listed `fsx-seed-1-unfinished:10000` since
+  2026-11-05. A diagnostics-only log of each operation and send (diag-w-bugs-b3-9, windows-latest, 2026-11-20) ended
+  `send begins kind 8` with no `send returned` for about 59 s, where every other send took at most 481 µs: the one
+  receive worker was held inside its own send of the shrink's answer (record:
+  `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown 2026-11-20").
+- **Cause.** WinFsp v2.1 completes an answered request on the thread that sent the answer (`src/sys/volume.c`
+  1089-1102); SetInformation's end-of-file completion runs `CcSetFileSizes` there (`src/sys/fileinfo.c` 1407,
+  `src/sys/file.c` 1852), which can wait on a paging request for the file's last page. A-198 made slates' receive worker
+  the drive's only receiver, so that request reached no one. WinFsp's own dispatcher runs at least two receivers
+  (`src/dll/fs.c` 26, 384-401) for this reason.
+- **Change.** `crate::inflight::relief` (bridge-winfsp): a primary receiver and a relief, each with its own retained
+  journal region (`opens::JOURNALS` = 2 after the open frames; `capture`'s protocol unchanged in each). The operation
+  state (`DllStation`: the DLL's operation table, private opens, working packet, shard channel, the confirmation in
+  flight, A-275's may-link set) is moved between them, never shared (R2, D-7): the primary parks it in a one-pointer
+  slot before each send and takes it back after (two atomic exchanges a send, no wake); the relief looks once a beat
+  (the daemon's watchdog beat, `HEARTBEAT_NS`, passed to the mount as `RELIEF_BEAT`) and, when the primary has been
+  inside the same send a whole beat, takes the state and serves its own region until the primary, its send returned,
+  asks for it back. So one thread operates at a time, as A-198 requires: the DLL has one caller, the shard channel's
+  bound (`REQUEST_BOUND`) and the one outstanding confirmation are unchanged, and recovery settles both regions before
+  either receives; the ledger's one unconfirmed open is kept when either journal's saved response vouches for it
+  (`Ledger::settle_pending` over both).
+- **Tests.** `inflight::relief::tests::a_send_whose_completion_waits_on_another_request_is_relieved` (every host): a
+  modelled driver on its own thread whose completion of a shrink's answer issues a nested read and returns the send
+  only once that read is answered, over the real journal regions. Red with the relief taken out (macOS arm64, Mac
+  Studio, 2026-11-20): "the shrink's answer never completed in 10.1 s: its nested read reached no receiver"; green in
+  0.03 s. The crash oracle (`inflight::oracle`) and the ledger's tests pass unchanged over the new `settle_pending`.
+- **By use (CI, 2026-11-20).** windows-latest and windows-11-arm (diag-w-bugs-b3-11): fsx seed 1 over the drive
+  passed on both (it had stopped at operation 45 on every run since 2026-11-05); `slates-cli --test winfsp_semantics`
+  and `--test winfsp` passed; `slates-bridge-winfsp --lib` with WinFsp (the live taken-request and recovery oracles)
+  127 passed on both, against 126 on main's tree with the same test support (diag-w-bugs-lib-fix-1 /
+  -control-1); the one failure in both arms, the same, is A-576's `the_volumes_upcase_table_is_the_systems` (109 units
+  where Windows' table differs from the published one), not this change's. jupiter (Windows x86_64, no WinFsp):
+  `--lib` 127 passed, the same one failing.
+- **Found on the way, fixed here because the runs above needed them.** (1) The harness judged the WinFsp fsx port by a
+  success line naming exactly the operations asked, but the port also counts each MAPWRITE's extension of the file
+  (`fsx.c` 1330-1337 at 6ac65cd): a whole run of 10,000 printed 10,770 and was called failed. It now takes a count of
+  at least the operations asked (`the_winfsp_ports_count_includes_its_extensions`, red then green). (2)
+  bridge-winfsp's Windows test support had not compiled since A-551 changed `Mounted::new` (`tests/support/transact.rs`)
+  and read the anchor's handoff from the environment where A-460 put it in a section (`tests/support/host.rs`, "handoff
+  checksum absent"): both brought to the daemon's own reading.
+- **Residual.** A relief itself held in a send is relieved by no one (two completions each waiting on the drive at
+  once); the relief's receive may run its transaction timeout (1 s) before it hands the state back.
+- **Applied in the same change to** GAPS (the delete/purge hang entry), the fsx bug record, amendments.tsv.
+
+### A-735 — A macOS claim made in a replaced daemon's bootstrap object ends (bug, 2026-11-20, w-forming; found by use: main's forming sweep, live_chaos `a_member_that_never_held_the_log_never_stands_in_for_its_holder` under `taskpolicy -b`, run 25; amends A-443's macOS look; §4.7 "Rendezvous")
+
+- **What happened.** The flow replaced fleet member `a` with a fresh daemon and asked it `volume list` while it started.
+  The client hung 30+ minutes in `Claim::wait` against a daemon serving with both shards parked: read at the hang, the
+  bootstrap object under the instance's name (its start stamp the fresh daemon's) had all 64 claim slots free and no
+  slot naming either hung client's pid.
+- **Cause.** A daemon run alone takes the owner's bootstrap name (`take_ownership`), then makes the object again
+  (`owned_object`; `SharedObject::create` unlinks the dead predecessor's). A client that opened the predecessor's object,
+  still published since a killed daemon never takes its stamp back, claimed a slot there; its look asked only whether the
+  owner's name was held, and the successor held it, so the claim was due for good.
+- **The fix.** `Claim::look` (macOS) also asks `made_again`: the object now under the name is opened and the claim's slot
+  read; a pid or start other than this process's (A-522's fields, written only by the claimant) means the object was made
+  again, and the claim is taken back and refused `DaemonUnavailable`. No object under the name yet reads not made again,
+  so the next look asks again. An anchor's object outlives its daemon's restarts, so its claims keep waiting.
+- **Tests.** `slates-ipc` `rendezvous::platform::tests::a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`: red
+  before (still due 2.000 s after the object was made again), refused 178 µs after it with the fix. macOS arm64, Mac
+  Studio (adas-mac-studio-4), local: `cargo test --locked -p slates-ipc --lib rendezvous::` 16 of 16,
+  `--test rendezvous` 14 of 14, fmt clean.
+- **Applied in the same change to.** §4.7's A-468 status (a status line), GAPS (the rendezvous waits entry).
+
+### A-733 — The DAV site runs a repository's hooks (2026-11-20, w-reaper, UI goal 93; §4.17.4 items 5 "HTTP" and 9; A-730, A-681, A-627, A-661)
+
+- **What was there.** After A-730, svn:// and svn+ssh:// ran a repository's hooks, but the DAV site refused a commit
+  at a configured start-commit or pre-commit ("This server does not run this repository's hooks yet"), never ran
+  post-commit, and ignored the lock hooks.
+- **Change.** `slates_svn::dav::commit::DavCommit` stops at its hooks: `begin_hooked` (the transaction begun as far as
+  start-commit, its due handed back) and `resume_begin`; `merge_hooked` (as far as pre-commit) and `resume_merge`;
+  `begin` and `merge` with a hooks closure are wrappers over them. `pending_base` and `pending_tokens` give a hook its
+  transaction's base and its presented tokens by repository path. The server's `SvnStores::begin_commit` hands back
+  start-commit's due with the transaction's name; `SvnExchange`'s POST, MERGE, LOCK and UNLOCK are async steps of its
+  `body_end`, each running its hooks through `vcs_svn::run_hook` with `HookSite::Http` (the exchange's `ClientGone`, the
+  repository's policy, which the exchange keeps). pre-lock and pre-unlock run once the request reads as a lock or an
+  unlock, before the table judges it (a read-only lend plans it first); a post-hook's failure is counted
+  (`vcs_http.svn_post_lock_failed`, `_post_unlock_failed`) and never told, as `mod_dav_svn` logs it.
+- **Tests.** `slates-server` `vcs_http::daemon_edge::tests::a_dav_posts_start_commit_hook_that_refuses_refuses_the_
+  transaction_in_svnserves_words`, `a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them`,
+  `a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock` (a daemon's HTTPS edge, shell-script hooks through
+  `SetRepositoryPolicy`; red before: the not-run refusal, or the hook ignored); `vcs_http::svn`, `vcs_svn::`,
+  `vcs_ssh::` and the svn crate's `dav::` and `commit::` unchanged; stock svn 1.15's HTTP round trip, locks, blame and
+  diff on the Mac Studio. macOS arm64.
+- **Applied in the same change to** §4.17.4 item 9's status, GAPS (A-730's line), amendments.tsv.
+- **Departure, stated.** start-commit's capabilities are `mergeinfo`, which every stock client announces in its
+  requests' `DAV` header, rather than read from the request.
+- **Owed.** The revprop hooks' calls with A-702 part 2 (w-svn). REPOS as A-645's read-only view (next).
+
+### A-736 — The SSH edge's signal of its client gone ends a hook's run (2026-11-20, w-k90-vendor, kiln goal 90; A-730's owed item, A-665 part 4a, A-651, A-683)
+- **Why.** A hook's run over SSH (git's receive-pack, A-683; Subversion's tunnel, A-730 part 3) ended only at its
+  learned bound or by itself: the SSH edge never learned that its client left, where the HTTP edge's `ClientGone` ends
+  a run once the connection's socket closes (A-665 part 4a).
+- **Change.** `vcs_ssh::site::ClientGone`, handed to each `Command::step` by the edge's loop: the connection's socket
+  watched while the step runs and the loop reads nothing else. An SSH client may still send then (a window adjustment,
+  its channel's EOF or close, a disconnect: encrypted packets the watch cannot read), so the watch takes the client's
+  bytes rather than peeking as the HTTP edge's does: `read_now` once readability says something came (its wait holds
+  no buffer, so a step that drops the watch loses nothing), kept after the bytes already unread and fed to the session
+  after the step as a read's are, at most the one read a connection holds (`READ_BYTES`). The client's end of stream
+  or a reset, behind whatever it sent, is gone; past the room kept the watch asks the kernel's record of the
+  connection once (`TcpStream::peer_closed`), and still there is unknown. git's receive-pack runs its hook with it
+  (`receive::answer_step`); the tunnel's hooks with it through `vcs_svn::HookSite::Tunnel` (`run_svn_hook` takes the
+  gone future; the listener's is A-665's watch of its socket), a run its client left ending the tunnel E210002 with
+  "Network connection closed unexpectedly", as `svnserve` ends where its client leaves inside a command; the tunnel's
+  "does not run this repository's hooks yet" fallback for a missing verdict goes, since only a client gone gives none.
+- **Tests** (macOS arm64, Mac Studio, local, own target, 2026-11-20). `slates-server`
+  `vcs_ssh::tests::g90_a_command_waiting_within_its_step_learns_its_ssh_client_has_gone` (a command waiting within its
+  step over the edge with a stock-shaped client: quiet while the client is there; resolved once it sent its channel's
+  EOF and closed): red with the edge passing no signal (left `(false, false)`), green with the watch. `cargo test
+  --locked -p slates-server --lib -- vcs_ssh vcs_svn vcs_store::upload` 79 of 79; fmt clean.
+- **Owed.** A live push over SSH whose client is killed while its hook runs (main's runs); Windows' build of the edge
+  (main's).
 
 ### A-722 part 2 — A row holds nothing known only once its push lands (2026-11-20, w-git for UI goal 93; A-722's design, point 3)
 - **Change.** `slates_git::store::rows`: an object row is its kind, length, position and (a commit's) commit-graph part;

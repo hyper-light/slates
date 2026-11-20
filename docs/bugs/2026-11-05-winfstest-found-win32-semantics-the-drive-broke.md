@@ -101,3 +101,13 @@ cached state) can be received by no one: the drive stops. It is the mechanism g2
 coherent purge (GAPS, 2026-11-18), shown here for fsx. The fix is slates': a receive must never wait for a send's
 completion (a second receiver while a send is in flight, WinFsp's own posture of at least two dispatcher threads, or
 sends made from a thread that does not receive) -- an amendment to A-198's single-receiver journal, owed.
+
+**Fixed 2026-11-20 by A-725 (the relief receiver).** A second receiver with its own journal region serves while the
+primary is held in a send; the operation state moves between them, so one thread still operates at a time
+(`crates/bridge-winfsp/src/inflight/relief.rs`). Test: `inflight::relief::tests::a_send_whose_completion_waits_on_another_request_is_relieved`,
+red with the relief taken out ("the shrink's answer never completed in 10.1 s: its nested read reached no receiver"),
+green after. By use on windows-latest (diag-w-bugs-b3-10): fsx seed 1 ran whole over the drive in 49 s, ending `All
+operations - 10770 - completed A-OK!`. That run also showed the harness judging the port wrongly: the port counts each
+MAPWRITE's extension of the file as a call (`fsx.c` 1330-1337), so a whole run of 10,000 operations prints 10,770; the
+judge now takes a count of at least the operations asked (`the_winfsp_ports_count_includes_its_extensions`). The
+`fsx-seed-1-unfinished:10000` line is struck.

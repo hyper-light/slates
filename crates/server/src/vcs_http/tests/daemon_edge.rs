@@ -1590,3 +1590,331 @@ fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic
     "{out}{err}"
   );
 }
+
+/// A Subversion repository's name that routes to [`REPOSITORY`]'s partition.
+#[cfg(unix)]
+fn svn_name_on_the_repositorys_partition() -> String {
+  (0u32..)
+    .map(|serial| format!("svn-hooked-{serial}"))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there")
+}
+
+/// Creates the Subversion repository `name` on [`REPOSITORY`]'s partition, owned by [`owner`], its policy running
+/// `hooks` (each a point and its program).
+#[cfg(unix)]
+fn create_svn_hooked(
+  daemon: &Daemon,
+  name: &str,
+  hooks: Vec<(slates_ipc::protocol::HookPointName, String)>,
+) {
+  let name = name.to_owned();
+  let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.clone(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Revisions,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    );
+    let set = crate::verbs::dispatch(
+      state,
+      2,
+      &owner(),
+      RequestBody::SetRepositoryPolicy {
+        repository: name.clone(),
+        read: 0,
+        rules: Vec::new(),
+        hooks: hooks
+          .iter()
+          .map(|(point, program)| slates_ipc::protocol::HookConfig {
+            point: *point,
+            name: svn_point_name(*point).to_owned(),
+            program: program.clone(),
+          })
+          .collect(),
+        hooks_env: Vec::new(),
+        signers: Vec::new(),
+      },
+    );
+    (created, set)
+  });
+  assert!(
+    !matches!(replies.0, ReplyBody::Refused { .. }),
+    "{replies:?}"
+  );
+  assert_eq!(replies.1, ReplyBody::Acknowledged);
+}
+
+/// The name Subversion gives a hook at `point`.
+#[cfg(unix)]
+fn svn_point_name(point: slates_ipc::protocol::HookPointName) -> &'static str {
+  use slates_ipc::protocol::HookPointName as Point;
+  match point {
+    Point::SvnStartCommit => "start-commit",
+    Point::SvnPreCommit => "pre-commit",
+    Point::SvnPostCommit => "post-commit",
+    Point::SvnPreLock => "pre-lock",
+    Point::SvnPostLock => "post-lock",
+    Point::SvnPreUnlock => "pre-unlock",
+    Point::SvnPostUnlock => "post-unlock",
+    _ => "other",
+  }
+}
+
+/// The status, head and body of the owner's DAV request `method target` with `fields` and `body`, on a new TLS
+/// connection to the edge.
+#[cfg(unix)]
+fn dav(
+  edge: (u16, &CertificateDer<'static>),
+  (method, target): (&str, &str),
+  fields: &[&str],
+  body: &[u8],
+) -> (u16, String, String) {
+  let (port, certificate) = edge;
+  let mut request = format!(
+    "{method} {target} HTTP/1.1\r\nHost: localhost\r\n{}\r\nContent-Length: {}\r\n",
+    owner_bearer(),
+    body.len()
+  );
+  for field in fields {
+    request.push_str(field);
+    request.push_str("\r\n");
+  }
+  request.push_str("\r\n");
+  let mut sent = request.into_bytes();
+  sent.extend_from_slice(body);
+  let mut stream = tls_client(port, certificate);
+  stream.write_all(&sent).expect("the request is sent");
+  let mut head = Vec::new();
+  while !head.ends_with(b"\r\n\r\n") {
+    head.extend(line_of(&mut stream));
+  }
+  let head = String::from_utf8_lossy(&head).into_owned();
+  let status = head
+    .split(' ')
+    .nth(1)
+    .and_then(|code| code.parse().ok())
+    .unwrap_or_else(|| panic!("no status line: {head:?}"));
+  let body = body_of(&mut stream, &head);
+  (status, head, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The value of field `name` in an answer's `head`.
+#[cfg(unix)]
+fn field(head: &str, name: &str) -> Option<String> {
+  head.lines().find_map(|line| {
+    let (named, value) = line.split_once(':')?;
+    named
+      .eq_ignore_ascii_case(name)
+      .then(|| value.trim().to_owned())
+  })
+}
+
+/// A file's whole text as svndiff 0, as a PUT of an added file sends it: the header, then one window of new data alone.
+#[cfg(unix)]
+fn fulltext_delta(text: &[u8]) -> Vec<u8> {
+  let length = u8::try_from(text.len()).expect("a text under 64 bytes");
+  let mut delta = b"SVN\0".to_vec();
+  // A window: source offset 0, source length 0, target length, instructions' length 1, new data's length; one
+  // instruction, new data (`0b10` in its top two bits) of the whole length.
+  delta.extend_from_slice(&[0, 0, length, 1, length, 0x80 | length]);
+  delta.extend_from_slice(text);
+  delta
+}
+
+/// A DAV commit of repository `name` adding `f.txt` with `text`, as stock svn sends it: the POST, the PUT and the
+/// MERGE; each answer's status, and the MERGE's body.
+#[cfg(unix)]
+fn dav_commit(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  text: &[u8],
+) -> (u16, u16, u16, String) {
+  let posted = dav(
+    edge,
+    ("POST", &format!("/{name}/!svn/me")),
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let Some(transaction) = field(&posted.1, "SVN-Txn-Name") else {
+    return (posted.0, 0, 0, posted.2);
+  };
+  let put = dav(
+    edge,
+    ("PUT", &format!("/{name}/!svn/txr/{transaction}/f.txt")),
+    &["Content-Type: application/vnd.svn-svndiff"],
+    &fulltext_delta(text),
+  );
+  let merge = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:merge xmlns:D=\"DAV:\"><D:source><D:href>/{name}/!svn/txn/\
+     {transaction}</D:href></D:source><D:no-auto-merge/><D:no-checkout/><D:prop><D:checked-in/><D:version-name/>\
+     </D:prop></D:merge>"
+  );
+  let merged = dav(
+    edge,
+    ("MERGE", &format!("/{name}")),
+    &["Content-Type: text/xml"],
+    merge.as_bytes(),
+  );
+  (posted.0, put.0, merged.0, merged.2)
+}
+
+/// A-733 (`mod_dav_svn` runs start-commit as the POST makes the transaction, `check_hook_result`'s words). Do: on a
+/// daemon's HTTP edge, a Subversion repository whose policy runs a start-commit hook that writes to standard error and
+/// exits 1; POST a transaction as stock svn does. Expect: the POST refused, its error in `svnserve`'s words "Commit
+/// blocked by start-commit hook (exit code 1) with output:" and the hook's standard error. Before A-733 the site refused
+/// it in its own words ("does not run this repository's hooks yet"), the hook never run.
+#[cfg(unix)]
+#[test]
+fn a_dav_posts_start_commit_hook_that_refuses_refuses_the_transaction_in_svnserves_words() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing =
+    crate::vcs_svn::tests::hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![(
+      slates_ipc::protocol::HookPointName::SvnStartCommit,
+      refusing,
+    )],
+  );
+  let (status, _, body) = dav(
+    (port, &certificate),
+    ("POST", &format!("/{name}/!svn/me")),
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  daemon.stop();
+  assert!(
+    status >= 400
+      && body.contains("Commit blocked by start-commit hook (exit code 1) with output:\nnot today"),
+    "{status}: {body}"
+  );
+}
+
+/// A-733 (`mod_dav_svn` runs pre-commit at the MERGE before the verdict and post-commit once the revision stands, its
+/// failure the MERGE response's `S:post-commit-err`, `merge.c`). Do: a repository whose policy runs start-commit and
+/// pre-commit hooks that record their arguments and accept, and a post-commit hook that writes to standard error and
+/// exits 1; commit a file over DAV as stock svn does (POST, PUT, MERGE). Expect: the POST `201`, the PUT `201`, the MERGE
+/// `200` naming revision 1 with post-commit's words in `S:post-commit-err`; start-commit given REPOS, the user,
+/// `mergeinfo` and the transaction; pre-commit REPOS and the same transaction.
+#[cfg(unix)]
+#[test]
+fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
+  use slates_ipc::protocol::HookPointName;
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let at = dir.path.display().to_string();
+  let start = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "start-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/start.args"),
+  );
+  let pre = crate::vcs_svn::tests::hook_script(
+    &dir.path,
+    "pre-commit",
+    &format!("for arg in \"$@\"; do echo \"$arg\"; done > {at}/pre.args"),
+  );
+  let post =
+    crate::vcs_svn::tests::hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![
+      (HookPointName::SvnStartCommit, start),
+      (HookPointName::SvnPreCommit, pre),
+      (HookPointName::SvnPostCommit, post),
+    ],
+  );
+  let (posted, put, merged, body) = dav_commit((port, &certificate), &name, b"hello\n");
+  daemon.stop();
+  #[allow(clippy::disallowed_methods)]
+  // test code: what the hooks recorded in its own scratch directory
+  let lines = |file: &str| -> Vec<String> {
+    std::fs::read_to_string(dir.path.join(file))
+      .unwrap_or_default()
+      .lines()
+      .map(str::to_owned)
+      .collect()
+  };
+  let (started, precommitted) = (lines("start.args"), lines("pre.args"));
+  let repos = format!("/{name}");
+  assert_eq!(
+    (
+      (posted, put, merged),
+      started.first(),
+      started.get(2).map(String::as_str),
+      started.len(),
+      precommitted.first(),
+      precommitted.get(1) == started.get(3),
+    ),
+    (
+      (201, 201, 200),
+      Some(&repos),
+      Some("mergeinfo"),
+      4,
+      Some(&repos),
+      true
+    ),
+    "start-commit {started:?}, pre-commit {precommitted:?}: {body}"
+  );
+  assert!(
+    body.contains("<S:post-commit-err>") && body.contains("post said no"),
+    "{body}"
+  );
+}
+
+/// A-733 (`mod_dav_svn`'s LOCK runs pre-lock through `svn_repos_fs_lock`, its refusal "Failed to create new lock." with
+/// the hook's error, `lock.c`). Do: commit a file over DAV, then LOCK it as stock svn does, through a repository whose
+/// policy runs a pre-lock hook that writes to standard error and exits 1. Expect: the LOCK refused, its error in
+/// `svnserve`'s words "Lock blocked by pre-lock hook (exit code 1) with output:" and the hook's standard error.
+#[cfg(unix)]
+#[test]
+fn a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock() {
+  let dir = crate::git_hooks::tests::ScratchDir::new();
+  let refusing =
+    crate::vcs_svn::tests::hook_script(&dir.path, "pre-lock", "echo 'no locks here' >&2\nexit 1");
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(
+    &daemon,
+    &name,
+    vec![(slates_ipc::protocol::HookPointName::SvnPreLock, refusing)],
+  );
+  let edge = (port, &certificate);
+  let (_, _, merged, merge_body) = dav_commit(edge, &name, b"hello\n");
+  let lockinfo: &[u8] =
+    b"<?xml version=\"1.0\" encoding=\"utf-8\"?><lockinfo xmlns=\"DAV:\"><lockscope><exclusive/>\
+</lockscope><locktype><write/></locktype><owner>editing it</owner></lockinfo>";
+  let (status, _, body) = dav(
+    edge,
+    ("LOCK", &format!("/{name}/f.txt")),
+    &["Content-Type: text/xml"],
+    lockinfo,
+  );
+  daemon.stop();
+  assert_eq!(merged, 200, "{merge_body}");
+  assert!(
+    status >= 400
+      && body.contains("Lock blocked by pre-lock hook (exit code 1) with output:\nno locks here"),
+    "{status}: {body}"
+  );
+}

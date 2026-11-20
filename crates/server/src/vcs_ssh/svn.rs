@@ -31,9 +31,10 @@
 //! id. The hooks run where `svnserve -t` runs them (A-730, through `crate::vcs_svn::run_hook` with the tunnel's
 //! repository record): start-commit at `open-root` and pre-commit at `close-edit`, whose verdicts resume the drive;
 //! post-commit once the revision stands, its failure `commit-info`'s `post-commit-err`; and around the lock verbs,
-//! pre-lock or pre-unlock for each path and post-lock or post-unlock once. No signal of the client gone reaches the
-//! tunnel yet (owed with git's on this edge), so a hook's run ends at its learned bound or by itself; Windows, with no
-//! hook driver, refuses a change at a configured point. The work the drive accepts lands through the owner's
+//! pre-lock or pre-unlock for each path and post-lock or post-unlock once. A hook's run ends at its learned bound, by
+//! itself, or once the edge's signal says the client has gone (`super::site::ClientGone`), which ends the tunnel as
+//! `svnserve` ends where its client leaves inside a command (E210002); Windows, with no hook driver, refuses a change at
+//! a configured point. The work the drive accepts lands through the owner's
 //! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::commit_work`, the one both ra_svn
 //! transports call, A-698), and `close-edit` is answered with `commit-info` (the revision, its date and author) or with
 //! the step's refusal as its failure, after which the client's commands are dropped until its `abort-edit`.
@@ -60,7 +61,7 @@
 //! **Owed** (GAPS, the §4.17 entry): the lender over A-662's map (the records A-655 part 2b keeps in its Subversion
 //! arm: the index, revision properties, contents, lock table and UUID; with a directory's entries from the green and
 //! the repository's `svnserve.conf` facts; the HTTP edge's DAV site waits for the same lender behind its own
-//! `SvnStores`), which lends and commits on the owner shard; the signal of the client gone for a hook's run; the
+//! `SvnStores`), which lends and commits on the owner shard; the
 //! FSFS-layout view stock `svnlook` reads REPOS through (A-645); CRAM-MD5 through the tunnel,
 //! whose keys the record of credentials does not hold yet (a lender that lists it gets every challenge failed, as
 //! `svnserve` fails one it cannot make); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send
@@ -76,8 +77,8 @@ use slates_svn::report::{self, exchange::Budget};
 use slates_svn::serve::{self, CommitStart, Connection, Limits, Made, Sources, Turn, Waiting};
 
 use super::site::{
-  Command, Next, Refused, SVNSERVE_FAILURE_STATUS, Service, Services, Start, Stepped, Unserved,
-  not_served,
+  ClientGone, Command, Next, Refused, SVNSERVE_FAILURE_STATUS, Service, Services, Start, Stepped,
+  Unserved, not_served,
 };
 use crate::repository::svn_commit::{self, Committed};
 use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
@@ -118,8 +119,6 @@ const CONNECTION_CLOSED: u32 = 210_002;
 const MALFORMED_DATA: u32 = 210_004;
 /// Format: `SVN_ERR_RA_SVN_REQUEST_SIZE`, the ra_svn category's start plus 9.
 const REQUEST_SIZE: u32 = 210_009;
-/// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the miscellaneous category's start (200,000) plus 7.
-const UNSUPPORTED_FEATURE: u32 = 200_007;
 
 /// The words of a client that left where the connection still read (recorded, the module doc).
 const CLOSED_WORDS: &str = "Network connection closed unexpectedly";
@@ -127,8 +126,6 @@ const CLOSED_WORDS: &str = "Network connection closed unexpectedly";
 const MALFORMED_WORDS: &str = "Malformed network data";
 /// The words of an item past its bound: `SVN_ERR_RA_SVN_REQUEST_SIZE`'s own (slates-svn's `report::Refused`).
 const TOO_LONG_WORDS: &str = "Client request too long";
-/// The words a change is refused with where a hook it waits on gave no verdict (the module doc's commit).
-const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
 
 /// The rights some name of a repository must grant a principal for its tunnel to open it: any of the four, each command
 /// then judged by the session, as the site judges Mercurial's `serve --stdio`.
@@ -246,10 +243,10 @@ impl<C: Command, T: Command> Command for EitherCommand<C, T> {
     }
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
+  async fn step(&mut self, gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     match self {
-      Self::Other(command) => command.step().await,
-      Self::Tunnel(command) => command.step().await,
+      Self::Other(command) => command.step(gone).await,
+      Self::Tunnel(command) => command.step(gone).await,
     }
   }
 
@@ -419,7 +416,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
 
   /// One step (the module doc): the connection's call over the input held, the tunnel's answer to what it asks, and the
   /// bytes it took given back.
-  async fn stepped(&mut self) -> Stepped {
+  async fn stepped(&mut self, gone: ClientGone<'_>) -> Stepped {
     if let Some(status) = self.exit {
       return exited(status);
     }
@@ -446,15 +443,15 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         consumed
       }
       Received::LockAsked(consumed) => {
-        self.lock_verb().await;
+        self.lock_verb(gone).await;
         consumed
       }
       Received::Hook { due, consumed } => {
-        self.answer_hook(&due).await;
+        self.answer_hook(&due, gone).await;
         consumed
       }
       Received::Accepted { work, consumed } => {
-        self.land(*work).await;
+        self.land(*work, gone).await;
         consumed
       }
       Received::Ended(refused) => {
@@ -589,7 +586,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   /// Judges the lock verb the client asked for over the lent sources, lands its entries through the owner's step and
   /// answers it (A-693 part 2): each new token drawn from the system's generator, one it cannot give refusing the
   /// landing; the table holding at most as many locks as one item has bytes.
-  async fn lock_verb(&mut self) {
+  async fn lock_verb(&mut self, gone: ClientGone<'_>) {
     let Some(record) = self.opened.as_ref() else {
       return self.not_held();
     };
@@ -612,10 +609,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Some(Ok(None)) => return,
       Some(Ok(Some(call))) => call,
     };
-    let site = HookSite::Tunnel(&policy);
-    // No signal of the client gone reaches the tunnel yet (the module doc), so every run's verdict comes back.
+    let site = HookSite::Tunnel(&policy, gone);
+    // No verdict: the client left during a run (the module doc's hooks).
     let Some(verdicts) = pre_lock_hooks(site, &hooked, room, &call).await else {
-      return self.not_held();
+      return self.client_left();
     };
     let undrawn = std::cell::Cell::new(false);
     let mut draw = || {
@@ -656,9 +653,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Err(refused) => return self.end(refused),
     };
     let ended = match post {
-      Some(call) => post_lock_hook(site, &hooked, room, &call)
-        .await
-        .unwrap_or_else(|| Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])),
+      Some(call) => match post_lock_hook(site, &hooked, room, &call).await {
+        Some(ended) => ended,
+        None => return self.client_left(),
+      },
       None => Ok(()),
     };
     let answered = self.connection.locks_finished(ended, &mut self.out);
@@ -695,7 +693,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
 
   /// Answers the hook the drive waits for (the module doc's commit): passed where none is configured at its point,
   /// refused in the not-served words where one is.
-  async fn answer_hook(&mut self, due: &Due) {
+  async fn answer_hook(&mut self, due: &Due, gone: ClientGone<'_>) {
     let Some(record) = self.opened.as_ref() else {
       return self.not_held();
     };
@@ -716,7 +714,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       .map(|(path, token)| LockToken { path, token })
       .collect();
     let base = self.connection.pending().map_or(0, |pending| pending.base);
-    let site = HookSite::Tunnel(&policy);
+    let site = HookSite::Tunnel(&policy, gone);
     let words_cap = self.bounds.limits.item_bytes;
     let ran = match due {
       Due::StartCommit { transaction } => {
@@ -752,10 +750,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         .await
       }
     };
-    // No signal of the client gone reaches the tunnel yet (the module doc), so every run's verdict comes back.
-    let answer = ran
-      .verdict
-      .unwrap_or_else(|| Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())]));
+    // No verdict: the client left during the run (the module doc's hooks).
+    let Some(answer) = ran.verdict else {
+      return self.client_left();
+    };
     let Self {
       connection,
       stores,
@@ -765,7 +763,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let answered = stores.lend(id, |sources| connection.answer_hook(answer, sources, out));
     match answered {
       None => self.not_held(),
-      Some(Ok(Turn::Accepted { work, .. })) => Box::pin(self.land(*work)).await,
+      Some(Ok(Turn::Accepted { work, .. })) => Box::pin(self.land(*work, gone)).await,
       Some(Ok(_)) => {}
       Some(Err(refused)) => self.end(refused),
     }
@@ -773,7 +771,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
 
   /// Lands the accepted `work` through the owner's commit step (the module doc's commit) and answers `close-edit` with
   /// the revision it made, or with its refusal.
-  async fn land(&mut self, work: Work) {
+  async fn land(&mut self, work: Work, gone: ClientGone<'_>) {
     let Some(record) = self.opened.as_ref() else {
       return self.not_held();
     };
@@ -790,7 +788,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
         let revision = committed.revision;
         let words_cap = self.bounds.limits.item_bytes;
         run_hook(
-          HookSite::Tunnel(&policy),
+          HookSite::Tunnel(&policy, gone),
           &hooked,
           words_cap,
           HookPoint::SvnPostCommit,
@@ -842,6 +840,12 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     }
   }
 
+  /// Ends the tunnel because its client left while a hook ran (the module doc's hooks): as `svnserve` ends where its
+  /// client leaves inside a command, though nothing written reaches a client that is gone.
+  fn client_left(&mut self) {
+    self.ends_with(CONNECTION_CLOSED, CLOSED_WORDS.as_bytes());
+  }
+
   /// Ends the tunnel because the repository's store is not held here: the site's not-served words, nothing more
   /// written.
   fn not_held(&mut self) {
@@ -873,8 +877,8 @@ impl<R: Repositories, V: SvnStores> Command for SvnCommand<R, V> {
     self.input_ended = true;
   }
 
-  async fn step(&mut self) -> Result<Stepped, Refused> {
-    Ok(self.stepped().await)
+  async fn step(&mut self, gone: ClientGone<'_>) -> Result<Stepped, Refused> {
+    Ok(self.stepped(gone).await)
   }
 
   fn output(&self) -> (&[u8], &[u8]) {

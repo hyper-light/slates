@@ -57,7 +57,8 @@
 //! holds at most the room again. An answer is written within the room; one past it is `500`.
 
 use crate::repository::svn_commit::{Committed, Uncommitted};
-use crate::vcs_hooks::HookPoint;
+use crate::vcs_hooks::{self, CommittedView, HookPoint, LockToken, PendingView};
+use crate::vcs_svn::{HookSite, Hooked, MERGEINFO, run_hook};
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
 use slates_http::Admission;
 use slates_http::head::{Head, Target};
@@ -71,7 +72,7 @@ use slates_svn::commit::drive::Due;
 use slates_svn::commit::drive::{Setup, Work};
 use slates_svn::dav::Bounds as XmlBounds;
 use slates_svn::dav::commit::{
-  self as commit, DavCommit, Hooks, Merged, PutStart, World as CommitWorld,
+  self as commit, DavCommit, Hooks, MergeStep, Merged, PutStart, World as CommitWorld,
 };
 use slates_svn::dav::locking::{self, HttpAnswer, LockHttp, UnlockHttp};
 use slates_svn::dav::response::MergeResponse;
@@ -160,16 +161,17 @@ pub(crate) trait SvnStores {
   ) -> Option<T>;
 
   /// Begins an HTTP commit in repository `id` for `principal` (A-681 part C): the transaction named, the setup
-  /// `setup_of` makes from its name and the owner's instant, the commit begun over the records with `hooks`, and kept;
-  /// its name, or the POST's refusal. None where this lender serves no commits or does not hold `id`'s records.
+  /// `setup_of` makes from its name and the owner's instant, the commit begun over the records as far as start-commit
+  /// (A-733, `DavCommit::begin_hooked`), and kept; its name and start-commit's due where the commit stopped for it, which
+  /// the caller runs and answers on the kept commit (`DavCommit::resume_begin`), or the POST's refusal. None where this
+  /// lender serves no commits or does not hold `id`'s records.
   fn begin_commit(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
     setup_of: impl FnOnce(String, AprTime) -> Setup,
-    hooks: Hooks<'_>,
-  ) -> Option<Result<String, HttpAnswer>> {
-    let _unserved = (id, principal, setup_of, hooks);
+  ) -> Option<Result<(String, Option<Due>), HttpAnswer>> {
+    let _unserved = (id, principal, setup_of);
     None
   }
 
@@ -544,9 +546,8 @@ pub(crate) struct SvnExchange<S> {
   name: String,
   /// The HTTPv2 commit headers the request sent ([`CommitHeaders`]).
   commit_headers: CommitHeaders,
-  /// Whether the repository configures each commit hook (start-commit, pre-commit), which this site does not run yet:
-  /// a commit meeting one is refused, as the svn+ssh tunnel refuses it.
-  hooked: (bool, bool),
+  /// The repository's policy: the hooks its commits and locks run (A-733).
+  policy: slates_db::catalog::RepositoryPolicy,
   /// A PUT on a transaction's root, its body streamed into the transaction's drive run by run and never held
   /// (§4.17.1 "A push's intake"); none for every other request.
   streamed: Option<Streamed>,
@@ -652,22 +653,11 @@ impl<S> SvnExchange<S> {
     .flatten()
     .fold(held, |held, value| held.saturating_add(to_u64(value.len())));
     admission.charge(held).ok()?;
-    let hooked_at = |point: HookPoint| {
-      repository
-        .policy
-        .hooks
-        .iter()
-        .any(|hook| HookPoint::of(hook.point) == point)
-    };
-    let hooked = (
-      hooked_at(HookPoint::SvnStartCommit),
-      hooked_at(HookPoint::SvnPreCommit),
-    );
     Some(Self {
       streamed: streamed_put(&method, &asked.routed.path),
       name: asked.routed.name.clone(),
       commit_headers,
-      hooked,
+      policy: repository.policy.clone(),
       stores,
       repository: repository.id,
       root: format!("/{}", asked.routed.name),
@@ -692,12 +682,29 @@ const UNSUPPORTED_FEATURE: u32 = 200_007;
 /// The words a commit is refused with at a point where the repository configures a hook, which this site does not run
 /// yet, as the svn+ssh tunnel words it.
 const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
+/// The words a change is refused with where its client hung up before its hook ended (A-733): the change does not go
+/// on, and no one reads them.
+const CLIENT_LEFT_WORDS: &str = "The client left before the repository's hook ended";
+/// The words a LOCK is refused with where its pre-lock hook wrote more before any NUL than the site keeps of its output:
+/// the token is not all here, so no lock is made with it.
+const TOKEN_PAST_CAP_WORDS: &str =
+  "The pre-lock hook's token is longer than the server keeps of its output";
+/// The first status that is no success: a lock answered below it was made (RFC 9110 §15.4).
+/// Format: RFC 9110 §15.4, the 3xx class.
+const HTTP_REDIRECTION: u16 = 300;
+/// The status a refused pre-hook is answered with where `dav_svn__convert_err` maps its error to none.
+/// Format: `lock.c`, `HTTP_INTERNAL_SERVER_ERROR`.
+const HTTP_INTERNAL_SERVER_ERROR: u16 = 500;
+/// Counter: a post-lock hook that failed, its lock standing; logged as `mod_dav_svn` logs it, never told.
+const POST_LOCK_FAILED: &str = "vcs_http.svn_post_lock_failed";
+/// Counter: a post-unlock hook that failed, the lock gone; logged as `mod_dav_svn` logs it, never told.
+const POST_UNLOCK_FAILED: &str = "vcs_http.svn_post_unlock_failed";
 
 impl<S: SvnStores> SvnExchange<S> {
   /// The answer to an HTTPv2 commit's request (A-681 part C; `slates_svn::dav::commit`): a POST to `!svn/me`, a
   /// request on a transaction's root (`!svn/txr/NAME/...`) or on the transaction itself (`!svn/txn/NAME`), a COPY
   /// whose destination is in a transaction, or a MERGE; none for every other request, which the read side answers.
-  fn commit_side(&mut self) -> Option<HttpAnswer> {
+  async fn commit_side(&mut self, gone: ClientGone<'_>) -> Option<HttpAnswer> {
     if let Some(streamed) = self.streamed.take() {
       return Some(self.end_stream(streamed));
     }
@@ -706,7 +713,7 @@ impl<S: SvnStores> SvnExchange<S> {
     let special = |segment: &str| segment == site::SPECIAL;
     let method = self.method.clone();
     Some(match (method.as_str(), segments.as_slice()) {
-      ("POST", [first, "me"]) if special(first) => self.post(),
+      ("POST", [first, "me"]) if special(first) => self.post(gone).await,
       ("DELETE", [first, "txn", name]) if special(first) => {
         self.on_transaction(name, |commit, world, hooks| commit.abort(world, hooks))
       }
@@ -717,32 +724,29 @@ impl<S: SvnStores> SvnExchange<S> {
       (method, [first, "txr", name, rest @ ..]) if special(first) => {
         self.on_transaction_root(method, name, &format!("/{}", rest.join("/")))
       }
-      ("MERGE", _) => self.merge(),
-      ("LOCK", _) => self.lock(),
-      ("UNLOCK", _) => self.unlock(),
+      ("MERGE", _) => self.merge(gone).await,
+      ("LOCK", _) => self.lock(gone).await,
+      ("UNLOCK", _) => self.unlock(gone).await,
       _ => return None,
     })
   }
 
-  /// The hook answer this repository gives (`hooked`): passed where none is configured at the hook's point.
+  /// The hook answer of a request that meets no hook: the transaction's own requests between its POST and its MERGE
+  /// (a PUT, a MKCOL, a DELETE, a COPY, a PROPPATCH), where the drive pauses for none; the POST and the MERGE run theirs
+  /// (A-733). Refused, never passed, were one ever due.
   fn hooks(&self) -> impl Fn(&Due) -> Result<(), Vec<(u32, String)>> + use<S> {
-    let (start, pre) = self.hooked;
-    move |due: &Due| {
-      let hooked = match due {
-        Due::StartCommit { .. } => start,
-        Due::PreCommit { .. } => pre,
-      };
-      if hooked {
-        Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
-      } else {
-        Ok(())
-      }
-    }
+    |_due: &Due| Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
+  }
+
+  /// What this repository's hooks need of it (A-733): its id, name and REPOS.
+  fn hooked(&self) -> Hooked {
+    Hooked::new(self.repository, &self.name)
   }
 
   /// A POST making a transaction: its revision properties from the body's skel, the principal its author.
-  fn post(&mut self) -> HttpAnswer {
+  async fn post(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let user = crate::lfs::owner_name(&self.principal);
+    let hook_user = user.clone();
     let properties = match commit::transaction_properties(&self.body, Some(&user)) {
       Ok(properties) => properties,
       Err(_) => return commit::unserved("A POST whose body is no create-txn skel"),
@@ -767,13 +771,62 @@ impl<S: SvnStores> SvnExchange<S> {
       rules: None,
       revision_properties: properties,
     };
-    let hooks = self.hooks();
-    match self
+    let (transaction, due) =
+      match self
+        .stores
+        .begin_commit(self.repository, &self.principal, setup_of)
+      {
+        Some(Ok(begun)) => begun,
+        Some(Err(refused)) => return refused,
+        None => return commit::unserved("Commits"),
+      };
+    let Some(due) = due else {
+      return commit::created(&transaction);
+    };
+    // start-commit, run where `mod_dav_svn` runs it: once the transaction is made (A-733). Its capabilities are
+    // `mergeinfo`, which every stock client announces in its requests' `DAV` header.
+    let base = self
       .stores
-      .begin_commit(self.repository, &self.principal, setup_of, &hooks)
-    {
-      Some(Ok(transaction)) => commit::created(&transaction),
-      Some(Err(refused)) => refused,
+      .on_commit(
+        self.repository,
+        &self.principal,
+        &transaction,
+        |commit, _| commit.pending_base(),
+      )
+      .flatten()
+      .unwrap_or_default();
+    let named = match &due {
+      Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction.clone(),
+    };
+    let ran = run_hook(
+      HookSite::Http(gone, &self.policy),
+      &self.hooked(),
+      to_usize(self.request_room),
+      HookPoint::SvnStartCommit,
+      |env, repos| {
+        vcs_hooks::svn_start_commit(
+          PendingView(base),
+          env,
+          repos,
+          &hook_user,
+          &[MERGEINFO],
+          &named,
+        )
+      },
+    )
+    .await;
+    let answer = ran
+      .verdict
+      .unwrap_or_else(|| Err(vec![(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]));
+    match self.stores.on_commit(
+      self.repository,
+      &self.principal,
+      &transaction,
+      |commit, world| commit.resume_begin(world, answer),
+    ) {
+      Some(Some(Ok(()))) => commit::created(&transaction),
+      Some(Some(Err(refused))) => refused,
+      Some(None) => commit::no_such_transaction(&transaction),
       None => commit::unserved("Commits"),
     }
   }
@@ -846,7 +899,7 @@ impl<S: SvnStores> SvnExchange<S> {
 
   /// A MERGE of the transaction its body names: closed, judged, landed through the owner's step, answered with the new
   /// revision (`merge.c` `dav_svn__merge_response`).
-  fn merge(&mut self) -> HttpAnswer {
+  async fn merge(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let bounds = xml_bounds(self.request_room);
     let Ok(request) = slates_svn::dav::request::merge(&self.body, &bounds) else {
       return commit::unserved("A MERGE whose body cannot be read");
@@ -862,7 +915,6 @@ impl<S: SvnStores> SvnExchange<S> {
       return commit::unserved("A MERGE of an activity");
     }
     let name = (*name).to_owned();
-    let hooks = self.hooks();
     let target = self.path.clone();
     let keep = self
       .commit_headers
@@ -870,23 +922,81 @@ impl<S: SvnStores> SvnExchange<S> {
       .as_deref()
       .is_some_and(|options| options.contains(KEEP_LOCKS));
     let tokens = request.lock_tokens;
-    let merged = self
-      .stores
-      .on_commit(self.repository, &self.principal, &name, |commit, world| {
-        for (path, token) in &tokens {
-          commit.present(&format!("{}/{path}", target.trim_end_matches('/')), token);
-        }
-        commit.keep_locks(keep);
-        commit.merge(world, &hooks)
-      });
-    let work = match merged {
-      Some(Some(Merged::Accepted(work))) => work,
-      Some(Some(Merged::Refused(refused))) => return refused,
+    let stepped =
+      self
+        .stores
+        .on_commit(self.repository, &self.principal, &name, |commit, world| {
+          for (path, token) in &tokens {
+            commit.present(&format!("{}/{path}", target.trim_end_matches('/')), token);
+          }
+          commit.keep_locks(keep);
+          let step = commit.merge_hooked(world);
+          (step, commit.pending_base(), commit.pending_tokens())
+        });
+    let (step, base, presented) = match stepped {
+      Some(Some(stepped)) => stepped,
       Some(None) => return commit::no_such_transaction(&name),
       None => return commit::unserved("Commits"),
     };
+    let merged = match step {
+      MergeStep::Done(merged) => merged,
+      MergeStep::Hook(due) => {
+        // pre-commit, run where `mod_dav_svn` runs it: before the verdict (A-733).
+        let named = match &due {
+          Due::StartCommit { transaction } | Due::PreCommit { transaction } => transaction.clone(),
+        };
+        let tokens: Vec<LockToken> = presented
+          .into_iter()
+          .map(|(path, token)| LockToken { path, token })
+          .collect();
+        let ran = run_hook(
+          HookSite::Http(gone, &self.policy),
+          &self.hooked(),
+          to_usize(self.request_room),
+          HookPoint::SvnPreCommit,
+          |env, repos| vcs_hooks::svn_pre_commit(PendingView(base), env, repos, &named, &tokens),
+        )
+        .await;
+        let answer = ran
+          .verdict
+          .unwrap_or_else(|| Err(vec![(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]));
+        match self
+          .stores
+          .on_commit(self.repository, &self.principal, &name, |commit, world| {
+            commit.resume_merge(world, answer)
+          }) {
+          Some(Some(merged)) => merged,
+          Some(None) => return commit::no_such_transaction(&name),
+          None => return commit::unserved("Commits"),
+        }
+      }
+    };
+    let work = match merged {
+      Merged::Accepted(work) => work,
+      Merged::Refused(refused) => return refused,
+    };
+    let transaction = work.record.transaction.clone();
     match self.stores.land(self.repository, &self.principal, *work) {
-      Some(Ok(committed)) => merged_answer(&self.root, &committed, to_usize(self.request_room)),
+      Some(Ok(committed)) => {
+        // post-commit, once the revision stands: its failure is the MERGE response's `S:post-commit-err` (A-733).
+        let revision = committed.revision;
+        let post = run_hook(
+          HookSite::Http(gone, &self.policy),
+          &self.hooked(),
+          to_usize(self.request_room),
+          HookPoint::SvnPostCommit,
+          |env, repos| {
+            vcs_hooks::svn_post_commit(CommittedView(revision), env, repos, revision, &transaction)
+          },
+        )
+        .await;
+        merged_answer(
+          &self.root,
+          &committed,
+          to_usize(self.request_room),
+          post.post_commit_error,
+        )
+      }
       Some(Err(uncommitted)) => not_committed(&uncommitted),
       None => commit::unserved("Commits"),
     }
@@ -962,7 +1072,7 @@ impl<S: SvnStores> SvnExchange<S> {
   /// A LOCK of the public path the request names (`slates_svn::dav::locking`, A-627): read, judged by the lock table
   /// at the owner's instant with a fresh token, its entries landed through the owner's step, and answered as
   /// `mod_dav_svn` answers it.
-  fn lock(&mut self) -> HttpAnswer {
+  async fn lock(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let user = crate::lfs::owner_name(&self.principal);
     let path = public_path(&self.path);
     let headers = self.commit_headers.clone();
@@ -973,6 +1083,54 @@ impl<S: SvnStores> SvnExchange<S> {
       to_usize(self.request_room),
       self.depth.clone(),
     );
+    // pre-lock, run where `svn_repos_fs_lock` runs it: once the request reads as a lock, before the table judges it
+    // (A-733). A request refused before then is answered by the judge below, no hook run.
+    let planned = self
+      .stores
+      .lend(self.repository, &self.principal, |lent| {
+        let asked = LockHttp {
+          path: &path,
+          user: Some(&user),
+          body: &body,
+          depth: depth.as_deref(),
+          timeout: headers.timeout.as_deref(),
+          options: headers.options.as_deref(),
+          version_name: headers.version_text.as_deref(),
+        };
+        let head = IndexHead(lent.index);
+        locking::lock_request(&asked, &head, lent.now, &bounds)
+          .ok()
+          .map(|plan| (plan.request.comment, plan.request.steal))
+      })
+      .flatten();
+    let mut token = None;
+    let lock_planned = planned.is_some();
+    if let Some((comment, steal)) = planned {
+      let comment = comment
+        .map(|comment| String::from_utf8_lossy(&comment).into_owned())
+        .unwrap_or_default();
+      let ran = run_hook(
+        HookSite::Http(gone, &self.policy),
+        &self.hooked(),
+        room,
+        HookPoint::SvnPreLock,
+        |env, repos| {
+          vcs_hooks::svn_pre_lock(CommittedView(0), env, repos, &path, &user, &comment, steal)
+        },
+      )
+      .await;
+      match (ran.verdict, ran.token) {
+        (Some(Err(chain)), _) => return hook_refused(&chain),
+        (None, _) => return hook_refused(&[(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]),
+        (Some(Ok(())), Some(vcs_hooks::SvnLockToken::Given(given))) => {
+          token = Some(String::from_utf8_lossy(&given).into_owned());
+        }
+        (Some(Ok(())), Some(vcs_hooks::SvnLockToken::PastCap)) => {
+          return hook_refused(&[(LOCK_UNWRITABLE, TOKEN_PAST_CAP_WORDS.to_owned())]);
+        }
+        (Some(Ok(())), Some(vcs_hooks::SvnLockToken::Made) | None) => {}
+      }
+    }
     let judged = self
       .stores
       .lock_verb(self.repository, &self.principal, |lent, draw| {
@@ -986,10 +1144,16 @@ impl<S: SvnStores> SvnExchange<S> {
           version_name: headers.version_text.as_deref(),
         };
         let head = IndexHead(lent.index);
-        let plan = match locking::lock_request(&asked, &head, lent.now, &bounds) {
+        let mut plan = match locking::lock_request(&asked, &head, lent.now, &bounds) {
           Ok(plan) => plan,
           Err(refused) => return (Vec::new(), refused.answer()),
         };
+        // pre-lock's token, where it gave one, is the lock's, judged as a client's is (`hooks.c`; A-733).
+        if let Some(token) = &token
+          && let Some(target) = plan.request.targets.get_mut(&path)
+        {
+          target.token = Some(token.clone());
+        }
         let decision = match lent
           .locks
           .lock(&plan.request, &head, lent.now, room, &mut || draw())
@@ -1031,15 +1195,78 @@ impl<S: SvnStores> SvnExchange<S> {
           ),
         }
       });
-    landed(judged)
+    let answered = landed(judged);
+    if lock_planned && answered.status < HTTP_REDIRECTION {
+      // post-lock once the lock stands; its failure is logged, never told: the lock is made and its answer stands
+      // (`lock.c` `append_locks`, SVN_ERR_REPOS_POST_LOCK_HOOK_FAILED).
+      let ran = run_hook(
+        HookSite::Http(gone, &self.policy),
+        &self.hooked(),
+        room,
+        HookPoint::SvnPostLock,
+        |env, repos| {
+          vcs_hooks::svn_post_lock(CommittedView(0), env, repos, &user, &[path.as_str()])
+        },
+      )
+      .await;
+      if let Some(Err(_)) = ran.verdict {
+        crate::fleet::count_refusal(POST_LOCK_FAILED);
+      }
+    }
+    answered
   }
 
   /// An UNLOCK of the public path the request names, judged and landed as [`Self::lock`] is.
-  fn unlock(&mut self) -> HttpAnswer {
+  async fn unlock(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let user = crate::lfs::owner_name(&self.principal);
     let path = public_path(&self.path);
     let headers = self.commit_headers.clone();
     let filesystem = self.name.clone();
+    let room = to_usize(self.request_room);
+    // pre-unlock, run where `svn_repos_fs_unlock` runs it: once the request reads as an unlock, before the table judges
+    // it (A-733).
+    let planned = self
+      .stores
+      .lend(self.repository, &self.principal, |lent| {
+        let asked = UnlockHttp {
+          path: &path,
+          user: Some(&user),
+          lock_token: headers.lock_token.as_deref(),
+          options: headers.options.as_deref(),
+        };
+        locking::unlock_request(&asked, lent.locks, lent.now)
+          .ok()
+          .map(|request| {
+            let token = request.targets.get(&path).cloned().flatten();
+            (token.unwrap_or_default(), request.break_lock)
+          })
+      })
+      .flatten();
+    if let Some((token, break_lock)) = &planned {
+      let ran = run_hook(
+        HookSite::Http(gone, &self.policy),
+        &self.hooked(),
+        room,
+        HookPoint::SvnPreUnlock,
+        |env, repos| {
+          vcs_hooks::svn_pre_unlock(
+            CommittedView(0),
+            env,
+            repos,
+            &path,
+            &user,
+            token,
+            *break_lock,
+          )
+        },
+      )
+      .await;
+      match ran.verdict {
+        Some(Err(chain)) => return hook_refused(&chain),
+        None => return hook_refused(&[(UNSUPPORTED_FEATURE, CLIENT_LEFT_WORDS.to_owned())]),
+        Some(Ok(())) => {}
+      }
+    }
     let judged = self
       .stores
       .lock_verb(self.repository, &self.principal, |lent, _| {
@@ -1084,8 +1311,41 @@ impl<S: SvnStores> SvnExchange<S> {
           }
         }
       });
-    landed(judged)
+    let answered = landed(judged);
+    if planned.is_some() && answered.status < HTTP_REDIRECTION {
+      // post-unlock once the lock is gone; its failure is logged, never told (`lock.c` `remove_lock`,
+      // SVN_ERR_REPOS_POST_UNLOCK_HOOK_FAILED).
+      let ran = run_hook(
+        HookSite::Http(gone, &self.policy),
+        &self.hooked(),
+        room,
+        HookPoint::SvnPostUnlock,
+        |env, repos| {
+          vcs_hooks::svn_post_unlock(CommittedView(0), env, repos, &user, &[path.as_str()])
+        },
+      )
+      .await;
+      if let Some(Err(_)) = ran.verdict {
+        crate::fleet::count_refusal(POST_UNLOCK_FAILED);
+      }
+    }
+    answered
   }
+}
+
+/// A lock verb refused by its pre-hook, `chain` its errors, outermost first: answered as `dav_svn__convert_err` answers
+/// the hook's error, its status from the error, `500` where it names none ("Failed to create new lock.", A-733).
+fn hook_refused(chain: &[(u32, String)]) -> HttpAnswer {
+  let (code, message) = chain
+    .first()
+    .cloned()
+    .unwrap_or((UNSUPPORTED_FEATURE, String::new()));
+  locking::error_answer(
+    locking::convert_status(code, HTTP_INTERNAL_SERVER_ERROR),
+    true,
+    code,
+    &message,
+  )
 }
 
 /// A lock verb's answer once its entries landed: the step's refusal answered as a commit's is.
@@ -1154,13 +1414,18 @@ fn below_root(location: &str, root: &str) -> Option<String> {
 }
 
 /// The MERGE's answer for `committed` (`dav_svn__merge_response`), `200` with the new baseline's facts.
-fn merged_answer(root: &str, committed: &Committed, room: usize) -> HttpAnswer {
+fn merged_answer(
+  root: &str,
+  committed: &Committed,
+  room: usize,
+  post_commit_error: Option<String>,
+) -> HttpAnswer {
   let response = MergeResponse {
     vcc: format!("{root}/{}/vcc/default", site::SPECIAL),
     revision: committed.revision,
     date: committed.date.clone(),
     author: committed.author.clone(),
-    post_commit_error: None,
+    post_commit_error,
   };
   match slates_svn::dav::response::merge(&response, room) {
     Ok(body) => HttpAnswer {
@@ -1222,8 +1487,8 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     Ok(())
   }
 
-  async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
-    if let Some(answer) = self.commit_side() {
+  async fn body_end(&mut self, gone: ClientGone<'_>) -> Result<(), Failed> {
+    if let Some(answer) = self.commit_side(gone).await {
       self.answered = Some(Answered::Whole {
         status: status_of(answer.status),
         headers: answer.headers,
