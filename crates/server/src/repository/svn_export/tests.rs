@@ -135,10 +135,47 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
       break made;
     }
   };
+  let counted = crate::daemon::observe_first(&daemon, counters);
   daemon.stop();
   let [whole, part] = made;
-  assert!(whole.as_deref() == Some(FULL), "full.dump");
-  assert!(part.as_deref() == Some(PART2), "part2.dump");
+  assert!(whole.as_deref() == Some(FULL), "full.dump; {counted:?}");
+  assert!(part.as_deref() == Some(PART2), "part2.dump; {counted:?}");
+}
+
+/// The shard's counters a failed export test names: the export's, the image tasks' and the replies'.
+fn counters(state: &mut ShardState) -> Vec<String> {
+  state
+    .refusals
+    .iter()
+    .filter(|(name, _)| ["export", "image", "reply", "refus"].iter().any(|part| name.contains(part)))
+    .map(|(name, count)| format!("{name}={count}"))
+    .collect()
+}
+
+/// A-652 part 3 (published with its completion, one atom). Do: export revisions 0 to 3 through the job's walks, then
+/// publish its volume with the request's completion as the verb's task does (`crate::image::complete`). Expect:
+/// `DumpExported` with `part1.dump`'s length, and the volume found by its name, its dump file `part1.dump` byte for
+/// byte.
+#[test]
+fn t_a652_the_export_is_published_with_its_completion() {
+  crate::daemon::audit_on_shard(|state| {
+    let (id, _) = holding_the_full_history(state, "svn");
+    let mut job = job_of(id, ((0, 3), Format::Two), "published");
+    let walked = measured(state, &mut job).and_then(|()| written(state, &mut job).map(drop));
+    assert_eq!(walked, Ok(()));
+    let request = (ORIGIN, RequestId::from_word(1));
+    let (reply, _) = crate::image::complete(state, request, |s| match job.publish(s) {
+      Ok(reply) => reply,
+      Err(refusal) => {
+        job.release(s);
+        crate::verbs::refused(refusal)
+      }
+    });
+    let length = u64::try_from(PART1.len()).unwrap_or(u64::MAX);
+    let exported = matches!(reply, ReplyBody::DumpExported { dump_bytes, .. } if dump_bytes == length);
+    assert!(exported, "{reply:?}");
+    assert!(dump_of(state, "published").as_deref() == Some(PART1), "part1.dump");
+  });
 }
 
 /// Runs `job`'s first walk to its end on the shard.

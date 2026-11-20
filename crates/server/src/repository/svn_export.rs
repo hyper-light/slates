@@ -270,8 +270,9 @@ impl ExportJob {
     let size = SizeClass::Bounded {
       limit: length.div_ceil(chunk).max(1).saturating_mul(chunk),
     };
-    let admitted = crate::verbs::admit(state, &self.principal, size, NamePolicy::Exact, false, None)
-      .map_err(|reply| crate::verbs::reply_refusal(*reply))?;
+    let admitted =
+      crate::verbs::admit(state, &self.principal, size, NamePolicy::Exact, false, None)
+        .map_err(|reply| crate::verbs::reply_refusal(*reply))?;
     // Held from here, so a refusal below discards it.
     let volume = &mut self.admitted.insert(admitted).volume;
     let store = &mut state.store;
@@ -281,7 +282,9 @@ impl ExportJob {
       .create_file_no(store, root, DUMP_FILE, DUMP_MODE)
       .map_err(vfs)?;
     let owner = volume.stat(store, root).map_err(vfs)?;
-    volume.chown(store, file, owner.uid, owner.gid).map_err(vfs)?;
+    volume
+      .chown(store, file, owner.uid, owner.gid)
+      .map_err(vfs)?;
     self.file = file;
     self.volume = Some(id);
     self.piece = usize::try_from(state.config.copy_slice_bytes())
