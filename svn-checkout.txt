@@ -1,0 +1,2 @@
+svn: E170013: Unable to connect to a repository at URL 'svn://127.0.0.1:34057/project/trunk'
+svn: E170001: SASL authentication error: SASL(-1): generic failure: All-whitespace username.: No such file or directory

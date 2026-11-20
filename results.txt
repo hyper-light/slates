@@ -1,0 +1,17 @@
+svn:// 34057, http 50837
+bootstrapped
+repository: project
+id: b860046b2545bd740000100000000001
+repository: project
+revisions: 1000
+youngest: 1000
+import exit 0 4.828482873 s
+credential token: exit 4; exports 0 words; its lines but the token's:
+  slates: denied: no anchor in this environment: grants, enrollments, revocations and recoveries are the anchor user's surface; run them from the session that started the daemon, with the variables the anchor printed exported (the MCP server and the SDKs cannot issue them)
+svn-checkout exit 1 .013719601 s
+svn youngest , files 0
+svn-update-500 exit 1 .011238488 s
+http-checkout exit 1 .012590342 s
+http youngest , files 0
+http-update-500 exit 1 .011321427 s
+1

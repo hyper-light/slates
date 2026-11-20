@@ -1,0 +1,138 @@
+pid: 8121
+generation: 1
+restarts: 0
+anchor_hold_refusals: 0
+anchor_log_lines_refused: 0
+log_lines_refused: 0
+dumps_local_full: false
+heartbeat_age_ns: 44278443
+clients_reaped: 4
+clients_refused: 0
+shards: 1
+fleet_host: 13285623758976302452
+fleet_f: 0
+fleet_host_epoch: 1
+fleet_members: 13285623758976302452
+fleet_peers_probed: 0
+fleet_unknown_id: 0
+fleet_inbox_full: 0
+fleet_sessions_refused: 0
+fleet_replaced: 0
+fleet_held_records: 0
+fleet_takeovers_pending: 0
+fleet_configuration_version: 0
+anchor: 17960902348293694806
+recovered: true
+seal: minted
+seal_root: d1a555416d2e5ab09836757867bbc10d
+seal_recipient: 455b827b8ef776b634c60ffc83c89e06
+seal_key_slots: 128
+seal_keys_held: 2
+fleet_configuration_members: 1
+fleet_settled_generation: 0
+fleet_neighbourhood_generation: 0
+fleet_council_leads: true
+fleet_council_base_periods: 10
+fleet_council_span_periods: 10
+fleet_council_rtt_tail_ns: 0
+fleet_council_rtt_spread_ns: 0
+fleet_council_samples: 0
+fleet_council_term: 1
+fleet_council_priority_ns: 0
+fleet_council_priority_spread_ns: 0
+fleet_council_rank: 0
+fleet_council_leader_lease: false
+fleet_council_pre_elections: 0
+fleet_council_elections: 1
+fleet_council_pre_votes_granted: 0
+fleet_council_pre_votes_refused: 0
+fleet_council_refused_role: 0
+fleet_council_refused_leased: 0
+fleet_council_refused_term: 0
+fleet_council_refused_log: 0
+fleet_council_voters: 1
+fleet_council_joint: false
+fleet_council_voter_ids: 13285623758976302452
+fleet_root_leads: true
+fleet_root_base_periods: 10
+fleet_root_span_periods: 10
+fleet_root_rtt_tail_ns: 0
+fleet_root_rtt_spread_ns: 0
+fleet_root_samples: 0
+fleet_root_term: 1
+fleet_root_priority_ns: 0
+fleet_root_priority_spread_ns: 0
+fleet_root_rank: 0
+fleet_root_leader_lease: false
+fleet_root_pre_elections: 0
+fleet_root_elections: 1
+fleet_root_pre_votes_granted: 0
+fleet_root_pre_votes_refused: 0
+fleet_root_refused_role: 0
+fleet_root_refused_leased: 0
+fleet_root_refused_term: 0
+fleet_root_refused_log: 0
+fleet_root_voters: 1
+fleet_root_joint: false
+fleet_root_voter_ids: 13285623758976302452
+fleet_detector_pool: configured=false samples=0 refused= expected_ns=0 margin_ns=0
+fleet_detector_relays: due_ns=0 stated=0
+fleet_detector_granularity_ns: 0
+fleet_peers_in_contact: 0
+fleet_peers_unmeshed: 0
+fleet_learner: council_version=0 fetched_version=0 asked=0 last_asked_ago_ms=never
+fleet_failover: total_ns=3000974411 detection_ns=2000974411 (detector periods 1226) confirmation_ns=0 (coordinator periods 0) recovery_ns=1000000000 (takeovers 0 volumes 0)
+shard 0: clients=1 volumes=0 served=3 replayed=0 replay_ns=33423 torn=false mapped=4294967296 locked=0 reserve=4294967296 committed=646696952 retained=646696952 replicated=0 retained_versions=0 metadata=3550229496 committed_metadata=0 tasks_refused=0 landings_awaiting=0/5166 landings_in_flight=0 target_leases=0
+shard 0 refused client.reaped_by_hangup: 4
+shard 0 refused content.purged_bytes: 1396543488
+shard 0 refused content.ticks.idle: 18
+shard 0 refused merge.checkpoint.taken: 4
+shard 0 refused pressure.watch_refused: 1
+shard 0 refused repository.import.answered: 1
+shard 0 refused repository.import.held: 1
+shard 0 refused vcs_store.charge_short: 1
+shard 0 refused vcs_store.replayed: 1
+shard 0 refused vcs_store.svn_import.done: 1
+shard 0 refused vcs_store.svn_import.revisions: 1000
+shard 0 refused vcs_store.svn_import.started: 1
+shard 0 refused vcs_store.svn_import.turns: 3243
+shard 0 refused vcs_svn.overdue: 1
+shard 0 refused mem.large.mapped: 3790
+shard 0 refused mem.large.unmapped: 3372
+shard 0 refused mem.large.mapped_bytes: 587210752
+shard 0 refused mem.large.returned_bytes: 5459800064
+shard 0 refused content_range.arena.allocated: 0
+shard 0 refused content_range.arena.prefault_reserve: 0
+shard 0 refused content_range.register_log.repository_records: 132881230
+shard 0 refused content_range.register_log.chain_entries: 132892668
+shard 0 refused content_range.register_log.checkpoints: 96710451
+shard 0 refused content_range.register_log.rest: 72017
+shard 0 refused content_range.register_snapshot.repository_records: 100271837
+shard 0 refused content_range.register_snapshot.chain_entries: 6747907
+shard 0 refused content_range.register_snapshot.checkpoints: 47347787
+shard 0 refused content_range.register_snapshot.rest: 5738
+shard 0 refused content_range.sweep.completed: 0
+shard 0 catalog.volumes: 0 (age 0 ns)
+shard 0 log.replay_ns: 33423 (age 125474885101 ns)
+shard 0 lease.expiring: 0 (age 0 ns)
+shard 0 ring.depth: 0 (age 0 ns)
+shard 0 shard.clients: 1 (age 0 ns)
+shard 0 shard.deferred: 0 (age 0 ns)
+shard 0 nfs.local_p50_ns: absent/unknown (age 125474885101 ns)
+shard 0 nfs.local_p99_ns: absent/unknown (age 125474885101 ns)
+shard 0 nfs.local_off_cpu_p99_ns: absent/unknown (age 125474885101 ns)
+shard 0 nfs.forwarded_p99_ns: absent/unknown (age 125474885101 ns)
+shard 0 shard.watch_window_ns: 1000000000 (age 0 ns)
+shard 0 telemetry: spans_held=9 spans_dropped=0
+shard 0 registry_attachments: 0
+shard 0 snapshots: taken=1 written=154373269 longest_ns=381781453 log_appended=658251718 tail_bytes=362556366 tail_replay_ns=845150322 budget_ns=1000000000 floor_bytes=154373269
+shard 0 drain: spans=10 window_ns=125474973586 horizon_ns=3100000000 shed_before=0 dropped_total=0 remaining=0 missing_links=0
+shard 0 span bridge.request: absent/unknown (never; producer filesystem bridge expected here)
+shard 0 span ring.request: spans=6 latest_age_ns=44884
+shard 0 span shard.op: absent/unknown (last seen 4986347906 ns ago; producer client verb expected here)
+shard 0 span log.append: absent/unknown (last seen 4986347906 ns ago; producer client verb expected here)
+shard 0 span ship.record: absent/unknown (never; no producer here (record replication (f ≥ 1)))
+shard 0 span consensus.step: absent/unknown (never; no producer here (configuration group))
+shard 0 span archive.chunk: absent/unknown (never; no producer here (archive codec))
+shard 0 span land.entry: absent/unknown (never; producer landing under grant expected here)
+shard 0 span merge.verdict: absent/unknown (never; producer client verb expected here)
