@@ -2087,8 +2087,10 @@
 > `replay-range` spun shard 0 (3596 ms without a step after 53 MB; the daemon killed, the client E210002) while
 > `svnsync`, a command a revision, passed: the svn:// listener went on to its next turn with no yield where a turn read
 > nothing from the client (a long answer's slices, pipelined commands), and a client draining as fast as it is written
-> never made a write wait. Fixed (w-svn): such a turn yields first, as the HTTP and SSH edges' turns do. No unit test
-> sees a missed yield; the check is the git/git `svnrdump dump` run again (main's).
+> never made a write wait. Fixed (w-svn): a turn that never waited yields first, as the HTTP and SSH edges' turns do.
+> Held by `pipelined_commands_are_answered_one_turn_a_shard_poll` (64 pipelined commands; `vcs_svn.turns_unyielded`,
+> a turn begun in the shard poll of the turn before, 0 on both shards; 67 on the repository's shard without the yield)
+> and the git/git `svnrdump dump` run again (main's).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
