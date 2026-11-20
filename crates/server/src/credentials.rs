@@ -111,7 +111,11 @@ pub fn id_of(material: &CredentialMaterial) -> [u8; 32] {
 /// The partition a credential lives on: its id's first eight bytes over the daemon's `partitions`. An id is a SHA-256,
 /// so credentials spread evenly; the same on every start, so a recovered partition holds what routes to it.
 pub fn owner_of(id: &[u8; 32], partitions: usize) -> u16 {
-  let word = u64::from_le_bytes(id.first_chunk::<8>().copied().unwrap_or_default());
+  let word = u64::from_le_bytes(
+    id.first_chunk::<{ size_of::<u64>() }>()
+      .copied()
+      .unwrap_or_default(),
+  );
   let count = u64::try_from(partitions.max(1)).unwrap_or(u64::MAX);
   u16::try_from(word.checked_rem(count).unwrap_or(0)).unwrap_or(u16::MAX)
 }
