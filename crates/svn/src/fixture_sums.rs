@@ -11,13 +11,14 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures");
 
 /// Each fixture directory and the files in it its recorder reads and never writes, which its `SHA256SUMS` leaves out:
 /// the recorder itself, and the history `report`'s recorder builds its repository from (its `inputs`).
-const RECORDER_INPUTS: [(&str, &[&str]); 7] = [
+const RECORDER_INPUTS: [(&str, &[&str]); 8] = [
   ("commit", &["make-fixtures.py"]),
   ("dump", &["make-fixtures.sh"]),
   ("fold", &["make-fold.py"]),
   ("handshake", &["make-fixtures.py"]),
   ("hooks", &["make-fixtures.py"]),
   ("reads", &["make-fixtures.py"]),
+  ("replay", &["make-fixtures.py"]),
   ("report", &["make-fixtures.py", "history.txt"]),
 ];
 

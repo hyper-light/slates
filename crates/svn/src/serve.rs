@@ -16,8 +16,9 @@
 //!   lock table, their entries landed by the caller through the owner's step, then answered;
 //! - `change-rev-prop` and `change-rev-prop2` (A-702, [`revprops`]): answered as `svnserve`
 //!   answers a repository with no pre-revprop-change hook, after its checks;
-//! - every other command of `svnserve`'s set, until its piece lands (`replay`, `replay-range`):
-//!   answered as a command `svnserve`
+//! - `replay` and `replay-range` (A-703, [`replays`]): the revisions' replays over the editor;
+//! - every other command of `svnserve`'s set, until its piece lands (none is left): answered as a
+//!   command `svnserve`
 //!   does not know, "Unknown editor command '…'" (210001), which a stock client reads as a server
 //!   without it, and counted
 //!   ([`Turn::Unserved`]); the connection goes on;
@@ -83,6 +84,8 @@
 //! No I/O, no clock, no randomness, no panic.
 
 mod locks;
+pub use locks::{LockHookCall, PreHooked};
+mod replays;
 mod revprops;
 #[cfg(test)]
 mod tests;
@@ -591,9 +594,17 @@ enum Phase {
   /// A lock verb was read, its item kept, and whether the client has just authenticated for it: the
   /// caller's judging is awaited ([`Connection::lock_verb`]).
   LockAsked(Box<Established>, Vec<u8>, bool),
+  /// A lock verb passed its access checks, its pre-hooks with the caller: their verdicts are awaited
+  /// ([`Connection::lock_judged`]; A-730).
+  LockHooking(Box<Established>, Box<locks::Hooking>),
   /// A lock verb was judged, its entries with the caller: their landing is awaited
   /// ([`Connection::locks_landed`]).
   Locking(Box<Established>, Box<locks::Pending>),
+  /// A lock verb's paths are answered, its post-hook with the caller: its verdict is awaited
+  /// ([`Connection::locks_finished`]; A-730).
+  LockFinishing(Box<Established>, Box<locks::Pending>),
+  /// A replay's answer has more to write (A-703).
+  Replaying(Box<Established>, Box<replays::Replaying>),
   /// The connection has ended.
   Ended,
 }
@@ -614,7 +625,10 @@ impl std::fmt::Debug for Phase {
       Self::Accepted(_) => "Accepted",
       Self::Dropping(_) => "Dropping",
       Self::LockAsked(..) => "LockAsked",
+      Self::LockHooking(..) => "LockHooking",
       Self::Locking(..) => "Locking",
+      Self::LockFinishing(..) => "LockFinishing",
+      Self::Replaying(..) => "Replaying",
       Self::Ended => "Ended",
     })
   }
@@ -654,12 +668,15 @@ impl Connection {
       Phase::Handshake(_) | Phase::Authenticating(..) => Waiting::Handshake,
       Phase::Commands(_) => Waiting::Command,
       Phase::Streaming(..)
+      | Phase::Replaying(..)
       | Phase::CommitAsked(..)
       | Phase::Resuming(..)
       | Phase::Hooked(..)
       | Phase::Accepted(_)
       | Phase::LockAsked(..)
-      | Phase::Locking(..) => Waiting::Writing,
+      | Phase::LockHooking(..)
+      | Phase::Locking(..)
+      | Phase::LockFinishing(..) => Waiting::Writing,
       Phase::Reporting(_, exchange) => match exchange.awaiting() {
         Awaiting::Report => Waiting::Report,
         Awaiting::Drive => Waiting::Writing,
@@ -676,6 +693,7 @@ impl Connection {
     match &self.phase {
       Phase::Commands(established)
       | Phase::Streaming(established, _)
+      | Phase::Replaying(established, _)
       | Phase::Reporting(established, _)
       | Phase::CommitAsked(established, _)
       | Phase::Authenticating(established, _, _)
@@ -685,7 +703,9 @@ impl Connection {
       | Phase::Accepted(established)
       | Phase::Dropping(established)
       | Phase::LockAsked(established, _, _)
-      | Phase::Locking(established, _) => Some(&established.session),
+      | Phase::LockHooking(established, _)
+      | Phase::Locking(established, _)
+      | Phase::LockFinishing(established, _) => Some(&established.session),
       Phase::Handshake(_) | Phase::Ended => None,
     }
   }
@@ -713,7 +733,9 @@ impl Connection {
         | Phase::Hooked(..)
         | Phase::Accepted(_)
         | Phase::LockAsked(..)
+        | Phase::LockHooking(..)
         | Phase::Locking(..)
+        | Phase::LockFinishing(..)
         | Phase::Ended
     ) {
       return Err(Refused::OutOfTurn);
@@ -992,6 +1014,9 @@ impl Connection {
       Phase::Streaming(established, stream) => {
         self.stream(established, stream, sources, out, budget)
       }
+      Phase::Replaying(established, replaying) => {
+        self.replaying(established, replaying, sources, out, budget)
+      }
       Phase::Reporting(established, exchange) => {
         self.exchange(established, exchange, sources, input, out, budget)
       }
@@ -1008,7 +1033,9 @@ impl Connection {
       | Phase::Hooked(..)
       | Phase::Accepted(_)
       | Phase::LockAsked(..)
+      | Phase::LockHooking(..)
       | Phase::Locking(..)
+      | Phase::LockFinishing(..)
       | Phase::Ended => Err(Refused::OutOfTurn),
     }
   }
@@ -1164,6 +1191,10 @@ impl Connection {
             self.phase = Phase::LockAsked(established, item.to_vec(), false);
             Turn::LockAsked { consumed }
           }
+          Answered::Replaying(replaying) => {
+            self.phase = Phase::Replaying(established, replaying);
+            Turn::Took { consumed }
+          }
           Answered::Unserved => {
             self.phase = Phase::Commands(established);
             Turn::Unserved {
@@ -1199,6 +1230,11 @@ impl Connection {
     }
     if locks::is_lock_verb(name) {
       return Ok(Answered::LockAsked);
+    }
+    if replays::is_replay(name) {
+      return Ok(Answered::Replaying(Box::new(
+        self.begin_replay(name, params, out)?,
+      )));
     }
     if revprops::is_revision_property_change(name) {
       let changed =
@@ -1674,6 +1710,8 @@ enum Answered {
   CommitAsked,
   /// A lock verb: the caller's judging is awaited.
   LockAsked,
+  /// A replay: its answer goes on at the next call.
+  Replaying(Box<replays::Replaying>),
   /// As a command not served yet.
   Unserved,
 }

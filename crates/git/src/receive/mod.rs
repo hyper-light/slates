@@ -84,7 +84,9 @@ use crate::object_name::{Kind, ObjectId};
 use crate::objects::FsckId;
 use crate::pack;
 use crate::pktline;
-use crate::unpack::{self, NoIndex, Object, Outside, Unpacked};
+use std::borrow::Cow;
+
+use crate::unpack::{self, Contents, Held, Keep, Kept, NoIndex, Object, Outside, Placed};
 use crate::{Admission, PastAdmission, to_u64};
 
 /// What the repository a push is made to holds (A-614's object store implements it, A-638).
@@ -125,15 +127,6 @@ impl HiddenRefs for NoneHidden {
 impl<T: HiddenRefs + ?Sized> HiddenRefs for &T {
   fn is_hidden(&self, name: &[u8]) -> bool {
     (**self).is_hidden(name)
-  }
-}
-
-/// A repository's objects, as the pack reader takes a thin pack's bases from.
-struct Bases<'r, R: ?Sized>(&'r R);
-
-impl<R: Repository + ?Sized> Outside for Bases<'_, R> {
-  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
-    self.0.object(id)
   }
 }
 
@@ -234,25 +227,32 @@ pub enum PackRefusal {
 pub struct Received {
   /// The request.
   pub request: Request,
-  /// The pack's objects, or why it was refused; `None` when no pack was due (only deletes, or no
-  /// command).
-  pub unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// The pack's objects' places, or why it was refused; `None` when no pack was due (only deletes,
+  /// or no command).
+  pub unpacked: Option<Result<Kept, PackRefused>>,
   /// Each command's outcome.
   pub outcomes: Vec<Outcome>,
 }
 
-/// The objects a push's pack brought, by name.
+/// The objects a push's pack brought, by name: each one's place, and its bytes where the caller
+/// lends them (A-719 part 3: a server's judge reads them from its own store instead).
 pub struct Pushed<'a> {
-  /// The objects, in pack order.
-  objects: &'a [Object],
+  /// The objects' places, in pack order.
+  objects: &'a [Placed],
   /// Each object's name and position, sorted by name.
   by_id: Vec<(ObjectId, usize)>,
+  /// Where their bytes are read, where the caller lends them.
+  contents: Option<&'a dyn Contents>,
 }
 
 impl<'a> Pushed<'a> {
-  /// The objects a pack brought, indexed by name in a table charged to `admission` before it is
-  /// made.
-  pub fn new(objects: &'a [Object], admission: &mut Admission) -> Result<Self, Refusal> {
+  /// The objects a pack brought, their bytes read from `contents` where it is lent, indexed by name
+  /// in a table charged to `admission` before it is made.
+  pub fn new(
+    objects: &'a [Placed],
+    contents: Option<&'a dyn Contents>,
+    admission: &mut Admission,
+  ) -> Result<Self, Refusal> {
     admission
       .charge_items::<(ObjectId, usize)>(objects.len())
       .map_err(Refusal::PastAdmission)?;
@@ -265,12 +265,25 @@ impl<'a> Pushed<'a> {
         .map(|(at, object)| (object.id, at)),
     );
     by_id.sort_unstable();
-    Ok(Self { objects, by_id })
+    Ok(Self {
+      objects,
+      by_id,
+      contents,
+    })
   }
 
-  /// The pushed object named `id`, if the pack brought it.
-  pub fn object(&self, id: &ObjectId) -> Option<&'a Object> {
-    self.position(id).and_then(|at| self.objects.get(at))
+  /// The pushed object named `id`, its type and bytes, if the pack brought it and its bytes are
+  /// lent.
+  pub fn object(&self, id: &ObjectId) -> Option<(Kind, Cow<'a, [u8]>)> {
+    let at = self.position(id)?;
+    let placed = self.objects.get(at)?;
+    Some((placed.kind, self.contents?.content(at, id)?))
+  }
+
+  /// The bytes of the object at position `at`, if they are lent.
+  pub fn content(&self, at: usize) -> Option<Cow<'a, [u8]>> {
+    let placed = self.objects.get(at)?;
+    self.contents?.content(at, &placed.id)
   }
 
   /// The position in pack order of the object named `id`, if the pack brought it.
@@ -283,9 +296,82 @@ impl<'a> Pushed<'a> {
       .map(|(_, at)| *at)
   }
 
-  /// The objects, in pack order.
-  pub fn objects(&self) -> &'a [Object] {
+  /// The objects' places, in pack order.
+  pub fn objects(&self) -> &'a [Placed] {
     self.objects
+  }
+}
+
+/// A pack read into memory over `repository`: the keeper a session keeps of its own, and
+/// [`receive`]'s.
+pub(crate) struct InMemory<'a, R: ?Sized> {
+  /// The repository.
+  pub(crate) repository: &'a R,
+  /// The objects kept.
+  pub(crate) held: &'a mut Held,
+}
+
+impl<R: Repository + ?Sized> Repository for InMemory<'_, R> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    self.repository.object(id)
+  }
+
+  fn holds(&self, id: &ObjectId) -> bool {
+    self.repository.holds(id)
+  }
+}
+
+impl<R: ?Sized> Contents for InMemory<'_, R> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.held.content(at, id)
+  }
+}
+
+impl<R: ?Sized> Keep for InMemory<'_, R> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), unpack::Refusal> {
+    self.held.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.held.release(hold, admission);
+  }
+}
+
+/// A push's site as the pack reader finishes a thin pack: its keeper, and its repository as the
+/// outside bases.
+struct Thin<'s, S: ?Sized>(&'s mut S);
+
+impl<S: Repository + ?Sized> Outside for Thin<'_, S> {
+  fn object(&self, id: &ObjectId) -> Option<(Kind, &[u8])> {
+    Repository::object(&*self.0, id)
+  }
+}
+
+impl<S: Contents + ?Sized> Contents for Thin<'_, S> {
+  fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
+    self.0.content(at, id)
+  }
+}
+
+impl<S: Keep + ?Sized> Keep for Thin<'_, S> {
+  fn keep(
+    &mut self,
+    at: usize,
+    object: Object,
+    hold: crate::Hold,
+    admission: &mut Admission,
+  ) -> Result<(), unpack::Refusal> {
+    self.0.keep(at, object, hold, admission)
+  }
+
+  fn release(&mut self, hold: crate::Hold, admission: &mut Admission) {
+    self.0.release(hold, admission);
   }
 }
 
@@ -413,42 +499,47 @@ where
   let mut reader = RequestReader::new(advertised);
   let took = reader.read(bytes, admission)?;
   let request = reader.request()?;
+  let mut held = Held::default();
+  let mut site = InMemory {
+    repository,
+    held: &mut held,
+  };
   let unpacked = request.wants_pack().then(|| {
     let mut pack = unpack::Reader::new(advertised.format, &NO_INDEX);
-    let read = pack.read(bytes.get(took..).unwrap_or_default(), admission);
-    finished_pack(pack, read.map(|_| ()), repository, admission)
+    let read = pack.read_into(bytes.get(took..).unwrap_or_default(), admission, &mut site);
+    finished_pack(pack, read.map(|_| ()), &mut site, admission)
   });
-  let checked = check(request, unpacked, repository, hidden, admission)?;
-  decide(checked, judge, admission)
+  let checked = check(request, unpacked, (repository, &held), hidden, admission)?;
+  decide(checked, Some(&held), judge, admission)
 }
 
-/// The pack's outcome once its bytes have ended or been refused (`read`): finished with its bases
-/// from `repository`; or refused, with the objects its header counted. Its objects are checked by
-/// [`check`] (or [`Checking`] a turn at a time).
-fn finished_pack<R: Repository + ?Sized>(
+/// The pack's outcome once its bytes have ended or been refused (`read`): finished into `site`, its
+/// keeper, with a thin pack's bases from the repository it is; or refused, with the objects its
+/// header counted. Its objects are checked by [`check`] (or [`Checking`] a turn at a time).
+fn finished_pack<S: Keep + Repository>(
   reader: unpack::Reader<'_, NoIndex>,
   read: Result<(), unpack::Refusal>,
-  repository: &R,
+  site: &mut S,
   admission: &mut Admission,
-) -> Result<Unpacked, PackRefused> {
+) -> Result<Kept, PackRefused> {
   let objects = reader.objects();
   let refused = |why| PackRefused { objects, why };
   read.map_err(|refusal| refused(PackRefusal::Unpack(refusal)))?;
   reader
-    .finish_with(&Bases(repository), admission)
+    .finish_into(admission, &mut Thin(site))
     .map_err(|refusal| refused(PackRefusal::Unpack(refusal)))
 }
 
 /// A push read and checked, before any verdict: its request, its pack's objects or why the pack was
-/// refused, and each command's refusal by the protocol's own checks. The caller may admit the
-/// pushed objects to its store's quarantine here ([`Checked::objects`]), holding nothing of
-/// receive-pack's, and then hand the push to [`decide`].
+/// refused, and each command's refusal by the protocol's own checks. Its objects are where the
+/// pack was read into (A-719 part 3: a server's quarantine), so the push holds none of their
+/// bytes; the caller hands it to [`decide`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checked {
   /// The request.
   pub request: Request,
-  /// The pack's objects, or why it was refused; `None` when no pack was due.
-  pub unpacked: Option<Result<Unpacked, PackRefused>>,
+  /// The pack's objects' places, or why it was refused; `None` when no pack was due.
+  pub unpacked: Option<Result<Kept, PackRefused>>,
   /// Each command's refusal by the checks, in the order sent; `None` for one they passed.
   pub early: Vec<Option<Outcome>>,
   /// The pushed objects' names and positions, sorted by name, charged once by [`check`].
@@ -456,8 +547,9 @@ pub struct Checked {
 }
 
 impl Checked {
-  /// The objects the push brought, in pack order: none when no pack was due or it was refused.
-  pub fn objects(&self) -> &[Object] {
+  /// The places of the objects the push brought, in pack order: none when no pack was due or it
+  /// was refused.
+  pub fn objects(&self) -> &[Placed] {
     match &self.unpacked {
       Some(Ok(unpacked)) => unpacked.objects.as_slice(),
       _ => &[],
@@ -469,50 +561,215 @@ impl Checked {
 /// git's checks refuse (git's `transfer.fsckObjects`); otherwise each new tip's connectivity against
 /// `repository`, then each ref against `hidden`. The tables made on the way are charged to
 /// `admission` before they are made. The checks run whole: [`Checking`] makes them a turn at a time.
-pub fn check<R, H>(
+pub fn check<R, C, H>(
   request: Request,
-  unpacked: Option<Result<Unpacked, PackRefused>>,
-  repository: &R,
+  unpacked: Option<Result<Kept, PackRefused>>,
+  (repository, contents): (&R, &C),
   hidden: &H,
   admission: &mut Admission,
 ) -> Result<Checked, Refusal>
 where
   R: Repository + ?Sized,
+  C: Contents,
   H: HiddenRefs + ?Sized,
 {
-  Checking::new(request, unpacked).checked(repository, hidden, admission)
+  Checking::new(request, unpacked).checked((repository, contents), hidden, admission)
 }
 
 /// Decides a checked push: each command no check refused has `judge`'s verdict and then its append,
 /// each on its own without `atomic`, all or none under it; every outcome in the order sent. The
-/// outcomes are charged to `admission` before they are made.
+/// outcomes are charged to `admission` before they are made. The decision runs whole: [`Deciding`]
+/// makes it a command at a time.
 pub fn decide<J: Judge + ?Sized>(
   checked: Checked,
+  contents: Option<&dyn Contents>,
   judge: &mut J,
   admission: &mut Admission,
 ) -> Result<Received, Refusal> {
-  let Checked {
-    request,
-    unpacked,
-    early,
-    by_id,
-  } = checked;
-  let mut outcomes = charged_vec(request.commands.len(), admission)?;
-  let objects = match &unpacked {
-    Some(Ok(unpacked)) => unpacked.objects.as_slice(),
-    _ => &[],
-  };
-  let pushed = Pushed { objects, by_id };
-  if request.requested.atomic {
-    atomic_outcomes(&request, &pushed, judge, early, &mut outcomes, admission)?;
-  } else {
-    each_outcome(&request, &pushed, judge, early, &mut outcomes);
+  let mut deciding = Deciding::new(checked, admission)?;
+  while !deciding.step(contents, judge, admission)? {}
+  Ok(deciding.received())
+}
+
+/// A checked push decided a command at a time (A-719; §4.3, no step longer than its quantum: git's
+/// push of its own repository brings over a thousand refs): without `atomic`, each step judges one
+/// command and, accepted, appends it; under `atomic`, each step judges one, and a last step appends
+/// them all or none. The outcomes come out as [`decide`]'s.
+pub struct Deciding<A> {
+  /// The request.
+  request: Request,
+  /// The pack's objects' places, or why it was refused.
+  unpacked: Option<Result<Kept, PackRefused>>,
+  /// The pushed objects' names and positions, sorted by name.
+  by_id: Vec<(ObjectId, usize)>,
+  /// Each command's refusal by the checks, taken as its step comes.
+  early: Vec<Option<Outcome>>,
+  /// The outcomes so far, in the order sent.
+  outcomes: Vec<Outcome>,
+  /// The next command.
+  at: usize,
+  /// Under `atomic`, each command accepted so far with its verdict.
+  accepted: Vec<(usize, A)>,
+  /// Whether every outcome is made.
+  done: bool,
+}
+
+impl<A> Deciding<A> {
+  /// The decision of `checked`, not yet begun, its outcomes' table charged to `admission` first.
+  pub fn new(checked: Checked, admission: &mut Admission) -> Result<Self, Refusal> {
+    let Checked {
+      request,
+      unpacked,
+      early,
+      by_id,
+    } = checked;
+    let count = request.commands.len();
+    let outcomes = charged_vec(count, admission)?;
+    let accepted = if request.requested.atomic {
+      charged_vec(count, admission)?
+    } else {
+      Vec::new()
+    };
+    Ok(Self {
+      request,
+      unpacked,
+      by_id,
+      early,
+      outcomes,
+      at: 0,
+      accepted,
+      done: count == 0,
+    })
   }
-  Ok(Received {
-    request,
-    unpacked,
-    outcomes,
-  })
+
+  /// One step of the decision through `judge`, the pushed objects' bytes read from `contents` where
+  /// lent: one command judged (and, without `atomic`, appended), or under `atomic` the appends of
+  /// them all. Whether every outcome is made.
+  pub fn step<J: Judge<Accepted = A> + ?Sized>(
+    &mut self,
+    contents: Option<&dyn Contents>,
+    judge: &mut J,
+    admission: &mut Admission,
+  ) -> Result<bool, Refusal> {
+    if self.done {
+      return Ok(true);
+    }
+    let unpacked = self.unpacked.take();
+    let objects = match &unpacked {
+      Some(Ok(unpacked)) => unpacked.objects.as_slice(),
+      _ => &[],
+    };
+    let pushed = Pushed {
+      objects,
+      by_id: core::mem::take(&mut self.by_id),
+      contents,
+    };
+    let stepped = if self.request.requested.atomic {
+      atomic_step(self, &pushed, judge, admission)
+    } else {
+      each_step(self, &pushed, judge);
+      Ok(())
+    };
+    self.by_id = pushed.by_id;
+    self.unpacked = unpacked;
+    stepped?;
+    Ok(self.done)
+  }
+
+  /// What was received, once every outcome is made.
+  pub fn received(self) -> Received {
+    Received {
+      request: self.request,
+      unpacked: self.unpacked,
+      outcomes: self.outcomes,
+    }
+  }
+}
+
+/// One step of a push without `atomic`: the next command no check refused judged and, accepted,
+/// appended on its own, so one ref's refusal holds no other (git's `execute_commands_non_atomic`;
+/// A-642).
+fn each_step<A, J: Judge<Accepted = A> + ?Sized>(
+  deciding: &mut Deciding<A>,
+  pushed: &Pushed<'_>,
+  judge: &mut J,
+) {
+  let at = deciding.at;
+  let early = deciding.early.get_mut(at).and_then(Option::take);
+  let outcome = match (early, deciding.request.commands.get(at)) {
+    (Some(refusal), _) => refusal,
+    (None, Some(command)) => match verdict(command, pushed, judge) {
+      Ok(accepted) => judge
+        .append(command, accepted)
+        .map_or_else(Outcome::Ng, Outcome::Ok),
+      Err(declined) => Outcome::Ng(declined),
+    },
+    (None, None) => return deciding.done = true,
+  };
+  deciding.outcomes.push(outcome);
+  deciding.at = at.saturating_add(1);
+  deciding.done = deciding.at >= deciding.request.commands.len();
+}
+
+/// One step of an atomic push: every command or none ("Either all refs are updated or none",
+/// gitprotocol-capabilities). A check's refusal leaves every other command `atomic push failure`,
+/// none judged; otherwise one command is judged a step until one is declined, which leaves every
+/// other `atomic push failure`; then one append moves every ref or none, and a refused append gives
+/// every command its reason, its band-2 line once (git's `execute_commands_atomic`).
+fn atomic_step<A, J: Judge<Accepted = A> + ?Sized>(
+  deciding: &mut Deciding<A>,
+  pushed: &Pushed<'_>,
+  judge: &mut J,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
+  let count = deciding.request.commands.len();
+  deciding.done = true;
+  if deciding.early.iter().any(Option::is_some) {
+    let others =
+      |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
+    let early = core::mem::take(&mut deciding.early);
+    deciding.outcomes.extend(early.into_iter().map(others));
+    return Ok(());
+  }
+  if let Some(command) = deciding.request.commands.get(deciding.at) {
+    let at = deciding.at;
+    match verdict(command, pushed, judge) {
+      Ok(verdict) => {
+        deciding.accepted.push((at, verdict));
+        deciding.at = at.saturating_add(1);
+        deciding.done = false;
+      }
+      Err(declined) => deciding.outcomes.extend((0..count).map(|other| {
+        if other == at {
+          Outcome::Ng(declined.clone())
+        } else {
+          refused(ATOMIC_FAILURE, None)
+        }
+      })),
+    }
+    return Ok(());
+  }
+  let accepted = core::mem::take(&mut deciding.accepted);
+  let mut appended = charged_vec(accepted.len(), admission)?;
+  let commands = &deciding.request.commands;
+  appended.extend(
+    accepted
+      .into_iter()
+      .filter_map(|(at, verdict)| commands.get(at).map(|command| (command, verdict))),
+  );
+  match judge.append_atomic(appended) {
+    Ok(reports) => {
+      let mut reports = reports.into_iter();
+      deciding
+        .outcomes
+        .extend((0..count).map(|_| Outcome::Ok(reports.next().unwrap_or_default())));
+    }
+    Err(declined) => deciding.outcomes.extend((0..count).map(|at| {
+      let message = declined.message.clone().filter(|_| at == 0);
+      refused(&declined.reason, message)
+    })),
+  }
+  Ok(())
 }
 
 /// A command's refusal before any judging, in git's order: its connectivity, then a hidden ref.
@@ -534,79 +791,6 @@ fn early_refusal<H: HiddenRefs + ?Sized>(
     }
     Connected::Complete => None,
   }
-}
-
-/// A push without `atomic`: each command no check refused judged and, accepted, appended on its
-/// own, in the order sent, so one ref's refusal holds no other (git's
-/// `execute_commands_non_atomic`; A-642).
-fn each_outcome<J: Judge + ?Sized>(
-  request: &Request,
-  pushed: &Pushed<'_>,
-  judge: &mut J,
-  early: Vec<Option<Outcome>>,
-  outcomes: &mut Vec<Outcome>,
-) {
-  for (command, early) in request.commands.iter().zip(early) {
-    let outcome = match early {
-      Some(refusal) => refusal,
-      None => match verdict(command, pushed, judge) {
-        Ok(accepted) => judge
-          .append(command, accepted)
-          .map_or_else(Outcome::Ng, Outcome::Ok),
-        Err(declined) => Outcome::Ng(declined),
-      },
-    };
-    outcomes.push(outcome);
-  }
-}
-
-/// An atomic push: every command or none ("Either all refs are updated or none",
-/// gitprotocol-capabilities). A check's refusal leaves every other command `atomic push failure`,
-/// none judged; otherwise each is judged in order until one is declined, which leaves every other
-/// `atomic push failure`; otherwise one append moves every ref or none, and a refused append gives
-/// every command its reason, its band-2 line once (git's `execute_commands_atomic`).
-fn atomic_outcomes<J: Judge + ?Sized>(
-  request: &Request,
-  pushed: &Pushed<'_>,
-  judge: &mut J,
-  early: Vec<Option<Outcome>>,
-  outcomes: &mut Vec<Outcome>,
-  admission: &mut Admission,
-) -> Result<(), Refusal> {
-  let count = request.commands.len();
-  if early.iter().any(Option::is_some) {
-    let others =
-      |outcome: Option<Outcome>| outcome.unwrap_or_else(|| refused(ATOMIC_FAILURE, None));
-    outcomes.extend(early.into_iter().map(others));
-    return Ok(());
-  }
-  let mut accepted = charged_vec(count, admission)?;
-  for (at, command) in request.commands.iter().enumerate() {
-    match verdict(command, pushed, judge) {
-      Ok(verdict) => accepted.push((command, verdict)),
-      Err(declined) => {
-        outcomes.extend((0..count).map(|other| {
-          if other == at {
-            Outcome::Ng(declined.clone())
-          } else {
-            refused(ATOMIC_FAILURE, None)
-          }
-        }));
-        return Ok(());
-      }
-    }
-  }
-  match judge.append_atomic(accepted) {
-    Ok(reports) => {
-      let mut reports = reports.into_iter();
-      outcomes.extend((0..count).map(|_| Outcome::Ok(reports.next().unwrap_or_default())));
-    }
-    Err(declined) => outcomes.extend((0..count).map(|at| {
-      let message = declined.message.clone().filter(|_| at == 0);
-      refused(&declined.reason, message)
-    })),
-  }
-  Ok(())
 }
 
 /// A command's verdict: its ref name as git checks it (`update`'s `funny refname`, with git's

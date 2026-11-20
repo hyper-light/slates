@@ -104,7 +104,7 @@ use slates_ssh::userauth::{KeyHolders, RECOMMENDED_FAILURE_LIMIT};
 
 use crate::vcs_http::Bounds;
 use crate::vcs_http::git::Located;
-use site::{Command, Dispatched, Next, Refused, SshSite};
+use site::{ClientGone, Command, Dispatched, Next, Refused, SshSite};
 use waits::{Overdue, Phase, PhaseWaits, Tracker};
 
 /// Derived: the transport's packet cap: the size every peer accepts (RFC 4253 §6.1: "All implementations MUST be able to
@@ -848,33 +848,38 @@ impl<S: SshSite> Link<S> {
   /// Runs the connection until it ends or moves to its repository's shard (the module doc's loop).
   async fn run(&mut self) -> Exit {
     loop {
-      if !self.session.pending_output().is_empty() {
-        if let Err(why) = self.write().await {
-          return Exit::Ended(why);
-        }
-        continue;
-      }
-      if self.session.is_closed() {
-        return Exit::Ended(Why::Refused);
-      }
-      if let Some(event) = self.session.poll_event() {
-        match self.on_event(event).await {
-          Some(exit) => return exit,
-          None => continue,
-        }
-      }
-      if !self.unread.is_empty() && self.feed() {
-        continue;
-      }
-      match self.turn().await {
-        Ok(Turn::Moved) => continue,
-        Ok(Turn::Client | Turn::Idle) => {}
-        Err(why) => return Exit::Ended(why),
-      }
-      if let Err(why) = self.read().await {
-        return Exit::Ended(why);
+      if let Some(exit) = self.pass().await {
+        return exit;
       }
     }
+  }
+
+  /// One pass of the loop: pending output written, or the session's end, an event, unread bytes fed, or a turn and a
+  /// read; how the connection left if it did, `None` to go round again.
+  async fn pass(&mut self) -> Option<Exit> {
+    if !self.session.pending_output().is_empty() {
+      return self.write().await.err().map(Exit::Ended);
+    }
+    if self.session.is_closed() {
+      return Some(Exit::Ended(Why::Refused));
+    }
+    if let Some(event) = self.session.poll_event() {
+      return self.on_event(event).await;
+    }
+    if !self.unread.is_empty() && self.feed() {
+      return None;
+    }
+    self.turn_and_read().await
+  }
+
+  /// The loop's turn, then a read unless the connection moved; how it left if it did.
+  async fn turn_and_read(&mut self) -> Option<Exit> {
+    match self.turn().await {
+      Ok(Turn::Moved) => return None,
+      Ok(Turn::Client | Turn::Idle) => {}
+      Err(why) => return Some(Exit::Ended(why)),
+    }
+    self.read().await.err().map(Exit::Ended)
   }
 
   /// Writes what the session has to send, within the phase's wait: the client's room is waited for.
@@ -1133,7 +1138,9 @@ impl<S: SshSite> Link<S> {
     Turn::Moved
   }
 
-  /// Steps the command and gives the input it consumed back to the client's window, then yields: one step a turn.
+  /// Steps the command and gives the input it consumed back to the client's window, then yields: one step a turn. The
+  /// step is told when its client has gone (`site::ClientGone`), the client's bytes it took meanwhile kept after those
+  /// already unread, at most one read in all ([`READ_BYTES`]), and fed to the session after it as a read's are.
   async fn step(&mut self) -> Result<Turn, Why> {
     let Some(command) = self
       .running
@@ -1143,7 +1150,13 @@ impl<S: SshSite> Link<S> {
       // A command-less run (a refusal, a failure) always has its exit queued, so it is never stepped.
       return Ok(Turn::Idle);
     };
-    match command.step().await {
+    let kept = RefCell::new(Vec::new());
+    let room = READ_BYTES.saturating_sub(self.unread.len());
+    let stepped = command
+      .step(ClientGone::watching(&self.stream, &kept, room))
+      .await;
+    self.unread.append(&mut kept.into_inner());
+    match stepped {
       Ok(stepped) => {
         if let Some(running) = self.running.as_mut() {
           running.next = stepped.next;

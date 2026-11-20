@@ -304,8 +304,9 @@ const CONFLICT_AT: &str = "Conflict at";
 /// What the drive reads from the green beyond the index, and how the green names what the work makes (§4.17.4 item 1:
 /// texts and property lists are content, named by their identity).
 pub trait Green {
-  /// The text held as `identity`; `None` when the green does not hold it.
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]>;
+  /// The text held as `identity`, borrowed where the green holds it in one piece, owned where it must copy it; `None`
+  /// when the green does not hold it.
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>>;
 
   /// The property list held as `identity`, every property, in any order; `None` when the green does not hold it.
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>>;
@@ -765,6 +766,30 @@ pub struct Pending<'drive> {
   pub texts: &'drive BTreeMap<ContentIdentity, Vec<u8>>,
   /// The property lists it made, by identity, each sorted by name.
   pub property_lists: &'drive BTreeMap<ContentIdentity, PropertyPairs>,
+  /// The session's path in the repository, which the client's paths are relative to.
+  pub base_path: &'drive str,
+  /// The lock tokens the commit presented, by full path.
+  pub presented: &'drive BTreeMap<String, String>,
+}
+
+impl Pending<'_> {
+  /// The lock tokens the commit presented as pre-commit reads them (`hooks.c` `lock_token_content`; A-730): each path
+  /// as the client gave it, relative to the commit's base (`serve.c` `add_lock_tokens` hands the filesystem the path as
+  /// sent), with its token, in path order.
+  pub fn lock_tokens(&self) -> Vec<(String, String)> {
+    let base = self.base_path.trim_end_matches('/');
+    self
+      .presented
+      .iter()
+      .map(|(full, token)| {
+        let relative = full
+          .strip_prefix(base)
+          .unwrap_or(full)
+          .trim_start_matches('/');
+        (relative.to_owned(), token.clone())
+      })
+      .collect()
+  }
 }
 
 /// An accepted work: what the caller commits.
@@ -910,6 +935,23 @@ impl Digests {
       <[u8; 20]>::try_from(sha1.as_ref()).map_err(|_| DriveRefusal::DigestFailed)?,
     ))
   }
+}
+
+/// `bytes` as a row names its text (A-664's Subversion objects: a revision the server makes of a submitted version):
+/// its content identity, its MD5 and SHA-1 as the drive keeps them for a text a client sent, and its length.
+///
+/// # Errors
+/// [`DriveRefusal::DigestFailed`] where the digests cannot be made.
+pub fn text_of(bytes: &[u8]) -> Result<Text, DriveRefusal> {
+  let mut digests = Digests::new()?;
+  digests.update(bytes)?;
+  let (md5, sha1) = digests.finish()?;
+  Ok(Text {
+    identity: *blake3::hash(bytes).as_bytes(),
+    md5,
+    sha1,
+    size: u64::try_from(bytes.len()).map_err(|_| DriveRefusal::DigestFailed)?,
+  })
 }
 
 /// The MD5 of `bytes`.
@@ -1477,6 +1519,8 @@ impl Drive {
       rows: &self.rows,
       texts: &self.texts,
       property_lists: &self.property_lists,
+      base_path: &self.setup.base_path,
+      presented: &self.setup.locks.presented,
     }
   }
 
@@ -2073,14 +2117,14 @@ impl Drive {
     let source = match delta.source {
       Some(identity) => texts
         .get(&identity)
-        .map(Vec::as_slice)
+        .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
         .or_else(|| green.text(&identity)),
-      None => Some(&[][..]),
+      None => Some(std::borrow::Cow::Borrowed(&[][..])),
     };
     let source = source.ok_or(DriveRefusal::Commit(CommitRefusal::Index(
       IndexRefusal::Corrupt,
     )))?;
-    read_windows(delta, source)?;
+    read_windows(delta, &source)?;
     let after = delta.pending.len().saturating_add(delta.target.len());
     let held = held.saturating_sub(before).saturating_add(after);
     if held > room {

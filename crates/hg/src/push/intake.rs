@@ -528,16 +528,17 @@ pub struct Rebase {
 }
 
 impl Rebase {
-  /// Starts re-basing `stale` (what `intaken` names) onto a fork of `index`. Refused, `stale` comes back.
+  /// Starts re-basing `stale` (what `intaken` names) onto a fork of `index`. Refused, `stale` comes back (boxed with the
+  /// refusal: an index is large).
   pub fn begin(
     stale: HgIndex,
     intaken: &Intaken,
     index: &mut HgIndex,
     store: &mut ContentStore,
-  ) -> Result<Self, (Unindexed, HgIndex)> {
+  ) -> Result<Self, Box<(Unindexed, HgIndex)>> {
     let fork = match index.fork(store) {
       Ok(fork) => fork,
-      Err(refused) => return Err((Unindexed::Fork(refused), stale)),
+      Err(refused) => return Err(Box::new((Unindexed::Fork(refused), stale))),
     };
     let logs = intaken.logs.clone();
     let intaken = Intaken {

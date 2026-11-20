@@ -21,6 +21,11 @@
 //! with no answered intake yet claims everything the shard can admit, its first value taken from the machine, never a
 //! literal. Weights are equal: the repository is the unit of fairness (§4.17.5).
 //!
+//! **The cold trigger** (A-724 piece 4). What a repository holds counts its rebuildable values too (a git repository's
+//! kept fragments). Each claimant found holding more than its grant gives back, by §4.11's cost model
+//! (`crate::vcs_store::git_encode::relieve`), the values worth more as room than as time saved, before the asker's room
+//! is read.
+//!
 //! **Live intakes.** An intake is live from its start until its [`Live`] guard drops (the push answered, refused or
 //! abandoned however its edge ended), kept in a map of this shard's thread apart from its state, so a guard dropped
 //! while the state is borrowed still counts its end. One entry a repository with an intake under way, so bounded by
@@ -140,7 +145,7 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
   claimants.extend(others);
   let held: Vec<u64> = claimants
     .iter()
-    .map(|(id, _)| state.vcs_stores.objects_charged(*id))
+    .map(|(id, _)| held_by(state, *id))
     .collect();
   let capacity = held
     .iter()
@@ -168,7 +173,21 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
     .first()
     .and_then(|grant| grant.granted.first())
     .map_or(0, |granted| whole_units(*granted));
-  let own_held = held.first().copied().unwrap_or(0);
+  // The cold trigger (A-724 piece 4): each claimant holding more than its grant gives back what its rebuildable values
+  // are worth giving back, by §4.11's cost model at its pressure (what it holds over its grant).
+  for ((id, _), (grant, holding)) in claimants.iter().zip(
+    grants
+      .iter()
+      .filter_map(|grant| grant.granted.first())
+      .zip(&held),
+  ) {
+    let grant = whole_units(*grant);
+    if *holding > grant {
+      let pressure = amount_of(*holding) / amount_of(grant.max(1));
+      crate::vcs_store::git_encode::relieve(state, *id, holding.saturating_sub(grant), pressure);
+    }
+  }
+  let own_held = held_by(state, repository);
   let headroom = share.saturating_sub(own_held);
   if headroom >= admittable {
     return Room {
@@ -184,6 +203,15 @@ pub(crate) fn room(state: &mut ShardState, repository: RepositoryId) -> Room {
       held: own_held,
     },
   }
+}
+
+/// What repository `id` holds of its shard: its entries' objects (A-662, A-714) and its derived values that can be made
+/// again (A-724 piece 4: a git repository's kept fragments).
+fn held_by(state: &ShardState, id: RepositoryId) -> u64 {
+  state
+    .vcs_stores
+    .objects_charged(id)
+    .saturating_add(crate::vcs_store::git_encode::kept_bytes(state, id))
 }
 
 /// What repository `id` claims with `intakes` under way while it holds `held` (module docs, "Demand, learned"): what it

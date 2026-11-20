@@ -990,7 +990,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     })
     .await
     {
-      Ok(reply) | Err(reply) => reply,
+      Ok(reply) => reply,
+      Err(reply) => *reply,
     }
   } else if is_forwardable_write(&body) {
     let forwarded = call_owner(control, shard, move |s| {
@@ -1008,7 +1009,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     .await;
     match forwarded {
       Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
-      Err(refusal) => refusal,
+      Err(refusal) => *refusal,
     }
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
@@ -1039,21 +1040,21 @@ fn refusal_of_access(access: &crate::state::StateAccess, shard: u16) -> ReplyBod
 /// why there is none (A-564). A call that was not sent, or whose owner was given up before it answered, answers
 /// `Overloaded` for `shard`, not started; an owner whose state refused it answers by what refused it
 /// ([`refusal_of_access`]). Until A-564 every one of these was `None` (`xshard::call_in_shard_time`), which the forward
-/// answered `NotFound`.
+/// answered `NotFound`. The refusal is boxed: a reply is far larger than most answers.
 async fn call_owner<T: Send + 'static>(
   control: u16,
   shard: u16,
   work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
-) -> Result<T, ReplyBody> {
+) -> Result<T, Box<ReplyBody>> {
   let Ok(call) = crate::xshard::call_on(control, shard, move || {
     Some(crate::state::try_with_state(work))
   }) else {
-    return Err(refused(Refusal::Overloaded { shard }));
+    return Err(Box::new(refused(Refusal::Overloaded { shard })));
   };
   match crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await {
     Some(Ok(answer)) => Ok(answer),
-    Some(Err(access)) => Err(refusal_of_access(&access, shard)),
-    None => Err(refused(Refusal::Overloaded { shard })),
+    Some(Err(access)) => Err(Box::new(refusal_of_access(&access, shard))),
+    None => Err(Box::new(refused(Refusal::Overloaded { shard }))),
   }
 }
 
@@ -1245,7 +1246,7 @@ async fn await_deferred_completion(
       }
       Ok(None) if slates_rt::futures::now_ns() < deadline => {}
       Ok(None) => return refused(Refusal::Overloaded { shard }),
-      Err(refusal) => return refusal,
+      Err(refusal) => return *refusal,
     }
   }
 }
@@ -9338,6 +9339,19 @@ fn submit(
       }
       reply
     }
+    None if crate::vcs_store::paths::whole_build::building(state, green_id) => {
+      // The green's map is being built whole after a push (A-664's live whole builds): the submit waits, parked, and
+      // runs again once the build ends.
+      let kind = ParkedKind::Local {
+        principal: principal.clone(),
+        work,
+        evidence,
+        signature,
+        authorship,
+        approval,
+      };
+      return park_submit(state, green_id, kind);
+    }
     None => {
       // The restatement an acceptance records must fit before the verdict (A-207), so a submit is refused rather than
       // accepted with the work's log unable to record it.
@@ -9597,8 +9611,13 @@ fn judge_submission(
       // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
       // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
       // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
-      crate::vcs_store::paths::advance(state, green_id, version);
-      crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
+      crate::vcs_store::commits::after_submit(state, green_id, version, &policy.authorship);
+      // A Subversion repository's green: the version becomes the revision the server makes of it, recorded in this
+      // transaction (A-664's Subversion objects, `vcs_store::svn_made`).
+      crate::vcs_store::svn_made::make(state, green_id, version, &policy.authorship);
+      // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
+      // transaction (A-731, `vcs_store::hg_made`).
+      crate::vcs_store::hg_made::make(state, green_id, version, &policy.authorship);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
@@ -10047,6 +10066,23 @@ pub(crate) fn owner_judge(
   if let Some(owed) = acknowledgement_owed(state, origin, id.client, &verb) {
     return Some(owed);
   }
+  if crate::vcs_store::paths::whole_build::building(state, sealed.green) {
+    // The green's map is being built whole after a push (A-664's live whole builds): parked until the build ends.
+    let green = sealed.green;
+    let parked = ParkedSubmit {
+      origin,
+      id,
+      route: Some(back),
+      kind: ParkedKind::Owner {
+        sealed,
+        evidence,
+        policy,
+      },
+    };
+    return crate::vcs_store::paths::whole_build::park(state, green, parked)
+      .err()
+      .map(refused);
+  }
   state.db.begin();
   state.current_request = Some((origin, id));
   state.reply_route = Some(back);
@@ -10066,6 +10102,171 @@ pub(crate) fn owner_judge(
       Some(refused(refusal_of_db(&error)))
     }
   }
+}
+
+/// A submit parked behind its green's whole build (A-664's live whole builds, `crate::vcs_store::paths::whole_build`):
+/// its request, where its answer goes, and what runs it again once the build ends.
+pub(crate) struct ParkedSubmit {
+  /// The completion key's origin.
+  origin: u64,
+  /// The request.
+  id: RequestId,
+  /// Where its answer goes; none where the request carried no route.
+  route: Option<crate::merge_service::ReplyRoute>,
+  /// What runs it again.
+  kind: ParkedKind,
+}
+
+impl ParkedSubmit {
+  /// Its request's completion key: a retry of it joins its entry.
+  pub(crate) fn key(&self) -> (u64, u32, u32) {
+    (self.origin, self.id.client, self.id.sequence)
+  }
+}
+
+/// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the
+/// verb of a work on the green's own shard ([`submit`]).
+enum ParkedKind {
+  /// Asked from a work's shard.
+  Owner {
+    /// The work.
+    sealed: crate::work_home::SealedWork,
+    /// Its evidence.
+    evidence: Vec<[u8; 32]>,
+    /// Its policy.
+    policy: SubmitPolicy,
+  },
+  /// Asked on the green's shard.
+  Local {
+    /// Who asked.
+    principal: Principal,
+    /// The work.
+    work: VolumeId,
+    /// Its evidence.
+    evidence: Vec<[u8; 32]>,
+    /// Its signature.
+    signature: Option<Vec<u8>>,
+    /// Its authorship.
+    authorship: slates_ipc::protocol::Authorship,
+    /// Its approval.
+    approval: Approval,
+  },
+}
+
+/// Parks the running submit behind `green`'s build: its request deferred as an acceptance that waits is (no completion,
+/// no reply, `merge_service::defer_acceptance`), or refused `Overloaded` at the bound.
+fn park_submit(state: &mut ShardState, green: DbVolumeId, kind: ParkedKind) -> ReplyBody {
+  let Some((origin, id)) = state.current_request else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
+  let parked = ParkedSubmit {
+    origin,
+    id,
+    route: state.reply_route,
+    kind,
+  };
+  match crate::vcs_store::paths::whole_build::park(state, green, parked) {
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      refused(Refusal::Overloaded { shard: state.shard })
+    }
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// Runs each parked submit again in its own transaction, in the order they came, and answers it on its route.
+pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
+  for submit in parked {
+    let ParkedSubmit {
+      origin,
+      id,
+      route,
+      kind,
+    } = submit;
+    let reply = match kind {
+      ParkedKind::Owner {
+        sealed,
+        evidence,
+        policy,
+      } => {
+        route.and_then(|back| owner_judge(state, (origin, id), (sealed, evidence, policy), back))
+      }
+      ParkedKind::Local {
+        principal,
+        work,
+        evidence,
+        signature,
+        authorship,
+        approval,
+      } => {
+        let verb = (work, (evidence, signature, authorship), approval);
+        resumed_local(state, (origin, id), route, &principal, verb)
+      }
+    };
+    if let (Some(reply), Some(route)) = (reply, route)
+      && !answered_on(route, (origin, id), reply)
+    {
+      state.count("vcs_store.paths.whole_build.undelivered", 1);
+    }
+  }
+}
+
+/// A parked local submit run again in its own transaction, as `run_recorded` runs a verb: its reply, recorded as its
+/// completion, or none where it waits again (an acceptance deferred, or parked behind a later build).
+fn resumed_local(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  principal: &Principal,
+  (work, carried, approval): (
+    VolumeId,
+    (
+      Vec<[u8; 32]>,
+      Option<Vec<u8>>,
+      slates_ipc::protocol::Authorship,
+    ),
+    Approval,
+  ),
+) -> Option<ReplyBody> {
+  state.db.begin();
+  state.current_request = Some((origin, id));
+  state.reply_route = route;
+  let reply = submit(state, principal, work, carried, approval);
+  state.current_request = None;
+  state.reply_route = None;
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => (!deferred).then_some(reply),
+    Err(error) => {
+      reconcile_unpublished_effects(state);
+      Some(refused(refusal_of_db(&error)))
+    }
+  }
+}
+
+/// Answers `reply` on `route`, as a waiting acceptance's answer goes (`merge_service::resolve_accepted`): whether it
+/// was handed on.
+fn answered_on(
+  route: crate::merge_service::ReplyRoute,
+  (origin, id): (u64, RequestId),
+  reply: ReplyBody,
+) -> bool {
+  crate::xshard::hand_reply_home(route.shard, move || {
+    if route.through_work {
+      let _ = crate::state::with_state_counted(|s| {
+        crate::work_home::answered_late(s, origin, id, reply);
+      });
+      return;
+    }
+    crate::state::deliver(route.client_index, route.request, reply, true);
+  })
+  .is_ok()
 }
 
 /// The owner's step of a rebase asked from a work's shard (A-247): nothing of the green changes, so it records nothing
@@ -23312,17 +23513,32 @@ mod tests {
     (sequence, body): &(u32, super::RequestBody),
   ) -> Option<ReplyBody> {
     use slates_vfs::clock::Clock as _;
+    let (handle, request) = packed_on_the_ring(state, seat, (*sequence, body));
+    let now = state.clock.monotonic_ns();
+    match super::serve(state, handle, &request, now) {
+      super::Served::Reply(reply) => Some(reply),
+      super::Served::Forwarded => None,
+    }
+  }
+
+  /// Packs `body` under `sequence` into the ring of the client seated at `seat`, as the client would: the seat's handle
+  /// and the request the shard reads back from the ring.
+  fn packed_on_the_ring(
+    state: &mut crate::state::ShardState,
+    seat: u32,
+    (sequence, body): (u32, &super::RequestBody),
+  ) -> (super::Handle<super::ClientSlot>, super::Request) {
     let generation = state.clients.generation_at(seat).unwrap();
     let handle = slates_mem::Handle::from_raw(seat, generation);
     let word = slates_wire::request::RequestId {
       client: ASKING,
-      sequence: *sequence,
+      sequence,
     }
     .word();
     let slot = slates_ipc::protocol::pack(
       state.clients.get_mut(handle).unwrap().end.region_mut(),
       slates_ipc::protocol::Direction::Request,
-      u64::from(*sequence),
+      u64::from(sequence),
       word,
       body,
     )
@@ -23332,11 +23548,7 @@ mod tests {
       kind: slot.kind,
       payload: slot.payload,
     };
-    let now = state.clock.monotonic_ns();
-    match super::serve(state, handle, &request, now) {
-      super::Served::Reply(reply) => Some(reply),
-      super::Served::Forwarded => None,
-    }
+    (handle, request)
   }
 
   /// What the resend test saw ([`resent_past_a_fenced_shard`]), each by request sequence.

@@ -310,7 +310,7 @@ fn obsstore(
     let mut alone = Vec::new();
     for window in store.windows(&marker) {
       admission.charge(to_u64(window.len()))?;
-      alone.extend_from_slice(window);
+      alone.extend_from_slice(&window);
     }
     let (version, body) = alone.split_first().ok_or_else(unreadable)?;
     if out.is_empty() {

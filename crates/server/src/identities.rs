@@ -25,7 +25,8 @@
 //! before the increment is built: a submit to a green of a repository carries a message (`MessageRequired`) and, for a
 //! git or Mercurial repository, an identity in its tool (`IdentityRequired`), for the commit the server makes of it
 //! (`slates_git::derived::Commits`, A-664 part 2). A Subversion revision's author is the principal's own name, owed with
-//! its revisions. A plain green takes a submit with neither. A stock client's push is not a submit: its works carry the
+//! its revisions (A-664's Subversion objects: every submit carries it, the principal's own name, `carried`). A plain
+//! green takes a submit with neither. A stock client's push is not a submit: its works carry the
 //! client's own commits and are judged on the push path.
 
 use std::ops::ControlFlow;
@@ -70,7 +71,17 @@ fn wire_identities(record: Option<&IdentityRecord>) -> ToolIdentities {
       email: git.email.clone(),
     }),
     mercurial: record.mercurial.clone(),
+    subversion: None,
   })
+}
+
+/// `identities` carried by a submit of `principal`'s session, with Subversion's author its own name (module docs), as
+/// the svn+ssh edge names a commit's author (`crate::lfs::owner_name`): never the client's word.
+fn carried(authorship: &mut Authorship, identities: ToolIdentities, principal: &Principal) {
+  authorship.identities = ToolIdentities {
+    subversion: Some(crate::lfs::owner_name(principal)),
+    ..identities
+  };
 }
 
 /// Format: the bytes Mercurial strips from both ends of a changeset's user before it writes the changeset, ASCII
@@ -199,7 +210,7 @@ pub(crate) fn with_session(
   match held {
     Some(identities) => {
       if let Some(authorship) = body.authorship_mut() {
-        authorship.identities = identities;
+        carried(authorship, identities, principal);
       }
       ControlFlow::Continue(body)
     }
@@ -291,7 +302,7 @@ impl Resumed {
     }
     let identities = kept_once(state, client, read);
     if let Some(authorship) = body.authorship_mut() {
-      authorship.identities = identities;
+      carried(authorship, identities, &self.principal);
     }
     state.reply_route = Some(crate::merge_service::ReplyRoute {
       shard: state.shard,
@@ -377,6 +388,7 @@ pub(crate) fn authored(work: slates_ipc::protocol::VolumeId, message: &str) -> R
         email: "author@example.com".to_owned(),
       }),
       mercurial: Some("A U Thor <author@example.com>".to_owned()),
+      subversion: Some("a-u-thor".to_owned()),
     };
   }
   body

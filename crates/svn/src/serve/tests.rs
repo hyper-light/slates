@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 
 mod commit;
+mod replay;
 
 /// A budget past anything one call of the fixtures writes.
 const PLENTY: Budget = Budget {
@@ -193,9 +194,14 @@ fn replay(fixture: &Fixture, recorded: Recorded, budget: Budget) -> (Vec<u8>, En
           ..fixture.sources_with(&locks)
         };
         let mut draw = || drawn;
-        let judged = connection.lock_verb(&given, &mut draw, LOCK_ROOM, &mut out);
-        if judged.unwrap().is_some() {
+        // No hook configured: each pre-hook goes on, and no post-hook's verdict is a failure (A-730).
+        if let Some(call) = connection.lock_verb(&given, &mut out).unwrap() {
+          let verdicts = call.paths.iter().map(|_| Ok(None)).collect();
+          connection
+            .lock_judged(&given, verdicts, &mut draw, LOCK_ROOM)
+            .unwrap();
           connection.locks_landed(Ok(()), &mut out).unwrap();
+          connection.locks_finished(Ok(()), &mut out).unwrap();
         }
       }
       Ok(Turn::Unserved { .. }) => return (out, Ending::Unserved(before)),
@@ -514,29 +520,22 @@ fn reparent_moves_the_session_within_its_repository() {
   assert_eq!((out.as_str(), turn), ("", Err(Refused::Malformed)));
 }
 
-/// A-656 (commands not served yet, and items that are no command): send `replay`, then
-/// `get-latest-rev`; then an item that is a number; expect "Unknown editor command 'replay'"
-/// (210001) and the connection going on, the youngest revision answered, then the connection's
-/// end.
+/// A-656 (a command `svnserve` does not know, and items that are no command; every command of its
+/// set is served since A-703): send `frobnicate`, then `get-latest-rev`; then an item that is a
+/// number; expect "Unknown command 'frobnicate'" as the read commands answer one and the connection
+/// going on, the youngest revision answered, then the connection's end.
 #[test]
-fn a_command_not_served_yet_is_answered_and_the_session_goes_on() {
+fn an_unknown_command_is_answered_and_the_session_goes_on() {
   let fixture = fixture();
   let mut connection = established();
-  let item = b"( replay ( 6 0 true ) ) ";
+  let item = b"( frobnicate ( ) ) ";
   let (out, turn) = send(&fixture, &mut connection, item);
-  let message = "Unknown editor command 'replay'";
-  assert_eq!(
-    out,
-    format!(
-      "( failure ( ( 210001 {}:{message} 0: 0 ) ) ) ",
-      message.len()
-    )
-  );
-  let unserved = Turn::Unserved {
-    command: "replay",
+  assert!(out.starts_with("( failure ( ( 210001 "), "{out}");
+  assert!(out.contains("'frobnicate'"), "{out}");
+  let took = Turn::Took {
     consumed: item.len(),
   };
-  assert_eq!(turn, Ok(format!("{unserved:?}")));
+  assert_eq!(turn, Ok(format!("{took:?}")));
   let (out, _) = send(&fixture, &mut connection, b"( get-latest-rev ( ) ) ");
   assert!(out.ends_with("( success ( 6 ) ) "), "{out}");
   let (out, turn) = send(&fixture, &mut connection, b"5 ");

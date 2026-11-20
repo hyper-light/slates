@@ -694,8 +694,16 @@ pub struct Green {
   /// that name them and kept while held whatever the files do.
   held: crate::held::Held,
   content_history: ContentHistory,
-  /// The chunks the content history's values share (`crate::history`).
+  /// The chunks the content history's values share (`crate::history`); a value stored whole names its file's block of
+  /// `content`'s arena instead of a copy (A-728).
   chunks: crate::history::Chunks,
+  /// The content history values that name a file's block instead of copying its bytes, and those bytes (A-728's
+  /// non-vacuity counters: a block named by the history instead of copied).
+  history_named: (u64, u64),
+  /// The splices whose added runs name the file's new block (A-728 part 2), and those values' bytes.
+  history_spliced_named: (u64, usize),
+  /// The superseded values sealed by a copy of the runs they alone named, and the bytes copied (A-728 part 2).
+  history_sealed: (u64, u64),
   /// The bytes every content history value's piece list costs, a running total.
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
@@ -891,7 +899,7 @@ fn changed_at<K: Clone, V: Clone>(
 /// What a path's latest content value counts among the current values ([`Green::history_bytes`] leaves them out): its
 /// bytes and its piece list.
 fn current_bytes(value: &crate::history::Value) -> usize {
-  value.len().saturating_add(value.list_bytes())
+  value.own_len().saturating_add(value.list_bytes())
 }
 
 /// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
@@ -1759,10 +1767,11 @@ impl Green {
     self.place_file(&changed.key, changed.value.as_deref());
     self.last_changed.insert(changed.key.clone(), changed.at);
     self.clear_content_history(&changed.key);
+    // The file just placed: its block named, not copied (A-728).
     let value = changed
       .value
       .as_ref()
-      .map(|bytes| crate::history::Value::whole(&mut self.chunks, bytes));
+      .map(|_| self.named_value(&changed.key));
     self.push_content(changed.key.clone(), changed.at, value);
   }
 
@@ -2643,7 +2652,9 @@ impl Green {
   pub fn content_ref_at(&self, path: &str, version: u64) -> Option<Cow<'_, [u8]>> {
     match self.content_read(path, version) {
       ContentRead::Head => self.content.get(path).map(Cow::Borrowed),
-      ContentRead::Value(value) => Some(Cow::Owned(value.materialize(&self.chunks))),
+      ContentRead::Value(value) => Some(Cow::Owned(
+        value.materialize(&self.chunks, self.content.blocks()),
+      )),
       ContentRead::Absent => None,
     }
   }
@@ -2709,7 +2720,7 @@ impl Green {
       .unwrap_or(usize::MAX)
       .min(total);
     Some((
-      value.read(&self.chunks, start, end),
+      value.read((&self.chunks, self.content.blocks()), start, end),
       u64::try_from(total).unwrap_or(u64::MAX),
     ))
   }
@@ -2751,7 +2762,9 @@ impl Green {
         (*version > 0).then(|| crate::checkpoint::Changed {
           key: path.clone(),
           at: *version,
-          value: value.as_ref().map(|value| value.materialize(&self.chunks)),
+          value: value
+            .as_ref()
+            .map(|value| value.materialize(&self.chunks, self.content.blocks())),
         })
       })
       .collect()
@@ -2790,31 +2803,114 @@ impl Green {
     else {
       return;
     };
-    let Green {
-      content, chunks, ..
-    } = self;
-    let Some(bytes) = content.get(path) else {
+    if !self.content.contains_key(path) {
       return;
-    };
-    let value = crate::history::Value::whole(chunks, bytes);
+    }
+    // The file's block, named (A-728): the bytes it held are its block, which the coming change lets the map go of and
+    // this value keeps.
+    let value = self.named_value(path);
     self.push_content(path.to_owned(), since, Some(value));
   }
 
-  /// The value `bytes` that `ops` make of `path`'s latest content (`crate::history::Value::spliced`), or `bytes`
-  /// whole for a path with none.
-  fn content_value(&mut self, path: &str, ops: &[Op], bytes: &[u8]) -> crate::history::Value {
+  /// `path`'s current file as a history value: its block named, one more holder of it, no byte copied (A-728,
+  /// `crate::history::Value::named`), counted. None for no file: an empty value.
+  fn named_value(&mut self, path: &str) -> crate::history::Value {
+    let Some(block) = self.content.hold_block_of(path) else {
+      return crate::history::Value::default();
+    };
+    let len = self.content.block_bytes(block).len();
+    let value =
+      crate::history::Value::named(&mut self.chunks, self.content.blocks_mut(), block, len);
+    if value.len() > 0 {
+      let (values, bytes) = self.history_named;
+      self.history_named = (
+        values.saturating_add(1),
+        bytes.saturating_add(u64::try_from(len).unwrap_or(u64::MAX)),
+      );
+    }
+    value
+  }
+
+  /// The content history values that named a file's block instead of copying it, and their bytes (A-728's
+  /// non-vacuity counters).
+  pub fn history_blocks_named(&self) -> (u64, u64) {
+    self.history_named
+  }
+
+  /// The splices whose added runs named the file's new block instead of a copy, and those values' bytes; and the
+  /// superseded values sealed by copying out the runs they alone named, and the bytes copied (A-728 part 2's
+  /// non-vacuity counters).
+  pub fn history_splices_named(&self) -> ((u64, usize), (u64, u64)) {
+    (self.history_spliced_named, self.history_sealed)
+  }
+
+  /// The bytes the content history owns, copied out of files (A-728: what a value stored whole no longer copies).
+  pub fn history_owned_bytes(&self) -> usize {
+    self.chunks.owned_bytes()
+  }
+
+  /// The value that `ops` made of `path`'s latest content, the file now holding its new bytes
+  /// (`crate::history::Value::spliced`), or the file's block named whole (A-728) for a path with none, or one the
+  /// splice shares nothing with or stores whole.
+  fn content_value(&mut self, path: &str, ops: &[Op]) -> crate::history::Value {
     let Green {
       content_history,
       chunks,
+      content,
       ..
     } = self;
-    match content_history
+    let block = content.block_of(path);
+    let spliced = content_history
       .get(path)
       .and_then(|history| history.last())
       .and_then(|(_, value)| value.as_ref())
-    {
-      Some(latest) => latest.spliced(chunks, ops, bytes),
-      None => crate::history::Value::whole(chunks, bytes),
+      .zip(block)
+      .and_then(|(latest, block)| {
+        let blocks = content.blocks();
+        latest.spliced(chunks, (blocks, block), ops, blocks.bytes(block))
+      });
+    match (spliced, block) {
+      (Some((value, named)), Some(block)) => {
+        // The added runs are the file's block (A-728 part 2): the chunk naming it takes its holder.
+        if named {
+          content.blocks_mut().hold(block);
+          let (values, bytes) = self.history_spliced_named;
+          self.history_spliced_named =
+            (values.saturating_add(1), bytes.saturating_add(value.len()));
+        }
+        value
+      }
+      _ => self.named_value(path),
+    }
+  }
+
+  /// Seals `path`'s latest content value as a change supersedes it, the file map having let its block go
+  /// (`crate::history::Value::seal`, A-728 part 2): the runs it alone names of a block nothing else holds are copied out
+  /// and the block let go, counted.
+  fn seal_latest(&mut self, path: &str) {
+    let Green {
+      content_history,
+      chunks,
+      content,
+      history_sealed,
+      ..
+    } = self;
+    let Some(latest) = content_history
+      .get_mut(path)
+      .and_then(|history| history.last_mut())
+      .and_then(|(_, value)| value.as_mut())
+    else {
+      return;
+    };
+    // Its own block stops being the current file's: from here it is history, whole or cut (A-728 part 4).
+    self.history_current = self.history_current.saturating_sub(latest.own_len());
+    let copied = latest.seal(chunks, content.blocks_mut());
+    if copied > 0 {
+      let (values, bytes) = *history_sealed;
+      *history_sealed = (
+        values.saturating_add(1),
+        bytes.saturating_add(u64::try_from(copied).unwrap_or(u64::MAX)),
+      );
     }
   }
 
@@ -2850,7 +2946,7 @@ impl Green {
       .last()
       .and_then(|(_, value)| value.as_ref())
       .unwrap_or(&empty);
-    at_base.applied_equals(&self.chunks, ops_and_post, head)
+    at_base.applied_equals((&self.chunks, self.content.blocks()), ops_and_post, head)
   }
 
   /// Drops `path`'s content history, its chunks released and the running totals with it.
@@ -2870,7 +2966,7 @@ impl Green {
   fn release_content(&mut self, value: Option<crate::history::Value>) {
     if let Some(value) = value {
       self.history_lists = self.history_lists.saturating_sub(value.list_bytes());
-      value.release(&mut self.chunks);
+      value.release(&mut self.chunks, self.content.blocks_mut());
     }
   }
 
@@ -4568,6 +4664,7 @@ impl Green {
       .insert(IdentityKey::File(path.to_owned()));
     self.seed_content(path, version);
     self.content.remove(path);
+    self.seal_latest(path);
     self.last_changed.insert(path.to_owned(), version);
     self.file_removed.insert(path.to_owned(), version);
     self.push_content(path.to_owned(), version, None);
@@ -4590,8 +4687,10 @@ impl Green {
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
     // the retention charged to the running totals.
     self.seed_content(&path, version);
-    let value = self.content_value(&path, &ops, &bytes);
+    // The file first, so the value names its block (A-728); the value it supersedes sealed before it is spliced from.
     self.content.insert(&path, bytes);
+    self.seal_latest(&path);
+    let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
     self.push_content(path.clone(), version, Some(value));
     delta.insert(path, ops);
@@ -5252,16 +5351,12 @@ impl Green {
 
   /// The most this increment can add to the retained history ([`Green::retention_charge`]), charged before the
   /// verdict (A-16): what the history would gain if every op were applied. Per path (W2: the history shares what a
-  /// version kept, `crate::history`):
-  /// - a content edit gains the bytes it adds, the bytes it deletes or truncates away (they leave the current value
-  ///   but stay in the history), and its piece list; or, when the list would outweigh the value and it is stored
-  ///   whole, the old value;
-  /// - a path replaced whole (created over, renamed onto, removed, or renamed away) keeps its old value and its list
-  ///   (a new value, whole, costs no more than it holds);
+  /// version kept, `crate::history`; A-728 part 4: it counts every block it keeps, and only the latest value's own block
+  /// is current):
+  /// - a file changed in any way (edited, created over, renamed onto, removed, or renamed away) supersedes its latest
+  ///   value, which keeps its list and what it keeps of its own block ([`Green::superseded_bytes`]); the new value's own
+  ///   block and list are current, and its other runs name chunks the history holds already;
   /// - an IPC node replaced or removed keeps the node.
-  ///
-  /// A post-state shorter than its ops declare is stored whole after the verdict (`crate::history::Value::spliced`);
-  /// the settle after it charges what that costs.
   pub fn history_reservation(&self, inc: &Increment) -> usize {
     if self.accepted.contains_key(&inc.id) {
       return 0;
@@ -5289,11 +5384,11 @@ impl Green {
     let content: usize = edits
       .iter()
       .filter(|(path, _)| !replaced.contains(*path))
-      .map(|(path, ops)| self.edit_reservation(path, ops))
+      .map(|(path, _)| self.superseded_bytes(path))
       .sum();
     let replaced = replaced.into_iter().fold(content, |total, path| {
       total
-        .saturating_add(self.latest_bytes(path))
+        .saturating_add(self.superseded_bytes(path))
         .saturating_add(if self.specials.contains_key(path) {
           SPECIAL_NODE_BYTES
         } else {
@@ -5303,70 +5398,33 @@ impl Green {
     replaced.saturating_add(self.replace_history_reservation(inc))
   }
 
-  /// [`Green::history_reservation`] for one path's content ops. The history gains the new value's chunk and list
-  /// less what the current value (bytes and list) grew by: the overwritten and the deleted or truncated bytes, and the
-  /// old value's list (the bytes an insert or extension adds are current). Stored whole, the old value and its list.
-  fn edit_reservation(&self, path: &str, ops: &[&Op]) -> usize {
-    let old = self.content.get(path).map_or(0, <[u8]>::len);
-    let old_len = u64::try_from(old).unwrap_or(u64::MAX);
-    let (overwritten, removed, inserted) =
-      ops
-        .iter()
-        .fold((0u64, 0u64, 0u64), |(over, removed, ins), op| {
-          match op.kind {
-            OpKind::Overwrite => (over.saturating_add(op.len), removed, ins),
-            OpKind::Insert | OpKind::Extend => (over, removed, ins.saturating_add(op.len)),
-            OpKind::Delete => (over, removed.saturating_add(op.len), ins),
-            OpKind::Truncate => (
-              over,
-              removed.saturating_add(old_len.saturating_sub(op.at)),
-              ins,
-            ),
-            _ => (over, removed, ins),
-          }
-        });
-    let to_usize = |bytes: u64| usize::try_from(bytes).unwrap_or(usize::MAX);
-    let latest = self.latest_bytes(path);
-    let old_list = latest.saturating_sub(old);
-    let spliced = to_usize(overwritten)
-      .saturating_add(to_usize(removed))
-      .saturating_add(old_list);
-    // Stored whole when the new list would outweigh the new value: at most the old pieces, each op splitting one
-    // and adding one.
-    let list = old_list.saturating_add(
-      ops
-        .len()
-        .saturating_mul(2)
-        .saturating_add(1)
-        .saturating_mul(crate::history::PIECE_BYTES),
-    );
-    let next = old
-      .saturating_sub(to_usize(removed))
-      .saturating_add(to_usize(inserted));
-    if list > next {
-      latest.max(spliced)
-    } else {
-      spliced
-    }
-  }
-
-  /// What `path`'s latest content value counts among the current values: its bytes and its list (none for no value).
-  /// A path with no history has none yet; its first change records its bytes whole (`seed_content`, A-534), and that
-  /// is what it counts.
-  fn latest_bytes(&self, path: &str) -> usize {
+  /// What the history gains when a change supersedes `path`'s latest content value (A-728 part 4, the honest charge),
+  /// whatever the change's ops: the value's piece list, no longer current, and what it keeps of its own block, the
+  /// current file's ([`crate::history::Value::kept_when_superseded`]): the whole block when the value names all of it
+  /// or a holder beyond the map and the history keeps it (the identity table, a branch), else the runs it names. The
+  /// new value's own block and list are current, and its other runs name chunks the history holds already. A path with
+  /// no history, or holding a copy's value (A-586), is recorded whole at its change (`seed_content`): its file's block
+  /// and one piece, all of it kept. A path with no file and no value gains nothing.
+  fn superseded_bytes(&self, path: &str) -> usize {
     let history = self.content_history.get(path);
-    // A path holding a copy's value (A-586) records it whole at its first change too.
     let covered = self.covered_since(path, last_entry(history)).is_some();
-    match history.filter(|_| !covered) {
-      Some(history) => history
-        .last()
-        .and_then(|(_, value)| value.as_ref())
-        .map_or(0, current_bytes),
-      None => self
+    let Some(history) = history.filter(|_| !covered) else {
+      return self
         .content
         .get(path)
-        .map_or(0, |bytes| crate::history::Value::whole_cost(bytes.len())),
-    }
+        .map_or(0, |bytes| crate::history::Value::whole_cost(bytes.len()));
+    };
+    let Some(latest) = history.last().and_then(|(_, value)| value.as_ref()) else {
+      return 0;
+    };
+    // The map and the latest value each hold the current block; any other holder keeps it past the seal.
+    let others = self
+      .content
+      .block_of(path)
+      .is_some_and(|block| self.content.blocks().holders(block) > 2);
+    latest
+      .list_bytes()
+      .saturating_add(latest.kept_when_superseded(others))
   }
 
   /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
@@ -5507,12 +5565,61 @@ impl Green {
   /// dropped value releases its chunks.
   fn fold_content_before(&mut self, floor: u64) {
     let mut dropped = Vec::new();
-    for history in self.content_history.values_mut() {
-      dropped.extend(fold_entries(history, floor));
+    let mut alone = Vec::new();
+    for (path, history) in &mut self.content_history {
+      let folded = fold_entries(history, floor);
+      if !folded.is_empty() && history.len() == 1 {
+        alone.push(path.clone());
+      }
+      dropped.extend(folded);
     }
     for (_, value) in dropped {
       self.release_content(value);
     }
+    for path in alone {
+      self.rename_alone(&path);
+    }
+  }
+
+  /// A path the fold left only its latest value, which is its current file: that value made the file's block, named
+  /// whole (A-728), so the earlier blocks and chunks it shared runs of are let go. Every read of the latest version is
+  /// the head's, and the verdict's head value is the file's bytes either way. A path whose value is a copy's (A-586), or
+  /// whose latest value is a removal or names the block already, is left as it is.
+  fn rename_alone(&mut self, path: &str) {
+    let history = self.content_history.get(path);
+    if self.covered_since(path, last_entry(history)).is_some() {
+      return;
+    }
+    let Some(block) = self.content.block_of(path) else {
+      return;
+    };
+    let Some(latest) = history
+      .and_then(|history| history.last())
+      .and_then(|(_, value)| value.as_ref())
+    else {
+      return;
+    };
+    if latest.is_block(&self.chunks, block) {
+      return;
+    }
+    let named = self.named_value(path);
+    let Some((_, slot)) = self
+      .content_history
+      .get_mut(path)
+      .and_then(|history| history.last_mut())
+    else {
+      return;
+    };
+    let old = slot.replace(named);
+    let new_cost = slot.as_ref().map_or(0, current_bytes);
+    let new_list = slot.as_ref().map_or(0, crate::history::Value::list_bytes);
+    let old_cost = old.as_ref().map_or(0, current_bytes);
+    self.history_current = self
+      .history_current
+      .saturating_sub(old_cost)
+      .saturating_add(new_cost);
+    self.history_lists = self.history_lists.saturating_add(new_list);
+    self.release_content(old);
   }
 
   /// Folds the IPC history below `floor`, its earlier nodes leaving the running total.
@@ -5943,6 +6050,8 @@ mod compute_tests;
 mod computed_wire_tests;
 #[cfg(test)]
 mod held_tests;
+#[cfg(test)]
+mod history_block_tests;
 #[cfg(test)]
 mod judge_tests;
 #[cfg(test)]

@@ -373,7 +373,7 @@ fn transact_cost() {
   let (purge_intents, private_opens) = crate::purge_intents::channel().unwrap();
   let mounted = Mounted::new(
     &drive,
-    true,
+    (true, crate::normalized::NameSearch::CaseSensitive),
     requests,
     Waker::noop().clone(),
     None,
@@ -635,7 +635,7 @@ fn measure_serving(serving: &Serving, opens: usize) {
   let (purge_intents, private_opens) = crate::purge_intents::channel().unwrap();
   let mounted = Mounted::new(
     &drive,
-    true,
+    (true, crate::normalized::NameSearch::CaseSensitive),
     requests,
     Waker::noop().clone(),
     None,

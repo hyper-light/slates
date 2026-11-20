@@ -44,7 +44,7 @@ type GreenNode = (NodeKind, PropertyList);
 /// The green the transcripts' repository holds: every revision's tree, the property lists, the texts and the revision
 /// properties.
 #[derive(Debug, Default)]
-struct Green {
+pub(crate) struct Green {
   /// Every revision's whole tree.
   trees: Vec<BTreeMap<String, GreenNode>>,
   /// The property lists, by identity.
@@ -105,19 +105,21 @@ impl Repository for Green {
     )
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let text = self.texts.get(identity)?;
     let start = usize::try_from(offset).ok()?;
-    text.get(start..start.saturating_add(PIECE).min(text.len()))
+    text
+      .get(start..start.saturating_add(PIECE).min(text.len()))
+      .map(std::borrow::Cow::Borrowed)
   }
 }
 
 /// The index and the green of the transcripts' repository.
-struct Fixture {
+pub(crate) struct Fixture {
   /// The index.
-  index: Index,
+  pub(crate) index: Index,
   /// The green.
-  green: Green,
+  pub(crate) green: Green,
 }
 
 /// Bytes from hex.
@@ -146,7 +148,7 @@ fn at_or_beneath(place: &str, path: &str) -> bool {
 
 impl Fixture {
   /// The repository `repository.txt` records, rebuilt revision by revision.
-  fn new() -> Self {
+  pub(crate) fn new() -> Self {
     let mut fixture = Self {
       index: Index::new(),
       green: Green::default(),
@@ -1086,13 +1088,17 @@ impl Repository for Torn<'_> {
     self.green.properties(identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     let left = usize::try_from(self.kept.checked_sub(offset)?).ok()?;
     let piece = self.green.text(identity, offset)?;
     if left == 0 {
       return None;
     }
-    piece.get(..piece.len().min(left))
+    let kept = piece.len().min(left);
+    Some(match piece {
+      std::borrow::Cow::Borrowed(bytes) => std::borrow::Cow::Borrowed(bytes.get(..kept)?),
+      std::borrow::Cow::Owned(bytes) => std::borrow::Cow::Owned(bytes.get(..kept)?.to_vec()),
+    })
   }
 }
 
@@ -1168,7 +1174,7 @@ impl Repository for Garbled<'_> {
     self.green.properties(identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     self.green.text(identity, offset)
   }
 }

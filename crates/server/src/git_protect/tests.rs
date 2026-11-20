@@ -398,20 +398,28 @@ fn answered(scenario: &Scenario, record: &RepositoryRecord) -> (Received, Vec<St
       .read(&scenario.request[took..], &mut admission)
       .unwrap();
     let bases = Bases(&server.objects);
-    Ok(pack.finish_with(&bases, &mut admission).unwrap())
+    pack.finish_with(&bases, &mut admission).unwrap()
   });
+  let objects: Vec<Object> = unpacked
+    .as_ref()
+    .map(|unpacked| unpacked.objects.clone())
+    .unwrap_or_default();
+  let (kept, held) = match unpacked.map(slates_git::unpack::Unpacked::into_kept) {
+    Some((kept, held)) => (Some(Ok(kept)), held),
+    None => (None, slates_git::unpack::Held::default()),
+  };
   let checked = {
     let view = IndexedObjects::new(&server.repository, &server.store, u64::MAX);
-    receive::check(request, unpacked, &view, &NoneHidden, &mut admission).unwrap()
+    receive::check(request, kept, (&view, &held), &NoneHidden, &mut admission).unwrap()
   };
-  let push = sealed(&server.repository, &mut server.store, checked.objects());
+  let push = sealed(&server.repository, &mut server.store, &objects);
   let mut judge = Protected {
     server: &server,
     push: &push,
     record,
     faults: Vec::new(),
   };
-  let received = receive::decide(checked, &mut judge, &mut admission).unwrap();
+  let received = receive::decide(checked, Some(&held), &mut judge, &mut admission).unwrap();
   (received, judge.faults)
 }
 

@@ -641,6 +641,11 @@ fn port_after(lines: &[String], prefix: &str) -> Option<u16> {
   })
 }
 
+/// The HTTP edge's port the daemon named in `lines`; a test fails when it named none.
+fn http_edge_port(lines: &[String]) -> u16 {
+  port_after(lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port")
+}
+
 /// Makes Subversion repository [`REPOSITORY`] through the CLI (`slates repository create`, A-685).
 fn create_repository(instance: &str) {
   let (code, out, err) = slates(
@@ -683,7 +688,7 @@ struct Leg {
 fn http_leg(session: &str) -> Option<Leg> {
   let instance = format!("svn-http-{session}-{}", std::process::id());
   let (anchor, lines, issuer) = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let port = http_edge_port(&lines);
   let issuer = issuer_or_skip(issuer, &format!("the HTTP leg of {session}"))?;
   create_repository(&instance);
   let (_, token) = minted_token(&instance, &issuer);

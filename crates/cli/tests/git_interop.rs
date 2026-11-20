@@ -563,6 +563,11 @@ fn port_after(lines: &[String], prefix: &str) -> Option<u16> {
   })
 }
 
+/// The HTTP edge's port the daemon named in `lines`; a test fails when it named none.
+fn http_edge_port(lines: &[String]) -> u16 {
+  port_after(lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port")
+}
+
 /// Makes git repository [`REPOSITORY`] through the CLI, in A-685's words: its object format SHA-1 and its default
 /// branch [`BRANCH`], the verb's defaults.
 fn create_repository(instance: &str) {
@@ -606,8 +611,7 @@ struct HttpLeg {
 fn http_leg(session: &str) -> Option<HttpLeg> {
   let instance = format!("git-http-{session}-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port =
-    port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let port = http_edge_port(&started.lines);
   let issuer = issuer_of(&started, "the HTTP leg")?;
   create_repository(&instance);
   let token = minted_token(&instance, &issuer);
@@ -634,8 +638,7 @@ fn stock_git_without_credentials_is_refused_in_its_own_words() {
   };
   let instance = format!("git-refused-{}", std::process::id());
   let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
-  let port =
-    port_after(&started.lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port");
+  let port = http_edge_port(&started.lines);
   let scratch = Scratch::new("git-refused");
   let git = Git::new(&program, &scratch, "refused", Vec::new());
   let site = format!("http://127.0.0.1:{port}");

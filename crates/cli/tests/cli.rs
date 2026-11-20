@@ -3206,6 +3206,17 @@ fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16;
   )
 }
 
+/// An issuer surface's exports: `(name, value)` pairs.
+type Exports = Vec<(String, String)>;
+
+/// What the SSH edge test saw across a restart: the successor's pid, the answer while it restarted, and the port and
+/// fingerprint the successor named.
+type AcrossRestart = (
+  Option<u32>,
+  Option<std::io::Result<Vec<u8>>>,
+  Option<(u16, String)>,
+);
+
 /// A client certificate and key, DER, as a node's `tlshd` holds them.
 type ClientIdentity = (
   rustls::pki_types::CertificateDer<'static>,
@@ -13792,7 +13803,7 @@ fn anchor_with_edges(instance: &str, edges: &[&str]) -> (AnchorProcess, Vec<Stri
 fn anchor_with_edges_and_issuer(
   instance: &str,
   edges: &[&str],
-) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+) -> (AnchorProcess, Vec<String>, Option<Exports>) {
   anchor_with_edges_as(instance, edges, true)
 }
 
@@ -13804,7 +13815,7 @@ fn anchor_with_edges_as(
   instance: &str,
   edges: &[&str],
   issuer: bool,
-) -> (AnchorProcess, Vec<String>, Option<Vec<(String, String)>>) {
+) -> (AnchorProcess, Vec<String>, Option<Exports>) {
   use std::io::{BufRead, Write};
   let mut child = slates()
     .args([
@@ -14750,11 +14761,7 @@ fn ssh_edge_across_a_restart(
   lines: &std::sync::mpsc::Receiver<String>,
   serving_line: &str,
   port: u16,
-) -> (
-  Option<u32>,
-  Option<std::io::Result<Vec<u8>>>,
-  Option<(u16, String)>,
-) {
+) -> AcrossRestart {
   let (mut successor, mut while_restarting, mut again, mut served) = (None, None, None, false);
   while successor.is_none() || !served {
     let line = lines

@@ -126,6 +126,25 @@ pub enum Merged {
   Refused(HttpAnswer),
 }
 
+/// How far a MERGE went before its caller's hook (A-733): stopped at pre-commit, which the caller runs and answers with
+/// [`DavCommit::resume_merge`]; or ended.
+#[derive(Debug)]
+pub enum MergeStep {
+  /// pre-commit is due.
+  Hook(Due),
+  /// The MERGE ended.
+  Done(Merged),
+}
+
+/// One editor command's step as far as its hook (A-733): what it made, or the hook due, which the caller runs and
+/// answers with the drive's resume.
+enum EditStep {
+  /// What it made.
+  Done(Edited),
+  /// A hook is due.
+  Hook(Due),
+}
+
 /// The revision properties a POST's skel names (`create_txn.c`: `( create-txn-with-props ( NAME VALUE ... ) )` or
 /// `( create-txn )`), each name once, `svn:author` and `svn:date` dropped (the principal's and the commit's own), then
 /// `svn:author` set to `user` where one is named; refused where the skel is malformed.
@@ -250,6 +269,22 @@ impl DavCommit {
     world: &World<'_, G>,
     hooks: Hooks<'_>,
   ) -> Result<Self, HttpAnswer> {
+    let (mut commit, due) = Self::begin_hooked(setup, world)?;
+    if let Some(due) = due {
+      commit.resume_begin(world, hooks(&due))?;
+    }
+    Ok(commit)
+  }
+
+  /// Begins a transaction as [`DavCommit::begin`] does, as far as start-commit (A-733): the commit, and start-commit's
+  /// due where the drive stopped for it, which the caller runs and answers with [`DavCommit::resume_begin`].
+  ///
+  /// # Errors
+  /// The answer to the POST where the drive refused it.
+  pub fn begin_hooked<G: Green + ?Sized>(
+    setup: Setup,
+    world: &World<'_, G>,
+  ) -> Result<(Self, Option<Due>), HttpAnswer> {
     let mut commit = Self {
       repository_url: setup.repository_url.clone(),
       drive: Drive::new(setup),
@@ -259,23 +294,71 @@ impl DavCommit {
       over: false,
       putting: None,
     };
-    commit.step(
+    let opened = commit.edit_until_hook(
       world,
-      hooks,
       &EditCommand::OpenRoot {
         revision: None,
         root: ROOT_TOKEN,
       },
     )?;
-    commit
-      .directories
-      .insert(String::new(), ROOT_TOKEN.to_vec());
-    Ok(commit)
+    match opened {
+      EditStep::Hook(due) => Ok((commit, Some(due))),
+      EditStep::Done(edited) => {
+        commit.root_opened(edited)?;
+        Ok((commit, None))
+      }
+    }
+  }
+
+  /// Answers the start-commit the begun transaction stopped for (A-733): the root opened, or the POST's refusal.
+  ///
+  /// # Errors
+  /// The answer to the POST where the hook or the drive refused it.
+  pub fn resume_begin<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Result<(), HttpAnswer> {
+    match self.resume_until_hook(world, answer)? {
+      EditStep::Done(edited) => self.root_opened(edited),
+      // `open-root` meets one hook alone: a second is no step this drive takes.
+      EditStep::Hook(_) => {
+        self.over = true;
+        Err(no_such_transaction(self.drive.pending().transaction))
+      }
+    }
+  }
+
+  /// The root's `open-root` made `edited`: the root kept open until the MERGE, or the transaction ended.
+  fn root_opened(&mut self, edited: Edited) -> Result<(), HttpAnswer> {
+    if edited != Edited::Taken {
+      self.over = true;
+      return Err(no_such_transaction(self.drive.pending().transaction));
+    }
+    self.directories.insert(String::new(), ROOT_TOKEN.to_vec());
+    Ok(())
   }
 
   /// Whether the transaction has ended.
   pub fn over(&self) -> bool {
     self.over
+  }
+
+  /// The revision the transaction was begun on: what its hooks' pending view names (A-733).
+  pub fn pending_base(&self) -> Revision {
+    self.drive.pending().base
+  }
+
+  /// The lock tokens the transaction presented, each by its repository path, as `mod_dav_svn` hands them to the
+  /// filesystem (`svn_fs_access_add_lock_token2`) and so to pre-commit's standard input (A-733).
+  pub fn pending_tokens(&self) -> Vec<(String, String)> {
+    self
+      .drive
+      .pending()
+      .presented
+      .iter()
+      .map(|(path, token)| (path.clone(), token.clone()))
+      .collect()
   }
 
   /// Presents a lock's `token` for the transaction path `path` (an `If` header's, or a MERGE's `S:lock-token-list`,
@@ -422,6 +505,18 @@ impl DavCommit {
 
   /// The MERGE: every directory closed, deepest first, then `close-edit`, pre-commit answered by `hooks`.
   pub fn merge<G: Green + ?Sized>(&mut self, world: &World<'_, G>, hooks: Hooks<'_>) -> Merged {
+    match self.merge_hooked(world) {
+      MergeStep::Done(merged) => merged,
+      MergeStep::Hook(due) => {
+        let answer = hooks(&due);
+        self.resume_merge(world, answer)
+      }
+    }
+  }
+
+  /// The MERGE as [`DavCommit::merge`] makes it, as far as pre-commit (A-733): its outcome, or pre-commit's due, which
+  /// the caller runs and answers with [`DavCommit::resume_merge`].
+  pub fn merge_hooked<G: Green + ?Sized>(&mut self, world: &World<'_, G>) -> MergeStep {
     let mut open: Vec<(String, Vec<u8>)> =
       std::mem::take(&mut self.directories).into_iter().collect();
     open.sort_by_key(|(path, _)| {
@@ -433,11 +528,42 @@ impl DavCommit {
       )
     });
     for (_, token) in &open {
-      if let Err(refused) = self.step(world, hooks, &EditCommand::CloseDir { directory: token }) {
-        return Merged::Refused(refused);
+      match self.edit_until_hook(world, &EditCommand::CloseDir { directory: token }) {
+        Ok(EditStep::Done(Edited::Taken)) => {}
+        // `close-dir` meets no hook: anything else ends the transaction.
+        Ok(_) => {
+          self.over = true;
+          return MergeStep::Done(Merged::Refused(no_such_transaction(
+            self.drive.pending().transaction,
+          )));
+        }
+        Err(refused) => return MergeStep::Done(Merged::Refused(refused)),
       }
     }
-    match self.edit(world, hooks, &EditCommand::CloseEdit) {
+    match self.edit_until_hook(world, &EditCommand::CloseEdit) {
+      Ok(EditStep::Hook(due)) => MergeStep::Hook(due),
+      Ok(EditStep::Done(edited)) => MergeStep::Done(self.merged(Ok(edited))),
+      Err(refused) => MergeStep::Done(Merged::Refused(refused)),
+    }
+  }
+
+  /// Answers the pre-commit the MERGE stopped for (A-733): the work accepted, or the MERGE's refusal.
+  pub fn resume_merge<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Merged {
+    match self.resume_until_hook(world, answer) {
+      Ok(EditStep::Done(edited)) => self.merged(Ok(edited)),
+      // `close-edit` meets pre-commit alone: a second hook is no step this drive takes.
+      Ok(EditStep::Hook(_)) => self.merged(Ok(Edited::Closed)),
+      Err(refused) => Merged::Refused(refused),
+    }
+  }
+
+  /// What `close-edit` made of the transaction.
+  fn merged(&mut self, edited: Result<Edited, HttpAnswer>) -> Merged {
+    match edited {
       Ok(Edited::Accepted(work)) => {
         self.over = true;
         Merged::Accepted(work)
@@ -792,19 +918,50 @@ impl DavCommit {
     hooks: Hooks<'_>,
     command: &EditCommand<'_>,
   ) -> Result<Edited, HttpAnswer> {
+    let mut step = self.edit_until_hook(world, command)?;
+    loop {
+      match step {
+        EditStep::Done(edited) => return Ok(edited),
+        EditStep::Hook(due) => step = self.resume_until_hook(world, hooks(&due))?,
+      }
+    }
+  }
+
+  /// One command as far as its hook (A-733): what it made, the hook due, or its refusal's answer, which ends the
+  /// transaction.
+  fn edit_until_hook<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    command: &EditCommand<'_>,
+  ) -> Result<EditStep, HttpAnswer> {
     if self.over {
       return Err(no_such_transaction(self.drive.pending().transaction));
     }
-    let mut edited = self
+    let edited = self
       .drive
       .edit(world.index, world.green, world.locks, command);
-    while let Edited::Hook(due) = &edited {
-      let answer = hooks(due);
-      edited = self
-        .drive
-        .resume_edit(world.index, world.green, world.locks, answer);
+    self.edit_step(edited)
+  }
+
+  /// The drive resumed with a hook's `answer` (A-733): what the command made, another hook due, or its refusal's answer.
+  fn resume_until_hook<G: Green + ?Sized>(
+    &mut self,
+    world: &World<'_, G>,
+    answer: Result<(), Vec<(u32, String)>>,
+  ) -> Result<EditStep, HttpAnswer> {
+    if self.over {
+      return Err(no_such_transaction(self.drive.pending().transaction));
     }
+    let edited = self
+      .drive
+      .resume_edit(world.index, world.green, world.locks, answer);
+    self.edit_step(edited)
+  }
+
+  /// What the drive's `edited` makes of the transaction: a refusal or a close ends it.
+  fn edit_step(&mut self, edited: Edited) -> Result<EditStep, HttpAnswer> {
     match edited {
+      Edited::Hook(due) => Ok(EditStep::Hook(due)),
       Edited::Refused(errors) => {
         self.over = true;
         Err(refused(&errors))
@@ -813,7 +970,7 @@ impl DavCommit {
         self.over = true;
         Err(no_such_transaction(self.drive.pending().transaction))
       }
-      other => Ok(other),
+      other => Ok(EditStep::Done(other)),
     }
   }
 }
