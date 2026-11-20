@@ -93,3 +93,8 @@
 - Target trimmed: 24 GB -> ~1.3 GB (incremental, release, orphaned *.rcgu.o); disk 78 GB free.
 - QUEUE NEXT: S5 (main's convergence plan; main will send hg's step details), then the server-made hg changeset
   (hg_made::make hook in verbs::judge_submission, per w-shared's seam message), then the inventory list.
+- A-731 (server-made hg changeset: slates-hg push::made, vcs_store::hg_made, Source::Made, HgStore::made, head_of)
+  LANDED main (piece 9ed874650, merge 36c65b2a3). Local: hg 74/74, server `-- hg vcs_store:: repository::` 130/130.
+- NOW: S5 = A-729 (claimed): content once by identity (main's 6-point spec: file texts by identity homed via homes.rs,
+  read via A-727 Cow seam; manifests/changelogs as revlog-shaped deltas, snapshot interval derived; SHGR names
+  identities only; intake rebuilds against stored base; replay re-indexes by identity; proof w-perf's import).
