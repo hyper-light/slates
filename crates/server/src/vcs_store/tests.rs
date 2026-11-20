@@ -483,7 +483,7 @@ impl Live {
     pending: &mut Pending,
     moves: &[RecordedMove],
   ) -> Result<(), GitRefused> {
-    let admitted = seal_moves(&self.content, &self.store, &mut pending.push, moves)?;
+    let admitted = seal_moves(&mut self.content, &mut self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
     let record = record_of(
       &self.content,
