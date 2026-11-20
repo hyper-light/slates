@@ -16910,6 +16910,10 @@ Owed from this measurement:
 - **Windows arm64: the 4–5 ms wait on every open and close of a written file**, all three runs, not on x86_64. The
   daemon's status named no WinFsp event, so no purge round ran, and `fsbench`'s open test (files never written) costs
   1.2 ms an open and close there. Not yet explained: find whose wait it is with the daemon's own timing first.
+  **Not reproduced 2026-11-20 (w-bugs, goal-83 B5; main 137bf3633, diag-w-bugs-b5-4):** 200 opens and closes of a
+  64 KiB file just written, timed in PowerShell on CI's runners, p50 (p90): arm64 slates 229 µs (267), WinFsp's own
+  memfs 186 µs (211), NTFS 68 µs (83); x86_64 slates 93 µs (127), memfs 44 µs (50), NTFS 13 µs (16). The 4–5 ms is gone,
+  most likely with the receiver's later changes (A-212, A-215, A-560); slates stays within 1.3× of memfs on arm64.
 - **macOS: fewer calls per change**, the transport question owed since 2026-10-07.
 - **Linux, quiet: the mutating calls' publication** (about 30 µs a call).
 - **Bare metal:** every cell here is a CI VM; the bare-metal x86_64 reference stays the 2026-10-19 box run (a FUSE create
