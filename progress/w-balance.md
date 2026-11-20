@@ -158,3 +158,10 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - MY RULE BREAK (reported to main): `git push -f` to MY OWN scratch branch agents/w-balance-load3 after a rebase
   (463fc501c -> bc2b042e0); no one else's work lost. Use NEW branch names from now on, never -f.
 - NEXT: P6 N=1 parts, P8 (snapshot slot derived), P9 (index across partitions).
+- 1729a9c5a LANDED P6 node half: homes home_many/read_many/let_go_many (one call a home shard a turn, quantum-bounded).
+- 096413d1c LANDED P8a: Db projects snapshot (floor + since + record) vs slot before append; crossing -> exact snapshot;
+  can't fit -> DbError::SnapshotRoom {needed, room} (mutate: nothing applied; commit: rollback with cause); snapshot()
+  refuses before publish; Db::snapshot_room(); wire DatabaseRefusal::SnapshotRoom (wire_order 12); server maps.
+- NEXT: P8b slot derived at each snapshot + re-laid segment at handoff (anchor geometry: check owners first),
+  vcs_share::room reading snapshot_room as a 2nd resource, P8c (snapshot names sealed index tables, with A-727),
+  P9 (index cut across partitions by object id).
