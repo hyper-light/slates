@@ -812,6 +812,7 @@ impl Drive {
       Some(Frame::Anchor) => "drive:anchor",
       Some(Frame::Directory(d)) => match d.phase {
         DirectoryPhase::Properties => "dir:properties",
+        DirectoryPhase::Listing => "dir:listing",
         DirectoryPhase::Report => "dir:report",
         DirectoryPhase::Deletions => "dir:deletions",
         DirectoryPhase::Targets => "dir:targets",
