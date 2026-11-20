@@ -72,6 +72,7 @@ pub mod content;
 pub mod cut;
 pub mod derived;
 pub mod index;
+pub mod rows;
 pub mod rule;
 pub mod share;
 pub mod table;
