@@ -990,7 +990,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     })
     .await
     {
-      Ok(reply) | Err(reply) => reply,
+      Ok(reply) => reply,
+      Err(reply) => *reply,
     }
   } else if is_forwardable_write(&body) {
     let forwarded = call_owner(control, shard, move |s| {
@@ -1008,7 +1009,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     .await;
     match forwarded {
       Ok(forwarded) => answer_forwarded_write(forwarded, (control, shard), origin_host, id).await,
-      Err(refusal) => refusal,
+      Err(refusal) => *refusal,
     }
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
@@ -1039,21 +1040,21 @@ fn refusal_of_access(access: &crate::state::StateAccess, shard: u16) -> ReplyBod
 /// why there is none (A-564). A call that was not sent, or whose owner was given up before it answered, answers
 /// `Overloaded` for `shard`, not started; an owner whose state refused it answers by what refused it
 /// ([`refusal_of_access`]). Until A-564 every one of these was `None` (`xshard::call_in_shard_time`), which the forward
-/// answered `NotFound`.
+/// answered `NotFound`. The refusal is boxed: a reply is far larger than most answers.
 async fn call_owner<T: Send + 'static>(
   control: u16,
   shard: u16,
   work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
-) -> Result<T, ReplyBody> {
+) -> Result<T, Box<ReplyBody>> {
   let Ok(call) = crate::xshard::call_on(control, shard, move || {
     Some(crate::state::try_with_state(work))
   }) else {
-    return Err(refused(Refusal::Overloaded { shard }));
+    return Err(Box::new(refused(Refusal::Overloaded { shard })));
   };
   match crate::xshard::within_shard_time(call, crate::daemon::LIVENESS_BUDGET_NS).await {
     Some(Ok(answer)) => Ok(answer),
-    Some(Err(access)) => Err(refusal_of_access(&access, shard)),
-    None => Err(refused(Refusal::Overloaded { shard })),
+    Some(Err(access)) => Err(Box::new(refusal_of_access(&access, shard))),
+    None => Err(Box::new(refused(Refusal::Overloaded { shard }))),
   }
 }
 
@@ -1245,7 +1246,7 @@ async fn await_deferred_completion(
       }
       Ok(None) if slates_rt::futures::now_ns() < deadline => {}
       Ok(None) => return refused(Refusal::Overloaded { shard }),
-      Err(refusal) => return refusal,
+      Err(refusal) => return *refusal,
     }
   }
 }
@@ -23312,17 +23313,32 @@ mod tests {
     (sequence, body): &(u32, super::RequestBody),
   ) -> Option<ReplyBody> {
     use slates_vfs::clock::Clock as _;
+    let (handle, request) = packed_on_the_ring(state, seat, (*sequence, body));
+    let now = state.clock.monotonic_ns();
+    match super::serve(state, handle, &request, now) {
+      super::Served::Reply(reply) => Some(reply),
+      super::Served::Forwarded => None,
+    }
+  }
+
+  /// Packs `body` under `sequence` into the ring of the client seated at `seat`, as the client would: the seat's handle
+  /// and the request the shard reads back from the ring.
+  fn packed_on_the_ring(
+    state: &mut crate::state::ShardState,
+    seat: u32,
+    (sequence, body): (u32, &super::RequestBody),
+  ) -> (super::Handle<super::ClientSlot>, super::Request) {
     let generation = state.clients.generation_at(seat).unwrap();
     let handle = slates_mem::Handle::from_raw(seat, generation);
     let word = slates_wire::request::RequestId {
       client: ASKING,
-      sequence: *sequence,
+      sequence,
     }
     .word();
     let slot = slates_ipc::protocol::pack(
       state.clients.get_mut(handle).unwrap().end.region_mut(),
       slates_ipc::protocol::Direction::Request,
-      u64::from(*sequence),
+      u64::from(sequence),
       word,
       body,
     )
@@ -23332,11 +23348,7 @@ mod tests {
       kind: slot.kind,
       payload: slot.payload,
     };
-    let now = state.clock.monotonic_ns();
-    match super::serve(state, handle, &request, now) {
-      super::Served::Reply(reply) => Some(reply),
-      super::Served::Forwarded => None,
-    }
+    (handle, request)
   }
 
   /// What the resend test saw ([`resent_past_a_fenced_shard`]), each by request sequence.

@@ -72,6 +72,7 @@ use slates_hg::push::classify::{
   self, BookmarkMove, BookmarkRead, DRAFT, LineMove, LineRead, Plan, RootChange,
 };
 use slates_hg::push::commit::Unindexed;
+#[cfg(test)]
 use slates_hg::push::held::IndexHeld;
 use slates_hg::push::intake::{self, Intake, Intaken, Refused as IntakeRefused, Stepped};
 use slates_hg::push::reply::{Refused, Replied, Reply};
@@ -395,7 +396,7 @@ impl Read {
   }
 
   /// The line at `line` among the lines read.
-  fn line(&self, line: usize) -> Result<&Named, Refused> {
+  fn line(&self, line: usize) -> Result<&Named, Box<Refused>> {
     self
       .lines
       .get(line)
@@ -404,7 +405,7 @@ impl Read {
   }
 
   /// The bookmark `mark` as read, where it is bound.
-  fn mark(&self, mark: &[u8]) -> Result<&Named, Refused> {
+  fn mark(&self, mark: &[u8]) -> Result<&Named, Box<Refused>> {
     self
       .marks
       .iter()
@@ -446,11 +447,11 @@ impl Read {
 }
 
 /// `error:abort` with slates' words.
-fn abort(message: Vec<u8>) -> Refused {
-  Refused::Abort {
+fn abort(message: Vec<u8>) -> Box<Refused> {
+  Box::new(Refused::Abort {
     message,
     hint: None,
-  }
+  })
 }
 
 /// Slates' words for a refusal: `push refused: ` and what refused it.
@@ -545,9 +546,9 @@ pub(crate) fn prepare<V: Repository, H: Held>(
   (brought, held_changesets): (&[ReadChangeset], &[Node]),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   check::judge(unbundle, view, admission).map_err(|refused| match refused {
-    CheckRefusal::Raced { words } => Refused::PushRaced { message: words },
+    CheckRefusal::Raced { words } => Box::new(Refused::PushRaced { message: words }),
     CheckRefusal::View(_) => abort(VIEW_REFUSED.to_vec()),
   })?;
   // The push's revisions are the fork's (A-720): every text the works read is read through `held`, the fork.
@@ -612,7 +613,7 @@ fn work<H: Held>(
   (verified, held): (&Verified, &H),
   (_, name, room): Terms,
   admission: &mut Admission,
-) -> Result<Increment, Refused> {
+) -> Result<Increment, Box<Refused>> {
   let engine = state
     .greens
     .get(&named.green)
@@ -635,7 +636,7 @@ fn changes<H: Held>(
   revisions: (&Verified, &H),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<Vec<BranchChange>, Refused> {
+) -> Result<Vec<BranchChange>, Box<Refused>> {
   let mut changes = Vec::new();
   for moved in &plan.lines {
     changes.push(match moved {
@@ -690,7 +691,7 @@ fn mark_change<H: Held>(
   revisions: (&Verified, &H),
   terms: Terms,
   admission: &mut Admission,
-) -> Result<BranchChange, Refused> {
+) -> Result<BranchChange, Box<Refused>> {
   Ok(match moved {
     BookmarkMove::Moved { name, to, .. } => {
       let named = read.mark(name)?;
@@ -932,7 +933,7 @@ pub(crate) fn admitted(
   state: &ShardState,
   (principal, repository): (&Principal, RepositoryId),
   prepared: &Prepared,
-) -> Result<(), Refused> {
+) -> Result<(), Box<Refused>> {
   let record = state
     .db
     .partition()
@@ -944,7 +945,7 @@ pub(crate) fn admitted(
 }
 
 /// The answer to a push the policy refused.
-fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Refused {
+fn policy_refused(refusal: PushRefusal, asked: &[Ask], principal: &Principal) -> Box<Refused> {
   let named = |index: u32| usize::try_from(index).ok().and_then(|at| asked.get(at));
   let words = match refusal {
     PushRefusal::Denied { index, .. } => {
@@ -1142,7 +1143,7 @@ pub(crate) async fn run_hooks<G: core::future::Future<Output = ()> + Unpin>(
       ran.output.push(Replied::Output { in_reply_to, words });
     }
     if !matches!(ended.outcome, Outcome::Accepted { .. }) {
-      ran.refused = Some(abort(hook_words(&hook.name, &ended.outcome)));
+      ran.refused = Some(*abort(hook_words(&hook.name, &ended.outcome)));
       break;
     }
   }
@@ -1181,7 +1182,7 @@ pub(crate) fn land(
     return Landed {
       answer: appended
         .map(|_| Reply::accepted(&replied, wanted))
-        .map_err(|refused| append_refused(&refused)),
+        .map_err(|refused| *append_refused(&refused)),
       released: Ok(()),
     };
   };
@@ -1198,7 +1199,7 @@ pub(crate) fn land(
     Some(Some(Ok(bytes))) => Some(bytes),
     Some(_) => {
       return Landed {
-        answer: Err(abort(UNRECORDED.to_vec())),
+        answer: Err(*abort(UNRECORDED.to_vec())),
         released: release_index(state, fork),
       };
     }
@@ -1213,7 +1214,7 @@ pub(crate) fn land(
       released: replace_index(state, repository, fork),
     },
     Err(refused) => Landed {
-      answer: Err(append_refused(&refused)),
+      answer: Err(*append_refused(&refused)),
       released: release_index(state, fork),
     },
   }
@@ -1433,7 +1434,7 @@ fn begin_intake<'g>(
   part: &'g ChangegroupPart,
   lend: u64,
   room: &mut Admission,
-) -> Option<Result<Taking<'g>, Refused>> {
+) -> Option<Result<Taking<'g>, Box<Refused>>> {
   vcs_store::within_budget(state, lend, |stores| {
     let generation = stores.generation_of(repository)?;
     let (content, store) = stores.mercurial(repository)?;
@@ -1476,7 +1477,7 @@ pub(crate) fn take_whole(
   repository: RepositoryId,
   part: &ChangegroupPart,
   room: &mut Admission,
-) -> Option<Result<Forked, Refused>> {
+) -> Option<Result<Forked, Box<Refused>>> {
   let lend = u64::MAX;
   let mut taking = match begin_intake(state, repository, part, lend, room)? {
     Ok(taking) => taking,
@@ -1499,7 +1500,7 @@ pub(crate) fn take_whole(
 }
 
 /// What an intake's refusal answers: verification's and the keeping's words, as 7.2 aborts.
-fn intake_refused(refused: &IntakeRefused) -> Refused {
+fn intake_refused(refused: &IntakeRefused) -> Box<Refused> {
   abort(match refused {
     IntakeRefused::Unverified(fault) => unverified_words(fault),
     IntakeRefused::Unindexed(fault) => unindexed_words(fault),
@@ -1521,7 +1522,7 @@ pub(crate) fn prepare_whole<V: Repository>(
   view: &V,
   terms: Terms,
   room: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
   let prepared = match state.vcs_stores.mercurial_ref(repository) {
     None => Err(abort(NO_STORE.to_vec())),
@@ -1554,7 +1555,7 @@ pub(crate) fn prepare_served(
   unbundle: &Unbundle,
   terms: Terms,
   room: &mut Admission,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   let forked = forked_whole(state, repository, unbundle, room)?;
   let over = forked.as_ref().map(|forked| &forked.fork);
   let prepared = hg_view::with_view_over(
@@ -1587,7 +1588,7 @@ fn forked_whole(
   repository: RepositoryId,
   unbundle: &Unbundle,
   room: &mut Admission,
-) -> Result<Option<Forked>, Refused> {
+) -> Result<Option<Forked>, Box<Refused>> {
   let Some((_, part)) = unbundle.changegroup() else {
     return Ok(None);
   };
@@ -1602,19 +1603,19 @@ fn forked_whole(
 #[cfg(test)]
 fn attach(
   state: &mut ShardState,
-  prepared: Result<Prepared, Refused>,
+  prepared: Result<Prepared, Box<Refused>>,
   forked: Option<Forked>,
-) -> Result<Prepared, Refused> {
+) -> Result<Prepared, Box<Refused>> {
   match prepared {
     Ok(mut prepared) => {
       prepared.forked = forked;
       Ok(prepared)
     }
     Err(refused) => {
-      if let Some(forked) = forked {
-        if release_index(state, forked.fork).is_err() {
-          state.count(vcs_store::RELEASE_REFUSED, 1);
-        }
+      if let Some(forked) = forked
+        && release_index(state, forked.fork).is_err()
+      {
+        state.count(vcs_store::RELEASE_REFUSED, 1);
       }
       Err(refused)
     }
@@ -1627,7 +1628,7 @@ fn brought_of(
   forked: Option<&Forked>,
   content: &ContentStore,
   room: &mut Admission,
-) -> Result<(Vec<ReadChangeset>, Vec<Node>), Refused> {
+) -> Result<(Vec<ReadChangeset>, Vec<Node>), Box<Refused>> {
   let Some(forked) = forked else {
     return Ok((Vec::new(), Vec::new()));
   };
@@ -1756,7 +1757,7 @@ fn push_name(repository: RepositoryId, bundle: &[u8]) -> [u8; 32] {
 
 /// The refusal of a push to `repository` while its policy configures a Mercurial hook (module docs, "The hook gate"),
 /// naming the first.
-fn hook_refused(state: &ShardState, repository: RepositoryId) -> Option<Refused> {
+fn hook_refused(state: &ShardState, repository: RepositoryId) -> Option<Box<Refused>> {
   let record = state.db.partition().repositories().repository(repository)?;
   let hook = record
     .policy
@@ -1798,16 +1799,16 @@ fn raced(refusal: &Refusal) -> bool {
 }
 
 /// 7.2's answer to a refused append (module docs).
-fn append_refused(refused: &AppendRefused) -> Refused {
+fn append_refused(refused: &AppendRefused) -> Box<Refused> {
   let race = match refused {
     AppendRefused::Changes(changes) => changes.iter().any(|change| raced_change(&change.why)),
     AppendRefused::Entry(refusal) => raced(refusal),
     AppendRefused::Repository(_) => false,
   };
   if race {
-    Refused::PushRaced {
+    Box::new(Refused::PushRaced {
       message: RACED.to_vec(),
-    }
+    })
   } else {
     abort(refused_words(refused))
   }

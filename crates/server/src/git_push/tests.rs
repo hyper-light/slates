@@ -582,42 +582,68 @@ fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
     let repository = git_repository(state, "atomic");
     pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
     let held = records(state, repository);
-    let (copy, tag): (&[u8], &[u8]) = (b"refs/heads/copy", b"refs/tags/v1");
-    let stale = [(SECOND, "", copy), (FIRST, "", tag)];
+    let stale = [(SECOND, "", COPY_REF), (FIRST, "", TAG_REF)];
     let received = pushed(state, repository, &request(&stale, ATOMIC, &[]));
     assert_eq!(reasons(&received), [ATOMIC_FAILURE, FAILED_TO_UPDATE]);
-    let reply = dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateBranch {
-        repository: "atomic".to_owned(),
-        name: "cli".to_owned(),
-        from: "main".to_owned(),
-        version: None,
-      },
-    );
-    assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-    let cli = [(TAG, "", tag), ("", SECOND, b"refs/heads/cli".as_slice())];
-    let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
-    assert_eq!(
-      reasons(&received),
-      [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
-    );
-    assert_first_line_names(&received, b"refs/heads/cli");
-    assert_eq!(records(state, repository), held);
-    assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+    atomic_refused_whole_at_its_append(state, repository, held);
     let received = pushed(state, repository, &request(&stale, CAPABILITIES, &[]));
     assert_eq!(reasons(&received), [b"ok".as_slice(), FAILED_TO_UPDATE]);
     assert_eq!(records(state, repository), held + 1);
     assert!(!bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
-    let again = [(TAG, "", tag), ("", SECOND, b"refs/heads/again".as_slice())];
-    let received = pushed(state, repository, &request(&again, ATOMIC, empty_pack()));
-    assert_eq!(reasons(&received), [b"ok", b"ok"]);
-    assert_eq!(records(state, repository), held + 2);
-    assert!(!bound(state, repository, "refs/tags/v1"));
-    assert_hold_the_second_text(state, repository, &["again"]);
+    atomic_applied_as_one_entry(state, repository, held + 1);
   });
+}
+
+/// Format: the ref the atomic test's fixtures push as `copy`.
+const COPY_REF: &[u8] = b"refs/heads/copy";
+/// Format: the tag the atomic test's fixtures push.
+const TAG_REF: &[u8] = b"refs/tags/v1";
+
+/// Branch `cli` made with the CLI's verb, then, with `atomic`, the tag deleted and `cli` created at a commit held:
+/// refused whole at its append, git's line naming `cli`, the tag still bound and the `held` records unchanged.
+fn atomic_refused_whole_at_its_append(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  held: usize,
+) {
+  let reply = dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::CreateBranch {
+      repository: "atomic".to_owned(),
+      name: "cli".to_owned(),
+      from: "main".to_owned(),
+      version: None,
+    },
+  );
+  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+  let cli = [
+    (TAG, "", TAG_REF),
+    ("", SECOND, b"refs/heads/cli".as_slice()),
+  ];
+  let received = pushed(state, repository, &request(&cli, ATOMIC, empty_pack()));
+  assert_eq!(
+    reasons(&received),
+    [ATOMIC_TRANSACTION_FAILED, ATOMIC_TRANSACTION_FAILED]
+  );
+  assert_first_line_names(&received, b"refs/heads/cli");
+  assert_eq!(records(state, repository), held);
+  assert!(bound(state, repository, "copy") && bound(state, repository, "refs/tags/v1"));
+}
+
+/// With `atomic`, the tag deleted and `again` created at a commit held: both applied as one entry past the `held`
+/// records, `again` holding the second commit's text.
+fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId, held: usize) {
+  let again = [
+    (TAG, "", TAG_REF),
+    ("", SECOND, b"refs/heads/again".as_slice()),
+  ];
+  let received = pushed(state, repository, &request(&again, ATOMIC, empty_pack()));
+  assert_eq!(reasons(&received), [b"ok", b"ok"]);
+  assert_eq!(records(state, repository), held + 1);
+  assert!(!bound(state, repository, "refs/tags/v1"));
+  assert_hold_the_second_text(state, repository, &["again"]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -675,7 +701,7 @@ fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: 
   });
   got
     .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
-    .expect("the push answered within the test's bound")
+    .unwrap_or_else(|_| Err("the push did not answer within the test's bound".to_owned()))
 }
 
 /// Drives the push of [`pushed_with_hooks`] and sends what it answered on `sent`.
