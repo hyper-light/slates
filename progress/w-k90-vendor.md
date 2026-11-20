@@ -70,3 +70,11 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
  NEXT P2: the walk's own sets (objects::select's BTreeSet/BTreeMap: objects, opened, done, sent commits, left_out;
     paint's flags; ready; shallow cut) made resumable under a quantum, upload::Answering {begin, step} modelled on
     hg's getbundle::Answering; oracle = sliced bytes == serve()'s whole for every upload test; least room < whole.
+ P2a LANDED slates main b56e5766..1c5c79a9: negotiation::Held (Positions charged per run) for paint want/have/taken,
+    sent commits, left_out, chosen objects, done, opened (tree: filter keeps a depth map); negotiation::Peak for queue
+    and stacks; Positions::insert_new in place. Red (main 86adda1c6 + test): PastAdmission{asked 16,left 0}; green 210
+    passed (merged tree). CAUTION learned: a scratch worktree sharing my target dir made cargo run ITS binary in my
+    worktree (same member path hash) -> never share a target dir between two worktrees of one repo at once.
+ NEXT P2b: walk resumable under a quantum (Paint::run, mark, open, sparse walk, ready, shallow cut) as a
+    negotiation::Negotiating state machine with step(graph, spent); upload::Answering {begin, step}; oracle: sliced
+    bytes == serve()'s whole for every upload test; least room a slice needs < whole answer's. Then P3 (server).
