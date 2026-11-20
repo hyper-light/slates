@@ -196,3 +196,18 @@
   quantum), up to 316,779 B vs room 278,528; DAV runs up to 8.3 ms (255 past), 410,243 B. Checkout 3.7/3.9 s, update
   2.1/2.06 s. Fix planned (A-745's hg template): slice never past its room (carry overflow), a stop-check closure from
   the server bounding each slice by the quantum, the report's generation held. Inbox note to w-svn written.
+
+## 2026-11-20: A-751, the resumable svndiff window encoder (main's piece, Ada's rule: performance gaps upfront)
+- Landed part 1 d12b5cdc8: svndiff::WindowMaking (the deltifier and the sections in units, no borrow of the texts)
+  and svndiff::lz4 (lz4_flex 0.11.6's block compressor, same bytes, in units). Main's red: a 102,400 B window took
+  6.0-7.7 ms in one step (debug); with 256 units a step, none past 500 us; every window is the whole window's bytes
+  under every unit size, v0 and v2 stored/LZ4.
+- Landed part 2 (main 1d7a60e1d): the update report's drive reads, makes and sends each window 1,024 units a step
+  (Call::DeltaPiece). svn:// frames a write's pieces as one textdelta-chunk; DAV base64s them. Red: big.txt driven a
+  step a call, 4 steps of 2.8-3.0 ms each run; green none past 500 us; the stream is the whole-window path's byte for
+  byte; the svnserve sessions are unchanged.
+- Owed: the replay drive (report/drive/replay.rs: svn:// replay/replay-range and the exporter's source) and
+  get-file-revs (reads/file_revs.rs) still make a window whole; format 3 adopts the maker (w-svn, inbox note sent).
+- Run request for main: re-run diag-w-bugs-svnfetch's checkout/update on macos-latest at 1d7a60e1d (svn:// and DAV
+  against svnadmin load over file://). Red would be a diff against svnadmin's working copy, or a slice still in
+  milliseconds.
