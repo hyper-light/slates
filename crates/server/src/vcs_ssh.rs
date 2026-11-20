@@ -65,9 +65,11 @@
 //! address and its host key's fingerprint. Its site serves git's receive-pack through the push driver on that owner
 //! shard, each step lent the shard's state (`receive`, A-683).
 //!
-//! **Owed** (GAPS, the §4.17 entry): Subversion's tunnel in the daemon's site (A-688's `SvnServices`), which awaits a
-//! lender of its stores over A-662's map, and is refused as not served until it lands; Subversion's tunnel moved to the
-//! shard of the repository its greeting names; the live `git clone`, `git push`, `hg clone` and `svn checkout
+//! Subversion's `svnserve -t` runs there too (A-688's `SvnServices` over `vcs_store::svn_view::TunnelRecords`, its
+//! commits through the owner's step, A-698).
+//!
+//! **Owed** (GAPS, the §4.17 entry): Subversion's tunnel moved to the shard of the repository its greeting names (it
+//! finds repositories on the shard its connection is on); the live `git clone`, `git push`, `hg clone` and `svn checkout
 //! svn+ssh://` over SSH (main's runs).
 
 mod daemon_edge;

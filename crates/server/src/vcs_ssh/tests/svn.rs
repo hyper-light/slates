@@ -977,3 +977,123 @@ fn the_tunnel_is_served_beside_the_other_services() {
   );
   assert!(matches!(ran, Dispatched::Run(EitherCommand::Tunnel(_))));
 }
+
+/// Shape: the room the daemon's site is built with here: past anything the recorded session holds.
+const DAEMON_ROOM: u64 = 1 << 20;
+
+/// `bytes` with each `from` replaced by `to`.
+fn replaced_all(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+  let mut out = Vec::new();
+  let mut rest = bytes;
+  while let Some(at) = rest.windows(from.len()).position(|window| window == from) {
+    out.extend_from_slice(&rest[..at]);
+    out.extend_from_slice(to);
+    rest = &rest[at + from.len()..];
+  }
+  out.extend_from_slice(rest);
+  out
+}
+
+/// `commit-info`'s 27-byte date in `bytes` (after `( 1 ( 27:`) replaced by `date`.
+fn dated(bytes: &[u8], date: &[u8]) -> Vec<u8> {
+  let mark = b"( 1 ( 27:";
+  match bytes.windows(mark.len()).position(|window| window == mark) {
+    Some(at) => {
+      let start = at + mark.len();
+      [
+        &bytes[..start],
+        date,
+        &bytes[(start + 27).min(bytes.len())..],
+      ]
+      .concat()
+    }
+    None => bytes.to_vec(),
+  }
+}
+
+/// The 36-byte UUID the realm names in a tunnel's output (`( EXTERNAL ) 36:`).
+fn realm_of(bytes: &[u8]) -> Vec<u8> {
+  let mark = b"( EXTERNAL ) 36:";
+  bytes
+    .windows(mark.len())
+    .position(|window| window == mark)
+    .and_then(|at| bytes.get(at + mark.len()..at + mark.len() + 36))
+    .unwrap_or_default()
+    .to_vec()
+}
+
+/// A-688 in the daemon (§4.17.4 piece 7; the tunnel's lender over A-662's map, A-698's step). Do: on a daemon's shard,
+/// create the Subversion repository the recorded `mkdir` session names as its owner; then, from a task there, dispatch
+/// `svnserve -t` through the daemon's SSH site (its services over its lenders) and hand it stock `svn` 1.15.0's
+/// recorded `mkdir` connection. Expect: stock `svnserve -t`'s every byte, its greeting less `svndiff1`, the
+/// repository's own UUID where the recording named its own, and `commit-info` naming the owner and the step's date:
+/// revision 1; nothing on standard error and exit 0; every byte consumed; the repository's records at revision 1.
+/// Before this the daemon's site refused `svnserve -t` as not served.
+#[test]
+fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
+  let daemon = crate::daemon::audit_daemon();
+  let id = crate::daemon::observe_first(&daemon, |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &principal(OWNER),
+      slates_ipc::protocol::RequestBody::CreateRepository {
+        name: REPOSITORY.to_owned(),
+        tool: slates_ipc::protocol::VcsTool::Subversion,
+        format: slates_ipc::protocol::ObjectFormat::Sha1,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      !matches!(created, slates_ipc::protocol::ReplyBody::Refused { .. }),
+      "{created:?}"
+    );
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(REPOSITORY)
+      .cloned();
+    record.expect("the repository").id
+  });
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      let _ = sent.send(tunnel(&mut site, &principal(OWNER), &[MKDIR_CLIENT]));
+    })
+    .expect("the tunnel's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (answered, consumed) = outcome
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .expect("the tunnel ended");
+  let youngest = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| records.youngest())
+  });
+  daemon.stop();
+  let uuid = realm_of(&answered.out);
+  let named = crate::lfs::owner_name(&principal(OWNER));
+  let author = format!("( {}:{named} )", named.len());
+  let stock = replaced(MKDIR_SERVER, RECORDED_AUTHOR, author.as_bytes());
+  let mark = b"( 1 ( 27:";
+  let date = answered
+    .out
+    .windows(mark.len())
+    .position(|window| window == mark)
+    .and_then(|at| answered.out.get(at + mark.len()..at + mark.len() + 27))
+    .unwrap_or_default()
+    .to_vec();
+  let expected = dated(
+    &replaced_all(&as_slates_writes(&stock), UUID.as_bytes(), &uuid),
+    &date,
+  );
+  assert_eq!(
+    (answered, consumed, youngest),
+    (Answered::of(&expected, "", 0), MKDIR_CLIENT.len(), Some(1))
+  );
+}

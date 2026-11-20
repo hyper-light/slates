@@ -469,6 +469,10 @@
 > `svn_commit::land` now folds the green by the merge service's doubling rule after each revision and, at the cap,
 > checkpoints at once and appends again, as a push does (test
 > `subversion_revisions_fold_their_greens_chain_as_they_land`, red then green; macOS arm64, this Mac, local).
+> 2026-11-19 (w-svn): the daemon's SSH site serves `svnserve -t` (A-688's `SvnServices` over
+> `svn_view::TunnelRecords`, commits through `commit_work`): stock `svn`'s recorded `mkdir` over the daemon's site
+> answered as `svnserve -t` answered it, revision 1 landed (macOS arm64, this Mac, local: `vcs_ssh::svn::`
+> `vcs_ssh::daemon_edge` 16 of 16). Owed: the tunnel's move to the repository's owner shard; live `svn+ssh://`.
 > **A-603 (2026-11-19, g261; shared piece 2 on the owner):** a repository's register is built in the metadata
 > database (`Op::RepositoryAdvanced`; `crates/db/src/repository/entry.rs`): one entry commits several greens' versions,
 > greens joining the lineage, namespace changes and the repository's own state (Mercurial's phase roots and obsolescence
