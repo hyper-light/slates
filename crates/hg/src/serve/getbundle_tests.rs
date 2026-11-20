@@ -596,6 +596,7 @@ fn check_hello(ours: &[u8], theirs: &[u8]) {
     b"bundle2",
     b"getbundle",
     b"known",
+    b"lookup",
     b"protocaps",
     b"unbundle",
   ];
@@ -726,7 +727,16 @@ fn a_request_this_server_cannot_answer_is_refused_out_of_band() {
   let batch_of = |cmds: &[u8]| request(b"batch", &[(b"cmds", cmds)], Some(&[]));
   for (input, refused) in [
     (
-      request(b"lookup", &[(b"key", b"tip")], None),
+      request(
+        b"pushkey",
+        &[
+          (b"namespace", b"bookmarks"),
+          (b"key", b"m"),
+          (b"old", b""),
+          (b"new", b""),
+        ],
+        None,
+      ),
       Refused::NotServed,
     ),
     (batch_of(b"heads ;getbundle "), Refused::NotServed),

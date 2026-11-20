@@ -13896,6 +13896,18 @@ fn hg_round_trip(hg: &[String], scratch: &str, url: &str, config: &[String]) {
     (2, &hg_nodes(hg, &clone)),
     "the pull brought the clone's push back"
   );
+  // `identify` asks the server's `lookup` (stock 7.2 aborted "remote repository does not support the 'lookup'
+  // capability" before g258's fix): the tip it names is the one both copies hold, as its short id.
+  let identified = hg_ok(
+    hg,
+    scratch,
+    &with_config(&["identify", "-r", "tip", url], config),
+  );
+  assert_eq!(
+    Some(identified.trim()),
+    nodes.first().and_then(|tip| tip.get(..12)),
+    "identify named the tip"
+  );
 }
 
 /// A-650 part 1, A-680 part 2a and A-686 (§4.17.3 "Access"; hgweb answers a client with no credentials `401` with a

@@ -624,7 +624,7 @@ fn born(
 }
 
 /// A key no green of `repository` has in its git store, which a change is judged against where its ref names no born
-/// green: the repository's own id's, minted by the counter its greens' ids are (`verbs::fresh_volume_id`), so it is no
+/// green: the repository's own id's, minted by the counter its greens' ids are (`verbs::fresh_family_id_at`), so it is no
 /// green's key. A create is so judged against no position of its own, as A-644 judges one: it brings every commit its
 /// head reaches.
 fn unheld_key(repository: RepositoryId) -> u64 {
