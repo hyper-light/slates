@@ -5994,6 +5994,35 @@ async fn rebuild_remote_work(
   else {
     return false;
   };
+  // A work this node made as a holder replays over the node's replica of its green, on the control shard (A-697 part
+  // e); one whose replica is not here yet waits for it, asked again when it is installed.
+  if work.holder {
+    let (green, created_at, here) = (work.green, work.created_at, shard.0);
+    let Some(control) = shards.first() else {
+      return false;
+    };
+    let Some(replayed) =
+      ask_once_more(
+        origin,
+        control.0,
+        move |s| match crate::work_home::holder_replay(s, (green, created_at), &entries, here) {
+          crate::work_home::HolderReplay::Replayed(replayed) => Some(replayed),
+          crate::work_home::HolderReplay::Later => None,
+        },
+      )
+      .await
+    else {
+      return false;
+    };
+    let Some(replayed) = replayed else {
+      return true;
+    };
+    return ask_once_more(origin, shard.0, move |s| {
+      crate::verbs::install_replayed_work(s, &work, replayed);
+    })
+    .await
+    .is_some();
+  }
   let partition = crate::verbs::owner_of(crate::verbs::to_wire_volume(work.green));
   let Some(owner) = shards.get(usize::from(partition)) else {
     return false;

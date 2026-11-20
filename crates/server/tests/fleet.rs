@@ -21339,6 +21339,173 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   );
 }
 
+/// A-697 part e, A-207 (a work comes back from its log after a restart), A-313 (a holder's replica is rebuilt from the
+/// records it holds): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a
+/// green at version 1 (`f` holding "hello") shared with B, and B, serving works over greens A owns (the test hook),
+/// makes a work over it and edits `f`. Do: restart B over its own segment (the hook is off while it recovers) and turn
+/// the hook on again; read `f` through the work until it is served; submit the work. Expect: the work served again with
+/// its edit, "hello world", replayed over B's replica of the green (B's counter moved), never refused for good; its
+/// submit answered version 2.
+#[test]
+fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["holder-work-a", "holder-work-b", "holder-work-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("holder-work-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let anchors_held: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      common::anchor::held_anchor(
+        &format!("holder-work-{node}-{pid}"),
+        profile,
+        &configs[node],
+      )
+    })
+    .collect();
+  let source = |node: usize| common::anchor::source_of(&anchors_held[node]);
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let (green, owners_work) = green_and_work_on(daemons[0].instance(), &[&daemons[1]]);
+  let mut owner = Client::connect(daemons[0].instance());
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  drop(owner);
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let replicated = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
+  });
+  assert!(replicated, "B replicates the green at version 1");
+  daemons[1].serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemons[1].instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let edited = holder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 5,
+    delete_len: 0,
+    bytes: b" world".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  drop(holder);
+  daemons.remove(1).stop();
+  daemons.insert(
+    1,
+    start_fleet_node(
+      &profiles[1],
+      configs[1].clone(),
+      identities[1].pop().unwrap(),
+      ports[1],
+      peers(1),
+      source(1),
+    ),
+  );
+  daemons[1].serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemons[1].instance());
+  let mut last: Result<Vec<u8>, Box<ReplyBody>> = Err(Box::new(ReplyBody::Acknowledged));
+  let refs: Vec<&Daemon> = daemons.iter().collect();
+  let served = poll_until(&refs, PLACEMENT_DEADLINE, || {
+    last = head_bytes(&mut holder, work, "f");
+    Ok(last.is_ok())
+  });
+  let replayed = daemons[1]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("merge.work.replayed_on_replica").copied());
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  drop(holder);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "the work was served again after the restart: {last:?}"
+  );
+  assert_eq!(last, Ok(b"hello world".to_vec()), "with its edit");
+  assert!(
+    matches!(replayed, Ok(Some(count)) if count >= 1),
+    "replayed over B's replica: {replayed:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "its submit committed: {submitted:?}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the

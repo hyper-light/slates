@@ -196,6 +196,9 @@ pub(crate) struct Unbuilt {
   pub(crate) green: DbVolumeId,
   /// The version it was created at.
   pub(crate) created_at: u64,
+  /// Whether its green is another node's (A-697 part e): a work this node made as a holder, replayed over this node's
+  /// replica of the green ([`holder_replay`]) rather than through an owner shard of this node.
+  pub(crate) holder: bool,
 }
 
 /// A shard's parked work verbs and the answer for the verb now running.
@@ -239,6 +242,10 @@ pub(crate) struct WorkHome {
   /// owner committed before the replica held them (A-697 part d), each answered once the replica does. Bounded by the
   /// node's parked verbs: one a parked submit, each let go past its verb's bound ([`hold_until_replica`]).
   replica_waits: Vec<ReplicaWait>,
+  /// On the control shard: the greens another node owns whose replica the replay of a recovered holder work waited for
+  /// (A-697 part e), each with the shards whose works wait; once the replica is installed each shard asks again
+  /// ([`replica_reached`]). Bounded by the greens this node replicates times its shards.
+  replays_owed: BTreeMap<slates_db::register::ObjectId, BTreeSet<u16>>,
 }
 
 /// A submit of a work on this holder node whose version its green's owner committed before this node's replica held it
@@ -330,7 +337,14 @@ fn remote_work(state: &ShardState, body: &RequestBody) -> Option<(DbVolumeId, Db
 /// on ([`WorkHome::on_holders`]) until A-697's last piece puts the real rule ("replicated here") in its place. The owner
 /// is the one this node's routing names, else the green's creator; a green on this shard never is.
 pub(crate) fn green_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
-  if !state.work_home.on_holders || state.greens.contains_key(&green) {
+  state.work_home.on_holders && owned_elsewhere(state, green)
+}
+
+/// Whether `green` is owned by another node, as this node's routing names its owner, else by its creator (A-697): a
+/// green this shard holds never is. Unlike [`green_elsewhere`] it holds whatever the test hook says, so a work this node
+/// made as a holder is recovered as one after a restart, which starts with the hook off (part e).
+pub(crate) fn owned_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
+  if state.greens.contains_key(&green) {
     return false;
   }
   let object = slates_db::register::ObjectId(green.bytes);
@@ -1560,6 +1574,7 @@ fn hold_until_replica(
 /// `merge_service::recompute`): every held submit whose version the replica now holds is answered on its work's shard
 /// (`answered_late`, which finds it by its key, so one already released is not answered twice).
 pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::register::ObjectId) {
+  replays_resumed(state, object);
   if state.work_home.replica_waits.is_empty() {
     return;
   }
@@ -1590,6 +1605,71 @@ pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::registe
     });
     if handed.is_err() {
       state.count(SETTLE_UNHANDED, 1);
+    }
+  }
+}
+
+/// Format: a recovered holder work's replay that waits for this node's replica of its green (A-697 part e), the
+/// non-vacuity count of [`holder_replay`]'s wait.
+pub(crate) const REPLAY_AWAITS_REPLICA: &str = "merge.work.replay_awaits_replica";
+/// Format: a recovered holder work replayed over this node's replica of its green (A-697 part e).
+pub(crate) const REPLAYED_ON_REPLICA: &str = "merge.work.replayed_on_replica";
+/// Format: a shard asked to replay its recovered holder works again once the replica was installed, by a message that
+/// could not be kept: they answer `Unpublished` until the daemon's next start.
+const REPLAY_ASK_UNHANDED: &str = "merge.work.replay_ask_unhanded";
+
+/// What [`holder_replay`] did.
+pub(crate) enum HolderReplay {
+  /// Replayed over the replica, or refused (`None`, the log did not replay): the outcome to install on the work's shard.
+  Replayed(Option<(u64, WorkFiles, Vec<VolumeOp>)>),
+  /// The replica is not here yet: its rebuild is under way, or waits for the green's next record. The work stays
+  /// recorded unbuilt, answering `Unpublished`, and its shard asks again once the replica is installed.
+  Later,
+}
+
+/// On the control shard: replays a recovered holder work's log (A-697 part e; A-207, A-247) over this node's replica of
+/// its green, which a restart leaves to be rebuilt from the records this node holds (A-313): the rebuild is started
+/// here when it is not, and while it is under way the replay waits for it ([`replica_reached`] asks `shard` again).
+pub(crate) fn holder_replay(
+  state: &mut ShardState,
+  (green, created_at): (DbVolumeId, u64),
+  entries: &[Vec<u8>],
+  shard: u16,
+) -> HolderReplay {
+  let object = slates_db::register::ObjectId(green.bytes);
+  if !state.merge.replicas.contains_key(&object)
+    && !matches!(
+      crate::merge_origin::rebuild_replica(state, object),
+      crate::merge_origin::Rebuild::Installed(_)
+    )
+  {
+    state.count(REPLAY_AWAITS_REPLICA, 1);
+    state
+      .work_home
+      .replays_owed
+      .entry(object)
+      .or_default()
+      .insert(shard);
+    return HolderReplay::Later;
+  }
+  state.count(REPLAYED_ON_REPLICA, 1);
+  HolderReplay::Replayed(
+    crate::work_log::replay(state.merge.replicas.get(&object), created_at, entries).ok(),
+  )
+}
+
+/// The replays of recovered holder works that waited for `object`'s replica, asked again on their shards now that it is
+/// installed (A-697 part e): each shard asks for every work it still records unbuilt (`verbs::ask_owners_to_replay`).
+fn replays_resumed(state: &mut ShardState, object: slates_db::register::ObjectId) {
+  let Some(shards) = state.work_home.replays_owed.remove(&object) else {
+    return;
+  };
+  for shard in shards {
+    let handed = crate::xshard::hand_reply_home(shard, || {
+      let _ = state::with_state_counted(crate::verbs::ask_owners_to_replay);
+    });
+    if handed.is_err() {
+      state.count(REPLAY_ASK_UNHANDED, 1);
     }
   }
 }

@@ -17955,7 +17955,11 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   // A green on another partition has not recovered yet, and its engine is not this shard's: the work is replayed
   // through its owner once every partition has recovered, before any client is admitted (A-247). So is a work over a
   // green this shard holds by adoption, whose engine the boot rebuilds from the ledger first (A-333).
-  if owner_of(to_wire_volume(green)) != state.partition
+  // A work over a green another node owns was made here as a holder (A-697): replayed over this node's replica of the
+  // green, whatever partition its id names here (part e).
+  let holder = crate::work_home::owned_elsewhere(state, green);
+  if holder
+    || owner_of(to_wire_volume(green)) != state.partition
     || state.merge.awaiting_adoption.contains_key(&green)
   {
     let created_at = match record.policy.role {
@@ -17966,6 +17970,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
       work: record.id,
       green,
       created_at,
+      holder,
     });
     return;
   }
@@ -18083,6 +18088,11 @@ pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
   let here = state.shard;
   for unbuilt in state.work_home.unbuilt.clone() {
     let entries = state.db.partition().work_log(unbuilt.work).to_vec();
+    // A holder's work replays over the node's replica of its green, on the control shard (A-697 part e).
+    if unbuilt.holder {
+      ask_holder_replay(state, unbuilt, entries);
+      continue;
+    }
     let Some(owner) = state
       .shards
       .get(usize::from(owner_of(to_wire_volume(unbuilt.green))))
@@ -18111,6 +18121,47 @@ pub(crate) fn ask_owners_to_replay(state: &mut ShardState) {
       WORK_REBUILD_ASK_REFUSED,
     );
   }
+}
+
+/// [`ask_owners_to_replay`] for a work this node made as a holder (A-697 part e): replayed over the node's replica of
+/// its green on the control shard (`work_home::holder_replay`), the outcome installed here once; a replay that waits for
+/// the replica is asked again when the replica is installed.
+fn ask_holder_replay(
+  state: &mut ShardState,
+  unbuilt: crate::work_home::Unbuilt,
+  entries: Vec<Vec<u8>>,
+) {
+  let here = state.shard;
+  let Some(control) = state.shards.first().copied() else {
+    return;
+  };
+  state.count(WORK_REBUILD_ASKED_AGAIN, 1);
+  // This shard is the control shard: replayed and installed in this step, since a message to this shard from inside
+  // its own step runs inline and meets the borrow the step holds.
+  if control == here {
+    if let crate::work_home::HolderReplay::Replayed(replayed) =
+      crate::work_home::holder_replay(state, (unbuilt.green, unbuilt.created_at), &entries, here)
+    {
+      install_replayed_work(state, &unbuilt, replayed);
+    }
+    return;
+  }
+  let replay = move |control_state: &mut ShardState| {
+    if let crate::work_home::HolderReplay::Replayed(replayed) = crate::work_home::holder_replay(
+      control_state,
+      (unbuilt.green, unbuilt.created_at),
+      &entries,
+      here,
+    ) {
+      crate::xshard::run_on_waiting(
+        control_state.shard,
+        here,
+        move |work_state| install_replayed_work(work_state, &unbuilt, replayed),
+        WORK_REBUILD_ASK_REFUSED,
+      );
+    }
+  };
+  crate::xshard::run_on_waiting(here, control, replay, WORK_REBUILD_ASK_REFUSED);
 }
 
 /// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
@@ -21302,6 +21353,7 @@ mod tests {
         work,
         green,
         created_at: 1,
+        holder: false,
       });
       let _lost = super::unbuilt_works(state);
       let listed_again = super::unbuilt_works(state);
@@ -21318,6 +21370,7 @@ mod tests {
         work,
         green,
         created_at: 1,
+        holder: false,
       };
       let before = state.store.budget.committed();
       super::install_replayed_work(state, &owed, replayed.clone());
@@ -23534,6 +23587,7 @@ mod tests {
         work: super::DbVolumeId { bytes: [0x53; 16] },
         green: super::DbVolumeId { bytes: [0x54; 16] },
         created_at: 1,
+        holder: false,
       };
       state.work_home.unbuilt.push(unbuilt);
       let id = slates_wire::request::RequestId {
@@ -23652,6 +23706,7 @@ mod tests {
         work,
         green,
         created_at,
+        holder: false,
       });
       super::ask_owners_to_replay(state);
     });

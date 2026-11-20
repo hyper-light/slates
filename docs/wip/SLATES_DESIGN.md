@@ -22704,7 +22704,8 @@ asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its
 `verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
 taken by position at the owner (`work_home::verdict_over_fleet`, `SubmitComputed`, `Green::submit_computed`). Part d
 (2026-11-20): the submit settles once the holder's replica holds the version (`work_home::hold_until_replica`,
-`replica_reached`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
+`replica_reached`). Part e (2026-11-20): a holder's work is recovered from its log over the holder's replica
+(`work_home::holder_replay`, `Unbuilt::holder`). A work's rebase and its base reads stay the green's owner's: A-273's replicas, which answered them on
 the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-528).
 
 - **Why.** Every operation of a green's works is served on the green's one owner shard, because a work is placed
@@ -22730,8 +22731,8 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
     replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
-    node's replica holds the version it made. Its rebase, a copy it submits, recovery and takeover follow in A-697's
-    later parts. Until A-400 a work was placed on
+    node's replica holds the version it made; after a restart it comes back from its log over the node's replica.
+    Its rebase, a copy it submits, and takeover follow in A-697's later parts. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -56268,3 +56269,36 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   world"). Red with the wake removed from `recompute`: the submit answered `Overloaded` at its bound. Fleet `a_holder`
   19 of 19, `a_forwarded_submit`, part b's test 3 of 3 after the fix; `slates-server --lib work_home` 2 of 2,
   `merge_service::` 14 of 14, `verbs::` 62 of 62; fmt clean.
+
+### A-697 part e — A holder's work comes back from its log over the holder's replica after a restart (2026-11-20, w-shared for UI goal 93; main's plan for A-697; A-207, A-313, A-513, A-533)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), GAPS (A-247's step two),
+`crates/server/src/work_home.rs`, `crates/server/src/verbs.rs`, `crates/server/src/daemon.rs`,
+`crates/server/src/merge_origin.rs`, `crates/server/tests/fleet.rs`.
+- **What was there.** A restarted node recovers each work from its log (A-207); a work whose green is on another
+  partition is replayed through that partition's owner shard (A-247, `daemon::rebuild_remote_works`). A holder's work's
+  green is no partition's here: its replay was asked of a shard without the green and refused, the work's records
+  dropped from the unbuilt list, so every edit it had acknowledged was out of reach; and one whose green's partition
+  number was its own shard's was skipped outright.
+- **Change.** Whether a green is another node's is now asked apart from the test hook (`work_home::owned_elsewhere`;
+  `green_elsewhere` is it with the hook on), since a restart starts with the hook off. A recovered work over such a green
+  is recorded unbuilt as a holder's (`Unbuilt::holder`), and its log is replayed on the control shard over the node's
+  replica of the green (`work_home::holder_replay`; from the recovery pass, `daemon::rebuild_remote_work`, and from the
+  ask as clients are let in, `verbs::ask_holder_replay`). A restart leaves the replica to be rebuilt from the records
+  the node holds (A-313), lazily: the replay starts that rebuild, and while it runs the work stays recorded, answering
+  `Unpublished` (A-533), and its shard is asked again once the replica is installed (`replica_reached` from
+  `merge_origin`'s install as from `recompute`). On a node whose work shard is its control shard the outcome is installed
+  in the same step: a message to its own shard ran inline and met the step's borrow, and the first run lost every
+  install so (the work answered `Unpublished` for good; the test's first run, by use).
+- **Counters.** `merge.work.replay_awaits_replica`, `merge.work.replayed_on_replica` (the test's non-vacuity count),
+  `merge.work.replay_ask_unhanded`.
+- **Owed.** A creation a restart caught waiting for the owner's admission is dropped here (`drop_pending_creations`),
+  and the floor the owner may have recorded for it stays there, since the pending record does not name the green: it
+  keeps more history, not less. Recovering a holder's pending submit is the existing path: the work's next verb runs it
+  again under its key, and the owner's completion record answers it.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_restart` (three nodes at `f = 1` keeping
+  their state across a restart; B makes a work over A's green and edits `f`, restarts over its own segment, turns the
+  hook on again: the work is served again reading "hello world", B's replay counter moved, its submit answered version
+  2). Its first run, before the same-step install, answered `Unpublished` for the poll's whole deadline (the red). Fleet
+  `a_holder` 20 of 20 and `a_forwarded_submit`; `slates-server --lib work_home` 2 of 2, `verbs::` 62 of 62,
+  `merge_origin::` 17 of 17, `merge_service::` 14 of 14, `takeover::` 18 of 18; fmt clean.
