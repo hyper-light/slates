@@ -218,12 +218,14 @@ fn assert_the_same_pack_within_4_kib(fixture: &served::Served) {
 /// small for it. Expect: each refused as past its admission, in an `ERR` line; and the same request answered whole
 /// with room enough. A-745 (§4.17.1 "A fetch's answer" rule 2: a request's room bounds a slice, never a repository): do
 /// answer it within 4 KiB, which once fell short of the two whole packets the pack was framed through. Expect: the same
-/// pack, every object of it, framed in packets a quarter of the room left at most, so more of them.
+/// pack, every object of it, framed in packets a quarter of the room left at most, so more of them. A-745 (a request's
+/// parsed lists are given back once its answer no longer needs them): the clone now answers within 384 bytes, where it
+/// once needed more than 512, so the rooms too small for it are 0, 64 and 256.
 #[test]
 fn an_answer_past_its_admission_is_refused() {
   let fixture = served::served();
   let served = serving(&fixture, &REFS, MAIN_REF);
-  for room in [0u64, 64, 512] {
+  for room in [0u64, 64, 256] {
     let mut source = WholeObjects::new(&fixture.objects);
     let mut admission = Admission::new(room);
     let mut answer = serve(
