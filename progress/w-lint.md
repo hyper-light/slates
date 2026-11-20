@@ -63,3 +63,16 @@
 - Hourly rounds: session cron b32dcdb1 at :17 (session-only, 7-day expiry).
 - Note: the blobless clone once reported a commit "in the commit graph but not in the object database" on fetch;
   a plain retry fetched fine (likely background maintenance racing). Watch for it.
+
+## 2026-11-20 round 0 CLOSED with Windows, at b79227222
+- d11c04473: native Windows (jupiter) clean for CI's three Windows steps: hook path gated cfg(unix) end to end
+  (Answering::Hook, presenter, hook_times, Hooked id/repos, the off-unix HookCall/HookAnswer/hook_ran removed),
+  Answered/Hook boxed, bridge-winfsp transact.rs takes (read_only, NameSearch) (A-551), cli winfsp tests reuse
+  write_through_drive and move impersonation asserts; plus verbs.rs ParkedKind boxed + SubmitCarried, svn test clone,
+  hg_made test split.
+- 9d81a56e7: wire-derive (A-742) and vcs content/rows splits. b79227222: hg delta.rs + intake test, server
+  vcs_http/svn commit_side, vcs_svn inspect_err, place.rs cast, cli svn_interop port helper.
+- RED (not mine, fails on main's own code): slates-vcs tests::the_same_bytes_from_git_and_mercurial_are_one_content_
+  held_by_both_repositories (store.get None after the git release); suspects f3429bdcd (storage seam) / e064c2dc7.
+- Skipped loudly: slates-sdk-python on jupiter (pyo3-build-config: no Python 3 interpreter there).
+- Hourly cron now 1fe... (see session); includes the jupiter Windows lane.
