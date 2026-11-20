@@ -9698,7 +9698,8 @@ that the current uid-based implementation enforces them.
 > `enroll`, `revoke` and `share`. Proven across real processes: the workload holds the capability in no
 > argument or environment value and owns what it creates; a sibling without the delivery is the
 > account; the Windows arm runs in the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP
-> roots, and the Linux issuer surface. Record: `docs/wip/enrollment.md` (2026-09-14 section).
+> roots, and the Linux issuer surface (built by A-754, 2026-11-20). Record: `docs/wip/enrollment.md` (2026-09-14
+> section).
 
 > **Status (2026-09-28).** The delivery name carries the channel's identity, not only its number. On Unix
 > it is `NUMBER:DEVICE:INODE:MTIME:MTIME_NSEC`, the pipe's `fstat` after the record is written. On Windows
@@ -10147,7 +10148,8 @@ would need a privilege slates never holds (R10).
 >
 > **Reconciled 2026-11-06 (VFS plan Step 15).** BUG-5 is swept (991c84e; GAP-A9-3), apart from the base entries' owner
 > fields and the mounted conformance run. BUG-11 is closed (9c97ce6b, 5127b4b3). `slates grant` issues a grant
-> (596bfb04); the Linux issuer surface stays owed (GAPS).
+> (596bfb04); the Linux issuer surface stays owed (GAPS). *Built by A-754 (2026-11-20): the anchor prints its issuer
+> route and secret, and a process that presents the secret over the route is handed the segment's descriptor.*
 
 > **Status (2026-11-18, A-287: the full entry list on demand).** Built: a presentation keeps its manifest's entries
 > (moved from the plan, never copied) and the conflict classes its preliminary pass found, for as long as A-46 keeps
@@ -12418,6 +12420,31 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > whole-window steps made several of about 3 ms. Their deltas are the whole-window path's byte for byte, and the
 > recorded svnserve sessions (replay, `get-file-revs`, svndiff 0) are unchanged. The dump exporter computes its own
 > windows (`migration::export`, `deltas_at`); its format 3 adopting the maker is w-svn's.
+> **The tests hold units, not time (same day, A-751, main's red from w-perf).** The four window tests timed each step
+> against 500 us in a debug build, and failed on main under w-perf's load. They now hold each step to its own unit
+> count, which contention cannot change. The maker counts the units its steps take (`WindowMaking::units_taken`), and a
+> step takes at most those it was given plus one block's look-up (`svndiff::STEP_OVERRUN`). A window step of the drives
+> and of `get-file-revs` takes at most `report::drive::WINDOW_STEP_UNITS` (1,088): bytes read or sent, or the maker's
+> units. Red with whole-window steps: 205,172 units in a step, and 329,608 in the maker's own test. The bound found a
+> hole: a failed block look-up went back to the walk's top unchecked, so a run of misses could fill one step; the walk
+> now checks its units there. Time stays the by-use signal, read in release: the diagnostics runs' past-budget counters,
+> and `window_step_times` (`--ignored`, release). On an M-series Mac, `big.txt` r5 to r6 took 1,310 calls; 5 were past
+> 5 us, the longest 54 us.
+> **A directory's listing at O(live children) (2026-11-20, A-759, w-bugs; main's ruling: fix the complexity before
+> slicing; shape agreed with w-svn, index owner).** `diag-w-bugs-svnfetch-9` named the update drive's directory step
+> as the long step: it listed both revisions' entries in one step, 100-650 us on average and up to 19.8 ms. A listing
+> walked every name ever made beneath the directory and its copy chain, resolved each in the revision, and the drive
+> resolved each child again for its entry: O(history beneath the directory) plus two resolves a child. Now every
+> directory node-revision holds a persistent ordered map of its children (`index::children`: a B-tree of up to 32
+> entries a node, a child's interned path number and node-revision, 8 bytes, in name order). The map's nodes live in
+> an arena the index owns: a change copies its path from the root once a revision (a revision's own nodes are edited
+> in place), and a copy shares its source's map whole. `Index::children` resolves the directory once and walks the
+> map. `Index::listing` gives each child's node-revision, so the drive makes an entry from the row. The maps' bytes
+> are charged to the index's room. A/B (`listing_times`, release, M-series Mac, `/trunk/big` with 10,000 names over
+> 1,000 revisions): `Index::children` took 3.84 ms at r1001 (9,001 live) and r500 (4,492 live) alike, and now 0.234
+> and 0.112 ms; the drive's listing went from 5.87 and 4.86 ms to 0.98 and 0.47 ms. The index holds 65,575 entries
+> (1.6 MB) for that history, the maps about 1.2 MB of it. Owed next: the drive reads a very large directory's listing
+> through a cursor, a few entries a step (a 9,001-entry listing is about 1 ms, past the quantum in one step).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -13848,9 +13875,16 @@ cooperative slices (§4.3).
 > request, before its answer is made, encodes each version whose fragments are not kept (`Repository::first_unencoded`)
 > a turn at a time under the shard's quantum, yielding between turns, and keeps them as content charged to the shard
 > (`crates/server/src/vcs_store/git_encode.rs`); the answer copies them. A version is encoded once, by the first fetch
-> after its push; one encoding a repository at a time, kept in the map between turns. Owed: the encoding from the push's
-> own intake (git's pack reuse, w-git's streaming intake), the base pack's rebuild, kept fragments across a recovery, and
-> the parts' bytes held between turns charged.
+> after its push; one encoding a repository at a time, kept in the map between turns. **Units a window's work (same day,
+> w-k90-vendor, found by use by w-interop):** a 56 MB push of git/git cut at v2.0.0 spun the shard 3.5 s in one unit of
+> the task that finishes the encoding (an object's whole delta trials and ten level samples), and the daemon died into a
+> restart loop. Each unit is now a window's work at most (`slates_git::store::Encoding`'s module doc): a row read, a
+> window of an object or its base read, a step of a delta search, a level sampled on a window, a window deflated, a
+> window put into the content store (`put_window`). Held by work, not wall time (the 56 MB push's encoding, every unit at
+> most a window and one row, the daemon living; `vcs_store::git_encode::tests::a718_no_unit_...`, ignored, its pack
+> named by `SLATES_ENCODE_PACK`). Owed: the encoding from the push's own intake (git's pack reuse, w-git's streaming
+> intake), the base pack's rebuild, kept fragments across a recovery, the parts' bytes held between turns charged, a pair
+> of trees read whole and the parts' record made in one unit.
 
 A push to a review prefix (`refs/for/<branch>` by default policy) creates or updates a review request (§4.17.1)
 instead of a ref, as git's `receive.procReceiveRefs` describes ("pushing to reference such as "refs/for/master" will not
@@ -14558,8 +14592,9 @@ signature verification).
 > over the Mercurial arm), each step over the store lent the shard's room and settled after. The push's name is hashed
 > from its repository and its bundle, so a push sent again makes the same works. Its answer is framed as 7.2 frames
 > `unbundle`'s (`serve::http::pushed`): a bundle2 reply in `application/mercurial-0.1`, uncompressed; `pusherr` in
-> `0.1`; a bundle1 out of band. HTTP's capabilities list `unbundle` and the bundle2 capabilities a push needs as 7.2
-> lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
+> `0.1`; a bundle1 out of band. A `pushkey` command is landed as a push of one advisory `pushkey` part through the same
+> driver and answered `1` or `0` (A-758, `serve::keys`). HTTP's capabilities list `pushkey`, `unbundle` and the bundle2
+> capabilities a push needs as 7.2 lists them (`changegroup=01,02,03`, `checkheads=related`, `error=abort,unsupportedcontent,pushraced,pushkey`,
 > `pushkey`). Differs from 7.2 on purpose: the `output` parts in which 7.2 captures its own progress words over HTTP
 > (`adding changesets`, `added 1 changesets with 1 changes to 1 files`) are not sent; they are no part a client acts on.
 > Not yet durable: a push's entry records its lines', bookmarks' and phase roots' moves and no record of its revisions,
@@ -55683,6 +55718,24 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4e — A stage a landing overtook is made again in turns before its append (2026-11-20, w-git for UI goal 93; the answer's 74 ms at 100 concurrent pushes)
+- **Why.** At 100 concurrent pushes to one repository the answer's longest step was 73.7 ms: every push sealed while
+  another landed had its stage overtaken, and its append's commit staged it again whole, in that step.
+- **Change.** The judge's `ready` (A-722 part 4c) first makes a push's overtaken stage again a turn at a time
+  (`SealedPush::restage_turn`, `Repository::needs_stage`), and starts it over if another landing overtakes it while it
+  is made. A stage that gives no position (every object indexed already, the usual case once one of the pushes landed)
+  can never be overtaken: the commit gives its fork back, adopts nothing and keeps the repository's next position. A
+  commit that still stages a push again whole is counted (`StoreCounters::restaged`).
+- **Found with it.** `Deciding`'s `each_step` called `ready` only where the checks' table had an empty slot for the
+  command, and the table is empty when no check refused: part 4c's turns never ran in a live push. It asks `ready` for
+  every command no check refused now.
+- **Tests.** `slates-server` `git_push::tests::t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`
+  (twelve pushes answered a step of each in turn: every one `ok`, `restaged` 0; red: 9, then 8 with `each_step` fixed).
+  `slates-git --lib -- store:: receive:: upload:: hook_view` 206 passed, 4 ignored; `slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 199 passed and the two long-history
+  edge tests past their client's read wait at a load of 56 to 67, as they are with `ready` doing nothing (main's own
+  behaviour), the load-only bug main named (next piece); fmt clean (macOS arm64, this Mac, local).
+
 ### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
 - **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
   repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
@@ -56481,9 +56534,11 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   every platform): an anchor with all three listeners on loopback ports the system picks; the daemon killed; each port
   asked while no daemon runs and answered by the successor (`401`, `SSH-2.0-`, svnserve's greeting); the successor
   naming the same three ports. Green on Windows x86_64 (jupiter, kiln r33: 61321, 61322 and 61323 before and after the
-  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Pure: rt's `share` codec (a record whose every field differs,
-  back whole; a byte short or long refused) and the anchor's `shared_listeners` (three shares back in order; every cut
-  inside a record refused `Truncated`; too many, too long).
+  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Red on Windows (jupiter, kiln r36, the same tree with the anchor
+  role's change alone reversed, which is main's behaviour before: the anchor held no listener): the killed daemon's
+  successor named the HTTP edge at 62797 where its predecessor had served 62786, and the test failed (7.81 s). Pure:
+  rt's `share` codec (a record whose every field differs, back whole; a byte short or long refused) and the anchor's
+  `shared_listeners` (three shares back in order; every cut inside a record refused `Truncated`; too many, too long).
 - **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
   `unsafe-budget.toml`, amendments.tsv.
 
@@ -56545,10 +56600,135 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   tail without a clone and return the head hashed once; `live_ship::append_entry` reads that head. Release, 2.4 MB,
   best and median of 9: a delta 3.63 / 4.59 ms before, 1.39 / 1.63 ms after; a whole state 3.06 / 3.42 ms before,
   0.94 / 0.97 ms after (`slates-db --test live measure_the_live_append_turn`, ignored, a measurement).
-- **Owed.** Part 2: the remaining hash in quantum slices across turns (a whole build's after sealing; a large delta's as
-  a build of its own). Part 3: the body held once, by identity in the content store (A-727) or an arena handle, so the
-  retained entry and the volume's whole state name one copy.
+- **Part 2 (whole builds).** `db::live::EntryHasher`, seeded by `Shipper::entry_hasher` with the next entry's place in
+  the chain and its payload's length, is fed the payload a slice at a time; `Shipper::append_checkpoint_hashed` appends
+  with its identity, refused `Behind` when the chain moved since it was seeded or it was fed other than the payload.
+  `live_ship::hash_whole_turn` joins a whole build's sealed body once its last piece is sealed, seeds the hasher, and
+  feeds it slices sized to the quantum left at the rate it measures (`piece_bytes`, a page to an archive chunk) across
+  the build's turns; `append_ready` appends the build only once it is hashed. The queue's credit keeps the build's size
+  while it hashes. Release, 2.4 MB, best and median of 9: the append turn 0.92 / 0.94 ms before, 0.46 us after, each
+  64 KiB hashing turn 27 to 32 us; peak RSS 8.80 to 8.85 MB both (`measure_the_whole_append_turn_hashed_at_once` and
+  `_in_slices`, ignored measurements). Tests: `a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once`; the
+  fleet sealed-in-turns test holds the hashing to at least a page a turn under the cut quantum (48 turns for 3 MiB),
+  red before (0 turns: hashed in the append's turn).
+- **Part 2b (large deltas).** A delta over one archive page (`built_in_turns`), sealed or in the clear, is built in turns
+  of its own as a whole state is: the build carries `whole` and `clear`, seals its pieces when this node seals, hashes
+  in slices, waits for the delta credit (`Shipper::admits_delta`) and appends with `Shipper::append_hashed`; a whole
+  state keeps A-377's rule. Release, 2.4 MB, best and median of 9, three runs: the append turn 0.92 to 1.77 / 0.94 to
+  2.32 ms before, 0.42 to 0.88 / 0.46 to 1.46 us after; each 64 KiB hashing turn 27 to 54 / 30 to 68 us
+  (`measure_the_delta_append_turn`). Tests: `a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once`; the fleet
+  test `a_large_live_delta_is_sealed_and_hashed_in_turns_of_its_own` (a three-MiB staged write, one publication), red
+  before (no build, no hashing turn), at least 48 hashing turns after.
+- **Part 3 (the body held once).** One owner and lends, no `Arc` (R2): the payload moves into the shipper at the
+  append (no clone), `Shipper::keep` names the whole entry the owner keeps as its last whole state, `trim` moves that
+  entry to a kept slot when the retained tail lets it go, and `Shipper::payload_at` lends it from either place.
+  `LiveVolume::whole` is a `WholeState`: `InLog(head)`, lent by the shipper, or `Image(head, bytes)`, an install image
+  made beside the log, which is not an entry. The content store (A-727) was not used: a live log's payload is an
+  in-memory shipping buffer, not durable content. Release, 50 volumes' 2.4 MB whole states held at rest: peak RSS 248.9
+  to 249.0 MB before, 127.7 MB after (`measure_whole_states_held_twice` and `_once`, ignored measurements). Tests:
+  `a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go`; the fleet `live`, `whole` and `install` tests and the
+  live_chaos fresh-member flow (2/2) send installs from the lent payload.
 - **Tests.** `slates-db --test live` 43/43 with `an_entrys_identity_is_the_blake3_of_its_canonical_bytes`;
   `slates-server --lib live_ship::` 24/24, `--test fleet live` 20/20; `slates-cluster --test live` 4/4.
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
+
+### A-752 — A push's work is built a unit at a time over the turns before its verdict, under the step quantum (2026-11-20, w-engine; Ada's rule "we address performance gaps upfront", main's order; w-git's measure; §4.3, §4.16, §4.17.1; A-618, A-658, A-722)
+
+- **The gap** (w-git's measure, debug, one command bringing 3,502 objects over a flat 3,500-file tree): the work build
+  (`ServerJudge::verdict` -> `push::build`) took 374 to 642 ms and the entry apply (`apply_planned`) 114 to 196 ms,
+  each in one step, both growing with the head's files: a monorepo's push would outlast the watchdog.
+- **Part 1, the deriver's replay** (landed): `compose_volume_planned` looked each path up by scanning every entity and
+  base file, O(n^2). Indexed (`Entities`: the live entity by path, the origins, the unlinked base files, the base's
+  lengths): a flat 3,500-file compose 129 -> 28 ms, 7,000 458 -> 58 ms (debug).
+- **Part 2, the build in turns.** `slates_merge::push::Building` owns a build across turns and borrows the green and
+  the objects for one ([`Building::advance`]): the walk an entry of a tree a unit (`Comparing`: each side's listing
+  named, then each name), the base a named path a unit (`Green::base_entries`, read at the push's base version, which
+  no later version changes), the composition, the post-state an operation or 64 KiB of zeros a unit, the identity a
+  piece of the document (`OpsDoc::encode_piece`, the pieces in order the encoding) or 64 KiB of the post-state a unit.
+  `build` is a `Building` run in one call. The deriver is `async` (R6): `compose_paced`'s every loop awaits a tick,
+  its sorts are a paced stable merge sort (`pace::sort_by`), its base lookups indexed (`BaseIndex`), so no unit is
+  O(files); `compose_volume_planned` is its one-poll facade, one implementation. A `Pace` holds the turn's deadline
+  and the owner's clock (a function: the merge engine reads no clock of its own); the first unit of a turn always
+  runs; the composition is polled through `Pace::drive`, which lends the turn to the thread for that poll (a `Copy`
+  of its figures in a thread-local cell, R2: nothing shared), so a turn shorter than any unit still runs one.
+  `Verdicts::prepare` runs a turn of the command's build from `ServerJudge::ready` (w-git's hook, after the move's
+  admission), its state beside `admitting` in the deciding push; the verdict takes the work built
+  (`Verdicts::prepared`), or builds in one call where no turn ran (another judge).
+- **Measure.** `slates status --json` `push.build.{turns, past_budget, longest_ns, longest_unit_ns,
+  longest_opening_ns}`: a turn is its opening (the admission's turn and the views set up, before its first unit), its
+  units, and what follows its last ask; one that ran past its budget (half the step quantum) by more than its opening,
+  its longest unit and its tail is past budget. Red first (`t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time`):
+  a flat 1,500-file create then an update changing every file (debug, the audit daemon's quantum about 3 us): before,
+  no build turn (the work built inside the verdict's step); after, about 160,000 build turns a push, `past_budget` 0,
+  the longest build turn 1.13 ms, its longest unit one tree's listing. A build in one-unit turns equals the one-call
+  build over every generated push history (`push::tests::land`).
+- **Part 2b, a tree an entry a unit.** `PushObjects::listing` gives a tree's entries to read one a unit (`Listing`):
+  git's view owns the tree's bytes (one copy) and decodes an entry at each read with `tree::entry_after`, the decoder
+  `Tree::parse` runs, charging each entry as the whole listing does; a store with no such decoder lists whole (the
+  trait's default; Mercurial's for now). A tree git's walk cannot read is refused at the entry where it stops, the same
+  `Malformed`. Measured: the longest build unit 1.12 -> 0.22 ms and the longest build turn 1.13 -> 0.49 ms (t_a752,
+  debug).
+- **Part 3a, the paths map's step after a push.** Measured in the update's one step (debug, 1,500 files, every file
+  changed; probes, 94 ms whole): retention secure 5.0 ms, the engine's verdict 8.3, the git store's record 6.5 and
+  commit 5.0, the engine's commit 10.9, the recorded entry 4.7, the paths map's step over the change 52.4. That step is
+  now a build of the shard's (`vcs_store::paths::whole_build::start_change`): the change's paths put a unit a slice
+  (removals noted), the change applied to the map and trees before at its end, its first path in the push's step. The
+  update's longest step 94 -> 42 ms. Its map equals the one built from the whole head, roots and all
+  (`t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build`).
+- **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
+  hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
+  (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
+  the commit (main's call asked: the green held out across the commit's turns, or staged and published whole); the
+  record's encode and append.
+- **Applied in the same change to** `crates/merge` (`pace`, `push::Building`, `increment::compose_paced` and its
+  stages, `ops_doc::OpsDoc::{canonicalize_paced, encode_piece}`, `special::Composition`, `Green::{base_entries,
+  base_links, base_copied}`), `crates/git` (`receive::works::{Preparing, Verdicts::prepare, Verdicts::prepared}`),
+  `crates/server` (`git_push::{PushTurns, ServerJudge::build_turn}`, status rows), GAPS, BENCHMARKS.md, amendments.tsv.
+
+### A-756 — A volume made on a node by materialization is found there by its name: it claims its name's alias (bug, 2026-11-20, w-fed-move, kiln goal 91; found by use: kiln's live move of an agent's captured clone, its mount refused `NOENT` on the new owner in four runs of five; §4.8 "Lookup", §4.10 "Ownership follows the writer"; A-236, A-291)
+- **Why.** A clone named for another partition than its origin's lives beside its origin and is found by name only
+  through the alias its name's partition holds (A-236). A planned move releases the old owner's alias with its copy
+  (`moves::release`), and the new owner materializes the volume in the partition its id names (`fleet::make_taken`)
+  without one, so a `MNT` of the name, routed to the name's partition (`nfs::routed`), found nothing there unless the
+  name happened to hash to the clone's partition. A takeover's successor had the same gap.
+- **Change.** `verbs::claim_name_alias`: once `make_taken` has made a volume, where its name hashes to another
+  partition, the name's shard reserves and confirms the alias for it (the clone's own two steps, `Op::NameAliasReserved`
+  then `Op::NameAliasConfirmed`): nothing when it already names the volume confirmed, refused when the name or its
+  alias is another volume's; a claim not taken is counted `names.alias_step_untaken` and left to recovery's
+  reconciliation, as an alias step is.
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_captured_clone_moved_to_another_node_is_found_there_by_its_name` (three daemons at `f = 1`, four shards each: a
+  captured clone named for another partition, moved a to b; b serves it and resolves its name as a mount does,
+  `Daemon::mount_capability`): red before the change (`Ok(None)`), green after.
+
+### A-754 — The Linux issuer surface: the anchor prints an issuer route and its secret, and a separate process that presents the secret is handed the segment (2026-11-20, w-reaper, main's ruling; §4.13 "Grants", A-299; closes the Linux issuer surface owed since 2026-09-13)
+
+- **Found by use.** w-interop: on Linux no user process could mint a credential (`slates credential token|key`). The
+  issuer surface was "a descriptor only the anchor's children hold", and `slates anchor` runs no child an operator
+  uses, so stock git, hg and svn could not authenticate to any edge there, and the Linux interop matrix could not run
+  (`PRINTS_ISSUER_SURFACE` false on Linux, every credential leg skipping).
+- **Change (main's ruling, matching macOS and Windows rather than widening anything).** At its start a Linux anchor
+  binds an abstract-namespace socket of its own, `slates-issuer-<instance>/<uid>` (`slates_ipc::issuer_route`), draws
+  a 256-bit secret from the system's generator, and prints both (`slates anchor: issuer surface: export
+  SLATES_ANCHOR_ISSUER_ROUTE=… SLATES_ANCHOR_ISSUER_SECRET=…`). Each turn of its loop it answers the claims waiting:
+  a peer whose user is the anchor's (`SO_PEERCRED`) and that sends the printed secret, compared in constant time, is
+  handed the segment's memfd (`SCM_RIGHTS`) and its length; any other is closed unanswered. A process given those
+  variables (`slates_api::Issuer::from_environment`) claims the descriptor at each proof, attaches the segment, reads
+  the daemon's issuer secret and lets both go. Same-uid alone is not enough: whoever holds the printed secret can issue,
+  exactly as whoever holds the printed name can on macOS and Windows; no anchor-child wrapper is needed. The route is
+  abstract, so no file names it, and it lives as long as the anchor.
+- **Tests.** `slates-ipc` `issuer_route::tests` (a printed secret read back, every wrong form refused, compared whole;
+  across a socket, the right secret handed the descriptor of the very object and its length, a wrong one nothing).
+  `crates/cli/tests/issuer_surface.rs` across processes, every platform: a separate `slates credential token` given
+  the printed surface mints a token, one given none is refused, and on Linux one given the route with a secret one bit
+  off, or the route alone, is refused. `PRINTS_ISSUER_SURFACE` is true on every platform in `tests/cli.rs`,
+  `git_interop`, `svn_interop`, `hg_interop` and `svn_http_reports`, so their credential legs run on Linux, where they
+  skipped. macOS arm64 (Mac Studio 2, main 8281ea29): `issuer_surface` 1 of 1. Linux x86_64 (CI ubuntu-latest, diag
+  run 44762814986 over 0ed39544): `slates-ipc --lib issuer_route` 2 of 2; `issuer_surface` 1 of 1; `git_interop` 6 of
+  6 with no leg skipped (stock git 2.56.1 minting its credential through the route and authenticating to both edges);
+  `svn_interop`'s legs skipped, ubuntu's Subversion not of the 1.15 line. The Linux code clippy-clean for
+  `x86_64-unknown-linux-gnu` from the Studio (`slates-ipc`, `slates-anchor`, `slates-mem`; `slates-api` and
+  `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
+- **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
+  harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.

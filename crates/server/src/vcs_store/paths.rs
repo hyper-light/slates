@@ -153,6 +153,9 @@ enum Plan<'g> {
   /// Every file of the head put already, a recovery's unit each ([`remake_green_sliced`]): the map and trees built of
   /// them.
   Put(BTreeMap<Vec<u8>, Entry>),
+  /// The version's change over the green's map and trees, each file put already, a push's unit each
+  /// ([`whole_build::start_change`], A-752 part 3).
+  PutChange(Head, Change),
 }
 
 /// How a green's map was had.
@@ -211,7 +214,35 @@ pub(crate) fn advance_after_push(state: &mut ShardState, green: DbVolumeId, vers
     whole_build::start(state, repository, green, version);
     return;
   }
+  // The step over the change in slices too (A-752 part 3: a push changing every file of a 1,500-file head stepped its
+  // map in its answer's step, 52 ms debug), its first slice run here at once, so a small change ends in this step.
+  if let Some((before, named)) = change_of(state, (repository, green), version) {
+    whole_build::start_change(state, (repository, green, version), (before, named));
+    return;
+  }
   advance(state, green, version);
+}
+
+/// The map `green`'s step to `version` derives from and the paths the change names ([`plan`]'s rule): none where the
+/// map is of the version already, no map before is kept, or a copy is named (each [`advance`]'s own).
+fn change_of(
+  state: &ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  version: u64,
+) -> Option<(Head, BTreeSet<String>)> {
+  let key = super::green_key(green);
+  let source = branch_source(state, green);
+  let engine = state.greens.get(&green)?;
+  let (_, git) = state.vcs_stores.git_ref(repository)?;
+  let held = git.heads.get(&key).copied();
+  if engine.head() != version || held.is_some_and(|head| head.version == version) {
+    return None;
+  }
+  let before = held
+    .filter(|head| head.version.checked_add(1) == Some(version))
+    .or_else(|| branch_before(git, held, (false, version), source))?;
+  let named = named(&engine, before.version, version)?;
+  Some((before, named))
 }
 
 /// Whether `green`'s step at `version` would build the map from the whole head ([`plan`]'s rule, read over the change
@@ -646,7 +677,7 @@ fn plan_bytes(plan: &Plan<'_>) -> u64 {
       .iter()
       .map(|(_, file)| file.bytes.len())
       .fold(0, usize::saturating_add),
-    Plan::Put(_) => 0,
+    Plan::Put(_) | Plan::PutChange(..) => 0,
   };
   u64::try_from(bytes).unwrap_or(u64::MAX)
 }
@@ -738,6 +769,13 @@ fn make(
       build_whole(content, (paths, trees), &entries, held)
     }
     Plan::Put(entries) => build_whole(content, (paths, trees), &entries, held),
+    Plan::PutChange(before, change) => {
+      let root = paths
+        .apply(content, Some(before.root), &change)
+        .map_err(StepRefused::Paths)?;
+      let made = trees.apply(content, Some(before.trees), &change);
+      with_trees(made, root, held).map(|(root, trees)| Some((root, trees, Stepped::Derived)))
+    }
   }
 }
 

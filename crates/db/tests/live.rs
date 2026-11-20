@@ -3472,3 +3472,259 @@ fn live_append(shipper: &mut Shipper, payload: &[u8], whole: bool) -> Head {
   }
   newest
 }
+
+/// A-757 part 2 (w-forming, 2026-11-20): a whole state's identity hashed a slice at a time across an owner's turns is
+/// the identity the shipper computes in one, and a hasher of a place the chain has left is refused. Do: on two equal
+/// shippers, append a whole state of a few hundred KiB, one at once and one fed to an [`slates_db::live::EntryHasher`]
+/// in 4 KiB slices; then seed a hasher, append a delta, and offer it; and offer one fed short. Expect: equal heads; the
+/// stale hasher refused `Behind` at the delta's head; the short one refused `Behind`.
+#[test]
+fn a_whole_state_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const WHOLE: usize = 300_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..WHOLE)
+    .map(|at| u8::try_from(at % 253).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(WHOLE * 4);
+  let mut in_slices = shipper_bounded_by_whole(WHOLE * 4);
+  let first = at_once.append_kept(vec![1, 2, 3]).unwrap();
+  assert_eq!(in_slices.append_kept(vec![1, 2, 3]).unwrap(), first);
+  let expected = at_once.append_checkpoint_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(hasher.fed(), hasher.length());
+  assert_eq!(
+    in_slices
+      .append_checkpoint_hashed(payload.clone(), hasher)
+      .unwrap(),
+    expected
+  );
+  let mut stale = in_slices.entry_hasher(payload.len()).unwrap();
+  stale.feed(&payload);
+  let moved = in_slices.append_kept(vec![9]).unwrap();
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload.clone(), stale),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+  let mut short = in_slices.entry_hasher(payload.len()).unwrap();
+  short.feed(&payload[..SLICE]);
+  assert_eq!(
+    in_slices.append_checkpoint_hashed(payload, short),
+    Err(LiveError::Behind { head: Some(moved) })
+  );
+}
+
+/// Shape: the slice a hashing turn feeds in the A/B: one archive page, the floor a whole build's turn hashes.
+const MEASURED_SLICE_BYTES: usize = 64 << 10;
+
+/// A measurement (w-forming's A/B for A-757 part 2; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l` for its peak RSS): the append turn of a [`MEASURED_APPEND_BYTES`] whole state with its identity
+/// hashed in that turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_at_once() {
+  let mut turns = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_kept(payload).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=at_once bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2]
+  );
+}
+
+/// The same whole state with its identity fed [`MEASURED_SLICE_BYTES`] a turn before the append (A-757 part 2): the
+/// longest hashing turn and the append turn, best and median of [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_whole_append_turn_hashed_in_slices() {
+  let mut turns = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    let head = shipper.append_checkpoint_hashed(payload, hasher).unwrap();
+    shipper.mark_checkpoint(head);
+    turns.push(began.elapsed());
+  }
+  turns.sort_unstable();
+  slices.sort_unstable();
+  println!(
+    "WHOLE_APPEND_TURN path=in_slices bytes={MEASURED_APPEND_BYTES} append_turn best={:?} median={:?}; longest \
+     {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    turns[0],
+    turns[MEASURED_APPENDS / 2],
+    slices[0],
+    slices[MEASURED_APPENDS / 2]
+  );
+}
+
+/// A-757 part 2b (w-forming, 2026-11-20): a large delta's identity hashed in slices appends at the head a delta hashed
+/// at once takes, under the delta credit. Do: on two equal shippers, append a delta of a few hundred KiB, one at once
+/// and one fed in 4 KiB slices. Expect equal heads, and `admits_delta` true before each.
+#[test]
+fn a_delta_hashed_in_slices_appends_at_the_head_hashed_at_once() {
+  const DELTA: usize = 200_000;
+  const SLICE: usize = 4096;
+  let payload: Vec<u8> = (0..DELTA)
+    .map(|at| u8::try_from(at % 239).unwrap())
+    .collect();
+  let mut at_once = shipper_bounded_by_whole(DELTA * 4);
+  let mut in_slices = shipper_bounded_by_whole(DELTA * 4);
+  assert!(at_once.admits_delta(payload.len()) && in_slices.admits_delta(payload.len()));
+  let expected = at_once.append_kept(payload.clone()).unwrap();
+  let mut hasher = in_slices.entry_hasher(payload.len()).unwrap();
+  for slice in payload.chunks(SLICE) {
+    hasher.feed(slice);
+  }
+  assert_eq!(in_slices.append_hashed(payload, hasher).unwrap(), expected);
+}
+
+/// A measurement (w-forming's A/B for A-757 part 2b; run alone in release with `--ignored --nocapture --exact`, under
+/// `/usr/bin/time -l`): a [`MEASURED_APPEND_BYTES`] delta's append turn, hashed at once (`append_kept`) and hashed
+/// [`MEASURED_SLICE_BYTES`] a turn before (`append_hashed`), with the longest hashing turn; best and median of
+/// [`MEASURED_APPENDS`].
+#[test]
+#[ignore = "a measurement: run in release with --ignored --nocapture"]
+fn measure_the_delta_append_turn() {
+  let mut at_once = Vec::new();
+  let mut hashed = Vec::new();
+  let mut slices = Vec::new();
+  for _ in 0..MEASURED_APPENDS {
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let began = std::time::Instant::now();
+    shipper.append_kept(payload).unwrap();
+    at_once.push(began.elapsed());
+    let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+    let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+    let mut hasher = shipper.entry_hasher(payload.len()).unwrap();
+    let mut longest = std::time::Duration::ZERO;
+    for slice in payload.chunks(MEASURED_SLICE_BYTES) {
+      let began = std::time::Instant::now();
+      hasher.feed(slice);
+      longest = longest.max(began.elapsed());
+    }
+    slices.push(longest);
+    let began = std::time::Instant::now();
+    shipper.append_hashed(payload, hasher).unwrap();
+    hashed.push(began.elapsed());
+  }
+  for times in [&mut at_once, &mut hashed, &mut slices] {
+    times.sort_unstable();
+  }
+  let median = MEASURED_APPENDS / 2;
+  println!(
+    "DELTA_APPEND_TURN bytes={MEASURED_APPEND_BYTES} at_once best={:?} median={:?}; hashed append best={:?} median={:?}; \
+     longest {MEASURED_SLICE_BYTES}-byte hashing turn best={:?} median={:?}",
+    at_once[0], at_once[median], hashed[0], hashed[median], slices[0], slices[median]
+  );
+}
+
+/// A-757 part 3 (w-forming, 2026-11-20): the whole state the owner keeps is the entry's one copy, lent while the retained
+/// tail holds it and after the tail lets it go. Do: bound a shipper's tail to two small entries, append a whole state and
+/// keep it, then append deltas until the tail has let it go; then keep a later delta's position, then none. Expect the
+/// whole state's payload lent at each step until another is kept, then not; nothing lent once none is kept.
+#[test]
+fn a_kept_whole_state_is_lent_after_the_retained_tail_lets_it_go() {
+  const SMALL: usize = 16;
+  let hosts = [HostId(1), HostId(2), HostId(3)];
+  let mut shipper = Shipper::new(
+    (hosts[0], OBJECT, HostEpoch(1)),
+    Quorum { f: 1 },
+    &hosts,
+    None,
+    bounds_of(64, 2, SMALL),
+  );
+  let whole: Vec<u8> = vec![7; SMALL];
+  let head = shipper.append_checkpoint_kept(whole.clone()).unwrap();
+  shipper.keep(Some(head.position));
+  shipper.mark_checkpoint(head);
+  assert_eq!(shipper.payload_at(head.position), Some(whole.as_slice()));
+  let mut last = head;
+  for value in 0..4u8 {
+    last = shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert!(
+    !shipper.retains_after(head.position),
+    "the tail let the whole state go"
+  );
+  assert_eq!(
+    shipper.payload_at(head.position),
+    Some(whole.as_slice()),
+    "the kept whole state is still lent"
+  );
+  shipper.keep(Some(last.position));
+  assert_eq!(
+    shipper.payload_at(head.position),
+    None,
+    "the old one let go"
+  );
+  shipper.keep(None);
+  for value in 4..8u8 {
+    shipper.append_kept(vec![value; SMALL]).unwrap();
+  }
+  assert_eq!(
+    shipper.payload_at(last.position),
+    None,
+    "none kept, none lent"
+  );
+}
+
+/// Shape: the live volumes the at-rest measurement holds whole states for.
+const MEASURED_VOLUMES: usize = 50;
+
+/// A measurement (w-forming's A/B for A-757 part 3; run alone in release under `/usr/bin/time -l` for its peak RSS):
+/// [`MEASURED_VOLUMES`] owners each holding a [`MEASURED_APPEND_BYTES`] whole state as `live_ship` held it before part 3,
+/// the payload cloned into the shipper and its own copy kept beside it.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_twice() {
+  let held: Vec<(Shipper, Vec<u8>)> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let payload = vec![0x5a_u8; MEASURED_APPEND_BYTES];
+      let head = shipper.append_checkpoint_kept(payload.clone()).unwrap();
+      shipper.mark_checkpoint(head);
+      (shipper, payload)
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=twice volumes={}", held.len());
+}
+
+/// The same owners as part 3 holds them: the payload moved into the shipper and kept there, lent back.
+#[test]
+#[ignore = "a measurement: run alone in release under /usr/bin/time -l"]
+fn measure_whole_states_held_once() {
+  let held: Vec<Shipper> = (0..MEASURED_VOLUMES)
+    .map(|_| {
+      let mut shipper = shipper_bounded_by_whole(MEASURED_APPEND_BYTES * 4);
+      let head = shipper
+        .append_checkpoint_kept(vec![0x5a_u8; MEASURED_APPEND_BYTES])
+        .unwrap();
+      shipper.keep(Some(head.position));
+      shipper.mark_checkpoint(head);
+      assert!(shipper.payload_at(head.position).is_some());
+      shipper
+    })
+    .collect();
+  println!("WHOLE_STATES_HELD path=once volumes={}", held.len());
+}

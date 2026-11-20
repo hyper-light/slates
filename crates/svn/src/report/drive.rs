@@ -627,7 +627,7 @@ pub(crate) struct WindowWork {
 /// Measured: the deltifier walks 102,400 positions in about 150 us on an M-series Mac (release,
 /// 2026-11-20), 1.5 ns a unit, so 1,024 units are about 1.5 us, under half the shard's step quantum
 /// there (about 3.7 us, `diag-w-bugs-svnfetch-6`); a byte read or sent costs less than a unit walked.
-const STEP_WORK: usize = 1024;
+pub(crate) const STEP_WORK: usize = 1024;
 
 /// One frame of the walk.
 #[derive(Clone, Debug)]
@@ -1605,21 +1605,26 @@ fn dirent<R: ?Sized>(
   Ok(history::present(sources.index, path, revision)?.map(|node| Dirent::of(&node)))
 }
 
-/// The entries of the directory at `path` in `revision`, by name (`svn_fs_dir_entries`).
+/// The entries of the directory at `path` in `revision`, by name (`svn_fs_dir_entries`): the index's listing, each
+/// child's entry made from the node-revision it lists (A-759: the directory resolved once, its live children walked,
+/// no child resolved again).
 fn entries<R: Repository + ?Sized>(
   sources: &Sources<'_, R>,
   path: &str,
   revision: Revision,
 ) -> Result<BTreeMap<String, Dirent>, DriveFailure> {
-  let names = sources
-    .repository
-    .entries(path, revision)
+  let listed = sources
+    .index
+    .listing(path, revision)
+    .map_err(|_| DriveFailure::corrupt())?
     .ok_or_else(DriveFailure::corrupt)?;
   let mut entries = BTreeMap::new();
-  for name in names {
-    let entry =
-      dirent(sources, &join_fspath(path, &name), revision)?.ok_or_else(DriveFailure::corrupt)?;
-    entries.insert(name, entry);
+  for (name, id) in listed {
+    let node = sources
+      .index
+      .node_revision(id)
+      .map_err(|_| DriveFailure::corrupt())?;
+    entries.insert(name, Dirent::of(&node));
   }
   Ok(entries)
 }
@@ -1730,29 +1735,63 @@ pub(crate) fn window_unit<R: Repository + ?Sized>(
     Some(work) => work,
     None => Box::new(begun_window(*delta.sent, delta.source, &delta.text)?),
   };
-  if work.target.len() < work.target_len {
+  let units = if work.target.len() < work.target_len {
     let piece = (*delta.sent, work.target_len);
-    read_piece(repository, &delta.text, piece, &mut work.target)?;
+    read_piece(repository, &delta.text, piece, &mut work.target)?
   } else if work.source.len() < work.source_len {
     let source = delta.source.ok_or_else(DriveFailure::corrupt)?;
     let piece = (work.view, work.source_len);
-    read_piece(repository, &source, piece, &mut work.source)?;
+    read_piece(repository, &source, piece, &mut work.source)?
   } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
-    make_window(&mut work, encoding)?;
-  } else if send_piece(&mut work, delta.header_sent, encoding.0, sink)? {
-    let length = u64::try_from(work.target_len).map_err(|_| DriveFailure::corrupt())?;
-    *delta.sent = delta.sent.saturating_add(length);
+    make_window(&mut work, encoding)?
+  } else {
+    let (sent, done) = send_piece(&mut work, delta.header_sent, encoding.0, sink)?;
+    note_units(sent);
+    if done {
+      let length = u64::try_from(work.target_len).map_err(|_| DriveFailure::corrupt())?;
+      *delta.sent = delta.sent.saturating_add(length);
+      return Ok(());
+    }
+    *work_held = Some(work);
     return Ok(());
-  }
+  };
+  note_units(units);
   *work_held = Some(work);
   Ok(())
+}
+
+/// The most units a window step takes: [`STEP_WORK`] bytes read or sent, or [`STEP_WORK`] of the maker's units and its
+/// overrun ([`crate::svndiff::STEP_OVERRUN`]).
+#[cfg(test)]
+pub(crate) const WINDOW_STEP_UNITS: usize = STEP_WORK + crate::svndiff::STEP_OVERRUN;
+
+#[cfg(test)]
+thread_local! {
+  /// The most units one window step took on this thread since [`take_most_window_units`] (A-751's bound, by test).
+  static MOST_WINDOW_UNITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes a window step's units, for the tests that hold every step to [`WINDOW_STEP_UNITS`].
+#[cfg(test)]
+fn note_units(units: usize) {
+  MOST_WINDOW_UNITS.with(|most| most.set(most.get().max(units)));
+}
+
+/// A window step's units are no one's to note outside the tests.
+#[cfg(not(test))]
+fn note_units(_units: usize) {}
+
+/// The most units one window step took on this thread since the last call, and the tally begun again.
+#[cfg(test)]
+pub(crate) fn take_most_window_units() -> usize {
+  MOST_WINDOW_UNITS.with(|most| most.replace(0))
 }
 
 /// [`STEP_WORK`] units of the window's making, begun once both pieces are read.
 fn make_window(
   work: &mut WindowWork,
   (version, compression): (Version, Compression),
-) -> Result<(), DriveFailure> {
+) -> Result<usize, DriveFailure> {
   let making = match &mut work.making {
     Some(making) => making,
     None => work.making.insert(
@@ -1765,20 +1804,22 @@ fn make_window(
       .map_err(|_| DriveFailure::corrupt())?,
     ),
   };
+  let before = making.units_taken();
   making
     .step(&work.source, &work.target, STEP_WORK)
     .map_err(|_| DriveFailure::corrupt())?;
-  Ok(())
+  usize::try_from(making.units_taken().saturating_sub(before)).map_err(|_| DriveFailure::corrupt())
 }
 
 /// The made window's next piece, [`STEP_WORK`] bytes at most of its current write, the delta's
-/// header in its first write where it is owed. Whether the window's last write is sent.
+/// header in its first write where it is owed. The bytes sent, and whether the window's last write
+/// is sent.
 fn send_piece(
   work: &mut WindowWork,
   header_sent: &mut bool,
   version: Version,
   sink: &mut dyn FnMut(usize, usize, Vec<u8>),
-) -> Result<bool, DriveFailure> {
+) -> Result<(usize, bool), DriveFailure> {
   let made = work
     .making
     .as_ref()
@@ -1788,10 +1829,11 @@ fn send_piece(
   let owed = *work.header.get_or_insert(!*header_sent);
   let writes = window_writes(&made, owed.then_some(&header[..]), version);
   let Some(write) = writes.get(work.write) else {
-    return Ok(true);
+    return Ok((0, true));
   };
   let total = write.iter().map(|part| part.len()).sum::<usize>();
   let piece = piece_of(write, work.at, STEP_WORK);
+  let sent = piece.len();
   sink(total, work.at, piece);
   *header_sent = true;
   work.at = work.at.saturating_add(STEP_WORK).min(total);
@@ -1799,7 +1841,7 @@ fn send_piece(
     work.write = work.write.saturating_add(1);
     work.at = 0;
   }
-  Ok(work.write >= writes.len())
+  Ok((sent, work.write >= writes.len()))
 }
 
 /// The window `txdelta_next_window` makes next of `text` with `sent` bytes of it sent: its target
@@ -1826,13 +1868,13 @@ fn begun_window(sent: u64, source: Option<Text>, text: &Text) -> Result<WindowWo
   })
 }
 
-/// Up to [`STEP_WORK`] more bytes of `text`'s piece from `offset` read into `piece`, short of `want`.
+/// Up to [`STEP_WORK`] more bytes of `text`'s piece from `offset` read into `piece`, short of `want`: the bytes read.
 fn read_piece<R: Repository + ?Sized>(
   repository: &R,
   text: &Text,
   (offset, want): (u64, usize),
   piece: &mut Vec<u8>,
-) -> Result<(), DriveFailure> {
+) -> Result<usize, DriveFailure> {
   let at = u64::try_from(piece.len())
     .ok()
     .and_then(|read| offset.checked_add(read))
@@ -1846,7 +1888,7 @@ fn read_piece<R: Repository + ?Sized>(
     .min(want.saturating_sub(piece.len()))
     .min(STEP_WORK);
   piece.extend_from_slice(run.get(..take).ok_or_else(DriveFailure::corrupt)?);
-  Ok(())
+  Ok(take)
 }
 
 /// A made window's writes as `svndiff.c` makes them (`crate::report::editor`'s `DeltaWrites`): a

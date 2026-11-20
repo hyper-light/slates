@@ -498,6 +498,47 @@ fn objects_the_view_cannot_give_are_refused_by_kind() {
   push.abandon(&mut store).unwrap();
 }
 
+/// A-752 part 2b (a build reads a tree an entry a unit). Do: list a pushed tree of nine entries, and a tree of two
+/// entries and a cut third that git's tree walk cannot read, through the push's view an entry at a time. Expect: the nine entries the
+/// whole listing gives, in order; and the unreadable tree refused `Malformed` at its first entry, as whole, then
+/// nothing.
+#[test]
+fn a_tree_listed_an_entry_at_a_time_is_the_whole_listing() {
+  let (mut store, repository) = empty();
+  let mut push = Push::new(ObjectFormat::Sha1);
+  let blob = admit(&mut store, &repository, &mut push, Kind::Blob, b"x\n");
+  let names: Vec<Vec<u8>> = (0..9).map(|at| format!("f{at}").into_bytes()).collect();
+  let entries: Vec<(&[u8], &[u8], ObjectId)> = names
+    .iter()
+    .map(|name| (&b"100644"[..], name.as_slice(), blob))
+    .collect();
+  let tree = admit(
+    &mut store,
+    &repository,
+    &mut push,
+    Kind::Tree,
+    &tree_bytes(&entries),
+  );
+  let mut broken = tree_bytes(&entries[..2]);
+  broken.extend_from_slice(b"100644 no-terminator");
+  let unreadable = admit(&mut store, &repository, &mut push, Kind::Tree, &broken);
+  let view = PushedObjects::new(&repository, &store, &push);
+  let whole = view.tree(key(tree)).unwrap();
+  let mut listing = view.listing(key(tree)).unwrap();
+  let mut read = Vec::new();
+  while let Some(entry) = listing.next_entry() {
+    read.push(entry.unwrap());
+  }
+  assert_eq!(read, whole);
+  // git asks of every entry that the bytes left end in a NUL and an id, so a tree whose tail is cut is refused at its
+  // first entry, as the whole listing refuses it.
+  assert_eq!(view.tree(key(unreadable)), Err(Unavailable::Malformed));
+  let mut listing = view.listing(key(unreadable)).unwrap();
+  assert_eq!(listing.next_entry(), Some(Err(Unavailable::Malformed)));
+  assert_eq!(listing.next_entry(), None);
+  push.abandon(&mut store).unwrap();
+}
+
 /// What [`push_branch`] admitted: the ids a test reads the push by.
 struct BranchPush {
   /// The root tree.

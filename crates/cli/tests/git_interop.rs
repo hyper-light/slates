@@ -18,7 +18,7 @@
 //! test's scratch directory, it never prompts (`GIT_TERMINAL_PROMPT=0`, no askpass program), and its messages are C's.
 //! Each test's copies, its key and git's home live in a scratch directory in the build output (`CARGO_TARGET_TMPDIR`),
 //! named with the process id and removed at its end. A credential is minted with the anchor's issuer surface, which
-//! the anchor names on macOS and Windows; on Linux the surface is a descriptor only the anchor's children hold, so a
+//! the anchor prints on every platform (on Linux its issuer route and secret since A-754); were it to print none, a
 //! leg that needs a credential skips loudly there (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`). Every platform: on Windows
 //! (jupiter) stock git is Git for Windows and `ssh` the OpenSSH the PATH names first (MSYS2's there), which read the
 //! scratch directory's forward-slashed paths and `/dev/null` as on Unix.
@@ -89,10 +89,9 @@ const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
 /// separate process exports to prove the human's authority, `NAME=VALUE` pairs separated by spaces.
 const ISSUER_SURFACE_LINE: &str = "slates anchor: issuer surface: export ";
 
-/// Shape: whether the anchor names its issuer surface through the environment: on macOS and Windows; on Linux the
-/// surface is a descriptor only its children hold (`tests/cli.rs`, `PRINTS_ISSUER_SURFACE`, which records why this is
-/// a platform fact and never read from the order of two processes' lines).
-const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
+/// Shape: whether the anchor names its issuer surface through the environment: on every platform since A-754 (macOS
+/// and Windows the segment's name, Linux its issuer route and secret; `tests/cli.rs`, `PRINTS_ISSUER_SURFACE`).
+const PRINTS_ISSUER_SURFACE: bool = true;
 
 /// Format: the start of the daemon's line naming where its HTTP edge serves cleartext, on the loopback address a test
 /// asks for (`crates/api/src/role/daemon.rs`, A-625 part 3); the port follows.
@@ -604,7 +603,7 @@ fn create_repository(instance: &str) {
 fn issuer_of(started: &Started, leg: &str) -> Option<Vec<(String, String)>> {
   if started.issuer.is_none() {
     eprintln!(
-      "skipping {leg}: this platform's issuer surface is a descriptor only the anchor's children hold, so no \
+      "skipping {leg}: the anchor printed no issuer surface, so no \
        separate process can mint a credential"
     );
   }

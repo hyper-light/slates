@@ -11,9 +11,9 @@
   clippy::panic_in_result_fn
 )]
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use slates_client::{Client, ClientError, Deadlines, ReadAt, Submitted, VolumeId};
+use slates_client::{Client, Deadlines, ReadAt, Submitted, VolumeId};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -22,8 +22,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards for the test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long the client retries the rendezvous while the daemon starts.
-const START_WAIT: Duration = Duration::from_secs(10);
 
 fn start(tag: &str) -> (Daemon, Client) {
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
@@ -45,17 +43,9 @@ fn start(tag: &str) -> (Daemon, Client) {
   daemon.bootstrap(true).unwrap();
   let deadlines =
     Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get();
-  let started = Instant::now();
-  let client = loop {
-    match Client::connect(&instance, deadlines) {
-      Ok(client) => break client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::thread::yield_now();
-      }
-      Err(e) => panic!("{e}"),
-    }
+  let client = match Client::connect(&instance, deadlines) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   };
   (daemon, client)
 }

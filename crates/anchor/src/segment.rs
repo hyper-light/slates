@@ -603,6 +603,13 @@ impl AnchorSegment {
     self.content = Some(object);
   }
 
+  /// A borrow of the segment's own descriptor, for the anchor's issuer route to hand a process that proved the issuer's
+  /// secret (A-754): the memfd its children inherit, which no other process can otherwise reach. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn object_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.object.as_fd()
+  }
+
   /// The content object, if any (a shard reads and publishes its recovery image through it).
   pub fn content(&self) -> Option<&SparseObject> {
     self.content.as_ref()

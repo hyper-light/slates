@@ -16,6 +16,8 @@
   clippy::indexing_slicing
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
 #[path = "support/recovered.rs"]
 mod recovered;
 #[path = "../../anchor/tests/windows_access/mod.rs"]

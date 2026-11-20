@@ -308,6 +308,34 @@ pub struct ServerTransport<E: Entropy> {
   last_exchange_ns: u64,
   /// Whether the closing disconnect was sealed: none until the connection closes on the server's side.
   disconnect_sealed: Option<bool>,
+  /// The last exchange after the first, until its caller takes it ([`ServerTransport::take_rekey`]).
+  rekeyed: Option<Rekeyed>,
+}
+
+/// What started an exchange after the first (A-745: every rekey is logged with its trigger).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RekeyTrigger {
+  /// The key time ran out ([`ServerTransport::poll_timers`]).
+  KeyTime,
+  /// A direction's key reached its rekey point: half its packets or blocks.
+  KeyUsage,
+  /// The client sent its KEXINIT first.
+  Client,
+}
+
+/// An exchange after the first as it began: its trigger, how long the keys it replaces served, and their usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rekeyed {
+  /// What started it.
+  pub trigger: RekeyTrigger,
+  /// How long the keys it replaces served, in nanoseconds.
+  pub served_ns: u64,
+  /// The server's key's usage: packets and blocks sealed.
+  pub sealed: Usage,
+  /// The client's key's usage: packets and blocks opened.
+  pub opened: Usage,
+  /// The key time the server holds now.
+  pub key_time_ns: u64,
 }
 
 impl<E: Entropy> core::fmt::Debug for ServerTransport<E> {
@@ -372,6 +400,7 @@ impl<E: Entropy> ServerTransport<E> {
       key_installed_ns: now_ns,
       last_exchange_ns: 0,
       disconnect_sealed: None,
+      rekeyed: None,
     };
     transport
       .begin_exchange(true, now_ns)
@@ -419,6 +448,31 @@ impl<E: Entropy> ServerTransport<E> {
   pub fn consume_output(&mut self, count: usize) {
     let count = count.min(self.output.len());
     self.output.drain(..count);
+  }
+
+  /// Whether an exchange holds the upper layer's sends back ([`SendRefusal::Rekeying`]): the server's KEXINIT out and
+  /// its NEWKEYS not. Only reading the client's half of the exchange ends it (A-745).
+  pub fn is_rekeying(&self) -> bool {
+    self
+      .exchange
+      .as_ref()
+      .is_some_and(|exchange| exchange.next_opener.is_none())
+  }
+
+  /// The last exchange after the first that began since this was last asked, with its trigger (A-745).
+  pub fn take_rekey(&mut self) -> Option<Rekeyed> {
+    self.rekeyed.take()
+  }
+
+  /// Notes an exchange after the first beginning now for `trigger`.
+  fn note_rekey(&mut self, trigger: RekeyTrigger, now_ns: u64) {
+    self.rekeyed = Some(Rekeyed {
+      trigger,
+      served_ns: now_ns.saturating_sub(self.key_installed_ns),
+      sealed: self.sealer.usage(),
+      opened: self.opener.usage(),
+      key_time_ns: self.key_time_ns,
+    });
   }
 
   /// Whether the connection is closed.
@@ -471,6 +525,7 @@ impl<E: Entropy> ServerTransport<E> {
     if !self.may_start_rekey() || now_ns < self.rekey_deadline_ns() {
       return Ok(());
     }
+    self.note_rekey(RekeyTrigger::KeyTime, now_ns);
     self
       .begin_exchange(false, now_ns)
       .inspect_err(|refusal| self.fail(*refusal))
@@ -531,11 +586,7 @@ impl<E: Entropy> ServerTransport<E> {
     if !self.service_accepted {
       return Err(SendRefusal::NotEstablished);
     }
-    if self
-      .exchange
-      .as_ref()
-      .is_some_and(|exchange| exchange.next_opener.is_none())
-    {
+    if self.is_rekeying() {
       return Err(SendRefusal::Rekeying);
     }
     let number = payload.first().copied().ok_or(SendRefusal::Empty)?;
@@ -743,6 +794,9 @@ impl<E: Entropy> ServerTransport<E> {
       self.strict = negotiated.strict;
     }
     if self.exchange.is_none() {
+      if !initial {
+        self.note_rekey(RekeyTrigger::Client, now_ns);
+      }
       self.begin_exchange(false, now_ns)?;
     }
     let exchange = self
@@ -965,6 +1019,7 @@ impl<E: Entropy> ServerTransport<E> {
       .open_limits()
       .is_some_and(|limits| limits.due(self.opener.usage()));
     if self.may_start_rekey() && (sent_due || received_due) {
+      self.note_rekey(RekeyTrigger::KeyUsage, now_ns);
       return self.begin_exchange(false, now_ns);
     }
     Ok(())

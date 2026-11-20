@@ -13,7 +13,7 @@ use crate::objects::tree::Tree;
 use crate::{Admission, to_u64};
 
 use super::encoding::Encoding;
-use super::fragment::{self, FragmentRefused, Learning, Named, Placed, Stored};
+use super::fragment::{self, FragmentRefused, Learning, Placed, Stored};
 use super::hook_view::Quantum;
 use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
@@ -193,6 +193,9 @@ pub struct StoreCounters {
   pub reference_deltas: u64,
   /// Base packs made.
   pub rebuilds: u64,
+  /// Pushes a commit staged again whole, their stage overtaken by a landing since (A-722 part 4e: a push's judge
+  /// stages it again a turn at a time before its append, [`Repository::needs_stage`], so a commit meets none).
+  pub restaged: u64,
 }
 
 /// The entry a path names in a version's tree.
@@ -968,15 +971,23 @@ impl Repository {
     let staged = match self.adoptable_stage(store, push)? {
       Some(staged) => staged,
       None => {
+        if !push.is_empty() {
+          self.count(|counters| counters.restaged = counters.restaged.saturating_add(1));
+        }
         self.stage(store, push)?;
         push.take_staged().ok_or(StoreRefused::Unsealed)?
       }
     };
     let fresh_ids: Vec<ObjectId> = staged.positions.keys().copied().collect();
     let positions = staged.positions.clone();
-    let next = staged
-      .base
-      .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX));
+    // A stage that gives no position leaves the next position where it is, however long ago it was made.
+    let next = if staged.positions.is_empty() {
+      self.next_position
+    } else {
+      staged
+        .base
+        .saturating_add(u64::try_from(staged.positions.len()).unwrap_or(u64::MAX))
+    };
     let brought_by = self.brought_by(moves, first);
     let landed = landed_runs(&fresh_ids, &positions, &brought_by);
     let (planned, heads) = self.plan(store, moves, &positions)?;
@@ -996,19 +1007,24 @@ impl Repository {
       give_back(store, &values)?;
       return Err(refused.into());
     }
-    let inserted = self
-      .index
-      .adopt(store, staged.fork)
-      .map_err(|refused| match refused {
-        slates_vcs::AdoptRefused::Refused(refused, fork) => {
-          let _ = fork.release(store);
-          StoreRefused::from(refused)
-        }
-        slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
-          let _ = fork.release(store);
-          StoreRefused::Moved { green: first.green }
-        }
-      });
+    // A stage that gives no position writes no row: its fork is given back, never adopted.
+    let inserted = if staged.positions.is_empty() {
+      staged.fork.release(store).map_err(StoreRefused::from)
+    } else {
+      self
+        .index
+        .adopt(store, staged.fork)
+        .map_err(|refused| match refused {
+          slates_vcs::AdoptRefused::Refused(refused, fork) => {
+            let _ = fork.release(store);
+            StoreRefused::from(refused)
+          }
+          slates_vcs::AdoptRefused::Stale(fork) | slates_vcs::AdoptRefused::NotAFork(fork) => {
+            let _ = fork.release(store);
+            StoreRefused::Moved { green: first.green }
+          }
+        })
+    };
     if let Err(refused) = inserted {
       store.discharge(more.saturating_add(landing_cost))?;
       give_back(store, &values)?;
@@ -1095,6 +1111,25 @@ impl Repository {
       .saturating_add(self.index.fork_room())
   }
 
+  /// Whether `push` holds objects its commit would stage again (A-722 part 4e): none staged, or a stage a landing
+  /// overtook since ([`Self::adoptable_stage`]'s rule). A push's judge stages it again a turn at a time while it does.
+  pub fn needs_stage(&self, push: &Push) -> bool {
+    if push.is_empty() {
+      return false;
+    }
+    !push
+      .staged()
+      .is_some_and(|staged| self.stage_current(staged))
+  }
+
+  /// Whether `staged` is a stage this index takes as it is: one that gives no position (every object the push holds
+  /// indexed already, as they stay), which no landing can overtake (A-722 part 4e); or one no landing overtook, no row
+  /// taken in nor position given since its fork was made.
+  fn stage_current(&self, staged: &super::push::Staged) -> bool {
+    staged.positions.is_empty()
+      || (staged.base == self.next_position && self.index.adoptable(&staged.fork))
+  }
+
   /// The push's staged rows when this index would adopt them as they are (A-722 part 3): no row taken in nor position
   /// given by the repository since its fork was made. A stage this repository outran is given back, for the push to be
   /// staged again ([`Self::stage`]).
@@ -1103,9 +1138,9 @@ impl Repository {
     store: &mut ContentStore,
     push: &mut Push,
   ) -> Result<Option<super::push::Staged>, StoreRefused> {
-    let current = push.staged().is_some_and(|staged| {
-      staged.base == self.next_position && self.index.adoptable(&staged.fork)
-    });
+    let current = push
+      .staged()
+      .is_some_and(|staged| self.stage_current(staged));
     let Some(staged) = push.take_staged() else {
       return Ok(None);
     };
@@ -1610,13 +1645,10 @@ fn fragments_slot(
     .map(|record| &mut record.fragments)
 }
 
-/// A fragment's bytes kept as content, and what its entries hold read once (`Kept`).
-fn keep(
-  store: &mut ContentStore,
-  (bytes, placed): fragment::Encoded,
-) -> Result<Kept, StoreRefused> {
+/// A fragment whose bytes are kept as `content` already (A-718: put a window at a time), and what
+/// its entries hold read once (`Kept`); the caller's hold on `content` becomes the fragment's.
+fn keep(((bytes, placed), content): (fragment::Encoded, ContentId)) -> Result<Kept, StoreRefused> {
   let order = position_order(&placed)?;
-  let content = store.put_object(&bytes)?;
   let positions = Positions::of(placed.iter().map(|entry| entry.position).collect());
   let references = Positions::of(
     placed
@@ -1655,18 +1687,20 @@ fn position_order(placed: &[Placed]) -> Result<Vec<u32>, StoreRefused> {
   Ok(order)
 }
 
-/// A version's two fragments, or a base pack's two parts, kept as content; refused, neither is
-/// kept.
+/// A version's two fragments, or a base pack's two parts, each kept as content already (its root
+/// held once by the caller), recorded; refused, both roots are given back.
 fn keep_both(
   store: &mut ContentStore,
-  objects: fragment::Encoded,
-  blobs: fragment::Encoded,
+  objects: (fragment::Encoded, ContentId),
+  blobs: (fragment::Encoded, ContentId),
 ) -> Result<Fragments, StoreRefused> {
-  let objects = keep(store, objects)?;
-  match keep(store, blobs) {
-    Ok(blobs) => Ok(Fragments { objects, blobs }),
-    Err(refused) => {
-      store.release(&objects.content)?;
+  let roots = [objects.1, blobs.1];
+  match (keep(objects), keep(blobs)) {
+    (Ok(objects), Ok(blobs)) => Ok(Fragments { objects, blobs }),
+    (Err(refused), _) | (_, Err(refused)) => {
+      for root in roots {
+        store.release(&root)?;
+      }
       Err(refused)
     }
   }
@@ -1721,21 +1755,6 @@ impl Repository {
       entries.insert(entry.name.to_vec(), (entry.is_dir(), id));
     }
     Ok(entries)
-  }
-
-  /// The object `id` names as a base a REF delta may name: its id, position and bytes.
-  pub(super) fn named(&self, store: &ContentStore, id: &ObjectId) -> Result<Named, StoreRefused> {
-    let (row, content) = self
-      .indexed(store, id)
-      .ok_or(StoreRefused::Missing { id: *id })?;
-    let bytes = store
-      .object_bytes(&content, row.len)
-      .ok_or(StoreRefused::Unreadable { id: *id })?;
-    Ok(Named {
-      id: *id,
-      position: row.position,
-      bytes,
-    })
   }
 
   /// Counts a kept fragment's entries by how each holds its object.
@@ -1887,28 +1906,38 @@ impl Repository {
     }
   }
 
-  /// Keeps a version's two encoded fragments as content and records them; a version whose
-  /// fragments were kept meanwhile keeps those. Refused, nothing is kept.
+  /// Records a version's two encoded fragments, each kept as content already under its root (A-718:
+  /// put a window a unit); a version whose fragments were kept meanwhile keeps those, the roots given
+  /// back. Refused, nothing is kept.
   pub(super) fn keep_version(
     &mut self,
     store: &mut ContentStore,
     (green, version): (u64, usize),
-    (objects, blobs): (fragment::Encoded, fragment::Encoded),
+    (objects, blobs): (
+      (fragment::Encoded, ContentId),
+      (fragment::Encoded, ContentId),
+    ),
   ) -> Result<(), StoreRefused> {
     if self.version_record(green, version)?.fragments.is_some() {
+      store.release(&objects.1)?;
+      store.release(&blobs.1)?;
       return Ok(());
     }
     let fragments = keep_both(store, objects, blobs)?;
     self.install(store, (green, version), fragments)
   }
 
-  /// Keeps a base pack's two encoded parts as content in place of the old ones, made from
-  /// `green`'s version `version` in `ns` of the owner's time. Refused, the old base pack stays.
+  /// Records a base pack's two encoded parts, each kept as content already under its root, in place
+  /// of the old ones, made from `green`'s version `version` in `ns` of the owner's time. Refused,
+  /// the old base pack stays.
   pub(super) fn keep_base(
     &mut self,
     store: &mut ContentStore,
     (green, version): (u64, usize),
-    (objects, blobs): (fragment::Encoded, fragment::Encoded),
+    (objects, blobs): (
+      (fragment::Encoded, ContentId),
+      (fragment::Encoded, ContentId),
+    ),
     ns: u64,
   ) -> Result<(), StoreRefused> {
     let parts = keep_both(store, objects, blobs)?;

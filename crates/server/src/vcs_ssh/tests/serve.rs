@@ -365,6 +365,10 @@ struct Peer {
   seen: usize,
   /// The server's channel number, once a session is open.
   channel: u32,
+  /// Whether a read that waited out the client's patience reads again rather than ends the session (A-745: a session
+  /// whose answer is long work waits for it while the daemon lives, as a git client over SSH waits, A-232's rule): the
+  /// server's own phase waits close a session that is stuck, so the connection's end still ends the wait.
+  patient: bool,
 }
 
 impl Peer {
@@ -382,6 +386,7 @@ impl Peer {
       )),
       seen: 0,
       channel: 0,
+      patient: false,
     };
     while peer.client.session_id.is_none() || peer.client.server_newkeys == 0 {
       if !peer.pump() {
@@ -398,13 +403,28 @@ impl Peer {
       return false;
     }
     let mut chunk = [0u8; 4096];
-    match self.stream.read(&mut chunk) {
-      Ok(0) | Err(_) => false,
-      Ok(count) => {
-        self.client.feed(&chunk[..count]);
-        true
+    loop {
+      match self.stream.read(&mut chunk) {
+        Err(error)
+          if self.patient
+            && matches!(
+              error.kind(),
+              std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) => {}
+        Ok(0) | Err(_) => return false,
+        Ok(count) => {
+          self.client.feed(&chunk[..count]);
+          return true;
+        }
       }
     }
+  }
+
+  /// [`Peer::connect`], its reads patient (the field's doc).
+  fn connect_patient(address: SocketAddrV4) -> Option<Peer> {
+    let mut peer = Peer::connect(address)?;
+    peer.patient = true;
+    Some(peer)
   }
 
   /// Sends `payload` as the client's next message.
@@ -665,11 +685,9 @@ fn a_held_key_runs_its_command_and_its_connection_teaches_the_edge() {
     (1, 1, 1, 1, 0)
   );
   assert!(samples[3] >= 1, "{samples:?}");
-  assert!(
-    seen.key_time_ns < RECOMMENDED_KEY_TIME_NS,
-    "{}",
-    seen.key_time_ns
-  );
+  // RFC 4253 §9: new keys after a gigabyte or an hour, never sooner for a lifetime an earlier session measured (A-745:
+  // a short session's tail rekeyed every long clone every few seconds).
+  assert_eq!(seen.key_time_ns, RECOMMENDED_KEY_TIME_NS);
 }
 
 /// Whether [`SAW_ITS_CLIENT_GO`] is marked within `for_ns`, looked at every [`TICK_NS`].
