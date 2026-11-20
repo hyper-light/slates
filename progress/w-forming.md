@@ -1,7 +1,7 @@
 # RESUME HERE (2026-11-19 ~22:00 local, relaunched on the Mac Studio; supersedes the checkpoint below)
 - Clone ~/slates-work/w-forming-repro (main); worktree ~/slates-work/w-forming-fix = agents/w-forming-repro
-  (cb97f4500 WIP aid) + local merge of origin/main a7051af96. NOT pushed: this machine has no GitHub credentials
-  (https push: "could not read Username"), so no push to the branch or to main is possible from here.
+  (cb97f4500 WIP aid) + local merge of origin/main a7051af96. Pushed over SSH (this Mac is adas-mac-studio-4; push url git@github.com; https has no credentials
+  ).
 - BLOCKED: disk here 7.4 GB free (others' use; guard 20 GB; nothing of mine to delete) -> no local build.
   kiln run r1 (build live_chaos + 12 runs of the fresh-member flow; needs macos/arm64 disk=60g; target
   ~/.cache/w-forming-target, logs ~/.cache/w-forming-runs/fm1 on whichever Mac takes it) is QUEUED, unplaced:
