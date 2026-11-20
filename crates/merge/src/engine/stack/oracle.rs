@@ -426,11 +426,19 @@ impl History {
         }
         Ok(true)
       }
-      Landed::Conflict { .. } if level == 0 => {
+      Landed::Conflict { .. } if level == 0 && between => {
+        // Every work between landed over the bottom in the replica, where the bottom landed first. The green, which
+        // landed them first, may still refuse it where one deletes the bytes between the bottom's insert and another's,
+        // which makes the two points one in the order the green was given (module docs): then the bottom lands over each
+        // of them alone, and only their composition refuses it.
         prop_assert!(
-          !between,
-          "the green refused the bottom where every work between landed over it"
+          stack.bottom_lands_over_each_alone(self)?,
+          "the green refused the bottom where every work between landed over it, and one alone refuses it"
         );
+        census.collapsed += 1;
+        Ok(false)
+      }
+      Landed::Conflict { .. } if level == 0 => {
         census.bottoms_refused += 1;
         Ok(false)
       }
@@ -501,6 +509,24 @@ impl Stack<'_> {
         prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
       }
       if !matches!(green.submit(work), Outcome::Accepted { .. }) {
+        return Ok(false);
+      }
+    }
+    Ok(true)
+  }
+
+  /// Whether the bottom lands over each work between alone, each landed first in a replica of the green before the
+  /// stack: the check that a refused bottom meets only the works between composed, two points made one by a delete
+  /// (module docs), never a change of one of them.
+  fn bottom_lands_over_each_alone(&self, history: &History) -> Result<bool, TestCaseError> {
+    let Some(bottom) = self.works.first() else {
+      return Ok(true);
+    };
+    for work in self.between {
+      let mut green = history.replica(self.prefix)?;
+      let outcome = green.submit(work);
+      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+      if !matches!(green.submit(bottom), Outcome::Accepted { .. }) {
         return Ok(false);
       }
     }
@@ -683,5 +709,52 @@ fn a_work_over_a_tree_lands_as_its_whole_file_model_does_over_every_history() {
   assert!(
     census.tree_applied > 0 && census.tree_refused > 0,
     "an answer never met: {census:?}"
+  );
+}
+
+/// A-659's oracle, a case it shrank to (2026-11-20, 3 of 30 runs at `PROPTEST_CASES=3000`): a bottom inserting before a
+/// byte one work between deletes, and another inserting after it. Do: land the case's two stacks. Expect the green to
+/// refuse the bottom (in the order it was given, B1's delete makes the two insertion points one: two inserts at one
+/// point, D-27, A-668), while the bottom lands over each work between alone, and the oracle to count it collapsed, not
+/// fail: in the replica the bottom lands first and no point becomes one (module docs). Until 2026-11-20 the oracle
+/// required the bottom to land, and failed on this shape about once in ten runs.
+#[test]
+fn a_bottom_refused_only_where_a_delete_between_makes_two_inserts_one_is_order_not_error() {
+  let steps = vec![
+    Step::Stack {
+      works: vec![Spec {
+        edits: vec![(0, vec![(0, 0, 0)])],
+        make: true,
+      }],
+      between: vec![],
+    },
+    Step::Stack {
+      works: vec![Spec {
+        edits: vec![(47, vec![(76, 225, 0)])],
+        make: true,
+      }],
+      between: vec![
+        Spec {
+          edits: vec![(221, vec![(26, 171, 21), (163, 4, 0)])],
+          make: true,
+        },
+        Spec {
+          edits: vec![(47, vec![(27, 155, 0)])],
+          make: true,
+        },
+      ],
+    },
+  ];
+  let mut census = Census::default();
+  let mut history = History::new();
+  for step in &steps {
+    if let Err(failure) = history.step(step, &mut census) {
+      panic!("{failure}");
+    }
+  }
+  assert_eq!(
+    (census.collapsed, census.between, census.depths[0]),
+    (1, 2, 1),
+    "the second bottom refused as order, after both works between landed"
   );
 }

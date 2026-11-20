@@ -387,10 +387,22 @@ pub(super) fn before<P: PresentView>(
     record,
     sealed,
     name,
-    mut hooks,
+    hooks,
     verdicts,
   } = hooking;
-  let received = push.decide(state, (&record, sealed, name), verdicts)?;
+  let mut decision = push.deciding((record, sealed, name), verdicts)?;
+  decision.then = Some(hooks);
+  push.decide_step(state, decision, out)
+}
+
+/// The push decided (`decide_step`'s last step): the report written but its last flush, then
+/// `post-receive`'s first step.
+pub(super) fn reported<P: PresentView>(
+  push: &mut ReceivePack<P>,
+  state: &mut ShardState,
+  (received, mut hooks): (Received, PushHooks),
+  out: &mut impl Out,
+) -> Result<Answering, PushFailed> {
   write_report_held(&received, out).map_err(PushFailed::Exchange)?;
   hooks.at = At::PostReceive;
   observe(push, state, Observing { received, hooks }, out)

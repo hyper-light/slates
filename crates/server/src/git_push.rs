@@ -109,8 +109,8 @@ use slates_git::objects::tag::Tag;
 use slates_git::out::Out;
 use slates_git::receive::works::{self, Entry, GreenRead, Unappended, Verdicts, Version};
 use slates_git::receive::{
-  self, Advertised, Checked, Command, Declined, HiddenRefs, Judge, Pushed, Received, Reported,
-  Repository as _, Request, Session, write_report,
+  self, Advertised, Checked, Command, Deciding, Declined, HiddenRefs, Judge, Pushed, Received,
+  Reported, Repository as _, Request, Session, write_report,
 };
 use slates_git::refname;
 use slates_git::store::Incoming;
@@ -264,6 +264,26 @@ enum Begun {
   /// The push sealed, its hooks before the verdicts due.
   #[cfg(unix)]
   Hooking(Box<hooks::Hooking>),
+  /// The push sealed, its commands decided a step at a time.
+  Deciding(Box<DecidingPush>),
+}
+
+/// A push's answer while its commands are decided a step at a time (A-719; `AnswerState::Deciding`):
+/// one command's verdict and append a step, so a push of a thousand refs never runs past its step.
+struct DecidingPush {
+  /// The repository's record as the answer read it.
+  record: RepositoryRecord,
+  /// The push's objects, sealed in quarantine.
+  sealed: SealedPush,
+  /// The push's name (module docs).
+  name: [u8; 32],
+  /// What the push's hooks before the verdicts decided of its commands.
+  verdicts: HookVerdicts,
+  /// The decision under way.
+  deciding: Deciding<Entry>,
+  /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
+  #[cfg(unix)]
+  then: Option<hooks::PushHooks>,
 }
 
 /// Where a push's answer stands between its steps.
@@ -279,6 +299,8 @@ enum AnswerState {
   /// Reported whole: the next step answers it.
   #[cfg(unix)]
   Reported(Box<Received>),
+  /// Its commands decided a step at a time.
+  Deciding(Box<DecidingPush>),
   /// Answered.
   Done,
 }
@@ -515,9 +537,8 @@ impl<P> ReceivePack<P> {
           let hooking = hooks::Hooking::new(record, (sealed, name), checked);
           return Ok(Begun::Hooking(Box::new(hooking)));
         }
-        let received = self.decide(state, (&record, sealed, name), HookVerdicts::default())?;
-        write_report(&received, out).map_err(PushFailed::Exchange)?;
-        Ok(Begun::Answering(Box::new(Answering::Answered(received))))
+        let deciding = self.deciding((record, sealed, name), HookVerdicts::default())?;
+        Ok(Begun::Deciding(Box::new(deciding)))
       }
     }
   }
@@ -538,37 +559,76 @@ impl<P> ReceivePack<P> {
     Ok(Answering::Answered(received))
   }
 
-  /// The verdicts and the appends of the sealed push (module docs, "Answering", items 3 to 6), each
-  /// command first answered as the hooks before the verdicts decided it (`verdicts`); the sealed
-  /// push given back after, holding only what no append committed: what was received. Nothing is
-  /// written: the caller writes the report.
-  fn decide(
+  /// The decision of the sealed push (module docs, "Answering", items 3 to 6), not yet begun, each
+  /// command to be first answered as the hooks before the verdicts decided it (`verdicts`): the
+  /// checked push taken from the session.
+  fn deciding(
+    &mut self,
+    (record, sealed, name): (RepositoryRecord, SealedPush, [u8; 32]),
+    verdicts: HookVerdicts,
+  ) -> Result<DecidingPush, PushFailed> {
+    let checked = self.session.take_checked().ok_or(PushFailed::Unchecked)?;
+    let deciding = Deciding::new(checked, &mut self.admission).map_err(PushFailed::Exchange)?;
+    Ok(DecidingPush {
+      record,
+      sealed,
+      name,
+      verdicts,
+      deciding,
+      #[cfg(unix)]
+      then: None,
+    })
+  }
+
+  /// One step of the decision (A-719): one command's verdict and append (under `atomic`, its
+  /// verdict, then the appends of all). Undecided, the decision is kept for the next step; decided,
+  /// the sealed push is given back, holding only what no append committed: what was received, and
+  /// the hooks `post-receive` is due from.
+  fn decision_turn(
     &mut self,
     state: &mut ShardState,
-    (record, mut sealed, name): (&RepositoryRecord, SealedPush, [u8; 32]),
-    mut verdicts: HookVerdicts,
-  ) -> Result<Received, PushFailed> {
-    let Self {
-      principal,
-      session,
-      admission,
-      ..
-    } = self;
-    let mut judge = ServerJudge {
-      state: &mut *state,
-      push: &mut sealed,
-      record,
-      principal,
-      name,
-      hooks: &mut verdicts,
+    mut decision: DecidingPush,
+  ) -> Result<Option<(Received, Then)>, PushFailed> {
+    let done = {
+      let DecidingPush {
+        record,
+        sealed,
+        name,
+        verdicts,
+        deciding,
+        ..
+      } = &mut decision;
+      let mut judge = ServerJudge {
+        state: &mut *state,
+        push: sealed,
+        record,
+        principal: &self.principal,
+        name: *name,
+        hooks: verdicts,
+      };
+      deciding
+        .step(None, &mut judge, &mut self.admission)
+        .map_err(PushFailed::Exchange)?
     };
-    let decided = session.decide_with(&mut judge, None, admission);
-    sealed.abandon(state);
-    decided
-      .map_err(PushFailed::Exchange)?
-      .ok_or(PushFailed::Unchecked)
+    if !done {
+      self.answer = AnswerState::Deciding(Box::new(decision));
+      return Ok(None);
+    }
+    decision.sealed.abandon(state);
+    #[cfg(unix)]
+    let then = decision.then;
+    #[cfg(not(unix))]
+    let then = ();
+    Ok(Some((decision.deciding.received(), then)))
   }
 }
+
+/// What follows a push's decision: `post-receive`'s hooks where one runs.
+#[cfg(unix)]
+type Then = Option<hooks::PushHooks>;
+/// What follows a push's decision: its report alone, where no hook runs.
+#[cfg(not(unix))]
+type Then = ();
 
 #[cfg(unix)]
 impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
@@ -603,12 +663,32 @@ impl<P: crate::git_hooks::PresentView> ReceivePack<P> {
         match self.begin(state, can_present, out)? {
           Begun::Answering(answering) => Ok(*answering),
           Begun::Hooking(hooking) => self.hooking(state, *hooking, out),
+          Begun::Deciding(decision) => self.decide_step(state, *decision, out),
         }
       }
       AnswerState::Hooking(hooking) => self.hooking(state, *hooking, out),
+      AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Observing(observing) => hooks::observe(self, state, *observing, out),
       AnswerState::Reported(received) => Ok(Answering::Answered(*received)),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the decision ([`Self::decision_turn`]): another step due, or git's report
+  /// written, held for `post-receive` where its hook is due.
+  fn decide_step(
+    &mut self,
+    state: &mut ShardState,
+    decision: DecidingPush,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.decision_turn(state, decision)? {
+      None => Ok(Answering::Turned),
+      Some((received, Some(hooks))) => hooks::reported(self, state, (received, hooks), out),
+      Some((received, None)) => {
+        write_report(&received, out).map_err(PushFailed::Exchange)?;
+        Ok(Answering::Answered(received))
+      }
     }
   }
 
@@ -662,11 +742,28 @@ impl<P> ReceivePack<P> {
         self.answer = AnswerState::Unbegun;
         Ok(Answering::Turned)
       }
-      AnswerState::Unbegun => {
-        let Begun::Answering(answering) = self.begin(state, false, out)?;
-        Ok(*answering)
-      }
+      AnswerState::Unbegun => match self.begin(state, false, out)? {
+        Begun::Answering(answering) => Ok(*answering),
+        Begun::Deciding(decision) => self.decide_step(state, *decision, out),
+      },
+      AnswerState::Deciding(decision) => self.decide_step(state, *decision, out),
       AnswerState::Done => Err(PushFailed::Unchecked),
+    }
+  }
+
+  /// One step of the decision ([`Self::decision_turn`]): another step due, or git's report written.
+  fn decide_step(
+    &mut self,
+    state: &mut ShardState,
+    decision: DecidingPush,
+    out: &mut impl Out,
+  ) -> Result<Answering, PushFailed> {
+    match self.decision_turn(state, decision)? {
+      None => Ok(Answering::Turned),
+      Some((received, ())) => {
+        write_report(&received, out).map_err(PushFailed::Exchange)?;
+        Ok(Answering::Answered(received))
+      }
     }
   }
 
