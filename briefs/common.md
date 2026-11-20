@@ -83,3 +83,7 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
   - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
     credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
     there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
+
+## NAMING A BRANCH WITHOUT CHECKOUT (main 2026-11-20 ~01:20 PST: two agents ran `git checkout -b` tonight)
+`git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
+worktree stays where it is) or push it directly: `git push origin HEAD:refs/heads/<name>`.

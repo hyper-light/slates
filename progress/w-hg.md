@@ -72,3 +72,8 @@
   (A-714 retention); cite w-git's §4.17.1 rule. Then (1)+(2) manifest/changelog deltas + SHGR v2. Numbers: claim by
   pushing amendments.tsv on agents/fanout-state (next free A-720 at last word). One-off import-room measurement was
   killed at 30 min (release build + 5.5 GB of manifest texts); not rerun.
+- A-720 claimed (ledger pushed). Part 1 (slates-hg push::intake, sliced engine) LANDED main (piece 56952183f). Local push:: 41/41.
+  Note: ran `git checkout -b agents/w-hg-a720` in ~/slates-work/w-hg-a712 by mistake (rule breach; no files changed).
+- NEXT part 2: server drives Intake in slices (with_state per slice, yield between, quantum = step_budget_ns), one
+  intake per repository at a time, prepare/classify/tree over IndexHeld(fork), land with the fork, record from fork.
+  Storage: point at w-perf's identity table when it lands (crates/merge slice 1); no second store meanwhile.

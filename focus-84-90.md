@@ -968,3 +968,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   w-perf: slice 1 (engine) NOW (before load test), then load test, then svn slices 2-3 (seam with w-svn's E160004).
   w-git/w-hg: land streaming + slicing now; switch storage to the table when slice 1 lands; no second store meanwhile.
 - w-interop: A-681 tests on the Studio's warm target (Mac disk 32 GiB free); `git checkout -b x` breach owned (no harm).
+- ~01:20 PST w-hg A-720 p1 landed (56952183f): slates-hg push::intake, a changegroup into an index fork one revision
+  per step (rebuild vs stored base, node check, kept once); working set one revision's texts. RULING for p2: intakes
+  run concurrently even per repository (a fork per push); only the landing verdict is ordered per repository.
+  common.md: name branches with `git branch`/push HEAD:refs/heads/<name>, never checkout -b (two breaches tonight).
