@@ -66,6 +66,7 @@ DatabaseRefusal 8 PolicyRuleMalformed
 DatabaseRefusal 9 PolicyHookMalformed
 DatabaseRefusal 10 Moved
 DatabaseRefusal 11 PolicyHooksEnvMalformed
+DatabaseRefusal 12 SnapshotRoom
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed

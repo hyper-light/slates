@@ -12,8 +12,16 @@
 //! one a unit, lent the room each brings, until the shard's step budget is spent (§4.3's quantum, at least one file),
 //! settles the charge, and yields; the last builds the map and trees of what was put and keeps them as the green's head
 //! (`Plan::Put`, as a recovery's sliced remake does). The files are read from the green at each slice by their paths,
-//! so nothing borrowed outlives a step. A push to the green before the build ends restarts it at the new head: the
-//! builds keep the head's map alone.
+//! so nothing borrowed outlives a step.
+//!
+//! **A push meanwhile** (main's ruling of 2026-11-20: tens of thousands of concurrent pushes, so a busy green's build
+//! must finish). A push to the green while its build runs leaves the build alone; at its next slice's boundary the build
+//! moves to the green's newest head once ([`moved`]): each path the change index names since its version loses what
+//! was put of it and is put again from the head, and everything else put stays. So a storm of pushes adds its changed
+//! paths to the build, never its whole head again, and the build ends. Only a change holding a copy, which the index
+//! names at its destination alone, starts the build again from nothing ([`RESTARTED`]). A commit a submit owed of the
+//! version the build began at is then not made over the newer map (`super::super::commits::make_owed` checks its
+//! version) and is settled by the push's own move, counted unmade.
 //!
 //! **The submits that need it wait, parked.** A submit to a green whose build is under way would build the map whole
 //! in its own step, the cost this module moves off the shard's steps: so it is parked ([`park`]), its verb's inputs and
@@ -49,6 +57,12 @@ use crate::verbs::ParkedSubmit;
 pub(crate) const BEGUN: &str = "vcs_store.paths.whole_build.begun";
 /// Counter: a whole build's slices. Format: a counter name in the daemon's status report.
 pub(crate) const SLICES: &str = "vcs_store.paths.whole_build.slices";
+/// Counter: a build moved to its green's newest head at a slice's boundary, a push having landed meanwhile. Format: a
+/// counter name in the daemon's status report.
+pub(crate) const MOVED: &str = "vcs_store.paths.whole_build.moved";
+/// Counter: a build started again from nothing, the change since it began holding a copy: zero under any storm of
+/// pushes that copy nothing. Format: a counter name in the daemon's status report.
+pub(crate) const RESTARTED: &str = "vcs_store.paths.whole_build.restarted";
 /// Counter: a submit parked behind a whole build. Format: a counter name in the daemon's status report.
 pub(crate) const PARKED: &str = "vcs_store.paths.whole_build.parked";
 /// Counter: a submit refused at the parked bound. Format: a counter name in the daemon's status report.
@@ -215,13 +229,17 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
   match head {
     Some(head) if head == build.version => {}
     Some(head) => {
-      // A push moved the green meanwhile: the build starts again at its head, the parked submits carried over.
-      state.vcs_stores.whole_builds.0.insert(green, build);
-      let repository = build_repository(state, green);
-      if let Some(repository) = repository {
-        start(state, repository, green, head);
+      // Pushes moved the green meanwhile: the build moves to its newest head here, at a slice's boundary, carrying what
+      // the change since left standing (module docs, "A push meanwhile").
+      if !moved(state, green, &mut build, head) {
+        state.vcs_stores.whole_builds.0.insert(green, build);
+        let repository = build_repository(state, green);
+        if let Some(repository) = repository {
+          state.count(RESTARTED, 1);
+          start(state, repository, green, head);
+        }
+        return false;
       }
-      return false;
     }
     None => {
       let parked = retire(state, build);
@@ -245,6 +263,29 @@ fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
       false
     }
   }
+}
+
+/// Moves `build` from its version to the green's `head` (module docs, "A push meanwhile"): each path the change index
+/// names between them loses what was put of it and is put again from the head, where git holds a file there; what the
+/// change left alone stays put. False where the change holds a copy, which the index names at its destination alone, so
+/// what it brought cannot be told from the change: the caller starts the build again (counted, [`RESTARTED`]).
+fn moved(state: &mut ShardState, green: DbVolumeId, build: &mut Build, head: u64) -> bool {
+  let Some(engine) = state.greens.get(&green) else {
+    return false;
+  };
+  let Some(changed) = super::named(&engine, build.version, head) else {
+    return false;
+  };
+  for path in changed {
+    build.entries.remove(map_path(&path));
+    if !map_path(&path).is_empty() && super::git_file(&engine, &path).is_some() {
+      build.paths.push(path);
+    }
+  }
+  build.version = head;
+  drop(engine);
+  state.count(MOVED, 1);
+  true
 }
 
 /// The repository of the build kept for `green`.
@@ -410,5 +451,15 @@ pub(crate) fn settle(state: &mut ShardState) {
   let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
   for green in greens {
     while slice(state, green, 0) {}
+  }
+}
+
+/// One slice of each build of the shard, given no budget (one file): what a test interleaving pushes with a build runs
+/// between two pushes.
+#[cfg(test)]
+pub(crate) fn step_once(state: &mut ShardState) {
+  let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
+  for green in greens {
+    slice(state, green, 0);
   }
 }

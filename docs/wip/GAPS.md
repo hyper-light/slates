@@ -60,7 +60,8 @@
 > holding the blobs its version's chain entry holds already, once, by reference; the maps' live whole builds (a
 > push's BUILT 2026-11-20, `paths::whole_build`: sliced by a task under the step budget, submits to the green parked
 > until it ends; a green's first submit's and one past a copy BUILT 2026-11-20 too, its commit owed durably,
-> `vcs_store::owed`, made at its build's end from what the submit staged) and a whole
+> `vcs_store::owed`, made at its build's end from what the submit staged; a push mid-build moves the build to the newest
+> head at a slice's boundary, never restarting it, BUILT 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
 > map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
@@ -100,14 +101,16 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
-> Designed, owed: the snapshot slot sized by its data (8) and a giant repository's index cut across partitions by
-> object id (9).
+> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). Owed: the slot
+> derived and re-laid at a handoff (8b), the snapshot naming sealed index tables (8c), a giant repository's index cut
+> across partitions by object id (9).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
 > Owed: compression of cold content.
 > Piece 5b's placement policy for A-722's intake off the owner (`vcs_share::place::intake_shard`, two choices by
 > intakes decoding) built, waiting for w-git's A-722 to call it.
+> Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -1545,6 +1548,12 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
+> `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
+> (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
+> byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
+> but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
+> after 53 MB: 28 of 29, owed to w-svn.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the

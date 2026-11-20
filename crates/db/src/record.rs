@@ -61,6 +61,11 @@ pub struct Encoded {
 }
 
 impl Encoded {
+  /// The body's bytes: what the record adds to the log, less its frame (A-724 piece 8's projection of the snapshot).
+  pub fn body_len(&self) -> usize {
+    self.body.len()
+  }
+
   /// Decodes the body as a replay of its record will: the work a replay repeats for the record beside its checksum, its
   /// copy and its apply (A-420). A body that does not decode is refused `Corrupt` before anything is written, since a
   /// replay would cut the record there as torn, and every record after it with it.
