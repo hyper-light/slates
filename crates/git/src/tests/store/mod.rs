@@ -44,7 +44,16 @@ impl Clock for Ticks {
 }
 
 /// Shape: the tests' exchange, a byte saved worth a nanosecond.
-const EXCHANGE: Exchange = Exchange { ns: 1, bytes: 1 };
+/// Shape: the tests' exchange, a nanosecond a byte, and fixed rates (A-718: the encoder's time is the measured rates',
+/// never a clock's), each level a nanosecond a KiB dearer than the one before.
+const EXCHANGE: Exchange = Exchange {
+  ns: 1,
+  bytes: 1,
+  rates: crate::store::learn::Rates {
+    deflate_ns_per_kib: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    search_ns_per_kib: 1,
+  },
+};
 
 /// git's own t0013 vector, `shattered-1.pdf`, cut to the 320 bytes that hold both colliding blocks (A-600's fixture).
 const SHATTERED_1: &[u8] = include_bytes!("../../../fixtures/objects/shattered-1.prefix.bin");
