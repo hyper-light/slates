@@ -405,3 +405,4 @@ NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x6
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
 NatVis script unloaded from 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'
+==== round 2 at 06:50:51
