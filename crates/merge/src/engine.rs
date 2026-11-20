@@ -5840,11 +5840,17 @@ pub use reanchor::{ReanchorRefused, Reanchored};
 mod position;
 pub use position::PositionRefused;
 
+// A computed verdict's wire form (A-658 part 3a): what a green's holder sends its owner, read back against the increment
+// it judged (`Computed::encode`, `Green::computed_from`).
+mod computed_wire;
+
 mod stack;
 pub use stack::{Landed, RestateRefused, Restated, TreeBase, TreeNode, Upper};
 
 #[cfg(test)]
 mod compute_tests;
+#[cfg(test)]
+mod computed_wire_tests;
 #[cfg(test)]
 mod judge_tests;
 #[cfg(test)]

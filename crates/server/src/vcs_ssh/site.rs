@@ -14,7 +14,13 @@
 //!    it, without one leading slash, and of the command's tool; none is refused as the tool refuses a missing repository
 //!    (git: `fatal: '<path>' does not appear to be a git repository`, its `die`'s 128 [C: git `builtin/upload-pack.c`,
 //!    `usage.c` at `e1ec09b2`]; Mercurial: `abort: repository <path> not found`, 255 [C: Mercurial 7.2 `localrepo.py`,
-//!    `scmutil.py`'s `callcatch`, `dispatch.py`'s `sys.exit(status & 255)`]). No second spelling is tried.
+//!    `scmutil.py`'s `callcatch`, `dispatch.py`'s `sys.exit(status & 255)`]). No second spelling is tried. Before it,
+//!    a Mercurial path that starts `--` is refused as 7.2's dispatch refuses it before opening anything, naming the
+//!    arguments as `stringutil.pprint` writes them, each in single quotes with its bytes as Python's
+//!    `codecs.escape_encode` writes them: `abort: potentially unsafe serve --stdio invocation: ['-R', '<path>',
+//!    'serve', '--stdio']`, `'--hidden'` last when asked, 255; a path that starts with one `-` goes on to the
+//!    repository's lookup, as in 7.2 [C: 7.2 `dispatch.py` `_runcatchfunc`; recorded from stock 7.2 on 2026-11-19
+//!    (A-679): `--`, `--x`, quotes, tab, line ends, a backslash, DEL, a control byte and bytes past ASCII].
 //! 2. The policy: a principal the repository's policy lets reach it for none of the command's rights is refused
 //!    (`crate::vcs_policy::reaches`, A-597). upload-pack asks to read; receive-pack to submit, rewrite or delete;
 //!    Mercurial's `serve --stdio`, which pulls and pushes in one session, any of the four, each command then judged by
@@ -22,13 +28,15 @@
 //! 3. The service ([`Services`]): one the server cannot start is refused as not served ([`Unserved`]), as the HTTP edge
 //!    answers `503`. git's upload-pack runs (`super::git`, A-651 part 2) when the store lender holds the repository's
 //!    store (A-625 part 3's [`StoreLender`]) at protocol v2 (`super::git`'s protocols): the daemon's lender lends each
-//!    store from A-662's map on its owner shard (`crate::vcs_store::upload::ShardStores`, A-682), which the daemon hands
-//!    this site once it starts the SSH edge. Mercurial's `serve --stdio` (`slates_hg::serve::stdio::Stdio`, A-650 part
-//!    2) waits likewise for a lender of its store. git's receive-pack runs A-654 part 2's driver over the repository's
-//!    store on its owner shard, the shard's own (A-662), so it needs no store lender: each of its steps is lent the
-//!    shard's state, as the HTTP site's are (A-654 part 3's [`ShardLender`]; `super::receive`, A-683). Subversion's
-//!    tunnel (A-656) waits for its entry point. Each becomes a [`Command`] behind [`Services`] as it can run, and the
-//!    not-served answer goes with the last of them.
+//!    store from A-662's map on its owner shard (`crate::vcs_store::upload::ShardStores`, A-682). Mercurial's `serve
+//!    --stdio` runs (`super::hg`, A-679: `slates_hg::serve::stdio::Stdio`, A-650 part 2) when the lender the HTTP site
+//!    reads Mercurial's stores from holds the repository's ([`HgStores`]): the daemon's lends each repository's served
+//!    view from its store on its owner shard (`crate::vcs_store::hg_view::ServedViews`, A-680 part 2a). The daemon
+//!    hands this site both lenders once it starts the SSH edge (A-684). git's receive-pack runs A-654 part 2's driver
+//!    over the repository's store on its owner shard, the shard's own (A-662), so it needs no store lender: each of its
+//!    steps is lent the shard's state, as the HTTP site's are (A-654 part 3's [`ShardLender`]; `super::receive`,
+//!    A-683). Subversion's tunnel (A-656) waits for its entry point. Each becomes a [`Command`] behind [`Services`] as
+//!    it can run, and the not-served answer goes with the last of them.
 //!
 //! Subversion's `svnserve -t` names no repository: its client names one in the greeting's URL (`svn_ra_svn` protocol), so
 //! its repository and policy are the tunnel session's to decide, and the edge only starts it (svnserve's own refusals
@@ -40,8 +48,10 @@ use slates_ssh::userauth::{Holding, KeyHolders, UserKey};
 use slates_vfs::clock::Clock;
 
 use super::git::UploadCommand;
+use super::hg::HgCommand;
 use super::receive::ReceiveCommand;
 use crate::vcs_http::git::{Located, Repositories, ShardLender, StoreLender};
+use crate::vcs_http::hg::HgStores;
 use crate::vcs_policy::{self, Right};
 
 /// Format: the refusal count of a key no credential in the record has the id of (A-651 part 3).
@@ -69,6 +79,9 @@ pub(crate) const GIT_DIE_STATUS: u32 = 128;
 pub(crate) const HG_ABORT_STATUS: u32 = 255;
 /// Format: svnserve's failure, `EXIT_FAILURE` (`svnserve.c` at `d434dc14`; C's `stdlib.h`).
 pub(crate) const SVNSERVE_FAILURE_STATUS: u32 = 1;
+/// Format: how a Mercurial repository argument begins that 7.2's dispatch refuses in a `serve --stdio`
+/// (`dispatch.py` `_runcatchfunc`: it prohibits "any repo name that starts with '--'").
+const HG_UNSAFE_START: &[u8] = b"--";
 
 /// A refused or failed command: what its client reads on standard error, and its exit status.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -289,45 +302,55 @@ pub(crate) trait Services {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NotYet;
 
-/// The services the server runs today: git's upload-pack from the stores `lender` lends, each request admitted `room`
-/// bytes (`super::git`, A-651 part 2), and git's receive-pack through A-654 part 2's driver on the repository's owner
-/// shard, whose state `shard` lends a step at a time as it lends the HTTP site's (`super::receive`, A-683), each push
-/// admitted `room` bytes; Mercurial's `serve --stdio` and Subversion's tunnel not yet, as their stores (A-662) and entry
-/// point (A-656) have not landed. A repository whose store the lender does not hold is not served upload-pack.
+/// The services the server runs today: git's upload-pack from the stores `lender` lends (`super::git`, A-651 part 2),
+/// Mercurial's `serve --stdio` from the stores `hg` lends (`super::hg`, A-679), and git's receive-pack through A-654
+/// part 2's driver on the repository's owner shard, whose state `shard` lends a step at a time as it lends the HTTP
+/// site's (`super::receive`, A-683), each request and each push admitted `room` bytes; Subversion's tunnel not yet, as
+/// its entry point (A-656) has not landed. A repository whose store its tool's lender does not hold is not served
+/// upload-pack or `serve --stdio`.
 #[derive(Clone, Debug)]
-pub(crate) struct ToolServices<L, S> {
-  /// Where the stores are lent, for upload-pack.
+pub(crate) struct ToolServices<L, H, S> {
+  /// Where git's stores are lent.
   lender: L,
+  /// Where Mercurial's stores are lent: the lender the HTTP site reads them from.
+  hg: H,
   /// Where the shard's state is lent, for receive-pack (in the daemon the HTTP site's `ThisShard`).
   shard: S,
   /// The bytes each request, and each push, may hold: the edge's room.
   room: u64,
 }
 
-impl<L, S> ToolServices<L, S> {
-  /// The services over `lender`'s stores and the state `shard` lends, each request admitted `room` bytes.
-  pub(crate) fn new(lender: L, shard: S, room: u64) -> Self {
+impl<L, H, S> ToolServices<L, H, S> {
+  /// The services over `lender`'s git stores, `hg`'s Mercurial stores and the state `shard` lends, each request
+  /// admitted `room` bytes.
+  pub(crate) fn new(lender: L, hg: H, shard: S, room: u64) -> Self {
     Self {
       lender,
+      hg,
       shard,
       room,
     }
   }
 }
 
-impl<L: StoreLender + Clone, S: ShardLender + Clone> Services for ToolServices<L, S> {
-  type Command = ToolCommand<L, S>;
+impl<L, H, S> Services for ToolServices<L, H, S>
+where
+  L: StoreLender + Clone,
+  H: HgStores + Clone,
+  S: ShardLender + Clone,
+{
+  type Command = ToolCommand<L, H, S>;
 
-  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, S>, Unserved> {
+  fn start(&mut self, start: &Start<'_>) -> Result<ToolCommand<L, H, S>, Unserved> {
     let version = slates_git::http::version(start.git_protocol);
     match (start.service, start.repository) {
       (Service::GitUploadPack, Some(repository)) if self.lender.holds(repository.id) => {
-        Ok(ToolCommand::Upload(Box::new(UploadCommand::new(
+        Ok(ToolCommand::Upload(UploadCommand::new(
           self.lender.clone(),
           (repository.id, start.principal.clone()),
           version,
           self.room,
-        ))))
+        )))
       }
       (Service::GitReceivePack, Some(repository)) => {
         Ok(ToolCommand::Receive(Box::new(ReceiveCommand::new(
@@ -338,25 +361,36 @@ impl<L: StoreLender + Clone, S: ShardLender + Clone> Services for ToolServices<L
           self.room,
         ))))
       }
+      (Service::Mercurial { hidden }, Some(repository)) if self.hg.holds(repository.id) => {
+        Ok(ToolCommand::Mercurial(HgCommand::new(
+          self.hg.clone(),
+          repository.id,
+          self.room,
+          hidden.then_some(start.principal),
+        )))
+      }
       _ => Err(Unserved),
     }
   }
 }
 
-/// A command [`ToolServices`] runs: git's upload-pack or its receive-pack, each boxed, so the command a connection holds
-/// is a pointer whichever it is.
-pub(crate) enum ToolCommand<L: StoreLender, S> {
-  /// git's upload-pack (`super::git`).
-  Upload(Box<UploadCommand<L>>),
-  /// git's receive-pack (`super::receive`).
+/// A command [`ToolServices`] started: one of the tools' sessions, receive-pack's boxed, so its push's session (A-620's)
+/// does not set the size every connection's command takes (clippy's `large_enum_variant` is denied).
+pub(crate) enum ToolCommand<L: StoreLender, H, S> {
+  /// git's upload-pack.
+  Upload(UploadCommand<L>),
+  /// git's receive-pack.
   Receive(Box<ReceiveCommand<S>>),
+  /// Mercurial's `serve --stdio`.
+  Mercurial(HgCommand<H>),
 }
 
-impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
+impl<L: StoreLender, H: HgStores, S: ShardLender> Command for ToolCommand<L, H, S> {
   fn input(&mut self, run: &[u8]) -> Result<(), Refused> {
     match self {
       ToolCommand::Upload(command) => command.input(run),
       ToolCommand::Receive(command) => command.input(run),
+      ToolCommand::Mercurial(command) => command.input(run),
     }
   }
 
@@ -364,6 +398,7 @@ impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
     match self {
       ToolCommand::Upload(command) => command.input_end(),
       ToolCommand::Receive(command) => command.input_end(),
+      ToolCommand::Mercurial(command) => command.input_end(),
     }
   }
 
@@ -371,6 +406,7 @@ impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
     match self {
       ToolCommand::Upload(command) => command.step().await,
       ToolCommand::Receive(command) => command.step().await,
+      ToolCommand::Mercurial(command) => command.step().await,
     }
   }
 
@@ -378,6 +414,7 @@ impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
     match self {
       ToolCommand::Upload(command) => command.output(),
       ToolCommand::Receive(command) => command.output(),
+      ToolCommand::Mercurial(command) => command.output(),
     }
   }
 
@@ -385,6 +422,7 @@ impl<L: StoreLender, S: ShardLender> Command for ToolCommand<L, S> {
     match self {
       ToolCommand::Upload(command) => command.sent(stderr, stdout),
       ToolCommand::Receive(command) => command.sent(stderr, stdout),
+      ToolCommand::Mercurial(command) => command.sent(stderr, stdout),
     }
   }
 }
@@ -504,6 +542,56 @@ fn repository_name(path: &[u8]) -> Option<&str> {
   Some(name.strip_prefix('/').unwrap_or(name))
 }
 
+/// The words a service the server cannot start ends with, in its tool's words (the module doc, step 3); a session whose
+/// store goes away mid-way ends in them too.
+pub(crate) fn not_served(service: Service) -> Refused {
+  Tool::of(service).refused(&format!("{} is not served yet", service.name()))
+}
+
+/// `bytes` as Python's `codecs.escape_encode` writes them, which 7.2's `stringutil.pprint` quotes (the module doc, step
+/// 1): a quote and a backslash each after a backslash; tab, line feed and carriage return as `\t`, `\n` and `\r`; any
+/// other byte below a space, and every byte from DEL up, as `\x` and two lowercase hexadecimal digits; the rest as
+/// themselves.
+fn python_escaped(bytes: &[u8]) -> String {
+  let mut text = String::with_capacity(bytes.len());
+  for &byte in bytes {
+    match byte {
+      b'\'' | b'\\' => {
+        text.push('\\');
+        text.push(char::from(byte));
+      }
+      b'\t' => text.push_str("\\t"),
+      b'\n' => text.push_str("\\n"),
+      b'\r' => text.push_str("\\r"),
+      b' '..=b'~' => text.push(char::from(byte)),
+      _ => text.push_str(&format!("\\x{byte:02x}")),
+    }
+  }
+  text
+}
+
+/// 7.2's refusal of a `serve --stdio` whose repository argument `path` starts `--`, before anything is opened (the
+/// module doc, step 1): the arguments it was run with listed as `stringutil.pprint` lists them, `'--hidden'` last when
+/// asked. None for any other command.
+fn unsafe_invocation(service: Service, path: &[u8]) -> Option<Refused> {
+  let Service::Mercurial { hidden } = service else {
+    return None;
+  };
+  if !path.starts_with(HG_UNSAFE_START) {
+    return None;
+  }
+  let ran: [&[u8]; 4] = [b"-R", path, b"serve", b"--stdio"];
+  let listed: Vec<String> = ran
+    .into_iter()
+    .chain(hidden.then_some(b"--hidden".as_slice()))
+    .map(|argument| format!("'{}'", python_escaped(argument)))
+    .collect();
+  Some(Tool::Mercurial.refused(&format!(
+    "potentially unsafe serve --stdio invocation: [{}]",
+    listed.join(", ")
+  )))
+}
+
 /// The production site: whose keys prove whom, where repositories are, and the services (the module doc).
 pub(crate) struct ToolSite<K, R, S> {
   /// The keys' lookup.
@@ -601,6 +689,9 @@ where
     git_protocol: Option<&[u8]>,
   ) -> Dispatched<S::Command> {
     let (service, path) = asked(command);
+    if let Some(refused) = path.and_then(|path| unsafe_invocation(service, path)) {
+      return Dispatched::Refuse(refused);
+    }
     let repository = match path.map(|path| self.reachable(service, path, principal)) {
       Some(Ok(repository)) => Some(repository),
       Some(Err(refused)) => return Dispatched::Refuse(refused),
@@ -614,9 +705,7 @@ where
     };
     match self.services.start(&start) {
       Ok(command) => Dispatched::Run(command),
-      Err(Unserved) => Dispatched::Refuse(
-        Tool::of(service).refused(&format!("{} is not served yet", service.name())),
-      ),
+      Err(Unserved) => Dispatched::Refuse(not_served(service)),
     }
   }
 }

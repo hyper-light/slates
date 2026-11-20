@@ -1453,7 +1453,26 @@ impl VolumeId {
   pub fn partition(&self) -> u16 {
     id_partition(&self.bytes)
   }
+
+  /// The counter the id was minted at (bytes 10-15, big-endian): the partition's minting counter when the volume was
+  /// made (A-694; `Db::volume_counter_at`).
+  pub fn counter(&self) -> u64 {
+    let mut counter = [0u8; size_of::<u64>()];
+    if let (Some(low), Some(minted)) = (
+      counter.get_mut(ID_COUNTER_PAD..),
+      self.bytes.get(ID_COUNTER_BYTES),
+    ) {
+      low.copy_from_slice(minted);
+    }
+    u64::from_be_bytes(counter)
+  }
 }
+
+/// Format: where a volume id's counter lies: its last six bytes, after the host's eight and the partition's two.
+const ID_COUNTER_BYTES: std::ops::Range<usize> = 10..16;
+
+/// Format: the bytes of a `u64` the counter's six leave above them: two.
+const ID_COUNTER_PAD: usize = size_of::<u64>() - (ID_COUNTER_BYTES.end - ID_COUNTER_BYTES.start);
 
 /// A repository (§4.17.1 "The repository and its greens"; A-515): a name a tool's clients reach, its tool and object
 /// format, its default branch, and its owner. Its namespace, each branch name bound to the green whose versions are the
@@ -2157,4 +2176,67 @@ pub struct RegisterRecord {
   pub locks: Vec<LockRecord>,
   /// Each entry's objects (`RepositoryEntry::objects`, A-662), in the order the register received them.
   pub objects: Vec<Vec<u8>>,
+}
+
+/// One change a state log's record carries (A-636 part 2b), in the order its operation made it: each took one position
+/// of its log, so a holder or a successor that applies a record's changes in order to the log at the record's `from`
+/// leaves it at the record's `to` (`crate::repository::Repositories` applies them by these rules).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum LoggedChange {
+  /// A green joined the repository's lineage (the names log).
+  Joined {
+    /// The member.
+    member: MemberRecord,
+  },
+  /// The namespace changed (the names log): a name bound or retired, or the default moved.
+  Named {
+    /// The change.
+    change: NameChange,
+  },
+  /// A green left the namespace and the lineage, destroyed (the names log): the name that bound it goes, and so does
+  /// its membership.
+  Left {
+    /// The green.
+    green: VolumeId,
+  },
+  /// The repository's own state changed (the phases, markers or locks log).
+  Changed {
+    /// The change.
+    change: StateChange,
+  },
+}
+
+/// One record of one of a repository's state logs as the fleet holds it (§4.17.1 shared piece 2, the fleet half; A-636
+/// part 2b): what one operation moved of the log, from the position it found the log at to the one it left it at, with
+/// that operation's changes of the log in order. Its log's register holds it at position `to` (`LogName::register`),
+/// one register a log, so each log ships to its holders on its own. An operation that moves several logs makes one
+/// record on each, all carrying the operation's identity and every span it moved, its greens' included, so a takeover
+/// can keep or drop the operation whole (A-642: a cut holds all of a record or none of it; A-636 part 1's rule).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct StateLogRecord {
+  /// The repository.
+  pub repository: RepositoryId,
+  /// The log.
+  pub log: StateLog,
+  /// The position the operation found the log at: its predecessor, the record before it ending there.
+  pub from: u64,
+  /// The position it left the log at: where the log's register holds it.
+  pub to: u64,
+  /// The operation's identity: BLAKE3 over its spans and its own encoding, so two operations that moved the same
+  /// positions alike are told apart by what they did, and every record of one operation names it alike.
+  pub identity: [u8; 32],
+  /// Every span the operation moved, in log order: each log's, this one's and its greens' included.
+  pub spans: Vec<LogSpan>,
+  /// The operation's changes of this log, in order: `to - from` of them.
+  pub changes: Vec<LoggedChange>,
+}
+
+impl StateLogRecord {
+  /// The log this record is of.
+  pub fn log_name(&self) -> LogName {
+    LogName::State {
+      repository: self.repository,
+      log: self.log,
+    }
+  }
 }

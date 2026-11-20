@@ -19,6 +19,7 @@ use slates_ipc::protocol::{
 };
 
 use super::super::Target;
+use super::super::hg_view::ServedViews;
 use super::super::tests::{
   Brought, FIRST_DATE, appended, begun, commit_of, owner, push_through, repository, tree_of,
 };
@@ -383,13 +384,13 @@ async fn run_command(command: &mut impl Command) -> Result<(Vec<u8>, Next), Stri
 }
 
 /// One SSH session of git's upload-pack over `record`'s repository, as the SSH site's services start it over the
-/// daemon's lender for its owner at protocol v2: its advertisement, then each of `requests`' answers, each with what the
-/// command waits for after it; none when the services would not start it.
+/// daemon's lenders (git's, and Mercurial's beside it, A-679) for its owner at protocol v2: its advertisement, then each
+/// of `requests`' answers, each with what the command waits for after it; none when the services would not start it.
 async fn ssh_session(
   record: &RepositoryRecord,
   requests: &[Vec<u8>],
 ) -> Result<Vec<(Vec<u8>, Next)>, String> {
-  let mut services = ToolServices::new(ShardStores, ThisShard, ROOM);
+  let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, ROOM);
   let start = Start {
     service: Service::GitUploadPack,
     repository: Some(record),

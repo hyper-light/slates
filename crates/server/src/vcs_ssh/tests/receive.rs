@@ -23,11 +23,12 @@ use crate::git_push::ReceivePack;
 use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, text};
 use crate::state::ShardState;
 use crate::vcs_http::Bounds;
-use crate::vcs_http::daemon_edge::ShardRepositories;
+use crate::vcs_http::ShardRepositories;
 use crate::vcs_http::git::{ShardLender, ThisShard};
 use crate::vcs_ssh::receive::ReceiveCommand;
 use crate::vcs_ssh::site::{Command, GIT_DIE_STATUS, Refused, ToolServices, ToolSite};
 use crate::vcs_ssh::{EdgeState, serve};
+use crate::vcs_store::hg_view::ServedViews;
 use crate::vcs_store::upload::ShardStores;
 
 /// Shape: the room each push is admitted: far past the fixture's bytes and what reading it builds (the driver's tests'
@@ -69,14 +70,18 @@ impl KeyHolders for OwnerKeys {
 
 /// The edge's production site: the owner's key, repositories found on the shard's own partition as the HTTP edge finds
 /// them, and the services the daemon's sites run: upload-pack lent each store from A-662's map ([`ShardStores`], A-682),
-/// and each push lent the state of the shard the connection runs on ([`ThisShard`]) and admitted [`ROOM`].
-fn site() -> ToolSite<OwnerKeys, ShardRepositories, ToolServices<ShardStores, ThisShard>> {
+/// `serve --stdio` each served view ([`ServedViews`], A-680 part 2a), and each push lent the state of the shard the
+/// connection runs on ([`ThisShard`]) and admitted [`ROOM`].
+fn site() -> ToolSite<OwnerKeys, ShardRepositories, DaemonServices> {
   ToolSite::new(
     OwnerKeys,
     ShardRepositories,
-    ToolServices::new(ShardStores, ThisShard, ROOM),
+    ToolServices::new(ShardStores, ServedViews, ThisShard, ROOM),
   )
 }
+
+/// The daemon's services ([`site`]).
+type DaemonServices = ToolServices<ShardStores, ServedViews, ThisShard>;
 
 /// Makes git repository [`NAME`] on the shard and serves the edge there with [`site`], its listener on a loopback port:
 /// the repository, the listener's address, and the advertisement the driver makes the owner now (git's refs in the

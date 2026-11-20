@@ -13475,11 +13475,12 @@ fn attach_hold_keeps_a_cli_attachment_alive_until_its_process_ends() {
 const VCS_HTTP_CLEARTEXT_LINE: &str =
   "slates daemon: the version-control HTTP edge serves cleartext on 127.0.0.1:";
 
-/// A-625 part 3 (§4.17.2 "Transports" item 1). Do: start an anchor whose daemon is asked for the version-control HTTP
-/// edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon names; ask that
-/// port for a repository's refs with no credentials. Expect: the daemon names the edge's port before it says it serves,
-/// and the edge answers `401` with a Bearer challenge and no Basic one (Basic's password is taken over TLS alone): the
-/// flag went from the anchor to its daemon, which started the shared edge.
+/// A-625 part 3 (§4.17.2 "Transports" item 1), A-629 part 2c. Do: start an anchor whose daemon is asked for the
+/// version-control HTTP edge on loopback, on a port the system picks (`--vcs-http 127.0.0.1:0`); read the port the daemon
+/// names; ask that port for a repository's refs with no credentials, then for its Git LFS locks. Expect: the daemon names
+/// the edge's port before it says it serves, and the edge answers each `401` with a Bearer challenge and no Basic one
+/// (Basic's password is taken over TLS alone), the LFS request's in `LFS-Authenticate` too: the flag went from the anchor
+/// to its daemon, which started the shared edge, and git's site routes Git LFS through its authentication.
 #[test]
 fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   use std::io::{BufRead, Write};
@@ -13525,10 +13526,20 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
-  let head = bare_request(port, WAIT_FOR).expect("the edge answered");
-  assert!(head.starts_with("http/1.1 401 "), "{head}");
-  assert!(head.contains("www-authenticate: bearer realm="), "{head}");
-  assert!(!head.contains("basic"), "{head}");
+  let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
+  assert!(bearer_alone(&refs, "www-authenticate"), "{refs}");
+  let locks = answer_head(port, LFS_LOCKS_REQUEST, WAIT_FOR).expect("the edge answered LFS");
+  assert!(bearer_alone(&locks, "lfs-authenticate"), "{locks}");
+}
+
+/// Shape: a Git LFS locks listing of `r.git` with no credentials, as git-lfs asks it (A-629 part 2c).
+const LFS_LOCKS_REQUEST: &str = "GET /r.git/info/lfs/locks HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.git-lfs+json\r\n\r\n";
+
+/// Whether `head`, in lower case, is a `401` whose `field` offers Bearer's challenge and no Basic one anywhere.
+fn bearer_alone(head: &str, field: &str) -> bool {
+  head.starts_with("http/1.1 401 ")
+    && head.contains(&format!("{field}: bearer realm="))
+    && !head.contains("basic")
 }
 
 /// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
@@ -13947,12 +13958,13 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 /// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`); run
 /// [`hg_round_trip`] over `ssh://` with OpenSSH holding that key alone. Expect each step done and both copies holding
 /// the same two changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`. Ignored until it can
-/// pass: as of main 34d10acb5 no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag
-/// --vcs-ssh`, kiln r174), the CLI has no `repository create` (A-685, g305), and the edge's Mercurial command waits on
-/// a lender of its store (A-679, g304: `hg -R <repo> serve --stdio` through `serve::stdio`).
+/// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
+/// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
+/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece, as the
+/// HTTP site's pushes wait on A-680 part 2b.
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>), A-685 (g305: slates repository create <name> --tool hg) and \
-            A-679 (g304: hg serve --stdio on the SSH edge)"]
+#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (unbundle in the stdio \
+            session, through hg_push as A-680 part 2b lands the HTTP site's)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {

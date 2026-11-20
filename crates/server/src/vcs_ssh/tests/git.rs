@@ -17,6 +17,7 @@ use super::super::site::{
 };
 use super::UploadCommand;
 use crate::vcs_http::git::{StoreLender, ThisShard};
+use crate::vcs_store::hg_view::ServedViews;
 
 /// Shape: the content store's budget and window the test's empty repository is kept in.
 const STORE_BUDGET: u64 = 1 << 20;
@@ -318,12 +319,13 @@ fn record(id: RepositoryId) -> RepositoryRecord {
 }
 
 /// A-651 part 2 and A-683 (the site's step 3). Do: start upload-pack and receive-pack for a repository whose store the
-/// lender holds and for one whose store it does not hold, and Mercurial's session for the held one. Expect: upload-pack
-/// started for the held store alone; receive-pack for both, as its driver reads the store the shard lent to its steps
-/// holds, never a store lender's; Mercurial's session not served.
+/// lender holds and for one whose store it does not hold, and Mercurial's session for the held one, Mercurial's lender
+/// the daemon's ([`ServedViews`], A-680 part 2a), which lends nothing off a shard. Expect: upload-pack started for the
+/// held store alone; receive-pack for both, as its driver reads the store the shard lent to its steps holds, never a
+/// store lender's; Mercurial's session not served.
 #[test]
 fn upload_pack_starts_only_over_a_store_the_lender_holds() {
-  let mut services = ToolServices::new(Lends::empty(), ThisShard, ROOM);
+  let mut services = ToolServices::new(Lends::empty(), ServedViews, ThisShard, ROOM);
   let held = record(HELD);
   let unheld = record(RepositoryId { bytes: [1; 16] });
   let principal = held.owner.clone();
