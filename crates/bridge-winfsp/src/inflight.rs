@@ -7,6 +7,7 @@
 pub mod capture;
 #[cfg(test)]
 mod oracle;
+pub mod relief;
 pub mod settle;
 
 /// Format: the public FSP_FSCTL_TRANSACT_BATCH_BUFFER_SIZEMIN, in bytes (WinFsp v2.1 fsctl.h).
