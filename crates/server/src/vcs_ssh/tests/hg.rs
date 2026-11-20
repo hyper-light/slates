@@ -1359,3 +1359,394 @@ fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
     .expect("the file's bytes");
   assert_eq!(payload.get(found..found + large.len()), Some(large));
 }
+
+/// Shape: the changesets of [`Grown`], each adding one file of [`GROWN_FILE`] bytes: an answer of tens of megabytes,
+/// many windows of a client that adjusts its window as OpenSSH does.
+const GROWN_CHANGESETS: u64 = 40;
+/// Shape: how long the reading client pauses after giving its window back: long enough for the server to fill the
+/// loopback socket's buffers.
+const GROWN_PAUSE_MS: u64 = 50;
+/// Shape: each [`Grown`] file's bytes.
+const GROWN_FILE: usize = 1 << 20;
+
+/// A public history of [`GROWN_CHANGESETS`] changesets, each adding the file `f<NN>` of [`GROWN_FILE`] bytes, held in
+/// memory with every text a clone reads.
+struct Grown {
+  /// Each changeset's node, oldest first.
+  changesets: Vec<Node>,
+  /// Each changeset's text.
+  texts: Vec<Vec<u8>>,
+  /// Each manifest's node and text, in its log's order.
+  manifests: Vec<(Node, Vec<u8>)>,
+  /// Each file's path and node, in path order (one revision a file).
+  files: Vec<(Vec<u8>, Node)>,
+  /// Every file's bytes.
+  bytes: Vec<u8>,
+}
+
+impl Grown {
+  fn made() -> Grown {
+    let node = |seed: u64| {
+      let mut node = [0; 20];
+      for (at, byte) in node.iter_mut().enumerate() {
+        *byte = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (at % 8 * 8)).to_le_bytes()[0]
+          ^ at.to_le_bytes()[0];
+      }
+      node
+    };
+    let mut grown = Grown {
+      changesets: Vec::new(),
+      texts: Vec::new(),
+      manifests: Vec::new(),
+      files: Vec::new(),
+      bytes: (0..GROWN_FILE)
+        .map(|at| u8::try_from(at % 251).unwrap() | 1)
+        .collect(),
+    };
+    let mut listing = Vec::new();
+    for rev in 0..GROWN_CHANGESETS {
+      let path = format!("f{rev:02}").into_bytes();
+      let file = node(3 * rev + 1);
+      grown.files.push((path.clone(), file));
+      listing.extend_from_slice(&path);
+      listing.push(0);
+      listing.extend_from_slice(crate::verbs::hex_of(&file).as_bytes());
+      listing.push(b'\n');
+      let manifest = node(3 * rev + 2);
+      grown.manifests.push((manifest, listing.clone()));
+      let text = format!(
+        "{}\nTest <test@example.com>\n0 0\n{}\n\ngrow",
+        crate::verbs::hex_of(&manifest),
+        String::from_utf8_lossy(&path)
+      )
+      .into_bytes();
+      grown.texts.push(text);
+      grown.changesets.push(node(3 * rev + 3));
+    }
+    grown
+  }
+
+  fn rev_of(&self, node: &Node) -> Option<Rev> {
+    self
+      .changesets
+      .iter()
+      .position(|held| held == node)
+      .map(|at| Rev::try_from(at).unwrap())
+  }
+}
+
+impl Repository for Grown {
+  fn count(&self) -> Rev {
+    Rev::try_from(self.changesets.len()).unwrap()
+  }
+  fn node(&self, rev: Rev) -> Option<Node> {
+    self.changesets.get(rev as usize).copied()
+  }
+  fn rev(&self, node: &Node) -> Option<Rev> {
+    self.rev_of(node)
+  }
+  fn parents(&self, rev: Rev) -> [Option<Rev>; 2] {
+    [rev.checked_sub(1), None]
+  }
+  fn branch(&self, _rev: Rev) -> &[u8] {
+    b"default"
+  }
+  fn closes(&self, _rev: Rev) -> bool {
+    false
+  }
+  fn phase(&self, _rev: Rev) -> Phase {
+    Phase::Public
+  }
+  fn publishing(&self) -> bool {
+    true
+  }
+  fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
+    std::iter::empty()
+  }
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    std::iter::empty()
+  }
+}
+
+impl Store for Grown {
+  fn changeset_text(
+    &self,
+    rev: Rev,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Cow<'_, [u8]>>, slates_hg::PastAdmission> {
+    Ok(
+      self
+        .texts
+        .get(rev as usize)
+        .map(|text| Cow::Borrowed(text.as_slice())),
+    )
+  }
+
+  fn manifest(
+    &self,
+    node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    let at = self.manifests.iter().position(|(held, _)| held == node);
+    Ok(at.map(|at| {
+      Logged {
+        position: at as u64,
+        parents: [
+          at.checked_sub(1)
+            .map_or(NULL_NODE, |before| self.manifests[before].0),
+          NULL_NODE,
+        ],
+        link: self.changesets[at],
+        flags: 0,
+        text: Cow::Borrowed(self.manifests[at].1.as_slice()),
+      }
+    }))
+  }
+
+  fn file(
+    &self,
+    path: &[u8],
+    node: &Node,
+    _room: &mut slates_hg::Admission,
+  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+    let at = self
+      .files
+      .iter()
+      .position(|(held, file)| held == path && file == node);
+    Ok(at.map(|at| Logged {
+      position: 0,
+      parents: [NULL_NODE, NULL_NODE],
+      link: self.changesets[at],
+      flags: 0,
+      text: Cow::Borrowed(self.bytes.as_slice()),
+    }))
+  }
+
+  fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
+    std::iter::empty()
+  }
+
+  fn manifest_linked(&self, position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
+    let at = usize::try_from(position).ok()?;
+    let (node, _) = self.manifests.get(at)?;
+    Some(slates_hg::serve::getbundle::Linked {
+      node: *node,
+      link: Some(Rev::try_from(at).unwrap()),
+    })
+  }
+
+  fn file_linked_from(
+    &self,
+    (path, position): (&[u8], u64),
+  ) -> Option<(Vec<u8>, u64, slates_hg::serve::getbundle::Linked)> {
+    self
+      .files
+      .iter()
+      .enumerate()
+      .find(|(_, (held, _))| (held.as_slice(), 0) >= (path, position))
+      .map(|(at, (held, node))| {
+        (
+          held.clone(),
+          0,
+          slates_hg::serve::getbundle::Linked {
+            node: *node,
+            link: Some(Rev::try_from(at).unwrap()),
+          },
+        )
+      })
+  }
+
+  fn holds_manifest(&self, node: &Node) -> bool {
+    self.manifests.iter().any(|(held, _)| held == node)
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
+}
+
+/// Lends [`Grown`] as [`HG`]'s store, each turn of a fetch within `turn` (the room and quantum the daemon's lender names);
+/// within a request's room where none.
+#[derive(Clone, Copy)]
+struct GrownLends(&'static Grown, Option<(u64, u64)>);
+
+impl HgStores for GrownLends {
+  type Store<'s> = Grown;
+  type Hold = RepositoryId;
+
+  fn hold(&mut self, id: RepositoryId, _room: &mut slates_hg::Admission) -> Option<RepositoryId> {
+    self.holds(id).then_some(id)
+  }
+
+  fn lend_held<R>(
+    &mut self,
+    hold: &RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.lend(*hold, room, step)
+  }
+
+  fn holds(&self, id: RepositoryId) -> bool {
+    id == HG
+  }
+
+  fn fetch_turn(&self, _repository: RepositoryId) -> Option<(u64, u64)> {
+    self.1
+  }
+
+  fn lend<R>(
+    &mut self,
+    id: RepositoryId,
+    room: &mut slates_hg::Admission,
+    step: impl for<'s> FnOnce(&Self::Store<'s>, &mut slates_hg::Admission) -> R,
+  ) -> Option<R> {
+    self.holds(id).then(|| step(self.0, room))
+  }
+
+  async fn push(
+    &mut self,
+    _id: RepositoryId,
+    _pushing: Pushing<'_>,
+    _room: &mut slates_hg::Admission,
+  ) -> Option<Outcome> {
+    None
+  }
+}
+
+/// Reads the session as OpenSSH's client does: each data message's bytes counted, the window given back
+/// (`SSH_MSG_CHANNEL_WINDOW_ADJUST`) once half of it is read, until the server closes the session; everything it gave.
+fn transcript_adjusting(peer: &mut Peer) -> Transcript {
+  let mut transcript = Transcript::default();
+  let mut unadjusted: u32 = 0;
+  while let Some(message) = peer.next(&[94, 95, 96, 97, 98]) {
+    let number = message[0];
+    if transcript.order.last() != Some(&number) {
+      transcript.order.push(number);
+    }
+    let string = |at: usize| {
+      let len = u32::from_be_bytes(message[at..at + 4].try_into().expect("a length")) as usize;
+      message[at + 4..at + 4 + len].to_vec()
+    };
+    match number {
+      94 | 95 => {
+        let data = if number == 94 { string(5) } else { string(9) };
+        if number == 94 {
+          transcript.out.extend_from_slice(&data);
+        } else {
+          transcript.err.extend_from_slice(&data);
+        }
+        unadjusted += u32::try_from(data.len()).unwrap();
+        if unadjusted >= super::CLIENT_WINDOW / 2 {
+          let mut adjust = vec![93];
+          adjust.extend_from_slice(&peer.channel.to_be_bytes());
+          adjust.extend_from_slice(&unadjusted.to_be_bytes());
+          peer.send(&adjust);
+          unadjusted = 0;
+          // A client whose reader is slower than the wire, as hg behind OpenSSH's pipe is: the socket's buffers fill
+          // while it pauses, so the server's writes wait on the socket, not on the window.
+          super::pause(GROWN_PAUSE_MS.saturating_mul(1_000_000));
+        }
+      }
+      98 if string(5) == b"exit-status" => {
+        let at = 5 + 4 + b"exit-status".len() + 1;
+        transcript.status = Some(u32::from_be_bytes(
+          message[at..at + 4].try_into().expect("four bytes"),
+        ));
+      }
+      97 => {
+        let mut close = vec![97];
+        close.extend_from_slice(&peer.channel.to_be_bytes());
+        peer.send(&close);
+        transcript.ended = peer.ended();
+        break;
+      }
+      _ => {}
+    }
+  }
+  transcript
+}
+
+/// A-745 (found by use, w-interop, release 295d8723d: `ssh-clone` of Mercurial's repository wrote 25 MB, then the
+/// daemon and the client both sat at 0% CPU for 20 minutes). Do: over the edge with the production site, its services
+/// lending a public history of 40 changesets each adding a 1 MiB file, authenticate with a held key, run `hg -R hg/r
+/// serve --stdio` and clone every head with `getbundle`, reading as OpenSSH reads (the window given back as it is
+/// read). Expect the whole answer, every file's bytes in it, then exit-status 0, EOF and close: no stall at any window.
+#[test]
+fn an_ssh_clone_past_many_windows_is_answered_whole() {
+  let grown: &'static Grown = Box::leak(Box::new(Grown::made()));
+  let head = *grown.changesets.last().expect("a head");
+  let (transcript, _) = served_by(
+    ONE_SEAT,
+    move || {
+      ToolSite::new(
+        Keys,
+        OneRepository,
+        // A turn as the daemon's lender gives one: room for a few files, and a quantum of a millisecond.
+        ToolServices::new(
+          NoGit,
+          GrownLends(grown, Some((8 * GROWN_FILE as u64, 1_000_000))),
+          ThisShard,
+          room(),
+        ),
+      )
+    },
+    move |address| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
+      send_data(&mut peer, &clone_request(&head));
+      Some(transcript_adjusting(&mut peer))
+    },
+  );
+  let transcript = transcript.expect("the session");
+  let sent = transcript.out.len();
+  assert_eq!(
+    (transcript.status, transcript.ended),
+    (Some(EXIT_STATUS), true),
+    "{sent} bytes of the answer read"
+  );
+  assert!(
+    sent > usize::try_from(GROWN_CHANGESETS).unwrap() * GROWN_FILE,
+    "{sent} bytes of the answer read"
+  );
+}
+
+/// A-745 (a stream refused past its start). Do: over the edge, clone [`Grown`] with each turn admitted a request's room
+/// alone, less than one of its files. Expect the session to end as 7.2's process ends on an abort: its words on standard
+/// error after the part of the answer already sent, and exit-status 255, never the 0 of a session that served.
+#[test]
+fn an_ssh_answer_refused_past_its_start_exits_as_an_abort() {
+  let grown: &'static Grown = Box::leak(Box::new(Grown::made()));
+  let head = *grown.changesets.last().expect("a head");
+  let (transcript, _) = served_by(
+    ONE_SEAT,
+    move || {
+      ToolSite::new(
+        Keys,
+        OneRepository,
+        ToolServices::new(NoGit, GrownLends(grown, None), ThisShard, room()),
+      )
+    },
+    move |address| {
+      let mut peer = Peer::connect(address)?;
+      (query(&mut peer, &HELD_SEED)? == 60).then_some(())?;
+      (sign(&mut peer, &HELD_SEED)? == 52).then_some(())?;
+      exec(&mut peer, b"hg -R hg/r serve --stdio").then_some(())?;
+      send_data(&mut peer, &clone_request(&head));
+      Some(transcript_adjusting(&mut peer))
+    },
+  );
+  let transcript = transcript.expect("the session");
+  assert!(transcript.out.starts_with(b"HG20"), "the answer began");
+  assert_eq!(
+    (
+      transcript.status,
+      String::from_utf8_lossy(&transcript.err).starts_with("abort: "),
+    ),
+    (Some(slates_hg::serve::stdio::FAILED_STATUS), true),
+    "{}",
+    String::from_utf8_lossy(&transcript.err)
+  );
+}

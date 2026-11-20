@@ -29,14 +29,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts — five seconds on a dev machine,
-/// scaled by [`RESTART_SLOWDOWN`] so a lane that declares itself slow gives the daemon the same room in its own
-/// terms. ThreadSanitizer forced this: on run 39527867650 a shard took 15 753 µs to initialize against 2 106 µs
-/// unloaded, one poll ran 11 922 ms against an anchor budget of 1 000 ms, and a flat five seconds read a daemon
-/// that was still starting as a daemon that was never coming.
-static START_WAIT: LazyLock<Duration> = LazyLock::new(|| {
-  Duration::from_secs(5).saturating_mul(u32::try_from(*RESTART_SLOWDOWN).unwrap_or(1))
-});
 
 /// The machine profile this binary's daemons derive from, measured once per process (§4.1), as
 /// production measures once at the anchor's boot. Measured afresh per daemon, the wake probe ran beside
@@ -83,17 +75,9 @@ fn deadlines() -> Deadlines {
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < *START_WAIT =>
-      {
-        std::thread::yield_now();
-      }
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 
@@ -108,7 +92,6 @@ fn scratch(name: &str) -> CreateSpec {
 }
 
 fn wait_until_listed(client: &mut Client, names: &[&str]) {
-  let started = Instant::now();
   loop {
     let mut listed: Vec<String> = client
       .list()
@@ -120,10 +103,6 @@ fn wait_until_listed(client: &mut Client, names: &[&str]) {
     if listed == names {
       return;
     }
-    assert!(
-      started.elapsed() < *START_WAIT,
-      "listing settles to {names:?}: {listed:?}"
-    );
   }
 }
 
@@ -1754,7 +1733,9 @@ fn a_map_whose_clients_shard_is_starved_at_its_hand_off_is_direct_past_a_wall_wi
             }
             fill_held.store(true, Ordering::Release);
             let held = Instant::now();
-            while !released.load(Ordering::Acquire) && held.elapsed() < *START_WAIT {
+            // Held until the test releases it (until 2026-11-20 capped at `START_WAIT`): a test that failed first leaves
+            // a spinning shard, which the daemon's own watchdog ends.
+            while !released.load(Ordering::Acquire) {
               std::hint::spin_loop();
             }
             true
@@ -2354,12 +2335,7 @@ fn assert_retry_meets_record(
 /// Lose the completed transport reply without acknowledging its durable completion. A subsequent
 /// retry must read the replacement daemon's record, with no old ring reply left to satisfy it.
 fn discard_reply(client: &mut Client, request: slates_wire::request::RequestId) {
-  let waiting = Instant::now();
   while client.poll_reply(request).unwrap().is_none() {
-    assert!(
-      waiting.elapsed() < *START_WAIT,
-      "the committed create must reply"
-    );
     std::thread::yield_now();
   }
 }
@@ -2573,12 +2549,10 @@ fn a_stranger_with_a_dead_clients_id_gets_neither_its_seat_nor_its_records() {
   }
   // The stranger's slot is ended and the id given back to the control shard by a message; the victim's reconnect may
   // meet the id still held until it lands.
-  let started = Instant::now();
   let retried = loop {
     match victim.retry(request, &victims_create()) {
-      Err(ClientError::SessionTaken { .. }) if started.elapsed() < *START_WAIT => {
-        std::thread::yield_now()
-      }
+      // The id comes back by a message while the daemon lives (A-232's rule; until 2026-11-20 within `START_WAIT`).
+      Err(ClientError::SessionTaken { .. }) => std::thread::yield_now(),
       other => break other.unwrap(),
     }
   };
@@ -3082,16 +3056,11 @@ const LARGE_EDIT_BYTES: usize = 20 * 1024;
 /// Drives the async edit `word` as an event loop does — `take_ready`, then the edit's poll — until it resolves,
 /// within the reply deadline per step.
 fn drive_edit(client: &mut Client, word: u64) -> Result<bool, slates_client::ClientError> {
-  let started = Instant::now();
   loop {
     client.take_ready()?;
     if let Some(done) = client.edit_poll(word)? {
       return Ok(done);
     }
-    assert!(
-      started.elapsed() < *START_WAIT,
-      "the chained edit resolved in time"
-    );
     std::thread::yield_now();
   }
 }

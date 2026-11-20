@@ -56,10 +56,6 @@ const TEST_SHARDS: u16 = 2;
 /// Shape: the least window a shard is judged by (the liveness budget, A-455), the beat.
 const WINDOW: Duration = Duration::from_nanos(LIVENESS_BUDGET_NS);
 const BEAT: Duration = Duration::from_nanos(HEARTBEAT_NS);
-/// Shape: how long the child may take to start and the client to connect: a hundred windows, a backstop far past any
-/// start, so only a start that never ends fails here. The start is not what is tested, and a busy machine stretches it:
-/// the role took 22 s to say it was ready at load 92 to 112 on the 18-CPU Mac (2026-11-13), past twenty windows.
-const START_WAIT: Duration = Duration::from_nanos(100 * LIVENESS_BUDGET_NS);
 /// Shape: the test's own bound on the whole exchange once the hold has begun: ten windows, far past the rule's bound and
 /// the reconnect budget after it, so a daemon that never ends itself fails here with the call still pending.
 const GIVE_UP: Duration = Duration::from_nanos(10 * LIVENESS_BUDGET_NS);
@@ -124,7 +120,7 @@ fn pause(span: Duration) {
 /// Which of `daemon`'s shards (its index in `Daemon::shards`) serves the client `client_id`, once its connection is
 /// seated.
 fn serving(daemon: &Daemon, client_id: u32) -> usize {
-  let started = Instant::now();
+  // Waited for while the daemon lives (A-232's rule; until 2026-11-20 a hundred windows, `START_WAIT`).
   loop {
     let found = daemon.shards().iter().position(|shard| {
       daemon
@@ -145,10 +141,6 @@ fn serving(daemon: &Daemon, client_id: u32) -> usize {
     if let Some(shard) = found {
       return shard;
     }
-    assert!(
-      started.elapsed() < START_WAIT,
-      "client {client_id} was seated on a shard"
-    );
     pause(BEAT);
   }
 }
@@ -207,6 +199,10 @@ fn a_lone_daemon_role() {
     return;
   };
   let hold = Hold::from_word(&hold);
+  // A clear memory level in the host's place: what these tests hold is a wedge, a stall of the log or a starved CPU,
+  // never memory, which on a host under memory pressure the watchdog would rightly see first (A-336; this Mac under
+  // kernel memory pressure, 2026-11-20, kept the wedged shard's daemon running 42 s).
+  slates_machine::memory_stall::put_in_place(Some(false));
   let instance = std::env::var(ROLE_INSTANCE).unwrap();
   let profile = profile();
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
@@ -363,30 +359,23 @@ fn start_lone_daemon(instance: &str, hold: Hold) -> LoneDaemon {
 }
 
 /// Waits for a line of `lines` carrying `tag`, within `within`; the line.
-fn await_tag(lines: &Receiver<(u64, String)>, tag: &str, within: Duration) -> String {
-  let started = Instant::now();
+/// The first line `lines` carries with `tag`, waited for while the child that writes them lives: its stream closes as it
+/// ends, which fails the wait at once, and a lone daemon that hangs is ended by its own watchdog (A-232's rule; until
+/// 2026-11-20 a hundred windows, `START_WAIT`).
+fn await_tag(lines: &Receiver<(u64, String)>, tag: &str) -> String {
   loop {
-    let left = within.saturating_sub(started.elapsed());
-    match lines.recv_timeout(left) {
+    match lines.recv() {
       Ok((_, line)) if line.contains(tag) => return line,
       Ok(_) => {}
-      Err(error) => panic!("no {tag} line within {within:?}: {error}"),
+      Err(error) => panic!("the child ended before its {tag} line: {error}"),
     }
   }
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        pause(BEAT);
-      }
-      Err(refused) => panic!("the lone daemon refused a client: {refused}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(refused) => panic!("the lone daemon refused a client: {refused}"),
   }
 }
 
@@ -552,7 +541,7 @@ const WINDOW_END_WORDS: &str = " ms window";
 /// the child's build (A-318), read from the watchdog's start line, which comes before the role says it is ready. A
 /// shard whose host overran the budget is held to its own window's, longer, which the end line names (A-455).
 fn spin_window_of(stderr: &Receiver<(u64, String)>) -> Duration {
-  let line = await_tag(stderr, SPIN_WINDOW_WORDS, START_WAIT);
+  let line = await_tag(stderr, SPIN_WINDOW_WORDS);
   let ms: u64 = line
     .split(SPIN_WINDOW_WORDS)
     .next()
@@ -601,7 +590,7 @@ fn judged_by(line: &str) -> Duration {
 fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let instance = format!("lone-{name}-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, hold);
-  await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  await_tag(&daemon.stdout, READY_TAG);
   let spin_window = spin_window_of(&daemon.stderr);
   // A spin's verdict needs the spin window of the shard's CPU, longer than the budget in a build slower than machine
   // code (A-318), and a shard's window may be held as long as the ceiling where its host overran it (A-455), so the
@@ -615,7 +604,7 @@ fn a_lone_daemons_stuck_shard_ends_it(name: &str, hold: Hold) {
   let stdin = daemon.stdin.as_mut().unwrap();
   writeln!(stdin, "{}", client.client_id()).unwrap();
   stdin.flush().unwrap();
-  let t0_ns = held_at_ns(&await_tag(&daemon.stdout, HELD_TAG, START_WAIT));
+  let t0_ns = held_at_ns(&await_tag(&daemon.stdout, HELD_TAG));
   let held_at = Instant::now();
   let mut driver = Driver::new(&client);
   let ticket = driver
@@ -848,7 +837,7 @@ fn a_lone_daemon_starved_beside_spinners_is_never_ended() {
   }
   let instance = format!("lone-starved-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, Hold::Starved);
-  await_tag(&daemon.stdout, READY_TAG, START_WAIT);
+  await_tag(&daemon.stdout, READY_TAG);
   let mut client = connect(&instance);
   let running: &'static std::sync::atomic::AtomicBool =
     Box::leak(Box::new(std::sync::atomic::AtomicBool::new(true)));
@@ -890,8 +879,9 @@ fn a_lone_daemon_starved_beside_spinners_is_never_ended() {
 
 /// Waits for a line of `daemon`'s standard output carrying `tag`, within `within`: the line, or, once the child has ended
 /// first, its exit and what it said on standard error.
-fn tag_or_end(daemon: &mut LoneDaemon, tag: &str, within: Duration) -> Result<String, String> {
-  let started = Instant::now();
+fn tag_or_end(daemon: &mut LoneDaemon, tag: &str) -> Result<String, String> {
+  // Waited for while the child lives, its end the other answer (until 2026-11-20 bounded by a hundred windows and the
+  // stall, `START_WAIT`).
   loop {
     match daemon.stdout.recv_timeout(BEAT) {
       Ok((_, line)) if line.contains(tag) => return Ok(line),
@@ -903,9 +893,6 @@ fn tag_or_end(daemon: &mut LoneDaemon, tag: &str, within: Duration) -> Result<St
           "the child ended ({status:?}) before {tag}; it said: {said:?}"
         ));
       }
-    }
-    if started.elapsed() >= within {
-      return Err(format!("no {tag} line within {within:?}"));
     }
   }
 }
@@ -934,8 +921,8 @@ fn said_until_quiet(stderr: &Receiver<(u64, String)>) -> Vec<String> {
 fn a_lone_daemon_whose_log_stalls_lives_on_and_serves() {
   let instance = format!("lone-log-{}", std::process::id());
   let mut daemon = start_lone_daemon(&instance, Hold::LogStalled);
-  await_tag(&daemon.stdout, READY_TAG, START_WAIT);
-  let over = tag_or_end(&mut daemon, STALL_OVER_TAG, START_WAIT + STALL_FOR);
+  await_tag(&daemon.stdout, READY_TAG);
+  let over = tag_or_end(&mut daemon, STALL_OVER_TAG);
   assert!(
     over.is_ok(),
     "the lone daemon lived through its log's stall: {over:?}"

@@ -5,36 +5,45 @@
 //! ([`Encoding::advance`]), each turn units of work until the owner's quantum (§4.3's step budget) is spent, at least
 //! one, as upload-pack's stream does ([`super::Upload`]).
 //!
-//! **The units.** The walk of a version's root tree beside the one before it, for the bases a reference delta may
-//! name: one pair of trees a unit, the pairs still to walk held. The objects' rows read into the encoding's order (by
-//! type, the largest first, then by id, which each object's row gives without its bytes): a window's worth of handles
-//! a unit, the order held as two sets, one a part. One object encoded: its bytes and its named base's read, then one
-//! entry put through the part's encoder, whose delta trials the learned window bounds. Last, both parts kept as content
-//! and recorded, one unit.
+//! **The units** (A-718: each a window's work at most, by its bytes, not by wall time, so no poll of the task that
+//! drives it outgrows its turn by more than a window's work; found by use: a 56 MB push of git/git cut at v2.0.0 spun
+//! the shard 3.5 s in one unit, an object's whole delta trials and level samples, and the daemon died into a restart
+//! loop). The walk of a version's root tree beside the one before it, for the bases a reference delta may name: one
+//! pair of trees a unit, the pairs still to walk held. The objects' rows read into the encoding's order (by type, the
+//! largest first, then by id, which each object's row gives without its bytes): one row a unit (a window's worth of
+//! handles had been 32,768 rows, 315 ms of one unit in a debug build), the order held as two sets, one a part. One
+//! object encoded: its row and its named base's row read; a window of its bytes, then of its base's, read a unit; then
+//! its entry made by the part's encoder a window's work a unit ([`super::fragment::Encoder::step`]): a step of one
+//! candidate base's delta search (`deltas::Search`, a window's blocks indexed or a window of the target scanned; the
+//! same delta `delta_of` makes), one level sampled on the data's first window, or a window of the data deflated (the
+//! same stream one call deflates). Last, each part put into the content store a window a unit
+//! (`ContentStore::put_window`, then its lists), and both recorded.
 //!
 //! **Between turns** the encoding holds no borrow of the store or the repository: it names objects by id and position
-//! and holds the order, the walk's bases, the part's bytes so far and its encoder's recent entries, those its learned
-//! window can try. Each unit learns into the repository's own window and levels, as one pass did, so a version encoded
-//! over any turns is the version encoded in one, byte for byte (`tests::store::encoding`).
+//! and holds the order, the walk's bases, the object under way, the part's bytes so far and its encoder's recent
+//! entries, those its learned window can try. Each unit learns into the repository's own window and levels, as one
+//! pass did, so a version encoded over any turns is the version encoded in one, byte for byte
+//! (`tests::store::encoding`); an object no longer than a window is the entry one call made before A-718, byte for
+//! byte, and a longer one samples its kind's levels on its first window, as upload-pack's stream does.
 //!
-//! **What one unit still costs** (owed): one object's encoding is bounded by that object and the learned window, not by
-//! a window of bytes (an object past a window encoded a window a unit is A-639's owed delta search past a window); a
-//! pair of trees is read whole; the last unit puts each part whole into the content store, which has no put by pieces.
+//! **What one unit still costs** (owed): a pair of trees is read whole; the last unit records both parts, sorting each
+//! part's entries by position and gathering its position sets in one pass (in memory, a few words an entry); and the
+//! object, its base and the candidates its learned window tries are held whole while it is encoded, as before.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_vcs::ContentStore;
+use slates_vcs::{ContentId, ContentStore, Writing};
 
 use crate::entry::PACK_HEADER_LEN;
 use crate::object_name::{Kind, ObjectId};
 use crate::to_u64;
 
-use super::fragment::{self, Encoded, Encoder, Placed, ToEncode};
+use super::fragment::{self, Encoded, Encoder, Named, Placed, Put, Putting, ToEncode};
 use super::learn::{Clock, Exchange};
 use super::positions::Positions;
 use super::repository::{Repository, StoreRefused};
-use super::upload::{Progress, Turn, handles};
+use super::upload::{Progress, Turn};
 
 /// An object's place in the encoding's order: its type, its length (the largest first), its id, and its position.
 type Key = (Kind, Reverse<u64>, ObjectId, u64);
@@ -66,16 +75,68 @@ impl Part {
   }
 }
 
+/// An object being encoded (A-718): its bytes read a window a unit, then its named base's, then its entry made a
+/// window's work a unit by the part's encoder.
+enum Current {
+  /// Reading the object's bytes, then its named base's.
+  Read {
+    object: Box<Reading>,
+    named: Option<Box<Reading>>,
+  },
+  /// Its entry being made (boxed: the encoder's state is most of the object's size).
+  Put(Box<Putting>),
+}
+
+/// An object's bytes being read a window a unit: its id, position, type, length, content and the bytes read so far.
+struct Reading {
+  id: ObjectId,
+  position: u64,
+  kind: Kind,
+  len: u64,
+  content: ContentId,
+  bytes: Vec<u8>,
+}
+
+impl Reading {
+  /// The next window of the object read, when one is left: whether one was.
+  fn read_window(&mut self, store: &ContentStore) -> Result<bool, StoreRefused> {
+    let id = self.id;
+    if to_u64(self.bytes.len()) >= self.len {
+      return Ok(false);
+    }
+    let window = to_u64(store.window().max(1));
+    let index = to_u64(self.bytes.len()).checked_div(window).unwrap_or(0);
+    let bytes = store
+      .window_at(&self.content, self.len, index)
+      .ok_or(StoreRefused::Unreadable { id })?;
+    self.bytes.extend_from_slice(&bytes);
+    Ok(true)
+  }
+}
+
 /// Where an encoding is.
 enum Stage {
   /// Walking the two root trees for the bases a reference delta may name: the pairs still to walk.
   Walk { pending: Vec<(ObjectId, ObjectId)> },
   /// Reading the objects' rows into the order, from position `from` on.
   Gather { from: u64 },
-  /// Encoding the commits, trees and tags' part, or the blobs' when `blobs`.
-  Encode { blobs: bool, part: Part },
-  /// Keeping both parts as content and recording them.
-  Keep { objects: Encoded, blobs: Encoded },
+  /// Encoding the commits, trees and tags' part, or the blobs' when `blobs`: the object under way, if any.
+  Encode {
+    blobs: bool,
+    part: Box<Part>,
+    current: Option<Box<Current>>,
+  },
+  /// Putting a part's bytes into the content store a window a unit (A-718): the commits, trees and tags' part first
+  /// (`blobs` false), then the blobs', the next byte to put, the object being written, and the first part's root once
+  /// it is kept.
+  Keep {
+    objects: Encoded,
+    blobs: Encoded,
+    putting_blobs: bool,
+    next: usize,
+    writing: Box<Writing>,
+    objects_root: Option<ContentId>,
+  },
   /// Kept, or nothing to encode.
   Done,
   /// Refused; every later turn is refused the same.
@@ -95,6 +156,16 @@ pub struct EncodingCounters {
   pub rows_read: u64,
   /// Objects encoded.
   pub objects: u64,
+  /// Units that alone took longer than their turn's quantum (A-718: a unit past the step budget, the signal of a unit
+  /// to split).
+  pub units_past_quantum: u64,
+  /// The longest unit of each stage, in the owner's nanoseconds: the walk, the gather, the encoding, the keeping.
+  /// Shape: one a stage, four.
+  pub longest_unit_ns: [u64; 4],
+  /// The most bytes one unit read, put into the store, or was given to search or deflate (A-718: a window at most).
+  pub most_bytes_a_unit: u64,
+  /// The most rows one unit read into the order (A-718: one).
+  pub most_rows_a_unit: u64,
 }
 
 /// A version's fragments, or a green's base pack, being encoded (module docs).
@@ -186,6 +257,7 @@ impl Encoding {
     let start = clock.now_ns();
     loop {
       let unit_start = clock.now_ns();
+      let stage = self.stage_index();
       let progress = match self.unit(repository, store, &mut *clock, exchange) {
         Ok(progress) => progress,
         Err(refused) => {
@@ -195,6 +267,12 @@ impl Encoding {
       };
       let unit_ns = clock.now_ns().saturating_sub(unit_start);
       self.spent_ns = self.spent_ns.saturating_add(unit_ns);
+      if unit_ns > quantum_ns {
+        self.counters.units_past_quantum = self.counters.units_past_quantum.saturating_add(1);
+      }
+      if let Some(longest) = self.counters.longest_unit_ns.get_mut(stage) {
+        *longest = (*longest).max(unit_ns);
+      }
       if progress == Progress::Done {
         return Ok(Progress::Done);
       }
@@ -225,6 +303,17 @@ impl Encoding {
     }
   }
 
+  /// The stage's index among [`EncodingCounters::longest_unit_ns`]'s.
+  pub fn stage_index(&self) -> usize {
+    match self.stage {
+      Stage::Walk { .. } => 0,
+      Stage::Gather { .. } => 1,
+      Stage::Encode { .. } => 2,
+      // Format: each stage's index, in the order of `longest_unit_ns`.
+      Stage::Keep { .. } | Stage::Done | Stage::Refused(_) => 3,
+    }
+  }
+
   /// One unit of work: the stage's next step.
   fn unit(
     &mut self,
@@ -237,13 +326,12 @@ impl Encoding {
     self.stage = match stage {
       Stage::Walk { pending } => self.walk(repository, store, pending)?,
       Stage::Gather { from } => self.gather(repository, store, from)?,
-      Stage::Encode { blobs, part } => {
-        self.encode(repository, store, clock, exchange, (blobs, part))?
-      }
-      Stage::Keep { objects, blobs } => {
-        self.keep(repository, store, (objects, blobs))?;
-        Stage::Done
-      }
+      Stage::Encode {
+        blobs,
+        part,
+        current,
+      } => self.encode(repository, store, clock, exchange, (blobs, *part, current))?,
+      keeping @ Stage::Keep { .. } => self.keep(repository, store, keeping)?,
       Stage::Done => return Ok(Progress::Done),
       Stage::Refused(refused) => return Err(refused),
     };
@@ -298,7 +386,7 @@ impl Encoding {
     Ok(())
   }
 
-  /// A window's worth of the objects' rows read into the order (module docs); with none left, the commits, trees and
+  /// One object's row read into the order (module docs; A-718: a row a unit); with none left, the commits, trees and
   /// tags encoded next.
   fn gather(
     &mut self,
@@ -306,40 +394,118 @@ impl Encoding {
     store: &ContentStore,
     from: u64,
   ) -> Result<Stage, StoreRefused> {
-    let mut at = from;
-    for _ in 0..handles(store) {
-      let Some(position) = self.positions.next_from(at) else {
-        return Ok(Stage::Encode {
-          blobs: false,
-          part: Part::new(),
-        });
-      };
-      let id = repository
-        .id_at(store, position)
-        .ok_or(StoreRefused::NoPosition { position })?;
-      let (row, _) = repository
-        .indexed(store, &id)
-        .ok_or(StoreRefused::Missing { id })?;
-      let order = if row.kind == Kind::Blob {
-        &mut self.blobs
-      } else {
-        &mut self.others
-      };
-      order.insert((row.kind, Reverse(row.len), id, position));
-      self.counters.rows_read = self.counters.rows_read.saturating_add(1);
-      at = position.saturating_add(1);
-    }
-    Ok(Stage::Gather { from: at })
+    let Some(position) = self.positions.next_from(from) else {
+      return Ok(Stage::Encode {
+        blobs: false,
+        part: Box::new(Part::new()),
+        current: None,
+      });
+    };
+    let id = repository
+      .id_at(store, position)
+      .ok_or(StoreRefused::NoPosition { position })?;
+    let (row, _) = repository
+      .indexed(store, &id)
+      .ok_or(StoreRefused::Missing { id })?;
+    let order = if row.kind == Kind::Blob {
+      &mut self.blobs
+    } else {
+      &mut self.others
+    };
+    order.insert((row.kind, Reverse(row.len), id, position));
+    self.counters.rows_read = self.counters.rows_read.saturating_add(1);
+    self.counters.most_rows_a_unit = self.counters.most_rows_a_unit.max(1);
+    Ok(Stage::Gather {
+      from: position.saturating_add(1),
+    })
   }
 
-  /// One object encoded into the part (module docs); with none left, the part ended.
+  /// One unit of the part's encoding (module docs; A-718): the next object begun (its row and its named base's
+  /// read), a window of its bytes or its base's read, or a step of its entry; with none left, the part ended.
   fn encode(
     &mut self,
     repository: &mut Repository,
     store: &ContentStore,
     clock: &mut dyn Clock,
     exchange: Exchange,
-    (blobs, mut part): (bool, Part),
+    (blobs, mut part, current): (bool, Part, Option<Box<Current>>),
+  ) -> Result<Stage, StoreRefused> {
+    let Some(mut current) = current else {
+      return self.begin_object(repository, store, (blobs, part));
+    };
+    let window = store.window().max(1);
+    let next = match *current {
+      Current::Read {
+        ref mut object,
+        ref mut named,
+      } => {
+        let before = object.bytes.len();
+        let mut read = object.read_window(store)?;
+        let mut taken = object.bytes.len().saturating_sub(before);
+        if !read && let Some(named) = named.as_mut() {
+          let before = named.bytes.len();
+          read = named.read_window(store)?;
+          taken = named.bytes.len().saturating_sub(before);
+        }
+        self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(taken));
+        if read {
+          Some(current)
+        } else {
+          let Current::Read { object, named } = *current else {
+            return Err(StoreRefused::FragmentUnreadable);
+          };
+          let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
+          let to_encode = ToEncode {
+            id: object.id,
+            position: object.position,
+            kind: object.kind,
+            bytes: object.bytes,
+            named: named.map(|named| Named {
+              id: named.id,
+              position: named.position,
+              bytes: named.bytes,
+            }),
+          };
+          let learning = repository.learning(exchange, clock);
+          let putting = part.encoder.begin(to_encode, at, &learning);
+          Some(Box::new(Current::Put(Box::new(putting))))
+        }
+      }
+      Current::Put(ref mut putting) => {
+        let mut learning = repository.learning(exchange, clock);
+        let put = part
+          .encoder
+          .step(putting, &mut learning, window)
+          .map_err(StoreRefused::Encoding)?;
+        self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(window));
+        match put {
+          Put::More(bytes) => {
+            part.bytes.extend_from_slice(&bytes);
+            Some(current)
+          }
+          Put::Done(bytes, record) => {
+            part.bytes.extend_from_slice(&bytes);
+            part.placed.push(fragment::in_fragment(record));
+            self.counters.objects = self.counters.objects.saturating_add(1);
+            None
+          }
+        }
+      }
+    };
+    Ok(Stage::Encode {
+      blobs,
+      part: Box::new(part),
+      current: next,
+    })
+  }
+
+  /// The part's next object begun: its row and its named base's row read, its bytes left to read a window a unit;
+  /// with none left, the part ended.
+  fn begin_object(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+    (blobs, part): (bool, Part),
   ) -> Result<Stage, StoreRefused> {
     let order = if blobs {
       &mut self.blobs
@@ -349,28 +515,41 @@ impl Encoding {
     let Some((_, _, id, position)) = order.pop_first() else {
       return Ok(self.part_ended(blobs, part));
     };
-    let (kind, bytes) = repository.read(store, &id)?;
-    let named = match self.named.get(&id) {
-      Some(old) => Some(repository.named(store, old)?),
-      None => None,
-    };
-    let object = ToEncode {
+    let (row, content) = repository
+      .indexed(store, &id)
+      .ok_or(StoreRefused::Missing { id })?;
+    let object = Reading {
       id,
       position,
-      kind,
-      bytes,
-      named,
+      kind: row.kind,
+      len: row.len,
+      content,
+      bytes: Vec::new(),
     };
-    let at = PACK_HEADER_LEN.saturating_add(to_u64(part.bytes.len()));
-    let mut learning = repository.learning(exchange, clock);
-    let (entry, record) = part
-      .encoder
-      .put(object, at, &mut learning)
-      .map_err(StoreRefused::Encoding)?;
-    part.bytes.extend_from_slice(&entry);
-    part.placed.push(fragment::in_fragment(record));
-    self.counters.objects = self.counters.objects.saturating_add(1);
-    Ok(Stage::Encode { blobs, part })
+    let named = match self.named.get(&id) {
+      Some(old) => {
+        let (row, content) = repository
+          .indexed(store, old)
+          .ok_or(StoreRefused::Missing { id: *old })?;
+        Some(Reading {
+          id: *old,
+          position: row.position,
+          kind: row.kind,
+          len: row.len,
+          content,
+          bytes: Vec::new(),
+        })
+      }
+      None => None,
+    };
+    Ok(Stage::Encode {
+      blobs,
+      part: Box::new(part),
+      current: Some(Box::new(Current::Read {
+        object: Box::new(object),
+        named: named.map(Box::new),
+      })),
+    })
   }
 
   /// A part with nothing left to encode: the blobs' part next, or both parts kept.
@@ -380,27 +559,98 @@ impl Encoding {
       self.objects = Some(encoded);
       return Stage::Encode {
         blobs: true,
-        part: Part::new(),
+        part: Box::new(Part::new()),
+        current: None,
       };
     }
     Stage::Keep {
       objects: self.objects.take().unwrap_or_default(),
       blobs: encoded,
+      putting_blobs: false,
+      next: 0,
+      writing: Box::default(),
+      objects_root: None,
     }
   }
 
-  /// Both parts kept as content and recorded (module docs): a version's fragments, or a base pack in place of the old.
+  /// One unit of keeping both parts (module docs; A-718): a window of a part put into the content store, a part's
+  /// object finished, or, both kept, both recorded (a version's fragments, or a base pack in place of the old).
+  /// Refused, what was put is given back.
   fn keep(
-    &self,
+    &mut self,
     repository: &mut Repository,
     store: &mut ContentStore,
-    parts: (Encoded, Encoded),
-  ) -> Result<(), StoreRefused> {
+    keeping: Stage,
+  ) -> Result<Stage, StoreRefused> {
+    let Stage::Keep {
+      objects,
+      blobs,
+      putting_blobs,
+      next,
+      mut writing,
+      objects_root,
+    } = keeping
+    else {
+      return Ok(keeping);
+    };
+    let window = store.window().max(1);
+    let bytes = if putting_blobs { &blobs.0 } else { &objects.0 };
+    let give_back = |store: &mut ContentStore, writing: Writing, root: Option<ContentId>| {
+      store.abandon_object(writing);
+      if let Some(root) = root {
+        let _ = store.release(&root);
+      }
+    };
+    if next < bytes.len() {
+      let to = next.saturating_add(window).min(bytes.len());
+      if let Err(refused) = store.put_window(&mut writing, bytes.get(next..to).unwrap_or_default())
+      {
+        give_back(store, *writing, objects_root);
+        return Err(refused.into());
+      }
+      self.counters.most_bytes_a_unit = self
+        .counters
+        .most_bytes_a_unit
+        .max(to_u64(to.saturating_sub(next)));
+      return Ok(Stage::Keep {
+        objects,
+        blobs,
+        putting_blobs,
+        next: to,
+        writing,
+        objects_root,
+      });
+    }
+    let root = match store.finish_object(&mut writing) {
+      Ok(root) => root,
+      Err(refused) => {
+        give_back(store, *writing, objects_root);
+        return Err(refused.into());
+      }
+    };
+    if !putting_blobs {
+      return Ok(Stage::Keep {
+        objects,
+        blobs,
+        putting_blobs: true,
+        next: 0,
+        writing: Box::default(),
+        objects_root: Some(root),
+      });
+    }
+    let Some(objects_root) = objects_root else {
+      let _ = store.release(&root);
+      return Err(StoreRefused::FragmentUnreadable);
+    };
+    let parts = ((objects, objects_root), (blobs, root));
     match self.target {
-      Target::Version { green, version } => repository.keep_version(store, (green, version), parts),
+      Target::Version { green, version } => {
+        repository.keep_version(store, (green, version), parts)?
+      }
       Target::Base { green, version } => {
-        repository.keep_base(store, (green, version), parts, self.spent_ns)
+        repository.keep_base(store, (green, version), parts, self.spent_ns)?;
       }
     }
+    Ok(Stage::Done)
   }
 }

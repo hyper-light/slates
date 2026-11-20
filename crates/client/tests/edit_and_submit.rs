@@ -15,7 +15,7 @@
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use proptest::strategy::Strategy;
 use proptest::test_runner::{Config, TestRunner};
@@ -31,8 +31,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards for each daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while its daemon starts.
-const START_WAIT: Duration = Duration::from_secs(10);
 /// Shape: the files of a generated green, each seeded with [`SEED`].
 const FILES: usize = 3;
 /// Shape: each file's seeded bytes, short so generated edits overlap and conflict often.
@@ -59,17 +57,9 @@ fn deadlines() -> Deadlines {
 }
 
 fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::thread::yield_now();
-      }
-      Err(e) => panic!("{e}"),
-    }
+  match Client::connect(instance, deadlines()) {
+    Ok(client) => client,
+    Err(e) => panic!("{e}"),
   }
 }
 
@@ -449,19 +439,11 @@ fn committed_unread(
   id: slates_client::RequestId,
 ) {
   let mut observer = connect(instance);
-  let started = Instant::now();
+  // Both waited for while the daemon lives (A-232's rule; until 2026-11-20 ten seconds each, `START_WAIT`).
   while observer.versions(green).unwrap() < version {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the edit and submit commits"
-    );
     std::thread::yield_now();
   }
   while client.poll_reply(id).unwrap().is_none() {
-    assert!(
-      started.elapsed() < START_WAIT,
-      "the committed request replies"
-    );
     std::thread::yield_now();
   }
 }

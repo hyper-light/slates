@@ -69,8 +69,7 @@ use crate::index::{
 use crate::lock::{AprTime, LockTable};
 use crate::reads::Repository;
 use crate::svndiff::{
-  Compression, Encoder, Instruction, Made, STEP_OVERRUN, Version, WINDOW_LIMIT, Window,
-  WindowMaking,
+  Compression, Encoder, Instruction, Made, Version, WINDOW_LIMIT, Window, WindowMaking,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::ops::Bound;
@@ -1731,16 +1730,15 @@ pub(crate) fn window_unit<R: Repository + ?Sized>(
     Some(work) => work,
     None => Box::new(begun_window(*delta.sent, delta.source, &delta.text)?),
   };
-  let units;
-  if work.target.len() < work.target_len {
+  let units = if work.target.len() < work.target_len {
     let piece = (*delta.sent, work.target_len);
-    units = read_piece(repository, &delta.text, piece, &mut work.target)?;
+    read_piece(repository, &delta.text, piece, &mut work.target)?
   } else if work.source.len() < work.source_len {
     let source = delta.source.ok_or_else(DriveFailure::corrupt)?;
     let piece = (work.view, work.source_len);
-    units = read_piece(repository, &source, piece, &mut work.source)?;
+    read_piece(repository, &source, piece, &mut work.source)?
   } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
-    units = make_window(&mut work, encoding)?;
+    make_window(&mut work, encoding)?
   } else {
     let (sent, done) = send_piece(&mut work, delta.header_sent, encoding.0, sink)?;
     note_units(sent);
@@ -1751,16 +1749,16 @@ pub(crate) fn window_unit<R: Repository + ?Sized>(
     }
     *work_held = Some(work);
     return Ok(());
-  }
+  };
   note_units(units);
   *work_held = Some(work);
   Ok(())
 }
 
 /// The most units a window step takes: [`STEP_WORK`] bytes read or sent, or [`STEP_WORK`] of the maker's units and its
-/// overrun ([`STEP_OVERRUN`]).
+/// overrun ([`crate::svndiff::STEP_OVERRUN`]).
 #[cfg(test)]
-pub(crate) const WINDOW_STEP_UNITS: usize = STEP_WORK + STEP_OVERRUN;
+pub(crate) const WINDOW_STEP_UNITS: usize = STEP_WORK + crate::svndiff::STEP_OVERRUN;
 
 #[cfg(test)]
 thread_local! {

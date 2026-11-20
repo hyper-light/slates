@@ -66,6 +66,10 @@ pub(crate) const BEHIND: &str = "vcs_store.git_encode.behind";
 /// however many versions a push left unencoded. Past it the fetch's stream searches what is still unencoded, a turn's
 /// object at a time as before A-718, and a task finishes the encoding for the fetches after it.
 const FETCH_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
+/// Counter: a unit of an encoding (a pair of trees walked, a window of rows read, an object encoded, the parts kept)
+/// that alone took longer than its turn's quantum, the step budget (A-718: a turn may overrun its quantum by its last
+/// unit, and no unit may outgrow the quantum). Format: a counter name.
+pub(crate) const UNITS_PAST_BUDGET: &str = "vcs_store.git_encode.units_past_budget";
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -154,9 +158,11 @@ fn turn_lent(
   }
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
+  let mut past = 0;
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
-      encoding.advance(
+      let before = encoding.counters().units_past_quantum;
+      let advanced = encoding.advance(
         &mut store.repository,
         content,
         Turn {
@@ -164,7 +170,12 @@ fn turn_lent(
           exchange,
           quantum_ns,
         },
-      )
+      );
+      past = encoding
+        .counters()
+        .units_past_quantum
+        .saturating_sub(before);
+      advanced
     });
   let turned = match advanced {
     Some(Ok(Progress::More)) => Turned::More,
@@ -182,6 +193,9 @@ fn turn_lent(
   };
   if begun {
     state.count(BEGUN, 1);
+  }
+  if past > 0 {
+    state.count(UNITS_PAST_BUDGET, past);
   }
   state.count(TURNS, 1);
   super::settle(state);

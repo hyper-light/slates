@@ -443,3 +443,34 @@ fn a_view_reads_texts_from_its_lent_source_alone() {
     );
   }
 }
+
+/// Shape: the piece of a whole text the test's export writes a call, far below a window: what a slow digest's slice
+/// would size it to.
+const SMALL_PIECE: usize = 4096;
+
+/// A-652 (format 2's piece sized by its caller: main's order of 2026-11-20, a call within the shard's slice). Do: export
+/// the whole history in format 2 with each whole text written [`SMALL_PIECE`] bytes a call. Expect `svnadmin dump`'s
+/// bytes (`full.dump`), and no call appending more than the piece and [`CALL_HEADROOM`]: the 107 KB text in pieces.
+#[test]
+fn a_whole_text_is_written_in_the_pieces_its_caller_sizes() {
+  use crate::migration::{Exporter, Exporting};
+  let source = imported(&["full.dump"]);
+  let piece = std::num::NonZeroUsize::new(SMALL_PIECE).unwrap();
+  let mut exporter = Exporter::new(&source, 0, source.youngest(), Format::Two)
+    .unwrap()
+    .with_text_piece(piece);
+  let mut out = Vec::new();
+  let mut largest = 0;
+  loop {
+    let before = out.len();
+    if exporter.export(&source, &mut out).unwrap() == Exporting::Done {
+      break;
+    }
+    largest = largest.max(out.len() - before);
+  }
+  assert!(
+    largest <= SMALL_PIECE + CALL_HEADROOM,
+    "a call appended {largest} bytes"
+  );
+  assert!(out == vector("full.dump"), "the bytes svnadmin dump wrote");
+}

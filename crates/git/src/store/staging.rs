@@ -219,6 +219,41 @@ impl Repository {
     Ok(())
   }
 
+  /// One unit of the fresh objects' census: the next object the push holds after `after`, kept with its kind when the
+  /// store has not indexed it; the positions begun once none is left. Refused, the fork is given back.
+  fn fresh_unit(
+    &mut self,
+    store: &mut ContentStore,
+    push: &mut Push,
+    (fork, base, after): (Index, u64, Option<ObjectId>),
+    (mut fresh, mut kinds): (Vec<Fresh>, BTreeMap<Kind, u64>),
+  ) -> Result<Step, StoreRefused> {
+    let held = push.held_after(after.as_ref().map(ObjectId::as_bytes));
+    let Some((bytes, number, content, len)) = held else {
+      return self.positions_begun((fork, base), fresh, &kinds);
+    };
+    let Some(id) = ObjectId::from_bytes(self.format, bytes) else {
+      fork.release(store)?;
+      return Err(StoreRefused::ForeignPush);
+    };
+    if self.indexed(store, &id).is_none() {
+      let Some(kind) = kind_of(number) else {
+        fork.release(store)?;
+        return Err(StoreRefused::Malformed { id });
+      };
+      fresh.push((id, kind, content, len));
+      let count = kinds.entry(kind).or_insert(0);
+      *count = count.saturating_add(1);
+    }
+    Ok(Step::Fresh {
+      fork,
+      base,
+      after: Some(id),
+      fresh,
+      kinds,
+    })
+  }
+
   /// One unit of `step`: the step after it. Refused, what the step held is given back.
   fn unit(
     &mut self,
@@ -254,34 +289,9 @@ impl Repository {
         fork,
         base,
         after,
-        mut fresh,
-        mut kinds,
-      } => {
-        let held = push.held_after(after.as_ref().map(ObjectId::as_bytes));
-        let Some((bytes, number, content, len)) = held else {
-          return self.positions_begun((fork, base), fresh, &kinds);
-        };
-        let Some(id) = ObjectId::from_bytes(self.format, bytes) else {
-          fork.release(store)?;
-          return Err(StoreRefused::ForeignPush);
-        };
-        if self.indexed(store, &id).is_none() {
-          let Some(kind) = kind_of(number) else {
-            fork.release(store)?;
-            return Err(StoreRefused::Malformed { id });
-          };
-          fresh.push((id, kind, content, len));
-          let count = kinds.entry(kind).or_insert(0);
-          *count = count.saturating_add(1);
-        }
-        Ok(Step::Fresh {
-          fork,
-          base,
-          after: Some(id),
-          fresh,
-          kinds,
-        })
-      }
+        fresh,
+        kinds,
+      } => self.fresh_unit(store, push, (fork, base, after), (fresh, kinds)),
       Step::Positions {
         fork,
         base,

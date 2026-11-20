@@ -531,10 +531,10 @@ pub(crate) fn big_text_stream(
   let mut stream = encoder.header().to_vec();
   let mut sent = 0usize;
   while sent < to.len() {
-    let target = &to[sent..(sent + WINDOW_LIMIT as usize).min(to.len())];
+    let target = &to[sent..(sent + usize::try_from(WINDOW_LIMIT).unwrap()).min(to.len())];
     let source = from.map_or(&[][..], |from| {
       let view = sent.min(from.len());
-      &from[view..(view + WINDOW_LIMIT as usize).min(from.len())]
+      &from[view..(view + usize::try_from(WINDOW_LIMIT).unwrap()).min(from.len())]
     });
     let mut window = window_of(source, target).unwrap();
     window.source_offset = sent.min(from.map_or(0, <[u8]>::len)) as u64;
@@ -662,4 +662,84 @@ pub(crate) fn big_texts() -> (Index, Green, Vec<u8>, Vec<u8>) {
     (text_at(5), text_at(6))
   };
   (index, green, five, six)
+}
+
+/// A history of one directory, `/trunk/big`, gaining `per_revision` files in each of `revisions` revisions, the first
+/// file of the revision before deleted and its last edited in each: a large directory with a long history, in
+/// `history.txt`'s grammar.
+pub(crate) fn long_directory_history(revisions: usize, per_revision: usize) -> String {
+  let date = "2026-01-01T00:00:01.000000Z";
+  let mut history = format!("\nrevision alice {date}\nmkdir trunk\nmkdir trunk/big\n");
+  for revision in 0..revisions {
+    history.push_str(&format!("\nrevision alice {date}\n"));
+    for file in 0..per_revision {
+      let number = revision * per_revision + file;
+      history.push_str(&format!(
+        "put trunk/big/f{number:07}.txt file {number}\\n\n"
+      ));
+    }
+    if revision > 0 {
+      let first = (revision - 1) * per_revision;
+      let last = first + per_revision - 1;
+      history.push_str(&format!("rm trunk/big/f{first:07}.txt\n"));
+      history.push_str(&format!(
+        "put trunk/big/f{last:07}.txt edited in {revision}\\n\n"
+      ));
+    }
+  }
+  history
+}
+
+/// A-751 follow-up's A/B (main's: "listing time ... before and after, on a large directory with a long history"), in
+/// release (`cargo test --release -p slates-svn --lib -- --ignored listing_times --nocapture`): `/trunk/big` after
+/// 1,000 revisions of 10 files each (9,001 live, 10,000 named), listed at the youngest revision and at the middle one.
+/// Printed for each: `Index::children`; a dirent for every child listed (`history::present`, as the drive's `entries`
+/// makes one); and the two together, the server's listing. Measured, not asserted.
+#[test]
+#[ignore = "a measurement, run in release"]
+fn listing_times() {
+  let (index, green) = green::repository_from(&long_directory_history(1_000, 10));
+  let locks = LockTable::new();
+  let sources = Sources {
+    index: &index,
+    repository: &green,
+    locks: &locks,
+    now: NOW,
+    rules: None,
+  };
+  let youngest = index.youngest();
+  for revision in [youngest, youngest / 2] {
+    let best = |run: &dyn Fn() -> usize| {
+      (0..5)
+        .map(|_| {
+          let began = std::time::Instant::now();
+          let count = run();
+          (began.elapsed(), count)
+        })
+        .min()
+        .unwrap()
+    };
+    let (children, live) = best(&|| {
+      index
+        .children("/trunk/big", revision)
+        .unwrap()
+        .unwrap()
+        .len()
+    });
+    let names = index.children("/trunk/big", revision).unwrap().unwrap();
+    let (dirents, _) = best(&|| {
+      names
+        .iter()
+        .filter(|name| {
+          dirent(&sources, &join_fspath("/trunk/big", name), revision)
+            .unwrap()
+            .is_some()
+        })
+        .count()
+    });
+    eprintln!(
+      "listing_times r{revision}: {live} live; children {children:?}; dirents {dirents:?}; listing {:?}",
+      children + dirents
+    );
+  }
 }
