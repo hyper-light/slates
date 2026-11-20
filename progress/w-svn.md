@@ -62,3 +62,10 @@
 - Import memory: svn_import is already sliced per turn and charged as retention; the 3.9 GiB RSS was probably the
   unfolded chain (not verified: w-perf's svn_scale.sh repro is main's to run).
 - NEXT in queue: A-693 part 2 (held by main), then DAV pieces (g297 brief).
+
+## svn+ssh in the daemon's SSH site -- LANDED main a14635977 (commit fc79d36ae, verified ancestor of origin/main)
+- svn_view::TunnelRecords (vcs_ssh::svn::SvnStores), daemon_edge::daemon_site. Test the_daemons_ssh_site_serves_
+  svnserve_t_and_lands_a_stock_commit; local 16/16.
+- NOW: green_chains import bug NOT fixed by f37a96515 (w-perf rerun on 9ea6e1311: still refused at revision 1,685,
+  RSS 3.4 GiB). Suspect: the repository log entries (each revision's record + contents, EntryParts.objects) are
+  charged to the partition's merge budget (green_chain_bytes) and never fold. Investigating.
