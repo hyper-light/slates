@@ -1064,6 +1064,12 @@ impl GitPush {
     })
   }
 
+  /// The objects admitted so far, in quarantine, read only: what a pack being read reads a delta's base back from and a
+  /// push's checks read its objects from (A-719 part 3).
+  pub(crate) fn quarantine(&self) -> &Push {
+    &self.push
+  }
+
   /// Keeps the push's pack as the client sent it (A-723), which the push's first record holds in place of its objects'
   /// bytes.
   pub(crate) fn keep_pack(&mut self, pack: Vec<u8>) {

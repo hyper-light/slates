@@ -44,6 +44,8 @@ use super::{
   ATOMIC_TRANSACTION_FAILED, Command, Declined, FAILED_TO_UPDATE, Judge, MISSING_OBJECTS, Pushed,
   Reported, Repository, message,
 };
+use std::borrow::Cow;
+
 use crate::Admission;
 use crate::object_name::{Kind, ObjectId};
 use crate::objects::commit::Commit;
@@ -183,6 +185,13 @@ pub trait Appends {
   fn append_atomic(&mut self, entries: Vec<Entry>) -> Result<(), Unappended>;
 }
 
+/// A push's own objects of any kind, as its quarantine holds them (A-719 part 3): what a verdict
+/// reads a pushed commit or tag from, the session no longer holding the push's bytes.
+pub trait PushedBytes {
+  /// The object named `id`, its type and bytes, from the index first and then the push.
+  fn pushed_object(&self, id: &ObjectId) -> Option<(Kind, Cow<'_, [u8]>)>;
+}
+
 /// receive-pack's part 2 verdicts, read only (module docs): each command's entry, judged over the
 /// greens as the push read them, moving nothing. [`Works`] pairs them with an [`Appends`]; a server
 /// whose greens and appends are one shard's state judges through them between its own appends
@@ -212,7 +221,7 @@ impl<'w, G, R, O, A> Works<'w, G, R, O, A>
 where
   G: Greens + ?Sized,
   R: Repository + ?Sized,
-  O: PushObjects,
+  O: PushObjects + PushedBytes,
   A: Appends + ?Sized,
 {
   /// A judge of the push named `name` (two submits of one push carry one name): its greens read
@@ -237,7 +246,7 @@ impl<'w, G, R, O> Verdicts<'w, G, R, O>
 where
   G: Greens + ?Sized,
   R: Repository + ?Sized,
-  O: PushObjects,
+  O: PushObjects + PushedBytes,
 {
   /// The verdicts of the push named `name` (two submits of one push carry one name): its greens
   /// read from `greens`, a commit it did not bring from `repository`, its trees and blobs from
@@ -317,14 +326,14 @@ where
     let mut scratch = Admission::new(u64::MAX);
     let (kind, content) = self.object(head, pushed)?;
     let target = match kind {
-      Kind::Tag => Tag::parse(content, &mut scratch).ok()?.object(format)?,
+      Kind::Tag => Tag::parse(&content, &mut scratch).ok()?.object(format)?,
       _ => *head,
     };
     let (kind, content) = self.object(&target, pushed)?;
     if kind != Kind::Commit {
       return None;
     }
-    Commit::parse(content, &mut scratch)
+    Commit::parse(&content, &mut scratch)
       .ok()?
       .parents(format)
       .next()
@@ -384,7 +393,7 @@ where
     let mut scratch = Admission::new(u64::MAX);
     let (kind, target) = match kind {
       Kind::Tag => {
-        let tag = Tag::parse(content, &mut scratch).map_err(|_| missing(name))?;
+        let tag = Tag::parse(&content, &mut scratch).map_err(|_| missing(name))?;
         let target = tag.object(format).ok_or_else(|| missing(name))?;
         (tag.kind(), target)
       }
@@ -393,7 +402,7 @@ where
     match kind {
       Some(Kind::Commit) => {
         let (_, content) = self.object(&target, pushed).ok_or_else(|| missing(name))?;
-        let commit = Commit::parse(content, &mut scratch).map_err(|_| missing(name))?;
+        let commit = Commit::parse(&content, &mut scratch).map_err(|_| missing(name))?;
         commit.tree(format).ok_or_else(|| missing(name))
       }
       Some(Kind::Tree) => Ok(target),
@@ -405,12 +414,20 @@ where
     }
   }
 
-  /// The object named `id`: the push's, or the repository's.
-  fn object<'p>(&'p self, id: &ObjectId, pushed: &'p Pushed<'p>) -> Option<(Kind, &'p [u8])> {
-    match pushed.object(id) {
-      Some(object) => Some((object.kind, object.content.as_slice())),
-      None => self.repository.object(id),
+  /// The object named `id`: the push's, as its pushed objects lend it or as its quarantine holds it
+  /// (A-719 part 3: a server keeps the push's bytes in its store, not in the session), or the
+  /// repository's.
+  fn object<'p>(&'p self, id: &ObjectId, pushed: &Pushed<'p>) -> Option<(Kind, Cow<'p, [u8]>)> {
+    if let Some(object) = pushed.object(id) {
+      return Some(object);
     }
+    if let Some(object) = self.objects.pushed_object(id) {
+      return Some(object);
+    }
+    self
+      .repository
+      .object(id)
+      .map(|(kind, content)| (kind, Cow::Borrowed(content)))
   }
 }
 
@@ -418,7 +435,7 @@ impl<G, R, O, A> Judge for Works<'_, G, R, O, A>
 where
   G: Greens + ?Sized,
   R: Repository + ?Sized,
-  O: PushObjects,
+  O: PushObjects + PushedBytes,
   A: Appends + ?Sized,
 {
   type Accepted = Entry;

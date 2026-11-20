@@ -446,19 +446,26 @@ pub(crate) fn answered(scenario: &Scenario) -> (Received, Vec<StoreRefused>) {
   let mut server = server(scenario);
   let (request, unpacked) = read_push(scenario, &server);
   let mut admission = Admission::new(u64::MAX);
+  let objects: Vec<Object> = unpacked
+    .as_ref()
+    .map(|unpacked| unpacked.objects.clone())
+    .unwrap_or_default();
+  let (kept, held) = match unpacked.map(unpack::Unpacked::into_kept) {
+    Some((kept, held)) => (Some(Ok(kept)), held),
+    None => (None, unpack::Held::default()),
+  };
   let checked = {
     let view = IndexedObjects::new(&server.repository, &server.store, u64::MAX);
-    let unpacked = unpacked.map(Ok);
-    receive::check(request, unpacked, &view, &NoneHidden, &mut admission).unwrap()
+    receive::check(request, kept, (&view, &held), &NoneHidden, &mut admission).unwrap()
   };
-  let push = sealed(&server.repository, &mut server.store, checked.objects());
+  let push = sealed(&server.repository, &mut server.store, &objects);
   let mut judge = ProtectedMain {
     server: &server,
     push: &push,
     keys: Keys::trusting(vec![key_blob(TRUSTED_PUB)]),
     faults: Vec::new(),
   };
-  let received = receive::decide(checked, &mut judge, &mut admission).unwrap();
+  let received = receive::decide(checked, Some(&held), &mut judge, &mut admission).unwrap();
   (received, judge.faults)
 }
 

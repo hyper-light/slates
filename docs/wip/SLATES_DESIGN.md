@@ -12218,9 +12218,11 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 
 > **Status (2026-11-20, A-719 parts 1 and 2).** Rule 3's checks are built for git (part 1: `slates_git::receive::Checking`);
 > rule 1's reader seam is built (part 2: `slates_git::unpack::Keep`, each object handed to its keeper as it resolves,
-> with the hold its bytes took, and a delta's base read back from it). Owed: git's intake keeping into the repository's
-> store as it reads (part 3), on w-perf's byte table once it lands; admission by the working set; the store's
-> admission and the verdicts a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+> with the hold its bytes took, and a delta's base read back from it); git's intake keeps into the repository's
+> quarantine as it reads (part 3: `git_push::intake`, each object fsck'd as it is kept and admitted after the session's
+> call, the checks reading commits and trees back from the store, the push holding none of their bytes). Owed: the
+> convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
+> set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -54793,3 +54795,29 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   record naming it. Agreed: w-shared (the ranking keyed by content id; a successor's rebuild fetches from homes), main
   (a move leaves cold content at its homes; no coordination call). Owed: w-fed-faults' answer on fault paths, then the
   region's half.
+
+### A-719 part 3 — git's push is read straight into its quarantine (2026-11-20, w-git for UI goal 93; §4.17.1 "A push's intake", rule 1; §4.17.2 "A push" items 3 to 5)
+- **Change (slates-git).** The receive session reads a pack into a site the caller gives it (`Session::input_into`,
+  `end_into`, `check_turn_with`, `decide_with`, `answer_with`): the pack reader's keeper and the repository its thin
+  bases come from; `Session::input` and the rest read into the session's own memory (`Held`) as before. Each object is
+  checked as git checks a push as it is kept (its bytes in hand). `Checked` and `Received` hold each object's place
+  (`unpack::Kept`), not its bytes; `Pushed` reads bytes through `unpack::Contents` where the caller lends them, and
+  `works::Verdicts` reads a pushed commit or tag from its quarantine view (`works::PushedBytes`, `PushedObjects`).
+- **Change (slates-server).** `git_push::intake`: each session call reads the repository's index and the quarantine
+  read only and queues each object as it resolves, with its hold; the driver then admits the queue to the push's
+  quarantine (`GitPush`, held from the push's start) and gives the holds back, so a push holds what one call resolved,
+  never its pack. The checks read commits and trees back from the store (a one-window object lent with no copy); the
+  answer seals the quarantine (`prepare` admits nothing now); a hook that cannot run, a store's refusal, or a push
+  dropped between steps gives the quarantine back.
+- **Found on the way.** `a_long_history_pushed_over_the_daemons_edge_is_fetched_whole_over_it` failed once under load
+  (main's report): its client waited past ten liveness windows on the push's answer, about twelve thousand quantum-sized
+  turns of the checks with the edge yielding between them, then one unsliced step sealing and deciding. Checking each
+  object as it is kept removed a third of the turns (debug build, load average 34: the answer 3.1 s, its steps 1.1 s).
+  Owed: the verdicts and the seal a turn at a time; the walk's two passes read each commit and tree twice.
+- **Tests.** `slates-server` `git_push::tests::t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes`
+  (a push of a mebibyte file: once its bytes are taken, the file in the quarantine and the push's admission holding
+  under a sixteenth of it; `main` created); the session, connectivity, protected-branch and works tests read the kept
+  objects through the session's keeper.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib` 553 passed, 4 ignored;
+  `cargo test --locked -p slates-server --lib -- git_push:: git_hooks:: git_protect vcs_http::git::
+  vcs_http::daemon_edge:: vcs_ssh:: vcs_store::` 152 of 152 before the new test, which then passed alone; fmt clean.
