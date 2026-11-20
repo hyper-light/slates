@@ -192,3 +192,7 @@
   of 278,528 (1.47x) -- the room does not bound a slice. Quantum on CI mac 3.95 us; lifetime longest_step 1.04 s (the
   import). svn:// bytes were measured after step() clears out -- wrong place. Run 5 measures each slice's own time and
   bytes (svn:// answer(), DAV report.resume()).
+- svn fetch run 5 (macos-latest): BOTH EDGES PAST BUDGET AND ROOM. svn:// slices up to 12.4 ms (99/108 past ~6.2 us
+  quantum), up to 316,779 B vs room 278,528; DAV runs up to 8.3 ms (255 past), 410,243 B. Checkout 3.7/3.9 s, update
+  2.1/2.06 s. Fix planned (A-745's hg template): slice never past its room (carry overflow), a stop-check closure from
+  the server bounding each slice by the quantum, the report's generation held. Inbox note to w-svn written.
