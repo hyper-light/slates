@@ -925,6 +925,51 @@ fn emit_repository_created(
   Ok(())
 }
 
+/// `repository import` (A-710): what the import took, as text (`name: value` lines) or one JSON object, its fields
+/// the reply's.
+fn emit_repository_imported(
+  client: &mut Client,
+  repository: &str,
+  path: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let fields = match client.import_repository(repository, path)? {
+    slates_client::Imported::Mercurial {
+      changesets,
+      manifests,
+      file_logs,
+      file_revisions,
+      markers,
+    } => serde_json::json!({
+      "repository": repository,
+      "changesets": changesets,
+      "manifests": manifests,
+      "file_logs": file_logs,
+      "file_revisions": file_revisions,
+      "markers": markers,
+    }),
+    slates_client::Imported::Dump {
+      revisions,
+      youngest,
+    } => serde_json::json!({
+      "repository": repository,
+      "revisions": revisions,
+      "youngest": youngest,
+    }),
+  };
+  if json {
+    slates_machine::out_line!("{fields}");
+  } else if let Some(fields) = fields.as_object() {
+    for (name, value) in fields {
+      match value.as_str() {
+        Some(text) => slates_machine::out_line!("{name}: {text}"),
+        None => slates_machine::out_line!("{name}: {value}"),
+      }
+    }
+  }
+  Ok(())
+}
+
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
@@ -1590,6 +1635,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::Move { volume, to } => emit_moved(client, *volume, *to, json)?,
     Verb::RepositoryCreate { spec } => emit_repository_created(client, spec, json)?,
+    Verb::RepositoryImport { repository, path } => {
+      emit_repository_imported(client, repository, path, json)?;
+    }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }
     | Verb::RecoveryPlan { .. }
