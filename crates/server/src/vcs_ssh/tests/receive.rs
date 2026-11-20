@@ -279,8 +279,7 @@ fn died(message: &str) -> Refused {
 /// `fatal: git-receive-pack is not served yet` with git's `die` status, 128, where the HTTP site answers `503`.
 #[test]
 fn t_a683_a_push_whose_shard_is_not_lent_is_refused_as_not_served() {
-  let mut command =
-    ReceiveCommand::new(NotLent, owner(), (GONE, NAME.to_owned()), Version::V1);
+  let mut command = ReceiveCommand::new(NotLent, owner(), (GONE, NAME.to_owned()), Version::V1);
   assert_eq!(
     ready(command.step()),
     Err(died("git-receive-pack is not served yet"))
