@@ -149,8 +149,10 @@
 > a-large-mercurial-import-crash-looped-the-daemon.md`. Part 2 FIXED (found by use, w-interop: a 57,035-revision push
 > over HTTP spun shard 0 at its landing): a push's record is written a part a slice before its landing
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
-> Owed: a rebuild's replay (`vcs_store::rebuild`, one step still); the landing's append of an entry as large as its
-> record, and the record's size itself (S5, A-729: identities, no texts); w-perf's and w-interop's by-use reruns.
+> Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
+> replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
+> generation moved after. Owed: the landing's append of an entry as large as its record, and the record's size itself
+> (S5, A-729 part 2: identities, no texts); w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

@@ -1455,7 +1455,10 @@ fn begin_rebase(
   let Forked { fork, intaken, .. } = stale;
   // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
   let begun = vcs_store::within_budget(state, 0, |stores| {
-    let Some(generation) = stores.generation_of(repository) else {
+    let Some(generation) = stores
+      .generation_of(repository)
+      .filter(|_| !stores.rebuilding(repository))
+    else {
       return Err(Box::new((None, fork)));
     };
     let Some((content, store)) = stores.mercurial(repository) else {
@@ -1644,6 +1647,9 @@ fn begin_intake<'g>(
   room: &mut Admission,
 ) -> Option<Result<Taking<'g>, Box<Refused>>> {
   vcs_store::within_budget(state, lend, |stores| {
+    if stores.rebuilding(repository) {
+      return None;
+    }
     let generation = stores.generation_of(repository)?;
     let (content, store) = stores.mercurial(repository)?;
     Some(match Intake::begin(part, &mut store.index, content, room) {
