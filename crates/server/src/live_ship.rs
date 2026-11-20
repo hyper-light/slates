@@ -3521,19 +3521,6 @@ fn whole_record(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Opt
   Some(VolumeRecord::Full { image }.to_bytes())
 }
 
-/// The entry payload of `record`: its kind and body byte, then the body (the record and its content runs), sealed
-/// under the volume's lineage key where this node seals; and, for a sealed whole entry, the anchors its copies of the
-/// lineage key are wrapped for (`None` for a clear body).
-fn payload(
-  state: &mut ShardState,
-  id: slates_db::catalog::VolumeId,
-  whole: bool,
-  record: Vec<u8>,
-) -> Option<(Vec<u8>, Option<Vec<u64>>)> {
-  let body = plain_body(state, id, record)?;
-  sealed_payload(state, id, whole, body)
-}
-
 /// The plain body of a publication of `record` (A-377 split it from [`payload`]): the record and its content runs, read
 /// from the volume now, so it is captured in the publication's own turn whenever it is sealed.
 fn plain_body(
