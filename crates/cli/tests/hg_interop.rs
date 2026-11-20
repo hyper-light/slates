@@ -799,3 +799,70 @@ fn stock_hg_sees_the_bookmarks_the_cli_makes_retires_and_binds() {
     "created: {after_create}; retired: {after_retire}; bound: {after_bind}"
   );
 }
+
+/// A-654 (`hg push -B`: a bookmark exported to the server, which keeps it in the repository's namespace). Do: over the
+/// HTTP edge, push a first changeset as stock hg 7.2; make bookmark `pushed-bm` at it and push it (`hg push -B
+/// pushed-bm`, answered "no changes found" and "exporting bookmark", exit 1 for no changesets, as hg answers any
+/// server); list a fresh clone's bookmarks. Expect `pushed-bm` at the pushed changeset. Skips loudly without stock hg
+/// 7.2 ([`STOCK_HG`]) and where the platform names no issuer surface ([`issuer_of`]).
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pushes_a_bookmark_and_a_clone_sees_it() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's bookmark push: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-pushed-bm-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's bookmark push") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let url = format!("{prefix}r");
+  let scratch = Scratch::new("hg-pushed-bm");
+  let local = format!("{}/local", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &local,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(&hg, &local, &with_config(&["push", &url], &config));
+  let pushed = hg_nodes(&hg, &local).into_iter().next().unwrap_or_default();
+  hg_ok(&hg, &local, &["bookmark", "pushed-bm"]);
+  let (code, out, err) = hg_in(
+    &hg,
+    &local,
+    &with_config(&["push", "-B", "pushed-bm", &url], &config),
+  );
+  let copy = format!("{}/copy", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &copy], &config),
+  );
+  let listed = hg_ok(
+    &hg,
+    &copy,
+    &["bookmarks", "--template", "{bookmark} {node}\\n"],
+  );
+  assert_eq!(
+    (code <= 1, listed.contains(&format!("pushed-bm {pushed}"))),
+    (true, true),
+    "push -B: {code} {out}{err}; the clone's bookmarks: {listed}"
+  );
+}
