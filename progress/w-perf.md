@@ -179,3 +179,12 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   vcs tests moved to bytes_of; new test windows_kept_by_a_storage_that_copies_out_read_and_free_as_the_heap_store_does.
   vcs content:: 8/8. Dependents' tests running. Then: land step 1; step 2 = server ArenaWindows over a repository
   ChunkStore per shard (pool owner-tag range), then (a3).
+- (a2) step 1 LANDED main 6b1fb644f (WindowStorage seam, HeapWindows, with_storage, Kept Here/Stored, bytes_of,
+  len_of; readers moved incl. homes read_here, kept_fragments). Landed tree: server 72/72, git store 87/87.
+- hg import re-run (A-732, w-hg's fix) running on Studio as kiln r66 (log ~/.cache/w-perf/hgimp2.log/.out, evidence
+  hg-import-2.log). Report result (completes/typed refusal, no spin/restart, RSS) to w-hg (slates-work-09) + main.
+- NEXT (a2) step 2: server ArenaWindows: a repository ChunkStore per home shard (vfs ChunkStore over a ChunkArena whose
+  ExtentSource = ContentPool with a distinct owner-tag range; content_pool.rs owner word = partition+1 today),
+  installed via ContentStore::with_storage where VcsStores.content is made; reads via read_extent_into (copy-out).
+  Then (a3): image section for the repository arena's chunk table + recovery before records + homes::image_begun/
+  image_published hooks + group commit; then (b) git record v3; then S4 slice 2 under rule (B).
