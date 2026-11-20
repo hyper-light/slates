@@ -26,6 +26,7 @@ use super::super::tests::{
 use super::{ShardStores, lend_on};
 use crate::repository::push::BranchChange;
 use crate::state::ShardState;
+use crate::vcs_http::git::ThisShard;
 use crate::vcs_ssh::site::{Command, Next, Service, Services, Start, ToolServices};
 
 /// Shape: the room a request and its answer are admitted: far past the tests' few small objects.
@@ -389,7 +390,7 @@ async fn ssh_session(
   record: &RepositoryRecord,
   requests: &[Vec<u8>],
 ) -> Result<Vec<(Vec<u8>, Next)>, String> {
-  let mut services = ToolServices::new(ShardStores, ServedViews, ROOM);
+  let mut services = ToolServices::new(ShardStores, ServedViews, ThisShard, ROOM);
   let start = Start {
     service: Service::GitUploadPack,
     repository: Some(record),
