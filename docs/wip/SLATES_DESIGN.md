@@ -15310,6 +15310,18 @@ path the server sends (absent entries, log's access levels, `get-file`, `get-dir
 (write on the path and its parent; recursive write to delete or replace a directory; recursive read of a copy source).
 A principal with read on the whole repository and no rule beneath meets one comparison and no per-path check.
 
+> **Status (2026-11-19, A-692: `svn://`'s CRAM-MD5 against enrolled tokens).** Built: a token's credential record
+> (§4.13, A-625 part 3) keeps HMAC-MD5's keyed contexts beside the token's hash (`CredentialKind::HttpToken`'s
+> `cram_md5_contexts`: MD5's state after the token's outer pad block, then after its inner, Dovecot's CRAM-MD5 layout),
+> which the CLI's issuer derives as it mints the token (`slates credential token`), so the daemon holds neither the token
+> nor anything that gives it back; the contexts live where the record lives, in the partition's RAM on the owner and
+> the anchor, durable and recovered as the record is. A client names its token by the token's id in lowercase hex, the
+> CLI's `id:` line; `slates_server::credentials::cram_md5_key` finds the record on its partition and keys the session
+> while the token is live and its consumer enrolled, the session's principal the token's, and the handshake finishes
+> the digest from the kept contexts with MD5 written from RFC 1321 (`slates-svn`'s `handshake::rfc1321`). The anchor's
+> layout is 15. Owed: the `svn://` connection asking `cram_md5_key` for a client's key (A-689's next slice, g234), and
+> CRAM-MD5 through the SSH tunnel, where `EXTERNAL` serves (A-688, g229).
+
 > **Status (2026-11-19, A-606).** Built: authorization (`slates-svn`'s `authz`, piece 10). The rules file, and a
 > separate groups file, are read as `svn_config__parse_stream` reads them and their sections, groups, aliases and
 > entries taken as `authz_parse.c` takes them; groups are resolved without being expanded. Each principal's rules in a
@@ -52596,3 +52608,54 @@ Applied in the same change to:
   keys for it); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's
   ending above; `svn checkout svn+ssh://` with a stock client against a daemon, the other platforms' runs and the
   red-checks (main's).
+
+### A-692 — `svn://`'s CRAM-MD5 against enrolled tokens: a token's record keeps HMAC-MD5's keyed contexts, never the token (2026-11-19, g307, UI goal 93; §4.17.4 item 10, §4.13; A-599's owed (3), A-625 part 3; found by the Subversion interop tests)
+Applied in the same change to: §4.17.4 item 10's status; GAPS (the §4.17.4 entry: A-599's owed (3), the interop tests'
+waits, an A-692 paragraph); `crates/svn/src/handshake.rs` (`CramContexts`, `CramKey::from_contexts`,
+`CramKey::from_secret` infallible, the module doc), `crates/svn/src/handshake/rfc1321.rs` (new), `crates/svn/Cargo.toml`
+and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `crates/db/src/catalog.rs`
+(`CredentialKind::HttpToken { cram_md5_contexts }`) and `crates/db/src/credentials.rs`; `crates/ipc/src/protocol.rs`
+(`CredentialMaterial::HttpToken { id, cram_md5_contexts }`, `EnrollCredential`'s doc); `crates/server/src/credentials.rs`
+(`cram_md5_contexts`, `cram_md5_key`, `Unkeyed`, `CramUser`, the module doc) and `vcs_http/daemon_edge.rs`;
+`crates/api/src/issuer.rs` (`enroll_token` derives and sends the contexts); `crates/anchor/src/layout.rs`
+(`LAYOUT_VERSION` 15) and `crates/anchor/tests/anchor.rs`; `crates/cli/src/args.rs` (`credential token`'s usage),
+`crates/cli/tests/svn_interop.rs` (the legs' waits: CRAM-MD5 served; A-685 landed); `docs/cli.md`.
+
+- **Why.** Stock `svn` commits over `svn://` only once it authenticated, by CRAM-MD5, whose server must hold the shared
+  secret or its keyed contexts (RFC 2195 §4). A token's record held its SHA-256 alone (A-625 part 3), which cannot
+  answer a challenge, so no stock client could commit over `svn://`; the interop tests' `svn://` leg found it (A-599's
+  owed (3)).
+- **What is kept.** HMAC-MD5's keyed contexts of the token: MD5's chaining state after the token's inner pad block and
+  after its outer pad block (RFC 2104 §4), 32 bytes in Dovecot's CRAM-MD5 layout (`hmac_md5_get_cram_context`,
+  `src/lib/hmac-cram-md5.c`: the outer state's words A, B, C, D, then the inner's, each low-order byte first; its
+  loader counts 64 bytes absorbed). The issuer derives them as it mints the token and sends them with the token's id;
+  the token never crosses a channel and is never held. The contexts answer CRAM-MD5 as the token does, so they "must be
+  protected" as it is, and they give no token back: an HTTP request, which presents the token, cannot be made from them.
+- **Who.** The client names its token by the token's id in lowercase hex, the CLI's `id:` line, since CRAM-MD5 finds a
+  secret by its user's name; the session's principal is the record's, never the name. A token keys a session while it
+  is live on the wall clock and, for a consumer's, while the consumer is enrolled, as the HTTP edge judges a presented
+  token; every other user (no id, unknown or revoked, an SSH key's id, expired) gets no key, answered as `svnserve`
+  answers a user it has no password for ("Username not found"), each reason typed (`Unkeyed`).
+- **MD5.** A digest finished from a kept state needs MD5's chaining state, which neither RustCrypto's `md-5` 0.10 (its
+  state and compression are private) nor the vendored aws-lc-rs (whole messages alone, and HMAC over the SHA family
+  alone) lets a caller start from, so `slates-svn`'s `handshake::rfc1321` writes MD5's compression and padding from RFC
+  1321 §3, with no allocation and no panic. `hmac` is dropped; `md-5` stays as a test oracle beside aws-lc-rs's MD5.
+- **Format.** The record's change is a field of `CredentialKind::HttpToken`, its tag unchanged (both wire-order guards
+  hold), so a token record of layout 14 would be misread: the anchor's layout is 15, and a segment of layout 14 is
+  refused at start, typed, before anything is served.
+- **Tests.** `slates-svn` (`handshake`): MD5 against RFC 1321's suite and both libraries at the padding's bounds, and
+  against both over generated messages; the contexts of RFC 2202's `Jefe` and of a minted token in Dovecot's bytes, as a
+  separate MD5 written from RFC 1321 in Python derived them (it checks its MD5 against `hashlib` and its HMAC against
+  `hmac`), and the token's contexts answering `<1.2@h>` with the digest Python's `hmac` made with the token; a key kept
+  as its contexts digesting as `cram.c`'s `compute_digest` (transcribed over `md-5`) does with the password, over
+  generated passwords either side of the block, and refusing a changed challenge; the existing stock sessions, RFC 2195's
+  example and RFC 2202's cases, now through the contexts. `slates-server` (`credentials`): a token enrolled through the
+  dispatch is held as its hash and contexts, its bytes nowhere in the record's encoding; an ra_svn session on a
+  two-shard daemon, keyed by `cram_md5_key` from the record, establishes the user its id names with the digest a stock
+  client makes (Python's, no code of slates'), the token proving its principal, answers another digest "Password
+  incorrect", and gives no key, each for its reason, to an expired token, a revoked one, an SSH key's id, `alice` and
+  the id in capitals. `slates-anchor`: `a_segment_from_before_cram_md5_contexts_is_refused_at_start`.
+- **Evidence.** @@A692RUN@@
+- **Owed.** The `svn://` connection asking `cram_md5_key` for a client's key (A-689's next slice, g234), when the
+  interop tests' `svn://` leg is un-ignored; CRAM-MD5 through the SSH tunnel (`svnserve -t` takes `EXTERNAL`; A-688,
+  g229); the Windows and Linux runs and the gates (main's).
