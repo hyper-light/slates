@@ -35,14 +35,22 @@ fn a_urls_candidates_are_its_leading_runs_longest_first_each_with_its_root_url()
           "team/repo/a b".to_owned(),
           b"svn://127.0.0.1:3690/team/repo/a%20b".to_vec(),
         ),
-        (2, "team/repo".to_owned(), b"svn://127.0.0.1:3690/team/repo".to_vec()),
+        (
+          2,
+          "team/repo".to_owned(),
+          b"svn://127.0.0.1:3690/team/repo".to_vec(),
+        ),
         (1, "team".to_owned(), b"svn://127.0.0.1:3690/team".to_vec()),
       ],
     ),
     (
       b"svn+ssh://h/my%20repo/x",
       vec![
-        (2, "my repo/x".to_owned(), b"svn+ssh://h/my%20repo/x".to_vec()),
+        (
+          2,
+          "my repo/x".to_owned(),
+          b"svn+ssh://h/my%20repo/x".to_vec(),
+        ),
         (1, "my repo".to_owned(), b"svn+ssh://h/my%20repo".to_vec()),
       ],
     ),

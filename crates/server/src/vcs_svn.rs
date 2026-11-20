@@ -698,7 +698,14 @@ async fn step(
           Stepped::Elsewhere(found, located)
         }
         Location::Found(located) => {
-          opened(stream, &mut conversation.connection, &found, Some(&located), out).await
+          opened(
+            stream,
+            &mut conversation.connection,
+            &found,
+            Some(&located),
+            out,
+          )
+          .await
         }
         Location::Nowhere => opened(stream, &mut conversation.connection, &found, None, out).await,
         Location::Unanswered => {
@@ -800,7 +807,10 @@ pub(crate) async fn locate(found: &Found) -> Location {
 }
 
 /// The longest of `names`, each with the depth it takes, that this shard holds as a Subversion repository.
-fn deepest_held(state: &mut crate::state::ShardState, names: &[(usize, String)]) -> Option<(usize, String)> {
+fn deepest_held(
+  state: &mut crate::state::ShardState,
+  names: &[(usize, String)],
+) -> Option<(usize, String)> {
   let repositories = state.db.partition().repositories();
   names
     .iter()
