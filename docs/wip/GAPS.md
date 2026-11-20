@@ -7051,10 +7051,15 @@
 >   edge's own reads (RFC 6298 over each bearer holder's acceptance-to-bearer time, `G` the shard's tick or scheduler
 >   lateness, RFC 9002's initial probe timeout as the prior keeping the share `1/(n+1)` after `n` arrivals), and is cut
 >   off unanswered there; a connection that has shown the bearer waits while it lives
->   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). Owed: a
->   listen stream's keep-alive period still comes from the reply deadline (half of it,
->   `slates_mcp::http::listen_keep_alive_ns`); an honest client cut off before its bearer arrived looks like any other
->   sender and teaches the bound nothing. The
+>   (`a_sender_that_never_shows_the_bearer_is_cut_off_at_the_learned_bound_and_a_token_holder_is_waited_for`). A listen
+>   stream's keep-alive period since 2026-11-20 (g226, goal 88's last part; main's ruling): it was half the reply
+>   deadline, a fixed 500 ms; it now beats by the heartbeat's rule over the liveness budget (the CLI's
+>   `listen_keep_alive_ns` over `slates_server::daemon::heartbeat_of`, `W / ELECTION_MARGIN`, the anchor's beat's rule),
+>   so a beat lands inside each liveness window and follows the budget
+>   (`the_mcp_listens_keep_alive_beats_by_the_heartbeats_rule_over_the_liveness_budget`; red before: 500,000,000 ns
+>   against the heartbeat's 100,000,000). Not learned from the stream's ends, since a client's close cannot tell an idle
+>   timeout from a cancellation. Owed: an honest client cut off before its bearer arrived looks like any other sender
+>   and teaches the bound nothing. The
 >   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
 >   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
 >   daemon's side waits on the client's since A-492, a daemon gone closing its end

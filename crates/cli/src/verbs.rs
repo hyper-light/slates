@@ -532,7 +532,7 @@ fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> R
     port: bound,
     bearer,
     tick_ns: config.runtime.timer_tick_ns,
-    keep_alive_ns: slates_mcp::http::listen_keep_alive_ns(slates_api::deadlines().reply_ns),
+    keep_alive_ns: listen_keep_alive_ns(slates_server::daemon::LIVENESS_BUDGET_NS),
     connections: config.clients_per_shard,
   };
   slates_machine::log_line!(
@@ -3479,6 +3479,16 @@ mod harness_tests {
   }
 }
 
+/// Derived: the period the MCP edge's quiet listen stream sends its keep-alive comment at
+/// (`slates_mcp::http::HttpEdge::keep_alive_ns`): the heartbeat's rule over the liveness budget `liveness_budget_ns`
+/// (`slates_server::daemon::heartbeat_of`, `W / ELECTION_MARGIN`), the rule the anchor's beat follows, so a beat lands
+/// inside each liveness window and a client whose patience is that window sees the edge alive within it (R3, goal 88's
+/// class C; main's ruling, 2026-11-20). Not learned from the stream's ends: a client's close cannot tell an idle
+/// timeout from a cancellation. Until 2026-11-20 half the client's reply deadline, a fixed 500 ms no budget moved.
+fn listen_keep_alive_ns(liveness_budget_ns: u64) -> u64 {
+  slates_server::daemon::heartbeat_of(liveness_budget_ns).max(1)
+}
+
 #[cfg(test)]
 mod tests {
   use super::{chokepoint_value, digest_json, failure_of_api, signal_value};
@@ -3489,6 +3499,34 @@ mod tests {
   /// exited 1 printing `denied: NoAuthority(NoHandoff)`). Do: map a missing issuer authority and a revoked consumer's
   /// denial to the command's failure. Expect the first the command's own (exit 4) naming the anchor's surface it needs,
   /// as `docs/cli.md` says, and the second the daemon's refusal (exit 1).
+  /// R3, goal 88's class C (main's ruling, 2026-11-20): the MCP edge's quiet listen stream beats inside each liveness
+  /// window by the anchor's beat's own rule, so it follows the budget. Do: take the keep-alive at the daemon's liveness
+  /// budget and at twice it. Expect each the heartbeat's rule over that budget: the shipped heartbeat at the shipped
+  /// budget, twice it at twice the budget, and the window holding more than one beat. Before, it was half the client's
+  /// reply deadline, a fixed 500 ms that no budget moved.
+  #[test]
+  fn the_mcp_listens_keep_alive_beats_by_the_heartbeats_rule_over_the_liveness_budget() {
+    let budget = slates_server::daemon::LIVENESS_BUDGET_NS;
+    assert_eq!(
+      super::listen_keep_alive_ns(budget),
+      slates_server::daemon::HEARTBEAT_NS,
+      "at the shipped budget, the daemon's heartbeat"
+    );
+    assert_eq!(
+      super::listen_keep_alive_ns(2 * budget),
+      slates_server::daemon::heartbeat_of(2 * budget),
+      "it follows the budget"
+    );
+    assert_eq!(
+      super::listen_keep_alive_ns(2 * budget),
+      2 * super::listen_keep_alive_ns(budget)
+    );
+    assert!(
+      super::listen_keep_alive_ns(budget) < budget / 2,
+      "more than one beat lands inside each window"
+    );
+  }
+
   #[test]
   fn a_missing_issuer_authority_fails_the_command_and_a_denial_is_a_refusal() {
     let missing = failure_of_api(
