@@ -7139,8 +7139,9 @@
 >   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
 >   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
 >   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
->   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end) and
->   `nfs_v4_restart` (Linux's, compiled here). Owed in `cli/tests`: `cli`, `live_fleet`, `vm`, `nfs_held`,
+>   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end),
+>   `nfs_v4_restart` (Linux's, compiled here) and `nfs_held` (its NFS sockets read without a timeout, the anchor holding
+>   them across a restart, A-113). Owed in `cli/tests`: `cli`, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module

@@ -693,8 +693,8 @@ pub(crate) fn long_directory_history(revisions: usize, per_revision: usize) -> S
 /// A-751 follow-up's A/B (main's: "listing time ... before and after, on a large directory with a long history"), in
 /// release (`cargo test --release -p slates-svn --lib -- --ignored listing_times --nocapture`): `/trunk/big` after
 /// 1,000 revisions of 10 files each (9,001 live, 10,000 named), listed at the youngest revision and at the middle one.
-/// Printed for each: `Index::children`; a dirent for every child listed (`history::present`, as the drive's `entries`
-/// makes one); and the two together, the server's listing. Measured, not asserted.
+/// Printed for each: `Index::children`; a dirent resolved for every child listed (`history::present`, as the drive's
+/// `entries` made one before A-759); and the drive's `entries` as it is now. Measured, not asserted.
 #[test]
 #[ignore = "a measurement, run in release"]
 fn listing_times() {
@@ -708,6 +708,12 @@ fn listing_times() {
     rules: None,
   };
   let youngest = index.youngest();
+  eprintln!(
+    "listing_times: the index holds {} entries of {} bytes ({} bytes), the children maps' bytes among them",
+    index.entries(),
+    Index::ENTRY_BYTES,
+    index.entries() * Index::ENTRY_BYTES
+  );
   for revision in [youngest, youngest / 2] {
     let best = |run: &dyn Fn() -> usize| {
       (0..5)
@@ -737,9 +743,10 @@ fn listing_times() {
         })
         .count()
     });
+    let (entries_made, _) = best(&|| entries(&sources, "/trunk/big", revision).unwrap().len());
     eprintln!(
-      "listing_times r{revision}: {live} live; children {children:?}; dirents {dirents:?}; listing {:?}",
-      children + dirents
+      "listing_times r{revision}: {live} live; children {children:?}; dirents resolved {dirents:?}; the drive's \
+       entries (listing, each from its row) {entries_made:?}"
     );
   }
 }
