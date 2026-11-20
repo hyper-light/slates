@@ -823,6 +823,15 @@ mod tests {
       .sum()
   }
 
+  /// Releases every value, then removes the file: neither the chunks nor the blocks may hold anything after.
+  fn release_all(chunks: &mut Chunks, files: &mut Files, values: Vec<Value>) {
+    for value in values {
+      value.release(chunks, files.blocks_mut());
+    }
+    files.remove("f");
+    assert_eq!((chunks.bytes(), files.blocks().live()), (0, 0));
+  }
+
   proptest! {
     #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
 
@@ -958,11 +967,7 @@ mod tests {
       values.last().unwrap().materialize(&chunks, files.blocks()),
       bytes
     );
-    for value in values {
-      value.release(&mut chunks, files.blocks_mut());
-    }
-    files.remove("f");
-    assert_eq!((chunks.bytes(), files.blocks().live()), (0, 0));
+    release_all(&mut chunks, &mut files, values);
   }
 
   /// A-728. Do: a file's block named as a value; a small overwrite made over it; then a whole replace of the result;
@@ -987,9 +992,23 @@ mod tests {
       "the splice's added bytes are the new block's"
     );
     assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
+    let third = replaced_whole(&mut chunks, &mut files, (&mut spliced, &next));
+    files.remove("f");
+    assert_eq!(named.materialize(&chunks, files.blocks()), first);
+    release_all(&mut chunks, &mut files, vec![named, spliced, third]);
+  }
+
+  /// `f` replaced whole over `spliced` (a small edit's value, reading `next`), made as the engine makes it. Expect the
+  /// replace to seal `spliced` (its 8 added bytes copied, its block let go, the first block and the new file's alone
+  /// left), and both values to read back exactly. The replacing value.
+  fn replaced_whole(
+    chunks: &mut Chunks,
+    files: &mut Files,
+    (spliced, next): (&mut Value, &[u8]),
+  ) -> Value {
     let replace = [op_of(4, 0, 0, 0), op_of(3, 0, 16, 0)];
-    let replaced = apply(&next, &replace, &[9u8; 16]);
-    let third = version(&mut chunks, &mut files, &mut spliced, (&replace, &replaced));
+    let replaced = apply(next, &replace, &[9u8; 16]);
+    let third = version(chunks, files, spliced, (&replace, &replaced));
     assert_eq!(
       chunks.owned_bytes(),
       8,
@@ -1000,14 +1019,9 @@ mod tests {
       2,
       "the first block (named whole) and the replacing file's"
     );
-    assert_eq!(third.materialize(&chunks, files.blocks()), replaced);
-    assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
-    files.remove("f");
-    assert_eq!(named.materialize(&chunks, files.blocks()), first);
-    for value in [named, spliced, third] {
-      value.release(&mut chunks, files.blocks_mut());
-    }
-    assert_eq!((chunks.bytes(), files.blocks().live()), (0, 0));
+    assert_eq!(third.materialize(chunks, files.blocks()), replaced);
+    assert_eq!(spliced.materialize(chunks, files.blocks()), next);
+    third
   }
 
   /// A-728 part 2. Do: splice a small edit into a file's block, let another holder keep that block (as the identity
@@ -1035,10 +1049,6 @@ mod tests {
       "cut once nothing else holds it"
     );
     assert_eq!(spliced.materialize(&chunks, files.blocks()), next);
-    for value in [latest, spliced] {
-      value.release(&mut chunks, files.blocks_mut());
-    }
-    files.remove("f");
-    assert_eq!((chunks.bytes(), files.blocks().live()), (0, 0));
+    release_all(&mut chunks, &mut files, vec![latest, spliced]);
   }
 }

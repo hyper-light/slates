@@ -2649,7 +2649,7 @@ pub(crate) fn rebuild_repository(
   };
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
   if let Err(error) = state.db.mutate(&mut state.segment, &op, now) {
-    eprintln!(
+    slates_machine::log_line!(
       "slates-server: partition {}: a repository taken over was not rebuilt: {error:?}",
       state.partition
     );

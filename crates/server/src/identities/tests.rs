@@ -134,6 +134,7 @@ fn git_only(name: &str) -> ToolIdentities {
       email: "ada@example.com".to_owned(),
     }),
     mercurial: None,
+    subversion: None,
   }
 }
 
@@ -142,6 +143,7 @@ fn mercurial_only(name: &str) -> ToolIdentities {
   ToolIdentities {
     git: None,
     mercurial: Some(format!("{name} <ada@example.com>")),
+    subversion: None,
   }
 }
 
@@ -150,6 +152,7 @@ fn both(name: &str) -> ToolIdentities {
   ToolIdentities {
     git: git_only(name).git,
     mercurial: mercurial_only(name).mercurial,
+    subversion: None,
   }
 }
 
@@ -520,7 +523,10 @@ fn t_a664_a_session_reads_its_identities_once_and_its_clients_claim_never_reache
     (
       true,
       Some((2, ReplyBody::IdentitiesSet { version: 1 })),
-      Some(ToolIdentities::default()),
+      Some(ToolIdentities {
+        subversion: Some(crate::lfs::owner_name(&owner())),
+        ..ToolIdentities::default()
+      }),
       false,
     ),
     (true, Some((1, Some(1))), Some(2)),

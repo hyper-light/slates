@@ -37,7 +37,8 @@
 //! with the new revision. A hook the repository configures at start-commit or pre-commit refuses the commit, as the
 //! svn+ssh tunnel refuses it, until hooks run. A commit presents its lock tokens as a stock client sends them: each
 //! request's `If` header, then the MERGE's `S:lock-token-list` with `X-SVN-Options: keep-locks` deciding whether the
-//! verdict releases them. An abandoned transaction is kept until its principal begins another.
+//! verdict releases them. A transaction idle past the edge's learned idle bound (`super::idle_bound_ns`) is released
+//! at the table's next use, as are any its principal left when it begins another.
 //!
 //! **Locks** (A-681, over A-627's `slates_svn::dav::locking` and A-602's lock table): a LOCK or an UNLOCK of a public
 //! path is read, judged by the repository's lock table at the owner's instant with a token drawn from the system's
@@ -115,7 +116,7 @@ fn to_usize(count: u64) -> usize {
 /// elements, nesting levels and attributes as many as parsed elements (`size_of::<Element>()` each) fit in the room.
 pub(crate) fn xml_bounds(room: u64) -> XmlBounds {
   let bytes = to_usize(room);
-  let elements = bytes / size_of::<Element>().max(1);
+  let elements = bytes.checked_div(size_of::<Element>()).unwrap_or(bytes);
   XmlBounds {
     body_bytes: bytes,
     depth: elements,
@@ -1062,7 +1063,7 @@ impl<S: SvnStores> SvnExchange<S> {
               .answers
               .iter()
               .find(|(named, _)| *named == path)
-              .map(|(_, answer)| answer.as_ref().map(|()| ()));
+              .map(|(_, answer)| answer.as_ref().map(|_unit| ()));
             match decided {
               Some(decided) => {
                 let answer = locking::unlock_answer(&request, decided, &filesystem);
@@ -1304,7 +1305,10 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
         let piece = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
-            lent.repository.text(&text.identity, at).map(<[u8]>::to_vec)
+            lent
+              .repository
+              .text(&text.identity, at)
+              .map(std::borrow::Cow::into_owned)
           })
           .flatten()
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;

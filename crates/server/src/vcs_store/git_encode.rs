@@ -106,14 +106,14 @@ fn turn_uncounted(state: &mut ShardState, id: RepositoryId) -> (Turned, u64) {
     return (Turned::Idle, 0);
   };
   let mut begun = false;
-  if !stores.encodings.0.contains_key(&id) {
+  if let std::collections::btree_map::Entry::Vacant(unencoded) = stores.encodings.0.entry(id) {
     let Some((green, version)) = store.repository.first_unencoded() else {
       super::settle(state);
       return (Turned::Idle, 0);
     };
     match Encoding::fragments(&store.repository, content, green, version) {
       Ok(encoding) => {
-        stores.encodings.0.insert(id, (encoding, (green, version)));
+        unencoded.insert((encoding, (green, version)));
         begun = true;
       }
       Err(_) => {

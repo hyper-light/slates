@@ -24,9 +24,13 @@ pub fn first_refusal(objects: &[Object], format: ObjectFormat) -> Option<(Object
 }
 
 /// What a push's check finds against `object`, if it refuses it.
-pub(crate) fn refusal(object: &Object, format: ObjectFormat) -> Option<FsckId> {
-  let content = object.content.as_slice();
-  match object.kind {
+fn refusal(object: &Object, format: ObjectFormat) -> Option<FsckId> {
+  refusal_of(object.kind, &object.content, format)
+}
+
+/// What a push's check finds against an object of `kind` holding `content`, if it refuses it.
+pub(crate) fn refusal_of(kind: Kind, content: &[u8], format: ObjectFormat) -> Option<FsckId> {
+  match kind {
     Kind::Commit => commit::fsck(content, format, Strictness::Strict).refusal(),
     Kind::Tag => tag::fsck(content, format, Strictness::Strict).refusal(),
     Kind::Tree => {

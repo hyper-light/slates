@@ -134,7 +134,7 @@ pub(crate) fn import_with(
 ) -> ReplyBody {
   let record = match super::owned_repository(state, principal, name, "import_repository") {
     Ok(record) => record,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   let imports = match record.tool {
     VcsTool::Mercurial => Imports::Mercurial,

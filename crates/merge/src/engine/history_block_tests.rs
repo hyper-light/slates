@@ -48,127 +48,119 @@ fn balanced(green: &Green) {
   );
 }
 
-/// A-728 (the shared path's non-vacuity counters). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
-/// bytes, overwrite 4 more, remove it, then fold the history to the head. Expect: the create and the whole replace each
-/// name the file's block (two values, 128 KiB) and the history owns no byte after them; the history retains the replaced
-/// version's 64 KiB, its block, and its one piece; the first overwrite's added runs name the new block, nothing copied;
-/// the second seals it (its 8 bytes copied out, its block let go) and the removal seals the second (4 more); every
-/// version reads back exactly; the fold keeps the head; the running totals equal their recount throughout.
-#[test]
-fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
-  const LEN: u64 = 64 * 1024;
-  let first: Vec<u8> = (0..LEN).map(|n| (n % 251) as u8).collect();
-  let second: Vec<u8> = (0..LEN).map(|n| (n % 241) as u8 ^ 0x5a).collect();
-  let mut green = Green::new();
+/// Submits an overwrite of `bytes` at `at` over `previous` (the head's bytes) as version `version`, expecting it
+/// accepted; the file's new bytes.
+fn overwrite(
+  green: &mut Green,
+  version: u64,
+  (at, bytes): (u64, &[u8]),
+  previous: &[u8],
+) -> Vec<u8> {
+  let len = u64::try_from(bytes.len()).unwrap();
+  let id = u8::try_from(version).unwrap();
+  let outcome = green.submit(&increment(
+    id,
+    version - 1,
+    "f",
+    &[(OpKind::Overwrite, at, len)],
+    bytes,
+  ));
+  assert_eq!(outcome, Outcome::Accepted { version });
+  let mut next = previous.to_vec();
+  let from = usize::try_from(at).unwrap();
+  next[from..from + bytes.len()].copy_from_slice(bytes);
+  next
+}
+
+/// Every `(version, bytes)` reads back exactly, and the running totals equal their recount.
+fn reads_back(green: &Green, versions: &[(u64, &[u8])]) {
+  for (version, bytes) in versions {
+    assert_eq!(
+      green.content_ref_at("f", *version).as_deref(),
+      Some(*bytes),
+      "version {version}"
+    );
+  }
+  balanced(green);
+}
+
+/// Versions 1 and 2 of the test's file, `first` created and `second` replacing it whole. Expect both to name the file's
+/// block (two values, `2 * len` bytes), the history to own no byte, and to retain the replaced version's block and its
+/// one piece.
+fn created_then_replaced_whole(green: &mut Green, first: &[u8], second: &[u8]) {
+  let len = u64::try_from(first.len()).unwrap();
   let made = green.submit(&increment(
     1,
     0,
     "f",
-    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, LEN)],
-    &first,
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    first,
   ));
   assert_eq!(made, Outcome::Accepted { version: 1 });
-  let replaced = green.submit(&increment(
-    2,
-    1,
-    "f",
-    &[(OpKind::Overwrite, 0, LEN)],
-    &second,
-  ));
-  assert_eq!(replaced, Outcome::Accepted { version: 2 });
-  assert_eq!(green.history_blocks_named(), (2, 2 * LEN));
+  overwrite(green, 2, (0, second), first);
+  assert_eq!(green.history_blocks_named(), (2, 2 * len));
   assert_eq!(green.history_owned_bytes(), 0, "the history copied no byte");
-  assert_eq!(green.content("f"), Some(second.as_slice()));
-  assert_eq!(
-    green.content_ref_at("f", 1).as_deref(),
-    Some(first.as_slice())
-  );
   assert_eq!(
     green.retained_bytes().history,
-    usize::try_from(LEN).unwrap() + crate::history::PIECE_BYTES,
+    first.len() + crate::history::PIECE_BYTES,
     "the replaced version's block and its one piece"
   );
-  balanced(&green);
+  reads_back(green, &[(1, first), (2, second)]);
+}
 
-  let edited = green.submit(&increment(
-    3,
-    2,
-    "f",
-    &[(OpKind::Overwrite, 100, 8)],
-    b"ABCDEFGH",
-  ));
-  assert_eq!(edited, Outcome::Accepted { version: 3 });
-  let mut third = second.clone();
-  third[100..108].copy_from_slice(b"ABCDEFGH");
+/// A-728 (the shared path's non-vacuity counters). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
+/// bytes, overwrite 4 more, remove it, then fold the history to the head. Expect: the create and the whole replace each
+/// name the file's block and the history owns no byte after them; the first overwrite's added runs name the new block,
+/// nothing copied; the second seals it (its 8 bytes copied out, its block let go) and the removal seals the second (4
+/// more); every version reads back exactly; the fold keeps the head; the running totals equal their recount throughout.
+#[test]
+fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
+  const LEN: usize = 64 * 1024;
+  let first: Vec<u8> = (0..LEN).map(|n| (n % 251) as u8).collect();
+  let second: Vec<u8> = (0..LEN).map(|n| (n % 241) as u8 ^ 0x5a).collect();
+  let mut green = Green::new();
+  created_then_replaced_whole(&mut green, &first, &second);
+
+  let third = overwrite(&mut green, 3, (100, b"ABCDEFGH"), &second);
   assert_eq!(
-    green.history_blocks_named(),
-    (2, 2 * LEN),
+    green.history_blocks_named().0,
+    2,
     "a splice names no whole block"
   );
   assert_eq!(
     green.history_splices_named(),
-    ((1, usize::try_from(LEN).unwrap()), (0, 0)),
-    "the splice's added runs name the new block (A-728 part 2)"
+    ((1, LEN), (0, 0)),
+    "added runs named in the new block"
   );
   assert_eq!(green.history_owned_bytes(), 0, "the splice copied nothing");
-  assert_eq!(green.content("f"), Some(third.as_slice()));
-  assert_eq!(
-    green.content_ref_at("f", 2).as_deref(),
-    Some(second.as_slice())
-  );
-  assert_eq!(
-    green.content_ref_at("f", 1).as_deref(),
-    Some(first.as_slice())
-  );
-  balanced(&green);
+  reads_back(&green, &[(1, &first), (2, &second), (3, &third)]);
 
-  let again = green.submit(&increment(
-    4,
-    3,
-    "f",
-    &[(OpKind::Overwrite, 200, 4)],
-    b"WXYZ",
-  ));
-  assert_eq!(again, Outcome::Accepted { version: 4 });
-  let mut fourth = third.clone();
-  fourth[200..204].copy_from_slice(b"WXYZ");
+  let fourth = overwrite(&mut green, 4, (200, b"WXYZ"), &third);
   assert_eq!(
     green.history_splices_named(),
-    ((2, 2 * usize::try_from(LEN).unwrap()), (1, 8)),
-    "superseded, version 3 is sealed: its 8 bytes copied out, its block let go"
+    ((2, 2 * LEN), (1, 8)),
+    "version 3 sealed"
   );
   assert_eq!(green.history_owned_bytes(), 8);
-  assert_eq!(green.content("f"), Some(fourth.as_slice()));
-  assert_eq!(
-    green.content_ref_at("f", 3).as_deref(),
-    Some(third.as_slice())
-  );
-  assert_eq!(
-    green.content_ref_at("f", 2).as_deref(),
-    Some(second.as_slice())
-  );
-  balanced(&green);
+  reads_back(&green, &[(2, &second), (3, &third), (4, &fourth)]);
 
-  let removed = green.submit(&{
-    let mut inc = increment(5, 4, "f", &[(OpKind::Unlink, 0, 0)], b"");
-    inc.doc.ops[0].src = u64::MAX;
-    inc
-  });
-  assert_eq!(removed, Outcome::Accepted { version: 5 });
+  removed_then_folded(&mut green, &fourth);
+}
+
+/// Removes the test's file as version 5 and folds the history to it. Expect the removal to seal version 4 (4 more bytes
+/// copied), version 4 to read back, and the file to stay absent after the fold, the totals balanced.
+fn removed_then_folded(green: &mut Green, fourth: &[u8]) {
+  let mut unlink = increment(5, 4, "f", &[(OpKind::Unlink, 0, 0)], b"");
+  unlink.doc.ops[0].src = u64::MAX;
+  assert_eq!(green.submit(&unlink), Outcome::Accepted { version: 5 });
   assert_eq!(green.content("f"), None);
   assert_eq!(
     green.history_splices_named().1,
     (2, 12),
-    "a removal seals the value it supersedes"
+    "a removal seals what it supersedes"
   );
-  assert_eq!(
-    green.content_ref_at("f", 4).as_deref(),
-    Some(fourth.as_slice())
-  );
-  balanced(&green);
-
+  reads_back(green, &[(4, fourth)]);
   green.fold_history_before(5);
-  assert_eq!(green.content("f"), None);
   assert_eq!(green.content_ref_at("f", 5).as_deref(), None);
-  balanced(&green);
+  balanced(green);
 }

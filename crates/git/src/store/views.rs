@@ -195,6 +195,14 @@ impl<'a> PushedObjects<'a> {
   }
 }
 
+impl receive::works::PushedBytes for PushedObjects<'_> {
+  fn pushed_object(&self, id: &ObjectId) -> Option<(Kind, Cow<'_, [u8]>)> {
+    let key = ObjectKey::new(id.as_bytes())?;
+    let (kind, content, len) = self.locate(key).ok()?;
+    Some((kind, self.bytes(&content, len).ok()?))
+  }
+}
+
 impl PushObjects for PushedObjects<'_> {
   fn tree(&self, id: ObjectKey) -> Result<Vec<TreeEntry>, Unavailable> {
     let (kind, content, len) = self.locate(id)?;

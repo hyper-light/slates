@@ -221,11 +221,12 @@ impl reads::Repository for Built {
     )
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     self
       .texts
       .get(identity)?
       .get(usize::try_from(offset).ok()?..)
+      .map(std::borrow::Cow::Borrowed)
   }
 }
 
@@ -255,13 +256,13 @@ impl reads::Repository for View<'_> {
     reads::Repository::properties(self.built, identity)
   }
 
-  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>> {
     reads::Repository::text(self.built, identity, offset)
   }
 }
 
 impl commit_drive::Green for View<'_> {
-  fn text(&self, identity: &ContentIdentity) -> Option<&[u8]> {
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
     commit_drive::Green::text(self.records, identity)
   }
 
