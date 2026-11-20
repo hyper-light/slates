@@ -781,9 +781,17 @@
 > and post-lock or post-unlock once over the paths changed after their answers, its failure after `done`, the locks
 > standing (`fs-wrap.c`); `slates_svn::serve`'s lock verb is four calls now (`lock_verb`, `lock_judged`, `locks_landed`,
 > `locks_finished`). **Part 3 (same day):** the `svn+ssh://` tunnel runs the same hooks through the same runner
-> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). Owed: the tunnel's signal of its client
-> gone (none on the SSH edge yet, git's too: a run there ends at its learned bound or by itself); the revprop hooks'
+> (`vcs_svn::run_hook` with `HookSite::Tunnel`, its repository record's policy). **A-736 (2026-11-20, w-k90-vendor):**
+> the SSH edge tells a command stepping that its client has gone (`vcs_ssh::site::ClientGone`: the client's bytes taken
+> while the step runs, kept for the session, its end of stream or a reset gone), so a hook's run over SSH ends with
+> its client, git's receive-pack and the tunnel's (which then ends E210002, as `svnserve` ends where its client leaves
+> inside a command). Owed: the revprop hooks'
 > calls (A-702 part 2, w-svn, on `vcs_svn::run_hook`); DAV's commit and lock hooks; REPOS as A-645's FSFS-layout view.
+> **A-733 (2026-11-20, w-reaper):** svn over http(s) runs the hooks too, where `mod_dav_svn` runs them, through A-730's
+> runner (`HookSite::Http`): start-commit at the POST, pre-commit at the MERGE, post-commit's failure in the MERGE's
+> `S:post-commit-err`, pre-lock/post-lock around a LOCK (pre-lock's token the lock's), pre-unlock/post-unlock around an
+> UNLOCK, a post-hook's failure logged, never told (`lock.c`). DAV's commit and lock hooks closed; owed still: the
+> revprop hooks' calls (A-702 part 2), the SSH edge's client-gone signal, REPOS as A-645's view (w-reaper, next).
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
 > slates-server, can read git's sparse patterns (A-640 part 4) with the policy's one matcher. Its oracle, git's `dowild`
@@ -2028,6 +2036,14 @@
 > w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
 > place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
 > and a rebuild re-holds the texts.
+> A-703, 2026-11-20 (w-svn): ra_svn's `replay` and `replay-range`: `report::drive::replay` drives a revision as
+> `svn_repos_replay2` over `svn_delta_path_driver3` does (copies with their source at or above the low-water mark, a
+> directory copied without it added whole, deltas against the copy's or the previous revision's text), and the
+> connection streams each revision (its readable `revprops` for a range) then `finish-replay`, within its budget.
+> Held to stock `svnserve` 1.15.0's own answers to stock `svnsync synchronize` and `svnrdump dump` of the reads
+> fixtures' repository (`crates/svn/fixtures/replay`, 31 revisions call for call) and six scripted replays. Owed: a
+> live `svnsync`/`svnrdump` over `svn://` against a daemon, compared with `svnsync.dump` and `svnrdump-dump.dump`
+> (main's); a deleted path's readability judged inside a copy (`was_readable`).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
@@ -3469,7 +3485,10 @@
 > every earlier send returned within 481 µs and no request was received after it (diagnostics branch
 > `diag-w-bugs-b3-9`; record `docs/bugs/2026-11-05-winfstest-found-win32-semantics-the-drive-broke.md`, "Shown
 > 2026-11-20"). SetInformation's completion runs `CcSetFileSizes` on the sender (`fileinfo.c` 1407, `file.c` 1852), so
-> the one receiver waits on the drive it alone receives for. The fix (a receive never waits on a send) is owed.
+> the one receiver waits on the drive it alone receives for. **Fixed by A-725 (2026-11-20):** a relief receiver with its own journal
+> serves while the primary is held in a send (`crate::inflight::relief`); fsx seed 1 now runs whole over the drive.
+> Open: whether the delete racing a coherent purge above had the same cause (the VM race, rerun with A-725); a relief
+> held in a send of its own is relieved by no one.
 > - WinFsp completes an answered IRP inline, on the thread that sent the answer. `FspVolumeTransact`
 >   (`src/sys/volume.c:1089-1102`) calls `FspIopDispatchComplete` for each answer, and the kind's `FSP_LEAVE_IOC`
 >   (`src/sys/driver.h:289-306`) ends in `IoCompleteRequest` (`src/sys/iop.c:321`).
@@ -6629,7 +6648,12 @@
 >   Linux the socket, reset with the listener's owner; on macOS the owner's bootstrap name, looked up at twice the time
 >   waited each time), and within the caller's restart bound only where a live anchor holds the rendezvous
 >   (`a_claim_on_a_daemon_that_answers_past_the_claim_wait_is_served`,
->   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). Windows since A-447 (2026-11-18, g251): the
+>   `a_claim_on_a_daemon_that_died_ends_by_its_owners_life_not_a_clock`). A macOS claim made in a replaced daemon's
+>   object since A-735 (2026-11-20, w-forming, found by use): a daemon holding its own rendezvous makes the object again
+>   at its start, so a claim made in its dead predecessor's object waited for good on the owner's name the successor held
+>   (a replaced fleet member's `volume list` hung 30+ minutes, every claim slot of the live object free); each look now
+>   reads its own slot in the object under the name and ends `DaemonUnavailable` when it is another
+>   (`a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends`). Windows since A-447 (2026-11-18, g251): the
 >   daemon writes its process id and creation time into the bootstrap header (layout `SLB3`), and a claim with no live
 >   anchor opens that process for `SYNCHRONIZE` and a limited query alone, judges it by its creation time (a reused pid is
 >   never taken for the daemon), and waits on the claim's Event and the process at once, ending at the daemon's exit; a

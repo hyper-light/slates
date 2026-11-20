@@ -4414,10 +4414,15 @@ pub mod platform {
       if elapsed < self.next_look_ns {
         return Ok(None);
       }
-      if owner_lives(&self.instance)? {
+      let why = if !owner_lives(&self.instance)? {
+        "the daemon's rendezvous has no live owner: its daemon died before answering the claim"
+      } else if self.made_again()? {
+        "the daemon's rendezvous was made again by a new owner: the claim is in its predecessor's object, which no \
+         daemon reads"
+      } else {
         self.next_look_ns = elapsed.saturating_mul(2).max(elapsed.saturating_add(1));
         return Ok(None);
-      }
+      };
       let _taken_back = state(&self.object, self.index)?.compare_exchange(
         CLAIMED,
         FREE,
@@ -4427,8 +4432,31 @@ pub mod platform {
       self.open = false;
       Err(IpcError::DaemonUnavailable {
         endpoint: self.instance.clone(),
-        why: "the daemon's rendezvous has no live owner: its daemon died before answering the claim",
+        why,
       })
+    }
+
+    /// Whether the bootstrap object under the instance's name now is another than the one this claim was made in: its
+    /// slot does not name this process by its pid and its start, which only this claimant writes (A-522). A daemon that
+    /// holds its own rendezvous makes the object again at its start, unlinking a dead predecessor's
+    /// ([`owned_object`]), and holds the owner's name the claim's life is judged by, so a claim made in the
+    /// predecessor's object (opened before the successor's start, or in the gap between its taking the name and making
+    /// the object) waited for good while the successor served with every slot free (w-forming, 2026-11-20). An anchor's
+    /// object outlives its daemon's restarts, so a claim under one reads its own slot and waits on (A-114, A-468). No
+    /// object under the name yet (the successor holds the name and has not made it) reads not made again: the next look
+    /// asks again.
+    #[cfg(target_os = "macos")]
+    fn made_again(&self) -> Result<bool, IpcError> {
+      let Some(handoff) = SharedObject::handoff_for_name(&rendezvous_name(&self.instance)) else {
+        return Ok(false);
+      };
+      let Ok(current) = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()) else {
+        return Ok(false);
+      };
+      let at = slot_at(self.index);
+      let pid = read_u32(&current, at.saturating_add(AT_PID))?;
+      let started = read_u64(&current, at.saturating_add(AT_STARTED))?;
+      Ok(pid != current_pid() || started != crate::exit_watch::ExitWatch::own_start()?)
     }
 
     /// Waits for the answer between polls: on the slot's state word until the owner's next look (macOS), or on the
@@ -4844,6 +4872,47 @@ pub mod platform {
       assert!(
         waited < std::time::Duration::from_nanos(CLAIM_WAIT_NS),
         "the claim ended {waited:?} after its anchor went, not at its going"
+      );
+    }
+
+    /// Found by use (w-forming, live_chaos `a_member_that_never_held_the_log_never_stands_in_for_its_holder` under
+    /// `taskpolicy -b`, 2026-11-20). Do: open a daemon end that holds its own rendezvous, begin a claim on it, let the
+    /// daemon end go with the claim unanswered, then open another daemon end of the instance, which makes the bootstrap
+    /// object again under its name, and poll the claim. Expect: refused `DaemonUnavailable` for a rendezvous made again,
+    /// within the claim wait of the new daemon end's opening. Before, the claim judged the owner's name alone, which the
+    /// new daemon end holds, and waited for good on its predecessor's object, which no daemon reads: a replaced fleet
+    /// member's `volume list` hung 30 minutes against a daemon serving with every claim slot free.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_claim_on_a_rendezvous_made_again_by_a_new_owner_ends() {
+      let name = instance("made-again");
+      let first = Listener::open(&name, None).unwrap();
+      let mut claim = begin(&name, 0).unwrap();
+      assert!(claim.poll().unwrap().is_none(), "the claim is due");
+      drop(first);
+      assert!(holder_goes(&name), "the first daemon end's owner name went");
+      let _second = Listener::open(&name, None).unwrap();
+      let made_again = std::time::Instant::now();
+      let refusal = loop {
+        match claim.poll() {
+          Ok(None) => assert!(
+            made_again.elapsed() < std::time::Duration::from_nanos(2 * CLAIM_WAIT_NS),
+            "the claim on the predecessor's object is still due {:?} after the rendezvous was made again",
+            made_again.elapsed()
+          ),
+          Ok(Some(_)) => panic!("a claim on the predecessor's object was answered"),
+          Err(refusal) => break refusal,
+        }
+      };
+      let waited = made_again.elapsed();
+      println!("a claim on a rendezvous made again: {refusal:?} after {waited:?}");
+      assert!(
+        matches!(&refusal, IpcError::DaemonUnavailable { why, .. } if why.contains("made again")),
+        "{refusal:?}"
+      );
+      assert!(
+        waited < std::time::Duration::from_nanos(CLAIM_WAIT_NS),
+        "the claim ended {waited:?} after the rendezvous was made again"
       );
     }
 

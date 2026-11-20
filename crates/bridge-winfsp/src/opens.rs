@@ -113,10 +113,15 @@ struct Slot {
   confirmed: bool,
 }
 
-/// The bytes an open ledger and its retained receive journal need. The bound is the bridge's admitted open cap.
+/// Shape: the retained receive journals after the open frames: the primary receiver's and its relief's (A-725,
+/// `crate::inflight::relief`), each [`crate::inflight::capture::BYTES`] long, the primary's first.
+pub const JOURNALS: usize = 2;
+
+/// The bytes an open ledger and its retained receive journals need. The bound is the bridge's admitted open cap.
 pub fn bytes(bound: usize) -> Result<usize, Refusal> {
-  capture_offset(bound)?
-    .checked_add(crate::inflight::capture::BYTES)
+  crate::inflight::capture::BYTES
+    .checked_mul(JOURNALS)
+    .and_then(|journals| capture_offset(bound).ok()?.checked_add(journals))
     .ok_or(Refusal::Bound)
 }
 
@@ -343,12 +348,12 @@ impl<M: Memory> Ledger<M> {
     Ok(())
   }
 
-  /// Before restoring reference counts, retain an unhanded open only when the journal has its successful response,
-  /// published or settled (A-274).
+  /// Before restoring reference counts, retain an unhanded open only when a journal (the primary's or the relief's,
+  /// A-725) has its successful response, published or settled (A-274).
   /// Otherwise retire its ledger context; its unpublished/local bridge handle is not a restored sibling's reference.
-  pub fn settle_pending(&mut self, saved_open: Option<(u64, u64)>) -> Result<(), Refusal> {
+  pub fn settle_pending(&mut self, saved_opens: &[Option<(u64, u64)>]) -> Result<(), Refusal> {
     if let Some((context, hint)) = self.pending {
-      if saved_open == Some((hint, context)) {
+      if saved_opens.contains(&Some((hint, context))) {
         self.confirmed(context)?;
       } else {
         self.closed(context)?;
@@ -680,7 +685,7 @@ mod tests {
     let sibling = ledger.opened(file(10), "\\file.bin").unwrap();
     let unhanded = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
     let mut recovered = Ledger::recover(ledger.into_memory(), 3).unwrap();
-    recovered.settle_pending(None).unwrap();
+    recovered.settle_pending(&[None]).unwrap();
     assert_eq!(recovered.get(unhanded), Err(Refusal::Stale));
     assert_eq!(recovered.get(sibling).unwrap().object, file(10).object);
     recovered.closed(sibling).unwrap();
@@ -694,10 +699,10 @@ mod tests {
     let mut ledger = Ledger::create(Ram(vec![0; bytes(2).unwrap()]), 2).unwrap();
     let context = ledger.opened_for(file(10), "\\file.bin", 41).unwrap();
     let mut recovered = Ledger::recover(ledger.into_memory(), 2).unwrap();
-    recovered.settle_pending(Some((41, context))).unwrap();
+    recovered.settle_pending(&[Some((41, context))]).unwrap();
     assert_eq!(recovered.get(context).unwrap().object, file(10).object);
     let mut again = Ledger::recover(recovered.into_memory(), 2).unwrap();
-    again.settle_pending(None).unwrap();
+    again.settle_pending(&[None]).unwrap();
     assert_eq!(again.get(context).unwrap().object, file(10).object);
     again.closed(context).unwrap();
     assert_eq!(again.live().count(), 0);
