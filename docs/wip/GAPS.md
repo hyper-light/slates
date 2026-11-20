@@ -2072,6 +2072,12 @@
 > fixtures' repository (`crates/svn/fixtures/replay`, 31 revisions call for call) and six scripted replays. Owed: a
 > live `svnsync`/`svnrdump` over `svn://` against a daemon, compared with `svnsync.dump` and `svnrdump-dump.dump`
 > (main's); a deleted path's readability judged inside a copy (`was_readable`).
+> **Found by use, 2026-11-20 (w-interop's matrix, git/git's last 2,000 commits):** `svnrdump dump`'s one
+> `replay-range` spun shard 0 (3596 ms without a step after 53 MB; the daemon killed, the client E210002) while
+> `svnsync`, a command a revision, passed: the svn:// listener went on to its next turn with no yield where a turn read
+> nothing from the client (a long answer's slices, pipelined commands), and a client draining as fast as it is written
+> never made a write wait. Fixed (w-svn): such a turn yields first, as the HTTP and SSH edges' turns do. No unit test
+> sees a missed yield; the check is the git/git `svnrdump dump` run again (main's).
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:
