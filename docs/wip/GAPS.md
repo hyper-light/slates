@@ -120,6 +120,10 @@
 > acknowledged after the home image, so `Unanswered` until A-727 a3); the healer at each configuration change
 > (`heal_region`, region holds idempotent). The transport is complete; it acknowledges once A-727 a3 lands.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
+> The daemon's end at ten large pushes fixed: a pack's waiting deltas resolve a delta a unit in the answer's turns
+> (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
+> repositories' wait (3.34 times their fair share; about a second before a push's first step unaccounted), a quiet
+> rerun of the cap-10 proof.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >

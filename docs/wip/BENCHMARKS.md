@@ -15003,3 +15003,24 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 - **The daemon's end.** Ten concurrent pushes of git/git v1.5.0 to one repository ended the daemon (the earlier record
   had nineteen): A-722's by-use proof must hold at ten. Reported to main.
 
+## Waiting deltas resolved in turns: ten large pushes no longer end the daemon (A-724; main's ruling of 2026-11-20; 2026-11-20)
+
+- **The command:** as the section above, `--per-repository-cap 10`. adas-mac-studio.local-2, M3 Ultra, 32 cores, 23
+  shards; release built from agents/w-balance-fix2 (141cb9f5a). **Not quiet:** three other agents' daemons ran
+  throughout and the load was 9 to 11; a cap-3 run after it met a load of 34 and seven daemons, so its times are void
+  and not recorded. A quiet rerun is owed.
+
+| | before (profile, 6b887d508) | after |
+|---|---|---|
+| ten concurrent v1.5.0 pushes to one repository | daemon ended: `shard 20 is spinning ... vcs_http.rs:1404, at its poll 595` | 10 of 10 answered, daemon alive |
+| longest input step | 1,435.7 ms | 1.2 ms |
+| v1.5.0 pushed alone, held | about 758 MiB | 424 to 438 MiB |
+| longest step of any phase | 1,435.7 ms (input) | 245.9 ms (the answer's last step) |
+
+- **What it says.** The daemon's end was one poll resolving every delta waiting at a pack's end. Resolved a delta a
+  unit in the answer's turns, no step past the quantum remains in reading a pack. The small repositories' p99 is not
+  moved by it (3.34 times their fair share after, 3.66 before, in quiet runs of the profile branches): their wait is
+  elsewhere. Per-phase counters (the push's steps and the wait before each) show a small push taking about 6,000 check
+  turns of 23 µs, each waiting about 91 µs for its shard, and about a second between the push's beginning and its first
+  step not yet accounted.
+

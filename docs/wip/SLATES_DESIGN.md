@@ -54850,6 +54850,22 @@ Applied in the same change to:
   packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
   is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
   such pushes to one repository end the daemon (A-722's proof must hold at ten).
+- **The daemon's end at ten large pushes, fixed: a pack's waiting deltas resolve a delta a unit, in the answer's
+  turns (2026-11-20; main's ruling of 2026-11-20).** Profiled with new per-repository counters in `slates status`
+  (each repository's usage row, a push's steps, time, longest step and the wait before them by phase): the kill's cause
+  line at ten v1.5.0 pushes named `vcs_http.rs:1404` at its poll 595, and the longest input step was 1,435.7 ms:
+  `slates_git::unpack::Reader::finish_into` resolved every delta waiting at a pack's end, and their dependents, in the
+  input step that brought the trailer. Now `Reader::resolve_turn` resolves them under a quantum (one unit at least, a
+  unit applying one delta or listing one entry's waiting children; a thin pack's outside bases one table row a unit),
+  the session holds `State::Resolving` between turns, and `ReceivePack::check_turn` gives it the turns the checks
+  get. The red: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` counts each step resolving
+  past its budget (64 deltas on one late base, a budget of four): 0 for the input step and 0 over every turn (the first
+  form of the fix, a base's children one unit, counted 1). By use (BENCHMARKS.md, "Waiting deltas resolved in
+  turns"): ten concurrent v1.5.0 pushes, 10 of 10 answered, the daemon alive, the longest input step 1.2 ms; v1.5.0
+  alone holds 424 to 438 MiB (about 758 before). Not the small repositories' wait: their counters show about 6,000
+  check turns a push of 23 µs each, each waiting about 91 µs for its shard, and about a second before the first step
+  still unaccounted, profiled next. Tests: slates-git 556 of 556; slates-server `git_push:: vcs_http::git:: vcs_ssh::
+  vcs_share:: vcs_store::upload::` 106 of 106; slates-ipc and slates-mcp whole.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
