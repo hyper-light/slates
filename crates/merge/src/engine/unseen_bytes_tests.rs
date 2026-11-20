@@ -70,6 +70,7 @@ impl Work {
       doc: self.doc,
       post_state: self.post,
       evidence: Vec::new(),
+      named: Default::default(),
     }
   }
 }

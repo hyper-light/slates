@@ -9099,6 +9099,7 @@ pub(crate) fn compose_increment(
     doc,
     post_state,
     evidence,
+    named: Default::default(),
   })
 }
 
@@ -10063,6 +10064,11 @@ fn judge_submission(
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       refused(copy_refused(path, case))
     }
+    // A named run not read yet (A-760): the content is not here to judge; nothing judged or applied.
+    slates_merge::engine::Outcome::ContentUnread { .. } => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      refused(Refusal::ContentUnavailable)
+    }
   }
 }
 
@@ -10370,6 +10376,9 @@ fn rebase_answer(
     }
     slates_merge::engine::Rebased::CopyRefused { path, case } => {
       RebaseAnswer::Reply(refused(copy_refused(path, case)))
+    }
+    slates_merge::engine::Rebased::ContentUnread { .. } => {
+      RebaseAnswer::Reply(refused(Refusal::ContentUnavailable))
     }
   }
 }

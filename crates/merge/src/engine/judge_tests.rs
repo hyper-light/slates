@@ -130,6 +130,7 @@ fn work(green: &Green, base: u64, edits: &[Edit], id: u64) -> Increment {
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
@@ -312,6 +313,7 @@ fn judged_and_committed(
       (Outcome::Conflict { windows }, None)
     }
     Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+    Judgment::ContentUnread { identity } => (Outcome::ContentUnread { identity }, None),
     Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
   })
 }

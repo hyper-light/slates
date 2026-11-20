@@ -915,6 +915,7 @@ impl<'b> Building<'b> {
       doc,
       post_state: self.post,
       evidence: Vec::new(),
+      named: Default::default(),
     })
   }
 

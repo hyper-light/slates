@@ -36,6 +36,7 @@ fn increment(id: u8, base: u64, path: &str, ops: &[(OpKind, u64, u64)], post: &[
     doc,
     post_state: post.to_vec(),
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 
