@@ -1188,7 +1188,7 @@ pub(crate) fn land(
       None => Ok(()),
     };
     return Landed {
-      answer: Err(abort(MOVED.to_vec())),
+      answer: Err(*abort(MOVED.to_vec())),
       released,
     };
   }
@@ -1307,7 +1307,7 @@ pub(crate) async fn unbundle(
   let mut forked = forked;
   loop {
     let tried = crate::state::with_state(|state| match forked.take() {
-      Some(stale) if is_stale(state, repository, &stale) => Err(stale),
+      Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
       fresh => Ok(landing(
         state,
         repository,
@@ -1319,7 +1319,7 @@ pub(crate) async fn unbundle(
     });
     match tried? {
       Ok(outcome) => return outcome,
-      Err(stale) => match rebase_sliced(repository, stale).await? {
+      Err(stale) => match rebase_sliced(repository, *stale).await? {
         Ok(rebased) => forked = Some(rebased),
         Err(outcome) => return Some(outcome),
       },
@@ -1405,23 +1405,25 @@ fn begin_rebase(
   stale: Forked,
 ) -> Option<Result<Rebasing, PushOutcome>> {
   let Forked { fork, intaken, .. } = stale;
+  // A refusal hands the fork back, boxed: an index is far larger than the rebase begun.
   let begun = vcs_store::within_budget(state, 0, |stores| {
     let Some(generation) = stores.generation_of(repository) else {
-      return Err((None, fork));
+      return Err(Box::new((None, fork)));
     };
     let Some((content, store)) = stores.mercurial(repository) else {
-      return Err((None, fork));
+      return Err(Box::new((None, fork)));
     };
     Rebase::begin(fork, &intaken, &mut store.index, content)
       .map(|rebase| Rebasing {
         rebase: Some(rebase),
         generation,
       })
-      .map_err(|(refused, fork)| (Some(refused), fork))
+      .map_err(|(refused, fork)| Box::new((Some(refused), fork)))
   });
   match begun {
     Ok(rebasing) => Some(Ok(rebasing)),
-    Err((refused, fork)) => {
+    Err(refused) => {
+      let (refused, fork) = *refused;
       if release_index(state, fork).is_err() {
         state.count(vcs_store::RELEASE_REFUSED, 1);
       }
