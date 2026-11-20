@@ -115,3 +115,14 @@
 - Six cross targets, unsafe (80/80), fmt: clean. structural, literals: clean after the fixes.
 - Windows (jupiter): r11 stopped (pre-fix tree); r14 on the fixed tree in flight -- kiln server timing out on reads.
 - Target trimmed after the round.
+
+## 2026-11-20 round 3 at 562b58593 (closed at 4ce207710, clean on every lane)
+- Fixed and landed: e3f012a61 (19: git, vcs, hg, server; structural A-745 suite seeds; literals; two polling loops
+  as deadline waits, neither a "did not happen" wait), f23d5ac80 (2: ungated Hook arm off unix; A-697 floor test),
+  22fcede45 (4: A-697 part c computed_request boxed, judge_submission split), 4ce207710 (3: svn_interop hook test
+  cfg(unix); A-697 settle test).
+- Windows lane now runs on a FRESH CLONE on jupiter (kiln run, sync: false, ~/w-lint-src re-cloned each round,
+  same target dir): kiln's synced copy there is damaged (a read-only .git pack "Access is denied"), which gave stale
+  files and false errors in r16/r17.
+- At 4ce207710: host, six cross targets, structural, literals, unsafe, fmt, Windows (crates, cli, xtask): clean.
+- Target trimmed after the round.
