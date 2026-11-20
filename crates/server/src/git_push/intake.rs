@@ -51,7 +51,7 @@ impl Repository for Intake<'_> {
 impl Contents for Intake<'_> {
   fn content(&self, at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     if let Some((object, _)) = self.queue.get(&at) {
-      return (object.id == *id).then(|| Cow::Borrowed(object.content.as_slice()));
+      return (object.id == *id).then_some(Cow::Borrowed(object.content.as_slice()));
     }
     self.quarantined.content(at, id)
   }
