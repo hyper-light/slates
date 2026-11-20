@@ -1,5 +1,8 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: A-697 node-verb authority = 43160e726 (main b0ececd09). NEXT (main's order): (2) increment too large
+  for the forward lane in bounded parts; (3) dropped creation's floor released at recovery; (4) f.
+
 ## LANDED 2026-11-20: A-697 rebase+copies = 4f61920f0 (main b279ba52c). Main's new order (2026-11-20): (1) MoveWorkFloor
   authority = the fleet link's authenticated member id equals the work id's creator member; red: another member refused;
   (2) increment too large for the forward lane carried in bounded parts; (3) a creation dropped at restart releases its
