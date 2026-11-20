@@ -7168,8 +7168,9 @@
 >   claim, its host reactor waits until the signal and through a live daemon's deadlines, its listings and attachment
 >   counts are waited for and its stream ends read without a timeout, its daemon in-process (A-232); `start.rs`'
 >   `NOBODY_WAIT` is the deadline its test proves, and stays. In `cli/tests` since 2026-11-20 (g226), judged in the waited-on processes' own CPU
->   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone or stalled
->   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`; `recovered::await_recovered_while_alive`):
+>   (`support/process_wait.rs`: while the tree under an anchor lives and gains CPU, failed once it is gone, stalled
+>   past the anchor's own lapse ceiling, `OBSERVE_BUDGET_NS`, or has spent `CPU_BUDGET` without the answer, as
+>   `live_chaos`' `START_CPU` judges a start; `recovered::await_recovered_while_alive`):
 >   `held_rendezvous`, `merge_kill` (its killer's wait for the client's submit ends too at the client's end),
 >   `nfs_v4_restart` (Linux's, compiled here) and `nfs_held` (its NFS sockets read without a timeout, the anchor holding
 >   them across a restart, A-113); `cli`'s `START_WAIT` waits (`StartProgress` judges every process of the instance,
@@ -7177,8 +7178,11 @@
 >   anchor's log, the anchor's successor and its end after refusing a replaced image judged the same; the TLS probe's
 >   socket reads with no timeout; `kill -9` run unbounded); `cli`'s `START_CEILING` waits (the anchor's restart and
 >   serving lines judged the same; the version-control edges' HTTP, svn:// and SSH reads with no timeout, the anchor
->   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone. Owed in `cli/tests`: `cli`'s
->   `WAIT_FOR`, `FLEET_WAIT` and container waits, `live_fleet`, `vm`,
+>   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone; `cli`'s `wait_for` (polled while
+>   the instance's processes progress; the epoch tests read the kernel's refusal before waiting on what it prevents)
+>   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
+>   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone. Owed in
+>   `cli/tests`: `cli`'s other `WAIT_FOR` waits and its container waits, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module

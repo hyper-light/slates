@@ -17,7 +17,7 @@ use slates_ipc::protocol::{
   PolicyRule, PolicyWho, ReplyBody, RequestBody, VcsTool,
 };
 
-use super::{AGENT, Answering, HOOK_NOT_RUN, ReceivePack, Unpresented};
+use super::{AGENT, Answering, HOOK_NOT_RUN, ROOT_UNPUBLISHED, ReceivePack, Unpresented};
 use crate::state::ShardState;
 use crate::verbs::dispatch;
 
@@ -525,6 +525,13 @@ fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refus
     );
     assert_declined_as_a_hook(&pushed(state, repository, &create), other, b"rule 0");
     set_policy(state, "policy", 3, (Vec::new(), vec![pre_receive()]));
+    // A-645 P3 (main's ruling 1): before this daemon has published its root mount, a configured hook's push is refused
+    // in words naming that; once it has, `hook not run` while nothing yet shows the hook's view.
+    let received = pushed(state, repository, &delete);
+    assert_eq!(reasons(&received), [ROOT_UNPUBLISHED]);
+    assert_first_line_names(&received, b"pre-receive");
+    assert_eq!(records(state, repository), held);
+    state.root_mount = Some(std::path::PathBuf::from("/slates-root"));
     let received = pushed(state, repository, &delete);
     assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
     assert_first_line_names(&received, b"pre-receive");

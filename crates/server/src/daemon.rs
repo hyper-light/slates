@@ -1395,6 +1395,20 @@ impl Daemon {
       .wait()
   }
 
+  /// Records `point` as the root mount this daemon published (§4.6, D-1; A-645 P3) on every shard: the point a hook is
+  /// handed its repository's view beneath (`ShardState::root_mount`). What the root mount's publication calls once the
+  /// mount is made (A-645 (a), owed); until a daemon has published one, a configured hook is refused, typed, for git
+  /// and Subversion alike. Refused where a shard does not answer.
+  pub fn record_root_mount(&self, point: &std::path::Path) -> Result<(), ObserveError> {
+    for shard in &self.shards {
+      let point = point.to_path_buf();
+      self.observe(Some(*shard), move |state| {
+        state.root_mount = Some(point.clone());
+      })?;
+    }
+    Ok(())
+  }
+
   /// Like [`Self::observe`] for a question of the shard's runtime context rather than of its state (a
   /// task count), answered the same way.
   fn observe_shard<T, Q>(&self, target: Option<ShardId>, question: Q) -> Result<T, ObserveError>
@@ -5088,6 +5102,7 @@ async fn init_shard(
     vcs_usage: slates_vcs::Ledger::new(config.clients_per_shard),
     #[cfg(unix)]
     hook_times: crate::vcs_hooks::HookTimesTable::default(),
+    root_mount: None,
     pending_green_materializations: std::collections::BTreeMap::new(),
     pending_repositories: std::collections::BTreeMap::new(),
   };
