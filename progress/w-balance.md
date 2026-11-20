@@ -136,3 +136,18 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   first-byte-sent vs answer), (2) the HTTP edge accept/body path, (3) arena growth (RSS 87 MiB -> 3.5 GB in seconds).
   Also: main b8e4591 ends the daemon at R=100 (run request; bisect owed).
 - 04376a543 LANDED: moved A-724's piece bullets (3c,4a,4b,5a,5,6,7,8-9) out of A-727/A-728/A-726/A-719p3 into A-724's entry (main's docs fix). RULE: append future A-724 log bullets at the END OF A-724'S ENTRY (before the next ### heading), never at the file's end.
+- STARVATION INVESTIGATION (2026-11-20, .local-2, release from main + harness 463fc501c):
+  * split timing: toys send in ~0.1 s, wait 4.4 s for the answer (server side).
+  * lanes per repository per shard (branch agents/w-balance-lanes 1b8010400): DEAD EVEN (toy wall p99 4.42/4.57 vs
+    4.55) -> rejected, not landed.
+  * 2 classes (no v1.5.0): daemon survives (crash is v1.5.0-specific); toys 11.6x; hot repo's 19 pushes serialized
+    (19 x 0.55 s = 10.4 s).
+  * ALL-SMALL control R=100 (v0.99 only): toys 12.6x / 10.7-11.8x -> not caused by a hot repo.
+  * name placement owner_of_name (FNV-1a mod partitions): R=10 one repo per partition, R=100 max 6 of 23 -> fine.
+  * sample top-of-stack: kevent 25,807 (zero-timeout spin polls, NOT idle), sha1 ~3,100, blake3 ~840; ps -M during
+    burst: 22 shard threads at 35-99% CPU -> daemon SATURATED: 86 x 0.28 s / 22 shards = 1.1 s ~ p50 0.99 s.
+  * CONCLUSION: "p99 / alone" is the wrong starvation metric under saturation; the concentrating load is a hot repo's
+    whole intake on its one owner shard (P5b, intake off owner, overlaps w-git's A-722/A-719 p4). Floor fast path /
+    admission order would not change these runs (no refusals, memory never bound).
+  * MY EARLIER CLAIMS CORRECTED: 'shards mostly idle' (r100.sample) was wrong (kevent = spin polls).
+- Worktree now ~/slates-work/w-balance-land3 at 463fc501c (harness split + counters, not on main yet; real messages).
