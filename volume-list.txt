@@ -1,0 +1,82 @@
+== try 1 at 06:00:16: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 2 at 06:00:19: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 3 at 06:00:22: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 4 at 06:00:25: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 5 at 06:00:28: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 6 at 06:00:31: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 7 at 06:00:34: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 8 at 06:00:37: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 9 at 06:00:41: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 10 at 06:00:44: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 11 at 06:00:47: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 12 at 06:00:50: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 13 at 06:00:53: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 14 at 06:00:56: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 15 at 06:00:59: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 16 at 06:01:02: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 17 at 06:01:05: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 18 at 06:01:08: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 19 at 06:01:11: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+== try 20 at 06:01:15: exit 4
+-- stdout
+-- stderr
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+slates: channel: shared memory: shared layout refused at 0 for 64 bytes: TouchesWord
+status exit 4
