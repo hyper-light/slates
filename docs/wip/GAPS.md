@@ -6315,6 +6315,9 @@
 > watcher), and the idle seal with its purge (aging buckets: each file's last write sets the instant it turns idle, the
 > keeper sleeps to the earliest); then the reap loop and its tick are deleted, no interval and no sweep, and §4.7 says
 > so.
+> **Since A-709 (piece 6)** base hints are drained at the kernel's report: one hint set a shard (epoll or kqueue, keyed
+> by the volume's generational handle) awaited by one task, and a delegation nobody returned lapses at its own deadline
+> on the keeper. Left on the tick: the idle seal with its purge, then the tick's deletion.
 > Still on `W` itself (class D): the reap loop's tick (`reap_loop`, leaving a job at a time in the event-driven reaper
 > series). **Since A-574 a laptop's failover detection term** is no longer A-405's fixed window: it is the widest window
 > the watchdog judges the daemon's shards by and then the anchor's own lapse bound, both measured, read at every beat.

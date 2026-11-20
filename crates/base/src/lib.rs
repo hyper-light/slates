@@ -28,6 +28,8 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod base_host;
+#[cfg(unix)]
+pub mod hint_set;
 pub mod own_mounts;
 pub mod s3;
 #[cfg(unix)]
@@ -98,6 +100,8 @@ pub(crate) fn windows_mode_and_bits(attributes: u32) -> (u32, u16) {
 }
 
 pub use base_host::BaseHost;
+#[cfg(unix)]
+pub use hint_set::HintSet;
 #[cfg(unix)]
 pub use unix::OsHost;
 #[cfg(windows)]

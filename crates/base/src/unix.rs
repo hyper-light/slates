@@ -220,6 +220,12 @@ impl OsHost {
     Ok((host, root))
   }
 
+  /// The descriptor of this host's watcher, readable while it holds hints (inotify on Linux, a kqueue on macOS), for the
+  /// shard's hint set to await (A-709, [`crate::HintSet`]); `None` when the kernel gave the host no watcher.
+  pub fn hint_source(&self) -> Option<BorrowedFd<'_>> {
+    self.watcher.source()
+  }
+
   /// A host of its own for a clone of the overlay this host serves (§4.4 clone; AC-1.16): every directory this one
   /// keeps, duplicated under the same handle (`F_DUPFD_CLOEXEC`, through `OwnedFd::try_clone`), so each directory the
   /// overlay's base plane names is the very same directory object in both, whatever an outsider has since renamed or
@@ -573,6 +579,11 @@ mod watch {
       }
     }
 
+    /// The inotify instance, readable while it holds events (A-709: the shard's hint set awaits it).
+    pub(super) fn source(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+      self.inotify.as_ref().map(std::os::fd::AsFd::as_fd)
+    }
+
     /// Nothing on Linux: the directory's watch already reports a write to any file in it (`IN_MODIFY`).
     pub(super) fn add_file(&mut self, _dir: HostDir, _name: &str, _fd: &OwnedFd) {}
 
@@ -622,7 +633,7 @@ mod watch {
   use std::collections::{BTreeMap, BTreeSet};
   use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
-  use rustix::event::kqueue::{Event, EventFilter, EventFlags, VnodeEvents, kevent, kqueue};
+  use rustix::event::kqueue::{Event, EventFilter, EventFlags, VnodeEvents, kqueue};
   use slates_vfs::host::{Hint, HostDir, WatchState};
 
   /// Shape: events drained per call; the queue is drained again on the next call.
@@ -664,14 +675,18 @@ mod watch {
         EventFlags::ADD | EventFlags::CLEAR,
         std::ptr::null_mut(),
       );
-      let mut none: Vec<Event> = Vec::new();
-      // SAFETY: the change list is one event on a descriptor this host owns; the output list is
-      // empty and stays empty (its capacity is zero), so the kernel writes nothing.
-      let registered = unsafe { kevent(queue, &[change], &mut none, None) };
+      // The output list is empty, so the kernel writes nothing back.
+      let mut none: [Event; 0] = [];
+      let registered = crate::hint_set::kevent_now(queue, &[change], &mut none);
       if registered.is_ok() {
         self.by_fd.insert(fd.as_raw_fd(), (dir, name));
       }
       registered.is_ok()
+    }
+
+    /// The kqueue, readable while it holds events (A-709: the shard's hint set awaits it).
+    pub(super) fn source(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+      self.queue.as_ref().map(AsFd::as_fd)
     }
 
     pub(super) fn add(&mut self, dir: HostDir, fd: &OwnedFd) -> WatchState {
@@ -722,20 +737,9 @@ mod watch {
         return Vec::new();
       };
       let mut events: Vec<Event> = Vec::with_capacity(DRAIN);
-      // The kernel fills the vector's spare capacity and rustix sets its length from the count
-      // returned. A bare `&mut events` hands rustix 1.x the vector's *length* (zero) as the event
-      // list's size, so the kernel reported nothing and no hint was ever delivered here
-      // (docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md).
-      // SAFETY: no changes are submitted; the output buffer is the vector's spare capacity, which
-      // the kernel may fill up to its length; a zero timeout never blocks.
-      let drained = unsafe {
-        kevent(
-          queue,
-          &[],
-          rustix::buffer::spare_capacity(&mut events),
-          Some(std::time::Duration::ZERO),
-        )
-      };
+      // A zero timeout never blocks; up to `DRAIN` events are written (`crate::hint_set::kevent_now`).
+      let drained =
+        crate::hint_set::kevent_now(queue, &[], rustix::buffer::spare_capacity(&mut events));
       if drained.is_err() {
         return Vec::new();
       }

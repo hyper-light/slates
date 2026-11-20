@@ -4732,6 +4732,7 @@ async fn init_shard(
     reaper_task: None,
     capture_deadlines: crate::deadlines::CaptureDeadlines::new(),
     deadline_task: None,
+    base_hints: crate::base_hints::BaseHints::default(),
     deadline_armed: None,
     destroy_retry_at: None,
     scatters: std::collections::BTreeMap::new(),
@@ -4850,6 +4851,7 @@ async fn init_shard(
     nfs_purges_refused: false,
     nfs_purge_at: None,
     nfs_purge_owed: false,
+    delegation_lapse_at: None,
     placement_rearm_at: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
@@ -4976,6 +4978,9 @@ async fn init_shard(
   // The keeper of the staging buffers' and status captures' deadlines (A-522): idle until the first is set.
   let keeper = futures::spawn(crate::deadlines::keeper()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(keeper);
+  // The hint watcher (A-709): drains each overlay's base hints when the shard's set reports its watcher ready.
+  let hints = futures::spawn(crate::base_hints::watcher()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(hints);
   // The pressure hold's sampler (A-570): on the control shard it samples at its start and at each report of the host's
   // memory pressure; elsewhere it ends at once.
   let sampler = futures::spawn(crate::pressure::sampler()).map_err(ServerError::Runtime)?;
@@ -5031,7 +5036,8 @@ async fn rebuild_and_report(
   }
 }
 
-/// The shard's tick for the cold work it still owns, at the liveness cadence: base hints and the idle seal. Since
+/// The shard's tick for the cold work it still owns, at the liveness cadence: the idle seal. Since A-709 base hints are
+/// drained when the shard's hint set reports a watcher ready (`crate::base_hints`). Since
 /// A-554 departed hosts' attachments are ended by the reaper when the fleet's members change
 /// (`crate::remote_attach::look_for_departures`), and taken-back maps no holder claimed are reclaimed by it at their
 /// claim's deadline (Linux, `crate::held_copy::reclaim_owed`); since A-570 the pressure hold is sampled at the host's
@@ -5053,67 +5059,7 @@ async fn reap_loop() {
   .get();
   loop {
     pace(cadence).await;
-    state::with_state(|s| {
-      process_base_hints(s);
-      // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
-      crate::delegation::drain(s);
-    });
     seal_idle_content().await;
-  }
-}
-
-/// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
-/// hints are taken again at the next tick's listing, so none is lost, but a refusal is never silent.
-const BASE_HINTS_REFUSED: &str = "base.hints_refused";
-/// Counter: watcher hints the reap tick drained, over every overlay volume (the drain's non-vacuity counter).
-const BASE_HINTS_DRAINED: &str = "base.hints_drained";
-/// Counter: delegation recalls an outsider's edit beneath an untouched base entry asked for (A-122).
-const OUTSIDE_RECALLS: &str = "nfs4.recall.outside_asked";
-
-/// Drains every overlay volume's watcher hints, once a reap tick (§4.5, §4.15; RFC 8881 §10.2): a changed base
-/// directory has its listing invalidated, its witnessed entries re-checked for drift, and every delegation held on an
-/// untouched entry in it asked to be recalled, so an outsider's edit reaches a delegation holder within a tick and a
-/// round trip. Before 2026-10-08 hints were drained only by `status` and the FUSE coherence path, so over NFS a client
-/// holding a read delegation kept serving its cached bytes after an outsider changed the file.
-///
-/// Derived: the cadence is the reap loop's (the liveness budget), which already wakes the shard, so draining adds one
-/// non-blocking read of each watcher per tick and no wakeup. A client without a delegation sees an outsider's edit only
-/// after its attribute cache times out (`acregmin`, 3 s by default on Linux, nfs(5)), so the tick bounds the delegated
-/// client inside that. Rejected for now: a task per volume awaiting its watcher's descriptor, whose descriptor a
-/// destroy closes while the task may still be waiting on it.
-fn process_base_hints(s: &mut ShardState) {
-  let mut refused = 0u64;
-  let mut drained = 0u64;
-  let recalls_before = s.store.recall_gate.outside_recalls();
-  for (_, slot) in s.volumes.iter_mut_all() {
-    let Some(host) = slot.host.as_mut() else {
-      continue;
-    };
-    let seq_before = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    if slot
-      .volume
-      .with_host(host)
-      .process_hints(&mut s.store)
-      .is_err()
-    {
-      refused = refused.saturating_add(1);
-    }
-    let seq_after = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
-    drained = drained.saturating_add(seq_after.saturating_sub(seq_before));
-  }
-  let asked = s
-    .store
-    .recall_gate
-    .outside_recalls()
-    .saturating_sub(recalls_before);
-  if refused > 0 {
-    s.count(BASE_HINTS_REFUSED, refused);
-  }
-  if drained > 0 {
-    s.count(BASE_HINTS_DRAINED, drained);
-  }
-  if asked > 0 {
-    s.count(OUTSIDE_RECALLS, asked);
   }
 }
 

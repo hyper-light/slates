@@ -5005,6 +5005,14 @@ root-relative path as an explicit alternative; it does not report that the reque
 > all nine on macOS (0.53 s). Record:
 > `docs/bugs/2026-11-02-an-empty-wake-test-mistook-an-armed-client-for-a-sleeper.md`.
 
+> **Status (2026-11-20, A-709: base hints leave the tick).** Each overlay's watcher descriptor (inotify, a kqueue) is
+> entered in one set of its shard's (`slates_base::HintSet`, an epoll or a kqueue, one-shot, keyed by the volume's
+> generational handle), and one task a shard (`crate::base_hints::watcher`) awaits that set's readability: a report
+> drains the ready volumes' hints, re-arms their watchers and sends the recalls they asked for, so an outsider's edit
+> reaches the shard at the kernel's report (10 ms in the unit test, macOS arm64) where it waited up to a window. A
+> volume whose host a landing has lent out is owed and drained when a state borrow finds it back. A delegation nobody
+> returned lapses at its own deadline on the keeper (`delegation::arm_lapse`). Left on the tick: the idle seal.
+
 > **Status (2026-11-19, A-570: the pressure hold leaves the tick).** The pressure hold's sampler (`crate::pressure`, a
 > task of the control shard's) samples at its start and at the kernel's own memory-pressure reports, a stall's end among
 > them (§4.2's A-570 status); a kernel that offers none has the watch refused by kind, counted. Off the tick so far:
@@ -54083,3 +54091,21 @@ Applied in the same change to:
   bc2803d66, reported); fmt clean on the changed files.
 - **Owed.** upload-pack's answer made in slices (its negotiation and the pack's plan run in one step: a 1,200-commit
   fetch's ran past a liveness window in a debug build); the git-matrix clone rows by use (main's).
+
+### A-709 — Base hints drained at the kernel's report, one hint set a shard; a delegation lapses at its own deadline (2026-11-20, w-reaper; the event-driven reaper's piece 6; §4.5, §4.7, §4.15; RFC 8881 §10.2; A-122, A-570)
+
+- **What was there.** The reap loop's tick drained every overlay volume's watcher once a liveness window
+  (`daemon::process_base_hints`), then ran `delegation::drain`, whether any watcher had hints or not; an outsider's edit
+  beneath a delegation waited up to a window, and a delegation nobody returned was revoked at the next tick.
+- **Change.** `slates_base::HintSet`: an epoll (`EPOLLIN | EPOLLONESHOT`) or a kqueue (`EVFILT_READ`, `EV_ONESHOT`) of
+  the shard's, each overlay's watcher descriptor entered under its volume's handle (index, generation), so a destroyed
+  volume is a stale handle and a closed watcher leaves the set with its descriptor. `crate::base_hints::watcher`, one
+  task a shard (`LOOP_TASKS_PER_SHARD` 8 -> 9), awaits the set and drains the ready volumes; a volume made, cloned or
+  recovered is entered as it joins the table; a lent-out host is owed until a borrow finds it back. `delegation::drain`
+  arms the deadline keeper at the earliest unreturned recall's lapse (`earliest_recall_ns`). The macOS watcher's kevent
+  calls folded into one (slates-base unsafe 11 -> 10). Windows keeps no watcher: its arms are no-ops (main's build).
+- **Tests.** `slates-server` `base_hints::tests::an_outsiders_edit_is_drained_at_the_kernels_report_without_a_tick`
+  (drained 10 ms after the write, bound half a window); `slates-base` `hint_set::tests` (2);
+  `slates-bridge-nfs` `the_earliest_unreturned_recall_names_when_its_revocation_falls_due`. macOS arm64, Mac Studio.
+- **Applied in the same change to** §4.7's status, GAPS (the reaper series), amendments.tsv.
+- **Owed.** The Linux epoll arm built and run (main's); the idle seal with its purge, then the tick's deletion.
