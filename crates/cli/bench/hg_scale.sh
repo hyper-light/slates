@@ -104,7 +104,7 @@ listing() {
 
 echo "dataset: $SOURCE at $(h -R "$SOURCE" log -r tip -T '{rev}:{node}'); $(h -R "$SOURCE" log -r 'all()' -T x | wc -c | tr -d ' ') changesets, $(h -R "$SOURCE" tags -T x | wc -c | tr -d ' ') tags, $(h -R "$SOURCE" bookmarks -T x | wc -c | tr -d ' ') bookmarks, $(h -R "$SOURCE" heads -T x | wc -c | tr -d ' ') heads"
 listing "$SOURCE" "$WORK/source"
-echo "hg: $(h --version | head -1); slates: $("$SLATES" --version 2> /dev/null || echo none); store: $(du -sh "$SOURCE/.hg/store" | cut -f1)"
+echo "hg: $(h --version | head -1); slates: $("$SLATES" version 2> /dev/null || echo none); store: $(du -sh "$SOURCE/.hg/store" | cut -f1)"
 echo "machine: $(sysctl -n machdep.cpu.brand_string 2> /dev/null), $(sysctl -n hw.ncpu 2> /dev/null) cores; load: $(uptime | sed 's/.*load averages*: //')"
 
 # The daemon's resident set in MiB, or "-" where it is gone.
