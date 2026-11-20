@@ -26,9 +26,6 @@ mod process_wait;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// Shape: how long the anchor and its daemon get to come up (a quick profile plus two
-/// starts), and how long the daemon gets to leave after its anchor dies.
-const START_WAIT: Duration = Duration::from_secs(20);
 /// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's unmount (A-511) to show in
 /// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
 /// one budget, so a death shows within two).
@@ -758,7 +755,7 @@ fn a_stuck_start_is_killed_and_restarted() {
   // runs, and was then rightly killed at its heartbeat's lapse, not as a start (2026-11-07).
   let pid = |raw: u32| rustix::process::Pid::from_raw(i32::try_from(raw).unwrap()).unwrap();
   rustix::process::kill_process(pid(killed), rustix::process::Signal::KILL).unwrap();
-  let stuck = restarted_pid(&lines);
+  let stuck = restarted_pid(&lines, &instance);
   rustix::process::kill_process(pid(stuck), rustix::process::Signal::STOP).unwrap();
   let answered = await_daemon(&instance, Some(stuck), &[]);
   let stuck_alive = Command::new("kill")
@@ -903,13 +900,12 @@ fn a_start_whose_shards_sum_past_a_window_comes_up() {
 /// Format: the anchor's restart line names the daemon it started after this (`crates/api/src/role/anchor.rs`).
 const RESTARTED_AS: &str = "restarted as pid ";
 
-/// The pid the anchor's next restart line names, from its forwarded lines, within [`START_CEILING`].
+/// The pid the anchor's next restart line names, from its forwarded lines, waited for while `instance`'s processes
+/// progress (until 2026-11-20 within `START_WAIT` times the starved share, `START_CEILING`).
 #[cfg(unix)]
-fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>) -> u32 {
+fn restarted_pid(lines: &std::sync::mpsc::Receiver<String>, instance: &str) -> u32 {
   loop {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the anchor said it restarted the daemon");
+    let line = recv_judged(lines, instance, "the anchor said it restarted the daemon");
     if let Some(after) = line.split(RESTARTED_AS).nth(1) {
       return after
         .split(|c: char| !c.is_ascii_digit())
@@ -3605,11 +3601,6 @@ fn bootstrap_once(instance: &str) {
   assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
 }
 
-/// Derived: the longest any wait for a daemon runs, however it progresses: the start wait at the slowest share of a
-/// CPU this suite holds a start to ([`STARVED_RUNS_ONE_IN`]). A guard against a daemon that runs and never answers;
-/// the wait is judged by [`StartProgress`] well before it.
-const START_CEILING: Duration = START_WAIT.saturating_mul(STARVED_RUNS_ONE_IN);
-
 /// A wait for a daemon judged as the anchor judges a start (§2.6 boot step 1): by the instance's processes' own CPU
 /// progress (`slates_machine::process_clock`; the anchor and its daemon), not the wall. The wait fails once they made
 /// none for [`process_wait::STALL`] (the anchor's own lapse ceiling), or once the instance has no process left. Until
@@ -3623,7 +3614,9 @@ const START_CEILING: Duration = START_WAIT.saturating_mul(STARVED_RUNS_ONE_IN);
 /// --workspace` (2026-10-18). And `START_ATTEMPTS`, the streak's attempts counted from the serving line (2026-10-21:
 /// a contended host makes each attempt slower, not more numerous), which still ran out at 240 runnable processes when
 /// the first daemon's beat lapsed during the streak and its successor took the attempts' time to come up. A daemon
-/// that flaps now ends the wait at [`START_CEILING`], or as a crash loop in the anchor's log ([`await_serving`]).
+/// that flaps ends the wait as a crash loop in the anchor's log ([`await_serving`]); until 2026-11-20 also at
+/// `START_CEILING`, twenty seconds at the slowest share of a CPU this suite holds a start to (a wall bound, gone with
+/// `START_WAIT`).
 struct StartProgress {
   /// The daemons and the sum of their progress counts at the last look that saw them move.
   seen: Option<(Vec<u32>, u64)>,
@@ -13753,9 +13746,9 @@ fn an_anchors_vcs_http_flag_starts_its_daemons_edge() {
   }
   anchor.drain = Some(echo_the_rest(stderr));
   let port = port.expect("the daemon named its edge's port before it served");
-  let refs = bare_request(port, WAIT_FOR).expect("the edge answered");
+  let refs = bare_request(port).expect("the edge answered");
   assert!(basic_then_bearer(&refs, "www-authenticate"), "{refs}");
-  let locks = answer_head(port, LFS_LOCKS_REQUEST, WAIT_FOR).expect("the edge answered LFS");
+  let locks = answer_head(port, LFS_LOCKS_REQUEST).expect("the edge answered LFS");
   assert!(basic_then_bearer(&locks, "lfs-authenticate"), "{locks}");
 }
 
@@ -13770,32 +13763,31 @@ fn basic_then_bearer(head: &str, field: &str) -> bool {
     && matches!((basic, bearer), (Some(basic), Some(bearer)) if basic < bearer)
 }
 
-/// Asks the version-control edge at loopback `port` for a repository's refs with no credentials, waiting `patience` for
-/// each read: the answer's head, lowercased, or why there was none (a refused connection among them).
-fn bare_request(port: u16, patience: Duration) -> std::io::Result<String> {
+/// Asks the version-control edge at loopback `port` for a repository's refs with no credentials: the answer's head,
+/// lowercased, or why there was none (a refused connection among them). Read as [`answer_head`] reads.
+fn bare_request(port: u16) -> std::io::Result<String> {
   answer_head(
     port,
     "GET /r.git/info/refs?service=git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\r\n",
-    patience,
   )
 }
 
-/// Asks the version-control edge at loopback `port` for `target` with `token` as a bearer token, waiting [`WAIT_FOR`]
-/// for each read: the answer's head, lowercased, or why there was none.
+/// Asks the version-control edge at loopback `port` for `target` with `token` as a bearer token: the answer's head,
+/// lowercased, or why there was none. Read as [`answer_head`] reads.
 fn bearer_request(port: u16, target: &str, token: &str) -> std::io::Result<String> {
   answer_head(
     port,
     &format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"),
-    WAIT_FOR,
   )
 }
 
-/// Sends `request` to the version-control edge at loopback `port`, waiting `patience` for each read: the answer's head,
-/// lowercased, or why there was none (a refused connection among them).
-fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<String> {
+/// Sends `request` to the version-control edge at loopback `port`: the answer's head, lowercased, or why there was none
+/// (a refused connection among them). Read without a timeout: the edge's daemon answers while it lives, and across a
+/// restart the anchor holds the listener for its successor (A-232, A-468); a stuck daemon is its anchor's to end, which
+/// ends the connection. Until 2026-11-20 each read waited `WAIT_FOR`, or `START_CEILING` across a restart.
+fn answer_head(port: u16, request: &str) -> std::io::Result<String> {
   use std::io::{Read, Write};
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-  stream.set_read_timeout(Some(patience))?;
   stream.write_all(request.as_bytes())?;
   let mut head = Vec::new();
   let mut chunk = [0u8; 1024];
@@ -13817,16 +13809,16 @@ fn answer_head(port: u16, request: &str, patience: Duration) -> std::io::Result<
 
 /// The port the next daemon of an anchor names for a version-control edge on the line that starts `port_line`, from
 /// the anchor's forwarded `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
+/// Each line is waited for while `instance`'s processes progress (until 2026-11-20 within `START_CEILING`).
 fn edge_port_before_serving(
   lines: &std::sync::mpsc::Receiver<String>,
+  instance: &str,
   port_line: &str,
   serving_line: &str,
 ) -> Option<u16> {
   let mut port = None;
   loop {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the daemon served within the start's ceiling");
+    let line = recv_judged(lines, instance, "the daemon served");
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
@@ -13868,9 +13860,9 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let port = edge_port_before_serving(&lines, VCS_HTTP_CLEARTEXT_LINE, &serving_line)
+  let port = edge_port_before_serving(&lines, &instance, VCS_HTTP_CLEARTEXT_LINE, &serving_line)
     .expect("the daemon named its edge's port before it served");
-  let first = bare_request(port, WAIT_FOR).expect("the edge answered");
+  let first = bare_request(port).expect("the edge answered");
   assert!(first.starts_with("http/1.1 401 "), "{first}");
   let killed = daemon_pid(&instance).expect("the daemon's pid");
   assert!(
@@ -13886,9 +13878,11 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
   let mut again = None;
   let mut served = false;
   while successor.is_none() || !served {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the anchor restarted its daemon and the successor served");
+    let line = recv_judged(
+      &lines,
+      &instance,
+      "the anchor restarted its daemon and the successor served",
+    );
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served again: {line}"
@@ -13901,7 +13895,7 @@ fn a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again() {
         .next()
         .and_then(|pid| pid.parse::<u32>().ok());
       // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
-      while_restarting = Some(bare_request(port, START_CEILING));
+      while_restarting = Some(bare_request(port));
     }
     if let Some(rest) = line.strip_prefix(VCS_HTTP_CLEARTEXT_LINE) {
       again = rest.trim().parse::<u16>().ok();
@@ -14211,15 +14205,14 @@ fn svnserves_answers(port: u16) -> (Vec<u8>, Vec<u8>) {
   )
 }
 
-/// Speaks to the svn:// listener at loopback `port` as stock `svn` 1.15.0 spoke to `svnserve`, waiting `patience` for
-/// each read: reads as many bytes as the greeting holds, answers with the recorded client's answer naming that port,
+/// Speaks to the svn:// listener at loopback `port` as stock `svn` 1.15.0 spoke to `svnserve`, read as [`answer_head`]
+/// reads: reads as many bytes as the greeting holds, answers with the recorded client's answer naming that port,
 /// and reads until the listener closes. What it read before answering and after, or why there was none (a refused
-/// connection among them, or a silence past `patience`, which names the bytes read before it).
-fn svn_exchange(port: u16, patience: Duration) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+/// connection among them, or an error that names the bytes read before it).
+fn svn_exchange(port: u16) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
   use std::io::{Read, Write};
   let (greeting, _) = svnserves_answers(port);
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-  stream.set_read_timeout(Some(patience))?;
   let mut greeted = Vec::new();
   let mut chunk = [0u8; 4096];
   while greeted.len() < greeting.len() {
@@ -14278,7 +14271,7 @@ fn an_anchors_vcs_svn_flag_starts_its_daemons_svn_listener() {
   let (_anchor, lines) = anchor_with_edges(&instance, &["--vcs-svn", "127.0.0.1:0"]);
   let port = port_on(&lines, VCS_SVN_LINE)
     .expect("the daemon named its svn:// listener's port before it served");
-  let exchanged = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  let exchanged = svn_exchange(port).expect("the listener answered");
   assert_svnserves_answers(&exchanged, port);
 }
 
@@ -14310,9 +14303,9 @@ fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let port = edge_port_before_serving(&lines, VCS_SVN_LINE, &serving_line)
+  let port = edge_port_before_serving(&lines, &instance, VCS_SVN_LINE, &serving_line)
     .expect("the daemon named its svn:// listener's port before it served");
-  let first = svn_exchange(port, WAIT_FOR).expect("the listener answered");
+  let first = svn_exchange(port).expect("the listener answered");
   assert_svnserves_answers(&first, port);
   let killed = daemon_pid(&instance).expect("the daemon's pid");
   assert!(
@@ -14328,9 +14321,11 @@ fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
   let mut again = None;
   let mut served = false;
   while successor.is_none() || !served {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the anchor restarted its daemon and the successor served");
+    let line = recv_judged(
+      &lines,
+      &instance,
+      "the anchor restarted its daemon and the successor served",
+    );
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served again: {line}"
@@ -14343,7 +14338,7 @@ fn a_daemon_restart_keeps_the_svn_listeners_port_and_serves_again() {
         .next()
         .and_then(|pid| pid.parse::<u32>().ok());
       // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
-      while_restarting = Some(svn_exchange(port, START_CEILING));
+      while_restarting = Some(svn_exchange(port));
     }
     if let Some(rest) = line.strip_prefix(VCS_SVN_LINE) {
       again = rest.trim().parse::<u16>().ok();
@@ -14499,16 +14494,15 @@ fn ssh_payload(stream: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
     .ok_or_else(|| ssh_refusal(format!("a packet of {length} bytes padded {padding}")))
 }
 
-/// The host key blob the SSH edge at loopback `port` sends in its first key exchange, waiting `patience` for each read:
+/// The host key blob the SSH edge at loopback `port` sends in its first key exchange, read as [`answer_head`] reads:
 /// RFC 5656 §4's `K_S` in the server's `SSH_MSG_KEX_ECDH_REPLY`, cleartext before the keys are taken; or why there was
 /// none (a refused connection among them). A reader written for this test from the RFCs: it offers what
 /// [`ssh_kexinit`] lists, sends its ephemeral key once the server's KEXINIT came, and reads up to the server's reply.
 /// It checks no signature: the edge's own tests do, with slates-ssh's client written from the RFCs
 /// (`crates/server/src/vcs_ssh/tests/daemon_edge.rs`).
-fn ssh_host_key(port: u16, patience: Duration) -> std::io::Result<Vec<u8>> {
+fn ssh_host_key(port: u16) -> std::io::Result<Vec<u8>> {
   use std::io::Write;
   let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))?;
-  stream.set_read_timeout(Some(patience))?;
   stream.write_all(b"SSH-2.0-slates_cli_test\r\n")?;
   stream.write_all(&ssh_packet(&ssh_kexinit()))?;
   ssh_identification(&mut stream)?;
@@ -14537,13 +14531,12 @@ fn ssh_host_key(port: u16, patience: Duration) -> std::io::Result<Vec<u8>> {
 /// `lines`, read until that daemon says it serves (`serving_line`); none if it named none first.
 fn ssh_edge_before_serving(
   lines: &std::sync::mpsc::Receiver<String>,
+  instance: &str,
   serving_line: &str,
 ) -> Option<(u16, String)> {
   let mut edge = None;
   loop {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the daemon served within the start's ceiling");
+    let line = recv_judged(lines, instance, "the daemon served");
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served: {line}"
@@ -14560,14 +14553,17 @@ fn ssh_edge_before_serving(
 /// before the successor served; and the port and fingerprint the successor names before it serves (`serving_line`).
 fn ssh_edge_across_a_restart(
   lines: &std::sync::mpsc::Receiver<String>,
+  instance: &str,
   serving_line: &str,
   port: u16,
 ) -> AcrossRestart {
   let (mut successor, mut while_restarting, mut again, mut served) = (None, None, None, false);
   while successor.is_none() || !served {
-    let line = lines
-      .recv_timeout(START_CEILING)
-      .expect("the anchor restarted its daemon and the successor served");
+    let line = recv_judged(
+      lines,
+      instance,
+      "the anchor restarted its daemon and the successor served",
+    );
     assert!(
       !line.starts_with(CRASH_LOOP_LINE),
       "the daemon never served again: {line}"
@@ -14580,7 +14576,7 @@ fn ssh_edge_across_a_restart(
         .next()
         .and_then(|pid| pid.parse::<u32>().ok());
       // The killed daemon is gone (the anchor saw it exit): only a held listener still takes a connection at its port.
-      while_restarting = Some(ssh_host_key(port, START_CEILING));
+      while_restarting = Some(ssh_host_key(port));
     }
     again = ssh_edge_of(&line).or(again);
     served |= line.starts_with(serving_line);
@@ -14619,9 +14615,9 @@ fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key()
   let (lines, forwarding) = forward_lines(stderr);
   anchor.drain = Some(forwarding);
   let serving_line = format!("{SERVING_LINE}{instance} serving on ");
-  let (port, fingerprint) = ssh_edge_before_serving(&lines, &serving_line)
+  let (port, fingerprint) = ssh_edge_before_serving(&lines, &instance, &serving_line)
     .expect("the daemon named its SSH edge's port and host key before it served");
-  let key = ssh_host_key(port, WAIT_FOR).expect("the edge's host key");
+  let key = ssh_host_key(port).expect("the edge's host key");
   assert_eq!(
     slates_server::credentials::key_fingerprint(&key),
     fingerprint,
@@ -14635,7 +14631,8 @@ fn an_anchors_vcs_ssh_edge_names_its_host_key_and_a_restart_keeps_port_and_key()
       .unwrap()
       .success()
   );
-  let (successor, while_restarting, again) = ssh_edge_across_a_restart(&lines, &serving_line, port);
+  let (successor, while_restarting, again) =
+    ssh_edge_across_a_restart(&lines, &instance, &serving_line, port);
   assert_ne!(successor, Some(killed), "the anchor started a new daemon");
   let restarted = while_restarting
     .expect("asked while the daemon restarted")

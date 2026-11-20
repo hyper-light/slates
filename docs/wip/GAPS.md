@@ -4851,6 +4851,11 @@
 > to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
+> A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
+> time). Owed from that sweep, each with its own wake: the waits for a lent record session (`forward_lane.rs`,
+> `fleet.rs` campaign sessions, `owner_location.rs`, `live_ship.rs`), a broadcast's stragglers (`owner_location.rs`), a
+> FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> bench run's exit 4 at 64 MiB under memory pressure.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
@@ -7170,8 +7175,10 @@
 >   them across a restart, A-113); `cli`'s `START_WAIT` waits (`StartProgress` judges every process of the instance,
 >   failed once none is left or none gained CPU for `OBSERVE_BUDGET_NS`, its wall ceiling gone; a line read off the
 >   anchor's log, the anchor's successor and its end after refusing a replaced image judged the same; the TLS probe's
->   socket reads with no timeout; `kill -9` run unbounded). Owed in `cli/tests`: `cli`'s `START_CEILING`, `WAIT_FOR`,
->   `FLEET_WAIT` and container waits, `live_fleet`, `vm`,
+>   socket reads with no timeout; `kill -9` run unbounded); `cli`'s `START_CEILING` waits (the anchor's restart and
+>   serving lines judged the same; the version-control edges' HTTP, svn:// and SSH reads with no timeout, the anchor
+>   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone. Owed in `cli/tests`: `cli`'s
+>   `WAIT_FOR`, `FLEET_WAIT` and container waits, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
