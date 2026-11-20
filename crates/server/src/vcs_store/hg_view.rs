@@ -243,6 +243,20 @@ fn lend_in<R>(
   made
 }
 
+/// The node `name` names in repository `id`'s served view as Mercurial resolves a name (A-575's `--from`;
+/// `slates_hg::serve::lookup::resolve_name`), within `room`: none where no view is lent (module docs, "Not lent"),
+/// counted as every lend counts it; the view's refusal where it could not resolve one.
+pub(crate) fn resolved_in(
+  state: &mut ShardState,
+  id: RepositoryId,
+  name: &[u8],
+  room: &mut Admission,
+) -> Option<Result<Option<Node>, slates_hg::serve::Refusal>> {
+  lend_in(state, id, room, |view, room| {
+    slates_hg::serve::lookup::resolve_name(view, name, room)
+  })
+}
+
 /// Runs `step` over repository `id`'s served view, made within `room` from what `shard` holds now, and what its index
 /// holds as a push verifies against it (`IndexHeld`); none when its store is not in the map or the view cannot be made
 /// (module docs, "Not lent"), which the caller counts.

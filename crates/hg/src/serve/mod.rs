@@ -81,6 +81,14 @@ pub trait Repository {
   /// phases` (`phases.py` 1049-1058: each root of `_phaseroots[draft]` from `repo.unfiltered().changelog`, kept where
   /// `phase(root) <= draft`; A-691).
   fn draft_roots(&self) -> impl Iterator<Item = Node>;
+
+  /// The node of the `.hgtags` file revision revision `rev`'s manifest names (7.2's `_readtagcache` reads one at each
+  /// head, `crate::tags`); none where its manifest names no `.hgtags`. What it reads is charged to `admission` first.
+  fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal>;
+
+  /// The bytes of `.hgtags` file revision `node`, its metadata block left out (7.2's `filectx.data()`), charged to
+  /// `admission` before they are read.
+  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal>;
 }
 
 /// Why a request was refused.
