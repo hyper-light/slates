@@ -12,6 +12,8 @@ set -u
 SLATES=$1 SOURCE=$2 WORK=$3
 INSTANCE="git-matrix-$$"
 STEP_LIMIT=${STEP_LIMIT:-3600}
+# PUSH_REFS: the refspecs the first pushes send (default every branch and tag).
+read -r -a PUSH_REFS <<<"${PUSH_REFS:-refs/heads/*:refs/heads/* refs/tags/*:refs/tags/*}"
 rm -rf "$WORK" && mkdir -p "$WORK" || exit 1
 cd "$WORK" || exit 1
 export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 HOME="$WORK/home"
@@ -68,8 +70,8 @@ export GIT_SSH_COMMAND="ssh -F /dev/null -i $WORK/key -o IdentitiesOnly=yes -o B
   -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$WORK/known_hosts -o GlobalKnownHostsFile=/dev/null"
 echo "git $(git --version); source $SOURCE $(git -C "$SOURCE" rev-list --all --count) commits; http $HTTP ssh $SSH"
 
-row push-all git -C "$SOURCE" push "$URL" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
-row push-all-ssh git -C "$SOURCE" push "$SSHURL" 'refs/heads/*:refs/heads/*' 'refs/tags/*:refs/tags/*'
+row push-all git -C "$SOURCE" push "$URL" "${PUSH_REFS[@]}"
+row push-all-ssh git -C "$SOURCE" push "$SSHURL" "${PUSH_REFS[@]}"
 row ls-remote git ls-remote "$URL"
 row clone git clone -q "$URL" a
 row fsck git -C a fsck --no-progress
