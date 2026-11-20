@@ -14909,8 +14909,13 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
 | medium class p99 / alone | 6.8 | 7.1 |
 | hot repository's 19 pushes | all ok, 30.1 s | none ok: 12 connections reset, 7 empty answers; the daemon gone |
 
-- **Why it lost.** A step that waits its turn re-polls by yielding, so a shard with many waiting pushes polls without
-  stepping, and the watchdog ended the daemon. And the toys grew slower, not faster, so their wait was not the owner
-  shard's CPU taken by the hot repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the
-  R = 100 step (owed, A-724), not guessed.
+- **Why it lost.** The toys grew slower, not faster, so their wait was not the owner shard's CPU taken by the hot
+  repository's steps. Rejected. The cause of the toys' p99 is to be found by profiling the R = 100 step (owed, A-724),
+  not guessed.
+- **Corrected (2026-11-20, a later run).** This section first said the daemon ended because waiting steps re-polled by
+  yielding. A run of main itself (release from b8e4591, no fair turns, the same command at R = 100, load 10.0) ended the
+  daemon the same way: the hot repository's 19 pushes 10 connections reset and 9 empty answers; the toys' p99 16.5 times
+  alone (5.293 s), the medium class 10.1 times. So the daemon's end is not this experiment's: main regressed between
+  1e84630b1 (the section above: every push ok) and b8e4591, or the end is intermittent. The rejection stands on the
+  toys' p99 alone. Reported to main; the run's profile is `~/.cache/w-balance/r100.sample` on adas-mac-studio.local-2.
 
