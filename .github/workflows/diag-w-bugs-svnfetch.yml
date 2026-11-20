@@ -49,6 +49,7 @@ jobs:
           httpport=$(sed -n 's|^slates daemon: the version-control HTTP edge serves cleartext on 127\.0\.0\.1:\([0-9]*\).*|\1|p' "$log" | head -1)
           exports=$(sed -n 's/^slates anchor: issuer surface: export //p' "$log" | head -1)
           echo "svn:// $svnport, http $httpport" >> "$r"
+          "$B" --instance "$inst" bootstrap root >> "$r" 2>&1
           "$B" --instance "$inst" repository create project --tool svn >> "$r" 2>&1
           t0=$(date +%s.%N); "$B" --instance "$inst" repository import project "$RUNNER_TEMP/git-1000.dump" >> "$r" 2>&1; echo "import exit $? $(echo "$(date +%s.%N) - $t0" | bc) s" >> "$r"
           minted=$(env $exports "$B" --instance "$inst" credential token)
