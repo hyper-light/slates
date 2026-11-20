@@ -4012,6 +4012,9 @@ pub enum LandingStage {
   Refused,
   /// Cancelled or crashed; a resume continues it.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it (A-779).
+  /// Appended.
+  Superseded,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -4666,6 +4669,12 @@ pub enum Refusal {
     held: u64,
     /// The members it must reach.
     needed: u64,
+  },
+  /// A grant asked for a landing a newer presentation of the same volume into the same target superseded (A-779, main's
+  /// ruling 2026-11-20): an older state never lands over a newer one. Grant the newer, after reading it. Appended.
+  LandingSuperseded {
+    /// The newer presentation.
+    newer: u64,
   },
 }
 

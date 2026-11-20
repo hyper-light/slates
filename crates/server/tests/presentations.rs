@@ -150,8 +150,11 @@ fn a_presentation_past_the_bound_is_refused_and_changes_nothing() {
     proof,
   );
   assert!(
-    matches!(replaced, Err(ClientError::Refused(Refusal::NotFound))),
-    "the replaced presentation is no longer grantable: {replaced:?}"
+    matches!(
+      replaced,
+      Err(ClientError::Refused(Refusal::LandingSuperseded { newer })) if newer == again
+    ),
+    "the replaced presentation is no longer grantable, refused by kind naming the newer (A-779): {replaced:?}"
   );
   drop(client);
   daemon.stop();
