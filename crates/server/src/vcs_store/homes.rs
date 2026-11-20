@@ -237,7 +237,8 @@ pub(crate) fn home_of(shards: &[u16], identity: &ContentId) -> Option<u16> {
     .and_then(|member| u16::try_from(*member).ok())
 }
 
-/// Keeps the window `bytes` on this shard, its home, held once more for its sender: its identity, and the ticket an
+/// Keeps the object `bytes` on this shard, its home, held once more for its sender (cut at the store's windows, named by
+/// the BLAKE3 of its bytes, the identity rule): its identity, and the ticket an
 /// entry naming it waits on (module docs, "Durable before named"). The shard's content
 /// store is made if it has none (as a first repository makes it), lent the room the shard could admit for the step,
 /// and settled after.
@@ -258,7 +259,7 @@ pub(crate) fn keep_here(
       .stores
       .content
       .as_mut()
-      .map(|content| content.put(bytes))
+      .map(|content| content.put_object(bytes))
   };
   super::settle(state);
   match kept {
@@ -276,12 +277,15 @@ pub(crate) fn keep_here(
 pub(crate) fn read_here(state: &mut ShardState, identity: &ContentId) -> Option<Vec<u8>> {
   let bytes = {
     let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
-    lent
-      .stores
-      .content
-      .as_ref()
-      .and_then(|content| content.bytes_of(identity))
-      .map(std::borrow::Cow::into_owned)
+    lent.stores.content.as_ref().and_then(|content| {
+      // The object whole, its windows in order (an object longer than a window is a list of them, named by its
+      // BLAKE3 through the store's alias): answered only when they hash to its identity.
+      let mut bytes = Vec::new();
+      for window in content.windows(identity) {
+        bytes.extend_from_slice(&window);
+      }
+      (!bytes.is_empty() && ContentId::of(&bytes) == *identity).then_some(bytes)
+    })
   }?;
   state.count(READ, 1);
   Some(bytes)
@@ -706,7 +710,8 @@ pub(crate) const HOMED_SHORT: &str = "vcs_store.homes.homed_short";
 /// [`slates_cluster::homes`]; each answers kept only once its home's image holding it is published. Its identity once
 /// `f + 1` homes (every member, in a region of fewer) answered kept within `budget`; refused `Unanswered` otherwise, and
 /// the caller records the names inline instead (version 2). Asked from shard `origin`; at most one window
-/// (`ContentRefused::PastWindow` refused `PastWindow`) until an object past one is sent in parts.
+/// (an object of any length a home keeps whole, cut at its own windows; one region message carries at most
+/// `slates_archive::format::MAX_CHUNK_BYTES` until an object past that is sent in parts).
 pub(crate) async fn home_in_region(
   origin: u16,
   shards: &[u16],
