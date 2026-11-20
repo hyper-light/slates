@@ -1120,6 +1120,58 @@ fn a_refused_pack_is_answered_in_gits_words() {
   }
 }
 
+/// Shape: the objects `refs/tags/v0.99` of git/git brings to an empty repository, the push stock git's client sent
+/// when A-704 was found (2026-11-19, Mac Studio).
+const V0_99_OBJECTS: u32 = 4_508;
+
+/// Shape: an admission that holds a one-command request and its checks but not the records of
+/// [`V0_99_OBJECTS`] objects.
+const REQUEST_ROOM: u64 = 1 << 16;
+
+/// A-704 (git's words for a pack past its room: `index-pack`'s `die(_("pack exceeds maximum
+/// allowed size"))` under `receive.maxInputSize`, which receive-pack's `unpack` answers `index-pack
+/// abnormal exit`). Do: push, multiplexed, a pack whose header counts [`V0_99_OBJECTS`] objects
+/// under an admission that holds its request but not the records its header counts. Expect: band
+/// 2 git's `fatal: pack exceeds maximum allowed size`; the report `unpack index-pack abnormal exit`,
+/// never `eof before pack header was fully read`, and the command `unpacker error`; nothing
+/// judged.
+#[test]
+fn a_pack_past_its_room_is_refused_in_the_words_of_gits_max_input_size() {
+  let id = name_of(ObjectFormat::Sha1, Kind::Commit, b"x").unwrap();
+  let command: [(ObjectId, ObjectId, &[u8]); 1] = [(zero(), id, b"refs/tags/v0.99")];
+  let capabilities = b" report-status side-band-64k";
+  let pack = pack_header(V0_99_OBJECTS);
+  let bytes = request(&[], &command, capabilities, &[], &pack);
+  let mut judge = Applies::default();
+  let mut admission = Admission::new(REQUEST_ROOM);
+  let received = receive(
+    &bytes,
+    &ADVERTISED,
+    &Repo::default(),
+    &NoneHidden,
+    &mut judge,
+    &mut admission,
+  )
+  .unwrap();
+  let (report, text) = bands(&answer_to(&received));
+  let mut expected = Vec::new();
+  for line in [
+    b"unpack index-pack abnormal exit\n".as_slice(),
+    b"ng refs/tags/v0.99 unpacker error\n",
+  ] {
+    pktline::write(Packet::Data(line), &mut expected).unwrap();
+  }
+  pktline::write(Packet::Flush, &mut expected).unwrap();
+  assert_eq!(
+    (String::from_utf8_lossy(&report), String::from_utf8_lossy(&text)),
+    (
+      String::from_utf8_lossy(&expected),
+      "fatal: pack exceeds maximum allowed size\n".into()
+    )
+  );
+  assert!(judge.0.is_empty());
+}
+
 /// `options`'s push received under `admission`.
 fn options_received(options: &Scenario, admission: &mut Admission) -> Result<Received, Refusal> {
   let repository = Repo::from_pack(options.before_pack);
