@@ -11747,6 +11747,13 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
 > by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
 > partition. Across nodes (a work on the creating client's node) is not built.
+>
+> **Measured (2026-11-20, w-work-cow): a work costs its divergence, never its green.** A work starts as an empty delta
+> over its green's pinned base and copies a file only when it changes it (`crate::work_files`). 16 works over a 64 MiB
+> green (1,024 files of 64 KiB), each requested, reading one file and editing it, added 1.2 MB resident (74 KiB per
+> work: the 64 KiB file it changed plus about 10 KiB) in 0.58 ms mean per work. With a copy of the green per work put
+> back, the same run added 975 MB in 4.46 ms. Release, macOS arm64, Mac Studio. Held by
+> `crates/server/tests/work_cow.rs`: N x (64 KiB + file) + 8 MiB, below one copy of the green.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
