@@ -999,29 +999,45 @@ const PHASE_CHECK: usize = 2;
 /// Format: the answer's last step (seal, hooks' views, verdicts, commit and report), one that answers `Answered`.
 const PHASE_ANSWER: usize = 3;
 
-/// The longest step of each phase of a git push, per repository (A-724's profile: where a push holds its shard at once),
-/// on this shard: [input, end, check turn, answer]. One entry a repository with a push stepped here, so bounded by the
+/// Each phase's steps of a git push on this shard, per repository (A-724's profile: where a push holds its shard, and
+/// how long it waits between its steps): indexed by phase [input, end, check turn, answer].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhaseSteps {
+  /// The longest step of each phase, nanoseconds.
+  pub(crate) longest: [u64; 4],
+  /// Steps of each phase.
+  pub(crate) steps: [u64; 4],
+  /// The nanoseconds those steps ran.
+  pub(crate) ns: [u64; 4],
+  /// The nanoseconds from the repository's previous push step's end to each step's start, summed by the step's phase:
+  /// before a check turn or an answer step, the time the push waited for its shard (it was ready); before an input step,
+  /// that and the client's bytes.
+  pub(crate) gap_ns: [u64; 4],
+  /// The shard clock at the repository's latest push step's end; zero before its first.
+  last_end: u64,
+}
+
+/// [`PhaseSteps`] by repository on this shard: one entry a repository with a push stepped here, so bounded by the
 /// partition's repositories.
-pub(crate) type PhaseLongest = std::collections::BTreeMap<RepositoryId, [u64; 4]>;
+pub(crate) type PhaseLongest = std::collections::BTreeMap<RepositoryId, PhaseSteps>;
 
 std::thread_local! {
   /// This shard's [`PhaseLongest`].
   static PHASE_LONGEST: std::cell::RefCell<PhaseLongest> = const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
 }
 
-/// `repository`'s longest push step of each phase on this shard ([`PhaseLongest`]): zeros where none ran.
-pub(crate) fn phase_longest(repository: RepositoryId) -> [u64; 4] {
+/// `repository`'s push steps by phase on this shard ([`PhaseSteps`]): zeros where none ran.
+pub(crate) fn phase_longest(repository: RepositoryId) -> PhaseSteps {
   PHASE_LONGEST.with(|longest| {
     longest
       .try_borrow()
       .ok()
       .and_then(|longest| longest.get(&repository).copied())
-      .unwrap_or([0; 4])
+      .unwrap_or_default()
   })
 }
 
-/// Counts a step of phase `phase` (module docs of [`PhaseLongest`]) on the repository's usage row and its phase's
-/// longest.
+/// Counts a step of phase `phase` ([`PhaseSteps`]) on the repository's usage row and its phase's steps.
 fn charge_phase(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1035,10 +1051,21 @@ fn charge_phase(
     .vcs_usage
     .stepped(&repository, Work::Intake, (step_ns, bytes_in), now);
   PHASE_LONGEST.with(|longest| {
-    if let Ok(mut longest) = longest.try_borrow_mut()
-      && let Some(slot) = longest.entry(repository).or_insert([0; 4]).get_mut(phase)
-    {
-      *slot = (*slot).max(step_ns);
+    if let Ok(mut longest) = longest.try_borrow_mut() {
+      let entry = longest.entry(repository).or_default();
+      let gap = if entry.last_end == 0 { 0 } else { began.saturating_sub(entry.last_end) };
+      entry.last_end = now;
+      if let (Some(most), Some(steps), Some(ns), Some(gaps)) = (
+        entry.longest.get_mut(phase),
+        entry.steps.get_mut(phase),
+        entry.ns.get_mut(phase),
+        entry.gap_ns.get_mut(phase),
+      ) {
+        *most = (*most).max(step_ns);
+        *steps = steps.saturating_add(1);
+        *ns = ns.saturating_add(step_ns);
+        *gaps = gaps.saturating_add(gap);
+      }
     }
   });
 }

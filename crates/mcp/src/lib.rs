@@ -2203,7 +2203,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
       "first_ns": r.first_ns,
       "last_ns": r.last_ns,
       "longest_intake_step_ns": r.longest_intake_step_ns,
-      "longest_push_phases_ns": r.longest_push_phases_ns,
+      "push_phases": push_phases_json(r),
     })).collect::<Vec<_>>(),
     "telemetry": telemetry.map(telemetry_json),
   })
@@ -2217,6 +2217,17 @@ pub fn signal_json(s: &Signal) -> Value {
     "value": s.value,
     "absence": s.absence.name(),
     "freshness_ns": s.freshness_ns,
+  })
+}
+
+/// A repository's git push steps by phase in `slates status` (A-724's profile), apart so the status object stays within
+/// `json!`'s recursion.
+fn push_phases_json(r: &slates_ipc::protocol::RepositoryUsageReport) -> serde_json::Value {
+  json!({
+    "longest_ns": r.longest_push_phases_ns,
+    "steps": r.push_phase_steps,
+    "ns": r.push_phase_ns,
+    "gap_ns": r.push_phase_gap_ns,
   })
 }
 

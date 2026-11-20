@@ -477,13 +477,23 @@ def main():
                     longest = max((rows[name].get("longest_intake_step_ns", 0) for name in names if name in rows), default=0)
                     phases = [0, 0, 0, 0]
                     for name in names:
-                        for at, ns in enumerate(rows.get(name, {}).get("longest_push_phases_ns", [])[:4]):
+                        for at, ns in enumerate(rows.get(name, {}).get("push_phases", {}).get("longest_ns", [])[:4]):
                             phases[at] = max(phases[at], ns)
                     if steps:
                         print(f"    class {cls} intake: {steps} steps, {took / 1e9:.3f} s, a step {took / steps / 1e6:.2f} ms "
                               f"on average, the longest {longest / 1e6:.1f} ms; longest by phase: input "
                               f"{phases[0] / 1e6:.1f} ms, end {phases[1] / 1e6:.1f} ms, check turn {phases[2] / 1e6:.1f} ms, "
                               f"answer {phases[3] / 1e6:.1f} ms", flush=True)
+                        # Each phase's steps, their time, and the time the push waited before them (A-724's profile).
+                        tally = {key: [0, 0, 0, 0] for key in ("steps", "ns", "gap_ns")}
+                        for name in names:
+                            for key, sums in tally.items():
+                                for at, value in enumerate(rows.get(name, {}).get("push_phases", {}).get(key, [])[:4]):
+                                    sums[at] += value
+                        print("      by phase: " + "; ".join(
+                            f"{label} {tally['steps'][at]} steps {tally['ns'][at] / 1e9:.3f} s "
+                            f"waited before {tally['gap_ns'][at] / 1e9:.3f} s"
+                            for at, label in enumerate(("input", "end", "check", "answer"))), flush=True)
                 busiest = sorted(by_shard.items(), key=lambda item: -item[1])[:3]
                 print("    busiest shards by step time: " + ", ".join(f"{part}: {ns / 1e9:.2f} s" for part, ns in busiest), flush=True)
                 print(f"    {len(served)} one-push repositories: served p50 {quantile(served, 0.5):.3f} s p99 "
