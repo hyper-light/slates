@@ -445,8 +445,9 @@ fn pushed_three(
 
 /// A-664's live whole builds (a push's; main's ruling of 2026-11-20). Do: push a commit of three files to a git
 /// repository's root green, whose map the push leaves to its build; read the green's kept tree; drive the build's slices
-/// to its end; read it again. Expect: the push answered with no map kept and the build under way; the build ran in
-/// more slices than one (a test's step budget is none, so a file a slice) and kept the pushed commit's tree, built once.
+/// to its end, each slice given no budget (`whole_build::settle`, so the count is the files', whatever the load); read it
+/// again. Expect: the push answered with no map kept and the build under way; the build ran in three slices, one a
+/// file, and kept the pushed commit's tree, built once.
 #[test]
 fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
   let seen = crate::daemon::audit_on_shard(|state| {
@@ -465,11 +466,11 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
     (
       answered,
       built,
-      slices > 1,
+      slices,
       count(state, crate::vcs_store::paths::BUILT),
     )
   });
-  assert_eq!(seen, ((None, true), (true, false), true, 1));
+  assert_eq!(seen, ((None, true), (true, false), 3, 1));
 }
 
 /// A-664's live whole builds (a submit parked behind one). Do: push a commit of three files to a git repository's root

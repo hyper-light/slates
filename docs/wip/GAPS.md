@@ -106,6 +106,8 @@
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
 > Owed: compression of cold content.
+> Piece 5b's placement policy for A-722's intake off the owner (`vcs_share::place::intake_shard`, two choices by
+> intakes decoding) built, waiting for w-git's A-722 to call it.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -129,8 +131,11 @@
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
 > resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
 > before its landing (`record::Writer`, the import's `Stage::Writing`), where each was one step; `docs/bugs/2026-11-20-
-> a-large-mercurial-import-crash-looped-the-daemon.md`. Owed: a rebuild's replay (`vcs_store::rebuild`, one step still);
-> the record's size itself (S5, A-729: identities, no texts); w-perf's by-use rerun.
+> a-large-mercurial-import-crash-looped-the-daemon.md`. Part 2 FIXED (found by use, w-interop: a 57,035-revision push
+> over HTTP spun shard 0 at its landing): a push's record is written a part a slice before its landing
+> (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
+> Owed: a rebuild's replay (`vcs_store::rebuild`, one step still); the landing's append of an entry as large as its
+> record, and the record's size itself (S5, A-729: identities, no texts); w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -3576,6 +3581,14 @@
 >   replaces the entry, and a decomposed and a precomposed `é` are two names. Such a volume and its drive take the same
 >   names for one, so neither residual above that comes from the two rules (the first and the last) can arise on it.
 >   Held by vfs's unit tests on every host (red 5 of 10 with the table removed, green 10 of 10, Mac Studio).
+> - **Fixed, A-737 (2026-11-20, w-bugs, goal 87; found by use): the table was not Windows'.** The Windows check
+>   (`the_volumes_upcase_table_is_the_systems`) failed on CI's x86_64 and arm64 runners: 109 units apart. Windows' own
+>   table (dumped through `RtlUpcaseUnicodeChar` on both, identical: 973 units mapped, no two to one, TableChecksum of
+>   the whole table E61F453Bh) leaves final sigma `ς` as it is, folds the case pairs Unicode added after the exFAT
+>   table (`ɐ`/`Ɐ`, `ͱ`/`Ͱ`, ...), and leaves `Ⱥ` (the exFAT table mapped it to the lowercase `ⱥ`). `Upcase` now folds by
+>   Windows' table; the "names the table folds alike and the volume keeps apart" residual above does not arise (every
+>   pair it folds alike, NFC and lowercasing fold alike too), and `ς` beside `σ` is two names, as on NTFS. No volume was
+>   made `Upcase` before (no client can choose it until part 2), so no stored name changes meaning.
 > - **Owed, A-576 part 2:** the policy in the protocol and the catalog (`NamePolicy`, `DbNamePolicy`, appended and
 >   published), its choice in the CLI, the SDKs and MCP, an archive importing it (refused `Unsupported` until then), and
 >   what a WinFsp mount of a `Fold` volume does once a drive's volume can be made `Upcase`. Main's: the Windows check

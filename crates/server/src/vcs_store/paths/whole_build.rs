@@ -195,14 +195,18 @@ fn head_paths(engine: &slates_merge::engine::Green) -> Vec<String> {
 
 /// Drives `green`'s build a slice at a time, yielding between slices, until it ends or is replaced.
 async fn drive(green: DbVolumeId) {
-  while crate::state::with_state_counted(|state| slice(state, green)) == Some(true) {
+  while crate::state::with_state_counted(|state| {
+    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+    slice(state, green, budget)
+  }) == Some(true)
+  {
     slates_rt::futures::yield_now().await;
   }
 }
 
-/// One slice of `green`'s build (module docs): whether more remain. A build no longer kept, or whose green is gone,
-/// has none.
-fn slice(state: &mut ShardState, green: DbVolumeId) -> bool {
+/// One slice of `green`'s build (module docs), putting files until `budget_ns` is spent (at least one): whether more
+/// remain. A build no longer kept, or whose green is gone, has none.
+fn slice(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
   let Some(mut build) = state.vcs_stores.whole_builds.0.remove(&green) else {
     return false;
   };
@@ -225,7 +229,7 @@ fn slice(state: &mut ShardState, green: DbVolumeId) -> bool {
       return false;
     }
   }
-  match put_some(state, green, &mut build) {
+  match put_some(state, (green, budget_ns), &mut build) {
     Ok(()) if build.at < build.paths.len() => {
       state.vcs_stores.whole_builds.0.insert(green, build);
       true
@@ -257,10 +261,9 @@ fn build_repository(state: &ShardState, green: DbVolumeId) -> Option<RepositoryI
 /// least one), then settles the charge.
 fn put_some(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (green, budget): (DbVolumeId, u64),
   build: &mut Build,
 ) -> Result<(), StepRefused> {
-  let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
   let began = slates_rt::futures::now_ns();
   let ShardState {
     store,
@@ -400,11 +403,12 @@ fn retire(state: &mut ShardState, build: Build) -> Vec<ParkedSubmit> {
 }
 
 /// Drives every build of the shard to its end, a slice at a time, in this step: what a test that pushes and then reads
-/// the map does, since a test's step runs no other task between its calls.
+/// the map does, since a test's step runs no other task between its calls. Each slice is given no budget, so it puts one
+/// file whatever the machine's load: a test's count of slices is the build's files, never a measure of time.
 #[cfg(test)]
 pub(crate) fn settle(state: &mut ShardState) {
   let greens: Vec<DbVolumeId> = state.vcs_stores.whole_builds.0.keys().copied().collect();
   for green in greens {
-    while slice(state, green) {}
+    while slice(state, green, 0) {}
   }
 }

@@ -1187,7 +1187,13 @@ pub(crate) fn land(
       released,
     };
   }
-  let Some(Forked { fork, intaken, .. }) = forked else {
+  let Some(Forked {
+    fork,
+    intaken,
+    record: written,
+    ..
+  }) = forked
+  else {
     let appended = RepositoryLogs::append(state, principal, repository, changes, parts);
     return Landed {
       answer: appended
@@ -1198,11 +1204,12 @@ pub(crate) fn land(
   };
   // The push's record, the revisions it kept written from the fork in the order kept, within the room the landing runs
   // within (A-680 part 2c, A-720); a push that kept none records none.
-  let written = (!intaken.logs.is_empty()).then(|| {
-    state
+  let written = (!intaken.logs.is_empty()).then(|| match written {
+    Some(record) => Some(Ok(record)),
+    None => state
       .vcs_stores
       .mercurial_ref(repository)
-      .map(|(content, _)| record::write_kept(&fork, content, &intaken.logs, admission.left()))
+      .map(|(content, _)| record::write_kept(&fork, content, &intaken.logs, admission.left())),
   });
   let record = match written {
     None => None,
@@ -1273,6 +1280,9 @@ pub(crate) struct Forked {
   pub(crate) intaken: Intaken,
   /// The generation of the index the fork was made from (`vcs_store::VcsStores::generation_of`).
   pub(crate) generation: u64,
+  /// Its record, written a part a slice before its landing (A-732's writer); none until written, and none again once
+  /// the fork is re-based, since a re-base renumbers what it holds.
+  pub(crate) record: Option<Vec<u8>>,
 }
 
 /// One `unbundle` on `repository`'s owner shard (module docs, "The driver"; A-720): its `heads` argument judged and its
@@ -1301,6 +1311,11 @@ pub(crate) async fn unbundle(
   // (A-720 part 2b), a slice at a time, and the landing tried again.
   let mut forked = forked;
   loop {
+    if let Some(taken) = forked.as_mut()
+      && let Err(outcome) = record_sliced(repository, taken, room.left()).await?
+    {
+      return Some(outcome);
+    }
     let tried = crate::state::with_state(|state| match forked.take() {
       Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
       fresh => Ok(landing(
@@ -1320,6 +1335,43 @@ pub(crate) async fn unbundle(
       },
     }
   }
+}
+
+/// Writes `forked`'s record a part at a time, a yield between slices (A-732's writer; written whole in the landing's one
+/// step, a large push's record held its shard past the watchdog's window): before its landing, so the landing appends
+/// it. Nothing to do where it is written or the push kept nothing; none when the store went away.
+async fn record_sliced(
+  repository: RepositoryId,
+  forked: &mut Forked,
+  room: u64,
+) -> Option<Result<(), PushOutcome>> {
+  if forked.record.is_some() || forked.intaken.logs.is_empty() {
+    return Some(Ok(()));
+  }
+  let unrecorded = || PushOutcome::refused(&abort(UNRECORDED.to_vec()));
+  let Ok(mut writer) = record::Writer::begin_kept(&forked.intaken.logs, room) else {
+    return Some(Err(unrecorded()));
+  };
+  loop {
+    let written = crate::state::with_state(|state| {
+      let quantum = vcs_store::hg_import::quantum_of(state);
+      let start = slates_rt::futures::now_ns();
+      let (content, _) = state.vcs_stores.mercurial_ref(repository)?;
+      Some(loop {
+        match writer.step(&forked.fork, content) {
+          Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          other => break other,
+        }
+      })
+    });
+    match written.flatten()? {
+      Ok(true) => slates_rt::futures::yield_now().await,
+      Ok(false) => break,
+      Err(_) => return Some(Err(unrecorded())),
+    }
+  }
+  forked.record = writer.finish();
+  Some(Ok(()))
 }
 
 /// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
@@ -1365,6 +1417,7 @@ impl Rebasing {
         fork,
         intaken,
         generation,
+        record: None,
       }),
       _ => {
         state.count(vcs_store::RELEASE_REFUSED, 1);
@@ -1544,6 +1597,7 @@ impl Taking<'_> {
         fork,
         intaken,
         generation: self.generation,
+        record: None,
       }),
       Err(intake) => {
         self.intake = Some(*intake);
