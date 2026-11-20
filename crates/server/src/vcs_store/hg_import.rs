@@ -577,10 +577,12 @@ fn landing_entry(
   let held = IndexHeld::new(&imported.index, content);
   let name = import_name(&record);
   let changes = bookmark_greens(state, (root, &imported.bookmarks), (&held, name, room))?;
+  // The record rides as the import's stored objects (`push_imported`), never as the parts' own.
   let parts = EntryParts {
     checks: Vec::new(),
     names: Vec::new(),
     state: phase_roots_added(&imported.phase_roots),
+    objects: Vec::new(),
   };
   Ok((owner, changes, parts, record))
 }

@@ -998,7 +998,9 @@ proptest! {
 // ---------------------------------------------------------------------------------------------------------------------
 // The import's record (A-687).
 
-use crate::import::record::{self, Refused as RecordRefused, Replayed, Revision, Source};
+use crate::import::record::{
+  self, Refused as RecordRefused, Replayed, Revision, Source as RecordSource,
+};
 use crate::index::HgIndex;
 
 /// Every repository the record tests import: the five stores of one history, and the history 7.2 kept with its phases,
@@ -1224,7 +1226,12 @@ fn revisions_of(index: &HgIndex, store: &ContentStore, log: Log<'_>) -> Vec<Held
 }
 
 /// A record of `index`'s revisions whose changeset is `below` the cut or not (`below` false), as `source` writes it.
-fn cut_record(index: &HgIndex, store: &ContentStore, (cut, below): (u32, bool), source: Source) -> Vec<u8> {
+fn cut_record(
+  index: &HgIndex,
+  store: &ContentStore,
+  (cut, below): (u32, bool),
+  source: RecordSource,
+) -> Vec<u8> {
   let mut logs = vec![Log::Changelog, Log::Manifest];
   let paths: Vec<Vec<u8>> = index.file_logs(store).map(<[u8]>::to_vec).collect();
   logs.extend(paths.iter().map(|path| Log::File(path.as_slice())));
@@ -1273,8 +1280,8 @@ fn cut_record(index: &HgIndex, store: &ContentStore, (cut, below): (u32, bool), 
 fn t_a687_a_push_record_appends_after_what_the_index_holds() {
   let (mut imported, store, _) = recorded("dot");
   assert!(imported.changesets > 3, "{imported:?}");
-  let below = cut_record(&imported.index, &store, (3, true), Source::Import);
-  let above = cut_record(&imported.index, &store, (3, false), Source::Push);
+  let below = cut_record(&imported.index, &store, (3, true), RecordSource::Import);
+  let above = cut_record(&imported.index, &store, (3, false), RecordSource::Push);
   let (mut replay_store, mut index, first) = replayed(&below);
   assert!(first.unwrap().whole);
   let second = record::replay(&above, &mut index, &mut replay_store).unwrap();

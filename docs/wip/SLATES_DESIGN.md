@@ -13891,15 +13891,18 @@ signature verification).
 > **Status (2026-11-19, A-687: the import made durable).** A done import lands as one entry of its repository's logs
 > (A-635's append, `repository::push::push_imported`), in the transaction that records its request's completion, so
 > the import and its answer are one durable step. The entry's objects are the import's record (`slates-hg`'s
-> `import::record`: every revision it kept, whole, with its node, parents, link and flags, in the import's order, then
-> its markers, and the room it ran within); its state is the phase roots it found, each added to the phases log
+> `import::record`, one kind for an import and a push, `SHGR`: groups of revisions in the order they were appended, each
+> whole with its node, parents, link and flags, then the markers, its source and the room it was written within;
+> `write` for an import's index, `write_revisions` for a push's revisions, `replay` for both); its state is the phase
+> roots it found, each added to the phases log
 > (decision 3); and each bookmark is a green bound to `bookmark:<label>:` (decision 2), made from the repository's root
 > at its head and moved to its changeset by a work A-618's builder makes from the imported index, as a push makes a
 > bookmark's. The store takes the index between the register's guard and the entry's apply, so an entry the guard
 > refuses never reaches it, and one refused after it makes the store again from the log. A recovery replays the record
 > through the import's own steps (each revision's flags and text held to its node, a changeset's manifest, branch and
-> closing read from its text, each kept and appended numbered its log's own, the markers in one batch) into the same
-> index, on this node or a successor, which never reads the importing host's directory (R8). Proven on macOS arm64 (Mac
+> closing read from its text, each kept and appended numbered its log's next, the markers in one batch) into a fork of
+> the index that takes its place whole, so the same index, on this node or a successor, which never reads the importing
+> host's directory (R8); an import's record only into an empty index. Proven on macOS arm64 (Mac
 > Studio, RUN-PENDING-STATUS). Owed: an imported repository's branch heads as lines (decision 1; a push after an import
 > finds the root as its first line); a request forwarded from another node answered from its record; for a large
 > repository, the record and the bookmarks' works made in slices and the snapshot carrying the store's tables.
@@ -52447,8 +52450,12 @@ completion in one transaction; their tests), GAPS (the §4.17.3 entry).
   directory may have changed since. As a git push's entry holds its objects (A-662), an import's entry holds its
   revisions: every one it kept, whole, with its node, parents' nodes, link's node and 7.2's flags, in the import's order
   (the changelog, the manifest log, each file log in its path's order), then the markers each alone in its obsstore
-  format, and the room the import ran within (`slates_hg::import::record`, magic `SHIR`, version 1, little-endian,
-  every count checked against the bytes left before anything is allocated). Not a revlog's deltas, which are the host's
+  format, and the room the import ran within (`slates_hg::import::record`, magic `SHGR`, version 1, little-endian,
+  every count checked against the bytes left before anything is allocated). One kind for an import and a push (main's
+  ruling): the record holds groups of revisions, each one log's in the order they were appended, and its source, so a
+  push's landing records the revisions it brought with `write_revisions`, and `replay` appends either into a fork of
+  the index that takes its place whole; an import's record replays only into an empty index, as its landing takes only
+  an empty store. Not a revlog's deltas, which are the host's
   encoding, nor the index's rows, which are made from the revisions; and not the directory's files, which a successor
   would read through a host it lacks.
 - **The replay is the import's own steps.** Each revision's flags held to what 7.2 knows and its text to its node
