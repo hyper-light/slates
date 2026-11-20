@@ -2991,8 +2991,10 @@
 >   append turn 0.92 to 0.94 ms before, about 0.46 us after, each hashing turn at most 27 to 32 us; peak RSS unchanged
 >   (8.8 MB). **A-757 part 2b (2026-11-20):** a delta over one archive page, sealed or in the clear, is sealed and hashed
 >   by a build of its own in turns, queued behind like a whole build: 2.4 MB in release, the append turn 0.92 to 2.32 ms
->   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **Owed:** the body is held twice (A-757 part
->   3)); and, after A-347's open, the takeover's
+>   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **A-757 part 3 (2026-11-20):** a whole entry's
+>   payload is held once, by the shipper, which keeps it past the retained tail and lends it for installs; the volume
+>   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
+>   MB after (release)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
