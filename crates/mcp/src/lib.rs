@@ -2202,6 +2202,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
       "fetch_step_ns": r.fetch_step_ns,
       "first_ns": r.first_ns,
       "last_ns": r.last_ns,
+      "longest_intake_step_ns": r.longest_intake_step_ns,
     })).collect::<Vec<_>>(),
     "telemetry": telemetry.map(telemetry_json),
   })

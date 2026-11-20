@@ -4336,6 +4336,7 @@ fn repository_usage_reports(
       fetch_step_ns: usage.fetch.step_ns,
       first_ns: usage.first_ns,
       last_ns: usage.last_ns,
+      longest_intake_step_ns: usage.intake.longest_step_ns,
     })
     .collect()
 }
