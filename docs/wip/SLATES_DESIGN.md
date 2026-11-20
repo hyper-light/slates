@@ -15931,6 +15931,72 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
 
 Then main runs the suite over both URLs, the differential run and the order-of-magnitude measurements.
 
+#### 4.17.5 Many repositories on one server, balanced by learned usage (A-724)
+
+> **Status (2026-11-20, A-724 piece 1).** Designed below; piece 1 built: each repository's usage counted on its owner
+> shard (`slates_vcs::usage`, kept as `ShardState::vcs_usage`; git's push steps and fetch steps count on it). Owed, in
+> order: the learned demand and the shares (piece 2), admission by share (3), the cold trigger (4), intake off the owner
+> shard and content homed by identity across shards (5), the fleet's placement by identity (6, main's ruling first: it
+> amends §4.10's content placement), and the many-repository load proof (7).
+
+**Role.** One slates server serves many repositories at once, from toys to monorepos the size of Google's or Meta's,
+several of those at once, and divides its memory, its CPU, its admission and its placement among them by what their
+agents and clients actually do (Ada, 2026-11-20). No repository has a fixed share: every share is a stated formula
+over measured inputs, logged with them (D-11), and learned online (§4.17.1 "Every tunable is learned online").
+
+**What a repository costs, counted** (piece 1). Each owner shard keeps one row a repository it owns, touched only by its
+own steps (no lock, no atomic on the path): for its intakes (pushes, commits) and its fetches (fetches, clones), the
+works begun and answered, the shard steps they took, the shard clock's time those steps ran and the bytes the clients
+sent; its first and latest activity; and its principals in a Space-Saving summary [A: Metwally et al., ICDT 2005] of
+`clients_per_shard` slots, so any principal with more than one client seat's share of the repository's work is named
+with bounded error, at bounded cost. A row is dropped with its repository. Its bytes are A-662's and A-714's charges,
+read where they are kept.
+
+**Hot, warm and cold.** A repository's bytes are *hot* (its heads' trees, its works under way, its live intakes),
+*warm* (recent history, as much as its memory share holds) or *cold* (the rest, and every index that can be rebuilt).
+RAM only (R1): there is no disk tier, so cold means compressed, held only on peers, or both.
+
+**Learned demand** (piece 2). For each repository and each principal: decayed rates of works and bytes, their decay set
+by the repository's own measured inter-arrival times; and its working set as a miss-ratio curve built by spatially
+sampled reuse distances [A: Waldspurger et al., "Efficient MRC Construction with SHARDS", FAST 2015], its sampling rate
+derived from the row's memory. A first value is the first work's own size at the rate this machine was just measured
+to do that work, never a literal.
+
+**Shares** (piece 2). Memory: the shard's admittable room (§4.2) split by marginal utility over the repositories' curves
+[A: Qureshi and Patt, "Utility-Based Cache Partitioning", MICRO 2006; A: Beckmann and Sanchez, "Talus", HPCA 2015],
+above a floor of the room over the repositories served now (A-188's share), so a small repository always fits. CPU:
+the shard's step quanta (§4.3) by weighted fair queuing among repositories with runnable work, memory and CPU together
+by dominant-resource fairness [A: Ghodsi et al., NSDI 2011], each weight its learned demand capped at its measured use.
+Every share is work-conserving: room a repository leaves unused is lent, and taken back first from the borrower's own
+cold bytes. Shares are published to the shard's siblings as an immutable snapshot at the learning cadence (D-8), never
+asked for per request.
+
+**Admission and backpressure** (piece 3). A work is admitted against its repository's share, else the room nobody's
+share is using. A work within the floor passes on one counter check (R9's fast path, counted). Past it, the reader is
+paused (the TCP window, the ring's credit) while the projected drain fits the client's deadline; past that, a typed,
+retryable `ShareExceeded { repository, asked, share }` in each tool's words (git's `receive.maxInputSize` line and
+`ERR`, Mercurial's `pusherr`, Subversion's error code). Never an out-of-memory end, and a hot repository never takes
+another's floor.
+
+**The cold trigger** (piece 4). §4.11's cost model, with `value_of_byte` raised by the repository's overrun of its memory
+share, chooses in cost order: drop derived values and caches (pack fragments, reach sets, A-718's deltas: rebuild cost
+times predicted reads against their bytes); compress cold content; hold cold content only at its f+1 holders (§4.10),
+fetched by identity when read.
+
+**Giant repositories** (pieces 5, 6). Load never moves ownership (§4.10). The owner keeps the repository's register (its
+refs and the ordered landing, §4.17.1 intake rule 4), its indexes' tails and fences and its hot set; everything else
+spreads. An intake's decoding, hashing and checks run on the shard its connection arrived at, and only its landing on
+the owner, so one hot repository uses every core. Content is homed by its identity: rendezvous over the content id
+across a node's shards (N=1) and across the region's members (a fleet), one rule (R8). Index tables are content
+(A-581), so a monorepo's cold runs live where their identities home. Nothing is looked up in a catalog (§2 ban 12):
+an id routes to its home.
+
+**Laptop degenerate.** One node, f = 0: the same rows, the same formulas; with one repository its share is the whole room.
+
+**Proof** (piece 7). w-perf's `push_load.py` over many repositories of Zipf-distributed sizes and activity, toy to
+giant: per class p50 and p99 latency, resident memory and refusals per repository; no starvation means a small
+repository's p99 stays within a derived bound of its p99 alone.
+
 ---
 
 ## Part 5 — Phased implementation plan
@@ -54351,3 +54417,26 @@ Applied in the same change to:
   (a push's, a green's first submit's, one past a copy), whose version's made commit needs the trees in the version's
   own transaction; a whole map's release (`ContentStore::release`'s cascade) a unit at a time; recovery's timing over a
   large repository (main's).
+
+### A-724 — Many repositories on one server, balanced by learned usage; piece 1: each repository's usage counted on its owner shard (2026-11-20, w-balance; Ada's goal of 2026-11-20; §4.17.5, §4.17.1 "Every tunable is learned online", D-11, D-28)
+- **Why.** One server must serve toy repositories and several Google- or Meta-size monorepos at once, dividing memory,
+  CPU, admission and placement by what agents and clients do, never by fixed shares. w-perf measured 100 concurrent
+  pushes into 100 repositories holding 28 GB, nothing dividing it (release 7b46fbdcd, Mac Studio).
+- **Design.** §4.17.5, new: costs hot, warm and cold; learned demand (decayed rates, SHARDS miss-ratio curves); shares
+  by utility-based partitioning and dominant-resource fairness, work-conserving; admission by share with backpressure
+  and a typed refusal; §4.11's cost model as the cold trigger; a giant repository's intake and content spread by
+  identity while its ownership stays. Evidence: Metwally ICDT 2005, Waldspurger FAST 2015, Qureshi MICRO 2006, Beckmann
+  HPCA 2015, Ghodsi NSDI 2011 (all A).
+- **Change (piece 1).** `slates_vcs::usage`: a `Ledger` of one `Usage` row a repository (intakes and fetches begun,
+  answered, steps, step time, bytes in; first and latest activity; principals in a Space-Saving summary of `k` slots).
+  The server keeps one on each shard (`ShardState::vcs_usage`, `k` = `clients_per_shard`); git's `ReceivePack` counts
+  a push as it starts, each input, end and answer step with its time, and the push answered; `vcs_store::upload::lend_on`
+  counts a fetch request and every lent step; `vcs_store::free` drops the row.
+- **Tests.** `slates-vcs` `usage::tests` (an oracle over 300 generated histories: rows equal an exact model, rows
+  dropped with their repository, and the summary within Space-Saving's bounds, every principal past `begun / k` named;
+  a heavy principal named exactly; rows apart); `slates-server`
+  `git_push::tests::t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row` (stock git's fixture pushes counted
+  on the pushed repository's row, bytes exact, its owner named for each; an idle repository has none).
+- **Applied in the same change to** §4.17.5 (new), GAPS, amendments.tsv.
+- **Owed.** Pieces 2 to 7 (§4.17.5's status); a fetch's answered count at its pack's last step; Mercurial's and
+  Subversion's intakes and reads counted; the rows in `slates status`.

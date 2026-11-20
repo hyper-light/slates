@@ -72,6 +72,7 @@ pub mod derived;
 pub mod index;
 pub mod rule;
 pub mod table;
+pub mod usage;
 pub mod wildmatch;
 
 pub use arrival::{
@@ -86,6 +87,7 @@ pub use derived::{
 pub use index::{Batch, Index, IndexCounters, IndexRefused, Inserted, NewRow};
 pub use rule::Compaction;
 pub use table::{RowRef, TableRefused, TableView};
+pub use usage::{Ledger, PrincipalCount, Usage, Work, WorkUsage};
 
 #[cfg(test)]
 mod tests;
