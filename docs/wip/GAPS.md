@@ -9873,6 +9873,9 @@ itself (`files.delegate_write(..) == Some(delegation)`), which is stronger. One 
   request, which is the exact condition entry invalidation exists to break. Nothing is dropped.
   Write-up, with the three edits a fix would make:
   `docs/bugs/2026-10-20-the-fuse-notify-rounds-wake-was-built-and-never-wired.md`.
+  **Fixed** by `7deddf549` (2026-10-21; the daemon's mount task waits on its `ChangeSignal`,
+  `fuse.rs` `change_signal` calls `wakes_with`); the record's Status set to fixed 2026-11-19
+  (goal-83 audit B16).
 
   While there, the Linux-only module itself was linted on Linux for the first time from this
   machine: `cargo clippy -p slates-bridge-fuse --all-targets -- -D warnings` is clean on a native

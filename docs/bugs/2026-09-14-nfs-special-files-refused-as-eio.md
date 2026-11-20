@@ -1,8 +1,13 @@
 # A fifo or socket created through the NFS mount fails with EIO, not an "unsupported" error
 
-Status: **open — a declared limit, reported to the transport owner** (`crates/bridge-nfs`,
-`procedures.rs` `mknod_unsupported`); found by pjdfstest through the conformance harness
-(`cargo xtask conformance run --suite pjdfstest`, docs/wip/conformance.md) on 2026-09-14.
+Status: **fixed** in `8613d1107` (2026-09-20): `NFSPROC3_MKNOD` makes FIFO and socket names
+with their real types (`procedures.rs` `do_mknod`; `mknod_unsupported` is gone), and A-268/A-294
+later gave device nodes Linux's own checks (EPERM for a caller who is not root, kept as metadata
+for root). Test: `crates/bridge-nfs/tests/procedures.rs`
+`mknod_creates_fifo_and_socket_names_with_their_real_types` (passed on main 8eeb004bd, macOS
+arm64, Mac Studio, 2026-11-19, goal-83 audit B16). Found by pjdfstest through the conformance
+harness (`cargo xtask conformance run --suite pjdfstest`, docs/wip/conformance.md) on 2026-09-14;
+the record below is the state on that day.
 
 ## Description
 
