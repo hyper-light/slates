@@ -72,6 +72,20 @@ every profile name a run leaves behind here; no other admin steps or installs.
   workspace/slates.rs (361,386,573,1008), workspace/slates_fleet.rs:778.
 - kiln server unreachable from this session ~10:30 PST (run refused "not connected"); 12e44704d's focused run waits on it.
 
+## 2026-11-20 ~11:30 PST: TouchesWord fixed in kiln; jupiter build started
+- LANDED kiln main e64eeb7cb (12e44704d: w8_p4 test by pointer, drive's first-turn failure shows Slates' log; r14 on
+  d1323898: slates_e2e checks:: 17/17, lib w8_p4_ 1/1, no clippy error in api.rs/slates_e2e.rs).
+- Bare-metal Windows job 136462100187 failed 2/2 drives with the same TouchesWord: Windows-wide, not microVM's. Slates main
+  had the fix: 721f4ff97 (A-717). LANDED kiln main cc1ecb625 (ff): vendor/patches/slates/0003 + UPSTREAM row (vendor.py
+  check slates: 1355 files, 3 recorded changes, 0 differences); r19 (adas-mac-studio-3, vendor/slates workspace,
+  unlocked scratch): slates-ipc rendezvous::platform 15/15 incl. a_claim_reads_the_process_marks_of_a_published_bootstrap_object.
+- GitHub whp drive dispatched on main cc1ecb625: run 44802283323.
+- jupiter: clone C:\Users\corph\w-k90-whp\kiln (cc1ecb625), target C:\Users\corph\w-k90-whp\target (own: a target shared
+  across clones rebuilds workspace crates anyway). r21: `cargo test --no-run -p kiln --test slates_e2e` (packs Shards from
+  cached NASM/zig/musl), log C:\Users\corph\w-k90-whp\build-cc1ecb625.log.
+- BLOCKER for the jupiter drive: no Python 3 there; the drive's runner_env -> stub_host_env -> stub_python errors on Windows.
+  w-k90-win asked main for Ada's word on Python. Goal on my stack: 01a1fa3695247602901e94e021bfa56e.
+
 ## AppContainer profiles left on jupiter by my runs
 - (none yet: no guest run on jupiter so far)
 
