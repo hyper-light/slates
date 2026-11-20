@@ -71,7 +71,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   credential key LINE [--principal PRINCIPAL] [--expires SECONDS] [--json]
             enroll an SSH public key (its .pub line) for git over SSH; PRINCIPAL is you unless given
   credential token [--principal PRINCIPAL] [--expires SECONDS] [--json]
-            mint a token for git over HTTPS (Basic's password or a bearer token); shown once
+            mint a token for git over HTTPS (Basic's password or a bearer token) and svn:// (CRAM-MD5's
+            password, its id the user name); shown once
   credential revoke ID [--json]                    revoke a credential by its id (a key's SHA256:... or hex)
   repository create NAME --tool git|hg|svn [--format FORMAT] [--default-branch BRANCH] [--root GREEN] [--json]
             create a repository and its root green, a new empty one unless GREEN; FORMAT is sha1 (git's

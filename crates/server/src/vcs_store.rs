@@ -94,6 +94,7 @@ use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
+pub(crate) mod commits;
 pub(crate) mod hg_import;
 pub(crate) mod hg_view;
 pub(crate) mod lfs_record;
@@ -178,9 +179,15 @@ pub(crate) struct GitStore {
   /// `heads` is made and read by. Declared with the content store's window when the store is made ([`made`]); `None`
   /// for a window too small for the map's branches, which no content plane's window is.
   pub(crate) paths: Option<paths::GreenPaths>,
-  /// Each green's map of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that committed a
-  /// version, its root held once by the store, replaced as each version commits, given back as the green leaves its
-  /// lineage and made again by a recovery.
+  /// The git trees' type over the repository's greens (A-664 part 3, [`paths`]): what each head's trees in `heads` are
+  /// made and read by, declared beside `paths` in the repository's format; `None` as `paths` is.
+  pub(crate) trees: Option<paths::GreenTrees>,
+  /// The commits' type the server makes its commits by (A-664 part 3, [`commits`]), declared beside `paths`; `None` as
+  /// `paths` is.
+  pub(crate) commits: Option<commits::GreenCommits>,
+  /// Each green's map and git trees of its head, by the green's key (A-664 part 3, [`paths`]): one a member green that
+  /// committed a version, its two roots held once by the store, replaced as each version commits, given back as the
+  /// green leaves its lineage and made again by a recovery.
   pub(crate) heads: BTreeMap<u64, paths::Head>,
   /// For each green's key, the green's version at each of the store's versions of it, in order: what a push's old
   /// value is read back to (`version_of`), as each record names it.
@@ -202,6 +209,8 @@ impl GitStore {
       derivations: Derivations::new(),
       reach: ReachSets::declare(window, Mode::Eager),
       paths: None,
+      trees: None,
+      commits: None,
       heads: BTreeMap::new(),
       versions: BTreeMap::new(),
       charged: 0,
@@ -475,12 +484,13 @@ fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Res
   let window = stores.content.as_ref().map_or(window, ContentStore::window);
   let store = match record.tool {
     VcsTool::Git => {
-      let mut git = GitStore::new(git_format(record.format).ok_or(Unmade)?, window);
-      // The map splits by the content store's own window, which its type's name carries (A-647).
-      git.paths = stores
-        .content
-        .as_ref()
-        .and_then(|content| paths::declare(content.window()));
+      let format = git_format(record.format).ok_or(Unmade)?;
+      let mut git = GitStore::new(format, window);
+      // The map, the trees and the commits split by the content store's own window, which their types' names carry
+      // (A-647, A-664 part 2).
+      git.paths = paths::declare(window);
+      git.trees = paths::declare_trees(format, window);
+      git.commits = Some(commits::declare(format, window));
       RepositoryStore::Git(git)
     }
     VcsTool::Mercurial => RepositoryStore::Mercurial(HgStore::default()),
@@ -526,7 +536,7 @@ fn release(stores: &mut VcsStores, id: RepositoryId) -> bool {
       let versions = content.discharge(store.charged).is_ok();
       let values = store.derivations.release(content).is_ok();
       let maps = store.heads.values().fold(true, |whole, head| {
-        content.release(&head.root).is_ok() && whole
+        paths::release_head(content, head) && whole
       });
       let lfs = store.lfs.release(content).is_ok();
       store.repository.release(content).is_ok() && values && versions && maps && lfs

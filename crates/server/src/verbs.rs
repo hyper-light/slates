@@ -9553,8 +9553,11 @@ fn judge_submission(
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
       // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
       let _ = crate::merge_service::settle_green_retention(state, green_id);
-      // A git repository's green keeps the version's map of paths to git's files (A-664 part 3, `vcs_store::paths`).
+      // A git repository's green keeps the version's map of paths to git's files and its git trees (A-664 part 3,
+      // `vcs_store::paths`), and the version becomes git's commit the server makes, recorded with the version in this
+      // transaction and admitted to the repository's store (A-664 part 3, `vcs_store::commits`).
       crate::vcs_store::paths::advance(state, green_id, version);
+      crate::vcs_store::commits::make(state, green_id, version, &policy.authorship);
       // The acceptance is published only once the version's merge record is **committed at the
       // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
       // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply

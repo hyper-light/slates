@@ -180,9 +180,11 @@ impl Issuer {
     )
   }
 
-  /// Mints an HTTP token for `principal`, good until `expires_ns` on the wall clock if one is given, and enrolls it by
-  /// its hash (A-625 part 3): the token's text, shown this once, and its id. The daemon is sent the hash alone, so the
-  /// token never crosses a channel; whoever holds the text presents it as Basic's password or as a bearer token.
+  /// Mints a token for `principal`, good until `expires_ns` on the wall clock if one is given, and enrolls it by its
+  /// hash and its CRAM-MD5 keyed contexts (A-625 part 3, A-692): the token's text, shown this once, and its id. The
+  /// daemon is sent the hash and the contexts alone, so the token never crosses a channel; whoever holds the text
+  /// presents it as Basic's password or as a bearer token over HTTP, and as CRAM-MD5's password over `svn://`, the id
+  /// in lowercase hex as its user name.
   pub fn enroll_token(
     &self,
     instance: &mut Instance,
@@ -194,10 +196,14 @@ impl Issuer {
       .map_err(|_| Error::Unsupported(Unsupported::SecureRandom))?;
     let token = slates_server::credentials::token_text(&random);
     let id = slates_server::credentials::token_id(token.as_bytes());
+    let cram_md5_contexts = slates_server::credentials::cram_md5_contexts(token.as_bytes());
     self.enroll_credential(
       instance,
       principal,
-      CredentialMaterial::HttpToken { id },
+      CredentialMaterial::HttpToken {
+        id,
+        cram_md5_contexts,
+      },
       expires_ns,
     )?;
     Ok((token, id))

@@ -1,13 +1,23 @@
 //! Version-control credentials (§4.13 "Principals", §4.17.2 "Access"; A-625 part 3): the human surface's verbs that
-//! enroll and revoke them, the partition each lives on, and the lookup the HTTP and SSH edges authenticate through.
+//! enroll and revoke them, the partition each lives on, and the lookups the HTTP and SSH edges and `svn://`'s CRAM-MD5
+//! authenticate through.
 //!
 //! **One record for both edges.** A credential is an SSH user key, held by its blob and named by the blob's SHA-256
-//! (OpenSSH's fingerprint, [`ssh_key_id`]), or an HTTP token, held as its SHA-256 alone ([`token_id`]). The issuer mints
-//! a token from the system's generator ([`TOKEN_RANDOM_BYTES`]), shows it to the human once ([`token_text`]) and sends
-//! the daemon only its hash, so a token never crosses a channel and the daemon never holds one. Each record names the
+//! (OpenSSH's fingerprint, [`ssh_key_id`]), or a token, held as its SHA-256 ([`token_id`]) and its CRAM-MD5 keyed
+//! contexts ([`cram_md5_contexts`], A-692). The issuer mints a token from the system's generator
+//! ([`TOKEN_RANDOM_BYTES`]), shows it to the human once ([`token_text`]) and sends the daemon only its hash and its
+//! contexts, so a token never crosses a channel and the daemon never holds one. Each record names the
 //! §4.13 principal it proves and when it stops proving it (`slates_db::catalog::CredentialRecord`), and lives on the
 //! partition its id routes to ([`owner_of`]), so the HTTP edge's authenticator and the SSH edge's key holders find a
 //! presented credential with one lookup there ([`find`]), with no global index (D-14).
+//!
+//! **`svn://`'s CRAM-MD5** (A-692; §4.17.4 item 10, RFC 2195). A token is also a Subversion client's password over
+//! `svn://`, whose CRAM-MD5 sends no password but a keyed digest of the server's challenge, so the server must hold
+//! something that makes that digest. It holds HMAC-MD5's keyed contexts, MD5's state after the token's two pad blocks
+//! (RFC 2104 §4; RFC 2195 §4: storing them avoids "explicit cleartext storage of the shared secret"), which the issuer
+//! derives as it mints the token and the record keeps beside its hash: they answer a challenge as the token does, and
+//! give no token back, so no HTTP request can be made from them. The client names its token by the token's id, as the
+//! CLI prints it, since CRAM-MD5 finds a secret by its user's name ([`cram_md5_key`]).
 //!
 //! **Only a human enrolls** (§4.13: enrollments and grants are the human surface's, never MCP's or an SDK's).
 //! `EnrollCredential` and `RevokeCredential` carry the launcher's proof, a keyed hash under the issuer secret of exactly
@@ -30,6 +40,7 @@ use slates_db::Op;
 use slates_db::catalog::{CredentialKind, CredentialRecord, Principal};
 use slates_ipc::protocol::{CredentialMaterial, Refusal, ReplyBody};
 use slates_ssh::userauth::{KeyRefusal, SignatureAlgorithm, UserKey};
+use slates_svn::handshake::{CramContexts, CramKey};
 use slates_vfs::clock::Clock;
 
 use crate::error::refusal_of_db;
@@ -48,6 +59,10 @@ pub const TOKEN_PREFIX: &str = "slates_";
 pub const TOKEN_RANDOM_BYTES: usize = 32;
 /// Format: the hex digits one byte is written in.
 const HEX_DIGITS_PER_BYTE: usize = 2;
+/// Format: the bits one hex digit holds.
+const HEX_DIGIT_BITS: u32 = 4;
+/// Format: the value of the hex letter `a`.
+const HEX_LETTER_BASE: u8 = 10;
 /// Derived: a minted token's text's bytes: the prefix, then two hex digits a random byte.
 const TOKEN_TEXT_BYTES: usize = TOKEN_PREFIX.len() + HEX_DIGITS_PER_BYTE * TOKEN_RANDOM_BYTES;
 
@@ -79,11 +94,17 @@ pub fn token_id(token: &[u8]) -> [u8; 32] {
   sha256(token)
 }
 
+/// A token's CRAM-MD5 keyed contexts (the module doc; A-692): HMAC-MD5's MD5 states after its pad blocks, in Dovecot's
+/// layout, what the issuer sends beside the token's id and the record keeps.
+pub fn cram_md5_contexts(token: &[u8]) -> [u8; CramContexts::BYTES] {
+  CramContexts::of_secret(token).to_bytes()
+}
+
 /// The id of the credential `material` gives.
 pub fn id_of(material: &CredentialMaterial) -> [u8; 32] {
   match material {
     CredentialMaterial::SshKey { blob } => ssh_key_id(blob),
-    CredentialMaterial::HttpToken { id } => *id,
+    CredentialMaterial::HttpToken { id, .. } => *id,
   }
 }
 
@@ -203,7 +224,9 @@ fn kind_of(material: CredentialMaterial) -> Result<CredentialKind, String> {
       algorithm: accepted_key(&blob)?.to_owned(),
       blob,
     }),
-    CredentialMaterial::HttpToken { .. } => Ok(CredentialKind::HttpToken),
+    CredentialMaterial::HttpToken {
+      cram_md5_contexts, ..
+    } => Ok(CredentialKind::HttpToken { cram_md5_contexts }),
   }
 }
 
@@ -344,6 +367,97 @@ pub(crate) async fn consumer_revoked(consumer: u64) -> Result<bool, Unanswered> 
   )
   .await
   .ok_or(Unanswered::Silent)
+}
+
+/// Why a CRAM-MD5 user has no key ([`cram_md5_key`]). A caller answers each as `svnserve` answers a user its password
+/// database lacks, "Username not found" (`Connection::key` with none), save [`Unkeyed::Unanswered`], with which no
+/// attempt can be judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unkeyed {
+  /// The user is no token's id as the CLI prints one: 64 lowercase hex digits.
+  NotAnId,
+  /// No credential has that id.
+  Unknown,
+  /// The credential is an SSH key, which CRAM-MD5 does not prove.
+  NotAToken,
+  /// The token's expiry has passed on the wall clock.
+  Expired,
+  /// The token proves an enrolled consumer that was revoked.
+  Revoked,
+  /// The record's partition did not answer ([`Unanswered`]), or the asking shard's wall clock could not be read.
+  Unanswered,
+}
+
+/// A CRAM-MD5 user's key and the principal its token proves (A-692).
+#[derive(Clone, Debug)]
+pub struct CramUser {
+  /// The key, made from the contexts the token's record keeps.
+  pub key: CramKey,
+  /// The principal the token proves: the session's, whatever name the client authenticated as.
+  pub principal: Principal,
+}
+
+/// The CRAM-MD5 key of `user`, a token's id as the CLI prints it, and the principal the token proves, asked from a task
+/// on any shard of the daemon (the module doc): what an ra_svn connection answers a client's CRAM-MD5 response with
+/// (`slates_svn::serve::Connection::key`). The record is found on its partition ([`find`]) and gives a key only while
+/// it is a token, live on the wall clock and, for a consumer's, while the consumer is enrolled, as the HTTP edge judges
+/// a presented token (`vcs_http::daemon_edge`). The key is the record's contexts; the token is never held. The session's
+/// principal is the record's: the user name names the token and no one.
+pub async fn cram_md5_key(user: &[u8]) -> Result<CramUser, Unkeyed> {
+  let id = id_of_user(user).ok_or(Unkeyed::NotAnId)?;
+  let record = find(id)
+    .await
+    .map_err(|_| Unkeyed::Unanswered)?
+    .ok_or(Unkeyed::Unknown)?;
+  let CredentialKind::HttpToken { cram_md5_contexts } = &record.kind else {
+    return Err(Unkeyed::NotAToken);
+  };
+  let key = CramKey::from_contexts(CramContexts::from_bytes(cram_md5_contexts));
+  let now_ns = crate::state::with_state(|state| state.clock.wall_ns())
+    .and_then(|ns| u64::try_from(ns).ok())
+    .ok_or(Unkeyed::Unanswered)?;
+  if !record.live_at(now_ns) {
+    return Err(Unkeyed::Expired);
+  }
+  if let Principal::Consumer { consumer, .. } = &record.principal
+    && consumer_revoked(*consumer)
+      .await
+      .map_err(|_| Unkeyed::Unanswered)?
+  {
+    return Err(Unkeyed::Revoked);
+  }
+  Ok(CramUser {
+    key,
+    principal: record.principal,
+  })
+}
+
+/// The id CRAM-MD5 user `user` names: 64 lowercase hex digits, the CLI's form of a token's id, read as its 32 bytes;
+/// none for any other user.
+fn id_of_user(user: &[u8]) -> Option<[u8; 32]> {
+  let (pairs, rest) = user.as_chunks::<HEX_DIGITS_PER_BYTE>();
+  if !rest.is_empty() {
+    return None;
+  }
+  let mut id = [0u8; 32];
+  if pairs.len() != id.len() {
+    return None;
+  }
+  for (byte, [high, low]) in id.iter_mut().zip(pairs) {
+    *byte = (lower_hex_digit(*high)? << HEX_DIGIT_BITS) | lower_hex_digit(*low)?;
+  }
+  Some(id)
+}
+
+/// The value of lowercase hex digit `digit`; none for any other byte.
+fn lower_hex_digit(digit: u8) -> Option<u8> {
+  match digit {
+    b'0'..=b'9' => digit.checked_sub(b'0'),
+    b'a'..=b'f' => digit
+      .checked_sub(b'a')
+      .and_then(|value| value.checked_add(HEX_LETTER_BASE)),
+    _ => None,
+  }
 }
 
 #[cfg(test)]

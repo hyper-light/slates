@@ -70,7 +70,7 @@ impl Authenticator for RecordedCredentials {
       .await
       .map_err(|_| Unproven::Unanswered)?
       .ok_or(Unproven::Unknown)?;
-    if !matches!(record.kind, CredentialKind::HttpToken) {
+    if !matches!(record.kind, CredentialKind::HttpToken { .. }) {
       return Err(Unproven::NotAToken);
     }
     let now_ns = crate::state::with_state(|state| state.clock.wall_ns())
