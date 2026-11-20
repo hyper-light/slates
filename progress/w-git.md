@@ -116,3 +116,7 @@
   into a per-push fork as objects land (positions at arrival; commit rows + generation sliced after pack), landing
   adopts the fork. Then concurrency (19/100 pushes) and arrival-shard decode (w-balance seam).
 - TODO after part 3: t_a665 hook tests wait on push's own answer with deadline derived from shard step time x steps (like w-shared da4dc2ff0), not fixed PUSH_WAIT_NS.
+- A-722 part 3 in progress (w-git-land, uncommitted): Push.Staged (fork, positions, commits, whole); Repository::stage
+  / stage_commits / stage_room / commits_room; commit adopts fork when adoptable else legacy (holes); hook_view cover
+  skips holes; vcs Index::adoptable + fork_room; server GitPush admit_all stages (lends rows room), seal stage_commits.
+  slates-git store tests green incl. 2 new; server tests being run.
