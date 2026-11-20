@@ -94,3 +94,23 @@
   red then green; local 10/10 + 21/21, rechecked after the final merge.
 - DAV pieces (A-681 rows) moved to w-interop by main. NEXT: A-693 part 2 from agents/w-svn-a693p2-wip (worktree
   ~/slates-work/w-svn-a714).
+
+## A-693 part 2 lock verbs -- LANDED main 576a8a860 (commit 64b6f79c3, verified on origin/main)
+- serve::locks (lock_verb / locks_landed; auth-for-one-command via Interrupted::Lock), Record::Locks (kind 4),
+  svn:// listener + tunnel (SvnStores::land_locks, TunnelRecords). Tests: lock-bob and lock-a byte for byte; server
+  landing+rebuild test; listener lock test. Local: svn 239/239 -> 164/164 merged, server 21/21, 32/32, 16/16 landed.
+- Disk fell to 17 GiB: deleted my target (now 59 GiB free).
+- NEXT (main): S4 with w-perf -- svn records name texts by identity, read from the green's content-identity index
+  (held.rs hold_path); agree the seam with w-perf. Queue after: A-702 revprops / replay (g302 brief), A-652 export.
+
+## A-702 part 1 -- LANDED main 15a3c5d4c (commit 3960207de, verified). serve::revprops; 165006 without a hook after
+## svnserve's checks. Local svn 128/128 then 131/131 merged. Part 2 waits on ra_svn running hooks.
+## NOW: S4 slice 1 (agreed with w-perf): slates-svn records keep text identity+size+checksums, no bytes; readers via
+## lent `TextSource` (`fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>>`); Room charges places.
+## w-perf does slice 2 (server TextSource over Green::held, svn_commit drops text bytes, rebuild re-holds).
+
+## S4 slice 1 -- LANDED main 21f03d433 (commit 7e1171e09) + follow-up 1d7c602ec (commit 5ff74820f), both verified
+- TextSource / WithTexts / Cow text traits. My push of 21f03d433 met main's new dav/report_file_revs/tests.rs and broke
+  slates-svn's lib-test build on main for one push; fixed by 5ff74820f (landed 1d7c602ec). Landed tree: svn 157/157
+  (reads/dav/serve), server lib tests compile. Lesson: re-run after the last merge even when only tests changed.
+- NEXT: w-perf's slice 2. My queue: A-702 part 2 waits on w-reaper's hooks piece; A-703 replay/replay-range next.

@@ -19,7 +19,32 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
   log ~/.cache/w-k90-microvm-hvf.log on whichever Mac ran it.
 - Then: land on kiln main; the macOS HVF drive (`SLATES_E2E=1 VM_E2E=1 cargo test -p kiln --test slates_e2e microvm::`)
   needs a Mac with room for a ~25 GB target.
-## Piece 2: SlatesVolumes keeps slates' resync end -- BLOCKED on Shards (then Hex)
+- **LANDED: kiln main edc8a2c8e..fa96bcc47** (e4d7f4eae re-vendor at Slates 38ed3dfd8, CONTRACT 50; merges 23f066947,
+  60cd0e284, fa96bcc47; agentic.md row W conflicts resolved onto main's row plus the A-587 sentence). Ancestor of
+  origin/main checked. Tests, macOS arm64, this Mac, local: `cargo test -p kiln --lib -- workspace::slates` 50/50
+  (23f066947), 51/51 (60cd0e284); the macOS HVF drive `SLATES_E2E=1 VM_E2E=1 cargo test -p kiln --test slates_e2e
+  microvm::` PASSED at 60cd0e284 (290 s; Ask held for approval, Bypass LAND_WRITTEN), log ~/.cache/w-k90-microvm-logs/hvf.log.
+  The drive's fixture commits with git: run it with GIT_CONFIG_COUNT=0 in a kiln session (signing injection).
+- Disk: freed ~52 GB of stale (3+ days untouched) cargo target dirs in ~/.cache (list in
+  ~/.cache/w-k90-microvm-logs/cleanup-candidates.txt), logs/evidence kept. Kiln runs r1/r2 stopped (local instead).
+
+## Piece 2: SlatesVolumes keeps slates' resync end -- IN PROGRESS (was wrongly marked blocked)
+- Shards half BUILT: branch agents/w-k90-microvm-resync-d288 (b9006561b; agents/w-k90-microvm-resync 0d37b8b28 is the
+  pre-amend copy, same code, D288 misplaced) on hyper-light/shards: D288, fs::resync + Slot::resync_on/ask_into,
+  ipc recv_exact + kinds 119/120, image wire v53 ServedAt::resync, run host/share/VM carry. Tests listed in D288, all
+  green on macOS; mutation red. Shards main merge is its coordinator's (R15). Owed: live daemon-kill run, scripts/lint.
+- Kiln half: worktree ~/kiln-work/w-k90-microvm-resync (branch agents/w-k90-microvm-resync from kiln main fa96bcc47):
+  D288 applied to vendor/shards, Hex `Servers::stream_resyncing` (default: none) + hex-runtime served.rs passes it,
+  kiln sandbox/served.rs returns Slates' resync end on Unix. Recorded: vendor/patches/shards/0002 (vendor.py record;
+  check shards: 2 changes, 0 differences), vendor/patches/hex/0003 written by hand (Hex's pin b4db7e69c is on no
+  remote this Mac reaches: GitHub hex lacks it, kiln's vendor cache too; so `vendor.py check hex` can't run here),
+  both UPSTREAM.md rows; agentic.md W8's "owed" paragraph rewritten. New drive test slates_e2e.rs
+  microvm::g90_an_agents_share_outlives_its_slates_daemon (WRITE, SIGKILL the instance's daemon, wait for the anchor's
+  successor, WRITE again). `--lib sandbox::` 73/74: the one failure, windows_path w8_p2 (/mnt/c vs /work), is
+  PRE-EXISTING on main (af97d9029 agentenv merge), not this piece's: reported, not chased.
+- Running: HVF `microvm::` (g266 + g90) on this Mac, log ~/.cache/w-k90-microvm-logs/hvf-resync.log; KVM r4 (piece 1
+  tree) on adacachy.
+- (Old, superseded) why it looked blocked:
 - Slates hands `ShardsStream { stream, resync: Option<StreamEnd> }`; kiln's served.rs returns `served.stream` alone
   because Hex's `hex_api::serve::Servers::stream` returns one `Stream`, and Shards' `ServedStream` /
   `--slates-fs-fd` take one end. Shards main 7158020b6 (= kiln's vendor) has NO resync anywhere (crates, docs, any of

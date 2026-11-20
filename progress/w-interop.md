@@ -110,3 +110,43 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
   repos path, depth, items, streamed resume via dav::Drive::take_written + Body::drain); site.rs Resource::Me (!svn/me),
   Walk {Log, Update}, Answer/Report now Debug-only derives, OPTIONS SVN-Allow-Bulk-Updates Prefer; test
   an_update_report_on_me_streams_a_checkout_and_refuses_a_revision_past_the_youngest. r25 on Studio running.
+- LANDED part B: 7f81be683 (fast-forward; on main, checked). r26: svn dav::/report:: 116/116, fmt clean; matrix
+  ROUTE=http: checkout/export/update pass (12/27); blame/diff unknown reports; commits POST 501.
+- Worktrees now: ~/slates-work/w-interop-a681-land (scratch, branch agents/w-interop-a681-land) and
+  ~/slates-work/w-interop-land (LANDING: branch agents/w-interop-land == main tip; next landing: `git merge --ff-only
+  origin/main` then `git merge --squash <scratch branch>`; scratch branches carry "(scratch)" commits).
+- Part C next: HTTPv2 commits. ra_serf commit.c flow: POST !svn/me create-txn (skel body) -> 201 + SVN-Txn-Name,
+  PROPPATCH !svn/txn/NAME (log), PUT !svn/txr/NAME/path (svndiff), MKCOL, DELETE, COPY (Destination), MERGE on the
+  public URL (body names txn) -> commit via repository::svn_commit::commit_work; DELETE txn on abort.
+- Part C (svn side green r29: dav::commit 3 new tests, 135/135): dav/commit.rs DavCommit (POST skel, PUT/MKCOL/DELETE/
+  COPY/PROPPATCH/MERGE -> EditCommands via Drive::edit typed API added in commit/drive.rs). Server side written:
+  VcsStores.dav_commits table (one per repo+principal), SvnStores begin_commit/on_commit/land (defaults None;
+  ServedRecords implements), SvnExchange::commit_side, Status CREATED/NO_CONTENT/CONFLICT/PRECONDITION_FAILED/LOCKED.
+  Scratch on agents/w-interop-a681c. NEXT: Studio run server vcs_http::svn + svn_interop http --ignored.
+- LANDED part C: d858d1904 (merge b0655e8a3; on main, checked) -- HTTPv2 commits + edge 204. Landing-tree run (r33):
+  svn dav::/commit:: 135/135, http-edge connection 20/20, server vcs_http::/vcs_store::/svn_commit 127/127, svn_interop
+  4 passed 1 ignored (HTTP round trip PASSES, un-ignored), fmt clean. Matrix: HTTP 23/27, svn:// 26/27.
+- PIECE 5 DONE per main's criteria. Owed (GAPS): LOCK/UNLOCK + commit lock tokens (lock test still ignored); reports
+  file-revs (blame), diff's, mergeinfo (merge); PUT body whole in room; abandoned txn expiry.
+- Next: tell main; ask nothing; continue queue: re-run hg/git matrices when w-hg/w-git push-spin fixes land; monitor.
+
+## Piece 6 (main ~08:30Z): (1) HTTP LOCK/UNLOCK + commit lock tokens; (2) PUT streamed; (3) abandoned txn deadline
+- (1) written: commit Drive::present_lock/keep_locks; DavCommit::present/keep_locks/if_tokens (+test); server
+  CommitHeaders(If, X-SVN-Options, Timeout, Lock-Token, version_text), LOCK/UNLOCK via SvnStores::lock_verb
+  (ServedRecords lands Record::Locks), MERGE presents lock-token-list + keep-locks; lock test un-ignored.
+  Scratch agents/w-interop-locks. Files told to main (w-reaper takes blame/diff/mergeinfo reports).
+- LANDED (1): d8eabb9e8 (merge f5cbdd1b7; on main, checked). Landing-tree run: svn 136/136, server 116/116,
+  svn_interop 5/5 none ignored (HTTP lock session passes). Reported.
+- (2) next: PUT body streamed into the drive (bounded window), §4.17.1 "A push's intake". Plan: SvnExchange::body()
+  feeds each run to the transaction's open file as a TextdeltaChunk (open file at first run, close at body_end), so the
+  exchange holds no body; DavCommit gets begin_put/put_chunk/end_put; on_commit per run.
+- LANDED (2): 15f4dbdde (fast-forward; on main, checked). Run over b3b267347: svn 137/137, server 116/116, svn_interop
+  5/5, matrix HTTP 24/27. Studio disk fine (1.1 TiB; kiln's "GB free" is memory); matrix scratch removed.
+- (3) next: abandoned transaction released at a derived deadline. Plan: VcsStores.dav_commits value gains `last_ns`
+  (owner clock wall ns at last step); deadline derived = the edge's idle wait bound? Find the edge's per-connection idle
+  bound (Bounds) or the liveness/observation budget; sweep on begin/take (bounded scan of the repo's entries) + on a
+  timer? Prefer: expire lazily on every table access (begin, take) across the whole table -- bounded by its bound.
+- LANDED (3): 3be8fd765 (merge 67920ccf8; on main, checked). Pre-push run on landing tree green; the final merge's
+  15 server files were pushed before checking (slip, told main); post-hoc run on main 67920ccf8 green (svn 137, server
+  117, svn_interop 5/5). Piece 6 DONE.
+- Next: git + hg matrices on main 67920ccf8 (A-719 p1, 765a19ccc, A-720 p2b landed).

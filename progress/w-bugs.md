@@ -80,3 +80,23 @@
   settle.rs is strictly serial over one journal (save, send, ack, then next receive), so a blocked send stops the drive.
 - Run 6 (b3-6): stacks taken too early (mount not up; no slates-winfsp-receive thread yet), no slates symbols.
   Run 7 (diag-w-bugs-b3-7, f59ff7698): waits for fsx.exe + 60 s, slates PDB from target/debug.
+- Runs 7-8: cdb -pv froze the daemon (anchor killed it at 2 s); its output was cut before the receive thread printed
+  (my "no receive thread" read was WRONG, corrected). A stacks-only minidump of the wedged daemon hung (0xC000011E).
+- Run 9 (diag-w-bugs-b3-9, 27c8b14a1 = main + diag-only operate/send log in dispatcher.rs): CAUSE SHOWN. Log ends
+  `operate kind 8` / `send begins kind 8` (SetInformation, op 45's shrink) with no `send returned` for ~59 s; every
+  earlier send <= 481 us. = the single receiver blocked in its own send while WinFsp completes the answer on that
+  thread (CcSetFileSizes), waiting on a drive request nobody else can receive.
+- LANDED docs main 06bafe27a: bug record "Shown 2026-11-20" (corrects "below the single receiver"), GAPS hang entry,
+  expected-failure line's reason.
+- NEXT (owed, A-198 amendment): a receive never waits on a send. Design pending; Windows-only, CI-iterated.
+- 2026-11-20 main: B3's fix is mine; jupiter (no WinFsp; Windows toolchain, 32 cores) takes Windows compiles/unit
+  tests, target C:\Users\corph\.cache\w-bugs-target; drive runs stay on CI diag. After B3: B14, then bug-claims open.
+- B3 DESIGN (relief receiver): P (primary) and R (relief), each its own capture region (held section + one
+  capture::BYTES). Station (DLL op state, PrivateOpens, confirming, may-link set moved out of thread_local, working
+  packet) is MOVED, never shared: P parks it in an AtomicPtr slot before each send and swaps it back after; R looks
+  every beat (100 ms): if P is in the same send (odd send generation unchanged) R swaps the station out, serves its
+  own region until P sets reclaim, then hands it back (back slot + unpark). One operating thread at a time (A-198,
+  DLL single caller, REQUEST_BOUND and one outstanding confirmation unchanged). Recovery settles both regions;
+  settle_pending gets the saved open from either. Failing test first: pure relief module over generic Port/Station,
+  model driver whose kind-8 send blocks until a nested request is answered (red with today's single receiver).
+  Residual: R stuck in its own send is not relieved (bound 2).

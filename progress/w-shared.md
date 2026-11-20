@@ -1,5 +1,41 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## (a) PUSH HALF DESIGN (in progress, worktree ~/slates-work/g261-a636p2b2, nothing committed yet for it)
+- New child module crates/server/src/vcs_store/paths/whole_build.rs (child of paths: uses Plan::Put, made_holding,
+  give_back, git_file, map_path, put_file, count, BUILT). Builds(BTreeMap<green, Build>) in VcsStores.whole_builds.
+  Build{repository, version, paths: Vec<String> engine paths (whole_head's names), at, entries, held, parked, task}.
+- push.rs:749 calls paths::advance_after_push: whole plan -> whole_build::start (spawn task: loop with_state_counted(slice)
+  + yield_now, like git_encode::settle_encodings; TaskId kept, detached; cancel on abandon); else step inline.
+- slice: take the build out of the map; head moved -> restart at new head; put files (lend per file, settle_in at end)
+  until slates_rt::futures::step_budget_ns spent (>=1); done -> made_holding(Plan::Put) keep head, count BUILT, resume parked.
+- Park: owner_judge (remote work path) before db.begin; local submit() before take_sealed (park the verb's args, set
+  acceptance_deferred). Parked enum {Owner{sealed,evidence,policy}, Local{principal,work,evidence,signature,authorship,
+  approval}} + origin,id, route Option<ReplyRoute>. Bound: clients_per_shard x region.slots (base_wait's), refuse Overloaded.
+  Resume: owner_judge / a local transaction (begin, current_request, reply_route, submit, record_completion unless deferred,
+  commit), deliver via xshard::hand_reply_home like merge_service resolve (~3437).
+- vcs_store::free -> whole_build::abandon(repository): give back held, cancel task, resume parked.
+
+## LANDED 2026-11-20: svn:author = cb1cc1782 (main 707d513ab). hg half -> w-hg (main's ruling; seam note sent). Main APPROVED (a)
+  design: owed commit staged durably in the submit's transaction (green, version, message, identity, second); completion
+  entry settles it in the same transaction as the made commit; replay never reads the clock (determinism test: crash after
+  staging, recover twice, same commit ids); one owed per green, later submits parked, typed refusal at the bound. PUSH HALF
+  FIRST. NOW: (a) push half. Then svn copies, symlinks. Disk: cleared incremental, removed w-shared-mode-land (49 GB free).
+  Landing helper: python3 ~/slates-work/w-shared-scratch/land.py <commit> (merge+resolve docs+push loop).
+
+## QUEUE (main 2026-11-20): item 4 hg half (asked main: now or after w-hg's rework) -> svn_made's three: svn:author (as the
+  svn:// commit path maps the principal), copies (copy-from rows), symlinks (svn:special) -> (a) live whole builds -> A-697, A-658 3c.
+  NOW: svn:author.
+
+## LANDED 2026-11-20: A-664 Subversion objects (bug) = 55cf568ae, main ..196ba2e15. Answered w-balance's Q1/Q4 (inbox).
+  NOW: item 4's Mercurial half (a submitted version -> server-made hg changeset). Then main's (a) live whole builds; then
+  A-697 (a)-(f), A-658 3c.
+
+## MAIN RULING 2026-11-20: A-664 live whole builds = (a): defer the made commit until the sliced build ends; later submits to
+  that green PARKED (woken by the build's completion, never polled); each slice yields under the step budget. Do after item 4.
+## NOW: item 4 svn first: failing test t_a664_svn_a_submitted_version_is_the_revision_the_server_makes (svn_commit/tests.rs)
+  RED (submit -> version 1, records youngest 0). Fix: a server-made svn revision from the submit's change, landed in the
+  submit's transaction without moving the green. Uncommitted in ~/slates-work/g261-a636p2b2.
+
 ## LANDED 2026-11-20: A-664 sliced whole builds part 1 (recovery's remake a file a unit) = ba7c04d7b, main 469436cce. Asked
   main for a ruling on the live whole builds (the made commit needs trees in the version's transaction). NOW: queue 4, A-664
   hg and svn server-made objects, unless main rules otherwise.
