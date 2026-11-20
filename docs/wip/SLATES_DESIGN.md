@@ -12356,7 +12356,10 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > report, or a read streamed over many calls, holds its records' generation (`svn_view::SvnHold`). A rebuild or
 > removal meanwhile keeps those records aside, still charged, until the last hold drops (`vcs_store::keep_held_svn`).
 > The oracle is the whole room's bytes (stock `svnserve`'s, `update.c`'s): every room's slices make the same bytes. CI
-> also checks working copies against `svnadmin load`'s over `file://`.
+> also checks working copies against `svnadmin load`'s over `file://`. By use after (`diag-w-bugs-svnfetch-6`), the
+> working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
+> The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
+> delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
