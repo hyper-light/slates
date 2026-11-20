@@ -6872,7 +6872,14 @@
 >   macOS route's claim steps since A-523 (2026-11-18, g251b): each socket step waited the caller's reply deadline at a
 >   time and asked the daemon's liveness when it ran out; it now waits while the route's connection lives, as the
 >   daemon's side waits on the client's since A-492, a daemon gone closing its end
->   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
+>   (`a_claim_waits_for_a_daemon_that_answers_past_the_old_step_bound`). A client gone before its route connection is
+>   accepted since A-747 (2026-11-20, w-bugs; main's red, found by g227): on macOS `setsockopt(SO_NOSIGPIPE)` on such a
+>   socket answers `EINVAL`, which `route::Listener::accept` reported as its own failure, so the daemon counted
+>   `shards.route_failed` for a client's close and stopped draining its queue until the next wake;
+>   `route::hostile_claims_get_no_descriptor_and_the_honest_claim_succeeds_once` had failed on macOS since d576a383a
+>   added its silent connection. `accept` now answers `Accepted::Departed` for it (a peek reads its end), counted
+>   `shards.route_malformed`, a hello cut short (`a_client_gone_before_its_accept_is_no_failure_of_the_listener`). A
+>   delivery's read since A-523 (2026-11-18, g251b): the client yielded for a
 >   descriptor until its reply deadline and gave up `DeadlineExceeded` there; it now waits on the control socket itself,
 >   readable or hung up, with no clock (`ClientEnd::wait_delivery`), and ends `ChannelLost` once the daemon is gone with
 >   nothing delivered (`a_delivery_wait_ends_at_the_delivery_or_the_daemons_going_with_no_clock`, Linux, main's to run). The synchronous send's

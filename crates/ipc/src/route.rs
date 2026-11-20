@@ -468,20 +468,54 @@ impl Listener {
   }
 
   /// A connection waiting to be accepted, made non-blocking and close-on-exec, with `SIGPIPE` set aside; `None` when
-  /// none waits.
-  pub fn accept(&self) -> Result<Option<OwnedFd>, IpcError> {
+  /// none waits, [`Accepted::Departed`] when its client closed before it could be taken or made ready.
+  pub fn accept(&self) -> Result<Option<Accepted>, IpcError> {
     let connection = match rustix::net::accept(&self.socket) {
       Ok(connection) => connection,
       Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => return Ok(None),
+      // A connection that left the queue before it was taken (its client gone) is no failure of the listener.
+      Err(rustix::io::Errno::CONNABORTED) => return Ok(Some(Accepted::Departed)),
       Err(e) => return Err(refused("accept route", e)),
     };
-    rustix::io::fcntl_setfd(&connection, rustix::io::FdFlags::CLOEXEC)
-      .map_err(|e| refused("fcntl_setfd", e))?;
-    rustix::net::sockopt::set_socket_nosigpipe(&connection, true)
-      .map_err(|e| refused("setsockopt(SO_NOSIGPIPE)", e))?;
-    rustix::io::ioctl_fionbio(&connection, true).map_err(|e| refused("ioctl_fionbio", e))?;
-    Ok(Some(connection))
+    match ready_connection(&connection) {
+      Ok(()) => Ok(Some(Accepted::Connection(connection))),
+      Err(_) if departed(&connection) => Ok(Some(Accepted::Departed)),
+      Err(refusal) => Err(refusal),
+    }
   }
+}
+
+/// What one accept on the route took.
+#[derive(Debug)]
+pub enum Accepted {
+  /// A client's connection, close-on-exec, non-blocking, and kept from raising `SIGPIPE`.
+  Connection(OwnedFd),
+  /// A client that closed before its connection was taken or made ready: on macOS `setsockopt(SO_NOSIGPIPE)` on such a
+  /// socket answers `EINVAL`. Its exchange ended before it began, as a hello cut short does.
+  Departed,
+}
+
+/// Readies an accepted connection: close-on-exec, kept from raising `SIGPIPE`, non-blocking.
+fn ready_connection(connection: &OwnedFd) -> Result<(), IpcError> {
+  rustix::io::fcntl_setfd(connection, rustix::io::FdFlags::CLOEXEC)
+    .map_err(|e| refused("fcntl_setfd", e))?;
+  rustix::net::sockopt::set_socket_nosigpipe(connection, true)
+    .map_err(|e| refused("setsockopt(SO_NOSIGPIPE)", e))?;
+  rustix::io::ioctl_fionbio(connection, true).map_err(|e| refused("ioctl_fionbio", e))
+}
+
+/// Whether `connection`'s client has closed it: a peek that does not wait reads its end, or the socket answers that it
+/// is no longer connected.
+fn departed(connection: &OwnedFd) -> bool {
+  let mut byte = [0u8; 1];
+  matches!(
+    rustix::net::recv(
+      connection,
+      &mut byte,
+      rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
+    ),
+    Ok((0, _)) | Err(rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN)
+  )
 }
 
 impl Drop for Listener {
@@ -950,7 +984,7 @@ mod tests {
     hold: std::time::Duration,
   ) {
     let connection = loop {
-      if let Some(connection) = listener.accept().unwrap() {
+      if let Some(Accepted::Connection(connection)) = listener.accept().unwrap() {
         break connection;
       }
       std::thread::yield_now();
@@ -984,6 +1018,29 @@ mod tests {
     .unwrap();
     let mut closed = [0u8; 1];
     let _ = rustix::net::recv(&connection, &mut closed, RecvFlags::empty());
+  }
+
+  /// A client that connects to the route and closes before the daemon accepts it (found by use: `slates-server`'s
+  /// `route::hostile_claims_get_no_descriptor_and_the_honest_claim_succeeds_once`, failing on macOS since d576a383a).
+  /// Do: connect, close, then accept. Expect: the accept answers the connection gone (`Accepted::Departed`) or the
+  /// connection, never a refusal: on macOS `setsockopt(SO_NOSIGPIPE)` on such a socket answers `EINVAL`, which the
+  /// accept reported as its own failure, and the daemon counted it so and stopped draining its queue.
+  #[test]
+  fn a_client_gone_before_its_accept_is_no_failure_of_the_listener() {
+    let instance = format!("route-gone-{}", std::process::id());
+    let listener = Listener::bind(&instance).unwrap();
+    let address = SocketAddrUnix::new(path(&instance).unwrap()).unwrap();
+    let socket = stream_socket().unwrap();
+    rustix::net::connect(&socket, &address).unwrap();
+    drop(socket);
+    let accepted = listener.accept();
+    assert!(
+      matches!(
+        accepted,
+        Ok(Some(Accepted::Departed | Accepted::Connection(_)))
+      ),
+      "accept answered {accepted:?}"
+    );
   }
 
   /// A-523 (R3's class C). Do: claim a map's offer from a stand-in daemon that takes the hello, holds its challenge half
