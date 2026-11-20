@@ -27,3 +27,20 @@ sync:true of the kiln repo to that machine hung (r7, never synced). Runner e3018
    Finding (read, not mine): crates/kiln/src/os/tree.rs:101 `is_fuse` is dead code on Windows (a warning there; a
    Windows clippy -D warnings would fail).
 Owed (main's): Linux/Windows clippy + tests of items 2-3 (gate), the Windows bare_metal drive once jupiter takes kiln work.
+
+## Next pieces from main (2026-11-20)
+Feedback: tool installs on Ada's machines (even user-scoped Python on jupiter) need Ada's word first (slates CLAUDE.md
+§2 item 14). Item 4 waits on Ada's word about WinFsp on jupiter; target kept there.
+5. kiln: `is_fuse` (crates/kiln/src/os/tree.rs) gated #[cfg(not(windows))] as let_go_of is. Worktree
+   ~/kiln-work/w-k90-vendor-isfuse, branch agents/w-k90-isfuse (from kiln main 68964a93d), uncommitted until jupiter's
+   check: `cargo rustc --locked -p kiln --lib -- -D warnings` on jupiter (kiln run r24, patch applied over 68964a93d in
+   C:\Users\corph\.cache\w-k90-vendor-kiln, target ...\w-k90-vendor-target).
+6. slates A-736 (SSH edge client-gone): LANDED slates main 431b1102..2b1b8106 (2a16c482 red, 028d88bf green, merges
+   a8aee59c + 2b1b8106). vcs_ssh::site::ClientGone (client's bytes read_now'd while a step runs, kept for the session,
+   EOF/reset = gone, past one read peer_closed once); Command::step(gone); git receive answer_step; svn tunnel via
+   HookSite::Tunnel(policy, gone), client left -> E210002. Red: g90 test (false,false); green 79/79; merged tree
+   vcs_ssh vcs_svn vcs_store::upload git_push vcs_http 159/159; fmt clean. amendments.tsv A-736 row (update to landed).
+   A local merge 15453374 had conflict markers in vcs_svn.rs (my marker check covered docs only); never pushed: the
+   landing went from a clean re-merge in ~/slates-work/w-k90-vendor-land (branch agents/w-k90-ssh-gone-land).
+   Run requests (main's): clippy/xtask for slates-server; Windows build of vcs_ssh; a live git push over SSH whose
+   client is killed while a hook runs.
