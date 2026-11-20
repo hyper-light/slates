@@ -15314,6 +15314,58 @@ their bytes in the content plane). Peak RSS does not follow the record from B to
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
 100,000 to warm (`ChunkStore` 560 bytes, moved by `mem::swap` both ways).
 
+## A lone client after W1 and A-400: quiet back to before W1, loaded better on Linux and still slower on the Mac, and ~10 µs gained since A-400 (g222; the supervisor's condition 3; 2026-11-20)
+
+**What it is.** The single-client edit and merge across the landings that moved it: `8dff8fcad` (before W1 and
+A-296), `379dfe750` (W1 and A-296, just before A-400), `f2081a3c8` (A-400 landed: a work on its client's shard) and
+`a5233e228` (main). A-400 was the fix the supervisor approved on 2026-11-20 for W1's lone-client regression (a client's
+work on its name's shard, two hops per submit); it had landed on 2026-11-18 (goals 231 and 257), measured at 1,000
+clients only. Nothing was built for this record.
+
+**Command.** `edit_merge_bench` built release (`--locked`) from each arm's `git archive` extract, rotated each round
+(forward, reversed, 3-1-4-2), 3 rounds: loaded `--loaded-only --spinners-per-core 2 --files 10 --form accept --form
+conflict`, then quiet `--quiet-only --files 10 --files 1000 --form accept --form conflict`. Each invocation is 3 runs;
+the figure is the invocation's median and the brackets every run. Linux: CI's `ubuntu-24.04-arm` (4 CPUs), branch
+`diag-measurer-g222-1`, run 44787483724, loaded inside `systemd-run --user --scope -p AllowedCPUs=0-1 -p
+MemoryMax=256M` with a sibling `dd conv=fsync` writer (A-224's lane), load average 3.7 to 12.6. Mac: adas-mac-studio-3.local
+(Apple M4 Max, 14 CPUs, macOS 26.2), `~/.cache/g222-scripts/studio-ab.sh`, load 9 to 10 loaded (the box shared). The
+32-CPU Studio was refused for the run (load 41, 354 MB of 103 GB free). Every run answered as the model said and exited 0.
+
+Linux arm64, µs (p50 and p99) and ms (loaded p99):
+
+| arm | quiet accept p50 | quiet accept p99 | quiet conflict p50 | loaded accept p99 ms | loaded conflict p99 ms |
+|---|---|---|---|---|---|
+| before W1 | 18.2 / 18.7 / 17.9 | 43.6 / 40.5 / 38.8 | 15.0 / 14.9 / 15.6 | 21.0 / 21.0 / 21.0 | 21.0 / 21.3 / 22.9 |
+| before A-400 | 54.6 / 51.6 / 51.1 | 87.4 / 96.6 / 95.2 | 48.9 / 49.0 / 47.9 | 13.1 / 14.0 / 13.0 | 11.7 / 11.5 / 13.8 |
+| A-400 | 21.1 / 21.0 / 20.2 | 41.9 / 47.8 / 49.9 | 17.6 / 18.2 / 17.3 | 8.0 / 4.0 / 8.0 | 1.9 / 4.0 / 6.0 |
+| main | 30.7 / 34.8 / 35.1 | 65.7 / 66.8 / 72.0 | 27.0 / 28.4 / 27.6 | 6.8 / 4.6 / 7.0 | 2.9 / 6.0 / 2.1 |
+
+Mac (M4 Max, 14 CPUs), same columns:
+
+| arm | quiet accept p50 | quiet accept p99 | quiet conflict p50 | loaded accept p99 ms | loaded conflict p99 ms |
+|---|---|---|---|---|---|
+| before W1 | 54.3 / 48.5 / 47.8 | 93.5 / 86.6 / 86.3 | 57.5 / 45.0 / 50.5 | 7.8 / 9.1 / 10.3 | 8.9 / 11.0 / 9.8 |
+| before A-400 | 155.8 / 155.0 / 155.3 | 221.8 / 222.5 / 225.3 | 150.4 / 151.5 / 151.6 | 20.2 / 24.6 / 17.2 | 21.7 / 21.6 / 18.5 |
+| A-400 | 41.9 / 43.3 / 40.2 | 91.6 / 105.0 / 86.0 | 36.1 / 36.7 / 35.5 | 13.5 / 14.6 / 13.8 | 17.6 / 14.3 / 14.4 |
+| main | 45.4 / 48.3 / 44.5 | 98.8 / 118.5 / 92.3 | 38.9 / 40.8 / 39.1 | 20.2 / 16.8 / 9.9 | 16.3 / 18.0 / 13.1 |
+
+Every run (Linux, loaded accept p99 ms): before W1 [23.9, 17.2, 21.0] [21.1, 21.0, 17.0] [21.0, 23.9, 20.0]; before
+A-400 [13.1, 11.0, 14.0] [14.0, 15.0, 14.0] [13.0, 12.3, 14.0]; A-400 [5.1, 8.0, 9.0] [3.3, 4.0, 6.1] [8.0, 6.0, 9.0];
+main [8.0, 6.8, 5.0] [6.0, 4.6, 4.0] [3.0, 7.0, 8.0]. Mac loaded accept p50 µs: before W1 95.5 / 97.6 / 110.2,
+before A-400 630.5 / 812.5 / 374.6, A-400 265.5 / 293.8 / 177.4, main 398.2 / 297.0 / 147.9. The rest of every run is
+in the logs (the CI artifact `measurer-arms-logs-ubuntu-24.04-arm`; `~/.cache/g222-studio-ab/logs` on the Mac).
+
+**What it means.**
+- A-400 undid W1's lone-client regression quiet on both platforms (Linux accept p50 51–55 → 20–21 µs, before W1 18;
+  the Mac 155 → 40–43, before W1 48–54) and loaded on Linux, where main's p99 is now three times lower than before W1
+  (21.0 → 4.6–7.0 ms). On the shared Mac, loaded, main is still slower than before W1 (accept p50 148–398 against
+  95–110 µs; p99 9.9–20.2 against 7.8–10.3 ms): what is left is the submit's ask to the green's owner (the verb
+  parked, the batched ask, the answer, the resume), the one hop a lone client still makes.
+- **New: about 10 µs on every quiet lone submit since A-400.** Linux accept p50 20–21 → 31–35 µs, conflict 17–18 →
+  27–28, p99 42–50 → 66–72; the Mac 40–43 → 45–48. It lies in the 309 first-parent commits `f2081a3c8..a5233e228`;
+  the bisect is next (g222).
+- The goal's bound is not met by any arm: the loaded p99 is milliseconds on both platforms, before W1 too.
+
 ## The FSFS view's texts as their stored deltas: 128 and 460 times fewer bytes, reads 8 and 27 times faster (A-645 P3 ruling 3; 2026-11-20)
 
 The A/B main asked for: the hook view's revision files with every text whole (P1, FSFS format 6, `PLAIN`) against every

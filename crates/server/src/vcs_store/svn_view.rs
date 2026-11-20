@@ -25,7 +25,9 @@
 
 use slates_db::catalog::{Principal, RepositoryId};
 use slates_svn::lock::{AprTime, LockEntry, UUID_BYTES};
-use slates_svn::migration::Repository as SvnRecords;
+use slates_svn::migration::WithTexts;
+
+use super::svn_texts::{HeadTexts, SvnView};
 use slates_vfs::clock::Clock;
 
 use slates_svn::commit::drive::{Due, Setup, Work};
@@ -46,7 +48,7 @@ const TOKEN_UNDRAWN: &str = "vcs_http.svn_token_undrawn";
 pub(crate) struct ServedRecords;
 
 impl SvnStores for ServedRecords {
-  type Repository = SvnRecords;
+  type Repository<'a> = SvnView<'a>;
 
   type Hold = SvnHold;
 
@@ -62,7 +64,7 @@ impl SvnStores for ServedRecords {
     &mut self,
     hold: &SvnHold,
     _principal: &Principal,
-    step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+    step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
     crate::state::with_state(|state| lend_held_in(state, hold, step)).flatten()
   }
@@ -76,7 +78,7 @@ impl SvnStores for ServedRecords {
     &mut self,
     id: RepositoryId,
     _principal: &Principal,
-    step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+    step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
     crate::state::with_state(|state| lend_in(state, id, step)).flatten()
   }
@@ -91,15 +93,17 @@ impl SvnStores for ServedRecords {
       let now = AprTime::from_wall_ns(state.clock.wall_ns());
       let youngest = state.vcs_stores.subversion_records(id)?.index().youngest();
       let name = state.vcs_stores.dav_transaction_name(youngest);
-      let records = state.vcs_stores.subversion_records(id)?;
-      let world = CommitWorld {
-        index: records.index(),
-        green: records,
-        locks: records.locks(),
-      };
       // The commit's sink: in memory until the green's staged blocks take its texts (w-perf's wiring of A-716).
       let texts = Box::new(slates_svn::commit::drive::HeldTexts::new());
-      let begun = DavCommit::begin_hooked(setup_of(name.clone(), now), &world, texts);
+      let setup = setup_of(name.clone(), now);
+      let begun = with_view(state, (id, None), |view| {
+        let world = CommitWorld {
+          index: view.records.index(),
+          green: view,
+          locks: view.records.locks(),
+        };
+        DavCommit::begin_hooked(setup, &world, texts)
+      })?;
       Some(begun.map(|(commit, due)| {
         let key = principal.key();
         let now_ns = state.clock.monotonic_ns();
@@ -117,7 +121,7 @@ impl SvnStores for ServedRecords {
     id: RepositoryId,
     principal: &Principal,
     name: &str,
-    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnRecords>) -> T,
+    step: impl FnOnce(&mut DavCommit, &CommitWorld<'_, SvnView<'_>>) -> T,
   ) -> Option<Option<T>> {
     crate::state::with_state(|state| {
       let key = principal.key();
@@ -126,13 +130,15 @@ impl SvnStores for ServedRecords {
       let Some(mut commit) = state.vcs_stores.take_dav_commit(id, &key, (name, now_ns)) else {
         return Some(None);
       };
-      let records = state.vcs_stores.subversion_records(id)?;
-      let world = CommitWorld {
-        index: records.index(),
-        green: records,
-        locks: records.locks(),
-      };
-      let stepped = step(&mut commit, &world);
+      // Over the view, so a text an earlier commit stored is a delta's base as the records' are.
+      let stepped = with_view(state, (id, None), |view| {
+        let world = CommitWorld {
+          index: view.records.index(),
+          green: view,
+          locks: view.records.locks(),
+        };
+        step(&mut commit, &world)
+      })?;
       let now_ns = state.clock.monotonic_ns();
       state
         .vcs_stores
@@ -142,24 +148,21 @@ impl SvnStores for ServedRecords {
     .flatten()
   }
 
-  fn land(
+  async fn land(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
-    crate::state::with_state(|state| {
-      let now = AprTime::from_wall_ns(state.clock.wall_ns());
-      svn_commit::commit_work(state, (principal, id), work, now, texts)
-    })
+    svn_commit::land_work((principal, id), work, texts).await
   }
   fn lock_verb(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
     judge: impl FnOnce(
-      &Lent<'_, SvnRecords>,
+      &Lent<'_, SvnView<'_>>,
       &mut dyn FnMut() -> [u8; UUID_BYTES],
     ) -> (Vec<LockEntry>, HttpAnswer),
   ) -> Option<Result<HttpAnswer, svn_commit::Uncommitted>> {
@@ -198,11 +201,39 @@ impl SvnStores for ServedRecords {
 pub(crate) fn lend_in<T>(
   state: &mut ShardState,
   id: RepositoryId,
-  step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+  step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
-  let records = state.vcs_stores.subversion_records(id)?;
-  lent_of(records, now, step)
+  with_view(state, (id, None), |view| lent_of(view, now, step)).flatten()
+}
+
+/// Runs `step` over the view a session reads of repository `id`'s records (its own, or the generation `held` a fetch
+/// holds): the records, their texts read through the green, then the content store, then the records themselves
+/// (`super::svn_texts::HeadTexts`; main's ruling (B)). The content store's chunks are lent for the step (A-727's lend), so
+/// a text a commit stored reads from them. None where the records are not here.
+pub(crate) fn with_view<T>(
+  state: &mut ShardState,
+  (id, held): (RepositoryId, Option<u64>),
+  step: impl FnOnce(&SvnView<'_>) -> T,
+) -> Option<T> {
+  let green = crate::repository::svn_commit::green_of(state, id).ok();
+  crate::vcs_store::lent_state(state, |state| {
+    let records = match held {
+      Some(generation) => super::held_svn_records(&state.vcs_stores, id, generation)?,
+      None => state.vcs_stores.subversion_records(id)?,
+    };
+    let engine = green.and_then(|green| state.greens.get(&green));
+    let texts = HeadTexts {
+      green: engine.as_deref(),
+      store: state.vcs_stores.content(),
+      records,
+    };
+    let view = WithTexts {
+      records,
+      texts: &texts,
+    };
+    Some(step(&view))
+  })
 }
 
 /// A fetch's hold on the generation of a Subversion repository's records it began on (A-749, §4.17.1 "A fetch's answer"
@@ -248,25 +279,29 @@ pub(crate) fn hold_in(state: &mut ShardState, id: RepositoryId) -> Option<SvnHol
 pub(crate) fn lend_held_in<T>(
   state: &mut ShardState,
   hold: &SvnHold,
-  step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+  step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
-  let records = super::held_svn_records(&state.vcs_stores, hold.id, hold.generation?)?;
-  lent_of(records, now, step)
+  let generation = hold.generation?;
+  with_view(state, (hold.id, Some(generation)), |view| {
+    lent_of(view, now, step)
+  })
+  .flatten()
 }
 
-/// Runs `step` over `records` lent at `now`.
+/// Runs `step` over `view` lent at `now`.
 fn lent_of<T>(
-  records: &SvnRecords,
+  view: &SvnView<'_>,
   now: AprTime,
-  step: impl FnOnce(&Lent<'_, SvnRecords>) -> T,
+  step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
+  let records = view.records;
   let uuid = records.uuid();
   // A record's UUID is RFC 4122's text, ASCII alone (`Uuid::parse`), so it always reads as UTF-8.
   let uuid = std::str::from_utf8(uuid.as_bytes()).ok()?;
   Some(step(&Lent {
     index: records.index(),
-    repository: records,
+    repository: view,
     uuid,
     locks: records.locks(),
     rules: None,
@@ -284,7 +319,7 @@ pub(crate) struct TunnelRecords;
 const MERGEINFO_KEPT: bool = true;
 
 impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
-  type Green = SvnRecords;
+  type Green<'a> = SvnView<'a>;
 
   fn holds(&self, id: RepositoryId) -> bool {
     crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
@@ -311,7 +346,7 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     &mut self,
     id: RepositoryId,
     texts: &dyn slates_svn::commit::drive::TextSink,
-    step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+    step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
   ) -> Option<T> {
     crate::state::with_state(|state| {
       let name = state
@@ -340,17 +375,14 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     .flatten()
   }
 
-  fn commit(
+  async fn commit(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
     work: Work,
     texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
-    crate::state::with_state(|state| {
-      let now = AprTime::from_wall_ns(state.clock.wall_ns());
-      svn_commit::commit_work(state, (principal, id), work, now, texts)
-    })
+    svn_commit::land_work((principal, id), work, texts).await
   }
 
   fn land_record(

@@ -62,6 +62,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::task::{Poll, Waker};
 
+use crate::vcs_store::svn_texts::SvnView;
 use slates_db::catalog::{Principal, RepositoryId, VcsTool};
 use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
@@ -73,8 +74,6 @@ use slates_svn::find::{Found, find_repository};
 use slates_svn::handshake::Verdict;
 use slates_svn::handshake::{Access, Unserved};
 use slates_svn::index::{ContentIdentity, Revision};
-use slates_svn::lock::AprTime;
-use slates_svn::migration::Repository as SvnRecords;
 use slates_svn::report::exchange::{Budget, Quantum};
 use slates_svn::serve::{CommitStart, Connection, Limits, Made, Policy, Sources, Turn};
 
@@ -977,7 +976,7 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
 fn lent_sources<T>(
   opened: &Opened,
   principal: &Principal,
-  step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+  step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
   held_sources(opened, principal, None, step)
 }
@@ -988,11 +987,11 @@ fn held_sources<T>(
   opened: &Opened,
   principal: &Principal,
   held: Option<&SvnHold>,
-  step: impl FnOnce(&Sources<'_, SvnRecords>) -> T,
+  step: impl FnOnce(&Sources<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
   crate::state::with_state(|state| {
     let authenticated = authenticated_access(state, &opened.name, principal);
-    let sources_of = |lent: &Lent<'_, SvnRecords>| {
+    let sources_of = |lent: &Lent<'_, SvnView<'_>>| {
       step(&Sources {
         index: lent.index,
         repository: lent.repository,
@@ -1710,10 +1709,7 @@ async fn land(
   let id = opened.id;
   let hooked = opened.hooked();
   let transaction = work.record.transaction.clone();
-  let landed = crate::state::with_state(|state| {
-    let now = AprTime::from_wall_ns(state.clock.wall_ns());
-    svn_commit::commit_work(state, (principal, id), work, now, &opened.texts)
-  });
+  let landed = svn_commit::land_work((principal, id), work, &opened.texts).await;
   opened.texts.clear();
   let Some(landed) = landed else {
     return false;

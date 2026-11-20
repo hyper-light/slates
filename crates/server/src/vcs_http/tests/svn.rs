@@ -336,7 +336,7 @@ struct Stores {
 }
 
 impl SvnStores for Stores {
-  type Repository = Repo;
+  type Repository<'a> = Repo;
   type Hold = RepositoryId;
 
   fn hold(&mut self, id: RepositoryId) -> Option<RepositoryId> {
@@ -583,6 +583,7 @@ fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
       .iter()
       .map(|bytes| (blake(bytes), bytes.to_vec()))
       .collect(),
+    stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   };
   let committed =

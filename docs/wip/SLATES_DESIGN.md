@@ -12290,6 +12290,9 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > call, the checks reading commits and trees back from the store, the push holding none of their bytes). Owed: the
 > convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
 > set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
+> Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
+> landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
+> revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
 mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
@@ -55258,6 +55261,13 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   replayed (`vcs_store.windows_restored`, `.windows_unrestored`, `.windows_unheld`). Test
   `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`. Owed: records naming
   identities only (slice b, with w-balance's name rows and the `homes` tickets); a homed window's holders.
+- **The identity rule and slice a3b (2026-11-20, main's ruling; R8).** An identity that crosses a node is plain BLAKE3 of
+  the bytes: `ContentStore::put_object`, `finish_object` and `object_id` answer it whatever window the store cuts at
+  (sixteen base pages: 256 KiB on macOS arm64, 64 KiB on 4 KiB Linux), the root a node-local name every lookup resolves
+  (9010c5630). a3b: the store's lists and names ride the shard image beside the windows (kinds 12 and 13), restored
+  before the records, so an object past a window is whole by its identity after a restart with no record's bytes.
+  Test `daemon::tests::t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity` (1 MiB file),
+  red with the pieces left out.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -55725,6 +55735,21 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
+
+### A-722 part 4g — A replayed record's moves are admitted an object a turn (bug, 2026-11-20, w-git for UI goal 93; main's report: a restarted daemon recovering git/git's v2.0.0 spun and was killed again)
+- **Found by use.** r110 (w-interop, git v2.0.0): every daemon restarted after the push spun in A-662's recovery of the
+  pushed repository (`daemon.rs` `spawn_alone`) and the watchdog killed it again, 7 of 27 steps answered.
+- **Cause.** Since parts 4a, 4b and 4d a record's pack is read, its objects admitted, its deltas resolved and the push
+  sealed a unit a turn; but the replay's end admitted its moves whole (`admit_moves`, `Repository::admit` to its end):
+  a create's walk of every object the push brought, every tree parsed, in one turn.
+- **Change.** `git_replay`'s `Stage::Moving`: each recorded move admitted by `slates_git::store::Admitting` (A-722 part
+  4c) a unit a turn, a delete at once; the commit then takes the admitted moves. Swept: Mercurial's recovery replays a
+  revision a unit (A-732); Subversion's replays each revision's record whole (`commit_record`), reported to main for its
+  owner. Owed: the landing's own whole passes (`Repository::commit`).
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn` (a
+  66-object record rebuilt at a quantum of none: red, 66 objects walked in one turn; now one at most);
+  `slates-server --lib -- vcs_store:: git_push::tests::t_a722 git_push::tests::t_a753` 94 passed; fmt clean (macOS
+  arm64, this Mac, local).
 
 ### A-722 part 4f — A push's connectivity propagation a step of its stack a unit (2026-11-20, w-git for UI goal 93; the check's 57.9 ms at 100 concurrent pushes)
 - **Change.** `slates_git::receive::connect`'s walk carries the worst state back over the edges with its explicit stack
@@ -56769,3 +56794,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
 - **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
   harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.
+
+### A-761 — Subversion's intake: texts streamed into a sink, then stored once by identity before the entry (2026-11-20, w-svn for UI goal 93; §4.17.1 "A push's intake", rules 1 to 3; main's ruling (B))
+
+- Part 1 (b5c4b8848): `commit::drive` applies each svndiff window into one window's room and hands it to a `TextSink`.
+- Part 2: `svn_commit::land_work` puts the sink's texts into the repository's content store a copy slice a turn, takes
+  `content_ticket`, awaits `content_durable` (A-727 slice b), then commits; the revision's record (version 2) names
+  each stored text by (identity, length) and the records keep only the reference. A refusal gives back every put text
+  (`Uncommitted::NotDurable`). Reads go green, store, records (`svn_texts::HeadTexts`); replay holds each stored identity
+  or refuses `SvnStored`. Held by `daemon::tests::a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+- **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.

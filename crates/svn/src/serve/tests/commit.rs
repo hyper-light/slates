@@ -278,7 +278,9 @@ impl reads::Repository for View<'_> {
 
 impl commit_drive::Green for View<'_> {
   fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+    // A text a commit stored is the content store's (here the sink's): the records keep it as a reference.
     commit_drive::Green::text(self.records, identity)
+      .or_else(|| crate::commit::drive::TextSink::sealed(self.texts, identity))
   }
 
   fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
@@ -362,7 +364,7 @@ fn make(
 ) {
   let now = svn_time(recorded).unwrap();
   replay.built.hold(&work, recorded, &replay.texts);
-  let revision = RevisionToCommit::of_work(work, now, &replay.texts).unwrap();
+  let revision = RevisionToCommit::of_work(work, now).unwrap();
   let date = revision.date().unwrap().to_owned();
   let author = revision.author().map(str::to_owned);
   let number = replay.records.commit(revision).unwrap();

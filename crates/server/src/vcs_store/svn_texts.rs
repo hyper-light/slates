@@ -41,18 +41,33 @@ const ENTRY_BYTES: u64 =
 pub(crate) struct HeadTexts<'a> {
   /// The repository's green, when it is held here.
   pub(crate) green: Option<&'a Green>,
+  /// The shard's content store, its chunks lent (`crate::vcs_store::lent_state`): where a text a commit stored lives
+  /// (§4.17.1 "A push's intake"; the records keep it as a reference).
+  pub(crate) store: Option<&'a slates_vcs::ContentStore>,
   /// The repository's records.
   pub(crate) records: &'a SvnRecords,
 }
 
 impl TextSource for HeadTexts<'_> {
+  /// The green's held text, then the content store's (a text a commit stored, read whole through its root), then the
+  /// records' (until c3 removes that arm).
   fn text(&self, identity: &ContentIdentity) -> Option<Cow<'_, [u8]>> {
     if let Some(bytes) = self.green.and_then(|green| green.held(identity)) {
       return Some(Cow::Borrowed(bytes));
     }
+    if let (Some(store), Some(len)) = (self.store, self.records.stored_len(identity)) {
+      let id = slates_vcs::ContentId(*identity);
+      if let Some(bytes) = store.object_bytes(&store.root_of(&id), len) {
+        return Some(Cow::Owned(bytes));
+      }
+    }
     TextSource::text(self.records, identity)
   }
 }
+
+/// What a Subversion repository's sessions read (§4.17.4; main's ruling (B)): its records, with their texts read through
+/// [`HeadTexts`].
+pub(crate) type SvnView<'a> = slates_svn::migration::WithTexts<'a, HeadTexts<'a>>;
 
 /// A file's text identity and its path in the green, as a walk finds it.
 type FileText = (ContentIdentity, String);
