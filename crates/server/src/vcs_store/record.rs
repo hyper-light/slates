@@ -239,7 +239,7 @@ fn whole_pack(
   for noted in objects {
     let mut bytes = Vec::new();
     for window in content.windows(&noted.identity) {
-      bytes.extend_from_slice(window);
+      bytes.extend_from_slice(&window);
     }
     if u64::try_from(bytes.len()).ok() != Some(noted.len) {
       return Err(WriteRefused::Unreadable { id: noted.id });

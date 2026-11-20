@@ -11306,8 +11306,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > restored file, and a change that shares no run with the value before it, which every push and import is) names the
 > file's block instead of copying it, so a changed file is held once; the file map letting the block go at the next
 > change leaves it held as the earlier version's bytes, nothing copied. A retired lineage member gives its chunks' holds
-> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`. Owed (part 2): a splice's added runs named
-> in the new block too, copied out only when the value is superseded.
+> back a chunk a step (`Release`). Counted: `Green::history_blocks_named`.
+>
+> **Status (2026-11-20, A-728 part 2: a splice's added bytes are the new block's).** A splice's added runs are pieces of
+> the file's new block at their place, so the latest value copies nothing at all; the change that supersedes it seals it
+> (`Value::seal`): a block it alone names and nothing else holds is cut to its runs, copied into one owned chunk, and let
+> go, when they are less than the block. A fold that leaves a path only its latest value makes that value the file's
+> block whole (`Green::rename_alone`), so the earlier blocks it shared runs of go. A block chunk is charged the runs its
+> value was made with, the copy it replaces, so admission's reservation is unchanged. Counted:
+> `Green::history_splices_named` (splices named, values sealed and the bytes copied).
 
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
@@ -54745,8 +54752,30 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   128 KiB, and the history owns no byte; a small overwrite owns its 8 bytes; every version reads back; the running
   totals equal their recount) and `a_value_named_by_a_files_block_copies_nothing_and_keeps_the_block_while_named`;
   integration `engine`, `checkpoint`, `chain_replay`, `rebase`, `splice`, `verdict`, `base_for` green; fmt clean.
-- **Owed.** Part 2: a splice's added runs named in the new block, copied out when the value is superseded. Part 3: the
-  1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in BENCHMARKS.md.
+- **Part 2: a splice's added runs are the new block's.** `Value::spliced` checks the runs it keeps against the new
+  bytes first, then makes its added runs pieces of the file's new block at their place (one chunk naming the block),
+  so the latest value copies nothing. The copy is made only when a later change supersedes the value and the map lets
+  the block go (`Value::seal`, from `set_file` and `remove_file_now`): a block chunk only that value names, whose block
+  nothing else holds, is cut to the runs the value names when they are less than the block; one it names whole, or one
+  another holder keeps (a branch's map, the identity table), stays. A fold that leaves a path only its latest value names
+  the current file's block whole (`Green::rename_alone`), letting the earlier blocks and chunks go: folded to the head,
+  the small-edits test's history holds 0 bytes, where it held the overwritten bytes of a shared chunk before.
+- **The charge.** A block chunk counts the runs its value was made with (the whole block for a value named whole, a
+  splice's added runs otherwise): what the copy it replaces counted, so `Green::history_reservation` and every
+  retention figure the service admits by are as before. Said plainly, that figure counts the file before a path's
+  first small edit as the current value's, though since that edit the current file is its own block: a first small
+  edit keeps the earlier file whole in memory (as the copy did before A-728) and charges its edit's bytes; a fold to the
+  head now frees it.
+- **Evidence (part 2).** macOS arm64, Mac Studio, local: `slates-merge --lib` 222 of 222 (`history::` 5, among them the
+  engine's flow restated over generated chains with sealing, and `a_seal_keeps_a_block_another_holder_keeps`;
+  `history_block_tests` extended: a splice copies nothing, the next change seals 8 bytes, a removal seals 4 more);
+  integration `engine` (the fold-to-head bound tightened to 0), `special`, `checkpoint`, `chain_replay`, `rebase`,
+  `splice`, `verdict`, `base_for`, `derive`, `increment`, `identity`, `map`, `origin`; `slates-server --test
+  green_retention`; fmt clean. Found by running: the stack oracle
+  (`a_stack_lands_as_its_works_applied_in_order_to_whole_trees_over_every_history`) refuses a bottom on origin/main at
+  `PROPTEST_CASES=3000` in 2 of 10 runs, with or without this change (0 of 10 with it): reported, not chased.
+- **Owed.** Part 3: the 1,000-revision Subversion profile (`crates/cli/bench/svn_scale.sh`) before and after, in
+  BENCHMARKS.md.
 - **Piece 5a, identity homes across a node's shards (2026-11-20).** `crate::vcs_store::homes`: a window (at most one
   window of content, named by its plain BLAKE3) is homed at the shard of the node that rendezvous ranks first for its
   identity, kept there in that shard's one content store (deduplicated with what its repositories hold, charged to its
