@@ -209,3 +209,8 @@
   worktree ~/.cache/w-git-wt, CARGO_TARGET_DIR=~/.cache/w-git-target.noindex CARGO_INCREMENTAL=0 (kiln once placed a
   needs-only run on this Mac: never again). NEXT: B2 rows by (pack, offset) + all readers via packed::read; B3
   quarantine by entry place; B4 drop inflated copies; red: resident <= k*pack + base.
+- ~14:10 LANDED eea6b39f6 (main ab049942c): Connection::interim + Exchange::interim; receive-pack keepalive while the
+  pack is read. Debug-load rerun filed in run-requests.md. NEXT: measure the push input decode per byte/object
+  (release, cold/warm; main's push-back: 820 KB should be ms) and fix if it's the gap; then B2 in-flight half
+  (quarantine reads the pushed pack in place while judged; landing via w-store's seam, no pack store; Ada's changeset
+  ruling: history = changesets; git objects derived & cached by identity).
