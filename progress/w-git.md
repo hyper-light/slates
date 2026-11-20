@@ -169,3 +169,11 @@
   so; (3) memory per push attribution, identical objects stored once, bounded per-push working set; then two
   load-only tests (daemon_edge long-history push, t_a665 update hook), Windows restart spin; record (a)-(d) BENCHMARKS.
 - Local target is now ~/.cache/w-git-local-target.noindex, build with CARGO_INCREMENTAL=0.
+- A-722 part 4e LANDED a986d5f1d (main b832652b0): restage in Judge::ready turns; empty stage never stale; each_step ready
+  fix (4c's admission turns were inert live before). Merged with w-engine's A-752 (ready = restage, admit, build work).
+  BENCHMARKS "A-722's proof" section records runs (a)-(e).
+- NEXT: (1) slice connect.rs propagate (check phase 57.9 ms); (2) load-only edge tests: edge sends nothing until the
+  answer -> move answer loop into reply + git side-band keepalive "0005\1" every receive.keepAlive (5 s, git default)
+  (ClientGone needed for hooks: driver hands it only to body_end); (3) memory per push attribution; (4) store commit
+  passes; (5) t_a665 derived deadline; Windows restart spin check. Note: w-balance's t_a724_a_rebuild_reads... is
+  load-flaky (passes alone).

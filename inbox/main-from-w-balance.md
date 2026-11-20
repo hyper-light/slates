@@ -72,3 +72,19 @@ put and its entry's append loses nothing named. Then back to v3 at f+1.
 (inbox/w-svn-from-w-balance.md). Red test `daemon::tests::t_a727b_...`: with the barrier bypassed, a crash after the
 entry leaves the successor refusing it (replay_refused 1); with it, recovered whole. The release latency measurement
 waits on the Studio (kiln unreachable). Back to v3 at f+1; the takeover question above still stands.
+
+### 2026-11-20 ~10:30: status for the UI (what is complete, what is not)
+COMPLETE, on main (please mark these steps done):
+- A-727 slice b, the content plane's durability barrier: db779baa3 (`vcs_store::content_ticket` / `content_durable`,
+  red crash test `daemon::tests::t_a727b_...`). w-svn has the interface and the commit.
+- A-724 piece 3c, per-repository turns: 3283dd758, proof recorded in BENCHMARKS (369102a32).
+- A-724 piece 8c's parts so far: v3 codec 09427301d, `home_in_region` c42b938f2, writer 7317f6cce (gated off), region
+  fetch 36c6ed55d, self-publishing barrier 6e9d2eeaf.
+NOT COMPLETE (keep open):
+- v3 at f+1: the gate stays off until a takeover test passes, which waits on your answer above (do a departed owner's
+  push records reach a successor?).
+- The release latency A/B (v2 against v3, which also measures the barrier's cost). First runs were invalid: one compared
+  v2 with v2 (cargo reused the build), and the second ran under memory pressure on the Studio (load 34, 595 MB free).
+  Locally, through the real HTTP edge, the v3 build homes its names (`homed_in_region` 1, `published_for_ticket` 1). A
+  clean run is going now (r71), waiting for load < 8 and memory pressure to clear.
+- Run 31 (co-location): stopped by memory pressure on the Studio; re-run after the A/B.

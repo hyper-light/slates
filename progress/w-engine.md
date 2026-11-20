@@ -159,3 +159,8 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   git_push group: it asserts the names' home differs from the owner shard, which depends on the shard the test lands on.
 - NEXT (part 3 rest): engine verdict in the ready turns (Green::compute resumable); recorded entry; retention secure;
   engine commit (needs main's call). w-git's store record/commit (11.5 ms) theirs.
+- ~11:00 main's reorder: 1b (A-760, increment names content by identity, staged + published) NEXT, ahead of items
+  3-7, then the ring give-back. A-752 not close: remaining verdict 8.3 / commit 10.9 / entry 4.7 / secure 5.0 ms
+  (debug 1,500) recorded owed; the commit question is answered for named content by stage-then-publish.
+- A-760 claimed; interface sent: inbox/w-svn-from-w-engine-a760-interface.md (cc main), waiting for w-svn's answer
+  before the build.
