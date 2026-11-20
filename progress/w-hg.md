@@ -83,3 +83,6 @@
   incremental (disk was 17-18 GB free).
 - NEXT: part 2b (re-base a stale fork by node at landing instead of MOVED), then part 3 (import room per repository),
   then S5 per main's convergence plan (file texts as green files by identity, changelog/manifest deltas, rows by id).
+- A-720 part 2b (stale fork re-based by node at landing; land never swaps in a stale fork; side-by-side pushes land)
+  LANDED main (piece 64d457979, merge 5df3c5a18). Local: hg 72/72, server 45/45 (32/32 hg filters on landed tree).
+- NEXT: part 3 (import room per repository; ImportRefused PastRoom{278528} on Mercurial's repo), then S5.

@@ -146,3 +146,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   (9 production readers in git/hg/svn/server) -> copy-out read_into / Cow; heap storage behind a seam. Then (a2) arena
   storage via vfs ChunkStore (open/write_open/seal/read_extent_into/claim_chunk_blocks/adopt_chunk), (a3) image
   table + recovery before records, (b) git v3, (c) svn, (d) replication. Group commit for image barrier per push.
+- A-727 (a1) in progress, worktree ~/slates-work/w-perf-a723 (agents/w-perf-a723): ContentStore::windows and
+  window_at answer Cow<[u8]> (get stays &[u8]: lists/tables are the store's own metadata, kept in memory); readers
+  adapted: git derived/tree.rs, store/upload.rs (868 &first, 917, 951 Cow::Borrowed(made_window), 1377, 1599),
+  store/views.rs as_kept -> Option<Cow> (a borrowed window lent, an owned one kept like assembled); hg import/record.rs,
+  push/held.rs, render.rs, serve/indexed.rs (copied generic over AsRef, framed chains Cow MARKER, lend counts borrow);
+  server commits.rs, record.rs; vcs blame.rs; tests oracle.rs, hg tests/import.rs, vcs content tests. Compiles.
+  Focused tests running (vcs content/derived, git store/derived/upload, hg serve/import/push/render, server vcs_store/git_push).
