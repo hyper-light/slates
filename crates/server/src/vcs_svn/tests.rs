@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use slates_db::HostId;
 use slates_db::catalog::Principal;
-use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{CredentialMaterial, ObjectFormat, ReplyBody, RequestBody, VcsTool};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 
 use crate::daemon::{Daemon, SegmentSource};
@@ -219,25 +219,144 @@ fn create_svn(daemon: &Daemon, partition: usize, name: &str) {
   assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
 }
 
-/// A-695 (§4.17.4 piece 7). Do: on a daemon of two shards, create a Subversion repository whose name routes to the
-/// listener's own partition, one whose name routes to the other shard's, and one there whose name holds a `/`; for each,
-/// connect and answer the greeting as stock `svn` 1.15.0 answered `svnserve` for a repository that allows no one,
-/// naming the repository at the listener's port (the last with a path beneath it), and read until the connection ends.
-/// Expect: each is greeted as `svnserve` greets, `svndiff1` aside, and answered as `svnserve` answered, "No access
-/// allowed to this repository" (170001): each was found on the shard that owns its name, the other's after the
-/// connection moved there, the slashed one as the longest run of the path's segments naming a repository, and opened
-/// with the mechanisms it allows, none yet (no anonymous principal, §4.13; CRAM-MD5's keys, A-692). Before A-695 each
-/// was "No repository found".
+/// The token the tests' owner enrolls, the password a stock client answers CRAM-MD5's challenge with.
+const TOKEN: &[u8] = b"slates-svn-listener-token";
+
+/// Enrolls [`TOKEN`] for [`owner`] on the partition its id routes to, as the CLI's issuer sends it (its id and its
+/// CRAM-MD5 contexts, never the token).
+fn enrolled(daemon: &Daemon) {
+  let material = CredentialMaterial::HttpToken {
+    id: crate::credentials::token_id(TOKEN),
+    cram_md5_contexts: crate::credentials::cram_md5_contexts(TOKEN),
+  };
+  let id = crate::credentials::id_of(&material);
+  let partition = usize::from(crate::credentials::owner_of(&id, usize::from(SHARDS)));
+  let reply = crate::daemon::observe_at(daemon, partition, move |state| {
+    let principal = slates_ipc::protocol::Principal::Uid {
+      host: 0,
+      uid: OWNER,
+    };
+    let proof = crate::credentials::enroll_proof(&state.issuer_secret, &principal, &material, None);
+    let body = RequestBody::EnrollCredential {
+      principal,
+      material,
+      expires_ns: None,
+      proof,
+    };
+    crate::verbs::dispatch(state, 0, &owner(), body)
+  });
+  assert_eq!(reply, ReplyBody::CredentialEnrolled { id });
+}
+
+/// What `stream` reads until the listener has sent `items` whole items, or ends, or is silent past its patience.
+fn read_items(stream: &mut ClientStream, items: usize) -> String {
+  let mut read = Vec::new();
+  let (mut depth, mut whole) = (0usize, 0usize);
+  let mut byte = [0u8; 1];
+  while whole < items {
+    match stream.read(&mut byte) {
+      Ok(1) => {}
+      _ => break,
+    }
+    read.push(byte[0]);
+    match byte[0] {
+      b'(' => depth += 1,
+      b')' => {
+        depth = depth.saturating_sub(1);
+        whole += usize::from(depth == 0);
+      }
+      _ => {}
+    }
+  }
+  // The space after the last item's parenthesis.
+  if stream.read(&mut byte).is_ok_and(|taken| taken == 1) {
+    read.push(byte[0]);
+  }
+  text(&read)
+}
+
+/// The string inside the one `( step ( N:string ) )` item `item`.
+fn challenge_of(item: &str) -> &str {
+  let length_end = item.find(':').expect("the challenge's length");
+  let start = item
+    .get(..length_end)
+    .and_then(|head| head.rfind(' '))
+    .expect("a space")
+    + 1;
+  let length: usize = item.get(start..length_end).unwrap().parse().unwrap();
+  item.get(length_end + 1..length_end + 1 + length).unwrap()
+}
+
+/// A stock client's CRAM-MD5 session with the listener at `port` for `url`, whose root URL is `root`: greeted, it
+/// answers as stock `svn` 1.15.0 answered `svnserve`, chooses CRAM-MD5, answers the challenge as the token's id with
+/// [`TOKEN`] as its password, and asks `get-latest-rev`. What the listener wrote after its greeting, and what stock
+/// `svnserve` 1.15.0 wrote in its own recorded `cram-md5` session (the realm and the UUID the repository's, the
+/// challenge the listener's).
+fn cram_session(port: u16, greeting: &[u8], url: &str, root: &str) -> (String, String) {
+  let mut stream = ClientStream::connect(("127.0.0.1", port)).expect("the listener takes it");
+  stream
+    .set_read_timeout(Some(Duration::from_nanos(PATIENCE_NS)))
+    .expect("a read timeout");
+  let greeted = read_up_to(&mut stream, greeting.len());
+  assert_eq!(text(&greeted), text(greeting), "the greeting");
+  let answer = replaced(NO_ACCESS_CLIENT, &string_item(NONE_URL), &string_item(url));
+  stream.write_all(&answer).expect("the answer is sent");
+  let asked = read_items(&mut stream, 1);
+  stream
+    .write_all(b"( CRAM-MD5 ( ) ) ")
+    .expect("the mechanism");
+  let step = read_items(&mut stream, 1);
+  let challenge = challenge_of(&step).to_owned();
+  let user: String = crate::credentials::token_id(TOKEN)
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let digest: String = slates_svn::handshake::CramKey::from_secret(TOKEN)
+    .digest(challenge.as_bytes())
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let response = format!("{user} {digest}");
+  stream
+    .write_all(format!("{}:{response} ", response.len()).as_bytes())
+    .expect("the response");
+  let established = read_items(&mut stream, 2);
+  stream
+    .write_all(b"( get-latest-rev ( ) ) ")
+    .expect("the command");
+  let latest = read_items(&mut stream, 2);
+  let uuid = asked
+    .split_once("36:")
+    .and_then(|(_, rest)| rest.get(..36))
+    .unwrap_or_default()
+    .to_owned();
+  let expected = format!(
+    "( success ( ( CRAM-MD5 ) 36:{uuid} ) ) {step}( success ( ) ) ( success ( 36:{uuid} {} ( mergeinfo ) ) ) \
+     ( success ( ( ) 0: ) ) ( success ( 0 ) ) ",
+    string_item(root)
+  );
+  (format!("{asked}{step}{established}{latest}"), expected)
+}
+
+/// A-692's svn:// half (§4.17.4 item 10; A-695's lookup). Do: on a daemon of two shards, enroll a token for the
+/// repositories' owner; create a Subversion repository whose name routes to the listener's own partition, one whose
+/// name routes to the other shard's, and one there whose name holds a `/`; for each, connect as stock `svn` 1.15.0
+/// does (the last naming a path beneath it), choose CRAM-MD5, answer the challenge with the token's id as the user and
+/// the token as the password, then ask `get-latest-rev`. Expect: each is greeted as `svnserve` greets, `svndiff1`
+/// aside, asked for CRAM-MD5 with the repository's UUID as its realm, challenged, authenticated, told the repository's
+/// UUID and root URL, and answered revision 0, as stock `svnserve` answered its recorded `cram-md5` session: each found
+/// on the shard that owns its name, the other's after the connection moved there, its sources lent there. Before this,
+/// each was refused "No access allowed to this repository" (170001), as w-interop's stock `svn checkout` found.
 #[test]
-fn a_repository_on_either_shard_is_opened_on_its_owner_as_svnserve_opens_one_allowing_no_one() {
+fn a_stock_client_signs_in_with_an_enrolled_token_on_either_shard_and_reads() {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
   let port = daemon.vcs_svn_port().expect("the listener started");
+  enrolled(&daemon);
   let refusal_at = NO_ACCESS_SERVER
     .windows(REFUSAL_START.len())
     .position(|window| window == REFUSAL_START)
     .expect("the recorded server refused");
   let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
-  let refusal = &NO_ACCESS_SERVER[refusal_at..];
   let cases = [
     ("svn-", LISTENER, ""),
     ("svn-", OTHER, ""),
@@ -246,13 +365,9 @@ fn a_repository_on_either_shard_is_opened_on_its_owner_as_svnserve_opens_one_all
   for (prefix, partition, beneath) in cases {
     let name = name_on(prefix, partition);
     create_svn(&daemon, partition, &name);
-    let url = format!("svn://127.0.0.1:{port}/{name}{beneath}");
-    let answer = replaced(NO_ACCESS_CLIENT, &string_item(NONE_URL), &string_item(&url));
-    assert_eq!(
-      exchange(port, greeting.len(), &answer),
-      (text(&greeting), text(refusal)),
-      "{url}"
-    );
+    let root = format!("svn://127.0.0.1:{port}/{name}");
+    let (session, expected) = cram_session(port, &greeting, &format!("{root}{beneath}"), &root);
+    assert_eq!(session, expected, "{root}");
   }
 }
 

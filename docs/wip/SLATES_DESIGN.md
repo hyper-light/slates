@@ -12482,6 +12482,9 @@ A-363's failover estimate is the pattern: its estimators keep learning from the 
 **The order-of-magnitude method.** Main measures and records it in `BENCHMARKS.md` under the rule of the project's
 §5: release builds, the hardware, the dataset's commit, the date, the load discipline, and the best of N with all N
 shown.
+> **Status (A-699, 2026-11-20, w-perf):** the stock baselines are recorded (`crates/cli/bench/{git,hg,svn}_scale.sh`,
+> BENCHMARKS.md): git/git, Mercurial's repository and git/git's newest 5,000 commits as svn, over `git daemon`,
+> `hg serve` and `svnserve`; slates' side and the remaining competitors and measures are owed.
 - Competitors: `git-http-backend` and Gitaly for git; `hg serve` for Mercurial; `svnserve` and `mod_dav_svn` for
   Subversion.
 - Dataset: the Linux kernel tree the load tests already hold, as a git repository, and its conversions to Mercurial
@@ -15197,6 +15200,11 @@ and export by landing).
 > repository's lock table at the call's instant (`slates_svn::reads::answer_lock_read`, `serve.c` 3366-3446): a held
 > lock as `write_lock` writes it, an expired one and one on an unreadable path left out, a depth `get_locks` refuses in
 > its words. Owed: `lock`, `lock-many`, `unlock`, `unlock-many` through the owner's step.
+>
+> **Status (2026-11-19, A-692 continued (1): svn:// signs in).** The listener asks for CRAM-MD5 with the repository's
+> UUID as its realm, keys the response from the enrolled token's record (`credentials::cram_md5_key`; the user is the
+> token's id in hex), and from then on lends each call its sources on the owner (`svn_view::lend_in`), the token's
+> principal writing where the repository's policy reaches it. Owed: commits through the owner's step (A-698).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),
