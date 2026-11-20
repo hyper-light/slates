@@ -12,11 +12,13 @@
 - Side effect: publishing wire tags also published VolumeRefusal 21 ReferenceUnresolved / 22 ReferencesHeld, which
   origin/main had left unpublished (wire_order was red on main for them).
 
-## Next (queue)
+## Piece 2: A-779 supersede (main's ruling 15:20): LANDED bbc605ac9 (merge f20719312)
+- See inbox/main-from-w-sessionlog-a779.md.
+
+## Next (queue, main's order 15:20)
 1. "identical" as a submission outcome: the engine commits an identical increment as a new version; telling it apart
    needs a field on ReplyBody::Submitted (~100 construct/match sites) or the green recording empty-effect versions.
 2. MCP tool `slates.log` (read-only, no grant verb) and the SDKs' read (sdk-node, sdk-python).
-3. A presentation never granted stays listed forever (presentations don't expire): decide supersede/expire with main.
 4. Ask-mode merges held for approval (Submitted::ApprovalRequired) are another "needs you" item not yet shown.
 
 ## Run requests (main's)
