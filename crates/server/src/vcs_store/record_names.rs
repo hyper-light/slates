@@ -55,6 +55,14 @@ pub(crate) fn names_to_content(
   store: &mut ContentStore,
   names: &[Name],
 ) -> Result<(ContentId, u64), NamesRefused> {
+  let bytes = encode_names(names)?;
+  let root = rows::put(store, &bytes).map_err(NamesRefused::Rows)?;
+  Ok((root, u64::try_from(names.len()).unwrap_or(u64::MAX)))
+}
+
+/// The rows of `names`, in their order (module docs, "The form"): what [`names_to_content`] puts, and what is homed in
+/// the region before a record names it (its BLAKE3 is the names' identity).
+pub(crate) fn encode_names(names: &[Name]) -> Result<Vec<u8>, NamesRefused> {
   let mut bytes = Vec::new();
   bytes
     .try_reserve_exact(names.len().saturating_mul(NAME_BYTES))
@@ -66,8 +74,7 @@ pub(crate) fn names_to_content(
     bytes.extend_from_slice(&identity.0);
     bytes.extend_from_slice(&len.to_le_bytes());
   }
-  let root = rows::put(store, &bytes).map_err(NamesRefused::Rows)?;
-  Ok((root, u64::try_from(names.len()).unwrap_or(u64::MAX)))
+  Ok(bytes)
 }
 
 /// The `count` names the content `root` holds in `store`, in the order they were put (module docs): refused typed when
