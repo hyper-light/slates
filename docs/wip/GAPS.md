@@ -1069,7 +1069,8 @@
 > fetches over it with OpenSSH 10.2p1 (macOS arm64, Mac Studio, kiln r1 over 43c86824e: `cargo test --locked -p
 > slates-cli --test git_interop -- --test-threads=1` 5 passed, 0 ignored, the SSH leg alone 1 of 1 in 7.4 s;
 > `cargo fmt -p slates-cli -- --check` clean). A credential is minted with the anchor's issuer surface, so on Linux, where
-> that surface is a descriptor only the anchor's children hold, those legs skip loudly. macOS arm64 (Mac Studio, kiln
+> that surface was a descriptor only the anchor's children hold, those legs skipped loudly (since A-754, 2026-11-20, the
+> Linux anchor prints its issuer route and secret, and they run). macOS arm64 (Mac Studio, kiln
 > r426 over main 5206419be): `cargo test --locked -p slates-cli --test git_interop -- --test-threads=1` 3 passed, 2
 > ignored; with `--ignored` the two failed at their waits (`slates: unknown flag --vcs-ssh`; `fatal: Authentication
 > failed for 'http://127.0.0.1:PORT/project/'`); rustfmt's layout applied from that run. Owed: the Linux run (the

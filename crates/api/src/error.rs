@@ -1569,6 +1569,9 @@ pub enum IssuerFault {
   },
   /// The segment the handoff names could not be attached or read (gone, another machine's, another layout).
   Attach(slates_anchor::AnchorError),
+  /// The anchor's issuer route refused the claim or did not answer (Linux, A-754): no anchor of this user and instance
+  /// listens, or the secret is not the one it printed.
+  Route(slates_ipc::IpcError),
   /// The daemon has not published an issuer secret yet (an all-zero secret is no authority): it is still starting.
   NotPublished,
   /// This authority is the launcher's secret (A-299), which proves grants, merges, policies, enrollments and
@@ -1586,6 +1589,7 @@ impl fmt::Display for IssuerFault {
       ),
       Self::Malformed { reason } => write!(f, "the anchor's handoff is malformed: {reason}"),
       Self::Attach(error) => write!(f, "attaching the anchor: {error}"),
+      Self::Route(error) => write!(f, "claiming the anchor's segment over its issuer route: {error}"),
       Self::NotPublished => f.write_str("the daemon has published no issuer secret yet"),
       Self::LauncherCannotRecover => f.write_str(
         "the launcher's secret cannot confirm a consensus recovery; that needs the anchor's segment",

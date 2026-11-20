@@ -57,6 +57,17 @@ enum Authority {
   },
   /// The launcher's own secret, which it provided at the instance's start and keeps.
   Launcher(LauncherSecret),
+  /// The anchor's issuer route on Linux (A-754): its abstract name and the secret the anchor printed, presented for the
+  /// segment's descriptor at each proof.
+  #[cfg(target_os = "linux")]
+  Route {
+    /// The route's abstract name.
+    name: String,
+    /// The secret the anchor printed for it.
+    secret: [u8; slates_ipc::issuer_route::SECRET_BYTES],
+    /// This machine's identity, which the segment's header must name.
+    identity: Identity,
+  },
 }
 
 impl Issuer {
@@ -64,11 +75,48 @@ impl Issuer {
   /// anchor's children inherit and, on macOS and Windows, the anchor's user exports from what the anchor printed.
   /// Refused [`IssuerFault::NoHandoff`] when there is none — the process was not started from the anchor's session.
   pub fn from_environment() -> Result<Issuer, Error> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os(ENV_HANDOFF).is_none()
+      && let Some(issuer) = Issuer::from_route_environment()?
+    {
+      return Ok(issuer);
+    }
     let pairs: Vec<(String, String)> = [ENV_HANDOFF, ENV_LEN]
       .into_iter()
       .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
       .collect();
     Issuer::from_handoff(&pairs)
+  }
+
+  /// The anchor's issuer route the environment names on Linux (A-754: `SLATES_ANCHOR_ISSUER_ROUTE` and
+  /// `SLATES_ANCHOR_ISSUER_SECRET`, as the anchor printed them for its user to export); none when neither is set, and
+  /// refused [`IssuerFault::Malformed`] for one without the other or a secret not in the printed form.
+  #[cfg(target_os = "linux")]
+  fn from_route_environment() -> Result<Option<Issuer>, Error> {
+    use slates_ipc::issuer_route::{ENV_ISSUER_ROUTE, ENV_ISSUER_SECRET, parse_secret};
+    match (
+      std::env::var(ENV_ISSUER_ROUTE).ok(),
+      std::env::var(ENV_ISSUER_SECRET).ok(),
+    ) {
+      (None, None) => Ok(None),
+      (Some(name), Some(secret)) => {
+        let secret = parse_secret(secret.trim()).ok_or_else(|| {
+          no_authority(IssuerFault::Malformed {
+            reason: "the issuer secret (SLATES_ANCHOR_ISSUER_SECRET) is not the anchor's printed form",
+          })
+        })?;
+        Ok(Some(Issuer {
+          authority: Authority::Route {
+            name,
+            secret,
+            identity: Facts::query().identity,
+          },
+        }))
+      }
+      _ => Err(no_authority(IssuerFault::Malformed {
+        reason: "the issuer route and its secret (SLATES_ANCHOR_ISSUER_ROUTE, SLATES_ANCHOR_ISSUER_SECRET) go together",
+      })),
+    }
   }
 
   /// The authority a handoff names, as the environment pairs the anchor hands its children (`SLATES_ANCHOR`,
@@ -120,16 +168,35 @@ impl Issuer {
   /// The issuer secret the running daemon published: the segment attached, read, and let go. Refused
   /// [`IssuerFault::NotPublished`] while the daemon has published none (an all-zero secret is no authority).
   fn secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], Error> {
-    let (handoff, len, identity) = match &self.authority {
+    let segment = match &self.authority {
       Authority::Launcher(secret) => return Ok(*secret.bytes()),
       Authority::Segment {
         handoff,
         len,
         identity,
-      } => (handoff, *len, identity),
+      } => AnchorSegment::attach(handoff, *len, identity)
+        .map_err(|e| no_authority(IssuerFault::Attach(e)))?,
+      #[cfg(target_os = "linux")]
+      Authority::Route {
+        name,
+        secret,
+        identity,
+      } => {
+        use std::os::fd::AsRawFd;
+        // The anchor answers within a turn of its loop, which the daemon's observation budget bounds.
+        let patience = std::time::Duration::from_nanos(slates_server::watchdog::WINDOW_CEILING_NS);
+        let (object, len) = slates_ipc::issuer_route::claim(name, secret, patience)
+          .map_err(|e| no_authority(IssuerFault::Route(e)))?;
+        let len = usize::try_from(len).map_err(|_| {
+          no_authority(IssuerFault::Malformed {
+            reason: "the issuer route named a segment longer than this platform maps",
+          })
+        })?;
+        // Attaching duplicates the descriptor, so the claimed one closes when this arm ends.
+        AnchorSegment::attach(&Handoff::Descriptor(object.as_raw_fd()), len, identity)
+          .map_err(|e| no_authority(IssuerFault::Attach(e)))?
+      }
     };
-    let segment = AnchorSegment::attach(handoff, len, identity)
-      .map_err(|e| no_authority(IssuerFault::Attach(e)))?;
     let secret = segment
       .issuer_secret()
       .map_err(|e| no_authority(IssuerFault::Attach(e)))?;
