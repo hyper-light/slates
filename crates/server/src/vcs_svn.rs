@@ -32,8 +32,11 @@
 //! announce, so no client sends it zlib (§4.17.4 "5. The wire"; A-599's handshake); the client's answer, its version,
 //! capabilities and client strings, is judged by A-599's handshake; then its URL is resolved as `svnserve`'s
 //! `find_repos` resolves it (`slates_svn::find`): no `svn://` URL, a path climbing with `..` and the server's root are
-//! answered in `svnserve`'s words. Otherwise the URL's first segment names a repository, and the name is located on the
-//! partition it routes to (`verbs::owner_of_name`, as `CreateRepository` routes it, D-14). A name another shard owns
+//! answered in `svnserve`'s words. Otherwise the repository is found as `svn_repos_find_root_path` finds it, walking up
+//! from the whole path ([`locate`], which the `svn+ssh://` tunnel calls too): the path's leading runs of segments are
+//! the names it could have, longest first, since a name may hold a `/`; each is asked of the shard whose partition its
+//! name routes to (`verbs::owner_of_name`, as `CreateRepository` routes it, D-14), every shard once with all of its
+//! candidates, and the longest held as a Subversion repository is the one. A repository another shard owns
 //! moves the connection there whole, as the HTTP edge moves one ([`migrate`]): the socket's handle, the connection with
 //! its answer read, its unread bytes and its deadline, one spawn on that shard's control channel; its seat here comes
 //! back as it leaves, and there it takes a seat as a new connection would, a free one, the most overdue's, or a wait
@@ -50,13 +53,14 @@
 //! lender, g297's), follows once a mechanism does (GAPS, A-656).
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::task::{Poll, Waker};
 
+use slates_db::catalog::VcsTool;
 use slates_rt::futures::{cancel, detach, now_ns, spawn_child};
 use slates_rt::shard::Kept;
 use slates_rt::tcp::{OwnedStream, SocketAddrV4, TcpListener, TcpStream};
 use slates_rt::{RtError, Runtime, ShardId, TaskId, futures};
-use slates_db::catalog::VcsTool;
 use slates_svn::dump::Uuid;
 use slates_svn::find::{Found, find_repository};
 use slates_svn::handshake::{Access, Unserved};
@@ -87,6 +91,8 @@ const NOT_REAPED: &str = "vcs_svn.not_reaped";
 const UNSERVED: &str = "vcs_svn.unserved";
 /// Counter: a repository that allows no one, answered "No access allowed to this repository".
 const NO_ACCESS: &str = "vcs_svn.no_access";
+/// Counter: a lookup a shard did not answer within the liveness budget: the connection closed, its repository unknown.
+const LOOKUP_UNANSWERED: &str = "vcs_svn.lookup_unanswered";
 /// Counter: a Subversion repository whose store its owner shard does not hold: the connection closed.
 const STORE_MISSING: &str = "vcs_svn.store_missing";
 /// Counter: a shard that could not keep its listener state, so a connection that moves there is lost.
@@ -601,8 +607,8 @@ enum Stepped {
   Go,
   /// It ends.
   End,
-  /// Its repository's name lives on runtime shard `shard`: it moves there.
-  Elsewhere(Found, u16),
+  /// Its repository lives on another shard: it moves there.
+  Elsewhere(Found, Located),
 }
 
 /// One connection, seated (the module doc): the greeting, then the conversation, each wait on the client marked overdue
@@ -632,15 +638,13 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
     match step(&stream, &mut conversation, &mut out, &seat).await {
       Stepped::Go => {}
       Stepped::End => return,
-      Stepped::Elsewhere(found, shard) => {
-        migrate(
-          shard,
-          Moving {
-            stream: stream.into_owned(),
-            conversation,
-            found,
-          },
-        );
+      Stepped::Elsewhere(found, located) => {
+        migrate(Moving {
+          stream: stream.into_owned(),
+          conversation,
+          found,
+          located,
+        });
         return;
       }
     }
@@ -689,9 +693,18 @@ async fn step(
       conversation
         .input
         .drain(..consumed.min(conversation.input.len()));
-      match whereabouts(&found.name) {
-        Some(shard) => Stepped::Elsewhere(found, shard),
-        None => opened(stream, &mut conversation.connection, &found, out).await,
+      match locate(&found).await {
+        Location::Found(located) if Some(located.shard) != this_shard() => {
+          Stepped::Elsewhere(found, located)
+        }
+        Location::Found(located) => {
+          opened(stream, &mut conversation.connection, &found, Some(&located), out).await
+        }
+        Location::Nowhere => opened(stream, &mut conversation.connection, &found, None, out).await,
+        Location::Unanswered => {
+          crate::fleet::count_refusal(LOOKUP_UNANSWERED);
+          Stepped::End
+        }
       }
     }
   }
@@ -728,15 +741,81 @@ fn refuse(connection: &mut Connection, unserved: Unserved<'_>, out: &mut Vec<u8>
   }
 }
 
-/// The runtime shard repository name `name` lives on, where that is not this shard: the shard of the partition the name
-/// routes to (`verbs::owner_of_name`, as `CreateRepository` routes it). None for this shard, and where the partition
-/// names no shard, whose lookup here finds nothing.
-fn whereabouts(name: &str) -> Option<u16> {
-  crate::state::with_state(|state| {
-    let partition = crate::verbs::owner_of_name(name, state.shards.len());
-    crate::verbs::shard_of_partition(state, partition).filter(|shard| *shard != state.shard)
-  })
-  .flatten()
+/// Where the repository a client's URL leads into lives ([`locate`]).
+pub(crate) enum Location {
+  /// Found.
+  Found(Located),
+  /// No candidate names a Subversion repository: "No repository found".
+  Nowhere,
+  /// A shard asked did not answer within the liveness budget, or the caller is on no shard: the repository is unknown.
+  Unanswered,
+}
+
+/// A repository found for a client's URL: where it lives and how much of the URL's path its name takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Located {
+  /// The runtime shard whose partition holds its record and its store.
+  pub(crate) shard: u16,
+  /// Its name.
+  pub(crate) name: String,
+  /// How many of the path's leading segments its name takes ([`Found::root_url`]).
+  pub(crate) depth: usize,
+}
+
+/// Finds where the repository `found` leads into lives, as `svn_repos_find_root_path` finds its root (the module doc,
+/// "Where a URL leads"): every candidate name asked of the shard its name routes to, each shard once with all of its
+/// candidates, the longest name held as a Subversion repository the one. Called by the `svn://` listener and the
+/// `svn+ssh://` tunnel alike, on the shard the connection is on.
+pub(crate) async fn locate(found: &Found) -> Location {
+  let Some((origin, asked)) = crate::state::with_state(|state| {
+    let mut asked: BTreeMap<u16, Vec<(usize, String)>> = BTreeMap::new();
+    for (depth, name) in found.candidates() {
+      let partition = crate::verbs::owner_of_name(&name, state.shards.len());
+      if let Some(shard) = crate::verbs::shard_of_partition(state, partition) {
+        asked.entry(shard).or_default().push((depth, name));
+      }
+    }
+    (state.shard, asked)
+  }) else {
+    return Location::Unanswered;
+  };
+  let mut deepest: Option<Located> = None;
+  for (shard, names) in asked {
+    let held = crate::xshard::call_in_shard_time_given_room(
+      origin,
+      shard,
+      move |state| deepest_held(state, &names),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    match held {
+      None => return Location::Unanswered,
+      Some(Some((depth, name))) if deepest.as_ref().is_none_or(|found| depth > found.depth) => {
+        deepest = Some(Located { shard, name, depth });
+      }
+      Some(_) => {}
+    }
+  }
+  deepest.map_or(Location::Nowhere, Location::Found)
+}
+
+/// The longest of `names`, each with the depth it takes, that this shard holds as a Subversion repository.
+fn deepest_held(state: &mut crate::state::ShardState, names: &[(usize, String)]) -> Option<(usize, String)> {
+  let repositories = state.db.partition().repositories();
+  names
+    .iter()
+    .filter(|(_, name)| {
+      repositories
+        .repository_named(name)
+        .is_some_and(|record| record.tool == VcsTool::Subversion)
+    })
+    .max_by_key(|(depth, _)| *depth)
+    .cloned()
+}
+
+/// The runtime shard this task runs on, if any.
+fn this_shard() -> Option<u16> {
+  crate::state::with_state(|state| state.shard)
 }
 
 /// What this shard holds of the repository a name names.
@@ -770,27 +849,26 @@ fn held(name: &str) -> Held {
   .unwrap_or(Held::None)
 }
 
-/// Opens the repository `found` names on this shard, its owner (the module doc, "Opened"), the answer written to
-/// `stream`: whether the conversation goes on, which it does while the client's mechanism is awaited.
+/// Answers the client's URL on the shard that owns its repository (the module doc, "Opened"): the repository
+/// `located` names opened with the mechanisms it allows, or, with none located or none held here any more, "No
+/// repository found"; the answer written to `stream`. Whether the conversation goes on, which it does while the
+/// client's mechanism is awaited.
 async fn opened(
   stream: &TcpStream,
   connection: &mut Connection,
   found: &Found,
+  located: Option<&Located>,
   out: &mut Vec<u8>,
 ) -> Stepped {
   out.clear();
-  let go = match held(&found.name) {
-    Held::Repository(uuid) => open(connection, found, uuid, out),
-    Held::NoStore => {
+  let go = match located.map(|located| (located, held(&located.name))) {
+    Some((located, Held::Repository(uuid))) => open(connection, found, located.depth, uuid, out),
+    Some((_, Held::NoStore)) => {
       crate::fleet::count_refusal(STORE_MISSING);
       false
     }
-    Held::None => {
-      refuse(
-        connection,
-        Unserved::NoRepository { url: &found.url },
-        out,
-      );
+    Some((_, Held::None)) | None => {
+      refuse(connection, Unserved::NoRepository { url: &found.url }, out);
       false
     }
   };
@@ -800,12 +878,20 @@ async fn opened(
   if go { Stepped::Go } else { Stepped::End }
 }
 
-/// Opens the repository of UUID `uuid` that `found` names with the mechanisms it allows (the module doc, "Opened"),
-/// the answer appended to `out`: whether the client's mechanism is awaited.
-fn open(connection: &mut Connection, found: &Found, uuid: Uuid, out: &mut Vec<u8>) -> bool {
+/// Opens the repository of UUID `uuid` whose name takes the first `depth` segments of `found`'s path, with the
+/// mechanisms it allows (the module doc, "Opened"), the answer appended to `out`: whether the client's mechanism is
+/// awaited.
+fn open(
+  connection: &mut Connection,
+  found: &Found,
+  depth: usize,
+  uuid: Uuid,
+  out: &mut Vec<u8>,
+) -> bool {
+  let root_url = found.root_url(depth);
   let repository = slates_svn::handshake::Repository {
     uuid: uuid.as_bytes(),
-    root_url: &found.root_url,
+    root_url: &root_url,
     realm: uuid.as_bytes(),
     mergeinfo: MERGEINFO_KEPT,
     anonymous: ANONYMOUS_READS,
@@ -822,8 +908,8 @@ fn open(connection: &mut Connection, found: &Found, uuid: Uuid, out: &mut Vec<u8
   }
 }
 
-/// A connection on its way to the shard its repository's name lives on (the module doc): its socket's handle, its
-/// conversation, and where its URL leads. Each part is plain data, so it moves whole.
+/// A connection on its way to the shard its repository lives on (the module doc): its socket's handle, its
+/// conversation, where its URL leads and where its repository was found. Each part is plain data, so it moves whole.
 struct Moving {
   /// The socket's handle, its readiness armed on no shard between awaits.
   stream: OwnedStream,
@@ -831,12 +917,15 @@ struct Moving {
   conversation: Conversation,
   /// Where its URL leads.
   found: Found,
+  /// Where its repository was found.
+  located: Located,
 }
 
-/// Moves `moving` to runtime shard `shard`: one spawn on that shard's control channel carrying the connection, which
+/// Moves `moving` to its repository's shard: one spawn on that shard's control channel carrying the connection, which
 /// there adopts the socket and is seated and served ([`arrived`]). A spawn the channel refuses dropped the handle with
 /// it, so the connection closed; it is counted, as the HTTP edge counts a refused move.
-fn migrate(shard: u16, moving: Moving) {
+fn migrate(moving: Moving) {
+  let shard = moving.located.shard;
   let arrive = slates_rt::task::SpawnRequest::new(
     Box::pin(async move {
       arrived(moving);
@@ -858,12 +947,13 @@ fn arrived(moving: Moving) {
     stream,
     conversation,
     found,
+    located,
   } = moving;
   let (Some(state), Ok(stream)) = (here(), TcpStream::from_owned(stream)) else {
     crate::fleet::count_refusal(ARRIVAL_LOST);
     return;
   };
-  match futures::spawn(serve_arrival(state, stream, conversation, found)) {
+  match futures::spawn(serve_arrival(state, stream, conversation, found, located)) {
     Ok(task) => {
       if detach(task).is_err() {
         crate::fleet::count_refusal(NOT_DETACHED);
@@ -882,6 +972,7 @@ async fn serve_arrival(
   stream: TcpStream,
   mut conversation: Conversation,
   found: Found,
+  located: Located,
 ) {
   let slot = match seat_arrival(state).await {
     Ok(slot) => slot,
@@ -902,7 +993,14 @@ async fn serve_arrival(
     let _ = state.with(|state| state.set_task(slot, task));
   }
   let mut out = Vec::new();
-  let stepped = opened(&stream, &mut conversation.connection, &found, &mut out).await;
+  let stepped = opened(
+    &stream,
+    &mut conversation.connection,
+    &found,
+    Some(&located),
+    &mut out,
+  )
+  .await;
   if matches!(stepped, Stepped::Go) {
     go_on(stream, conversation, seat).await;
   }

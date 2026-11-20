@@ -190,10 +190,10 @@ fn owner() -> Principal {
   }
 }
 
-/// A Subversion repository's name that routes to partition `partition`.
-fn name_on(partition: usize) -> String {
+/// A Subversion repository's name beginning `prefix` that routes to partition `partition`.
+fn name_on(prefix: &str, partition: usize) -> String {
   (0u32..)
-    .map(|serial| format!("svn-{serial}"))
+    .map(|serial| format!("{prefix}{serial}"))
     .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == partition)
     .expect("a name routes there")
 }
@@ -220,14 +220,16 @@ fn create_svn(daemon: &Daemon, partition: usize, name: &str) {
 }
 
 /// A-695 (§4.17.4 piece 7). Do: on a daemon of two shards, create a Subversion repository whose name routes to the
-/// listener's own partition and one whose name routes to the other shard's; for each, connect and answer the greeting
-/// as stock `svn` 1.15.0 answered `svnserve` for a repository that allows no one, naming the repository at the
-/// listener's port, and read until the connection ends. Expect: both are greeted as `svnserve` greets, `svndiff1` aside,
-/// and answered as `svnserve` answered, "No access allowed to this repository" (170001): each was found on the shard
-/// that owns its name, the other's after the connection moved there, and opened with the mechanisms it allows, none
-/// yet (no anonymous principal, §4.13; CRAM-MD5's keys, A-692). Before A-695 both were "No repository found".
+/// listener's own partition, one whose name routes to the other shard's, and one there whose name holds a `/`; for each,
+/// connect and answer the greeting as stock `svn` 1.15.0 answered `svnserve` for a repository that allows no one,
+/// naming the repository at the listener's port (the last with a path beneath it), and read until the connection ends.
+/// Expect: each is greeted as `svnserve` greets, `svndiff1` aside, and answered as `svnserve` answered, "No access
+/// allowed to this repository" (170001): each was found on the shard that owns its name, the other's after the
+/// connection moved there, the slashed one as the longest run of the path's segments naming a repository, and opened
+/// with the mechanisms it allows, none yet (no anonymous principal, §4.13; CRAM-MD5's keys, A-692). Before A-695 each
+/// was "No repository found".
 #[test]
-fn a_repository_either_shard_owns_is_opened_there_and_refused_as_svnserve_refuses_one_allowing_no_one() {
+fn a_repository_on_either_shard_is_opened_on_its_owner_as_svnserve_opens_one_allowing_no_one() {
   let daemon = daemon(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
   let port = daemon.vcs_svn_port().expect("the listener started");
   let refusal_at = NO_ACCESS_SERVER
@@ -236,15 +238,20 @@ fn a_repository_either_shard_owns_is_opened_there_and_refused_as_svnserve_refuse
     .expect("the recorded server refused");
   let greeting = replaced(&NO_ACCESS_SERVER[..refusal_at], SVNDIFF1, "");
   let refusal = &NO_ACCESS_SERVER[refusal_at..];
-  for partition in [LISTENER, OTHER] {
-    let name = name_on(partition);
+  let cases = [
+    ("svn-", LISTENER, ""),
+    ("svn-", OTHER, ""),
+    ("team/svn-", OTHER, "/trunk/a"),
+  ];
+  for (prefix, partition, beneath) in cases {
+    let name = name_on(prefix, partition);
     create_svn(&daemon, partition, &name);
-    let url = format!("svn://127.0.0.1:{port}/{name}");
+    let url = format!("svn://127.0.0.1:{port}/{name}{beneath}");
     let answer = replaced(NO_ACCESS_CLIENT, &string_item(NONE_URL), &string_item(&url));
     assert_eq!(
       exchange(port, greeting.len(), &answer),
       (text(&greeting), text(refusal)),
-      "the repository on partition {partition}"
+      "{url}"
     );
   }
 }

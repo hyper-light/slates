@@ -1,37 +1,61 @@
 //! Tests of `find_repos`'s port (A-695): what a URL leads to, and how a URL that leads nowhere is refused.
 
-use super::{Found, find_repository};
+use super::find_repository;
 use crate::handshake::Unserved;
 
-/// A-695. Do: resolve the URLs stock `svn` 1.15.0 sent `svnserve` in the recorded sessions, one with a port and a path
-/// beneath the repository, one whose name and path hold escapes, a tunnel's, and one holding a `...` segment. Expect:
-/// each names the repository by its path's first segment, decoded, and its root URL is the client's URL less the
-/// components beneath the repository, its escapes as the client wrote them; three dots climb nowhere.
+/// What a URL leads to: each candidate name with its depth, longest first, and each candidate's root URL.
+type Resolved = Vec<(usize, String, Vec<u8>)>;
+
+/// `url`'s candidates, each with its root URL.
+fn resolved(url: &[u8]) -> Resolved {
+  let found = find_repository(url).expect("the URL leads somewhere");
+  found
+    .candidates()
+    .map(|(depth, name)| (depth, name, found.root_url(depth)))
+    .collect()
+}
+
+/// A-695. Do: resolve the URL stock `svn` 1.15.0 sent `svnserve` in the recorded `anonymous` session, one with a port
+/// and a path holding an escape, one whose first segment holds an escape, a tunnel's, and one holding a `...` segment.
+/// Expect: the candidate names are the path's leading runs of segments, decoded and joined by `/`, longest first, as
+/// `svn_repos_find_root_path` walks up; each one's root URL is the client's URL less the components beneath it, its
+/// escapes as the client wrote them; three dots climb nowhere.
 #[test]
-fn a_url_names_its_repository_by_its_first_segment_and_its_root_by_what_is_beneath() {
-  let cases: [(&[u8], &str, &[u8]); 6] = [
-    (b"svn://127.0.0.1/anon", "anon", b"svn://127.0.0.1/anon"),
-    (b"svn://127.0.0.1/missing", "missing", b"svn://127.0.0.1/missing"),
+fn a_urls_candidates_are_its_leading_runs_longest_first_each_with_its_root_url() {
+  let cases: [(&[u8], Resolved); 4] = [
     (
-      b"svn://127.0.0.1:3690/repo/trunk/a%20b",
-      "repo",
-      b"svn://127.0.0.1:3690/repo",
+      b"svn://127.0.0.1/anon",
+      vec![(1, "anon".to_owned(), b"svn://127.0.0.1/anon".to_vec())],
     ),
-    (b"svn://h/my%20repo/x", "my repo", b"svn://h/my%20repo"),
-    (b"svn+ssh://h/repo/trunk", "repo", b"svn+ssh://h/repo"),
-    (b"svn://h/repo/.../x", "repo", b"svn://h/repo"),
+    (
+      b"svn://127.0.0.1:3690/team/repo/a%20b",
+      vec![
+        (
+          3,
+          "team/repo/a b".to_owned(),
+          b"svn://127.0.0.1:3690/team/repo/a%20b".to_vec(),
+        ),
+        (2, "team/repo".to_owned(), b"svn://127.0.0.1:3690/team/repo".to_vec()),
+        (1, "team".to_owned(), b"svn://127.0.0.1:3690/team".to_vec()),
+      ],
+    ),
+    (
+      b"svn+ssh://h/my%20repo/x",
+      vec![
+        (2, "my repo/x".to_owned(), b"svn+ssh://h/my%20repo/x".to_vec()),
+        (1, "my repo".to_owned(), b"svn+ssh://h/my%20repo".to_vec()),
+      ],
+    ),
+    (
+      b"svn://h/repo/...",
+      vec![
+        (2, "repo/...".to_owned(), b"svn://h/repo/...".to_vec()),
+        (1, "repo".to_owned(), b"svn://h/repo".to_vec()),
+      ],
+    ),
   ];
-  for (url, name, root_url) in cases {
-    assert_eq!(
-      find_repository(url),
-      Ok(Found {
-        url: url.to_vec(),
-        name: name.to_owned(),
-        root_url: root_url.to_vec(),
-      }),
-      "{}",
-      String::from_utf8_lossy(url)
-    );
+  for (url, expected) in cases {
+    assert_eq!(resolved(url), expected, "{}", String::from_utf8_lossy(url));
   }
 }
 
@@ -42,9 +66,24 @@ fn a_url_names_its_repository_by_its_first_segment_and_its_root_by_what_is_benea
 #[test]
 fn a_url_of_another_scheme_a_climb_or_the_servers_root_is_refused_as_svnserve_refuses_it() {
   let cases: [(&[u8], Unserved<'_>); 8] = [
-    (b"http://h/repo", Unserved::BadUrl { url: b"http://h/repo" }),
-    (b"svnx://h/repo", Unserved::BadUrl { url: b"svnx://h/repo" }),
-    (b"svn:/h/repo", Unserved::BadUrl { url: b"svn:/h/repo" }),
+    (
+      b"http://h/repo",
+      Unserved::BadUrl {
+        url: b"http://h/repo",
+      },
+    ),
+    (
+      b"svnx://h/repo",
+      Unserved::BadUrl {
+        url: b"svnx://h/repo",
+      },
+    ),
+    (
+      b"svn:/h/repo",
+      Unserved::BadUrl {
+        url: b"svn:/h/repo",
+      },
+    ),
     (b"svn://h/repo/../other", Unserved::BadPath),
     (b"svn://h/%2E%2E/other", Unserved::BadPath),
     (b"svn://h", Unserved::NoRepository { url: b"svn://h" }),

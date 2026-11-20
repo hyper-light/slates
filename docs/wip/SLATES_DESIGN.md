@@ -14926,6 +14926,24 @@ and export by landing).
 > sources lent with every call, CRAM-MD5 keys over §4.13's principals, each phase's wait learned (one mechanism for the
 > HTTP, SSH and svn:// edges), and the SSH tunnel's entry point. Windows keeps no listener across a restart
 > (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+>
+> **Status (2026-11-19, A-695: where an svn:// URL leads, A-656 part 2's second slice).** Built: the listener resolves
+> the client's URL as `svnserve`'s `find_repos` does (`slates_svn::find`, `serve.c` 3884-3955): no `svn://` URL is
+> "Non-svn URL passed to svn server", a path climbing with `..` (decoded first, so `%2E%2E` climbs) "Couldn't determine
+> repository path", and the server's root "No repository found". The repository is the longest run of the path's
+> leading segments that names one, as `svn_repos_find_root_path` walks up (a name may hold a `/`): each candidate is
+> asked of the shard its name's partition is on, every shard once (`vcs_svn::locate`, which the `svn+ssh://` tunnel
+> can call too), and a repository another shard owns moves the connection there whole (the socket's handle, the
+> connection with its answer read, its unread bytes and deadline), where it takes a seat as a new connection would
+> (every shard keeps the listener's seats). On the owner a name no Subversion repository has is "No repository
+> found"; a repository is opened with its UUID, its root URL (the client's URL less the components beneath the
+> repository) and the mechanisms it allows, none yet: a client that has not authenticated is no principal (§4.13), and
+> CRAM-MD5 waits on the keyed contexts of enrolled credentials (A-692), so every repository answers as `svnserve`
+> answers one that allows no one. Proven on a two-shard daemon against stock `svnserve` 1.15.0's recorded `no-access`
+> session, a repository on each shard. Owed: the authenticated session's sources, read each call through the shared
+> Subversion lender (g297's) once a mechanism exists; `svn_uri_canonicalize` before the lookup (a stock client's URL
+> is already canonical); the tunnel's own move to the owner (A-688's site, which finds repositories on its shard
+> alone).
 
 **Role.** slates serves stock Subversion clients (the `svn` command line of the 1.x line, and TortoiseSVN and SVNKit,
 which speak the same protocols) as `svnserve` and Apache's `mod_dav_svn` do: over `svn://` (the ra_svn protocol on TCP),

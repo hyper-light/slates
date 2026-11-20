@@ -6,14 +6,15 @@
 //! [`Unserved::BadUrl`]. Its authority is skipped (`svnserve` without `--virtual-host`), and what follows the first `/`
 //! is the path: made a canonical relative path (`svn_relpath_canonicalize`: empty and `.` names dropped), then
 //! percent-decoded (`svn_path_uri_decode`). A path holding a `..` segment would climb out of the server's root, so it is
-//! [`Unserved::BadPath`], checked after the decoding, so `%2E%2E` climbs too. `svnserve` then searches the path's
-//! prefixes for a repository's root (`svn_repos_find_root_path`); here the first segment names the repository, as the
-//! HTTP edge's Subversion site takes it (`SVNParentPath`'s rule), since a name routes to the partition its hash names and
-//! a longest-prefix search would ask every partition (GAPS). A path with no segment names the server's root, where no
-//! repository lives: [`Unserved::NoRepository`]. The repository's root URL, which `repos-info` sends, is the client's
-//! URL less as many trailing components as the path beneath the repository holds (`svn_path_remove_components`).
+//! [`Unserved::BadPath`], checked after the decoding, so `%2E%2E` climbs too. A path with no segment names the
+//! server's root, where no repository lives: [`Unserved::NoRepository`]. `svnserve` then walks up from the whole path
+//! to the first directory that is a repository's root (`svn_repos_find_root_path`): here the names a repository could
+//! have are the path's leading runs of segments joined by `/`, longest first ([`Found::candidates`]), since a
+//! repository's name may hold a `/`. The repository's root URL, which `repos-info` sends, is the client's URL less as
+//! many trailing components as the path beneath the repository holds ([`Found::root_url`],
+//! `svn_path_remove_components`).
 //!
-//! Whether a repository of that name exists, and on which shard, is the caller's to find (the server's listener).
+//! Which candidate names a repository, and on which shard, is the caller's to find (the server's listeners).
 //!
 //! **Not here yet.** `svnserve` canonicalizes the client's URL first (`construct_server_baton`'s
 //! `svn_uri_canonicalize_safe`), which every stock client's URL already is; a URL no stock client sends (an upper-case
@@ -35,24 +36,38 @@ const CURRENT: &[u8] = b".";
 /// Format: the segment that names its parent, which would climb out of the server's root (`repos_path_valid`).
 const PARENT: &[u8] = b"..";
 
-/// Where a client's URL leads beneath the server's root, as `find_repos` resolves it.
+/// Where a client's URL leads beneath the server's root, as `find_repos` resolves it before it searches.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Found {
-  /// The URL as the client sent it, which a refusal names: on the shard that owns the name, a repository of none is
-  /// "No repository found in" it.
+  /// The URL as the client sent it, which a refusal names ("No repository found in" it).
   pub url: Vec<u8>,
-  /// The repository's name: the first segment of the URL's path, decoded.
-  pub name: String,
-  /// The repository's root URL, `repos-info`'s: the client's URL less as many trailing components as the path beneath
-  /// the repository holds.
-  pub root_url: Vec<u8>,
+  /// The path's segments, decoded: at least one, none of them empty, `.` or `..`.
+  pub segments: Vec<Vec<u8>>,
+}
+
+impl Found {
+  /// The names a repository the URL leads into could have, with how many leading segments each takes, longest first:
+  /// `svn_repos_find_root_path`'s walk up from the whole path. A run that is no UTF-8 names no repository and is left
+  /// out.
+  pub fn candidates(&self) -> impl Iterator<Item = (usize, String)> + '_ {
+    (1..=self.segments.len()).rev().filter_map(|depth| {
+      let run = self.segments.get(..depth)?.join(&SEPARATOR);
+      String::from_utf8(run).ok().map(|name| (depth, name))
+    })
+  }
+
+  /// The root URL of the repository whose name takes the path's first `depth` segments: the client's URL less the
+  /// components beneath it.
+  pub fn root_url(&self, depth: usize) -> Vec<u8> {
+    without_components(&self.url, self.segments.len().saturating_sub(depth))
+  }
 }
 
 /// Finds where the client's `url` leads (the module doc).
 ///
 /// # Errors
 /// [`Unserved::BadUrl`] for a URL that is no `svn://` URL; [`Unserved::BadPath`] for a path that climbs with `..`;
-/// [`Unserved::NoRepository`] for the server's root, and for a first segment no repository's name can be (not UTF-8).
+/// [`Unserved::NoRepository`] for the server's root.
 pub fn find_repository(url: &[u8]) -> Result<Found, Unserved<'_>> {
   let after_scheme = skip_scheme_part(url).ok_or(Unserved::BadUrl { url })?;
   let path = after_scheme
@@ -65,17 +80,12 @@ pub fn find_repository(url: &[u8]) -> Result<Found, Unserved<'_>> {
   if segments.contains(&PARENT) {
     return Err(Unserved::BadPath);
   }
-  let no_repository = Unserved::NoRepository { url };
-  let first = segments
-    .first()
-    .filter(|segment| !segment.is_empty())
-    .ok_or(no_repository)?;
-  let name = std::str::from_utf8(first).map_err(|_| no_repository)?;
-  let beneath = segments.len().saturating_sub(1);
+  if segments.iter().all(|segment| segment.is_empty()) {
+    return Err(Unserved::NoRepository { url });
+  }
   Ok(Found {
     url: url.to_vec(),
-    name: name.to_owned(),
-    root_url: without_components(url, beneath),
+    segments: segments.into_iter().map(<[u8]>::to_vec).collect(),
   })
 }
 
