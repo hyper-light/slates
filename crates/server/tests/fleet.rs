@@ -21919,15 +21919,23 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
 }
 
-/// Whether A (`daemons[0]`) holds no floor of `green` for any of `admitted` within the placement deadline.
+/// Whether A (`daemons[0]`) holds no floor of `green` for any of `admitted`, and B (`daemons[1]`) counted the release,
+/// within the placement deadline.
 fn floors_released(daemons: &[Daemon], green: VolumeId, admitted: &[VolumeId]) -> bool {
   let refs: Vec<&Daemon> = daemons.iter().collect();
+  // B counts the release once A's answer is back, which may be after A dropped the floor: both are waited for (the
+  // counter was read at once, and the test failed once in a batch run, 2026-11-20).
   poll_until(&refs, PLACEMENT_DEADLINE, || {
     let floors = daemons[0].work_floors_of(green)?;
+    let counted = daemons[1]
+      .refusals_on_every_shard()?
+      .get("merge.work.admission_released")
+      .is_some_and(|count| *count >= 1);
     Ok(
-      admitted
-        .iter()
-        .all(|work| floors.iter().all(|(held, _)| held != work)),
+      counted
+        && admitted
+          .iter()
+          .all(|work| floors.iter().all(|(held, _)| held != work)),
     )
   })
 }

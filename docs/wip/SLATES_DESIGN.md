@@ -56732,3 +56732,37 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
 - **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
   harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.
+
+### AUD-11 amended — A forwarded write's deferred acceptance is answered by its commit, and the submit's phases are timed (2026-11-20, w-shared for UI goal 93; A-697's release bench; main's ruling of 2026-11-20)
+Applied in the same change to: §4.16 "Commit" (AUD-11's forwarded answer), GAPS (A-247's step two; the sibling waits),
+BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_completion`), `crates/server/src/merge_service.rs`
+(`AwaitingAcceptance::forwarded`, `await_forwarded`, `ForwardedAcceptance`, `resolve_accepted`; the phase counters
+`SUBMIT_JUDGE` and siblings, `PendingMergeRecord::enqueued_ns` and `shipments`), `crates/server/src/xshard.rs`
+(`awaited`, `answer_awaited`), `crates/server/src/work_home.rs` (`SUBMIT_COMPOSE` and siblings),
+`crates/server/tests/fleet.rs`.
+- **What was measured.** A-697's release bench (BENCHMARKS, 2026-11-20): a holder's 4 MiB submit spent 130 ms in its
+  forward against 33 ms of work at the owner. A forwarded write whose acceptance waits for its quorum commit (AUD-11:
+  every forwarded submit at `f >= 1`) slept a heartbeat before its first look at the owner's completion window and
+  looked again each heartbeat, so its answer came at about 100 ms whatever its commit took.
+- **Change.** The forward's exchange, on the control shard, registers an awaited call (`xshard::awaited`) and attaches
+  it to the deferred acceptance on the owner shard (`merge_service::await_forwarded`: the completion if recorded already,
+  else the wait's entry takes the call). `resolve_accepted` answers it with the reply it records, in the same step
+  (`xshard::answer_awaited`, carried as any result is, so from the control shard's own step too). The liveness budget,
+  in the owner's own time, stays the bound; an acceptance that no longer waits (a restart between) answers retryable.
+- **The submit's phases** are counted as pairs (count, nanoseconds; `merge.submit.*`): on the owner the verdict, the
+  chain's append, the placement from enqueue and the input shipments a version took; on a holder the recompute; and on a
+  holder node's own submit the composition, the verdict computed on its replica, the forward and the wait for its
+  replica. `bench_a697_holder_and_local_submit_phases` (ignored, run by its recorded command) prints them a submit.
+- **The sibling sweep (main's order).** Every runtime sleep in `crates/server/src` was read. Waits that sleep before
+  looking at what an event could tell them, owed as their own pieces, each with its own wake: the waits for a lent
+  record session to come back (`forward_lane.rs` `SessionOut`, `fleet.rs` campaign sessions, `owner_location.rs`
+  `wait_for_returning_sessions`, `live_ship.rs`'s one-tick wait); a broadcast's stragglers polled at an interval
+  (`owner_location.rs`); a FUSE mount helper's exit polled at a tick (`fuse.rs`). Test seams (the injected forward
+  silence, serve and content-ack delays, turn pauses) and true timers (deadlines, backoffs, retry delays, the deferred
+  verdicts' timer, the perpetual loops' pace) are not.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_forwarded_submit_is_answered_by_its_commit_not_by_a_poll` (two nodes at `f = 1`, a client on B submitting a work A
+  owns three times: versions 1 to 3, A's attached and answered counters each moved by three, answered in 20.7, 4.4 and
+  4.9 ms, the best within a heartbeat). Red with the waiter never attached: each waited out the liveness budget, about
+  1.02 s. Fleet `a_forwarded_submit` and `a_holder`; `slates-server --lib merge_service:: verbs:: xshard:: work_home`;
+  fmt clean.
