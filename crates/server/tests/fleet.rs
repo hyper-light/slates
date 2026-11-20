@@ -4925,6 +4925,11 @@ struct ThreeMembers {
 
 /// [`ThreeMembers`], started and formed.
 fn three_members() -> ThreeMembers {
+  three_members_sharded(1)
+}
+
+/// [`three_members`] with `shards` shards on each daemon: a test of what a name or an id routes to across partitions.
+fn three_members_sharded(shards: u16) -> ThreeMembers {
   let names = ["a", "b", "c"];
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
     names.iter().map(|name| fleet_node(name)).collect();
@@ -4932,7 +4937,16 @@ fn three_members() -> ThreeMembers {
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let (serve_lease, serve) = mesh_serve_ports(names.len());
-  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    shards,
+    &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
+  );
   let hosts: Vec<HostId> = daemons
     .iter()
     .map(|daemon| daemon.member_identity().unwrap())
@@ -6826,6 +6840,80 @@ fn a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an
     &seen.disk,
     &landed_after_two_moves(),
     &described,
+  );
+}
+
+/// Goal 91's live move (kiln's K4 across runners): a captured clone moved to another node is found there by its name, as
+/// a mount names it. A clone named for another partition than its origin's is reached through an alias that the name's
+/// partition holds (A-236); a move releases the old owner's alias, and the new owner must hold one of its own, or a
+/// `MNT` of the name (routed to the name's partition, `nfs::routed`) finds nothing there and the kernel's mount is
+/// refused `NOENT` (kiln's live-move test, 2026-11-19: four runs of five). Three daemons at `f = 1`. Do: on a, overlay
+/// the captured tree, capture its base, and clone it under a name whose partition is not the clone's; share it with b and
+/// move it there until the move is done. Expect: b serves the clone, and b resolves its name to it as a mount does
+/// (`Daemon::mount_capability`), a's alias gone with its copy.
+#[test]
+fn a_captured_clone_moved_to_another_node_is_found_there_by_its_name() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members_sharded(4);
+  let base = captured_tree_dir();
+  let (served, resolved, answers, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let ReplyBody::Created { id: overlay } = client_a.call(&RequestBody::Create {
+      name: "captured-tree".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: Some(base.path.clone()),
+    }) else {
+      panic!("overlay of the captured tree on node a");
+    };
+    // The clone lives beside its origin, in the partition the overlay's id encodes; its name is chosen to hash to
+    // another partition on b (every daemon here has the same shards), so only an alias there finds it.
+    let clone_partition = u16::from_be_bytes([overlay.bytes[8], overlay.bytes[9]]);
+    let partitions = members.daemons[1].shards().len();
+    assert!(
+      partitions > 1,
+      "the test needs more than one partition, has {partitions}"
+    );
+    let name = (0..64)
+      .map(|n| format!("moved-by-name-{n}"))
+      .find(|name| slates_server::verbs::owner_of_name(name, partitions) != clone_partition)
+      .expect("a name hashing to another partition than the clone's");
+    let captured = client_a.call(&RequestBody::CaptureBase { volume: overlay });
+    let ReplyBody::BaseCaptured { snapshot } = captured else {
+      panic!("capture of the overlay's base: {captured:?}");
+    };
+    let cloned = client_a.call(&RequestBody::Clone {
+      volume: overlay,
+      snapshot,
+      name: name.clone(),
+    });
+    let ReplyBody::Cloned { id: clone } = cloned else {
+      panic!("clone {name} of the captured snapshot: {cloned:?}");
+    };
+    share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
+    poll_until(&fleet, SERVE_DEADLINE, || {
+      Ok(move_counter(&members.daemons[0], CARRY_RECORDED)? >= 1)
+    });
+    let (moved, answers) = move_until_done(&fleet, &mut client_a, clone, members.hosts[1]);
+    assert!(moved, "the move to b was done: {answers:?}");
+    let mut client_b = Client::connect(&members.instances[1]);
+    let (served, _) = read_back(&fleet, &mut client_b, clone, &[("/kept", KEPT_AS_CAPTURED)]);
+    let mut resolved = None;
+    poll_until(&fleet, SERVE_DEADLINE, || {
+      resolved = Some(members.daemons[1].mount_capability(&name));
+      Ok(matches!(resolved, Some(Ok(Some(_)))))
+    });
+    (served, resolved, answers, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(served, "b serves the moved clone; {described}");
+  assert!(
+    matches!(resolved, Some(Ok(Some(_)))),
+    "b resolves the moved clone's name as a mount does: {resolved:?} (move: {answers:?}); {described}"
   );
 }
 
