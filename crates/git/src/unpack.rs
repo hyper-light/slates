@@ -573,19 +573,21 @@ impl crate::store::learn::Clock for Unhurried {
   }
 }
 
-/// The waiting deltas' resolution between its turns (A-724's starvation fix): their table by base, the deltas resolved
-/// whose own children are still to look for, the next entry whose children are, and whether the deltas on bases outside
-/// the pack are done. So a pack whose deltas all wait for a late base resolves them a turn at a time, never in one poll.
+/// The waiting deltas' resolution between its turns (A-724's starvation fix): their table by base, the deltas found
+/// waiting on a resolved base and still to apply, the next entry whose waiting children are looked for, and the next
+/// row of the table looked at for a base outside the pack. A unit of a turn applies one delta, or lists one entry's
+/// waiting children, so a pack whose deltas all wait for one late base resolves them a turn at a time, never in one poll
+/// (a base with 64 waiting children took one unit before: `tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time`).
 #[derive(Debug, Default)]
 struct Resolving {
   /// The waiting deltas, by their base's key, sorted.
   waiting: Vec<(Key, usize)>,
-  /// Deltas resolved whose children are still to look for.
-  stack: Vec<usize>,
-  /// The next entry, in pack order, whose children are looked for.
+  /// Deltas waiting on a resolved base, still to apply: (the base's entry, the delta's).
+  pending: Vec<(usize, usize)>,
+  /// The next entry, in pack order, whose waiting children are listed.
   next: usize,
-  /// Whether the deltas on bases outside the pack are resolved.
-  outside: bool,
+  /// The next row of `waiting` looked at for a base outside the pack; its length once all are.
+  outside: usize,
 }
 
 impl<'index, L: Locate + ?Sized> Reader<'index, L> {
@@ -1099,20 +1101,19 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         if count == 0 {
           self.resolving = Some(Resolving {
             next: self.entries.len(),
-            outside: true,
             ..Resolving::default()
           });
           return Ok(true);
         }
         let waiting = self.waiting_table(count, admission)?;
         charge_items::<usize>(admission, count)?;
-        let mut stack = Vec::new();
-        reserve(&mut stack, count)?;
+        let mut pending = Vec::new();
+        reserve(&mut pending, count)?;
         Resolving {
           waiting,
-          stack,
+          pending,
           next: 0,
-          outside: false,
+          outside: 0,
         }
       }
     };
@@ -1123,33 +1124,23 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
         break false;
       }
       units = units.saturating_add(1);
-      if let Some(child) = resolving.stack.pop() {
-        self.resolve_children(
-          child,
-          &resolving.waiting,
-          &mut resolving.stack,
-          (admission, &mut *keep),
-        )?;
+      if let Some((parent, child)) = resolving.pending.pop() {
+        if self.resolve_child(parent, child, (admission, &mut *keep))? {
+          self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+        }
         continue;
       }
       if resolving.next < self.entries.len() {
         let entry = resolving.next;
         resolving.next = resolving.next.saturating_add(1);
-        self.resolve_children(
-          entry,
-          &resolving.waiting,
-          &mut resolving.stack,
-          (admission, &mut *keep),
-        )?;
+        self.list_children(entry, &resolving.waiting, &mut resolving.pending)?;
         continue;
       }
-      if !resolving.outside {
-        resolving.outside = true;
-        self.resolve_outside(
-          &resolving.waiting,
-          &mut resolving.stack,
-          (admission, &mut *keep),
-        )?;
+      if let Some((key, child)) = resolving.waiting.get(resolving.outside).copied() {
+        resolving.outside = resolving.outside.saturating_add(1);
+        if self.resolve_outside(key, child, (admission, &mut *keep))? {
+          self.list_children(child, &resolving.waiting, &mut resolving.pending)?;
+        }
         continue;
       }
       break true;
@@ -1197,14 +1188,13 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
     Ok(table)
   }
 
-  /// Applies every waiting delta whose base is the entry at `parent`, once it is resolved, by its position and by its
-  /// name; each one resolved goes on `stack`, so its own children follow.
-  fn resolve_children<K: Keep + ?Sized>(
-    &mut self,
+  /// Lists the deltas still waiting on the entry `parent`, once it is resolved, as pending under it (by its position and
+  /// its id): each is listed only while it waits, so no delta is listed twice before it is applied.
+  fn list_children(
+    &self,
     parent: usize,
     waiting: &[(Key, usize)],
-    stack: &mut Vec<usize>,
-    (admission, keep): (&mut Admission, &mut K),
+    pending: &mut Vec<(usize, usize)>,
   ) -> Result<(), Refusal> {
     let Some(Record {
       state: State::Resolved(resolved),
@@ -1217,61 +1207,59 @@ impl<'index, L: Locate + ?Sized> Reader<'index, L> {
       let start = waiting.partition_point(|(base, _)| *base < key);
       let children = waiting.get(start..).unwrap_or_default();
       for (_, child) in children.iter().take_while(|(base, _)| *base == key) {
-        if self.resolve_child(parent, *child, (admission, &mut *keep))? {
-          stack.push(*child);
+        if matches!(
+          self.entries.get(*child).map(|record| &record.state),
+          Some(State::Waiting(_))
+        ) {
+          if pending.len() == pending.capacity() {
+            reserve(pending, pending.len().max(1))?;
+          }
+          pending.push((parent, *child));
         }
       }
     }
     Ok(())
   }
 
-  /// Applies the deltas still waiting for a base named outside the pack: one table group at a time, the base taken from
-  /// the keeper's outside when it holds it (copied, as the keeper then takes what it makes), each delta resolved then
-  /// its own children as the pack's are.
+  /// Applies the delta at `child`, if it still waits on the base `key` names outside the pack and the keeper's outside
+  /// holds that base (copied, as the keeper then takes what it makes): whether it resolved, its own children then listed
+  /// by the caller as the pack's are.
   fn resolve_outside<K: Keep + Outside + ?Sized>(
     &mut self,
-    waiting: &[(Key, usize)],
-    stack: &mut Vec<usize>,
+    key: Key,
+    child: usize,
     (admission, keep): (&mut Admission, &mut K),
-  ) -> Result<(), Refusal> {
-    for (key, child) in waiting {
-      let Key::Id(id) = key else {
-        continue;
-      };
-      if !matches!(
-        self.entries.get(*child).map(|record| &record.state),
-        Some(State::Waiting(_))
-      ) {
-        continue;
-      }
-      let Some((kind, content)) = keep.object(id) else {
-        continue;
-      };
-      let (content, hold) = held_while(admission, |admission| {
-        admission
-          .charge(to_u64(content.len()))
-          .map_err(Refusal::PastAdmission)?;
-        let mut owned = Vec::new();
-        reserve(&mut owned, content.len())?;
-        owned.extend_from_slice(content);
-        Ok(owned)
-      })?;
-      let source = Source {
-        kind,
-        id: *id,
-        content: &content,
-        depth: 0,
-      };
-      let resolved = self.resolve_child_on(source, *child, (admission, &mut *keep))?;
-      keep.release(hold, admission);
-      if resolved {
-        stack.push(*child);
-        while let Some(next) = stack.pop() {
-          self.resolve_children(next, waiting, stack, (admission, &mut *keep))?;
-        }
-      }
+  ) -> Result<bool, Refusal> {
+    let Key::Id(id) = key else {
+      return Ok(false);
+    };
+    if !matches!(
+      self.entries.get(child).map(|record| &record.state),
+      Some(State::Waiting(_))
+    ) {
+      return Ok(false);
     }
-    Ok(())
+    let Some((kind, content)) = keep.object(&id) else {
+      return Ok(false);
+    };
+    let (content, hold) = held_while(admission, |admission| {
+      admission
+        .charge(to_u64(content.len()))
+        .map_err(Refusal::PastAdmission)?;
+      let mut owned = Vec::new();
+      reserve(&mut owned, content.len())?;
+      owned.extend_from_slice(content);
+      Ok(owned)
+    })?;
+    let source = Source {
+      kind,
+      id,
+      content: &content,
+      depth: 0,
+    };
+    let resolved = self.resolve_child_on(source, child, (admission, &mut *keep))?;
+    keep.release(hold, admission);
+    Ok(resolved)
   }
 
   /// Applies the delta at `child`, if still waiting, to `source`, an object outside the pack, and hands what it makes

@@ -1075,12 +1075,57 @@ impl crate::store::learn::Clock for Ticking {
   }
 }
 
+/// Shape: a resolution turn's budget, in units of the ticking clock (one unit of work a read).
+const BUDGET: u64 = 4;
+
+/// The objects `held` keeps.
+fn kept(held: &super::Held) -> u64 {
+  held.objects.iter().flatten().count() as u64
+}
+
+/// Resolves `reader`'s waiting deltas in turns of [`BUDGET`] on a ticking clock: the turns taken, and how many resolved
+/// more than their budget.
+fn in_turns(
+  reader: &mut Reader<'_, Placed>,
+  admission: &mut Admission,
+  held: &mut super::Held,
+) -> (u32, u32) {
+  let mut clock = Ticking(0);
+  let (mut turns, mut past_budget) = (0u32, 0u32);
+  loop {
+    turns += 1;
+    assert!(turns <= 1_000, "the resolution never ended");
+    let before = kept(held);
+    let quantum = crate::store::hook_view::Quantum {
+      clock: &mut clock,
+      ns: BUDGET,
+    };
+    let done = reader
+      .resolve_turn(
+        admission,
+        &mut Beside {
+          outside: &NoObjects,
+          held: &mut *held,
+        },
+        quantum,
+      )
+      .unwrap();
+    if kept(held) - before > BUDGET {
+      past_budget += 1;
+    }
+    if done {
+      return (turns, past_budget);
+    }
+  }
+}
+
 /// A-724's starvation fix (found by use: a push's last input step resolved every delta waiting on a late base in one
 /// poll, 1,435.7 ms for git/git v1.5.0 on the 32-core Studio, starving the small repositories on its shard and ending
-/// the daemon at ten such pushes). Do: read whole a pack of 64 reference deltas whose base comes last, then resolve its
-/// waiting deltas with a turn of one nanosecond on a clock that ticks each read. Expect: many turns, each resolving at
-/// least one delta and returning; every delta resolved at the end, each object as reading the pack whole in one call
-/// makes it; and the pack then finished with nothing left to resolve.
+/// the daemon at ten such pushes). Do: read a pack of 64 reference deltas whose base comes last (the input step), then
+/// resolve its waiting deltas in turns of a budget of four units on a clock that ticks each read, counting each step
+/// that resolved more than its budget. Expect: the past-budget count 0 for the input step (it resolves none of the 64:
+/// before the fix it resolved all of them, past any budget) and 0 over every turn after it; many turns; every object as reading the pack whole in one call makes it; and the pack then finished with
+/// nothing left to resolve.
 #[test]
 fn deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time() {
   let format = ObjectFormat::Sha256;
@@ -1112,32 +1157,13 @@ fn deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time() {
     )
     .unwrap();
   assert!(reader.is_whole());
-  let mut clock = Ticking(0);
-  let mut turns = 0u32;
-  loop {
-    turns += 1;
-    assert!(turns <= 1_000, "the resolution never ended");
-    let quantum = crate::store::hook_view::Quantum {
-      clock: &mut clock,
-      ns: 1,
-    };
-    let done = reader
-      .resolve_turn(
-        &mut admission,
-        &mut Beside {
-          outside: &NoObjects,
-          held: &mut held,
-        },
-        quantum,
-      )
-      .unwrap();
-    if done {
-      break;
-    }
-  }
+  let input_step = kept(&held);
+  assert_eq!(input_step, 1, "the input step resolved waiting deltas");
+  let (turns, past_budget) = in_turns(&mut reader, &mut admission, &mut held);
+  assert_eq!(past_budget, 0, "turns past their budget");
   assert!(
-    turns >= 32,
-    "64 waiting deltas resolved in {turns} turns of one nanosecond"
+    turns >= 16,
+    "64 waiting deltas resolved in {turns} turns of {BUDGET} units"
   );
   for (at, object) in whole.objects.iter().enumerate() {
     let kept = held.take(at).expect("each object kept");
