@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
 # single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
 # loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
 # a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
@@ -12,7 +12,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "8dff8fcad238b37a69f2ae093da300840d14a055 379dfe750ab544863961af458be3075eb365efca f2081a3c8cc6924ba4c16471ea07b1919b6a6097 a5233e228978b8e60ccc0306c54b440564596807"
+  ARMS: "f2081a3c8cc6924ba4c16471ea07b1919b6a6097 b207f2321f60f1bcfb19738389702a99ac425673 63c55ffd546ae1e8f5b236b52092ff3da0a999d4 4b1d1a287877ede75b62a8832747b2111aa0ce34 fa995b7bbe41158b8b6cacaa0a84971a3944bcf9 4edc73b77c0dd5609338cd9e52dc7a93351ecfc6 b705a24c55040fe00da012b557bf2d0d99f9b50f ffecc5bcc8ee9301b9732d23e6d7784d0d577716 a5233e228978b8e60ccc0306c54b440564596807"
   ROUNDS: "3"
 
 jobs:
@@ -86,7 +86,7 @@ jobs:
           else
             echo "cap: none (the harness's own spinners, two a core)" | tee "$W/capnote"
           fi
-      - name: Interleaved rounds, loaded then quiet
+      - name: Interleaved rounds, quiet
         run: |
           W="$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/msr"; EXE=""; [ "${RUNNER_OS}" = Windows ] && EXE=".exe"
           load() { uptime 2>/dev/null || powershell -NoProfile -Command "(Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average" 2>/dev/null; }
@@ -102,24 +102,7 @@ jobs:
           EOS
           chmod +x "$W/loaded.sh"
           set +e
-          order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{print $3, $1, $4, $2}';; esac; }
-          for round in $(seq 1 "$ROUNDS"); do
-            for arm in $(order $round); do
-              s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/loaded-$s-r$round.log"
-              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
-              if [ "${RUNNER_OS}" = Linux ]; then
-                if [ "$(cat "$W/constraint")" = systemd ]; then
-                  MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
-                  timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
-                else
-                  timeout 1200 taskset -c 0,1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
-                fi
-              else
-                perl -e 'alarm shift; exec @ARGV' 1200 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
-              fi
-              echo "exit $?" >> "$L"; grep -E "goal|WRONG|ratchet-info|exit" "$L" | cut -c1-220
-            done
-          done
+          order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
           for round in $(seq 1 "$ROUNDS"); do
             for arm in $(order $round); do
               s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/quiet-$s-r$round.log"
