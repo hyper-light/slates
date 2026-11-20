@@ -55933,6 +55933,26 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
+- **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
+  (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
+  the content store as it was admitted: a v1.5.0 record held its 304.6 MiB of objects twice at its replay's peak.
+- **Change.** The replay reads its record's pack a chunk at a time into a site of its own (`git_replay::Site`: a
+  queue by pack position, the push and the repository read only through the live intake's `Quarantined`, the
+  repository's objects as a thin pack's bases), each chunk's bytes added to the push's own copy of the pack
+  (`Push::extend_pack`) and each object admitted as it resolves where it lies there (`admit_object` with its offset,
+  `Push::keep_read`), its hold given back; the waiting deltas resolve a unit at a time (`Reader::resolve_turn`) and are
+  admitted the same way; `Reader::finish_into` ends the pack. Its names are compared as sets (the replay order fix
+  above), so admitting in its own turns' order is the live push's own. Staging then puts what lands in resolution order,
+  as a live push's does.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic: a v1.5.0 push, then its repository's store made
+  again from the log, each replay turn 1 ms): the process's peak RSS grew by 189.6 MiB across the replay before (772.6
+  to 962.2 MiB, 2,712 turns) and by 0.1 MiB after (781.8 to 781.9 MiB, 1,921 turns, 2.43 s); the content store's peak
+  is 309.0 MiB either way, what lands. The time before (6.39 s) was taken with every core busy, so the turns and the
+  resident bytes are the comparison.
+- **Tests.** `slates-server --lib -- git vcs_store` 163 passed, the replays of `t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  and `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` among them (kiln, adas-mac-studio.local-2).
+
 ### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
 - **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
   in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
