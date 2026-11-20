@@ -179,3 +179,19 @@ engine/branch.rs (branch_at, Lent, retire, release_step).
   8,498 release / 29,177 debug steps, ~10 s at load 60 for ms of CPU). Red: N cheap units take ~work/quantum steps, not
   N; longest step under the quantum. After A-760 part 2 (not quick: git's Quantum paths and the shard's quantum size
   are in it too).
+## A-760 part 2 (main's start, ~13:00) -- PLAN (RSS bounded by a slice, not the file)
+Facts read: Blocks::add moves a Vec (no copy), so a file's insert is O(1); make_mapped's apply copies the whole file;
+merge_create builds a created file's bytes in the verdict (only needed to compare with an existing file);
+hold_computed clones inc.post_state into Judged (a whole copy); part 1's read_step reads runs into the post-state (a
+transient whole copy). So today a named 500 MB text exists 3x at peak (plane, post-state, green file).
+Build order:
+1. Staging in the green's arena: Green::stage_named(&inc, &objects, slice) reads each named run straight into an
+   unreferenced Blocks slot (reserved at its length, pages made as written), a slice a step; Staged { runs: Vec<Block> }.
+2. One read view Post<'_> { inline: &[u8], runs: staged blocks } replacing every engine &[u8] post-state reader
+   (apply, span_bytes, post_slice, special_payload, lands_on_head, merge_*, copy.rs, stack judge identical).
+3. merge_create: bytes lazy (len from declared ops; bytes only when a file stands there to compare).
+4. Judged carries the inline post-state and the staged blocks (handles), never a whole clone.
+5. Publish: make_mapped takes a whole-text run's block as the file (Files::insert_block, holders), copies a slice a
+   unit only for a partial splice (staged too); commit O(files).
+6. Server: Objects over vcs_store's plane (identity -> object root map); land turns; replay reads runs first.
+Red: a focused server test landing a large named text: no step past the quantum, RSS growth <= file + slice.
