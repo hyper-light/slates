@@ -67,9 +67,8 @@
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
 //! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); a Mercurial push's record and its replay (A-680 part 2c: an import's replays
-//! since A-687, [`replay_hg`]; a push lands into the arm, `repository::hg_push::land`, its entry holding none yet); the
-//! Subversion index charged by the bytes it holds, once
+//! today, as a commit is one step); a Mercurial push's obsmarkers in its record (its revisions replay since
+//! A-680 part 2c, as an import's since A-687, [`replay_hg`]); the Subversion index charged by the bytes it holds, once
 //! slates-svn measures them (its entries are bounded meanwhile); a version's pack fragments encoded again after a
 //! recovery, off the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same
 //! records (A-636).
