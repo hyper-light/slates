@@ -95,6 +95,12 @@
 >
 > **A-704 (2026-11-20, g309; a push past one ring region).** BUILT: a push is admitted what its shard can hold (`git_push::push_room`), a room refusal in git's `receive.maxInputSize` words. Owed: the unpack into the quarantine a slice at a time; the whole git/git push end to end (main's run).
 >
+> **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
+> holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
+> room with typed refusals. OWED: slice 1b a green op that sets a path from a held identity reusing its block; 1c the
+> table in the green's checkpoint (recovery, replication); 2-3 svn records naming texts by identity and reading them
+> here (the log entry's text bytes dropped); git's and hg's intakes holding by bytes.
+>
 > **A-718 (2026-11-20, w-perf, UI goal 93; §4.17.2 "A push" item 8):** a pushed version's fragments are encoded once,
 > by the first fetch after its push, before its answer (`vcs_store::git_encode`, driven through `StoreLender::encode` on
 > both edges), and kept as content charged to the shard; later fetches copy them. OWED: the encoding from the push's own
