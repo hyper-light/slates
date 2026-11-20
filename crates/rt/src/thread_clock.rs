@@ -1108,3 +1108,39 @@ mod tests {
     );
   }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod w_forming_probe {
+  //! Throwaway measurement (w-forming, 2026-11-20; not for landing): one `read` of another thread's clock.
+  #[test]
+  #[allow(clippy::disallowed_methods)]
+  fn w_forming_probe_read_cost() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+      scope.spawn(|| {
+        tx.send(super::current()).unwrap();
+        let mut x = 0u64;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+          x = x.wrapping_add(1);
+          std::hint::black_box(x);
+        }
+      });
+      let handle = rx.recv().unwrap().unwrap();
+      let mut costs = Vec::new();
+      for _ in 0..20_000 {
+        let t = std::time::Instant::now();
+        std::hint::black_box(super::read(handle));
+        costs.push(t.elapsed().as_nanos() as u64);
+      }
+      stop.store(true, std::sync::atomic::Ordering::Relaxed);
+      costs.sort_unstable();
+      let at = |q: f64| costs[((costs.len() - 1) as f64 * q) as usize];
+      let total: u64 = costs.iter().sum();
+      println!(
+        "W_FORMING_PROBE reads {} total {} us p50 {} ns p99 {} ns p999 {} ns max {} ns",
+        costs.len(), total / 1000, at(0.5), at(0.99), at(0.999), costs[costs.len() - 1]
+      );
+    });
+  }
+}

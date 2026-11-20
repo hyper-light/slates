@@ -176,29 +176,80 @@ fn take_round(state: &mut ShardState) -> Option<Round> {
 /// (A-222, A-554: `remote_attach::look_for_departures`), since a departed host's clients are dead clients no watch here
 /// can see; and it sends the NFSv4 purges its shard's table owes when the keeper hands it a round (A-570,
 /// `crate::nfs::owe_purge_round`). One task a shard, made at its start; it ends with the shard's state.
+/// Throwaway probe (w-forming, 2026-11-20; not for landing): logs any poll of `future` of 50 ms or more under `name`.
+async fn w_forming_probe_polls<T>(name: &'static str, future: impl std::future::Future<Output = T>) -> T {
+  let mut future = std::pin::pin!(future);
+  std::future::poll_fn(|cx| {
+    let polled = std::time::Instant::now();
+    let answer = future.as_mut().poll(cx);
+    let took = polled.elapsed();
+    if took >= std::time::Duration::from_millis(50) {
+      eprintln!("W_FORMING_PROBE reaper section {name}: one poll {} ms", took.as_millis());
+    }
+    answer
+  })
+  .await
+}
+
 pub(crate) async fn reaper() {
   if state::with_state(|state| state.reaper_task = slates_rt::futures::current_task()).is_none() {
     return;
   }
   let mut deferred: VecDeque<(Handle<ClientSlot>, u32)> = VecDeque::new();
   loop {
-    if serve_owed_looks().await.is_none() {
+    if w_forming_probe_polls("serve_owed_looks", serve_owed_looks()).await.is_none() {
       return;
     }
-    let Some(round) = state::with_state(take_round) else {
+    let Some(round) = w_forming_probe_polls("take_round", async { state::with_state(take_round) }).await else {
       return;
     };
     let Some(round) = round else {
-      if idle_until_owed(&mut deferred).await.is_none() {
+      if w_forming_probe_polls("idle_until_owed", idle_until_owed(&mut deferred)).await.is_none() {
         return;
       }
       continue;
     };
-    for (seat, client_id) in round.clients {
-      if !retire(round.origin, &round.shards, round.batch, seat, client_id).await {
-        deferred.push_back((seat, client_id));
+    let probe_clients = round.clients.len();
+    let probe_shards = round.shards.len();
+    crate::xshard::W_FORMING_PROBE.with(|probe| *probe.borrow_mut() = (0, 0, 0, 0));
+    let probe_began = std::time::Instant::now();
+    let mut probe_polls = 0u64;
+    let mut probe_max_poll_ns = 0u64;
+    let mut probe_sum_poll_ns = 0u64;
+    let mut probe_round = std::pin::pin!(async {
+      let mut deferred_now = Vec::new();
+      for (seat, client_id) in round.clients {
+        if !retire(round.origin, &round.shards, round.batch, seat, client_id).await {
+          deferred_now.push((seat, client_id));
+        }
       }
-    }
+      deferred_now
+    });
+    let deferred_now = std::future::poll_fn(|cx| {
+      let polled = std::time::Instant::now();
+      let answer = probe_round.as_mut().poll(cx);
+      let took = u64::try_from(polled.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      probe_polls = probe_polls.saturating_add(1);
+      probe_sum_poll_ns = probe_sum_poll_ns.saturating_add(took);
+      probe_max_poll_ns = probe_max_poll_ns.max(took);
+      if took >= 50_000_000 {
+        eprintln!("W_FORMING_PROBE reaper section round: one poll {} ms", took / 1_000_000);
+      }
+      answer
+    })
+    .await;
+    deferred.extend(deferred_now);
+    let (calls, inline, new_ns, new_max_ns) = crate::xshard::W_FORMING_PROBE.with(|probe| *probe.borrow());
+    slates_machine::log_line!(
+      "W_FORMING_PROBE reap round: {probe_clients} clients over {probe_shards} shards; {} ms wall; {probe_polls} polls, \
+       longest {} us, polled {} us in all; {calls} cross-shard calls ({inline} inline); ShardTime::new {} us in all, \
+       longest {} us",
+      probe_began.elapsed().as_millis(),
+      probe_max_poll_ns / 1_000,
+      probe_sum_poll_ns / 1_000,
+      new_ns / 1_000,
+      new_max_ns / 1_000
+    );
     slates_rt::futures::yield_now().await;
   }
 }
@@ -211,7 +262,7 @@ async fn serve_owed_looks() -> Option<()> {
   // (A-554).
   let departures = state::with_state(|state| std::mem::take(&mut state.departures_owed))?;
   if departures {
-    crate::remote_attach::sweep_departed().await;
+    w_forming_probe_polls("sweep_departed", crate::remote_attach::sweep_departed()).await;
   }
   // A taken-back map no holder claimed within the reconnect budget is reclaimed as a dead client's maps are (A-197),
   // owed by the keeper at its claim's deadline (A-554). Linux alone takes such maps back.
@@ -220,7 +271,7 @@ async fn serve_owed_looks() -> Option<()> {
   // A purge round the NFSv4 table owes its owners, handed over by the keeper at its deadline (A-570).
   let purges = state::with_state(|state| std::mem::take(&mut state.nfs_purge_owed))?;
   if purges {
-    crate::nfs::purge_owed_here().await;
+    w_forming_probe_polls("nfs_purge_owed_here", crate::nfs::purge_owed_here()).await;
   }
   Some(())
 }

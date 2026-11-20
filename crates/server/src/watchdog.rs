@@ -799,6 +799,9 @@ fn run(
   let mut said_control_ended = false;
   let mut stopping = false;
   let mut lateness = Lateness::default();
+  // Throwaway probe (w-forming, 2026-11-20; not for landing): per shard, the steps and polling word last seen, since
+  // when, the shard's CPU then, and whether this held poll was told.
+  let mut w_forming_held: Vec<Option<(u64, u64, u64, u64, bool)>> = vec![None; holders.len()];
   loop {
     match stop.recv_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS)) {
       Err(RecvTimeoutError::Timeout) => {}
@@ -810,6 +813,33 @@ fn run(
       control_ended = true;
     }
     let now = clock.monotonic_ns();
+    for (holder, held) in holders.iter().zip(w_forming_held.iter_mut()) {
+      let Some((steps, word)) = slates_rt::registry::with_entry(holder.shard(), |entry| {
+        (entry.pulse.steps(), entry.pulse.polling_word())
+      }) else {
+        continue;
+      };
+      let cpu = slates_rt::registry::shard_cpu(*holder).map_or(0, |reading| reading.spent_ns);
+      match held {
+        Some((seen_steps, seen_word, since, cpu_then, told)) if *seen_steps == steps && *seen_word == word => {
+          if !*told
+            && now.saturating_sub(*since) >= 300_000_000
+            && cpu.saturating_sub(*cpu_then) >= 100_000_000
+          {
+            *told = true;
+            eprintln!(
+              "W_FORMING_PROBE_HELD pid={} shard={} held_ms={} cpu_ms={} task={}",
+              std::process::id(),
+              holder.shard(),
+              now.saturating_sub(*since) / 1_000_000,
+              cpu.saturating_sub(*cpu_then) / 1_000_000,
+              polling_words(holder.shard())
+            );
+          }
+        }
+        _ => *held = Some((steps, word, now, cpu, false)),
+      }
+    }
     let late_ns = lateness.look(now);
     // How late this thread's own looks come, at their p99 (A-474): a gap they explain is no span it did not watch.
     let watcher_late_ns = lateness.p99_ns();

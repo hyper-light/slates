@@ -343,13 +343,31 @@ pub(crate) async fn sweep_departed() {
   let mut settled = true;
   for shard in shards {
     let anchors = gone.clone();
+    let probe_anchors = anchors.len();
+    let probe_began = std::time::Instant::now();
     let ended = crate::xshard::call_in_shard_time(
       control,
       shard,
-      move |state| end_hosts(state, &anchors),
+      move |state| {
+        let began = std::time::Instant::now();
+        let answer = end_hosts(state, &anchors);
+        eprintln!(
+          "W_FORMING_PROBE end_hosts on shard {}: {:?} ended in {} us (one call, inline {})",
+          state.shard,
+          answer,
+          began.elapsed().as_micros(),
+          state.shard == control
+        );
+        answer
+      },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
+    eprintln!(
+      "W_FORMING_PROBE sweep_departed: {probe_anchors} departed anchors, shard {shard} answered {:?} after {} us",
+      ended,
+      probe_began.elapsed().as_micros()
+    );
     if !matches!(ended, Some(Ok(_))) {
       settled = false;
     }

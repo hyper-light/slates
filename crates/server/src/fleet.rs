@@ -7030,7 +7030,12 @@ const LOOP_SPAWN_REFUSED: &str = "fleet.loop_spawn";
 /// would hold the shard's shutdown); a spawn the arena refuses is counted under `refused` — a refusal is
 /// counted, never swallowed (§4.14, banned item 9). Before this every fleet loop's spawn was `if let Ok`,
 /// so a refused loop left a node silently without a plane, a peer link or its coordinator.
-fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refused: &'static str) {
+fn spawn_detached<F: std::future::Future<Output = ()> + 'static>(future: F, refused: &'static str) {
+  // Throwaway probe (w-forming, 2026-11-20; not for landing): label the loop by its future's type.
+  let future = async move {
+    let _doing = futures::doing(std::any::type_name::<F>());
+    future.await
+  };
   match futures::spawn(future) {
     Ok(task) => {
       let _ = futures::detach(task);

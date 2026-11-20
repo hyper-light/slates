@@ -246,6 +246,11 @@ impl Pulse {
     crate::label::Polling::unpack(self.polling.load(Ordering::Relaxed))
   }
 
+  /// Throwaway probe (w-forming, 2026-11-20; not for landing): the raw polling word.
+  pub fn polling_word(&self) -> u64 {
+    self.polling.load(Ordering::Relaxed)
+  }
+
   /// The owning shard records its driver-wait count as it enters a wait.
   pub fn record_waits(&self, waits: u64) {
     self.waits.store(waits, Ordering::Relaxed);

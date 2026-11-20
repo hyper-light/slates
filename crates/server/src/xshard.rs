@@ -37,6 +37,12 @@ use std::task::{Context, Poll, Waker};
 use slates_rt::control::Control;
 use slates_rt::error::RtError;
 use slates_rt::registry;
+
+thread_local! {
+  // Throwaway probe (w-forming, 2026-11-20; not for landing): calls, inline calls, ShardTime::new ns total and max.
+  pub(crate) static W_FORMING_PROBE: RefCell<(u64, u64, u64, u64)> = const { RefCell::new((0, 0, 0, 0)) };
+}
+
 use slates_rt::task::SpawnRequest;
 
 use crate::state::{self, ShardState};
@@ -1080,6 +1086,8 @@ where
   F: Future<Output = T> + 'static,
 {
   let work = async move {
+    // Throwaway probe (w-forming, 2026-11-20; not for landing): label the work by its future's type.
+    let _doing = slates_rt::futures::doing(std::any::type_name::<F>());
     let result = start().await;
     let back = SpawnRequest::new(
       Box::pin(async move {
@@ -1119,8 +1127,18 @@ pub async fn within_shard_time<T: 'static>(
   mut call: CrossShardCall<T>,
   budget_ns: u64,
 ) -> Option<T> {
+  let probe_began = std::time::Instant::now();
   let mut time = registry::holder_of(call.target)
     .map(|holder| crate::observe::ShardTime::new(holder, budget_ns));
+  let probe_new_ns = u64::try_from(probe_began.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  let probe_inline = call.ready.is_some();
+  W_FORMING_PROBE.with(|probe| {
+    let mut probe = probe.borrow_mut();
+    probe.0 = probe.0.saturating_add(1);
+    probe.1 = probe.1.saturating_add(u64::from(probe_inline));
+    probe.2 = probe.2.saturating_add(probe_new_ns);
+    probe.3 = probe.3.max(probe_new_ns);
+  });
   let mut window_ns = budget_ns;
   loop {
     match slates_rt::futures::within(window_ns, &mut call).await {

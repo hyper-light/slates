@@ -2194,6 +2194,16 @@ fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Opt
     task.long_steps = task.long_steps.saturating_add(1);
   }
   task.longest_step_ns = task.longest_step_ns.max(elapsed);
+  // Throwaway probe (w-forming, 2026-11-20; not for landing): name every poll of 200 ms or more.
+  if elapsed >= 200_000_000 {
+    eprintln!(
+      "W_FORMING_PROBE long poll: {} ms in task {:?} (its poll {}, attributed {:?})",
+      elapsed / 1_000_000,
+      crate::label::label_of(task.label),
+      task.polls,
+      attributed
+    );
+  }
   if done {
     finish(inner, local, slot, Outcome::Completed);
     return Some(future);
