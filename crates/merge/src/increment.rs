@@ -498,52 +498,151 @@ struct Entity {
   clobbered: bool,
 }
 
-/// The index of the live entity at `path`, if any.
-fn live_index(entities: &[Entity], path: &str) -> Option<usize> {
-  entities.iter().position(|e| e.live && e.final_path == path)
+/// A replay's entities with the indexes its operations look them up by (A-752): the live entity at each path, the base
+/// paths any entity came from, the base file at its own path that an unlink left (a recreate's target), and the base's
+/// file lengths. Each operation looks up what it touches in O(log n), where a scan of every entity and every base file
+/// made a push of n files cost O(n^2): a flat 3,500-file push composed in 127 ms, 7,000 in 458 ms (debug, Mac Studio,
+/// 2026-11-20), past a shard's step.
+struct Entities<'b> {
+  /// The entities, in the order the replay made them (what the seal emits by).
+  list: Vec<Entity>,
+  /// The live entity at each path: at most one, since a create refuses over one and a rename clobbers its destination.
+  live: std::collections::BTreeMap<String, usize>,
+  /// Every base path an entity came from (a base file materialized, or re-rooted by a rename over it).
+  origins: std::collections::BTreeSet<String>,
+  /// The base file an unlink left at its own path, neither recreated nor clobbered: at most one a path.
+  unlinked: std::collections::BTreeMap<String, usize>,
+  /// The base's file lengths by path.
+  base: std::collections::BTreeMap<&'b str, u64>,
 }
 
-/// The base content length of `path`, if it existed at base.
-fn base_len_of(base: &Base, path: &str) -> Option<u64> {
-  base
-    .files
-    .iter()
-    .find(|(candidate, _)| candidate == path)
-    .map(|(_, len)| *len)
-}
+impl<'b> Entities<'b> {
+  /// None yet, over `base`.
+  fn over(base: &'b Base) -> Entities<'b> {
+    Entities {
+      list: Vec::new(),
+      live: std::collections::BTreeMap::new(),
+      origins: std::collections::BTreeSet::new(),
+      unlinked: std::collections::BTreeMap::new(),
+      base: base
+        .files
+        .iter()
+        .map(|(path, len)| (path.as_str(), *len))
+        .collect(),
+    }
+  }
 
-/// Whether `path`'s base file has already been materialized into an entity (so it cannot be
-/// materialized again).
-fn consumed(entities: &[Entity], path: &str) -> bool {
-  entities.iter().any(|e| e.origin.as_deref() == Some(path))
+  /// The index of the live entity at `path`, if any.
+  fn live_index(&self, path: &str) -> Option<usize> {
+    self.live.get(path).copied()
+  }
+
+  /// The base content length of `path`, if it existed at base.
+  fn base_len_of(&self, path: &str) -> Option<u64> {
+    self.base.get(path).copied()
+  }
+
+  /// Whether `path`'s base file has already been materialized into an entity (so it cannot be materialized again).
+  fn consumed(&self, path: &str) -> bool {
+    self.origins.contains(path)
+  }
+
+  /// Adds `entity`, indexed; its index.
+  fn push(&mut self, entity: Entity) -> usize {
+    let index = self.list.len();
+    if entity.live {
+      self.live.insert(entity.final_path.clone(), index);
+    }
+    if let Some(origin) = &entity.origin {
+      self.origins.insert(origin.clone());
+    }
+    self.list.push(entity);
+    index
+  }
+
+  /// Marks the entity at `index` unlinked: not live, and a recreate's target where it is a base file at its own path.
+  fn unlink(&mut self, index: usize) {
+    let Some(entity) = self.list.get_mut(index) else {
+      return;
+    };
+    entity.live = false;
+    if self.live.get(&entity.final_path) == Some(&index) {
+      self.live.remove(&entity.final_path);
+    }
+    if !entity.clobbered && entity.origin.as_deref() == Some(entity.final_path.as_str()) {
+      self.unlinked.insert(entity.final_path.clone(), index);
+    }
+  }
+
+  /// Marks the entity at `index` clobbered (killed by a rename over it, or superseded by a recreate): not live, and no
+  /// longer a recreate's target.
+  fn clobber(&mut self, index: usize) {
+    let Some(entity) = self.list.get_mut(index) else {
+      return;
+    };
+    entity.live = false;
+    entity.clobbered = true;
+    if self.live.get(&entity.final_path) == Some(&index) {
+      self.live.remove(&entity.final_path);
+    }
+    if self.unlinked.get(&entity.final_path) == Some(&index) {
+      self.unlinked.remove(&entity.final_path);
+    }
+  }
+
+  /// Moves the live entity at `index` to `to`.
+  fn move_to(&mut self, index: usize, to: &str) {
+    let Some(entity) = self.list.get_mut(index) else {
+      return;
+    };
+    if self.live.get(&entity.final_path) == Some(&index) {
+      self.live.remove(&entity.final_path);
+    }
+    entity.final_path = to.to_owned();
+    if entity.live {
+      self.live.insert(to.to_owned(), index);
+    }
+  }
+
+  /// Re-roots the entity at `index` at the base file `to` (a new file renamed over it, module docs of `apply_rename`).
+  fn reroot(&mut self, index: usize, to: &str, base_len: u64) {
+    let Some(entity) = self.list.get_mut(index) else {
+      return;
+    };
+    entity.origin = Some(to.to_owned());
+    entity.base_len = base_len;
+    entity.content.insert(0, ContentOp::Truncate { len: 0 });
+    self.origins.insert(to.to_owned());
+  }
 }
 
 /// Materializes an untouched base file into a live entity and returns its index, or `None` when
 /// `path` is not an untouched base file (not at base, or already consumed).
-fn materialize_base(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Option<usize> {
-  if consumed(entities, path) {
+fn materialize_base(entities: &mut Entities<'_>, path: &str) -> Option<usize> {
+  if entities.consumed(path) {
     return None;
   }
-  let base_len = base_len_of(base, path)?;
-  entities.push(Entity {
+  let base_len = entities.base_len_of(path)?;
+  Some(entities.push(Entity {
     origin: Some(path.to_owned()),
     base_len,
     content: Vec::new(),
     live: true,
     final_path: path.to_owned(),
     clobbered: false,
-  });
-  entities.len().checked_sub(1)
+  }))
 }
 
 /// Applies one operation to the entity set.
-fn apply_op(entities: &mut Vec<Entity>, base: &Base, op: &VolumeOp) -> Result<(), DeriveError> {
+fn apply_op(entities: &mut Entities<'_>, op: &VolumeOp) -> Result<(), DeriveError> {
   if let Some(content) = op.content() {
     let path = op.single_path().unwrap_or("");
-    let index = live_index(entities, path)
-      .or_else(|| materialize_base(entities, base, path))
+    let index = entities
+      .live_index(path)
+      .or_else(|| materialize_base(entities, path))
       .ok_or_else(|| DeriveError::ContentOnMissing(path.to_owned()))?;
     entities
+      .list
       .get_mut(index)
       .ok_or_else(|| DeriveError::ContentOnMissing(path.to_owned()))?
       .content
@@ -551,29 +650,29 @@ fn apply_op(entities: &mut Vec<Entity>, base: &Base, op: &VolumeOp) -> Result<()
     return Ok(());
   }
   match op {
-    VolumeOp::Create { path } => apply_create(entities, base, path),
-    VolumeOp::Unlink { path } => apply_unlink(entities, base, path),
-    VolumeOp::Rename { from, to } => apply_rename(entities, base, from, to),
+    VolumeOp::Create { path } => apply_create(entities, path),
+    VolumeOp::Unlink { path } => apply_unlink(entities, path),
+    VolumeOp::Rename { from, to } => apply_rename(entities, from, to),
     _ => Ok(()),
   }
 }
 
 /// A `Create`: refuses over a live or untouched-base file; recreates an in-place-unlinked base
 /// file as a content replacement; otherwise makes a fresh new file.
-fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
-  if live_index(entities, path).is_some() {
+fn apply_create(entities: &mut Entities<'_>, path: &str) -> Result<(), DeriveError> {
+  if entities.live_index(path).is_some() {
     return Err(DeriveError::CreateOverExisting(path.to_owned()));
   }
   // An in-place unlink of this base path (dead, not clobbered, still named here): recreating it
   // replaces the base content.
-  let replaced = entities.iter().position(|e| {
-    !e.live && !e.clobbered && e.final_path == path && e.origin.as_deref() == Some(path)
-  });
-  if let Some(unlinked) = replaced.and_then(|index| entities.get_mut(index)) {
-    let base_len = unlinked.base_len;
+  if let Some(unlinked) = entities.unlinked.get(path).copied() {
+    let base_len = entities
+      .list
+      .get(unlinked)
+      .map_or(0, |entity| entity.base_len);
     // The recreation supersedes the unlink: mark the dead entity clobbered so seal emits no
     // stale `Unlink` for a path that is present again.
-    unlinked.clobbered = true;
+    entities.clobber(unlinked);
     entities.push(Entity {
       origin: Some(path.to_owned()),
       base_len,
@@ -584,11 +683,11 @@ fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
     });
     return Ok(());
   }
-  if base_len_of(base, path).is_some() {
+  if entities.base_len_of(path).is_some() {
     // A base path here: an untouched one is still present (create over it fails); a consumed one
     // (its base was renamed away — the in-place-unlink case was handled above) is the owed
     // recreate-at-a-renamed-away-base-path case.
-    return if consumed(entities, path) {
+    return if entities.consumed(path) {
       Err(DeriveError::Unsupported(path.to_owned()))
     } else {
       Err(DeriveError::CreateOverExisting(path.to_owned()))
@@ -608,54 +707,53 @@ fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
 /// An `Unlink`: kills the live (or materialized-base) entity at `path`. Its writes stay with it: a hard link may still
 /// name its node, and then the seal declares them there ([`heirs_of_writes`], A-669). Until A-669 they were cleared
 /// here, and the green handed the link the head's bytes, so a write was lost with its file's name.
-fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
-  let index = live_index(entities, path)
-    .or_else(|| materialize_base(entities, base, path))
+fn apply_unlink(entities: &mut Entities<'_>, path: &str) -> Result<(), DeriveError> {
+  let index = entities
+    .live_index(path)
+    .or_else(|| materialize_base(entities, path))
     .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
-  let unlinked = entities
-    .get_mut(index)
-    .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
-  unlinked.live = false;
+  if entities.list.get(index).is_none() {
+    return Err(DeriveError::UnlinkMissing(path.to_owned()));
+  }
+  entities.unlink(index);
   Ok(())
 }
 
 /// A `Rename`: moves the source entity to `to`, replacing whatever was there.
-fn apply_rename(
-  entities: &mut Vec<Entity>,
-  base: &Base,
-  from: &str,
-  to: &str,
-) -> Result<(), DeriveError> {
+fn apply_rename(entities: &mut Entities<'_>, from: &str, to: &str) -> Result<(), DeriveError> {
   if from == to {
     return Ok(());
   }
-  let source = live_index(entities, from)
-    .or_else(|| materialize_base(entities, base, from))
+  let source = entities
+    .live_index(from)
+    .or_else(|| materialize_base(entities, from))
     .ok_or_else(|| DeriveError::RenameMissingSource(from.to_owned()))?;
-  let destination = resolve_rename_target(entities, base, to)?;
+  let destination = resolve_rename_target(entities, to)?;
   let missing = || DeriveError::RenameMissingSource(from.to_owned());
   if let Some(dst) = destination {
-    let clobbered = entities.get_mut(dst).ok_or_else(missing)?;
-    clobbered.live = false;
-    clobbered.clobbered = true;
+    let (dst_origin, dst_base_len) = {
+      let clobbered = entities.list.get(dst).ok_or_else(missing)?;
+      (clobbered.origin.clone(), clobbered.base_len)
+    };
+    entities.clobber(dst);
     // Only a base file at its *own* path is a write-and-rename target: replacing it is a content
     // change to that base file. A base file that was itself renamed here is not a base path, so
     // the source is just a new file at `to`, and the clobbered file's original name is orphaned
     // (unlinked at seal by the survivor rule).
-    let dst_at_own_base = clobbered.origin.as_deref() == Some(to);
-    let dst_base_len = clobbered.base_len;
-    let moved = entities.get_mut(source).ok_or_else(missing)?;
+    let dst_at_own_base = dst_origin.as_deref() == Some(to);
+    let moved = entities.list.get(source).ok_or_else(missing)?;
     if dst_at_own_base && moved.origin.is_none() {
       // A new file renamed over a base file: the destination's content is replaced (a delete of
       // the base and the new bytes), so re-root the source at the destination's base.
-      moved.origin = Some(to.to_owned());
-      moved.base_len = dst_base_len;
-      moved.content.insert(0, ContentOp::Truncate { len: 0 });
+      entities.reroot(source, to, dst_base_len);
     }
     // A base file over a base file keeps its origin (emitting a `Rename` at seal); a new file
     // clobbered here simply cancels.
   }
-  entities.get_mut(source).ok_or_else(missing)?.final_path = to.to_owned();
+  if entities.list.get(source).is_none() {
+    return Err(missing());
+  }
+  entities.move_to(source, to);
   Ok(())
 }
 
@@ -663,18 +761,17 @@ fn apply_rename(
 /// as the clobber target, or `None` when the path is free. A base path already consumed is a
 /// typed refusal (owed).
 fn resolve_rename_target(
-  entities: &mut Vec<Entity>,
-  base: &Base,
+  entities: &mut Entities<'_>,
   to: &str,
 ) -> Result<Option<usize>, DeriveError> {
-  if let Some(index) = live_index(entities, to) {
+  if let Some(index) = entities.live_index(to) {
     return Ok(Some(index));
   }
-  if base_len_of(base, to).is_some() {
-    if consumed(entities, to) {
+  if entities.base_len_of(to).is_some() {
+    if entities.consumed(to) {
       return Err(DeriveError::Unsupported(to.to_owned()));
     }
-    return Ok(materialize_base(entities, base, to));
+    return Ok(materialize_base(entities, to));
   }
   Ok(None)
 }
@@ -1260,7 +1357,7 @@ pub fn compose_volume_planned(
   let symlinks = compose_symlinks(base, journal, &sym_paths)?;
   let link_paths = hardlink_paths(base, journal);
   let link_state = link_states(base, journal, &link_paths)?;
-  let mut entities: Vec<Entity> = Vec::new();
+  let mut indexed = Entities::over(base);
   for op in journal {
     if op.is_directory()
       || op.is_symlink()
@@ -1277,8 +1374,9 @@ pub fn compose_volume_planned(
     {
       continue;
     }
-    apply_op(&mut entities, base, op)?;
+    apply_op(&mut indexed, op)?;
   }
+  let entities = indexed.list;
   // The files present at seal: the live entities' final paths, plus base files no entity ever
   // touched (still present, e.g. a base file that was only chmod'd).
   let entity_origins: std::collections::BTreeSet<&str> = entities

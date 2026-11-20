@@ -12351,9 +12351,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
 > dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
 > HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
-> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
-> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
-> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> KiB, its pack far larger, each answered whole. **Rule 4 BUILT (same day):** a fetch's request takes a hold on its
+> repository's generation (`StoreLender::hold`, `vcs_store::upload::GitGeneration`): a fork of the store's repository at
+> its stamp (`Repository::fork`, `Repository::stamp`: the positions given and the versions its greens have, both only
+> growing), shared by every fetch that begins at that stamp, with the refs and `HEAD` as they stood; every later step of
+> the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
+> landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
+> id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
+> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
+> run); the live `git clone` rows of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
@@ -12370,6 +12377,26 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > working copies match svnadmin's over both edges after a checkout, an update back 500 revisions and the update forward.
 > The largest slice is 99,424 B on svn:// and 136,865 B on DAV. Rule 3 is still owed: one drive step, a text window's
 > delta, takes up to 4.7 ms on svn:// and 6.5 ms on DAV, so a window must be made in pieces (`report::drive`).
+> **The window encoder BUILT (2026-11-20, A-751, w-bugs; Ada's rule: performance gaps are addressed upfront).** One
+> shared encoder makes a window in units: `svndiff::WindowMaking`, which takes a unit a target position walked, a byte
+> compared or copied, a source block indexed, or an instruction encoded, at least one a step. It keeps its place between
+> steps and never borrows the texts. Each phase is `compute_delta`'s, cut at its loops, and the sections are the
+> encoder's. Version 2's LZ4 block is made in parts by `svndiff::lz4`, a port of `lz4_flex` 0.11.6's block compressor
+> that makes its bytes. The oracle is the whole window, which `deltas` makes and `Encoder::window` encodes: every
+> window, made under every unit size in versions 0 and 2, stored and LZ4, is the same bytes. Red, by main's test: a
+> 102,400-byte window made whole took 6.0 to 7.7 ms in one step (debug, M-series Mac). At 256 units a step, no step
+> passes 500 us. **The update report's drive BUILT (same day, A-751 part 2).** The drive makes each window a step at a
+> time (`report::drive`'s `WindowWork`): its target and source pieces are read 1,024 bytes a step, the window is made
+> 1,024 units a step, and its writes, as `svndiff.c` makes them, are sent 1,024 bytes a piece (`Call::DeltaPiece`).
+> 1,024 units are about 1.5 us of an M-series Mac's release build, under half the ~3.7 us quantum. Each consumer frames
+> the pieces as before: svn:// sends a write's pieces as its one `textdelta-chunk` string, the head of which carries
+> the write's whole length (`ra_svn::write_string_head`); DAV base64s them. The drive encodes in its consumer's
+> version (`Drive::with_encoding`, svn://'s `editor::encoding_of`). By test: `/trunk/big.txt` (6,000 lines) driven a
+> step a call, edited and added, in version 0 and version 2 with LZ4: before, 4 steps of 2.8-3.0 ms each run (debug);
+> now none past 500 us, and its stream is the whole-window path's byte for byte. The recorded svnserve sessions are
+> unchanged. Owed: the replay drive (`report::drive::replay`, svn://'s `replay`/`replay-range` and the dump exporter's
+> source) and `get-file-revs` (`reads::file_revs`) still make a window whole; the dump exporter's format 3 adopts the
+> maker (w-svn).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -13118,7 +13145,8 @@ engine: the verdict, rebase, position mapping, the register).
 > restart never drops the edge's port: a client that connects while a daemon is down waits in the listener's queue and
 > is answered by the next daemon. An address the anchor cannot bind ends its start by name, as a fleet node's serve
 > sockets do. A library starter asks for the edge too (`StartSpec::vcs_http`), and its anchor holds it the same way.
-> Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2): each daemon binds its own.
+> Since A-748 Windows holds it too, with the SSH edge's and svn://'s: the anchor shares each with every daemon it spawns
+> as an explicit duplicate made for that daemon's process (`WSADuplicateSocketW`), never an inherited handle (A-183).
 >
 > **Status (2026-11-19, A-682: upload-pack served from each repository's store on its owner shard).** The daemon's
 > git site serves upload-pack from the store A-662 keeps on the repository's owner shard, lent by
@@ -51877,7 +51905,10 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   with the edge's own backlog, derived from the same configuration the daemon derives (`bind_vcs_http_listener`), so
   the queue is the edge's whoever bound it. (3) An address the anchor cannot bind ends its start by name, as a fleet
   node's serve sockets do: the operator asked for the edge there, and a daemon would fail the same bind; one that cannot
-  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. (4) No second `unsafe` site:
+  be made inheritable is not held, and each daemon binds its own, as for the NFS listener. *Amended by A-748
+  (2026-11-20, main's ruling): Windows gets the same hold, the anchor sharing each listener with each daemon as an
+  explicit `WSADuplicateSocketW` duplicate made for its process id; a listener that cannot be shared with one daemon is
+  said on the log, and that daemon binds its own.* (4) No second `unsafe` site:
   the NFS listener's adoption became `held_listener(variable)`, which both use. (5) A library starter's anchor takes the
   same option (`StartSpec::vcs_http`), its role and command carrying it, as main asked if it was the same piece.
 - **Tests.** macOS arm64 (Mac Studio, `cargo test --locked`, fmt clean for `slates-anchor`, `slates-api`, `slates-cli`
@@ -51892,7 +51923,7 @@ unchanged); `docs/cli.md`; `docs/library.md`.
   (`a_daemon_restart_keeps_the_vcs_http_edges_port_and_serves_again`: a request made while the killed daemon's
   successor started was answered `401` by it, at the port the successor named again).
 - **Owed.** Windows keeps no listener across a restart (`docs/wip/platforms.md`, gap 2), the edge's as the NFS
-  listener's.
+  listener's. *The edges' closed by A-748; the NFS listener's and the fleet's serve sockets stay owed.*
 
 ### A-654 part 3 — receive-pack on git's HTTP site (2026-11-19, g258, UI goal 93; §4.17.2 "A push", "Transports" item 1 and "Access"; A-625 parts 2 and 3, A-654 part 2)
 
@@ -55631,6 +55662,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-753 — A branch created at a commit another branch holds is made from it, and a resent object is read from the index (bug, 2026-11-20, w-git for UI goal 93; found by use in A-722's proof)
+- **Found by use.** A-722's proof on the 32-core Studio (release, git/git): 100 concurrent v1.5.0 pushes to one
+  repository, each creating its own branch, answered 80 `ok` and 20 `ng refs/heads/pN failed to update ref`, twice; a
+  diagnostic build (branch agents/w-git-diag, never main) logged each as the append refused
+  `TableAtCapacity { table: "green_chains" }`.
+- **Causes.** (1) A create was made at the green its new value's first parent heads, else the default branch's head:
+  with neither, each branch made the whole tree again as its own work, and a hundred branches at one commit held it a
+  hundred times in the partition's chains (a checkpoint costs the chains what its increments did, so folding frees
+  nothing). (2) Found by the test: a push resending objects the repository indexes was refused `missing necessary
+  objects`, since the connectivity check read each pack object from the quarantine, which passes over what the index
+  holds. (3) At the chains' cap a push checkpointed only the greens it updated, so an entry of creates alone could free
+  nothing.
+- **Change.** `receive::works::Greens::holding_head`: a create is made first at the green whose head is its new value,
+  its work empty (`ShardGreens::holding`); `git_push::intake::Quarantined` reads an object the quarantine passed over
+  from the index (`Repository::stored`); `repository::push::admit` at the cap checkpoints the repository's other members
+  too.
+- **Tests.** `slates-server` `git_push::tests::t_a753_a_repository_takes_branch_creates_past_its_chain_budget` (24
+  creates under a 64 KiB chain budget, each resending its pack; red on main: every create after the first refused).
+  `slates-server --lib -- vcs_store:: git_push:: repository:: vcs_http::git vcs_http::daemon_edge git_hooks::
+  git_protect` 199 passed; `slates-git --lib -- receive::` 46 passed; fmt clean (macOS arm64, this Mac, local).
+
 ### A-722 part 4b's race — A staging a landing overtakes is staged again, whatever step it was in (bug, 2026-11-20, w-git; found by reading after the 100-push run)
 - **Cause.** Part 4b made the stage's fork at its rows' step and read the next position at its positions' step, so a
   push that landed during the staging's earlier turns could leave a stage that looked current (its fork made after
@@ -56383,6 +56435,36 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   `Forbidden` and the floor kept). Red with the check removed: the second floor dropped. Fleet `a_holder` 22 of 22 (the
   admissions, floor moves and computed submits of every holder test pass the check); `verbs::` 63 of 63, `work_home` 2
   of 2; fmt clean.
+
+### A-748 — On Windows the anchor holds the version-control listeners too, sharing each with every daemon as an explicit duplicate (2026-11-20, w-reaper, main's ruling; amends A-625 part 3 continued (2) decision 3; §4.6; A-183, A-684, A-689)
+
+- **Found by use.** w-interop on jupiter: after each daemon restart both version-control edges came back on new ports
+  (the HTTP edge at 52289, then 53602, 53617, 53629; the SSH edge likewise, its host key kept), so every client lost
+  its URL whenever the daemon restarted. On Unix the anchor holds each listener and hands it over inherited; A-625 part
+  3's decision 3 let a listener that "cannot be made inheritable" go unheld, and Windows inherits no socket (A-183), so
+  there none was held.
+- **Change (main's ruling).** Windows gets the same hold, never by inheritance. The anchor binds the HTTP edge's, the
+  SSH edge's and the svn:// listener once and keeps them (`Supervisor::hold_vcs_*_listener` on Windows). At each spawn
+  it hands the daemon the reading end of a fresh pipe in the spawn's explicit handle list, named by
+  `ENV_SHARED_LISTENERS`; once the daemon's process id is known it duplicates each listener for that process alone
+  (`slates_rt::tcp::share_listener`, `WSADuplicateSocketW`) and writes the protocol records down the pipe
+  (`slates_anchor::shared_listeners`: the variable each answers to and its 628-byte record, every length checked on
+  read), then closes it. The daemon reads the pipe once and makes each listener from its record
+  (`TcpListener::from_share`, `WSASocketW` with `FROM_PROTOCOL_INFO`, kept from its children). The kernel keeps the
+  listening socket and its queue across a restart, as on Unix. A listener that cannot be shared with one daemon is said
+  on the log, and that daemon binds its own; the next spawn shares again.
+- **Unsafe.** `slates-rt` 107 → 109 (`WSADuplicateSocketW`; `WSASocketW` over the record), `slates-server` 5 → 6 (the
+  pipe's reading end taken into ownership once); the record crosses as bytes encoded field by field, with no unsafe
+  view. Each site has its SAFETY line and is named in `unsafe-budget.toml`.
+- **Tests.** `crates/cli/tests/vcs_edge_restart.rs` (`a_daemon_restart_keeps_every_version_control_listeners_port`,
+  every platform): an anchor with all three listeners on loopback ports the system picks; the daemon killed; each port
+  asked while no daemon runs and answered by the successor (`401`, `SSH-2.0-`, svnserve's greeting); the successor
+  naming the same three ports. Green on Windows x86_64 (jupiter, kiln r33: 61321, 61322 and 61323 before and after the
+  kill, 2.10 s) and macOS arm64 (Mac Studio 2, 3.1 s). Pure: rt's `share` codec (a record whose every field differs,
+  back whole; a byte short or long refused) and the anchor's `shared_listeners` (three shares back in order; every cut
+  inside a record refused `Truncated`; too many, too long).
+- **Applied in the same change to** A-625 part 3's status and decision 3, `docs/wip/platforms.md` gap 2,
+  `unsafe-budget.toml`, amendments.tsv.
 
 ### A-697 part e2 — A holder creation a restart caught waiting for its admission releases the owner's floor before it is dropped (2026-11-20, w-shared for UI goal 93; main's order: performance gaps up front, held history the same waste as A-742's)
 Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's step two), `crates/db/src/catalog.rs`

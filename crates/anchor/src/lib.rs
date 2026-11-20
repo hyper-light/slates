@@ -38,6 +38,7 @@ pub mod held;
 pub mod held_windows;
 pub mod layout;
 pub mod segment;
+pub mod shared_listeners;
 pub mod supervise;
 
 pub use error::AnchorError;

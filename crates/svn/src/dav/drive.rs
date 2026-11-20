@@ -255,6 +255,7 @@ impl Drive {
       Call::ChangeProperty { name, value } => self.change_property(name, value),
       Call::ApplyTextDelta { base_md5 } => self.apply_textdelta(base_md5),
       Call::Window(window) => self.window(window),
+      Call::DeltaPiece { bytes, .. } => self.delta_piece(bytes),
       Call::TextDeltaEnd => self.textdelta_end(),
       Call::CloseFile { md5 } => self.close_file(md5),
       Call::CloseDirectory => self.close_directory(),
@@ -446,6 +447,22 @@ impl Drive {
         value: format!("{error:?}"),
       })?;
     text.push_str(&delta.base64.push(&bytes));
+    self.body.push(&text)
+  }
+
+  /// A piece of the delta started last, already encoded in the svndiff stream's order (A-751): its base64, the
+  /// stream's header having come with the first window's first piece.
+  pub fn delta_piece(&mut self, bytes: &[u8]) -> Result<(), DavRefusal> {
+    let driving = self.driving();
+    let Some(delta) = self.delta.as_mut().filter(|_| driving) else {
+      return Err(DavRefusal::DriveOrder { call: "window" });
+    };
+    if delta.dropped {
+      return Ok(());
+    }
+    let mut text = delta_start(delta);
+    delta.header_sent = true;
+    text.push_str(&delta.base64.push(bytes));
     self.body.push(&text)
   }
 

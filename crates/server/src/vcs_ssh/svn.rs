@@ -68,7 +68,7 @@
 //! canonical URLs); the drop's ending above.
 
 use slates_db::catalog::{Principal, RepositoryId, RepositoryRecord, VcsTool};
-use slates_svn::commit::drive::{Due, Green, Work};
+use slates_svn::commit::drive::{Due, Green, HeldTexts, TextSink, Work};
 use slates_svn::commit::record::Record;
 use slates_svn::handshake::{self, Access, Repository, Unserved as Refusal};
 use slates_svn::ra_svn::ItemError;
@@ -168,6 +168,7 @@ pub(crate) trait SvnStores {
     id: RepositoryId,
     principal: &Principal,
     work: Work,
+    texts: &dyn TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
   /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step: a lock verb's
   /// entries (`Record::Locks`, A-693 part 2) or a revision's properties whole (`Record::RevisionProperties`, A-702 part
@@ -182,6 +183,7 @@ pub(crate) trait SvnStores {
   fn lend<T>(
     &mut self,
     id: RepositoryId,
+    texts: &dyn TextSink,
     step: impl FnOnce(&Sources<'_, Self::Green>) -> T,
   ) -> Option<T>;
 }
@@ -319,6 +321,10 @@ pub(crate) struct SvnCommand<R, V> {
   bounds: TunnelBounds,
   /// The commits the connection began, which name their transactions.
   commits: u64,
+  /// Where its commits' new texts go (`slates_svn::commit::drive::TextSink`): kept in memory per session until the
+  /// green's staged blocks take them (w-perf's wiring of A-716's `Green::stage`); given back at each commit's start and
+  /// after its landing.
+  texts: HeldTexts,
 }
 
 /// What one call of the connection made of the client's bytes, owned, so the input can be consumed after it.
@@ -424,6 +430,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       exit: None,
       bounds,
       commits: 0,
+      texts: HeldTexts::new(),
     })
   }
 
@@ -489,6 +496,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Self {
       connection,
       stores,
+      texts,
       opened,
       input,
       out,
@@ -504,7 +512,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       return Received::NotHeld;
     };
     stores
-      .lend(id, |sources| {
+      .lend(id, texts, |sources| {
         connection
           .receive(Some(sources), input, out, budget)
           .map_or_else(Received::Ended, Received::of)
@@ -615,10 +623,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       let Self {
         connection,
         stores,
+        texts,
         out,
         ..
       } = self;
-      stores.lend(id, |sources| connection.lock_verb(sources, out))
+      stores.lend(id, texts, |sources| connection.lock_verb(sources, out))
     };
     let call = match called {
       None => return self.not_held(),
@@ -641,9 +650,12 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     };
     let judged = {
       let Self {
-        connection, stores, ..
+        connection,
+        stores,
+        texts,
+        ..
       } = self;
-      stores.lend(id, |sources| {
+      stores.lend(id, texts, |sources| {
         connection.lock_judged(sources, verdicts, &mut draw, room)
       })
     };
@@ -708,10 +720,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       let Self {
         connection,
         stores,
+        texts,
         out,
         ..
       } = self;
-      stores.lend(id, |sources| {
+      stores.lend(id, texts, |sources| {
         connection.revision_property_hooked(sources, verdict, out)
       })
     };
@@ -746,6 +759,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
   /// Begins the commit the client asked for, its transaction named as the module doc says, over the lent sources.
   fn begin_commit(&mut self) {
     self.commits = self.commits.saturating_add(1);
+    // A drive that ended without landing (an abort, a refusal) leaves its texts: given back as the next commit starts.
+    self.texts.clear();
     let commits = self.commits;
     let room = self.bounds.commit_room;
     let Some(id) = self.opened.as_ref().map(|record| record.id) else {
@@ -754,10 +769,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Self {
       connection,
       stores,
+      texts,
       out,
       ..
     } = self;
-    let begun = stores.lend(id, |sources| {
+    let begun = stores.lend(id, texts, |sources| {
       let start = CommitStart {
         transaction: transaction_name(sources.index.youngest(), commits),
         now: sources.now,
@@ -837,10 +853,13 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Self {
       connection,
       stores,
+      texts,
       out,
       ..
     } = self;
-    let answered = stores.lend(id, |sources| connection.answer_hook(answer, sources, out));
+    let answered = stores.lend(id, texts, |sources| {
+      connection.answer_hook(answer, sources, out)
+    });
     match answered {
       None => self.not_held(),
       Some(Ok(Turn::Accepted { work, .. })) => Box::pin(self.land(*work, gone)).await,
@@ -859,7 +878,9 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let policy = record.policy.clone();
     let hooked = Hooked::new(id, &record.name);
     let transaction = work.record.transaction.clone();
-    let Some(landed) = self.stores.commit(id, &self.principal, work) else {
+    let landed = self.stores.commit(id, &self.principal, work, &self.texts);
+    self.texts.clear();
+    let Some(landed) = landed else {
       return self.not_held();
     };
     // post-commit runs once the revision stands, and its failure is `commit-info`'s `post-commit-err` (A-730).

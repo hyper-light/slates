@@ -231,8 +231,9 @@ pub(crate) trait SvnStores {
     id: RepositoryId,
     principal: &Principal,
     work: Work,
+    texts: &dyn slates_svn::commit::drive::TextSink,
   ) -> Option<Result<Committed, Uncommitted>> {
-    let _unserved = (id, principal, work);
+    let _unserved = (id, principal, work, texts);
     None
   }
 }
@@ -1026,12 +1027,15 @@ impl<S: SvnStores> SvnExchange<S> {
         }
       }
     };
-    let work = match merged {
-      Merged::Accepted(work) => work,
+    let (work, texts) = match merged {
+      Merged::Accepted(work, texts) => (work, texts),
       Merged::Refused(refused) => return refused,
     };
     let transaction = work.record.transaction.clone();
-    match self.stores.land(self.repository, &self.principal, *work) {
+    match self
+      .stores
+      .land(self.repository, &self.principal, *work, &*texts)
+    {
       Some(Ok(committed)) => {
         // post-commit, once the revision stands: its failure is the MERGE response's `S:post-commit-err` (A-733).
         let revision = committed.revision;

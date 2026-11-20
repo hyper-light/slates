@@ -187,7 +187,6 @@ fn hold_fleet_serve(
 /// restarts: a client that connects then waits in the listener's queue for the next daemon. An address that cannot be
 /// bound refuses the anchor's start by name, as a fleet node's serve sockets do: the operator asked for the edge there.
 /// One that cannot be made inheritable is not held, and each daemon binds its own, as for the NFS listener.
-#[cfg(unix)]
 fn hold_vcs_http_listener(
   supervisor: &mut Supervisor,
   config: &DaemonConfig,
@@ -195,14 +194,17 @@ fn hold_vcs_http_listener(
 ) -> Result<(), Failure> {
   let listener = slates_server::daemon::bind_vcs_http_listener(config, address)
     .map_err(|e| failed("vcs-http", format!("{address}: {e}")))?;
-  let fd = listener.into_owned();
-  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
     slates_machine::log_line!(
       "slates anchor: the version-control edge's listener cannot be made inheritable ({e}); each daemon binds its own"
     );
     return Ok(());
   }
-  supervisor.hold_vcs_http_listener(fd);
+  supervisor.hold_vcs_http_listener(owned);
   Ok(())
 }
 
@@ -211,7 +213,6 @@ fn hold_vcs_http_listener(
 /// daemon it spawns ([`slates_anchor::ENV_VCS_SSH`]), as [`hold_vcs_http_listener`] does the HTTP edge's: an address that
 /// cannot be bound refuses the anchor's start by name, and one that cannot be made inheritable is not held, each daemon
 /// then binding its own.
-#[cfg(unix)]
 fn hold_vcs_ssh_listener(
   supervisor: &mut Supervisor,
   config: &DaemonConfig,
@@ -219,14 +220,17 @@ fn hold_vcs_ssh_listener(
 ) -> Result<(), Failure> {
   let listener = slates_server::daemon::bind_vcs_ssh_listener(config, address)
     .map_err(|e| failed("vcs-ssh", format!("{address}: {e}")))?;
-  let fd = listener.into_owned();
-  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
     slates_machine::log_line!(
       "slates anchor: the SSH edge's listener cannot be made inheritable ({e}); each daemon binds its own"
     );
     return Ok(());
   }
-  supervisor.hold_vcs_ssh_listener(fd);
+  supervisor.hold_vcs_ssh_listener(owned);
   Ok(())
 }
 
@@ -252,8 +256,8 @@ fn publish_ssh_host_key(segment: &mut AnchorSegment) -> Result<(), Failure> {
 /// ([`slates_anchor::ENV_VCS_SVN`]), so the listener's port never drops while a daemon restarts: a client that connects
 /// then waits in the listener's queue for the next daemon. An address that cannot be bound refuses the anchor's start by
 /// name, as the HTTP edge's does: the operator asked for the listener there. One that cannot be made inheritable is not
-/// held, and each daemon binds its own, as for the NFS listener.
-#[cfg(unix)]
+/// held, and each daemon binds its own, as for the NFS listener. On Windows it is shared with each daemon as an explicit
+/// duplicate made for its process (A-748).
 fn hold_vcs_svn_listener(
   supervisor: &mut Supervisor,
   config: &DaemonConfig,
@@ -261,14 +265,17 @@ fn hold_vcs_svn_listener(
 ) -> Result<(), Failure> {
   let listener = slates_server::daemon::bind_vcs_svn_listener(config, address)
     .map_err(|e| failed("vcs-svn", format!("{address}: {e}")))?;
-  let fd = listener.into_owned();
-  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+  let owned = listener.into_owned();
+  // Unix hands it to each daemon inherited at its number, so it must be inheritable; Windows shares it with each
+  // daemon as an explicit duplicate made for that daemon's process (A-748), and needs nothing of it here.
+  #[cfg(unix)]
+  if let Err(e) = rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::empty()) {
     slates_machine::log_line!(
       "slates anchor: the svn:// listener cannot be made inheritable ({e}); each daemon binds its own"
     );
     return Ok(());
   }
-  supervisor.hold_vcs_svn_listener(fd);
+  supervisor.hold_vcs_svn_listener(owned);
   Ok(())
 }
 
@@ -373,17 +380,14 @@ pub(crate) fn supervise(options: &ProcessOptions, daemon_args: &[String]) -> Res
   }
   // The version-control edge's listener is held the same way (A-625 part 3): bound once here, at the address the
   // operator gave, and handed to every daemon, so a restart never drops the edge's port.
-  #[cfg(unix)]
   if let Some(address) = options.vcs_http {
     hold_vcs_http_listener(&mut supervisor, &config, address)?;
   }
   // And the SSH edge's (A-684), whose host key the segment already holds.
-  #[cfg(unix)]
   if let Some(address) = options.vcs_ssh {
     hold_vcs_ssh_listener(&mut supervisor, &config, address)?;
   }
   // And the svn:// listener (A-689): bound once here and handed to every daemon, so a restart never drops its port.
-  #[cfg(unix)]
   if let Some(address) = options.vcs_svn {
     hold_vcs_svn_listener(&mut supervisor, &config, address)?;
   }

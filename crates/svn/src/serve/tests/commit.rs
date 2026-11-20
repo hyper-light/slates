@@ -126,7 +126,7 @@ impl Built {
   /// The next revision, made of `work` at `date`: its rows applied in path order, a deletion or a
   /// replacement taking the path's subtree, an addition or a replacement by a copy bringing its
   /// source's.
-  fn hold(&mut self, work: &Work, date: &str) {
+  fn hold(&mut self, work: &Work, date: &str, sink: &crate::commit::drive::HeldTexts) {
     let mut tree = self.trees.last().unwrap().clone();
     let mut rows: Vec<_> = work.record.changes.iter().collect();
     rows.sort_by(|left, right| left.path.cmp(&right.path));
@@ -152,7 +152,11 @@ impl Built {
       }
     }
     self.trees.push(tree);
-    self.texts.extend(work.texts.clone());
+    for identity in &work.texts {
+      use crate::commit::drive::TextSink;
+      let bytes = sink.sealed(identity).unwrap().into_owned();
+      self.texts.insert(*identity, bytes);
+    }
     self.lists.extend(work.property_lists.clone());
     let mut properties = work.revision_properties.clone();
     properties.push((b"svn:date".to_vec(), date.as_bytes().to_vec()));
@@ -235,6 +239,7 @@ impl reads::Repository for Built {
 struct View<'r> {
   records: &'r Records,
   built: &'r Built,
+  texts: &'r crate::commit::drive::HeldTexts,
 }
 
 impl Contents for View<'_> {
@@ -284,6 +289,8 @@ impl commit_drive::Green for View<'_> {
 struct Replay {
   records: Records,
   built: Built,
+  /// Where its commits' new texts go.
+  texts: crate::commit::drive::HeldTexts,
   transactions: u64,
   /// The items that matched `svnserve`'s only with their property lists as sets.
   in_hash_order: usize,
@@ -300,6 +307,7 @@ impl Replay {
     Self {
       records: Records::new(uuid, CREATED, room).unwrap(),
       built: Built::new(),
+      texts: crate::commit::drive::HeldTexts::new(),
       transactions: 0,
       in_hash_order: 0,
     }
@@ -310,6 +318,7 @@ impl Replay {
     View {
       records: &self.records,
       built: &self.built,
+      texts: &self.texts,
     }
   }
 }
@@ -328,6 +337,7 @@ fn sources<'s>(view: &'s View<'s>) -> Sources<'s, View<'s>> {
       authz: None,
       filesystem: "fixture",
     },
+    texts: view.texts,
   }
 }
 
@@ -341,8 +351,8 @@ fn make(
   out: &mut Vec<u8>,
 ) {
   let now = svn_time(recorded).unwrap();
-  replay.built.hold(&work, recorded);
-  let revision = RevisionToCommit::of_work(work, now).unwrap();
+  replay.built.hold(&work, recorded, &replay.texts);
+  let revision = RevisionToCommit::of_work(work, now, &replay.texts).unwrap();
   let date = revision.date().unwrap().to_owned();
   let author = revision.author().map(str::to_owned);
   let number = replay.records.commit(revision).unwrap();

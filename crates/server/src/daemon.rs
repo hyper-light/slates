@@ -54,7 +54,14 @@ const SLEEP_REFUSED: &str = "runtime.sleep_refused";
 /// `daemon.alive`): the liveness window over the election margin, `W / ELECTION_MARGIN` (A-129 item 1, the leader beats
 /// ten times per election timeout, and item 2, the death-confirmation window is the election timeout; A-359), so nine
 /// beats fit inside a window. 100 ms.
-pub const HEARTBEAT_NS: u64 = LIVENESS_BUDGET_NS / slates_cluster::timing::ELECTION_MARGIN;
+pub const HEARTBEAT_NS: u64 = heartbeat_of(LIVENESS_BUDGET_NS);
+
+/// The heartbeat's rule over a liveness window of `liveness_budget_ns`: `W / ELECTION_MARGIN`, so nine beats fit inside
+/// the window ([`HEARTBEAT_NS`] at the daemon's own window). Shared by every beat that shows a peer it is alive within
+/// that peer's patience: the anchor's, and a quiet MCP listen stream's keep-alive (`slates_mcp::http`).
+pub const fn heartbeat_of(liveness_budget_ns: u64) -> u64 {
+  liveness_budget_ns / slates_cluster::timing::ELECTION_MARGIN
+}
 /// Derived: the liveness window `W` (A-228, A-359): how long a daemon, a shard or a peer may show no progress before it
 /// is judged stuck or silent and its recovery begins. It is the recovery budget `T`
 /// (`slates_db::replay::RECOVERY_BUDGET_NS`, ratified, GAPS §5): the verdict starts a recovery that costs `T`, so
@@ -502,10 +509,60 @@ pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtErro
   Some(TcpListener::from_owned(owned))
 }
 
-/// See the Unix arm: no anchor holds a listener for its daemons on Windows (`docs/wip/platforms.md`, gap 2).
+/// See the Unix arm. On Windows the anchor shares each listener it holds with this daemon as an explicit duplicate made
+/// for this process (A-748, `slates_anchor::shared_listeners`): the shares arrive on the pipe the environment names,
+/// read once, and the one answering to `variable` is made into this process's listener. None where the anchor shared
+/// none for it (a standalone start, tests, or an anchor that could not share it, which said so).
 #[cfg(windows)]
-pub(crate) fn held_listener(_variable: &str) -> Option<Result<TcpListener, RtError>> {
-  None
+pub(crate) fn held_listener(variable: &str) -> Option<Result<TcpListener, RtError>> {
+  let share = shared_listeners()
+    .iter()
+    .find(|share| share.variable == variable)?;
+  Some(TcpListener::from_share(&share.bytes))
+}
+
+/// The listeners the anchor shared with this daemon (A-748), read whole from the pipe [`slates_anchor::shared_listeners::
+/// ENV_SHARED_LISTENERS`] names the first time a listener is asked for, and kept for the process's life. A pipe that
+/// cannot be read, or whose bytes are not shares, is said on the log and read as none: each edge then binds its own.
+#[cfg(windows)]
+fn shared_listeners() -> &'static [slates_anchor::shared_listeners::Share] {
+  /// Shape: the records a pipe may hold: one a listener the anchor holds (the HTTP edge's, the SSH edge's, svn://'s).
+  const MOST_SHARES: usize = 3;
+  static SHARES: std::sync::OnceLock<Vec<slates_anchor::shared_listeners::Share>> =
+    std::sync::OnceLock::new();
+  SHARES.get_or_init(|| {
+    let Some(raw) = std::env::var(slates_anchor::shared_listeners::ENV_SHARED_LISTENERS)
+      .ok()
+      .and_then(|value| value.parse::<usize>().ok())
+    else {
+      return Vec::new();
+    };
+    // SAFETY: the anchor duplicated the pipe's reading end into the explicit handle list of this process's spawn and
+    // named its value here (`slates_anchor::Supervisor`'s Windows spawn); nothing else in this process owns it, and it
+    // is read once, in this initializer, so this is its single owner.
+    let owned = unsafe {
+      <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(
+        raw as std::os::windows::io::RawHandle,
+      )
+    };
+    let _ = slates_ipc::win_spawn::clear_inheritance(&owned);
+    let mut bytes = Vec::new();
+    let read = std::io::Read::read_to_end(&mut std::io::PipeReader::from(owned), &mut bytes);
+    match read
+      .map_err(|error| error.to_string())
+      .and_then(|_| {
+        slates_anchor::shared_listeners::decode(&bytes, MOST_SHARES)
+          .map_err(|refusal| format!("{refusal:?}"))
+      }) {
+      Ok(shares) => shares,
+      Err(why) => {
+        slates_machine::log_line!(
+          "slates daemon: the anchor's shared listeners could not be read ({why}); each edge binds its own"
+        );
+        Vec::new()
+      }
+    }
+  })
 }
 
 /// Binds the version-control servers' shared HTTP edge's listener at `address` as the daemon binds its own, its backlog

@@ -36,6 +36,15 @@ pub use core::net::{Ipv4Addr, SocketAddrV4};
 /// Windows ([`TcpListener::into_owned`], [`TcpStream::from_owned`]).
 pub type OwnedStream = netsys::OwnedStream;
 
+/// A listener's share with process `process` (A-748): the bytes of an explicit duplicate of `listener` made for that
+/// process alone (`WSADuplicateSocketW`), which it makes into its own listener with [`TcpListener::from_share`]. The
+/// caller keeps `listener`; a supervisor holds one across its daemons and shares it with each it spawns, so the port
+/// and the connections waiting on it survive a restart, as an inherited descriptor does on Unix. Windows only.
+#[cfg(windows)]
+pub fn share_listener(listener: &OwnedStream, process: u32) -> Result<Vec<u8>, RtError> {
+  netsys::share_listener(listener, process)
+}
+
 /// A connection's round trip as its kernel measured it ([`TcpStream::round_trip`]), and the resolution of the clock it
 /// measured it by, RFC 6298 §2.3's clock granularity for that measurement: Linux's `tcpi_rtt` and Windows' `RttUs` count
 /// microseconds, macOS's `tcpi_srtt` milliseconds (xnu's `TCP_RETRANSHZ`).
@@ -112,6 +121,16 @@ impl TcpListener {
   /// The local address the listener is bound to (the OS-assigned port on an ephemeral bind).
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
     netsys::local_addr(&self.socket)
+  }
+
+  /// The listener a supervisor shared with this process ([`share_listener`], A-748): its socket made from the share,
+  /// kept from this process's children and non-blocking, as [`TcpListener::from_owned`] makes one. Windows only, where
+  /// a listener crosses a spawn as an explicit duplicate rather than an inherited handle.
+  #[cfg(windows)]
+  pub fn from_share(share: &[u8]) -> Result<TcpListener, RtError> {
+    Ok(TcpListener {
+      socket: netsys::adopt_share(share)?,
+    })
   }
 
   /// Accepts the next connection, awaiting readability through the driver when none is pending. The

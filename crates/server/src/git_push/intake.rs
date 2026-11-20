@@ -17,9 +17,9 @@ use std::collections::BTreeMap;
 
 use slates_git::object_name::{Kind, ObjectId};
 use slates_git::receive::Repository;
-use slates_git::store::Push;
 use slates_git::store::kind_of;
 use slates_git::store::views::IndexedObjects;
+use slates_git::store::{Push, Repository as GitRepository};
 use slates_git::unpack::{self, Contents, Keep, Object};
 use slates_git::{Admission, Hold};
 use slates_vcs::ContentStore;
@@ -80,12 +80,28 @@ pub(super) struct Quarantined<'s> {
   pub(super) push: Option<&'s Push>,
   /// The store its objects are in.
   pub(super) store: &'s ContentStore,
+  /// The repository, whose index holds the objects a pack resends that the quarantine passed over (A-753).
+  pub(super) repository: &'s GitRepository,
 }
 
 impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
-    let (number, content, len) = self.push?.object(id)?;
-    kind_of(number)?;
+    // An object the repository indexed already is passed over by the quarantine as it arrives (`admit_object`): a pack
+    // that resends it is read back from the index (A-753; git's receive-pack takes such a pack).
+    let held = self
+      .push
+      .and_then(|push| push.object(id))
+      .and_then(|(number, content, len)| {
+        kind_of(number)?;
+        Some((content, len))
+      });
+    let (content, len) = match held {
+      Some(held) => held,
+      None => {
+        let (_, content, len) = self.repository.stored(self.store, id)?;
+        (content, len)
+      }
+    };
     // An object of one window is that window in the store: lent with no copy where the store lends it (A-727 a1).
     let mut windows = self.store.windows(&content);
     if let (Some(window), None) = (windows.next(), windows.next())

@@ -428,7 +428,11 @@ slates-mem = 80
 #   connection queued and the peer has not acknowledged, which with `tcpi_bytes_acked` (read through the existing
 #   `getsockopt` helper) tells a successor whether the stream a dead daemon left stands on a record's boundary. rustix
 #   wraps `FIONREAD` but not `SIOCOUTQ`, and no other call reads it.
-slates-rt = 107
+# 2026-11-20 (+2, A-748, `netsys.rs`, compiled only for Windows): a held listener shared with a daemon as an explicit
+#   duplicate made for its process: `share_listener`'s `WSADuplicateSocketW` (1), and `adopt_share`'s `WSASocketW` over
+#   the protocol record (`FROM_PROTOCOL_INFO`, 1). Winsock has no safe wrapper for either; the record itself crosses as
+#   bytes encoded and decoded field by field, with no unsafe view of it.
+slates-rt = 109
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
@@ -546,7 +550,10 @@ slates-ipc = 147
 # handle after the bounded handoff parser checked nonzero values and aliasing; its inheritance flag is cleared in IPC.
 # 2026-11-18 (-3, A-475): the Windows liveness probe of a client's process (`peer.rs`'s open, zero-timeout wait and close)
 #   is gone with the poll it served; a client's process exit is awaited through the shard (`slates-rt`'s `handle_wait`).
-slates-server = 5
+# 2026-11-20 (+1, A-748, `daemon.rs` `shared_listeners`, compiled only for Windows): the daemon takes unique ownership of
+#   the reading end of the anchor's shared-listener pipe, handed in its spawn's explicit handle list and named in its
+#   environment, read once; its inheritance flag is cleared at once (`slates_ipc::win_spawn::clear_inheritance`).
+slates-server = 6
 slates-client = 0
 slates-api = 10
 slates-cli = 2
