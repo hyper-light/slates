@@ -7,11 +7,12 @@
 //! integers little-endian:
 //!
 //! ```text
-//! row    = kind (u8, the pack's number) | length (u64) | position (u64) | green (u64) | version (u64) [| commit]
+//! row    = kind (u8, the pack's number) | length (u64) | position (u64) [| commit]
 //! commit = tree (u64, a position) | date (u64) | generation (u64) | parents (u32) | each parent (u64, a position)
 //! ```
 //!
-//! The green and the version are those whose commit indexed the object: the version that brought it. A commit's part
+//! A row holds nothing known only once its push lands, so a push can write its rows as its objects arrive (A-722): the
+//! version that brought an object is the repository's landing map's, by position (`Repository::bringer_of`). A commit's part
 //! is what git's commit-graph keeps of it [B: gitformat-commit-graph]: its root tree, its committer's date, its
 //! generation number (one more than its parents' greatest, one for a root: version 1, "topological levels") and its
 //! parents in its own order, each by position. **A position row** names nothing and carries the object's id.
@@ -43,10 +44,6 @@ pub struct ObjectRow {
   pub len: u64,
   /// Its position.
   pub position: u64,
-  /// The green whose commit indexed it.
-  pub green: u64,
-  /// That green's version.
-  pub version: u64,
   /// A commit's part; `None` for any other type.
   pub commit: Option<CommitRow>,
 }
@@ -83,7 +80,7 @@ pub fn position_key(position: u64) -> Vec<u8> {
 /// An object row's payload.
 pub fn encode(row: &ObjectRow) -> Vec<u8> {
   let mut out = vec![row.kind.pack_number()];
-  for word in [row.len, row.position, row.green, row.version] {
+  for word in [row.len, row.position] {
     out.extend_from_slice(&word.to_le_bytes());
   }
   if let Some(commit) = &row.commit {
@@ -132,12 +129,7 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
   let (&number, rest) = payload.split_first()?;
   let kind = kind_of(number)?;
   let mut fields = Fields { bytes: rest };
-  let (len, position, green, version) = (
-    fields.word()?,
-    fields.word()?,
-    fields.word()?,
-    fields.word()?,
-  );
+  let (len, position) = (fields.word()?, fields.word()?);
   let commit = if kind == Kind::Commit {
     Some(decode_commit(&mut fields)?)
   } else {
@@ -147,8 +139,6 @@ pub fn decode(payload: &[u8]) -> Option<ObjectRow> {
     kind,
     len,
     position,
-    green,
-    version,
     commit,
   })
 }

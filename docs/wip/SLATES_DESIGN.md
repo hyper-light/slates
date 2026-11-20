@@ -55259,3 +55259,17 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   the by-use proof on both architectures: with this change `slates-bridge-winfsp --lib` with WinFsp passes whole on
   x86_64 and arm64 (diag-w-bugs-lib-737, 2026-11-20), where every Windows run failed the check before.
 - **Applied in the same change to** GAPS (A-576's entry), `normalized.rs`' module docs, amendments.tsv.
+
+### A-722 part 2 — A row holds nothing known only once its push lands (2026-11-20, w-git for UI goal 93; A-722's design, point 3)
+- **Change.** `slates_git::store::rows`: an object row is its kind, length, position and (a commit's) commit-graph part;
+  the green and version that brought it are no longer in it, so a push can write its rows before it lands. The
+  repository keeps them beside the index as a landing map of position runs (`Repository::bringer_of`), written as a
+  commit lands (each fresh object's first move, consecutive positions of one pair one run) and charged to the store.
+  upload-pack's choice of a kept fragment and the hook view's cover read it there; a position no landing gave answers
+  none, so a reader passes over it.
+- **Tests.** `slates-git` `store::tests::the_landing_map_answers_the_version_that_brought_each_position`; the row and
+  commit-row tests read the landing map.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- store:: upload::
+  receive:: hook_view` 200 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
+  vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
+  (3 of 3); fmt clean.
