@@ -52167,7 +52167,8 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   admitted to the git store with the green's head moved and recorded with the version; a submit refused before its
   verdict when its post-state is one git cannot hold; a whole build and a whole map's release sliced a unit at a time
   (each is one step, as A-662's replay of a record is); a branch's first map derived from its source's where the
-  source's head is the version it was made at; the holders' maps (A-636's fleet half); a copy made through a work
+  source's head is the version it was made at (BUILT 2026-11-20, `paths::branch_before`: the branch's version 0 is that
+  version, so its first version derives over (0, 1] from the source's head; built whole once the source moved on); the holders' maps (A-636's fleet half); a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Mercurial's manifests and Subversion's trees
   by the same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);

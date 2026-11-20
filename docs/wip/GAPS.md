@@ -44,6 +44,8 @@
 > record in an entry of the register holding it alone (no entry kind of its own: the register takes one, with no
 > position), appended in the version's own transaction and replayed by a recovery; a stock client's clone through
 > A-682's lender fetches it; a commit git would refuse or the budget refuses not made, counted, the version standing.
+> A branch's first map derived from its source's (2026-11-20, w-shared): BUILT where the source's head is the version the
+> branch was made at (its version 0); built whole otherwise (`paths::branch_before`; macOS arm64, this Mac, local).
 > OWED: the clients' surfaces
 > (the typed client's submits, `Client::submit` and its siblings, the approvals and the edit and submit, carrying a
 > message; the SDKs, the MCP and the CLI; setting identities); Subversion's author (its revisions); the holders'

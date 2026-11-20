@@ -460,12 +460,13 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
   assert_eq!(counts, (1, 1, 2));
 }
 
-/// A-664 part 3 (its first piece: a branch's first version has no parent's map of its own green). Do: submit a file to
-/// a git repository's root green, branch it at its head, then submit two versions to the branch. Expect: the branch's
-/// first version built whole and holding the root's file and its own; its second derived from it; each equal to its
-/// model.
+/// A-664 part 3 (a branch's first map from its source's: the branch's version 0 is its source's version it was made
+/// at). Do: submit a file to a git repository's root green, branch it at its head, then submit two versions to the
+/// branch; branch the root again, move the root on, then submit to the second branch. Expect: the first branch's first
+/// version derived from the root's map and holding the root's file and its own, its second derived from it, each equal
+/// to its model; the second branch's first version built whole, its source's head having moved past it.
 #[test]
-fn t_a664_p3_a_branchs_first_version_is_built_whole_then_derived() {
+fn t_a664_p3_a_branchs_first_version_derives_from_its_sources_map() {
   let counts = crate::daemon::audit_on_shard(|state| {
     let (repository, root) = git_repository(state, "branched");
     version(state, root, 1, vec![create("/f", b"root")]);
@@ -478,9 +479,17 @@ fn t_a664_p3_a_branchs_first_version_is_built_whole_then_derived() {
     let second = version(state, topic, 3, vec![Op::Edit("/t", 0, 5, b"TOPIC")]);
     set(&mut model, "t", FileClass::File, b"TOPIC");
     assert_kept(state, (repository, topic), second, &model);
-    (count(state, BUILT), count(state, DERIVED))
+    let derived = (count(state, BUILT), count(state, DERIVED));
+    let late = branch(state, "branched", "late");
+    version(state, root, 4, vec![create("/g", b"moved")]);
+    let late_first = version(state, late, 5, vec![create("/l", b"late")]);
+    let mut late_model = Model::new();
+    set(&mut late_model, "f", FileClass::File, b"root");
+    set(&mut late_model, "l", FileClass::File, b"late");
+    assert_kept(state, (repository, late), late_first, &late_model);
+    (derived, count(state, BUILT), count(state, DERIVED))
   });
-  assert_eq!(counts, (2, 1));
+  assert_eq!(counts, ((1, 2), 2, 3));
 }
 
 /// A-664 part 3 (its first piece; A-662: the live store equals a store made again from the log, which keeps a map for
