@@ -1376,6 +1376,20 @@ impl Client {
     self.declare_begin_spin(&work, WorkOp::SetMode { path, mode })
   }
 
+  /// Begins a copy and spins (A-626 part 4).
+  #[napi]
+  pub fn begin_spin_copy(
+    &mut self,
+    work: String,
+    from: String,
+    to: String,
+    version: Option<i64>,
+    replace: Option<bool>,
+  ) -> Result<UnitBegin> {
+    let op = copy_op(from, to, version, replace)?;
+    self.declare_begin_spin(&work, op)
+  }
+
   /// Begins a symlink and spins.
   #[napi]
   pub fn begin_spin_symlink(
@@ -1725,6 +1739,108 @@ impl Client {
   pub fn remove_xattr(&mut self, work: String, path: String, name: String) -> Result<()> {
     self.declare(&work, WorkOp::RemoveXattr { path, name })
   }
+
+  /// Copies `from`'s tree to `to` on a work volume by reference (A-626 part 4): as version `version` of the work's
+  /// green held it, the work's base when none; replacing what `to` holds when `replace`.
+  #[napi]
+  pub fn copy(
+    &mut self,
+    work: String,
+    from: String,
+    to: String,
+    version: Option<i64>,
+    replace: Option<bool>,
+  ) -> Result<()> {
+    let op = copy_op(from, to, version, replace)?;
+    self.declare(&work, op)
+  }
+}
+
+/// A copy's operation from JavaScript's arguments: a version a non-negative integer, `replace` false when absent.
+fn copy_op(
+  from: String,
+  to: String,
+  version: Option<i64>,
+  replace: Option<bool>,
+) -> Result<WorkOp> {
+  let version = version
+    .map(u64::try_from)
+    .transpose()
+    .map_err(|_| Error::from_reason("version must be a non-negative integer"))?;
+  Ok(WorkOp::Copy {
+    from,
+    to,
+    version,
+    replace: replace.unwrap_or(false),
+  })
+}
+
+/// The client's method that declares `op`, or none where the SDK offers no such op: every operation of the wire's
+/// `WorkOp` named here by an exhaustive match, so an operation appended to it breaks this build until the SDK decides
+/// whether and how to offer it (A-626 part 4's lesson: a copy reached the wire and no surface had it). A declared
+/// device or named pipe (`Mknod`) carries the declaring host's metadata, which the SDK's verbs do not take.
+fn work_op_method(op: &WorkOp) -> Option<&'static str> {
+  match op {
+    WorkOp::Unlink { .. } => Some("unlink"),
+    WorkOp::Rename { .. } => Some("rename"),
+    WorkOp::Mkdir { .. } => Some("mkdir"),
+    WorkOp::Rmdir { .. } => Some("rmdir"),
+    WorkOp::SetMode { .. } => Some("chmod"),
+    WorkOp::Symlink { .. } => Some("symlink"),
+    WorkOp::Link { .. } => Some("link"),
+    WorkOp::SetXattr { .. } => Some("setXattr"),
+    WorkOp::RemoveXattr { .. } => Some("removeXattr"),
+    WorkOp::Mknod { .. } => None,
+    WorkOp::Copy { .. } => Some("copy"),
+  }
+}
+
+/// The client methods that declare a work's operations ([`work_op_method`]), one an operation the SDK offers: what the
+/// by-use tests hold both clients to.
+#[napi]
+pub fn work_op_methods() -> Vec<String> {
+  let path = String::new;
+  let ops = [
+    WorkOp::Unlink { path: path() },
+    WorkOp::Rename {
+      from: path(),
+      to: path(),
+    },
+    WorkOp::Mkdir { path: path() },
+    WorkOp::Rmdir { path: path() },
+    WorkOp::SetMode {
+      path: path(),
+      mode: 0,
+    },
+    WorkOp::Symlink {
+      path: path(),
+      target: path(),
+    },
+    WorkOp::Link {
+      path: path(),
+      target: path(),
+    },
+    WorkOp::SetXattr {
+      path: path(),
+      name: path(),
+      value: Vec::new(),
+    },
+    WorkOp::RemoveXattr {
+      path: path(),
+      name: path(),
+    },
+    WorkOp::Copy {
+      from: path(),
+      to: path(),
+      version: None,
+      replace: false,
+    },
+  ];
+  ops
+    .iter()
+    .filter_map(work_op_method)
+    .map(str::to_owned)
+    .collect()
 }
 
 impl Client {

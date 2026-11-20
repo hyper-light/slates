@@ -14835,6 +14835,30 @@ cutting the temporaries brought both down. Measured-and-rejected: `malloc_zone_p
 import released 0 bytes (footprint 2,457 and 2,545 MB). With the system allocator alone the freed memory came back on
 its schedule: five seconds after the import 1,565 to 1,834 MB in three runs and none in two others.
 
+## The anchor's memory by range after the svn import (A-744; UI goal 93; 2026-11-20)
+
+- **Machine and build:** the Mac Studio of the entries above, 2026-11-20 ~11:07 UTC, load average 12.25 (shared; not
+  quiesced). Release build of `slates-cli` with A-744.
+- **Data and command:** `git-1000.dump` (223 MiB); a fresh anchor, `slates repository create project --tool svn`,
+  `slates repository import project git-1000.dump`, then `slates status --json` until every shard's
+  `content_ranges.sweep.completed` is at least 1 (28 requests), summing each range over the shards; three runs.
+
+| Range | bytes (all shards) | in RAM, written (all shards) | owner shard 10 |
+|---|---|---|---|
+| content object: write log | 8,192 MiB | 0.7 MiB | 0 |
+| content object: image slots | 65,536 MiB | 0.7 MiB | 0 |
+| content object: delta log | 32,768 MiB | 0.4 MiB | 0 |
+| content object: DAX range table | 1 MiB | 0.5 MiB | 0 |
+| content object: chunk arena | 1,024 MiB (0 allocated) | 0 | 0 |
+| anchor segment: log ring | 8,192 MiB | 355.9 MiB | 355.2 MiB |
+| anchor segment: snapshot slots | 32,769 MiB | 226.5 MiB | 225.8 MiB |
+| total | | 584.7 MiB | 581.0 MiB |
+
+Identical in the three runs (bytes written 583.2 to 584.6 MiB; footprint 1,453 to 1,530 MB). The written shared memory
+`vmmap` showed after the import (581 MiB) is the owner partition's durable register in the anchor segment: its log ring
+(the repository records and chain entries the import logged) and its snapshot slots (the partition snapshot). The
+content object holds 2.3 MiB; a green's files are not in it.
+
 ## Slates against git daemon on git/git cut at v1.0.0: the read path works, clone 9.4 times slower, its delta search the cause (A-699; UI goal 93; 2026-11-20)
 
 - **Machine and build:** Mac Studio (as above), 2026-11-20 ~06:00 UTC, load average 7.42 at the start and 13.45 at the

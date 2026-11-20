@@ -629,6 +629,28 @@ impl Client {
     )
   }
 
+  /// Copies `from`'s tree to `to` on a work volume by reference (A-626 part 4): as version `version` of the work's green
+  /// held it, the work's base when none; replacing what `to` holds when `replace`.
+  #[pyo3(signature = (work, from, to, version=None, replace=false))]
+  fn copy(
+    &mut self,
+    work: &str,
+    from: &str,
+    to: &str,
+    version: Option<u64>,
+    replace: bool,
+  ) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Copy {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        version,
+        replace,
+      },
+    )
+  }
+
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a
   /// test can assert a session survived a restart — §4.9).
   fn reconnects(&self) -> u64 {
@@ -1258,6 +1280,30 @@ impl AsyncClient {
     )
   }
 
+  /// Copies `from`'s tree to `to` on a work volume by reference (A-626 part 4): as version `version` of the work's green
+  /// held it, the work's base when none; replacing what `to` holds when `replace`.
+  #[pyo3(signature = (work, from, to, version=None, replace=false))]
+  fn copy<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    from: &str,
+    to: &str,
+    version: Option<u64>,
+    replace: bool,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Copy {
+        from: from.to_owned(),
+        to: to.to_owned(),
+        version,
+        replace,
+      },
+    )
+  }
+
   /// Removes the extended attribute `name` at `path` on a work volume (§4.16).
   fn remove_xattr<'py>(
     slf: Bound<'py, Self>,
@@ -1843,12 +1889,77 @@ fn apparmor_profile(executable: &str) -> PyResult<String> {
 
 /// The `slates` extension module: the [`Client`] and [`AsyncClient`] classes, the launcher's command and AppArmor
 /// profile (A-370), and the SDK version.
+/// The client's method that declares `op`, or none where the SDK offers no such op: every operation of the wire's
+/// `WorkOp` named here by an exhaustive match, so an operation appended to it breaks this build until the SDK decides
+/// whether and how to offer it (A-626 part 4's lesson: a copy reached the wire and no surface had it). A declared
+/// device or named pipe (`Mknod`) carries the declaring host's metadata, which the SDK's verbs do not take.
+fn work_op_method(op: &WorkOp) -> Option<&'static str> {
+  match op {
+    WorkOp::Unlink { .. } => Some("unlink"),
+    WorkOp::Rename { .. } => Some("rename"),
+    WorkOp::Mkdir { .. } => Some("mkdir"),
+    WorkOp::Rmdir { .. } => Some("rmdir"),
+    WorkOp::SetMode { .. } => Some("chmod"),
+    WorkOp::Symlink { .. } => Some("symlink"),
+    WorkOp::Link { .. } => Some("link"),
+    WorkOp::SetXattr { .. } => Some("set_xattr"),
+    WorkOp::RemoveXattr { .. } => Some("remove_xattr"),
+    WorkOp::Mknod { .. } => None,
+    WorkOp::Copy { .. } => Some("copy"),
+  }
+}
+
+/// The client methods that declare a work's operations ([`work_op_method`]), one an operation the SDK offers: what the
+/// by-use tests hold both clients to.
+#[pyfunction]
+fn work_op_methods() -> Vec<&'static str> {
+  let path = String::new;
+  let ops = [
+    WorkOp::Unlink { path: path() },
+    WorkOp::Rename {
+      from: path(),
+      to: path(),
+    },
+    WorkOp::Mkdir { path: path() },
+    WorkOp::Rmdir { path: path() },
+    WorkOp::SetMode {
+      path: path(),
+      mode: 0,
+    },
+    WorkOp::Symlink {
+      path: path(),
+      target: path(),
+    },
+    WorkOp::Link {
+      path: path(),
+      target: path(),
+    },
+    WorkOp::SetXattr {
+      path: path(),
+      name: path(),
+      value: Vec::new(),
+    },
+    WorkOp::RemoveXattr {
+      path: path(),
+      name: path(),
+    },
+    WorkOp::Copy {
+      from: path(),
+      to: path(),
+      version: None,
+      replace: false,
+    },
+  ];
+  ops.iter().filter_map(work_op_method).collect()
+}
+
 #[pymodule]
 fn slates(module: &Bound<'_, PyModule>) -> PyResult<()> {
   module.add_class::<Client>()?;
   module.add_class::<AsyncClient>()?;
   module.add_function(wrap_pyfunction!(exec_command, module)?)?;
   module.add_function(wrap_pyfunction!(apparmor_profile, module)?)?;
+  module.add_function(wrap_pyfunction!(work_op_methods, module)?)?;
   module.add("SlatesError", module.py().get_type_bound::<SlatesError>())?;
   module.add("__version__", env!("CARGO_PKG_VERSION"))?;
   Ok(())

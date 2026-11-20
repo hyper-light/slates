@@ -1118,8 +1118,10 @@ fn tool_list() -> Vec<Value> {
       "slates.merge.declare",
       "Declare a namespace op on a work (the counterpart to edit). `op.kind` is one of unlink{path}, \
        rename{from,to}, mkdir{path}, rmdir{path}, set_mode{path,mode}, symlink{path,target}, \
-       link{path,target}, set_xattr{path,name,value}, remove_xattr{path,name}.",
-      json!({ "work": string, "op": { "type": "object", "properties": { "kind": string, "path": string, "from": string, "to": string, "target": string, "name": string, "value": string, "mode": integer }, "required": ["kind"] } }),
+       link{path,target}, set_xattr{path,name,value}, remove_xattr{path,name}, \
+       copy{from,to,version?,replace?} (`from`'s tree at the green's `version`, the work's base when absent, \
+       copied to `to` by reference; `replace` takes the place of what `to` holds).",
+      json!({ "work": string, "op": { "type": "object", "properties": { "kind": string, "path": string, "from": string, "to": string, "target": string, "name": string, "value": string, "mode": integer, "version": integer, "replace": { "type": "boolean" } }, "required": ["kind"] } }),
       json!(["work", "op"]),
     ),
     tool(
@@ -1441,6 +1443,27 @@ pub fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
   )
 }
 
+/// The `kind` an op object names `op` by on this surface, or none where MCP offers no such op: every operation of
+/// the wire's `WorkOp` named here by an exhaustive match, so an operation appended to it breaks this build until MCP
+/// decides whether and how to offer it (A-626 part 4's lesson: a copy verb reached the wire and no surface had it).
+/// A declared device or named pipe (`Mknod`) carries the declaring host's metadata, which a model has no way to know,
+/// so MCP offers none.
+pub fn work_op_kind(op: &WorkOp) -> Option<&'static str> {
+  match op {
+    WorkOp::Unlink { .. } => Some("unlink"),
+    WorkOp::Rename { .. } => Some("rename"),
+    WorkOp::Mkdir { .. } => Some("mkdir"),
+    WorkOp::Rmdir { .. } => Some("rmdir"),
+    WorkOp::SetMode { .. } => Some("set_mode"),
+    WorkOp::Symlink { .. } => Some("symlink"),
+    WorkOp::Link { .. } => Some("link"),
+    WorkOp::SetXattr { .. } => Some("set_xattr"),
+    WorkOp::RemoveXattr { .. } => Some("remove_xattr"),
+    WorkOp::Mknod { .. } => None,
+    WorkOp::Copy { .. } => Some("copy"),
+  }
+}
+
 /// Reads a `WorkOp` from an `op` object (§4.16): `kind` names the operation, the rest are its fields.
 /// The `WorkOp` enum stays inside the server — its wire form is this plain JSON object.
 fn work_op_from(op: &Value) -> Result<WorkOp, McpError> {
@@ -1477,6 +1500,12 @@ fn work_op_from(op: &Value) -> Result<WorkOp, McpError> {
     "remove_xattr" => WorkOp::RemoveXattr {
       path: path(op)?,
       name: string_arg(op, "name")?,
+    },
+    "copy" => WorkOp::Copy {
+      from: string_arg(op, "from")?,
+      to: string_arg(op, "to")?,
+      version: op.get("version").and_then(Value::as_u64),
+      replace: op.get("replace").and_then(Value::as_bool).unwrap_or(false),
     },
     other => {
       return Err(McpError {
@@ -2160,6 +2189,33 @@ fn group_json(g: &GroupReport) -> Value {
   })
 }
 
+/// Format: the prefix of a shard's content-range figures among its counters (A-744; the server's
+/// `content_ranges::PREFIX`): `content_range.<range>.<figure>`.
+const CONTENT_RANGE_PREFIX: &str = "content_range.";
+
+/// A shard's slice of the anchor content object, range by range (A-744): `{range: {figure: bytes}}` from its
+/// `content_range.<range>.<figure>` counters, the figures `bytes`, `resident`, `modified` (where the OS says) and the arena's
+/// `allocated`.
+fn content_ranges_json(counters: &[slates_ipc::protocol::RefusalCount]) -> Value {
+  let mut ranges = serde_json::Map::new();
+  for counter in counters {
+    let Some(rest) = counter.kind.strip_prefix(CONTENT_RANGE_PREFIX) else {
+      continue;
+    };
+    let Some((range, figure)) = rest.split_once('.') else {
+      continue;
+    };
+    if let Some(entry) = ranges
+      .entry(range.to_owned())
+      .or_insert_with(|| json!({}))
+      .as_object_mut()
+    {
+      entry.insert(figure.to_owned(), json!(counter.count));
+    }
+  }
+  Value::Object(ranges)
+}
+
 /// One shard's block of the daemon's status as JSON (§4.14): the fields the text form prints per
 /// shard, its health signals, and its telemetry drain when gathered.
 fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
@@ -2168,7 +2224,13 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "clients": s.clients,
     "volumes": s.volumes,
     "served": s.served,
-    "refusals": s.refusals.iter().map(|r| json!({ "kind": r.kind, "count": r.count })).collect::<Vec<_>>(),
+    "refusals": s
+      .refusals
+      .iter()
+      .filter(|r| !r.kind.starts_with(CONTENT_RANGE_PREFIX))
+      .map(|r| json!({ "kind": r.kind, "count": r.count }))
+      .collect::<Vec<_>>(),
+    "content_ranges": content_ranges_json(&s.refusals),
     "replayed_records": s.replayed_records,
     "replay_ns": s.replay_ns,
     "torn_tail": s.torn_tail,

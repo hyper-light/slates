@@ -1160,13 +1160,21 @@ impl GitPush {
   /// Seals the push: every commit's generation number, its parents read from the push or the repository (A-614). Each
   /// append then admits its own moves ([`SealedPush::admit`]). Refused, the push is abandoned and its holds given back.
   pub(crate) fn seal(mut self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
-    let sealed = match state.vcs_stores.git(self.repository) {
+    // Its rows written for its landing to adopt (A-722 part 3), with the room they take lent.
+    let rows = state
+      .vcs_stores
+      .git_ref(self.repository)
+      .map_or(0, |(_, store)| store.repository.stage_room(&self.push));
+    let push = &mut self.push;
+    let repository = self.repository;
+    let sealed = within_budget(state, rows, |stores| match stores.git(repository) {
       Some((content, store)) => store
         .repository
-        .seal(content, &mut self.push)
+        .seal(content, push)
+        .and_then(|()| store.repository.stage(content, push))
         .map_err(GitRefused::Store),
       None => Err(GitRefused::NoStore),
-    };
+    });
     match sealed {
       Ok(()) => Ok(SealedPush {
         repository: self.repository,
@@ -1281,14 +1289,15 @@ fn lacks<'s>(content: &'s ContentStore, store: &'s GitStore) -> impl Fn(&ObjectI
 
 /// Seals `push` and admits each of `moves` against the store, in order (A-614's `seal` and `admit`).
 fn seal_moves(
-  content: &ContentStore,
-  store: &GitStore,
+  content: &mut ContentStore,
+  store: &mut GitStore,
   push: &mut Push,
   moves: &[RecordedMove],
 ) -> Result<Vec<Move>, GitRefused> {
   store
     .repository
     .seal(content, push)
+    .and_then(|()| store.repository.stage(content, push))
     .map_err(GitRefused::Store)?;
   admit_moves(content, store, push, moves)
 }

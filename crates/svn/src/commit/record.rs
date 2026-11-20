@@ -216,7 +216,10 @@ impl Record {
   /// The bytes of `revision`'s record, as [`Record::encode`] writes a [`Record::Revision`], without taking the
   /// revision: what the owner's step writes before it hands the revision to the check (A-655 part 2b).
   pub fn revision_bytes(revision: &Revision) -> Vec<u8> {
-    let mut out = header(REVISION);
+    // Reserved at the record's exact length once, never grown: a revision carries its texts, and growing a buffer of
+    // that size by doubling copied it again at each step (A-742: 265 MiB of such copies in a 1,000-revision import).
+    let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(revision_len(revision)));
+    put_header(&mut out, REVISION);
     put_revision(&mut out, revision);
     out
   }
@@ -254,11 +257,117 @@ impl Record {
 
 /// A record's first bytes: the magic, the version and `kind`.
 fn header(kind: u8) -> Vec<u8> {
-  let mut out = Vec::new();
-  put_word(&mut out, MAGIC);
-  put_word(&mut out, VERSION);
-  out.push(kind);
+  let mut out = Vec::with_capacity(HEADER_LEN);
+  put_header(&mut out, kind);
   out
+}
+
+/// Appends a record's first bytes ([`header`]).
+fn put_header(out: &mut Vec<u8>, kind: u8) {
+  put_word(out, MAGIC);
+  put_word(out, VERSION);
+  out.push(kind);
+}
+
+/// Format: a header's length: the magic and the version (two words) and the kind (a byte).
+const HEADER_LEN: usize = 4 + 4 + 1;
+
+/// Format: a count, a length, a revision or a size ([`put_long`]).
+const LONG: usize = size_of::<u64>();
+
+/// A length-prefixed byte string's encoded length ([`put_bytes`]).
+fn bytes_len(bytes: &[u8]) -> usize {
+  LONG.saturating_add(bytes.len())
+}
+
+/// The bytes [`put_revision`] writes for `revision`, exactly.
+fn revision_len(revision: &Revision) -> usize {
+  let rows = revision.record.changes.iter().map(row_len);
+  let properties = revision
+    .properties
+    .iter()
+    .map(|(name, value)| bytes_len(name).saturating_add(bytes_len(value)));
+  let contents = revision
+    .contents
+    .iter()
+    .map(|(identity, bytes)| size_of_val(identity).saturating_add(bytes_len(bytes)));
+  let locks = revision.lock_entries.iter().map(lock_len);
+  [
+    LONG,
+    bytes_len(revision.record.transaction.as_bytes()),
+    LONG,
+    rows.fold(0usize, usize::saturating_add),
+    LONG,
+    properties.fold(0usize, usize::saturating_add),
+    LONG,
+    contents.fold(0usize, usize::saturating_add),
+    LONG,
+    locks.fold(0usize, usize::saturating_add),
+  ]
+  .into_iter()
+  .fold(0usize, usize::saturating_add)
+}
+
+/// The bytes [`put_row`] writes for `row`, exactly.
+fn row_len(row: &ChangedPath) -> usize {
+  let copy = row.copy_from.as_ref().map_or(0, |source| {
+    bytes_len(source.path.as_bytes()).saturating_add(LONG)
+  });
+  let text = row.text.as_ref().map_or(0, |text| {
+    [
+      size_of_val(&text.identity),
+      size_of_val(&text.md5),
+      size_of_val(&text.sha1),
+      LONG,
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+  });
+  let properties = match &row.properties {
+    Some(PropertyList::Held { identity, .. }) => 1usize
+      .saturating_add(size_of_val(identity))
+      .saturating_add(1),
+    None | Some(PropertyList::Empty) => 1,
+  };
+  // The path, the action and kind bytes, the copy's mark and the text's mark, the properties, the mergeinfo mark.
+  [
+    bytes_len(row.path.as_bytes()),
+    2,
+    1,
+    copy,
+    1,
+    text,
+    properties,
+    1,
+  ]
+  .into_iter()
+  .fold(0usize, usize::saturating_add)
+}
+
+/// The bytes [`put_lock_entry`] writes for `entry`, exactly.
+fn lock_len(entry: &LockEntry) -> usize {
+  match entry {
+    LockEntry::Set(lock) => [
+      1,
+      bytes_len(lock.path.as_bytes()),
+      bytes_len(lock.token.as_str().as_bytes()),
+      bytes_len(lock.owner.as_bytes()),
+      1,
+      lock
+        .comment
+        .as_ref()
+        .map_or(0, |comment| bytes_len(comment.as_bytes())),
+      1,
+      size_of_val(&lock.created.0),
+      1,
+      lock.expires.map_or(0, |expires| size_of_val(&expires.0)),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add),
+    LockEntry::Removed { path, token } => 1usize
+      .saturating_add(bytes_len(path.as_bytes()))
+      .saturating_add(bytes_len(token.as_str().as_bytes())),
+  }
 }
 
 /// Appends a word.
