@@ -899,6 +899,6 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
       read.trim(),
     ),
     (true, (0, true, true), 0, "changed"),
-    "policy: {out}{err}; changed: {changed:?}"
+    "refused: {refused:?}; policy: {out}{err}; changed: {changed:?}"
   );
 }
