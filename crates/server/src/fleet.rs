@@ -1683,6 +1683,42 @@ async fn serve_peer_records(
         }
         continue;
       }
+      // A large live message is taken in turns of its own (A-757 part 4): its entries' identities are hashed a slice a
+      // turn before they are taken, so it holds no other request of the peer and no poll of this shard long. The owner
+      // sends a holder's next message only once this one is answered, so its entries stay in order.
+      crate::forward_lane::Next::Request {
+        stream_id,
+        kind,
+        request,
+      } if (kind == slates_cluster::live::LIVE_ENTRY_STREAM
+        || kind == slates_cluster::live::LIVE_ENTRIES_STREAM)
+        && enrolled
+        && crate::live_ship::hashed_in_turns(request.len()) =>
+      {
+        let peer_host = state::with_state(|s| {
+          s.learned_members
+            .get(&peer_anchor)
+            .map_or(seed, |learned| learned.host)
+        })
+        .unwrap_or(seed);
+        let served = forwards.spawn(stream_id, async move {
+          let object = slates_db::live::object_of(&request);
+          let admission = crate::live_ship::admit_claim(control, local, peer_host, object).await;
+          match admission.refusal() {
+            Some(refusal) => refusal,
+            None => {
+              let batch = kind == slates_cluster::live::LIVE_ENTRIES_STREAM;
+              crate::live_ship::serve_entries_hashed(local, peer_host, batch, request).await
+            }
+          }
+        });
+        if let Some(reply) = served
+          && endpoint.reply(stream_id, reply).is_err()
+        {
+          return;
+        }
+        continue;
+      }
       // A work route's question (A-288) is answered on the green's shard, so it too runs on its own task.
       crate::forward_lane::Next::Request {
         stream_id,

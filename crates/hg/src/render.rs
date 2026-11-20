@@ -199,7 +199,7 @@ fn revlog(
       rev,
     };
     let (parents, link) = numbers(index, store, log, rev).ok_or_else(unreadable)?;
-    let kept = kept(index, store, log, rev, true).ok_or_else(unreadable)?;
+    let kept = kept(index, store, log, rev).ok_or_else(unreadable)?;
     let mut text = Vec::new();
     admission.charge(kept.len.saturating_add(to_u64(ENTRY_BYTES + 1)))?;
     if write_text(&mut text, store, &kept) != kept.len {
@@ -544,7 +544,7 @@ fn data_chunk(
     log: unreadable_name(&log),
     rev,
   };
-  let kept = kept(index, store, log.log(), rev, true).ok_or_else(unreadable)?;
+  let kept = kept(index, store, log.log(), rev).ok_or_else(unreadable)?;
   admission.charge(kept.len.saturating_add(1))?;
   let mut text = Vec::new();
   if write_text(&mut text, store, &kept) != kept.len {

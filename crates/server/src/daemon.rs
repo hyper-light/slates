@@ -7774,6 +7774,230 @@ mod tests {
     assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
   }
 
+  /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained
+  /// anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any node's window); read
+  /// the file's object by its identity, the BLAKE3 of its bytes; publish; stop; start a successor and read it again.
+  /// Expect: the object whole by its identity on both; the successor taking back every list and name of the content
+  /// store from the shard image (none refused), so the records' replay stores no list again.
+  #[test]
+  fn t_a727_a3b_an_object_past_a_window_survives_a_warm_restart_by_its_identity() {
+    use slates_anchor::AnchorSegment;
+    const LARGE: usize = 1 << 20;
+    let profile = test_profile();
+    let instance = format!("a727-a3b-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let (request, _) = crate::git_push::tests::large_create(LARGE);
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = slates_vcs::ContentId::of(&blob);
+    let len = u64::try_from(LARGE).unwrap();
+    let read = move |state: &mut crate::state::ShardState| {
+      let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content()
+        .and_then(|content| content.object_bytes(&identity, len))
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let before = first
+      .observe(first.shards.first().copied(), move |state| {
+        let repository = crate::git_push::tests::git_repository(state, "large");
+        let received = crate::git_push::tests::pushed(state, repository, &request);
+        let _ = received;
+        crate::vcs_store::paths::whole_build::settle(state);
+        read(state)
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let observe = || {
+      second
+        .observe(shard, move |state| {
+          let bytes = read(state);
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let lists = state
+            .vcs_stores
+            .content()
+            .map(|content| content.counters().lists);
+          (
+            bytes,
+            count(crate::vcs_store::NODES_RESTORED),
+            count(crate::vcs_store::NODES_UNRESTORED),
+            lists,
+          )
+        })
+        .ok()
+    };
+    let mut seen = observe();
+    for _ in 0..600 {
+      if seen.as_ref().is_some_and(|seen| seen.0.is_some()) {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_millis(50));
+      seen = observe();
+    }
+    second.stop();
+    assert_eq!(
+      before.as_deref(),
+      Some(blob.as_slice()),
+      "the object by its identity before"
+    );
+    let (after, restored, unrestored, lists) = seen.expect("the successor answered");
+    assert_eq!(
+      after.as_deref(),
+      Some(blob.as_slice()),
+      "the object by its identity after"
+    );
+    assert!(restored > 0, "the lists and names taken back");
+    assert_eq!(
+      (unrestored, lists),
+      (0, Some(0)),
+      "none refused, no list stored again"
+    );
+  }
+
+  /// §4.17.1 "A push's intake" part 2 (main's ruling (B), A-727 slice b's barrier). Do: on a daemon over a retained
+  /// anchor segment, land a Subversion work whose text spans several copy slices through `svn_commit::land_work`: its
+  /// text put into the content store a slice a turn, its revision appended naming the text by identity only once the
+  /// text is durable; then stop the daemon without publishing anything more, as a crash right after the entry, and
+  /// start a successor over the same segment. Expect: the successor replays the revision with its stored text held, no
+  /// replay refused, and the text read back whole from the store. Without the barrier (the entry appended right after
+  /// the puts) the text is in no image and the replay is refused `SvnStored`.
+  #[test]
+  fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
+    use slates_anchor::AnchorSegment;
+    use slates_svn::commit::drive::TextSink;
+    let profile = test_profile();
+    let instance = format!("svn-intake-barrier-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let bytes: Vec<u8> = (0..3 * 65_536 + 17)
+      .map(|at: u32| (at % 251) as u8)
+      .collect();
+    let text = slates_svn::commit::drive::text_of(&bytes).unwrap();
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let put = bytes.clone();
+    first
+      .observe(shard, move |state| {
+        let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "barrier");
+        let task = slates_rt::futures::spawn(async move {
+          let texts = slates_svn::commit::drive::HeldTexts::new();
+          let staged = texts.stage().unwrap();
+          texts.append(staged, &put).unwrap();
+          texts.seal(staged, text.identity).unwrap();
+          let work = slates_svn::commit::drive::Work {
+            head: 0,
+            record: slates_svn::index::RevisionRecord {
+              transaction: "0-1".to_owned(),
+              changes: vec![slates_svn::index::ChangedPath {
+                path: "/a.txt".to_owned(),
+                action: slates_svn::index::Action::Add,
+                kind: slates_svn::index::NodeKind::File,
+                copy_from: None,
+                text: Some(text),
+                properties: None,
+                mergeinfo_modified: false,
+              }],
+            },
+            lock_entries: Vec::new(),
+            revision_properties: vec![(b"svn:author".to_vec(), b"alice".to_vec())],
+            texts: std::iter::once(text.identity).collect(),
+            property_lists: std::collections::BTreeMap::new(),
+            locks: slates_svn::lock::CommitLocks::default(),
+          };
+          let owner = crate::repository::svn_commit::tests::owner();
+          let landed =
+            crate::repository::svn_commit::land_work((&owner, repository), work, &texts).await;
+          let _ = sent.send((repository, landed.map(|landed| landed.map(|_| ()))));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, landed) = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the landing answered");
+    assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let identity = text.identity;
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let refused = state
+            .refusals
+            .get(crate::vcs_store::REPLAY_REFUSED)
+            .copied()
+            .unwrap_or(0);
+          let recovered = state.vcs_stores.unrecovered(repository).is_none()
+            && !state.vcs_stores.rebuilding(repository)
+            && state.vcs_stores.holds(repository);
+          let whole = crate::vcs_store::lent_state(state, |state| {
+            let len = state
+              .vcs_stores
+              .subversion_records(repository)?
+              .stored_len(&identity)?;
+            let store = state.vcs_stores.content()?;
+            store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
+          });
+          (recovered, refused, whole)
+        })
+        .ok()
+    };
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    let mut seen = read();
+    while std::time::Instant::now() < deadline
+      && !seen
+        .as_ref()
+        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1 > 0)
+    {
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+      seen = read();
+    }
+    second.stop();
+    drop(segment);
+    let seen =
+      seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
+    assert_eq!(seen, Some((true, 0, true)));
+  }
+
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
   /// git repository and push the fixtures' `create` and `update` into it; publish every shard; stop; start a successor
   /// over the same segment. Expect: every window the first daemon kept (by identity, with its holders and its bytes)
@@ -7875,6 +8099,90 @@ mod tests {
       (restored, unrestored, unheld),
       (u64::try_from(before.len()).unwrap(), 0, 0)
     );
+  }
+
+  /// A-729 part 2 (an import's record names its contents by identity; main's ruling: since A-727 a3 the content survives
+  /// a restart in the shard image, recovered before the records). Do: on a daemon over a retained anchor segment, import
+  /// the `states` repository into a Mercurial repository a unit a turn and land it; publish every shard; stop; start a
+  /// successor over the same segment. Expect the successor's index of the repository the first's row for row, made
+  /// again from its identity record over the windows the image restored: every window restored, none refused, none left
+  /// unheld once the records were replayed.
+  #[test]
+  fn t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity() {
+    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
+    use slates_anchor::AnchorSegment;
+    let profile = test_profile();
+    let instance = format!("a729-identities-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (id, before) = first
+      .observe(shard, |state| {
+        let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
+        let laid = directory(crate::hg_base::tests::STATES.iter().copied());
+        assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
+        assert!(to_its_end(state, id).1.is_ok(), "imported");
+        assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+        (id, rows_of(state, id))
+      })
+      .unwrap();
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let read = || {
+      second
+        .observe(shard, move |state| {
+          let rows = if state.vcs_stores.mercurial(id).is_some() {
+            rows_of(state, id)
+          } else {
+            Vec::new()
+          };
+          let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          (
+            rows,
+            count(crate::vcs_store::WINDOWS_RESTORED),
+            count(crate::vcs_store::WINDOWS_UNRESTORED),
+            count(crate::vcs_store::WINDOWS_UNHELD),
+          )
+        })
+        .ok()
+    };
+    let mut seen = read();
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to replay the record.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+      if seen.as_ref().is_some_and(|seen| seen.0 == before) {
+        break;
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+      seen = read();
+    }
+    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    second.stop();
+    assert!(!before.is_empty(), "the import kept rows");
+    assert_eq!(
+      after, before,
+      "the successor made the index again by identity"
+    );
+    assert!(restored > 0, "no window was restored");
+    assert_eq!((unrestored, unheld), (0, 0));
   }
 
   /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's

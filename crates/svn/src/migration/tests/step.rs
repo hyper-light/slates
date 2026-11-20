@@ -86,6 +86,7 @@ fn first() -> RevisionToCommit {
       ("svn:log", "first"),
     ]),
     contents: BTreeMap::from([content(b"alpha\n"), (list_identity, list)]),
+    stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   }
 }
@@ -108,6 +109,7 @@ fn edit(head: u64, bytes: &[u8], entries: Vec<LockEntry>) -> RevisionToCommit {
       ("svn:log", "an edit"),
     ]),
     contents: BTreeMap::from([content(bytes)]),
+    stored: BTreeMap::new(),
     lock_entries: entries,
   }
 }
@@ -371,5 +373,54 @@ fn s4_c2_a_file_changed_many_times_reads_back_through_a_logarithmic_chain_of_del
     repository.text_bytes() * 4 < whole,
     "the deltas hold {} of {whole} bytes",
     repository.text_bytes()
+  );
+}
+
+/// A-761 (§4.17.1 "A push's intake", part 2). Do: commit revision 1 twice, once with [`FILE`]'s text kept in the
+/// records and once with it stored (the records naming it alone, its bytes in a store beside them); export each whole in
+/// formats 2 and 3, the stored one reading its text through that store. Expect: the same dumps byte for byte; and the
+/// stored one exported through its records alone refused `Corrupt`, since they hold no bytes of it.
+#[test]
+fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does() {
+  use crate::dump::Format;
+  use crate::migration::{Exporter, Exporting, MigrationRefusal, TextSource};
+  /// The records, and one text a commit stored beside them.
+  struct Beside<'a>(&'a Repository, (ContentIdentity, Vec<u8>));
+  impl TextSource for Beside<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+      if *identity == (self.1).0 {
+        return Some(std::borrow::Cow::Borrowed((self.1).1.as_slice()));
+      }
+      TextSource::text(self.0, identity)
+    }
+  }
+  let exported = |repository: &Repository, texts: &dyn TextSource, format: Format| {
+    let mut exporter = Exporter::new(repository, 0, repository.youngest(), format)?;
+    let mut out = Vec::new();
+    while exporter.export(repository, texts, &mut out)? != Exporting::Done {}
+    Ok::<_, MigrationRefusal>(out)
+  };
+  let mut kept = created();
+  let checked = kept.check(first()).unwrap();
+  kept.apply(checked).unwrap();
+  let (identity, bytes) = content(b"alpha\n");
+  let mut naming = first();
+  naming.contents.remove(&identity);
+  naming
+    .stored
+    .insert(identity, u64::try_from(bytes.len()).unwrap());
+  let mut stored = created();
+  let checked = stored.check(naming).unwrap();
+  stored.apply(checked).unwrap();
+  let beside = Beside(&stored, (identity, bytes));
+  for format in [Format::Two, Format::Three] {
+    assert_eq!(
+      exported(&stored, &beside, format).unwrap(),
+      exported(&kept, &kept, format).unwrap()
+    );
+  }
+  assert_eq!(
+    exported(&stored, &stored, Format::Two),
+    Err(MigrationRefusal::Corrupt)
   );
 }

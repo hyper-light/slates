@@ -1012,6 +1012,26 @@ impl Index {
     path: &str,
     revision: Revision,
   ) -> Result<Option<Vec<(String, NodeRevisionId)>>, IndexRefusal> {
+    Ok(
+      self
+        .listing_after(path, revision, None, usize::MAX)?
+        .map(|(listed, _)| listed),
+    )
+  }
+
+  /// Up to `most` children of the directory at `path` in `revision` whose names come after `after` (all, without one),
+  /// in byte order with their node-revisions, and whether more follow: a cursor a caller reads a very large directory
+  /// through a few entries a step (A-759). None when no directory stands there.
+  ///
+  /// # Errors
+  /// [`Index::children`]'s.
+  pub fn listing_after(
+    &self,
+    path: &str,
+    revision: Revision,
+    after: Option<&str>,
+    most: usize,
+  ) -> Result<Option<(Vec<(String, NodeRevisionId)>, bool)>, IndexRefusal> {
     let path = checked_path(path)?;
     self.check_revision(revision)?;
     let Some(id) = self.resolve(path, revision)? else {
@@ -1021,15 +1041,15 @@ impl Index {
     if row.kind != NodeKind::Directory {
       return Ok(None);
     }
-    let held = children::entries(self, row.children).ok_or(IndexRefusal::Corrupt)?;
+    let (held, more) =
+      children::entries_after(self, row.children, after, most).ok_or(IndexRefusal::Corrupt)?;
     let mut listed = Vec::with_capacity(held.len());
     for (key, child) in held {
-      let name =
-        children::MapRead::key_name(self, u32::try_from(key).map_err(|_| IndexRefusal::Corrupt)?)
-          .ok_or(IndexRefusal::Corrupt)?;
+      let key = u32::try_from(key).map_err(|_| IndexRefusal::Corrupt)?;
+      let name = children::MapRead::key_name(self, key).ok_or(IndexRefusal::Corrupt)?;
       listed.push((name.to_owned(), child));
     }
-    Ok(Some(listed))
+    Ok(Some((listed, more)))
   }
 
   /// The node-revision `id`, as [`Node::predecessor`] and [`Node::copy_root`] name one.

@@ -41,7 +41,7 @@ use super::MigrationRefusal;
 use super::paths::{
   absolute, basename, compare_paths, dirname, join, longest_ancestor, names, relative,
 };
-use super::records::{Facts, Properties, Repository, node};
+use super::records::{Facts, Properties, Repository, TextSource, node};
 use crate::dump::{
   CopyFrom, DeltaBase, Event, Format, NodeAction, NodeHeader, Property, PropertySection,
   RevisionHeader, TextSection, Writer, section_len,
@@ -186,6 +186,8 @@ impl Exporter {
 
   /// Appends the next part of the range's records to `out` ([`Exporting::Wrote`]), so one call's work is one changed
   /// path's, never a whole revision's; the stream's version and UUID records before the first revision's.
+  /// `texts` is where the records' texts are read: the records themselves, or the store a commit put them in beside
+  /// them (A-761).
   ///
   /// # Errors
   /// [`MigrationRefusal::Corrupt`] for records that name what the repository does not hold, and the writer's refusal
@@ -194,6 +196,7 @@ impl Exporter {
   pub fn export(
     &mut self,
     repository: &Repository,
+    texts: &dyn TextSource,
     out: &mut Vec<u8>,
   ) -> Result<Exporting, MigrationRefusal> {
     if let Some(refusal) = &self.refused {
@@ -203,7 +206,7 @@ impl Exporter {
       return Ok(Exporting::Done);
     };
     let ended = match self.drive.is_some() {
-      true => self.step(repository, revision, out),
+      true => self.step((repository, texts), revision, out),
       false => self.begin(repository, revision, out),
     };
     match ended {
@@ -280,7 +283,7 @@ impl Exporter {
   /// directories still open; whether the revision is written.
   fn step(
     &mut self,
-    repository: &Repository,
+    (repository, texts): (&Repository, &dyn TextSource),
     revision: Revision,
     out: &mut Vec<u8>,
   ) -> Result<bool, MigrationRefusal> {
@@ -290,7 +293,7 @@ impl Exporter {
     if let Some(texting) = pending.text {
       let mut stream = Stream { writer, out };
       pending.text = write_text(
-        repository,
+        texts,
         &mut stream,
         (texting, self.text_piece),
         &mut pending.texts,
@@ -298,7 +301,7 @@ impl Exporter {
       return Ok(false);
     }
     if let Some(measuring) = pending.measuring {
-      match measure_window(repository, measuring, &mut pending.texts)? {
+      match measure_window(texts, measuring, &mut pending.texts)? {
         Some(more) => pending.measuring = Some(more),
         None => {
           pending.measuring = None;
@@ -823,7 +826,7 @@ fn window_room() -> Result<NonZeroUsize, MigrationRefusal> {
 /// The texts the window calls read held in `texts` (`Pending::texts`): each of `wanted` made from the records once,
 /// and the texts no longer wanted let go, so it holds a delta's two at most.
 fn load(
-  repository: &Repository,
+  repository: &dyn TextSource,
   texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
   wanted: &[Option<Text>],
 ) -> Result<(), MigrationRefusal> {
@@ -863,7 +866,7 @@ fn bytes_of(
 
 /// Writes the next window of a record's text, or its end: the texting still owed, none once its end is written.
 fn write_text(
-  repository: &Repository,
+  repository: &dyn TextSource,
   stream: &mut Stream<'_>,
   (texting, text_piece): (Texting, NonZeroUsize),
   texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
@@ -918,7 +921,7 @@ fn write_text(
 /// Measures the next window of a delta, adding its length as svndiff version 0 writes it, keeping no window: the
 /// measuring still owed, none once the deltifier has made its last window.
 fn measure_window(
-  repository: &Repository,
+  repository: &dyn TextSource,
   measuring: Measuring,
   texts: &mut Vec<(ContentIdentity, Vec<u8>)>,
 ) -> Result<Option<Measuring>, MigrationRefusal> {

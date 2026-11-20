@@ -359,9 +359,10 @@ fn objects_of(scenario: &Scenario, repository: &Repo) -> usize {
 /// that took the pack's last bytes, and its shard ran past the watchdog's window). Do: feed a
 /// session each captured push whole, end its input if that did not read it whole, then make its
 /// checks in turns that each end after one unit of work, and answer it. Expect: read whole, its
-/// checks not yet made, when its pack ended; at least one turn an object it brought (each object is
-/// read by fsck and by both passes of the walk); answered, and its bytes written, as the push held
-/// whole is.
+/// checks not yet made, when its pack ended; at least five turns an object it brought (each object is
+/// read by fsck and by both passes of the walk, and its propagation takes its root's turn and its
+/// finishing turn, A-722 part 4: the propagation ran whole in one turn, 57.9 ms at 100 concurrent
+/// v1.5.0 pushes); answered, and its bytes written, as the push held whole is.
 #[test]
 fn a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole() {
   for scenario in scenarios() {
@@ -376,7 +377,7 @@ fn a_pushs_checks_are_made_a_turn_at_a_time_and_answer_as_made_whole() {
     let (turns, checked) = checked_in_turns(&mut session, &repository);
     assert_eq!((read, checked), (Ok(true), Ok(true)), "{}", scenario.name);
     assert!(
-      !packed || turns >= objects,
+      !packed || turns >= 5 * objects,
       "{}: {turns} turns, {objects} objects",
       scenario.name
     );

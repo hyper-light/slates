@@ -564,6 +564,60 @@ impl HgIndex {
     log: Log<'_>,
     group: &[NewRevision],
   ) -> Result<Vec<u32>, Refused> {
+    let (revs, mut planned) = self.planned(store, log, group.iter())?;
+    let previous = match (log, planned.first()) {
+      (Log::Manifest, Some(first)) if first.rev > 0 => {
+        let rev = first.rev.saturating_sub(1);
+        let row = self
+          .revision(store, log, rev)
+          .ok_or(Refused::Unread { rev })?;
+        let text = self
+          .revision_text(store, log, rev)
+          .ok_or(Refused::Unread { rev })?;
+        Some((rev, text, row.chain))
+      }
+      _ => None,
+    };
+    let puts = kept_as(store, log, &mut planned, previous)?;
+    let written = self.write(store, log, &planned);
+    for put in &puts {
+      drop(store.release(put));
+    }
+    written.map(|()| revs)
+  }
+
+  /// Appends a group of revisions to `log` as they were stored (A-729 part 2: an import's record names each row's
+  /// content by identity, its delta's base and lengths, so its replay appends the rows as the import kept them, nothing
+  /// read, rebuilt or put): each one's number, the number it had already for one the log held. Each content must be one
+  /// the store holds; the rows hold it again.
+  pub fn append_stored(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    group: &[(NewRevision, Stored)],
+  ) -> Result<Vec<u32>, Refused> {
+    let (revs, mut planned) =
+      self.planned(store, log, group.iter().map(|(revision, _)| revision))?;
+    for row in &mut planned {
+      let stored = group
+        .iter()
+        .find(|(revision, _)| revision.node == row.node)
+        .map_or(WHOLE, |(_, stored)| *stored);
+      row.payload.extend_from_slice(&stored.0.to_le_bytes());
+      row.payload.extend_from_slice(&stored.1.to_le_bytes());
+      row.payload.extend_from_slice(&stored.2.to_le_bytes());
+    }
+    self.write(store, log, &planned).map(|()| revs)
+  }
+
+  /// A group's rows planned (its numbering, parents and links read, as 7.2's `addgroup` places them), their delta
+  /// fields not yet written: every number, and the rows to write.
+  fn planned<'g>(
+    &self,
+    store: &ContentStore,
+    log: Log<'_>,
+    group: impl Iterator<Item = &'g NewRevision>,
+  ) -> Result<(Vec<u32>, Vec<Planned>), Refused> {
     if log == Log::Changelog {
       return Err(Refused::MissingLink { node: NULL_NODE });
     }
@@ -589,26 +643,7 @@ impl HgIndex {
         contents,
       });
     }
-    let (revs, mut planned) = (planner.revs, planner.planned);
-    let previous = match (log, planned.first()) {
-      (Log::Manifest, Some(first)) if first.rev > 0 => {
-        let rev = first.rev.saturating_sub(1);
-        let row = self
-          .revision(store, log, rev)
-          .ok_or(Refused::Unread { rev })?;
-        let text = self
-          .revision_text(store, log, rev)
-          .ok_or(Refused::Unread { rev })?;
-        Some((rev, text, row.chain))
-      }
-      _ => None,
-    };
-    let puts = kept_as(store, log, &mut planned, previous)?;
-    let written = self.write(store, log, &planned);
-    for put in &puts {
-      drop(store.release(put));
-    }
-    written.map(|()| revs)
+    Ok((planner.revs, planner.planned))
   }
 
   /// The whole text of `log`'s revision `rev` (A-729): a manifest kept as a delta rebuilt from the whole text its chain
@@ -809,8 +844,12 @@ fn common_payload(node: Node, p1: u32, p2: u32, flags: u16, len: u64) -> Vec<u8>
   payload
 }
 
+/// How a revision's content is stored (A-729): the number of its delta's base ([`NONE`] for a whole text), the delta's
+/// length, and the delta bytes of its chain since the whole text it rests on.
+pub type Stored = (u32, u64, u64);
+
 /// Format: a whole text's delta fields: no base, no delta, no chain.
-const WHOLE: (u32, u64, u64) = (NONE, 0, 0);
+const WHOLE: Stored = (NONE, 0, 0);
 
 /// Each planned manifest kept as a delta against the one before it where its chain allows, else whole (A-729): the
 /// delta put as content and named in the row's place of the text, its base, length and chain added to the payload;

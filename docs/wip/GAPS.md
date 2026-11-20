@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A lone client's edit and merge after W1 (g222, 2026-11-20; BENCHMARKS, "A lone client after W1 and A-400").**
+> W1 had made a single client two to three times slower quiet on every multi-shard daemon (its work on its name's
+> shard). **Closed quiet by A-400** (a work on its client's shard): Linux arm64 accept p50 51–55 → 20–21 µs (before W1
+> 18), the Mac 155 → 40–43 (before W1 48–54); loaded on Linux main is three times lower than before W1 (p99 21.0 →
+> 4.6–7.0 ms). **Open:** (a) about 10 µs added to every quiet lone submit since A-400 (Linux accept p50 20–21 → 31–35
+> µs, conflict 17–18 → 27–28; in `f2081a3c8..a5233e228`, bisect under way); (b) the shared Mac loaded, where main is
+> still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
+> ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
+>
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
 > A-534, A-575, A-581; UI goal 91; owners g261 git, g291 Mercurial, g292 Subversion; the object store g083).**
@@ -195,10 +204,15 @@
 > live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
 > in place); the landing appends that, where it appended every text whole. An import's record (version 3) writes a
 > manifest the index keeps as a delta as that delta and its base's node, never rebuilt (Mercurial's own manifests:
-> 5.5 GB whole, 9.4 MB as deltas); its replay rebuilds it from the manifest before or the fork. A file revision is
-> written as one hunk against the revision before it in its log, from their common prefix to their common suffix
-> (`delta::encode_span`), where that is shorter than its text (found by use, w-perf: Mercurial's import record was
-> 4,657,833,574 bytes with file texts whole, and its landing's one-step append spun the shard). A made changeset's
+> 5.5 GB whole, 9.4 MB as deltas). An import's record now names every revision's content by identity and holds none
+> of its bytes (`SHGR` version 4, main's ruling: A-727 a3's image restores the content before the records): the row as
+> the index stores it (its delta's base and lengths, its content's and block's identities), replayed by
+> `HgIndex::append_stored` over the restored windows, a content the store lacks refused `Unheld`; the import's landing
+> commits only once its shard's image holding the content is published (A-727 slice b's `content_ticket` and
+> `content_durable`); a rebuild sets the old index aside, holding the content, until its records are in. Proven by a
+> warm restart (`daemon::tests::t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity`). Found by
+> use, w-perf: Mercurial's import record was 4,657,833,574 bytes with texts whole and 1,295,268,184 with one-hunk deltas
+> (de49b6bd4, superseded), and its landing spun and passed the partition's 746,950,834-byte snapshot slot. A made changeset's
 > record (version 3 too) writes its manifest as its delta against its first parent's text (`write_made`'s `parent`,
 > read from the index; replayed through the same rebuild, held by A-731's rebuild test). Owed: the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
@@ -2081,7 +2095,14 @@
 > `discard_staged`) landed first. Held by `a_text_larger_than_the_request_room_is_streamed_into_the_sink_and_accepted`
 > (a 1 MB text through a 256 KB room: red E210009 before). Owed: the server's sink over the green's staged blocks
 > (w-perf; until then `HeldTexts` keeps them in memory per connection), the revision's record and log reading the held
-> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> texts by identity (w-perf's c2, c3), and the by-use 500 MB commit measured again. **Intake, part 2 (A-761, same day, w-svn, main's ruling (B)):**
+> a commit's texts go into the repository's content store (A-727's chunk arena), put from the sink a copy slice a turn
+> (`svn_commit::land_work`, `store_step`); the revision names each by (identity, length) (`Revision::stored`, record
+> version 2) and the records keep the reference, no bytes; the entry is appended only once the store answers the texts
+> durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
+> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
+> refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+> Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -3026,7 +3047,12 @@
 >   before, 0.42 to 1.46 us after, each 64 KiB hashing turn 27 to 68 us. **A-757 part 3 (2026-11-20):** a whole entry's
 >   payload is held once, by the shipper, which keeps it past the retained tail and lends it for installs; the volume
 >   holds its own bytes only for an install image: 50 volumes' 2.4 MB whole states at rest, peak RSS 249 MB before, 128
->   MB after (release)); and, after A-347's open, the takeover's
+>   MB after (release). **A-757 part 4 (2026-11-20):** a holder takes a live message over one page on a task of its own,
+>   its entries' identities hashed in slices across turns before the guard, which checks them as given: 2.4 MB in
+>   release, the take turn's guard 0.96 to 1.05 ms before, under 0.1 us after, each 64 KiB slice 27 to 34 us. **Owed
+>   (measured, w-forming's probes, debug under `taskpolicy -b`):** the record-plane coordinator `run_record_plane` held
+>   one poll 312 ms of CPU; the rest of `serve_peer_records` 76 to 179 ms (now outside the live entries); a takeover's
+>   `make_taken` 46 ms; one forwarded `Telemetry` verb 415 ms of wall); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is

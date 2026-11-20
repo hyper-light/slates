@@ -207,7 +207,7 @@ impl Replay {
     let step = drive
       .command(
         records.index(),
-        records,
+        &self.green(),
         records.locks(),
         &self.texts,
         item,
@@ -231,13 +231,48 @@ impl Replay {
     drive
       .resume(
         records.index(),
-        records,
+        &self.green(),
         records.locks(),
         &self.texts,
         answer,
         out,
       )
       .unwrap()
+  }
+}
+
+impl Replay {
+  /// What its drives read as the green: the records, and the texts its commits stored, from the sink (the records keep
+  /// a stored text as a reference, its bytes the content store's).
+  fn green(&self) -> StoredGreen<'_> {
+    StoredGreen {
+      records: &self.repository,
+      texts: &self.texts,
+    }
+  }
+}
+
+/// The records with the texts their commits stored ([`Replay::green`]).
+struct StoredGreen<'a> {
+  records: &'a Repository,
+  texts: &'a crate::commit::drive::HeldTexts,
+}
+
+impl Green for StoredGreen<'_> {
+  fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+    Green::text(self.records, identity).or_else(|| TextSink::sealed(self.texts, identity))
+  }
+
+  fn properties(&self, identity: &ContentIdentity) -> Option<Vec<(&[u8], &[u8])>> {
+    Green::properties(self.records, identity)
+  }
+
+  fn name_text(&self, text: &[u8]) -> ContentIdentity {
+    Green::name_text(self.records, text)
+  }
+
+  fn name_properties(&self, properties: &[(Vec<u8>, Vec<u8>)]) -> ContentIdentity {
+    Green::name_properties(self.records, properties)
   }
 }
 
@@ -313,7 +348,7 @@ fn recorded_date(server: &[Read<'_>]) -> String {
 /// as the revision whole.
 fn commit_work(replay: &mut Replay, work: Work, date: &str, out: &mut Vec<u8>) {
   let now = crate::dav::request::svn_time(date).unwrap();
-  let revision = RevisionToCommit::of_work(work, now, &replay.texts).unwrap();
+  let revision = RevisionToCommit::of_work(work, now).unwrap();
   let record = crate::commit::record::Record::Revision(revision.clone());
   assert_eq!(
     crate::commit::record::Record::decode(&record.encode()),
@@ -360,7 +395,7 @@ fn replay_commit(replay: &mut Replay, connection: Connection, race: Option<Conne
     let mut step = drive
       .command(
         records.index(),
-        records,
+        &replay.green(),
         records.locks(),
         &replay.texts,
         item,
@@ -1364,7 +1399,7 @@ fn hooks_met(
     let mut step = drive
       .command(
         records.index(),
-        records,
+        &replay.green(),
         records.locks(),
         &replay.texts,
         &item,
@@ -1425,7 +1460,7 @@ fn refused_by_hook(replay: &Replay, refused: &str) -> (Option<Vec<(u64, String)>
     let mut step = drive
       .command(
         records.index(),
-        records,
+        &replay.green(),
         records.locks(),
         &replay.texts,
         &item,
@@ -1506,7 +1541,7 @@ fn opened_with(
     let step = drive
       .command(
         records.index(),
-        records,
+        &replay.green(),
         records.locks(),
         &replay.texts,
         &item,
@@ -1566,7 +1601,7 @@ fn an_item_while_a_hook_is_due_or_a_resume_with_none_ends_the_drive() {
   for (item, _) in items(DIRECTORY_PROPERTY).into_iter().take(2) {
     let step = drive.command(
       records.index(),
-      records,
+      &replay.green(),
       records.locks(),
       &replay.texts,
       &item,
@@ -1607,9 +1642,9 @@ fn a_revision_judged_at_a_moved_head_is_refused_by_the_records() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
+  let second = RevisionToCommit::of_work(second, now).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
+  let first = RevisionToCommit::of_work(first, now).unwrap();
   let refusal = replay.repository.commit(first).unwrap_err();
   let answered = (refusal.subversion_code(), refusal.message());
   assert_eq!(answered, (160_028, "Transaction out of date".to_owned()));
@@ -1651,9 +1686,9 @@ fn t_a655_a_work_judged_at_a_moved_head_is_merged_again_and_lands() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project/sub", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
+  let second = RevisionToCommit::of_work(second, now).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
+  let first = RevisionToCommit::of_work(first, now).unwrap();
   let rows = first.record.changes.clone();
   let checked = replay
     .repository
@@ -1677,9 +1712,9 @@ fn t_a655_a_moved_work_that_conflicts_is_refused_in_the_verdicts_words() {
   let first = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let second = accepted_work(&replay, "/trunk/project", DIRECTORY_PROPERTY);
   let now = AprTime(1_795_073_195_123_456);
-  let second = RevisionToCommit::of_work(second, now, &replay.texts).unwrap();
+  let second = RevisionToCommit::of_work(second, now).unwrap();
   assert_eq!(replay.repository.commit(second), Ok(4));
-  let first = RevisionToCommit::of_work(first, now, &replay.texts).unwrap();
+  let first = RevisionToCommit::of_work(first, now).unwrap();
   let refusal = replay
     .repository
     .check_work(first, &alices_locks(), now)
@@ -1723,7 +1758,7 @@ fn read_at_pre_commit(
     let mut step = drive
       .command(
         records.index(),
-        records,
+        &replay.green(),
         records.locks(),
         &replay.texts,
         &item,

@@ -30,7 +30,13 @@
 //! entry its landing appends are the size of what arrived; its replay takes the changegroup again through the live
 //! push's own intake (`push::intake`), against the index as the push met it, so it keeps the same rows.
 //!
-//! **A manifest as its delta** (A-729 part 2, version 3, an import's): after a revision's flags, a form byte: 0 its
+//! **Identities** (A-729 part 2, version 4, an import's; main's ruling): an import's record names each revision's content
+//! by identity and holds none of its bytes, since the shard's image restores the content before the records are
+//! replayed (A-727 a3). A changeset is its node, parents, flags, length and its text's identity, its text read back from
+//! the store at the replay; a manifest or file revision is its row as the index stores it, replayed as it was
+//! (`HgIndex::append_stored`). A content the store does not hold refuses the replay ([`Refused::Unheld`]).
+//!
+//! **A manifest as its delta** (A-729 part 2, version 3, now a made changeset's): after a revision's flags, a form byte: 0 its
 //! length and text as below, 1 the node of its delta's base, then the delta's length and bytes, as the index keeps a
 //! manifest (A-729 part 1), never rebuilt for the record. The replay rebuilds it from the manifest replayed before it or
 //! from the fork, then keeps it as any revision.
@@ -70,6 +76,10 @@ const CHANGEGROUP_VERSION: u32 = 2;
 /// Format: the version of a record of revisions each given whole or as the delta the index keeps it as (A-729 part 2,
 /// an import's): a form byte after a revision's flags, and a delta's base after it.
 const DELTA_VERSION: u32 = 3;
+/// Format: the version of an import's record that names each revision's content by identity and holds none of its bytes
+/// (A-729 part 2; main's ruling: since A-727 a3 the content a shard stores survives a restart in its image, recovered
+/// before the records, so a record names what the store holds, never a second copy in the log).
+const IDENTITY_VERSION: u32 = 4;
 /// Format: the form byte of a revision given whole.
 const TEXT_FORM: u8 = 0;
 /// Format: the form byte of a revision given as its delta, its base's node after the byte.
@@ -186,6 +196,14 @@ pub enum Refused {
   /// revision numbered other than its log's own, a link or a manifest the index lacks, the index's or the content
   /// store's refusal (its budget among them).
   Import(ImportRefused<Infallible>),
+  /// A revision named by its content's identity (an [`IDENTITY_VERSION`] record) whose content the store does not hold:
+  /// a record replayed where its content was never kept, or one whose identity was changed.
+  Unheld {
+    /// Its revlog's radix.
+    revlog: Box<[u8]>,
+    /// The revision.
+    rev: u32,
+  },
   /// A revision given as a delta whose base its log does not hold, or in a log the index keeps whole.
   Base {
     /// Its revlog's radix.
@@ -303,8 +321,6 @@ pub(crate) struct Kept {
   bytes: ContentId,
   /// A manifest kept as a delta: its text, rebuilt from its chain (A-729), where its reader asked for texts.
   rebuilt: Option<Vec<u8>>,
-  /// A manifest kept as a delta: its base's node, `bytes` then the delta (A-729 part 2).
-  base: Option<Node>,
 }
 
 /// The record of the index an import made (module docs), `room` the room it ran within: every revision it holds, the
@@ -331,10 +347,9 @@ pub struct Writer {
   out: Vec<u8>,
   /// Whether the markers are written.
   done: bool,
-  /// Whether a revision kept as a delta is written as its delta ([`DELTA_VERSION`], an import's) or rebuilt whole.
-  deltas: bool,
-  /// A file log's revision written last and its text: the next one's base, where its delta is shorter than its text.
-  last: Option<(Node, Vec<u8>)>,
+  /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`], an import's) or written whole (a
+  /// push's, the tests' oracle).
+  identities: bool,
 }
 
 impl Writer {
@@ -378,13 +393,17 @@ impl Writer {
   fn of(
     logs: Vec<(u8, Vec<u8>, u32)>,
     (source, room): (Source, u64),
-    deltas: bool,
+    identities: bool,
   ) -> Result<Writer, WriteRefused> {
     let mut out = Vec::new();
     out
       .try_reserve(HEAD_BYTES.saturating_add(LONG_BYTES))
       .map_err(|_| WriteRefused::Allocation)?;
-    let version = if deltas { DELTA_VERSION } else { VERSION };
+    let version = if identities {
+      IDENTITY_VERSION
+    } else {
+      VERSION
+    };
     write_head(&mut out, (version, source, room), to_u64(logs.len()));
     let at = (0, logs.first().map_or(0, |(_, _, first)| *first));
     Ok(Writer {
@@ -392,8 +411,7 @@ impl Writer {
       at,
       out,
       done: false,
-      deltas,
-      last: None,
+      identities,
     })
   }
 
@@ -432,16 +450,11 @@ impl Writer {
     if rev == first {
       write_group_head(&mut part, log, u64::from(len.saturating_sub(first)));
     }
-    if rev == first {
-      self.last = None;
-    }
     if rev < len {
-      let kept =
-        kept(index, store, log, rev, !self.deltas).ok_or_else(|| unreadable(&radix, rev))?;
-      let written = match log {
-        Log::File(_) if self.deltas => self.write_file(&mut part, store, &kept),
-        _ if self.deltas => write_formed_revision(&mut part, store, &kept),
-        _ => write_kept_revision(&mut part, store, &kept),
+      let written = if self.identities {
+        write_identity_revision(&mut part, (index, store), log, rev)
+      } else {
+        kept(index, store, log, rev).and_then(|kept| write_kept_revision(&mut part, store, &kept))
       };
       written.ok_or_else(|| unreadable(&radix, rev))?;
       self.at = (at, rev.saturating_add(1));
@@ -452,46 +465,6 @@ impl Writer {
     }
     self.put(&part)?;
     Ok(true)
-  }
-
-  /// A file revision of an import's record (A-729 part 2): its delta against the revision written before it in its log
-  /// where that is shorter than its text ([`crate::delta::encode_span`]), else whole; its text kept for the next. None
-  /// where its text is not its length.
-  fn write_file(&mut self, out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> Option<()> {
-    let mut text = Vec::new();
-    if write_text(&mut text, store, kept) != kept.len {
-      return None;
-    }
-    let mut delta = Vec::new();
-    let base = match &self.last {
-      Some((node, last)) => {
-        crate::delta::encode_span(last, &text, &mut delta).ok()?;
-        (delta.len() < text.len()).then_some(*node)
-      }
-      None => None,
-    };
-    out.extend_from_slice(&kept.node);
-    out.extend_from_slice(&kept.p1);
-    out.extend_from_slice(&kept.p2);
-    if let Some(link) = kept.link {
-      out.extend_from_slice(&link);
-    }
-    out.extend_from_slice(&kept.flags.to_le_bytes());
-    match base {
-      Some(base) => {
-        out.push(DELTA_FORM);
-        out.extend_from_slice(&base);
-        out.extend_from_slice(&to_u64(delta.len()).to_le_bytes());
-        out.extend_from_slice(&delta);
-      }
-      None => {
-        out.push(TEXT_FORM);
-        out.extend_from_slice(&kept.len.to_le_bytes());
-        out.extend_from_slice(&text);
-      }
-    }
-    self.last = Some((kept.node, text));
-    Some(())
   }
 
   /// Whether the record is an import's, whose markers it holds.
@@ -532,26 +505,53 @@ fn write_kept_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> 
   (write_text(out, store, kept) == kept.len).then_some(())
 }
 
-/// One kept revision as a [`DELTA_VERSION`] record writes it: its node, parents, link, flags, then its form: whole
-/// (its length and text), or the delta the index keeps it as (its base's node, the delta's length and bytes).
-fn write_formed_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> Option<()> {
-  out.extend_from_slice(&kept.node);
-  out.extend_from_slice(&kept.p1);
-  out.extend_from_slice(&kept.p2);
-  if let Some(link) = kept.link {
-    out.extend_from_slice(&link);
-  }
-  out.extend_from_slice(&kept.flags.to_le_bytes());
-  let Some(base) = kept.base else {
-    out.push(TEXT_FORM);
-    out.extend_from_slice(&kept.len.to_le_bytes());
-    return (write_text(out, store, kept) == kept.len).then_some(());
+/// One revision as a [`IDENTITY_VERSION`] record names it (A-729 part 2): its node, its parents' nodes, a manifest's or
+/// file revision's link's node, 7.2's flags and its text's length; then a changeset's text by its identity, or a
+/// manifest's or file revision's row as the index stores it: its delta fields (base number, delta length, chain bytes),
+/// its content's identity (the text, a file revision's bytes, or a delta), and a file revision's metadata block's
+/// identity behind a byte that says whether it has one. None where the index lacks the row or a parent.
+fn write_identity_revision(
+  out: &mut Vec<u8>,
+  (index, store): (&HgIndex, &ContentStore),
+  log: Log<'_>,
+  rev: u32,
+) -> Option<()> {
+  let node_of = |number: u32| {
+    if number == NONE {
+      return Some(NULL_NODE);
+    }
+    match log {
+      Log::Changelog => index.changeset(store, number).map(|row| row.node),
+      _ => index.revision(store, log, number).map(|row| row.node),
+    }
   };
-  out.push(DELTA_FORM);
-  out.extend_from_slice(&base);
-  out.extend_from_slice(&window_bytes(store, &kept.bytes).to_le_bytes());
-  for window in store.windows(&kept.bytes) {
-    out.extend_from_slice(&window);
+  if log == Log::Changelog {
+    let row = index.changeset(store, rev)?;
+    out.extend_from_slice(&row.node);
+    out.extend_from_slice(&node_of(row.p1)?);
+    out.extend_from_slice(&node_of(row.p2)?);
+    out.extend_from_slice(&row.flags.to_le_bytes());
+    out.extend_from_slice(&row.len.to_le_bytes());
+    out.extend_from_slice(&row.text.0);
+    return Some(());
+  }
+  let row = index.revision(store, log, rev)?;
+  out.extend_from_slice(&row.node);
+  out.extend_from_slice(&node_of(row.p1)?);
+  out.extend_from_slice(&node_of(row.p2)?);
+  out.extend_from_slice(&changeset_node(index, store, row.link)?);
+  out.extend_from_slice(&row.flags.to_le_bytes());
+  out.extend_from_slice(&row.len.to_le_bytes());
+  out.extend_from_slice(&row.base.to_le_bytes());
+  out.extend_from_slice(&row.stored.to_le_bytes());
+  out.extend_from_slice(&row.chain.to_le_bytes());
+  out.extend_from_slice(&row.bytes.0);
+  match row.block {
+    Some(block) => {
+      out.push(1);
+      out.extend_from_slice(&block.0);
+    }
+    None => out.push(0),
   }
   Some(())
 }
@@ -912,13 +912,7 @@ fn unreadable(radix: &[u8], rev: u32) -> WriteRefused {
 
 /// Revision `rev` of `log` as the record holds it, its parents and link read back to their nodes; `None` where the
 /// index does not answer one of them.
-pub(crate) fn kept(
-  index: &HgIndex,
-  store: &ContentStore,
-  log: Log<'_>,
-  rev: u32,
-  texts: bool,
-) -> Option<Kept> {
+pub(crate) fn kept(index: &HgIndex, store: &ContentStore, log: Log<'_>, rev: u32) -> Option<Kept> {
   if log == Log::Changelog {
     let row = index.changeset(store, rev)?;
     let parent = |number: u32| changeset_node(index, store, number);
@@ -932,7 +926,6 @@ pub(crate) fn kept(
       block: None,
       bytes: row.text,
       rebuilt: None,
-      base: None,
     });
   }
   let row = index.revision(store, log, rev)?;
@@ -942,14 +935,11 @@ pub(crate) fn kept(
     }
     index.revision(store, log, number).map(|parent| parent.node)
   };
-  // A manifest kept as a delta (A-729): its base named, and its text rebuilt from its chain where texts are asked for,
-  // the one revision's text held.
-  let (rebuilt, base) = if row.base == NONE {
-    (None, None)
-  } else if texts {
-    (Some(index.revision_text(store, log, rev)?), None)
+  // A manifest kept as a delta (A-729): its text rebuilt from its chain, the one revision's text held.
+  let rebuilt = if row.base == NONE {
+    None
   } else {
-    (None, Some(index.revision(store, log, row.base)?.node))
+    Some(index.revision_text(store, log, rev)?)
   };
   Some(Kept {
     node: row.node,
@@ -961,7 +951,6 @@ pub(crate) fn kept(
     block: row.block,
     bytes: row.bytes,
     rebuilt,
-    base,
   })
 }
 
@@ -1182,6 +1171,8 @@ struct Revisions {
   replayed: Replayed,
   /// Whether each revision names its form ([`DELTA_VERSION`]).
   formed: bool,
+  /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`]).
+  identities: bool,
   /// The manifest replayed last and its text: the next one's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
 }
@@ -1387,6 +1378,7 @@ impl Revisions {
       done: false,
       replayed: Replayed::default(),
       formed: version == DELTA_VERSION,
+      identities: version == IDENTITY_VERSION,
       last: None,
     })
   }
@@ -1507,8 +1499,17 @@ impl Revisions {
       _ => (Log::File(path), [DATA, path].concat()),
     };
     let linked = log != Log::Changelog;
-    let read = reader.revision(linked, self.formed)?;
     let rev = self.fork.len(store, log);
+    if self.identities {
+      self.identified(reader, store, (log, radix.as_slice()), rev)?;
+      let left = left.saturating_sub(1);
+      self.group = Some((tag, (start, end), left, all));
+      if left == 0 {
+        self.group_done(tag, all);
+      }
+      return Ok(());
+    }
+    let read = reader.revision(linked, self.formed)?;
     if self.formed && linked {
       self.formed_revision(store, (log, radix.as_slice()), (rev, &read))?;
     } else if read.base.is_some() {
@@ -1527,6 +1528,72 @@ impl Revisions {
     if left == 0 {
       self.group_done(tag, all);
     }
+    Ok(())
+  }
+
+  /// One revision of a record that names identities (A-729 part 2): a changeset's text read back from the store by its
+  /// identity and replayed as any changeset is (its manifest, branch and closing read from it); a manifest's or file
+  /// revision's row appended as it was stored (`HgIndex::append_stored`), its content held again by identity, nothing
+  /// read or put. Its node is not hashed again: the text was held to it when it was kept, and the store names it by its
+  /// bytes. A content the store does not hold refuses the replay by kind.
+  fn identified(
+    &mut self,
+    reader: &mut Reader<'_>,
+    store: &mut ContentStore,
+    (log, radix): (Log<'_>, &[u8]),
+    rev: u32,
+  ) -> Result<(), Refused> {
+    let unheld = || Refused::Unheld {
+      revlog: Box::from(radix),
+      rev,
+    };
+    let node = reader.node()?;
+    let p1 = reader.node()?;
+    let p2 = reader.node()?;
+    if log == Log::Changelog {
+      let flags = flags_of(reader)?;
+      let len = reader.long()?;
+      let text_id = identity_of(reader)?;
+      let text = store.object_bytes(&text_id, len).ok_or_else(unheld)?;
+      let read = Read {
+        node,
+        p1,
+        p2,
+        link: NULL_NODE,
+        flags,
+        text: &text,
+        base: None,
+      };
+      return replay_changeset(&mut self.fork, store, (rev, &read), self.room);
+    }
+    let link = reader.node()?;
+    let flags = flags_of(reader)?;
+    let len = reader.long()?;
+    let stored = (reader.word()?, reader.long()?, reader.long()?);
+    let bytes = identity_of(reader)?;
+    let block = match reader.byte()? {
+      0 => None,
+      1 => Some(identity_of(reader)?),
+      tag => return Err(Refused::Tag { tag }),
+    };
+    if store.len_of(&bytes).is_none() || block.is_some_and(|block| store.len_of(&block).is_none()) {
+      return Err(unheld());
+    }
+    let row = NewRevision {
+      node,
+      p1,
+      p2,
+      link,
+      flags,
+      len,
+      bytes,
+      block,
+    };
+    let numbers = self
+      .fork
+      .append_stored(store, log, &[(row, stored)])
+      .map_err(|refused| ImportRefused::<Infallible>::Index(refused))?;
+    settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
     Ok(())
   }
 
@@ -1592,6 +1659,19 @@ impl Revisions {
   }
 }
 
+/// A revision's flags, read.
+fn flags_of(reader: &mut Reader<'_>) -> Result<u16, Refused> {
+  let flags =
+    <[u8; FLAGS_BYTES]>::try_from(reader.take(FLAGS_BYTES)?).map_err(|_| Refused::Truncated)?;
+  Ok(u16::from_le_bytes(flags))
+}
+
+/// A content's identity, read.
+fn identity_of(reader: &mut Reader<'_>) -> Result<ContentId, Refused> {
+  let bytes = reader.take(slates_vcs::content::IDENTITY_BYTES)?;
+  ContentId::from_slice(bytes).ok_or(Refused::Truncated)
+}
+
 /// The record's head read: its magic, its version held to the two this build reads, its source (a changegroup's record
 /// a push's alone), and the room it was written within.
 fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
@@ -1599,7 +1679,14 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     return Err(Refused::Magic);
   }
   let version = reader.word()?;
-  if ![VERSION, CHANGEGROUP_VERSION, DELTA_VERSION].contains(&version) {
+  if ![
+    VERSION,
+    CHANGEGROUP_VERSION,
+    DELTA_VERSION,
+    IDENTITY_VERSION,
+  ]
+  .contains(&version)
+  {
     return Err(Refused::Version { version });
   }
   let source = match reader.byte()? {

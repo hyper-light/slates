@@ -330,7 +330,7 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
 }
 
 /// `request` pushed to `repository` by its owner: what was received.
-fn pushed(state: &mut ShardState, repository: RepositoryId, request: &[u8]) -> Received {
+pub(crate) fn pushed(state: &mut ShardState, repository: RepositoryId, request: &[u8]) -> Received {
   let (_, mut push) = started(state, repository);
   answered(state, &mut push, request).1
 }
@@ -1222,7 +1222,7 @@ fn stored_zlib(data: &[u8]) -> Vec<u8> {
 }
 
 /// A create of `main` at a root commit whose one file is `bytes` long, as stock git posts it, and the file's name.
-fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
+pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
   use slates_git::entry::{self, Header, Representation};
   use slates_git::object_name::{Kind, name_of};
   let blob: Vec<u8> = (0..bytes)

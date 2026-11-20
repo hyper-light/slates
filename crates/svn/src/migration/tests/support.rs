@@ -122,7 +122,7 @@ pub(super) fn export_in(
 ) -> Result<Vec<u8>, MigrationRefusal> {
   let mut exporter = Exporter::new(repository, first, last, format)?;
   let mut out = Vec::new();
-  while exporter.export(repository, &mut out)? != Exporting::Done {}
+  while exporter.export(repository, repository, &mut out)? != Exporting::Done {}
   Ok(out)
 }
 

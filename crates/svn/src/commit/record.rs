@@ -47,8 +47,12 @@ use crate::migration::Properties;
 /// kind are refused at the first word.
 const MAGIC: u32 = u32::from_le_bytes(*b"SSVR");
 
-/// Format: the record's version; a decoder refuses any other.
-const VERSION: u32 = 1;
+/// Format: the record's version, which the encoder writes: 2 since a revision names the texts its commit stored in the
+/// content store (identity and length, no bytes; §4.17.1 "A push's intake", main's ruling of 2026-11-20).
+const VERSION: u32 = 2;
+
+/// Format: the version before stored texts, which a decoder still reads (a revision of it stores none).
+const VERSION_WITHOUT_STORED: u32 = 1;
 
 /// Format: the kind byte of a repository's creation.
 const CREATED: u8 = 0;
@@ -234,12 +238,12 @@ impl Record {
       return Err(RecordRefused::Magic);
     }
     let version = reader.word()?;
-    if version != VERSION {
+    if version != VERSION && version != VERSION_WITHOUT_STORED {
       return Err(RecordRefused::Version { version });
     }
     let record = match reader.byte()? {
       CREATED => created(&mut reader)?,
-      REVISION => Self::Revision(revision(&mut reader)?),
+      REVISION => Self::Revision(revision(&mut reader, version)?),
       UUID_SET => Self::Uuid(uuid(&mut reader)?),
       PROPERTIES_SET => Self::RevisionProperties {
         revision: reader.long()?,
@@ -291,6 +295,7 @@ fn revision_len(revision: &Revision) -> usize {
     .contents
     .iter()
     .map(|(identity, bytes)| size_of_val(identity).saturating_add(bytes_len(bytes)));
+  let stored = revision.stored.len().saturating_mul(CONTENT_FEWEST);
   let locks = revision.lock_entries.iter().map(lock_len);
   [
     LONG,
@@ -301,6 +306,8 @@ fn revision_len(revision: &Revision) -> usize {
     properties.fold(0usize, usize::saturating_add),
     LONG,
     contents.fold(0usize, usize::saturating_add),
+    LONG,
+    stored,
     LONG,
     locks.fold(0usize, usize::saturating_add),
   ]
@@ -418,6 +425,11 @@ fn put_revision(out: &mut Vec<u8>, revision: &Revision) {
   for (identity, bytes) in &revision.contents {
     out.extend_from_slice(identity);
     put_bytes(out, bytes);
+  }
+  put_count(out, revision.stored.len());
+  for (identity, len) in &revision.stored {
+    out.extend_from_slice(identity);
+    put_long(out, *len);
   }
   put_count(out, revision.lock_entries.len());
   for entry in &revision.lock_entries {
@@ -588,7 +600,7 @@ fn uuid(reader: &mut Reader<'_>) -> Result<Uuid, RecordRefused> {
 }
 
 /// A revision's record, after its kind.
-fn revision(reader: &mut Reader<'_>) -> Result<Revision, RecordRefused> {
+fn revision(reader: &mut Reader<'_>, version: u32) -> Result<Revision, RecordRefused> {
   let head = reader.long()?;
   let transaction = reader.string()?;
   let rows = reader.count(ROW_FEWEST)?;
@@ -598,6 +610,11 @@ fn revision(reader: &mut Reader<'_>) -> Result<Revision, RecordRefused> {
   }
   let properties = properties(reader)?;
   let contents = contents(reader)?;
+  let stored = if version == VERSION_WITHOUT_STORED {
+    BTreeMap::new()
+  } else {
+    stored(reader)?
+  };
   let lock_entries = lock_entries(reader)?;
   Ok(Revision {
     head,
@@ -607,8 +624,27 @@ fn revision(reader: &mut Reader<'_>) -> Result<Revision, RecordRefused> {
     },
     properties,
     contents,
+    stored,
     lock_entries,
   })
+}
+
+/// The texts a revision stored in the content store: their count, then each identity and length, identities ascending.
+fn stored(reader: &mut Reader<'_>) -> Result<BTreeMap<ContentIdentity, u64>, RecordRefused> {
+  let count = reader.count(CONTENT_FEWEST)?;
+  let mut stored = BTreeMap::new();
+  for _ in 0..count {
+    let identity: ContentIdentity = reader.array()?;
+    let len = reader.long()?;
+    if stored
+      .last_key_value()
+      .is_some_and(|(last, _)| *last >= identity)
+    {
+      return Err(RecordRefused::Order);
+    }
+    stored.insert(identity, len);
+  }
+  Ok(stored)
 }
 
 /// A row.
