@@ -25,3 +25,8 @@ run 22 exit 0 0 skip-lines
 run 23 exit 0 0 skip-lines
 run 24 exit 0 0 skip-lines
 run 25 exit 0 0 skip-lines
+run 26 exit 0 0 skip-lines
+run 27 exit 0 0 skip-lines
+run 28 exit 0 0 skip-lines
+run 29 exit 0 0 skip-lines
+run 30 exit 0 0 skip-lines
