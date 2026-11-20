@@ -56472,6 +56472,11 @@ Applied in the same change to: part b's entry (its "Who may send it" closed), GA
   the printed surface mints a token, one given none is refused, and on Linux one given the route with a secret one bit
   off, or the route alone, is refused. `PRINTS_ISSUER_SURFACE` is true on every platform in `tests/cli.rs`,
   `git_interop`, `svn_interop`, `hg_interop` and `svn_http_reports`, so their credential legs run on Linux, where they
-  skipped. macOS arm64 (Mac Studio 2, main 8281ea29): `issuer_surface` 1 of 1. The Linux run is queued on adacachy.
+  skipped. macOS arm64 (Mac Studio 2, main 8281ea29): `issuer_surface` 1 of 1. Linux x86_64 (CI ubuntu-latest, diag
+  run 44762814986 over 0ed39544): `slates-ipc --lib issuer_route` 2 of 2; `issuer_surface` 1 of 1; `git_interop` 6 of
+  6 with no leg skipped (stock git 2.56.1 minting its credential through the route and authenticating to both edges);
+  `svn_interop`'s legs skipped, ubuntu's Subversion not of the 1.15 line. The Linux code clippy-clean for
+  `x86_64-unknown-linux-gnu` from the Studio (`slates-ipc`, `slates-anchor`, `slates-mem`; `slates-api` and
+  `slates-cli` with `--no-deps`, main's `slates-git` holding a lint of its own).
 - **Applied in the same change to** §4.13's status (the Linux issuer surface owed since 2026-09-13), GAPS, the test
   harnesses' `PRINTS_ISSUER_SURFACE` and their words, amendments.tsv.
