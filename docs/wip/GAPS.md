@@ -7181,8 +7181,11 @@
 >   holding their listeners across a restart), `START_WAIT` and `START_CEILING` gone; `cli`'s `wait_for` (polled while
 >   the instance's processes progress; the epoch tests read the kernel's refusal before waiting on what it prevents)
 >   and its `FLEET_WAIT` waits (every node's processes judged together, `StartProgress::look_all`; the fleet submit run
->   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone. Owed in
->   `cli/tests`: `cli`'s other `WAIT_FOR` waits and its container waits, `live_fleet`, `vm`,
+>   while they progress; a draining or refused process's exit judged in its own CPU), `FLEET_WAIT` gone; `cli`'s map,
+>   second-mount, journal-pipeline and referenced-bytes waits judged the same (`WAIT_FOR` now bounds only what no slates
+>   process holds: a sibling test's child keeping a mount busy or a pipe's end open, and a container probe's map). Owed
+>   in `cli/tests`: `cli`'s container waits (`CONTAINER_WAIT`, `DOCKER_INFO_WAIT`, on Docker) and `shards_reader`'s
+>   read timeout, `live_fleet`, `vm`,
 >   `start_judgment`, `winfsp`, `fs_server`, `live_chaos`, `guest_vhost`, `support/relay`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
 >   own platforms), `cli/src/verbs.rs`' test module
