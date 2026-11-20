@@ -856,9 +856,12 @@ impl KeptText {
 /// Derived: a `u64`'s 64 halvings, and the first version.
 const MAX_CHAIN: usize = 65;
 
+/// An encoded delta and its windows: each window's (offset into the target, target length, offset into the delta).
+type EncodedDelta = (Vec<u8>, Vec<(u64, u64, usize)>);
+
 /// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
 /// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
-fn encode_delta(source: &[u8], target: &[u8]) -> Option<(Vec<u8>, Vec<(u64, u64, usize)>)> {
+fn encode_delta(source: &[u8], target: &[u8]) -> Option<EncodedDelta> {
   let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
   let mut encoder = svndiff::Encoder::new(svndiff::Version::Two);
   let mut out = encoder.header().to_vec();

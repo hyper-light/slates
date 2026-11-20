@@ -842,3 +842,107 @@ fn a_slice_of_an_update_report_ends_at_the_first_step_past_its_quantum() {
     assert!(sliced.concat() == whole, "other bytes");
   }
 }
+
+/// Shape: the PROPFIND of a baseline's two properties a DeltaV v1 client reads a revision's collection by.
+const PROPFIND_BASELINE: &[u8] =
+  b"<?xml version=\"1.0\" encoding=\"utf-8\"?><propfind xmlns=\"DAV:\"><prop>\
+<baseline-collection/><version-name/></prop></propfind>";
+
+/// DeltaV v1 (`liveprops.c` `checked-in` for `DAV_SVN_RESTYPE_VCC`): do PROPFIND the VCC, `!svn/vcc/default`, at
+/// depth 0 for `checked-in` and `version-name`; expect `207`, one response naming the VCC, `checked-in` the youngest
+/// baseline (`!svn/bln/6`), and `version-name`, which a VCC does not support, listed not found.
+#[test]
+fn deltav_v1_the_vcc_names_the_youngest_baseline() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("PROPFIND", "/!svn/vcc/default", Some("0"), PROPFIND_VERSION);
+  let expected = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n\
+<D:response xmlns:lp1=\"DAV:\" xmlns:g0=\"DAV:\">\n<D:href>/repo/!svn/vcc/default</D:href>\n<D:propstat>\n<D:prop>\n\
+<lp1:checked-in><D:href>/repo/!svn/bln/6</D:href></lp1:checked-in>\n</D:prop>\n\
+<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n<D:propstat>\n<D:prop>\n<g0:version-name/>\n</D:prop>\n\
+<D:status>HTTP/1.1 404 Not Found</D:status>\n</D:propstat>\n</D:response>\n</D:multistatus>\n";
+  assert_eq!(
+    (answer.status, text_of(&answer)),
+    (207, expected.to_owned())
+  );
+}
+
+/// DeltaV v1 (`liveprops.c` `baseline-collection`, `version-name` for a baselined version resource): do PROPFIND the
+/// baseline of revision 3, `!svn/bln/3`, for its collection and name; expect the revision's collection `!svn/bc/3/`
+/// and `3`.
+#[test]
+fn deltav_v1_a_baseline_names_its_revisions_collection() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("PROPFIND", "/!svn/bln/3", Some("0"), PROPFIND_BASELINE);
+  let expected = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n\
+<D:response xmlns:lp1=\"DAV:\">\n<D:href>/repo/!svn/bln/3</D:href>\n<D:propstat>\n<D:prop>\n\
+<lp1:baseline-collection><D:href>/repo/!svn/bc/3/</D:href></lp1:baseline-collection>\n\
+<lp1:version-name>3</lp1:version-name>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n\
+</D:response>\n</D:multistatus>\n";
+  assert_eq!(
+    (answer.status, text_of(&answer)),
+    (207, expected.to_owned())
+  );
+}
+
+/// DeltaV v1 (`deadprops.c`: a baseline's dead properties are its revision's): do PROPFIND `allprop` of revision 6's
+/// baseline; expect its revision properties (`svn:log` as `S:log`), `resourcetype` `D:baseline`, and no `checked-in`,
+/// length or MD5, which a baseline does not define.
+#[test]
+fn deltav_v1_a_baselines_allprop_is_its_revisions_properties() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("PROPFIND", "/!svn/bln/6", Some("0"), PROPFIND_ALL);
+  let body = text_of(&answer);
+  assert_eq!(
+    (
+      answer.status,
+      body.contains("<S:log>"),
+      body.contains("<lp1:resourcetype><D:baseline/></lp1:resourcetype>"),
+      body.contains("checked-in"),
+      body.contains("getcontentlength"),
+      body.contains("md5-checksum"),
+    ),
+    (207, true, true, false, false, false)
+  );
+}
+
+/// DeltaV v1 (`liveprops.c`: `checked-in` is a version-controlled resource's alone): do PROPFIND a version resource,
+/// `!svn/ver/1/trunk/dir/c.bin`, for `checked-in` and `version-name`, and GET it; expect `version-name` 1 found and
+/// `checked-in` not found, and the GET the file's text.
+#[test]
+fn deltav_v1_a_version_resource_is_its_node_in_that_revision() {
+  let fixture = Fixture::new();
+  let path = "/!svn/ver/1/trunk/dir/c.bin";
+  let answer = fixture.anonymous("PROPFIND", path, Some("0"), PROPFIND_VERSION);
+  let body = text_of(&answer);
+  let found = body.split("HTTP/1.1 200 OK").next().unwrap_or_default();
+  let text = fixture
+    .index
+    .node("/trunk/dir/c.bin", 1)
+    .unwrap()
+    .unwrap()
+    .text();
+  let got = match fixture.ask(Some(&rules_of(None)), "GET", (path, None), b"") {
+    Answer::Text { text, .. } => text,
+    _ => panic!("no text"),
+  };
+  assert_eq!(
+    (
+      answer.status,
+      found.contains("<lp1:version-name>1</lp1:version-name>"),
+      found.contains("checked-in"),
+      body.contains("<g0:checked-in/>"),
+      got,
+    ),
+    (207, true, false, true, text)
+  );
+}
+
+/// DeltaV v1 (`repos.c` `parse_vcc_uri`, `parse_baseline_uri`): do PROPFIND a VCC named other than `default` and the
+/// baseline of a revision past the youngest; expect `mod_dav_svn`'s malformed URI (`500`) and `404`.
+#[test]
+fn deltav_v1_an_unknown_vcc_or_a_future_baseline_is_refused() {
+  let fixture = Fixture::new();
+  let other = fixture.anonymous("PROPFIND", "/!svn/vcc/other", Some("0"), PROPFIND_VERSION);
+  let future = fixture.anonymous("PROPFIND", "/!svn/bln/7", Some("0"), PROPFIND_BASELINE);
+  assert_eq!((other.status, future.status), (500, 404));
+}

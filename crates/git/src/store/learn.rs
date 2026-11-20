@@ -105,7 +105,11 @@ impl Rates {
     for (level, slot) in (0..LEVELS).zip(deflate_ns_per_kib.iter_mut()) {
       let start = clock.now_ns();
       let _ = super::fragment::deflate(&corpus, level);
-      *slot = clock.now_ns().saturating_sub(start) / kib;
+      *slot = clock
+        .now_ns()
+        .saturating_sub(start)
+        .checked_div(kib)
+        .unwrap_or(0);
     }
     let mut changed = corpus.clone();
     let step = usize::try_from(KIB).unwrap_or(1);
@@ -114,7 +118,11 @@ impl Rates {
     }
     let start = clock.now_ns();
     let _ = super::deltas::delta_of(&corpus, &changed);
-    let search_ns_per_kib = clock.now_ns().saturating_sub(start) / kib.saturating_mul(2);
+    let search_ns_per_kib = clock
+      .now_ns()
+      .saturating_sub(start)
+      .checked_div(kib.saturating_mul(2))
+      .unwrap_or(0);
     Rates {
       deflate_ns_per_kib,
       search_ns_per_kib,
@@ -138,7 +146,7 @@ fn corpus(len: usize) -> Vec<u8> {
     let word = next();
     let letters = (word % 8).saturating_add(1);
     for at in 0..letters {
-      let letter = u8::try_from((word >> (8 + at * 5)) % 26).unwrap_or(0);
+      let letter = u8::try_from((word >> at.saturating_mul(5).saturating_add(8)) % 26).unwrap_or(0);
       out.push(b'a'.saturating_add(letter));
     }
     out.push(if word % 11 == 0 { b'\n' } else { b' ' });

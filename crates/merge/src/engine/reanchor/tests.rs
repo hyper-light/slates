@@ -388,6 +388,7 @@ impl History {
       doc: work.doc,
       post_state: work.post,
       evidence: Vec::new(),
+      named: Default::default(),
     };
     if let Outcome::Accepted { version } = self.green.submit(&increment) {
       prop_assert_eq!(version, self.texts.len() as u64, "versions are dense");
@@ -720,6 +721,7 @@ fn submit(green: &mut Green, work: Work, base: u64, id: u8) -> Outcome {
     doc: work.doc,
     post_state: work.post,
     evidence: Vec::new(),
+    named: Default::default(),
   })
 }
 

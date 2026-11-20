@@ -72,6 +72,7 @@ fn replace(base: u64, at: u64, bytes: &[u8], n: u64) -> Increment {
     doc,
     post_state: bytes.to_vec(),
     evidence: Vec::new(),
+    named: Default::default(),
   }
 }
 

@@ -30,8 +30,8 @@ use std::process::Command;
 
 use slates_guest_probe::protocol::{Command as Ask, Reply};
 use vm::{
-  Anchor, DELIVERY_MILLIS, Guest, MountPoint, REPLY_WAIT, created_volume, initramfs,
-  kill_the_daemon, run, start_anchor, write_at, write_whole,
+  Anchor, DELIVERY_MILLIS, Guest, MountPoint, created_volume, initramfs, kill_the_daemon, run,
+  start_anchor, write_at, write_whole,
 };
 
 /// Shape: the pages of each shared file; the guest's memory and processors.
@@ -309,14 +309,11 @@ struct Tally {
 fn arrival_in_the_map((at, run): (u64, u64), value: u8, guest: &mut Guest) -> u64 {
   let mut slowest = 0;
   for end in [at, at.saturating_add(run).saturating_sub(1)] {
-    match guest.ask(
-      &Ask::Wait {
-        at: end,
-        byte: value,
-        millis: DELIVERY_MILLIS,
-      },
-      REPLY_WAIT,
-    ) {
+    match guest.ask(&Ask::Wait {
+      at: end,
+      byte: value,
+      millis: DELIVERY_MILLIS,
+    }) {
       Reply::Waited { micros } => slowest = slowest.max(micros),
       other => panic!(
         "the other path's write of {value} at [{at}, {at} + {run}) did not reach the guest's map at {end}: \
@@ -366,13 +363,10 @@ impl<'r> History<'r> {
 
   /// Has `guest` map the file, which must be served through the DAX window.
   fn map(&self, guest: &mut Guest) {
-    match guest.ask(
-      &Ask::Map {
-        path: self.file.clone(),
-        pages: PAGES,
-      },
-      REPLY_WAIT,
-    ) {
+    match guest.ask(&Ask::Map {
+      path: self.file.clone(),
+      pages: PAGES,
+    }) {
       Reply::Mapped { dax: true } => {}
       other => panic!(
         "map {} → {other:?}: DAX is what this test is for\n{}",
@@ -434,7 +428,7 @@ impl<'r> History<'r> {
   /// The guest syncs its map. A sync may be refused, `EIO`, where a write-back of the guest's stores was (A-248): the
   /// guest is told, as a program is at its `msync`.
   fn sync(&mut self, guest: &mut Guest) {
-    match guest.ask(&Ask::Sync, REPLY_WAIT) {
+    match guest.ask(&Ask::Sync) {
       Reply::Done => {}
       Reply::Refused(why) if why.starts_with("msync") => {
         self.tally.refused_syncs = self.tally.refused_syncs.saturating_add(1);
@@ -450,13 +444,10 @@ impl<'r> History<'r> {
   fn check(&mut self, guest: &mut Guest) {
     self.sync(guest);
     let held = self.volume_holds_the_latest_writes(guest);
-    match guest.ask(
-      &Ask::Read {
-        at: 0,
-        len: self.len,
-      },
-      REPLY_WAIT,
-    ) {
+    match guest.ask(&Ask::Read {
+      at: 0,
+      len: self.len,
+    }) {
       Reply::Bytes(mapped) => assert!(
         mapped == held,
         "the guest's map of {} differs from the volume: {} byte(s)\n{}",

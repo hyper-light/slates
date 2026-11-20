@@ -14,8 +14,12 @@
 //! **Resources** (`repos.c` `parse_uri`, `parse_baseline_coll_uri`, `prep_regular`). A path below the root not under
 //! the special URI ([`SPECIAL`]) is the node at that path in the youngest revision (a public URL). `!svn/rvr/REV/PATH`
 //! and `!svn/bc/REV/PATH` are the node at `PATH` in `REV` (a revision root's resource and a baseline collection's,
-//! which `mod_dav_svn` treats alike). `!svn` itself and every other special resource it names (`me`, `rev`, `vcc`,
-//! `bln`, `ver`, `his`, `wrk`, `act`, `wbl`, `txn`, `txr`, `vtxn`, `vtxr`) is one this part does not serve; any other
+//! which `mod_dav_svn` treats alike). DeltaV v1's (A-766 part 1; `prep_vcc`, `prep_version`, `liveprops.c`):
+//! `!svn/vcc/default` is the version-controlled configuration, whose `checked-in` names the youngest baseline and to
+//! which a v1 client sends its update-report; `!svn/bln/REV` is REV's baseline (its collection, number and revision
+//! properties); `!svn/ver/REV/PATH` is the node at `PATH` in `REV` as a version resource, without `checked-in`.
+//! `!svn` itself and every other special resource it names (`me`, `rev`, `his`, `wrk`, `act`, `wbl`, `txn`, `txr`,
+//! `vtxn`, `vtxr`) is one this part does not serve; any other
 //! special path, or a revision that is not a number, is `mod_dav_svn`'s malformed URI: `500` (error 190001). A revision
 //! past the youngest is `404`, "No such revision N" (160006), as `dav_svn__convert_err` maps it. Each of these is
 //! answered whatever the method.
@@ -92,7 +96,7 @@ pub const SPECIAL: &str = "!svn";
 /// Format: `mod_dav_svn`'s `me` (`repos.c`).
 const ME: &str = "me";
 
-/// The special resources `mod_dav_svn` knows, of which this part serves `rvr` and `bc`.
+/// The special resources `mod_dav_svn` knows, of which this part serves `rvr`, `bc`, `vcc`, `bln` and `ver`.
 /// Format: `repos.c` `special_subdirs`.
 const SPECIAL_KINDS: [&str; 15] = [
   "ver", "his", "wrk", "act", "vcc", "bc", "bln", "wbl", "me", "rev", "rvr", "txn", "txr", "vtxn",
@@ -137,6 +141,18 @@ const SVN_PREFIX: &str = "svn:";
 /// The VCC's name in its URL.
 /// Format: `DAV_SVN__DEFAULT_VCC_NAME` (`dav_svn.h`).
 const DEFAULT_VCC: &str = "default";
+
+/// The special resource of a version-controlled configuration (DeltaV v1).
+/// Format: `repos.c` `special_subdirs`, `vcc`.
+const VCC: &str = "vcc";
+
+/// The special resource of a baseline (DeltaV v1).
+/// Format: `repos.c` `special_subdirs`, `bln`.
+const BASELINE: &str = "bln";
+
+/// The special resource of a version resource (DeltaV v1): a node in a revision, as `!svn/ver/REV/PATH`.
+/// Format: `repos.c` `special_subdirs`, `ver`.
+const VERSION: &str = "ver";
 
 /// `SVN_ERR_FS_NO_SUCH_REVISION`.
 /// Format: the filesystem category's start, 160,000, plus 6 (`svn_error_codes.h`).
@@ -335,6 +351,8 @@ struct Place {
   revision: Revision,
   /// Whether the URL is a public one.
   public: bool,
+  /// Whether the URL names a version resource (`!svn/ver/REV/PATH`, DeltaV v1's), not a revision root's node.
+  version: bool,
 }
 
 /// What a request's URL names.
@@ -344,6 +362,11 @@ enum Resource {
   Node(Place),
   /// HTTPv2's `me` resource (`!svn/me`), which a stock client sends its update-report to.
   Me,
+  /// DeltaV v1's version-controlled configuration (`!svn/vcc/default`): its `checked-in` names the youngest
+  /// baseline, and a v1 client sends its update-report here.
+  Vcc,
+  /// DeltaV v1's baseline of a revision (`!svn/bln/REV`): the revision's collection and properties.
+  Baseline(Revision),
   /// A special resource this part does not serve.
   Unserved,
 }
@@ -389,12 +412,33 @@ fn resolve<R: ?Sized>(served: &Served<'_, R>, path: &str) -> Result<Resource, Ht
   }
   let place = match segments.split_first() {
     Some((&first, [me])) if first == SPECIAL && *me == ME => return Ok(Resource::Me),
+    Some((&first, [vcc, name])) if first == SPECIAL && *vcc == VCC => {
+      // `repos.c` `parse_vcc_uri`: `default` alone names the VCC.
+      return match *name == DEFAULT_VCC {
+        true => Ok(Resource::Vcc),
+        false => Err(malformed_uri()),
+      };
+    }
+    Some((&first, [baseline, revision])) if first == SPECIAL && *baseline == BASELINE => {
+      let revision = decimal(revision).ok_or_else(malformed_uri)?;
+      if revision > served.index.youngest() {
+        let message = format!("No such revision {revision}");
+        return Err(error_answer(
+          HTTP_NOT_FOUND,
+          true,
+          SVN_ERR_FS_NO_SUCH_REVISION,
+          &message,
+        ));
+      }
+      return Ok(Resource::Baseline(revision));
+    }
     Some((&first, rest)) if first == SPECIAL => special(rest)?,
     _ => Some(Place {
       url: String::new(),
       path: joined(&segments),
       revision: served.index.youngest(),
       public: true,
+      version: false,
     }),
   };
   let Some(mut place) = place else {
@@ -425,7 +469,8 @@ fn special(segments: &[&str]) -> Result<Option<Place>, HttpAnswer> {
   if !SPECIAL_KINDS.contains(&kind) {
     return Err(malformed_uri());
   }
-  if !REVISION_ROOTS.contains(&kind) {
+  let version = kind == VERSION;
+  if !REVISION_ROOTS.contains(&kind) && !version {
     return Ok(None);
   }
   let Some((&revision, path)) = rest.split_first() else {
@@ -437,6 +482,7 @@ fn special(segments: &[&str]) -> Result<Option<Place>, HttpAnswer> {
     path: joined(path),
     revision,
     public: false,
+    version,
   }))
 }
 
@@ -594,8 +640,12 @@ fn report<R: Repository + ?Sized>(
   if let Asked::Update(update) = &asked {
     let v2 = match resource {
       Resource::Me => true,
-      Resource::Node(_) => false,
-      Resource::Unserved => return Answer::Whole(unserved_method("REPORT")),
+      // DeltaV v1's client sends its update-report to the VCC (`update.c`, `session->vcc_url`); its checked-in
+      // hrefs name version resources.
+      Resource::Node(_) | Resource::Vcc => false,
+      Resource::Baseline(_) | Resource::Unserved => {
+        return Answer::Whole(unserved_method("REPORT"));
+      }
     };
     let youngest = served.index.youngest();
     return match UpdateWalk::new(update, served.root, youngest, served.uuid, v2, room) {
@@ -669,21 +719,36 @@ struct Subject<'p> {
   collection: bool,
   /// Its created revision.
   created: Revision,
-  /// The created revision's author.
-  author: Option<Vec<u8>>,
-  /// The created revision's date, as stored.
-  date: Option<String>,
+  /// The created revision's author, lent by the repository.
+  author: Option<&'p [u8]>,
+  /// The created revision's date, as stored, lent by the repository.
+  date: Option<&'p str>,
   /// Its text, for a file that has one.
   text: Option<Text>,
-  /// Its own properties, in name order.
-  properties: Vec<(Vec<u8>, Vec<u8>)>,
+  /// Its own properties, in name order, each lent by the repository (MEMORY SIZING: no copy of a value).
+  properties: Vec<(&'p [u8], &'p [u8])>,
   /// The revision `checked-in` names it in (`dav_svn__get_safe_cr`).
   safe_created: Revision,
+  /// What kind of resource it is, which decides the live properties it has.
+  kind: Kind,
+}
+
+/// The kinds of resource a PROPFIND describes, each with its own live properties (`liveprops.c`, `std_liveprop.c`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+  /// A node at a public URL or in a revision root (`DAV_RESOURCE_TYPE_REGULAR`).
+  Regular,
+  /// A version resource, `!svn/ver/REV/PATH` (`DAV_RESOURCE_TYPE_VERSION`).
+  Version,
+  /// The version-controlled configuration (`DAV_RESOURCE_TYPE_PRIVATE`, `DAV_SVN_RESTYPE_VCC`).
+  Vcc,
+  /// A baseline (`DAV_RESOURCE_TYPE_VERSION`, baselined).
+  Baseline,
 }
 
 /// The subject `node` at `place` is; refused `500` where the green lacks a property list the index names.
 fn subject<'p, R: Repository + ?Sized>(
-  served: &Served<'_, R>,
+  served: &'p Served<'_, R>,
   place: &'p Place,
   node: &Node<'_>,
 ) -> Result<Subject<'p>, HttpAnswer> {
@@ -696,17 +761,14 @@ fn subject<'p, R: Repository + ?Sized>(
     revision_properties
       .iter()
       .find(|(found, _)| *found == name)
-      .map(|(_, value)| value.to_vec())
+      .map(|(_, value)| *value)
   };
   let mut properties = match node.properties() {
     PropertyList::Empty => Vec::new(),
     PropertyList::Held { identity, .. } => served
       .repository
       .properties(&identity)
-      .ok_or_else(corrupt)?
-      .into_iter()
-      .map(|(name, value)| (name.to_vec(), value.to_vec()))
-      .collect(),
+      .ok_or_else(corrupt)?,
   };
   properties.sort();
   Ok(Subject {
@@ -714,10 +776,15 @@ fn subject<'p, R: Repository + ?Sized>(
     collection: node.kind() == NodeKind::Directory,
     created,
     author: find(AUTHOR),
-    date: find(DATE).and_then(|date| String::from_utf8(date).ok()),
+    date: find(DATE).and_then(|date| std::str::from_utf8(date).ok()),
     text: node.text(),
     properties,
     safe_created: safe_created(served.index, place, node),
+    kind: if place.version {
+      Kind::Version
+    } else {
+      Kind::Regular
+    },
   })
 }
 
@@ -806,8 +873,8 @@ impl Subject<'_> {
     self
       .properties
       .iter()
-      .find(|(found, _)| found == name)
-      .map(|(_, value)| value.as_slice())
+      .find(|(found, _)| *found == name)
+      .map(|(_, value)| *value)
   }
 }
 
@@ -866,6 +933,9 @@ fn propfind<R: Repository + ?Sized>(
   bounds: &Bounds,
   room: usize,
 ) -> HttpAnswer {
+  if let Resource::Vcc | Resource::Baseline(_) = resource {
+    return private_propfind(served, resource, request, bounds, room);
+  }
   let Resource::Node(place) = resource else {
     return unserved_method("PROPFIND");
   };
@@ -887,6 +957,75 @@ fn propfind<R: Repository + ?Sized>(
   }
   match described(served, place, &node, &asked, depth) {
     Ok((responses, headers)) => multistatus(&responses, headers, room),
+    Err(refused) => refused,
+  }
+}
+
+/// A PROPFIND of DeltaV v1's VCC or a baseline (`repos.c` `prep_vcc`, `prep_version`): one response, neither being a
+/// collection, its live properties those its kind has; a baseline's dead properties are its revision's properties
+/// (`deadprops.c`, a baselined resource's), the VCC has none.
+fn private_propfind<R: Repository + ?Sized>(
+  served: &Served<'_, R>,
+  resource: &Resource,
+  request: &Request<'_>,
+  bounds: &Bounds,
+  room: usize,
+) -> HttpAnswer {
+  if depth_of(request.depth).is_none() {
+    return bare(HTTP_BAD_REQUEST);
+  }
+  let asked = match request::propfind(request.body, bounds) {
+    Ok(asked) => asked,
+    Err(refused) => return refused_body(&refused),
+  };
+  let root = served.root.trim_end_matches('/');
+  let (url, revision, kind) = match resource {
+    Resource::Baseline(revision) => (
+      format!("{root}/{SPECIAL}/{BASELINE}/{revision}"),
+      *revision,
+      Kind::Baseline,
+    ),
+    _ => (
+      format!("{root}/{SPECIAL}/{VCC}/{DEFAULT_VCC}"),
+      served.index.youngest(),
+      Kind::Vcc,
+    ),
+  };
+  let place = Place {
+    url,
+    path: String::from("/"),
+    revision,
+    public: false,
+    version: false,
+  };
+  let revision_properties = served
+    .repository
+    .revision_properties(revision)
+    .unwrap_or_default();
+  let find = |name: &[u8]| {
+    revision_properties
+      .iter()
+      .find(|(found, _)| *found == name)
+      .map(|(_, value)| *value)
+  };
+  let mut properties = match kind {
+    Kind::Baseline => revision_properties.clone(),
+    _ => Vec::new(),
+  };
+  properties.sort();
+  let subject = Subject {
+    place: &place,
+    collection: false,
+    created: revision,
+    author: find(AUTHOR),
+    date: find(DATE).and_then(|date| std::str::from_utf8(date).ok()),
+    text: None,
+    properties,
+    safe_created: revision,
+    kind,
+  };
+  match one_response(served, &subject, &asked, href_of(&place.url, false)) {
+    Ok((described, headers)) => multistatus(&[described], headers, room),
     Err(refused) => refused,
   }
 }
@@ -993,6 +1132,7 @@ fn described<R: Repository + ?Sized>(
         path: child_path(&place.path, &name),
         revision: place.revision,
         public: place.public,
+        version: place.version,
       };
       let Ok(Some(child_node)) = node_at(served, &child) else {
         continue;
@@ -1249,10 +1389,58 @@ fn live_value<R: ?Sized>(
   group: Group,
   name: &str,
 ) -> Option<String> {
-  match group {
-    Group::Core => core_value(subject, lock, name),
-    Group::Dav => dav_value(served, subject, name),
-    Group::Svn => svn_value(served, subject, name),
+  match (subject.kind, group) {
+    (Kind::Vcc, Group::Dav) => vcc_value(served, name),
+    (Kind::Vcc, Group::Svn) => (name == "repository-uuid").then(|| served.uuid.to_owned()),
+    (Kind::Vcc, Group::Core) => None,
+    (Kind::Baseline, Group::Dav) => baseline_value(served, subject, name),
+    (Kind::Baseline, Group::Svn) => (name == "repository-uuid").then(|| served.uuid.to_owned()),
+    (Kind::Version, Group::Dav)
+      if matches!(name, "checked-in" | "version-controlled-configuration") =>
+    {
+      None
+    }
+    (Kind::Version, Group::Svn) if matches!(name, "baseline-relative-path" | "deadprop-count") => {
+      None
+    }
+    (_, Group::Core) => core_value(subject, lock, name),
+    (_, Group::Dav) => dav_value(served, subject, name),
+    (_, Group::Svn) => svn_value(served, subject, name),
+  }
+}
+
+/// The VCC's one live property in `DAV:` (`liveprops.c`): `checked-in`, the youngest baseline. Every other is not
+/// supported there, `resourcetype` too (`std_liveprop.c` defines none for a private resource); `getcontentlength`,
+/// which `liveprops.c` would compute as a file's length at `/` and fail, is answered not found.
+fn vcc_value<R: ?Sized>(served: &Served<'_, R>, name: &str) -> Option<String> {
+  (name == "checked-in").then(|| {
+    format!(
+      "<D:href>{}/{SPECIAL}/{BASELINE}/{}</D:href>",
+      quote(&uri_encode(served.root), true),
+      served.index.youngest()
+    )
+  })
+}
+
+/// A baseline's live properties in `DAV:` (`liveprops.c`, `std_liveprop.c`): `resourcetype` `D:baseline`, its
+/// revision's date and author, an empty etag (`RESOURCE_LACKS_ETAG_POTENTIAL`), `baseline-collection` naming the
+/// revision's collection and `version-name` its number; no length, type, `checked-in` or configuration.
+fn baseline_value<R: ?Sized>(
+  served: &Served<'_, R>,
+  subject: &Subject<'_>,
+  name: &str,
+) -> Option<String> {
+  let revision = subject.place.revision;
+  match name {
+    "resourcetype" => Some(String::from("<D:baseline/>")),
+    "getetag" => Some(String::new()),
+    "creationdate" | "getlastmodified" | "creator-displayname" => dav_value(served, subject, name),
+    "baseline-collection" => Some(format!(
+      "<D:href>{}/{SPECIAL}/bc/{revision}/</D:href>",
+      quote(&uri_encode(served.root), true)
+    )),
+    "version-name" => Some(revision.to_string()),
+    _ => None,
   }
 }
 

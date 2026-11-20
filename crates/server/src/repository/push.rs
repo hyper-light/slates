@@ -951,6 +951,7 @@ fn judge(
       Some(Judgment::CopyRefused { path, case }) => {
         ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
       }
+      Some(Judgment::ContentUnread { .. }) => ChangeRefusal::Refused(Refusal::ContentUnavailable),
       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
     };
     verdicts.push(None);

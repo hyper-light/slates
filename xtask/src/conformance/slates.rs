@@ -19,12 +19,15 @@ use slates_conformance::capability::{
 };
 use slates_conformance::record::Transport;
 
-use super::{Run, create_dir, pause, stdout_of};
+use super::{Run, create_dir, pause, process_wait, stdout_of};
 use crate::Failure;
 
-/// Shape: how long the anchor and its daemon get to come up — the CLI test's twenty seconds,
-/// tripled for a loaded shared runner.
-const START_WAIT: Duration = Duration::from_secs(60);
+/// Derived: how long an anchor's processes get to leave once killed, and again once their daemon is killed too
+/// ([`Anchor::end`]): the observation budget (`slates_machine::budgets::observe_budget_ns`, the source the daemon's
+/// own `OBSERVE_BUDGET_NS` is), the longest any party goes unobserved. An orphaned daemon notices its anchor's death
+/// within a liveness window, and a killed one's exit is the kernel's. Until 2026-11-20 the harness's 60 s
+/// `START_WAIT`.
+const LEAVE_WAIT: Duration = Duration::from_nanos(slates_machine::budgets::observe_budget_ns());
 /// Shape: consecutive `volume list` successes before the daemon counts as settled (the CLI test's
 /// streak, which outlasts the anchor's one startup restart).
 const STABLE_STREAK: u32 = 10;
@@ -33,12 +36,14 @@ const SHARDS: &str = "2";
 /// Shape: how long a mount gets to appear in the mount table.
 pub(super) const MOUNT_WAIT: Duration = Duration::from_secs(20);
 
-/// Derived: mount control calls share the kernel-mount wait budget; reconnect may also span
-/// the harness's startup budget. Both are operational bounds already owned by this harness.
+/// Derived: the mount control calls' deadlines, the product's own (`slates_api::deadlines`): the liveness and recovery
+/// budgets from their one source (`slates_machine::budgets`). A call waits while its daemon lives (A-232) and a
+/// reconnect while its anchor does (A-468), so no wall bound of the harness's own is needed. Until 2026-11-20 the reply
+/// deadline was the mount wait and the reconnect budget the harness's 60 s start wait.
 pub(super) fn mount_deadlines() -> slates_client::Deadlines {
   slates_client::Deadlines::derive(
-    u64::try_from(MOUNT_WAIT.as_nanos()).unwrap_or(u64::MAX),
-    u64::try_from(START_WAIT.as_nanos()).unwrap_or(u64::MAX),
+    slates_machine::budgets::liveness_budget_ns(),
+    slates_machine::budgets::RECOVERY_BUDGET_NS,
   )
   .get()
 }
@@ -210,6 +215,9 @@ pub(crate) struct Anchor {
   /// both have left (their pipe ends closed). The slates processes write to the pipe, never to a file:
   /// a regular file behind their standard error would be a disk write of theirs (AUD-29-42).
   drain: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
+  /// Told once the drain has read the pipe to its end: the kernel's word that every process holding its write end, the
+  /// anchor and its daemon, has left ([`Anchor::end`]).
+  drained: std::sync::mpsc::Receiver<()>,
 }
 
 /// Opens the anchor's log file for writing: the development tool's own scratch output.
@@ -269,15 +277,21 @@ impl Anchor {
     // The command, holding the parent's copy of the pipe's write end, is gone once spawned, so the drain
     // reads to the end when the anchor and its daemon have closed theirs.
     drop(command);
+    let (ended, drained_signal) = std::sync::mpsc::channel();
     let drain = std::thread::Builder::new()
       .name(format!("anchor-log-{instance}"))
-      .spawn(move || std::io::copy(&mut drained, &mut log_file))
+      .spawn(move || {
+        let copied = std::io::copy(&mut drained, &mut log_file);
+        let _ = ended.send(());
+        copied
+      })
       .map_err(|e| Failure(format!("spawning the anchor log's drain: {e}")))?;
     let anchor = Anchor {
       child,
       log,
       instance: instance.to_owned(),
       drain: Some(drain),
+      drained: drained_signal,
     };
     anchor.wait_ready(binary)?;
     Ok(anchor)
@@ -302,8 +316,11 @@ impl Anchor {
     all[from..].join("\n")
   }
 
+  /// Waits until the daemon answers [`STABLE_STREAK`] verbs in a row, while the instance's processes progress in their
+  /// own CPU (`process_wait::InstanceWait`, the suites' judgment, b25a5b7a6): refused once they made none for the
+  /// observation budget, spent their CPU budget, or left. Until 2026-11-20 within the harness's 60 s `START_WAIT`.
   fn wait_ready(&self, binary: &SlatesBinary) -> Result<(), Failure> {
-    let started = Instant::now();
+    let mut progress = process_wait::InstanceWait::new();
     let mut streak = 0u32;
     loop {
       let reply = binary.run(&self.instance, &["volume", "list"])?;
@@ -315,9 +332,11 @@ impl Anchor {
       } else {
         streak = 0;
       }
-      if started.elapsed() > START_WAIT {
+      if !progress.look(&self.instance) {
         return Err(Failure(format!(
-          "the daemon did not come up within {START_WAIT:?} (last exit {}); anchor log:\n{}",
+          "the daemon did not come up before its processes stalled, spent their CPU budget or left ({:?}; last exit \
+           {}); anchor log:\n{}",
+          progress.seen,
           reply.code,
           std::fs::read_to_string(&self.log).unwrap_or_default()
         )));
@@ -364,7 +383,7 @@ impl Anchor {
       Ok(())
     } else {
       Err(Failure(format!(
-        "the daemon of {} was still running {START_WAIT:?} after it was killed",
+        "the daemon of {} was still running {LEAVE_WAIT:?} after it was killed",
         self.instance
       )))
     }
@@ -372,8 +391,9 @@ impl Anchor {
 
   /// Kills and reaps the anchor, then waits until no process runs its daemon's command line. Orphaned by the
   /// kill, the daemon cannot be reaped here: it leaves in its own time, writing its last lines to and closing
-  /// the log it shares with the anchor. One still running after [`START_WAIT`] is killed, and waited for as
-  /// long again. So no process of one suite outlives it: CI run 36565560556's hermeticity trace, which keeps
+  /// the log it shares with the anchor. Its leaving is awaited on the kernel's word, the end of that log's pipe, which
+  /// the drain reads once every writer has left (until 2026-11-20 a poll of `pgrep` every pause). One still running
+  /// after [`LEAVE_WAIT`] is killed, and waited for as long again. So no process of one suite outlives it: CI run 36565560556's hermeticity trace, which keeps
   /// every slates process's events, took the workloads suite's departing daemon's last write and close of
   /// its log for its own violations
   /// (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`). Whether the
@@ -384,21 +404,21 @@ impl Anchor {
     // the daemon along; its departure shows as the end of the log's pipe, which the drain reads to the end then.
     let _ = self.child.kill();
     let _ = self.child.wait();
-    let started = Instant::now();
-    while self
-      .drain
-      .as_ref()
-      .is_some_and(|drain| !drain.is_finished())
-    {
-      if started.elapsed() > START_WAIT {
-        return false;
-      }
-      pause();
+    if !self.left_within(LEAVE_WAIT) {
+      return false;
     }
     if let Some(drain) = self.drain.take() {
       let _ = drain.join();
     }
     true
+  }
+
+  /// Whether the log's pipe reached its end within `wait`: every process holding its write end has left.
+  fn left_within(&self, wait: Duration) -> bool {
+    match self.drained.recv_timeout(wait) {
+      Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+      Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+    }
   }
 
   #[cfg(unix)]
@@ -410,11 +430,11 @@ impl Anchor {
       .args(["-KILL", "-f", &self.anchor_command()])
       .status();
     let daemon = self.daemon_command();
-    let left = none_running(&daemon) || {
+    let left = self.left_within(LEAVE_WAIT) || {
       let _ = Command::new("pkill")
         .args(["-KILL", "-f", &daemon])
         .status();
-      none_running(&daemon)
+      self.left_within(LEAVE_WAIT)
     };
     // Reaped only after the processes a tracer follows are gone, which is when a root tracer ends.
     let _ = self.child.wait();
@@ -424,21 +444,6 @@ impl Anchor {
       let _ = drain.join();
     }
     left
-  }
-}
-
-/// Polls until no process runs `command`, for at most [`START_WAIT`]; whether none does.
-#[cfg(unix)]
-fn none_running(command: &str) -> bool {
-  let started = Instant::now();
-  loop {
-    if stdout_of("pgrep", &["-f", command]).is_empty() {
-      return true;
-    }
-    if started.elapsed() > START_WAIT {
-      return false;
-    }
-    pause();
   }
 }
 
@@ -811,15 +816,14 @@ pub(crate) fn mount_volume(
       mount
     }
   };
-  let started = Instant::now();
-  while !is_mounted(&mount.path) {
-    if started.elapsed() > MOUNT_WAIT {
-      return Err(Failure(format!(
-        "{} is not in the mount table after {MOUNT_WAIT:?}",
-        mount.path.display()
-      )));
-    }
-    pause();
+  // Awaited on the kernel's word that the table changed, never a poll (`process_wait::await_mount_table`, main's ruling
+  // of 2026-11-20), within the observation budget; until then polled within `MOUNT_WAIT`.
+  if !process_wait::await_mount_table(|| is_mounted(&mount.path)) {
+    return Err(Failure(format!(
+      "{} is not in the mount table after {:?}",
+      mount.path.display(),
+      process_wait::MOUNT_TABLE_WAIT
+    )));
   }
   Ok(mount)
 }
@@ -1034,11 +1038,13 @@ impl Session {
     let started = super::live_fleet::LiveFleet::start(&binary, suite, run.scratch.path())?;
     let volume_name = format!("{suite}-vol");
     let created = {
-      let deadline = Instant::now() + START_WAIT;
+      // Retried while the owner's processes progress (until 2026-11-20 within the harness's 60 s start wait).
+      let mut progress = process_wait::InstanceWait::new();
       loop {
         match create_volume(&binary, &started.owner_instance, &volume_name, size, fold) {
           Err(Failure(why))
-            if why.contains("ConsensusNotInitialized") && Instant::now() < deadline =>
+            if why.contains("ConsensusNotInitialized")
+              && progress.look(&started.owner_instance) =>
           {
             pause()
           }

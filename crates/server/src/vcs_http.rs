@@ -269,6 +269,9 @@ pub(crate) trait Exchange {
   async fn reply_fields(&mut self) -> Result<Fields, Failed> {
     Ok(Fields::new())
   }
+  /// Appends to `out` what the reply may send while the request's body is still being read, on a route whose head is
+  /// written at once (`StatusMode::AtHead`): git's keepalive while a long pack is read (A-722). Nothing by default.
+  fn interim(&mut self, _out: &mut Vec<u8>) {}
   /// Appends the reply's next run to `out`: `true` while more follows, `false` once the reply has ended.
   /// `gone` resolves if the client goes while the reply is made (a git push answered in the reply's turns, which may
   /// run a hook, A-722's keepalive).
@@ -411,6 +414,14 @@ impl<G: Exchange, H: Exchange, S: Exchange> Exchange for ToolExchange<G, H, S> {
       Self::Git(exchange) => exchange.reply_status(),
       Self::Hg(exchange) => exchange.reply_status(),
       Self::Svn(exchange) => exchange.reply_status(),
+    }
+  }
+
+  fn interim(&mut self, out: &mut Vec<u8>) {
+    match self {
+      Self::Git(exchange) => exchange.interim(out),
+      Self::Hg(exchange) => exchange.interim(out),
+      Self::Svn(exchange) => exchange.interim(out),
     }
   }
 
@@ -1156,7 +1167,14 @@ impl<S: Site> Parts<S> {
   /// Tells the engine whether the service took the body's run, then yields: one run a turn (the module doc).
   async fn body_taken(&mut self, connection: &mut Connection, taken: Result<(), Failed>) -> Flow {
     match taken {
-      Ok(()) => connection.body_taken(),
+      Ok(()) => {
+        connection.body_taken();
+        if let Some(started) = self.service.as_mut() {
+          self.reply.clear();
+          started.exchange.interim(&mut self.reply);
+          connection.interim(&self.reply);
+        }
+      }
       Err(Failed(status)) => {
         self.service = None;
         connection.fail(status);

@@ -584,17 +584,23 @@ fn a764_a_members_enrollment_and_revocation_are_held_here_and_idempotent() {
       1,
       "one change made"
     );
-    let revoke = CredentialMessage::Revoke { id };
-    assert!(super::apply_here(state, &revoke), "let go as asked");
-    assert_eq!(held(state, &id), None);
-    assert!(
-      super::apply_here(state, &revoke),
-      "the same revocation again: gone either way"
-    );
-    assert_eq!(counted(state, "credential.fleet.applied"), 2);
-    assert!(
-      !super::apply_here(state, &CredentialMessage::Answer { id, held: true }),
-      "an answer asks nothing"
-    );
+    revoked_twice(state, id);
   });
+}
+
+/// The revocation half of the A-764 test above: a member's revocation of `id` applied here twice, then an answer.
+fn revoked_twice(state: &mut ShardState, id: [u8; 32]) {
+  use slates_cluster::credentials::CredentialMessage;
+  let revoke = CredentialMessage::Revoke { id };
+  assert!(super::apply_here(state, &revoke), "let go as asked");
+  assert_eq!(held(state, &id), None);
+  assert!(
+    super::apply_here(state, &revoke),
+    "the same revocation again: gone either way"
+  );
+  assert_eq!(counted(state, "credential.fleet.applied"), 2);
+  assert!(
+    !super::apply_here(state, &CredentialMessage::Answer { id, held: true }),
+    "an answer asks nothing"
+  );
 }

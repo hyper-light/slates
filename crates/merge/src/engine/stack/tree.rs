@@ -82,6 +82,7 @@ impl Green {
       doc: work.doc.clone(),
       post_state: work.post_state.clone(),
       evidence: work.evidence.clone(),
+      named: Default::default(),
     };
     let resolved = Green::resolve(&restated);
     if let Some(path) = resolved.copies.keys().next() {

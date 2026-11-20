@@ -491,6 +491,7 @@ fn resubmitted_beside_submitted(
     doc,
     post_state: Vec::new(),
     evidence: Vec::new(),
+    named: Default::default(),
   };
   let mut resubmitting = made()?;
   if !matches!(resubmitting.submit(&next), Outcome::Accepted { .. }) {
@@ -607,6 +608,7 @@ fn submitted_at_the_fifo(journal: &[VolumeOp], id: u8) -> Result<AtTheFifo, Stri
     doc,
     post_state: Vec::new(),
     evidence: Vec::new(),
+    named: Default::default(),
   };
   Ok(match green.submit(&increment) {
     Outcome::Conflict { windows } => AtTheFifo::Conflict(classes_at_the_fifo(&windows)),
