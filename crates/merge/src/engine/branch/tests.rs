@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
+use proptest::strategy::Union;
 
 use super::super::{Green, Increment, Outcome};
 use super::{Lent, Lineage, LineageGreen, LineageRefused};
@@ -424,18 +425,20 @@ enum Seed {
   Hardlink(usize),
 }
 
+/// A file's bytes, from three letters. This union and the ones below are built as `prop_oneof!` builds one of more than
+/// ten arms: its shorter forms hold their arms in `Arc`s (R2).
 fn bytes() -> impl Strategy<Value = Vec<u8>> {
-  proptest::collection::vec(prop_oneof![Just(b'x'), Just(b'y'), Just(b'z')], 1..6)
+  proptest::collection::vec(Union::new([Just(b'x'), Just(b'y'), Just(b'z')]), 1..6)
 }
 
 fn origin() -> impl Strategy<Value = Origin> {
-  let seed = prop_oneof![
-    3 => Just(Seed::Nothing),
-    4 => bytes().prop_map(Seed::File),
-    1 => (0..PATHS.len()).prop_map(Seed::Symlink),
-    1 => any::<u8>().prop_map(Seed::Special),
-    1 => (0..PATHS.len()).prop_map(Seed::Hardlink),
-  ];
+  let seed = Union::new_weighted(vec![
+    (3, Just(Seed::Nothing).boxed()),
+    (4, bytes().prop_map(Seed::File).boxed()),
+    (1, (0..PATHS.len()).prop_map(Seed::Symlink).boxed()),
+    (1, any::<u8>().prop_map(Seed::Special).boxed()),
+    (1, (0..PATHS.len()).prop_map(Seed::Hardlink).boxed()),
+  ]);
   (
     proptest::collection::vec(seed, PATHS.len()),
     proptest::collection::btree_set(0..DIRS.len(), 0..=DIRS.len()),
@@ -507,13 +510,30 @@ enum Step {
 }
 
 fn step() -> impl Strategy<Value = Step> {
-  prop_oneof![
-    6 => (0..GREENS, 0u8..3, proptest::collection::vec(edit(), 1..4))
-      .prop_map(|(green, back, edits)| Step::Submit { green, back, edits }),
-    2 => (0..GREENS, any::<u8>()).prop_map(|(from, back)| Step::Branch { from, back }),
-    1 => (0..GREENS, any::<u8>()).prop_map(|(green, back)| Step::Fold { green, back }),
-    1 => (0..GREENS).prop_map(|green| Step::Retire { green }),
-  ]
+  Union::new_weighted(vec![
+    (
+      6,
+      (0..GREENS, 0u8..3, proptest::collection::vec(edit(), 1..4))
+        .prop_map(|(green, back, edits)| Step::Submit { green, back, edits })
+        .boxed(),
+    ),
+    (
+      2,
+      (0..GREENS, any::<u8>())
+        .prop_map(|(from, back)| Step::Branch { from, back })
+        .boxed(),
+    ),
+    (
+      1,
+      (0..GREENS, any::<u8>())
+        .prop_map(|(green, back)| Step::Fold { green, back })
+        .boxed(),
+    ),
+    (
+      1,
+      (0..GREENS).prop_map(|green| Step::Retire { green }).boxed(),
+    ),
+  ])
 }
 
 /// `head` less `back`, kept at or above `floor`.
@@ -649,17 +669,9 @@ fn at_head(green: &Green, edits: &[Edit], id: u64) -> Increment {
   work(green, green.head(), edits, id)
 }
 
-/// A-534 (§4.17.1 item 4, "without walking it"). Do: seed a green with ten thousand files in ninety-seven directories, a
-/// mode and an attribute; over three versions overwrite a file, then overwrite another and change the mode, then set
-/// the attribute and remove a third file; make a lineage of it and branch it at version 1, then at its head. Expect:
-/// neither branch visits a node of any map; the branch at version 1 sets back exactly the four keys changed after it
-/// (two files, the mode, the attribute) and makes no more nodes than its path copies and inserts can (per key: one a
-/// byte of its key, each edge holding at least one, the map's root, and the leaf and split an insert adds); the branch
-/// at the head sets back nothing and makes no node; and each reads as a green seeded from a copy of the source at its
-/// version.
-#[test]
-fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
-  let mut source = Green::with_origin(tree());
+/// The walk test's three versions over its tree: overwrite a file; overwrite another and change a mode; set an
+/// attribute and remove a third file.
+fn submit_three_versions(source: &mut Green) {
   let edits: [Vec<(OpKind, &str, Vec<u8>)>; 3] = [
     vec![(OpKind::Overwrite, "src/dir5/file5.rs", b"FIVE".to_vec())],
     vec![
@@ -672,22 +684,7 @@ fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
     ],
   ];
   for (version, ops) in edits.iter().enumerate() {
-    let mut work = Work::default();
-    for (kind, path, bytes) in ops {
-      match kind {
-        OpKind::Overwrite => {
-          let src = work.stash(bytes);
-          work.op(OpKind::Overwrite, path, 0, bytes.len() as u64, src);
-        }
-        OpKind::SetMode => work.op(OpKind::SetMode, path, 0, 0o755, 0),
-        OpKind::SetXattr => {
-          let name = work.name("user.x");
-          let src = work.stash(bytes);
-          work.op(OpKind::SetXattr, path, name, bytes.len() as u64, src);
-        }
-        _ => work.op(*kind, path, 0, 0, u64::MAX),
-      }
-    }
+    let work = edit_work(ops);
     let inc = Increment {
       id: [u8::try_from(version).unwrap() + 1; 32],
       base: version as u64,
@@ -702,6 +699,41 @@ fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
       }
     );
   }
+}
+
+/// The walk test's work of one version's `(kind, path, bytes)` ops.
+fn edit_work(ops: &[(OpKind, &str, Vec<u8>)]) -> Work {
+  let mut work = Work::default();
+  for (kind, path, bytes) in ops {
+    match kind {
+      OpKind::Overwrite => {
+        let src = work.stash(bytes);
+        work.op(OpKind::Overwrite, path, 0, bytes.len() as u64, src);
+      }
+      OpKind::SetMode => work.op(OpKind::SetMode, path, 0, 0o755, 0),
+      OpKind::SetXattr => {
+        let name = work.name("user.x");
+        let src = work.stash(bytes);
+        work.op(OpKind::SetXattr, path, name, bytes.len() as u64, src);
+      }
+      _ => work.op(*kind, path, 0, 0, u64::MAX),
+    }
+  }
+  work
+}
+
+/// A-534 (§4.17.1 item 4, "without walking it"). Do: seed a green with ten thousand files in ninety-seven directories, a
+/// mode and an attribute; over three versions overwrite a file, then overwrite another and change the mode, then set
+/// the attribute and remove a third file; make a lineage of it and branch it at version 1, then at its head. Expect:
+/// neither branch visits a node of any map; the branch at version 1 sets back exactly the four keys changed after it
+/// (two files, the mode, the attribute) and makes no more nodes than its path copies and inserts can (per key: one a
+/// byte of its key, each edge holding at least one, the map's root, and the leaf and split an insert adds); the branch
+/// at the head sets back nothing and makes no node; and each reads as a green seeded from a copy of the source at its
+/// version.
+#[test]
+fn a_branch_walks_no_map_and_sets_back_only_what_changed_after_its_version() {
+  let mut source = Green::with_origin(tree());
+  submit_three_versions(&mut source);
   let mut at_one = Green::with_origin(copy_at(&source, 1));
   let mut at_head = Green::with_origin(copy_at(&source, 3));
   let (expected_one, expected_head) = (view(&mut at_one), view(&mut at_head));
@@ -785,29 +817,35 @@ fn changes_to_a_branch_and_its_source_never_cross() {
     lineage.copied() > copied,
     "the writes copied no shared node"
   );
-  let read = |lineage: &mut Lineage, green: LineageGreen, path: &str| {
-    lineage
-      .with(green, |green| green.content(path).map(<[u8]>::to_vec))
-      .unwrap()
-  };
-  assert_eq!(read(&mut lineage, source, "d/e"), Some(b"SSe".to_vec()));
-  assert_eq!(read(&mut lineage, branch, "d/e"), Some(b"BBe".to_vec()));
-  assert_eq!(read(&mut lineage, source, "a.b"), Some(b"a.b".to_vec()));
-  assert_eq!(read(&mut lineage, branch, "a.b"), None);
+  each_reads_its_own_writes(&mut lineage, (source, branch), &mut alone);
+}
+
+/// The bytes `green` of `lineage` holds at `path`.
+fn read_member(lineage: &mut Lineage, green: LineageGreen, path: &str) -> Option<Vec<u8>> {
+  lineage
+    .with(green, |green| green.content(path).map(<[u8]>::to_vec))
+    .unwrap()
+}
+
+/// What the crossing test expects: the source and the branch each read their own writes and never the other's, and
+/// the source holds the identity `alone`, fed only the source's works, holds.
+fn each_reads_its_own_writes(
+  lineage: &mut Lineage,
+  (source, branch): (LineageGreen, LineageGreen),
+  alone: &mut Green,
+) {
+  assert_eq!(read_member(lineage, source, "d/e"), Some(b"SSe".to_vec()));
+  assert_eq!(read_member(lineage, branch, "d/e"), Some(b"BBe".to_vec()));
+  assert_eq!(read_member(lineage, source, "a.b"), Some(b"a.b".to_vec()));
+  assert_eq!(read_member(lineage, branch, "a.b"), None);
   assert_eq!(
     lineage.with(source, Green::head_identity).unwrap(),
     alone.head_identity()
   );
 }
 
-/// A-534. Do: branch a green past its head, below its fold floor, and through the handle of a green retired before.
-/// Expect: each refused by its kind (`PastHead`, `Folded`, `Stale`), and a refused branch adds no green and sets nothing
-/// back.
-#[test]
-fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_its_kind() {
-  let mut origin = Origin::default();
-  origin.files.push(("a".to_owned(), b"0123".to_vec()));
-  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+/// Three versions of `root`, each overwriting the first byte of its file `a` with the version's digit.
+fn overwrite_three_times(lineage: &mut Lineage, root: LineageGreen) {
   for id in 1..=3u64 {
     let inc = lineage
       .with(root, |green| {
@@ -827,6 +865,17 @@ fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_it
       Outcome::Accepted { version: id }
     );
   }
+}
+
+/// A-534. Do: branch a green past its head, below its fold floor, and through the handle of a green retired before.
+/// Expect: each refused by its kind (`PastHead`, `Folded`, `Stale`), and a refused branch adds no green and sets nothing
+/// back.
+#[test]
+fn a_branch_past_the_head_below_the_floor_or_of_a_retired_green_is_refused_by_its_kind() {
+  let mut origin = Origin::default();
+  origin.files.push(("a".to_owned(), b"0123".to_vec()));
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  overwrite_three_times(&mut lineage, root);
   assert_eq!(
     lineage.branch(root, 4),
     Err(LineageRefused::PastHead {
@@ -998,6 +1047,25 @@ fn first_byte(green: &Green, path: &str, n: u32) -> Increment {
   }
 }
 
+/// While a member is taken out of `lineage`, `other` is refused every lend, branch and retire (`Busy`), and a put-back
+/// naming it is refused `Stale`.
+fn every_other_lend_waits(lineage: &mut Lineage, other: LineageGreen) {
+  assert_eq!(
+    lineage.with(other, |green| green.head()),
+    Err(LineageRefused::Busy)
+  );
+  assert!(matches!(
+    Lent::new(&mut *lineage, other),
+    Err(LineageRefused::Busy)
+  ));
+  assert_eq!(lineage.branch(other, 0), Err(LineageRefused::Busy));
+  assert!(matches!(lineage.retire(other), Err(LineageRefused::Busy)));
+  assert_eq!(
+    lineage.put_back(other, Green::new()),
+    Err(LineageRefused::Stale)
+  );
+}
+
 /// A-575. Do: take a lineage's root engine out, then lend, branch, retire and put back the other member, and put the
 /// root back; then retire the other and take the root out again before its release runs. Expect: the engine taken out
 /// reads its files; while it is out every other lend, branch, retire and release step is refused `Busy` (the arenas
@@ -1011,27 +1079,12 @@ fn a_member_taken_out_holds_the_arenas_and_every_other_lend_waits_for_it() {
   let other = lineage.branch(root, 0).unwrap();
   let out = lineage.take(root).unwrap();
   assert_eq!(out.content("a"), Some(b"0123".as_slice()));
-  assert_eq!(
-    lineage.with(other, |green| green.head()),
-    Err(LineageRefused::Busy)
-  );
-  assert!(matches!(
-    Lent::new(&mut lineage, other),
-    Err(LineageRefused::Busy)
-  ));
-  assert_eq!(lineage.branch(other, 0), Err(LineageRefused::Busy));
-  assert!(matches!(lineage.retire(other), Err(LineageRefused::Busy)));
-  assert_eq!(
-    lineage.put_back(other, Green::new()),
-    Err(LineageRefused::Stale)
-  );
+  every_other_lend_waits(&mut lineage, other);
   lineage.put_back(root, out).unwrap();
-  let read = |lineage: &mut Lineage, member: LineageGreen| {
-    lineage
-      .with(member, |green| green.content("a").map(<[u8]>::to_vec))
-      .unwrap()
-  };
-  assert_eq!(read(&mut lineage, other), Some(b"0123".to_vec()));
+  assert_eq!(
+    read_member(&mut lineage, other, "a"),
+    Some(b"0123".to_vec())
+  );
   let mut release = lineage.retire(other).unwrap();
   let out = lineage.take(root).unwrap();
   assert_eq!(
@@ -1040,8 +1093,41 @@ fn a_member_taken_out_holds_the_arenas_and_every_other_lend_waits_for_it() {
   );
   lineage.put_back(root, out).unwrap();
   while lineage.release_step(&mut release).unwrap() {}
-  assert_eq!(read(&mut lineage, root), Some(b"0123".to_vec()));
+  assert_eq!(read_member(&mut lineage, root, "a"), Some(b"0123".to_vec()));
   assert_eq!(lineage.len(), 1);
+}
+
+/// Change the first byte of every tenth of `branch`'s thousand files.
+fn change_a_tenth(lineage: &mut Lineage, branch: LineageGreen) {
+  for n in (0..1_000u32).step_by(10) {
+    let path = format!("dir{}/file{n}", n % 10);
+    let inc = lineage
+      .with(branch, |green| first_byte(green, &path, n))
+      .unwrap();
+    assert!(matches!(
+      lineage.with(branch, |green| green.submit(&inc)).unwrap(),
+      Outcome::Accepted { .. }
+    ));
+  }
+}
+
+/// Retire `branch` and give its holds back a step at a time: at least one step, none freeing more than one node.
+fn retire_a_node_a_step(lineage: &mut Lineage, branch: LineageGreen) {
+  let mut release = lineage.retire(branch).unwrap();
+  let mut steps = 0u64;
+  loop {
+    let before = lineage.live_nodes();
+    let more = lineage.release_step(&mut release).unwrap();
+    assert!(
+      before - lineage.live_nodes() <= 1,
+      "a step freed more than one node"
+    );
+    if !more {
+      break;
+    }
+    steps += 1;
+  }
+  assert!(steps > 0, "the release took no step");
 }
 
 /// A-575 (§4.16, a retire sliced under the shard's budget). Do: branch a green of a thousand files at its head, change
@@ -1061,35 +1147,12 @@ fn a_retired_branch_gives_back_a_node_a_step_and_frees_only_what_it_alone_held()
   let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
   let held_alone = lineage.live_nodes();
   let branch = lineage.branch(root, 0).unwrap();
-  for n in (0..1_000u32).step_by(10) {
-    let path = format!("dir{}/file{n}", n % 10);
-    let inc = lineage
-      .with(branch, |green| first_byte(green, &path, n))
-      .unwrap();
-    assert!(matches!(
-      lineage.with(branch, |green| green.submit(&inc)).unwrap(),
-      Outcome::Accepted { .. }
-    ));
-  }
+  change_a_tenth(&mut lineage, branch);
   assert!(
     lineage.live_nodes() > held_alone,
     "the branch's writes copied no node"
   );
-  let mut release = lineage.retire(branch).unwrap();
-  let mut steps = 0u64;
-  loop {
-    let before = lineage.live_nodes();
-    let more = lineage.release_step(&mut release).unwrap();
-    assert!(
-      before - lineage.live_nodes() <= 1,
-      "a step freed more than one node"
-    );
-    if !more {
-      break;
-    }
-    steps += 1;
-  }
-  assert!(steps > 0, "the release took no step");
+  retire_a_node_a_step(&mut lineage, branch);
   assert_eq!(
     lineage.live_nodes(),
     held_alone,
