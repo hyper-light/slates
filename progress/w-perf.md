@@ -251,3 +251,18 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
 - S4 c1 LANDED 17aa54dd8 (svn_texts: hold/release per landed revision, rehold_head at recovery, HeadTexts source).
   Reads switch to HeadTexts + drop records' text bytes + drop fallback = c3 (one series; GAT refactor of SvnStores).
 - NEXT: c2 (old text as svndiff delta vs successor in repo ContentStore before the green folds); BENCHMARKS on r80.
+- S4 c2 LANDED 14215b0c3 (skip-delta records). main ruling: sink texts land as Stored{len} refs (w-svn), my c2 encoder
+  becomes a background sliced deltify job on supersede (hooks stored_texts()/supersede() from w-svn). Fix records.rs:231
+  `mut fresh` warning in next landing.
+- Identity rule (main): cross-node identity = plain BLAKE3 of bytes; store root node-local. Note pushed state 2db786af6.
+  IN PROGRESS (uncommitted, w-perf-a723): ContentStore objects/rooted alias maps, put_object/finish_object return BLAKE3,
+  resolve() in every lookup + release cascade, root_of/root_id for old records (git replay same_name/alike compat);
+  vcs 104/104; git/hg/svn/server suites running (bze1r0hhg). NEXT a3b: image lists + aliases (main: must survive restart
+  for v3), restart red.
+- A/B/C hg import DONE -> BENCHMARKS entry written (uncommitted): A 10.05 GB rec/23.9 GB RSS, B 4.66/10.1, C 1.30/10.7,
+  C refused by snapshot slot after a spin. Sent to w-hg. Main's svn A/B (whole vs skip-delta vs FSFS) still owed.
+- LANDED: identity rule 9010c5630; a3b 9b9d8dec6 (landed tree bf10a773a verified 189/189). Signalled main (now
+  slates-72? sent there; slates-7a gone) to mark goal-93 steps complete; part itself NOT complete.
+- OPEN (mine): background deltify job (supersede hook from w-svn), svn storage A/B (whole/skip-delta/FSFS, all N),
+  c3 (drop records fallback), review w-svn's sliced exporter `load`, push_load/git_scale rerun (w-git A-722 p3).
+- w-lint red (content-once test) passes at bf10a773a; asked main for w-lint's base.

@@ -126,3 +126,24 @@
   files and false errors in r16/r17.
 - At 4ce207710: host, six cross targets, structural, literals, unsafe, fmt, Windows (crates, cli, xtask): clean.
 - Target trimmed after the round.
+
+## 2026-11-20 round 4 at 26e125adb (closed on macOS at 2e521d875; Windows last seen at 982ea33d5)
+- Landed: 945b5f5cb (41: svn A-751 svndiff/lz4/making, git staging, vcs, rt Windows decode, server daemon/verbs/
+  vcs_store, A-697 fleet tests, cli edge restart), ecf8f9f6e (client never-looping loops x8, hg ssh test casts +
+  slow-client pause on the runtime timer, two fleet tests, a literal), eed69ad0b (3: server config, ssh import, hg
+  keys literal), b3fd44bda (10: A-718 git encoding's large enums and arithmetic + literals; git_encode test on a
+  channel; unused pushed_large removed).
+- Process notes: the blobless clone failed to merge (missing promisor object) with a local "wip-local" commit in its
+  history; re-cloned FULLY into the same path (warm target kept) and applied the round's diff as one patch, so no wip
+  message reached main. 03f872541 and 7113b38e7 on main are titled "wip" (Ada's commits): told main.
+- Windows: r21 clone hit a GitHub reset; r22 lost to a jupiter runner restart; the run at 982ea33d5 found A-718's
+  git errors (fixed in b3fd44bda, unverified on Windows); the last re-run failed (network reset, then kiln timeout).
+- At 2e521d875 on macOS: host, six cross targets, structural, literals, unsafe, fmt clean.
+
+## 2026-11-20 round 5 (Windows confirmed): main 4c2a3aede clean on Windows; 9e33fd418 clean on the macOS host
+- Landed: d412275d3 (Windows at a5233e2: git_push tests' PUSH_WAIT_NS/pack_of unix-only yet used everywhere,
+  give_back.rs import, client leftover; ipc hex literal), 4c2a3aede (INTERLEAVED gated as its unix test),
+  9e33fd418 (cli merge_kill never-looping loop).
+- At 4c2a3aede: Windows (crates, cli, xtask) clean on jupiter; six cross targets, structural, unsafe, fmt clean.
+- Open, not mine: literals in merge pace.rs RUN = 16 and push.rs UNIT_BYTES = 64 KiB (A-752, 004f072d4) -- owner
+  to derive. Red test slates-vcs the_same_bytes_from_git_and_mercurial... (w-perf).

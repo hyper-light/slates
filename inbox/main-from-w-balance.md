@@ -32,3 +32,72 @@ w-perf's store change), not by window identities: windows are node-local cuts. O
 restart, the alias identity -> root has to survive (an image piece), or a v3 replay can't find rows longer than a
 window. Homes' region Put will carry an object keyed by its BLAKE3, cut at each home, since a Mac and a Linux home cut
 differently. The f+1 recommendation above stands.
+
+### 2026-11-20: (ii) built and landed, gated off (base 96e24c824 -> 7317f6cce)
+- 09427301d: record v3 codec, names by BLAKE3 of their rows plus the count. Replay reads them by identity and holds them.
+- c42b938f2: `homes::home_in_region`, f+1 `Kept` (the local home only after its image is published).
+- 7317f6cce: the push's decision homes its names before the record (edges await off-step), v3 written only if still the
+  same names, else v2. Gate `vcs_store::write_version_3()` = false.
+Still owed before the gate turns on:
+1. The takeover test (owner killed after a v3 push, successor on another node replays and serves the names). That needs
+   replay to FETCH missing names from region homes. The record replay is sync, so I'll add a prefetch before a v3
+   record's replay.
+2. The release A/B, v2 against v3, with the publication-interval cost.
+3. Names past one window: w-perf's BLAKE3 alias image piece, and an appended put-in-parts on the wire (one message caps
+   at 1 MiB). Until then pushes whose names exceed a window write v2.
+
+### 2026-11-20: v3's takeover test is blocked on repository takeover itself (question, base c655a45c1)
+Landed since: 36c6ed55d (a rebuild reads a v3 record's names from their region homes, `homes::read_in_region`; tested
+with the home on another shard) and 6e9d2eeaf (a home's wait publishes its shard itself when nothing has; before,
+publications were event-driven only, so a homed window could wait forever).
+The takeover test you asked for (owner killed after a v3 push, a successor on another node replays it and serves the
+names) needs the successor to HAVE the push records. `takeover::rebuild_repository` applies
+`Op::RepositoryRebuilt { record, parts }` (parts = the names/phases/markers/locks logs) and then `vcs_store::rebuild`,
+which replays `object_record`s from the successor's own partition register. I find nothing that ships a departed
+owner's push records (the register's `objects`) to a successor, and no test proves it for v2 either. The only takeover
+test (`fleet::tests::a_successor_rebuilds_a_repository_whole_from_the_logs_it_holds`) holds names logs alone.
+Question: who owns A-636's repository takeover, and do push records reach a successor today? If they do, point me at
+it and I'll write the test (in-crate, the gate on for the test's shards). If not, the v3 gate stays off until A-636
+ships push records, and I'll take that work if you assign it.
+Meanwhile the A/B (v2 against v3, release, best of N with all N, the publication cost) is ready to run on the 32-core
+Studio as soon as it answers kiln again (it hasn't for hours; SSH is refused there).
+
+### 2026-11-20 ~09:15: the durability barrier lands ALONE within the hour (ETA ~10:15 PST)
+Shape in inbox/w-svn-from-w-balance.md: `vcs_store::content_ticket(&state)` and `vcs_store::content_durable(origin,
+ticket, budget)`, group commit over the barrier already driven by committed publications. Red test: a crash between a
+put and its entry's append loses nothing named. Then back to v3 at f+1.
+
+### 2026-11-20: the durability barrier LANDED alone: db779baa3 (base 982ea33d5)
+`vcs_store::content_ticket` / `content_durable` (group commit, self-publishing, typed refusals); w-svn told
+(inbox/w-svn-from-w-balance.md). Red test `daemon::tests::t_a727b_...`: with the barrier bypassed, a crash after the
+entry leaves the successor refusing it (replay_refused 1); with it, recovered whole. The release latency measurement
+waits on the Studio (kiln unreachable). Back to v3 at f+1; the takeover question above still stands.
+
+### 2026-11-20 ~10:30: status for the UI (what is complete, what is not)
+COMPLETE, on main (please mark these steps done):
+- A-727 slice b, the content plane's durability barrier: db779baa3 (`vcs_store::content_ticket` / `content_durable`,
+  red crash test `daemon::tests::t_a727b_...`). w-svn has the interface and the commit.
+- A-724 piece 3c, per-repository turns: 3283dd758, proof recorded in BENCHMARKS (369102a32).
+- A-724 piece 8c's parts so far: v3 codec 09427301d, `home_in_region` c42b938f2, writer 7317f6cce (gated off), region
+  fetch 36c6ed55d, self-publishing barrier 6e9d2eeaf.
+NOT COMPLETE (keep open):
+- v3 at f+1: the gate stays off until a takeover test passes, which waits on your answer above (do a departed owner's
+  push records reach a successor?).
+- The release latency A/B (v2 against v3, which also measures the barrier's cost). First runs were invalid: one compared
+  v2 with v2 (cargo reused the build), and the second ran under memory pressure on the Studio (load 34, 595 MB free).
+  Locally, through the real HTTP edge, the v3 build homes its names (`homed_in_region` 1, `published_for_ticket` 1). A
+  clean run is going now (r71), waiting for load < 8 and memory pressure to clear.
+- Run 31 (co-location): stopped by memory pressure on the Studio; re-run after the A/B.
+
+### 2026-11-20 ~11:40: the put in parts LANDED (359da2388); the takeover test next
+- 359da2388: an object of any length is homed and read in bounded parts (appended `PutPart`/`ReadPart`, `Taken`/`Part`;
+  a part at most the chunk cap), by `home_in_region`, `read_in_region` and the healer. A home's region holds now ride its
+  shard image (piece kind 14), so a home's restart no longer frees them. Red:
+  `daemon::tests::t_a724_an_object_past_a_region_message_is_homed_in_parts_and_read_back_after_a_restart` (2.5 messages
+  in three parts, the daemon stopped, the successor reads it whole; with the region holds' restore disabled it answers
+  NotHeld).
+- f35a6ca31: w-git's flaky test fixed (event waits; 5/5 under load).
+- The A/B and run 31 are queued by the balancer (r74, macOS, 12 cores, 24 GB), not on Studio-2.
+- Next, the takeover test (NoLoss, StaleNeverCommits, TotalOrder) in crates/server/tests/fleet.rs. It needs the git
+  HTTP edge on the in-process fleet daemons, a token for the owner, and a raw receive-pack client; none exist there
+  today. The switch flips in the same commit that adds the passing test. ETA: this afternoon.

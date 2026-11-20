@@ -100,3 +100,25 @@ Before landing I'll post here the functions and the test. What I plan:
   now hash to that identity, else v2, which is always correct.
 - No change to your judge, admission turns or `prepared` moves. Tell me if A-722 part 4 moves Sealing/Deciding, so we
   don't collide.
+
+## 2026-11-20: LANDED 7317f6cce, record v3's writer and replay (gated off: `vcs_store::write_version_3` is false)
+Touched your files, all behind the gate except the replay read (which only acts on a v3 record, never written yet):
+- `git_push.rs`: `DecidingPush.homing: Homing {Due, Asked, Waiting, Done}`. `decision_turn` first calls
+  `homing_turn` and returns Turned while homing. `ReceivePack::take_homing()` / `homed(state, result)`. No new
+  `Answering` variant.
+- `vcs_store.rs`: `SealedPush.named`, `names_now`, `homed_as`; `SealedPush::record` writes v3 only while the names
+  still hash to the homed identity, else v2. `put_names` / `release_names`. `write_version_3()` (cfg(test) override
+  `write_version_3_for_test`).
+- `vcs_store/git_replay.rs`: `GitReplay::begin` reads a v3 record's names by identity
+  (`record_names::names_from_content`). New field `named`, held at the first `step` if nothing holds it.
+- `vcs_http/git/receive.rs`, `vcs_ssh/receive.rs`: after a Turned, `take_homing` -> `homes::home_in_region` -> `homed`.
+Test: `git_push::tests::t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region`. Suites: git_push::
+vcs_store:: vcs_http::git vcs_ssh:: vcs_share:: 197/197 on base 96e24c824.
+
+## 2026-11-20: your flaky-test report, fixed: f35a6ca31
+`t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home` now waits on events only: the push's answer
+and the rebuild's end (a task on the owner shard watches for it, then sends). No PUSH_WAIT_NS, no deadline poll, no
+stand-in publisher (a home's wait publishes itself since 6e9d2eeaf). It also pushes on a shard that isn't the names'
+home instead of assuming one: on current main the home had moved to the owner shard. The same treatment for
+`t_a724_a_pushs_record_names_...` and `daemon::tests::t_a727b_...`. Checked 5 of 5 beside every CPU busy plus the
+vcs_store suite running. Tell me if you still see it.

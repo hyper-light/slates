@@ -1,5 +1,22 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## STOPPED 2026-11-20 after landing 1fc1da1fb (main 2eca76a9b), per CLAUDE.md §8 (supervisor starts the next piece).
+  Reported to slates-72 (slates-7a is gone; slates-72 presumed the relaunched main). Worktrees: ~/slates-work/w-shared-lent-wake
+  (fresh off origin/main 359da2388, no edits; for the lent-session wake piece), ~/slates-work/w-shared-state (my own
+  fanout-state worktree: the shared ~/.local/state/slates-fanout index holds a staged reversal of my ledger lines that I did
+  not make, so I push the ledger from here). Old branch archived as agents/g261-a636p2b2-archive; its worktree removed.
+  Lent-session wake design (not started): per-host waiters on the control shard (xshard::awaited), answered from
+  fleet::return_sessions and every record_sessions insert/remove site (fleet.rs 7642/7877/7907/7938/8268, member_task.rs
+  321, live_ship.rs 4469); the four waits (forward_lane SessionOut, fleet campaign 8920, owner_location 476, live_ship 4090)
+  wait on it within their own deadlines.
+
+## LANDED 2026-11-20: forwarded completion + phase timers = 1fc1da1fb (main 2eca76a9b; tests on 306214c57, key tests
+  re-run on 2eca76a9b). Release baseline (fresh mode) in BENCHMARKS. Bench branch agents/w-shared-a697-bench on origin
+  (Studio clone ~/.cache/w-shared-a697-bench-src over https; target ~/.cache/w-shared-a697-bench-target).
+  NEXT (main's order): sibling waits (lent sessions x4, broadcast stragglers, FUSE helper exit) each with its own wake;
+  explain exit 4 at 64 MiB; (1) B holds its composed inputs, A's record to B record-only; lane throughput (~200 MB/s);
+  (2) content plane vs lane A/B before by-reference; then f (flip + hook deleted together), then A-658 3c.
+
 ## LANDED 2026-11-20: A-697 part e2 = c0710afca (main e261100c1; tests on base f2421b5f3, fleet a_holder 23/23 re-run on
   e261100c1). Target now ~/.cache/w-shared-local-target.noindex with CARGO_INCREMENTAL=0. Removed landed worktrees
   g261-a497/a515/a534/a575/a603-land/a635-land/a636/git-mercurial-subversion-a275; kept g261-a603, g261-a635,

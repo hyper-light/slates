@@ -231,3 +231,19 @@
 - Proposed to w-svn (inbox): per-directory-row persistent children maps in the index, listing at O(live children),
   entries with ids (no second resolve), then a cursor for very large directories. Waiting on w-svn's agreement
   before touching index.rs.
+- 2026-11-20 runs 10/11 (macos-latest, 477abbf73): fetches 3-12x slower than run 8 (checkout 25.0 s / 23.2 s vs
+  7.1 / 7.6; update 32.5 / 24.6 vs 2.7 / 3.6). Window steps ~100 us average (4.4 us in run 9), up to 95 ms. Cause:
+  S4 c2 14215b0c3 (w-perf): Repository::text rebuilds the whole text from its skip-delta chain on every call, and
+  the fetches read 1,024 bytes a step. Sent to w-perf's inbox with two shapes that fit the budget (a made-text cache
+  or reader handle; the chain applied in units). Listing measurement landed 477abbf73 (3.84 ms children regardless
+  of live count). Still waiting on w-svn's agreement for the listing index.
+- 2026-11-20 A-759 landed: part 1 088bf935b (children maps, listing O(live), children 3.84 -> 0.23 ms), part 2
+  1417c0868 (cursor, 16 entries a step, 1.6-1.75 us a step; red 1,801). Main signalled
+  (inbox/main-from-w-bugs-a759.md). Left: replay add_subdir whole listing; CI re-measure waits on w-perf's S4 c2 fix.
+- 2026-11-20 A-759 part 3 landed 7d2b45174 (replay add_subdir through the cursor, red 10,000 -> 16). Reported to
+  main: vcs_ssh svnserve_t commit test red on clean main 359da2388, suspect 28e57ac18 (durable texts). Next: CI
+  rerun after w-perf's S4 c2 fix, then the next open bug.
+- 2026-11-20 next-bug triage (main: "the next open bug in your goal's list"): none left in my lane that use found and
+  no one owns. verify_current and the NFS purge are already fixed (bug-claims.md struck); the completion record's
+  framing is g262's; the svnserve_t red is A-761's (w-svn told). The jupiter fleet six are filed in run-requests.md.
+  Asked main which to take.

@@ -65,9 +65,26 @@
   server held_listener windows). Test cli vcs_edge_restart: green jupiter r33 (61321-3 kept) + macOS. RED OWED: r36
   (copy of synced tree on jupiter with api role anchor.rs reversed; script ~/.cache/w-reaper-target/red748.sh) --
   add its numbers to A-748 as a follow-up. hg on jupiter: no installs (main), legs skip.
-  NEXT: Linux issuer surface (main's ruling): anchor prints an issuer secret on Linux; client presents it over the
-  abstract rendezvous socket + SO_PEERCRED uid; anchor hands back the issuer descriptor; PRINTS_ISSUER_SURFACE true on
-  Linux; amend issuer design; cross-process test. Then A-645 P3 when A-727 a2 lands.
+  A-748 red recorded (jupiter r36: successor 62797 vs 62786 without the hold) in 52454246.
+  A-754 LANDED main 52454246: Linux issuer surface -- anchor binds abstract slates-issuer-<instance>/<uid>, prints
+  route + 256-bit secret; claim = SO_PEERCRED uid + constant-time secret -> segment memfd via SCM_RIGHTS
+  (slates_ipc::issuer_route, api Issuer Route authority, anchor role IssuerSurface answered each loop turn).
+  PRINTS_ISSUER_SURFACE true everywhere. Linux: CI ubuntu diag run 44762814986 green (ipc 2/2, issuer_surface 1/1,
+  git_interop 6/6 no skips; svn skips, ubuntu svn != 1.15). Linux clippy from Studio via zig cc wrapper
+  (~/.cache/w-reaper-target/zig/cc). OWED: red arm diag-w-reaper-a754-red-1 published nothing yet (check; worktree
+  ~/slates-work/w-reaper-red754 to delete after).
+  A-645 P3 RULINGS (main ~10:45): (1) root path from A-227's own record, typed refusal before publication, no /<name>
+  fallback -- ASKED main whether to do (a) first (else every hook off until (a)); (2) vfs Referenced file of
+  (identity,len) via resolve(), agree API with w-perf (inbox/w-perf-from-w-reaper.md, no reply yet), zero-copy counter;
+  (3) FSFS format 8 DELTA over stored deltas -- LANDED main e526100c (stock svn 1.14.5 CI run 44793305924 5/5; A/B in
+  BENCHMARKS: 128x/460x fewer bytes, reads 8x/27x faster). Bench: crates/svn/examples/fsfs_view_bench.rs.
+  r15 gone from kiln; rerun as r44 (needs linux/amd64). A-754 red arms red-1/red-2 never ran (no results) -- owed.
+  RULING 1 LANDED main f265b858: ShardState::root_mount (Daemon::record_root_mount, (a) will call it); svn REPOS
+  <root>/<name>, refused E200007 ROOT_UNPUBLISHED_WORDS before publication; tunnel via SvnStores::root_mount; git
+  push refused ROOT_UNPUBLISHED before, HOOK_NOT_RUN after (until presenter). Pre-existing main failure routed to main:
+  vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit (not durable: Unanswered).
+  NEXT: ruling 2 (vfs Referenced file) once w-perf answers inbox/w-reaper-from-w-perf.md; then P3 presenter (view
+  volume under root mount), P4, (a). Git global identity unset on Studio-2: use -c user.name/user.email.
 - State branch lives in ~/fanout-state-w-reaper (own folder, main's rule 4d39b11; ~/fanout-state is shared, untouched). An
   A-number is mine only once my push of its amendments.tsv row succeeds (pull, append next free, bump, push at once).
 - Piece A (A-709, base hints by readiness + delegation lapse) LANDED: main 9b93fd77c (merged ea05b2ad6). Tests macOS
