@@ -941,3 +941,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   bases, bounded working set, sliced; admission charges the working set, content charged as stored (A-714); w-git
   writes the shared rule into §4.17.1. w-hg: same inside (3). w-svn: cite it on the commit path. w-perf: after A-716,
   a concurrent-push load test (replay client; 1 -> 10,000+ pushes on one daemon), before T4.
+- ~00:45 PST w-hg fixed the two hg-site 503 tests on main 7379a4d8e (3a59b5776): cause was A-687 (a done import waits
+  in the map until it lands; create_hg_from_states stopped at Done), not A-711. Next: (3)+(4) with content once.
+- GOALS MET (main, verified): event-driven reaper (A-709 9b93fd77c, A-715 f70230cc8, reap_loop deleted); A-583 fleet
+  tests; A-503 move test (macOS arm64; Linux run r627 queued, adacachy full). w-reaper sent a stale "reap tick"
+  comment/name sweep (dax_backing, daemon.rs, cli.rs test, nfs_large_write bench).
