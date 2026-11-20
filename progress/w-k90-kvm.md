@@ -52,3 +52,16 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   ~/.cache/w-k90-kvm/wt3 at a8156f377, logs ~/.cache/w-k90-kvm/logs/r5-a8156f377*).
 - Slip: I ran `git switch` once (to a new branch at the same commit, no file change). No more.
 - for main to delete (adacachy): ~/.cache/w-k90-kvm/wt (r2/r3 scratch, diag patch applied), ~/.cache/w-k90-kvm/clone.
+
+## 2026-11-20 ~12:10 PST: LANDED kiln 22bb3fb9e (main merge 448985fef; is-ancestor checked)
+- Red (macOS arm64, this Studio, local, base 715063153): vm_harnesses waits::s35_a_wait_refuses_at_once_where_its_harness_is_gone_for_good
+  FAILED (left Wait, right Ended{-1, halt words}) with the rule hunk held out; green 1/1 with it;
+  sandbox::hexvm::tests::g90_a_refused_members_end_says_why_on_its_stderr 1/1. agentic.md W8: one status sentence.
+- Landing route that works here: bundle -> studio-3 (2768d0d5) ~/.cache/w-k90-kvm-kiln-push + worktree
+  ~/.cache/w-k90-kvm-kiln-land, a fetch/merge/push loop there (main moves every few minutes).
+- Ada (via the turn): don't block on CI runs; focused tests locally, then merge.
+- KVM proof by use: run r3 (adacachy, unit run-p3140219, wt ~/.cache/w-k90-kvm/wt3 at a8156f377 = same code on
+  715063153), microvm:: (g266 + g90 resync). Building at CPUWeight=1 (load 60-120). Logs ~/.cache/w-k90-kvm/logs/r5-a8156f377*.
+- NEXT: read r3; if green -> parts 1+2 evidence to main (plan 01a1fa36 steps 5, 8). Part 3: main's slates_e2e now has
+  container::a520_in_a_container_on_its_volume_... (someone else's); my podman/user_allow_other question to main stands.
+- for main to delete: kiln branch agents/w-k90-kvm-g90 (superseded by 22bb3fb9e); local ~/kiln-work/w-k90-kvm-land once r3 is read.
