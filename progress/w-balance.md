@@ -126,3 +126,7 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - NEXT: profile the R=100 step to find why toys wait 14x (sample the daemon on .local-2 during the burst: `sample`
   per shard, or a slates status counter dump), then fix by evidence. Then batch forms (after a3), P6 region half
   (Q3), P8, P9.
+- run5 (main b8e4591, NO gate) at R=100: daemon GONE too (hot 19 pushes reset/empty), toys 16.5x -> regression on
+  main between 129cd0d1b and b8e4591 (run request filed). Corrected BENCHMARKS (landed). Profile saved on .local-2
+  ~/.cache/w-balance/r100.sample (8 s sample during burst); kiln server stopped answering before I could read it.
+- NEXT: read r100.sample when kiln answers (heaviest shard threads); find toys' wait cause.
