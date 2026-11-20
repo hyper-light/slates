@@ -15258,6 +15258,9 @@ blocks as the sink, the increment setting the path from the held identity, the r
   one-call form took 66 ms (merge-level probe of the whole build, debug, unbounded pace).
 - **Part 2b** (git's trees listed an entry a unit, same command and machine, 2026-11-20): longest build unit 1.12 ->
   0.22 ms, longest build turn 1.13 -> 0.49 ms, past budget 0, turns unchanged (158,681 and 163,182).
+- **Part 3a** (the paths map's step after a push in slices, same command and machine, 2026-11-20): the update's longest
+  answer step 94 -> 42 ms (its parts before, by probes: secure 5.0, engine verdict 8.3, git store record 6.5, git store
+  commit 5.0, engine commit 10.9, recorded entry 4.7, paths map 52.4 ms).
 
 ## Mercurial's own repository imported: the record 7.8 times smaller in three steps, the landing still one step (A-727, A-732, S5; UI goal 93; 2026-11-20)
 

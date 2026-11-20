@@ -56654,8 +56654,15 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   trait's default; Mercurial's for now). A tree git's walk cannot read is refused at the entry where it stops, the same
   `Malformed`. Measured: the longest build unit 1.12 -> 0.22 ms and the longest build turn 1.13 -> 0.49 ms (t_a752,
   debug).
+- **Part 3a, the paths map's step after a push.** Measured in the update's one step (debug, 1,500 files, every file
+  changed; probes, 94 ms whole): retention secure 5.0 ms, the engine's verdict 8.3, the git store's record 6.5 and
+  commit 5.0, the engine's commit 10.9, the recorded entry 4.7, the paths map's step over the change 52.4. That step is
+  now a build of the shard's (`vcs_store::paths::whole_build::start_change`): the change's paths put a unit a slice
+  (removals noted), the change applied to the map and trees before at its end, its first path in the push's step. The
+  update's longest step 94 -> 42 ms. Its map equals the one built from the whole head, roots and all
+  (`t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build`).
 - **Owed, named.** Units still one object's size: a blob read and laid whole, a tree's bytes copied once, the green's
-  hard links, a copy's tree. Part 3: the entry apply in turns: the verdict
+  hard links, a copy's tree; the change build's end (the map's and trees' apply, O(the change)). Part 3: the entry apply in turns: the verdict
   (`Green::compute`, pure, A-658) made resumable and run in the ready turns, taken at the append by `judge_computed`;
   the commit (main's call asked: the green held out across the commit's turns, or staged and published whole); the
   record's encode and append.
