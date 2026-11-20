@@ -12026,8 +12026,10 @@ decides the details.
 > register at the position it leaves the log at, in order, committed at `f + 1`, and a holder keeps it only where it
 > continues its copy of the log, so every holder's copy is a prefix and a successor can rebuild the repository's state
 > from it and keep or drop each operation whole. A repository's greens are of its family (A-636 part 2b-2), so every
-> log of a repository, its greens' included, is placed on one set of holders and follows one successor. Owed: the
-> server's takeover by this rule (2c); and the repository policy's check before the verdict (A-622's next part).
+> log of a repository, its greens' included, is placed on one set of holders and follows one successor; and its record
+> (name, tool, format, owner, policy) is its own register, shipped as its catalog is a volume's and adopted by its
+> successor (A-636 part 2c-1). Owed: the successor's rebuild of the repository from its record and its logs by this
+> rule (2c-2); and the repository policy's check before the verdict (A-622's next part).
 
 1. A repository is a record in the metadata database (§4.8): its name, its tool, its object format (git's SHA-1 or
    SHA-256, Mercurial's node format, Subversion's revision numbers), its policy (below), its default branch, and its
@@ -12569,7 +12571,8 @@ holder set is the owner, and every arrow above is an in-process call. The code i
    it is; each log's promise on the wire, counted only by its own log's round; a takeover a log at a time, adopting
    every log or none); and each state log's records shipped to its holders a log at a time, every record naming its
    operation's identity and spans (A-636 part 2b); and a repository's greens minted in its family, placed and taken
-   over as it is (A-636 part 2b-2); owed: the server's takeover by the rule (2c).
+   over as it is (A-636 part 2b-2); and its record shipped as its own register and adopted by its successor (A-636 part
+   2c-1); owed: the successor's rebuild of the repository by the rule (2c-2).
 3. The object store: raw objects as content; the per-repository index as immutable content tables plus a mutable tail;
    forks sharing tables; every object checked against its id on arrival (built as a pure core, A-581: `slates-vcs`'s
    content store with objects held as windows, tables of one window, an index of runs whose tail seal is derived and
@@ -53948,3 +53951,29 @@ and the workspace's manifest and lock (`hmac` removed, `md-5` a test oracle); `c
   their snapshot); `slates-server` `repository::tests::a_repository_and_every_green_made_for_it_share_one_line` (a
   repository, its root and branches on one line; an adopted lone green's repository on its own).
 - **Owed.** The server's takeover adopting a repository's logs and records whole (2c).
+
+### A-636 part 2c-1 — A repository's record is its own register: shipped to its family's candidates at each change and adopted by its successor (2026-11-20, w-shared for UI goal 93)
+- **Why.** 2c's successor rebuilds a repository from what it holds as a holder, and nothing shipped a repository's own
+  record (its name, tool, object format, owner and policy): the state logs carry its namespace and state, the greens'
+  logs their versions, but no holder could make the repository they belong to. Split from 2c (main, 2026-11-20): 2c-1
+  ships and adopts the record; 2c-2 rebuilds the repository from it and its logs by part 1's rule.
+- **Change.** The record is the value of the repository's own register (its id in the own class, which nothing else
+  used), class byte `REPOSITORY_CLASS` = 6 (`crate::catalog::repository_value`, `repository_of`), a single value a holder
+  keeps at its newest. Its sequence is one past its policy's version plus its names log's position
+  (`repository_sequence`): after its creation a record changes only by a policy setting or a default branch moved,
+  which moves the names log, so one sequence never names two values and each change ships as a newer record. The owner
+  ships it as a volume's catalog ships (`fleet::owed_repositories`, through `owed_record` and the record plane's
+  rounds), to its family's candidates (A-636 part 2b-2); a repository lost to a successor ships nothing. A successor's
+  adoption reads it by its class (`takeover::adopt_own`) and keeps it as a pending repository with the sequence adopted
+  (`ShardState::pending_repositories`, counted `fleet.takeover.repository_adopted`), never as a volume or a green.
+- **The cost.** One more register commit per names change or policy setting, beside the names log's own part; batched
+  with it later (owed).
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20: `cargo test --locked -p slates-server --lib -- fleet::state_log_tests
+  takeover:: state_log mirror:: repository::tests --test-threads=4` 33 of 33; fmt clean). `slates-server` `fleet::state_log_tests::an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change`
+  (owed at 5 to the family's candidates, held by both, owed again at 6 after a retire);
+  `takeover::tests::a_repositorys_record_is_adopted_as_its_own_never_as_a_volume_or_a_green` (kept pending with its
+  sequence, counted once; a cut-short value and one of another class kept as none).
+- **Owed.** The rebuild (2c-2): once a repository's record and its four state logs are adopted and its greens rebuilt,
+  its successor keeps each state log's records only where every log they span holds them whole (part 1's rule, a
+  green's log judged by its adopted head), records the repository whole in its database and makes its store from the
+  log; the record's commit batched with the names log's part.
