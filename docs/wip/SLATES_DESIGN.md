@@ -1365,6 +1365,29 @@ writers to the admitted volume must still be able to consume its remaining entit
 the invariant independently at every holder. Acceptance is observable competing-allocation,
 pressure, fragmentation, restart and open/close behavior, not assertions on quota fields.
 
+> **Status (2026-11-20, A-742: freed memory returns to the OS, never by allocator luck; main's ruling).** The `slates`
+> binary's global allocator maps every allocation of at least 64 pages directly and unmaps it when freed
+> (`slates_mem::large`); the rest are the system allocator's. Large temporaries are made fewer and once: `Wire::to_bytes`
+> reserves `Wire::encoded_len` (exact for every derived type), `Db::mutate_owned` moves an operation into its record,
+> `Checkpoint::into_encoded` writes in place into a buffer sized exactly, a chain entry reserves its bound. A
+> 1,000-revision Subversion import ends at 1,431 to 1,495 MB of footprint against 2,417 to 2,551 MB, at once and steady,
+> in the same time (BENCHMARKS.md). `slates status --json` prints each shard's `retained_bytes` and `retained_versions`,
+> and the control shard's `mem.large.*` give-back counters.
+
+> **Status (2026-11-20, A-744: the anchor's memory, range by range).** `slates status --json` prints, per shard,
+> `content_ranges`: its slice of the anchor content object (write log, image slots, delta log, DAX range table, chunk
+> arena with its allocated bytes) and its partition's regions of the anchor segment (log ring, snapshot slots), each
+> with its bytes, the bytes in RAM and the bytes written where the OS says (`slates_mem::resident`, the kernel's page
+> table), swept in bounded steps a status request. After a 1,000-revision Subversion import, 584.7 MiB of the anchor's
+> written pages are the owner partition's segment log ring (355.2 MiB) and snapshot slots (225.8 MiB); the content
+> object holds 2.3 MiB (BENCHMARKS.md).
+
+> **Status (2026-11-20, A-746: the register by record kind).** `content_ranges` adds `register_log` (the log since the
+> last snapshot) and `register_snapshot` (the last snapshot), each by repository records, green chain entries,
+> checkpoints and the rest (`slates_db::replay::RegisterSplit`), and the arena's `prefault_reserve`. After the
+> 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
+> entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -4587,7 +4610,8 @@ so the backend's end reaches it as a descriptor. The daemon is that backend:
 - Shards' owner word (`trusted.shards.owner`, its value `UID:GID`) is the stream's to take, never a file's attribute
   (A-281). Shards' init sets it on a share's root as it mounts the share, so that a run of an unprivileged user can
   write the share it was given. It is read in the SETXATTR form the stream's INIT kept, the extended one where the
-  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587). It is taken from the
+  guest's kernel kept `FUSE_SETXATTR_EXT`, as the dispatch reads every other SETXATTR (A-587), each request's form read
+  from its own bytes, since one sized before INIT's reply arrived is short whatever INIT kept (A-741). It is taken from the
   guest's root on the stream's root alone, and refused otherwise
   as Shards' own server refuses it: `EPERM` from any other caller, `EINVAL` on any other node or for a value that is
   no `UID:GID`. From then on the guest is shown the owner the volume keeps for the stream's root as the run's owner,
@@ -12250,6 +12274,39 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > convergence plan's S3 (A-722: blobs as the push work's file ops, the git store an index); admission by the working
 > set; the verdicts and the seal a turn at a time; Mercurial's and Subversion's intakes (w-hg, w-svn).
 
+**A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
+mirrored).** One server serves tens of thousands of concurrent clones, many of one repository, so an answer is held to
+four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, and Subversion's report cite:
+1. *Its working set is bounded whatever the repository's size.* The answer is made from what is stored (S5: revisions
+   kept as the deltas they arrived as, or the index's deltas) and sent as it is made, a slice at a time. Nothing holds
+   the whole answer, every text it sends, or a list of every revision it sends: across slices a fetch holds its place
+   (the log, the revision next), the one text a delta is made against, and tables of a bit or a word a changeset where
+   the protocol's order needs them (the missing set), charged as below.
+2. *Admission charges the slice in flight.* Each slice's bytes are charged to the request's room as they are made and
+   given back once sent; the tables of rule 1 are charged once, at the start. The answer's whole size never meets the
+   room, so a request's room bounds a slice, never a repository.
+3. *Every slice runs a turn at a time* under the shard's step quantum (§4.3), the repository's view lent for that turn
+   alone; a yield between slices.
+4. *Fetches run concurrently, one repository's too.* A fetch reads the index as it stood when it began (a hold on that
+   generation, given back as it ends), so a push landing meanwhile neither stops it nor changes its answer.
+
+> **Status (2026-11-20, A-745).** Red, by use: a clone whose answer is past one request's room is refused
+> `PastAdmission` (`vcs_http::daemon_edge`'s `a_mercurial_clone_larger_than_one_ring_region_...`, ignored until it
+> passes; w-interop's clone of Mercurial's 57,035 revisions, `asked: 228144, left: 218727`). Mercurial's `getbundle`
+> built the whole answer, then framed it. Piece 1 BUILT: `slates_hg::serve::getbundle::Answering` makes it a slice at a
+> time, each step its own room, a clone of every head walked by its links (7.2's `fastpathlinkrev`: the missing
+> changesets as ranges, the manifest log, then the file logs row to row through `HgIndex::file_revision_from`), any
+> other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
+> HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
+> shard's room and quantum, the stream compressed as it is made; the red passes. Owed: SSH (piece 2b), the hold on the
+> generation a fetch began on (rule 4), the stream clone (piece 3), git's upload-pack (w-git).
+> **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
+> fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
+> none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
+> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
+> within a request's room (piece 3, reverting A-713's shard room).
+
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
 > the tool named them by, read through `PushObjects` (tree entries, a blob's length, a blob's bytes; a store implements
@@ -14421,7 +14478,9 @@ markers and topics, which git has no counterpart for, are decided here.
    the second in one entry. A new named branch (`--new-branch`) is a line made at its first parent's version (item 4
    there). A closing changeset (`close=1`) is one more version, and its line stays, closed, as `branchmap` reports
    closed heads.
-2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. A bookmark moves only
+2. **Bookmarks.** Each bookmark is a green (§4.17.1's table) whose head is the bookmark's node. The owner's branch
+   verbs name it as Mercurial does (`topic`), spelled `bookmark:topic:` in the namespace; a line's or bookmark's
+   namespace spelling passes as it is (A-575, `hg_push::owner_name`). A bookmark moves only
    when a push names it (the `bookmarks` part or a `bookmarks` pushkey), and every move is a compare and swap on the old
    value the client sent (a pushkey "should succeed iff value was old" [C: `pushkey.py`]; `check:bookmarks` [B:
    `internals.bundle2`]), so the head operation decides it as it decides a git ref. A deletion retires the green.
@@ -14584,6 +14643,9 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 Status (A-729 part 1, the index's storage): a manifest is kept as its delta against the one before while its chain's
 delta bytes stay within its text's length (derived, as 7.2's `deltas.py` bounds a delta), else whole; every reader
 rebuilds it through `HgIndex::revision_text`.
+Status (A-729 part 2): a push's record is its changegroup as it arrived (`SHGR` version 2), replayed through the same
+intake; the landing appends deltas, never texts. An import's record (version 3) writes each delta-kept manifest as its
+delta and base; a made changeset's record is still version 1 (texts).
 Status (A-720 part 1): `slates-hg`'s `push::intake` takes a push's changegroup into a fork a revision a step, its
 working set one revision's texts whatever the push's size (§4.17.1); the server drives it in slices (part 2a): each
 push its own fork, taken side by side within the shard's quantum, judged and landed in one step against the view at
@@ -14972,6 +15034,21 @@ and export by landing).
 > one, a copy from a version its source changed after, and Subversion's replace with history (a copy onto a path its
 > own increment removes), each in the A-586 entry.
 >
+> **Status (2026-11-20, A-586's hard link in a copied tree; main's ruling).** Built: a copy of a tree holding hard links.
+> The rule, a snapshot's: names in the copied tree that share a node keep sharing one new node in the copy (a copied
+> link names its node's copy); a name whose node lies outside the copied tree gets a node of its own in the copy,
+> holding that node's bytes, mode or IPC node, its bytes named by the content they hold. Derived at the commit from the
+> head before the copies land (`Green::copy_link_effects`), as a node's moves are, so a replay and a checkpoint hold the
+> same; a copy whose outside nodes changed after its version is refused.
+>
+> **Status (2026-11-20, A-586's copy refusals typed; main's ruling).** A copy this piece does not make is refused before
+> any verdict, by a submit and a rebase alike, as `Refusal::CopyRefused { path, case }` (the wire's `CopyCase`; the
+> engine's `CopyRefusal`), never a conflict: no concurrent change caused it and no rebase answers it. Refusals FSFS's
+> commit makes too: `Root` (the root as destination), `PastHead` (a source version past the head), `SourceEmpty`.
+> Following from retention: `VersionFolded` (the version's values folded away). Owed work, refused until built:
+> `OutsideNodeChanged` (a link naming an outside node changed since the version), `ChangedSourceLink` (a hard link in a
+> source changed since its version), `LinkAcrossCopy` (a rename or hard link declared across a copied tree's edge).
+>
 > **Status (2026-11-19, A-626 part 1).** Built: the engine's replace with history (`REPLACE`, a flag on `Copy`: the
 > destination's tree taken away key by key at the copy's version, judged as a removal against the base) and copies
 > nested in one increment, a second copy into a new branch and a move inside one (a copy and a removal) among them, so
@@ -15175,7 +15252,20 @@ and export by landing).
 > Subversion's error number, the revision being loaded and the path; the end answers `DumpImported`. Held to
 > `part1.dump` exported again byte for byte after its import through the daemon and after a rebuild from the log, and
 > to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
-> volume and landed under a grant); an import resumed across a restart.
+> volume and landed under a grant; built since, below); an import resumed across a restart.
+>
+> **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
+> revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
+> `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
+> repository's owner, writes format 2, or format 3 with `deltas`, a range starting after revision 0 incrementally, into
+> a new volume `name` holding it as `DUMP_FILE` in its root, which the caller lands under a grant (§4.15, R10) or reads
+> through a mount. A task of the owner shard walks the range twice, a revision a unit within the shard's slice: the
+> first measures, so the volume is admitted exactly; the second writes a copy slice at a time, so no dump is ever held
+> whole, and a second walk that made other bytes than the first is refused, nothing kept; the volume's record, its
+> publication and the request's completion one atom. Refused by kind first: another tool's repository
+> (`Unsupported`), a range the repository does not hold (`BadRequest`, `svn_repos_dump_fs4`'s words), a name taken
+> (`AlreadyExists`). Held to `full.dump`, `part2.dump` (format 3, revisions 4 to 13) and `deltas.dump` written again
+> byte for byte from a history imported through the daemon. Owed: the CLI's and the SDKs' words for both verbs.
 >
 > **Status (2026-11-19, A-616, part 2, its first slice).** Built: the drive's calls and ra_svn's writer of them
 > (`slates-svn`'s `report::drive` and `report::editor`). `Call` is the one set of `svn_delta_editor_t` calls a drive
@@ -15706,6 +15796,12 @@ client's: it asks for mergeinfo, logs with merged revisions, location segments a
 copy and commits the result as any commit. The server never merges file contents (§2 ban 11).
 
 *Branches, tags, stacks, rebases and reviews* (what §4.17.1 leaves to this section).
+- The repository's lineage verbs (`CreateBranch`, `BindBranch`, `RetireBranch`; `slates repository branch`) are refused
+  `Unsupported` by kind on a Subversion repository (2026-11-20, found by reading after A-622's CLI verbs): a green of
+  its own is no branch any Subversion client reaches, and the root's binding is what every path serves. A branch is
+  made as a stock client makes one, by a copy it commits (`svn copy ^/trunk ^/branches/b`). Held by
+  `vcs_svn::tests::a_subversion_repositorys_branch_verbs_are_refused_by_kind` (each verb refused, the repository
+  served after them; before, `CreateBranch` answered `GreenCreated`).
 - A branch or a tag is a directory made by a copy of any path at any revision; Subversion has no other kind. Policy
   protects a path prefix (`/trunk`, `/tags/**`) as §4.17.1's policy protects a green's name pattern: who may commit
   under it, whether a directory under `/tags` may change after the revision that made it, what evidence a commit under
@@ -16044,8 +16140,8 @@ green, the index recomputed), §4.11 (content identity, chunks, content-defined 
    tools stay stock): a repository made by slates' own repository verb (A-575), an existing repository's dump imported
    as its history, and a history exported as a dump for migration, each a server verb over the index and the records
    with typed refusals; import(export(R)) = R, and export(import(D)) = D for the dumps stock `svnadmin` writes, is their
-   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's wiring built,
-   A-652 part 3; the export's owed).
+   gate (the dump codec built, A-593; the verbs built, A-628, format 3's export with A-652; the import's and the
+   export's wiring built, A-652 part 3).
    `svnadmin`'s other commands are the stock tool's and are not rebuilt; what a server needs of them (a revision
    property changed, the locks listed) comes through the protocol pieces.
 7. The ra_svn server: the greeting and authentication (built, A-599: `handshake`, held to stock 1.15.0's sessions);
@@ -54813,6 +54909,31 @@ Applied in the same change to:
   window, which the sender's let-go or the healer releases. Test: `vcs_store::homes::tests::a_put_from_the_region_is_kept_on_its_home_shard_and_acknowledged_only_once_its_image_is_published`
   (the barrier played by hand: no `Kept` before publication, `Kept` after, read back, let go, gone, misnamed refused).
   Owed: the sender (batched puts to the homes `homes()` names) and the healer's loop at each configuration change.
+- **Piece 6's region half, the sender and the healer (2026-11-20; the transport done).** A home keeps one region hold
+  a window however often the region offers it (`keep_for_region`, `let_go_for_region`), so offers are idempotent. The
+  healer (`vcs_store::homes::heal_region`), called from the control shard's `follow_configuration` every period, begins
+  a pass only at a new configuration version (never on a write's path, §2 ban 10): it walks the windows this node holds
+  for the region, a turn a period within the round budget, offers each to its homes (`homes()`, a `Put` broadcast on
+  `HOME_STREAM` over the record sessions), and lets this node's hold go once `heal()` finds every home holding it and
+  this node not among them (add before remove), counted (`vcs_store.homes.heal_offered`, `heal_released`). Tests:
+  `vcs_store::homes::tests` 6 of 6 (region offers idempotent; a lone node's healer moves nothing; the region put
+  acknowledged only after its image) and `fleet::` 33 of 33. A region home answers `Kept` only once A-727 a3 drives its
+  image barrier, so until then the healer offers and keeps its own copy (no release without every home's `Kept`).
+- **Piece 9b, the cut in the record and look-ups routed by it (2026-11-20).** `RepositoryRecord::index_bits` (appended,
+  zero at creation, the whole index on the owner) moves one bit at a time by `Op::RepositoryIndexCut` (appended, `Op`
+  102), its guard refusing any other step or a cut past 32 bits `DbError::IndexCutStep { current }` (the wire's
+  `DatabaseRefusal::IndexCutStep`, 13); a partition's snapshot carries it. `crate::vcs_share::place::index_partition`
+  names the partition holding an object's index row from the record and the id alone (the owner's at a cut of zero,
+  else the range's by `range_partition`), and `index_cut_step` moves a cut one bit toward `bits_for` of the index's
+  bytes. Nothing moves a live cut yet: until a push's rows are routed to their ranges (with record v3, after A-727 a3),
+  a cut above zero would send look-ups to partitions holding no rows. Tests: `repository::tests::a_repositorys_index_cut_moves_one_bit_at_a_time_and_is_kept_by_its_snapshot`
+  and `place::tests::a_repositorys_index_rows_route_by_its_cut_and_the_cut_steps_one_bit_at_a_time`; slates-db `--lib`
+  180 of 180, `--test model` 26 of 26, both `wire_order` goldens; slates-server `repository:: takeover:: vcs_ssh::
+  vcs_http:: git_protect:: lfs:: vcs_policy:: vcs_share::` 236 of 236.
+- **Piece 7, with a hot repository's large packs (2026-11-20).** BENCHMARKS.md, "A hot repository pushing large
+  packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
+  is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
+  such pushes to one repository end the daemon (A-722's proof must hold at ten).
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -54900,6 +55021,15 @@ Applied in the same change to: GAPS (§4.17). Status: designed; slices (a1) to (
   committed image names is not reused before a newer image commits; (a3) the content table in the shard image and its
   recovery before the records; (b) git's record version 3; (c) Subversion's texts with A-716's slices; (d) replication's
   content-before-record order, held by the two-node test.
+- **Slice a2, landed (2026-11-20; main's ruling (ii)).** The windows are chunks of the volume store's own chunk store
+  (`vcs_store::arena_windows::ChunkWindows`), one arena and one budget (A-64): a second arena over the same pool was
+  tried first and found nothing to claim. The chunk store is lent to the content store per step by a swap
+  (`WindowStorage::lend_in`/`hand_back`, `ChunkStore::empty` the placeholder) under a guard (`vcs_store::Lent`, and
+  `lent_state` for a step over the whole state), so readers keep `&ContentStore` and nothing is unsafe; a lend inside
+  a lend takes nothing; outside one a read answers none and a put is refused `ContentRefused::Storage`, typed, and a
+  release frees its chunk at the next lend. A put the arena has no block for grows it from its pool, the lend's end
+  extending the shard budget by the growth. The swap moves a `ChunkStore` (560 bytes); its release cost is measured with the slice's by-use run.
+  Tests (merged with main, local, own target): `slates-server` lib 947 of 947 run (`content_ranges::tests::a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes`, A-744's, skipped: it spins a debug shard past its window here, alone too, and touches no repository code), `arena_windows::tests` 2 of 2; `slates-vcs` 100, `slates-hg` 356, `slates-git` 557. Slice a2 step 1's three red `slates-vcs` tests read windows through `get()`, which lends only content held Here; they read through `bytes_of`/`len_of` now.
 
 
 ### A-664 Subversion objects — A version a work submits to a Subversion repository's green becomes the revision the server makes of it (bug, 2026-11-20, w-shared for UI goal 93)
@@ -55351,6 +55481,54 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   vcs_http::git:: git_hooks::` 91 passed and one hook test past its bound under load (load average 71), passing alone
   (3 of 3); fmt clean.
 
+### A-722 part 3 — A push's rows are written before its landing, which only makes them visible (2026-11-20, w-git for UI goal 93; A-722's design, point 1)
+- **Change.** The seal stages the whole push (`Repository::stage`): its fresh objects' positions by type then id from
+  the repository's next position (A-639's runs kept), their rows written into a fork of the index
+  (`Index::fork`, `insert_all`, `seal_all`), held by the push (`push::Staged`), the rooms lent (`stage_room`). The
+  landing adopts the fork (`Index::adopt`) when no other landing moved the next position or the index since; otherwise
+  it stages again and adopts that. Every landing adopts a fork, so the index's tables never depend on when a fork was
+  made and a store made again from the log equals the live one (replay stages at its seal too).
+- **Tests.** `slates-git` `store::tests::a_staged_push_lands_the_rows_it_wrote_before_its_landing`,
+  `two_pushes_staged_at_once_both_land_and_no_position_goes_unused`; the store's recovery tests (remade = live).
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-git --lib -- store:: upload::
+  receive:: hook_view` 202 passed, 4 ignored; `cargo test --locked -p slates-server --lib -- vcs_store:: git_push::
+  vcs_http::git:: vcs_http::daemon_edge:: git_hooks:: git_protect` 119 of 119; fmt clean. The 3,000-commit push over
+  the daemon's edge 2.0 s, its fetch 3.7 s (main 1.9 s, 4.1 s; load average 43).
+- **Owed (part 4).** The seal's staging pass and the moves' admission sliced; the landing's remaining whole passes
+  (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
+  intake.
+
+### A-722 part 4a — A git record's pack is replayed a turn at a time (2026-11-20, w-git for UI goal 93; main's ruling: a large pack record's replay ran in one turn and crash-looped the daemon)
+- **Change.** `vcs_store::git_replay`: a version-2 record carrying a pack is decoded once as its replay begins (names,
+  moves and the pack's place in the record kept), then read a chunk at a time (`DaemonConfig::archive_slice_bytes_within`
+  of the turn) and its objects admitted one at a time, each turn held to the shard's step quantum and taking one unit
+  at least; the names compared, the seal, the moves and the commit at its end. A rebuild's turn and a recovery's unit
+  step it (`record_turn`); a replay under way is kept on the stores and given back if its rebuild is replaced. Owed,
+  sliced in turn: a thin pack's resolve of outside bases (`Reader::finish_with`, after w-balance's receive resolve
+  slicing lands), the seal's staging pass, the moves' admission and the landing's whole passes.
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns`
+  (one record of 66 objects; red before: replayed in one turn); `t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn`
+  now a turn a record at least.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- vcs_store::
+  git_push:: repository:: vcs_http::git vcs_http::daemon_edge` 165 passed, 1 ignored; fmt clean.
+
+### A-743 — Every name the namespace binds is a ref git's site serves (bug, 2026-11-20, w-git for UI goal 93; main's ruling; found by use by w-interop)
+- **Found by use.** Stock git 2.50.1 over the HTTP edge: a branch made with `slates repository branch create project
+  topic --from main` never showed in `git ls-remote --heads`. The advertisement listed each bound name whose green held a
+  git version in the store, and a branch the CLI made held none.
+- **Change.** `CreateBranch` records the new green's first store version, at its head version, naming the commit its
+  branch was made at (`vcs_store::commits::branch_made`, the made commit's parent rule), as a push of no objects moving
+  one ref is recorded, so it is replayed with the log. The advertisement, upload-pack's lender and a push all read it:
+  `RetireBranch` drops the ref, `BindBranch` brings it back, and a push to `refs/heads/topic` moves the green the CLI made.
+  A refusal is counted (`vcs_commits.branch_ref_unmade`).
+- **Tests.** `slates-server` `git_push::tests::t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green`
+  (red before: `(false, false, false)`); `crates/cli/tests/git_interop.rs`
+  `stock_git_sees_the_branches_the_cli_makes_retires_and_binds` un-ignored and passing under stock git 2.50.1. The
+  atomic test's unborn CLI branch is now made at `main`'s version before its first push.
+- **Runs.** macOS arm64, this Mac, local (own target): `cargo test --locked -p slates-server --lib -- git_push::tests
+  repository:: vcs_store:: vcs_http::git` 146 passed; `cargo test --locked -p slates-cli --test git_interop --
+  stock_git_sees_the_branches` 1 passed; fmt clean.
+
 ### A-664 live whole builds, the push storm — A push landing mid-build moves the build to the newest head at a slice's boundary, never starts it again (2026-11-20, w-shared for UI goal 93; main's ruling)
 - **Why.** Part 1 started a green's whole build again from nothing at every push that landed while it ran, so under
   a steady stream of pushes (the target is tens of thousands concurrent) a busy repository's build never ended.
@@ -55467,3 +55645,311 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   t_a664_svn_a_submitted_symbolic_link_is_a_special_file` (revision 1 adds `/trunk/l` as a file `link a.txt` with the
   `svn:special` list, which the records hold). `cargo test --locked -p slates-server --lib -- repository::svn_commit::
   vcs_svn vcs_store:: identities:: --test-threads=4` 102 of 102; fmt clean.
+
+### A-742 — Freed memory returns to the OS, never by allocator luck: large allocations mapped directly, large temporaries made fewer and once (2026-11-20, w-engine; main's ruling; §4.2, D-12; A-723, A-728)
+
+Applied in the same change to: `crates/mem` (`large.rs`, the global allocator, its counters; `unsafe-budget.toml` +16);
+`crates/cli` (`main.rs` installs it); `crates/wire` and `crates/wire-derive` (`Wire::encoded_len`, `encoded_len_slice`,
+`to_bytes` reserving it, generated for every struct and enum); `crates/db` (`Db::mutate_owned`); `crates/merge`
+(`Checkpoint::into_encoded` and its exact length, `Increment::encoded_len`, `chain_entry::encode` reserving its bound);
+`crates/server` (`repository::push::record_all` and `merge_service::checkpoint_green_when` give their operations up; the
+control shard reports `mem.large.*`); `crates/mcp` (a shard's `retained_bytes`, `retained_versions` in the status JSON);
+§4.2's status; GAPS; BENCHMARKS.md.
+
+- **What held the memory.** A 1,000-revision import of git/git (223 MiB) left the daemon at 2.4 to 2.6 GB. `vmmap` named
+  about 896 MiB of it system-allocator regions holding no live allocation (`MALLOC_LARGE (empty)` 712.6 MiB, `MALLOC_REALLOC
+  (empty)` 135.9, `MALLOC_SMALL (empty)` 47.0). Every allocation and free of the import, read from `malloc_history
+  -allEvents` under full stack logging (a diagnostic build whose liveness window let the tool suspend the daemon), showed
+  4,188 MiB made and freed in 698 blocks of a MiB or more: register entries encoded by doubling, decoded back, cloned
+  into the log entry; checkpoints cloned, encoded by doubling, cloned again; chain entries and increments encoded twice;
+  one 179.7 MiB partition snapshot. The system allocator kept the freed blocks and gave them back on its own schedule
+  (in some runs a part five seconds later, in others none); `malloc_zone_pressure_relief` released 0 bytes.
+- **The rule.** An allocation of at least `FLOOR_PAGES` (64) pages whose alignment a page satisfies is a fresh anonymous
+  mapping and its free unmaps it: freed large memory returns to the OS when it is freed, by construction. The layout
+  decides the path, so an allocation and its free agree; a reallocation across the floor moves the block. The floor
+  bounds page rounding to one page in 64.
+- **Fewer, sized temporaries.** `Wire::encoded_len` is exact for the primitives and every derived type (a hand-written
+  encoder says 0, a hint only), and `to_bytes` reserves it: an encode is one allocation, never grown. `Db::mutate_owned`
+  moves an operation into its log entry or transaction instead of copying it; `mutate` copies and calls it. A
+  checkpoint given up is canonicalized in place and written into a buffer of its exact length; a chain entry reserves
+  its bound; a push sizes an entry by `Increment::encoded_len` instead of encoding the increment.
+- **Measured** (BENCHMARKS.md): footprint after the import 1,431 / 1,486 / 1,495 MB against 2,417 / 2,551 / 2,423 MB
+  (main de9591c70), unchanged five seconds later; the import 1.77 / 1.78 / 1.69 s against 1.74 / 1.83 / 1.73 s. The
+  allocator alone, before the temporaries were cut, ended at 1,562 to 1,645 MB but took the import to 2.04 to 2.87 s, every
+  large temporary then fresh zero-filled pages.
+- **Tests.** macOS arm64, Mac Studio, local: `slates-mem --lib large` (a block mapped, grown, moved below the floor and
+  returned; zeroed blocks on both paths); `slates-wire --test golden` (`encoded_len` is the encoding's length for every
+  sample, and `to_bytes` reserves it once), `--lib`, `--test compile_fail`; `slates-db --lib replay`, `--test model`;
+  `slates-merge --lib` 223, `--test engine` (an increment's `encoded_len`), `--test checkpoint` (a checkpoint given up
+  encodes the same bytes into a buffer of their exact length, over generated greens and the golden vector),
+  `chain_replay`; `slates-server --lib` `git_push::`, `vcs_store::svn_import`, `svn_commit`, `merge_service`,
+  `repository::push`, `--test green_retention`, `green_checkpoint`; `slates-mcp --test mcp` (each shard's retained bytes
+  and versions, retained within committed); fmt clean.
+- **Owed.** `Record::revision_bytes` (Subversion) and the register entry's decode-after-encode check still make
+  revision-sized temporaries; the svn commit still clones its entry parts for a retry at the chain's cap; an embedding
+  host must install the allocator itself; the anchor content object's 581 MiB is not yet split by range.
+
+### A-732's sibling for git and Subversion — A store made again from the log replays a record a turn, lent to nothing until it is whole (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** `vcs_store::rebuild` made a git or Subversion repository's store again in one step, every record replayed
+  and every map made at once; a large repository's rebuild held its shard past the watchdog's window, which
+  crash-looped the daemon when a recovery met it, as Mercurial's import did (A-732, whose part 3 sliced Mercurial's).
+- **Change.** `rebuild` of a git or Subversion repository (`rebuild_sliced`): the store freed and made empty, marked
+  rebuilding with a generation (`VcsStores::rebuild_turns`), and a task replays its records a record a turn
+  (`rebuild_turn`, a yield between); while it runs the store is lent to nothing (`VcsStores::git`, `git_ref`, `store`,
+  `subversion`, `subversion_records` answer none), and a rebuild started again ends the one before. At its end the store
+  is lent again and each git green's map is made again in slices by its build (`paths::whole_build::start_remade`,
+  counted `REMADE`), whose end makes any commit owed; submits to it are parked meanwhile. `rebuild_whole` stays for the
+  tests that read a store made at once.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::tests::
+  t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn` (red first: the store made whole at once and lent;
+  green: rebuilding and lent to nothing, its five records replayed one a turn, then lent again and its map made again).
+  The tests that make a store again drive its turns and builds to their end (`settle_rebuild`). `cargo test --locked -p
+  slates-server --lib -- vcs_store:: repository:: git_push:: vcs_http:: vcs_ssh:: vcs_svn lfs:: work_home:: identities::
+  takeover:: --test-threads=4` 307 of 309, the two others failing alike without this change (`vcs_store::homes`' and
+  `vcs_http::daemon_edge`'s long history, each flaky alone, reported); fmt clean.
+- **Owed.** One git record (a large push's pack) is still one turn; a successor's rebuild (`make_whole`) is one step.
+
+### A-741 — A SETXATTR's form is the request's own: one sized before INIT was answered is short on a connection that kept the extended form (bug, 2026-11-20, w-k90-vendor, kiln goal 90; found by use: kiln's macOS microVM g266 drive refused a run's every write `EACCES`, intermittently; amends A-378 and A-587; §4.6)
+- **Why.** Linux sizes a `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c`
+  `fuse_setxattr`, lines 31-32 at master on 2026-11-20, sha256 89203290559bd37a:
+  `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and holds the request until `INIT`'s reply is in
+  (`fs/fuse/dev.c` `fuse_block_alloc`, lines 88-124, sha256 29cc467f872b1ef0; `fc->setxattr_ext` set in
+  `fs/fuse/inode.c` `process_init_reply`, line 1398). Shards' init sets its owner word (A-281) as it mounts the share,
+  often before its kernel took that reply, so the word travels in the short form on a connection that kept the
+  extended one. A Shards stream read it in the extended form alone (A-587), missed its name, and handed it to the
+  dispatch, which refused it `EOPNOTSUPP`; the run (uid 200000) was then shown its share owned by the host and refused
+  every create, append and removal `EACCES`. Recorded on the Mac Studio (kiln main 28ea7df79's vendored Slates, a
+  diagnostic of each stream request): `Init` kept `FUSE_SETXATTR_EXT`; then `SetXattr` node 1 uid 0, its body
+  `0d000000 00000000 "trusted.shards.owner\0" "200000:200000"`, errno 95; no owner word taken.
+- **Change.** `abi::setxattr_head(body, negotiated)`: on a connection that kept the extended form, the extended head is
+  read where the request's second 8 bytes are a known setter's flag (`FUSE_SETXATTR_ACL_KILL_SGID`) and a zero pad, the
+  short head otherwise: a name begins with its namespace, never a flag word and a zero word. The bridge's `SETXATTR`
+  and the stream's owner word both read through it; a body whose name ends nowhere stays `EIO`.
+- **Tests** (macOS arm64, Mac Studio, local, own target, 2026-11-20). `slates-bridge-fuse`
+  `shards_fs::tests::a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form`
+  (the recorded short word on an extended stream: the run named; red: left `None`) and `tests/shards_fs.rs`
+  `a741_a_setxattr_sized_before_init_was_answered_is_served_on_a_route_that_kept_the_extended_form` (a `user.` name
+  set short on an extended guest route reads back as set; red: errno 95). `--lib -- shards_fs:: bridge:: abi:: init::`
+  9 of 9, `--test shards_fs` 11 of 11 (A-378's ACL test among them), `slates-server --lib -- shards::` 11 of 11; fmt
+  clean. By use: kiln's macOS microVM g266 drive (`SLATES_E2E=1 VM_E2E=1 slates_e2e microvm::g266`, kiln main
+  28ea7df79 on the Mac Studio): without the change it failed on its first run three times running (every write
+  `EACCES`); with it vendored, six runs in a row passed (439, 355, 271, 303, 171 and 172 s).
+- **Owed.** kiln's re-vendor; the same race on slates' own FUSE mounts is closed by the same reader (a host kernel's
+  connection keeps no extended form, so its requests were never misread).
+
+- **A successor's rebuild too** (main's ruling, the same day): `takeover::rebuild_repository` makes the adopted
+  repository's store through `vcs_store::rebuild` (Mercurial's task, or this one), not `make_whole` in one step, since a
+  large repository's adoption would spin the successor's shard past the watchdog, the crash loop on another path. Its
+  test (`vcs_store::paths::tests::t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map`) asserts the
+  store rebuilding and lent to nothing after the takeover's step, then its map made by driving the turns and builds;
+  `cargo test --locked -p slates-server --lib -- takeover:: fleet::state_log_tests vcs_store:: repository:: git_push::
+  vcs_svn lfs:: --test-threads=4` 168 of 168.
+- **Owed.** One git record (a large push's pack) is still one turn (w-git, through the sliced intake).
+
+### A-626 part 4, the work verb — A work declares a copy (`WorkOp::Copy`), and its version holds the copied tree (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A-626 parts 1 to 3 built the green's copy by reference and its rebase's restatement (`VolumeOp::Copy`,
+  `LoggedOp::Copy`, the owner's composition), but no client could ask a work for one: no `WorkOp` named a copy, so no
+  submitted version held one, and what reads a version's copies (a map's whole build, A-664; a Subversion revision's
+  copy-from rows) had nothing to read.
+- **Change.** `slates_ipc::protocol::WorkOp::Copy { from, to, version, replace }`, appended (wire order published):
+  `from`'s tree as version `version` of the work's green held it (the work's base when none) copied to `to` by
+  reference, replacing what `to` holds when `replace`. `verbs::declare` makes it the deriver's `VolumeOp::Copy`, which
+  the work logs (`LoggedOp::Copy`) and the green's owner composes against the copied tree
+  (`merge.work.copy_composed_by_owner`).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `vcs_store::paths::tests::
+  t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it` (`/d/a` submitted; a work copying `/d` to `/e` from its base:
+  version 2 accepted, its map built whole and equal to `d/a` and `e/a`, the green holding both, composed by the owner
+  once; A-664's owed copy through a work's whole build). `cargo test --locked -p slates-server --lib -- t_a626_p4
+  vcs_store:: verbs:: work_home:: work_log --test-threads=4` 135 of 135; `slates-ipc --test wire_order` published
+  (`WorkOp 10 Copy`); fmt clean.
+- **Owed.** The SDKs' (Python, Node), MCP's and the CLI's surfaces for a copy; Subversion's copy-from rows over it
+  (`vcs_store::svn_made`, next).
+
+### A-744 — The anchor's memory, range by range: the 581 MiB is the owner partition's durable register, not the content object; and A-742's leftovers (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.14, §4.17.1; A-64, A-420, A-626, A-727, A-742)
+
+Applied in the same change to: `crates/mem` (`resident.rs`, a mapped range's pages in RAM and written, by `mincore`;
+`SparseObject::residency`, `Region::residency`, `residency_of`; `unsafe-budget.toml` +1, named); `crates/anchor`
+(`AnchorSegment::region_residency`); `crates/server` (`content_ranges.rs`, the sweep the status report advances;
+`daemon::slice_start` visible; `repository::svn_commit::land` checkpoints first and appends once,
+`CHAIN_ROOM_CHECKPOINTED`); `crates/db` (`Partition::green_chain_room`); `crates/svn` (`Record::revision_bytes` reserved
+at its exact length); `crates/mcp` (a shard's `content_ranges`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): is the 581 MiB of written shared memory after the 1,000-revision import a green's
+  bytes in the content pool, so that A-64 for greens (a green's blocks in the pool) would remove a copy?
+- **The report.** For each shard, every range of its slice of the content object (write log, image slots, delta log,
+  DAX range table, chunk arena with its allocated bytes) and its partition's regions of the anchor segment (log ring,
+  snapshot slots): bytes, bytes in RAM, bytes written where the OS says (macOS's `MINCORE_MODIFIED`; Linux reports
+  residency alone; Windows is owed, a typed refusal). The kernel answers about 3 ns a page (1 GiB in 0.23 ms, 64 GiB in
+  11.9 ms on the Mac Studio), so a slice of tens of GiB of address space is past a turn: each status request advances
+  the shard's sweep for half its live step quantum, and the report is the last completed sweep with the count of sweeps.
+- **Measured** (three runs, identical): the owner shard's segment log ring 355.2 MiB written, its snapshot slots 225.8
+  MiB, 584.7 MiB with the rest of the shards' few pages; the content object's every range together 2.3 MiB; the arena
+  nothing allocated. So the 581 MiB is the durable register: the repository records and chain entries the import logged
+  (each revision's texts and increments) and the partition snapshot holding them again. A green's files are not in the
+  content object at all (A-742's design note: they are only the engine's), so A-64 for greens removes no resident copy
+  here; what it could still give is chain entries and checkpoints that name chunks instead of carrying bytes, which is
+  the same register's growth, and A-727 (w-perf: repository bytes out of the partition snapshot, records naming
+  identities) is aimed at it.
+- **The svn record** reserves its exact length (`revision_len`, `row_len`, `lock_len`, mirroring the encoder), so a
+  revision's record is one allocation, never grown.
+- **The svn commit** knows its chain entry's bound before the append (`entry_bound` of the increment's
+  `encoded_len`, with the copies' fixes' room, A-626), checkpoints the green first where the chains have less room
+  (`Partition::green_chain_room`), and appends once: the parts are moved into the entry, no copy kept for a retry.
+- **The log's decode-after-encode stays.** It is the measure of a record's replay work (A-420): timing the encode in
+  its place had let a record whose decode allocates what its encode copies (a thousand one-byte keys) replay past the
+  recovery budget. Its copy is a large temporary, which A-742's allocator returns to the OS at its free; removing the
+  copy needs a replay measure that does not decode, owed and main's call.
+- **Tests.** macOS arm64, Mac Studio, local: `slates-mem --lib resident` (written pages resident and modified, untouched
+  ones not modified), `large`; `slates-server --lib content_ranges` (a sweep completes within its bound and holds every
+  range to its bytes), `svn_commit` 13 (the chain-room checkpoint's counter moves where the merge budget is small),
+  `vcs_store::svn_import`; `slates-svn --lib commit::record` (every shape reserved at its exact length);
+  `slates-mcp --test mcp` (each shard's content ranges, none past its bytes); `cargo xtask unsafe` ok (slates-mem
+  80 of 80); fmt clean.
+
+### A-626 part 4, the work verb on every surface — `copy` on the CLI, both SDKs and MCP, each held to the wire's operations by an exhaustive match (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** A verb is done when every surface has it (R10: a copy is no grant verb, so the SDKs and MCP carry it too).
+  The surfaces named the wire's work operations by name, with no exhaustive match, which is how `WorkOp::Copy` reached
+  the wire with no surface having it and no build saying so.
+- **Change.** The CLI's `copy WORK FROM TO [--version N] [--replace] [--json]`; the Python SDK's `copy(work, from, to,
+  version=None, replace=False)` on `Client` and `AsyncClient`; the Node SDK's `copy(work, from, to, version?,
+  replace?)` on `Client` and `AsyncClient` (`beginSpinCopy`), typed in `index.d.ts`; MCP's `copy{from,to,version?,
+  replace?}` kind of `slates.merge.declare`, in its schema. MCP (`slates_mcp::work_op_kind`) and both SDKs
+  (`work_op_method`, exported as `work_op_methods()` / `workOpMethods()`) name each `WorkOp` by an exhaustive match, so
+  an operation appended to the wire breaks their builds until each decides whether and how to offer it (`Mknod`, a
+  declaring host's metadata, is offered on none of them); the SDKs' tests hold every listed method to both clients.
+- **Tests, by use against a real daemon** (macOS arm64, this Mac, local, own target, 2026-11-20). CLI:
+  `the_verbs_emit_json_with_the_json_flag` with `SLATES_TEST_CLI=1` (`merge_copy`: `/c/x.txt` lands, `copy WORK /c /e`
+  lands, `read GREEN /e/x.txt` streams it), and the argument parser's test; MCP: `cargo test -p slates-mcp --test mcp`
+  (`assert_copy_declared_and_read_back`, the in-process daemon); Python: `python -m unittest
+  crates/sdk-python/tests/test_sdk.py` with `SLATES_DAEMON` (4 of 4: the copy round trip read back by the CLI, and
+  every offered method on both clients), the extension built by `maturin develop`; Node: `node --test
+  tests/sdk.test.mjs tests/sdk_async.test.mjs` with `SLATES_NODE_ADDON` (the crate's cdylib) and `SLATES_DAEMON`, 9 of 9.
+- **Found by use** (reported, next piece): a copy of a tree holding a hard link is refused as a `TypeChanged` conflict at
+  its destination (A-586's "does not yet copy" case answering the wrong kind); the surfaces' tests copy a tree without
+  one.
+
+### A-652 part 3, continued — A Subversion repository's range of revisions exported by the daemon as a dump into a new volume, walked twice and never held whole (2026-11-20, g268 for UI goal 93 (kiln 51cef9f7); §4.17.4 piece 6; §4.15; R10; A-628, A-441, A-459)
+Applied in the same change to: §4.17.4 (a status block, piece 6's line, the import's status), GAPS (the §4.17.4
+entry), `crates/ipc` (`RequestBody::ExportDump` and `ReplyBody::DumpExported`, appended; `DUMP_FILE`; the routing of a
+repository's verbs; `tests/wire_order.txt`), `crates/server` (`repository/svn_export.rs` and its tests, new;
+`repository.rs`: the module's line; `verbs.rs`: the verb's route and dispatch; `image.rs`: `NameAlias`, `name_alias`,
+`reserve` and `settle` shared with the export; `vcs_store/svn_import.rs` and its tests: the import's test helpers
+shared with the export's).
+- **What was there.** A-628's exporter wrote a range of a repository's records as `svnadmin dump` writes it, in format
+  2 and, since A-652, format 3; only slates-svn's tests called it, over records they held themselves. The import's half
+  of part 3 brought a dump's history into a daemon's repository; nothing took one out.
+- **The verb.** `ExportDump { repository, first, last, deltas, name }` is served on the partition the repository's
+  name hashes to, for the repository's owner (`NotFound`, `Forbidden`). Refused by kind before anything is made: a
+  repository of another tool (`Unsupported`); a range the repository does not hold, in `svn_repos_dump_fs4`'s words
+  (`BadRequest`: "Start revision F is greater than end revision L", "End revision L is invalid (youngest revision is
+  Y)", `dump.c` 2072-2080 of Subversion's 1.15.x branch, read 2026-11-20); a name a volume, an alias or a work holds
+  (`AlreadyExists`); a request outside a recorded one (`Unsupported`). Where another partition holds the name, an
+  alias of it is reserved there before the volume is made and confirmed or released before the reply, as an archive's
+  is (A-236).
+- **The dump and its volume.** Format 2, or format 3 with `deltas` (`--deltas`), a range starting after revision 0
+  incrementally (`--incremental`), as A-628 writes it; written into a new plain volume `name`, bounded at the dump's
+  length rounded up to whole chunks (a write is charged its chunk window, §4.5), as the file `DUMP_FILE`
+  (`repository.dump`), readable and writable by its owner alone, owned as the root is. The disk is written only by the
+  caller's granted landing of the volume (§4.15, R10), or the file is read through a mount.
+- **Two walks, sliced, never held whole** (as A-459's archive). A task of the owner shard runs the export in slices of
+  the shard (`crate::image::sliced`), a revision a unit, a yield between slices: the first walk measures each
+  revision's records, hashes them (BLAKE3) and drops them, so the volume is admitted exactly; the second walks the range
+  again and writes each revision's records into the file a copy slice at a time (`DaemonConfig::copy_slice_bytes`),
+  hashing them as it goes. So the export holds one revision's records at most. A second walk that made other bytes than
+  the first measured (the revisions changed under it, as an import setting revision 0's properties does) is refused
+  `Unpublished` ("ask again"), counted (`repository.svn_export.walks_differed`), and the volume is given back. The
+  volume's record, its publication and the request's completion are one atom (`crate::image::complete`); the reply
+  `DumpExported { id, dump_bytes }` names the volume and the dump's length.
+- **Not taken (decided by the design, not measured).** One walk staging the whole dump before the volume is admitted:
+  it holds the whole history in memory once more, where two walks hold a revision. A volume that grows as the dump is
+  written (a dynamic volume): its admission could refuse midway, after work the exact admission refuses before.
+- **Tests** (`crates/server/src/repository/svn_export/tests.rs`). On a running shard, a history imported from
+  `part1.dump` and `part2.dump`, then revisions 0 to 13 in format 2 and 4 to 13 in format 3 asked under two requests:
+  both held, then both volumes published, their dump files `full.dump` and `part2.dump` byte for byte. Through the
+  job's two walks, a slice at a time: revisions 0 to 3 in format 2 as `part1.dump` and the whole range in format 3 as
+  `deltas.dump`, byte for byte. Revision 0's properties set through the owner's step between the walks: the second
+  walk refused `Unpublished`, counted once, the volume given back. Refused by kind: a repository nobody made, another
+  principal, a git repository, the two ranges in Subversion's words, the green's own name, and a request outside a
+  recorded one.
+- **Evidence** (w-svn, local, macOS arm64 MacBook, debug, 2026-11-20, over main 57839dd54): `cargo test -p
+  slates-server --lib -- repository::svn_export vcs_store::svn_import` 11 of 11, the two exports side by side byte for
+  byte (`full.dump` 223,752 bytes, `part2.dump` 112,741). Red first: the whole history's export refused
+  `AlreadyExists` naming the part's volume (both minted one fresh id at their walks' end), fixed by minting in the
+  publishing atom. Measured and owed: a unit is a whole revision (60 µs for 195 bytes, 2.4 ms for a 107 KB text,
+  against a 14 µs slice; `image.units_past_budget` 87), so the exporter must resume inside a revision (GAPS).
+- **Owed.** The CLI's and the SDKs' words for the import and the export; the export's volume landed by `slates land`
+  as any volume is (no new verb needed); main's runs (clippy, `xtask check`, the doc gate, Linux and Windows builds,
+  the mutation red-checks).
+
+### A-586's hard link in a copied tree — Names sharing a node share the copy's node; a name whose node lies outside gets one of its own (2026-11-20, w-shared for UI goal 93; main's ruling; found by use through MCP)
+- **Why.** A copy of a tree holding a hard link was refused (A-586: "does not yet copy"), and answered as a `TypeChanged`
+  conflict at the destination. An agent's workspace holds hard links routinely (`git clone --local` links its objects),
+  so the copy verb on every surface met it: MCP's by-use test did.
+- **The rule** (amended into A-586's status in §4.16 and `slates-merge`'s `engine/copy.rs` docs), as for a snapshot:
+  names in the copied tree that share a node keep sharing one new node in the copy; a name whose node also has a name
+  outside the copied tree, or lies outside it, gets a node of its own in the copy, holding the node's bytes, mode or IPC
+  node, its bytes named by the content they hold, never copied by the outside node.
+- **Change.** `Green::copy_link_effects`, called by `Green::commit` beside `node_moves`: for each copy, every hard link in
+  its source's tree becomes `Effect::Hardlink` naming its node's copy, or `RemoveHardlink` and the outside node's
+  `Special`, or its `Mode` and `SetContent` (`ContentSource::Copied`), applied after the graft; derived from the head,
+  never recorded, so a replay and a checkpoint hold the same. The verdict accepts a source holding hard links, refusing
+  only one whose outside nodes changed after the copy's version (`Green::outside_link_moved`): the head would not hold
+  what they held then.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` `engine::copy_tests::
+  a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns_one` (an inside link names the copy's
+  node; an outside one is a file of its own with the node's bytes and mode; identity equal to its recount; a replayed
+  replica and a restored checkpoint read and hash alike); `a_copy_is_refused_typed_and_changes_nothing` (the refusal
+  now a copy from before its outside node changed); `cargo test --locked -p slates-merge --lib -- copy engine::` 163 of
+  163. `slates-server` `vcs_store::paths::tests::t_a626_p4_a_work_copies_a_tree_holding_a_hard_link` (red before: the
+  server's repro, refused `TypeChanged`), `-- t_a626_p4 vcs_store::paths:: vcs_store::commits::` 20 of 20; fmt clean.
+- **Owed.** The refusal kept, and A-586's other "does not yet copy" cases, answering their own typed refusals rather than
+  `TypeChanged` (next); a copy from before an outside node changed, read from its history.
+
+
+### A-746 — The register by record kind: chain entries and checkpoints lead (270.5 MiB) over repository records (222.4 MiB), so the next content-once step is a green's bytes named, not carried (2026-11-20, w-engine; main's rulings; §4.2, §4.8, §4.16, §4.17.1; A-64, A-727, A-744)
+
+Applied in the same change to: `crates/db` (`replay::RegisterSplit`, `DbStats::tail_split` and `snapshot_split`, kept
+at each append and each snapshot); `crates/server` (`content_ranges`: the register's splits and the arena's
+`prefault_reserve`; `daemon::prefault_reserve_bytes`); §4.2's status; GAPS; BENCHMARKS.md.
+
+- **The question** (main's ruling): of the 581 MiB A-744 found in the owner partition's log ring and snapshot slots,
+  how much is repository records carrying texts, green chain entries carrying file bytes, checkpoints, and the rest?
+- **The split.** The log is counted as it is appended: each record's operations by what they carry (a green's advance
+  and origin, and the chain entries a repository entry carries for its greens; a checkpoint; a repository entry's
+  objects), the rest its other bytes; reset at each snapshot. A snapshot is counted when it is taken, its repository
+  registers', chains' and checkpoints' encoded lengths (exact: derived `Wire::encoded_len`), the rest the remainder.
+- **Measured** (three runs, identical): the log since the last snapshot 267.2 MiB (repository records 87.5, chain
+  entries 87.4, checkpoints 92.2, rest 0.1); the last snapshot 225.8 MiB, exactly its slot's resident pages (repository
+  records 134.9, chain entries 45.7, checkpoints 45.2). Over both, chain entries and checkpoints 270.5 MiB, repository
+  records 222.4 MiB. The ring's other 88 MiB in RAM (355.2 resident against the 267.2 live) are pages it released at its
+  last snapshot and never gave back. The prefault reserve was 0.
+- **The decision** (main's rule): chain entries and checkpoints lead, so a green's bytes named rather than carried is
+  next (A-742's design note, items 3 to 7: Files' blocks as chunk references through one block seam, chain entries and
+  checkpoints naming chunks), on A-727's seam with w-perf, agreed before code. The repository records go to A-727 (a3)
+  and S4 (w-perf, w-svn).
+- **Tests.** macOS arm64, Mac Studio, local: `slates-db --lib replay` (a record's bytes split by what its operations
+  carry), `--test model`; `slates-server --lib content_ranges`, `svn_commit`; `slates-mcp --test mcp`; fmt clean.
+- **Owed.** The log ring's released pages given back (as the write log's are, A-105); `projected_snapshot_bytes`
+  (A-724 piece 8) encodes a whole entry to read its length, where the derived `encoded_len` would do once every
+  field's is exact.
+
+### A-586's copy refusals typed — A copy this piece does not make is refused before any verdict by its own case, never a conflict (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Why.** Each copy the engine does not make was answered as a `TypeChanged` conflict window at its destination, which
+  misnamed it: no concurrent change caused it and no rebase answers it.
+- **Change.** `slates-merge`: `CopyRefusal` (`Root`, `PastHead`, `SourceEmpty`, `VersionFolded`, `OutsideNodeChanged`,
+  `ChangedSourceLink`, `LinkAcrossCopy`), decided before any verdict (`Green::copy_refusal`, from `compute` and `rebase`;
+  `copy_fix` now answers its own two cases; `split_copies` keeps a rename or link across a copy apart from the invalid
+  document's paths), answered as `ComputeRefused::CopyRefused`, `Judgment::CopyRefused`, `Outcome::CopyRefused`,
+  `Rebased::CopyRefused` and `Landed::CopyRefused`. The wire: `Refusal::CopyRefused { path, case }` and `CopyCase`,
+  appended (wire order published); the server maps the engine's case by an exhaustive match (`verbs::copy_refused`) for a
+  submit, a rebase and a push's held judgment; `slates-api` types it `Invalid::Copy`; the Python and Node SDKs and MCP
+  name every case by an exhaustive match (`copy_case_name`), reporting "the copy to PATH is refused: CASE".
+- **Which is which.** Refused by FSFS's commit too: `Root`, `PastHead`, `SourceEmpty`. Following from retention:
+  `VersionFolded`. Owed work, kept visible: `OutsideNodeChanged`, `ChangedSourceLink`, `LinkAcrossCopy`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-merge` lib 224 of 224 (the refusal test's
+  five typed cases, the folded version, the rebase-equals-submit oracle refusing `LinkAcrossCopy` alike), `--test
+  engine --test checkpoint` 4 and 49; `slates-server` `vcs_store::paths::tests::t_a626_p4_a_copy_of_nothing_is_refused_by_its_case`
+  and the filters `t_a626_p4 vcs_store:: work_home:: verbs:: repository::` 192 of 192; `slates-api`
+  `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
+  MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
+  --test wire_order` published; fmt clean.

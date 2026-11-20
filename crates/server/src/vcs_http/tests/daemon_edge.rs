@@ -1295,6 +1295,93 @@ fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge()
   assert_eq!(heads, (200, format!("{tip}\n").into_bytes()));
 }
 
+/// A-745. A fetch's answer (§4.17.1, main's ruling 2026-11-20: a clone's working set is bounded whatever the repository's size;
+/// found by use, w-interop: every clone of Mercurial's own history, 57,035 revisions, was refused `PastAdmission`, its
+/// answer built whole within one request's room). Do: start a two-shard daemon whose edge serves loopback TLS, each
+/// request admitted one ring region; push, as stock hg posts it, one changeset whose one file is twice that room; then
+/// clone it as stock 7.2 asks (`getbundle` of its head, nothing common, bundle2 with changegroup 02 and 03, the answer
+/// uncompressed). Expect `200`, and the answer's changegroup carrying the file's bytes whole: an answer is made a slice
+/// at a time from what is stored, each slice admitted, never the whole answer within one request's room.
+#[test]
+fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let (daemon, instance) = daemon_named(Some(identity));
+  let room = super::bounds_of(&crate::DaemonConfig::derive(
+    &crate::daemon::test_profile(),
+    &instance,
+    Some(SHARDS),
+  ))
+  .room;
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = hg_name_on_the_repositorys_partition();
+  create_empty_hg(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let mut state = 0x2545_f491_4f6c_dd1du64;
+  let large: Vec<u8> = (0..usize::try_from(room * 2).expect("a size"))
+    .map(|_| {
+      state = state
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+      state.to_be_bytes()[0]
+    })
+    .collect();
+  let large: &'static [u8] = Box::leak(large.into_boxed_slice());
+  let made = history_of(&[("large", "large", large, None, "default")]);
+  let pushed = hg_unbundle(edge, &name, &history_bundle(&made, &[0]));
+  let tip = crate::verbs::hex_of(&made[0].node);
+  let cloned = hg_getbundle(edge, &name, &tip);
+  daemon.stop();
+  assert_eq!(pushed.0, 200, "{}", String::from_utf8_lossy(&pushed.2));
+  assert_eq!(
+    (cloned.0, cloned.1.as_str()),
+    (200, "application/mercurial-0.2"),
+    "{}",
+    String::from_utf8_lossy(&cloned.2)
+  );
+  let stream = cloned
+    .2
+    .strip_prefix(b"\x04none")
+    .expect("an uncompressed answer");
+  let bundle =
+    Bundle2::decode(stream, &mut slates_hg::Admission::new(u64::MAX)).expect("a bundle2");
+  let (index, _) = bundle
+    .parts
+    .iter()
+    .enumerate()
+    .find(|(_, part)| part.kind.eq_ignore_ascii_case(b"changegroup"))
+    .unwrap_or_else(|| panic!("no changegroup part: {}", String::from_utf8_lossy(stream)));
+  let payload = bundle
+    .payload_bytes(index, &mut slates_hg::Admission::new(u64::MAX))
+    .expect("its payload");
+  let found = payload
+    .windows(64)
+    .position(|window| window == &large[..64])
+    .expect("the file's bytes");
+  assert_eq!(payload.get(found..found + large.len()), Some(large));
+}
+
+/// The answer to a clone of Mercurial repository `name` at `head` by its owner, as stock hg 7.2 asks one over HTTP
+/// (`getbundle` with bundle2's changegroup 02 and 03, nothing common, the answer uncompressed): its status,
+/// `Content-Type` and body.
+fn hg_getbundle(
+  edge: (u16, &CertificateDer<'static>),
+  name: &str,
+  head: &str,
+) -> (u16, String, Vec<u8>) {
+  let (port, certificate) = edge;
+  let common = "0".repeat(40);
+  let arguments = format!(
+    "bundlecaps=HG20%2Cbundle2%3DHG20%250Achangegroup%253D02%252C03&cg=1&common={common}&heads={head}"
+  );
+  let sent = format!(
+    "GET /{name}?cmd=getbundle HTTP/1.1\r\nHost: localhost\r\n{}\r\nAccept: application/mercurial-0.1\r\n\
+     X-HgArg-1: {arguments}\r\nX-HgProto-1: 0.1 0.2 comp=none\r\n\r\n",
+    owner_bearer()
+  );
+  typed_exchange(port, certificate, sent.as_bytes())
+}
+
 /// `bundle` pushed to Mercurial repository `name` by its owner as stock hg 7.2 pushes over HTTP: the answer's status,
 /// `Content-Type` and body.
 fn hg_unbundle(

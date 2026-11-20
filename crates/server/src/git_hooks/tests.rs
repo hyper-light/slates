@@ -242,7 +242,7 @@ fn shown(
   let turns = sealed_whole(state, &mut view, one_unit);
   let sealed = state.vcs_stores.charged();
   let dir = ScratchDir::new();
-  present(state, &view, &dir.path);
+  crate::vcs_store::lent_state(state, |state| present(state, &view, &dir.path));
   let presented = view.presented_at(&dir.path);
   view.close(state);
   assert_balanced(before, opened, sealed, footprint(state));

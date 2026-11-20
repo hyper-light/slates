@@ -765,9 +765,9 @@ fn sealed_record(
       state, &refused,
     )));
   }
-  sealed
-    .record(&state.vcs_stores)
-    .map_err(|refused| AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)))
+  let recorded =
+    sealed.record(crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores).stores);
+  recorded.map_err(|refused| AppendRefused::Entry(crate::vcs_store::refusal_of(state, &refused)))
 }
 
 /// Each of a git push's store moves resolved (A-662): a green of the repository keyed by its id, a new branch's by the
@@ -825,7 +825,7 @@ fn apply_planned(
     .map(|record| Op::VolumeCreated { record })
     .collect();
   ops.push(Op::RepositoryAdvanced { entry });
-  record_all(state, &ops)?;
+  record_all(state, ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
   after(state, steps, &committed, held);
@@ -948,6 +948,9 @@ fn judge(
           version: base,
         })
       }
+      Some(Judgment::CopyRefused { path, case }) => {
+        ChangeRefusal::Refused(crate::verbs::copy_refused(path, case))
+      }
       None => ChangeRefusal::Refused(Refusal::ContentUnavailable),
     };
     verdicts.push(None);
@@ -1004,7 +1007,7 @@ fn entry(
   }
   for (step, verdict) in steps.iter().zip(verdicts) {
     if let (Some((green, work)), Some(Verdict::Held(judged))) = (step.work(), verdict) {
-      let bound = slates_merge::chain_entry::entry_bound(work.encode().len(), work);
+      let bound = slates_merge::chain_entry::entry_bound(work.encoded_len(), work);
       entry.versions.push(GreenVersion {
         green,
         version: judged.at().saturating_add(1),
@@ -1141,7 +1144,7 @@ fn recorded_entry(
 /// whatever it met, as a verb's is (`verbs::run_recorded`), and a refused publication's in-memory effects reconciled
 /// with what the log holds (`verbs::reconcile_unpublished_effects`). Each op was judged whole beforehand
 /// (`Partition::check_creating`), so none is refused here; one that is, is counted.
-fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), AppendRefused> {
+fn record_all(state: &mut ShardState, ops: Vec<Op>) -> Result<(), AppendRefused> {
   let now = state.clock.monotonic_ns();
   let own = !state.db.in_transaction();
   if own {
@@ -1149,7 +1152,8 @@ fn record_all(state: &mut ShardState, ops: &[Op]) -> Result<(), AppendRefused> {
   }
   let mut recorded = Ok(());
   for op in ops {
-    if let Err(error) = state.db.mutate(&mut state.segment, op, now) {
+    // Moved into the record, never copied: the entry carries the push's or revision's objects (A-742).
+    if let Err(error) = state.db.mutate_owned(&mut state.segment, op, now) {
       state.count(PUSH_COMMIT_REFUSED, 1);
       recorded = Err(AppendRefused::Entry(refusal_of_db(&error)));
       break;

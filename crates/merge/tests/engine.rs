@@ -28,7 +28,9 @@ use slates_merge::verdict::MergeConflictClass;
 fn conflict_class(outcome: &Outcome) -> Option<MergeConflictClass> {
   match outcome {
     Outcome::Conflict { windows } => windows.first().map(|window| window.class),
-    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } => None,
+    Outcome::Accepted { .. } | Outcome::BaseUnavailable { .. } | Outcome::CopyRefused { .. } => {
+      None
+    }
   }
 }
 
@@ -869,7 +871,8 @@ fn a_rebased_operation_still_merges_a_later_disjoint_head_move() {
 }
 
 /// An increment round-trips through encode/decode exactly (§4.8 chain persistence): the identity,
-/// base, ops document and post-state all survive, so a replayed chain rebuilds the same green.
+/// base, ops document and post-state all survive, so a replayed chain rebuilds the same green; and `encoded_len` is the
+/// encoding's length (A-742).
 #[test]
 fn an_increment_round_trips_through_encode_and_decode() {
   let inc = Build::new()
@@ -877,8 +880,12 @@ fn an_increment_round_trips_through_encode_and_decode() {
     .overwrite("f", 0, b"HELLO")
     .setxattr("f", "user.k", b"v")
     .at(7, 3);
-  let decoded = Increment::decode(&inc.encode()).expect("a valid increment decodes");
+  let bytes = inc.encode();
+  let decoded = Increment::decode(&bytes).expect("a valid increment decodes");
   assert_eq!(decoded, inc, "decode(encode(increment)) == increment");
+  // A-742: its length known without making the bytes, and the bytes reserved once at it.
+  assert_eq!(inc.encoded_len(), bytes.len());
+  assert_eq!(bytes.capacity(), bytes.len());
 }
 
 /// A truncated increment refuses by type rather than panicking (§4.8 — a torn chain entry).

@@ -168,7 +168,7 @@ fn abandon(push: Push, store: &mut ContentStore) {
 #[derive(Clone, Debug)]
 struct Answer {
   runs: Vec<Versions>,
-  objects: Vec<u64>,
+  objects: Positions,
   thin: bool,
   ofs: bool,
   filter: Option<Filter>,
@@ -179,7 +179,7 @@ impl Answer {
   fn objects(objects: &Positions) -> Answer {
     Answer {
       runs: Vec::new(),
-      objects: objects.iter().collect(),
+      objects: objects.clone(),
       thin: false,
       ofs: true,
       filter: None,
@@ -192,7 +192,7 @@ impl Answered for Answer {
     &self.runs
   }
 
-  fn objects(&self) -> &[u64] {
+  fn objects(&self) -> &Positions {
     &self.objects
   }
 
@@ -591,6 +591,91 @@ fn a_fast_forward_brings_only_what_its_green_had_not_reached() {
   assert_eq!(repository.reached(&store, 1, 1), Ok(reached));
   repository.release(&mut store).unwrap();
   assert!(store.is_empty());
+}
+
+/// `objects` pushed, sealed and staged (A-722 part 3): its rows whole in its own fork, for its landing to adopt.
+fn staged_push(repository: &mut Repository, store: &mut ContentStore, objects: Vec<Made>) -> Push {
+  let mut push = sealed(repository, store, objects);
+  repository.stage(store, &mut push).unwrap();
+  push
+}
+
+/// Commits `push` moving `green` to `to`.
+fn land(
+  repository: &mut Repository,
+  store: &mut ContentStore,
+  mut push: Push,
+  green: u64,
+  to: ObjectId,
+) {
+  let admitted = repository.admit(store, &push, green, Some(to)).unwrap();
+  repository.commit(store, &mut push, &[admitted]).unwrap();
+}
+
+/// A-722 part 3 (a push's rows written before it lands, its landing adopting them). Do: push the merge history, children
+/// first, seal and stage it, then land it. Expect: every commit's row with its tree, parents, date and generation; every
+/// object a position of its own, one run; every position brought by green 1's version 0.
+#[test]
+fn a_staged_push_lands_the_rows_it_wrote_before_its_landing() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let made = history(format);
+  let push = staged_push(&mut repository, &mut store, made.objects.clone());
+  land(&mut repository, &mut store, push, 1, made.merge.id);
+  assert_eq!(
+    commit_of(&repository, &store, &made.merge.id),
+    (made.t2.id, vec![made.c2.id, made.c3.id], 400, 3)
+  );
+  assert_eq!(
+    commit_of(&repository, &store, &made.c3.id),
+    (made.t1.id, vec![made.c1.id], 300, 2)
+  );
+  let positions = Positions::of(
+    made
+      .objects
+      .iter()
+      .map(|object| repository.object(&store, &object.id).unwrap().position)
+      .collect(),
+  );
+  assert_eq!((positions.len(), positions.runs()), (8, 1));
+  assert_eq!(
+    bringers(&repository, &positions),
+    BTreeSet::from([Some((1, 0))])
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty() && store.used() == 0);
+}
+
+/// A-722 part 3 (concurrent pushes to one repository, each staged in its own fork). Do: stage two pushes of the same
+/// history to greens 1 and 2 at once, land the second, then the first. Expect: both land, the first, outrun, given its
+/// rows at its landing; every object one position, read back; no position left unused (a stage's positions are
+/// tentative), every one brought by green 2's version 0.
+#[test]
+fn two_pushes_staged_at_once_both_land_and_no_position_goes_unused() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let mut repository = Repository::new(format);
+  let made = history(format);
+  let first = staged_push(&mut repository, &mut store, made.objects.clone());
+  let second = staged_push(&mut repository, &mut store, made.objects.clone());
+  land(&mut repository, &mut store, second, 2, made.merge.id);
+  land(&mut repository, &mut store, first, 1, made.merge.id);
+  let positions = Positions::of(
+    made
+      .objects
+      .iter()
+      .map(|object| repository.object(&store, &object.id).unwrap().position)
+      .collect(),
+  );
+  assert_eq!(positions, Positions::span(0, repository.next_position()));
+  assert_eq!(positions.len(), 8);
+  assert_eq!(
+    bringers(&repository, &positions),
+    BTreeSet::from([Some((2, 0))])
+  );
+  repository.release(&mut store).unwrap();
+  assert!(store.is_empty() && store.used() == 0);
 }
 
 /// The green and version the landing map gives each position of `positions`.

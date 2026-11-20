@@ -343,6 +343,7 @@ impl Repositories for Held {
       _ => return None,
     };
     Some(RepositoryRecord {
+      index_bits: 0,
       id,
       name: name.to_owned(),
       tool,
@@ -1189,7 +1190,7 @@ fn commit_under_hooks(hooks: Vec<slates_db::catalog::HookConfig>) -> (Answered, 
     owner: principal(OWNER),
     hooks,
   };
-  let services = SvnServices::new(NotYet, held.clone(), lends.clone(), BOUNDS);
+  let services = SvnServices::new(NotYet, held.clone(), lends, BOUNDS);
   let mut site = ToolSite::new(NoKeys, held, services);
   let Dispatched::Run(mut command) = site.dispatch(&principal(OWNER), &Asked::Subversion, None)
   else {

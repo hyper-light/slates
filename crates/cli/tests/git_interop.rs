@@ -838,3 +838,60 @@ fn stock_git_clones_pushes_and_fetches_over_the_ssh_edge() {
   let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]);
   round_trip(&git, &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"));
 }
+
+/// A-575 (`slates repository branch create|retire|bind`, the owner's branch verbs). Do: over the HTTP edge, push a
+/// first commit to [`BRANCH`] as stock git; make branch `topic` from it with the CLI; list the heads with stock `git
+/// ls-remote`; retire `topic` and list them; bind `topic` again to the green the create printed and list them. Expect
+/// `topic` at the pushed commit after the create, gone after the retire, and back at the same commit after the bind:
+/// stock git sees the namespace the CLI changes (A-743: every name the namespace binds is a ref git's site serves).
+#[test]
+fn stock_git_sees_the_branches_the_cli_makes_retires_and_binds() {
+  let Some(program) = stock_git() else {
+    eprintln!(
+      "skipping the branch verbs under stock git: no stock git here (set {STOCK_GIT} to the command that runs it)"
+    );
+    return;
+  };
+  let Some(leg) = http_leg("branches") else {
+    return;
+  };
+  let instance = format!("git-http-branches-{}", std::process::id());
+  let scratch = Scratch::new("git-branches");
+  let git = Git::new(&program, &scratch, "branches", Vec::new());
+  let url = format!(
+    "http://{USER}:{}@127.0.0.1:{}/{REPOSITORY}",
+    leg.token, leg.port
+  );
+  let pushed = first_push(&git, &url);
+  let verb = |args: &[&str]| {
+    let (code, out, err) = slates(&instance, &[], args);
+    assert_eq!(code, 0, "{args:?}: {out}{err}");
+    out
+  };
+  let heads = || git.ok(&git.scratch, &["ls-remote", "--heads", &url]);
+  let made = verb(&[
+    "repository",
+    "branch",
+    "create",
+    REPOSITORY,
+    "topic",
+    "--from",
+    BRANCH,
+  ]);
+  let green = value_of(&made, "id");
+  let after_create = heads();
+  verb(&["repository", "branch", "retire", REPOSITORY, "topic"]);
+  let after_retire = heads();
+  verb(&["repository", "branch", "bind", REPOSITORY, "topic", &green]);
+  let after_bind = heads();
+  let topic = format!("{pushed}\trefs/heads/topic");
+  assert_eq!(
+    (
+      after_create.contains(&topic),
+      after_retire.contains("refs/heads/topic"),
+      after_bind.contains(&topic),
+    ),
+    (true, false, true),
+    "created: {after_create}; retired: {after_retire}; bound: {after_bind}"
+  );
+}

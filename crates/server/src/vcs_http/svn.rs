@@ -710,10 +710,25 @@ impl<S: SvnStores> SvnExchange<S> {
     }
     let path = self.path.clone();
     let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
-    let special = |segment: &str| segment == site::SPECIAL;
     let method = self.method.clone();
+    if let Some(answer) = self.on_special_path(method.as_str(), &segments) {
+      return Some(answer);
+    }
     Some(match (method.as_str(), segments.as_slice()) {
-      ("POST", [first, "me"]) if special(first) => self.post(gone).await,
+      ("POST", [first, "me"]) if *first == site::SPECIAL => self.post(gone).await,
+      ("MERGE", _) => self.merge(gone).await,
+      ("LOCK", _) => self.lock(gone).await,
+      ("UNLOCK", _) => self.unlock(gone).await,
+      _ => return None,
+    })
+  }
+
+  /// The answer to a request on a transaction (`!svn/txn/NAME`: a DELETE aborts it, anything else is unserved), a COPY
+  /// from a revision (`!svn/rvr` or `!svn/bc`), or any request on a transaction's root (`!svn/txr/NAME/...`); none for
+  /// every other path. Asked before the commit's own POST, MERGE, LOCK and UNLOCK, as `commit_side` matched them.
+  fn on_special_path(&mut self, method: &str, segments: &[&str]) -> Option<HttpAnswer> {
+    let special = |segment: &str| segment == site::SPECIAL;
+    Some(match (method, segments) {
       ("DELETE", [first, "txn", name]) if special(first) => {
         self.on_transaction(name, |commit, world, hooks| commit.abort(world, hooks))
       }
@@ -724,9 +739,6 @@ impl<S: SvnStores> SvnExchange<S> {
       (method, [first, "txr", name, rest @ ..]) if special(first) => {
         self.on_transaction_root(method, name, &format!("/{}", rest.join("/")))
       }
-      ("MERGE", _) => self.merge(gone).await,
-      ("LOCK", _) => self.lock(gone).await,
-      ("UNLOCK", _) => self.unlock(gone).await,
       _ => return None,
     })
   }

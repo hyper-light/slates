@@ -431,7 +431,8 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
       (name, head, engine.head_identity())
     })
     .collect();
-  let (content, store) = state.vcs_stores.mercurial(id).expect("the store");
+  let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+  let (content, store) = lent.stores.mercurial(id).expect("the store");
   let content: &ContentStore = content;
   let rows = store
     .index

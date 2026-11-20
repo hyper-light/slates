@@ -40,8 +40,9 @@ pub mod hold;
 pub use client::{
   Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
   Deadlines, Digest, DriftedPage, EntriesPage, ImageBuilt, Imported, LAST_SEQUENCE, Landing,
-  MergeRecord, MergeStatement, MoveState, Page, Rebased, RepositorySpec, Rewitnessed,
-  SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd, Submitted, VhostUserDevice,
+  MergeRecord, MergeStatement, MoveState, Page, Rebased, RepositoryPolicy, RepositorySpec,
+  Rewitnessed, SESSION_KEY_BYTES, Session, ShardsStream, SignedLanding, StreamEnd, Submitted,
+  VhostUserDevice,
 };
 /// A file mapped for reading by the same-kernel direct map (§4.6; A-171, A-173, A-175), or copied where it cannot be;
 /// and one mapped read and write, whose stores the daemon writes back into the file (A-186).
@@ -56,7 +57,7 @@ pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, E
 pub use slates_ipc::protocol::{
   ARCHIVE_FILE, AbsenceIs, ActionCount, ArchiveFault, AttachRequest, AttachTransport,
   AttachmentCapability, AuditEntry, CauseRecord, ChangedCursor, CheckoutReport, ChokepointReport,
-  ConflictClass, Conformance, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
+  ConflictClass, Conformance, CopyCase, DaemonReport, DeleteWhileOpen, DetectorPeerReport,
   DetectorPoolReport, DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter,
   FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
   HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache,

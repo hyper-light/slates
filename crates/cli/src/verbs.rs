@@ -739,6 +739,26 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       delete_len,
       bytes,
     } => merge_edit(client, *work, path, *at, *delete_len, bytes, json)?,
+    Verb::Copy {
+      work,
+      from,
+      to,
+      version,
+      replace,
+    } => {
+      let op = slates_ipc::protocol::WorkOp::Copy {
+        from: from.clone(),
+        to: to.clone(),
+        version: *version,
+        replace: *replace,
+      };
+      client.declare(*work, op)?;
+      if json {
+        slates_machine::out_line!("{}", serde_json::json!({ "declared": true }));
+      } else {
+        slates_machine::out_line!("declared");
+      }
+    }
     Verb::Submit { work, evidence } => {
       let outcome = client.submit_with_evidence(*work, evidence)?;
       if json {
@@ -965,6 +985,77 @@ fn emit_repository_imported(
         Some(text) => slates_machine::out_line!("{name}: {text}"),
         None => slates_machine::out_line!("{name}: {value}"),
       }
+    }
+  }
+  Ok(())
+}
+
+/// A branch verb's answer (A-575): the repository, the branch and its green where it has one, as text (`name: value`
+/// lines) or one JSON object.
+fn emit_branch(repository: &str, name: &str, green: Option<VolumeId>, json: bool) {
+  let id = green.map(volume_id_text);
+  if json {
+    slates_machine::out_line!(
+      "{}",
+      serde_json::json!({ "repository": repository, "branch": name, "id": id })
+    );
+  } else {
+    slates_machine::out_line!("repository: {repository}");
+    slates_machine::out_line!("branch: {name}");
+    if let Some(id) = id {
+      slates_machine::out_line!("id: {id}");
+    }
+  }
+}
+
+/// `repository policy` (A-622): the policy read, each named point's hooks replaced by the ones given for it (an empty
+/// program clearing it), every other part kept, then set from the version read; the version it is at now, and its hooks,
+/// as text (`name: value` lines) or one JSON object.
+fn emit_repository_policy(
+  client: &mut Client,
+  repository: &str,
+  given: &[(slates_ipc::protocol::HookPointName, String, String)],
+  json: bool,
+) -> Result<(), ClientError> {
+  let mut policy = client.describe_repository_policy(repository)?;
+  let named: Vec<(slates_ipc::protocol::HookPointName, &str)> = given
+    .iter()
+    .map(|(point, name, _)| (*point, name.as_str()))
+    .collect();
+  policy.hooks.retain(|hook| {
+    !named
+      .iter()
+      .any(|(point, name)| hook.point == *point && hook.name == *name)
+  });
+  policy.hooks.extend(
+    given
+      .iter()
+      .filter(|(_, _, program)| !program.is_empty())
+      .map(|(point, name, program)| slates_ipc::protocol::HookConfig {
+        point: *point,
+        name: name.clone(),
+        program: program.clone(),
+      }),
+  );
+  client.set_repository_policy(repository, &policy)?;
+  let version = policy.version.saturating_add(1);
+  let hooks: Vec<String> = policy
+    .hooks
+    .iter()
+    .map(|hook| format!("{}={}", hook.name, hook.program))
+    .collect();
+  if json {
+    let fields = serde_json::json!({
+      "repository": repository,
+      "version": version,
+      "hooks": hooks,
+    });
+    slates_machine::out_line!("{fields}");
+  } else {
+    slates_machine::out_line!("repository: {repository}");
+    slates_machine::out_line!("version: {version}");
+    for hook in &hooks {
+      slates_machine::out_line!("hook: {hook}");
     }
   }
   Ok(())
@@ -1526,6 +1617,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::ChangedSince { .. }
     | Verb::Work { .. }
     | Verb::Edit { .. }
+    | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
     | Verb::Advance { .. }
@@ -1637,6 +1729,30 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     Verb::RepositoryCreate { spec } => emit_repository_created(client, spec, json)?,
     Verb::RepositoryImport { repository, path } => {
       emit_repository_imported(client, repository, path, json)?;
+    }
+    Verb::RepositoryPolicy { repository, hooks } => {
+      emit_repository_policy(client, repository, hooks, json)?;
+    }
+    Verb::BranchCreate {
+      repository,
+      name,
+      from,
+      version,
+    } => {
+      let green = client.create_branch(repository, (name, from, *version))?;
+      emit_branch(repository, name, Some(green), json);
+    }
+    Verb::BranchBind {
+      repository,
+      name,
+      green,
+    } => {
+      client.bind_branch(repository, name, *green)?;
+      emit_branch(repository, name, Some(*green), json);
+    }
+    Verb::BranchRetire { repository, name } => {
+      client.retire_branch(repository, name)?;
+      emit_branch(repository, name, None, json);
     }
     // Served in `run`, before this: their authority comes from the anchor, not the client.
     Verb::Bootstrap { .. }

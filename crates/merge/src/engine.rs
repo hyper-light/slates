@@ -99,20 +99,7 @@ impl Increment {
   /// and length-delimited so [`Increment::decode`] is exact.
   pub fn encode(&self) -> Vec<u8> {
     let doc = self.doc.encode();
-    let mut out = Vec::with_capacity(
-      [
-        self.id.len(),
-        size_of::<u64>(), // the base version
-        size_of::<u64>(), // the ops document's length
-        size_of::<u64>(), // the post-state's length
-        size_of::<u64>(), // the evidence count
-        doc.len(),
-        self.post_state.len(),
-        self.evidence.len().saturating_mul(EVIDENCE_BYTES),
-      ]
-      .into_iter()
-      .fold(0, usize::saturating_add),
-    );
+    let mut out = Vec::with_capacity(self.encoded_len_with(doc.len()));
     out.extend_from_slice(&self.id);
     out.extend_from_slice(&self.base.to_le_bytes());
     out.extend_from_slice(&(doc.len() as u64).to_le_bytes());
@@ -124,6 +111,29 @@ impl Increment {
       out.extend_from_slice(reference);
     }
     out
+  }
+
+  /// The length of [`Increment::encode`]'s bytes, without making them: what a caller sizing an entry by it needs (A-728
+  /// part 5: a push encoded each increment once only to read this length, a revision's bytes each time). Only the ops
+  /// document is encoded, which is small beside the post-state.
+  pub fn encoded_len(&self) -> usize {
+    self.encoded_len_with(self.doc.encode().len())
+  }
+
+  /// [`Increment::encoded_len`] given the ops document's encoded length.
+  fn encoded_len_with(&self, doc: usize) -> usize {
+    [
+      self.id.len(),
+      size_of::<u64>(), // the base version
+      size_of::<u64>(), // the ops document's length
+      size_of::<u64>(), // the post-state's length
+      size_of::<u64>(), // the evidence count
+      doc,
+      self.post_state.len(),
+      self.evidence.len().saturating_mul(EVIDENCE_BYTES),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
   }
 
   /// Decodes an increment persisted by [`Increment::encode`] — the inverse used to replay a green's
@@ -203,6 +213,14 @@ pub enum Outcome {
     /// The oldest base the green still judges.
     floor: u64,
   },
+  /// A copy the increment declares is refused before any verdict, typed ([`CopyRefusal`]; main's ruling of
+  /// 2026-11-20): no concurrent change caused it, so it is no conflict and no rebase answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
+  },
 }
 
 /// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
@@ -273,6 +291,13 @@ pub enum Judgment {
     base: u64,
     /// The oldest base the green still judges.
     floor: u64,
+  },
+  /// A copy it declares is refused before any verdict (as [`Outcome::CopyRefused`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -404,7 +429,7 @@ impl core::fmt::Debug for Computed {
 
 /// Why a green computes no verdict for an increment ([`Green::compute`], A-658), typed: it does not hold every version
 /// the increment is judged over. Neither is a verdict; the caller computes on a green that holds them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComputeRefused {
   /// The base is below the version this green was restored at from a checkpoint: the deltas it would be mapped through
   /// are folded away.
@@ -420,6 +445,13 @@ pub enum ComputeRefused {
     base: u64,
     /// This green's head.
     head: u64,
+  },
+  /// A copy the increment declares is refused before any verdict ([`CopyRefusal`]).
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -462,6 +494,14 @@ pub enum Rebased {
     base: u64,
     /// The green's head.
     head: u64,
+  },
+  /// A copy the work declares is refused, typed, as its submit refuses it ([`Outcome::CopyRefused`]): no rebase
+  /// answers it.
+  CopyRefused {
+    /// The copy's destination.
+    path: String,
+    /// Why.
+    case: CopyRefusal,
   },
 }
 
@@ -1269,6 +1309,8 @@ struct Resolved {
   creates: BTreeSet<String>,
   specials: BTreeMap<String, SpecialNode>,
   invalid: BTreeSet<String>,
+  /// The renames and hard links declared with an end in a copied tree (`Green::copy_refusal`, A-586).
+  across_copies: BTreeSet<String>,
   unlinks: BTreeSet<String>,
   mkdirs: BTreeSet<String>,
   rmdirs: BTreeSet<String>,
@@ -4363,6 +4405,10 @@ impl Green {
     self.make_mapped(&mut effects, post_state);
     let moves = self.node_moves(&effects);
     effects.extend(moves);
+    // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
+    // head before the copies land and applied after them.
+    let linked = self.copy_link_effects(&effects);
+    effects.extend(linked);
     let mut changed: BTreeSet<String> = effects.iter().map(|e| e.path().to_owned()).collect();
     changed.extend(self.commit_copies(&effects, version));
     let mut staged = Staged::default();
@@ -4889,6 +4935,7 @@ impl Green {
       Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
       Judgment::BaseUnavailable { base, floor } => (Outcome::BaseUnavailable { base, floor }, None),
+      Judgment::CopyRefused { path, case } => (Outcome::CopyRefused { path, case }, None),
     }
   }
 
@@ -4924,6 +4971,9 @@ impl Green {
       });
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Err(ComputeRefused::CopyRefused { path, case });
+    }
     let mut units = position::Units::first();
     self.decide_units(inc, &resolved, &mut units);
     Ok(computed(Reached::of(units.into_units().0)))
@@ -4992,6 +5042,7 @@ impl Green {
         base,
         floor: self.deltas_from,
       },
+      Err(ComputeRefused::CopyRefused { path, case }) => Judgment::CopyRefused { path, case },
     }
   }
 
@@ -5664,6 +5715,9 @@ impl Green {
       };
     }
     let resolved = Green::resolve(inc);
+    if let Some((path, case)) = self.copy_refusal(&resolved) {
+      return Rebased::CopyRefused { path, case };
+    }
     // The verdict is `submit`'s, on an immutable green; it adds to the fast-path counter (through `merge_content`),
     // which a rebase puts back, since it merges nothing.
     let fast_path_before = self.fast_path_hits.get();
@@ -6023,6 +6077,7 @@ mod branch;
 pub use branch::{Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 mod copy;
+pub use copy::CopyRefusal;
 
 mod copy_checkpoint;
 

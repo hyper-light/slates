@@ -321,8 +321,9 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   let mut answer = Vec::new();
   loop {
     match push.answer_step(state, &mut answer).expect("answered") {
-      Answering::Answered(received) => return (answer, received),
+      Answering::Answered(received) => return (answer, *received),
       Answering::Turned => {}
+      #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
   }
@@ -574,7 +575,7 @@ fn assert_first_line_names(received: &Received, what: &[u8]) {
 
 /// A-654 part 2 (§4.17.2 "A push" item 7; A-635, A-642). Do: push the fixtures' `create`, `update`, `tag` and `copy`;
 /// then, with `atomic`, delete `copy` and the tag, the tag's old value one it never held; make branch `cli` with the
-/// CLI's verb, which git sees unborn; with `atomic`, delete the tag and create `cli` at a commit held; without
+/// CLI's verb at `main`'s version before its first push, which git sees unborn; with `atomic`, delete the tag and create `cli` at a commit held; without
 /// `atomic`, delete `copy` and the tag, the tag's old value wrong again; with `atomic`, delete the tag and create
 /// `again` at a commit held. Expect: the first refused all or none (`atomic push failure` for `copy`, the tag's
 /// `failed to update ref`); the second refused whole at its append (`atomic transaction failed` for both, git's line
@@ -603,7 +604,7 @@ const COPY_REF: &[u8] = b"refs/heads/copy";
 /// Format: the tag the atomic test's fixtures push.
 const TAG_REF: &[u8] = b"refs/tags/v1";
 
-/// Branch `cli` made with the CLI's verb, then, with `atomic`, the tag deleted and `cli` created at a commit held:
+/// Branch `cli` made with the CLI's verb at `main`'s version before its first push (no commit, so git sees it unborn), then, with `atomic`, the tag deleted and `cli` created at a commit held:
 /// refused whole at its append, git's line naming `cli`, the tag still bound and the `held` records unchanged.
 fn atomic_refused_whole_at_its_append(
   state: &mut ShardState,
@@ -618,7 +619,7 @@ fn atomic_refused_whole_at_its_append(
       repository: "atomic".to_owned(),
       name: "cli".to_owned(),
       from: "main".to_owned(),
-      version: None,
+      version: Some(0),
     },
   );
   assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
@@ -648,6 +649,90 @@ fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId,
   assert_eq!(records(state, repository), held + 1);
   assert!(!bound(state, repository, "refs/tags/v1"));
   assert_hold_the_second_text(state, repository, &["again"]);
+}
+
+/// A-743 (main's ruling 2026-11-20, found by use: a branch the CLI made never showed in `git ls-remote`; §4.17's concept
+/// table, a slates branch a git ref; A-654's `ref_of`, name `N` ref `refs/heads/N`). Do: push the fixtures' `create`
+/// (`main` at the first commit); make branch `topic` from `main` with the CLI's verb; read the advertisement; retire
+/// `topic` and read it; bind `topic` again to the green the create answered and read it; then push `topic` from the first
+/// commit to the second. Expect: `topic` advertised at the first commit, gone after the retire, back after the bind;
+/// the push `ok`, `topic` still bound to the green the CLI made (no second green, the lineage's members unchanged),
+/// holding the second commit's text. Before that push, the store made again from the log advertises `topic` too.
+#[test]
+fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "bindings");
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let branch = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
+    let made = branch(
+      state,
+      RequestBody::CreateBranch {
+        repository: "bindings".to_owned(),
+        name: "topic".to_owned(),
+        from: "main".to_owned(),
+        version: None,
+      },
+    );
+    let ReplyBody::GreenCreated { id: green } = made else {
+      panic!("no branch: {made:?}");
+    };
+    let topic = (named(FIRST), b"refs/heads/topic".to_vec());
+    let after_create = super::advertised_refs(state, repository).contains(&topic);
+    let retired = branch(
+      state,
+      RequestBody::RetireBranch {
+        repository: "bindings".to_owned(),
+        name: "topic".to_owned(),
+      },
+    );
+    assert!(matches!(retired, ReplyBody::Acknowledged), "{retired:?}");
+    let after_retire = super::advertised_refs(state, repository)
+      .iter()
+      .any(|(_, name)| name == b"refs/heads/topic");
+    let bound_again = branch(
+      state,
+      RequestBody::BindBranch {
+        repository: "bindings".to_owned(),
+        name: "topic".to_owned(),
+        green,
+      },
+    );
+    assert!(
+      matches!(bound_again, ReplyBody::Acknowledged),
+      "{bound_again:?}"
+    );
+    let after_bind = super::advertised_refs(state, repository).contains(&topic);
+    assert_eq!(
+      (after_create, after_retire, after_bind),
+      (true, false, true)
+    );
+    crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
+    assert!(super::advertised_refs(state, repository).contains(&topic));
+    let members = state
+      .db
+      .partition()
+      .repositories()
+      .members_of(repository)
+      .count();
+    let update = scenario!("update").request;
+    let pack = &update[update
+      .windows(4)
+      .position(|magic| magic == b"PACK")
+      .unwrap()..];
+    let moved = [(FIRST, SECOND, b"refs/heads/topic".as_slice())];
+    let received = pushed(state, repository, &request(&moved, CAPABILITIES, pack));
+    assert_eq!(reasons(&received), [b"ok"]);
+    let repositories = state.db.partition().repositories();
+    assert_eq!(
+      (
+        repositories.branch(repository, "topic"),
+        repositories.members_of(repository).count()
+      ),
+      (Some(crate::verbs::to_db_volume(green)), members)
+    );
+    assert_hold_the_second_text(state, repository, &["topic"]);
+  });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -744,7 +829,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
       .ok_or("no state for a step")?
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
     match step {
-      Answering::Answered(received) => break received,
+      Answering::Answered(received) => break *received,
       Answering::Turned => slates_rt::futures::yield_now().await,
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
@@ -1088,8 +1173,9 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
     let mut answer = Vec::new();
     let received = loop {
       match push.answer_step(state, &mut answer).expect("answered") {
-        Answering::Answered(received) => break received,
+        Answering::Answered(received) => break *received,
         Answering::Turned => {}
+        #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };
@@ -1149,6 +1235,7 @@ fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
 
 /// Shape: the branches of [`t_a719_a_push_is_decided_a_command_a_step`]: enough that a decision made whole is told
 /// from one made a command a step.
+#[cfg(unix)]
 const BRANCHES: usize = 40;
 
 /// A-719 (found by use: stock git's push of git/git, 1,027 refs, ran its whole decision in one step and spun its
@@ -1179,8 +1266,9 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     let received = loop {
       let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
       match push.answer_step(state, &mut answer).expect("answered") {
-        Answering::Answered(received) => break received,
+        Answering::Answered(received) => break *received,
         Answering::Turned => deciding += usize::from(was_deciding),
+        #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };
@@ -1191,6 +1279,29 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     assert!(
       deciding + 2 >= BRANCHES,
       "{deciding} decision steps for {BRANCHES} commands"
+    );
+  });
+}
+
+/// A-727 (holders made again; w-git's finding through main). Do: push the fixtures' `create` and `update` (a plain push
+/// making `main`, then a thin pack moving it) and make the store again from the repository's records. Expect: the store
+/// made again equal to the live one whole: its rows, `main`'s versions and every content with the holders it has, so
+/// the live store holds no content the records would not, and the rebuilt none fewer.
+#[test]
+fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "again");
+    pushed_from_the_fixtures(state, repository, &["create", "update"]);
+    let main = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .expect("main");
+    crate::vcs_store::tests::assert_made_again_whole(
+      state,
+      repository,
+      &[crate::vcs_store::green_key(main)],
     );
   });
 }

@@ -449,6 +449,7 @@ fn t_a664_p3_a_store_made_again_holds_each_greens_map_again() {
     version(state, at.1, 1, vec![create("/f", b"one")]);
     let second = version(state, at.1, 2, vec![Op::Edit("/f", 0, 3, b"two")]);
     crate::vcs_store::rebuild(state, at.0);
+    crate::vcs_store::settle_rebuild(state, at.0);
     set(&mut model, "f", FileClass::File, b"two");
     assert_kept(state, at, second, &model);
     let third = version(state, at.1, 3, vec![create("/g", b"three")]);
@@ -489,6 +490,12 @@ fn t_a664_holders_a_successors_rebuilt_repository_holds_each_greens_map() {
       record,
       vec![main_bound(at)]
     ));
+    // Its store made a record a turn and its map in slices, by tasks a test's step never runs: driven to their end.
+    assert!(
+      state.vcs_stores.rebuilding(at.0) && state.vcs_stores.git_ref(at.0).is_none(),
+      "a successor's store is made again a step a turn, lent to nothing meanwhile"
+    );
+    crate::vcs_store::settle_rebuild(state, at.0);
     set(&mut model, "f", FileClass::File, b"two");
     assert_kept(state, at, second, &model);
     let third = version(state, at.1, 3, vec![create("/g", b"three")]);
@@ -623,9 +630,129 @@ fn t_a664_p3_a_destroyed_branch_takes_its_map_with_it() {
     assert_eq!((before, after), (true, false), "the branch's map");
     let live = held(state);
     crate::vcs_store::rebuild(state, repository);
+    crate::vcs_store::settle_rebuild(state, repository);
     assert_eq!(held(state), live, "the store made again");
     let mut model = Model::new();
     set(&mut model, "f", FileClass::File, b"root");
     assert_kept(state, (repository, root), head, &model);
   });
+}
+
+/// A-626 part 4 (a copy made through a work). Do: submit `/d/a` to a git repository's root green; then submit a work
+/// declaring a copy of `/d` to `/e` from its base, with no other change. Expect: the second version accepted, its map of
+/// git's files built whole (the copy names a tree at its destination alone) and equal to `d/a` and `e/a`, the green
+/// holding `e/a` with `a`'s bytes beside `d/a`, and the copy composed by the green's owner (counted).
+#[test]
+fn t_a626_p4_a_work_copies_a_tree_and_its_version_holds_it() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "copied");
+    version(state, at.1, 1, vec![create("/d/a", b"alpha")]);
+    let copy = Op::Declare(WorkOp::Copy {
+      from: "/d".to_owned(),
+      to: "/e".to_owned(),
+      version: None,
+      replace: false,
+    });
+    let second = version(state, at.1, 2, vec![copy]);
+    // The copy names a tree at its destination alone, so its version's map is built whole (`Green::copied_after`), and
+    // equals the files git holds there (A-664's owed copy through a work's whole build).
+    let mut model = Model::new();
+    set(&mut model, "d/a", FileClass::File, b"alpha");
+    set(&mut model, "e/a", FileClass::File, b"alpha");
+    assert_kept(state, at, second, &model);
+    let green = to_db_volume(at.1);
+    let engine = state.greens.get(&green).expect("the green's engine");
+    let held = (
+      engine.content("e/a").map(<[u8]>::to_vec),
+      engine.content("d/a").map(<[u8]>::to_vec),
+    );
+    drop(engine);
+    (
+      second,
+      held,
+      count(state, "merge.work.copy_composed_by_owner"),
+    )
+  });
+  assert_eq!(
+    seen,
+    (2, (Some(b"alpha".to_vec()), Some(b"alpha".to_vec())), 1)
+  );
+}
+
+/// Main's ruling of 2026-11-20 (a copy through a work of a tree holding a hard link; found by use through MCP, refused
+/// as a `TypeChanged` conflict at the destination before). Do: submit `/d/g.txt` and a hard link `/d/hard.txt` to it;
+/// then submit a work copying `/d` to `/e`. Expect: the copy accepted; `e/hard.txt` names `e/g.txt`, the copy's node, and
+/// reads its bytes; `d/hard.txt` still names `d/g.txt`.
+#[test]
+fn t_a626_p4_a_work_copies_a_tree_holding_a_hard_link() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "linked");
+    let link = Op::Declare(WorkOp::Link {
+      path: "/d/hard.txt".to_owned(),
+      target: "/d/g.txt".to_owned(),
+    });
+    version(state, at.1, 1, vec![create("/d/g.txt", b"keep"), link]);
+    let copy = Op::Declare(WorkOp::Copy {
+      from: "/d".to_owned(),
+      to: "/e".to_owned(),
+      version: None,
+      replace: false,
+    });
+    let second = version(state, at.1, 2, vec![copy]);
+    let engine = state
+      .greens
+      .get(&to_db_volume(at.1))
+      .expect("the green's engine");
+    let linked = (
+      engine.hardlink("e/hard.txt").map(str::to_owned),
+      engine.content("e/g.txt").map(<[u8]>::to_vec),
+      engine.hardlink("d/hard.txt").map(str::to_owned),
+    );
+    drop(engine);
+    (second, linked)
+  });
+  assert_eq!(
+    seen,
+    (
+      2,
+      (
+        Some("e/g.txt".to_owned()),
+        Some(b"keep".to_vec()),
+        Some("d/g.txt".to_owned())
+      )
+    )
+  );
+}
+
+/// A-586 (main's ruling of 2026-11-20: a copy this piece does not make is refused typed, never a conflict). Do: submit
+/// a work copying `/nothing` to `/z`. Expect: the submit refused `CopyRefused` naming `z` and `SourceEmpty`.
+#[test]
+fn t_a626_p4_a_copy_of_nothing_is_refused_by_its_case() {
+  let reply = crate::daemon::audit_on_shard(|state| {
+    let at = git_repository(state, "nothing");
+    version(state, at.1, 1, vec![create("/a", b"a")]);
+    let made = ask(
+      state,
+      RequestBody::CreateWork {
+        green: at.1,
+        name: "w".to_owned(),
+      },
+    );
+    let ReplyBody::WorkCreated { id: work, .. } = made else {
+      return made;
+    };
+    let copy = WorkOp::Copy {
+      from: "/nothing".to_owned(),
+      to: "/z".to_owned(),
+      version: None,
+      replace: false,
+    };
+    ask(state, RequestBody::Declare { work, op: copy });
+    ask(state, crate::identities::authored(work, "copy nothing"))
+  });
+  let expected = slates_ipc::protocol::Refusal::CopyRefused {
+    path: "z".to_owned(),
+    case: slates_ipc::protocol::CopyCase::SourceEmpty,
+  };
+  assert_eq!(reply, ReplyBody::Refused { refusal: expected });
 }

@@ -330,7 +330,84 @@ fn assert_declare_namespace_ops(server: &mut McpServer, green: &str) {
     submitted["accepted"], true,
     "the namespace ops submit cleanly: {submitted}"
   );
+  assert_copy_declared_and_read_back(server, green);
   assert_attach_advance_read(server, green);
+}
+
+/// A copy over MCP (A-626 part 4, `slates.merge.declare` with `copy`): `/c/g.txt` lands; a work copies `/c`'s tree
+/// from its base to `/e` by reference and submits; a read at the green's head finds the copied file with its bytes. Every op this
+/// surface offers decodes from its `kind`, and the kinds name each one once (`work_op_kind`).
+fn assert_copy_declared_and_read_back(server: &mut McpServer, green: &str) {
+  let made = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "source" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  call(
+    server,
+    "slates.merge.edit",
+    json!({ "work": made, "path": "/c/g.txt", "at": 0, "text": "keep" }),
+  );
+  let source = call(server, "slates.merge.submit", json!({ "work": made }));
+  assert_eq!(
+    source["accepted"], true,
+    "the copy's source lands: {source}"
+  );
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "copied" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let op = json!({ "kind": "copy", "from": "/c", "to": "/e" });
+  assert_eq!(
+    call(
+      server,
+      "slates.merge.declare",
+      json!({ "work": work, "op": op })
+    ),
+    json!({ "declared": true })
+  );
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work }));
+  assert_eq!(submitted["accepted"], true, "the copy submits: {submitted}");
+  let read = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "/e/g.txt" }),
+  );
+  assert_eq!(read["text"], "keep", "the copied file reads back: {read}");
+  let copy = slates_ipc::protocol::WorkOp::Copy {
+    from: "/d".to_owned(),
+    to: "/e".to_owned(),
+    version: None,
+    replace: false,
+  };
+  assert_eq!(slates_mcp::work_op_kind(&copy), Some("copy"));
+  // A copy of nothing is refused before any verdict, typed by its case (A-586; main's ruling of 2026-11-20).
+  let empty = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "copied-nothing" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let op = json!({ "kind": "copy", "from": "/nothing", "to": "/z" });
+  call(
+    server,
+    "slates.merge.declare",
+    json!({ "work": empty, "op": op }),
+  );
+  let refused = call_refused(server, "slates.merge.submit", json!({ "work": empty }));
+  assert!(
+    refused.contains("CopyRefused") && refused.contains("source_empty"),
+    "{refused}"
+  );
 }
 
 /// Calls a tool expecting a JSON-RPC error, returning its message.
@@ -714,7 +791,9 @@ fn refused_file_calls_change_nothing(server: &mut McpServer, (volume, writer): (
 /// text form's definition, not a subset). Expect: two shard blocks; a measured `catalog.volumes` as a
 /// number with its absence meaning; the nine chokepoints in roster order; `shard.op` fresh on some
 /// shard after the lifecycle verbs; `archive.chunk` typed absent (`unknown`), never reported, with no
-/// producer on this host; and a span carrying the request, trace, span and cause identities distinctly.
+/// producer on this host; a span carrying the request, trace, span and cause identities distinctly; and each shard's
+/// retained bytes and versions, the retained bytes within its committed bytes; and its content ranges, the arena among
+/// them, none resident or written past its own bytes.
 fn assert_status_exports_the_registries(status: &Value) {
   let shards = status["shards"]
     .as_array()
@@ -731,10 +810,54 @@ fn assert_status_exports_the_registries(status: &Value) {
   assert_chokepoint_registry(shards);
   assert_span_identities(shards);
   for shard in shards {
-    let drain = &shard["telemetry"];
-    assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
-    assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
-    assert!(drain["window_ns"].is_u64() && drain["horizon_ns"].is_u64());
+    assert_retention_ranges_and_drain(shard);
+  }
+}
+
+/// One shard's block: its retained bytes and versions within its committed bytes (A-742), its content ranges, the arena
+/// among them, none resident or written past its own bytes (A-744), and its telemetry drain's figures.
+fn assert_retention_ranges_and_drain(shard: &Value) {
+  // The budget's retention (§4.2): what freed heads' snapshots pin and greens' histories hold, part of the committed
+  // bytes (A-742: the JSON printed it nowhere, so a retention charge was invisible).
+  let (retained, committed) = (&shard["retained_bytes"], &shard["committed_bytes"]);
+  assert!(
+    retained.is_u64() && shard["retained_versions"].is_u64(),
+    "{shard}"
+  );
+  assert!(
+    retained.as_u64() <= committed.as_u64(),
+    "retention is part of the committed bytes: {shard}"
+  );
+  assert_content_ranges(shard);
+  let drain = &shard["telemetry"];
+  assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
+  assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
+  assert!(drain["window_ns"].is_u64() && drain["horizon_ns"].is_u64());
+}
+
+/// A-744: one shard's slice of the anchor content object, range by range; the arena always among them; nothing in RAM
+/// or written past a range's own bytes.
+fn assert_content_ranges(shard: &Value) {
+  // A-744: the slice of the anchor content object, range by range; the arena always among them; nothing in RAM or
+  // written past a range's own bytes.
+  let ranges = shard["content_ranges"]
+    .as_object()
+    .expect("the content ranges, by name");
+  assert!(ranges["sweep"]["completed"].is_u64(), "{shard}");
+  assert!(ranges["arena"]["allocated"].is_u64(), "{shard}");
+  // A sweep advances a bounded slice a request; the ranges a completed one measured hold to their bytes.
+  for (range, figures) in ranges {
+    let Some(bytes) = figures["bytes"].as_u64() else {
+      continue;
+    };
+    assert!(
+      figures["resident"].as_u64().is_some_and(|r| r <= bytes),
+      "{range}: {figures}"
+    );
+    assert!(
+      figures["modified"].as_u64().is_none_or(|m| m <= bytes),
+      "{range}: {figures}"
+    );
   }
 }
 

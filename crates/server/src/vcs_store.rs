@@ -97,8 +97,10 @@ use slates_vfs::volume::Store;
 
 use crate::state::ShardState;
 
+pub(crate) mod arena_windows;
 pub(crate) mod commits;
 pub(crate) mod git_encode;
+pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_view;
@@ -172,6 +174,16 @@ pub(crate) struct VcsStores {
   /// A-732): not lent to a read, a push or a made changeset until they are whole; bounded by the partition's
   /// repositories.
   rebuilding: std::collections::BTreeSet<RepositoryId>,
+  /// The git and Subversion repositories whose stores are being made again from their records a record a turn
+  /// ([`rebuild`], A-732's sibling): each with its rebuild's generation and the next record to replay. Their stores are
+  /// lent to nothing ([`VcsStores::git`], [`VcsStores::subversion`] and their kin answer none) until the last record is
+  /// replayed; bounded by the partition's repositories.
+  rebuild_turns: BTreeMap<RepositoryId, (u64, usize)>,
+  /// The last rebuild's generation: a rebuild started again ends the turns of the one before.
+  rebuild_generations: u64,
+  /// The git records whose replay is under way a turn at a time (A-722 part 4, [`git_replay`]): at most one a
+  /// repository, the record its rebuild or recovery replays now; bounded by the partition's repositories.
+  git_replays: BTreeMap<RepositoryId, Box<git_replay::GitReplay>>,
   /// What each repository's entries' objects, which the partition's register keeps (A-662), hold of the shard's budget,
   /// charged as retention ([`settle_objects`]): bounded by the partition's repositories.
   objects_charged: BTreeMap<RepositoryId, u64>,
@@ -184,6 +196,9 @@ pub(crate) struct VcsStores {
   /// The request each import's end answers, by repository (A-678; `crate::repository::import`): one an import, so
   /// bounded as the imports are.
   answers: BTreeMap<RepositoryId, crate::repository::import::Answer>,
+  /// Where the content store keeps its windows once it is made (A-727 slice a2): the shard's repository arena, given by
+  /// the shard's start; none in a test's stores, whose content store keeps them in memory.
+  window_storage: Option<Box<dyn slates_vcs::WindowStorage>>,
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
@@ -404,6 +419,15 @@ fn content_refused(refused: ContentRefused) -> GitRefused {
 }
 
 impl VcsStores {
+  /// Stores whose content store, once made, keeps its windows in `storage` (A-727 slice a2: the shard's repository
+  /// arena).
+  pub(crate) fn with_windows(storage: Box<dyn slates_vcs::WindowStorage>) -> VcsStores {
+    VcsStores {
+      window_storage: Some(storage),
+      ..VcsStores::default()
+    }
+  }
+
   /// The shard's next generation for a Mercurial store's index (A-720).
   fn next_generation(&mut self) -> u64 {
     self.generations = self.generations.saturating_add(1);
@@ -487,11 +511,17 @@ impl VcsStores {
 
   /// Repository `id`'s store, if held.
   pub(crate) fn store(&self, id: RepositoryId) -> Option<&RepositoryStore> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
     self.entries.get(&id)
   }
 
   /// Repository `id`'s git store with the content store, lent for one step.
   pub(crate) fn git(&mut self, id: RepositoryId) -> Option<(&mut ContentStore, &mut GitStore)> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
     let content = self.content.as_mut()?;
     match self.entries.get_mut(&id)? {
       RepositoryStore::Git(store) => Some((content, store)),
@@ -501,6 +531,9 @@ impl VcsStores {
 
   /// Repository `id`'s git store with the content store, read.
   pub(crate) fn git_ref(&self, id: RepositoryId) -> Option<(&ContentStore, &GitStore)> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
     let content = self.content.as_ref()?;
     match self.entries.get(&id)? {
       RepositoryStore::Git(store) => Some((content, store)),
@@ -531,6 +564,14 @@ impl VcsStores {
 
   /// Repository `id`'s Subversion store, lent for one step.
   pub(crate) fn subversion(&mut self, id: RepositoryId) -> Option<&mut SvnStore> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
+    self.svn_unlent(id)
+  }
+
+  /// [`VcsStores::subversion`] whether or not the store is lent: a rebuild's own replay reaches it this way.
+  fn svn_unlent(&mut self, id: RepositoryId) -> Option<&mut SvnStore> {
     match self.entries.get_mut(&id)? {
       RepositoryStore::Subversion(store) => Some(store),
       _ => None,
@@ -625,6 +666,9 @@ impl VcsStores {
   }
 
   pub(crate) fn subversion_records(&self, id: RepositoryId) -> Option<&SvnRecords> {
+    if self.rebuild_turns.contains_key(&id) {
+      return None;
+    }
     match self.entries.get(&id)? {
       RepositoryStore::Subversion(store) => store.records.as_ref(),
       _ => None,
@@ -668,10 +712,7 @@ pub(crate) fn make(state: &mut ShardState, record: &RepositoryRecord) {
 
 /// [`make`]'s step over the stores, the content store made at the first repository with the content plane's `window`.
 fn made(stores: &mut VcsStores, record: &RepositoryRecord, window: usize) -> Result<(), Unmade> {
-  if stores.content.is_none() {
-    let content = ContentStore::new(stores.charged, window).map_err(|_| Unmade)?;
-    stores.content = Some(content);
-  }
+  stores.content_made(window).map_err(|_| Unmade)?;
   let window = stores.content.as_ref().map_or(window, ContentStore::window);
   let store = match record.tool {
     VcsTool::Git => {
@@ -702,6 +743,11 @@ struct Unmade;
 /// given back to the content store, then the shard's charge trued up to what remains. A refusal while giving back is
 /// counted, and the rest is given back.
 pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
+  // A git or Subversion rebuild under way ends with its store: its task finds its turns gone and stops.
+  if state.vcs_stores.rebuild_turns.remove(&id).is_some() {
+    state.vcs_stores.rebuilding.remove(&id);
+  }
+  abandon_git_replay(state, id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -961,9 +1007,128 @@ pub(crate) fn within_budget<T>(
   step: impl FnOnce(&mut VcsStores) -> T,
 ) -> T {
   lend(&mut state.store, &mut state.vcs_stores, bytes);
-  let answer = step(&mut state.vcs_stores);
+  let answer = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    step(&mut *lent.stores)
+  };
   settle(state);
   answer
+}
+
+impl VcsStores {
+  /// Makes the shard's content store if it has none, over the windows' storage it was given (`with_windows`) or the
+  /// heap's, with the content plane's `window`: what a first repository, or a first window homed here, makes.
+  pub(crate) fn content_made(&mut self, window: usize) -> Result<(), slates_vcs::ContentRefused> {
+    if self.content.is_none() {
+      let content = match self.window_storage.take() {
+        Some(storage) => ContentStore::with_storage(self.charged, window, storage),
+        None => ContentStore::new(self.charged, window),
+      }?;
+      self.content = Some(content);
+    }
+    Ok(())
+  }
+
+  /// Lends `chunks` to the content store's windows, or to the storage a content store not made yet will keep them in,
+  /// so a store made inside the step finds it lent (`Lent`): whether it took them.
+  fn lend_in(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
+    match (self.content.as_mut(), self.window_storage.as_mut()) {
+      (Some(content), _) => content.lend_in(chunks),
+      (None, Some(storage)) => storage.lend_in(chunks),
+      (None, None) => false,
+    }
+  }
+
+  /// Hands back what [`VcsStores::lend_in`] took, from the content store or the storage not made into one yet.
+  fn hand_back(&mut self, chunks: &mut slates_vfs::content::ChunkStore) -> bool {
+    match (self.content.as_mut(), self.window_storage.as_mut()) {
+      (Some(content), _) => content.hand_back(chunks),
+      (None, Some(storage)) => storage.hand_back(chunks),
+      (None, None) => false,
+    }
+  }
+}
+
+/// The shard's chunk store lent to the repository content store for one step (A-727 slice a2, `arena_windows`): taken
+/// in when made, handed back when dropped, so no path out of the step keeps it, and the shard budget extended by what
+/// the step's puts grew the arena from its pool. A lend inside a lend takes nothing and hands nothing back; with no
+/// content store made yet, the storage it will be made over is lent.
+pub(crate) struct Lent<'a> {
+  /// The shard's chunk store, or the placeholder the content store left in its place while it is lent.
+  chunks: &'a mut slates_vfs::content::ChunkStore,
+  /// The shard's budget, extended by the arena's growth at the end.
+  budget: &'a mut slates_mem::budget::ShardBudget,
+  /// The stores the step runs over.
+  pub(crate) stores: &'a mut VcsStores,
+  /// The arena's capacity when lent, if this lend took the chunk store in.
+  took: Option<usize>,
+}
+
+impl<'a> Lent<'a> {
+  /// Lends the chunk store of `store` to the content store of `stores` for as long as this lives.
+  pub(crate) fn new(store: &'a mut Store, stores: &'a mut VcsStores) -> Lent<'a> {
+    let Store {
+      content, budget, ..
+    } = store;
+    let took = lend_chunks(content, stores);
+    Lent {
+      chunks: content,
+      budget,
+      stores,
+      took,
+    }
+  }
+}
+
+impl Drop for Lent<'_> {
+  fn drop(&mut self) {
+    hand_chunks_back(self.chunks, self.budget, self.stores, self.took);
+  }
+}
+
+/// The shard's chunk store taken in by [`take_chunks`], for [`give_chunks`] to hand back.
+#[derive(Debug)]
+#[must_use = "a chunk store taken in is handed back by give_chunks"]
+pub(crate) struct Taken(Option<usize>);
+
+/// Lends the shard's chunk store to its content store for a caller that holds the state across a serving call whose
+/// reads are `&self` (`lfs::ShardObjects`): handed back by [`give_chunks`].
+pub(crate) fn take_chunks(state: &mut ShardState) -> Taken {
+  Taken(lend_chunks(&mut state.store.content, &mut state.vcs_stores))
+}
+
+/// Hands back what [`take_chunks`] took, the shard budget extended by the arena's growth.
+pub(crate) fn give_chunks(state: &mut ShardState, taken: Taken) {
+  let ShardState {
+    store, vcs_stores, ..
+  } = state;
+  hand_chunks_back(&mut store.content, &mut store.budget, vcs_stores, taken.0);
+}
+
+/// Lends `chunks` to `stores`: the arena's capacity then, if taken.
+fn lend_chunks(
+  chunks: &mut slates_vfs::content::ChunkStore,
+  stores: &mut VcsStores,
+) -> Option<usize> {
+  let capacity = chunks.arena().capacity();
+  stores.lend_in(chunks).then_some(capacity)
+}
+
+/// Hands back what [`lend_chunks`] took, `budget` extended by what the arena grew meanwhile.
+fn hand_chunks_back(
+  chunks: &mut slates_vfs::content::ChunkStore,
+  budget: &mut slates_mem::budget::ShardBudget,
+  stores: &mut VcsStores,
+  took: Option<usize>,
+) {
+  let Some(before) = took else {
+    return;
+  };
+  stores.hand_back(chunks);
+  let grown = chunks.arena().capacity().saturating_sub(before);
+  if grown > 0 {
+    budget.extend(u64::try_from(grown).unwrap_or(u64::MAX));
+  }
 }
 
 /// Runs `read` over the stores, read only, with the room [`lend`] gives: what a step that parses objects needs, since
@@ -975,7 +1140,10 @@ fn lent_to_read<T>(
   read: impl FnOnce(&VcsStores) -> T,
 ) -> T {
   lend(store, stores, 0);
-  let answer = read(stores);
+  let answer = {
+    let lent = Lent::new(&mut *store, stores);
+    read(&*lent.stores)
+  };
   set_back(stores);
   answer
 }
@@ -985,8 +1153,22 @@ fn lent_to_read<T>(
 /// (A-654). Read only, so the room lent is given back and nothing is charged.
 pub(crate) fn with_room<T>(state: &mut ShardState, read: impl FnOnce(&ShardState) -> T) -> T {
   lend(&mut state.store, &mut state.vcs_stores, 0);
-  let answer = read(state);
+  let answer = lent_state(state, |state| read(state));
   set_back(&mut state.vcs_stores);
+  answer
+}
+
+/// Runs `step` over the whole shard state with the shard's chunk store lent to the repository content store (`Lent`'s
+/// rule, for a step that needs more of the state than the stores): taken in before and handed back after, nothing
+/// between the two able to leave another way. Within it the volume store's chunk store is the placeholder, so the step
+/// grows nothing and reads no volume chunk; [`lend`] runs before it.
+pub(crate) fn lent_state<T>(state: &mut ShardState, step: impl FnOnce(&mut ShardState) -> T) -> T {
+  let took = lend_chunks(&mut state.store.content, &mut state.vcs_stores);
+  let answer = step(state);
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  hand_chunks_back(&mut store.content, &mut store.budget, vcs_stores, took);
   answer
 }
 
@@ -1129,13 +1311,21 @@ impl GitPush {
   /// Seals the push: every commit's generation number, its parents read from the push or the repository (A-614). Each
   /// append then admits its own moves ([`SealedPush::admit`]). Refused, the push is abandoned and its holds given back.
   pub(crate) fn seal(mut self, state: &mut ShardState) -> Result<SealedPush, GitRefused> {
-    let sealed = match state.vcs_stores.git(self.repository) {
+    // Its rows written for its landing to adopt (A-722 part 3), with the room they take lent.
+    let rows = state
+      .vcs_stores
+      .git_ref(self.repository)
+      .map_or(0, |(_, store)| store.repository.stage_room(&self.push));
+    let push = &mut self.push;
+    let repository = self.repository;
+    let sealed = within_budget(state, rows, |stores| match stores.git(repository) {
       Some((content, store)) => store
         .repository
-        .seal(content, &mut self.push)
+        .seal(content, push)
+        .and_then(|()| store.repository.stage(content, push))
         .map_err(GitRefused::Store),
       None => Err(GitRefused::NoStore),
-    };
+    });
     match sealed {
       Ok(()) => Ok(SealedPush {
         repository: self.repository,
@@ -1250,14 +1440,15 @@ fn lacks<'s>(content: &'s ContentStore, store: &'s GitStore) -> impl Fn(&ObjectI
 
 /// Seals `push` and admits each of `moves` against the store, in order (A-614's `seal` and `admit`).
 fn seal_moves(
-  content: &ContentStore,
-  store: &GitStore,
+  content: &mut ContentStore,
+  store: &mut GitStore,
   push: &mut Push,
   moves: &[RecordedMove],
 ) -> Result<Vec<Move>, GitRefused> {
   store
     .repository
     .seal(content, push)
+    .and_then(|()| store.repository.stage(content, push))
     .map_err(GitRefused::Store)?;
   admit_moves(content, store, push, moves)
 }
@@ -1464,17 +1655,31 @@ fn recorded_alike(
   remade: &RecordWriter,
   record: &Record<'_>,
 ) -> bool {
+  if record.objects.is_empty() {
+    return names_alike(content, store, remade, &record.names);
+  }
   let admitted = remade
     .lacked(lacks(content, store))
     .map(|noted| (noted.kind, noted.identity, noted.len));
-  if record.objects.is_empty() {
-    return admitted.eq(record.names.iter().copied());
-  }
   let recorded = record.objects.iter().map(|object| {
     let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
     (object.kind, object.identity, len)
   });
   admitted.eq(recorded)
+}
+
+/// Whether the objects the replay's admission would record now are `names`, a version-2 record's, in order
+/// ([`recorded_alike`]).
+fn names_alike(
+  content: &ContentStore,
+  store: &GitStore,
+  remade: &RecordWriter,
+  names: &[(slates_git::object_name::Kind, slates_vcs::ContentId, u64)],
+) -> bool {
+  remade
+    .lacked(lacks(content, store))
+    .map(|noted| (noted.kind, noted.identity, noted.len))
+    .eq(names.iter().copied())
 }
 
 /// Admits a record's objects, each checked against its identity first, at the record's deepest chain.
@@ -1558,16 +1763,19 @@ fn replay_record(
   let bytes = db.partition().repositories().object_record(id, index)?;
   let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
   lend(store, vcs_stores, brought);
-  let room = vcs_stores.subversion(id).map(|svn| {
+  let room = vcs_stores.svn_unlent(id).map(|svn| {
     let entries = svn
       .records
       .as_ref()
       .map_or(0, |records| records.index().entries());
     svn_room(store, svn.charged, entries)
   });
-  let replayed = replay_into(vcs_stores, id, bytes, room);
+  let replayed = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    replay_into(lent.stores, id, bytes, room)
+  };
   let mut whole = settle_in(store, vcs_stores);
-  if let Some(svn) = vcs_stores.subversion(id) {
+  if let Some(svn) = vcs_stores.svn_unlent(id) {
     whole &= settle_records(store, svn);
   }
   if !whole {
@@ -1633,7 +1841,10 @@ fn hg_record_step(
     0
   };
   lend(store, vcs_stores, lent);
-  let stepped = hg_step_in(vcs_stores, id, bytes, replay);
+  let stepped = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    hg_step_in(lent.stores, id, bytes, replay)
+  };
   let whole = settle_in(store, vcs_stores);
   if !whole {
     state.count(CHARGE_SHORT, 1);
@@ -1892,39 +2103,58 @@ pub(crate) async fn recover(
     .cloned()
     .collect();
   for record in records {
-    make(state, &record);
-    let mut index = 0usize;
-    loop {
-      // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
-      // shard past the watchdog's window at every restart.
-      let outcome = if record.tool == VcsTool::Mercurial {
-        replay_hg_sliced(state, record.id, index, slices).await
-      } else {
-        replay_record(state, record.id, index)
-      };
-      let Some(outcome) = outcome else {
-        break;
-      };
-      if !replayed(state, record.id, outcome) {
-        break;
-      }
-      index = index.saturating_add(1);
-      slices.unit_done().await;
-    }
-    // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
-    let greens: Vec<DbVolumeId> = state
-      .db
-      .partition()
-      .repositories()
-      .members_of(record.id)
-      .map(|member| member.green)
-      .collect();
-    for green in greens {
-      paths::remake_green_sliced(state, green, slices).await;
-      slices.unit_done().await;
-    }
-    paths::whole_build::resume_owed(state, record.id);
+    recover_repository(state, &record, slices).await;
   }
+}
+
+/// Makes `record`'s store again and replays its records in log order, a record a unit of the recovery's slices, then
+/// makes each green's map of its head again, a green a unit.
+async fn recover_repository(
+  state: &mut ShardState,
+  record: &RepositoryRecord,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) {
+  make(state, record);
+  let mut index = 0usize;
+  loop {
+    // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
+    // shard past the watchdog's window at every restart.
+    let outcome = if record.tool == VcsTool::Mercurial {
+      replay_hg_sliced(state, record.id, index, slices).await
+    } else {
+      // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
+      let ns = state.config.step_quantum_ns();
+      match record_turn(state, (record.id, index), ns) {
+        Some(RecordTurn::More) => {
+          slices.unit_done().await;
+          continue;
+        }
+        Some(RecordTurn::Replayed(outcome)) => Some(outcome),
+        None => None,
+      }
+    };
+    let Some(outcome) = outcome else {
+      break;
+    };
+    if !replayed(state, record.id, outcome) {
+      break;
+    }
+    index = index.saturating_add(1);
+    slices.unit_done().await;
+  }
+  // Each green's map of its head, made again as the live store holds it (A-664 part 3), a green a unit.
+  let greens: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(record.id)
+    .map(|member| member.green)
+    .collect();
+  for green in greens {
+    paths::remake_green_sliced(state, green, slices).await;
+    slices.unit_done().await;
+  }
+  paths::whole_build::resume_owed(state, record.id);
 }
 
 /// Makes repository `id`'s store again from the log (module docs): what a commit whose entry was not made durable left
@@ -1937,7 +2167,7 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
     .repository(id)
     .is_some_and(|record| record.tool == VcsTool::Mercurial);
   if !mercurial {
-    rebuild_whole(state, id);
+    rebuild_sliced(state, id);
     return;
   }
   // A Mercurial repository's records replayed whole in one step held a large repository's shard past the watchdog's
@@ -1956,7 +2186,232 @@ pub(crate) fn rebuild(state: &mut ShardState, id: RepositoryId) {
   state.count(REBUILT, 1);
 }
 
-/// [`rebuild`] in one step, every record replayed at once: the rebuild of a git or Subversion repository, and the tests'.
+/// [`rebuild`] of a git or Subversion repository (A-732's sibling; main's ruling of 2026-11-20): a large repository's
+/// records replayed in one step held its shard past the watchdog's window and crash-looped the daemon, as Mercurial's did.
+/// Its store made empty now and lent to nothing ([`VcsStores::rebuild_turns`]), its records replayed a record a turn by
+/// a task ([`rebuild_turn`]), and once the last is in, each green's map made again in slices by its build
+/// (`paths::whole_build`), whose end makes any commit owed.
+fn rebuild_sliced(state: &mut ShardState, id: RepositoryId) {
+  free(state, id);
+  let Some(record) = state.db.partition().repositories().repository(id).cloned() else {
+    return;
+  };
+  make(state, &record);
+  let generation = state.vcs_stores.rebuild_generations.wrapping_add(1);
+  state.vcs_stores.rebuild_generations = generation;
+  state.vcs_stores.rebuild_turns.insert(id, (generation, 0));
+  state.vcs_stores.rebuilding.insert(id);
+  let task =
+    slates_rt::futures::spawn(rebuild_turns(id, generation)).and_then(slates_rt::futures::detach);
+  if task.is_err() {
+    // No task to run it: the store stays lent to nothing, and the next recovery makes it again a unit at a time.
+    state.count(REPLAY_REFUSED, 1);
+  }
+  state.count(REBUILT, 1);
+}
+
+/// Repository `id`'s rebuild of `generation` driven a turn at a time, a yield between, until it ends or is replaced.
+async fn rebuild_turns(id: RepositoryId, generation: u64) {
+  while crate::state::with_state(|state| rebuild_turn(state, id, generation)) == Some(true) {
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// One turn of repository `id`'s rebuild of `generation`: its next record replayed, or, past the last or at a refusal,
+/// the rebuild ended ([`rebuild_ended`]). Whether more turns remain; none for a rebuild ended or replaced.
+fn rebuild_turn(state: &mut ShardState, id: RepositoryId, generation: u64) -> bool {
+  let ns = state.config.step_quantum_ns();
+  rebuild_turn_within(state, (id, generation), ns)
+}
+
+/// [`rebuild_turn`] held to `ns` of the shard's clock: a git record's replay takes a turn's units at least one
+/// ([`git_replay`], A-722 part 4), any other record whole.
+fn rebuild_turn_within(
+  state: &mut ShardState,
+  (id, generation): (RepositoryId, u64),
+  ns: u64,
+) -> bool {
+  let Some((current, index)) = state.vcs_stores.rebuild_turns.get(&id).copied() else {
+    return false;
+  };
+  if current != generation {
+    return false;
+  }
+  let advanced = match record_turn(state, (id, index), ns) {
+    Some(RecordTurn::More) => return true,
+    Some(RecordTurn::Replayed(outcome)) => replayed(state, id, outcome),
+    None => false,
+  };
+  if advanced {
+    state
+      .vcs_stores
+      .rebuild_turns
+      .insert(id, (generation, index.saturating_add(1)));
+    return true;
+  }
+  rebuild_ended(state, id);
+  false
+}
+
+/// What a turn of a record's replay left.
+enum RecordTurn {
+  /// A git record's replay under way: more turns remain.
+  More,
+  /// The record replayed, or refused.
+  Replayed(Result<(), ReplayRefused>),
+}
+
+/// One turn of repository `id`'s record at `index`, held to `ns` of the shard's clock (A-722 part 4): a git record
+/// carrying a pack replayed a turn's units by its [`git_replay::GitReplay`], begun at its first turn with the room its
+/// bytes take lent, kept between turns; any other record replayed whole ([`replay_record`]). None when it has no record
+/// there.
+fn record_turn(
+  state: &mut ShardState,
+  (id, index): (RepositoryId, usize),
+  ns: u64,
+) -> Option<RecordTurn> {
+  let chunk = usize::try_from(state.config.archive_slice_bytes_within(ns)).unwrap_or(usize::MAX);
+  let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
+  let under_way = state.vcs_stores.git_replays.remove(&id);
+  let ShardState {
+    db,
+    store,
+    vcs_stores,
+    ..
+  } = &mut *state;
+  let bytes = db.partition().repositories().object_record(id, index)?;
+  let format = match vcs_stores.entries.get(&id) {
+    Some(RepositoryStore::Git(git)) => Some(git.repository.format()),
+    _ => None,
+  };
+  let stepped =
+    under_way.is_some() || format.is_some_and(|format| git_replay::stepped(bytes, format));
+  if !stepped {
+    return replay_record(state, id, index).map(RecordTurn::Replayed);
+  }
+  let lent = if under_way.is_none() {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+  } else {
+    0
+  };
+  lend(store, vcs_stores, lent);
+  let turned = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    git_turn_in(lent.stores, id, bytes, under_way, (deadline_ns, chunk))
+  };
+  if !settle_in(store, vcs_stores) {
+    state.count(CHARGE_SHORT, 1);
+  }
+  Some(match turned {
+    Ok(git_replay::Stepped::More(replay)) => {
+      state.vcs_stores.git_replays.insert(id, replay);
+      RecordTurn::More
+    }
+    Ok(git_replay::Stepped::Done(unkept)) => {
+      state.count(VALUE_UNKEPT, unkept);
+      RecordTurn::Replayed(Ok(()))
+    }
+    Err(refused) => RecordTurn::Replayed(Err(refused)),
+  })
+}
+
+/// [`record_turn`]'s turn of a git record's replay over the stores: begun where none is `under_way`.
+fn git_turn_in(
+  stores: &mut VcsStores,
+  id: RepositoryId,
+  bytes: &[u8],
+  under_way: Option<Box<git_replay::GitReplay>>,
+  (deadline_ns, chunk): (u64, usize),
+) -> Result<git_replay::Stepped, ReplayRefused> {
+  let unheld = ReplayRefused::Git(GitRefused::NoStore);
+  let content = stores.content.as_mut().ok_or(unheld.clone())?;
+  let Some(RepositoryStore::Git(store)) = stores.entries.get_mut(&id) else {
+    return Err(unheld);
+  };
+  let replay = match under_way {
+    Some(replay) => replay,
+    None => git_replay::GitReplay::begin(content, store.repository.format(), bytes)?,
+  };
+  let turn = git_replay::Turn { deadline_ns, chunk };
+  let mut now = slates_rt::futures::now_ns;
+  replay.step((content, store), bytes, (turn, &mut now))
+}
+
+/// Gives back what repository `id`'s git record's replay under way holds, where one is: its rebuild ended or replaced.
+fn abandon_git_replay(state: &mut ShardState, id: RepositoryId) {
+  let Some(replay) = state.vcs_stores.git_replays.remove(&id) else {
+    return;
+  };
+  let given = {
+    let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
+    lent
+      .stores
+      .content
+      .as_mut()
+      .map(|content| replay.abandon(content))
+  };
+  if !matches!(given, Some(Ok(()))) {
+    state.count(RELEASE_REFUSED, 1);
+  }
+}
+
+/// A git or Subversion rebuild's end: the store lent again, then each git green's map made again in slices by its build
+/// (`paths::whole_build`), whose end makes any commit a submit owed of it.
+fn rebuild_ended(state: &mut ShardState, id: RepositoryId) {
+  state.vcs_stores.rebuild_turns.remove(&id);
+  state.vcs_stores.rebuilding.remove(&id);
+  if !matches!(state.vcs_stores.store(id), Some(RepositoryStore::Git(_))) {
+    return;
+  }
+  let greens: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .repositories()
+    .members_of(id)
+    .map(|member| member.green)
+    .collect();
+  for green in greens {
+    let head = state.greens.get(&green).map(|engine| engine.head());
+    if let Some(head) = head.filter(|head| *head > 0) {
+      paths::whole_build::start_remade(state, id, green, head);
+    }
+  }
+}
+
+/// Runs repository `id`'s git or Subversion rebuild under way to its end in this step, then every map build: what a test
+/// that makes a store again and reads it does, since a test's step runs no other task between its calls.
+#[cfg(test)]
+pub(crate) fn settle_rebuild(state: &mut ShardState, id: RepositoryId) {
+  if let Some((generation, _)) = state.vcs_stores.rebuild_turns.get(&id).copied() {
+    while rebuild_turn(state, id, generation) {}
+  }
+  paths::whole_build::settle(state);
+}
+
+/// One turn of repository `id`'s git or Subversion rebuild under way: whether more remain.
+#[cfg(test)]
+pub(crate) fn rebuild_turn_once(state: &mut ShardState, id: RepositoryId) -> bool {
+  state
+    .vcs_stores
+    .rebuild_turns
+    .get(&id)
+    .copied()
+    .is_some_and(|(generation, _)| rebuild_turn(state, id, generation))
+}
+
+/// One turn of repository `id`'s git or Subversion rebuild under way, held to `ns` of the shard's clock: whether more
+/// remain.
+#[cfg(test)]
+pub(crate) fn rebuild_turn_once_within(state: &mut ShardState, id: RepositoryId, ns: u64) -> bool {
+  state
+    .vcs_stores
+    .rebuild_turns
+    .get(&id)
+    .copied()
+    .is_some_and(|(generation, _)| rebuild_turn_within(state, (id, generation), ns))
+}
+
+/// [`rebuild`] in one step, every record replayed at once: the tests' and Mercurial's tests'.
 pub(crate) fn rebuild_whole(state: &mut ShardState, id: RepositoryId) {
   free(state, id);
   let Some(record) = state.db.partition().repositories().repository(id).cloned() else {

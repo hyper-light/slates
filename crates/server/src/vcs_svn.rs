@@ -163,6 +163,9 @@ const NANOS_PER_MICRO: i64 = 1_000;
 
 /// Counter: a lock verb's entries the owner's step refused, answered in each judged path's place.
 const LOCKS_REFUSED: &str = "vcs_svn.locks_refused";
+/// Counter: a conversation's turn begun in the same poll of its shard as the turn before it, no other task run between
+/// them ([`go_on`]): a bug signal, a long answer or pipelined commands holding the shard (the git/git `svnrdump` spin).
+pub(crate) const TURNS_UNYIELDED: &str = "vcs_svn.turns_unyielded";
 
 /// Counter: a lock verb whose new token the system's generator could not draw: its landing refused.
 const TOKEN_UNDRAWN: &str = "vcs_svn.token_undrawn";
@@ -754,8 +757,23 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
 /// ([`migrate`]), its seat here given back as it leaves.
 async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
   let mut out = Vec::new();
+  let mut last_poll = None;
   loop {
-    match step(&stream, &mut conversation, &mut out, &seat).await {
+    // The shard's polls so far: unchanged since the last turn began, this turn follows it with nothing run between.
+    let poll = futures::polls_so_far();
+    if poll.is_some() && poll == last_poll {
+      let _ = crate::state::with_state(|state| state.count(TURNS_UNYIELDED, 1));
+    }
+    last_poll = poll;
+    let went = step(&stream, &mut conversation, &mut out, &seat).await;
+    // A turn that never waited yields before the next: a long answer (a replay-range over a whole history, a checkout)
+    // or commands pipelined in one read are many turns with no wait between, and a client that drains the socket as
+    // fast as it is written never makes a write wait either, so without the yield the shard never steps (git/git's
+    // last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
+    if matches!(went, Stepped::Go) && futures::polls_so_far() == poll {
+      futures::yield_now().await;
+    }
+    match went {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
@@ -788,6 +806,10 @@ async fn step(
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
+  // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
+  // answer after it, never this again (a revision property change once wrote its trivial authentication request twice,
+  // which stock svn read as the change's success).
+  out.clear();
   follow(stream, conversation, next, out, seat).await
 }
 
@@ -802,19 +824,11 @@ async fn follow(
 ) -> Stepped {
   let went = match next {
     Next::Read => return read_step(stream, conversation, seat).await,
-    // A turn that read nothing from the client yields before the next: a long answer (a replay-range over a whole
-    // history, a checkout) or commands pipelined in one read are many turns with no wait between, and a client that
-    // drains the socket as fast as it is written never makes a write wait either, so without the yield the shard never
-    // steps (git/git's last 2,000 commits through `svnrdump dump`: "shard 0 is spinning: 3596 ms" after 53 MB).
     Next::Consume(taken) => {
       consume(conversation, taken);
-      futures::yield_now().await;
       return Stepped::Go;
     }
-    Next::Again => {
-      futures::yield_now().await;
-      return Stepped::Go;
-    }
+    Next::Again => return Stepped::Go,
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
@@ -1156,9 +1170,8 @@ fn land_locks(
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
-  .map_err(|failure| {
+  .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    failure
   })
 }
 
@@ -1453,20 +1466,26 @@ pub(crate) struct HookAnswer {
 /// repository's name beneath `/`, as `SVNParentPath` lays repositories out, until A-645's read-only FSFS-layout view
 /// gives `svnlook` a directory to read: design §4.17.4 item 9).
 pub(crate) struct Hooked {
-  /// The repository's id, which its hooks' learned times are kept under.
+  /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
+  #[cfg(unix)]
   id: RepositoryId,
   /// Its name, which its record is found by on its owner shard.
   name: String,
-  /// REPOS.
+  /// REPOS (unix alone, where hooks run).
+  #[cfg(unix)]
   repos: String,
 }
 
 impl Hooked {
   /// What the hooks of the repository `id`, named `name`, need of it.
   pub(crate) fn new(id: RepositoryId, name: &str) -> Self {
+    #[cfg(not(unix))]
+    let _ = id;
     Self {
+      #[cfg(unix)]
       id,
       name: name.to_owned(),
+      #[cfg(unix)]
       repos: format!("/{name}"),
     }
   }
@@ -1584,7 +1603,8 @@ async fn run_svn_hook(
 }
 
 /// No hook runs on Windows yet (the hook driver is Unix's alone, A-622 part 3): a point where the repository configures
-/// one refuses its change in the not-run words, as before A-730, and a point with none lets it go on.
+/// one refuses its change in the not-run words, as before A-730, and a point with none answers as `svnserve` does with
+/// none (`vcs_hooks::svn_told_unconfigured`): pre-revprop-change refuses every change (E165006), the rest go on.
 #[cfg(not(unix))]
 async fn run_svn_hook(
   policy: &slates_db::catalog::RepositoryPolicy,
@@ -1598,11 +1618,20 @@ async fn run_svn_hook(
     .hooks
     .iter()
     .any(|hook| HookPoint::of(hook.point) == point);
+  let unconfigured = match vcs_hooks::svn_told_unconfigured(point) {
+    Some(vcs_hooks::SvnTold::Failure(chain)) => Err(
+      chain
+        .into_iter()
+        .map(|error| (error.code, error.message))
+        .collect(),
+    ),
+    _ => Ok(()),
+  };
   HookAnswer {
     verdict: Some(if configured {
       Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
     } else {
-      Ok(())
+      unconfigured
     }),
     post_commit_error: None,
     token: None,

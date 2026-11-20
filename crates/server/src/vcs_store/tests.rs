@@ -483,7 +483,7 @@ impl Live {
     pending: &mut Pending,
     moves: &[RecordedMove],
   ) -> Result<(), GitRefused> {
-    let admitted = seal_moves(&self.content, &self.store, &mut pending.push, moves)?;
+    let admitted = seal_moves(&mut self.content, &mut self.store, &mut pending.push, moves)?;
     let deepest = pending.push.deepest();
     let record = record_of(
       &self.content,
@@ -1406,13 +1406,17 @@ pub(crate) fn records(state: &ShardState, repository: RepositoryId) -> Vec<Vec<u
     .collect()
 }
 
-/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one
-/// whole over the refs keyed `greens`, every record replayed and none refused.
+/// The store made again from the partition's log (`super::rebuild`, the recovery's own replay) equals the live one,
+/// its whole builds settled, whole over the refs keyed `greens`, every record replayed and none refused.
 pub(crate) fn assert_made_again_whole(
   state: &mut ShardState,
   repository: RepositoryId,
   greens: &[u64],
 ) {
+  // The live store's whole builds run in slices after a push's answer, and a rebuild settles its own before it is
+  // compared (`settle_rebuild`), so the live store is compared settled too: otherwise a build under way holds what it
+  // has put so far and the two differ in holders and contents while their rows and refs agree.
+  super::paths::whole_build::settle(state);
   let live = {
     let (content, store) = state.vcs_stores.git_ref(repository).expect("the store");
     facts(content, store, greens)
@@ -1420,6 +1424,7 @@ pub(crate) fn assert_made_again_whole(
   let count = u64::try_from(records(state, repository).len()).expect("a count");
   let replayed = state.refusals.get(super::REPLAYED).copied().unwrap_or(0);
   super::rebuild(state, repository);
+  super::settle_rebuild(state, repository);
   assert_eq!(state.vcs_stores.unrecovered(repository), None);
   let made = {
     let (content, store) = state
@@ -1805,4 +1810,96 @@ fn an_http_commit_idle_past_the_edges_idle_bound_is_released() {
     .take_dav_commit(id, b"alice", ("0-1", 2_600))
     .is_some();
   assert_eq!((found, kept, after), (true, 1, false));
+}
+
+/// A git repository of `pushes` pushes to its root green, each a commit changing `README` over the one before: its id
+/// and root.
+fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId, DbVolumeId) {
+  let (repository, root) = repository(state, name, VcsTool::Git);
+  let mut parent: Option<(ObjectId, ObjectId)> = None;
+  for push in 0..pushes {
+    let files = [(b"README".to_vec(), format!("push {push}\n").into_bytes())];
+    let parents: Vec<ObjectId> = parent.iter().map(|(commit, _)| *commit).collect();
+    let (objects, commit) = commit_of(&files, &parents, FIRST_DATE.saturating_add(push));
+    let tree = tree_of(&objects);
+    let base = parent.map(|(_, tree)| tree);
+    push_through(state, (repository, root), &objects, (base, commit, tree));
+    parent = Some((commit, tree));
+  }
+  (repository, root)
+}
+
+/// A-732's sibling for git (main's ruling of 2026-11-20: a large repository's rebuild in one step spun past the
+/// watchdog and crash-looped the daemon). Do: push five commits to a git repository; make its store again from the log.
+/// Expect: the rebuild under way and the store lent to nothing; its five records replayed a turn each at least (a pack
+/// record over as many as its units take, A-722 part 4); then the store
+/// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
+#[test]
+fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = pushed_many(state, "sliced-rebuild", 5);
+    let records = records(state, repository).len();
+    super::rebuild(state, repository);
+    let during = (
+      state.vcs_stores.rebuilding(repository),
+      state.vcs_stores.git_ref(repository).is_none(),
+    );
+    let mut turns = 0usize;
+    while super::rebuild_turn_once(state, repository) {
+      turns = turns.saturating_add(1);
+    }
+    let lent =
+      state.vcs_stores.git_ref(repository).is_some() && !state.vcs_stores.rebuilding(repository);
+    crate::vcs_store::paths::whole_build::settle(state);
+    let mapped = state
+      .vcs_stores
+      .git_ref(repository)
+      .is_some_and(|(_, git)| git.heads.contains_key(&green_key(root)));
+    (during, turns >= records && records == 5, lent, mapped)
+  });
+  assert_eq!(seen, ((true, true), true, true, true));
+}
+
+/// Shape: the files of the one commit whose push's record holds many objects: enough that a replay a unit a turn takes
+/// many turns, few enough for a test's step.
+const MANY_FILES: usize = 64;
+
+/// A-722 part 4 (main's ruling 2026-11-20: a large pack record's replay ran in one turn and crash-looped the daemon). Do:
+/// push one commit of [`MANY_FILES`] files to a git repository, one record whose pack holds every blob, the tree and the
+/// commit; make its store again from the log, each turn held to no time at all. Expect: the one record replayed over
+/// at least as many turns as its pack has objects, and the store made again holding the commit at the green's head.
+/// Red before the change: the record was replayed whole in one turn.
+#[test]
+fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
+  let seen = crate::daemon::audit_on_shard(|state| {
+    let (repository, root) = repository(state, "many-objects", VcsTool::Git);
+    let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
+      .map(|n| {
+        (
+          format!("f{n}").into_bytes(),
+          format!("file {n}\n").into_bytes(),
+        )
+      })
+      .collect();
+    let (objects, commit) = commit_of(&files, &[], FIRST_DATE);
+    let tree = tree_of(&objects);
+    push_through(state, (repository, root), &objects, (None, commit, tree));
+    let held = records(state, repository).len();
+    super::rebuild(state, repository);
+    let mut turns = 0usize;
+    while super::rebuild_turn_once_within(state, repository, 0) {
+      turns = turns.saturating_add(1);
+    }
+    crate::vcs_store::paths::whole_build::settle(state);
+    let key = green_key(root);
+    let head = state
+      .vcs_stores
+      .git_ref(repository)
+      .and_then(|(content, git)| {
+        let newest = git.repository.versions(key).checked_sub(1)?;
+        git.repository.head(content, key, newest)
+      });
+    (held, turns >= objects.len(), head == Some(commit))
+  });
+  assert_eq!(seen, (1, true, true));
 }

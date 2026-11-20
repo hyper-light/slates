@@ -306,6 +306,25 @@ impl Store for Probed {
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     std::iter::empty()
   }
+
+  fn manifest_linked(&self, _position: u64) -> Option<slates_hg::serve::getbundle::Linked> {
+    None
+  }
+
+  fn file_linked_from(
+    &self,
+    _from: (&[u8], u64),
+  ) -> Option<(Vec<u8>, u64, slates_hg::serve::getbundle::Linked)> {
+    None
+  }
+
+  fn holds_manifest(&self, _node: &Node) -> bool {
+    false
+  }
+
+  fn serves_every_changeset(&self) -> bool {
+    true
+  }
 }
 
 /// Lends the probed repository's store as [`HG`]'s, and no other, until the test says it went away.
@@ -432,6 +451,7 @@ impl StoreLender for NoGit {
 /// The Mercurial repository `id`, [`HOLDER`]'s, with no rules.
 fn record(id: RepositoryId, name: &str) -> RepositoryRecord {
   RepositoryRecord {
+    index_bits: 0,
     id,
     name: name.to_owned(),
     tool: VcsTool::Mercurial,
@@ -1021,7 +1041,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared, &mut room);
+  let landed = hg_push::land(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"

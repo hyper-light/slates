@@ -719,6 +719,7 @@ impl Repositories {
       Op::RepositoryGreenJoined { record } => self.check_joined(record, held),
       Op::RepositoryAdvanced { entry } => entry::check(self, entry, held, head),
       Op::RepositoryPolicySet { repository, policy } => self.check_policy(*repository, policy),
+      Op::RepositoryIndexCut { repository, bits } => self.check_index_cut(*repository, *bits),
       Op::RepositoryRebuilt { record, parts } => self.check_rebuilt(record, parts, capacity),
       _ => Ok(()),
     }
@@ -811,6 +812,19 @@ impl Repositories {
       return Err(DbError::PolicyChanged { current });
     }
     policy::check(record.tool, policy)
+  }
+
+  /// A repository's index cut moves one bit at a time, within an id's 32 leading bits (A-724 piece 9, §4.17.5: a split
+  /// doubles the ranges, a merge halves them, each row moving to one range): `IndexCutStep` names the cut now.
+  fn check_index_cut(&self, repository: RepositoryId, bits: u8) -> Result<(), DbError> {
+    let record = self.repository(repository).ok_or(DbError::NotFound)?;
+    let current = record.index_bits;
+    let one_step = bits.checked_sub(current) == Some(1) || current.checked_sub(bits) == Some(1);
+    let most = u8::try_from(u32::BITS).unwrap_or(u8::MAX);
+    if !one_step || bits > most {
+      return Err(DbError::IndexCutStep { current });
+    }
+    Ok(())
   }
 
   /// What setting `policy` on `repository` adds to the merge budget and gives back of it: its rules' and hooks' bytes,
@@ -921,6 +935,11 @@ impl Repositories {
         // The policy's own version is its log's position (A-622): nothing else moves.
         record.policy = policy.clone();
         Ok(bytes)
+      }
+      Op::RepositoryIndexCut { repository, bits } => {
+        let record = self.records.get_mut(repository).ok_or(DbError::NotFound)?;
+        record.index_bits = *bits;
+        Ok(StateBytes::default())
       }
       Op::RepositoryDestroyed { repository } => {
         let record = self.records.remove(repository).ok_or(DbError::NotFound)?;
@@ -1590,6 +1609,7 @@ mod tests {
 
   fn repository(serial: u8, name: &str) -> RepositoryRecord {
     RepositoryRecord {
+      index_bits: 0,
       id: repository_id(HOME, serial),
       name: name.to_owned(),
       tool: VcsTool::Git,
@@ -1677,6 +1697,53 @@ mod tests {
         .map(|green| repositories.branch_floor(volume_id(HOME, green)))
         .collect(),
     )
+  }
+
+  /// A-724 piece 9 (§4.17.5). Do: create a repository, move its index cut 0 to 1 to 2, try a jump of two and a cut past
+  /// 32 bits, step back to 1, and rebuild the partition from its snapshot. Expect: each one-bit step taken and read back
+  /// on the record; the jump and the overrun refused `IndexCutStep` naming the cut then, nothing changed; a cut for a
+  /// repository not here refused `NotFound`; the rebuilt partition's record holding the cut.
+  #[test]
+  fn a_repositorys_index_cut_moves_one_bit_at_a_time_and_is_kept_by_its_snapshot() {
+    let mut partition = Partition::new(caps(), 0);
+    let record = repository(9, "monorepo");
+    let repo = record.id;
+    run(&mut partition, &Op::RepositoryCreated { record }).unwrap();
+    let cut = |bits| Op::RepositoryIndexCut {
+      repository: repo,
+      bits,
+    };
+    let bits = |partition: &Partition| {
+      partition
+        .repositories()
+        .repository(repo)
+        .unwrap()
+        .index_bits
+    };
+    run(&mut partition, &cut(1)).unwrap();
+    run(&mut partition, &cut(2)).unwrap();
+    assert_eq!(bits(&partition), 2);
+    assert_eq!(
+      run(&mut partition, &cut(4)),
+      Err(DbError::IndexCutStep { current: 2 })
+    );
+    assert_eq!(bits(&partition), 2);
+    run(&mut partition, &cut(1)).unwrap();
+    let mut far = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    for step in 2..=32u8 {
+      run(&mut far, &cut(step)).unwrap();
+    }
+    assert_eq!(
+      run(&mut far, &cut(33)),
+      Err(DbError::IndexCutStep { current: 32 })
+    );
+    let stranger = Op::RepositoryIndexCut {
+      repository: repository_id(HOME, 77),
+      bits: 1,
+    };
+    assert_eq!(run(&mut partition, &stranger), Err(DbError::NotFound));
+    let rebuilt = Partition::from_snapshot(&partition.to_snapshot(0), caps(), 0).unwrap();
+    assert_eq!(bits(&rebuilt), 1);
   }
 
   /// A-515 (§4.17.1). Do: create a repository, make two greens and a plain volume on its partition and a green on

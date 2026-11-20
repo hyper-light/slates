@@ -131,7 +131,7 @@ fn run_answer(thin: bool, filter: Option<Filter>) -> Answer {
       after: 0,
       through: 2,
     }],
-    objects: Vec::new(),
+    objects: Positions::new(),
     thin,
     ofs: true,
     filter,
@@ -217,7 +217,7 @@ fn a_fetch_is_its_runs_fragments_then_what_no_fragment_covers() {
   )
   .unwrap();
   let mut answer = run_answer(true, None);
-  answer.objects = repository.brought(&store, 2, 0).unwrap().iter().collect();
+  answer.objects = repository.brought(&store, 2, 0).unwrap();
   let (pack, counters) = streamed(&repository, &store, answer, u64::MAX);
   let read = read_back(format, &pack, &Held::of(&versions[0])).unwrap();
   let mut expected = run_ids(&repository, &store);
@@ -878,7 +878,7 @@ fn answer_for(
     .collect();
   let mut answer = Answer {
     runs: Vec::new(),
-    objects: Vec::new(),
+    objects: Positions::new(),
     thin,
     ofs,
     filter,
@@ -894,7 +894,7 @@ fn answer_for(
         .iter()
         .map(|id| real.repository.object(&real.store, id).unwrap().position)
         .collect();
-      answer.objects = Positions::of(positions).iter().collect();
+      answer.objects = Positions::of(positions);
     }
   }
   (answer, wanted)

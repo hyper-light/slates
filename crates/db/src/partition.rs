@@ -573,6 +573,15 @@ impl Partition {
     self.caps
   }
 
+  /// The bytes the green chains may still grow by before an increment is refused (`green_chains` at its cap): what a
+  /// caller sizing a chain entry beforehand checks, so it can checkpoint first and append once (A-742).
+  pub fn green_chain_room(&self) -> usize {
+    self
+      .caps
+      .green_chain_bytes
+      .saturating_sub(self.green_chain_bytes)
+  }
+
   /// A green volume's merge chain (§4.16): its accepted increments after its checkpoint
   /// ([`Partition::green_checkpoint`]; all of them while it holds none), encoded, in commit order, so the chain's
   /// entry `n` is version `checkpoint + n + 1`. Empty for a green with no version past its checkpoint and for any
@@ -1630,6 +1639,13 @@ impl Partition {
         let bytes = self.repositories.policy_bytes(*repository, policy);
         self.merge_bytes_fit(bytes.released, bytes.added)
       }
+      // A repository's index cut (A-724 piece 9): `crate::repository`, one bit at a time; no bytes move.
+      Op::RepositoryIndexCut { .. } => self.repositories.check(
+        op,
+        self.caps.volumes,
+        |id| self.held(id),
+        |green| self.green_head(green),
+      ),
       // A review record keeps §4.17.1's rules (A-596): `crate::review`; its bytes fit the merge byte budget.
       Op::ReviewCommented { .. }
       | Op::ReviewCommentMoved { .. }
@@ -2213,7 +2229,8 @@ impl Partition {
       | Op::RepositoryDefaultSet { .. }
       | Op::RepositoryGreenJoined { .. }
       | Op::RepositoryAdvanced { .. }
-      | Op::RepositoryPolicySet { .. } => self.apply_repository(op),
+      | Op::RepositoryPolicySet { .. }
+      | Op::RepositoryIndexCut { .. } => self.apply_repository(op),
       // A destroyed repository's review records leave with it, their bytes back to the merge budget (A-596), as its
       // register's state does (A-603).
       Op::RepositoryDestroyed { repository } => {

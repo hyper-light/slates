@@ -29,6 +29,14 @@
 //! base, which every reader takes (`mdiff.trivialdiffheader`); held deltas and computed ones are the learned delta
 //! choice's (§4.17.3's tunables).
 //!
+//! **Made a slice at a time** (A-745; §4.17.1 "A fetch's answer"). [`Answering`] writes the answer in steps, each given
+//! the served view and a room of its own: the stream's head, then the changegroup a unit a step ([`Walk`]), then the
+//! parts after it. A fetch that leaves no served changeset neither sent nor held, over a view that serves every
+//! changeset (a clone of every head, the large case), is walked by its links, 7.2's own fast path (`fastpathlinkrev`):
+//! the missing changesets as ranges, the manifest log in its order and then the file logs from row to row, each
+//! revision whose log links it to a missing changeset, so nothing grows with the repository but the walk's place. Any
+//! other fetch (a pull of some heads, a view that hides changesets) takes the slow path below, bounded by what it sends.
+//!
 //! **Texts lent** (A-680). The store lends each text in place where it holds it in one piece and copies it otherwise,
 //! the copy charged to the request's admission before it is made ([`Store`]). Each missing changeset's text is lent
 //! once and kept in its entry, whose list of paths the files are read from; each manifest is lent once, checked whole,
@@ -45,7 +53,7 @@ use super::pull::{self, Outgoing};
 use super::{Refusal, Repository, Rev, RevSet, node_of, parents_of};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::capabilities::{self, Bundle2Capabilities};
-use crate::changegroup::{Changegroup, Group, Revision, Version};
+use crate::changegroup::{self, Changegroup, Group, Revision, Version};
 use crate::obsmarkers::{self, Format, Marker};
 use crate::out::{Measure, Out};
 use crate::read::to_u64;
@@ -86,6 +94,21 @@ pub trait Store: Repository {
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
 
+  /// The manifest log's revision at `position` (A-745: a fetch walks the log in its order): its node, and the served
+  /// revision of the changeset the log links it to; `None` past the log's end.
+  fn manifest_linked(&self, position: u64) -> Option<Linked>;
+
+  /// The first file revision at or after `from` (a path and a position in its log) in the file logs' order, by path
+  /// and then position (A-745): its path, its position, its node and its link; `None` past the last file log.
+  fn file_linked_from(&self, from: (&[u8], u64)) -> Option<(Vec<u8>, u64, Linked)>;
+
+  /// Whether the manifest log holds `node` (A-745: a changeset sent is held to name a manifest the log holds).
+  fn holds_manifest(&self, node: &Node) -> bool;
+
+  /// Whether the view serves every changeset its changelog holds (A-745): then every link names a served changeset,
+  /// and a fetch that leaves none neither sent nor held is walked by its links.
+  fn serves_every_changeset(&self) -> bool;
+
   /// Whether a stream clone is served (stream clones part 2): a view over a repository's index that holds no secret
   /// changeset, as 7.2's `allowservergeneration` refuses a store with one. None by default.
   fn streams(&self) -> bool {
@@ -101,6 +124,16 @@ pub trait Store: Repository {
     let _ = room;
     Ok(None)
   }
+}
+
+/// A manifest or file revision as a fetch walks its log (A-745): its node, and the served revision of the changeset its
+/// log links it to, none where the view does not serve that changeset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Linked {
+  /// The node.
+  pub node: Node,
+  /// The served revision of the changeset its log links it to (its linkrev).
+  pub link: Option<Rev>,
 }
 
 /// A manifest or file revision as its log keeps it.
@@ -187,24 +220,106 @@ pub fn getbundle(
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refusal> {
-  let mut unquoted = Vec::new();
-  let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
-  let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
-  let mut parts = Vec::new();
-  parts.extend(changegroup_part(
-    store, &outgoing, asked.cg, &caps, admission,
-  )?);
-  if flag(asked.bookmarks, false) {
-    parts.extend(bookmarks_part(store, &caps, admission)?);
+  let mut answering = Answering::begin(store, asked, admission)?;
+  while answering.step(store, admission, out)? {}
+  Ok(())
+}
+
+/// A `getbundle`'s answer made a slice at a time (A-745; §4.17.1 "A fetch's answer"): what [`getbundle`] writes whole,
+/// cut into steps its owner advances, each lent the served view anew and charged to the room it is given. A step writes
+/// the stream's head and the changegroup part's header, or one unit of the changegroup (a revision, a group's end) as
+/// one payload chunk, or the parts after it and the stream's end. What the answer holds across steps is the parts after
+/// the changegroup (made when it begins: bookmarks, `listkeys`, markers, phase heads), the missing changesets as ranges
+/// ([`pull::Ranges`]) and its place in the changegroup ([`Walk`]); never a revision's text past its step.
+pub struct Answering {
+  /// The stream's head and the changegroup part's header, until the first step writes them.
+  head: Option<Vec<u8>>,
+  /// The changegroup, while one is sent.
+  walk: Option<Walk>,
+  /// The parts after the changegroup and the stream's end, until the last step writes them.
+  tail: Option<Vec<u8>>,
+}
+
+impl Answering {
+  /// Begins the answer to `asked` over `store` (the module docs' parts, in 7.2's order), what it holds charged to
+  /// `admission`; refused before anything is written, as 7.2 refuses before its first part.
+  pub fn begin(
+    store: &impl Store,
+    asked: &Asked<'_>,
+    admission: &mut Admission,
+  ) -> Result<Answering, Refusal> {
+    let mut unquoted = Vec::new();
+    let caps = bundle2_capabilities(asked.bundlecaps, admission, &mut unquoted)?;
+    let outgoing = pull::outgoing(store, asked.heads, asked.common, admission)?;
+    let changegroup = changegroup_part(&outgoing, asked.cg, &caps)?;
+    let mut parts = Vec::new();
+    if flag(asked.bookmarks, false) {
+      parts.extend(bookmarks_part(store, &caps, admission)?);
+    }
+    listkeys_parts(store, asked.listkeys, admission, &mut parts)?;
+    if flag(asked.obsmarkers, false) {
+      parts.extend(markers_part(store, &outgoing.heads, &caps, admission)?);
+    }
+    if flag(asked.phases, false) {
+      parts.push(phases_part(store, &outgoing.heads, &caps, admission)?);
+    }
+    let mut head = Vec::new();
+    crate::bundle2::put_stream_head(&mut head);
+    let first = match &changegroup {
+      Some(built) => {
+        let header = built_part(built, 0);
+        crate::bundle2::put_part_header(&header, &mut head).map_err(|_| unencodable("a part"))?;
+        1
+      }
+      None => 0,
+    };
+    let tail = frame_after(&parts, first, admission)?;
+    admission.charge(to_u64(head.len()))?;
+    let walk = match changegroup {
+      Some(_) => Some(Walk::begin(
+        store,
+        &outgoing,
+        version_of(&caps)?,
+        admission,
+      )?),
+      None => None,
+    };
+    Ok(Answering {
+      head: Some(head),
+      walk,
+      tail: Some(tail),
+    })
   }
-  listkeys_parts(store, asked.listkeys, admission, &mut parts)?;
-  if flag(asked.obsmarkers, false) {
-    parts.extend(markers_part(store, &outgoing.heads, &caps, admission)?);
+
+  /// Appends the answer's next slice to `out`, what it makes charged to `room`: whether more follow. Refused past the
+  /// head, the answer cannot be finished, and its owner ends the stream unfinished.
+  pub fn step(
+    &mut self,
+    store: &impl Store,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    if let Some(head) = self.head.take() {
+      out.extend_from_slice(&head);
+      return Ok(true);
+    }
+    if let Some(walk) = &mut self.walk {
+      let mut chunk = Vec::new();
+      let more = walk.step(store, room, &mut chunk)?;
+      if !chunk.is_empty() {
+        crate::bundle2::put_payload_chunk(out, &chunk).map_err(|_| unencodable("a chunk"))?;
+      }
+      if !more {
+        crate::bundle2::put_payload_chunk(out, &[]).map_err(|_| unencodable("a chunk"))?;
+        self.walk = None;
+      }
+      return Ok(true);
+    }
+    if let Some(tail) = self.tail.take() {
+      out.extend_from_slice(&tail);
+    }
+    Ok(false)
   }
-  if flag(asked.phases, false) {
-    parts.push(phases_part(store, &outgoing.heads, &caps, admission)?);
-  }
-  frame(&parts, admission, out)
 }
 
 /// A boolean argument as 7.2 reads one: `default` where absent, false for `0` or nothing, true otherwise.
@@ -247,22 +362,20 @@ fn offers(caps: &Bundle2Capabilities<'_>, name: &[u8], value: Option<&[u8]>) -> 
 }
 
 /// The `CHANGEGROUP` part where it is asked (sent unless `cg` is false) and the client named bundle2 capabilities:
-/// the version first, then none where nothing is missing; else the changegroup and its count of changesets.
+/// the version first, then none where nothing is missing; else its header (the version and the count of changesets),
+/// its payload made a step at a time ([`Walk`]).
 fn changegroup_part(
-  store: &impl Store,
   outgoing: &Outgoing,
   cg: Option<&[u8]>,
   caps: &Bundle2Capabilities<'_>,
-  admission: &mut Admission,
 ) -> Result<Option<Built>, Refusal> {
   if !flag(cg, true) || caps.iter().next().is_none() {
     return Ok(None);
   }
-  let (name, version) = changegroup_version(caps)?;
+  let (name, _) = changegroup_version(caps)?;
   if outgoing.missing.is_empty() {
     return Ok(None);
   }
-  let payload = changegroup(store, outgoing, version, admission)?;
   Ok(Some(Built {
     kind: b"CHANGEGROUP",
     mandatory: vec![(&b"version"[..], name.to_vec())],
@@ -270,8 +383,13 @@ fn changegroup_part(
       &b"nbchanges"[..],
       outgoing.missing.len().to_string().into_bytes(),
     )],
-    payload,
+    payload: Vec::new(),
   }))
+}
+
+/// The changegroup version the client and this server share ([`changegroup_version`]'s).
+fn version_of(caps: &Bundle2Capabilities<'_>) -> Result<Version, Refusal> {
+  changegroup_version(caps).map(|(_, version)| version)
 }
 
 /// The highest served changegroup version the client lists.
@@ -400,8 +518,29 @@ fn unencodable(what: &'static str) -> Refusal {
   Refusal::Unencodable { what }
 }
 
-/// Frames the parts as one bundle2 stream, its length charged before it is written.
-fn frame(parts: &[Built], admission: &mut Admission, out: &mut Vec<u8>) -> Result<(), Refusal> {
+/// A built part's header as part `id` of the stream.
+fn built_part(built: &Built, id: u32) -> Part<'_> {
+  let params = built
+    .mandatory
+    .iter()
+    .chain(&built.advisory)
+    .map(|(key, value)| Param {
+      key,
+      value: value.as_slice(),
+    })
+    .collect();
+  Part {
+    kind: built.kind,
+    id,
+    params,
+    mandatory_params: built.mandatory.len(),
+    depth: 0,
+  }
+}
+
+/// The parts after the changegroup, numbered from `first`, and the stream's end, their length charged before they are
+/// written.
+fn frame_after(parts: &[Built], first: u32, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
   // Format: a payload chunk's length is a signed 32-bit field, so a chunk holds at most `i32::MAX` bytes.
   let largest = usize::try_from(i32::MAX).unwrap_or(usize::MAX);
   let mut stream = Bundle2 {
@@ -410,22 +549,8 @@ fn frame(parts: &[Built], admission: &mut Admission, out: &mut Vec<u8>) -> Resul
     events: Vec::new(),
   };
   for (index, built) in parts.iter().enumerate() {
-    let params = built
-      .mandatory
-      .iter()
-      .chain(&built.advisory)
-      .map(|(key, value)| Param {
-        key,
-        value: value.as_slice(),
-      })
-      .collect();
-    stream.parts.push(Part {
-      kind: built.kind,
-      id: u32::try_from(index).unwrap_or(u32::MAX),
-      params,
-      mandatory_params: built.mandatory.len(),
-      depth: 0,
-    });
+    let id = first.saturating_add(u32::try_from(index).unwrap_or(u32::MAX));
+    stream.parts.push(built_part(built, id));
     stream.events.push(Event::Open(index));
     stream
       .events
@@ -434,7 +559,269 @@ fn frame(parts: &[Built], admission: &mut Admission, out: &mut Vec<u8>) -> Resul
   }
   let len = stream.encoded_len().map_err(|_| unencodable("a part"))?;
   admission.charge(len)?;
-  stream.encode(out).map_err(|_| unencodable("a part"))
+  let mut out = Vec::new();
+  stream
+    .encode_parts(&mut out)
+    .map_err(|_| unencodable("a part"))?;
+  Ok(out)
+}
+
+/// Whether a fetch of `outgoing` is walked by its links ([`Walk::begin`]): the view serves every changeset, and every
+/// one it serves is sent or descends to a common revision, which a bit each of the view, let go after, tells.
+fn by_links(
+  store: &impl Store,
+  outgoing: &Outgoing,
+  admission: &mut Admission,
+) -> Result<bool, Refusal> {
+  if !store.serves_every_changeset() {
+    return Ok(false);
+  }
+  let held = common_ancestors(store, &outgoing.common, admission)?;
+  let held_count = (0..store.count()).filter(|rev| held.contains(*rev)).count();
+  let covered = to_u64(held_count).saturating_add(outgoing.missing.len());
+  Ok(covered == u64::from(store.count()))
+}
+
+/// The changegroup of `outgoing` in `version`, its payload whole: [`Walk`]'s steps at once.
+pub fn changegroup(
+  store: &impl Store,
+  outgoing: &Outgoing,
+  version: Version,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refusal> {
+  let mut walk = Walk::begin(store, outgoing, version, admission)?;
+  let mut out = Vec::new();
+  while walk.step(store, admission, &mut out)? {}
+  Ok(out)
+}
+
+/// Where a changegroup's walk stands (A-745).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum At {
+  /// The changelog's group, from this served revision.
+  Changelog(Rev),
+  /// The manifest log, from this position.
+  Manifests(u64),
+  /// The file logs, from this path and position; the path whose group is open, its name written.
+  Files {
+    /// The path the walk resumes at.
+    path: Vec<u8>,
+    /// The position in its log.
+    position: u64,
+    /// The path whose group is open.
+    open: Option<Vec<u8>>,
+  },
+}
+
+/// A changegroup made a unit at a time from what the store holds (A-745; 7.2's `cgpacker` with its link-revision fast
+/// path, `fastpathlinkrev`): the missing changesets oldest first; the manifest log in its order, each revision whose
+/// link is a missing changeset, linked to it; then each file log in its path's order, each revision whose link is a
+/// missing changeset. A revision travels as its full text against the null base, which every reader takes
+/// (`mdiff.trivialdiffheader`). The walk holds its place alone: the missing changesets as ranges, and the log and
+/// position next. It never collects the paths the changesets touch: the file logs are walked from one to the next
+/// ([`Store::file_linked_from`]), and a log whose revisions no missing changeset links sends no group.
+pub struct Walk {
+  /// The changesets the client lacks.
+  missing: pull::Ranges,
+  /// The version written.
+  version: Version,
+  /// Where the walk stands; none once the changegroup's end is written.
+  at: Option<At>,
+  /// A fetch the links cannot walk ([`named_changegroup`]): its changegroup, made whole when it began, written in one
+  /// step.
+  named: Option<Vec<u8>>,
+}
+
+impl Walk {
+  /// A walk of the changegroup of `outgoing` in `version`, at its start: by the links where the fetch leaves no served
+  /// changeset neither sent nor held and the view serves every changeset (7.2's `fastpathlinkrev`, which it takes for
+  /// a fetch of every head), else by the changesets that name each revision, made whole within `admission`.
+  pub fn begin(
+    store: &impl Store,
+    outgoing: &Outgoing,
+    version: Version,
+    admission: &mut Admission,
+  ) -> Result<Walk, Refusal> {
+    let mut walk = Walk {
+      missing: outgoing.missing.clone(),
+      version,
+      at: Some(At::Changelog(0)),
+      named: None,
+    };
+    if !by_links(store, outgoing, admission)? {
+      walk.named = Some(named_changegroup(store, outgoing, version, admission)?);
+      walk.at = None;
+    }
+    Ok(walk)
+  }
+
+  /// Appends the next unit of the changegroup to `out`, a text lent charged to `room`: whether more follow.
+  pub fn step(
+    &mut self,
+    store: &impl Store,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    if let Some(named) = self.named.take() {
+      out.extend_from_slice(&named);
+      return Ok(false);
+    }
+    // A refused step leaves the walk where it was, so a step given more room takes the same unit again.
+    let Some(at) = self.at.clone() else {
+      return Ok(false);
+    };
+    self.at = match at {
+      At::Changelog(from) => self.changeset(store, from, room, out)?,
+      At::Manifests(position) => self.manifest(store, position, room, out)?,
+      At::Files {
+        path,
+        position,
+        open,
+      } => self.file(store, (path, position), open, room, out)?,
+    };
+    Ok(self.at.is_some())
+  }
+
+  /// The missing changeset at or after `from`, or the changelog group's end.
+  fn changeset(
+    &self,
+    store: &impl Store,
+    from: Rev,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<At>, Refusal> {
+    let Some(rev) = self.missing.next_from(from) else {
+      changegroup::put_end(out);
+      return Ok(Some(At::Manifests(0)));
+    };
+    let node = node_of(store, rev)?;
+    let [first, second] = parents_of(store, rev)?;
+    let parent =
+      |parent: Option<Rev>| parent.map_or(Ok(NULL_NODE), |parent| node_of(store, parent));
+    let parents = [parent(first)?, parent(second)?];
+    let text = store
+      .changeset_text(rev, room)?
+      .ok_or_else(no_changeset_text)?;
+    let (manifest, _) = read_changeset(&text)?;
+    if manifest != NULL_NODE && !store.holds_manifest(&manifest) {
+      return Err(no_manifest());
+    }
+    self.put((node, parents, node, 0), &text, room, out)?;
+    Ok(Some(At::Changelog(rev.saturating_add(1))))
+  }
+
+  /// The manifest at `position` where a missing changeset links it, or the manifest group's end.
+  fn manifest(
+    &self,
+    store: &impl Store,
+    position: u64,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<At>, Refusal> {
+    let Some(linked) = store.manifest_linked(position) else {
+      changegroup::put_end(out);
+      if self.version.has_tree_list() {
+        changegroup::put_end(out);
+      }
+      return Ok(Some(At::Files {
+        path: Vec::new(),
+        position: 0,
+        open: None,
+      }));
+    };
+    let next = Some(At::Manifests(position.saturating_add(1)));
+    let Some(link) = linked.link.filter(|link| self.missing.contains(*link)) else {
+      return Ok(next);
+    };
+    let logged = store
+      .manifest(&linked.node, room)?
+      .ok_or_else(no_manifest)?;
+    let link = node_of(store, link)?;
+    self.put(
+      (linked.node, logged.parents, link, logged.flags),
+      &logged.text,
+      room,
+      out,
+    )?;
+    Ok(next)
+  }
+
+  /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
+  /// one, the open group's end first where it is another path's), or the file list's end.
+  fn file(
+    &self,
+    store: &impl Store,
+    (path, position): (Vec<u8>, u64),
+    open: Option<Vec<u8>>,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<Option<At>, Refusal> {
+    let Some((found, position, linked)) = store.file_linked_from((&path, position)) else {
+      if open.is_some() {
+        changegroup::put_end(out);
+      }
+      changegroup::put_end(out);
+      return Ok(None);
+    };
+    let next = |open| At::Files {
+      path: found.clone(),
+      position: position.saturating_add(1),
+      open,
+    };
+    let Some(link) = linked.link.filter(|link| self.missing.contains(*link)) else {
+      return Ok(Some(next(open)));
+    };
+    let logged = store
+      .file(&found, &linked.node, room)?
+      .ok_or(Refusal::Store {
+        what: "a file revision",
+      })?;
+    if open.as_deref() != Some(found.as_slice()) {
+      if open.is_some() {
+        changegroup::put_end(out);
+      }
+      changegroup::put_name(&found, out).map_err(|_| unencodable("a path"))?;
+    }
+    let link = node_of(store, link)?;
+    self.put(
+      (linked.node, logged.parents, link, logged.flags),
+      &logged.text,
+      room,
+      out,
+    )?;
+    Ok(Some(next(Some(found.clone()))))
+  }
+
+  /// Appends one revision (its node, parents, link and flags) as its full text against the null base, its bytes
+  /// charged to `room` before they are written.
+  fn put(
+    &self,
+    (node, parents, link, flags): (Node, [Node; 2], Node, u16),
+    text: &[u8],
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refusal> {
+    room.charge(to_u64(delta::HUNK_HEADER_LEN.saturating_add(text.len())))?;
+    let mut data = Vec::new();
+    delta::encode_full_text(text, &mut data).map_err(|_| unencodable("a full text"))?;
+    let revision = Revision {
+      node,
+      p1: parents[0],
+      p2: parents[1],
+      base: NULL_NODE,
+      link,
+      flags: if self.version == Version::V02 {
+        0
+      } else {
+        flags
+      },
+      info: None,
+      protocol_flags: 0,
+      data: &data,
+      sidedata: None,
+    };
+    changegroup::put_revision(&revision, self.version, out).map_err(|_| unencodable("a revision"))
+  }
 }
 
 /// What one revision of the changegroup carries before its delta is written.
@@ -451,58 +838,26 @@ struct Entry<'s> {
   text: Cow<'s, [u8]>,
 }
 
-/// The changegroup of `outgoing` in `version`, encoded. Each missing changeset's text is lent once and each manifest's
-/// once (A-680): the changesets' entries hold their texts, which the paths they list are read from, and each path's
-/// file node is found in the text of the manifest's entry ([`manifest::find`]).
-pub fn changegroup(
+/// The changegroup of `outgoing` in `version` by the changesets that name each revision (7.2's `cgpacker` off its
+/// link-revision fast path), encoded whole: a fetch that leaves some served changeset neither sent nor held, or a view
+/// that hides some, whose revisions a link names past what the client holds after it. Bounded by what the fetch
+/// sends, never the repository. Each missing changeset's text is lent once and each manifest's once (A-680): the
+/// changesets' entries hold their texts, which the paths they list are read from, and each path's file node is found
+/// in the text of the manifest's entry ([`manifest::find`]).
+pub(crate) fn named_changegroup(
   store: &impl Store,
   outgoing: &Outgoing,
   version: Version,
   admission: &mut Admission,
 ) -> Result<Vec<u8>, Refusal> {
   let held = common_ancestors(store, &outgoing.common, admission)?;
-  let changelog = changelog_entries(store, &outgoing.missing, admission)?;
+  let missing: Vec<Rev> = outgoing.missing.iter().collect();
+  admission.charge_items::<Rev>(missing.len())?;
+  let changelog = changelog_entries(store, &missing, admission)?;
   let (manifests, files) = named_revisions(store, &changelog, &held, admission)?;
   let mut groups: Vec<(&[u8], Vec<Entry<'_>>)> = Vec::with_capacity(files.len());
   groups.extend(files);
   encode_changegroup(version, &changelog, &manifests, &groups, admission)
-}
-
-/// The revisions every common revision descends from: the common revisions and all their ancestors.
-fn common_ancestors(
-  store: &impl Store,
-  common: &[Rev],
-  admission: &mut Admission,
-) -> Result<RevSet, Refusal> {
-  let mut held = RevSet::new(store.count(), admission)?;
-  let Some(top) = common.iter().copied().max() else {
-    return Ok(held);
-  };
-  for rev in common {
-    held.insert(*rev);
-  }
-  for rev in (0..=top).rev() {
-    if held.contains(rev) {
-      for parent in parents_of(store, rev)?.into_iter().flatten() {
-        held.insert(parent);
-      }
-    }
-  }
-  Ok(held)
-}
-
-/// The refusal of a store that lacks a changeset's text, or holds one no reader takes.
-fn no_changeset_text() -> Refusal {
-  Refusal::Store {
-    what: "a changeset's text",
-  }
-}
-
-/// The refusal of a store that lacks a manifest revision, or holds one no reader takes.
-fn no_manifest() -> Refusal {
-  Refusal::Store {
-    what: "a manifest revision",
-  }
 }
 
 /// The missing changesets' entries, oldest first, each linked to itself and holding its text, lent once.
@@ -718,6 +1073,43 @@ fn encode_changegroup(
     .encode(&mut out)
     .map_err(|_| unencodable("a changegroup"))?;
   Ok(out)
+}
+
+/// The revisions every one of `revs` descends from: themselves and all their ancestors, a bit each of the view.
+fn common_ancestors(
+  store: &impl Store,
+  revs: &[Rev],
+  admission: &mut Admission,
+) -> Result<RevSet, Refusal> {
+  let mut held = RevSet::new(store.count(), admission)?;
+  let Some(top) = revs.iter().copied().max() else {
+    return Ok(held);
+  };
+  for rev in revs {
+    held.insert(*rev);
+  }
+  for rev in (0..=top).rev() {
+    if held.contains(rev) {
+      for parent in parents_of(store, rev)?.into_iter().flatten() {
+        held.insert(parent);
+      }
+    }
+  }
+  Ok(held)
+}
+
+/// The refusal of a store that lacks a changeset's text, or holds one no reader takes.
+fn no_changeset_text() -> Refusal {
+  Refusal::Store {
+    what: "a changeset's text",
+  }
+}
+
+/// The refusal of a store that lacks a manifest revision, or holds one no reader takes.
+fn no_manifest() -> Refusal {
+  Refusal::Store {
+    what: "a manifest revision",
+  }
 }
 
 /// The markers relevant to the ancestors of `heads` (`obsstore.relevantmarkers`), sorted.

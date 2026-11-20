@@ -42,8 +42,9 @@ use super::hg_import::room_of;
 use crate::repository::svn_commit::{self, Uncommitted};
 use crate::state::ShardState;
 
+// Its import helpers serve the export's tests too (`crate::repository::svn_export`, A-652 part 3).
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Counter: an import started, its file open. Format: a counter name in the status report.
 pub(crate) const STARTED: &str = "vcs_store.svn_import.started";

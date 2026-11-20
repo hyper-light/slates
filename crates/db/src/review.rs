@@ -525,6 +525,7 @@ mod tests {
   fn created(serial: u8) -> Op {
     Op::RepositoryCreated {
       record: RepositoryRecord {
+        index_bits: 0,
         id: repository_id(serial),
         name: format!("repository-{serial}"),
         tool: VcsTool::Git,

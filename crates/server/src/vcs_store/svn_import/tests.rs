@@ -24,11 +24,11 @@ use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
 /// Format 2, revisions 0 to 3 (`svnadmin dump -r 0:3`), A-593's golden vector.
-const PART1: &[u8] = include_bytes!("../../../../svn/fixtures/dump/part1.dump");
+pub(crate) const PART1: &[u8] = include_bytes!("../../../../svn/fixtures/dump/part1.dump");
 /// Format 3, revisions 4 on, as changes (`svnadmin dump --deltas --incremental -r 4:13`).
-const PART2: &[u8] = include_bytes!("../../../../svn/fixtures/dump/part2.dump");
+pub(crate) const PART2: &[u8] = include_bytes!("../../../../svn/fixtures/dump/part2.dump");
 /// Format 2, every revision whole (`svnadmin dump`): what the two parts make together.
-const FULL: &[u8] = include_bytes!("../../../../svn/fixtures/dump/full.dump");
+pub(crate) const FULL: &[u8] = include_bytes!("../../../../svn/fixtures/dump/full.dump");
 
 /// Shape: the dump's file name on the simulated host.
 const DUMP: &str = "repository.dump";
@@ -40,7 +40,7 @@ const PATH: &str = "/dumps/repository.dump";
 const PART1_LAST: u64 = 3;
 
 /// Shape: the youngest revision of `full.dump`.
-const FULL_LAST: u64 = 13;
+pub(crate) const FULL_LAST: u64 = 13;
 
 /// Shape: how many turns a test lets an import take before it gives up: far past a debug build's turns over the
 /// vectors (one revision or a slice a unit), so only an import that never ends reaches it.
@@ -59,7 +59,7 @@ const NO_CLIENT: u32 = 4096;
 const TASK_WAIT: Duration = Duration::from_secs(60);
 
 /// The repository's owner.
-fn owner() -> Principal {
+pub(crate) fn owner() -> Principal {
   Principal::Uid {
     host: slates_db::HostId(0),
     uid: 1234,
@@ -67,7 +67,7 @@ fn owner() -> Principal {
 }
 
 /// Creates Subversion repository `name` on the shard: its id and its one green.
-fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
+pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
   let reply = dispatch(
     state,
     1,
@@ -98,7 +98,7 @@ fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
 
 /// Imports `dump` into repository `id` on the shard, a turn at a time, to its end: what the turns ended with, and how
 /// many there were.
-fn imported(
+pub(crate) fn imported(
   state: &mut ShardState,
   id: RepositoryId,
   dump: &[u8],
@@ -256,6 +256,7 @@ fn t_a652_the_records_an_import_committed_are_made_again_from_the_log() {
     assert!(imported(state, svn, PART1).0.is_ok());
     let replayed = count(state, crate::vcs_store::REPLAYED);
     crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
     assert_eq!(state.vcs_stores.unrecovered(svn), None);
     assert!(
       history(state, svn) == Some((PART1_LAST, PART1.to_vec())),

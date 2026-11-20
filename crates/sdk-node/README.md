@@ -82,6 +82,7 @@ client.chmod(work.id, '/dir/notes.txt', 0o600);
 client.symlink(work.id, '/dir/link', 'notes.txt');
 client.link(work.id, '/dir/hard.txt', '/dir/notes.txt');
 client.setXattr(work.id, '/dir/notes.txt', 'user.tag', Buffer.from('v'));
+client.copy(work.id, '/dir', '/dir-copy'); // by reference, from the work's base (version, replace optional)
 // also: unlink, rmdir, removeXattr
 
 const outcome = client.submit(work.id);

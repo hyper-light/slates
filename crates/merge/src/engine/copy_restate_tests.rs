@@ -3,7 +3,7 @@
 //! a version, then edits and files made in it, or a rename out of it or a link into it), based behind the head. Each
 //! must rebase as it submits: a copy and what its work does in the copied tree restate cleanly, and the restated journal
 //! composed again over the head and submitted gives the green the original submit gives; a rename or a hard link with an
-//! end in a copied tree is refused (`TypeChanged`) by both.
+//! end in a copied tree is refused alike by both, typed (`CopyRefusal::LinkAcrossCopy`, main's ruling of 2026-11-20).
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -14,7 +14,6 @@ use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use super::{Green, Increment, Outcome, Rebased};
 use crate::increment::{VolumeOp, compose_volume_planned};
 use crate::ops_doc::OpKind;
-use crate::verdict::MergeConflictClass;
 
 /// Shape: the trunk's files at version 1, then the head's change at version 2 (`trunk/c`'s first byte), so a copy from
 /// version 1 brings bytes its source no longer holds.
@@ -284,24 +283,25 @@ struct Census {
   links_in_refused: u64,
 }
 
-/// Whether the windows name a type change (A-586: a rename out of a copied tree, a link into one), among any others the
-/// work's other steps add: an edit of the file it then renames out adds a delete against modify on the rename's
-/// destination, whose source the base never held (the oracle's first run, kiln r193, Mac Studio).
-fn refused_typed(windows: &[super::ConflictWindow]) -> bool {
-  windows
-    .iter()
-    .any(|window| window.class == MergeConflictClass::TypeChanged)
-}
-
 /// The oracle on one work: rebase on one fixture, submit on a twin; refused alike, or the restated journal, composed
 /// again over the head with the rebased work's files, submitted on a third twin, giving the twin's green.
 fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
   let (rebasing, mut accepting) = (fixture()?, fixture()?);
   let increment = compose(&rebasing, (1, 9), &work.journal, &work.files)?;
   match (rebasing.rebase(&increment), accepting.submit(&increment)) {
-    (Rebased::Conflict { windows }, Outcome::Conflict { windows: refused }) if work.refused => {
-      if !refused_typed(&windows) || windows != refused {
-        return Err(format!("refused otherwise: {windows:?} and {refused:?}"));
+    (
+      Rebased::CopyRefused { path, case },
+      Outcome::CopyRefused {
+        path: refused_path,
+        case: refused_case,
+      },
+    ) if work.refused => {
+      if case != crate::engine::CopyRefusal::LinkAcrossCopy
+        || (&path, case) != (&refused_path, refused_case)
+      {
+        return Err(format!(
+          "refused otherwise: {path} {case:?} and {refused_path} {refused_case:?}"
+        ));
       }
       let renamed = work
         .journal

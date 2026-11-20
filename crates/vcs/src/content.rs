@@ -168,6 +168,18 @@ pub trait WindowStorage: std::fmt::Debug {
   fn read(&self, window: StoredWindow) -> Option<Cow<'_, [u8]>>;
   /// Lets the bytes kept under `window` go.
   fn release(&mut self, window: StoredWindow);
+
+  /// Takes in `lent`, when it is what this storage keeps its windows in and none is lent to it now (A-727: the shard's
+  /// chunk store, lent for one step), leaving what it held in its place: whether it took it. A storage that keeps its
+  /// windows itself takes nothing.
+  fn lend_in(&mut self, _lent: &mut dyn std::any::Any) -> bool {
+    false
+  }
+
+  /// Hands back what [`WindowStorage::lend_in`] took, exchanging it with `lent` again: whether it held one.
+  fn hand_back(&mut self, _lent: &mut dyn std::any::Any) -> bool {
+    false
+  }
 }
 
 /// The windows kept in the process's memory: the storage of a store made with [`ContentStore::new`], for tests and
@@ -815,6 +827,17 @@ impl ContentStore {
     }
   }
 
+  /// Lends `lent` to the window storage for one step (A-727): whether it took it ([`WindowStorage::lend_in`]). The
+  /// lender hands it back with [`ContentStore::hand_back`] once the step ends.
+  pub fn lend_in(&mut self, lent: &mut dyn std::any::Any) -> bool {
+    self.storage.lend_in(lent)
+  }
+
+  /// Hands back what [`ContentStore::lend_in`] lent: whether the storage held one.
+  pub fn hand_back(&mut self, lent: &mut dyn std::any::Any) -> bool {
+    self.storage.hand_back(lent)
+  }
+
   /// A store whose windows are kept by `storage` (A-727: the daemon's shard repository arena), otherwise as
   /// [`ContentStore::new`] makes one.
   ///
@@ -865,12 +888,26 @@ impl ContentStore {
     if index >= windows {
       return None;
     }
-    let mut height = 0_u32;
-    let mut nodes = windows;
-    while nodes > 1 {
-      nodes = nodes.div_ceil(fanout);
-      height = height.checked_add(1)?;
+    let height = list_levels(windows, fanout)?;
+    let identity = self.window_identity(root, (height, fanout), index)?;
+    let held = self
+      .entries
+      .get(&identity)
+      .filter(|held| held.form == Form::Window)?;
+    match held_window(held) {
+      Some(window) => self.storage.read(window),
+      None => held.here().map(Cow::Borrowed),
     }
+  }
+
+  /// The identity of window `index` under `root`, read down the one list a level of a tree `height` lists deep, each of
+  /// `fanout` children: at each level the child is that level's digit of `index` in the fanout's base.
+  fn window_identity(
+    &self,
+    root: &ContentId,
+    (height, fanout): (u32, u64),
+    index: u64,
+  ) -> Option<ContentId> {
     let mut identity = *root;
     for level in (0..height).rev() {
       let span = fanout.checked_pow(level)?;
@@ -883,14 +920,7 @@ impl ContentStore {
       let to = from.checked_add(IDENTITY_BYTES)?;
       identity = list.here()?.get(from..to).and_then(ContentId::from_slice)?;
     }
-    let held = self
-      .entries
-      .get(&identity)
-      .filter(|held| held.form == Form::Window)?;
-    match held_window(held) {
-      Some(window) => self.storage.read(window),
-      None => held.here().map(Cow::Borrowed),
-    }
+    Some(identity)
   }
 
   /// An object's bytes, read whole from its root, or `None` when the store does not hold its tree whole.
@@ -1086,6 +1116,17 @@ impl<'s> Iterator for Windows<'s> {
       self.stack.push((held.here()?, 0));
     }
   }
+}
+
+/// How many levels of lists sit above `windows` windows, each list naming `fanout` children: none for one window.
+fn list_levels(windows: u64, fanout: u64) -> Option<u32> {
+  let mut height = 0_u32;
+  let mut nodes = windows;
+  while nodes > 1 {
+    nodes = nodes.div_ceil(fanout);
+    height = height.checked_add(1)?;
+  }
+  Some(height)
 }
 
 #[cfg(test)]

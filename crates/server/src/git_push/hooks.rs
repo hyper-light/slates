@@ -274,7 +274,9 @@ impl PushHooks {
     if !sealed {
       return Turn::Sealing;
     }
-    let Some(root) = presenter.present(state, &open.view) else {
+    // A presentation reads the view's files from the repository's windows, so the shard's chunk store is lent to it.
+    let shown = crate::vcs_store::lent_state(state, |state| presenter.present(state, &open.view));
+    let Some(root) = shown else {
       self.close(state, presenter);
       return Turn::NotRun(b"nothing shows its view here".to_vec());
     };
@@ -371,7 +373,7 @@ pub(super) fn before<P: PresentView>(
             room_of(&push.admission),
           );
           push.answer = AnswerState::Hooking(Box::new(hooking));
-          return Ok(Answering::Hook(call));
+          return Ok(Answering::Hook(Box::new(call)));
         }
         hooking.hooks.close(state, &mut push.presenter);
         not_run(
@@ -545,7 +547,7 @@ pub(super) fn observe<P: PresentView>(
         room_of(&push.admission),
       );
       push.answer = AnswerState::Observing(Box::new(observing));
-      Ok(Answering::Hook(call))
+      Ok(Answering::Hook(Box::new(call)))
     }
     Turn::NotRun(_) => {
       state.count(POST_RECEIVE_UNACCEPTED, 1);
@@ -557,7 +559,7 @@ pub(super) fn observe<P: PresentView>(
 /// The report's last flush, and the answer.
 fn finish(received: Received, out: &mut impl Out) -> Result<Answering, PushFailed> {
   write_report_end(&received, out).map_err(PushFailed::Exchange)?;
-  Ok(Answering::Answered(received))
+  Ok(Answering::Answered(Box::new(received)))
 }
 
 /// Takes what the hook the last step handed the edge answered (the module docs): its view's showing

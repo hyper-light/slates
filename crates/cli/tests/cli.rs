@@ -1984,6 +1984,52 @@ fn json_merge_queries(instance: &str) {
     "submit json accepted: {out}"
   );
   json_merge_reader(instance, &green);
+  merge_copy(instance, &green);
+}
+
+/// The copy's source: a work lands `/c/x.txt` holding `copied` on `green`.
+fn land_the_copys_source(instance: &str, green: &str) {
+  let (code, out, err) = run(instance, &["work", green, "worksource"]);
+  assert_eq!(code, 0, "{err}");
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["edit", &work, "/c/x.txt", "0", "0", "copied"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"accepted\":true"), "the source lands: {out}");
+}
+
+/// A copy through the CLI (A-626 part 4): a work lands `/c/x.txt`; another declares `copy WORK /c /e` from its base and
+/// submits; a read of `/e/x.txt` at the green's head streams the copied bytes.
+fn merge_copy(instance: &str, green: &str) {
+  land_the_copys_source(instance, green);
+  let (code, out, err) = run(instance, &["work", green, "workcopy"]);
+  assert_eq!(code, 0, "{err}");
+  let work = value_of(&out, "id");
+  let (code, out, err) = run(instance, &["copy", &work, "/c", "/e", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"declared\":true"),
+    "the copy is declared: {out}"
+  );
+  let (code, out, err) = run(instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"accepted\":true"), "the copy lands: {out}");
+  let (code, out, err) = run(instance, &["read", green, "/e/x.txt"]);
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(out, "copied", "the copied file streams at the head");
+  // A copy of nothing is refused before any verdict, typed by its case (A-586).
+  let (code, out, err) = run(instance, &["work", green, "worknothing"]);
+  assert_eq!(code, 0, "{err}");
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["copy", &work, "/nothing", "/z"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, _, err) = run(instance, &["submit", &work]);
+  assert_eq!(code, 1, "the copy of nothing is refused: {err}");
+  assert!(
+    err.contains("CopyRefused") && err.contains("SourceEmpty"),
+    "{err}"
+  );
 }
 
 /// A green reader through the CLI (§4.16 "Attachments and versions"; AC-6.13/T-6.15): `attach GREEN

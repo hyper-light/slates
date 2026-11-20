@@ -76,6 +76,87 @@ pub struct DbStats {
   pub recovery_budget_ns: u64,
   /// The floor: the last snapshot's size, which the tail must reach before the next one.
   pub snapshot_floor_bytes: u64,
+  /// The log since the last snapshot, by what its records carry (A-745).
+  pub tail_split: RegisterSplit,
+  /// The last snapshot, by what it holds (A-745).
+  pub snapshot_split: RegisterSplit,
+}
+
+/// A partition's register bytes by what they carry (A-745, main's ruling of 2026-11-20: split the log ring and the
+/// snapshot slots by record kind before choosing the next content-once step): repository records (a repository entry's
+/// objects, a Subversion revision's texts among them; in a snapshot the repository registers), green chain entries
+/// (an increment's file bytes: an advance, an origin, and the chain entries a repository entry carries for its greens;
+/// in a snapshot the chains), checkpoints, and the rest (records' framing and every other kind).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegisterSplit {
+  /// Repository records: objects (texts) and, in a snapshot, the repository registers.
+  pub repository_records: u64,
+  /// Green chain entries: increments' bytes.
+  pub chain_entries: u64,
+  /// Green checkpoints.
+  pub checkpoints: u64,
+  /// Everything else.
+  pub rest: u64,
+}
+
+impl RegisterSplit {
+  /// Adds a record of `bytes` appended for `entry`: what its operations carry, by kind, and the rest of its bytes.
+  fn add_entry(&mut self, entry: &LogEntry, bytes: u64) {
+    let wide = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    let mut carried = RegisterSplit::default();
+    for op in entry.ops() {
+      match op {
+        Op::GreenAdvanced { increment, .. } => {
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(increment.len()));
+        }
+        Op::GreenOriginated { origin, .. } => {
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(origin.len()));
+        }
+        Op::GreenCheckpointed { checkpoint, .. } => {
+          carried.checkpoints = carried.checkpoints.saturating_add(wide(checkpoint.len()));
+        }
+        Op::RepositoryAdvanced { entry } => {
+          carried.repository_records = carried
+            .repository_records
+            .saturating_add(wide(entry.objects.len()));
+          let versions = entry
+            .versions
+            .iter()
+            .map(|version| version.entry.len())
+            .fold(0usize, usize::saturating_add);
+          carried.chain_entries = carried.chain_entries.saturating_add(wide(versions));
+        }
+        _ => {}
+      }
+    }
+    let known = carried
+      .repository_records
+      .saturating_add(carried.chain_entries)
+      .saturating_add(carried.checkpoints);
+    self.repository_records = self
+      .repository_records
+      .saturating_add(carried.repository_records);
+    self.chain_entries = self.chain_entries.saturating_add(carried.chain_entries);
+    self.checkpoints = self.checkpoints.saturating_add(carried.checkpoints);
+    self.rest = self.rest.saturating_add(bytes.saturating_sub(known));
+  }
+
+  /// A snapshot of `total` bytes by what it holds: each kind's field encoded length, the rest the remainder.
+  fn of_snapshot(snapshot: &PartitionSnapshot, total: u64) -> RegisterSplit {
+    let wide = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    let repository_records = wide(snapshot.repository_registers.encoded_len());
+    let chain_entries = wide(snapshot.green_chains.encoded_len());
+    let checkpoints = wide(snapshot.green_checkpoints.encoded_len());
+    RegisterSplit {
+      repository_records,
+      chain_entries,
+      checkpoints,
+      rest: total
+        .saturating_sub(repository_records)
+        .saturating_sub(chain_entries)
+        .saturating_sub(checkpoints),
+    }
+  }
 }
 
 /// What recovery found.
@@ -471,22 +552,32 @@ impl Db {
     op: &Op,
     now_ns: u64,
   ) -> Result<u64, DbError> {
-    self.partition.check(op, now_ns)?;
+    self.mutate_owned(segment, op.clone(), now_ns)
+  }
+
+  /// [`Db::mutate`] of an operation the caller gives up: it moves into the log entry (or the transaction) instead of
+  /// being copied, so a large one (a repository entry carrying a revision, a green's checkpoint) is held once while it is
+  /// logged and applied (A-742: the copy was 202 MiB of large temporaries in a 1,000-revision import).
+  pub fn mutate_owned(
+    &mut self,
+    segment: &mut AnchorSegment,
+    op: Op,
+    now_ns: u64,
+  ) -> Result<u64, DbError> {
+    self.partition.check(&op, now_ns)?;
     self.last_now_ns = now_ns;
     if self.pending.is_some() {
       // Inside a transaction: applied now (later operations see it), logged at the commit.
-      self.apply_timed(op)?;
+      self.apply_timed(&op)?;
       if let Some(pending) = self.pending.as_mut() {
-        pending.push(op.clone());
+        pending.push(op);
       }
       let made = self.partition.take_state_log_records();
       self.logged_in_transaction.extend(made);
       return Ok(self.next_seq);
     }
     let seq = self.next_seq;
-    let entry = LogEntry {
-      ops: vec![op.clone()],
-    };
+    let entry = LogEntry { ops: vec![op] };
     // A-724 piece 8: past the slot's projected room, the state so far is snapshotted now, measured exactly; if the
     // record still would not fit beside it, the mutation is refused, typed, with nothing applied.
     if self.past_snapshot_room(segment, &entry) {
@@ -511,13 +602,17 @@ impl Db {
       }
       Err(e) => return Err(e),
     };
-    let applied = timed(&mut work_ns, || self.partition.apply(op));
+    let applied = match entry.ops.first() {
+      Some(op) => timed(&mut work_ns, || self.partition.apply(op)),
+      None => Ok(()),
+    };
     self.charge_replay_work(work_ns);
     applied?;
     let made = self.partition.take_state_log_records();
     self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(seq)
@@ -601,6 +696,7 @@ impl Db {
     self.logged.extend(made);
     self.next_seq = seq.saturating_add(1);
     self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    self.stats.tail_split.add_entry(&entry, bytes);
     self.stats.log_bytes_appended = self.stats.log_bytes_appended.saturating_add(bytes);
     self.maintain(segment);
     Ok(Some(seq))
@@ -715,6 +811,8 @@ impl Db {
     }
     segment.publish(RegionKind::Snapshot(self.index, self.next_slot), &bytes)?;
     let snapshot_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.stats.snapshot_split = RegisterSplit::of_snapshot(&snapshot, snapshot_bytes);
+    self.stats.tail_split = RegisterSplit::default();
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     // The next snapshot's floor (A-243): the tail must reach this one's size first.
     self.snapshot_floor_bytes = snapshot_bytes;
@@ -779,6 +877,59 @@ mod tests {
   };
   use slates_anchor::Geometry;
   use slates_machine::facts::Identity;
+
+  /// A-745. Do: split a record of a green's advance (100 bytes), a checkpoint (300) and a repository entry carrying
+  /// 500 bytes of objects and two chain entries (70 and 30 bytes), appended as `extra` bytes more than they carry; then
+  /// another such record. Expect: the chain entries 200 a record, the checkpoints 300, the repository records 500, the
+  /// rest the record's other bytes, summed over both records; a record carrying less than its bytes leaves nothing out.
+  #[test]
+  fn a_records_bytes_split_by_what_its_operations_carry() {
+    let green = VolumeId::default();
+    let entry = LogEntry {
+      ops: vec![
+        Op::GreenAdvanced {
+          green,
+          increment: vec![0; 100],
+        },
+        Op::GreenCheckpointed {
+          green,
+          version: 1,
+          checkpoint: vec![0; 300],
+        },
+        Op::RepositoryAdvanced {
+          entry: crate::catalog::RepositoryEntry {
+            objects: vec![0; 500],
+            versions: vec![
+              crate::catalog::GreenVersion {
+                green,
+                version: 2,
+                entry: vec![0; 70],
+              },
+              crate::catalog::GreenVersion {
+                green,
+                version: 3,
+                entry: vec![0; 30],
+              },
+            ],
+            ..crate::catalog::RepositoryEntry::default()
+          },
+        },
+      ],
+    };
+    let extra = 64u64;
+    let mut split = RegisterSplit::default();
+    split.add_entry(&entry, 1_000 + extra);
+    split.add_entry(&entry, 1_000 + extra);
+    assert_eq!(
+      split,
+      RegisterSplit {
+        repository_records: 1_000,
+        chain_entries: 400,
+        checkpoints: 600,
+        rest: 2 * extra,
+      }
+    );
+  }
 
   /// Shape: the segment page.
   const PAGE: u64 = 4096;

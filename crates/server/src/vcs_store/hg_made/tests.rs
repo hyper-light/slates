@@ -64,7 +64,7 @@ fn parent_of(state: &ShardState, repository: RepositoryId, node: &Node) -> Optio
 
 /// A client's push of a changeset adding `pushed.txt` over `parent`: its node, landed as the driver lands it.
 fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> Node {
-  let verified = {
+  let verified = crate::vcs_store::lent_state(state, |state| {
     let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
     let authored = Authored {
       user: b"Client <c@example.com>",
@@ -84,7 +84,7 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
       &mut Admission::new(u64::MAX),
     )
     .unwrap()
-  };
+  });
   let (changeset, manifest) = (&verified.changesets[0], &verified.manifests[0]);
   let (path, files) = &verified.files[0];
   let one = Made {
@@ -102,9 +102,14 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
     }],
   };
   let (_, part) = unbundle.changegroup().unwrap();
-  let forked = take_whole(state, repository, part, &mut Admission::new(u64::MAX))
-    .unwrap()
-    .unwrap();
+  let forked = take_whole(
+    state,
+    repository,
+    (part.version, part.payload.clone()),
+    &mut Admission::new(u64::MAX),
+  )
+  .unwrap()
+  .unwrap();
   let landed = land_in(
     state,
     repository,
@@ -150,17 +155,27 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
     let second = head_of(state, green).expect("the second submit made a changeset");
     assert_eq!(parent_of(state, repository, &second), Some(pushed));
     assert_eq!(state.refusals.get(MADE).copied(), Some(2));
-    crate::vcs_store::rebuild_whole(state, repository);
-    assert_eq!(
-      head_of(state, green),
-      Some(second),
-      "the made node from the record"
-    );
-    for node in [first, pushed, second] {
-      assert!(
-        parent_of(state, repository, &node).is_some(),
-        "{node:?} not held after the rebuild"
-      );
-    }
+    assert_rebuilt_from_the_log(state, (repository, green), [first, pushed, second]);
   });
+}
+
+/// `repository`'s store made again from its log: `green`'s head still the last changeset of `held`, the made node
+/// put back from the record, and every changeset of `held` held.
+fn assert_rebuilt_from_the_log(
+  state: &mut ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  held: [Node; 3],
+) {
+  crate::vcs_store::rebuild_whole(state, repository);
+  assert_eq!(
+    head_of(state, green),
+    Some(held[2]),
+    "the made node from the record"
+  );
+  for node in held {
+    assert!(
+      parent_of(state, repository, &node).is_some(),
+      "{node:?} not held after the rebuild"
+    );
+  }
 }
