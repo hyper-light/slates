@@ -1725,6 +1725,77 @@ fn a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_seal
   assert_eq!(of("refused"), 0, "no write was refused: {counters:?}");
 }
 
+/// A live write ships what it changed (w-forming, 2026-11-20; found by use: 32 KiB NFS writes to a 3 MiB live file
+/// shipped about 245 KB of delta each, 54 MB over 221 appends, since a delta carried every content window a write
+/// touched). Do fill a live volume's file to three MiB with stable NFS writes of 32 KiB, then make [`PAGE_WRITES`] page
+/// writes spread over it. Expect the delta bytes the owner shipped for them (`fleet.live.change_bytes`) within the bytes
+/// written plus a page of record a publication. Before, each page write shipped its whole window.
+#[test]
+fn a_live_write_ships_the_bytes_it_changed_not_its_window() {
+  /// Shape: the fill's writes, 32 KiB each, three MiB in all.
+  const FILL_WRITES: u64 = 96;
+  /// Shape: the fill's write bytes.
+  const FILL_BYTES: usize = 32 << 10;
+  /// Shape: the measured writes, one page each.
+  const PAGE_WRITES: u64 = 64;
+  /// Shape: a measured write's bytes.
+  const PAGE_BYTES: usize = 4096;
+  /// Shape: what a publication carries beside the bytes it changed (its volume record, the patched inode's image, the
+  /// payload's framing), allowed per publication: a page.
+  const RECORD_ALLOWANCE: u64 = 4096;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live write-amplification flow: set SLATES_TEST_CLI=1 to run it (three daemons)"
+    );
+    return;
+  }
+  let fleet = start_fleet("live-write-bytes");
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
+  let (mut live, file, _id) = stable_session(owner, "write-bytes", true);
+  let fill = vec![0x3c_u8; FILL_BYTES];
+  let page = vec![0xc3_u8; PAGE_BYTES];
+  let mut xid = 100;
+  let fill_step = u64::try_from(FILL_BYTES).unwrap();
+  for index in 0..FILL_WRITES {
+    xid += 1;
+    let status = nfs::write_at_status(&mut live, &file, index * fill_step, &fill, xid);
+    assert_eq!(status, 0, "the fill write at {index} was answered");
+  }
+  let before = live_counters(owner);
+  let span = FILL_WRITES * fill_step / PAGE_WRITES;
+  for index in 0..PAGE_WRITES {
+    xid += 1;
+    let status = nfs::write_at_status(&mut live, &file, index * span + 512, &page, xid);
+    assert_eq!(status, 0, "the page write at {index} was answered");
+  }
+  let after = live_counters(owner);
+  drop(live);
+  drop(fleet.daemons);
+  drop(fleet.scratch);
+  let grew = |name: &str| {
+    after
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+      .saturating_sub(before.get(name).copied().unwrap_or(0))
+  };
+  let (shipped, appended) = (grew("change_bytes"), grew("appended"));
+  let written = PAGE_WRITES * u64::try_from(PAGE_BYTES).unwrap();
+  let bound = written + appended * RECORD_ALLOWANCE;
+  eprintln!(
+    "live write bytes: {PAGE_WRITES} page writes, {written} bytes written; {appended} appended, {shipped} bytes shipped \
+     (bound {bound}); whole {}",
+    grew("whole")
+  );
+  assert!(appended >= 1, "the writes were shipped: {after:?}");
+  assert!(
+    shipped <= bound,
+    "the deltas shipped what the writes changed: {shipped} bytes for {written} written in {appended} appends, bound \
+     {bound}"
+  );
+}
+
 /// A-200, AC-8.9: a candidate's copy of a live log stays within its bound however long the writer runs. Do make stable
 /// NFS writes to a live volume bounded at 1 MiB until the changes shipped are three times its size. Expect every write
 /// answered, no candidate refusing an entry for its bound, and whole records shipped as the changes grow: a candidate

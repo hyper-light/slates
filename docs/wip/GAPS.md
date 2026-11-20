@@ -3068,7 +3068,9 @@
 >   more than one piece is now captured at the head, sealed in turns of an `ImageBuild` and made the image if the head
 >   has not moved (else dropped, still owed). **Still measured, debug under `taskpolicy -b` on main 359da2388:** a
 >   takeover's `make_taken` 38 ms of one poll's CPU; a forward-lane child 17 ms; the record period's capture of an owed
->   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall); and, after A-347's open, the takeover's
+>   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall. **A-763 (2026-11-20):** a live write ships the
+>   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
+>   309,760 after)); and, after A-347's open, the takeover's
 >   restore (`slates_archive::restore` in `verbs::materialize_taken_over`) lays the whole archive out in the one turn
 >   that makes the volume, and the sealed manifest is opened in one turn (its cost grows with the entries).
 >   **The live takeover's half closed 2026-11-18 (A-374, g251):** the nemesis's watchdog kills of successors ("shard 1 is
