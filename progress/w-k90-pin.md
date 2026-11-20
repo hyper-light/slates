@@ -46,3 +46,9 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   says + "Slates tests" step on macos-latest/windows-11-arm/ubuntu-24.04-arm; linux job tests whatever Clippy says;
   slates_roles compile fix (Made.shared, E0063 since 6965eaf63); UI mock.
 - Local macOS lane 2 (lane2.sh, log lane2-macos.log) on the merged tree: running.
+- LANDED kiln main 9d87d2a9d..ca1a0302e (af5ae609b + merges; merge-base confirmed). Local macOS arm64 (Mac Studio 2,
+  merged tree 5ec015dc0 = af21030a8's crates): --lib workspace::slates 57 passed; slates_roles 1 passed
+  (w1_kiln_runs_its_slates_instance_...); vendored 11 passed.
+- CAUTION: ~/kiln-work/w-k90-pin-kiln's local main holds scratch commits (2898dfe42, fb5062a85, a "local:" commit):
+  never push it. Landing worktree: ~/kiln-work/w-k90-pin-land.
+- NEXT: GitHub ci.yml run on ca1a0302e (api.github.com, unauthenticated; 60/h shared): per lane Build + Slates tests.
