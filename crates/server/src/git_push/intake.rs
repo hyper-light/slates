@@ -86,12 +86,12 @@ impl Contents for Quarantined<'_> {
   fn content(&self, _at: usize, id: &ObjectId) -> Option<Cow<'_, [u8]>> {
     let (number, content, len) = self.push?.object(id)?;
     kind_of(number)?;
-    // An object of one window is that window in the store: lent with no copy.
+    // An object of one window is that window in the store: lent with no copy where the store lends it (A-727 a1).
     let mut windows = self.store.windows(&content);
     if let (Some(window), None) = (windows.next(), windows.next())
       && u64::try_from(window.len()).ok() == Some(len)
     {
-      return Some(Cow::Borrowed(window));
+      return Some(window);
     }
     self.store.object_bytes(&content, len).map(Cow::Owned)
   }
