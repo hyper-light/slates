@@ -1087,6 +1087,22 @@ impl Index {
     })
   }
 
+  /// The node-revisions `revision` created, in the order the index made them: what FSFS's revision file for it holds
+  /// (A-738). Each revision's rows are appended together and no row is created in a revision before its own, so they
+  /// are one run of the rows.
+  pub fn created_in(&self, revision: Revision) -> Result<Vec<Node<'_>>, IndexRefusal> {
+    self.check_revision(revision)?;
+    let start = self
+      .rows
+      .partition_point(|row| row.created_revision < revision);
+    let end = self
+      .rows
+      .partition_point(|row| row.created_revision <= revision);
+    (start..end)
+      .map(|number| self.node_revision(NodeRevisionId(number)))
+      .collect()
+  }
+
   /// The revision the node at `path` in `revision` was created in, or `None` when the path is absent there.
   pub fn created_revision(
     &self,
