@@ -12351,9 +12351,16 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > it in turns, the pack source's `turn` the shard's step quantum on the shard's clock (`ShardPacks`); an SSH session
 > dies as git's does on a refusal the answer gives as it is written. By use: the 3,000-commit clone over the daemon's
 > HTTP edge, each request one ring region, and the same history pushed and cloned over the SSH edge, each request 64
-> KiB, its pack far larger, each answered whole. Owed for git: protocol v0's fetch in turns, `begin`'s `ready` and cut
-> and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a run), and a fetch held to the index
-> generation it began on (rule 4); the live `git clone` rows of the matrix (main's).
+> KiB, its pack far larger, each answered whole. **Rule 4 BUILT (same day):** a fetch's request takes a hold on its
+> repository's generation (`StoreLender::hold`, `vcs_store::upload::GitGeneration`): a fork of the store's repository at
+> its stamp (`Repository::fork`, `Repository::stamp`: the positions given and the versions its greens have, both only
+> growing), shared by every fetch that begins at that stamp, with the refs and `HEAD` as they stood; every later step of
+> the answer is lent from it (`lend_held`), and the last hold's release gives the fork back. By use, a push and a new tag
+> landing after a fetch's first step: the held answer's pack is the start generation's objects in its order (each by
+> id, so byte for byte; the zlib level each is deflated at is the stream's own timed choice, §4.11). Before it, the
+> edges lent the later steps the objects with no refs, so `include-tag` lost its tags. Owed for git: protocol v0's fetch
+> in turns, `begin`'s `ready` and cut and `include-tag`'s scan in units, a plan of scattered positions (16 bytes a
+> run); the live `git clone` rows of the matrix (main's).
 > **Subversion BUILT (2026-11-20, A-749, w-bugs; main's piece, measured first).** Measured on macos-latest over git/git's
 > newest 1,000 commits as a dump (`diag-w-bugs-svnfetch-5`): a checkout and a 500-revision update broke rules 2 and 3 on
 > both edges. svn:// slices ran to 12.4 ms (99 of 108 past the ~6.2 us quantum) and wrote to 316,779 B, past the
