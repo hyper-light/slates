@@ -18,6 +18,18 @@
 - Finding: content.purged_bytes counts discarded ranges, not resident pages (10.3 GB "given back" for a 64 MiB burst).
 - Finding: content_range.arena.resident read 0 with 64 MiB allocated in the red run (a stale sweep).
 
+## Piece 1b (main's 4 items after A-765), in flight
+- w-hg's split (release 1d4909821, after hg history push): RSS 8,520 MiB; prefault_reserve 4,931.4 MiB = whole burst;
+  20 s idle -> 12,055 MiB (+3.5 GB refill). Content retained 4,495.5 MiB is w-hg's.
+- Item 4 DONE (probes ~/.cache/w-sizing-probe): REUSABLE on shm: footprint 513->1 MiB, RSS 513 stays, NOT reclaimed in
+  10 s under pressure (reusable_reclaimed +0); frees only when the object is destroyed. Purgeable Mach memory entry +
+  VM_PURGABLE_EMPTY: RSS 513 -> 1 MiB at once with two mappings, reads zero after NONVOLATILE, whole-entry granularity.
+  => true give-back on macOS needs arena extents as purgeable entries shared with the anchor by port (design piece).
+- Item 1 A/B: kiln run r1 (queued): ab/run.sh in ~/slates-work/w-sizing-seg (untracked ab/): A = main 6337049f6, B =
+  ab/no-prefault.patch (reserve 0); provision_bench + nfs_large_write, release, interleaved x3, /usr/bin/time -l.
+- Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
+- Disk here 14 GiB free (others' caches; mine 2.5 GB).
+
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =
    write log R/4 + images 2R + delta log R + arena R (R = reserve_per_shard = memory/shards/3) ~ 1.42 x memory, plus
