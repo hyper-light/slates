@@ -9673,6 +9673,16 @@ server, not inferred from command names.
 > proven under the issuer secret as an enrollment is; a consumer's channel is refused `Forbidden`, and MCP and the SDKs
 > carry no proof. The one record keeps an SSH key by its fingerprint and an HTTP token by its hash alone, each with the
 > principal it proves and its expiry (§4.17.2's A-625 part 3 status).
+>
+> **Status (2026-11-20, A-764: credentials are fleet state).** A credential is the region's, not its issuing node's: the
+> node that enrolls or revokes one sends it to every other member (`slates_cluster::credentials`, the record session's
+> stream 31), and each holds it on the partition its id routes to, so the edges still authenticate with one local
+> lookup, and a client's token proves its principal on a successor after the issuing node is lost. An enrollment is
+> acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
+> would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
+> reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
+> region holds. Owed: a member partitioned through a revocation and back with its state keeps the record until the
+> revocation is asked again; a revocation's tombstone would close it (GAPS).
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -57048,4 +57058,31 @@ install, refresh and removals, `take_campaign_sessions`), `crates/server/src/for
   returned counter moved by three, none elapsed). Red with the return's wake removed: the returned counter 0 and the
   test failed; with the plain woken counter as the check, the forwards took 532, 916 and 965 ms, woken only by a later
   refresh. Focused runs listed with the landing.
+
+### A-764 — A credential is fleet state: enrolled or revoked in the region, acknowledged at f + 1 holders, healed at each configuration change (2026-11-20, w-fed-faults, main's ruling; §4.13 "Principals", A-625 part 3)
+
+- **Found by use.** w-balance's `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` nodes at `f = 1`, stock
+  git over each node's HTTPS edge): after the owner's anchor and daemon were killed, the successor answered the owner's
+  token 401, and a token minted there proved another host's account (403), so the test granted every principal before
+  the kill. Logs: a credential lived on the partition its id routes to on the issuing daemon alone
+  (`credentials::owner_of` over that daemon's shards); nothing sent it to another member, so the successor held none.
+- **Change (main's ruling: a principal and its tokens are fleet state, never node-local).** `slates_cluster::credentials`
+  (stream 31): enroll (the record in its wire encoding), revoke (the id), answer (held or not). The node that enrolls or
+  revokes serves the request on its channel as a task (`verbs::credential_on_channel`): recorded on its own partition as
+  before, then sent to every other member (`credentials::enroll_in_region`, `revoke_in_region`); an enrollment answered
+  once `f + 1` hold it, a revocation once every member has let it go, otherwise refused `CredentialUnreplicated { held,
+  needed }` (appended, wire tag 80; `slates_api::RetryCause::CredentialUnreplicated`). A member applies a message
+  idempotently on the partition its id routes to (`credentials::apply_here`, `serve_remote`). At each configuration
+  change every member offers every credential it holds to every other (`credentials::heal_region`, beside the homes'
+  healer). The edges' lookup is unchanged: one local lookup, now finding the region's credentials.
+- **Tests.** `slates-cluster --lib credentials` 3 (the messages round-trip, hostile bytes refused, `f + 1`);
+  `slates-server --lib credentials` 12, `a764_a_members_enrollment_and_revocation_are_held_here_and_idempotent` new;
+  `slates-ipc --test wire_order` 2. By use: `v3_takeover` with its grant-all and its survivor's token removed, the
+  owner's token used throughout: before, both survivors answered 401; after, each survivor counts
+  `credential.fleet.applied` and the successor authenticates the owner's token (`ls-remote` exit 0). The test's own
+  verdict still fails on the refs a takeover loses, w-balance's half. macOS arm64, Mac Studio, local.
+- **Owed.** A member partitioned through a revocation that comes back with its state keeps the record until the
+  revocation is asked again: a revocation's tombstone, kept and offered as enrollments are, closes it. The healer
+  offers every credential at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
+  in the test's run).
 

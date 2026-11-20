@@ -2486,6 +2486,36 @@ fn serve_on_channel(
       proof,
     ));
   }
+  // A version-control credential is fleet state (A-764): served on the channel, recorded on the partition its id
+  // routes to and sent to every other member of the region before it answers.
+  if let RequestBody::EnrollCredential {
+    principal: proven,
+    material,
+    expires_ns,
+    proof,
+  } = body
+  {
+    let asked = crate::credentials::Enrollment {
+      principal: proven,
+      material,
+      expires_ns,
+      proof,
+    };
+    return Break(credential_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      CredentialAsk::Enroll(asked),
+    ));
+  }
+  if let RequestBody::RevokeCredential { id, proof } = body {
+    return Break(credential_on_channel(
+      state,
+      (client.index(), request.request),
+      principal,
+      CredentialAsk::Revoke { id, proof },
+    ));
+  }
   if let RequestBody::SetPolicy {
     subject: slates_ipc::protocol::PolicySubject::Consumer { consumer },
     policy,
@@ -4873,6 +4903,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::IdentityRequired { .. } => "identity_required",
     Refusal::ImportRefused { .. } => "import_refused",
     Refusal::CopyRefused { .. } => "copy_refused",
+    Refusal::CredentialUnreplicated { .. } => "credential_unreplicated",
   }
 }
 
@@ -5790,6 +5821,60 @@ fn consumer_gate(
     }),
     other => Ok(other),
   }
+}
+
+/// What a credential request asks ([`credential_on_channel`]).
+enum CredentialAsk {
+  /// `EnrollCredential`.
+  Enroll(crate::credentials::Enrollment),
+  /// `RevokeCredential`.
+  Revoke {
+    /// The credential's id.
+    id: [u8; 32],
+    /// The proof of issuer authority.
+    proof: [u8; 32],
+  },
+}
+
+/// A credential enrolled or revoked as fleet state (A-764), served on the channel: as a task, recorded on the partition
+/// its id routes to (`crate::credentials::enroll` and `revoke`, every refusal of theirs as before) and sent to every other
+/// member of the region, answered once as many hold it as it must reach
+/// (`crate::credentials::enroll_in_region`, `revoke_in_region`).
+fn credential_on_channel(
+  state: &mut ShardState,
+  (client_index, request): (u32, u64),
+  principal: &Principal,
+  asked: CredentialAsk,
+) -> Served {
+  let id = match &asked {
+    CredentialAsk::Enroll(enrollment) => crate::credentials::id_of(&enrollment.material),
+    CredentialAsk::Revoke { id, .. } => *id,
+  };
+  let origin = state.shard;
+  let Some(owner) =
+    shard_of_partition(state, crate::credentials::owner_of(&id, state.shards.len()))
+  else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let channel = principal.clone();
+  let budget = crate::fleet::live_budget();
+  let task = slates_rt::futures::spawn(async move {
+    let reply = match asked {
+      CredentialAsk::Enroll(enrollment) => {
+        crate::credentials::enroll_in_region(origin, owner, (channel, enrollment), budget).await
+      }
+      CredentialAsk::Revoke { id, proof } => {
+        crate::credentials::revoke_in_region(origin, owner, (channel, id, proof), budget).await
+      }
+    };
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  // Freshly admitted on this shard, with no await before detaching: the slot is still live.
+  let _ = slates_rt::futures::detach(task);
+  Served::Forwarded
 }
 
 /// Sets a consumer's write policy (A-285), served on the channel as a revocation is: refused `Forbidden` for a consumer

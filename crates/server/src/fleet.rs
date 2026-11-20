@@ -1906,6 +1906,12 @@ async fn serve_peer_records(
             )
             .await
           }
+          // A credential enrolled or revoked elsewhere in the region (A-764, `slates_cluster::credentials`): applied to
+          // the partition its id routes to and answered whether it is held as asked.
+          slates_cluster::credentials::CREDENTIAL_STREAM => {
+            crate::credentials::serve_remote(control, &request, crate::daemon::LIVENESS_BUDGET_NS)
+              .await
+          }
           stream if is_content_stream(stream) => {
             let reply = state::with_state(|s| {
               let peer_host = s
@@ -10738,6 +10744,9 @@ async fn follow_configuration(
   // Windows homed by identity in the region (A-724 piece 6): at a new configuration, offered to their homes and let go
   // here once every home holds them, a turn a period (`vcs_store::homes::heal_region`).
   crate::vcs_store::homes::heal_region(origin, shards, budget).await;
+  // Credentials as fleet state (A-764): at a new configuration, every credential this node holds offered to every other
+  // member, so one that joined or came back with nothing holds what the region holds (`credentials::heal_region`).
+  crate::credentials::heal_region(origin, shards, budget).await;
   // Planned moves (A-291): each move this node's shards began is reported until the switch, routed to its new owner
   // from then on, and released once adopted; a destroyed moved volume's exception is reported forgotten.
   crate::moves::drive_outgoing(origin, local, owner_acceptor, budget, in_flight).await;

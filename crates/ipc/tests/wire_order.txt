@@ -302,6 +302,7 @@ Refusal 76 MessageRequired
 Refusal 77 IdentityRequired
 Refusal 78 ImportRefused
 Refusal 79 CopyRefused
+Refusal 80 CredentialUnreplicated
 ReplyBody 0 Created
 ReplyBody 1 Snapshotted
 ReplyBody 2 SnapshotDestroyed
