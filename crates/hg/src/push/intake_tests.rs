@@ -288,6 +288,31 @@ fn a_pushs_record_is_written_a_revision_a_step() {
   index.release(&mut store).unwrap();
 }
 
+/// `part`'s record written a part a step (`record::ChangegroupWriter`) is `whole`, the record written at once, and took
+/// more than one step.
+fn assert_written_a_part_a_step_as_whole(part: &ChangegroupPart, revisions: u64, whole: &[u8]) {
+  use crate::import::record::ChangegroupWriter;
+  let mut writer =
+    ChangegroupWriter::begin(1 << 20, (part.version, part.payload.len()), revisions).unwrap();
+  let mut steps = 1_u64;
+  while writer.step(&part.payload).unwrap() {
+    steps += 1;
+  }
+  assert_eq!(writer.finish().as_deref(), Some(whole));
+  assert!(steps > 1, "the record was copied in one step");
+}
+
+/// The record `whole` cut a byte short is refused `Truncated`, and with a byte after it `Trailing`.
+fn assert_cut_and_trailing_records_refused(whole: &[u8], store: &mut ContentStore) {
+  use crate::import::record::{self, Refused as RecordRefused};
+  let cut = record::replay(&whole[..whole.len() - 1], &mut HgIndex::new(), store);
+  assert_eq!(cut.err(), Some(RecordRefused::Truncated));
+  let mut trailing = whole.to_vec();
+  trailing.push(0);
+  let after = record::replay(&trailing, &mut HgIndex::new(), store);
+  assert_eq!(after.err(), Some(RecordRefused::Trailing));
+}
+
 /// A-729 part 2 (a push's record holds its changegroup as it arrived). Do: take stock 7.2's bundle through the intake,
 /// write its record from the changegroup a part a step (`record::ChangegroupWriter`) and whole
 /// (`record::write_changegroup`), and replay it into another empty index (`record::replay`, which takes the changegroup
@@ -295,21 +320,14 @@ fn a_pushs_record_is_written_a_revision_a_step() {
 /// the replayed index the intake's fork row for row, with the changesets and revisions counted; and a record cut short or with a byte after it refused by kind.
 #[test]
 fn a_pushs_record_holds_its_changegroup_and_replays_through_the_intake() {
-  use crate::import::record::{self, ChangegroupWriter, Refused as RecordRefused};
+  use crate::import::record;
   let part = stock();
   let mut store = store();
   let mut index = HgIndex::new();
   let (mut fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
   let revisions = intaken.kept + intaken.passed_over;
   let whole = record::write_changegroup(1 << 20, (part.version, &part.payload), revisions).unwrap();
-  let mut writer =
-    ChangegroupWriter::begin(1 << 20, (part.version, part.payload.len()), revisions).unwrap();
-  let mut steps = 1_u64;
-  while writer.step(&part.payload).unwrap() {
-    steps += 1;
-  }
-  assert_eq!(writer.finish(), Some(whole.clone()));
-  assert!(steps > 1, "the record was copied in one step");
+  assert_written_a_part_a_step_as_whole(&part, revisions, &whole);
   // A delta's header is larger than this fixture's few-byte texts, so the record is held to the changegroup's size,
   // not to the texts' (the saving is a large history's: each text there is a short delta against its parent's).
   assert!(whole.len() < part.payload.len() + 64);
@@ -324,12 +342,7 @@ fn a_pushs_record_holds_its_changegroup_and_replays_through_the_intake() {
     u64::from(replayed.changesets) + u64::from(replayed.manifests) + replayed.file_revisions,
     intaken.kept
   );
-  let cut = record::replay(&whole[..whole.len() - 1], &mut HgIndex::new(), &mut store);
-  assert_eq!(cut.err(), Some(RecordRefused::Truncated));
-  let mut trailing = whole.clone();
-  trailing.push(0);
-  let after = record::replay(&trailing, &mut HgIndex::new(), &mut store);
-  assert_eq!(after.err(), Some(RecordRefused::Trailing));
+  assert_cut_and_trailing_records_refused(&whole, &mut store);
   for index in [replayed_index, fork, index] {
     index.release(&mut store).unwrap();
   }
