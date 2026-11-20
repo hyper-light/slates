@@ -67,8 +67,8 @@
 //! that moves no green, replayed by the step's own apply (`commit_record`).
 //!
 //! **Owed** (each in GAPS' §4.17 entry). A snapshot carrying each store's sealed tables by identity, so a recovery
-//! replays only the log's suffix; the replay and a rebuild sliced a unit at a time within a record (a record is one unit
-//! today, as a commit is one step); a Mercurial push's obsmarkers in its record (its revisions replay since
+//! replays only the log's suffix; a git or Subversion record's replay, and a rebuild's, sliced a unit at a time within a
+//! record (a Mercurial record's recovery replay is, a revision a unit since A-732, `replay_hg_sliced`); a Mercurial push's obsmarkers in its record (its revisions replay since
 //! A-680 part 2c, as an import's since A-687, [`replay_hg`]); the Subversion index charged by the bytes it holds, once
 //! slates-svn measures them (its entries are bounded meanwhile); a version's pack fragments encoded again after a
 //! recovery, off the answer's path as a live version's are (A-654); and the fleet half, holders replaying the same
@@ -1536,6 +1536,105 @@ fn replay_record(
   Some(replayed.map(|unkept| state.count(VALUE_UNKEPT, unkept)))
 }
 
+/// Replays repository `id`'s Mercurial record at `index` a unit at a time, a unit of `slices` each (A-732; the
+/// record's `Replay`): its bytes read from the register afresh at each step, the room its bytes take lent once and the
+/// shard's charge settled after each step; none when it has no record there.
+async fn replay_hg_sliced(
+  state: &mut ShardState,
+  id: RepositoryId,
+  index: usize,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Option<Result<(), ReplayRefused>> {
+  let begun = hg_record_step(state, id, index, None)?;
+  let mut replay = match begun {
+    Ok(HgStep::Begun(replay)) => replay,
+    Ok(HgStep::Stepped(..)) => return Some(Ok(())),
+    Err(refused) => return Some(Err(refused)),
+  };
+  loop {
+    match hg_record_step(state, id, index, Some(replay))? {
+      Ok(HgStep::Stepped(Some(more))) => {
+        replay = more;
+        slices.unit_done().await;
+      }
+      Ok(HgStep::Stepped(None) | HgStep::Begun(_)) => return Some(Ok(())),
+      Err(refused) => return Some(Err(refused)),
+    }
+  }
+}
+
+/// One step of a Mercurial record's sliced replay: begun, or advanced (the replay back while more follow, none once it
+/// finished and the fork took the index's place); a refusal gives the fork back.
+enum HgStep {
+  /// The replay begun.
+  Begun(slates_hg::import::record::Replay),
+  /// A unit replayed: the replay while more follow.
+  Stepped(Option<slates_hg::import::record::Replay>),
+}
+
+/// [`replay_hg_sliced`]'s one step over the shard's state (its type's docs); none when the register holds no record at
+/// `index`.
+fn hg_record_step(
+  state: &mut ShardState,
+  id: RepositoryId,
+  index: usize,
+  replay: Option<slates_hg::import::record::Replay>,
+) -> Option<Result<HgStep, ReplayRefused>> {
+  let ShardState {
+    db,
+    store,
+    vcs_stores,
+    ..
+  } = &mut *state;
+  let bytes = db.partition().repositories().object_record(id, index)?;
+  let lent = if replay.is_none() {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+  } else {
+    0
+  };
+  lend(store, vcs_stores, lent);
+  let stepped = hg_step_in(vcs_stores, id, bytes, replay);
+  let whole = settle_in(store, vcs_stores);
+  if !whole {
+    state.count(CHARGE_SHORT, 1);
+  }
+  Some(stepped)
+}
+
+/// [`hg_record_step`] over the stores.
+fn hg_step_in(
+  stores: &mut VcsStores,
+  id: RepositoryId,
+  bytes: &[u8],
+  replay: Option<slates_hg::import::record::Replay>,
+) -> Result<HgStep, ReplayRefused> {
+  let unheld = ReplayRefused::Git(GitRefused::NoStore);
+  let content = stores.content.as_mut().ok_or(unheld.clone())?;
+  let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
+    return Err(unheld);
+  };
+  let Some(mut replay) = replay else {
+    return slates_hg::import::record::Replay::begin(bytes, &mut store.index, content)
+      .map(HgStep::Begun)
+      .map_err(ReplayRefused::Mercurial);
+  };
+  match replay.step(bytes, content) {
+    Ok(true) => Ok(HgStep::Stepped(Some(replay))),
+    Ok(false) => {
+      let replayed = replay
+        .finish(&mut store.index, content)
+        .map_err(ReplayRefused::Mercurial)?;
+      replayed_hg(store, &replayed).map(|_| HgStep::Stepped(None))
+    }
+    Err(refused) => {
+      if replay.abandon(content).is_err() {
+        return Err(ReplayRefused::Released);
+      }
+      Err(ReplayRefused::Mercurial(refused))
+    }
+  }
+}
+
 /// Replays `bytes` into repository `id`'s store, by its tool, a Subversion record within `svn_room`: the derived values
 /// not kept.
 fn replay_into(
@@ -1572,7 +1671,15 @@ fn replay_hg(
 ) -> Result<u64, ReplayRefused> {
   let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
     .map_err(ReplayRefused::Mercurial)?;
-  // A made changeset's record names its green and version (A-731): the made node noted from the record alone.
+  replayed_hg(store, &replayed)
+}
+
+/// What a replayed Mercurial record leaves beside the index: a made changeset's node noted from the record alone
+/// (A-731); refused where the index replaced was not given back whole.
+fn replayed_hg(
+  store: &mut HgStore,
+  replayed: &slates_hg::import::record::Replayed,
+) -> Result<u64, ReplayRefused> {
   if let Some((green, version, node)) = replayed.made {
     let newer = store
       .made
@@ -1747,7 +1854,17 @@ pub(crate) async fn recover(
   for record in records {
     make(state, &record);
     let mut index = 0usize;
-    while let Some(outcome) = replay_record(state, record.id, index) {
+    loop {
+      // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
+      // shard past the watchdog's window at every restart.
+      let outcome = if record.tool == VcsTool::Mercurial {
+        replay_hg_sliced(state, record.id, index, slices).await
+      } else {
+        replay_record(state, record.id, index)
+      };
+      let Some(outcome) = outcome else {
+        break;
+      };
       if !replayed(state, record.id, outcome) {
         break;
       }

@@ -110,6 +110,12 @@
 > admits a push. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
+> **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
+> FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
+> resumable, its place a byte offset; `vcs_store::replay_hg_sliced`), and an import's record is written a revision a turn
+> before its landing (`record::Writer`, the import's `Stage::Writing`), where each was one step; `docs/bugs/2026-11-20-
+> a-large-mercurial-import-crash-looped-the-daemon.md`. Owed: a rebuild's replay (`vcs_store::rebuild`, one step still);
+> the record's size itself (S5, A-729: identities, no texts); w-perf's by-use rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a

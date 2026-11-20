@@ -42,8 +42,9 @@
 //!
 //! **Owed** (GAPS' §4.17.3 entry). The lines of an imported repository's branch heads (decision 1); a host's pending
 //! fetch retried at the next turn rather than ending the import; the adapter's handles held between turns beside the
-//! import; and, for a large repository, the record and the bookmarks' works made in slices rather than whole at the
-//! landing, and the snapshot carrying the store's tables, so a recovery replays only the log's suffix.
+//! import; and, for a large repository, the bookmarks' works made in slices rather than whole at the landing (the record
+//! is written a part a turn before it since A-732, `Stage::Writing`), and the snapshot carrying the store's tables, so a
+//! recovery replays only the log's suffix.
 
 use slates_db::catalog::{
   MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId,
@@ -105,12 +106,28 @@ enum Stage {
     /// The directory.
     directory: HostDir,
   },
-  /// Done: its index and state, waiting to land ([`land`]), and the room it ran within, which its record carries.
+  /// Its record being written a revision a turn (A-732: written whole at the landing, a large repository's held its
+  /// shard past the watchdog's window): what it imported, the room the landing runs within, the writer, and what its
+  /// end answers.
+  Writing {
+    /// What it imported.
+    imported: Box<Imported>,
+    /// The room the landing runs within.
+    room: u64,
+    /// The record's writer.
+    writer: Box<record::Writer>,
+    /// What its end answers, its turns counted on.
+    finished: Box<Finished>,
+  },
+  /// Done: its index and state, waiting to land ([`land`]), the room it ran within, which its record carries, and its
+  /// record, written.
   Done {
     /// What it imported.
     imported: Box<Imported>,
     /// The room it ran within.
     room: u64,
+    /// Its record.
+    record: Vec<u8>,
   },
 }
 
@@ -121,6 +138,9 @@ impl std::fmt::Debug for Importing {
       Stage::Running { import, .. } => shown
         .field("turns", &import.turns())
         .field("units", &import.units()),
+      Stage::Writing { finished, .. } => shown
+        .field("writing", &true)
+        .field("turns", &finished.turns),
       Stage::Done { room, .. } => shown.field("done", &true).field("room", room),
     };
     shown
@@ -308,6 +328,16 @@ pub(crate) fn turn(
   id: RepositoryId,
   (clock, quantum_ns): (&mut dyn Clock, u64),
 ) -> Option<Result<Turned, ImportFailed>> {
+  if matches!(
+    state.vcs_stores.imports.get(&id),
+    Some(Importing {
+      stage: Stage::Writing { .. },
+      ..
+    })
+  ) {
+    state.count(TURNS, 1);
+    return Some(write_turn(state, id, (clock, quantum_ns)));
+  }
   let advanced = advance(state, id, Turn { clock, quantum_ns })?;
   state.count(TURNS, 1);
   Some(match advanced {
@@ -431,16 +461,118 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
   // The landing's room, which bounds its record and its bookmarks' works: what the shard could admit now (A-720 part 3),
   // the import's own holding given back above.
   let room = room_of(state);
-  let done = Importing {
-    stage: Stage::Done {
+  let content = state
+    .vcs_stores
+    .content
+    .as_ref()
+    .ok_or(ImportFailed::NoStore)?;
+  let writer = match record::Writer::begin(&imported.index, content, room) {
+    Ok(writer) => writer,
+    Err(refused) => {
+      give_back(state, imported.index);
+      return Err(ImportFailed::Landing(write_refusal(state, &refused)));
+    }
+  };
+  let writing = Importing {
+    stage: Stage::Writing {
       imported: Box::new(imported),
       room,
+      writer: Box::new(writer),
+      finished: Box::new(finished),
+    },
+    reserved: 0,
+  };
+  state.vcs_stores.imports.insert(id, writing);
+  Ok(Turned::More)
+}
+
+/// One turn of repository `id`'s record being written (A-732): parts written until the record is whole or `quantum_ns`
+/// is spent on `clock`, at least one; whole, the import is done, waiting to land. Refused, everything it held is given
+/// back.
+fn write_turn(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (clock, quantum_ns): (&mut dyn Clock, u64),
+) -> Result<Turned, ImportFailed> {
+  let start = clock.now_ns();
+  let stores = &mut state.vcs_stores;
+  let written = match (stores.content.as_ref(), stores.imports.get_mut(&id)) {
+    (
+      Some(content),
+      Some(Importing {
+        stage:
+          Stage::Writing {
+            imported,
+            writer,
+            finished,
+            ..
+          },
+        ..
+      }),
+    ) => {
+      finished.turns = finished.turns.saturating_add(1);
+      loop {
+        match writer.step(&imported.index, content) {
+          Ok(true) if clock.now_ns().saturating_sub(start) < quantum_ns => {}
+          other => break other,
+        }
+      }
+    }
+    _ => return Err(ImportFailed::NoStore),
+  };
+  match written {
+    Ok(true) => Ok(Turned::More),
+    Ok(false) => written_whole(state, id),
+    Err(refused) => {
+      let refusal = write_refusal(state, &refused);
+      end(state, id);
+      state.count(REFUSED, 1);
+      Err(ImportFailed::Landing(refusal))
+    }
+  }
+}
+
+/// Repository `id`'s record written whole: the import done, waiting to land with its record; what it found answered.
+fn written_whole(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFailed> {
+  let Some(Importing {
+    stage: Stage::Writing {
+      imported,
+      room,
+      writer,
+      finished,
+    },
+    ..
+  }) = state.vcs_stores.imports.remove(&id)
+  else {
+    return Err(ImportFailed::NoStore);
+  };
+  let Some(record) = writer.finish() else {
+    give_back(state, imported.index);
+    return Err(ImportFailed::Landing(Refusal::ContentUnavailable));
+  };
+  let done = Importing {
+    stage: Stage::Done {
+      imported,
+      room,
+      record,
     },
     reserved: 0,
   };
   state.vcs_stores.imports.insert(id, done);
   state.count(DONE, 1);
-  Ok(Turned::Done(Box::new(finished)))
+  Ok(Turned::Done(finished))
+}
+
+/// The register's refusal for a record that could not be written.
+fn write_refusal(state: &ShardState, refused: &WriteRefused) -> Refusal {
+  match refused {
+    WriteRefused::Allocation => Refusal::BudgetExceeded {
+      available: state.store.admittable(),
+    },
+    WriteRefused::Unreadable { .. } | WriteRefused::UnreadableMarker { .. } => {
+      Refusal::ContentUnavailable
+    }
+  }
 }
 
 /// Puts `index` in repository `id`'s Mercurial store's place, giving back the empty index it replaces: whether every
@@ -515,7 +647,7 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
   state.store.budget.credit_retention(reserved);
   let whole = match (state.vcs_stores.content.as_mut(), stage) {
     (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
-    (Some(content), Stage::Done { imported, .. }) => {
+    (Some(content), Stage::Done { imported, .. } | Stage::Writing { imported, .. }) => {
       let Imported { index, .. } = *imported;
       index.release(content).is_ok()
     }
@@ -545,18 +677,22 @@ fn give_back(state: &mut ShardState, index: HgIndex) {
 /// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
 /// the import is still under way, `NoStore` when none is held for `id`.
 pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  let (mut imported, room) = match state.vcs_stores.imports.remove(&id) {
+  let (mut imported, room, record) = match state.vcs_stores.imports.remove(&id) {
     Some(Importing {
-      stage: Stage::Done { imported, room },
+      stage: Stage::Done {
+        imported,
+        room,
+        record,
+      },
       ..
-    }) => (imported, room),
+    }) => (imported, room, record),
     Some(running) => {
       state.vcs_stores.imports.insert(id, running);
       return Err(ImportFailed::Busy);
     }
     None => return Err(ImportFailed::NoStore),
   };
-  let entry = landing_entry(state, id, (&*imported, room));
+  let entry = landing_entry(state, id, (&*imported, room), record);
   let mut index = Some(core::mem::take(&mut imported.index));
   let appended = entry.and_then(|(owner, changes, parts, record)| {
     crate::repository::push::push_imported(
@@ -592,20 +728,13 @@ fn landing_entry(
   state: &ShardState,
   id: RepositoryId,
   (imported, room): (&Imported, u64),
+  record: Vec<u8>,
 ) -> Result<Landing, Refusal> {
   let content = state
     .vcs_stores
     .content
     .as_ref()
     .ok_or(Refusal::ContentUnavailable)?;
-  let record = record::write(&imported.index, content, room).map_err(|refused| match refused {
-    WriteRefused::Allocation => Refusal::BudgetExceeded {
-      available: state.store.admittable(),
-    },
-    WriteRefused::Unreadable { .. } | WriteRefused::UnreadableMarker { .. } => {
-      Refusal::ContentUnavailable
-    }
-  })?;
   let repositories = state.db.partition().repositories();
   let owner = repositories
     .repository(id)
