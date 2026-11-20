@@ -98,17 +98,24 @@ jobs:
           echo "fsx seen at $(date -u +%T)" >> "$out/status.txt"
           sleep 60
           syms="srv*c:\\symbols*https://msdl.microsoft.com/download/symbols;$(cygpath -w "$GITHUB_WORKSPACE/target/debug");$(cygpath -w "$GITHUB_WORKSPACE/target/debug/deps")"
+          mkdir -p "$RUNNER_TEMP/dumps"
           for round in 1 2; do
             echo "==== round $round at $(date -u +%T)" >> "$out/stacks.txt"
             for img in slates.exe fsx.exe; do
               for pid in $(tasklist //fo csv //nh //fi "IMAGENAME eq $img" | tr -d '"\r' | cut -d, -f2 | grep -E '^[0-9]+$'); do
-                echo "==== $img pid $pid round $round" >> "$out/stacks.txt"
-                [ -n "$cdb" ] && timeout 150 "$cdb" -pv -p "$pid" -y "$syms" -c "~*kn 50; qd" >> "$out/stacks.txt" 2>&1
+                d="$(cygpath -w "$RUNNER_TEMP/dumps")\\$img-$pid-$round.dmp"
+                # -pvr: noninvasive and never suspended, so the anchor sees no frozen daemon; a stacks-only minidump.
+                timeout 60 "$cdb" -pvr -p "$pid" -c ".dump /m /o $d; qd" > /dev/null 2>&1
+                echo "==== $img pid $pid round $round dump exit $?" >> "$out/stacks.txt"
               done
             done
-            "$RUNNER_TEMP/publish.sh"
             sleep 30
           done
+          for d in "$RUNNER_TEMP"/dumps/*.dmp; do
+            echo "==== $(basename "$d")" >> "$out/stacks.txt"
+            timeout 600 "$cdb" -z "$(cygpath -w "$d")" -y "$syms" -c "~*kn 60; q" 2>&1 | grep -vE '^(ModLoad|NatVis|\*\*\*)' >> "$out/stacks.txt"
+          done
+          "$RUNNER_TEMP/publish.sh"
           wait $xt
           echo "fsx exit $?" >> "$out/status.txt"
           "$RUNNER_TEMP/publish.sh"
