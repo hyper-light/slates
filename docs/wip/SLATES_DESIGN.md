@@ -56838,3 +56838,34 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   4.9 ms, the best within a heartbeat). Red with the waiter never attached: each waited out the liveness budget, about
   1.02 s. Fleet `a_forwarded_submit` and `a_holder`; `slates-server --lib merge_service:: verbs:: xshard:: work_home`;
   fmt clean.
+
+### §4.8 amended — A borrower waiting for a record session out on loan is woken by its return, never paced (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family one of three)
+Applied in the same change to: §4.8 "Lookup" (a forward that finds its peer's session out), GAPS (the sweep's line),
+`crates/server/src/fleet.rs` (`session_returned`, `SessionChange`, `sessions_changed`, `return_sessions`, the link's
+install, refresh and removals, `take_campaign_sessions`), `crates/server/src/forward_lane.rs` (`drive_turn`),
+`crates/server/src/live_ship.rs` (`borrow_session`, the lost links), `crates/server/src/owner_location.rs`
+(`wait_for_returning_sessions`), `crates/server/src/member_task.rs`, `crates/server/src/daemon.rs`
+(`hold_record_session`), `crates/server/src/state.rs` (`session_waiters`, `session_woken`), `crates/server/tests/fleet.rs`.
+- **What was there.** A borrower that found its peer's record session out on another borrower's loan slept a pace and
+  looked again: the forward lane a tenth of a period (10 ms), a live write's shipper one timer tick at a time, a
+  campaign and a location round the fleet's poll interval, the test hook a tenth of a period. A session handed back just
+  after a look waited out the rest of the pace, and the tick-at-a-time wait parked and looked once a tick for as long as
+  the session was out.
+- **Change.** `fleet::session_returned(hosts, left)` waits, within the caller's own deadline, for a change of one of
+  those peers' record links: a `Send` future that registers its task's waker under each peer at its first poll, on the
+  control shard where the sessions are, and takes its registrations away when dropped. `fleet::sessions_changed(host)`
+  wakes every wait for that peer once (and takes it off the other peers' lists) wherever `record_sessions` changes:
+  every arm of `return_sessions` (handed back, dropped as reset or silent, a stale return), the link's install and its
+  discovery refresh, and each removal (the link task's, a learned id's replacement, a restarted peer's, the live
+  shipper's lost links). No wait possible (off a shard) ends the caller's wait as a refused sleep did; a test's campaign
+  hold, which ends at an instant and not at an event, caps the campaign's wait at that instant.
+- **Counters.** `fleet.session_wait.woken`, `fleet.session_wait.elapsed`, and `fleet.session_wait.returned`: the waits
+  woken by the session's own return, the test's red (a discovery refresh also wakes a wait, so the plain woken count
+  passed with the return's wake removed).
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server --test fleet
+  a_forward_waiting_for_its_lent_session_is_woken_by_its_return` (two nodes at `f = 1`; B holds its session to A out for
+  50 ms by the test hook while a client on B asks A's green's versions, three times: answered in 52.3 to 53.2 ms, B's
+  returned counter moved by three, none elapsed). Red with the return's wake removed: the returned counter 0 and the
+  test failed; with the plain woken counter as the check, the forwards took 532, 916 and 965 ms, woken only by a later
+  refresh. Focused runs listed with the landing.
+

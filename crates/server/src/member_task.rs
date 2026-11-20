@@ -319,6 +319,7 @@ fn note_reconnected(state: &mut ShardState, anchor: HostId, member: HostId, proc
   let restarted = previous.is_some_and(|previous| previous != process);
   if restarted && anchor > state.origin_anchor {
     state.record_sessions.remove(&member);
+    crate::fleet::sessions_changed(state, member);
     state.plane.announced_on.remove(&member);
     crate::fleet::wake_link_waiter_of(state, member);
     crate::fleet::count_refusal_in(state, PEER_RECONNECTED);

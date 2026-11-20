@@ -7639,7 +7639,10 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
       // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
       // costs nothing until the peer is alive again.
-      state::with_state(|s| s.record_sessions.remove(&peer_host));
+      state::with_state(|s| {
+        s.record_sessions.remove(&peer_host);
+        sessions_changed(s, peer_host);
+      });
       dial_settled(peer_host);
       crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
@@ -7875,6 +7878,7 @@ fn refresh_record_identity_in(
     .map_or(previous, |learned| learned.host);
   if current != previous {
     state.record_sessions.remove(&previous);
+    sessions_changed(state, previous);
     // The dial's record is the previous id's: the link's dial under the new id starts afresh.
     state.record_dials.remove(&previous);
     let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
@@ -7906,6 +7910,7 @@ async fn enroll_record_session(
       state
         .record_sessions
         .insert(peer_host, crate::state::RecordLink::up(session));
+      sessions_changed(state, peer_host);
     });
     crate::live_ship::holder_reached(peer_host);
   }
@@ -7934,8 +7939,10 @@ async fn refresh_discovery(
         if let Some(link) = state.record_sessions.get_mut(&peer_host) {
           link.endpoint = Some(session);
         }
+        sessions_changed(state, peer_host);
       } else {
         state.record_sessions.remove(&peer_host);
+        sessions_changed(state, peer_host);
         // A discovery page can be the first exchange to meet the restarted peer's reset (A-261): counted as a reset,
         // as a borrower's return counts it, not left to read as an unexplained drop.
         if session.peer_reset() {
@@ -8266,6 +8273,7 @@ impl Dispatch {
       state::with_state(|s| {
         for host in &lost {
           s.record_sessions.remove(host);
+          sessions_changed(s, *host);
         }
       });
     }
@@ -8957,8 +8965,16 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    // A refused sleep (off a shard) ends the wait with what was taken, never a spin.
-    if futures::sleep(budget.poll_interval_ns).await.is_err() {
+    // Waits for one of the voters' sessions to come back (or its link to change) within what is left, then takes
+    // again; it slept the fleet's poll interval between looks before 2026-11-20. A test's campaign hold ends at its
+    // instant, not at an event, so while one holds the wait ends there too. No wait possible (off a shard) ends the wait
+    // with what was taken, never a spin.
+    let now = futures::now_ns();
+    let mut left = budget.deadline_ns.saturating_sub(now.saturating_sub(began));
+    if out.iter().any(|voter| withheld.contains(voter)) && now < withheld_until {
+      left = left.min(withheld_until.saturating_sub(now));
+    }
+    if session_returned(&out, left).await.is_none() {
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
@@ -11609,6 +11625,127 @@ const NS_PER_MS: u64 = 1_000_000;
 /// ([`return_sessions`]), for the link to dial again.
 const LINK_SESSION_JUDGED_DEAD: &str = "fleet.link.session_judged_dead";
 
+/// Format: a wait for a record session out on loan woken by its return or its link's change ([`session_returned`]),
+/// the non-vacuity count of the woken wait.
+pub(crate) const SESSION_WAIT_WOKEN: &str = "fleet.session_wait.woken";
+/// Format: such a wait that met its deadline unwoken.
+pub(crate) const SESSION_WAIT_ELAPSED: &str = "fleet.session_wait.elapsed";
+/// Format: such waits woken by the session's own return to its link ([`return_sessions`]), the count that tells a wake
+/// at the return from one by any other change of the link.
+pub(crate) const SESSION_WAIT_RETURNED: &str = "fleet.session_wait.returned";
+
+/// Waits, on the control shard, for a record session to one of `hosts` to come back from its loan, or for its link to
+/// change (installed or dropped), for at most `left_ns`: `Some(true)` when such a change woke it, `Some(false)` at the
+/// deadline, `None` when no wait could be made (off a shard, as a refused sleep was): the caller ends its wait then, never
+/// spins. A borrower that finds a session out waits here for the event and looks again at once; before
+/// 2026-11-20 each slept a pace (a timer tick, a tenth of a period, the fleet's poll interval) and looked again, so a
+/// session handed back just after a look waited out the rest of the pace (main's sweep after A-697's release bench).
+pub(crate) async fn session_returned(hosts: &[HostId], left_ns: u64) -> Option<bool> {
+  let woken = match futures::within(
+    left_ns,
+    SessionChange {
+      hosts: hosts.to_vec(),
+      token: None,
+    },
+  )
+  .await
+  {
+    Ok(Some(Some(()))) => true,
+    Ok(Some(None)) | Err(_) => return None,
+    Ok(None) => false,
+  };
+  let _ = state::with_state(|s| {
+    s.count(
+      if woken {
+        SESSION_WAIT_WOKEN
+      } else {
+        SESSION_WAIT_ELAPSED
+      },
+      1,
+    );
+  });
+  Some(woken)
+}
+
+/// The wait of [`session_returned`]: registered with its waker under each of `hosts` at its first poll, on the shard it
+/// runs on (the control shard, where the sessions are), and ready once [`sessions_changed`] woke its token; `None` when
+/// the shard's state could not be read (off a shard). Dropped, it takes its registrations away, so none outlives it.
+struct SessionChange {
+  hosts: Vec<HostId>,
+  token: Option<u64>,
+}
+
+impl std::future::Future for SessionChange {
+  type Output = Option<()>;
+
+  fn poll(
+    self: std::pin::Pin<&mut Self>,
+    cx: &mut std::task::Context<'_>,
+  ) -> std::task::Poll<Option<()>> {
+    let this = self.get_mut();
+    let polled = state::with_state(|s| match this.token {
+      Some(token) if s.session_woken.remove(&token) => std::task::Poll::Ready(Some(())),
+      Some(_) => std::task::Poll::Pending,
+      None => {
+        let token = s.next_session_wait;
+        s.next_session_wait = token.wrapping_add(1);
+        for host in &this.hosts {
+          s.session_waiters
+            .entry(*host)
+            .or_default()
+            .push((token, cx.waker().clone()));
+        }
+        this.token = Some(token);
+        std::task::Poll::Pending
+      }
+    });
+    polled.unwrap_or(std::task::Poll::Ready(None))
+  }
+}
+
+impl Drop for SessionChange {
+  fn drop(&mut self) {
+    let Some(token) = self.token else {
+      return;
+    };
+    let hosts = std::mem::take(&mut self.hosts);
+    let _ = state::with_state(|s| {
+      s.session_woken.remove(&token);
+      for host in hosts {
+        if let Some(waiters) = s.session_waiters.get_mut(&host) {
+          waiters.retain(|(waiting, _)| *waiting != token);
+          if waiters.is_empty() {
+            s.session_waiters.remove(&host);
+          }
+        }
+      }
+    });
+  }
+}
+
+/// Answers every wait for `host`'s record session ([`session_returned`]): its session handed back, or its link installed
+/// or dropped. Called wherever `record_sessions` changes for a host. Each wait is woken once, and leaves the lists of the
+/// other peers it waited for. Returns how many it woke.
+pub(crate) fn sessions_changed(state: &mut ShardState, host: HostId) -> u64 {
+  let Some(waiters) = state.session_waiters.remove(&host) else {
+    return 0;
+  };
+  let mut woken = 0u64;
+  for (token, waker) in waiters {
+    if state.session_woken.insert(token) {
+      for others in state.session_waiters.values_mut() {
+        others.retain(|(waiting, _)| *waiting != token);
+      }
+      waker.wake();
+      woken = woken.saturating_add(1);
+    }
+  }
+  state
+    .session_waiters
+    .retain(|_, waiters| !waiters.is_empty());
+  woken
+}
+
 /// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
 /// that left it — the entry still there, its session out, and the returning session's connection id the
 /// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
@@ -11670,6 +11807,9 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         }
         _ => s.count(LINK_STALE_RETURN, 1),
       }
+      // Whatever became of it (handed back, dropped, or a stale return), the borrowers waiting for this peer look again.
+      let woken = sessions_changed(s, host);
+      s.count(SESSION_WAIT_RETURNED, woken);
     }
   });
 }

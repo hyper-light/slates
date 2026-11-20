@@ -4852,8 +4852,8 @@
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
-> time). Owed from that sweep, each with its own wake: the waits for a lent record session (`forward_lane.rs`,
-> `fleet.rs` campaign sessions, `owner_location.rs`, `live_ship.rs`), a broadcast's stragglers (`owner_location.rs`), a
+> time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
+> pace between looks). Owed from that sweep, each with its own wake: a broadcast's stragglers (`owner_location.rs`), a
 > FUSE mount helper's exit (`fuse.rs`); the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure.
 
