@@ -1,0 +1,12 @@
+volume list exit 0 after 1 s
+bootstrapped
+bootstrap exit 0
+volume create exit 0
+id: 9b2bb2d2db816d660000000000000005
+path: (none until a bridge exists)
+
+volume id [9b2bb2d2db816d660000000000000005]
+mount exit 0
+mounted: S:
+
+unmounted: S:
