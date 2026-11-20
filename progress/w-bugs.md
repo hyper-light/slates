@@ -168,3 +168,6 @@
   A-576 drive test (ɐ/Ɐ one file, ς/σ two) green, red with the same forced flag; workloads (git/hg/svn) pass on stock
   WinFsp; A-498 hang REPRODUCED on pre-A-725 main x86_64 (2 of 3 runs: one 10 s timeout at round 7, one process hang
   at round 43) and gone with A-725 (6/6). To land: the race test + A-576 drive test (patches in ~/.cache/w-bugs-msg).
+- LANDED main 15d25e8b2: the A-498 race test (A-725 cures the hang: pre-A-725 x86_64 2/3 hung, post 6/6) and the
+  A-576/A-737 folding-drive test; A-551 drive tests red-checked; workloads pass on stock WinFsp both arches. GAPS updated.
+- Goal 87's assigned items done. Open: B8, B9 (reading, main's); B6 no record anywhere.
