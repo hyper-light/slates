@@ -54751,6 +54751,25 @@ Applied in the same change to:
   `--lib` 176 of 176, `--test model` 26 of 26; slates-ipc `--test wire_order`. Owed: the slot derived at each snapshot
   and grown by a re-laid segment at a handoff (8b); the snapshot naming sealed index tables by identity (8c, with A-727);
   the room read by `vcs_share::room` as a second resource.
+- **Piece 9a, the cut and its placement (2026-11-20).** `slates_vcs::cut`: an index cut into `2^b` ranges by its
+  objects' ids' leading bits (`range_of`), `b` the least that fits each range's room (`bits_for`,
+  `ceil(log2(bytes / room))`), a split due when a measured range passes the room (`split_due`), each row then moving to
+  one of its range's two children (`child_of`; Fagin et al. 1979). `crate::vcs_share::place::range_partition`: a range
+  held on the partition rendezvous ranks first for the repository's family key and the range. Tests: `cut::tests`
+  (300 generated cuts: one range an id, a split's children holding exactly the parent's ids; the derived cut the least
+  that fits; git/git whole, the kernel at 2 bits against a quarter slot, a billion objects cut; hostile ids total) and
+  `place::tests::a_repositorys_index_ranges_spread_over_the_partitions_by_rendezvous`. Owed (9b): `b` in the repository's
+  record; a push's rows sent to their ranges' partitions and committed by the owner's landing record (needs 8c's names
+  by identity, proposed to w-perf); look-ups routed by range; the split's moves.
+- **Piece 8a in admission, the snapshot slot a second resource (2026-11-20).** `crate::vcs_share::room` divides memory and
+  the partition's snapshot slot's room left (`Db::snapshot_room`) together by dominant-resource fairness: each
+  repository holds its records' bytes of the slot (`Repositories::objects_bytes`) and claims them with its traffic's
+  mean, and its room is the lesser headroom, its bound naming the binding resource's share; a repository alone gets
+  the lesser of what the shard admits and the slot's room (`Bound::Snapshot { room }`). So a push whose record could
+  not fit the snapshot is refused at admission, before its body, not at its commit. Tests: `vcs_share::tests`
+  (`t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot`: a slot shrunk below the admittable room binds
+  alone and is divided beside another; the share test against the lesser resource), 23 of 23 with `git_push::` and
+  `vcs_store::upload::`; `vcs_http::git:: vcs_http::hg vcs_ssh::` 88 of 88.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55346,5 +55365,16 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   the golden dump's repository written out as the view is passed by `svnadmin verify`, dumps back to `full.dump` and
   `deltas.dump` byte for byte, and `svnlook changed --copy-info` gives `changed.txt` for every revision (macOS arm64,
   Mac Studio 1, 3 of 3; the stock leg skips loudly where Subversion is absent).
-- **Owed.** P2 (the transaction directory), P3 (the presenter under SLATES_ROOT), P4, the root mount's publication.
+- **Part 2 (same day): the transaction directory.** `fsfs::transaction_files` writes what FSFS keeps for an open
+  transaction (`structure`, "Transaction layout"), from the index's trial of a work on its base (`Index::trial`; the
+  trial now answers its node-revisions, `Trial::made` and `Trial::node_revision`): `props`, `next-ids`, the changed
+  paths unterminated, a `node.<node>.<copy>` file a node-revision it made (identities `_<n>` and `t<name>`), a
+  `.props` file where it changed a list and a `.children` file, entries whole, where a child was made or deleted, each
+  then `-1`; texts it gave in `db/txn-protorevs/<name>.rev`, generated when read and streamed from the source;
+  anything kept names the committed representation the view placed. Test: every revision of the golden repository,
+  its work tried as a transaction on the revision before it in a repository cut there, is read by stock `svnlook -t`
+  as `svnlook -r` reads the revision: `changed --copy-info`, `info`, `tree`, `dirs-changed` and `diff` (Mac Studio 1,
+  Subversion 1.15.0; `fsfs_view` 5 of 5).
+- **Owed.** P3 (the presenter under SLATES_ROOT, after A-727 a2: the hook drivers handing the view's path as REPOS),
+  P4, the root mount's publication.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.

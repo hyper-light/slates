@@ -101,9 +101,10 @@
 > repository's usage counted on its owner shard (`slates_vcs::usage`, `ShardState::vcs_usage`; git's push and fetch
 > steps); the division of a shard among claims (`slates_vcs::share::divide`, weighted DRF, piece 2's core). Owed:
 > one room for every admission (`crate::vcs_share::room`, piece 3a: fast path alone, DRF share while others push).
-> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). Owed: the slot
+> Piece 8a: growth past the snapshot slot refused typed before it is written (`DbError::SnapshotRoom`). The slot's room is
+> admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
 > derived and re-laid at a handoff (8b), the snapshot naming sealed index tables (8c), a giant repository's index cut
-> across partitions by object id (9).
+> across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
@@ -806,7 +807,8 @@
 > **A-738 (2026-11-20, w-reaper; A-645 route A P1):** `slates_svn::fsfs` derives a repository's FSFS format 6 revision
 > and revprops files from the index and the green, laid out a revision a step and generated when read; stock
 > `svnadmin verify`, `dump` (whole and `--deltas`) and `svnlook changed` read the golden repository's view as the
-> repository the dump came from. Owed: P2 (the transaction directory for `svnlook -t`), P3 (the presenter under
+> repository the dump came from. Part 2: `fsfs::transaction_files`, an open transaction's directory and
+> prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. Owed: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on

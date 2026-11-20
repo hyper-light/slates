@@ -95,6 +95,26 @@ pub(crate) fn intake_shard(
   }
 }
 
+/// The partition of `partitions` that holds range `range` of a repository's index cut (A-724 piece 9, §4.17.5 "A
+/// giant repository's metadata across partitions", `slates_vcs::cut`): the one rendezvous ranks first for the repository's
+/// family key and the range (`family` is the family's line key, so every repository of the family ranks one way), by the
+/// one weight every placement ranks by. No catalog: any shard computes it from the repository's id, the range and the
+/// partitions it knows. None for no partitions.
+// Owed caller: piece 9's index ranges on their partitions (the next part); until then only the tests call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn range_partition(family: &[u8], range: u32, partitions: &[u16]) -> Option<u16> {
+  let mut key = Vec::with_capacity(family.len().saturating_add(core::mem::size_of::<u32>()));
+  key.extend_from_slice(family);
+  key.extend_from_slice(&range.to_be_bytes());
+  let members: Vec<u64> = partitions
+    .iter()
+    .map(|partition| u64::from(*partition))
+    .collect();
+  rendezvous_ranked_by_key(&members, &key)
+    .first()
+    .and_then(|member| u16::try_from(*member).ok())
+}
+
 #[cfg(test)]
 mod tests {
   use super::{Decoding, decoding_on, intake_shard};
@@ -138,6 +158,45 @@ mod tests {
     );
     // Everything on the owner, today's placement, for scale: all 19 on one shard.
     assert!(two < 19);
+  }
+
+  /// A-724 piece 9 (§4.17.5). Do: place every range of a 2-bit, 6-bit and 10-bit cut of one repository over 23
+  /// partitions, and another repository's. Expect: every range on one of the partitions, the same answer every time; the
+  /// ranges spread (no partition holding more than three times its even share at 10 bits); another family's ranges
+  /// placed independently of the first's; none for no partitions.
+  #[test]
+  fn a_repositorys_index_ranges_spread_over_the_partitions_by_rendezvous() {
+    use super::range_partition;
+    let partitions: Vec<u16> = (0..23).collect();
+    for bits in [2u32, 6, 10] {
+      let mut held = vec![0usize; partitions.len()];
+      for range in 0..(1u32 << bits) {
+        let at = range_partition(b"monorepo-family", range, &partitions).unwrap();
+        assert_eq!(
+          range_partition(b"monorepo-family", range, &partitions),
+          Some(at)
+        );
+        held[usize::from(at)] += 1;
+      }
+      if bits == 10 {
+        let even = (1usize << bits) / partitions.len();
+        assert!(
+          held.iter().all(|count| *count <= 3 * even),
+          "uneven: {held:?}"
+        );
+      }
+    }
+    let differ = (0..64u32)
+      .filter(|range| {
+        range_partition(b"monorepo-family", *range, &partitions)
+          != range_partition(b"another-family", *range, &partitions)
+      })
+      .count();
+    assert!(
+      differ > 32,
+      "two families placed alike: {differ} of 64 ranges differ"
+    );
+    assert_eq!(range_partition(b"monorepo-family", 0, &[]), None);
   }
 
   /// A-724. Do: decode on a shard, then let each intake go. Expect: the shard's count rises with each and falls back

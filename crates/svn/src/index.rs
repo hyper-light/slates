@@ -1413,6 +1413,45 @@ pub struct TrialNode {
 }
 
 impl Trial<'_> {
+  /// The revision the transaction's new identities are numbered in: one past the youngest, which no node-revision of
+  /// the index was created in.
+  pub fn revision(&self) -> Revision {
+    self.builder.revision
+  }
+
+  /// The revision the transaction was made on.
+  pub fn base(&self) -> Revision {
+    self.builder.previous
+  }
+
+  /// The node-revisions the transaction made, in the order it made them: what FSFS's transaction directory holds
+  /// (A-738 part 2).
+  pub fn made(&self) -> Result<Vec<Node<'_>>, IndexRefusal> {
+    let first = self.builder.index.rows.len();
+    (0..self.builder.rows.len())
+      .map(|made| {
+        let id = first.checked_add(made).ok_or(IndexRefusal::Corrupt)?;
+        self.node_revision(NodeRevisionId(id))
+      })
+      .collect()
+  }
+
+  /// Node-revision `id`, the index's or one the transaction made.
+  pub fn node_revision(&self, id: NodeRevisionId) -> Result<Node<'_>, IndexRefusal> {
+    let row = self.builder.row(id)?;
+    let created_path = self.builder.path_name(row.created_path)?;
+    let copy_from = match row.copy_from {
+      Some((from, revision)) => Some((self.builder.path_name(from)?, revision)),
+      None => None,
+    };
+    Ok(Node {
+      id,
+      row,
+      created_path,
+      copy_from,
+    })
+  }
+
   /// The transaction's node at `path`, or `None` when the work left the path absent.
   pub fn node(&self, path: &str) -> Result<Option<TrialNode>, IndexRefusal> {
     let path = checked_path(path)?;

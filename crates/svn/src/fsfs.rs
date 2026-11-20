@@ -43,8 +43,8 @@ use std::fmt::Write as _;
 
 use crate::dump::Digests;
 use crate::index::{
-  Action, ContentIdentity, CopyId, Index, IndexRefusal, Node, NodeId, NodeKind, NodeRevisionId,
-  PropertyList, Revision,
+  Action, ChangedPath, ContentIdentity, CopyId, Index, IndexRefusal, Node, NodeId, NodeKind,
+  NodeRevisionId, PropertyList, Revision, Trial,
 };
 use crate::reads::Repository as Source;
 
@@ -691,31 +691,397 @@ impl Layout<'_> {
         .index
         .node(&row.path, at)?
         .ok_or(ViewRefusal::Unplaced)?;
-      let action = match row.action {
-        Action::Add => "add",
-        Action::Delete => "delete",
-        Action::Replace => "replace",
-        Action::Modify => "modify",
-      };
-      writeln!(
-        section,
-        "{} {action}-{} {} {} {}",
-        self.id_of(node.id())?,
-        kind_text(row.kind),
-        row.text.is_some(),
-        row.properties.is_some(),
-        row.path
-      )
-      .map_err(|_| ViewRefusal::Overflow)?;
-      if let Some(source) = &row.copy_from {
-        write!(section, "{} {}", source.revision, source.path)
-          .map_err(|_| ViewRefusal::Overflow)?;
-      }
-      section.push('\n');
+      change_line(&mut section, &self.id_of(node.id())?, row)?;
     }
     section.push('\n');
     self.writer.bytes(section.as_bytes())
   }
+}
+
+/// A transaction's directory and prototype revision file as FSFS keeps them while the transaction is open (A-738
+/// part 2): what a pre-commit hook's `svnlook -t` reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionFiles {
+  /// The directories to make beneath the repository, parents first.
+  pub directories: Vec<String>,
+  /// Each file beneath the repository and its bytes: the transaction's properties, its next identities, its changed
+  /// paths, each node-revision it made with its property list and its entries where they changed, the prototype's
+  /// lock.
+  pub files: Vec<(String, Vec<u8>)>,
+  /// Where the prototype revision file lies beneath the repository.
+  pub prototype_path: String,
+  /// The prototype revision file: the texts the transaction gave, read from the source in runs.
+  pub prototype: RevisionFile,
+}
+
+/// The directory a transaction named `name` keeps (`structure`, "Transaction layout"), beneath the repository.
+pub fn transaction_path(name: &str) -> String {
+  format!("db/transactions/{name}.txn")
+}
+
+/// The transaction `trial` stands for, named `name` and holding the properties `properties`, made by the changed-path
+/// rows `work` on `trial`'s base: its directory as FSFS format 6 keeps it (`structure`, "Transaction layout"). Each
+/// node-revision it made is a `node.<node>.<copy>` file with the transaction's identities (`_<number>` for one it
+/// made, `t<name>` its place); a text it gave lies in the prototype file and is named `-1 <offset> …`; a property list
+/// it changed is `-1` and a `.props` file; a directory whose entries changed is `-1` and a `.children` file holding
+/// them whole; anything it kept is the committed representation the view placed. The changed paths are the
+/// revision's form, unterminated, as the transaction appends them. `view` must be laid out through the base.
+///
+/// # Errors
+/// [`ViewRefusal::NotLaidOut`] for a base the view has not reached; otherwise as [`View::advance`].
+pub fn transaction_files<S: Source + ?Sized>(
+  view: &View,
+  index: &Index,
+  trial: &Trial<'_>,
+  work: &[ChangedPath],
+  name: &str,
+  properties: Vec<(&[u8], &[u8])>,
+  source: &S,
+) -> Result<TransactionFiles, ViewRefusal> {
+  if trial.base() >= view.laid_out() {
+    return Err(ViewRefusal::NotLaidOut {
+      revision: trial.base(),
+    });
+  }
+  let made = trial.made()?;
+  let mut transaction = Transaction {
+    view,
+    index,
+    trial,
+    name,
+    writer: Writer::default(),
+    files: Vec::new(),
+    uniquifier: 0,
+  };
+  let directory = transaction_path(name);
+  let mut next_node = 0_u64;
+  let mut next_copy = 0_u64;
+  for node in &made {
+    for (part, next) in [
+      (node.node_id(), &mut next_node),
+      (
+        NodeId {
+          revision: node.copy_id().revision,
+          number: node.copy_id().number,
+        },
+        &mut next_copy,
+      ),
+    ] {
+      if part.revision == trial.revision() {
+        *next = (*next).max(part.number.checked_add(1).ok_or(ViewRefusal::Overflow)?);
+      }
+    }
+    transaction.node(source, node, work, &directory)?;
+  }
+  let mut changes = String::new();
+  let mut rows: Vec<&ChangedPath> = work.iter().collect();
+  rows.sort_by(|first, second| first.path.as_bytes().cmp(second.path.as_bytes()));
+  for row in rows {
+    let id = if row.action == Action::Delete {
+      index
+        .node(&row.path, trial.base())?
+        .ok_or(ViewRefusal::Unplaced)?
+        .id()
+    } else {
+      trial.node(&row.path)?.ok_or(ViewRefusal::Unplaced)?.id
+    };
+    change_line(&mut changes, &transaction.id_of(id)?, row)?;
+  }
+  let mut files = vec![
+    (format!("{directory}/props"), hash_dump(properties)),
+    (
+      format!("{directory}/next-ids"),
+      format!("{} {}\n", base36(next_node), base36(next_copy)).into_bytes(),
+    ),
+    (format!("{directory}/changes"), changes.into_bytes()),
+    (format!("db/txn-protorevs/{name}.rev-lock"), Vec::new()),
+  ];
+  files.append(&mut transaction.files);
+  Ok(TransactionFiles {
+    directories: vec![directory],
+    files,
+    prototype_path: format!("db/txn-protorevs/{name}.rev"),
+    prototype: RevisionFile {
+      segments: transaction.writer.segments,
+      length: transaction.writer.length,
+    },
+  })
+}
+
+/// A transaction's directory being made.
+struct Transaction<'a, 'trial> {
+  /// The committed revisions' layout.
+  view: &'a View,
+  /// The index.
+  index: &'a Index,
+  /// The transaction.
+  trial: &'a Trial<'trial>,
+  /// Its name.
+  name: &'a str,
+  /// Its prototype revision file.
+  writer: Writer,
+  /// Its node-revision files so far.
+  files: Vec<(String, Vec<u8>)>,
+  /// The uniquifiers its texts took so far.
+  uniquifier: u64,
+}
+
+impl Transaction<'_, '_> {
+  /// Whether `node` is one the transaction made.
+  fn made(&self, node: &Node<'_>) -> bool {
+    node.created_revision() == self.trial.revision()
+  }
+
+  /// The node and copy parts of a node-revision's ID: `_<number>` for an identity the transaction made.
+  fn parts(&self, node: &Node<'_>) -> (String, String) {
+    let part = |number: u64, revision: Revision| {
+      if revision == self.trial.revision() {
+        format!("_{}", base36(number))
+      } else {
+        id_part(number, revision)
+      }
+    };
+    (
+      part(node.node_id().number, node.node_id().revision),
+      part(node.copy_id().number, node.copy_id().revision),
+    )
+  }
+
+  /// Node-revision `id`'s ID: the transaction's form for one it made, the revision's otherwise.
+  fn id_of(&self, id: NodeRevisionId) -> Result<String, ViewRefusal> {
+    let node = self.trial.node_revision(id)?;
+    if self.made(&node) {
+      let (node_part, copy_part) = self.parts(&node);
+      return Ok(format!("{node_part}.{copy_part}.t{}", self.name));
+    }
+    let placed = self.view.placed.get(&id).ok_or(ViewRefusal::Unplaced)?;
+    Ok(id_text(
+      node.node_id(),
+      node.copy_id(),
+      node.created_revision(),
+      placed.offset,
+    ))
+  }
+
+  /// Writes `node`'s file, and its property and entries files where it changed them.
+  fn node<S: Source + ?Sized>(
+    &mut self,
+    source: &S,
+    node: &Node<'_>,
+    work: &[ChangedPath],
+    directory: &str,
+  ) -> Result<(), ViewRefusal> {
+    let (node_part, copy_part) = self.parts(node);
+    let file = format!("{directory}/node.{node_part}.{copy_part}");
+    let predecessor = match node.predecessor() {
+      Some(id) => Some((
+        self.trial.node_revision(id)?,
+        self.view.placed.get(&id).copied(),
+      )),
+      None => None,
+    };
+    let text = match node.kind() {
+      NodeKind::File => self.file_text(node, predecessor.as_ref())?,
+      NodeKind::Directory => self.entries(node, predecessor.as_ref(), work, &file)?,
+    };
+    let properties = match node.properties() {
+      PropertyList::Empty => None,
+      PropertyList::Held { identity, .. } => match &predecessor {
+        Some((before, Some(at))) if before.properties() == node.properties() => {
+          at.properties.as_ref().map(representation_text)
+        }
+        _ => {
+          let pairs = source
+            .properties(&identity)
+            .ok_or(ViewRefusal::MissingProperties)?;
+          self.files.push((format!("{file}.props"), hash_dump(pairs)));
+          Some("-1".to_owned())
+        }
+      },
+    };
+    let header = self.header(node, text, properties, work.is_empty())?;
+    self.files.push((file, header.into_bytes()));
+    Ok(())
+  }
+
+  /// A file's text line: its predecessor's representation when equal, otherwise the text written to the prototype.
+  fn file_text(
+    &mut self,
+    node: &Node<'_>,
+    predecessor: Option<&(Node<'_>, Option<Placed>)>,
+  ) -> Result<Option<String>, ViewRefusal> {
+    let Some(text) = node.text() else {
+      return Ok(None);
+    };
+    if let Some((before, at)) = predecessor
+      && before.text().map(|held| held.identity) == Some(text.identity)
+    {
+      let at = at.ok_or(ViewRefusal::Unplaced)?;
+      return Ok(at.data.as_ref().map(representation_text));
+    }
+    let offset = self.writer.length;
+    self.writer.bytes(PLAIN)?;
+    self.writer.text(text.identity, text.size)?;
+    self.writer.bytes(END_REPRESENTATION)?;
+    let number = self.uniquifier;
+    self.uniquifier = number.checked_add(1).ok_or(ViewRefusal::Overflow)?;
+    Ok(Some(format!(
+      "-1 {offset} {} {} {} {} {}/_{}",
+      text.size,
+      text.size,
+      hex(&text.md5),
+      hex(&text.sha1),
+      self.name,
+      base36(number)
+    )))
+  }
+
+  /// A directory's text line: its predecessor's entries when no child was made or deleted beneath it, otherwise `-1`
+  /// and its entries whole in its `.children` file.
+  fn entries(
+    &mut self,
+    node: &Node<'_>,
+    predecessor: Option<&(Node<'_>, Option<Placed>)>,
+    work: &[ChangedPath],
+    file: &str,
+  ) -> Result<Option<String>, ViewRefusal> {
+    let path = node.created_path();
+    let mut names: Vec<String> = match predecessor {
+      Some((before, _)) => self
+        .index
+        .children(before.created_path(), before.created_revision())?
+        .unwrap_or_default(),
+      None => Vec::new(),
+    };
+    let mut changed = false;
+    for row in work
+      .iter()
+      .filter(|row| parent_of(&row.path) == path && row.path != path)
+    {
+      let Some((_, name)) = row.path.rsplit_once('/') else {
+        continue;
+      };
+      if row.action != Action::Modify {
+        changed = true;
+      }
+      if row.action != Action::Delete && !names.iter().any(|held| held == name) {
+        names.push(name.to_owned());
+      }
+    }
+    let mut entries = Vec::with_capacity(names.len());
+    for name in names {
+      let Some(child) = self.trial.node(&joined(path, &name))? else {
+        continue;
+      };
+      let child_node = self.trial.node_revision(child.id)?;
+      changed |= self.made(&child_node);
+      entries.push((name, child.kind, child.id));
+    }
+    if !changed {
+      return match predecessor {
+        Some((_, at)) => Ok(
+          at.ok_or(ViewRefusal::Unplaced)?
+            .data
+            .as_ref()
+            .map(representation_text),
+        ),
+        None => Ok(None),
+      };
+    }
+    let mut pairs = Vec::with_capacity(entries.len());
+    for (name, kind, id) in entries {
+      let value = format!("{} {}", kind_text(kind), self.id_of(id)?);
+      pairs.push((name.into_bytes(), value.into_bytes()));
+    }
+    let bytes = hash_dump(
+      pairs
+        .iter()
+        .map(|(name, value)| (name.as_slice(), value.as_slice()))
+        .collect(),
+    );
+    self.files.push((format!("{file}.children"), bytes));
+    Ok(Some("-1".to_owned()))
+  }
+
+  /// `node`'s file (`svn_fs_fs__write_noderev` as a transaction writes it): a copy root the transaction made is
+  /// revision `-1`, and named only where it is not the node itself.
+  fn header(
+    &self,
+    node: &Node<'_>,
+    text: Option<String>,
+    properties: Option<String>,
+    fresh: bool,
+  ) -> Result<String, ViewRefusal> {
+    let mut header = String::new();
+    let mut line = |text: std::fmt::Arguments<'_>| -> Result<(), ViewRefusal> {
+      header.write_fmt(text).map_err(|_| ViewRefusal::Overflow)?;
+      header.push('\n');
+      Ok(())
+    };
+    line(format_args!("id: {}", self.id_of(node.id())?))?;
+    line(format_args!("type: {}", kind_text(node.kind())))?;
+    if let Some(predecessor) = node.predecessor() {
+      line(format_args!("pred: {}", self.id_of(predecessor)?))?;
+    }
+    line(format_args!("count: {}", node.predecessor_count()))?;
+    if let Some(text) = text {
+      line(format_args!("text: {text}"))?;
+    }
+    if let Some(properties) = properties {
+      line(format_args!("props: {properties}"))?;
+    }
+    line(format_args!("cpath: {}", node.created_path()))?;
+    if let Some((path, revision)) = node.copy_from() {
+      line(format_args!("copyfrom: {revision} {path}"))?;
+    }
+    let root = self.trial.node_revision(node.copy_root())?;
+    if self.made(&root) {
+      if root.created_path() != node.created_path() {
+        line(format_args!("copyroot: -1 {}", root.created_path()))?;
+      }
+    } else {
+      line(format_args!(
+        "copyroot: {} {}",
+        root.created_revision(),
+        root.created_path()
+      ))?;
+    }
+    if fresh && node.created_path() == "/" {
+      line(format_args!("is-fresh-txn-root: y"))?;
+    }
+    if node.mergeinfo_count() > 0 {
+      line(format_args!("minfo-cnt: {}", node.mergeinfo_count()))?;
+    }
+    if node.has_mergeinfo() {
+      line(format_args!("minfo-here: y"))?;
+    }
+    header.push('\n');
+    Ok(header)
+  }
+}
+
+/// Appends changed-path row `row`'s entry, its node-revision `id` (`write_change_entry`, format 6).
+fn change_line(section: &mut String, id: &str, row: &ChangedPath) -> Result<(), ViewRefusal> {
+  let action = match row.action {
+    Action::Add => "add",
+    Action::Delete => "delete",
+    Action::Replace => "replace",
+    Action::Modify => "modify",
+  };
+  writeln!(
+    section,
+    "{id} {action}-{} {} {} {}",
+    kind_text(row.kind),
+    row.text.is_some(),
+    row.properties.is_some(),
+    row.path
+  )
+  .map_err(|_| ViewRefusal::Overflow)?;
+  if let Some(source) = &row.copy_from {
+    write!(section, "{} {}", source.revision, source.path).map_err(|_| ViewRefusal::Overflow)?;
+  }
+  section.push('\n');
+  Ok(())
 }
 
 /// A node-revision ID: `<node>.<copy>.r<revision>/<offset>` (`id.c` `svn_fs_fs__id_unparse`).
