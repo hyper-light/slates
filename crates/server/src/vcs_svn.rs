@@ -791,7 +791,10 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
     }
     match went {
       Stepped::Go => {}
-      Stepped::End => return,
+      Stepped::End => {
+        slates_machine::log_line!("diag-steps svn:// conversation: {}", slates_svn::diag_steps::take_summary());
+        return;
+      }
       Stepped::Elsewhere(found, located) => {
         // A hold is given back on the shard that holds its records.
         conversation.held = None;
@@ -819,7 +822,7 @@ async fn step(
   let next = {
     // A-740: a shard stuck answering a call (a replay, a log, an update's drive) names it.
     let _doing = slates_rt::futures::doing("vcs_svn::answer");
-    answer(conversation, out)
+    slates_svn::diag_steps::timed("svn:answer", || answer(conversation, out))
   };
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
@@ -963,7 +966,7 @@ fn answer(conversation: &mut Conversation, out: &mut Vec<u8>) -> Next {
     return next_of(connection, turn, out);
   };
   let lent = held_sources(opened, principal, held.as_ref(), |sources| {
-    let turn = connection.receive(Some(sources), input, out, budget);
+    let turn = slates_svn::diag_steps::timed("svn:receive", || connection.receive(Some(sources), input, out, budget));
     next_of(connection, turn, out)
   });
   // A read whose answer goes on past this call holds the records this call read, in the same step (A-749 rule 4).

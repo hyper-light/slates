@@ -530,7 +530,7 @@ async fn first_slices<S: SvnStores>(
     let budget = slice_budget(room, stores.fetch_quantum());
     let progress = stores
       .lend_held(hold, principal, |lent| {
-        report.resume(&served_of(lent, root), &mut pending, budget)
+        slates_svn::diag_steps::timed("dav:first-slice-resume", || report.resume(&served_of(lent, root), &mut pending, budget))
       })
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     let done = match progress {
@@ -1569,11 +1569,11 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     let bounds = xml_bounds(self.request_room);
     let room = to_usize(self.request_room);
     let root = self.root.as_str();
-    let answer = self
+    let answer = slates_svn::diag_steps::timed("dav:answer", || self
       .stores
       .lend(self.repository, &self.principal, |lent| {
         site::answer(&served_of(lent, root), &request, &bounds, room)
-      })
+      }))
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     let answered = match answer {
       SiteAnswer::Whole(whole) => Answered::Whole {
@@ -1671,15 +1671,18 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           .generation
           .as_ref()
           .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
-        let progress = self
-          .stores
-          .lend_held(hold, &self.principal, |lent| {
-            report.resume(&served_of(lent, root), out, budget)
+        let stores = &mut self.stores;
+        let principal = &self.principal;
+        let progress = slates_svn::diag_steps::timed("dav:lend+resume", || {
+          stores.lend_held(hold, principal, |lent| {
+            slates_svn::diag_steps::timed("dav:resume", || report.resume(&served_of(lent, root), out, budget))
           })
-          .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+        })
+        .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
         match progress {
           ReportProgress::More => Ok(true),
           ReportProgress::Done => {
+            slates_machine::log_line!("diag-steps dav report: {}", slates_svn::diag_steps::take_summary());
             *done = true;
             Ok(false)
           }
