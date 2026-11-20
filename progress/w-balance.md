@@ -65,3 +65,8 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
   forgets); docs §4.17.5 + A-724 log entry + GAPS line. Target ~/.cache/w-balance-target. Clone ~/slates-work/w-balance.
 - NEXT: P2 share model (pure module in slates-vcs: decayed rates, SHARDS MRC, utility split + floor, DRF weights) with
   a serial reference-allocator oracle.
+- P2 division LANDED main 4bbf7f4ba (merge abc2722e0), merge-base checked: crates/vcs/src/share.rs (divide, Claim,
+  Granted). share tests 4/4 (oracle 500). Found+fixed: zero-room unused resource stopped claims at level 0.
+- NEXT (P2b+P3): server side. Per shard: claims from vcs_usage rows + held bytes (objects_charged, store) -> divide
+  over [admittable room, step-ns per period]; admission by share in git_push::push_room / upload room; typed
+  ShareExceeded in git's words; floor fast path counted.
