@@ -70,8 +70,8 @@
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
 > principal's own name, its session's `ToolIdentities::subversion`, BUILT 2026-11-20; symbolic links as `svn:special`
-> files, `link ` and the target, BUILT 2026-11-20), its copies as rows with their sources owed until a work can make a
-> copy (A-626 part 4); Mercurial's changesets of a submitted
+> files, `link ` and the target, BUILT 2026-11-20; its copies as copy-from rows, BUILT 2026-11-20 over A-626 part 4's
+> `WorkOp::Copy`); Mercurial's changesets of a submitted
 > version owed
 > (A-626 part 4); a submit refused before the verdict when its post-state or its message is one git cannot hold (a
 > `.git` name, a `.gitmodules` link, a name past 4096 bytes, a NUL in the message: today the version lands and its
@@ -138,6 +138,10 @@
 > acknowledged after the home image, so `Unanswered` until A-727 a3); the healer at each configuration change
 > (`heal_region`, region holds idempotent). The transport is complete; it acknowledges once A-727 a3 lands.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
+> The daemon's end at ten large pushes fixed: a pack's waiting deltas resolve a delta a unit in the answer's turns
+> (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
+> repositories' wait (3.34 times their fair share; about a second before a push's first step unaccounted), a quiet
+> rerun of the cap-10 proof.
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
 >
@@ -155,7 +159,10 @@
 > **A-713 (2026-11-20, w-git; every clone of a long history refused for its room, found by use).** BUILT: git's
 > upload-pack, HTTP and SSH, admits each request what its repository's shard could admit (`StoreLender::room`), as A-704
 > admits a push. A-745 git piece 1 (2026-11-20, w-k90-vendor): the plan carries its objects as runs of positions, never a
-> handle an object. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
+> handle an object; piece 2a: the negotiation's walk keeps its sets as runs, its stacks charged at their deepest (a 3,000-
+> commit clone negotiated within 4 KiB); piece 2b part 1: the choice of the pack's objects a unit at a time
+> (`negotiation::begin`, `Negotiating::step`); part 2: `upload::serve_in_turns` and `Answer::write_within` choose them
+> within the owner's quantum, the answer the same bytes. Owed: upload-pack's answer made in slices (a 1,200-commit fetch's first step ran past a liveness window
 > in a debug build); the git-matrix clone rows by use (main's).
 >
 > **A-729 (2026-11-20, w-hg; S5 of main's convergence plan: Mercurial content held once).** Part 1 BUILT: a manifest is
@@ -196,8 +203,16 @@
 > answered whole. Piece 2b BUILT (SSH): the session begins a `getbundle` (`session::begin_serving`), the `Stdio`
 > holds its answer and makes it a slice at a time (`Stdio::stream`), the server's step streaming it within the shard's
 > room and quantum, a turn ending once a room's worth waits to be sent; an SSH clone of a file twice a request's room
-> is answered whole (test). Owed: a hold on the index generation a fetch began on (rule 4: a push landing mid-clone is
-> read by the clone's later turns; next); the stream clone's; w-interop's matrix rerun.
+> is answered whole (test). Rule 4 BUILT: a streamed answer holds the generation it began on (`hg_view::Generation`: a
+> fork of the index and the register's roots and bookmarks as they stood, taken in the turn the answer began, given
+> back by its drop), and every later turn lends a view over it (`HgStores::lend_held`, HTTP and SSH); a clone across a
+> landing and a rebuild in flight answers the start generation's bytes, byte for byte (test; without the hold the
+> rebuild's turn is lent nothing). Piece 3 BUILT: `stream_out` is sent a row at a time (`render::Streaming`: a first
+> walk counts the files and bytes its head names from the rows alone, then each revlog's index entries and data chunks
+> a row a step, the data file's size known from the offsets the index file kept), over HTTP and SSH as `getbundle`'s
+> answer is (`session::Producing`); its bytes are `render::revlogs`' byte for byte (test), a step's least room below the
+> whole answer's (test), and a stream clone of a file twice a request's room is answered through the daemon's edge
+> (test). Owed: `stream2` (bundle2's stream part) and stock `hg clone --stream` by use; w-interop's matrix rerun.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -2785,7 +2800,13 @@
 > its volume destroyed, so a log that could never be held (A-353's catalog refused for good) kept its writer waiting 21
 > minutes. A hold now ends at the failover SLO, refused `DurabilityPending` and recorded as the request's outcome; the
 > writer still waits through a shorter silence. Test:
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`.
+> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`.
+> - **CLOSED 2026-11-20 (g226; main's ruling): the given-up verb never takes effect twice.** The refusal was recorded as
+>   the request's completion, so a consumer told to make the call again ran the verb a second time over its own effect
+>   (an append twice, a directory's second making refused `AlreadyExists`). The verb's own reply is now the recorded
+>   completion and the refusal goes unrecorded; `slates_client` sends the request again under its id once, so its caller
+>   is handed the verb's own reply. A yield's waiters (A-409) still record the refusal: their write never took effect on
+>   the successor.
 > - **Owed (the integrator's):** live_chaos and live_fleet flows that keep a writer waiting past the failover SLO (10 s)
 >   now meet `DurabilityPending` where they waited; each flow's stops are a few liveness budgets, under it, but a flow
 >   that stops every candidate longer must treat the refusal as its write's outcome (not acknowledged, so never owed to

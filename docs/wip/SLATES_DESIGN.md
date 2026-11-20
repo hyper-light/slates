@@ -7992,15 +7992,17 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > (`live_ship::judge_held_destroys`), answered `Refusal::DurabilityPending { held_ns }` and counted
 > `fleet.live.held_gave_up` (`fleet.destroy.held_gave_up`), with what durability lacked logged. Through a shorter
 > silence the writer still waits, as the 2026-11-05 sweep chose (a writer waits, never a false success), so a candidate
-> stopped for a few liveness budgets still answers the write when it resumes. The refusal is recorded as the request's
-> completion, as a fence's is, so a retry under the same id meets it (§4.9); the verb's effects stay committed on the
-> owner, never claimed durable, and a consumer runs the verb again under a new id (slates-api's
-> `RetryCause::DurabilityPending`, CONTRACT 22). A retry that joined a request's wait is answered with it, judged by the
-> request's first hold. Held by
-> `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+> stopped for a few liveness budgets still answers the write when it resumes. Since 2026-11-20 (main's ruling, A-354's
+> amendment) the verb's own reply is recorded as the request's completion and the refusal is delivered unrecorded
+> (`live_ship::answer_given_up`): the verb took effect once on the owner, so its resend under the same id is answered its
+> own reply (§4.9) and a verb never takes effect twice. The client sends a `DurabilityPending` request again under its id
+> itself, once, on the sync and the async path (`slates_client::Client`), so a caller is handed that reply. A retry that
+> joined a request's wait is answered with it, judged by the request's first hold. Held by
+> `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
 > (`crates/server/tests/fleet.rs`: both survivors refuse the owner's register records, so a new live volume's head never
-> places; the write refused after 10.03 and 10.08 s, the same request answered the same refusal, and the write sent again
-> answered `FsDone` once the refusals lifted).
+> places; a directory made through the raw ring is refused at the failover delay, and its resend answered `FsDone`; one
+> made through `slates_client` is answered `FsDone`; each listed once). Until then the refusal was the recorded
+> completion and a consumer told to make the call again ran the verb a second time (g226).
 >
 > **Every other durability claim (2026-11-05, the sibling sweep of FUSE `fsync`).** Each place a client is told data is
 > durable on a live volume now waits for the position its barrier published, and the same failing test holds each to
@@ -12299,14 +12301,34 @@ four rules, which git's upload-pack, Mercurial's `getbundle` and stream clone, a
 > other fetch by the changesets that name each revision (7.2's slow path, bounded by what it sends). Piece 2a BUILT:
 > HTTP drives it a turn at a time (`vcs_http::hg`'s `HgExchange::turn`), each turn the view lent anew within the
 > shard's room and quantum, the stream compressed as it is made; the red passes. Piece 2b BUILT: SSH the same
-> (`Stdio::stream`, `vcs_ssh::hg`). Owed: the hold on the generation a fetch began on (rule 4), the stream clone (piece
-> 3), git's upload-pack (w-git).
+> (`Stdio::stream`, `vcs_ssh::hg`). Rule 4 BUILT: a streamed answer holds its generation (`hg_view::Generation`, a
+> fork of the index with the register's roots and bookmarks), every turn lent a view over it. Piece 3 BUILT: the stream
+> clone (`stream_out`) is sent a row at a time (`slates_hg::render::Streaming`, counted first from the rows alone).
+> Owed: `stream2`, git's upload-pack (w-git).
 > **git, piece 1 BUILT (2026-11-20, w-k90-vendor):** the negotiation's answer and the pack's plan carry the objects a
 > fetch sends as runs of positions (`slates_git::positions::Positions`, moved out of the store so the negotiation names
 > none), charged a run's bytes each, never a handle an object: one push's objects are one run, so a clone's plan is a
-> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). Owed for git: the walk's own
-> sets (piece 2: negotiation and plan a step at a time, `upload::Answering`), the server driving it a turn at a time
-> within a request's room (piece 3, reverting A-713's shard room).
+> few words (A-582's repository: 12 objects, one run, 16 bytes where the copy charged 96). **Piece 2a BUILT (same
+> day):** the walk keeps what it meets as runs too (`negotiation::Held`: the paint's three sets, the commits sent, what
+> the client holds, the objects chosen, the trees done and opened, a `tree:` filter's depths aside), charged a run as a
+> set's runs grow, and its queue and stacks at their longest (`negotiation::Peak`), never once an entry pushed: a clone
+> of 3,000 commits pushed in one piece, 9,000 objects, is negotiated within 4 KiB (it was refused there, `PastAdmission`).
+> Positions met in no order (a set the store gave piece by piece) cost a run an object, 16 bytes against the 8 the sets
+> charged; one push's order costs a run a kind or less. **Piece 2b part 1 BUILT (same day):** the choice of what a pack
+> sends one by one is made a unit at a time (`negotiation::begin`, then `Negotiating::step` until its owner's quantum is
+> spent, at least one unit a step, a commit from the walk's queue or an entry from a tree walk's stack, its place kept:
+> the commit walk, what the client holds, the sent commits' trees, the wants, `include-tag`); `negotiate` is the same
+> stepped to its end, and a sparse walk's frames are held while they live, given back as they are left. Held to the
+> negotiation's oracle and to the whole answer on 1,024 generated requests stepped a unit at a time. **Piece 2b part 2
+> BUILT (same day):** `upload::serve_in_turns` answers a protocol v2 `fetch` with the sections before its pack encoded
+> from what `begin` decided, and `Answer::write_within` chooses the pack's objects within its owner's quantum (the
+> repository lent for each write), then begins the pack; a choice refused, or a pack that cannot begin, after those
+> sections ends the response with git's band-3 words, as a pack refused midway ends. `serve` still chooses them before
+> it answers. Every upload test's exchange is answered both ways and held to the same bytes and refusal (its counters
+> too, but where a `sparse:oid` blob dies unread: in turns it dies before any walk, as git's `pack-objects` does).
+> Owed for git: the servers answering in turns within a request's room (piece 3, reverting A-713's shard room), protocol
+> v0's fetch in turns, what `begin` decides (`ready`, the cut) and `include-tag`'s scan in units, and a fetch held to
+> the index generation it began on (rule 4).
 
 > **Status (2026-11-19, A-618: shared piece 4 built in the engine).** `slates_merge::push::build` makes a client's push
 > into the work items 2 to 4 state. It compares the base version's tree and the pushed tree entry by entry by the ids
@@ -33053,9 +33075,22 @@ Applied in the same change to:
 - `crates/server/src/live_ship.rs`: `Awaiting::held_since_ns`, `judge_held` (at the period's visit to a live volume),
   `judge_held_destroys` (once a period on each shard), `held_past` (a request's entries judged by its first hold),
   counters `fleet.live.held_gave_up` and `fleet.destroy.held_gave_up`. `crates/server/src/verbs.rs`: the refusal's name.
-- Tests: `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again`
+- Tests: `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`
   (`crates/server/tests/fleet.rs`); `a_reply_held_past_its_durable_bound_is_a_retry` (`crates/api/src/error.rs`).
 - GAPS: the entry of 2026-11-18.
+
+**Amended 2026-11-20 (main's ruling on g226's finding): a verb never takes effect twice.** At the failover delay the
+verb's own reply, not the refusal, is recorded as its completion, in one durable step as every completion is (A-127's
+pattern, `verbs::record_completion`), and `DurabilityPending` is delivered unrecorded (`live_ship::answer_given_up`, for
+`judge_held` and `judge_held_destroys`). A resend under the same id is answered the verb's own reply. `slates_client`
+sends a `DurabilityPending` request again under its id once, itself (`Client::exchange` on the sync path,
+`resent_for_durability` on the async one), so every caller of the client is handed that reply. A yielded volume's
+waiters (A-409) still record `DurabilityPending`: their write was made on a copy the successor passed, so it never took
+effect there, and the same request run again goes to the successor. Why: the refusal recorded as the completion told a
+consumer to make the call again under a new id, which ran the verb a second time over its own effect: a directory's
+second making refused `AlreadyExists`, an append landed twice. Applied in the same change to: §4.10's status,
+`crates/server/src/live_ship.rs`, `crates/client/src/client.rs`, `crates/api/src/error.rs` (`RetryCause::DurabilityPending`),
+the test (renamed `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply`), GAPS.
 - **What was there.** A deferred verb's reply ended only once its log was durable where its publication put it (or its
   tombstone placed), its owner fenced, or its volume destroyed. The 2026-11-05 sweep chose to keep the writer waiting
   rather than refuse it at the transports' silent window, and nothing bounded the wait: a log that could never be held
@@ -41170,7 +41205,7 @@ GAPS).
 - **Names.** The three tests that still said `failover_slo` after A-525 deleted the placeholder now name the failover
   delay they test: `a_held_replys_wait_ends_at_the_failover_delay_from_its_hold` (`crates/bridge-core/src/durable_bound.rs`,
   whose docs and reason line said "failover SLO" too),
-  `a_reply_held_for_a_durability_it_cannot_reach_is_refused_at_the_failover_delay_and_runs_again` and
+  `a_verb_held_past_the_failover_delay_took_effect_once_and_its_resend_is_answered_its_own_reply` and
   `the_failover_delay_ends_a_forwards_location_budget` (`crates/server/tests/fleet.rs`); their citations here and in
   GAPS follow.
 
@@ -52671,7 +52706,7 @@ and `ref_of` crate-visible), `crates/client` (`RepositorySpec`, `Client::create_
   release owed; a copy made through a work
   driven through the whole build by a test, once a client verb makes one; Subversion's revision of a submitted version
   (BUILT 2026-11-20, `vcs_store::svn_made`, its author the principal's own name, its symbolic links `svn:special`
-  files; its copies owed until a work makes one); Mercurial's manifests by the
+  files, its copies copy-from rows); Mercurial's manifests by the
   same rule.
 - **Applied in the same change to:** `crates/server/src/vcs_store/paths.rs` and `paths/tests.rs` (new);
   `crates/server/src/vcs_store.rs` (`GitStore::paths` and `heads`, `made`, `release`, `recover`, `rebuild`) and
@@ -54935,6 +54970,22 @@ Applied in the same change to:
   packs": with v1.5.0's 9.8 MB packs in the mix, capped at 5 or 3 pushes to one repository, the small repositories' p99
   is 3.07 and 3.63 times their fair share (within it without large packs); the wait is daemon-wide, to be profiled. Ten
   such pushes to one repository end the daemon (A-722's proof must hold at ten).
+- **The daemon's end at ten large pushes, fixed: a pack's waiting deltas resolve a delta a unit, in the answer's
+  turns (2026-11-20; main's ruling of 2026-11-20).** Profiled with new per-repository counters in `slates status`
+  (each repository's usage row, a push's steps, time, longest step and the wait before them by phase): the kill's cause
+  line at ten v1.5.0 pushes named `vcs_http.rs:1404` at its poll 595, and the longest input step was 1,435.7 ms:
+  `slates_git::unpack::Reader::finish_into` resolved every delta waiting at a pack's end, and their dependents, in the
+  input step that brought the trailer. Now `Reader::resolve_turn` resolves them under a quantum (one unit at least, a
+  unit applying one delta or listing one entry's waiting children; a thin pack's outside bases one table row a unit),
+  the session holds `State::Resolving` between turns, and `ReceivePack::check_turn` gives it the turns the checks
+  get. The red: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` counts each step resolving
+  past its budget (64 deltas on one late base, a budget of four): 0 for the input step and 0 over every turn (the first
+  form of the fix, a base's children one unit, counted 1). By use (BENCHMARKS.md, "Waiting deltas resolved in
+  turns"): ten concurrent v1.5.0 pushes, 10 of 10 answered, the daemon alive, the longest input step 1.2 ms; v1.5.0
+  alone holds 424 to 438 MiB (about 758 before). Not the small repositories' wait: their counters show about 6,000
+  check turns a push of 23 µs each, each waiting about 91 µs for its shard, and about a second before the first step
+  still unaccounted, profiled next. Tests: slates-git 556 of 556; slates-server `git_push:: vcs_http::git:: vcs_ssh::
+  vcs_share:: vcs_store::upload::` 106 of 106; slates-ipc and slates-mcp whole.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55995,3 +56046,18 @@ at each append and each snapshot); `crates/server` (`content_ranges`: the regist
   `a_copy_refusal_is_typed_invalid_by_its_case`; by use against a real daemon, a copy of nothing refused with its case:
   MCP's test, the Python SDK 4 of 4, the Node SDK 9 of 9, the CLI's JSON flow (`SLATES_TEST_CLI=1`); `slates-ipc
   --test wire_order` published; fmt clean.
+
+### A-664 Subversion objects, copies — A copy a work submits is the made revision's copy-from row (2026-11-20, w-shared for UI goal 93; main's ruling)
+- **Change.** `verbs::judge_submission` hands the version's copies (`vcs_store::svn_made::copies_of`, its increment's
+  `Copy` operations: destination, source, the source's version, which version N = revision N makes the copy-from
+  revision, and its replace) to `svn_made::make`. A copy's destination is a row with its copy source (`copy_row`): `add`,
+  or `replace` where something stood there or it replaces, the source's kind at its revision, its text and property list
+  set where the head differs from the source's; a path beneath it is judged against the source's node at the copy-from
+  revision (`copy_beneath`); a directory above a node added beneath it stood where it stood in the source. A copy the
+  version holds and the submit did not hand over is still refused, counted.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20). `slates-server` `repository::svn_commit::tests::
+  t_a664_svn_a_submitted_copy_is_a_copy_from_row` (red before: the copy refused, revision 2 unmade; green: its one row
+  adds `/branches/b` copied from `/trunk` at revision 1, the records hold `/branches/b/a.txt`, a client's revision lands
+  as 3); `cargo test --locked -p slates-server --lib -- repository::svn_commit:: vcs_svn vcs_store:: identities::
+  --test-threads=4` 116 of 116; fmt clean.
+- **Owed.** A stock `svn log -v` and `svn checkout` over the made copy by use (main's).

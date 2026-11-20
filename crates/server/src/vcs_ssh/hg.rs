@@ -64,9 +64,11 @@ use crate::vcs_http::hg::HgStores;
 const HIDDEN_REFUSED: &[u8] = b"ignoring request to access hidden changeset by unauthorized user: ";
 
 /// One `hg serve --stdio` session over SSH (the module doc).
-pub(crate) struct HgCommand<S> {
+pub(crate) struct HgCommand<S: HgStores> {
   /// Where the store is lent.
   stores: S,
+  /// A streamed `getbundle` answer's hold on the generation it began on (A-745 rule 4).
+  generation: Option<S::Hold>,
   /// The repository.
   repository: RepositoryId,
   /// Who the session's pushes are by: the principal the client's key proved.
@@ -98,6 +100,7 @@ impl<S: HgStores> HgCommand<S> {
     };
     Self {
       stores,
+      generation: None,
       repository,
       principal,
       room,
@@ -171,6 +174,7 @@ impl<S: HgStores> Command for HgCommand<S> {
   async fn step(&mut self, _gone: ClientGone<'_>) -> Result<Stepped, Refused> {
     let Self {
       stores,
+      generation,
       repository,
       principal,
       room,
@@ -183,7 +187,7 @@ impl<S: HgStores> Command for HgCommand<S> {
     }
     let progress = if stdio.taking_push() {
       stdio.step_push()
-    } else if stdio.streaming() {
+    } else if let (true, Some(generation)) = (stdio.streaming(), generation.as_ref()) {
       // A-745 (§4.17.1 "A fetch's answer"): a `getbundle`'s answer made a turn at a time, the view lent for the turn,
       // each slice within the shard's room, the turn ending at its quantum or once a room's worth waits to be sent.
       let (turn_room, quantum) = stores.fetch_turn(*repository).unwrap_or((*room, 0));
@@ -191,7 +195,7 @@ impl<S: HgStores> Command for HgCommand<S> {
       let start = slates_rt::futures::now_ns();
       let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
       stores
-        .lend(*repository, &mut admission, |store, _| {
+        .lend_held(generation, &mut admission, |store, _| {
           loop {
             match stdio.stream(store, turn_room) {
               Progress::Streamed { more: true }
@@ -204,12 +208,21 @@ impl<S: HgStores> Command for HgCommand<S> {
         .ok_or_else(unheld)?
     } else {
       let mut admission = Admission::new(*room);
-      stores
+      let progress = stores
         .lend(*repository, &mut admission, |store, left| {
           stdio.step(store, left.left())
         })
-        .ok_or_else(unheld)?
+        .ok_or_else(unheld)?;
+      if stdio.streaming() {
+        // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
+        let mut held = Admission::new(*room);
+        *generation = Some(stores.hold(*repository, &mut held).ok_or_else(unheld)?);
+      }
+      progress
     };
+    if !stdio.streaming() {
+      *generation = None;
+    }
     if let Some(push) = stdio.take_push() {
       land(stores, (*repository, principal), push, stdio).await?;
     }

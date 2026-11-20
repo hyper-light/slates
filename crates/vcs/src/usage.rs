@@ -52,6 +52,8 @@ pub struct WorkUsage {
   pub step_ns: u64,
   /// Bytes the clients sent for the works.
   pub bytes_in: u64,
+  /// The longest one step ran, in the shard clock's nanoseconds: how long a work of this kind held its shard at once.
+  pub longest_step_ns: u64,
 }
 
 /// One slot of a repository's principal summary (module docs).
@@ -198,6 +200,7 @@ impl<R: Ord + Clone, P: Clone + Eq> Ledger<R, P> {
     let counts = self.row(repository, now_ns).work_mut(work);
     counts.steps = counts.steps.saturating_add(1);
     counts.step_ns = counts.step_ns.saturating_add(step_ns);
+    counts.longest_step_ns = counts.longest_step_ns.max(step_ns);
     counts.bytes_in = counts.bytes_in.saturating_add(bytes_in);
   }
 
@@ -324,6 +327,7 @@ mod tests {
             let counts = if intake { &mut row.intake } else { &mut row.fetch };
             counts.steps += 1;
             counts.step_ns += u64::from(ns);
+            counts.longest_step_ns = counts.longest_step_ns.max(u64::from(ns));
             counts.bytes_in += u64::from(bytes);
           }
           Event::Answered(repository, intake) => {
@@ -417,7 +421,8 @@ mod tests {
         answered: 1,
         steps: 1,
         step_ns: 900,
-        bytes_in: 4096
+        bytes_in: 4096,
+        longest_step_ns: 900,
       }
     );
     assert_eq!((pushed.first_ns, pushed.last_ns), (5, 7));

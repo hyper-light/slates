@@ -2047,6 +2047,49 @@ pub struct ShardReport {
   /// This node's failover estimate (A-363): live on the control shard, which runs the coordinator; elsewhere the
   /// recovery prior alone. Appended.
   pub failover: FailoverReport,
+  /// Each repository this shard owns with an event since it was made here, and its usage (A-724 piece 1's ledger,
+  /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
+  /// Appended.
+  pub repositories: Vec<RepositoryUsageReport>,
+}
+
+/// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUsageReport {
+  /// The repository's name.
+  pub name: String,
+  /// Intakes (pushes, commits) begun.
+  pub intakes_begun: u64,
+  /// Intakes answered.
+  pub intakes_answered: u64,
+  /// Intake steps run.
+  pub intake_steps: u64,
+  /// The shard clock's nanoseconds those steps ran.
+  pub intake_step_ns: u64,
+  /// Bytes the clients sent for them.
+  pub intake_bytes_in: u64,
+  /// Fetch requests begun.
+  pub fetches_begun: u64,
+  /// The shard clock's nanoseconds fetch steps ran.
+  pub fetch_step_ns: u64,
+  /// The shard clock's nanoseconds at its first event.
+  pub first_ns: u64,
+  /// The shard clock's nanoseconds at its latest event.
+  pub last_ns: u64,
+  /// The longest one intake step ran, in nanoseconds: how long an intake held its shard at once.
+  pub longest_intake_step_ns: u64,
+  /// A git push's longest step of each phase on this shard, in nanoseconds: a run of the body read, the body's end, a
+  /// turn of the pack's checks, and the answer's last step (seal, hooks, verdicts, commit, report). Zeros for others.
+  pub longest_push_phases_ns: Vec<u64>,
+  /// A git push's steps of each phase on this shard, in the phases' order above.
+  pub push_phase_steps: Vec<u64>,
+  /// The nanoseconds those steps ran, by phase.
+  pub push_phase_ns: Vec<u64>,
+  /// The nanoseconds from the repository's previous push step's end to each step's start, by the step's phase: before
+  /// a check turn or the answer, the push's wait for its shard; before an input step, that and the client's bytes.
+  pub push_phase_gap_ns: Vec<u64>,
+  /// The nanoseconds from each git push's beginning to its first step, summed.
+  pub push_first_gap_ns: u64,
 }
 
 /// A learner's configuration fetches (§4.8, D-14): the council version it holds now, the version it held after its last

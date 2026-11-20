@@ -1664,9 +1664,10 @@ fn take_awaiting(state: &mut ShardState, volume: [u8; 16]) -> Vec<Awaiting> {
 /// operator's bound on how long an object may go unserved before a takeover serves it, past which a write not yet held
 /// is past what the fleet promises. Through a shorter silence the reply still waits, as the 2026-11-05 sweep chose for
 /// the slates protocol (a writer waits, never a false success; a transport answers its own failure earlier). The
-/// refusal is recorded as the verb's completion, as a fence's is ([`refuse_awaiting`]), so a retry under the same id
-/// meets it (§4.9): the verb's effects stay committed on the owner, nothing claims them durable, and a consumer runs the
-/// verb again under a new id. Judged at the period's visit to the volume ([`period_volume`]). Until 2026-11-18 a held
+/// verb's own reply is recorded as its completion and the refusal delivered unrecorded ([`answer_given_up`]): the verb
+/// took effect once on the owner, so its resend under the same id is answered its own reply (§4.9) and never runs it
+/// again. Until 2026-11-20 the refusal was the recorded completion and a consumer told to run the verb again under a new
+/// id ran it twice: an append landed twice (g226; main's ruling). Judged at the period's visit to the volume ([`period_volume`]). Until 2026-11-18 a held
 /// reply ended only durable, fenced or destroyed, so a log that could never be held (its holders' catalog refused for
 /// good, A-353's case) kept its writer waiting without end.
 ///
@@ -1699,14 +1700,14 @@ fn judge_held(state: &mut ShardState, volume: [u8; 16]) {
         durability_report(state, id, key.1)
       );
       state.count(LIVE_HELD_GAVE_UP, 1);
-      answer(state, entry, durability_pending(held_ns));
+      answer_given_up(state, entry, held_ns);
     }
   }
 }
 
 /// Answers each destroy this shard has held past the failover SLO for its tombstone's placement
-/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] answers a write: the same bound, the same refusal, recorded
-/// as the destroy's completion. Judged once a record period on each shard ([`period`]); bounded by the shard's held
+/// [`Refusal::DurabilityPending`] (A-354), as [`judge_held`] answers a write: the same bound, the same refusal, and the
+/// destroy's own reply recorded as its completion, so its resend is answered `Destroyed`. Judged once a record period on each shard ([`period`]); bounded by the shard's held
 /// replies ([`awaiting_bound`]).
 ///
 /// [`Refusal::DurabilityPending`]: slates_ipc::protocol::Refusal::DurabilityPending
@@ -1733,7 +1734,7 @@ fn judge_held_destroys(state: &mut ShardState) {
         sequence
       );
       state.count(DESTROY_HELD_GAVE_UP, 1);
-      answer(state, entry, durability_pending(held_ns));
+      answer_given_up(state, entry, held_ns);
     }
   }
 }
@@ -1948,6 +1949,26 @@ const LIVE_FENCED: &str = "fleet.live.fenced";
 /// Answers one waiting verb with `reply`: its completion recorded on this partition (one durable step, so a retry after
 /// meets it) and the reply delivered to its client's shard.
 fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::ReplyBody) {
+  answer_recording(state, entry, None, reply);
+}
+
+/// Answers one waiting verb past the failover SLO (A-354): its own reply recorded as its completion, so a resend under
+/// its id is answered that reply and never runs the verb again, and `DurabilityPending` delivered now, recorded nowhere,
+/// since the durability its reply claims was not reached. The verb took effect once on the owner; what was not reached
+/// is only the claim (main's ruling, 2026-11-20).
+fn answer_given_up(state: &mut ShardState, entry: Awaiting, held_ns: u64) {
+  let own = entry.reply.clone();
+  answer_recording(state, entry, Some(own), durability_pending(held_ns));
+}
+
+/// Answers one waiting verb: `recorded` (or `reply` itself when `None`) recorded as its completion on this partition, in
+/// one durable step, and `reply` delivered to its client's shard.
+fn answer_recording(
+  state: &mut ShardState,
+  entry: Awaiting,
+  recorded: Option<slates_ipc::protocol::ReplyBody>,
+  reply: slates_ipc::protocol::ReplyBody,
+) {
   state
     .live
     .awaiting_by_request
@@ -1957,7 +1978,13 @@ fn answer(state: &mut ShardState, entry: Awaiting, reply: slates_ipc::protocol::
     .destroys_by_request
     .remove(&(entry.origin, entry.id.client, entry.id.sequence));
   state.db.begin();
-  let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply);
+  let recorded = match recorded {
+    Some(own) => {
+      let _ = crate::verbs::record_completion(state, entry.origin, entry.id, own);
+      reply
+    }
+    None => crate::verbs::record_completion(state, entry.origin, entry.id, reply),
+  };
   if state.db.commit(&mut state.segment).is_err() {
     state.count(LIVE_UNRECORDED, 1);
     return;

@@ -196,7 +196,7 @@ pub struct Streamed {
   /// A slice made and not yet compressed, its bound refused: compressed first by the next step, within its room.
   pending: Option<(Vec<u8>, bool)>,
   /// The answer.
-  answering: Answering,
+  answering: session::Producing,
 }
 
 impl Streamed {
@@ -267,10 +267,22 @@ pub fn begin(
     Err(refusal) => return Begun::Answered(error(Refused::Http(refusal))),
   };
   let transport = Transport::Http { header_line };
+  if command == b"stream_out" && store.revlogs().is_some() {
+    // 7.2's `streamreslegacy`: the revlogs as they are, in `application/mercurial-0.1`, never compressed.
+    return Begun::Streamed(Box::new(Streamed {
+      media_type: MEDIA_TYPE_V1,
+      head: None,
+      compressor: compression::StreamCompressor::Uncompressed,
+      engine: Engine::Uncompressed,
+      pending: None,
+      answering: session::Producing::Revlogs(Box::default()),
+    }));
+  }
   if command == b"getbundle" {
     let asked = session::getbundle_asked(&arguments);
     let (answered, refused) = match Answering::begin(store, &asked, admission) {
       Ok(answering) => {
+        let answering = session::Producing::Bundle(Box::new(answering));
         return match streaming(answering, request, compressor, admission) {
           Ok(streamed) => Begun::Streamed(Box::new(streamed)),
           Err(refused) => Begun::Answered(error(refused)),
@@ -292,7 +304,7 @@ pub fn begin(
 /// A `getbundle`'s answer begun: its media and compression chosen as [`streamed`] chooses them for a stream whose
 /// length is not known, and its `0.2` header made.
 fn streaming(
-  answering: Answering,
+  answering: session::Producing,
   request: &Request<'_>,
   compressor: &mut impl Compressor,
   admission: &mut Admission,
