@@ -55559,6 +55559,16 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (members' positions, landed runs, holds' release); a stale restage sliced; a record's replay through the same sliced
   intake.
 
+### A-722 part 4d — A replayed record's thin pack resolves its deltas a delta a unit (2026-11-20, w-git for UI goal 93)
+- **Change.** `slates_git::unpack::Reader::resolve_turn_with`: w-balance's resolution in turns (032617278) over the
+  reader's own keeper, a thin pack's outside bases read from the store; a git record's replay (`git_replay`) resolves
+  its pack's waiting deltas there, a delta a unit, before it admits the objects.
+- **Tests.** `slates-server` `git_push::tests::t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  (the fixtures' `create` and thin `update`, the store made again at a quantum of none: more turns than records, the
+  refs advertised alike).
+- **Runs.** macOS arm64, this Mac, local (own target): `slates-server --lib -- vcs_store:: git_push:: repository::
+  vcs_http::git vcs_http::daemon_edge git_hooks:: git_protect` 192 passed; fmt clean.
+
 ### A-722 part 4c — A move is admitted a unit at a time before its append (2026-11-20, w-git for UI goal 93)
 - **Change.** `slates_git::store::Admitting` (`Repository::admitting`, `admit_turn`): A-614's admission of a move (the
   walk of what it brings against the green's reached set, the fast-forward's descent by generation number, the search
