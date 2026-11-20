@@ -23,12 +23,12 @@
 use super::answer::{Answer, Framing, Said};
 use super::sparse;
 use super::{PackPlan, PackSource, Refusal, Refused, Served, Sink, charged, refs};
-use crate::Admission;
 use crate::negotiation::{self, Acknowledgments, Deepen, Filter, Outcome, ShallowInfo};
 use crate::object_name::{ObjectFormat, ObjectId};
 use crate::store::StoreGraph;
 use crate::v2::fetch::{Argument, Event, Response, Section, WantedRef};
 use crate::v2::{Ending, Line};
+use crate::{Admission, Hold};
 
 /// What a `fetch` asks for that is a choice, not a list.
 #[derive(Clone, Copy, Debug, Default)]
@@ -129,7 +129,7 @@ impl Asked<'_> {
 pub(super) fn answer<P: PackSource>(
   graph: &StoreGraph<'_>,
   served: &Served<'_>,
-  arguments: &[Line<Argument<'_>>],
+  (arguments, decoded): (Vec<Line<Argument<'_>>>, Hold),
   packs: &mut P,
   admission: &mut Admission,
   turns: bool,
@@ -141,7 +141,20 @@ pub(super) fn answer<P: PackSource>(
     refusal,
     multiplexed,
   };
-  let asked = read(graph, served, arguments, admission).map_err(refused)?;
+  let before = admission.left();
+  let asked = read(graph, served, &arguments, admission);
+  // A-745: the lists `asked` holds live until the answer is made, and are given back then; the decoded lines are read
+  // once into `asked` and given back at once, before the negotiation's tables.
+  let lists = admission.held_since(before);
+  drop(arguments);
+  admission.release(decoded);
+  let asked = match asked {
+    Ok(asked) => asked,
+    Err(refusal) => {
+      admission.release(lists);
+      return Err(refused(refusal));
+    }
+  };
   let sparse = sparse::read(graph, served, asked.filter.as_ref(), admission).map_err(refused)?;
   let request = negotiation::Request {
     wants: &asked.wants,
@@ -172,6 +185,8 @@ pub(super) fn answer<P: PackSource>(
       .map_err(|refusal| refused(Refusal::Negotiation(refusal)))?;
     written(served, &asked, outcome, packs, sparse, admission).map_err(refused)?
   };
+  drop(asked);
+  admission.release(lists);
   match graph.fault() {
     Some(fault) => Err(refused(Refusal::Store(fault))),
     None => Ok(answer),

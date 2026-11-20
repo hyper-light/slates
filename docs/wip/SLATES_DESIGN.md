@@ -56923,3 +56923,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read; red before) and
   `a_stored_text_is_read_a_store_window_a_step`.
 - **Applied in the same change to** §4.17.1's status, GAPS, amendments.tsv.
+
+### A-763 — A live write ships the bytes it changed (2026-11-20, w-forming; main's order, item 1; found by use: 32 KiB NFS writes to a 3 MiB live file shipped about 245 KB of delta each, 54 MB over 221 appends; §4.10 "Live shipping"; A-126, A-200)
+
+- **Cause.** A live delta's content runs (`live_ship::content_runs`) carried every extent of each patched file's image,
+  and a patch's image carries every extent in the windows its writes touched (A-126's `Dirty::windows`, the write's
+  window and the open extent's): a page written into a 3 MiB file shipped about 313 KB.
+- **The change.** The volume keeps the byte ranges each publication's writes changed (`Dirty::writes`, from the old end
+  of the file when a write grows it, since the zeros it opens are new; cleared into `Dirty::published_writes` at
+  `mark_published`, read through `Volume::published_writes`); a patched file's runs are those ranges clipped to its
+  extents (`clipped_to_writes`), a file changed otherwise ships its extents as before. A successor's rebuild overlays
+  the runs by byte range per inode (`overlay_run`: the later bytes over the earlier, the rest kept) and reads each
+  extent from them (`run_bytes`, refused where a byte is missing, as before), so a window's unwritten bytes come from the
+  entries before it. The delta record's format is unchanged.
+- **Tests.** `slates-cli` live_fleet `a_live_write_ships_the_bytes_it_changed_not_its_window` (64 page writes spread over
+  a 3 MiB live file, the delta bytes held within the bytes written and a page a publication): red before (20,063,216
+  bytes shipped for 262,144 written in 64 appends), 309,760 after (bytes, not time: the same in a release build).
+  `live_ship::tests::overlaid_runs_read_back_the_latest_bytes_and_refuse_a_gap` (a byte-array oracle) and
+  `a_patched_files_spans_are_clipped_to_its_writes`; the takeover flows that serve written volumes from a successor's
+  rebuild (live_fleet's warm-restart, no-copy and stopped-successor takeovers; the live_chaos fresh-member flow).

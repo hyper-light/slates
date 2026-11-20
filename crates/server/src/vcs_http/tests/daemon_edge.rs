@@ -2118,8 +2118,9 @@ fn a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock() {
 }
 
 /// Shape: the blobs a partial clone's checkout fetches lazily in one request, as `git clone --filter=blob:none` asks
-/// for every blob of its checkout: two thousand, as w-interop's matrix source checked out.
-const LAZY_BLOBS: usize = 2_000;
+/// for every blob of its checkout: 2,900, toward git/git's checkout (about 4,400 files), past the about 2,870 wants
+/// whose parsed lists alone filled one ring region's room (278,528 bytes) at about 97 bytes a want.
+const LAZY_BLOBS: usize = 2_900;
 
 /// A v2 `fetch` as git's promisor fetch asks for missing objects (`promisor-remote.c` `fetch_objects`: `git fetch
 /// --filter=blob:none --stdin` with the no-op negotiator): a `want` for each of `ids`, the filter, no haves, `done`.
@@ -2175,4 +2176,113 @@ fn a_partial_clones_lazy_fetch_of_many_blobs_is_answered_over_the_daemons_edge()
   assert_eq!(fetched.0, 200, "{answer}");
   assert!(answer.starts_with("000dpackfile\n"), "{answer}");
   assert_eq!(ids_in(&fetched_pack(&fetched.1)).len(), LAZY_BLOBS);
+}
+
+/// Shape: [`merge_history`]'s main line: each of its commits after the first merges a topic.
+const MERGE_MAINLINE: usize = 150;
+/// Shape: each topic's commits, as long as a typical git/git topic series.
+const MERGE_TOPIC: usize = 20;
+/// Shape: how far back along the main line a topic branches, as git/git's topics branch from an older release.
+const MERGE_BACK: usize = 60;
+
+/// A history shaped as git/git's: a main line of [`MERGE_MAINLINE`] commits, each after the first a merge of the line
+/// and a topic of [`MERGE_TOPIC`] commits branched [`MERGE_BACK`] commits back, every commit over one tree (the walk is
+/// the graph's, so the texts are left out). The push creating `main` at its tip, and the tip.
+fn merge_history() -> (Vec<u8>, ObjectId) {
+  use slates_git::object_name::Kind;
+  let blob = b"one\n".to_vec();
+  let mut tree = b"100644 file\0".to_vec();
+  tree.extend_from_slice(git_name(Kind::Blob, &blob).as_bytes());
+  let tree_id = git_name(Kind::Tree, &tree);
+  let mut objects: Vec<(Kind, Vec<u8>)> = vec![(Kind::Blob, blob), (Kind::Tree, tree)];
+  let mut commit = |parents: &[ObjectId], message: String| {
+    let lines: String = parents
+      .iter()
+      .map(|parent| format!("parent {parent}\n"))
+      .collect();
+    let bytes = format!(
+      "tree {tree_id}\n{lines}author A <a@example.com> 1700000000 +0000\n\
+       committer A <a@example.com> 1700000000 +0000\n\n{message}\n"
+    )
+    .into_bytes();
+    let id = git_name(Kind::Commit, &bytes);
+    objects.push((Kind::Commit, bytes));
+    id
+  };
+  let mut main: Vec<ObjectId> = vec![commit(&[], "main 0".to_owned())];
+  for at in 1..MERGE_MAINLINE {
+    let mut topic = main[at.saturating_sub(MERGE_BACK)];
+    for step in 0..MERGE_TOPIC {
+      topic = commit(&[topic], format!("topic {at} {step}"));
+    }
+    let previous = main[at - 1];
+    main.push(commit(&[previous, topic], format!("merge {at}")));
+  }
+  let tip = *main.last().expect("a commit");
+  let listed: Vec<(Kind, &[u8])> = objects
+    .iter()
+    .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+    .collect();
+  let mut request = Vec::new();
+  let line = format!("{ZERO} {tip} refs/heads/main\0{CAPABILITIES}");
+  pktline::write(Packet::Data(line.as_bytes()), &mut request).expect("the command");
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request.extend_from_slice(&stored_pack(&listed));
+  (request, tip)
+}
+
+/// A v2 `fetch` deepening a shallow clone of `tip` by `depth` as `git fetch --deepen <depth>` asks: `want` the tip, its
+/// `shallow` boundary, `deepen <depth>` and `deepen-relative`, `have` the tip, `done`.
+fn deepen_of(tip: ObjectId, depth: usize) -> Vec<u8> {
+  let mut request = Vec::new();
+  pktline::write(Packet::Data(b"command=fetch\n"), &mut request).expect("the command");
+  pktline::write(Packet::Delim, &mut request).expect("the delimiter");
+  for argument in [
+    format!("want {tip}\n"),
+    format!("shallow {tip}\n"),
+    format!("deepen {depth}\n"),
+    "deepen-relative\n".to_owned(),
+    format!("have {tip}\n"),
+    "no-progress\n".to_owned(),
+    "done\n".to_owned(),
+  ] {
+    pktline::write(Packet::Data(argument.as_bytes()), &mut request).expect("an argument");
+  }
+  pktline::write(Packet::Flush, &mut request).expect("the flush");
+  request
+}
+
+/// A-745 (found by use: w-interop's stock-git matrix, row deepen, on git/git, r103 on 36c6ed55d and r110 on 944588f6a:
+/// `git fetch --deepen 100` from a `--depth 1` clone exited 128, `upload-pack: the request needs more room than the
+/// server admits`). Do: push [`merge_history`] (git/git's shape: every main commit a merge of a long topic) through the
+/// daemon's edge, each request admitted one ring region; then, as a shallow clone of its tip, fetch at protocol v2 as
+/// `git fetch --deepen 100` asks. Expect: the fetch `200`, a `shallow-info` section and a packfile section: a
+/// deepening's walk is admitted a slice at a time, never sized by the history it walks.
+#[test]
+fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, tip) = merge_history();
+  let created = pushed(edge, &name, &request);
+  let deepened = uploaded(edge, &name, &deepen_of(tip, 100));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  let answer = String::from_utf8_lossy(
+    deepened
+      .1
+      .get(..deepened.1.len().min(400))
+      .unwrap_or_default(),
+  )
+  .into_owned();
+  assert_eq!(deepened.0, 200, "{answer}");
+  assert!(answer.contains("shallow-info"), "{answer}");
+  assert!(
+    String::from_utf8_lossy(&deepened.1).contains("packfile"),
+    "{answer}"
+  );
 }
