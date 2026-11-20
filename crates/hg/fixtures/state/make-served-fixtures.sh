@@ -58,7 +58,7 @@ unfiltered = repo.unfiltered()
 write('unserved', ['%s %s' % (text(unfiltered[r].hex()), 'hidden' if r in hidden else 'secret')
                    for r in unfiltered if r not in served])
 PY
-REPOS=(states states-store divergent)
+REPOS=(states states-store divergent amended-root)
 if [ $# -gt 1 ]; then shift; REPOS=("$@"); fi
 for repo in "${REPOS[@]}"; do
   mkdir -p "$WORK/$repo/.hg/store"
