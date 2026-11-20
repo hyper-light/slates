@@ -164,3 +164,8 @@
   activity = a transaction begun lazily (revprops from the wbl PROPPATCH) and wrk/ACT/path == txr/TXN/path.
   Part 1 slates-svn sans-io (URIs, CHECKOUT body/answer, activity state), part 2 server site, part 3 by-use (stock
   svn 1.15 against a no-v2 OPTIONS test hook, on a machine with svn).
+- DeltaV v1 parts, revised: 1 READS -- site.rs serves vcc/default (checked-in -> bln/YOUNGEST), bln/N
+  (baseline-collection -> bc/N/, version-name), ver/N/PATH (a version resource: PROPFIND, GET) as repos.c answers
+  them; 2 WRITES sans-io (dav/activity.rs: URIs, CHECKOUT body, mod_dav's 201 HTML body pinned from httpd 2.4.x
+  mod_dav.h DAV_RESPONSE_BODY_1..5 + "X Y has been created.", Cache-Control no-cache; DavCommit activity + checked-out
+  revisions); 3 server; 4 by-use.
