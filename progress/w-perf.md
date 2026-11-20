@@ -188,3 +188,10 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   installed via ContentStore::with_storage where VcsStores.content is made; reads via read_extent_into (copy-out).
   Then (a3): image section for the repository arena's chunk table + recovery before records + homes::image_begun/
   image_published hooks + group commit; then (b) git record v3; then S4 slice 2 under rule (B).
+- (a2) step 2 PARKED on branch agents/w-perf-a727-a2s2 (08cb0ddd0): ContentPool::open_repository (owner
+  partitions+partition), daemon repository_windows(), ArenaWindows (seal/read-copy/free; tests pass), VcsStores::
+  with_windows wiring. FINDING: in a real shard the repository arena is starved: first put ArenaExhausted, grow adds 0
+  (volume arena holds the slice's pool extents); hg_made t_a731 test fails with it, passes with heap storage. Also the
+  shard budget tracks only the volume arena. Asked main to rule: (i') layout range per slice, (i'') budget-grown +
+  balancing, or (ii) windows as chunks of the volume ChunkStore lent per step (recommended). Waiting.
+- hg import re-run (A-732) r66 still running on Studio (or done: check logs hgimp2.out / evidence/hg-import-2.log).
