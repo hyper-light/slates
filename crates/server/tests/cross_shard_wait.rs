@@ -39,8 +39,6 @@ const OFF: Duration = Duration::from_millis(40);
 /// Shape: the client's reply deadline: ten windows, far past any hold here, so what is measured is the daemon's own
 /// wait on its shard and not the client's (the client's deadline is the liveness window, A-232's to derive).
 const REPLY_WAIT_NS: u64 = 10 * LIVENESS_BUDGET_NS;
-/// Shape: how long a client retries the rendezvous while the daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the clients connected while looking for one the shard that is not the control shard serves; with two shards a
 /// run that finds none in this many is a fault of the placement, not luck.
 const CLIENT_TRIES: usize = 16;
@@ -98,18 +96,9 @@ fn connect(instance: &str) -> Client {
     reply_ns: REPLY_WAIT_NS,
     ..common::client::deadlines()
   };
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::thread::yield_now();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
+  // The claim waits while the rendezvous's holder lives (A-468), so a refusal is the test's failure, never a wait
+  // (until 2026-11-20 a five-second retry, `START_WAIT`).
+  Client::connect(instance, deadlines).unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// A client served on `shard`, with the others connected on the way (kept, so the placement does not hand their seats
