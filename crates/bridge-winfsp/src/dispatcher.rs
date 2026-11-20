@@ -419,14 +419,24 @@ impl inflight::settle::Edges for Dll<'_> {
   }
 
   fn send(&mut self, response: &[u8]) -> Result<(), WinFspError> {
-    transaction(
+    // DIAG (w-bugs B3, never for main): each send's kind and hint, before and after the driver takes it.
+    let kind = response.get(4..8).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes);
+    let hint = response.get(8..16).and_then(|b| b.try_into().ok()).map_or(0, u64::from_le_bytes);
+    let started = std::time::Instant::now();
+    slates_machine::log_line!("diag-b3: send begins kind {kind} hint {hint:#x}");
+    let sent = transaction(
       self.control,
       TRANSACT_BATCH,
       response,
       &mut [],
       &self.private.intents,
     )
-    .map(|_| ())
+    .map(|_| ());
+    slates_machine::log_line!(
+      "diag-b3: send returned kind {kind} hint {hint:#x} after {} us",
+      started.elapsed().as_micros()
+    );
+    sent
   }
 
   fn operate(
@@ -436,6 +446,11 @@ impl inflight::settle::Edges for Dll<'_> {
     replaying: bool,
   ) -> Result<usize, WinFspError> {
     REPLAYING.set(replaying);
+    slates_machine::log_line!(
+      "diag-b3: operate kind {} hint {:#x}",
+      request.kind(),
+      request.hint()
+    );
     let length = operation(
       self.file_system,
       request,
