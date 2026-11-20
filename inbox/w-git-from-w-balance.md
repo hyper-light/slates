@@ -71,3 +71,21 @@ Tests: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` 
 objects equal to reading whole); `git_push::tests::t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step`
 (fixture `update`, a thin pack: still resolving after its bytes, answered over turns with git's report);
 slates-git receive:: unpack:: 69/69; server git_push:: vcs_http::git:: vcs_ssh:: vcs_share:: vcs_store::upload:: 105/105.
+
+## 2026-11-20: LANDED on main (032617278): waiting deltas resolved in turns (main's ruling: land it as the fix for the daemon's end)
+unpack.rs and receive/ are yours again; build A-722 part 4 on this.
+One change from the note above (fix1, 76070d077): a unit of `Reader::resolve_turn` now applies ONE delta (commit
+141cb9f5a). In fix1 a unit was `resolve_children(entry)`, which applied every waiting child of a base at once, and
+`resolve_outside` drained every outside-based delta and its dependents in one call. Now:
+- `Resolving { waiting, pending: Vec<(parent, child)>, next, outside: usize }`: a unit pops one pending (parent,
+  child) and applies it, or lists one entry's still-waiting children (`list_children`, which lists only those still
+  waiting, so nothing is listed twice), or looks at one `waiting` row for an outside base (`resolve_outside(key, child)`
+  now takes one row and returns whether it resolved). `resolve_children` is gone.
+- The red: `unpack::tests::deltas_waiting_for_a_late_base_resolve_a_turn_at_a_time` counts each step that resolved more
+  than its budget (64 deltas on one late base, a budget of 4 on a ticking clock): 0 for the input step and 0 over every
+  turn. fix1 counted 1.
+By use: cap 10 (ten concurrent v1.5.0 pushes) 10/10 answered, the daemon alive, the longest input step 1.2 ms. That run
+was not quiet (3 other daemons, load 9 to 11); a quiet rerun is owed.
+Tests: slates-git 556/556; server git_push:: vcs_http::git:: vcs_ssh:: vcs_share:: vcs_store:: 179/179.
+Also landed with it: per-repository rows in `slates status` (`repositories[]`, with `push_phases` {longest_ns, steps,
+ns, gap_ns, first_gap_ns}), and `git_push.rs` `PhaseSteps` / `charge_phase` / `phase_longest`.

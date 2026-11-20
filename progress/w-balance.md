@@ -203,3 +203,4 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - FIX (branch agents/w-balance-fix1 76070d077, NOT LANDED per main's rule): resolve in turns. Input longest 1.1 ms, cap 10
   alive, v1.5.0 alone 423 MiB, but toys still 3.34x fair share -> resolve is NOT the toys' wait. Inbox note to w-git
   written. Awaiting main's ruling. NEXT: profile the answer step (213-247 ms) and per-step round cost.
+- 2026-11-20: LANDED 032617278 on main: a pack's waiting deltas resolve a delta a unit in the answer's turns (the daemon's end at ten v1.5.0 pushes); red past-budget counter 0/0; cap 10 10/10 alive (not quiet: 3 daemons, load 9-11, quiet rerun owed). Per-repository push counters by phase in status. w-git told. Next work in progress: the toys' wait, ~1 s before a push's first step unaccounted, measuring it.
