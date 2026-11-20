@@ -65,7 +65,7 @@
 > 2026-11-20) and a whole
 > map's release sliced a unit at a time, and the build of the put files in slices of its own (a recovery's remake puts
 > the files a unit each, BUILT 2026-11-20); a branch's first
-> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test, once a client verb makes one;
+> map derived from its source's where the source's head is the version it was made at; a copy made through a work driven through the maps' whole build by a test BUILT 2026-11-20 (`WorkOp::Copy`, A-626 part 4's work verb; the SDKs', MCP's and the CLI's surfaces for it owed);
 > Subversion's revision of a submitted version BUILT (2026-11-20, w-shared, bug
 > `docs/bugs/2026-11-20-a-submit-to-a-subversion-green-made-no-revision.md`: `vcs_store::svn_made`, the change's rows
 > read before from the records and after from the green, recorded in the submit's transaction; `svn:author` the
@@ -107,7 +107,8 @@
 > admission's second resource (`vcs_share::room`, `Bound::Snapshot`). Owed: the slot
 > derived and re-laid at a handoff (8b), the snapshot naming a push's names by identity (8c: the codec `slates_vcs::rows` built; record v3's switch waits
 > for A-727 a3's durable content), a giant repository's index cut
-> across partitions by object id (9: the cut and its placement built, 9a; the record, routing and split owed, 9b).
+> across partitions by object id (9: the cut and its placement, 9a; the cut in the record, its one-bit op and look-up routing, 9b; the rows'
+> routing and the split's moves wait for record v3, after A-727 a3).
 > Piece 4a: an overrun's drop chosen by §4.11's cost model (`slates_vcs::cold`) and git's kept fragments dropped and
 > re-encoded (`Repository::drop_fragments`); 5a: windows homed by identity across a node's shards
 > (`vcs_store::homes`); 4b: the trigger in `vcs_share::room`, rebuild cost learned per repository.
@@ -143,7 +144,12 @@
 > its chain's delta bytes stay within its text's length, else whole (derived: a text rebuilds from at most its own
 > length of deltas, 7.2's bound); `HgIndex::revision_text` rebuilds it for every reader (the served view, the push's
 > held texts, the record writer, a re-base). Mercurial's own manifests, 5,501,443,727 bytes whole, are 9.4 MB as revlog
-> deltas. Owed: part 2, records naming identities with the changegroup's deltas (no texts), replay re-taking them;
+> deltas. Part 2 BUILT (the push's half): a push's record is its changegroup as it arrived (`SHGR` version 2:
+> the head, the room the intake began within, the changegroup's version and bytes; deltas, never texts), written a
+> mean revision's bytes a step (`record::ChangegroupWriter`) and replayed by taking the changegroup again through the
+> live push's own intake (`record::Replay`, `push::intake::Intake` now lent its bytes each step, so a replay reads them
+> in place); the landing appends that, where it appended every text whole. Owed: an import's and a made changeset's
+> records still hold texts (version 1); the names list (the changegroup names every node, so none is written yet);
 > file texts by the green's identity; RSS measured before and after by use.
 > **A-732 (2026-11-20, w-hg; BUG found by use, w-perf: importing Mercurial's own repository crash-looped the daemon).**
 > FIXED: a Mercurial record is replayed at recovery a revision a unit of its slices (`slates_hg::import::record::Replay`,
@@ -154,8 +160,8 @@
 > (`record::Writer::begin_kept`, `hg_push::record_sliced`), again after a re-base, where the landing wrote it whole.
 > Part 3 FIXED: a Mercurial store's rebuild (`vcs_store::rebuild`, after a commit refused past its store's step)
 > replays its records a step a turn in a task, the store lent to nothing meanwhile (`VcsStores::rebuilding`), its
-> generation moved after. Owed: the landing's append of an entry as large as its record, and the record's size itself
-> (S5, A-729 part 2: identities, no texts); w-perf's and w-interop's by-use reruns.
+> generation moved after. The landing's append is now the size of the push's changegroup (A-729 part 2). Owed:
+> w-perf's and w-interop's by-use reruns.
 > **A-731 (2026-11-20, w-hg; A-664 item 4's Mercurial half).** BUILT: a version a work submits to a Mercurial
 > repository's green is the changeset the server makes of it (`vcs_store::hg_made::make` in `verbs::judge_submission`;
 > `slates-hg` `push::made`, held to stock 7.2's nodes for an add, a change, an executable file and a removal on a
@@ -1582,6 +1588,22 @@
 > byte-identical and the matrix passes 29 of 29 (Mac Studio, debug). Over git/git's last 2,000 commits svnsync passes
 > but `svnrdump dump` (one `replay-range` of the whole history) gets shard 0 spinning 3.6 s and the daemon killed
 > after 53 MB: 28 of 29, owed to w-svn.
+> Since a469a6b85 (the listener yields while its client drains) `svnrdump dump` of that history finishes, 72 MB in 14 s:
+> 29 of 29.
+> **`slates repository policy` (w-interop, 2026-11-20; A-622, A-685's owed words):** the owner reads a repository's
+> policy (`DescribeRepositoryPolicy`, appended; `RepositoryPolicy` reply) and sets it from the version read, each
+> `--hook POINT=PROGRAM` replacing that point's hooks and every other part kept; a stranger's read or set is
+> `Forbidden`, a stale set `PolicyChanged`. By use: a pre-revprop-change hook set this way lets stock svn 1.15 change
+> a revision property over svn://. Found by use: with no hook such a change is taken (`change-rev-prop2`), where
+> svnserve refuses E165006; `svn_interop.rs` holds that test ignored for w-svn.
+> The svn matrix sets that hook with the verb and changes revision 1's `svn:log` over svn:// and svn+ssh (rows
+> revprop-hook, revprop-svn, revprop-ssh): 32 of 32 over the reads fixtures' repository and over git/git's last 2,000
+> commits (Mac Studio, debug).
+> **`slates repository branch create|bind|retire` (w-interop, 2026-11-20; A-575, A-685's owed words):** the owner's
+> branch verbs from the command line (`CreateBranch`, `BindBranch`, `RetireBranch`; the client's `create_branch`,
+> `bind_branch`, `retire_branch`). Found by use: a branch the namespace binds is not among the refs git's site serves
+> (`git ls-remote` lists `main` alone after `branch create topic --from main`); `git_interop.rs` holds the by-use test
+> ignored for w-git.
 > Since fc79d36ae svn+ssh runs: `svn_interop.rs`'s svn+ssh round trip un-ignored, and the matrix passes 24 of 27
 > (main a146359; `lock` over svn:// and the HTTP rows remain).
 > **A-726 part 1, blame and diff over HTTP (w-reaper, 2026-11-20):** the `file-revs-report` (`svn blame`) and the
@@ -2077,7 +2099,14 @@
 > then post-revprop-change with the old value, over `svn://` and `svn+ssh://` (`vcs_svn::revision_property_hook`; tests
 > `a_revision_property_change_runs_its_hooks_and_lands_as_svnserve_does`, `..._runs_its_hooks_around_its_record`).
 > `SvnStores::land_locks` became `land_record`. Owed: a recorded stock `svn propset --revprop` session over each scheme
-> (run request for main); DAV's revprop change.
+> (run request for main); DAV's revprop change. **Found by use, same day (w-interop, stock svn 1.15.0 over svn://):**
+> with no pre-revprop-change hook `svn propset --revprop` was answered "property set", exit 0. The listener wrote a
+> turn's output, then wrote it again with the answer of what followed the turn: the change's trivial authentication
+> request twice, the second read by stock svn as the change's success, the 165006 after it unread. Fixed (w-svn): the
+> written output is cleared before what follows the turn (`vcs_svn::step`), which a commit's hooks and landing and a
+> lock verb follow too; the listener's no-hook test sends `change-rev-prop` and `change-rev-prop2` with the policy set
+> and never set and refuses a doubled request; `svn_interop.rs`'s by-use test runs un-ignored. Sibling: Windows'
+> hook stand-in let a change with no pre-revprop-change hook go on; it now answers 165006 too (main's Windows build).
 > S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
 > `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
 > answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
@@ -2296,6 +2325,13 @@
 > entry the leader lacks (the integrator's diag-green-44269355181 arm64 run 7: leader at last log 6, follower at 7, same
 > term 1, no stuck dial), and the Windows two-region root whose new voters reported no committed root voter set (run
 > 44298844583, no stuck dial).
+> **Sweep (2026-11-20, w-forming; macOS arm64, Mac Studio adas-mac-studio-4, local, origin/main 69d1f2ec3 with A-735):**
+> the live_chaos fresh-member flow `a_member_that_never_held_the_log_never_stands_in_for_its_holder` 48 times under
+> `taskpolicy -b` (the one-CPU stand-in), nothing else of the worker's beside it: the fleet formed and settled in 48 of
+> 48 and the replaced member rejoined in 48 of 48; none of the three shapes above recurred. The test passed 47 of 48;
+> run 21 failed after forming, a successor owner's shard 0 spinning 5.6 s without a step right after its takeover
+> (watchdog exit 4; owed, w-forming's queue). An earlier sweep on the build before A-735 hung twice on a replaced
+> member's client claim (A-735).
 
 > **A fresh member that joined before its admission kept contact with no one: fixed (2026-11-18, A-331, §4.8; goal
 > g225; found 2026-11-09 by raft-chaos and recorded then on a branch that never reached main).** live_chaos's
@@ -2988,6 +3024,13 @@
 > in each form (`crates/bridge-fuse/src/shards_fs.rs`), and a daemon's stream taking it after an INIT that kept the
 > extended form, its root then shown as the run's (`crates/server/src/shards.rs`). Swept: no other intercept of the
 > stream reads a negotiated form. Owed: kiln's re-vendor and its macOS microVM drive (main's run).
+> **Fixed since (A-741, 2026-11-20, w-k90-vendor):** a connection that kept the extended form still sends a SETXATTR
+> its kernel sized before INIT's reply arrived in the short form (Linux `fuse_setxattr` sizes by `fc->setxattr_ext`
+> at the call; `fuse_block_alloc` holds it until the reply), and Shards' init sets the owner word just then: read in the
+> extended form alone, the word fell to the dispatch (`EOPNOTSUPP`) and kiln's macOS microVM g266 drive was refused
+> every write `EACCES`, intermittently (recorded on the Mac Studio: `SetXattr` node 1 from uid 0, `setxattr_ext=true`,
+> an 8-byte `fuse_setxattr_in`). The form is the request's own now (`abi::setxattr_head`), for the word and the
+> dispatch alike. Owed: kiln's re-vendor (with its drive's run).
 > **Built since (A-303, 2026-11-18):** a stream's tables for a VM's save and restore (Shards' D176 part 5): a SAVE
 > waits for the guest's stores through its maps, takes and publishes a snapshot at the cut and answers tables naming
 > it with the guest's references, opens, scope and owner view; a RESTORE, a fresh stream's first frame, takes them onto
@@ -16891,6 +16934,10 @@ Owed from this measurement:
 - **Windows arm64: the 4–5 ms wait on every open and close of a written file**, all three runs, not on x86_64. The
   daemon's status named no WinFsp event, so no purge round ran, and `fsbench`'s open test (files never written) costs
   1.2 ms an open and close there. Not yet explained: find whose wait it is with the daemon's own timing first.
+  **Not reproduced 2026-11-20 (w-bugs, goal-83 B5; main 137bf3633, diag-w-bugs-b5-4):** 200 opens and closes of a
+  64 KiB file just written, timed in PowerShell on CI's runners, p50 (p90): arm64 slates 229 µs (267), WinFsp's own
+  memfs 186 µs (211), NTFS 68 µs (83); x86_64 slates 93 µs (127), memfs 44 µs (50), NTFS 13 µs (16). The 4–5 ms is gone,
+  most likely with the receiver's later changes (A-212, A-215, A-560); slates stays within 1.3× of memfs on arm64.
 - **macOS: fewer calls per change**, the transport question owed since 2026-10-07.
 - **Linux, quiet: the mutating calls' publication** (about 30 µs a call).
 - **Bare metal:** every cell here is a CI VM; the bare-metal x86_64 reference stays the 2026-10-19 box run (a FUSE create

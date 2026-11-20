@@ -67,6 +67,7 @@ DatabaseRefusal 9 PolicyHookMalformed
 DatabaseRefusal 10 Moved
 DatabaseRefusal 11 PolicyHooksEnvMalformed
 DatabaseRefusal 12 SnapshotRoom
+DatabaseRefusal 13 IndexCutStep
 DeleteWhileOpen 0 NoKernelClient
 DeleteWhileOpen 1 Unlinked
 DeleteWhileOpen 2 SillyRenamed
@@ -372,6 +373,7 @@ ReplyBody 75 CredentialRevoked
 ReplyBody 76 IdentitiesSet
 ReplyBody 77 RepositoryImported
 ReplyBody 78 DumpImported
+ReplyBody 79 RepositoryPolicy
 RequestBody 0 Create
 RequestBody 1 Snapshot
 RequestBody 2 DestroySnapshot
@@ -463,6 +465,7 @@ RequestBody 87 EnrollCredential
 RequestBody 88 RevokeCredential
 RequestBody 89 SetIdentities
 RequestBody 90 ImportRepository
+RequestBody 91 DescribeRepositoryPolicy
 Residency 0 DaemonRam
 Residency 1 DaemonRamAndKernelCache
 Residency 2 DaemonRamKernelCacheAndRuntimeVm
@@ -562,6 +565,7 @@ WorkOp 6 Link
 WorkOp 7 SetXattr
 WorkOp 8 RemoveXattr
 WorkOp 9 Mknod
+WorkOp 10 Copy
 WriteAct 0 Merge
 WriteAct 1 Land
 WriteMode 0 Bypass

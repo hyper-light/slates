@@ -24,7 +24,7 @@ use std::io;
 
 use slates_bridge_core::{Bridge, OpContext};
 
-use crate::abi::{COMPAT_SETXATTR_IN_BYTES, OUT_HEADER_LEN, Opcode, SETXATTR_IN_BYTES};
+use crate::abi::{OUT_HEADER_LEN, Opcode};
 use crate::bridge::{EINVAL, EIO, EPERM, FUSE_ROOT_ID, dispatch, reply_error, takes_reply};
 use crate::init::{MAX_WRITE, max_pages};
 use crate::reply::ReplyHeader;
@@ -226,19 +226,17 @@ impl OwnerWord {
 /// `FUSE_SETXATTR_EXT` (`extended`, A-378), the setter's flags and a pad, then the name and its NUL, then the value: read
 /// in the form the stream's guest sends, as the dispatch reads every other `SETXATTR` (A-587; read in the short form
 /// alone, a guest whose kernel kept the extended one never had its word taken, so its run was shown its share owned by
-/// the host and refused its writes `EACCES`). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
+/// the host and refused its writes `EACCES`), each request's own form decided by its bytes, since a guest's init sets
+/// the word as it mounts, often before its kernel took `INIT`'s reply, and so in the short form ([`crate::abi::setxattr_head`],
+/// A-741). The flags (`XATTR_CREATE`, `XATTR_REPLACE`) and the setter's flags are
 /// ignored, as Shards' server ignores them, since the word names no attribute a file keeps. The value may end in NULs,
 /// which are dropped.
 pub fn owner_word(request: &[u8], extended: bool) -> Option<OwnerWord> {
-  let head = if extended {
-    SETXATTR_IN_BYTES
-  } else {
-    COMPAT_SETXATTR_IN_BYTES
-  };
   let parsed = Request::parse(request).ok()?;
   if parsed.opcode != Some(Opcode::SetXattr) {
     return None;
   }
+  let (head, _setter) = crate::abi::setxattr_head(parsed.body, extended);
   let rest = parsed.body.get(head..)?;
   let end = rest.iter().position(|b| *b == 0)?;
   if rest.get(..end)? != OWNER_WORD {
@@ -597,6 +595,40 @@ mod tests {
       refused(EIO),
       "a value cut short of its size"
     );
+  }
+
+  /// A-741 (kiln goal 90: kiln's macOS microVM drive refused a run's every write `EACCES`, intermittently). Linux sizes a
+  /// `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c` `fuse_setxattr`:
+  /// `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and then waits for `INIT`'s reply before sending
+  /// it (`fs/fuse/dev.c` `fuse_block_alloc`), so a call made before that reply arrived (Shards' init names the run's
+  /// owner as it mounts) travels in the short form on a connection that kept the extended one. Do: read the owner word
+  /// `200000:200000` in the short form, the bytes the drive's guest sent (recorded 2026-11-20), as a stream that kept
+  /// the extended form reads it; and the same word in the extended form with each setter's flag. Expect the run's owner
+  /// named each time: read in the extended form alone, the short one's name began 8 bytes in, and the word fell to the
+  /// dispatch (`EOPNOTSUPP`), so the run was shown its share owned by the host.
+  #[test]
+  fn a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form()
+   {
+    let named = Some(OwnerWord::Named {
+      unique: 4,
+      uid: 200_000,
+      gid: 200_000,
+    });
+    let root = (4, FUSE_ROOT_ID);
+    let short = setxattr(root, (0, 0), None, OWNER_WORD, b"200000:200000");
+    assert_eq!(
+      owner_word(&short, true),
+      named,
+      "the short form, on a stream that kept the extended one"
+    );
+    for setter in [0, crate::abi::SETXATTR_ACL_KILL_SGID] {
+      let extended = setxattr(root, (0, 0), Some(setter), OWNER_WORD, b"200000:200000");
+      assert_eq!(
+        owner_word(&extended, true),
+        named,
+        "the extended form, setter's flags {setter:#x}"
+      );
+    }
   }
 
   /// A-587. Do: read Shards' owner word `1000:1001` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: the value's size

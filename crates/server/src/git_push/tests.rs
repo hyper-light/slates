@@ -321,8 +321,9 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   let mut answer = Vec::new();
   loop {
     match push.answer_step(state, &mut answer).expect("answered") {
-      Answering::Answered(received) => return (answer, received),
+      Answering::Answered(received) => return (answer, *received),
       Answering::Turned => {}
+      #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
   }
@@ -744,7 +745,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
       .ok_or("no state for a step")?
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
     match step {
-      Answering::Answered(received) => break received,
+      Answering::Answered(received) => break *received,
       Answering::Turned => slates_rt::futures::yield_now().await,
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
@@ -1088,8 +1089,9 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
     let mut answer = Vec::new();
     let received = loop {
       match push.answer_step(state, &mut answer).expect("answered") {
-        Answering::Answered(received) => break received,
+        Answering::Answered(received) => break *received,
         Answering::Turned => {}
+        #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };
@@ -1149,6 +1151,7 @@ fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
 
 /// Shape: the branches of [`t_a719_a_push_is_decided_a_command_a_step`]: enough that a decision made whole is told
 /// from one made a command a step.
+#[cfg(unix)]
 const BRANCHES: usize = 40;
 
 /// A-719 (found by use: stock git's push of git/git, 1,027 refs, ran its whole decision in one step and spun its
@@ -1179,8 +1182,9 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
     let received = loop {
       let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
       match push.answer_step(state, &mut answer).expect("answered") {
-        Answering::Answered(received) => break received,
+        Answering::Answered(received) => break *received,
         Answering::Turned => deciding += usize::from(was_deciding),
+        #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
     };

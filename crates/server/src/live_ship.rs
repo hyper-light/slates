@@ -1917,6 +1917,7 @@ pub(crate) fn inject_superseded(
 /// published from now on becomes durable, so a reply held for its durability waits out its bound
 /// ([`wait_durable`]). The holders are the two hosts after this one's id, which no audit daemon's fleet has.
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn ship_to_silent_holders(state: &mut ShardState, volume: slates_db::catalog::VolumeId) {
   let local = state.fleet.configuration().owner;
   let holders = [

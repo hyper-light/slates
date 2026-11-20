@@ -806,6 +806,10 @@ async fn step(
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
+  // Written: what follows (a revision property change's hooks, a commit's hook or landing, a lock verb) writes its own
+  // answer after it, never this again (a revision property change once wrote its trivial authentication request twice,
+  // which stock svn read as the change's success).
+  out.clear();
   follow(stream, conversation, next, out, seat).await
 }
 
@@ -1166,9 +1170,8 @@ fn land_locks(
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
-  .map_err(|failure| {
+  .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    failure
   })
 }
 
@@ -1463,20 +1466,26 @@ pub(crate) struct HookAnswer {
 /// repository's name beneath `/`, as `SVNParentPath` lays repositories out, until A-645's read-only FSFS-layout view
 /// gives `svnlook` a directory to read: design §4.17.4 item 9).
 pub(crate) struct Hooked {
-  /// The repository's id, which its hooks' learned times are kept under.
+  /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
+  #[cfg(unix)]
   id: RepositoryId,
   /// Its name, which its record is found by on its owner shard.
   name: String,
-  /// REPOS.
+  /// REPOS (unix alone, where hooks run).
+  #[cfg(unix)]
   repos: String,
 }
 
 impl Hooked {
   /// What the hooks of the repository `id`, named `name`, need of it.
   pub(crate) fn new(id: RepositoryId, name: &str) -> Self {
+    #[cfg(not(unix))]
+    let _ = id;
     Self {
+      #[cfg(unix)]
       id,
       name: name.to_owned(),
+      #[cfg(unix)]
       repos: format!("/{name}"),
     }
   }
@@ -1594,7 +1603,8 @@ async fn run_svn_hook(
 }
 
 /// No hook runs on Windows yet (the hook driver is Unix's alone, A-622 part 3): a point where the repository configures
-/// one refuses its change in the not-run words, as before A-730, and a point with none lets it go on.
+/// one refuses its change in the not-run words, as before A-730, and a point with none answers as `svnserve` does with
+/// none (`vcs_hooks::svn_told_unconfigured`): pre-revprop-change refuses every change (E165006), the rest go on.
 #[cfg(not(unix))]
 async fn run_svn_hook(
   policy: &slates_db::catalog::RepositoryPolicy,
@@ -1608,11 +1618,20 @@ async fn run_svn_hook(
     .hooks
     .iter()
     .any(|hook| HookPoint::of(hook.point) == point);
+  let unconfigured = match vcs_hooks::svn_told_unconfigured(point) {
+    Some(vcs_hooks::SvnTold::Failure(chain)) => Err(
+      chain
+        .into_iter()
+        .map(|error| (error.code, error.message))
+        .collect(),
+    ),
+    _ => Ok(()),
+  };
   HookAnswer {
     verdict: Some(if configured {
       Err(vec![(UNSUPPORTED_FEATURE, HOOK_NOT_RUN_WORDS.to_owned())])
     } else {
-      Ok(())
+      unconfigured
     }),
     post_commit_error: None,
     token: None,

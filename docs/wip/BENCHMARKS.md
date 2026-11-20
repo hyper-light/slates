@@ -15015,3 +15015,25 @@ client's deltas compressed and naming blobs in the green's identity table (w-git
   99 percent CPU during the burst (`ps -M`). The `kevent` frames that topped `sample`'s stacks are the runtime's
   zero-timeout polls before it parks, busy and not idle; an earlier reading of them as idle was wrong.
 
+## A hot repository pushing large packs: the small repositories wait 3 to 4 times their fair share, and ten such pushes end the daemon (A-724 piece 7; 2026-11-20)
+
+- **The command:** `crates/cli/bench/multi_repo_load.py SLATES ~/.cache/g309-scale/src.git v0.99 v1.0.0 v1.5.0
+  --steps ... --per-repository-cap N` (the cap: at most N pushes to one repository a step, main's order to stay below the
+  pushes that end the daemon). adas-mac-studio.local-2, M3 Ultra, 32 cores, a 23-shard daemon; release built from
+  6526905e5 (main 6f9d93d21 with the cap); load 9 to 11; one run each.
+
+| R = 100, cap | small p99 / fair share (one shard) | medium | hot (v1.5.0, its pushes) | daemon |
+|---|---|---|---|---|
+| 10 | 5.81 (4.457 s) | 0.85 | 0.38, 10 refused (7 empty, 3 reset) | gone |
+| 5 | 3.07 (2.567 s, ideal 0.836 s) | 0.93 | 0.78 (5 ok) | alive |
+| 3 | 3.63 (1.800 s, ideal 0.497 s) | 1.18 | 0.84 (3 ok) | alive |
+| no v1.5.0 class (the section above) | 0.87 | | 0.72 | alive |
+
+- **What it says.** With a repository pushing 9.8 MB packs (each push holding about 770 MiB), the small repositories'
+  p99 is 3 to 4 times their fair share even when the hot repository has only three pushes under way; without large
+  packs it was within it. The hot repository's own shard cannot explain it (a small repository sharing it would wait
+  many seconds; the measured p99 is 1.8 to 2.6 s), so the wait is daemon-wide: the daemon grows by about 2.9 GB in
+  seconds, and memory's making is the next profile. The fair-share starvation is open, owed to that profile.
+- **The daemon's end.** Ten concurrent pushes of git/git v1.5.0 to one repository ended the daemon (the earlier record
+  had nineteen): A-722's by-use proof must hold at ten. Reported to main.
+
