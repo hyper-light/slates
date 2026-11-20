@@ -192,9 +192,11 @@ sparse ambiguous-commits 67fd
 sparse ambiguous-commits-path 67fd:dir/file
 sparse ambiguous-tags 2188
 git config --unset uploadpack.allowFilter
-# Revision suffixes (A-640 part 4, fifth slice): parents and ancestors, peels, and `@{...}` in a repository that keeps
-# no reflog, as a served one keeps none, with git's branch marks; `67fd~1` reads the alike commits' abbreviation for a
-# commit.
+# Revision suffixes (A-640 part 4, fifth slice): parents and ancestors, peels, and `@{...}` with git's branch marks;
+# `67fd~1` reads the alike commits' abbreviation for a commit. A served repository is bare, and a bare repository logs
+# no ref update (`core.logAllRefUpdates`), so the logs this working repository kept are removed for these captures.
+git config core.logAllRefUpdates false
+rm -rf .git/logs
 git config uploadpack.allowFilter true
 while read -r name blob_ish; do sparse "$name" "$blob_ish"; done <<'NAMES'
 ancestor main~1:dir/file
