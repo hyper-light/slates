@@ -364,7 +364,6 @@ impl FileRevsStream {
     Ok(
       deltas(&source, &target, room)
         .map_err(|_| Failure::corrupt())?
-        .into_iter()
         .collect(),
     )
   }

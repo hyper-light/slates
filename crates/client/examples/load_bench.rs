@@ -336,11 +336,12 @@ struct Tally {
 impl Tally {
   /// Records one logical operation of `kind`, from its first send to its final answer, resends included, with no part
   /// of it the harness's.
+  #[cfg(test)]
   fn operation_took(&mut self, kind: Kind, ns: u64) {
     self.operation_split(kind, ns, 0);
   }
 
-  /// [`Self::operation_took`] with `harness` of its `ns` the harness's (A-559), the rest the server's.
+  /// `operation_took` with `harness` of its `ns` the harness's (A-559), the rest the server's.
   fn operation_split(&mut self, kind: Kind, ns: u64, harness: u64) {
     let harness = harness.min(ns);
     self.operations.entry(kind).or_default().push(ns);
@@ -997,6 +998,7 @@ impl Agent {
 }
 
 /// Records one latency of `kind` with no part of it the harness's.
+#[cfg(test)]
 fn record(tally: &mut Tally, kind: Kind, elapsed: u64) {
   record_split(tally, kind, elapsed, 0);
 }

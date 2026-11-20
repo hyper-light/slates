@@ -118,7 +118,10 @@
 > its fork back. Part 2b BUILT: a fork made from an index another push replaced since is re-based by node at
 > landing (`intake::Rebase`: each kept row appended again to a fork of the index as it is, by node, its content reused,
 > a row the index already holds passed over), a slice at a time, then judged and landed; `land` never puts a stale
-> fork in the index's place. Owed: part 3, the import's room per repository; S5 (main's convergence plan): file
+> fork in the index's place. Part 3 BUILT: an import's room is what its shard could admit, a bound only,
+> the shard charged what it holds between turns (`Import::holding`), trued up each turn (it was one client region,
+> 278,528 B: Mercurial's own repository refused `PastRoom`); the by-use import of that repository is w-perf's run.
+> Owed: part 3's by-use proof; S5 (main's convergence plan): file
 > texts as the work's green files by identity, changelog and manifests as deltas, rows naming content by identity.
 > **A-711 (2026-11-20, w-hg; found by use: stock hg 7.2's push of Mercurial's own repository, 57,036 changesets,
 > answered `413` after 7.5 s).** BUILT: a Mercurial push over HTTP and SSH is admitted what its shard can hold
@@ -1967,6 +1970,13 @@
 > write access with authentication for the command, the revision readable whole, `svn_repos__validate_prop`, the
 > revision held). Owed (part 2, once ra_svn runs a repository's hooks): the change itself, its previous value's check,
 > its `Record::RevisionProperties` through the owner's step, post-revprop-change.
+> S4 slice 1 (with A-716), 2026-11-19 (w-svn): every Subversion text is read through a source its reader is lent:
+> `migration::TextSource` (`text(identity) -> Cow`), `reads::Repository::text` and `commit::drive::Green::text`
+> answering `Cow`, and `migration::WithTexts`, the records with their texts read from any lent source (test
+> `a_view_reads_texts_from_its_lent_source_alone`). The records still serve their own texts through it. Owed (slice 2,
+> w-perf): the lenders lend the green's content index as the source, the records keep each text's identity and
+> place without its bytes, the importer's delta base, the export and `svn_commit`'s lookups read through the source,
+> and a rebuild re-holds the texts.
 > A-692 continued (1), 2026-11-19 (w-svn): the svn:// listener offers CRAM-MD5 and keys it from the token's record
 > (`cram_md5_key`), the session's principal the token's; each call after it is lent its sources on the owner, write
 > access where the repository's policy reaches the principal. A stock client's session (macOS arm64, this Mac, local:

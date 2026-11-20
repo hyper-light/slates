@@ -334,3 +334,68 @@ fn t_a652_an_import_hands_each_record_over_and_reads_on_once_it_is_committed() {
   };
   assert_eq!((names.len(), ended), (4, Err(refused)));
 }
+
+/// A source of texts held apart from the records, by identity.
+struct HeldApart(std::collections::BTreeMap<crate::index::ContentIdentity, Vec<u8>>);
+
+impl crate::migration::TextSource for HeldApart {
+  fn text(&self, identity: &crate::index::ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+    self
+      .0
+      .get(identity)
+      .map(|text| std::borrow::Cow::Borrowed(text.as_slice()))
+  }
+}
+
+/// S4 (A-716's seam: a text held once, named by identity). Do: import `full.dump`; take a text a revision names; read
+/// it through `WithTexts` over the records with a source holding it, from offset 0 and from offset 1, for the reads and
+/// for the commit drive; then through a source holding nothing; and read a property list through both. Expect: the
+/// text as the source holds it at each offset, by either trait; none where the source holds none, though the records
+/// still hold its bytes; the property list the records' either way: a reader of the view takes texts from the lent
+/// source alone.
+#[test]
+fn a_view_reads_texts_from_its_lent_source_alone() {
+  use crate::commit::drive::Green;
+  use crate::migration::WithTexts;
+  use crate::reads::Repository as ReadSource;
+  let repository = imported(&["full.dump"]);
+  let (identity, list) = (1..=repository.youngest())
+    .flat_map(|revision| repository.index().changes(revision).unwrap())
+    .find_map(|change| change.text.map(|text| (text.identity, change.properties)))
+    .expect("a revision names a text");
+  let bytes = repository
+    .content(&identity)
+    .expect("the records hold it")
+    .to_vec();
+  let held = HeldApart(std::collections::BTreeMap::from([(
+    identity,
+    bytes.clone(),
+  )]));
+  let empty = HeldApart(std::collections::BTreeMap::new());
+  let view = WithTexts {
+    records: &repository,
+    texts: &held,
+  };
+  let bare = WithTexts {
+    records: &repository,
+    texts: &empty,
+  };
+  let read =
+    |source: &dyn ReadSource, offset| source.text(&identity, offset).map(|text| text.into_owned());
+  assert_eq!(read(&view, 0), Some(bytes.clone()));
+  assert_eq!(read(&view, 1), bytes.get(1..).map(<[u8]>::to_vec));
+  assert_eq!(
+    Green::text(&view, &identity).map(|text| text.into_owned()),
+    Some(bytes)
+  );
+  assert_eq!(
+    (read(&bare, 0), Green::text(&bare, &identity)),
+    (None, None)
+  );
+  if let Some(crate::index::PropertyList::Held { identity: list, .. }) = list {
+    assert_eq!(
+      ReadSource::properties(&bare, &list),
+      ReadSource::properties(&repository, &list)
+    );
+  }
+}

@@ -238,6 +238,22 @@ fn a_versions_fragments_read_back_and_an_edit_is_a_delta_against_its_previous_ve
   }
 }
 
+/// The pack of both versions reads back as every object `first` and `second` made.
+fn assert_both_versions_read_back(
+  format: ObjectFormat,
+  (repository, store): (&Repository, &ContentStore),
+  first: &[Made],
+  second: &[Made],
+) {
+  let pack = pack_of(repository, store, &brought_by(repository, store, 1, 0..=1));
+  let made: BTreeMap<ObjectId, Vec<u8>> = first
+    .iter()
+    .chain(second)
+    .map(|object| (object.id, object.content.clone()))
+    .collect();
+  assert_eq!(unpacked(format, &pack), made);
+}
+
 /// A-724 piece 4 (§4.17.5 "The cold trigger"). Do: encode two versions, then drop the second's
 /// fragments, then encode it again. Expect: both listed as kept with the bytes their content
 /// holds; the drop giving exactly those bytes back to the content store and leaving the version to
@@ -270,17 +286,7 @@ fn a_versions_fragments_dropped_give_their_bytes_back_and_encode_again_the_same(
       .fragments(1, 1)
       .map(|(o, b)| (o.to_vec(), b.to_vec()));
     assert_eq!(after, before);
-    let pack = pack_of(
-      &repository,
-      &store,
-      &brought_by(&repository, &store, 1, 0..=1),
-    );
-    let made: BTreeMap<ObjectId, Vec<u8>> = first
-      .iter()
-      .chain(&second)
-      .map(|object| (object.id, object.content.clone()))
-      .collect();
-    assert_eq!(unpacked(format, &pack), made);
+    assert_both_versions_read_back(format, (&repository, &store), &first, &second);
     repository.release(&mut store).unwrap();
     assert!(store.is_empty());
   }
