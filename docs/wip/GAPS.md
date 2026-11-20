@@ -1265,9 +1265,8 @@
 > offered Bearer alone, on which stock hg 7.2 crashed (`ValueError` from urllib's digest handler, which reads the
 > first challenge alone), until A-686 put Basic's challenge first and took Basic with the token as password on the
 > loopback edge. The HTTP round trip passes since the hg site's pushes (A-680 part 2b: stock hg 7.2, macOS arm64, Mac
-> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one waits on the pushes
-> over `serve --stdio` (`--vcs-ssh <addr>`, A-684, is built), over the same lender, which the edge's `serve --stdio`
-> (A-679, built) reads as the HTTP site does (A-680).
+> Studio, run un-ignored, 2 of 2 with the refusal), so it is no longer ignored; the SSH one too since its pushes
+> (A-696: `unbundle` over `serve --stdio` through the same driver; stock hg 7.2, macOS arm64, Mac Studio, 1 of 1).
 > Stock hg 7.2's clone over the SSH edge runs (w-interop, 2026-11-20): `stock_hg_clones_over_the_ssh_edge`, an empty
 > repository cloned and pulled, host key checked strictly (macOS arm64, Mac Studio, kiln r3: 1 of 1, fmt clean).
 > Their credentials are minted with the anchor's issuer surface since 2026-11-19 (g309, main's ruling): `credential
@@ -1297,8 +1296,7 @@
 > around `slates hg serve --stdio`'s session, held deltas in place of full texts, the answers sliced within the shard's
 > step budget, and the index's kept heads in place of the walks over the whole view; (5, rest) pushes (A-657 part 4
 > built the policy before the verdict in `acl`'s words and the `pretxnchangegroup` and `changegroup` hooks through
-> the driver): the principal's Mercurial identity in `acl`'s words (§4.13); the SSH edge's pushes through the same
-> driver (`unbundle` in `serve --stdio`'s session, which A-679 serves for reads alone);
+> the driver): the principal's Mercurial identity in `acl`'s words (§4.13);
 > part 2's refusals in Mercurial's own words (slates' words name them now); the pushkey compatibility hooks; a
 > compressed bundle inflated in slices within the shard's step budget (A-598's inflater runs a stream whole in one call,
 > bounded by the admission), and the bundle read in slices too (part 1 holds it whole); a stricter-than-7.2

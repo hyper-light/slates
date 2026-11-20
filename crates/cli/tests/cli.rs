@@ -13993,14 +13993,10 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 /// verb, run with the anchor's issuer surface: [`anchor_with_edges_and_issuer`]); run [`hg_round_trip`] over `ssh://`
 /// with OpenSSH holding that key alone. Expect each step done and both copies holding the same two changesets. Skips
 /// loudly without stock hg 7.2 ([`STOCK_HG`]) or `ssh-keygen`, and where the platform names no issuer surface
-/// ([`NO_ISSUER_SURFACE`]). Ignored until it can
-/// pass: no daemon starts the SSH edge (`--vcs-ssh <addr>` is A-684, g299; `unknown flag --vcs-ssh`, kiln r174 over
-/// main 34d10acb5), and the edge's Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`, over
-/// the HTTP site's lender, A-680 part 2a) serves reads alone: the session's `unbundle` waits for its piece (A-696),
-/// as the HTTP site's pushes do through `hg_push` since A-680 part 2b.
+/// ([`NO_ISSUER_SURFACE`]). Everything it needs is built: the SSH edge (`--vcs-ssh <addr>`, A-684), the edge's
+/// Mercurial command (A-679: `hg -R <repo> serve --stdio` through `serve::stdio`) and its pushes (A-696: `unbundle` in
+/// the stdio session, through `hg_push` as the HTTP site's are since A-680 part 2b).
 #[test]
-#[ignore = "waits on A-684 (g299: --vcs-ssh <addr>) and the pushes over hg serve --stdio (A-696: unbundle in the \
-            stdio session, through hg_push as the HTTP site's are since A-680 part 2b)"]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clones_pulls_and_pushes_over_the_ssh_edge() {
   let Some(hg) = stock_hg() else {
