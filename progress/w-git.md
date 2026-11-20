@@ -120,3 +120,8 @@
   / stage_commits / stage_room / commits_room; commit adopts fork when adoptable else legacy (holes); hook_view cover
   skips holes; vcs Index::adoptable + fork_room; server GitPush admit_all stages (lends rows room), seal stage_commits.
   slates-git store tests green incl. 2 new; server tests being run.
+- A-722 p3 design refined: tentative positions (base = next_position at fork, no holes); ONE landing path: commit
+  adopts the staged fork when adoptable, else restage() (fresh fork, arrival order) then adopt -> repository index
+  keeps no tail, so fork timing never changes tables and log replay matches. Replay stages too (InOrder keeper keeps
+  resolution order); intake Queue keeps resolution order. Removed legacy fresh/positions_for/rows_for/insert.
+  A-639 by-type positions given up (arrival order) -> flag to main to measure fragment-set runs.

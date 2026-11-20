@@ -37,6 +37,7 @@
   A-735 again on the pre-fix build. Stopped sw48 at 24/26 PASS (16 = start starvation beside rp1; 25, 26 = A-735).
   Started sw48c: clean 48 on exact origin/main 69d1f2ec3 (has A-735), built from ~/slates-work/w-forming-repro,
   taskpolicy -b, nothing of mine beside it (another agent's g227 suite loop does run on this Mac). Bg task bff43ui5h.
+- sw48c run 21 FAIL after forming (formed, fresh b rejoined 37 s): new owner d served the volume after 19.7 s of takeover (6254 writes acked), then its shard 0 spun 5628 ms CPU without a step -> watchdog exit 4 -> a write unanswered 40 s (live_chaos.rs:1779). Same spin as run 25: on a successor owner right after a takeover. Log ~/.cache/w-forming-runs/sw48c/run-21.log (diagnosis printed).
 - Queue after sw48c: run-7 stall chase; then run-25 spin (main 2026-11-20: name the unsliced task, fix failing-test
   first or hand main its location). Tool: ~/.cache/w-forming-scripts/spin-sampler.sh <runs-dir> samples every chaos
   daemon on a >=300 ms poll line; use with repro loops only, never during evidence runs.

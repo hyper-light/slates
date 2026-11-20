@@ -170,3 +170,23 @@ Depends on: w-perf A-723 (one copy per byte), w-git A-719/A-722 (sliced intake).
 - 61a74fe35 LANDED P9a: slates_vcs::cut (range_of, bits_for, split_due, child_of) + vcs_share::place::range_partition.
 - NEXT: 9b needs 8c; meanwhile snapshot_room as 2nd resource in vcs_share::room (DRF over memory + snapshot room).
 - b759bddb3 LANDED: vcs_share::room DRF over [memory, snapshot slot room]; Bound::Snapshot; tests 23/23, edges 88/88 (the hg ssh test now passes on main).
+- 0011a4606 LANDED 8c codec slates_vcs::rows. BLOCKER for record.rs v3 switch: A-727 a3 (content durable in image,
+  recovered before records); today HeapWindows rebuilt FROM records -> v3 would lose pushes on restart. Told w-perf.
+- Q3 answered (w-fed-faults, inbox line 37): identity-homed content must NOT use ContentHold (object-scoped releases
+  follow owner epochs: takeover release_certified, retain_object late copies, tombstone forget_object, ledger
+  compaction). Keep it keyed by content id; healer reads membership + rank only.
+- NEXT: P6 fleet half per Q3; then 9b.
+- 58f756e0a LANDED P6 region rule: slates_db::identity_homes (homes, heal) by membership+rank only.
+- P6 transport PROPOSED to goal-91 + w-shared (inbox goal91-...md, bottom): HomeContent/HomeRead/HomeLetGo request kinds
+  keyed by content id, authority = configuration's homes(), ack after home image; healer per config change. Waiting.
+- NEXT: 9b (repository record's b; range rows routing) while waiting; 8c v3 switch after A-727 a3.
+- Main ruled: build P6 transport myself. 599294892 slates_cluster::homes (HomeMessage Put/Read/LetGo/Answer,
+  HOME_STREAM=30, admits). c77324051 serve_remote + fleet.rs dispatch arm; acks only after published() (Unanswered
+  until A-727 a3 calls image_begun/image_published).
+- NEXT: P6 sender + healer loop (6c-3); 9b; record v3 after a3.
+- Cleared target incremental (9.5 GB); target 27 GB; Studio-2 53 GB free.
+- 9f57e4810 LANDED P6 healer: keep_for_region/let_go_for_region (idempotent), heal_region from follow_configuration
+  (pass only per new config version, turn per period within round budget), fleet:: 33/33.
+- 1b449bcc9 LANDED flake fix: homes tests recv() not recv_timeout; region publish sequenced; 20/20 under 4 burners.
+  NOTE: I used `pkill -x yes` to stop my burners (matches any yes process; prefer PIDs next time).
+- NEXT: 9b. Record v3 switch after A-727 a3.
