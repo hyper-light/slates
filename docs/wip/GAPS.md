@@ -116,7 +116,8 @@
 > intakes decoding) built, waiting for w-git's A-722 to call it.
 > Piece 6's region half: its rule (`slates_db::identity_homes`: homes and the healer's plan by membership and rank
 > alone); its wire (`slates_cluster::homes`, the door's rule); the daemon serving it (`vcs_store::homes::serve_remote`,
-> acknowledged after the home image, so `Unanswered` until A-727 a3). The sender and the healer's loop owed.
+> acknowledged after the home image, so `Unanswered` until A-727 a3); the healer at each configuration change
+> (`heal_region`, region holds idempotent). The transport is complete; it acknowledges once A-727 a3 lands.
 > Piece 6's node half: homes' batch forms (`home_many`, `read_many`, `let_go_many`, one call a home shard a turn).
 > Owed: A-722's reservation against it and the share refusal in each tool's words, hg/svn intakes live, admission by share (3), the cold trigger (4), intake off the owner and
 > content by identity across shards (5), the fleet's placement by identity (6, main's ruling), the load proof (7).
