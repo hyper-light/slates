@@ -7,10 +7,12 @@ use slates_db::catalog::{
   Principal, RepositoryId, RepositoryPolicy, RepositoryRecord, VcsTool,
 };
 use slates_git::http::{Reply, Service, Version, no_cache_fields, reply_fields};
+use slates_git::lfs::Timestamp;
+use slates_git::lfs::serve::{Answer as LfsAnswer, CREATED, Endpoint, Kind, NOT_ACCEPTABLE};
 use slates_http::Admission;
 use slates_http::head::{Head, HeadReader, Progress};
 use slates_http::reply::Status;
-use slates_http_edge::connection::Fields;
+use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential::Credential;
 
 use slates_git::object_name::ObjectFormat as GitFormat;
@@ -19,9 +21,11 @@ use slates_git::upload::{PackPlan, PackRefused, PackSource, Served as UploadServ
 use slates_vcs::ContentStore;
 
 use super::{
-  Authenticator, GitServices, GitSite, Located, Proven, Refused, Repositories, ServiceRefused,
-  Start, StoreLender, Unproven, UploadServices,
+  Authenticator, GitServices, GitSite, LfsService, Located, Proven, Refused, Repositories,
+  ServiceRefused, Start, StoreLender, Unproven, UploadServices,
 };
+use crate::lfs::LfsCall;
+use crate::vcs_http::daemon_edge::ShardLfs;
 use crate::vcs_http::{Answer, Decided, Exchange, Failed, Site};
 
 /// Shape: room enough for every head these tests send.
@@ -97,9 +101,16 @@ const EXPIRED_TOKEN: &[u8] = b"expired-token";
 const REVOKED_TOKEN: &[u8] = b"revoked-token";
 /// Shape: a token whose record's partition did not answer.
 const SILENT_TOKEN: &[u8] = b"silent-token";
+/// Shape: a token that proves the owner and expires at [`EXPIRES_NS`].
+const EXPIRING_TOKEN: &[u8] = b"expiring-token";
+/// Shape: [`EXPIRING_TOKEN`]'s expiry on the wall clock, half a second into the second 1,800,000,000 of the Unix epoch.
+const EXPIRES_NS: u64 = 1_800_000_000_500_000_000;
+/// Shape: the second [`EXPIRES_NS`] falls in, which an LFS action's expiry names.
+const EXPIRES_SECOND: i64 = 1_800_000_000;
 
-/// Proves [`OWNER_TOKEN`] the owner and [`STRANGER_TOKEN`] the stranger, from Basic's password or a bearer token; answers
-/// [`EXPIRED_TOKEN`], [`REVOKED_TOKEN`] and [`SILENT_TOKEN`] with why each proves no one.
+/// Proves [`OWNER_TOKEN`] the owner and [`STRANGER_TOKEN`] the stranger, from Basic's password or a bearer token, and
+/// [`EXPIRING_TOKEN`] the owner until [`EXPIRES_NS`]; answers [`EXPIRED_TOKEN`], [`REVOKED_TOKEN`] and [`SILENT_TOKEN`]
+/// with why each proves no one.
 struct Tokens;
 
 impl Authenticator for Tokens {
@@ -116,14 +127,18 @@ impl Authenticator for Tokens {
     if let Some((_, why)) = unproven.into_iter().find(|(token, _)| *token == secret) {
       return Err(why);
     }
-    [(OWNER_TOKEN, OWNER), (STRANGER_TOKEN, STRANGER)]
-      .into_iter()
-      .find(|(token, _)| *token == secret)
-      .map(|(_, uid)| Proven {
-        principal: principal(uid),
-        bearer_expires_ns: None,
-      })
-      .ok_or(Unproven::Unknown)
+    [
+      (OWNER_TOKEN, OWNER, None),
+      (STRANGER_TOKEN, STRANGER, None),
+      (EXPIRING_TOKEN, OWNER, Some(EXPIRES_NS)),
+    ]
+    .into_iter()
+    .find(|(token, _, _)| *token == secret)
+    .map(|(_, uid, expires)| Proven {
+      principal: principal(uid),
+      bearer_expires_ns: expires,
+    })
+    .ok_or(Unproven::Unknown)
   }
 }
 
@@ -287,6 +302,7 @@ fn served<E>(decided: Decided<E>) -> (Fields, bool, E, bool) {
       fields,
       head_only,
       exchange,
+      ..
     } => (fields, head_only, exchange, decided.proven),
     Answer::Refuse { status, .. } => panic!("refused {status:?} where a service was expected"),
     Answer::Move { shard } => panic!("moved to shard {shard} where a service was expected"),
@@ -385,7 +401,7 @@ fn credentials_that_prove_no_principal_are_401_and_a_repeated_line_400() {
   }
   let repeated = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER, OWNER_BEARER]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&repeated)))),
+    refusal(&ready(site.answer(&head(&repeated), true))),
     (Status::BAD_REQUEST, with_cache(&[]), false)
   );
 }
@@ -418,7 +434,7 @@ fn a_proven_principal_meets_404_then_403_then_503() {
   for (target, credential, expected) in cases {
     let asked = request("GET", target, &[credential]);
     assert_eq!(
-      refusal(&ready(site.answer(&head(&asked)))),
+      refusal(&ready(site.answer(&head(&asked), true))),
       (expected, with_cache(&[]), true),
       "{target} with {credential}"
     );
@@ -446,8 +462,8 @@ fn a_rule_that_lets_a_principal_read_admits_it_to_upload_pack_alone() {
   let receive = request("GET", RECEIVE_ADVERTISEMENT, &[STRANGER_BEARER]);
   assert_eq!(
     (
-      refusal(&ready(site.answer(&head(&upload)))).0,
-      refusal(&ready(site.answer(&head(&receive)))).0
+      refusal(&ready(site.answer(&head(&upload), true))).0,
+      refusal(&ready(site.answer(&head(&receive), true))).0
     ),
     (Status::SERVICE_UNAVAILABLE, Status::FORBIDDEN)
   );
@@ -466,7 +482,8 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     .collect();
   let owner = principal(OWNER);
   let v0 = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  let (served_fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&v0))));
+  let (served_fields, head_only, mut exchange, proven) =
+    served(ready(site.answer(&head(&v0), true)));
   assert_eq!((&served_fields, head_only, proven), (&fields, false, true));
   assert_eq!(
     replies(&mut exchange),
@@ -480,7 +497,7 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     UPLOAD_ADVERTISEMENT,
     &[OWNER_BEARER, "Git-Protocol: version=2"],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&v2))));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&v2), true)));
   assert_eq!(
     replies(&mut exchange),
     [started_as(
@@ -491,7 +508,7 @@ fn a_served_advertisement_is_its_prelude_then_its_service() {
     )]
   );
   let only_head = request("HEAD", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
-  assert!(served(ready(site.answer(&head(&only_head)))).1);
+  assert!(served(ready(site.answer(&head(&only_head), true))).1);
 }
 
 /// A-625 part 2 (gitprotocol-http's service requests). Do: as the owner, POST a receive-pack request of its content type
@@ -509,7 +526,7 @@ fn a_service_request_streams_its_body_to_the_service_and_its_reply_back() {
       "Content-Length: 3",
     ],
   );
-  let (fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&asked))));
+  let (fields, head_only, mut exchange, proven) = served(ready(site.answer(&head(&asked), true)));
   let result: Fields = reply_fields(Reply::Result(Service::ReceivePack))
     .iter()
     .map(|(name, value)| (name.to_vec(), value.to_vec()))
@@ -528,12 +545,12 @@ fn a_route_refused_by_its_syntax_is_http_backends_whoever_asks() {
   let mut site = site(Vec::new(), Unserved);
   let dumb = request("GET", "/r.git/objects/info/packs", &[]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&dumb)))),
+    refusal(&ready(site.answer(&head(&dumb), true))),
     (Status::FORBIDDEN, with_cache(&[]), false)
   );
   let put = request("PUT", "/r.git/git-upload-pack", &[]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&put)))),
+    refusal(&ready(site.answer(&head(&put), true))),
     (
       Status::METHOD_NOT_ALLOWED,
       with_cache(&[("Allow", "POST")]),
@@ -669,7 +686,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
     UPLOAD_ADVERTISEMENT,
     &[OWNER_BEARER, "Git-Protocol: version=2"],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&advertise))));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&advertise), true)));
   ready(exchange.body_end()).unwrap();
   let advertisement = replies(&mut exchange).concat();
   assert!(
@@ -693,7 +710,7 @@ fn upload_pack_answers_the_advertisement_and_ls_refs_from_the_store() {
       &length,
     ],
   );
-  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&post))));
+  let (_, _, mut exchange, _) = served(ready(site.answer(&head(&post), true)));
   ready(exchange.body(ls_refs)).unwrap();
   ready(exchange.body_end()).unwrap();
   assert_eq!(replies(&mut exchange).concat(), b"0000");
@@ -715,7 +732,7 @@ fn a_request_upload_pack_refuses_is_answered_in_gits_words() {
       "Content-Length: 4",
     ],
   );
-  let (_, _, mut exchange, proven) = served(ready(site.answer(&head(&post))));
+  let (_, _, mut exchange, proven) = served(ready(site.answer(&head(&post), true)));
   ready(exchange.body(garbage)).unwrap();
   ready(exchange.body_end()).unwrap();
   let answer = replies(&mut exchange).concat();
@@ -738,7 +755,7 @@ fn receive_pack_and_an_unheld_store_are_503() {
   let mut site = site(Vec::new(), UploadServices::new(lender, ROOM));
   let receive = request("GET", RECEIVE_ADVERTISEMENT, &[OWNER_BEARER]);
   assert_eq!(
-    refusal(&ready(site.answer(&head(&receive)))).0,
+    refusal(&ready(site.answer(&head(&receive), true))).0,
     Status::SERVICE_UNAVAILABLE
   );
   assert!(!lender.holds(RepositoryId { bytes: [1; 16] }));
@@ -753,7 +770,7 @@ fn receive_pack_and_an_unheld_store_are_503() {
 fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_refused_here() {
   let mut site = site(Vec::new(), Unserved);
   let asked = request("GET", ELSEWHERE, &[OWNER_BEARER]);
-  let decided = ready(site.answer(&head(&asked)));
+  let decided = ready(site.answer(&head(&asked), true));
   assert!(
     matches!(decided.answer, Answer::Move { shard } if shard == ELSEWHERE_SHARD),
     "a proven request moves"
@@ -761,7 +778,7 @@ fn a_proven_request_for_another_shards_repository_moves_and_an_unproven_one_is_r
   assert!(decided.proven);
   for fields in [&[][..], &["Authorization: Bearer nobody"][..]] {
     let asked = request("GET", ELSEWHERE, fields);
-    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked))));
+    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked), true)));
     assert_eq!(
       (status, proven),
       (Status::UNAUTHORIZED, false),
@@ -802,7 +819,7 @@ fn a_credential_that_proves_no_one_is_typed_by_why() {
   for (fields, why) in cases {
     let asked = request("GET", UPLOAD_ADVERTISEMENT, fields);
     assert_eq!(ready(site.proof(&head(&asked))), Err(why), "{fields:?}");
-    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked))));
+    let (status, _, proven) = refusal(&ready(site.answer(&head(&asked), true)));
     assert_eq!((status, proven), (why.status(), false), "{fields:?}");
   }
   let asked = request("GET", UPLOAD_ADVERTISEMENT, &[OWNER_BEARER]);
@@ -813,4 +830,263 @@ fn a_credential_that_proves_no_one_is_typed_by_why() {
       bearer_expires_ns: None,
     })
   );
+}
+
+/// Shape: Git LFS's media type, as its JSON endpoints take and answer it (A-610).
+const LFS_JSON: &str = "application/vnd.git-lfs+json";
+/// Shape: a request body's media type as LFS's JSON endpoints take it.
+const LFS_BODY: &str = "Content-Type: application/vnd.git-lfs+json";
+/// Shape: the locks API's endpoint of the git repository `r.git`.
+const LFS_LOCKS: &str = "/r.git/info/lfs/locks";
+/// Shape: an object's transfer endpoint of `r.git`, its oid the SHA-256 of nothing.
+const LFS_OBJECT: &str =
+  "/r.git/info/lfs/objects/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// Git LFS's service in these tests: it serves every endpoint but an object's download, and answers each call `201`
+/// with LFS's media type and a body naming what the call carried.
+#[derive(Clone, Copy, Debug, Default)]
+struct Carried;
+
+impl LfsService for Carried {
+  fn serves(&self, endpoint: &Endpoint) -> bool {
+    !matches!(endpoint, Endpoint::Download(_))
+  }
+
+  fn answer(&mut self, call: &LfsCall<'_>) -> LfsAnswer {
+    LfsAnswer {
+      status: CREATED,
+      kind: Kind::Json,
+      challenge: None,
+      body: carried(call).into_bytes(),
+    }
+  }
+}
+
+/// What `call` carried, as [`Carried`] answers it.
+fn carried(call: &LfsCall<'_>) -> String {
+  format!(
+    "{:?} {} {} {:?} {:?} {:?} {:?} {:?} {}",
+    call.routed,
+    String::from_utf8_lossy(call.query),
+    String::from_utf8_lossy(call.body),
+    call.principal,
+    call.credential_expiry,
+    call.challenge,
+    call.origin,
+    call.request_id,
+    call.room
+  )
+}
+
+/// A site over [`Tokens`] and [`Held`] with no rules on `r.git`, its git services unserved, and Git LFS through `lfs`.
+fn lfs_site<L: LfsService + Clone>(lfs: L) -> GitSite<Tokens, Held, Unserved, L> {
+  site(Vec::new(), Unserved).with_lfs(lfs)
+}
+
+/// A served answer's fields, whether it is the head alone, when its status is decided, its exchange, and whether its
+/// credentials proved a principal; panics on any other answer.
+fn served_lfs<E>(decided: Decided<E>) -> (Fields, bool, StatusMode, E, bool) {
+  match decided.answer {
+    Answer::Serve {
+      fields,
+      head_only,
+      status,
+      exchange,
+    } => (fields, head_only, status, exchange, decided.proven),
+    Answer::Refuse { status, .. } => panic!("refused {status:?} where a service was expected"),
+    Answer::Move { shard } => panic!("moved to shard {shard} where a service was expected"),
+  }
+}
+
+/// A-629 part 2c (locking.md's methods; batch.md's media types; RFC 9110 §15.5.6). Do: with no credentials, `DELETE`
+/// the locks API, `POST` its batch API a body of another media type, and ask it for an answer only HTML would satisfy.
+/// Expect: `405` naming `GET, POST`, `415` and `406`, each with the cache fields and unproven: a route's refusal is
+/// answered whoever asks, before any credential is read, as git's own routes' are.
+#[test]
+fn an_lfs_route_refused_by_its_syntax_is_answered_whoever_asks() {
+  let mut site = lfs_site(Carried);
+  let cases = [
+    (
+      request("DELETE", LFS_LOCKS, &[]),
+      with_cache(&[("Allow", "GET, POST")]),
+      Status::METHOD_NOT_ALLOWED,
+    ),
+    (
+      request(
+        "POST",
+        "/r.git/info/lfs/objects/batch",
+        &["Content-Type: text/plain"],
+      ),
+      with_cache(&[]),
+      Status::UNSUPPORTED_MEDIA_TYPE,
+    ),
+    (
+      request("POST", LFS_LOCKS, &[LFS_BODY, "Accept: text/html"]),
+      with_cache(&[]),
+      NOT_ACCEPTABLE,
+    ),
+  ];
+  for (asked, fields, status) in cases {
+    assert_eq!(
+      refusal(&ready(site.answer(&head(&asked), true))),
+      (status, fields, false),
+      "{}",
+      String::from_utf8_lossy(&asked)
+    );
+  }
+}
+
+/// A-629 part 2c (batch.md: "`LFS-Authenticate` ... mirrors the standard `WWW-Authenticate` header"). Do: ask the locks
+/// API with no credentials over TLS. Expect: `401`, unproven, with Basic's and Bearer's challenges in
+/// `WWW-Authenticate`, the cache fields, and each challenge again in `LFS-Authenticate`, so git-lfs asks for credentials.
+#[test]
+fn an_lfs_request_without_credentials_is_401_naming_its_challenges_for_git_lfs_too() {
+  let mut site = lfs_site(Carried);
+  let asked = request("POST", LFS_LOCKS, &[LFS_BODY]);
+  let (www, lfs) = ("WWW-Authenticate", "LFS-Authenticate");
+  let mut expected = with_cache(&[(www, BASIC_CHALLENGE), (www, BEARER_CHALLENGE)]);
+  expected.extend([
+    (lfs.as_bytes().to_vec(), BASIC_CHALLENGE.as_bytes().to_vec()),
+    (
+      lfs.as_bytes().to_vec(),
+      BEARER_CHALLENGE.as_bytes().to_vec(),
+    ),
+  ]);
+  assert_eq!(
+    refusal(&ready(site.answer(&head(&asked), true))),
+    (Status::UNAUTHORIZED, expected, false)
+  );
+}
+
+/// A-629 part 2c (§4.17.2 "Access"; A-625 part 3's order). Do: as the owner, ask the locks API of a repository another
+/// shard holds; of one that does not exist; of a Mercurial repository; as a principal no rule names, of `r.git`; then as
+/// the owner, an object's download, which the service does not serve, and the locks API of a site with no LFS service.
+/// Expect: the connection moved to the other shard; then `404`, `404`, `403`, `503` and `503`, each with the cache fields
+/// and proven.
+#[test]
+fn an_lfs_request_meets_its_shard_then_404_403_and_503_for_an_endpoint_not_served() {
+  let mut lfs = lfs_site(Carried);
+  let elsewhere = request(
+    "POST",
+    "/elsewhere.git/info/lfs/locks",
+    &[LFS_BODY, OWNER_BEARER],
+  );
+  let moved = ready(lfs.answer(&head(&elsewhere), true));
+  assert!(
+    matches!(moved.answer, Answer::Move { shard } if shard == ELSEWHERE_SHARD) && moved.proven
+  );
+  let cases = [
+    (
+      "POST",
+      "/missing.git/info/lfs/locks",
+      OWNER_BEARER,
+      Status::NOT_FOUND,
+    ),
+    (
+      "POST",
+      "/hg/info/lfs/locks",
+      OWNER_BEARER,
+      Status::NOT_FOUND,
+    ),
+    ("POST", LFS_LOCKS, STRANGER_BEARER, Status::FORBIDDEN),
+    ("GET", LFS_OBJECT, OWNER_BEARER, Status::SERVICE_UNAVAILABLE),
+  ];
+  for (method, target, credential, status) in cases {
+    let asked = request(method, target, &[LFS_BODY, credential]);
+    assert_eq!(
+      refusal(&ready(lfs.answer(&head(&asked), true))),
+      (status, with_cache(&[]), true),
+      "{method} {target} with {credential}"
+    );
+  }
+  let mut unserved = site(Vec::new(), Unserved);
+  let asked = request("POST", LFS_LOCKS, &[LFS_BODY, OWNER_BEARER]);
+  assert_eq!(
+    refusal(&ready(unserved.answer(&head(&asked), true))),
+    (Status::SERVICE_UNAVAILABLE, with_cache(&[]), true)
+  );
+}
+
+/// A-629 part 2c (main's ruling, 2026-11-19: an LFS route decides its status after its body; the action expires with
+/// the credential that asked). Do: as the owner, with a bearer token expiring half a second into a second, `POST` the
+/// locks API over TLS with a query, its body in two runs. Expect: served, not the head alone, its status decided after
+/// the body, proven; then the service's `201`, LFS's media type, and one run naming the call: the route, the query and
+/// the whole body, the owner, the second the token expires in, no challenge, `https` and the request's authority, no
+/// request id, and the edge's room.
+#[test]
+fn a_served_lfs_request_is_answered_after_its_body_with_its_services_status_and_call() {
+  let mut site = lfs_site(Carried);
+  let asked = request(
+    "POST",
+    "/r.git/info/lfs/locks?refspec=refs%2Fheads%2Fmain",
+    &[LFS_BODY, "Authorization: Bearer expiring-token"],
+  );
+  let (fields, head_only, status, mut exchange, proven) =
+    served_lfs(ready(site.answer(&head(&asked), true)));
+  assert_eq!(
+    (fields, head_only, status, proven),
+    (Fields::new(), false, StatusMode::AfterBody, true)
+  );
+  for run in [&b"{\"path\":"[..], &b"\"a.bin\"}"[..]] {
+    ready(exchange.body(run)).unwrap();
+  }
+  ready(exchange.body_end()).unwrap();
+  let said = (
+    exchange.reply_status(),
+    ready(exchange.reply_fields()).unwrap(),
+    replies(&mut exchange),
+  );
+  let call = format!(
+    "Routed {{ repo: \"r.git\", endpoint: CreateLock }} refspec=refs%2Fheads%2Fmain {{\"path\":\"a.bin\"}} {:?} {:?} \
+     None (\"https\", \"git.example\") None {ROOM}",
+    Some(principal(OWNER)),
+    Timestamp::from_unix(EXPIRES_SECOND),
+  );
+  assert_eq!(
+    said,
+    (
+      CREATED,
+      vec![(b"Content-Type".to_vec(), LFS_JSON.as_bytes().to_vec())],
+      vec![call.into_bytes()]
+    )
+  );
+}
+
+/// A-629 part 2c (the daemon's LFS: no upload acknowledged that a restart would forget, A-581). Do: as the owner, ask the
+/// daemon's LFS service, through the site, for the batch API, an object's upload, download and verification, and the
+/// locks API's create, list, verify and unlock. Expect: the four object endpoints `503` at their head, proven, their
+/// bodies never read; the four lock endpoints served, each deciding its status after its body.
+#[test]
+fn the_daemons_lfs_serves_the_locks_api_and_refuses_objects_at_their_head() {
+  let mut site = lfs_site(ShardLfs);
+  let verify = format!("{LFS_OBJECT}/verify");
+  let objects = [
+    ("POST", "/r.git/info/lfs/objects/batch"),
+    ("PUT", LFS_OBJECT),
+    ("GET", LFS_OBJECT),
+    ("POST", verify.as_str()),
+  ];
+  for (method, target) in objects {
+    let asked = request(method, target, &[LFS_BODY, OWNER_BEARER]);
+    assert_eq!(
+      refusal(&ready(site.answer(&head(&asked), true))),
+      (Status::SERVICE_UNAVAILABLE, with_cache(&[]), true),
+      "{method} {target}"
+    );
+  }
+  let locks = [
+    ("POST", LFS_LOCKS.to_owned()),
+    ("GET", LFS_LOCKS.to_owned()),
+    ("POST", format!("{LFS_LOCKS}/verify")),
+    ("POST", format!("{LFS_LOCKS}/1.61/unlock")),
+  ];
+  for (method, target) in locks {
+    let asked = request(method, &target, &[LFS_BODY, OWNER_BEARER]);
+    let (_, _, status, _, proven) = served_lfs(ready(site.answer(&head(&asked), true)));
+    assert_eq!(
+      (status, proven),
+      (StatusMode::AfterBody, true),
+      "{method} {target}"
+    );
+  }
 }

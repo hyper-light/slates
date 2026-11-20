@@ -12839,7 +12839,13 @@ engine: the verdict, rebase, position mapping, the register).
 > keeps now, at the owner's exchange (a saved byte worth the time to copy it, §4.11 at neutral). The SSH site's services
 > take the same lender (`ToolServices<ShardStores>`), for the SSH edge once the daemon starts one. Owed: the objects a
 > hidden ref alone reaches, fetchable by id until slates-git hides them; the daemon starting the SSH edge (A-684); the
-> live stock `git clone` over the daemon's edge (the next piece) and the other platforms (main's).
+> other platforms (main's).
+>
+> **Status (2026-11-19, stock git's interop tests).** Stock git 2.50.1 clones a repository from a real anchor's
+> daemon, pushes to it and fetches from it over the HTTP edge, the token a bearer credential
+> (`crates/cli/tests/git_interop.rs`), each step held to what git's own server answers the same round trip over
+> `file://`, and git with no credential is refused in its own words. The round trip with the token as Basic's password
+> runs since A-686, its one wait; over the SSH edge it waits on A-684 and A-683, ignored naming them.
 >
 > **Status (2026-11-19, A-650 part 1: a reply's fields named as its reply begins, and Mercurial's site).** The edge's
 > engine renders a served reply's head with the reply's first bytes, from the decision's fields and then any the
@@ -12974,6 +12980,22 @@ engine: the verdict, rebase, position mapping, the register).
 > the body (LFS answers `201`, `409`, `422` and `507` after reading it); the objects' durable store on the owner
 > shard (A-581); principals' names for people (§4.13); locks by others than the owner once the push's policy
 > check lands.
+>
+> **Status (2026-11-19, A-629 part 2c: Git LFS on the shared HTTP edge).** git's HTTP site (`crates/server`,
+> `vcs_http::git`) routes a request under `<repo>/info/lfs` through `slates_git::lfs::serve::route` before git's own
+> routes, in A-625 part 3's order: a route's refusal whoever asks (`405` with `Allow`, `400`, `414`, `415`, `406`); the
+> credentials, a `401` naming each challenge in `LFS-Authenticate` too; the repository, the connection moved to its
+> owner shard, or `404`; the policy's gate for LFS's rights (`403`); and `503` at the head for an endpoint the site's
+> service does not serve. A served request decides its status after its body (main's ruling: a route's status is
+> decided at its head or after its body; `slates-http-edge`'s `StatusMode` and `Connection::reply_status`): its body is
+> kept whole within the request's room and answered with the status, fields and body `lfs::answer` decided, its hrefs
+> under the authority the request named, its actions expiring in the second the bearer token that asked expires in. A
+> status no reply's content may follow (`1xx`, `204`, `205`, `304`), or one named on a streamed route, fails the
+> request `500` in stages. The daemon (`daemon_edge::ShardLfs`) serves the locks API over the repository's locks log;
+> the batch API and the transfers answer `503` at their head until the owner shard keeps LFS objects durably (A-581),
+> so no upload is acknowledged that a restart would forget. Owed: A-581's durable objects and the batch API and the
+> transfers served over them; locks by others than the owner once the push's policy check lands; principals' names for
+> people (§4.13); the stock git-lfs client end to end against the daemon (main's).
 >
 > **Status (2026-11-19, A-624 part 1: v2 reads ids as git's server does).** `v2` takes an object id's digits in either
 > case and writes them in lower case, as v0 does (A-604); each line still records its ending, so stock git's streams
@@ -14016,8 +14038,8 @@ signature verification).
 > repository on the other shard whose store took `fixtures/state`'s `states` by an import, `heads` equal to its
 > history's heads read from the index, while a git repository asked as Mercurial asks is `404` and git's own request
 > still git's; the lender lends nothing while an import fills a store, for a git repository or an unknown one, or past
-> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and the stock `hg` interop run over
-> the edge once a repository can be made from the CLI (A-685) and the edge offers hg's client Basic first (A-686).
+> the room. Owed: the site's pushes (`unbundle` through `hg_push`, A-680 part 2b), and with them the stock `hg` round
+> trip over the edge (a repository made from the CLI, A-685, and Basic offered first, A-686, are built since).
 >
 > **Status (2026-11-19, A-690: divergent bookmarks left out where bookmarks are served).**
 > `serve::pull::bookmark_entries`, which `listkeys bookmarks` and a `getbundle`'s `bookmarks` part both read, leaves out
@@ -15145,6 +15167,28 @@ for Subversion.)
   through its client channel, and the server takes the SSH login as the principal (the `EXTERNAL` mechanism). Over
   slates' own SSH server (§4.17.2, A-633) the same `svnserve -t` is read from the `exec` request and served in the
   daemon, the principal the one the client's key proved.
+
+> **Status (2026-11-19, A-688: svn+ssh over slates' own SSH server).** Built in `crates/server`'s `vcs_ssh::svn`: the
+> SSH site's `exec` of `svnserve -t` (`SvnServices`, beside the other services) runs A-656's one ra_svn connection over
+> the channel, the greeting written first. The client's URL is found as `find_repos` finds it: the longest run of
+> leading segments naming a Subversion repository here, its root URL the client's URL cut after it; `..` refused
+> E125001, another scheme E125002, no repository E210005; a principal A-597's policy lets reach it for no right refused
+> E170001 "No access allowed to this repository". The tunnel's user, which `EXTERNAL` takes, is the principal the
+> client's key proved, named by its index key in hexadecimal until §4.13 names people, never the SSH login. The
+> repository's sources are lent afresh each step (`SvnStores`); a commit begins with its transaction, its hooks pass
+> where none is configured and refuse it where one is, and its work is refused 200007 until the tunnel calls A-655 part
+> 2b's owner step. The tunnel ends as `svnserve -t` 1.15.0 ends: its error on standard error, `svnserve: E` and six
+> digits, and `EXIT_FAILURE`. Held to stock `svnserve -t`: the recorded `mkdir` commit item for item through the
+> commit's start, and the scripted sessions recorded on the Mac Studio (2026-11-19), their output, standard error and
+> exit status; and end to end over the SSH edge with a key (macOS arm64, Mac Studio, kiln r311: `--lib vcs_ssh::` red 26
+> of 35 with the site sending the tunnel to the other services, green 35 of 35; slates-svn `handshake:: serve::` 60 of
+> 60; fmt clean; as it landed over main 693bc8feb, r377: 38 of 38 and 60 of 60). Owed: the lender of a store over
+> A-662's map (its Subversion arm holds the records since A-655 part 2b; the lender adds a directory's entries from the
+> green and the repository's `svnserve.conf` facts), which the daemon's site needs to start the tunnel; the accepted
+> work handed to the owner's commit step (`repository::svn_commit::commit`); the daemon's edge (A-684); a configured
+> hook run rather than refused; CRAM-MD5 through the tunnel; a client that leaves during a refused edit's drop ends
+> E210002 where `svnserve` exits 0; `svn checkout svn+ssh://` with a stock client against a daemon (main's run).
+
 - **HTTP.** HTTPv2 for clients from 1.7 (notes §3): OPTIONS with the `SVN-*` headers and stubs; GET with
   `X-SVN-VR-Base` answered as an svndiff; PROPFIND and PROPPATCH; the REPORTs; POST to open a transaction; PUT, MKCOL,
   COPY and DELETE against it with `X-SVN-Version-Name` for the out-of-date test; MERGE; LOCK and UNLOCK. DeltaV's
@@ -52393,6 +52437,185 @@ every held verdict through the wire form), `crates/merge/src/engine/position.rs`
   the owner carries the form; the owner's submit takes it by `judge_computed` then `commit_judged`, its own verdict only
   on a typed refusal, with a two-node test whose counter shows verdicts taken by position. 3c: git's and Mercurial's
   pushes taking computed verdicts the same way.
+
+### A-694 — An append's new branches are minted distinct volume ids, and a recovery mints what the live partition would (bug, 2026-11-19, g300 for UI goal 93 (kiln 51cef9f7); §4.17.1 "The repository and its greens" item 2 and shared piece 2; §4.8 "Lookup" and "Recovery"; A-635; found by A-687's import landing)
+
+Applied in the same change to: `crates/db` (`VolumeId::counter`; the partition's volume counter, its apply and its
+snapshot field; `Db::volume_counter_at`; the model test's minting histories), `crates/server` (`verbs::fresh_volume_id`
+and `fresh_volume_id_at`; `repository::push`'s plan; the append's and the Mercurial push's tests), GAPS (the A-635
+entry), `docs/bugs/2026-11-19-an-appends-new-branches-were-minted-one-volume-id.md`.
+- **The bug.** A volume id is the creator host, the owner partition and a counter (`verbs::fresh_volume_id`, §4.8
+  "Lookup"); the counter was the database's next log sequence, which moves only when a record commits. A-635's append
+  mints a new branch's id as it plans it, before anything is recorded, so every new branch of one entry got the same
+  id, and the second was refused `ContentUnavailable` with the whole entry: a git push under `atomic` creating two refs,
+  a Mercurial push making two lines or bookmarks, A-687's import of two bookmarks.
+- **The fix.** The partition keeps a volume counter: one past the highest counter of every volume created on it,
+  advanced by each `VolumeCreated` in `apply`, unconditionally, as the guard-then-apply rule asks of every replayed
+  effect, and carried by the partition's snapshot (appended). `Db::volume_counter_at(offset)` answers the counter the
+  `offset`-th id minted now takes, `max(next_seq, counter) + offset`, none past the register-class bit; the append's
+  plan mints each new branch at the count of new branches planned before it. One record's new volumes are minted
+  consecutive counters, each creation moves the counter past its own, so no later mint repeats one, inside the verb's
+  transaction or after it; and a recovery, which applies the same records or restores the snapshot, mints what the live
+  partition would.
+- **Not taken.** Offsets from the next sequence alone: the records after the entry mint from the next sequences, which
+  the entry's second and later ids would already hold. A counter kept beside the database: the counter is state a
+  replay must reproduce, so it lives where the log's apply moves it.
+- **Tests** (macOS arm64, Mac Studio, kiln r398, 2026-11-19, debug, rustc 1.98.1, over main b288b412e):
+  `t_a694_an_append_makes_each_new_branch_its_own_green` (three new branches in one entry, each its own green holding its
+  source's file and bound to its name, a fourth made after by the branch verb, every counter past the one before it),
+  `t_a694_a_push_making_two_bookmarks_makes_two_greens` (a `bookmarks` part making two bookmarks at a held changeset,
+  each its own green at it), `t_a694_every_mint_is_new_and_a_recovery_mints_alike` (the db model test: generated
+  histories of volumes created alone and several to one record, the database dropped and recovered at random points,
+  every id new and every recovery equal to the live partition, minting the next id the live database would). Red first
+  (branch `agents/g300-a694-mint-ids-red` at 8dd016acd, every new branch minted at offset 0): `cargo test --locked -p
+  slates-server --lib -- t_a694` 0 passed, 2 failed, the append refused and the Mercurial push answered `error:abort`
+  naming change 1 `ContentUnavailable`. Green (d53177e26): `-p slates-db --test model -- t_a694 every_recovery` 3 of 3
+  (the recovery histories compare the snapshot, which now carries the counter), `-p slates-db --lib -- snapshot` 8 of 8,
+  `-p slates-server --lib -- t_a694 repository::push repository::hg_push repository::tests git_push vcs_store::` 55 of
+  55, `-p slates-server --test green_checkpoint` 6 of 6, `cargo fmt` (one rewrap of the model test, applied). Main's:
+  clippy, `xtask check`, the doc gates and the other platforms.
+
+### A-629 part 2c — Git LFS on the shared HTTP edge: its routes on git's site through the edge's authentication, its status decided after its body, the locks API served by the daemon (2026-11-19, g230, UI goal 93 (kiln 51cef9f7); §4.17.2 "Large files", "Access" and "Transports" item 1; after A-629 part 2b-ii, A-625 part 3 and A-650 part 1)
+Applied in the same change to: §4.17.2's status; GAPS (the §4.17 entry); `crates/http-edge` (`connection.rs`:
+`StatusMode`, `Decision::Serve`'s `status`, `Connection::reply_status`, `carries_content`; its tests); `crates/server`
+(`vcs_http.rs`: `Exchange::reply_status`, `Answer::Serve`'s `status`, the reply step; `vcs_http/git.rs`: `LfsService`,
+`NoLfs`, `LfsExchange`, `SiteExchange`, the LFS route, gate and refusals, `expiry_of`; `vcs_http/daemon_edge.rs`:
+`ShardLfs`, `DaemonSite`; `vcs_http/hg.rs`; `vcs_http/svn.rs`, at the merge with A-681 part 1: its route decides its
+status after its body; `lfs.rs`: `NoObjects`, `bare`; the tests of `vcs_http`'s git site, hg site and serving loop);
+`crates/git` (`lfs::serve::Answer::fields`); `crates/cli` (`tests/cli.rs`).
+- **A status per route** (main's ruling, 2026-11-19). A served reply's status is its route's to decide: at its head,
+  `200`, as git's services and Mercurial's commands stream theirs (`StatusMode::Streamed`); or after its body, named by
+  the service as its reply begins (`StatusMode::AfterBody`), as Git LFS answers `201`, `409`, `422`, `413` and `507`
+  only once it has read the request, and Subversion's site a PROPFIND's `207` or a refusal its body explains. The
+  engine asks the exchange once, before its fields (`Exchange::reply_status`, `200` unless the exchange names another).
+  A status no reply's content may follow (RFC 9110 §6.4.1's `1xx`, `204` and `304`; §15.3.6's `205`), a code outside
+  §15's classes, or a status other than `200` named for a streamed route fails the request `500` in stages, nothing of
+  a reply sent; one named after the reply began is never written. A-681 part 1 landed the same naming for Subversion's
+  site while this piece was in flight; at the merge the two became one mechanism, not two: A-681's synchronous
+  `Exchange::reply_status` with its `200` default, this piece's per-route mode and content rule, and Subversion's
+  route deciding its status after its body.
+- **The routes on git's site.** An LFS path (`<repo>/info/lfs/...`, the server URL git-lfs derives from a remote) is
+  routed by `slates_git::lfs::serve::route` before git's own routes; a path it does not know falls through to them,
+  and both decode a path alike. The order is A-625 part 3's: the route's refusal whoever asks (`405` naming the
+  endpoint's methods, `400`, `414`, `415`, `406`); a request naming no authority `400`; the credentials (`401` with the
+  connection's challenges, each named again in `LFS-Authenticate`, batch.md, so git-lfs asks for credentials); the
+  repository (the connection moved to its owner shard, or `404` for none or another tool's); the policy's gate, the
+  principal reaching the repository for some LFS right (read, submit or rewrite; `403`); then the service (`503` for an
+  endpoint it does not serve). Every refusal carries `http-backend`'s cache fields, as git's own do. Each endpoint's
+  own right on the ref it names stays `lfs::answer`'s (`LfsAccess`, A-629 part 2b-ii).
+- **The call.** A served LFS request's body is kept whole within the request's room, which the engine's admission
+  bounds, and answered once it ends. `LfsCall` carries the route, the query, the body, the proven principal, the
+  credential's expiry (the second a bearer token's `expires_ns` falls in, so no action outlives the token; none for
+  Basic, whose transfers authenticate as their batch did, A-625 part 3), the scheme and the authority the request named
+  (an absolute-form target's, else `Host`'s, as slates-http checked it) and the room. The answer's status, its fields
+  (`Answer::fields`: the media type, and a `401`'s `LFS-Authenticate`) and its body are the reply's.
+- **What the daemon serves** (`ShardLfs`): the locks API, on the repository's owner shard over its locks log (A-635),
+  durable as the partition's log is, the objects seam handed in holding nothing (`lfs::NoObjects`). The batch API and
+  the transfers answer `503` at their head, their bodies never read: the owner shard keeps no durable LFS object store
+  yet (A-581), and an acknowledged upload that a restart forgot would leave a pushed pointer naming nothing, against
+  §4.17.1's rule that a repository's acknowledged state is durable as greens are (A-662). Rejected on that rule: the
+  objects held in memory beside the git store (`GitStore::lfs`), as the unfinished draft this piece took over had them.
+- **Tests.** `slates-http-edge`
+  (`connection::tests::a_route_deciding_its_status_after_the_body_carries_the_status_its_service_names`: `201`, none,
+  `204`, `205`, a streamed route's `201` and its own `200`, one named after the reply began; A-681's PROPFIND test runs
+  on a route deciding after its body). `slates-server` `vcs_http::git::tests`: route
+  refusals whoever asks; `401` with `LFS-Authenticate`; the owner shard, `404`, `403` and `503`; a served call's status,
+  fields, body and what it carried (the route, query, whole body, principal, expiry, origin and room); the daemon's
+  `ShardLfs` refusing the four object endpoints at their head and serving the locks API's four. `vcs_http::tests::serve`
+  over a loopback connection: `201` heading a reply, and `204` or a status on a streamed route failing it in stages.
+  `slates-cli` `an_anchors_vcs_http_flag_starts_its_daemons_edge`: a real anchor's daemon answers its git refs and its
+  LFS locks `401`, Bearer's challenge in `WWW-Authenticate` and in `LFS-Authenticate`, no Basic in cleartext.
+- **Evidence** (macOS arm64, Mac Studio, 2026-11-19, debug, `CARGO_BUILD_JOBS=2`; kiln r109 over this piece on main
+  cb9d7f5a5, 21:41 to 21:53 UTC, load 8 to 16). Failing first, the edge never taking the status its service names:
+  the edge test failed, 0 of 1. Restored: `cargo test --locked -p slates-http-edge --lib -- connection::` 18 of 18;
+  `-p slates-git --lib -- lfs::` 73 of 73; `-p slates-server --lib -- vcs_http:: lfs:: credentials:: --test-threads=4`
+  55 of 55, the six new among them and main's four `lfs::tests` passing on the seam as it was; `-p slates-cli --test cli
+  -- an_anchors_vcs_http_flag_starts_its_daemons_edge` 1 of 1, in 3.86 s. rustfmt asked for six layout changes, made
+  as it wrote them: `rustfmt --check --edition 2024` (1.9.0) clean over the twelve changed files at 8188f1214. The
+  Linux and Windows runs are owed (main's).
+- **Owed.** The objects' durable store on the owner shard (A-581), and with it the batch API and the transfers served;
+  locks by others than the owner once the push's policy check lands (A-635); principals' names for people (§4.13); a
+  request id named in LFS's error bodies; the stock git-lfs client end to end against the daemon (main's).
+
+### A-688 — svn+ssh over slates' own SSH server: the SSH site's `svnserve -t` runs A-656's ra_svn connection over the channel, the key's principal the tunnel's user (2026-11-19, g229, UI goal 93; §4.17.4 "The wire" (svn+ssh) and piece 12; after A-656, A-651, A-633, A-597 and A-662)
+Applied in the same change to:
+- §4.17.4's status under "The wire" (svn+ssh); GAPS (the §4.17 entry, after A-651 part 2's line, and A-656's owed
+  line);
+- `crates/server` (new: `vcs_ssh::svn`, `SvnServices`, `SvnCommand`, `SvnStores`, and its tests; `vcs_ssh::site`'s
+  not-served words shared; the edge's test of a tunnel end to end); `crates/svn` (`handshake::Unserved::failure`, the
+  error a refused URL is answered with, which the tunnel also ends with).
+- **The session** (`SvnCommand`). As `svnserve -t` does, the tunnel speaks first: the greeting is written as the
+  command starts. The client's answer names a URL, found as `svnserve`'s `find_repos` finds it (`serve.c` at
+  `d434dc14`, 1.15.0 alike) [C]: the path beneath the scheme (`svn`, an optional `+` and a tunnel's name, `://`) and
+  host, each segment percent-decoded as `svn_path_uri_decode` decodes one, a `..` segment refused "Couldn't determine
+  repository path" (E125001), then the longest run of leading segments naming a Subversion repository on this shard;
+  its root URL is the client's URL cut after that run. Another scheme is refused "Non-svn URL passed to svn server"
+  (E125002), a URL no Subversion repository holds "No repository found in '…'" (E210005), a git repository's name
+  alike. Then A-597's policy: a principal it lets reach the repository for none of its rights is refused "No access
+  allowed to this repository" (E170001), as the site judges Mercurial's `serve --stdio`; each command is then the
+  session's to judge (the repository's own `svnserve.conf` and authorization file, lent with its sources).
+- **Who** (§4.13; §4.17.4: "the principal the one the client's key proved"). The tunnel's user, which `EXTERNAL`
+  takes, is that principal, named as slates' version-control answers name one until §4.13 names principals for people:
+  its index key in hexadecimal (`lfs::owner_name`). The SSH login proves nothing and names no one: a client can send
+  any login, so `EXTERNAL` naming the login (`git`, as every git and svn+ssh client sends) is refused "Requested
+  username does not match", as `svnserve -t` refuses a name other than its tunnel's user.
+- **The sources** (`SvnStores`). What the handshake tells the client (the UUID, the realm, mergeinfo, who may read)
+  and, from the session's establishment on, the repository's index, green, lock table, policy and the owner's instant
+  are lent afresh for each step, as git's site lends its stores (A-640 part 2), so a shard's state is never held across
+  a wait. A repository whose store is not held here, or whose store goes away mid-session, is not served, in the site's
+  words, with nothing more written to the client.
+- **A commit.** `commit` begins A-656's drive with its transaction (the youngest revision, `-`, the connection's count
+  of commits in base 36). A hook the drive waits for (A-661) passes where the repository's policy configures none at
+  its point, as `svnserve` answers a point with no hook; where one is configured the commit is refused there, since
+  running a hook needs the transaction's view, owed with the owner's commit step, and no hook is ever skipped. An
+  accepted work is refused 200007 "This server does not make commits yet" until the tunnel hands it to A-655 part 2b's
+  owner step (`repository::svn_commit::commit`, which runs on the owner shard's state), owed with the lender.
+- **How it ends** (recorded, below). The error that ended the connection on standard error, `svnserve: E`, its number
+  in six digits, `: ` and its message, and `EXIT_FAILURE` (1); a clean end 0 with nothing: a client that leaves between
+  commands or inside a command's item. A client that leaves during the handshake, a report or an edit, E210002; a
+  malformed item, E210004; protocol version 3 and a client without `edit-pipeline`, E210006 in the handshake's words;
+  each refused URL as above, written to the client too. Where `svnserve` aborts and on the caller's own errors the
+  tunnel ends 1 with nothing more, counted.
+- **The oracle.** Stock `svnserve -t` 1.15.0 (Homebrew's, the Mac Studio, macOS arm64), two ways. The recorded `mkdir`
+  commit (`crates/svn/fixtures/commit/`, made through `svnserve -t`), item for item through the commit's start. And
+  sessions recorded for this piece at 2026-11-19T22:27:07Z and 22:33:56Z: each scripted client's bytes piped to
+  `svnserve -t --tunnel-user=alice -r ROOT`, ROOT holding `repo` (`svnadmin create`, `svnadmin setuuid
+  00000000-0000-4000-8000-00000000a617`, `anon-access = none`, `auth-access = write`) and `closed` (`auth-access =
+  none`), its output, standard error and exit status kept; the first six sessions' bytes are pinned by SHA-256 in the
+  tests. One recorded ending the tunnel does not meet: a client that leaves while a refused edit's commands are being
+  dropped (`open-dir` of a missing path, then gone) ends 0 there and E210002 here, since A-656's `Waiting` does not
+  tell the drop from a live edit (GAPS).
+- **Tests.** `vcs_ssh::svn::tests`, each held to stock `svnserve -t` 1.15.0, the command dispatched by the site and
+  stepped as the edge steps one: `the_scripted_sessions_are_the_recorded_ones` (the first batch's clients, outputs and
+  errors, their SHA-256 as recorded); `a_stock_commit_is_answered_as_svnserve_t_answers_it_until_the_owners_step` (the
+  recorded `mkdir`, split inside an item, item for item through the commit's start, then 200007; `abort-edit`, exit 0;
+  every byte consumed; the store lent); `a_scripted_session_is_answered_as_svnserve_t_answers_it` (a URL naming the
+  repository's root, and one beneath it); `the_tunnels_user_is_the_principal_the_key_proved_never_the_login`;
+  `a_url_naming_no_subversion_repository_is_refused_as_svnserve_t_refuses_it` (no repository, another scheme, `..`, a
+  git repository's name); `a_principal_the_policy_keeps_out_is_refused_as_svnserve_t_refuses_a_closed_repository`;
+  `a_repository_whose_store_is_not_held_here_is_not_served`; `the_tunnel_ends_as_svnserve_t_ends_each_session` (seven
+  recorded endings); `the_tunnel_is_served_beside_the_other_services`. And the edge's
+  `vcs_ssh::tests::an_svnserve_tunnel_serves_a_stock_session_over_the_channel`: a key's principal runs `svnserve -t`
+  over a real SSH connection on the runtime's TCP, the recorded `latest` session and EOF, its output as `svnserve -t`
+  wrote it, exit-status 0, EOF and close in order.
+- **Runs.** macOS arm64, the Mac Studio, kiln r311, 2026-11-19 (22:47 to 22:59Z, load 14 to 25), over main
+  `b94ae6e90` with the change (`934e36797`): `cargo fmt -p slates-server -p slates-svn -- --check` clean; red, a scratch
+  copy whose `SvnServices` sends `svnserve -t` to the other services as today's site does, `cargo test --locked -p
+  slates-server --lib vcs_ssh:: -- --test-threads=4` 26 passed, 9 failed (the ten new but the digests'); green, the
+  same 35 of 35, no compiler warning; `cargo test --locked -p slates-svn --lib -- handshake:: serve::` 60 of 60
+  (`Unserved::failure` moved out of `Server::refuse`). The landing tree, the change over main `693bc8feb` (A-651 part
+  3's site and A-655 part 2b's step among main's commits since): kiln r377, 23:13 to 23:21Z, fmt clean, `--lib
+  vcs_ssh::` 38 of 38 (A-651 part 3's four tests among them), slates-svn 60 of 60. No integration target reaches the
+  tunnel: the daemon starts no SSH edge yet (A-684).
+- **Owed.** The lender of a Subversion store over A-662's map: since A-655 part 2b its Subversion arm holds the
+  records (the index, revision properties, contents, lock table and UUID), and the lender adds a directory's entries
+  from the green and the repository's `svnserve.conf` facts; until it lands no store is lent and the daemon's site
+  cannot start the tunnel (the HTTP edge's DAV site, A-681, waits for the same lender behind its own `SvnStores`); the
+  accepted work handed to the owner's commit step; the daemon's SSH edge (A-684) and the connection moved to the
+  repository's owner shard; running a configured hook; CRAM-MD5 through the tunnel (the credentials record holds no
+  keys for it); a URL canonicalized as `svn_uri_canonicalize` would (stock clients send canonical URLs); the drop's
+  ending above; `svn checkout svn+ssh://` with a stock client against a daemon, the other platforms' runs and the
+  red-checks (main's).
 
 ### A-686 — Basic with the token as the password on the loopback cleartext edge as over TLS, and Basic's challenge first on every connection, so stock Mercurial 7.2 reads a `401` (2026-11-19, g258 for UI goal 93; §4.17.2 "Access" and "Transports" item 1; §4.17.3 "Access"; main's ruling of 2026-11-19, revising A-625 part 3's "never in cleartext"; A-625 parts 1 to 3, A-650 part 1)
 

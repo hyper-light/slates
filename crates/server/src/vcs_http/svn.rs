@@ -20,12 +20,13 @@
 //! 6. The store. A repository whose store this shard does not hold is `503` (the daemon lends none yet: [`NoSvnStores`]).
 //!
 //! A served request's body is read whole within the request's room (`413` past it), then answered at its end from the
-//! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND), its
-//! headers and its body; a file's text a piece a reply run, lent from the green each run, never held whole; a REPORT's
-//! answer a slice of the room a reply run, the store lent again for each, its first slices stepped at the body's end
-//! (the task yielding between them) until it has written its first bytes or ended, since they decide its status: a
-//! walk refused before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it
-//! ends the connection (a refusal within those first slices after the first byte is `500`, nothing sent).
+//! store as `slates_svn::dav::site` decides: its status, which the reply names as it begins (`207` for a PROPFIND; the
+//! route decides its status after its body, `StatusMode::AfterBody`, A-629 part 2c's engine rule), its headers and its
+//! body; a file's text a piece a reply run, lent from the green each run, never held whole; a REPORT's answer a slice
+//! of the room a reply run, the store lent again for each, its first slices stepped at the body's end (the task
+//! yielding between them) until it has written its first bytes or ended, since they decide its status: a walk refused
+//! before its first byte is answered with its error, as `mod_dav` answers one, and one refused after it ends the
+//! connection (a refusal within those first slices after the first byte is `500`, nothing sent).
 //!
 //! **Names.** A repository is the one named by the URL's first path segment, decoded; the rest of the path is below
 //! its root (`/repo/!svn/rvr/5/trunk` is `repo`'s `/!svn/rvr/5/trunk`). A repository whose name holds a slash cannot be
@@ -43,7 +44,7 @@ use slates_http::Admission;
 use slates_http::head::{Head, Target};
 use slates_http::percent::{self, Plus};
 use slates_http::reply::Status;
-use slates_http_edge::connection::Fields;
+use slates_http_edge::connection::{Fields, StatusMode};
 use slates_http_edge::credential;
 use slates_rt::futures::yield_now;
 use slates_svn::authz::PrincipalRules;
@@ -273,6 +274,7 @@ impl<A: Authenticator, R: Repositories, S: SvnStores + Clone> SvnSite<A, R, S> {
         answer: Answer::Serve {
           fields: Fields::new(),
           head_only: head.method == HEAD,
+          status: StatusMode::AfterBody,
           exchange,
         },
         proven: true,
