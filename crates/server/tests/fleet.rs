@@ -8669,6 +8669,83 @@ fn a_forward_is_never_refused_below_its_paths_floor() {
   assert_answered_at_the_paths_floor(&answer, (took, slo), &counters);
 }
 
+/// Shape: the forwards [`a_lane_measured_past_the_failover_delay_logs_it_once`] makes through b, one after another: enough
+/// that a line a forward (the flood's rate) and a line a lane are told apart many times over.
+const FLOOR_FORWARDS: u64 = 40;
+
+/// Format: b's count of its lanes' floors crossing past the failover delay (`forward_lane::note_floor`).
+const FLOOR_PAST_SLO: &str = "fleet.forward.floor_past_slo";
+/// Format: b's count of the log lines it wrote about its lanes' floors (`forward_lane::note_floor`).
+const FLOOR_LOGGED: &str = "fleet.forward.floor_logged";
+
+/// CLAUDE.md §2 item 8 (no unbounded log), found by w-fed-faults' flows (2026-11-20): a lane whose path's floor is past the
+/// failover delay says so once, not once a forward. Do: three nodes whose failover delay is held at one liveness budget
+/// (injected, A-363), below the path's floor on loopback (about 2 to 3 s); a volume on a; through b, [`FLOOR_FORWARDS`]
+/// status reads of it, one after another, each a forward to a on its own lane turn. Expect b to count the floor crossing
+/// past the delay once and one line about it (`fleet.forward.floor_past_slo`, `fleet.forward.floor_logged`). Before, a
+/// lane left with nothing was dropped and the next forward made it afresh, its floor measured from nothing, so every
+/// forward crossed the delay again and logged a line: about a million lines, 260 MB, in one flow.
+#[test]
+fn a_lane_measured_past_the_failover_delay_logs_it_once() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  for daemon in &daemons {
+    daemon
+      .inject_failover(Some(LIVENESS_BUDGET_NS))
+      .expect("the failover delay is held on each node");
+  }
+  let mut owner = Client::connect(daemons[0].instance());
+  let volume = volume_owned_by(&mut owner, 0, "floor-once", &daemons);
+  let mut router = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut router, volume, COUNCIL_RETIRE_DEADLINE);
+  let before = summed_counters(&daemons[1]);
+  let answered = (0..FLOOR_FORWARDS)
+    .filter(|_| {
+      matches!(
+        router.call(&RequestBody::Status { volume }),
+        ReplyBody::Status { .. }
+      )
+    })
+    .count();
+  let after = summed_counters(&daemons[1]);
+  drop(router);
+  drop(owner);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let grew = |name: &str| count_of(&after, name).saturating_sub(count_of(&before, name));
+  let (crossed, logged) = (
+    count_of(&after, FLOOR_PAST_SLO),
+    count_of(&after, FLOOR_LOGGED),
+  );
+  eprintln!(
+    "{answered} of {FLOOR_FORWARDS} reads answered through b; b's floor crossed past the delay {crossed} times ({} in \
+     the reads), {logged} lines ({} in the reads)",
+    grew(FLOOR_PAST_SLO),
+    grew(FLOOR_LOGGED)
+  );
+  assert!(routed, "b routed the volume to a: {last:?}");
+  assert_eq!(
+    u64::try_from(answered).unwrap(),
+    FLOOR_FORWARDS,
+    "every read was answered"
+  );
+  assert_eq!(crossed, 1, "the lane's floor crossed past the delay once");
+  assert_eq!(logged, 1, "one line said so");
+}
+
 /// The probe through b's deaf session: answered on the replacement session, never refused below its path's floor;
 /// answered past its failover SLO `slo`, so the floor is what held it; and b's `counters` show the deaf session dropped
 /// and the probe's bound held at the path's measured floor.
@@ -21482,6 +21559,178 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
     ),
     "its submit committed: {submitted:?}"
   );
+}
+
+/// A-697 (a holder's work rebased over the holder's replica; A-658: a rebase is a pure function of the versions it maps
+/// through): in a two-node `f = 1` fleet, A owns a green at version 1 (`f` holding "hello") shared with B, and B serves
+/// works over greens A owns (the test hook). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
+/// `f` and submits, version 2; B's work rebases. Expect: answered `Rebased` at version 2, mapped on B's replica (B's
+/// counter moved); the work then reads `f` as version 2 holds it and keeps `g`; A's floor for the work rises to 2.
+#[test]
+fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edit = |client: &mut Client, work, path: &str, at, bytes: &[u8]| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    })
+  };
+  let version_of = |reply: &ReplyBody| match reply {
+    ReplyBody::Submitted { version, .. } => *version,
+    _ => None,
+  };
+  assert!(matches!(
+    edit(&mut owner, owners_work, "f", 0, b"hello"),
+    ReplyBody::Edited
+  ));
+  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert_eq!(version_of(&first), Some(1), "{first:?}");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let wrote = edit(&mut holder, work, "g", 0, b"mine");
+  assert!(matches!(
+    edit(&mut owner, owners_work, "f", 5, b", there"),
+    ReplyBody::Edited
+  ));
+  let second = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let rebased_before = daemon_b
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.rebased_on_replica")
+    .copied()
+    .unwrap_or(0);
+  let both = [&daemon_a, &daemon_b];
+  let replica_at_two = poll_until(&both, PLACEMENT_DEADLINE, || {
+    Ok(daemon_b.merge_holder_state(green)?.version == Some(2))
+  });
+  let rebased = holder.call(&RequestBody::Rebase { work });
+  let rebased_on_replica = daemon_b
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("merge.work.rebased_on_replica")
+    .copied()
+    .unwrap_or(0)
+    - rebased_before;
+  let f = head_bytes(&mut holder, work, "f");
+  let g = head_bytes(&mut holder, work, "g");
+  let floor_rose = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a
+      .work_floor(green, work)
+      .map(|floor| floor == Some(2))
+  });
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(matches!(wrote, ReplyBody::Edited), "{wrote:?}");
+  assert_eq!(version_of(&second), Some(2), "{second:?}");
+  assert!(replica_at_two, "B's replica took version 2");
+  assert!(
+    matches!(
+      rebased,
+      ReplyBody::Rebased {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the work rebased onto version 2: {rebased:?}"
+  );
+  assert_eq!(rebased_on_replica, 1, "mapped on B's replica");
+  assert_eq!(f, Ok(b"hello, there".to_vec()), "f as version 2 holds it");
+  assert_eq!(g, Ok(b"mine".to_vec()), "the work keeps its own file");
+  assert!(floor_rose, "A's floor for the work rose to 2");
+}
+
+/// A-697 (a copy a holder's work declares, composed over the holder's replica; A-626): in a two-node `f = 1` fleet, A
+/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over greens A owns (the test
+/// hook). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
+/// increment composed on B's replica (B's counter moved), since a copy's source is the green's; A's green reads `f2` as
+/// "hello".
+#[test]
+fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, _daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
+  let mut owner = Client::connect(&instance_a);
+  let edited = owner.call(&RequestBody::Edit {
+    work: owners_work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  assert!(
+    matches!(
+      first,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{first:?}"
+  );
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("B made the work at base 1: {created:?}");
+  };
+  let composed = |daemon: &Daemon| {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get("merge.work.composed_on_replica")
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = composed(&daemon_b);
+  let declared = holder.call(&RequestBody::Declare {
+    work,
+    op: slates_ipc::protocol::WorkOp::Copy {
+      from: "f".to_owned(),
+      to: "f2".to_owned(),
+      version: None,
+      replace: false,
+    },
+  });
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let composed_here = composed(&daemon_b) - before;
+  let copied = head_bytes(&mut owner, green, "f2");
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(
+    matches!(declared, ReplyBody::Declared { .. }),
+    "{declared:?}"
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "the copy committed as version 2: {submitted:?}"
+  );
+  assert!(
+    composed_here >= 1,
+    "composed on B's replica: {composed_here}"
+  );
+  assert_eq!(copied, Ok(b"hello".to_vec()), "A's green holds the copy");
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447

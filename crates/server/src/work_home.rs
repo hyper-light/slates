@@ -699,10 +699,9 @@ pub(crate) fn gate(
       Err(refusal) => Gate::Answer(crate::verbs::refused(refusal)),
     };
   }
-  let Some((work, green)) = remote_work(state, &body) else {
+  let Some((work, _green)) = remote_work(state, &body) else {
     return Gate::Run(body);
   };
-  let elsewhere = green_elsewhere(state, green);
   if let Some(gate) = settle_pending_first(state, (client_id, principal), &body, work) {
     return gate;
   }
@@ -715,22 +714,6 @@ pub(crate) fn gate(
   } else {
     None
   };
-  // A work on a holder node is judged by its composed increment's verdict, computed on the node's replica and taken by
-  // position at the owner (A-697 part c); one holding a copy the owner composes, and its rebase, are not built yet.
-  if elsewhere {
-    let unbuilt = match &need {
-      Some(Need::Verdict { sealed, .. }) if sealed.composed.is_none() => {
-        Some("a copy submitted from a work on a holder node")
-      }
-      Some(Need::Rebase { .. }) => Some("a rebase of a work on a holder node"),
-      _ => None,
-    };
-    if let Some(feature) = unbuilt {
-      return Gate::Answer(crate::verbs::refused(Refusal::Unsupported {
-        feature: feature.to_owned(),
-      }));
-    }
-  }
   if !queued && need.is_none() {
     return Gate::Run(body);
   }
@@ -1160,8 +1143,18 @@ fn start_ask(
   }
   // A work on a holder node computes its verdict on the node's replica and sends it to the owner (A-697 part c).
   let need = match need {
-    Need::Verdict { sealed, policy, .. } if green_elsewhere(state, sealed.green) => {
-      return verdict_over_fleet(state, queue, (origin, id), principal, (*sealed, policy));
+    Need::Verdict {
+      sealed,
+      policy,
+      evidence,
+    } if green_elsewhere(state, sealed.green) => {
+      return verdict_over_fleet(
+        state,
+        queue,
+        (origin, id),
+        principal,
+        (*sealed, policy, evidence),
+      );
     }
     need => need,
   };
@@ -1183,10 +1176,10 @@ fn start_ask(
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
   let owner_partition =
     target.unwrap_or_else(|| crate::verbs::owner_of(crate::verbs::to_wire_volume(green)));
-  // A base read of a work on a holder node goes to the node's control shard, which holds its replica of the green
-  // (A-697 part a); a verdict or a rebase of one is refused at the gate.
+  // A base read and a rebase of a work on a holder node go to the node's control shard, which holds its replica of the
+  // green (A-697); its verdict went to the owner above.
   let owner = if target.is_none() && green_elsewhere(state, green) {
-    if matches!(need, Need::Verdict { .. } | Need::Rebase { .. }) {
+    if matches!(need, Need::Verdict { .. }) {
       return false;
     }
     state.shards.first().copied()
@@ -1363,11 +1356,8 @@ fn verdict_over_fleet(
   queue: DbVolumeId,
   (origin, id): (u64, RequestId),
   principal: &Principal,
-  (sealed, policy): (SealedWork, crate::verbs::SubmitPolicy),
+  (sealed, policy, evidence): (SealedWork, crate::verbs::SubmitPolicy, Vec<[u8; 32]>),
 ) -> bool {
-  let Some(inc) = sealed.composed else {
-    return false;
-  };
   let (Some(here), Some(control)) = (
     crate::verbs::shard_of_partition(state, state.partition),
     state.shards.first().copied(),
@@ -1416,7 +1406,7 @@ fn verdict_over_fleet(
       control,
       move || async move {
         let built =
-          state::with_state(|s| computed_request(s, (work, green), inc, (id, principal), carried));
+          state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
         let reply = match built {
           Some(Ok(request)) => crate::verbs::resolve_and_forward(
             crate::verbs::to_wire_volume(green),
@@ -1461,12 +1451,18 @@ fn verdict_over_fleet(
 /// base or a copy the verdict refuses refused by its kind, as the owner would.
 fn computed_request(
   state: &mut ShardState,
-  (work, green): (DbVolumeId, DbVolumeId),
-  inc: slates_merge::engine::Increment,
+  (sealed, evidence): (SealedWork, Vec<[u8; 32]>),
   (id, principal): (RequestId, Principal),
   carried: slates_ipc::protocol::ComputedSubmit,
 ) -> Result<Vec<u8>, Box<ReplyBody>> {
   use slates_merge::engine::ComputeRefused;
+  let (work, green) = (sealed.work, sealed.green);
+  // A work holding a copy leaves its increment to be composed where the green's bytes are: here, over the replica.
+  let inc = match sealed.composed {
+    Some(inc) => inc,
+    None => crate::verbs::compose_on_replica(state, &sealed, evidence)
+      .map_err(|refusal| Box::new(crate::verbs::refused(refusal)))?,
+  };
   let behind = crate::verbs::refused(Refusal::Overloaded { shard: state.shard });
   let Some(replica) = state
     .merge
@@ -1832,6 +1828,12 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
       Some(reply) => Outcome::Answered(Answered::Verdict(reply)),
       None => Outcome::Deferred,
     },
+    // A holder's work is rebased over this node's replica (A-697); any other through the green.
+    Need::Rebase { sealed } if state.work_home.on_holders && !state.greens.contains_key(&green) => {
+      Outcome::Answered(Answered::Rebased(crate::verbs::replica_rebase(
+        state, &sealed,
+      )))
+    }
     Need::Rebase { sealed } => Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(
       state, *sealed,
     ))),

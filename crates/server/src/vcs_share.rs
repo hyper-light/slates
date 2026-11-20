@@ -281,6 +281,7 @@ fn demand_of(
 }
 
 pub(crate) mod place;
+pub(crate) mod turns;
 
 #[cfg(test)]
 mod tests;
