@@ -748,6 +748,73 @@ pub(crate) async fn home_in_region(
   }
 }
 
+/// The object `identity` read from the region (A-724 piece 8c: a version-3 record's names, read where its replay runs):
+/// from this node's own home shard when it holds it, else from each of its region homes in turn, the first answer whose
+/// bytes hash to `identity` taken (a home answering other bytes is passed over). None when no home answered it within
+/// `budget`. Asked from shard `origin`.
+pub(crate) async fn read_in_region(
+  origin: u16,
+  shards: &[u16],
+  identity: ContentId,
+  budget: slates_cluster::CommitBudget,
+) -> Option<Vec<u8>> {
+  use slates_cluster::homes::{HOME_STREAM, HomeMessage, HomeOutcome};
+  let budget_ns = budget.max_deadline_ns();
+  if let Some(bytes) = read(origin, shards, identity, budget_ns).await
+    && ContentId::of(&bytes) == identity
+  {
+    return Some(bytes);
+  }
+  let (local, members, f) = crate::state::with_state(|state| {
+    (
+      state.fleet.host(),
+      state.fleet.members().to_vec(),
+      usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
+    )
+  })?;
+  let others: Vec<slates_db::HostId> = slates_db::identity_homes::homes(&identity.0, &members, f)
+    .into_iter()
+    .filter(|home| *home != local)
+    .collect();
+  if others.is_empty() {
+    return None;
+  }
+  let request = HomeMessage::Read {
+    identity: identity.0,
+  }
+  .encode();
+  let sessions =
+    crate::fleet::take_sessions("vcs_store.homes.region_read", |host| others.contains(&host));
+  let outgoing: Vec<_> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let (replied, _stragglers) = slates_cluster::broadcast(
+    outgoing,
+    HOME_STREAM,
+    slates_transport::connection::Priority::Bulk,
+    budget,
+  )
+  .await;
+  let mut found = None;
+  let mut returned = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    if found.is_none()
+      && let Ok(HomeMessage::Answer {
+        identity: answered,
+        outcome: HomeOutcome::Bytes(bytes),
+      }) = HomeMessage::decode(&reply.bytes)
+      && answered == identity.0
+      && ContentId::of(&bytes) == identity
+    {
+      found = Some(bytes);
+    }
+    returned.push((host, endpoint));
+  }
+  crate::fleet::return_sessions(returned);
+  found
+}
+
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
 pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";
 /// Counter: identities this node let go once every region home held them. Format: a counter name.
