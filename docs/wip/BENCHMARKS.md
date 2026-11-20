@@ -14668,3 +14668,36 @@ an order of magnitude is worth chasing; the one-commit steps are already 0.15 to
 round trips. Subversion's load costs 0.16 s a revision (it flushes each), and its one-file commit 3.7 s, most of it the
 client walking a 4,872-file working copy. Owed against §4.17.1's method: git-http-backend and Gitaly, mod_dav_svn, the
 Linux kernel as the dataset, the server's CPU and peak memory, and N concurrent clients.
+
+## Slates against svnserve over svn://, and what stops git's and Mercurial's whole histories (A-699; UI goal 93; 2026-11-20)
+
+- **Machine and builds:** the Mac Studio of the stock entry above, 2026-11-20 ~06:10 UTC, load average 19.16 at the
+  start and 34.04 at the end (agents' builds; not quiesced). slates: release build of main bc2803d66 (`slates anchor
+  --vcs-svn 127.0.0.1:0`, 23 shards derived, a minted token as CRAM-MD5's credentials).
+- **Data:** git/git's newest 1,000 first-parent commits to f7de81456940 as a dump (`git_to_svn_dump.py src.git master
+  1000`, 223 MiB). Both servers hold the same 1,000 revisions: each first checkout's 4,872 files' blob ids equal git's
+  tree, and each log names 1,000 revisions.
+- **Command:** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=slates crates/cli/bench/svn_scale.sh git-1000.dump src.git
+  master WORK 3 1800`, runs interleaved, stock first.
+
+| svn:// | stock 1 | 2 | 3 | best | slates 1 | 2 | 3 | best |
+|---|---|---|---|---|---|---|---|---|
+| fill (`svnadmin load`, once / `slates repository import`) | 62.817 | | | 62.817 | 1.874 | 1.958 | 1.878 | 1.874 |
+| checkout of trunk | 4.904 | 4.989 | 6.354 | 4.904 | 5.089 | 5.238 | 5.454 | 5.089 |
+| `log -q`, whole history | 0.140 | 0.227 | 0.197 | 0.140 | 0.071 | 0.083 | 0.062 | 0.062 |
+| one-file commit | 4.376 | 5.033 | 5.008 | 4.376 | 4.020 | 3.698 | 4.226 | 3.698 |
+| update to it | 1.009 | 0.993 | 0.985 | 0.985 | 1.022 | 0.986 | 0.990 | 0.986 |
+
+The import fills the repository 33 times as fast as stock's load, and `log` is 2.3 times as fast. Checkout, commit and
+update are even, within this loaded box's noise. Those three are client-bound: the client walks and writes a
+4,872-file working copy. The daemon held 2,561 to 2,582 MiB after each import. (The run's update-across step reached
+r0, which holds no trunk, so it is left out. The harness now takes a short history back to r1.)
+
+What stops the larger datasets (each found by use, reported to its owner, and owed before slates' numbers on it):
+- git/git whole push (main 9f0851ea0, A-704 in): shard 10 spins 1,046 ms without a step, the watchdog kills the
+  daemon, and git hangs after "unable to rewind rpc post data" (w-git).
+- Mercurial's repository (57,036 changesets) whole push: 413 at the edge's 278,528 B room (main 9f0851ea0). After
+  A-711 (main bc2803d66) the 413 is gone, but shard 10 spins 1,152 ms, the daemon is killed, and hg aborts after 7.6 s.
+  `slates repository import` of the same repository is refused `PastRoom { room: 278528 }` (w-hg).
+- Subversion 5,000-revision dump: the import stops at 1,685 revisions, `TableAtCapacity { table: "green_chains" }`,
+  with the daemon at 3,390 MiB (main 9ea6e1311; w-svn).
