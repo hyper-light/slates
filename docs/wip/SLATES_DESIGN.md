@@ -14412,6 +14412,8 @@ struct HgIndex { changelog: Tables<HgChangelogRow>, manifests: Art<TreePath, Tab
 **Pull and clone.**
 1. Discovery (`heads`, `known`, `branchmap`, `lookup`, `listkeys`, and the legacy `between` and `branches`) reads the
    index in RAM at one register position (§4.17.1 "Reads"): one consistent cut of every line, bookmark and phase.
+   Status (A-705): `lookup` served over both transports in 7.2's `revsymbol` order (`serve::lookup`); tags beyond `tip`
+   owed.
 2. `getbundle` with `common` and `heads`: the missing changesets are the ancestors of `heads` that are not ancestors of
    `common`, in the served view (no secret and no hidden changeset), walked over revision numbers as Mercurial's own
    outgoing computation walks them [C: `exchange._computeoutgoing`].
@@ -14514,6 +14516,9 @@ follow the pinned client's own writer (`revlogutils/deltas.py`), so a stream clo
 would have built, and `hg verify` on the clone is the check: the rule is the client's, not a slates tunable. A stream
 is offered only when it holds nothing the principal may not read. The same rendering is the read-only repository the
 admission hooks see and what an export lands (§4.15).
+Status (A-706, stream clones part 1): `slates_hg::render` renders the index whole into those files, each revision a full
+text in a split revlog (no deltas or compression yet), and stock 7.2's `hg verify` passes on what it renders; the
+deltas, the rendering appended as versions commit, `stream_out` and `stream2` are later parts.
 
 **hgweb.** hgweb's read URLs (`log`, `changeset`, `file`, `rawfile`, `annotate`, `filelog`, `archive`, `graph`,
 `branches`, `bookmarks`, `tags`, `summary`) in the `json` and `raw` styles (`/json-log`, or `?style=json` [B:
