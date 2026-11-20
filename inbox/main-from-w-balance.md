@@ -134,3 +134,13 @@ Fix:
 keeps the labelled grant-all workaround until w-fed-faults' credential fix lands; it's that fix's red too.
 Tests: slates-db all; slates-server takeover/state_log/vcs_store/git_push/vcs_http::git/vcs_ssh 236/236.
 Next: the v3 switch on, its takeover runs going now.
+
+### 2026-11-20: v3 switch LANDED 08fba4007; grant-all workaround removed e73283fd6
+- 08fba4007: `vcs_store::write_version_3` true. Takeover test 4/4 with it. One run's counts: the successor replayed 3
+  records and read one record's names from a region home (`names_fetched` 1); each survivor homed 2 objects and served
+  19 region exchanges, and its homing waits published its home shard 11 and 13 times.
+  The first v3 runs hung: main's `answer_until` refactor had dropped the HTTP edge's `take_homing`. It's restored, and
+  a decision whose homing no edge takes by its next turn now falls back to v2 (`homing_untaken`), never waits; there's a
+  unit test for that.
+- e73283fd6: the takeover test asks the successor with the OWNER's token (A-764 works); the grant is gone. 3/3.
+- Running now: the local release A/B, v2 (f95edf68e) against v3 (5ca050628), all rounds shown.
