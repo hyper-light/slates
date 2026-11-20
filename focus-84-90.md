@@ -912,3 +912,11 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   streamed, remaining search sliced; w-git's sliced intake may keep pushed deltas as they arrive (w-git's call).
 - Ledger clash fixed: A-715 = w-reaper (idle sweep), A-716 = w-perf (svn texts once); next free A-717.
 - w-shared A-636 2c-1 landed 82d3538b0 (878fc386c); next 2c-2 (successor rebuilds the repository by keep-whole rule).
+- ~23:55 PST CLEANUP: stopped Studio w-shared (couldn't push; local kiln w-shared 01a1f785b29870d68d5512861bc03492
+  landed 2c-1 82d3538b0 and continues 2c-2), w-fed-a583 (A-583 already on main via 8eeb004bd), w-fed-a503 (queue done).
+  Ledger clashes x2 resolved (A-715 w-reaper, A-716 w-perf svn texts once, A-717 w-bugs, A-718 w-perf git deltas,
+  A-719 w-git push spin; next A-720). common.md: claim A-numbers by pushing the ledger; own state folder per Studio
+  agent; adas-mac-studio.local-2 (32-core) has NO GitHub credentials (SSH publickey denied, HTTPS none) -> land via
+  kiln run on adas-mac-studio-2.local (SSH verified 23:50) like w-fed-faults. Broadcast to all 14 agents.
+- Goal stack items 487 (A-583 three-daemon fleet test) + 488 (A-503 move test): passed macOS arm64 (8eeb004bd);
+  Linux x86_64 run r627 started by main at 60e23101a (kiln linux/amd64) -> mark both met when it passes.
