@@ -82,7 +82,7 @@ row log-graph git -C a log --graph --oneline -n 2000 --all
 row blame git -C a blame -- "$(git -C a ls-files | grep -m1 -E '\.(c|rs|py|go)$')"
 row diff git -C a diff HEAD~50 HEAD --stat
 row show git -C a show --format=fuller HEAD
-row checkout-tag bash -c "cd a && git checkout -q \$(git describe --tags --abbrev=0) && git checkout -q -"
+row checkout-old bash -c "cd a && git checkout -q HEAD~100 && git checkout -q -"
 row branch-push bash -c "cd a && git switch -q -c matrix-topic && echo topic >matrix.txt && git add matrix.txt \
   && git commit -qm topic && git push -q origin matrix-topic"
 row tag-push bash -c "cd a && git tag -a matrix-v1 -m matrix && git push -q origin matrix-v1"

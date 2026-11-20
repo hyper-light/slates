@@ -226,7 +226,7 @@ async fn answer_step<S: ShardLender>(
     .map_err(|failed| refused(failed, name))?;
   match answering {
     Answering::Answered(_) => Ok(Next::Exited(0)),
-    Answering::Sealing => Ok(Next::More),
+    Answering::Turned => Ok(Next::More),
     Answering::Hook(call) => {
       let answer = call.run(core::future::pending()).await;
       lent(lender, |state| push.hook_ran(state, answer, &mut *out))?

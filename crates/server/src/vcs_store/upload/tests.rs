@@ -109,6 +109,48 @@ pub(crate) fn answered(
   panic!("an answer that never ended: {out:?}")
 }
 
+/// [`answered`] for a `fetch`, with what the pack's stream did: its bytes, and its counters (A-718).
+fn fetched_with_counters(
+  state: &mut ShardState,
+  (id, reader): (RepositoryId, &Principal),
+  wants: &[u8],
+) -> (Vec<u8>, slates_git::store::UploadCounters) {
+  let mut admission = Admission::new(ROOM);
+  let mut answer = lend_on(state, (id, Some(reader)), |served, packs| {
+    upload::serve(
+      served,
+      Version::V2,
+      Asked::Request(wants),
+      packs,
+      &mut admission,
+    )
+  })
+  .expect("the request's step lent");
+  let mut out = Vec::new();
+  for _ in 0..STEPS {
+    let written = lend_on(state, (id, None), |served, packs| {
+      answer.write(served, packs, &mut admission, &mut out, MAX_LEN)
+    })
+    .expect("the answer's step lent");
+    if written == Written::End {
+      let counters = answer.pack_source().expect("a fetch's pack").counters();
+      return (out, counters);
+    }
+  }
+  panic!("an answer that never ended: {out:?}")
+}
+
+/// Turns repository `id`'s encoding until it is idle, as a fetch's request does before its answer (A-718); the turns
+/// taken, within [`STEPS`].
+fn encoded(state: &mut ShardState, id: RepositoryId) -> usize {
+  for turns in 0..STEPS {
+    if super::super::git_encode::turn(state, id) == super::super::git_encode::Turned::Idle {
+      return turns;
+    }
+  }
+  panic!("an encoding that never ended")
+}
+
 /// The data packets of `bytes` up to the first flush, each whole; a stream that ends before one fails the test.
 pub(crate) fn lines_of(bytes: &[u8]) -> Vec<Vec<u8>> {
   let mut lines = Vec::new();
@@ -455,4 +497,46 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
     (Vec::new(), Next::Exited(0)),
   );
   assert_eq!(observed, expected, "{advertised:?}");
+}
+
+/// A-718 (§4.17.2 "A push" item 8: a pushed version encoded once, off the answer's path, so a fetch copies its kept
+/// fragments rather than searching its objects for deltas again). Do: push one commit to a git repository's `main`
+/// through A-635's append on the owner shard and fetch it; then turn the repository's encoding until it is idle, turn it
+/// again, and fetch the commit again. Expect: the first fetch encodes its three objects afresh and copies no kept part;
+/// the encoding keeps the version's fragments once (counted encoded once, and a second encoding idle at once, nothing
+/// encoded again); the second fetch copies kept parts and encodes nothing afresh; both packs hold exactly the commit,
+/// its tree and its blob, read as index-pack reads one.
+#[test]
+fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments() {
+  let (before, after, encoded_count, again, objects) = crate::daemon::audit_on_shard(|state| {
+    let (id, objects, head) = pushed_repository(state, "encoded", &[]);
+    let wants = fetch(&[head], &[]);
+    let before = fetched_with_counters(state, (id, &owner()), &wants);
+    encoded(state, id);
+    let again = encoded(state, id);
+    let encoded_count = state
+      .refusals
+      .get(super::super::git_encode::ENCODED)
+      .copied();
+    let after = fetched_with_counters(state, (id, &owner()), &wants);
+    (before, after, encoded_count, again, objects)
+  });
+  assert_eq!((encoded_count, again), (Some(1), 0));
+  let fresh =
+    |counters: &slates_git::store::UploadCounters| counters.loose_whole + counters.loose_deltas;
+  assert_eq!(
+    (before.1.parts_copied, fresh(&before.1) > 0),
+    (0, true),
+    "{:?}",
+    before.1
+  );
+  assert_eq!(
+    (after.1.parts_copied > 0, fresh(&after.1)),
+    (true, 0),
+    "{:?}",
+    after.1
+  );
+  for (pack, _) in [before, after] {
+    assert_eq!(ids_in(&pack_of(&pack)), ids_of(&objects));
+  }
 }

@@ -991,10 +991,9 @@ fn hg_name_on_the_repositorys_partition() -> String {
 }
 
 /// Creates the Mercurial repository `name` on its partition, owned by [`owner`], and imports `fixtures/state`'s
-/// `states` repository into its store there (A-675), a unit a turn to its end: the heads `heads` answers of the history
-/// its store then holds, every changeset served while its register holds no phase root, each a revision no other names
-/// as a parent, newest first, in hexadecimal, as 7.2 lists them.
-fn create_hg_from_states(daemon: &Daemon, name: &str) -> Vec<u8> {
+/// `states` repository into its store there (A-675), a unit a turn to its end, and lands it (A-687): its phase roots and
+/// markers recorded, so the store serves what 7.2's `served` filter serves of it ([`STATES_SERVED_HEADS`]).
+fn create_hg_from_states(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
     let created = crate::verbs::dispatch(
@@ -1032,32 +1031,9 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) -> Vec<u8> {
       ),
       "the import did not end: {ended:?}"
     );
-    let (content, store) = state.vcs_stores.mercurial_ref(id).expect("the store");
-    let changelog = slates_hg::index::Log::Changelog;
-    let rows: Vec<_> = (0..store.index.len(content, changelog))
-      .map(|rev| {
-        store
-          .index
-          .changeset(content, rev)
-          .expect("a changelog row")
-      })
-      .collect();
-    let named = |rev: u32| rows.iter().any(|row| row.p1 == rev || row.p2 == rev);
-    let heads: Vec<String> = (0..rows.len())
-      .rev()
-      .filter(|rev| !named(u32::try_from(*rev).unwrap()))
-      .map(|rev| {
-        rows[rev]
-          .node
-          .iter()
-          .map(|byte| format!("{byte:02x}"))
-          .collect()
-      })
-      .collect();
-    let mut answer = heads.join(" ").into_bytes();
-    answer.push(b'\n');
-    answer
-  })
+    // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
+    assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+  });
 }
 
 /// The status and body of `GET /<name>?cmd=<command>` by the owner's bearer token, as stock hg asks a command.
@@ -1080,6 +1056,11 @@ fn hg_command(edge: (u16, &CertificateDer<'static>), name: &str, command: &str) 
 /// and `heads` the heads of the history the store holds, newest first; the git repository asked as Mercurial asks
 /// `404`, a repository of another tool answered as one that does not exist; the git request still git's, answered as
 /// its upload-pack half answers (`503` until A-682 lends its store, `200` after), never Mercurial's `404`.
+/// Format: stock 7.2's `heads` of the `states` repository's served view (slates-hg's
+/// `fixtures/state/states-served-heads.txt`): its amended changeset hidden and its secret one left out, since the
+/// import lands their phase roots and markers (A-687).
+const STATES_SERVED_HEADS: &str = "b252f2a7c3d2e773bea91bf42aaa0acb39463176\n";
+
 #[test]
 fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
   let (identity, certificate) = identity();
@@ -1087,7 +1068,7 @@ fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
   let port = daemon.vcs_http_port().expect("the edge started");
   let hg = hg_name_on_the_repositorys_partition();
   let git = name_on_the_repositorys_partition();
-  let expected_heads = create_hg_from_states(&daemon, &hg);
+  create_hg_from_states(&daemon, &hg);
   create(&daemon, &git);
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let edge = (port, &certificate);
@@ -1110,7 +1091,7 @@ fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
   );
   assert_eq!(
     (heads.0, String::from_utf8_lossy(&heads.1).into_owned()),
-    (200, String::from_utf8_lossy(&expected_heads).into_owned())
+    (200, STATES_SERVED_HEADS.to_owned())
   );
   assert_eq!(git_as_hg, 404);
   assert!(
