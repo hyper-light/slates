@@ -15669,6 +15669,56 @@ What it says:
   added work is the line delta against p1); a cross-tool clone served from the other tool's landing; N=3 on a quiet
   machine.
 
+## A-722 part 3 against the main before it: a push's rows staged at its seal, by use (w-git's run request; main's go of 2026-11-20 15:35; UI goal 93; 2026-11-20)
+
+- **The builds:** before = 5ad8dea09 (main just before the part landed); p3 = 7b93d68c3 (the merge landing w-git's
+  82ff3bc79, "a push's rows are written at its seal and its landing adopts them"). Release, each from a `git archive` of
+  its commit into its own target directory (`cargo build --locked --release -p slates-cli`, 7 min 23 s and 24 s side by
+  side); the binaries differ. Script: `~/.cache/w-perf/bench/a722p3.sh` on the Studio, kiln r12.
+- **The commands**, each round on a fresh daemon an arm, the arms' order flipped each round (before, p3; p3, before;
+  before, p3): `crates/cli/bench/push_load.py SLATES ~/.cache/w-perf/data/cut-1.0.git 'v1.0.0^{commit}' --max 10` (1
+  push, then 10 at once, each to its own repository; a 3,434,551-byte pack of 12,232 objects), then `SERVERS=slates
+  crates/cli/bench/git_scale.sh SLATES cut-1.0.git WORK 1 900` (git/git cut at v1.0.0). The scripts as on main
+  (unchanged since before).
+- **The machine:** adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB), 2026-11-20 15:29 to 15:42 PST, shared
+  with other agents' builds: load average 38 to 54 throughout, so every figure here is slower than the quiet records
+  above (one push 0.79 s at load 5 on 7b46fbdcd). Every clone: `fsck` clean, refs (2) and object ids (12,233) identical.
+  Every push answered `ok`, the daemon alive throughout.
+
+push_load, seconds and MiB, every round (r1, r2, r3):
+
+| | before | p3 |
+|---|---|---|
+| 1 push, wall | 2.882, 1.936, 2.455 | 1.820, 1.352, 1.404 |
+| 10 at once, p50 | 2.116, 2.119, 2.071 | 1.849, 1.311, 1.395 |
+| 10 at once, p99 | 2.134, 2.163, 2.082 | 1.874, 1.338, 1.431 |
+| daemon peak at 10 (MiB) | 1,777, 1,752, 1,726 | 1,768, 1,759, 1,762 |
+| held a push at 10 (MiB) | 152.5, 150.0, 147.2 | 151.6, 150.0, 150.9 |
+
+git_scale, seconds, every round:
+
+| | before | p3 |
+|---|---|---|
+| push, both refs | 2.012, 2.500, 3.454 | 2.134, 1.611, 1.791 |
+| first clone `--mirror` | 11.488, 11.852, 12.624 | 7.446, 7.299, 8.445 |
+| second clone `--mirror` | 1.162, 1.007, 0.958 | 1.082, 0.998, 1.043 |
+| one-commit push | 0.100, 0.106, 0.142 | 0.081, 0.084, 0.098 |
+| fetch of it | 0.111, 0.122, 0.119 | 0.086, 0.081, 0.098 |
+| clone `--depth 1` | 0.130, 0.211, 0.140 | 0.149, 0.108, 0.160 |
+| clone `--filter=blob:none` | 0.720, 0.637, 0.623 | 0.933, 0.925, 1.036 |
+| daemon RSS at the end (MiB) | 242, 241, 245 | 247, 244, 259 |
+
+What it says:
+- **Kept, by use.** Best of three: one push 1.936 → 1.352 s (1.4 times), ten at once p99 2.082 → 1.338 s (1.6 times),
+  git's push of both refs 2.012 → 1.611 s, and the first clone after a push 11.488 → 7.299 s (1.6 times). The one-commit
+  push and its fetch are 15 to 30 % faster; the second clone and the shallow clone are even.
+- **Not moved: memory.** A push still holds about 150 MiB at ten at once (44 times its 3.4 MB pack), the same in both
+  arms; p3 moves when rows are written, not what a push keeps. That is A-722 memory B1/B2's (w-git), not this part's.
+- **Regressed: the partial clone**, 0.623 to 0.720 s before against 0.925 to 1.036 s after (1.4 to 1.5 times slower in
+  every round). Reported to w-git with the logs.
+- Logs: `~/.cache/w-perf/ab/a722p3-20261120T232946/` on the Studio (`push-<arm>-<round>.log`,
+  `scale-<arm>-<round>.log`).
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
