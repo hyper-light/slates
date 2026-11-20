@@ -599,6 +599,40 @@ mod tests {
     );
   }
 
+  /// A-741 (kiln goal 90: kiln's macOS microVM drive refused a run's every write `EACCES`, intermittently). Linux sizes a
+  /// `SETXATTR` by the form its connection holds when the call is made (`fs/fuse/xattr.c` `fuse_setxattr`:
+  /// `fc->setxattr_ext ? sizeof(inarg) : FUSE_COMPAT_SETXATTR_IN_SIZE`) and then waits for `INIT`'s reply before sending
+  /// it (`fs/fuse/dev.c` `fuse_block_alloc`), so a call made before that reply arrived (Shards' init names the run's
+  /// owner as it mounts) travels in the short form on a connection that kept the extended one. Do: read the owner word
+  /// `200000:200000` in the short form, the bytes the drive's guest sent (recorded 2026-11-20), as a stream that kept
+  /// the extended form reads it; and the same word in the extended form with each setter's flag. Expect the run's owner
+  /// named each time: read in the extended form alone, the short one's name began 8 bytes in, and the word fell to the
+  /// dispatch (`EOPNOTSUPP`), so the run was shown its share owned by the host.
+  #[test]
+  fn a741_an_owner_word_sized_before_init_was_answered_is_taken_on_a_stream_that_kept_the_extended_form()
+   {
+    let named = Some(OwnerWord::Named {
+      unique: 4,
+      uid: 200_000,
+      gid: 200_000,
+    });
+    let root = (4, FUSE_ROOT_ID);
+    let short = setxattr(root, (0, 0), None, OWNER_WORD, b"200000:200000");
+    assert_eq!(
+      owner_word(&short, true),
+      named,
+      "the short form, on a stream that kept the extended one"
+    );
+    for setter in [0, crate::abi::SETXATTR_ACL_KILL_SGID] {
+      let extended = setxattr(root, (0, 0), Some(setter), OWNER_WORD, b"200000:200000");
+      assert_eq!(
+        owner_word(&extended, true),
+        named,
+        "the extended form, setter's flags {setter:#x}"
+      );
+    }
+  }
+
   /// A-587. Do: read Shards' owner word `1000:1001` in the short form (`FUSE_COMPAT_SETXATTR_IN_SIZE`: the value's size
   /// and the flags) as a stream that kept no `FUSE_SETXATTR_EXT` reads it: from the guest's root on the share's root,
   /// from another caller, and on another node; and a `SETXATTR` of another name in that form. Expect the run's owner
