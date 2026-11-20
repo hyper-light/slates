@@ -80,3 +80,11 @@ Windows half is w-k90-win's (inbox/w-k90-win-from-w-k90-pin.md).
   push run 01a1fa83bde5 also carries them. Stale trial 01a1f9fb0653 (old base) still holds runners (linux-arm64 leg hung
   on docker pull) -- cancel needs a person's click (for main).
 - GitHub poller restarted (poll2.sh 715063153). GitHub main CI blocked by run 44784299374 until it times out.
+- kiln's own main CI has the same pathology: every queued ci.yaml run on main is cancelled by the next push before it
+  gets legs (01a1fa83bde5, my dispatch 01a1fa885fc5, 01a1fa88a1b1 ...). So: ci.runs.local of main commit 08f1a434 under
+  refs of their own (branch agents/w-k90-pin-evidence pushed at 08f1a434; kiln didn't see it, runs.local takes the ref):
+  linux-x86_64 01a1fa8f0de173e39b8af52219ffb700 (leg 01a1fa8f0de8, 451397 running), macos-arm64
+  01a1fa8fe4097372b94f7337ff2b7fd3 (d1323898 running), linux-arm64 01a1fa8ff6d771bc90e709b705554f79 (queued headroom),
+  win-arm64-cross 01a1fa9006fe76bcbc4891519afba25e (b24c running). Dropped dupes: 01a1fa8f420a, 01a1fa8f481d, 01a1fa8f4cfa.
+- Windows x86-64 CI evidence: GitHub windows-slates (w-k90-win; GitHub main CI stuck behind 44784299374) -- jupiter has
+  5 GB free, so no kiln-runner lane there.
