@@ -1166,9 +1166,8 @@ fn land_locks(
     (principal, opened.id),
     slates_svn::commit::record::Record::Locks(entries),
   )
-  .map_err(|failure| {
+  .inspect_err(|_| {
     crate::fleet::count_refusal(LOCKS_REFUSED);
-    failure
   })
 }
 

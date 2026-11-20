@@ -641,6 +641,11 @@ fn port_after(lines: &[String], prefix: &str) -> Option<u16> {
   })
 }
 
+/// The svn:// listener's port the daemon named in `lines`; a test fails when it named none.
+fn svn_listener_port(lines: &[String]) -> u16 {
+  port_after(lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port")
+}
+
 /// The HTTP edge's port the daemon named in `lines`; a test fails when it named none.
 fn http_edge_port(lines: &[String]) -> u16 {
   port_after(lines, VCS_HTTP_LINE).expect("the daemon named its HTTP edge's port")
@@ -718,7 +723,7 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   }
   let instance = format!("svn-protocol-{}", std::process::id());
   let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let Some(issuer) = issuer_or_skip(issuer, "stock svn over svn://") else {
     return;
   };
@@ -847,7 +852,7 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
     return None;
   }
   let (anchor, lines, issuer) = start_anchor(instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = port_after(&lines, VCS_SVN_LINE).expect("the daemon named its svn:// listener's port");
+  let port = svn_listener_port(&lines);
   let issuer = issuer_or_skip(issuer, "the revision property tests")?;
   create_repository(instance);
   let (id, token) = minted_token(instance, &issuer);
