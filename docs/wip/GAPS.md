@@ -7221,7 +7221,8 @@
 >   `svn_http_reports`) and `issuer_surface` since 2026-11-20: a daemon's settling and the anchor's lines judged in the
 >   anchor's tree (`process_wait::Judged`, which every platform builds; `Judged::of_all` judges several trees together);
 >   their stock clients' `exit_within` keeps `PATIENCE`, owed: a client waiting on a stock server has no slates tree to
->   judge beside it. Owed in `cli/tests`: `vm`, `start_judgment`
+>   judge beside it. `load_scale` since 2026-11-20: its `eventually` and its wait for an anchor's daemon judged the
+>   same, its 80 s `FLEET_WAIT` gone. Owed in `cli/tests`: `vm`, `start_judgment`
 >   and `shards` (Windows-only: `InstanceWait` finds an instance's processes with `pgrep`, and a Windows tree's children
 >   are not listed yet), `winfsp`, `guest_vhost`, `pmem` and the rest
 >   (`recovered::await_recovered`'s wall form goes with the last of `winfsp` and `guest_vhost`, which run only on their
