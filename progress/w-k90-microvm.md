@@ -75,3 +75,19 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
 - Piece 3: HVF proven (g90 + piece 1's g266 pass); KVM r4 (adacachy, piece-1 tree) still running; WHP BLOCKED.
 
 ## 2026-11-20: piece 1 goal closed: HVF `microvm::` at kiln main 81174ac49 (A-741 in): 2 passed, 0 failed (g266 Ask+Bypass, g90 daemon 4630 killed -> successor 19863), 1998 s, alone on the Mac; log ~/.cache/w-k90-microvm-logs/hvf-main.log; target trimmed.
+
+## 2026-11-20 ~08:20 PST: KVM drive (piece 3) -- r4 was HUNG, not slow
+- r4 (piece-1 tree 23f066947) waited ~7 h on g266's first turn: on KVM the Ask agent's microVM started twice
+  (kiln-z1-0, kiln-z1-1), each failing `agent control: Unstarted(Failed)` (its member's command never started in the
+  guest; Hex's MCP wait ran out at 41 ms), and kiln never failed the session, so the unbounded drive waited for ever.
+  The runner itself (`kiln agent --name slatesvm`) did NOT respawn: up 6h54m; the fresh `kiln agent` children
+  beneath it are unexplained yet. Stopped r4 and its unit (run-p112760).
+- Reproduced at kiln main 9129995e8 (r17, bounded): same Unstarted(Failed) twice. Hex deletes a failed box's
+  run-host diagnostics (hex-records/image-diagnostics) with it, so the cause in the guest is unread yet.
+- r33 (ed8991d29) failed at once: ENOSPC. adacachy's /tmp (62 GB tmpfs, shared) was 100% full: my two killed
+  drives' fixtures (3.4 GB, removed) and /tmp/.tmpZzjYQO (38 GB, someone's ACTIVE kiln test fixture since 08:07,
+  not mine, left alone, reported to main). Drives here now run with TMPDIR=$HOME/.k9t.
+- r41 (ed8991d29, bounded: test 2400 s, unit 3000 s, run 3300 s): g266 on KVM with a copier saving each box's
+  diagnostics to ~/.cache/w-k90-microvm-diag on adacachy. Queued.
+- Next: read the guest's words on why the member never started; failing test first; fix; rerun bounded.
+- Also owed (kiln bug seen): a session whose microVM's member never starts is never failed (the drive waited 7 h).
