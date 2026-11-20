@@ -2100,6 +2100,33 @@ pub struct ShardReport {
   /// `slates_vcs::usage`): what the share model reads, reported so a load run can see where a shard's time went.
   /// Appended.
   pub repositories: Vec<RepositoryUsageReport>,
+  /// This shard's part of the daemon's memory by kind ([`MemoryKindReport`]): on the control shard the anchor segment
+  /// and content object whole, on every shard its arenas and its clients' ring regions. Appended.
+  pub memory: Vec<MemoryKindReport>,
+}
+
+/// One kind of the daemon's mapped memory (§4.14; A-232's gotcha, main's ruling of 2026-11-20): read in the daemon's own
+/// process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which past the anchor's window gets
+/// it killed by design. Kinds: `segment` (the anchor segment), `content` (the anchor content object, the shards' arenas
+/// among its bytes), `arenas` (the shards' arena extents), `regions` (the clients' ring regions) and `heap` (the
+/// allocators' bytes).
+#[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
+pub struct MemoryKindReport {
+  /// The kind.
+  pub kind: String,
+  /// Its mappings: one each for the segment and the content object, an arena's extents, a region per client, the large
+  /// allocations mapped on their own for the heap.
+  pub mappings: u64,
+  /// The address space it reserves: the mappings' lengths, or for the heap what the allocators hold from the OS.
+  pub reserved_bytes: u64,
+  /// Its bytes in RAM, from the kernel's page table at the last completed sweep of the shard that maps it (or for the
+  /// heap the bytes live allocations hold, now); 0 until a sweep completes ([`MemoryKindReport::measured`]).
+  pub resident_bytes: u64,
+  /// Its bytes written, where the OS says (macOS); `None` where it does not, and for the heap.
+  pub modified_bytes: Option<u64>,
+  /// Whether `resident_bytes` is a reading: each sweep that maps the kind has completed at least once (each status
+  /// request advances a shard's sweep, A-744's bound).
+  pub measured: bool,
 }
 
 /// One repository's usage on its owner shard (A-724; `slates_vcs::usage::Usage`), as a shard's report carries it.
@@ -2770,6 +2797,8 @@ pub struct DaemonReport {
   /// ends a daemon on purpose (a test's kill, an operator's) waits for it first. `false` with no anchor, which judges
   /// nothing. Appended.
   pub recovered: bool,
+  /// The daemon's mapped memory by kind ([`MemoryKindReport`]), every shard's part summed and the heap's added. Appended.
+  pub memory: Vec<MemoryKindReport>,
 }
 
 /// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or

@@ -4393,6 +4393,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     },
     failover: failover_report(state),
     repositories: repository_usage_reports(state),
+    memory: crate::content_ranges::memory(state),
   }
 }
 
@@ -4659,6 +4660,40 @@ fn demux_sum(
   })
 }
 
+/// The daemon's memory by kind (§4.14; A-232's gotcha): every shard's parts summed kind by kind, in the order first seen,
+/// then the heap's (`slates_mem::heap`), read now. A kind is `measured` once every shard's part of it is, and its written
+/// bytes are known only where every part's are.
+fn daemon_memory(
+  parts: &[slates_ipc::protocol::MemoryKindReport],
+) -> Vec<slates_ipc::protocol::MemoryKindReport> {
+  let mut kinds: Vec<slates_ipc::protocol::MemoryKindReport> = Vec::new();
+  for part in parts {
+    match kinds.iter_mut().find(|kind| kind.kind == part.kind) {
+      Some(kind) => {
+        kind.mappings = kind.mappings.saturating_add(part.mappings);
+        kind.reserved_bytes = kind.reserved_bytes.saturating_add(part.reserved_bytes);
+        kind.resident_bytes = kind.resident_bytes.saturating_add(part.resident_bytes);
+        kind.modified_bytes = kind
+          .modified_bytes
+          .zip(part.modified_bytes)
+          .map(|(sum, more)| sum.saturating_add(more));
+        kind.measured &= part.measured;
+      }
+      None => kinds.push(part.clone()),
+    }
+  }
+  let heap = slates_mem::heap::stats();
+  kinds.push(slates_ipc::protocol::MemoryKindReport {
+    kind: "heap".to_owned(),
+    mappings: heap.large_mappings,
+    reserved_bytes: heap.reserved,
+    resident_bytes: heap.in_use.min(heap.reserved),
+    modified_bytes: None,
+    measured: true,
+  });
+  kinds
+}
+
 /// The daemon's view: the anchor's words in the segment and the process-wide counters, over
 /// every shard's part.
 fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
@@ -4684,6 +4719,10 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       )
     })
     .unwrap_or((0, 0, 0, 0, 0, false));
+  let shards_memory: Vec<slates_ipc::protocol::MemoryKindReport> = shards
+    .iter()
+    .flat_map(|shard| shard.memory.iter().cloned())
+    .collect();
   let fleet = fleet_report(state, &shards);
   // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
   let control_recipient = shards
@@ -4708,6 +4747,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       dumps_local_full: crate::local_dumps::full(),
       anchor: state.origin_anchor.0,
       recovered,
+      memory: daemon_memory(&shards_memory),
     }),
   }
 }

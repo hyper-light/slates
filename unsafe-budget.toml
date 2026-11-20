@@ -54,6 +54,9 @@
 #   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
 #   Sealed blocks (`sealed.rs`, A-273 step 3, +5 on 2026-11-18: 63 → 68) went with the A-273 replicas, measured and
 #   rejected (2026-11-19, A-528): 68 → 63.
+#   Raised 80 → 83 on 2026-11-20 for `heap.rs` (the daemon's own memory report, §4.14, main's ruling after the anchor
+#   killed a daemon `vmmap` suspended): the zeroed `malloc_statistics_t` and `malloc_zone_statistics` on macOS (2) and
+#   glibc's `mallinfo2` on Linux (1), the system allocator's own statistics, which no safe wrapper offers.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -317,7 +320,7 @@ slates-machine = 97
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 80
+slates-mem = 83
 # 2026-11-20 (+1, A-744, a range's pages in RAM, main's ruling: every site named, `// SAFETY:` directly above):
 #   17. `resident.rs`, Unix `os::query`: `libc::mincore` over a page-aligned range into a vector of one byte a page (the
 #   kernel reads only the page table; rustix has no wrapper). Windows answers a typed refusal, no unsafe code.

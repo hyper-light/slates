@@ -982,6 +982,17 @@ impl AnchorSegment {
     )
   }
 
+  /// What of `len` bytes at `at` in the whole mapped segment is in RAM, and written where the OS says
+  /// (`slates_mem::resident`, A-744): the daemon's own memory report sweeps the segment whole with it (§4.14), nothing
+  /// suspended. Refused past the segment's end.
+  pub fn residency_of(
+    &self,
+    at: usize,
+    len: usize,
+  ) -> Result<slates_mem::resident::Residency, AnchorError> {
+    Ok(self.object.residency(at, len)?)
+  }
+
   /// [`AnchorSegment::region_residency`] of `len` bytes at `at` within the region, a span past the region refused
   /// (`Geometry`): what a caller walking a large region a bounded step at a time asks (A-744). Words and payloads alike:
   /// the kernel's page table is read, no byte.

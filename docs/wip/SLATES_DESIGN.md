@@ -1388,6 +1388,15 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > 1,000-revision import the owner partition's register holds 222.4 MiB of repository records, 133.1 MiB of chain
 > entries and 137.4 MiB of checkpoints (BENCHMARKS.md).
 
+> **Status (2026-11-20, the daemon's memory by kind; A-232's gotcha).** `slates status` (and `--json`'s `memory`) reports
+> the daemon's mapped memory by kind, read in its own process with nothing suspended: `segment` and `content` (the
+> anchor segment and content object whole, swept on the control shard), `arenas` (the shards' arena extents, which lie
+> in the content object), `regions` (the clients' ring regions), each with its mappings, reserved bytes, resident bytes
+> and written bytes where the OS says (the A-744 sweep, now armed by a status request to run to completion a step a
+> turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
+> debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
+> its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
 **Data model.**
@@ -29789,6 +29798,15 @@ The steps' own records follow.
     the process judgment. On this Mac: supervised 10 of 10, unsupervised 10 of 10, frozen 5 of 5. Mutations each turned
     their own shape red on both runners: the client's `Stalled` branch, the lone self-end, and starved treated as stuck.
     The tables are in the bug record.
+
+- **An inspector's suspension is a freeze, by design (2026-11-20, main's ruling; the bug record
+  `docs/bugs/2026-11-20-the-anchor-killed-a-daemon-an-inspector-suspended.md`).** A tool that suspends the daemon's task
+  to read it (`vmmap`, `heap`, `footprint`, a debugger) stops its watchdog with every other thread, and the anchor sees
+  what a wedged daemon shows: no beat, no CPU, nothing runnable, every thread in a wait (the suspend count is readable
+  only through the task port). Past the anchor's window it kills the daemon as frozen, as this rule asks: w-hg's
+  `vmmap -summary` of a daemon mapping ~220 GB took 2.42 s and lost the daemon at each look. Read the daemon's memory
+  from the daemon instead: `slates status` reports it by kind (segment, content, arenas, regions, heap), read in process
+  with nothing suspended (§4.14).
 
 ### A-277 — A fleet node may bind elsewhere than it advertises (2026-11-17, built for goal g229, chaos across real processes)
 
