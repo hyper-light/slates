@@ -398,3 +398,109 @@ fn t_a655_a_flipped_byte_never_panics_and_what_reads_is_canonical() {
     }
   }
 }
+
+/// The tests' record of the repository named by [`UUID`] (A-652 part 3).
+fn uuid_set() -> Record {
+  Record::Uuid(Uuid::parse(UUID).unwrap())
+}
+
+/// The tests' record of revision 0's properties set whole: its date and an empty log (A-652 part 3).
+fn properties_set() -> Record {
+  Record::RevisionProperties {
+    revision: 0,
+    properties: BTreeMap::from([
+      (b"svn:date".to_vec(), DATE.to_vec()),
+      (b"svn:log".to_vec(), Vec::new()),
+    ]),
+  }
+}
+
+/// A record's first bytes: the magic, the version and the kind byte `kind`.
+fn head_of(kind: u8) -> Vec<u8> {
+  [b"SSVR".as_slice(), &1u32.to_le_bytes(), &[kind]].concat()
+}
+
+/// The bytes of revision 0's properties set to the two entries `first` and `second`, in that order.
+fn properties_set_bytes(first: &[u8], second: &[u8]) -> Vec<u8> {
+  [head_of(3).as_slice(), &long(0), &long(2), first, second].concat()
+}
+
+/// The entries of [`properties_set`], as the record writes each: its date's, then its log's.
+fn property_entries() -> (Vec<u8>, Vec<u8>) {
+  (
+    [string(b"svn:date"), string(DATE)].concat(),
+    [string(b"svn:log"), string(b"")].concat(),
+  )
+}
+
+/// A-652 part 3 (the records an import sets beside its revisions, the module documentation). Do: encode the tests'
+/// UUID record and revision 0's properties set whole, and decode each. Expect: each byte for byte as laid out by hand
+/// (the kind byte 2 and the UUID's 36 bytes; the kind byte 3, the revision, the count and each entry in name order),
+/// and each read back equal.
+#[test]
+fn t_a652_a_uuid_and_a_revisions_properties_are_pinned_and_read_back() {
+  let (date, log) = property_entries();
+  let uuid_bytes = [head_of(2).as_slice(), UUID].concat();
+  let set_bytes = properties_set_bytes(&date, &log);
+  assert_eq!(
+    (uuid_set().encode(), properties_set().encode()),
+    (uuid_bytes.clone(), set_bytes.clone())
+  );
+  assert_eq!(
+    (Record::decode(&uuid_bytes), Record::decode(&set_bytes)),
+    (Ok(uuid_set()), Ok(properties_set()))
+  );
+}
+
+/// A-652 part 3 (hostile inputs: truncated headers). Do: decode every prefix of the two records shorter than each.
+/// Expect: each refused, `Truncated` or `Count`, never read as a record.
+#[test]
+fn t_a652_every_truncation_of_either_record_is_refused() {
+  for bytes in [uuid_set().encode(), properties_set().encode()] {
+    for end in 0..bytes.len() {
+      let refused = Record::decode(&bytes[..end]);
+      assert!(
+        matches!(
+          refused,
+          Err(RecordRefused::Truncated | RecordRefused::Count)
+        ),
+        "{end}: {refused:?}"
+      );
+    }
+  }
+}
+
+/// A-652 part 3 (hostile inputs, by kind). Do: decode the properties' record with its names out of order and with a
+/// byte after its last, and the UUID's record with a UUID not in RFC 4122's form. Expect: `Order`, `Trailing` and
+/// `Uuid`.
+#[test]
+fn t_a652_hostile_uuid_and_properties_records_are_refused_by_kind() {
+  let (date, log) = property_entries();
+  let unordered = properties_set_bytes(&log, &date);
+  let trailing = [properties_set().encode().as_slice(), &[0]].concat();
+  let undashed = UUID.map(|byte| if byte == b'-' { b'0' } else { byte });
+  let dashless = [head_of(2).as_slice(), &undashed].concat();
+  let refused = [unordered, trailing, dashless].map(|bytes| Record::decode(&bytes));
+  assert_eq!(
+    refused,
+    [
+      Err(RecordRefused::Order),
+      Err(RecordRefused::Trailing),
+      Err(RecordRefused::Uuid)
+    ]
+  );
+}
+
+/// A-652 part 3 (hostile inputs: bit flips). Do: decode the two records with each byte's bits all flipped in turn.
+/// Expect: never a panic; what is read, when anything is, encodes to the bytes read.
+#[test]
+fn t_a652_a_flipped_byte_of_either_record_never_panics_and_what_reads_is_canonical() {
+  for bytes in [uuid_set().encode(), properties_set().encode()] {
+    for at in 0..bytes.len() {
+      let flipped = patched(&bytes, at, &[!bytes[at]]);
+      if let Ok(record) = Record::decode(&flipped) {
+        assert_eq!(record.encode(), flipped, "byte {at}");
+      }
+    }
+  }
+}

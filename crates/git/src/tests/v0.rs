@@ -23,7 +23,7 @@ macro_rules! fixture {
 }
 
 /// Every file the script wrote, by its name in `SHA256SUMS`.
-const FILES: [(&str, &[u8]); 45] = [
+const FILES: [(&str, &[u8]); 47] = [
   fixture!("advertisement-empty.bin"),
   fixture!("advertisement-receive-pack.bin"),
   fixture!("advertisement-sha256.bin"),
@@ -65,6 +65,8 @@ const FILES: [(&str, &[u8]); 45] = [
   fixture!("sparse-missing-v0.response.bin"),
   fixture!("sparse-v0.request.bin"),
   fixture!("sparse-v0.response.bin"),
+  fixture!("sparse-warn-v0.request.bin"),
+  fixture!("sparse-warn-v0.response.bin"),
   fixture!("unknown-want.request.bin"),
   fixture!("unknown-want.response.bin"),
   fixture!("unshallow.request.bin"),

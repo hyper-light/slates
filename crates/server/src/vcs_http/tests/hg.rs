@@ -171,6 +171,10 @@ impl Repository for Empty {
   fn bookmarks(&self) -> impl Iterator<Item = (&[u8], Node)> {
     std::iter::empty()
   }
+
+  fn draft_roots(&self) -> impl Iterator<Item = Node> {
+    std::iter::empty()
+  }
 }
 
 impl Store for Empty {
@@ -541,6 +545,7 @@ fn served<S: HgStores + Clone>(
       fields,
       head_only,
       exchange,
+      ..
     } => {
       assert!(fields.is_empty() && !head_only);
       exchange

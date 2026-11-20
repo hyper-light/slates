@@ -1,0 +1,7 @@
+000dpackfile
+002eerror: short object ID 2188 is ambiguous
+0085hint: The candidates are:
+hint:   2188765 tag 2005-04-07 - collide-106
+hint:   2188e00 tag 2005-04-07 - collide-48
+fatal: unable0026 to access sparse blob in '2188'
+0047aborting due to possible repository corruption on the remote side.

@@ -148,11 +148,18 @@ pub(crate) fn unpin_origin(
 /// `None` once the counter would reach the register-class bit (`slates_db::register::MAX_OBJECT_COUNTER`): an id
 /// past it would read as another register class of an older volume, so the partition mints no more ids
 /// ([`ids_exhausted`]). Until 2026-09-30 the counter was truncated silently to its low 48 bits.
+///
+/// The counter is the database's (`Db::volume_counter_at`, A-694): the next record's sequence, or one past the highest
+/// counter of any volume created here when that is later, so a volume a verb records moves the next mint past it even
+/// within the verb's own transaction.
 pub(crate) fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
-  let count = state.db.next_seq();
-  if count > slates_db::register::MAX_OBJECT_COUNTER {
-    return None;
-  }
+  fresh_volume_id_at(state, 0)
+}
+
+/// The `offset`-th of several fresh volume ids minted before any of their volumes is recorded (A-694): an append's new
+/// branches, each its own, where [`fresh_volume_id`] would name the same id for each.
+pub(crate) fn fresh_volume_id_at(state: &mut ShardState, offset: u64) -> Option<DbVolumeId> {
+  let count = state.db.volume_counter_at(offset)?;
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
@@ -5139,7 +5146,8 @@ fn dispatch_inner(
       (&repository, read),
       (&rules, &hooks, &hooks_env, &signers),
     ),
-    // A Mercurial repository's directory imported into its store, answered when the import ends (A-678).
+    // A Mercurial repository's directory, or a Subversion dump, imported into its store, answered when the import ends
+    // (A-678, A-652 part 3).
     RequestBody::ImportRepository { repository, path } => {
       crate::repository::import::import_repository(state, principal, (&repository, &path))
     }
