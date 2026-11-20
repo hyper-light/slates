@@ -897,3 +897,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   (timer wheels 898 MiB reserved). T2 svn checkout/commit/update client-bound: server CPU per checkout 0.12 s vs
   svnserve 0.56 s. RULINGS: M1 measure slope only (w-svn is in that code), hand to w-svn; M2 w-perf now (bound);
   T2 recorded client-bound with the server's share; M3-M5 recorded as owed.
+- ~23:15 PST w-perf CORRECTION: M2 is not importer retention; svn texts are held twice: svn records' own
+  `Repository.contents` BTreeMap (crates/svn/src/migration/records.rs:77; 306 MiB @1,000 revs, 1.37x dump) + the
+  green's content pool (585 MB); the register's A-662 entries hold a third (~245 KB/rev). RULING: content once (A-64):
+  svn records name the green's content by ContentIdentity; w-perf implements (seam agreed with w-svn: green content
+  durable before the naming record), lands after w-svn's charging fix; register copy -> w-svn GAPS. w-perf landed
+  183dd0e23 (BENCHMARKS "Where the svn server's time and memory go"). Next for w-perf after M2 starts: git read path
+  vs git daemon once w-interop's matrix shows clones passing (A-713).

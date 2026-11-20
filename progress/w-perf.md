@@ -48,3 +48,9 @@ Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to
   (segment, fixed); apply_repository 39.7 (257); merge engine apply 31.5+20.5; thread stacks 47 (fixed).
   Virtual only: timer Wheel::new 898 MiB (39 MiB a shard), segment/content-pool maps.
 - Plan sent to main ~06:45Z; awaiting its pick.
+- Slope 250->1000 (mh-250/mh-1000 on Studio ~/.cache/w-perf/prof): all linear. M2 corrected: the "Importer" heap is
+  svn records' Repository.contents (texts whole), and the green's content pool holds the same files: texts held
+  twice. Reported to main + w-svn (slates-work-3d); awaiting main's ruling on M2 (w-svn's code).
+- LANDED main 183dd0e23: BENCHMARKS.md "Where the svn server's time and memory go, ranked" (T2 + M1-M5).
+- Worktree now ~/slates-work/w-perf-plan (agents/w-perf-plan). Waiting on: w-git push spin, w-hg sliced intake +
+  import PastRoom, w-svn green_chains; main's M2 ruling. On each: rebuild on Studio, rerun harness, record.
