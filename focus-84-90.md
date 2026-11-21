@@ -1604,3 +1604,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - ~/.local/share/kiln up 37 -> 53 GB (agent work folders);
   - other sessions' new caches (kmf-local 6.4 GB, reliquary-rq03 2.3 GB, kiln-move-freeze 1.1 GB).
   The clean-aggressive rule applies under 30 GB; kiln-opt-target (18 GB, unwritten since 23:09) qualifies then. No agent waiting on main.
+- 2026-11-21 03:03 PST
+  - LANDED: 6b555466b (w-perf: an index never merged, such as a repository filled by pushes alone, is merged once its lookups are reported, which times the rule's price; red: four runs, no merge). inserts_took stays owed in GAPS for w-hg's and w-git's intakes. The stream A/B restarted on the big Studio (r3).
+  - w-fed-move claimed an A-number for the work-log wall ("a work's log is what it wrote").
+  - DISK: the MacBook at 29 GB. clean-aggressive freed 0: kiln-opt-target has a file open, so it's in use and kept. The growth is Docker (the kiln-build container's 14 GB layer, freed on exit; images +14 GB) and kiln's agent folders. Ada's. Studio-1's g221 and g223 offline again.
