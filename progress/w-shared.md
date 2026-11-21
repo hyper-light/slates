@@ -373,3 +373,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   CPU in the task at identities.rs:243 (read_then_route: a session's first submit runs whole inline in one poll). 64 MiB:
   exit 101 with 1,652 ms near miss. Record-plane fix did not cover it. Next: sample a 128 MiB submit, slice the step.
   inbox/main-from-w-shared-exit4.md. Family three: kiln r4 still running on adacachy.
+
+## LANDED 2026-11-21 ~00:35 PST: exit 4 = c592a81f0 (main 5ab1c23b5): deriver's piece list blocked (√ops), runs merged.
+  Bench 64-320 MiB all pass on Studio-1. CLOSED (note in close file). Lane: in-place forward ~105-150 MB/s; asked main.
+  Family three: kiln r4 still on adacachy.

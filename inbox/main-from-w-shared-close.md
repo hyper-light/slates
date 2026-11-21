@@ -57,3 +57,16 @@ Tests (macOS arm64, local; on the merged tree):
 - new fleet `a_version_crossing_in_several_shipments_is_archived_once` (red: made 3 over 3 shipments);
 - merge_service + merge_origin 32 of 32.
 Exit 4 closes when kiln r9's 64-320 MiB reruns show no watchdog end (or name another cause, which I'll fix next).
+
+## Closed 2026-11-21 ~00:35 PST (machine clock): exit 4 at 64 MiB (robustness)
+Commit c592a81f0 on origin/main (landed as 5ab1c23b5). Cause, named by the watchdog and a `sample` profile: the
+deriver composed a path by walking a flat piece list from its front for every declared op, so a file written a few KiB
+a write cost the square of its writes. A 128 MiB submit spun shard 1 for 1.0 to 1.2 s in one poll (exit 4), on a quiet
+Studio-1 as well as a loaded MacBook. Fix: blocked piece list (about √ops a step), new runs merged.
+Measurement: A-697's release bench on Studio-1 at 64, 128, 256 and 320 MiB, every size passing, exit 0 (before: exit 4 at
+128 to 320). BENCHMARKS has the phase table. Tests: slates-merge --test derive 10 of 10 including the new cost bound
+(red: 55,109,413 examined against 12,000,000); slates-merge lib 248 of 248.
+The earlier record-plane piece (8f04c9130) was real (inputs rebuilt per shipment) but was not exit 4's cause.
+Found, in GAPS, not on my list: the holder's forward runs at ~105-150 MB/s in this bench (320 MiB in 3,047 ms) against
+the transport's 1.3 GB/s, and the control shard's beat task runs 0.5-1.4 s late during it. That bears on the lane item;
+see inbox/main-from-w-shared-lane.md.

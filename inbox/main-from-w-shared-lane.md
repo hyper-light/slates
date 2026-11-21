@@ -50,3 +50,10 @@ Lane so far: ~1.07 GB/s -> ~1.31 GB/s median on a quiet Mac, with every per-pack
 receiver's). The profile's top is now sendto / recvfrom, one syscall a datagram. The next lever is batching datagrams
 per syscall (sendmsg_x/recvmsg_x on macOS, sendmmsg/recvmmsg or GSO/GRO on Linux). Shall I take that under the lane
 item, or close the lane item here (the ~200 MB/s question answered: it was load, and the copies are gone)?
+
+## ~00:35 PST: the lane measured in place, after exit 4's fix
+A-697's release bench on Studio-1 (main 5ab1c23b5's parent tree ffb2a65): a holder's forward of its increment takes
+428 ms at 64 MiB, 849 at 128, 2,737 at 256, 3,047 at 320: about 105-150 MB/s, while the transport alone does
+1.3 GB/s (bulk row). So the lane's in-place throughput is bounded above the transport: the forward lane's own steps
+(its chunking and its session borrow per turn, `forward_lane.rs`), and the control shard's beat runs 0.5-1.4 s late
+during the larger ones. I'd take this as the lane item's remainder, ahead of datagram batching. Your call.
