@@ -1,5 +1,47 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-20 ~16:40 PST — LANDED: A-787 part 1 on origin/main (piece 5df1db1f4, main cafb424e3)
+
+Main's 15:20 pushback, item 1: slice the refinement under the quantum.
+- What: `slates_merge::refine` paced. All work is metered (`WORK_PER_TICK` = 4,096) and asks `pace::Ticks` between
+  units; hot loops run synchronously up to a unit's room. Tokens are cut at 4,096 bytes. No vector doubles and no
+  table rehashes in one step: units are counted then laid, ranges sit in doubling chunks, and the anchors are a paced
+  radix sort of 32-bit hashes of word units. `refine_paced` / `refine_rewrites_paced` are new; the sync API is
+  unchanged.
+- Red: `a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time` failed with the asks disabled; green 9/9, plus
+  server green_post_state 6/6, before and after merging main.
+- A/B (examples/rewrite_slices.rs, adas-mac-studio-2 M4 Max, release, interleaved with 561c655a3, 3 runs × 5 rounds;
+  BENCHMARKS "A rewrite's refinement sliced"):
+  - Longest unit: 10-46 µs on sources, 31-99 µs at 1-4 MiB, typically 40-300 µs at 12 MiB. 3 of 15 12 MiB rounds had
+    one unit of 1.8-2.8 ms, unexplained (preemption or a large free?).
+  - Per save: 1.45-1.5x on sources and 1 MiB, 1.35x at 4 MiB, 1.15x at 12 MiB. Same search steps; the cost is the
+    meter's bookkeeping.
+  - Verdicts unchanged: 0/720 false conflicts, 240/240 clashes conflict.
+- Rejected, measured: a heapsort for the anchors (12x slower at 1 MiB); per-round instead of per-diagonal awaits (no
+  change); a hash table (its rehash is one O(n) step).
+- Slip, reported in inbox/main-from-w-rewrite-ops-a787.md: one `git checkout --` (no paths, a no-op).
+
+## Next (queue from main's 15:20 message)
+1. Part 2: the submit drives `refine_rewrites_paced` over the shard's turns (`compose_increment` still runs it in one
+   step). Proposed shape:
+   - work_home's gate parks a submit or rebase whose journal replaces a file whole, whether its green is local or not
+     (today it parks only for a remote green);
+   - a task of the work's shard owns copies of the two files (copied a unit at a time) and drives the refinement with
+     a Pace a turn at a time;
+   - its ranges resume the verb as an owner's answer does (`resolve`, a new `Answered::Refined`), and
+     `compose_increment` takes them instead of refining.
+   - Open: wait for A-783 (w-engine's slates-pace Step) or use `pace::Ticks` now; the copy (2 bytes per file byte,
+     transient) versus an explicit-state refiner that re-borrows each turn.
+2. A work composed on its own shard (A-247): ask the owner for the base bytes of whole-replaced paths, so they refine
+   too (today `base_missing` skips files the work holds).
+3. Refine a rename over an existing file (today a `Rename` op keeps the whole replacement).
+
+## For main to delete
+- ~/.cache/w-rewrite-ops-ab (adas-mac-studio-2: the A/B's two trees and targets); ~/.cache/w-rewrite-ops-push
+  (studio-3); ~/.cache/w-rewrite-ops-bundle, ~/.cache/w-rewrite-ops-scratch, ~/.cache/w-rewrite-ops-ab-target.noindex
+  (this Mac).
+
+
 ## 2026-11-20 ~14:22 PST — LANDED: A-776 on slates origin/main 561c655a3 (the piece 6035b016a + merge)
 
 - What: `slates_merge::refine` (crates/merge/src/refine.rs). At the seal (`compose_increment` in
