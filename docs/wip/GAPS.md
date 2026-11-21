@@ -8,10 +8,19 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). Still open, owner w-provision-gate: a recovery over a
-> base of ~192k directories reopens them in one step and overruns the 1 s liveness window, so adacachy's restarted
-> daemon is killed every ~1 s and the anchor counts each restart as recovered. Witnessed descriptors are still bounded
-> only by the large-class copies a volume holds.
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
+> daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
+> Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
+> its source path without following links, held to the record by `same_object`, else `BaseUnavailable` with its
+> untouched entries), and an unreacquired one's record goes into the next image unchanged, with no `fstat`. Red on main:
+> 201 host handles after recovering 200 listed directories; green: 1
+> (`a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use`).
+> **Still open (main):** (1) a directory listed in this daemon's life keeps its listing and its open directory until the
+> directory leaves the volume: bounded by the directories used, not by a derived budget; the listings need an idle
+> close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
+> recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
+> (4) `image()` still `fstat`s every reacquired directory at each publication.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
