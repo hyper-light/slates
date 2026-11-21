@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "keys:fbc6bc971"
+      ARMS: "base:fbc6bc971 cache:8b67b484f"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
