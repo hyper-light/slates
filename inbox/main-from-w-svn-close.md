@@ -23,6 +23,12 @@
   a_commit_over_svn_runs_its_repositorys_commit_hooks green (load 11-17). The vcs_svn, vcs_hooks and svn_hooks suites
   green.
 - Please remove the run-requests.md entry.
+- Red reproduced, as you asked at 15:35. A post-unlock hook that sleeps past the old ten-window wait (12 s against
+  10 s) gave:
+  - with the old wait: an_unlock_runs_pre_unlock_and_post_unlock failed exactly as the flake did, the answer cut at
+    "( success ( 7:new.txt ) ) done (";
+  - with HOOK_PATIENCE_NS: passed.
+  This was a one-off local run, not committed.
 
 ## R5 the exporter's rebuild sliced + the red svnserve-over-SSH test -- CLOSED
 - Exporter: A-762, 507d722b3 + 2cf1b1d35. TextSource::read_step reads a delta chain one window a step, a stored text
