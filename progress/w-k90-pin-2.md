@@ -70,3 +70,16 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Clippy red on Windows/Linux (all clippy legs): crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` is a
   disallowed method (A-520 piece 5, w-k90-containers'). For main / lint keeper.
 - Poller bebez30pl stopped at its 2 h limit.
+
+## ~21:45 PST (05:45Z)
+- GREEN Linux x86-64: GitHub run 44851246181 (kiln 4f5e58c1b, contains e763e394f + the 08f1a434 pin), job 136703754443
+  `ubuntu-latest (Slates build and tests)`: every step success. macOS arm64 green again there (136703754428).
+- ubuntu-24.04-arm 136703754445: build ran 90 min (oomd off, swap, -j2), exit 101, no detail; its (clippy, build) leg
+  lost the runner (143). LANDED kiln f500759d2 (base f500759d2): slates Report covers the build step.
+- windows-11-arm 136703754464: build OK, lib Slates tests OK (51 min), `--test vendored --test slates_roles` exit 101
+  again (slates_roles is #![cfg(unix)] -> the `vendored` test or the test build fails on Windows arm64). Report step
+  (eb7194f00) not in that run; next run 44867288588 (af73099bd) carries it.
+- windows-slates (w-k90-win) on 4f5e58c1b: slates_e2e GREEN; lib: 2 tests with hard-coded Unix paths (mod.rs:747/764)
+  -> told w-k90-win (agents_send + inbox).
+- clippy container.rs:301 -> w-k90-containers says it's w-k90-a520's, forwarded.
+- r145 (jupiter repro) still queued: jupiter not answering. kiln's own lanes for 08f1a434 still wedged.

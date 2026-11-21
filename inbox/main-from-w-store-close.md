@@ -61,3 +61,59 @@
   slates-store 20/20 and slates-api store_sizing 1/1. Told w-hg, w-perf and w-svn.
 - Next: C4 with w-hg, rerunning its store test on main; then C5 with w-git; then C6 with w-svn's import over the
   sliced landing.
+
+## 2026-11-20 ~22:30: C5's store side; the grant's G row
+- ad1d9e7a6: `StorePacks` (crates/server/src/vcs_store/store_packs.rs), git's sync `PackSource` over the store's
+  owner. An awaited `fill` puts the covering 64 KiB store pieces into an LRU bounded by the caller's derived `most`;
+  `piece` lends from that alone, and a miss is the cue to fill. There is no blocking read (R6). Test: a 300,000-byte
+  pack read forward through a three-piece bound, each piece fetched once and every miss one fill (server --lib 1/1).
+  Shape posted to w-git.
+- e5baf401c: the standing grant is durable as the store's `G` row: recorded at the first open, checkpointed before
+  anything lands, and found as first issued after a crash. Every landing's header names its id
+  (`StoreHandle::grant()`); the creation landing does now, and the tools were told. Tests: slates-store 21/21, server
+  store_tests 2/2. Still owed: a standing-grant `AuditKind` with its audit position, and revocation.
+
+## 2026-11-20 ~23:30: a creation in the one landing order (e4cfbd38d)
+- Red first: `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once`
+  (server --lib, `repository/store_tests.rs`). A test-only fault ends the landing task between its two steps. Before
+  the fix, the repository was left in the register with no creation in the store.
+- Fix: `land_then_record`. It judges the `RepositoryCreated` guard (no apply) and reserves the repository's and root's
+  ids, then lands changeset 0. Only after that does one transaction record the repository, its root and the
+  completion, and the client is answered (the verb's acceptance is deferred until then). A kill in between leaves a
+  changeset no repository names, and the retry creates the repository once. Tests: `store_tests` 3/3.
+- **Your call:** id reservation was needed because ids were only peeked from the partition's family counter when the
+  verb ran. `ShardState::family_reserved_through` is a high-water mark; `fresh_family_id_at` now mints past it, so an
+  id that never got recorded becomes a gap and is never reused.
+- **Your call:** with a store, a create with no reply route (forwarded from another node) is refused `Unsupported`,
+  since it has nowhere to be answered after the landing. This is in GAPS as owed with the fleet half. Overrule if you
+  want something else.
+- There was no GAPS line for this finding, so I recorded it as CLOSED in the A-767 entry, with a design status line.
+- `repository::tests`: 58 pass and 4 fail. The 4 failures are the same ones (submit refused `Overloaded`) I reported on
+  clean main f9c113ae9, not from this change.
+- Sibling: svn_made's order is with w-svn (your note). w-hg's push already lands first on its branch.
+
+## 2026-11-20 ~23:59: e4cfbd38d's two choices (174459b36, merged as 9bfcbb9be)
+1. **The restart.** Test: `a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`. A create is
+   killed between the steps; the daemon and the store's owner stop; a successor starts over the same anchor segment
+   and store; the same partition creates again. The log does hold two changesets 0 under one id (asserted, so the
+   successor really minted the orphan's id again).
+   **It was green with no code change, so there was no red to show.** The store's `C` row for `(repository,
+   sequence)` is the newest landing at that key, and that is the only one the register can ever name: a record
+   follows its landing, and once an id is recorded the counter passes it. So the new repository's rows give exactly
+   its own creation. This is your "applies only what the register named" rule, enforced by the store's key, so I added
+   no second mechanism. The orphan's log bytes stay until the cleaner of unnamed log space (in GAPS). If you want
+   recovery to drop unnamed changesets explicitly anyway, say so and I'll build it on that cleaner.
+2. **Forwarded creates.** No create is ever forwarded to another node. Every repository verb names no volume
+   (`RequestBody::volume` in `crates/ipc/src/protocol.rs`: "served on the partition its name hashes to", A-575), and
+   `verbs::serve_forward` refuses any volume-less verb (`Unsupported { "forwarded verb" }`) before it runs. A create
+   always runs on the node the client reached, and a forward between shards of one node carries its reply route. So
+   the refusal I had was unreachable by any client, laptop or fleet, and R8 already holds.
+   - I built the parked-answer path on dc4f6eb06's mechanism (an attach in `await_deferred_completion`), then took it
+     out: it could never run, and the rules ban a "just in case" second path.
+   - What remains is one typed refusal, for a dispatch with no client request or route (a shard's own call), and it is
+     the same on every node.
+   - The GAPS "owed" line is gone, replaced by these facts.
+   - If repository verbs are ever forwarded, the attach is three small pieces: a map of creations by request, a guard
+     arm in `await_deferred_completion`, and `answer_awaited` at the record.
+- Tests: `store_tests` 4/4 and `slates-store` 21/21, run on the merged tree (it includes main's lint round 13).
+- Next: the standing grant's AuditKind and revocation.

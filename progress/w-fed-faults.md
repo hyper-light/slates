@@ -1,4 +1,5 @@
 # RESUME HERE (2026-11-20 ~20:45 PST): CLOSE LIST DONE
+- 92b STOPPED on main's order (no S3 work: Ada never asked for it): adacachy unit w-fed-faults-92b stopped before any result; nothing committed; only an untracked build script in ~/slates-work/w-fed-faults-slates. Waiting for main.
 - C1 (goal 91) closed: inbox/main-from-w-fed-faults-close.md 7aa3c86; kiln 73712cc last. All six flows PASS on macOS;
   killed/restarted/partitioned PASS on Linux; Linux link flows filed for main's lane (run-requests a89aeaa).
 - C2 (goal 85c) closed: slates c733506 (GAPS), live_chaos client-killed-mid-write PASSED macOS (9.3 s); inbox 7d202fd.
@@ -71,3 +72,9 @@ Rules: briefs/common.md (FAST LANDING LOOP, NO KILN, OWN TARGET DIR ~/.cache/w-f
   own entry (check_bind; a708_ unit test); test: Lab::start_relayed with Slates' relay by #[path] (vendor), reroot by
   daemon pid, flows w7_a708_ slow lossy link + move, runner cut off while running; docs/agentic.md W7 paragraph.
   Drafted (uncommitted) in worktree ~/slates-work/w-fed-faults-a708 (branch agents/w-fed-faults-a708); build after piece 1 lands.
+- 2026-11-20 late, A-795 (main's brief: delete the S3 base whole, Ada ~21:27): done on macOS, on branch
+  agents/w-fed-faults-no-s3 (5747905, one commit over main 68ce3d585); local worktree ~/slates-work/w-fed-faults-no-s3
+  (055c0d3bd). Built, macOS tests passed (touched crates' libs, ipc/db wire_order for tags 97/7/3). NOT landed: main's step
+  4 wants the Linux build of fuse.rs first, and adacachy has refused every start and sync since about 22:00 (7 tries).
+  Reading the diff found a Linux-only break (fuse.rs's A-509 test kept the removed fields), now fixed. Lands by
+  land-once.sh once Linux builds.

@@ -7007,3 +7007,33 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
   `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
 - 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.
+- w-shared, record plane (8f04c9130): RSS and time of one 64, 128, 256 and 320 MiB holder submit's placement, before
+  (c990989f7^) and after, release, on the big Studio (`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n>
+  SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture`).
+  Red would be the after's peak RSS or placement time growing with size squared, or a watchdog end (exit 4).
+- w-shared, lane (main's item 4): CPU profile, sender and holder, of
+  `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
+  packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
+- w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
+  encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
+  Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
+- w-shared, transport step two (35c740150): stream data in flight as spans of the sender's bytes (loss recovery, probes
+  and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
+  Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
+  after a loss.
+- w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
+  suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
+  taken partial, or a stalled exchange (its progress now counted on delivery).
+
+## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
+- clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
+- Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.
+- w-fed-faults for w-lint, A-795 (6f29c8d, the S3 base removed): the Linux-only code it changed was never compiled.
+  crates/server/src/fuse.rs (the kept-request path removed; the turn lends the host straight to the bridge; the A-509
+  test's FuseMount without `kept`/`kept_waker`) and crates/bridge-fuse/src/channel.rs (`dispatch_kept`,
+  `allocation_running` and `Dispatched::request` removed). The Mac Studio has both Linux Rust targets but no Linux C
+  cross-compiler or sysroot (zstd-sys, blake3 and aws-lc-sys stop), and adacachy refused every start. On Linux x86_64
+  (and aarch64): `cargo clippy --locked -p slates-server -p slates-bridge-fuse --lib --tests`, then
+  `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
+  Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
+  held replies).

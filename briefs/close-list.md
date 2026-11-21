@@ -73,8 +73,9 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
 90f SlatesVolumes' resync end on KVM ......................... w-k90-kvm, w-k90-microvm
 90g A-520 piece 5: REMOVED 21:05 (kiln container-engine wiring, not this goal). w-k90-a520: stop r81, done
 91  the multi-runner test with injected faults ............... w-fed-faults
-92a the Shards-owed items with Shards' side .................. w-k90-whp
-92b A-555 parts 2-3 .......................................... w-k90-whp
+92a Shards' side works inside kiln, each project vendored once (Ada 21:33): six items validated or made to work
+    in kiln's vendored tree ........ w-k90-kvm (w-k90-whp offline)
+92b DELETED 21:29 (Ada: "I didn't specify s3. I said nfs." then "delete it"): w-fed-faults removes the S3 base
 93 shared  w-shared (three sleep-and-look waits, exit 4 at 64 MiB, inputs held at B, the lane's ~200 MB/s, the
     content-plane-vs-lane A/B, A-697 f, A-658 3c); w-perf (deltify job, svn storage A/B vs FSFS, c3); w-engine (A-760
     whole, A-752's literals); w-balance (send v3-at-f+1 evidence: e73283fd6, 08fba4007)

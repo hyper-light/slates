@@ -352,3 +352,31 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   disk=60g. kiln: "queued; link down 3, haven't answered 3, not macos 3, under strain 1 (the big Studio d1323898...)".
 NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and their whole archive on every shipment
   pass (size squared, one owner step each); building the fix with an RSS-bound test.
+
+## LANDED 2026-11-20 ~22:50 PST: record plane, inputs archived once = 8f04c9130 (main c990989f7). Exit 4 open until kiln r9
+  (queued) reports. Family three: kiln r11 started on adacachy (green running). Next: land sweep-3 on r11 green; read r9.
+
+## LANDED 2026-11-20 ~23:55 PST: lane step one = b72aff1fc (frames encoded in place, packets sealed in one reused
+  buffer; Studio-1 profile before/after in BENCHMARKS: memmove 604->491, median 1,066.5->1,103 MB/s). Lane is ~1.1 GB/s
+  quiet. NEXT: step two (frames by reference into the send stream until acked; receiver copies). Family three: kiln r15
+  (Linux, queued, r11 lost to a runner restart). Exit 4: kiln r9 (queued).
+
+## LANDED 2026-11-21 ~00:40 PST: lane step two = 35c740150 (main 585b89299): spans of the sender's bytes, no copy
+  into frames. memmove 604 -> 491 -> 433 over the two steps; goodput ~1.1 GB/s quiet, level. NEXT in lane: receiver
+  copies (decode, reassembly), then datagram batching per syscall. Family three: kiln r15 (Linux, queued). Exit 4: r9.
+
+## LANDED 2026-11-20 ~23:20 PST (machine clock): lane step three = c3db76bcd (receiver copies). Lane ~1.31 GB/s median
+  quiet (from ~1.07). Asked main: batch datagrams per syscall next, or close the lane item. Kiln: r4 family three on
+  adacachy (running), r3 exit 4 (queued for this MacBook).
+
+## 2026-11-20 ~23:50 PST: EXIT 4 LOCALIZED (kiln r3, main 90e9b72): 128/256/320 MiB exit 4, shard 1 spinning ~1.0-1.1 s
+  CPU in the task at identities.rs:243 (read_then_route: a session's first submit runs whole inline in one poll). 64 MiB:
+  exit 101 with 1,652 ms near miss. Record-plane fix did not cover it. Next: sample a 128 MiB submit, slice the step.
+  inbox/main-from-w-shared-exit4.md. Family three: kiln r4 still running on adacachy.
+
+## LANDED 2026-11-21 ~00:35 PST: exit 4 = c592a81f0 (main 5ab1c23b5): deriver's piece list blocked (√ops), runs merged.
+  Bench 64-320 MiB all pass on Studio-1. CLOSED (note in close file). Lane: in-place forward ~105-150 MB/s; asked main.
+  Family three: kiln r4 still on adacachy.
+
+## 2026-11-21 ~01:05 PST: lane in place: 320 MiB holder submit refused Overloaded 1 of 2 runs (forward ~3.1 s; transfer
+  ~2.2 s ~150 MB/s vs 1.3 GB/s raw). Reported; next: time the forward's phases on both ends. Family three: r4 running.

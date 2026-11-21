@@ -298,3 +298,17 @@
 - P6: measurement test (w-svn-next, uncommitted vcs_ssh/tests/svn.rs: RSS checkpoints + update/checkout) got
   "not whole" 524-byte answers for update; release run printing the answer in progress (bq3pv7luh). git-200.dump made
   (~/.cache/w-svn-gitgit) for faster runs; debug builds die to the watchdog in import.
+- C2 stage A built in ~/slates-work/w-svn-c2 (uncommitted at 22:40, testing): every svn record store-first
+  (svn_commit::landing: gate/turn, sequence = register object count, reference-only register entries), recovery and
+  rebuild read changesets back from the store (vcs_store svn_to_fetch/fetch_svn), svn creation refused without
+  --vcs-store, crate::test_store shared helper (TestStore guard, StoredDaemon, run_on_first), svn_commit/import/export
+  tests async on stored daemons, arbiter + crash tests in repository::store_tests. slates-server svn+store_tests
+  96/96, identities+vcs_store 37/37, barrier/deltify/svn_texts 3/3, cli --test cli a_repository_the_cli_creates 1/1.
+  svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
+- P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
+  status returned too soon" (the script's report). Fix the script after C2.
+- C2 stage A LANDED 72576cb1f (0703e62d2 + 65f69e1da). Tests: server 136/136 affected; cli svn_interop 4/4,
+  svn_http_reports 9/9, cli create 1/1. Main's ruling on svn_made (inbox w-svn-from-main-c2-made): submit acceptance
+  deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
+- C2 stage B part 1 LANDED 40c3f8d1e (e69375553): texts in the changeset, recovery fetch, barrier gone for svn. P6/P7
+  measured (BENCHMARKS). Next: B part 2 (texts read through the owner). Stock legs kiln r2 on mac-studio.local-2; P8 next.
