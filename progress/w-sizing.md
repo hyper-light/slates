@@ -133,6 +133,10 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   heap) after the push and after 20 s idle, rev 39aa0995d: script ~/.cache/w-sizing-logs/hgmem.sh (+ hgmem-cmd.txt).
   Blocked at 20:40: the big Studio had 5 GB free (needs ~6.2 GB at peak); it is the only runner with uvx and the
   dataset (~/.cache/w-hg-mem/hg). w-hg/w-store have not answered inbox/w-hg-from-w-sizing-r3.md yet.
+- R3 measurement QUEUED as kiln r46 on d1323898 (main's order): `on` + mem refuses at once when memory is short, so the
+  run asks no memory and waits on the machine itself until 8 GiB is free (<= 2 h, then NO-ROOM), then pushes hg's
+  history at 39aa0995d and prints RSS + status memory kinds after the push and after 20 s idle. Kiln reports its end.
+- Branches: agents/w-sizing-r2win already deleted at landing; agents/w-sizing-r2hold (red experiment) deleted; none left.
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =
