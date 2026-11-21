@@ -1689,41 +1689,40 @@ fn verdict_over_fleet(
     if staged != Some(true) {
       return;
     }
-    let reply = crate::xshard::task_within(
-      here,
-      control,
-      move || async move {
-        let build_start = slates_machine::clock::monotonic_ns();
-        let built =
-          state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
-        let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
-        state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
-        let forward_start = slates_machine::clock::monotonic_ns();
-        let reply = match built {
-          Some(Ok(request)) => crate::verbs::resolve_and_forward(
-            crate::verbs::to_wire_volume(green),
-            region,
-            None,
-            vec![request],
-          )
-          .await
-          .0
-          .first()
-          .clone(),
-          Some(Err(reply)) => *reply,
-          None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
-        };
-        let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
-        // The work settles on its new base only once this node's replica holds it (A-697 part d).
-        let held = state::with_state(|s| {
-          crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
-          hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
-        })
-        .unwrap_or(false);
-        (reply, held)
-      },
-      deadline,
-    )
+    // Awaited to its end: the forward bounds itself by its own progress (its lane's stall rule, which counts the request's
+    // bytes acknowledged), and the replica's wait by `deadline`. A wall deadline here, the failover delay, refused a
+    // submit whose increment was still crossing, and its retry sent the whole increment again (main's ruling on the
+    // lane, 2026-11-21).
+    let reply = crate::xshard::task_to_its_end(here, control, move || async move {
+      let build_start = slates_machine::clock::monotonic_ns();
+      let built =
+        state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
+      let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
+      state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
+      let forward_start = slates_machine::clock::monotonic_ns();
+      let reply = match built {
+        Some(Ok(request)) => crate::verbs::resolve_and_forward(
+          crate::verbs::to_wire_volume(green),
+          region,
+          None,
+          vec![request],
+        )
+        .await
+        .0
+        .first()
+        .clone(),
+        Some(Err(reply)) => *reply,
+        None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
+      };
+      let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
+      // The work settles on its new base only once this node's replica holds it (A-697 part d).
+      let held = state::with_state(|s| {
+        crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
+        hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
+      })
+      .unwrap_or(false);
+      (reply, held)
+    })
     .await;
     let _ = state::with_state_counted(|s| match reply {
       Some((_, true)) => defer_oldest(s, queue),

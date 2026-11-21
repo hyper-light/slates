@@ -16,7 +16,7 @@ use slates_vcs::{ContentId, ContentStore, Mode};
 
 use super::{BUILT, DERIVED, GreenPaths, REFUSED, REMADE};
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
 
 /// Shape: the room the oracle's own store is made with: the fixed histories' few files and their maps, many times over.
 const SCRATCH_BUDGET: u64 = 1 << 24;

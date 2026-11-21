@@ -1405,3 +1405,113 @@ fn an_import_measured() {
     err.join().unwrap().trim()
   );
 }
+
+/// P7 of Ada's close list (A-772: svnsync over the matrix took 524 s over HTTP and 1,068 s over svn://; a measurement,
+/// not a gate). Do: for svn:// and the HTTP edge in turn, start an anchor whose daemon holds a changeset store, create a
+/// Subversion repository and import the dump `SLATES_SVN_SYNC_DUMP` names through the CLI; then mirror it with stock
+/// `svnsync` 1.15 into a local FSFS repository (`svnadmin create`, a pre-revprop-change hook allowing every change,
+/// `svnsync init`, then `svnsync sync` timed), sampling the daemon's resident bytes. Expect nothing: print each scheme's
+/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, and the daemon's
+/// resident bytes before and at its peak. Skips loudly without stock Subversion 1.15 or the dump.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: the mirror's hook, in the test's own scratch directory
+#[ignore = "a measurement: SLATES_SVN_SYNC_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_svnsync_measured --nocapture"]
+fn an_svnsync_measured() {
+  use std::os::unix::fs::PermissionsExt;
+  let Ok(dump) = std::env::var("SLATES_SVN_SYNC_DUMP") else {
+    eprintln!("skipping svnsync's measurement: SLATES_SVN_SYNC_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() || !stock_svnserve() {
+    eprintln!(
+      "skipping svnsync's measurement: no stock Subversion 1.15 here (svn, svnadmin, svnsync)"
+    );
+    return;
+  }
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-sync-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "svnsync's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let importing = Instant::now();
+    let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+    assert_eq!(code, 0, "repository import: {out}{err}");
+    let imported = importing.elapsed().as_secs_f64();
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-sync-{scheme}"));
+    let mirror = format!("{}/mirror", scratch.path);
+    let made = Command::new("svnadmin")
+      .args(["create", &mirror])
+      .output()
+      .unwrap();
+    assert!(made.status.success(), "svnadmin create: {made:?}");
+    let hook = format!("{mirror}/hooks/pre-revprop-change");
+    std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mirror_url = format!("file://{mirror}");
+    let options = [
+      "--non-interactive".to_owned(),
+      "--no-auth-cache".to_owned(),
+      "--config-dir".to_owned(),
+      format!("{}/svn-config", scratch.path),
+      "--source-username".to_owned(),
+      user,
+      "--source-password".to_owned(),
+      token,
+    ];
+    let init = Command::new("svnsync")
+      .args(["init", &mirror_url, &url])
+      .args(&options)
+      .env("LC_ALL", "C")
+      .output()
+      .unwrap();
+    assert!(init.status.success(), "svnsync init: {init:?}");
+    let before = daemon_rss_kib(&instance);
+    let mut child = Command::new("svnsync")
+      .args(["sync", &mirror_url])
+      .args(&options)
+      .env("LC_ALL", "C")
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap();
+    let err = read_on_a_thread(child.stderr.take().unwrap());
+    let started = Instant::now();
+    let mut peak = 0;
+    let code = loop {
+      peak = peak.max(daemon_rss_kib(&instance));
+      if let Some(status) = child.try_wait().unwrap() {
+        break status.code().unwrap_or(-1);
+      }
+      pause();
+    };
+    let seconds = started.elapsed().as_secs_f64();
+    let youngest = Command::new("svnlook")
+      .args(["youngest", &mirror])
+      .output()
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+      .unwrap_or_default();
+    let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
+    println!(
+      "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
+       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}",
+      seconds * 1e3 / revisions,
+      err.join().unwrap().trim()
+    );
+  }
+}

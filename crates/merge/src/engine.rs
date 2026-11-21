@@ -1637,6 +1637,9 @@ struct Resolved {
   copies: BTreeMap<String, copy::CopySpec>,
   /// The operations on paths in the copies' trees, judged against the copied trees (`copy`, its module docs).
   copied: Option<Box<Resolved>>,
+  /// The paths a resolution's replacement brings into being at the head (A-796, AC-6.13): the work's kept metadata on
+  /// them is judged as for a path the increment itself establishes, since the replacement establishes it.
+  resolution_establishes: BTreeSet<String>,
 }
 
 impl Resolved {
@@ -1697,6 +1700,7 @@ impl Resolved {
       || self.mkdirs.contains(path)
       || self.renames.contains_key(path)
       || self.specials.contains_key(path)
+      || self.resolution_establishes.contains(path)
   }
 
   /// Notes a copy to `dst` (A-586); a second copy onto one destination in one increment is no copy anyone can mean, so
@@ -6446,6 +6450,14 @@ impl Green {
   /// versions it maps through and the work (A-658), so any copy of the green that holds them answers it as the owner
   /// does, and a copy that has not reached the work's base answers [`Rebased::BaseAhead`].
   pub fn rebase(&self, inc: &Increment) -> Rebased {
+    self.rebase_establishing(inc, BTreeSet::new())
+  }
+
+  /// [`Green::rebase`] for a resolution (A-796, AC-6.13): `established` names the paths the resolution's replacement
+  /// brings into being at the head, so the work's kept mode and attribute changes on them are judged as on a path the
+  /// work establishes (a file the head removed, written anew by the replacement), never as a change to the removed one.
+  /// Nothing else of the verdict changes; with no path named it is the rebase.
+  pub fn rebase_establishing(&self, inc: &Increment, established: BTreeSet<String>) -> Rebased {
     if inc.base < self.deltas_from {
       return Rebased::BaseUnavailable {
         base: inc.base,
@@ -6466,7 +6478,8 @@ impl Green {
         identity: run.identity,
       };
     }
-    let resolved = Green::resolve(inc);
+    let mut resolved = Green::resolve(inc);
+    resolved.resolution_establishes = established;
     if let Some((path, case)) = self.copy_refusal(&resolved) {
       return Rebased::CopyRefused { path, case };
     }
