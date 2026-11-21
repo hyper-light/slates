@@ -17138,6 +17138,74 @@ and every round shown, as main extracted them from the run's log.
     the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
     128,000-150,000 calls loaded, and in 0-8 quiet.
 
+## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
+
+**The question** (main's 84a ruling, 2026-11-21). A-224's slice was rejected on loaded p50 excursions measured while
+the client spun for its reply, which A-799 removed. Does the slice now take 84a's loaded p99 and p999 under 1 ms on
+both CI Linux runners, with the loaded p50 inside B's spread and quiet runs even?
+
+**The arms.** One binary (`diag-g222-slice`, never main: main with B plus diagnostic switches), rotated each round:
+- **b:** B (A-799) as landed.
+- **s:** each shard thread asks `sched_setattr(SCHED_NORMAL, sched_runtime)` for its own step quantum, 7.0-8.8 µs as
+  measured at start.
+- **sc:** s plus the client thread asking the same call.
+The kernel held 100 µs, its floor, for every thread asked, read back with `sched_getattr`: 3 shard reads at
+start on arm64 and 6 on x86_64, and 6 client reads on each. The shards still held it after 20,000-park intervals (21 reads). A park doesn't drop the slice.
+
+**The lane.** A-224's: `systemd-run --scope -p AllowedCPUs=0-1`, plus `MemoryMax=256M` on arm64 (on x86_64 the
+256 MB probe failed, so CPUs only), an fsync writer, and two spinners a core. Three rounds; f10, accept and conflict.
+Each cell is r1/r2/r3 in µs.
+
+**ubuntu-24.04-arm** (run 44938733403, `diag-measurer-g222-27`, kernel 7.0.0-1017-azure):
+
+| form | arm | p50 | p99 | p999 |
+|---|---|---|---|---|
+| accept loaded | b | 251/245/255 | 371/415/643 | 416/3,993/1,467 |
+| accept loaded | s | 232/233/237 | 341/325/481 | 1,129/886/3,996 |
+| accept loaded | sc | 237/234/228 | 339/327/337 | 592/869/959 |
+| conflict loaded | b | 200/197/203 | 811/727/1,250 | 1,830/1,875/2,714 |
+| conflict loaded | s | 194/192/199 | 299/285/306 | 930/314/834 |
+| conflict loaded | sc | 195/195/199 | 306/298/297 | 714/4,964/937 |
+| accept quiet | b / s / sc | 112/111/108 · 104/108/106 · 101/107/106 | 169/154/151 · 145/150/146 · 143/150/144 | 241/237/202 · 416/205/269 · 313/238/270 |
+| conflict quiet | b / s / sc | 83/82/80 · 78/80/79 · 78/79/79 | 124/126/123 · 122/123/121 · 122/120/123 | 198/142/149 · 160/142/156 · 208/135/158 |
+
+**ubuntu-latest** (kernel 7.0.0-1016-aws). Two runs: 44938733403 (`-27`), then 44940103469 (`-28`, run again so its
+stamps were dumped before the bench's 1 ms gate exits):
+
+| form | arm | p50 (-27; -28) | p99 (-27; -28) | p999 (-27; -28) |
+|---|---|---|---|---|
+| accept loaded | b | 106/109/107; 70/74/59 | 2,905/2,914/2,898; 2,587/2,940/198 | 3,092/3,151/3,340; 3,251/3,278/1,816 |
+| accept loaded | s | 115/113/111; 71/61/76 | 1,785/3,995/1,315; 1,684/234/1,793 | 2,829/3,997/2,057; 3,246/1,452/3,865 |
+| accept loaded | sc | 180/123/123; 86/93/87 | 1,189/1,264/1,248; 1,812/1,048/1,032 | 1,822/1,851/1,518; 3,997/1,755/1,717 |
+| conflict loaded | b | 88/90/90; 55/57/49 | 3,219/3,311/3,372; 3,092/3,040/188 | 4,598/5,707/5,925; 4,303/5,960/2,929 |
+| conflict loaded | s | 89/90/90; 55/56/57 | 3,000/2,213/1,253; 1,489/1,197/1,494 | 4,001/4,003/2,040; 3,950/1,912/2,783 |
+| conflict loaded | sc | 172/154/99; 168/170/122 | 1,208/1,212/1,219; 1,493/1,713/1,162 | 1,796/1,799/1,499; 1,904/2,976/1,609 |
+
+Quiet on ubuntu-latest is even across the arms (-27: accept p99 102-130 µs in every arm, conflict p99 89-111).
+
+**Per-wake stamps** (kick -> the parked shard running; per request: landed -> taken, taken -> written,
+written -> the client saw it). In B the slowest 1% of requests by round trip are almost all deferred replies (forwarded
+verbs); with a slice, sync and deferred both appear.
+- **arm64, kick -> run, p50/p99/p999 in µs:** b 913/1,995/3,001 and 914/1,996/2,997 (at least 1 ms: 864 and 937 of
+  about 34,800). s 915/1,003/1,989, 912/1,000/1,559, 911/1,001/1,560 (337-421 at least 1 ms). sc 909/1,001/1,284,
+  913/1,000/1,486, 906/1,000/1,559. A deferred reply's taken -> written: p50 about 1.0-1.1 ms in every arm; p99
+  2.98-3.12 ms in b, 1.99-2.01 ms with a slice.
+- **x86_64 (-28):** the one derived shard almost never parks (1-3 kicked parks a run); it stays runnable. The tail is
+  the queue in front of it. In b the p99 tail's median landed -> taken is 2.66-2.86 ms (queued p99 2.39-2.71 ms,
+  p999 3.0 ms). With a slice it is 0.91-1.0 ms (queued p99 0.75-1.0 ms, p999 1.01-1.11 ms).
+
+**Reading.** On both runners a ready shard gets the CPU only at a 1 ms scheduler tick, never at its wake: kick -> run's
+median is 0.91 ms, and the tails sit at exactly 1.0, 2.0 and 3.0 ms. The slice makes the shard win the first tick
+instead of waiting out the spinners' 2.1 ms default slice, so the 2-3 ms tails become about 1 ms. It can't remove the
+first tick: nothing preempts a spinner at a wake. (The CI kernel's `sched/features` such as RUN_TO_PARITY can't be
+read without privilege.) So no fair-class slice reaches 84a's bound on this lane:
+- **arm64, sc:** p99 under 1 ms in all 6 rounds and p999 in 5 of 6 (conflict r2 4,964 µs); p50 at or below B's; quiet
+  even. Close, but one p999 over.
+- **x86_64:** sc's p99 is 1.03-1.81 ms and p999 1.5-4.0 ms. Its loaded p50 is beyond B's spread (conflict 99-172
+  against 49-90 µs, accept 86-180 against 59-109). s keeps the p50 but its p99 reaches 4.0 ms.
+- **Verdict:** not taken. The remaining tick is the scheduler's own. The only classes that preempt at a wake
+  (`SCHED_FIFO`/`SCHED_RR`, `SCHED_DEADLINE`, a negative nice) need privilege (R10).
+
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** As "Subversion on the changeset store" above (adas-macbook-pro-2.local, release, load 15
@@ -17629,3 +17697,55 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
   branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
   a version, A-803 (c).
+
+## 2026-11-21 — A resolution judged at the head as it is (main's ruling of 10:33 PST): measured and rejected (w-fed-move, goal 86b)
+
+The idea (main ruled it as one verb): A-796's `ResolveMerge` judged against the current head, not refused
+`StaleMergeView` when the head had moved since the check. Its discards are retired and the rest rebased onto the
+current head in the same step, refused only by a conflict on windows it did not discard. The load harness resolved each
+conflict with `CheckMerge` then `ResolveMerge` (the declaration's operations on the windows discarded, the round's own
+slots written again), against its read-and-rebase loop.
+- **Built.** The owner's `merge_answer` without the stamp-head refusal; A-796's test red first (a moved head refused,
+  then rebased there); and a generated oracle in `crates/server/tests/merge_check.rs` (slot sets of the work, of rivals
+  before the check and after it). The oracle was accepted exactly when no kept slot was touched after the check, then
+  the head's file with the work's slots; otherwise a conflict naming only those slots. 24 histories passed. The harness
+  gained `--resolve`.
+- **Kept as:** `~/slates-work/w-fed-move-resolve-at-head-rejected.patch` (w-fed-move's machine).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`;
+  each pair back to back, main 67fa7f75a, this Mac Studio under other agents' load. Oracle failures were 0 in all eight runs.
+
+| hot files | resolve | asks a client | rebase-kind asks | verdict asks | verdicts/s | rebase conflicts |
+|---|---|---|---|---|---|---|
+| 300 | read+rebase | 11.2 | 2.1 | 2.4 | 3,264 | 754 |
+| 300 | check+resolve | 11.9 | 2.9 | 2.2 | 3,656 | 199 |
+| 100 | read+rebase | 13.0 | 3.6 | 2.7 | 2,271 | 1,822 |
+| 100 | check+resolve | 13.3 | 3.9 | 2.6 | 3,342 | 284 |
+| 30 | read+rebase | 19.3 | 8.7 | 3.8 | 2,168 | 5,850 |
+| 30 | check+resolve | 17.9 | 7.2 | 4.0 | 2,084 | 529 |
+| 10 | read+rebase | 31.8 | 20.1 | 5.1 | 1,260 | 16,035 |
+| 10 | check+resolve | 26.8 | 13.2 | 7.0 | 3,607 | 584 |
+
+- **Why rejected.** Main's bar was 19.8 to about 4.6 rebase asks a client at 10 hot files; it measured 20.1 to 13.2.
+  A resolution costs two asks (the check and the resolve), and the submit after it conflicts more often (6.0 against
+  4.2 a client at 10 hot files), since the head moves on while the client re-submits. At 300 and 100 hot files, where a
+  plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
+  measured on a shared, loaded machine and is not read as a result.
+
+## 2026-11-21 — A shard-level cache of base lengths (option 3): its ceiling measured, rejected unbuilt (w-fed-move, goal 86b)
+
+After A-817 a work's first edit of each file asks its green's owner for that file's length (4.8 a client at 300 hot
+files, 4.7 at 10, in the 1,000-client stand-in: release, in-process, `kernel/`, one round). The question was whether a
+cache of lengths shared by the works on one shard would cut it. A temporary diagnostic on the owner counted, for each
+length ask, whether the same asking shard had asked the same path before at a version since which the path had not
+changed: the asks a cache with perfect invalidation could have served.
+
+| hot files | length asks sampled | reusable | share |
+|---|---|---|---|
+| 300 | 4,000 | 398 | 10% |
+| 10 | 4,000 | 704 | 18% |
+
+So even a perfect cache saves at most about 0.5 to 0.8 asks a client, and a real one less: a work's shard cannot
+know that a file is unchanged since a cached answer without asking. Not built. With the resolution at the head
+rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
+each verdict, each work's first edit of a file, and a creation's admission and name.
+
