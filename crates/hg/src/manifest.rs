@@ -177,7 +177,7 @@ pub fn find<'a>(text: &'a [u8], path: &[u8]) -> Option<Entry<'a>> {
 }
 
 /// One line's entry, or `None` for a line that is not one.
-fn parse(line: &[u8]) -> Option<Entry<'_>> {
+pub(crate) fn parse(line: &[u8]) -> Option<Entry<'_>> {
   let nul = line.iter().position(|byte| *byte == NUL)?;
   let path = line.get(..nul).filter(|path| !path.is_empty())?;
   let rest = line.get(nul.saturating_add(1)..)?;

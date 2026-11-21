@@ -274,8 +274,11 @@ fn submit_when_room(client: &mut Client, work: VolumeId) -> Submitted {
   }
 }
 
-/// Advances the green from `writer` until its chain refuses, a held floor having kept it from folding; the version the
-/// refused submit would have been, its edit still in the work.
+/// Advances the green from `writer` until it is refused, a held floor having kept it from folding; the version the
+/// refused submit would have been, its edit still in the work. Since chain entry format 6 (A-825) an entry names its
+/// increment in the content store, so the green's history retention, held by the same floor and bounded by the same
+/// derived cap, refuses first (`BudgetExceeded`); before it the chain's own cap did (`TableAtCapacity`). Either is the
+/// held floor's typed refusal.
 fn fill_the_chain(client: &mut Client, writer: VolumeId, delete: u64) -> u64 {
   for next in 2..=VERSIONS {
     client
@@ -286,6 +289,7 @@ fn fill_the_chain(client: &mut Client, writer: VolumeId, delete: u64) -> u64 {
       Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
         return next;
       }
+      Err(ClientError::Refused(Refusal::BudgetExceeded { .. })) => return next,
       other => panic!("submit {next}: {other:?}"),
     }
   }

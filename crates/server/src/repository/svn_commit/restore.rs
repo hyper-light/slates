@@ -151,6 +151,18 @@ pub(super) async fn plan(
 }
 
 /// The child `name` of the path `parent`.
+/// Each of `names` pushed onto `stack` as a (source, destination) pair under `source` and `dest`, last first, so the
+/// walk takes them in order.
+fn push_children(
+  stack: &mut Vec<(String, String)>,
+  (source, dest): (&str, &str),
+  names: &[String],
+) {
+  for name in names.iter().rev() {
+    stack.push((child(source, name), child(dest, name)));
+  }
+}
+
 fn child(parent: &str, name: &str) -> String {
   if parent == "/" {
     format!("/{name}")
@@ -237,9 +249,7 @@ fn step(
           all.extend(names(&source, walk.head)?);
           all.sort_unstable();
           all.dedup();
-          for name in all.iter().rev() {
-            walk.stack.push((child(&source, name), child(&dest, name)));
-          }
+          push_children(&mut walk.stack, (&source, &dest), &all);
         }
       }
       (Some(old), None) => {
@@ -254,18 +264,22 @@ fn step(
           },
         ));
         if directory {
-          for name in names(&source, walk.revision)?.iter().rev() {
-            walk.stack.push((child(&source, name), child(&dest, name)));
-          }
+          push_children(
+            &mut walk.stack,
+            (&source, &dest),
+            &names(&source, walk.revision)?,
+          );
         }
       }
       (None, Some(new)) => {
         let directory = new.1 == NodeKind::Directory;
         walk.plan.restores.push((to, Restore::Remove { directory }));
         if directory {
-          for name in names(&source, walk.head)?.iter().rev() {
-            walk.stack.push((child(&source, name), child(&dest, name)));
-          }
+          push_children(
+            &mut walk.stack,
+            (&source, &dest),
+            &names(&source, walk.head)?,
+          );
         }
       }
     }

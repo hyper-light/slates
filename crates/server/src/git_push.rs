@@ -69,7 +69,7 @@
 //! **A create** is made at the version of the member whose head its first parent is, where it can still be branched
 //! from (the default branch's first, then the members as they joined), else at the default branch's newest version
 //! (A-654 part 1), and appended as A-635's new branch made at that version, owing the push that moves it to the pushed
-//! tree (P2, A-821: `BranchChange::CreateDeferred`, made when first reached through `crate::green_ready`). While the
+//! tree (P2, A-823: `BranchChange::CreateDeferred`, made when first reached through `crate::green_ready`). While the
 //! default branch is unborn, a create's push is over an empty green, made from the default branch's green, which must be
 //! empty at its version 0: the default branch itself owes the push as its next version (`BranchChange::UpdateDeferred`),
 //! any other ref is a new branch made at that empty version. A default branch that holds files no git commit names
@@ -381,6 +381,13 @@ pub(crate) struct Landing {
   header: slates_store::log::Header,
   /// Its `Names` and its `Payload`.
   parts: Vec<slates_store::owner::Part>,
+}
+
+impl Landing {
+  /// The sequence the changeset lands at: what the record names once it is landed.
+  pub(crate) fn sequence(&self) -> u64 {
+    self.header.sequence
+  }
 }
 
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
@@ -1025,8 +1032,9 @@ pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
 
 /// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
 /// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
-/// landing side by side never share one. None where the daemon holds no store, or the repository no store here.
-fn landing_of(
+/// landing side by side never share one. None where the daemon holds no store, or the repository no store here. A git
+/// commit the server makes lands the same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
+pub(crate) fn landing_of(
   state: &mut ShardState,
   repository: RepositoryId,
   (names, pack): (Vec<u8>, Vec<u8>),
