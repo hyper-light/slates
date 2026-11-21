@@ -4188,10 +4188,12 @@ fn role_store_verbs_part(
     grant: None,
     signature: None,
   };
-  let Refusal::Unsupported { feature } = refusal_of(client, &land) else {
-    panic!("land of a green");
+  // A green lands as any volume's landing, under a grant (A-774, A-774 part 3: "presented and granted as any volume's
+  // landing", R10), so it is judged as a landing, never refused by its role: here its target does not exist, refused
+  // typed by the target and writing nothing. Before A-774 a green's landing was refused `Unsupported`.
+  let Refusal::Target { .. } = refusal_of(client, &land) else {
+    panic!("a green's landing is judged as any volume's: refused by its missing target");
   };
-  assert!(feature.contains("landing"), "{feature}");
   let Refusal::Unsupported { feature } = refusal_of(client, &RequestBody::Snapshot { volume: w })
   else {
     panic!("snapshot of a work");

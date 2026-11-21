@@ -404,6 +404,12 @@ pub(crate) struct HgStore {
   /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
   /// register's references at recovery.
   pub(crate) landed: u64,
+  /// Whether its index holds revisions the changeset store does not keep: an import's, a made changeset's, or a push's
+  /// whose record holds its revisions inline (one landed before A-767 C4); w-hg's C1 steps 3 and after land imports as
+  /// changesets. Such a repository advertises no stream clone, since its stream sends each revision as the store keeps
+  /// it (`slates_hg::serve::indexed::State::stored_logs`; goal 93 perf). A push replayed from the changeset log keeps
+  /// its revisions in the store, so leaves it as it was.
+  pub(crate) unstored: bool,
 }
 
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
@@ -1636,10 +1642,12 @@ impl SealedPush {
   ) -> bool {
     let repository = self.repository;
     let push = &mut self.push;
-    let room = state
-      .vcs_stores
-      .git_ref(repository)
-      .map_or(0, |(_, store)| store.repository.stage_room(push));
+    // Nothing to stage again, and none under way: current at once, no room reckoned (each decision step asks).
+    let room = match state.vcs_stores.git_ref(repository) {
+      Some((_, store)) if staging.is_none() && !store.repository.needs_stage(push) => return true,
+      Some((_, store)) => store.repository.stage_room(push),
+      None => 0,
+    };
     let turned = within_budget(state, room, |stores| {
       let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
       let mut begun = match staging.take() {
@@ -3053,6 +3061,7 @@ fn hg_step_in(
       let replayed = replay
         .finish(&mut store.index, content)
         .map_err(ReplayRefused::Mercurial)?;
+      store.unstored = true;
       replayed_hg(store, &replayed).map(|_| HgStep::Stepped(None))
     }
     Err(refused) => {
@@ -3100,6 +3109,7 @@ fn replay_hg(
 ) -> Result<u64, ReplayRefused> {
   let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
     .map_err(ReplayRefused::Mercurial)?;
+  store.unstored = true;
   replayed_hg(store, &replayed)
 }
 

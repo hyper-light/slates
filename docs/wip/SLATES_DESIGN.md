@@ -58980,6 +58980,20 @@ are to work a slice at a time over the pack held once (GAPS).
 Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
 `crates/git/src/receive/tests/session.rs`.
 
+**Layer 2, piece 2: a decision step reckons its stage's room from counts** (`slates_git::store::Push::commit_parts`,
+`Repository::stage_room`, `crate::vcs_store::SealedPush::restage_turn`).
+- Found: with the checks fixed, git/git's push landed its changeset and then decided its 1,027 refs at about 0.5 ms a
+  step, unanswered after 1,200 s. A stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits:
+  every decision step first asks whether the push's stage must be made again (A-722 part 4e), and that reckoned the
+  stage's room by a pass over every commit pushed, about 75,000.
+- Now the push keeps the parents its commits name as they arrive, and the room is two counts. A step with no stage due
+  reckons no room at all. Measured on the same push: about 30 µs a decision step.
+- The next wall, measured and owed (GAPS): creating a ref whose head descends from no green's head walks the whole
+  history it reaches for that green's reached set (A-614), so deciding many old tags is about refs times history.
+
+Also applied to: `crates/git/src/store/push.rs`, `crates/git/src/store/repository.rs`,
+`crates/server/src/vcs_store.rs`.
+
 Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
 `crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
 `crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
@@ -59093,6 +59107,33 @@ Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the r
 - **Owed** (GAPS C2): the made changeset's record lands in the register's entry, not first on the node's store as a
   push's does (a made reference and its replay, with w-hg), and a client's push takes no landing turn.
 
+### A-808 — An edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched (2026-11-21, w-fed-move, goal 86b; main's order 03:16 PST: owner asks per client grow with scale; A-247, A-801)
+- **How it was found.** Owner asks per client were 17.5 at 1,000 clients and about 101 at the 100k rung. Contention
+  injected into the 1,000-client stand-in (release, in-process, `kernel/`, one round, `--per-connection 32`), the
+  hot set narrowed: 300, 100, 30, 10 hot files gave 17.5, 23.1, 38.7, 69.4 asks a client; rebases 2.3, 3.9, 9.7, 22.2
+  a client. Counted by the verb that asked (`merge.work.base_ask.<verb>.<files|lengths>`): at 300 hot files edits
+  asked 7.9 lengths a client, at 10 hot files 18.1, and rebases asked 1.6 then 15.0 files a client. An edit asked its
+  file's length whenever the work did not hold the file, though the work keeps each touched path's base entry (A-247:
+  `WorkState::entries`, always at its current base), which names that length; and a rebase gave entries only for the
+  paths its restated journal named, so a path whose change became the head's (a conflict resolved by taking the head's
+  bytes) lost its entry.
+- **Change.** `crates/server/src/work_files.rs`: `Base` carries the work's kept entries, and `Base::len` reads a length
+  there when neither the green nor the verb's fetch has it (`entry_len`); `crates/server/src/work_home.rs`: an edit of
+  a path whose entry the work keeps asks nothing (counted `merge.work.length_from_entry`), and base asks are counted by
+  the verb that asked them; `crates/server/src/verbs.rs` `rebase_answer`: the entries of every path the increment
+  touched, beside those its journal names.
+- **Tests** (macOS arm64, Mac Studio, local). Red first, `slates-server --test works_off_owner
+  an_edit_after_a_rebase_reads_its_files_length_from_the_kept_entry` (a work off its green's shard, its change to `f`
+  made identical to the head, rebased, then editing `f` again: one length asked before, none after, counted from the
+  entry, both writes read back). `works_off_owner` (17), `merge_load`, `work_cow`, `work_edit_cow`, `green_post_state`,
+  `verdict_pages`, the fleet's holder/rebase/work tests (49) and `--lib work_home work_files work_log verbs::tests`
+  pass.
+- **A/B by use** (same stand-in): at 300 hot files asks 17.5 to 14.1 a client (lengths 7.7 to 4.8); at 10 hot files
+  69.4 to 48.5 (lengths 18.1 to 4.7): the length asks now flat in contention, the first edits' alone. Oracle failures 0;
+  at 10 hot files 4 clients starved past the harness's 64 resolutions a round (1 in each run before, that contention's
+  own). Open: a rebase still asks files (13.8 a client at 10 hot files), for the paths its journal names that the work
+  no longer holds (a change identical to the head), whose base bytes its next composition reads.
+
 ### A-809 — A length-preserving change takes its path's anchor through a layer and walks one value (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 3; fixes A-803 by w-fed-move's option 1; A-793, A-787 part 2)
 Applied in the same change to:
 - `crates/merge/src/history.rs`: `Layers`, `Layer`, `Piece::epoch`, `overlay`, `flatten`, `Chunks::resolve_into` and
@@ -59127,4 +59168,3 @@ Applied in the same change to:
     65.4 to 22.5 µs, values 228 to 1.6 a verdict, verdicts/s 4,851–5,178 to 5,684–5,961; oracle failures 0 in all 18
     runs.
 - **Cost moved to reads.** An earlier value's read resolves its anchor's layers (GAPS A-803 (a)).
-

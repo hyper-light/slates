@@ -178,8 +178,15 @@
 > a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
 > the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
-> whole; a log the store does not keep (an imported repository's, until w-hg's C1 step 3) serves no stream (`1\n`,
-> which stock `hg clone --stream` takes as "operation forbidden by server").
+> whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
+> stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
+> `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
+> kept such a revision bare). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
+> stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
+> warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
+> server" (main's ruling 02:31; the stock-hg test above, and
+> `a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs`). Such a clone is a plain clone's speed.
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
@@ -307,9 +314,15 @@
 > object is incomplete of its own, every pushed tip is complete and the walk ends after its first pass. Otherwise it
 > carries the worst state back from each tip depth first, a frame an object, its stack charged as it grows. Red:
 > `receive::tests::the_connectivity_check_charges_its_objects_never_its_edges` (322 objects, 16,449 edges, 8 B an
-> object) asked 134,176 B with 2,254 left at df349a9fe; green. Owed: what else the answer holds for the whole pack
-> (the next wall the 611 MB push meets, measured); red, that push landing within its room; an A/B against stock git
-> (10.77 s).
+> object) asked 134,176 B with 2,254 left at df349a9fe; green. Piece 2 BUILT (2026-11-21): the push then landed its
+> changeset and decided its 1,027 refs at about 0.5 ms a step, unanswered after 1,200 s (r13/r14 at b7d2ae37e, Studio-2;
+> a stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits): `restage_turn`, asked every
+> decision step, reckoned `Repository::stage_room` by a pass over every commit pushed. Now the push keeps its commits'
+> parents as they arrive and the room is two counts; `restage_turn` reckons none when no stage is due. Measured: about
+> 30 µs a decision step (6.9 M steps, 210 s stepping, in 350 s). Owed, the next wall: a created ref whose head descends
+> from no green's head (git/git's old tags) walks its whole history for its green's reached set (A-614), so the
+> decision is about refs times history; design to main. Then red, that push landing within its room; an A/B against
+> stock git (10.77 s). Also measured: the checks take 16 s and the seal 3.7 s of that push.
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -439,6 +452,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
+> asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
+> keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
+> (13.8 a client at 10 hot files) for journal paths whose change became the head's.
+>
+> **A-774 follow-up (2026-11-21, w-fed-move; main's order):** FIXED the stale assertion in `daemon`'s
+> `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`: a green's landing is judged as any
+> volume's (A-774 part 3), so at a missing target it is refused `Target`, no longer `Unsupported` by role.
 >
 > **A-806 (2026-11-21, w-fed-move; goal 86b's 300 MB work log).** FIXED: a rebase answers each changed file as parts
 > over the head; the work holds and its restatement logs those parts, so a work's log is what it wrote. Largest log at

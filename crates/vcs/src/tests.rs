@@ -640,30 +640,41 @@ fn a_merge_made_a_table_a_step_reads_the_same_rows_throughout_and_ends_as_one_ru
   let before = read(&index, &store);
   let runs = index.run_tables().len();
   assert!(runs > 2, "runs to merge: {runs}");
-  let mut merge = index.merge_begin(&store, usize::MAX).unwrap();
-  let mut steps = 0usize;
-  let rows = loop {
-    steps = steps.saturating_add(1);
-    match index.merge_step(&mut store, &mut merge).unwrap() {
-      MergeStep::More => {
-        assert_eq!(merge.tables_cut(), steps, "one table a step");
-        assert_eq!(
-          read(&index, &store),
-          before,
-          "nothing changes until the last step"
-        );
-        assert_eq!(index.run_tables().len(), runs);
-      }
-      MergeStep::Done(rows) => break rows,
-      MergeStep::GivenUp => panic!("nothing shares these runs"),
-    }
-  };
+  let (rows, steps) = merged_a_table_a_step(&mut index, &mut store, &before, runs);
   assert_eq!((rows, steps), (40, 8));
   assert_eq!(index.run_tables().len(), 1);
   assert_eq!(read(&index, &store), before);
   assert_tables_within_the_window(&index, &store);
   index.release(&mut store).unwrap();
   assert_empty(&store);
+}
+
+/// `index`'s runs merged a step at a time: one table cut a step, every row read back as `before` and `runs` runs left
+/// until the last step. The rows merged and the steps taken.
+fn merged_a_table_a_step(
+  index: &mut Index,
+  store: &mut ContentStore,
+  before: &[(Vec<u8>, Vec<u8>)],
+  runs: usize,
+) -> (u64, usize) {
+  let mut merge = index.merge_begin(store, usize::MAX).unwrap();
+  let mut steps = 0usize;
+  loop {
+    steps = steps.saturating_add(1);
+    match index.merge_step(store, &mut merge).unwrap() {
+      MergeStep::More => {
+        assert_eq!(merge.tables_cut(), steps, "one table a step");
+        assert_eq!(
+          read(index, store),
+          before,
+          "nothing changes until the last step"
+        );
+        assert_eq!(index.run_tables().len(), runs);
+      }
+      MergeStep::Done(rows) => return (rows, steps),
+      MergeStep::GivenUp => panic!("nothing shares these runs"),
+    }
+  }
 }
 
 /// A merge whose runs a fork comes to share before its last step is given up, nothing changed: a fork must keep every
@@ -680,7 +691,7 @@ fn a_merge_whose_runs_a_fork_comes_to_share_is_given_up() {
     index.merge_step(&mut store, &mut merge),
     Ok(MergeStep::More)
   );
-  let mut fork = index.fork(&mut store).unwrap();
+  let fork = index.fork(&mut store).unwrap();
   assert_eq!(
     index.merge_step(&mut store, &mut merge),
     Ok(MergeStep::GivenUp)

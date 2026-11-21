@@ -583,6 +583,50 @@ fn read_back(
   })
 }
 
+/// Revision 1's changeset carries the text it put (C2 stage B): its payload `alpha\n`, the `Texts` entry naming it there,
+/// then its record.
+fn carries_its_text(
+  log: &ChangesetLog<hyper_block::file::DeviceFile>,
+  located: &slates_store::log::Located,
+) {
+  let sections = log.sections(located).unwrap();
+  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
+  assert_eq!(
+    kinds,
+    vec![
+      SectionKind::Payload,
+      SectionKind::Texts,
+      SectionKind::Record
+    ]
+  );
+  let read = |section: &slates_store::log::Section| {
+    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
+    log.read_at(&mut bytes, section.offset).unwrap();
+    bytes
+  };
+  let payload = read(&sections[0]);
+  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
+  assert_eq!(payload, b"alpha\n");
+  let entry = &entries[0];
+  assert_eq!(
+    (
+      entries.len(),
+      entry.path.as_slice(),
+      entry.text,
+      entry.len,
+      entry.base
+    ),
+    (
+      1,
+      b"/trunk/a.txt".as_slice(),
+      *blake3::hash(b"alpha\n").as_bytes(),
+      6,
+      None
+    )
+  );
+  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+}
+
 /// C2's arbiter (main's ruling of 2026-11-20 20:30, item 4: "the state before the kill must equal the state recovered
 /// from the store"). Do: on a daemon holding a store, create a Subversion repository, land revision 1 (`/trunk` and a
 /// file), a revision's properties set whole, and revision 2 changing the file; stop the daemon (a stop publishes
@@ -672,44 +716,7 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
     .collect();
   let sequences: Vec<u64> = ours.iter().map(|located| located.header.sequence).collect();
   assert_eq!(sequences, vec![0, 1, 2, 3]);
-  // Revision 1's changeset carries the text it put (C2 stage B): its payload, the `Texts` entry naming it there, then
-  // its record.
-  let sections = log.sections(&ours[1]).unwrap();
-  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
-  assert_eq!(
-    kinds,
-    vec![
-      SectionKind::Payload,
-      SectionKind::Texts,
-      SectionKind::Record
-    ]
-  );
-  let read = |section: &slates_store::log::Section| {
-    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
-    log.read_at(&mut bytes, section.offset).unwrap();
-    bytes
-  };
-  let payload = read(&sections[0]);
-  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
-  assert_eq!(payload, b"alpha\n");
-  let entry = &entries[0];
-  assert_eq!(
-    (
-      entries.len(),
-      entry.path.as_slice(),
-      entry.text,
-      entry.len,
-      entry.base
-    ),
-    (
-      1,
-      b"/trunk/a.txt".as_slice(),
-      *blake3::hash(b"alpha\n").as_bytes(),
-      6,
-      None
-    )
-  );
-  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+  carries_its_text(&log, &ours[1]);
 }
 
 /// C2's crash between the store's landing and the register's commit (main's rulings of 2026-11-20 20:30 item 5 and

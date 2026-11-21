@@ -9013,6 +9013,7 @@ fn edit(
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_edit(
       (&mut w.files, &mut w.journal),
@@ -9249,6 +9250,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op)
   };
@@ -9422,6 +9424,7 @@ fn build_increment(
     green: Some(&*engine),
     fetched: None,
     version: base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
@@ -11178,6 +11181,7 @@ pub(crate) fn compose_on_replica(
     green: Some(replica),
     fetched: None,
     version: sealed.base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(
     state,
@@ -11373,6 +11377,7 @@ fn apply_replacement(
     green: Some(engine),
     fetched: None,
     version: head,
+    entries: None,
   };
   let unknown = || Refusal::UnknownBase {
     green: VolumeId::default(),
@@ -11435,12 +11440,21 @@ fn rebase_answer(
       changed,
       journal,
     } => {
-      // A work that composed its own increment composes its next one too: it is given the entries it will need.
+      // A work that composed its own increment composes its next one too: it is given the entries it will need, of the
+      // paths its restated journal names and of every path its increment touched, so an edit of a path whose change
+      // became the head's reads its length from the entry, not the owner (A-808).
       let entries = if composes {
         journal
           .iter()
           .flat_map(VolumeOp::names)
           .flatten()
+          .chain(
+            inc
+              .doc
+              .ops
+              .iter()
+              .filter_map(|op| inc.doc.paths.path(op.path)),
+          )
           .map(|path| (path.to_owned(), engine.path_base(version, path)))
           .collect()
       } else {

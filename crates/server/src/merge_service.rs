@@ -356,6 +356,7 @@ pub(crate) fn with_work_base<R>(
     green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
+    entries: Some(&work.entries),
   })
 }
 
