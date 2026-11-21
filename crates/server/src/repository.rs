@@ -462,18 +462,22 @@ pub(crate) const CREATION_UNRUN: &str = "repository.create.unrun";
 /// store cannot recover; the client's retry creates it afresh. The repository's record is judged before the landing (a
 /// name already taken lands nothing), and judged again when it is recorded, since another creation may have taken the
 /// name meanwhile. Its ids are reserved now (`ShardState::family_reserved_through`). The verb defers its acceptance
-/// (AUD-11); a request with no reply route (one forwarded from another node, answered on the exchange that carried it)
-/// cannot wait for the landing, and is refused `Unsupported` on a node keeping a store.
+/// (AUD-11) and the client is answered by its reply route once the creation is recorded. Every creation has one: a
+/// repository's verbs are served on the node the client reached, on the partition its name hashes to (A-575;
+/// `RequestBody::volume` names no volume for them, so `verbs::serve_forward` never carries one to another node), and a
+/// same-node forward between shards carries its route; so a fleet answers a creation as a laptop does (R8). A dispatch
+/// with no request or no route (a shard's own call) is refused `Unsupported`, typed, on every node alike.
 fn land_then_record(
   state: &mut ShardState,
   (disk, principal): (slates_store::owner::StoreHandle, &Principal),
   (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
   (adopted, (repository, minted)): (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
 ) -> ReplyBody {
-  let Some(deferred) = state.current_request.zip(state.reply_route) else {
+  let Some((request, route)) = state.current_request.zip(state.reply_route) else {
     return refused(Refusal::Unsupported {
-      feature: "a repository created by a request with no reply route on a node keeping a changeset store (A-767 item 7)"
-        .to_owned(),
+      feature:
+        "a repository created with no client request to answer once it is landed (A-767 item 7)"
+          .to_owned(),
     });
   };
   let judged = admits(
@@ -542,7 +546,7 @@ fn land_then_record(
         },
         1,
       );
-      let ((origin, id), route) = deferred;
+      let (origin, id) = request;
       state.db.begin();
       let reply = match landed {
         Ok(_) => record_created(
@@ -561,9 +565,9 @@ fn land_then_record(
           refused(refusal_of_db(&error))
         }
       };
-      (route, reply, state.shard)
+      (reply, state.shard)
     });
-    if let Some((route, reply, here)) = answered {
+    if let Some((reply, here)) = answered {
       crate::told::deliver_to(route, reply, here);
     }
   };

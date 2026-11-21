@@ -189,8 +189,12 @@
 > could not recover. Now `land_then_record` judges the record, reserves its ids (`ShardState::family_reserved_through`),
 > lands changeset 0, and only then records the repository, its root and its completion in one transaction and answers.
 > Held by `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once` (red
-> before: the repository left behind). A create with no reply route (forwarded from another node) on a node keeping a
-> store is refused `Unsupported`: owed with the store's fleet half (A-767 item 5).
+> before: the repository left behind). No creation is forwarded to another node (repository verbs name no volume,
+> so `serve_forward` never carries one; A-575), so a fleet answers it as a laptop does (R8). Across a restart the
+> successor mints a killed creation's id again; its new changeset 0 is the row the store gives, the orphan's never
+> (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, green unchanged: a `(repository,
+> sequence)` row is the newest landing at it, the only one the register can name). The orphan's log bytes stay until
+> the cleaner of unnamed log space (owed).
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.

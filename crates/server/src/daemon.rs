@@ -4298,7 +4298,7 @@ fn region_name_key(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) ->
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`
 /// marker replaced by `con`, so it stays the same length (within the platform's shared-object name
 /// limit the segment already meets) and is distinct from the segment's own name.
-fn content_name_of(seg_name: &str) -> String {
+pub(crate) fn content_name_of(seg_name: &str) -> String {
   match seg_name.strip_prefix("slates-seg-") {
     Some(rest) => format!("slates-con-{rest}"),
     None => format!("{seg_name}-c"),
