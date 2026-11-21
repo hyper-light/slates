@@ -307,3 +307,24 @@
   svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
 - P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
   status returned too soon" (the script's report). Fix the script after C2.
+- C2 stage A LANDED 72576cb1f (0703e62d2 + 65f69e1da). Tests: server 136/136 affected; cli svn_interop 4/4,
+  svn_http_reports 9/9, cli create 1/1. Main's ruling on svn_made (inbox w-svn-from-main-c2-made): submit acceptance
+  deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
+- C2 stage B part 1 LANDED 40c3f8d1e (e69375553): texts in the changeset, recovery fetch, barrier gone for svn. P6/P7
+  measured (BENCHMARKS). Next: B part 2 (texts read through the owner). Stock legs kiln r2 on mac-studio.local-2; P8 next.
+- 2026-11-21 ~00:50: P6 CLOSED (close note), P8 CLOSED (002a7944f), P7: real-daemon peak measured (8508a8d52: 1,570
+  MiB for a 437 MiB dump, half the segment: green chain carries texts), green-fold rejected (c9f79f925), svnsync
+  measurement landed (1bfe51f88) and running on the big Studio (kiln r10). Stock legs pass on the Studio (r8).
+  Open: C2 B2 (main to decide, inbox stage-b2-value), svn_made (w-work-cow's view), C. B2a wait-path patch kept at
+  ~/.cache/w-svn-b2a-wait.patch.
+- 2026-11-21 ~01:20 PST state: CLOSED C1 R3 R4 R5 P6 P8. P7 measured (svn:// svnsync 270.7 s vs 1,068; real daemon peak
+  1,570 MiB / 437 MiB dump, half the green's chain in the segment; HTTP svnsync init fixed 2dafcad02, replay-report
+  absent -> GAPS), awaiting main's close. C2: stage A (72576cb1f) and B part 1 (40c3f8d1e) on main; B part 2 and C sent
+  to main with sizing (inbox stage-b2-value, stage-c-analysis), awaiting the call; svn_made waits for w-work-cow's
+  post-verdict view (main's routing), w-git builds git's made commits on the same hook. Worktree ~/slates-work/w-svn-c2
+  at main 9d792682f, clean. Patches kept: ~/.cache/w-svn-b2a-wait.patch (B2 wait path), ~/.cache/w-svn-fold-attempt.patch
+  (rejected fold).
+- 2026-11-21 ~02:10 PST: B2 (a) on main: drives (35786a9dd/b934f9e5b), ra_svn get-file (9061acd6c), DAV GET
+  (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
+  window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
+  and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.

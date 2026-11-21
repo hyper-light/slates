@@ -6954,10 +6954,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-mount C1/R4 (77fcae73a, 60a71db8a; main 56e44c7f8)
 - Linux (FUSE): `cargo test --locked -p slates-server --test fuse_mount a_work_mounted_through_fuse` on a host with
   fusermount3 and /dev/fuse. Red: a read of `f` refused (the tree host not lent) or the submit not Accepted with TWO in
-  the green's head.
-- Windows: build `cargo test --locked -p slates-server --no-run` (winfsp.rs's tree lend, cfg(windows), never compiled on
-  macOS), then `cargo test --locked -p slates-cli --test winfsp a_work_mounted_through_winfsp` with WinFsp live. Red: a
-  compile error in crates/server/src/winfsp.rs, a refused read through the drive, or the save missing from the head.
+  the green's head. (Mine to run, as the Windows ones are: main 2026-11-21.)
 - Suites (main's): `cargo test -p slates-server` integration targets nfs_mount, snapshot_landing, presentations,
   recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
 - Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
@@ -7024,3 +7021,45 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
   suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
   taken partial, or a stalled exchange (its progress now counted on delivery).
+
+## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
+- clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
+- Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.
+- w-fed-faults for w-lint, A-795 (6f29c8d, the S3 base removed): the Linux-only code it changed was never compiled.
+  crates/server/src/fuse.rs (the kept-request path removed; the turn lends the host straight to the bridge; the A-509
+  test's FuseMount without `kept`/`kept_waker`) and crates/bridge-fuse/src/channel.rs (`dispatch_kept`,
+  `allocation_running` and `Dispatched::request` removed). The Mac Studio has both Linux Rust targets but no Linux C
+  cross-compiler or sysroot (zstd-sys, blake3 and aws-lc-sys stop), and adacachy refused every start. On Linux x86_64
+  (and aarch64): `cargo clippy --locked -p slates-server -p slates-bridge-fuse --lib --tests`, then
+  `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
+  Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
+  held replies).
+
+## 2026-11-21T08:20Z w-fed-move main 086089ba (goal 86b C1 rung: A-792, A-793, A-794, A-797 by use)
+- Command (repository root, release; a load run, so main's under CLAUDE.md §8):
+  `SLATES_LOADTEST_TREE=<a Linux kernel checkout, v7.4-rc4 5f22fb204, 97,371 files>
+  SLATES_LOADTEST_BENCH=<target>/release/examples/load_bench SLATES_LOADTEST_CLIENTS=100000
+  SLATES_LOADTEST_ARGS="--rounds 1 --per-connection 32 --hot-files 42000 --reply-patience 3600"
+  cargo test --release --locked -p slates-cli --test load_scale -- --nocapture`, after
+  `cargo build --release --locked -p slates-client --example load_bench` and `-p slates-cli`.
+- Needs: mem=40g (measured about 30 GB: primary 13 GB, replicas 5.8 GB each, client daemon 1.8 GB, bench 3.3 GB) and
+  disk for the 2.1 GB tree; in kiln declare it in `needs` (`cpus=16,mem=40g` or more), never pin with `on`.
+  Runs 15 to 65 minutes.
+- Platform: macOS arm64 or Linux (the test reads `ps`; on Linux raise `ulimit -n`, per the test's module docs).
+- What to read: the `bound`, `oracle`, `refusal`, `node` and `rung` rows, and any `slates-server: ... (first
+  occurrence)` lines (the merge-budget and retention-cap diagnoses), `is spinning`, `killing it`.
+- Red: any `oracle_failures` above 0 (a wrong verdict); a watchdog kill (`killing it`, A-797's wall); `refusal` rows
+  (TableAtCapacity: A-794's wall; BudgetExceeded: open); `bench_exit -1` with `pending ... inflight Some((SubmitAccepted`
+  rows that stop moving (the open lost-reply wall: compare the client node's `fleet.forward.client.resolved` with
+  `delivered_home` in its `slates status --json`).
+- Known so far: on main 8a18edcc + A-797 (stopped at 96 of 97 GB swap) no kill in 3,110 s; about 2,700 submits never
+  answered; one 300 MB work log.
+- Who to send results to: w-fed-move
+
+
+## w-shared 01:40 PST 2026-11-21 (kiln ids; all sync:false over https)
+- r16 (big Studio, running): agents/w-shared-byref-ci 4a16c53d4: merge, cluster, server lib, 8 server suites, cli kill test, and a baseline of 5 lib tests at 544020bd2.
+- r20 (queued, macos mem=16g disk=40g): the kill test's red at 544020bd2 with only the test applied (r18, r19 lost: runner b24c5c95 did not answer).
+- r21 (queued, same needs): 3a release bench on origin/main, 64/128/256/320/512 MiB x 10 (r15's placement went away before it started).
+- r22 (queued, linux): family three green + red (r14 lost: adacachy restarted mid-build).
+- Local target ~/.cache/w-shared-local-target.noindex deleted at 01:38 (main's 01:23 note); exit-4 scratch deleted too. No local builds from here.

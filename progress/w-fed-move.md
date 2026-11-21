@@ -1,5 +1,49 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~02:30 PST: A-802 LANDED slates main fd0dd8eb (injections; the destroy's O(volumes) scan)
+- Harness injections: --idle-works M, --preload V, --lagged-submit; the owner's per-kind counters printed after each
+  phase. Results: (a) flat; (b) verdict about 2x at 10^5; (c) 10^4 idle works cut 6,513 to 2,506 verdicts/s, which
+  was a destroy collecting every volume record (erase_volume_keys) -> per-tenant count. A/B: 2,506 -> 5,956/s.
+- Next: (b) the verdict's growth with history (41 -> 90 us over 10^5 versions).
+
+## 2026-11-21 ~01:40 PST: A-801 LANDED slates main 2d079c44 (throughput: name the mechanism first)
+- Owner asks counted by kind and answers timed by kind on the owner; the harness prints the server nodes' merge
+  counters (`server_counter` rows; load_scale passes its servers).
+- 1k in-process over kernel/: 17.5 asks a client (lengths 44%, files 18%), owner 185 ms in all: not the wall at 1k.
+- Waiting on r48's primary rows to pick the throughput mechanism. Small-scale proxies tried: 1k in-process (above).
+
+## 2026-11-21 ~01:30 PST: A-800 LANDED slates main 9918e6c0 (main's order: the lost replies first)
+- Drop sites on the reply-home hop listed, each counted apart; the silent ones (a reply dropped while its shard's
+  state is borrowed, finish_owner_forward's and deliver's refused borrows) now resend or count. Three red/green tests.
+- Told main: inbox/main-from-w-fed-move-counters.md (main reruns 100k from run-requests.md).
+- Leading candidate: a reply admitted and never run; A-798 (931e52ed) fixed such a lost kick since.
+- Next (main's order 3): the throughput walls (153 verdicts/s; 10.1 M owner asks), each with a counter-named mechanism
+  and an A/B; measured only at small scale here, the heavy runs filed to main.
+
+## 2026-11-21 ~00:20 PST: A-797 LANDED slates main 086089ba; main STOPPED my 100k run (swap); load runs are main's now
+- A-797: the green's owner answers a batch of asks within its step budget, the rest handed back (the primary had been
+  killed by its watchdog: shard 0 spun 1,055 ms in one batch). Unit test red->green; 42 fleet tests pass.
+- Partial evidence, not proof (run on main 8a18edcc + A-797, ~22:49-00:03, stopped by main: the Studio was at 96 of 97
+  GB swap; the run held ~30 GB): no `is spinning` and no kill in 3,110 s (the run before: six reports, one kill);
+  1,570,311 batches handed back. Latencies confounded by swap. Open walls it showed (GAPS A-797): ~2,700 submits never
+  answered (client node: forwards resolved 9,116,579, delivered home 9,113,196, 3,383 lost); one 300 MB work log;
+  10.1 M owner asks.
+- Log summary recorded here; the 100k rung is filed in run-requests.md (mem=40g). I do not run it again.
+- Next: my close list has C1 (this) and R2 (closed). Next piece on C1 that needs no load run: the lost forwarded reply
+  (3,383 between resolved and delivered_home), found with unit/integration tests only.
+
+## 2026-11-20 ~23:00 PST: C1 continued
+- A-794 LANDED slates main 8a18edcc (dc4f6eb0): forwarded CreateWork placed by its name's partition, not the green's
+  (76,955 works had filled the primary's one partition: TableAtCapacity 71,776 -> 0); a forwarded verb parked at its
+  work's gate answers its exchange at resume. CreateWork p50 18.3 -> 10.0 s. Next: 64,072 accepted submits refused
+  BudgetExceeded (a retention-cap first-occurrence log line is in A-794).
+- A-797 (claimed; in progress, uncommitted in ~/slates-work/w-fed-move-slates): the primary was KILLED by its watchdog
+  -- shard 0 spun 1,055 ms in one poll answering a batch of work asks (xshard.rs:926) -> answer_within: a batch answered
+  within the owner's step budget, the rest handed back. Unit test red->green; 42 fleet work/forward tests pass. Running:
+  100k (~/slates-work/w-fed-move-c1-100k-a797.log).
+- MISTAKE, fixed: my state push 339b8fd0 carried amendments.tsv conflict markers (~10 min); fixed in 02895150. Now
+  pushing state only via ~/.cache/w-fed-move-state-push.sh (stops on any conflict or marker).
+
 ## 2026-11-20 ~22:30 PST: C1 (goal 86b) in progress -- two walls fixed and LANDED, the third diagnosed next
 - A-792 LANDED slates main 60586cdd (3b3e0f4f): a green's listing at its head reads the directory's subtree
   (Green::head_under). 10k clients: wall 201 -> 75 s, primary CPU 175 -> 53 s, oracle clean.

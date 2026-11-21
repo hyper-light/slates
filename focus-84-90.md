@@ -1375,3 +1375,181 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - 2026-11-20 22:33 PST NETWORK worse: from the big Studio, the router 2.1-3.6 s and 1.1.1.1 4.3-4.5 s; DNS fails; kiln's MCP link drops ("not connected") though its port answers. This Studio's en1 carries only about 588 KiB/s in and 20 KiB/s out, so the congestion is elsewhere (the router or the Wi-Fi channel). Nothing published; agents unreachable.
 - 2026-11-20 22:34 PST NETWORK recovering: the router at 34-47 ms, 1.1.1.1 at 160-200 ms, DNS answers; the four held state commits published (7218c47). kiln's MCP link from main still "not connected". LANDED: f9ddaf1d4 (w-lint: Windows clippy reds from jupiter's run r10; unix-only helpers gated, a missing hold bound, an unwrap).
 - 2026-11-20 22:46 PST MAIN MOVED back to the MacBook (adas-macbook-pro-2.local) after its session restarted at about 22:40. Its own state checkout is now ~/.local/state/slates-fanout-main: the MacBook's ~/.local/state/slates-fanout is the workers' shared checkout, on branch main. Pushes go over SSH directly; the audit clone is ~/.local/state/slates-audit.git. The memory directory here predated main's 18:00-22:00 work; the three new memories (kiln engines, vendor once, peer plans) and the five-minute notes were copied over from the big Studio and the index fixed. LANDED: f9ddaf1d4 (w-lint: Windows clippy reds from jupiter's r10, unix-only helpers gated, a missing hold bound, an unwrap); w-work-mount's Windows branch content on main. The MacBook's agents run again. Studio-2's runner doesn't answer runs again (15 s), and its agents w-lint, w-balance, w-reaper and w-work-mount show offline. STILL NEEDS ADA: w-store.
+- 2026-11-20 22:49 PST LANDED: c3db76bcd (w-shared transport step three: a received packet opened where it arrived, its stream bytes delivered once, a message taken whole by move; the bulk row's goodput median from 1,092 to about 1,300 MB/s). DISK: Studio-4 down to 31 GiB free (59 at 21:58). clean-aggressive.sh freed 0 GB: everything recent or in use. Owners told to delete by exact path: g228-local-target 36.9 GiB (g228), w-forming-land.noindex 18.7 GiB (w-forming), g222-p2-target 10.7 GiB (g222, 84b closed), w-provision-gate-target 4.8, w-realtools-target 4.7, w-git-target 2.4, w-rewrite-ops-ab 1.3 (lists done). Studio-2's runner still doesn't answer runs in 15 s, though its agents show idle again.
+- 2026-11-20 22:54 PST LANDED: 6823fde6f (w-work-cow, goal 88: A-796, the Codex agent's conflict check and head-conditional resolution on main's rebase; a check publishes nothing, a resolution is bound to what was checked; proven on one shard and on eight, red with the moved-head check removed). w-work-cow told to finish the strand: conflict-cli's CLI/MCP adapters, the rebase_with refinement, conflict-mutants' tests. Studio-4 back to 59 GiB free after the owners' trims. Studio-2's runner still doesn't answer runs. UI: since the restart moved main's kiln session to the MacBook (kiln: "restarted on this machine part-way through your last turn"), goals_get shows main's stack empty (items [], updated_at 0), so goals_update and goals_done fail ("no goal ... in this stack"). Goal 88's landing couldn't be recorded in its text. Asked Ada.
+- 2026-11-20 22:58 PST DISK: Studio-4 at 56 GiB free (w-forming deleted its 19 GB target; w-git its 2.4 GiB). Studio-2's runner still answers no runs, now about an hour; w-reaper's ef3247236 (the hook view's derived size) has sat 99 min, its completion notices likely lost; told to read its runs and land, or rerun on Studio-1 and Linux. UI: main's goal stack still reads empty since the restart, waiting on Ada.
+- 2026-11-20 23:03 PST READY: A-795 (w-fed-faults, the S3 base removed whole: agents/w-fed-faults-no-s3 5747905, 58 files, +223/-10,875; A-464, A-471, A-524, A-555 and A-791 marked removed; kept with non-S3 users: BaseHost::Tree, the vendored aws-lc-rs and its MD5, hg_base's refusal tests over EIO). It waits only on a Linux build of fuse.rs, and adacachy has refused starts since about 22:00. Told: cross-target check from the Mac (x86_64-unknown-linux-gnu), then land. RED ON MAIN (found by w-fed-faults): (1) 10 server tests fail with a submit refused Overloaded (repository, vcs_store paths and commits); w-fed-faults bisects next. (2) A-796 appended five wire variants and MergeView without publishing their tags, so slates-ipc --test wire_order fails on 68ce3d585; w-work-cow publishes them before its adapters. Studio-2's runner still answers no runs. The goal stack still reads empty.
+- 2026-11-20 23:09 PST LANDED: c1e76d0a7 (w-work-cow: the merge check and resolution as MCP tools and CLI verbs, slates.merge.check/read_check/resolve and slates check/resolve, one JSON shape; goal 88's adapters); 3760530f5 (w-interop GAPS: Linux counts on adacachy, release 90e9b720c, load 31-55: hg 22/24 and git v2.0.0 26/27; spins in hg_push::unbundle, the HTTP edge's connection task vcs_http.rs:850 and a restarted daemon's start_shard daemon.rs:1186). ROUTED, since they block 93 interop's Linux rows: start_shard and the HTTP edge to w-bugs after its P1 spin lands; unbundle to w-hg with its no-store commit. Studio-2's runner still answers no runs; the goal stack still reads empty.
+- 2026-11-20 23:14 PST LANDED: 04b8da713 (w-work-cow: A-796's wire variants published; main's wire_order green again); 72576cb1f (w-svn C2 stage A: every svn record landed whole on the store, committed by a reference-only register entry, recovery replaying named changesets, the unnamed dropped; no --vcs-store refused typed; one shared test_store helper; 136/136 plus the arbiter and crash tests). Goal 88: all landed except the rebase_with refinement; w-work-cow told to settle it with a test. RULINGS: w-engine 89b, progress for paced background work is a guarantee: start the fold when its backlog's cost passes a quantum, and give it one slice per quantum even while others wait, slice from the latency budget; A/B against cut 1 (and fold-at-write), judged on SubmitAccepted p99/p999 and the fold beating the cap. w-engine builds w-svn's post-verdict read view first (changeset completion before performance). w-svn: stage B (texts on the store, async) now, svn_made when the hook lands, then stage C measured. w-provision-gate: the benches' end-of-run hang (round_trip forever, every shard parked), a lost wake, red first. w-shared: exit 4 traced to identities.rs:243 read_then_route running a 128 MiB+ first submit inline in one poll.
+- 2026-11-20 23:19 PST CORRECTION: Studio-1 (adas-mac-studio.local, Mac.attlocal.net) has no svn (checked: command -v svn finds none). Stock svn 1.15 is on the big Studio, adas-mac-studio.local-2, as w-reaper found when its runs died; main's earlier pointers to w-reaper and w-svn were wrong. w-svn corrected. w-git told to land agents/w-git-c5 (10 commits, 32 min) once r5 is green. w-reaper's ef3247236 is 118 min unlanded; it is rerunning on the big Studio. Studio-2's runner still answers no runs; the goal stack still reads empty.
+- 2026-11-20 23:24 PST w-engine was deaf after the big Studio's runner restart (the 23:15 ruling sat "waiting"); agents_restart restarted its harness in place ("restarted": true). It works for main's own children where agents_start is refused for mode, so w-engine keeps bypass. w-reaper's runs died at the sync because Studio-2's runner is silent; told to run unsynced on the big Studio (svn 1.15 there), fetching agents/w-reaper-a645a from GitHub. w-hg fixed its 59 tests broken by the creation-first order with a test-only blocking creator (production unchanged). w-git's C5 waits only on r5's focused tests.
+- 2026-11-20 23:29 PST Studio-2's runner link is down: agents_restart of w-reaper answered "the link to its runner dropped before it answered". The agents there (w-reaper, w-lint, w-balance, w-work-mount, w-sessionlog, w-k90-microvm) can't take messages or start runs. HANDOVER: w-interop lands w-reaper's ef3247236 (the hook view's derived size; 128 min unlanded), tested on the big Studio's svn 1.15, then reruns its svn matrix. w-fed-faults told to land A-795 (the S3 removal, 32 min) before its bisect goes on. w-engine re-sent its order after its restart. NEEDS ADA: a restart of Studio-2's kiln runner; w-store's restore; the goal stack.
+- 2026-11-20 23:34 PST w-engine stays deaf after two agents_restart calls ("restarted": true each time, its message still "waiting"); its harness on the big Studio isn't taking turns. w-svn's post-verdict read view (svn_made) moves to w-work-cow after rebase_with (next to its A-796 pure check), red first on a generated history; w-svn told. w-interop merged w-reaper's fix (f09d464ec on its scratch branch), tests next. No landings since 23:10; A-795 (S3 removal), w-git C5 and w-reaper's fix all wait on their tests. NEEDS ADA: Studio-2's runner restart; w-engine deaf (its restart needs a person or a working harness); w-store's restore; the goal stack.
+- 2026-11-20 23:38 PST LANDED: 931e52ed6 (w-provision-gate, A-798: the benches' end-of-run lost wake. A shard's idle spin looked at its rings before it harvested the driver, so a kick that came between was taken by the harvest and the shard parked with the ring unseen. Harvest first, then look. crates/rt/tests/spin_kick.rs deterministic, red 3/3 (parked to the 20 s backstop) and green 3/3; reproduced first by use, 1 provision_bench run in 2 hung on main. Unblocks 84a, 86a and 89b's measurements). c592a81f0 (w-shared, 93 shared: a path's composition finds each op's offset in about root-ops steps, new runs merged as made; exit 4 at 128-320 MiB gone, each size passing on Studio-1). w-svn's svn_made waits only on the post-verdict read view, now with w-work-cow.
+- 2026-11-20 23:43 PST LANDED: ef3247236 via a51023f57 (w-reaper's view sized to its own content, landed by w-interop for the stranded w-reaper; tested on the big Studio's svn 1.15); 976854bee (g222, 84a's reply-wait A/B on five platforms: parking at once takes Linux arm64's loaded accept p99 from 2.1-3.2 ms to 0.36-0.43 ms with R9 unharmed at 31.6-37.7 us, but Linux x86_64 stays at 3.2 ms, macOS at 8 ms, and no p999 is under 1 ms; 84a still open). w-hg confirms the Overloaded reds on clean main 68ce3d585 (10 of its 11 non-hg failures); w-fed-faults is bisecting. Still unlanded: A-795 (47 min), w-git C5 (57 min, r5 running).
+- 2026-11-21 00:05 PST CONFIRMED: A-795, the S3 base removed whole, is on main as 6f29c8de5 (22:55); no S3 files left on main apart from aws-lc's vendored TLS sources (s3_*.cc are SSLv3, not S3). RULINGS:
+  - w-engine 89b (pacing): background work with a deadline gets a guaranteed share, a sporadic or constant-bandwidth server. The fold starts once its backlog's measured cost passes one quantum, and gets one slice per quantum even while others wait; the slice is derived from the latency bound, and the deadline is checked on every slice. The last ~43 ms step and the 13 ms single-key folds get sliced too. The +0.1-0.7 ms median at Z=20 needs a counter-named cause before landing.
+  - w-shared, the lane's 320 MiB refusals: measure the forward's phases first. The control beat running 0.5-1.4 s late is a bounded-work bug. The refusal is a liveness bug: the bound must be judged on progress or derived from bytes over the measured rate, and a retry never re-sends content the owner stored. Red test first; 320 and 512 MiB must pass 10 of 10.
+  - w-hg: its store-less refusal test must not assert git succeeds (C2 ruling §1: one rule for all three tools); git's leg goes to w-git's C5.
+  - g226 unfrozen after 5 h: the status memory report reading 0 MiB for a 256 MiB burst is a defect in R3's split, not new work; option (a), test first.
+  - w-reaper: its fix is on main (a51023f57); stop retrying and close.
+- 2026-11-21 00:05 PST MEMORY: the big Studio was swapping 96 GB on 96 GiB of RAM (180-250 MB free). Main sent TERM to w-fed-move's 100,000-client load run (~30 GB, started 22:49; a load run is main's under §8) and to w-k90-containers' release kiln build for the comparison test (23 GB; out of scope since Ada's 21:00 ruling, and its Windows container port is not to land). 28 GB unused after. w-git's C5 run r5 sat at 0% CPU for 70 min, beside an orphan of the run kiln lost. w-git is told to sample it, kill it, merge main (A-798) and rerun with timeout_s and mem needs. common.md gains SHARED MACHINES' MEMORY.
+- 2026-11-21 00:16 PST LANDED (verified on main):
+  - c079819bb (A-797, goal 86b): the green's owner answers a batch of work asks within its step budget and hands the rest back; a 100k run showed no spinning shard or watchdog kill in 3,110 s.
+  - e69375553 (w-svn C2 stage B part 1): a commit's texts land in its changeset in one sliced landing.
+  - e1f246ca8 (g228): each timed live hop publishes per-write p50/p99/p999/max.
+  - f9ddaf1d4 (w-lint): r10's mechanical Windows clippy reds.
+  RULINGS:
+  - g222: land B (park at once) now. It holds R9 at 31.6-37.7 us and takes Linux arm64's loaded p99 from 2.1-3.2 ms to 0.36-0.43 ms; its quiet p50 cost of +10-30 us is recorded. Then C wins that back or goes in as measured-and-rejected. Next, Linux x86_64's one-shard derivation on 4 cores (A/B the shard count), macOS split by hop, then p999.
+  - w-shared's lane plan approved, with step 4 (content by identity) before step 3 (slicing), so the copies step 4 deletes are never sliced.
+  w-engine: deaf a third time, its harness alive but idle and not taking in mail. Main ended that idle harness (pid 14495, checked against its session path) and restarted it (pid 76811, 00:11).
+- 2026-11-21 00:14 PST (the "00:16" stamp above was written at 00:12; stamps come from `date` from here on). LANDED (on main):
+  - f660401d4 (w-bugs P1, A-745 item 4): a fetch's pack marks a part's wanted entries a window at a time, so a deepen's pack no longer spins its shard.
+  - 95babc5ab (w-git's r5 hang): the test store owner's stop is bounded, and a leaked handle is a failure, not a hang.
+  - ecbeed926: one test_store declaration (w-svn's).
+  GOAL STACKS: two of the vendoring plan's per-agent goals still carried the pre-ruling text, and kiln kept re-sending them, which is why the container-engine work kept coming back.
+  - w-k90-containers' "OCI/Docker engine" goal (01a1fa58d068, plan 01a1fa365f56 step 2) is marked MET with the 20:58 attach evidence: macOS bind r70 at kiln fa86489f5; export as an NFS volume r49 at kiln 2f589baa6; Linux rootless podman.
+  - w-k90-a520's "A-520 piece 5" goal (01a1fa36855a, step 3) is REMOVED (skipped), as it was in the UI at 20:58.
+  - w-k90-a520 was interrupted before it ran the bind-vs-export A/B on the MacBook.
+  - No other w-* agent holds an open goal except w-k90-pin-2's vendoring CI on every platform.
+  RULING: w-k90-win frees kiln's CI lane. It cancels pre-fix run 44867288588 once w-k90-pin-2 confirms it needs nothing from it, then starts one run with the w2/w7 fix (f16212799). w-shared is told to land its exit-4 docs branch, 38 min old.
+- 2026-11-21 00:22 PST
+  - PERF GAP (goal 93): w-interop's hg table, best of 3, the Studio loaded, slates 907c246ac against hg serve, 57,035 changesets:
+    - push of the whole history: 136.4 s vs 22.6 s (6x slower)
+    - clone -U: 24.0 vs 16.4 s (1.5x)
+    - one-changeset push: about even
+    - one-changeset pull: 4.219 vs 0.230 s (18x)
+    - clone --stream: 48.1 vs 0.894 s (54x)
+    - svn is at about parity; git waits on w-git's push fix.
+  - ROUTED:
+    - w-perf (its list done) takes hg's serve side: phase-split the pull and stream clone, design with w-hg on the store-backed path, A/B against hg serve. It uses the kiln CLI from the MacBook, which reached the big Studio at 00:20.
+    - w-hg keeps the push with the unbundle spin.
+    - w-interop starts r7 (svn HTTP v2 rows), then splits svn's slower checkout and update by phase for w-svn.
+    - w-bugs starts the HTTP edge spin while its r5 queues.
+    - w-git declares disk for cold builds; r15's cold build is on the MacBook, which has 43 GB free.
+  - STOPPED: w-k90-containers' Windows container build on jupiter (task started 00:13 from the stale re-sent goal, kiln-work/w-k90-containers-win). Main ended its process tree by exact path: taskkill /T on bash 537332 after checking its command line; cargo 533828 and its rustc children gone; jupiter's idle cores went from 20 to 28 of 32. kiln refuses another agent's run id ("no run"). w-k90-containers' harness hasn't taken main's 00:23 stop yet.
+- 2026-11-21 00:25 PST LANDED (on main):
+  - 85b88770e: A-799, 84a arm B. A client's sync wait parks at once unless its caller names a spin.
+  - 645937436: w-fed-faults, the 10 Overloaded server reds fixed. A-787's park now composes unrefined outside a recorded request. Bisected to 2a498b90f.
+  - 47b87f28d: w-shared lane step 1. The forward is timed on both ends; a 32 MiB holder submit's build step measured at 909 ms.
+  - e460c0501: w-svn P7, an import's memory attributed by region.
+  - f656820d3 and 41167afaa: g228, 85a's costs A/B'd and both shapes rejected. A live write adds 107-113 us at the median on Linux and 169-205 us on the Studio, against the 50 us target.
+  - A-792, A-793, A-794 and A-797 from w-fed-move.
+  CLOSED: w-fed-faults' list (A-795 and the bisect); w-reaper's list; w-k90-a520's list; w-interop's HTTP v2 rows. 86b C1 is NOT met: 153 verdicts/s, and p99 in tens of seconds at 100k.
+  RULINGS:
+  - w-fed-move: the 3,383 lost replies come first, a correctness bug. Find every drop site on the control-to-client-shard hop, add a counter per site, and write small injected red tests. Main reruns 100k once the counters land.
+  - g228: split the ~30 us of exchange overhead against the transport bench, then the entry's 25 us; the macOS park shares g222's spin primitive.
+  - w-perf: the stream clone sends stored deltas in place (4.3 GiB of whole texts becomes about 94 MiB); the bar is parity with hg serve.
+  - w-interop fixes repos_for_hook's fixed one-second budget (a literal, and size-independent): judged on progress, red first, then reruns the revprop rows.
+  REDS ON MAIN ROUTED:
+  - w-rewrite-ops: A-787's refinement job runs 3.5 s of CPU without a step (exit 4 in green_post_state, debug); slice it.
+  - w-work-cow: A-796's wire tags unpublished (wire_order red).
+  - w-hg: five daemon_edge hg tests, in step 0.
+- 2026-11-21 00:29 PST RULINGS:
+  - w-svn: stage B part 2 (history on the store, plus the wait path through every text reader) is completion under Ada's STORAGE ruling, not optional. Order: C (the sliced import) first, built on the records' seam, then B2. Its (a) is committed to a branch now. P7's findings go to GAPS and come after: 440 MB of retention for a 35 MB history, 593 MB of unowned small heap, ~1 GB of whole-text transients held once inside C.
+  - w-perf's stream design: four questions to w-hg; defaults given so w-perf doesn't idle (entries from HgIndex, chunks from the store; the base map derived per stream; deltas of the framed text, or the intake stores what the wire needs). w-hg answers at its turn's end.
+  DISK: the MacBook at 37 GB free. w-svn trims ~/.cache/w-svn-c2-target (31 GB). Not ours, left alone: ~/.cache/kiln-send-route-target (27 GB, active) and kiln-move-stuck-target (23 GB, idle since 20:57), both kiln sessions' targets.
+- 2026-11-21 00:35 PST
+  - DISK: the MacBook fell from 37 to 31 GB free in about 8 minutes. Main removed 17 unused slates-* Docker volumes, its own from earlier sessions: slates-arm64-target 11.5 GB, slates-bug-sweep-target 6.75 GB, slates-a187-* 4 GB, slates-nfs-write-* 3.6 GB, plus caches. Every one had 0 links, and docker volume rm refuses any volume in use. Free space went 31 -> 55 GB at once.
+  - w-git C5 part 2a, landing after r21: git refused without a store (Unsupported, naming --vcs-store), and git's tests on the shared helper. Moving the HTTP edge suite onto stores also fixes the Mercurial daemon_edge tests. w-hg is told not to repeat that in step 0; w-git merges main first, since the Overloaded reds are fixed there.
+  - w-interop: its red test for the hook view passed on main's code (2,000 revisions of one file lay out in under 1 s); it is making the repro bite.
+- 2026-11-21 00:39 PST LANDED (on main):
+  - ac5f6c48f, bdf99f92d and e14493d62 (w-interop, A-645 (a)): a hook's first FSFS view is driven as turns on its owner shard, and its wait is judged on their progress, not one liveness budget for the whole. Red first, then made to bite with a tree as wide as git/git's (4,872 files).
+  NOTED:
+  - w-shared: the owner's step for a 32 MiB submit runs 4.2-6.9 s as one step (decode, verdict, append, checksum of the whole increment). A stuck owner reads no acks, so the holder rightly gives the forward up. Bounded work (item 2) is therefore 3a's prerequisite. It slices the owner's step by part, with by-reference content where the two meet.
+  - w-perf: (c) confirmed from w-hg's code: the text identity is of the framed text, so a stream chunk is the stored bytes. It builds the stream fix now while the pull profile runs.
+  - w-fed-move claimed an A-number for counting and resending lost replies.
+  DISK: Studio-4 42 GB free (82 at 23:58). g226's worktree is 30 GB and is told to trim. ~/.cache/kiln-gate (44 GB) is kiln's own, not ours. Studio-1 73 GB, the big Studio 777 GB, the MacBook 56 GB. Studio-2 unreachable.
+- 2026-11-21 00:45 PST LANDED (on main):
+  - 9249a6a73 (w-fed-move, A-800, goal 86b's lost replies): every place a reply carried home can be lost is counted apart, and the silent ones resend; three red tests.
+  - cf6b3c98a (w-git C5 part 2a): git creation refused without a store, and git's tests on the shared test_store.
+  RUN: main's 100k rerun is queued as kiln r48 (needs macos,cpus=16,mem=40g,disk=40g; 2 h bound; a fresh clone of main; kernel tree 5f22fb204). kiln refuses a pinned run when the pinned machine lacks room, so it goes unpinned and carries its own tree. kiln's estimate: the big Studio, by about 02:42. Results go to w-fed-move.
+  RULING: w-git C5 2b approved. Pushes write version 5 only and are refused when short. Made commits adopt w-svn's deferred-submit hook (one hook); version 2 stays in GAPS until then. A new refusal variant publishes its wire tag in the same commit.
+  MEMORY: Studio-4 had 0.3-14 GB free, with swap at 18.6 of 19.5 GB. Most of it is a Virtualization VM up since boot (18 GB resident plus 30 GB compressed), not an agent's. g226 trimmed its worktree: 42 -> 53 GB disk free.
+- 2026-11-21 00:48 PST LANDED (on main):
+  - 71e55b6c2 (w-shared lane 3a): a holder's forward is held to its own progress, and acknowledged bytes count as progress.
+  - 002a7944f (w-svn P8): a 500 MB svn commit on the changeset store took 11.2 s over svn:// and 13.9 s over DAV, peak 4,067 MiB (8x the text, 12x before).
+  - cc917a1bf and 8508a8d52 (w-svn P7): the git-2000 import takes 26.2 s, peak 1,570 MiB (3.6x the dump).
+  - 1bfe51f88: stock svnsync 1.15 measured against a store-backed daemon (A-772).
+  RULING (w-shared, the owner's durable step): (A), by reference, not (B). (B) is a layer that (A) deletes, and it keeps two copies. (A) removes the work and carries 3b. Durability is proven first, then chain entry format 6 as a durable format change, retention until checkpoint, one content store. Meanwhile 3a is measured in release at 64-512 MiB, 10 runs each.
+- 2026-11-21 00:53 PST LANDED (on main):
+  - 2c32af2b5 (w-rewrite-ops, A-787 part 2's red): the cause was the merge engine's reanchor at O(n k) twice over, not the refinement job's slicing. It now runs in O((n + k) log k): 80,000 ops take 90 ms, was 22.5 s, with a property test against the old scan. green_post_state passes 8 of 8 in debug.
+  - 73cbdfc42 (w-shared): a file's mode moves with its rename.
+  w-git R2 found: the keepalive went out only after two 5 s intervals, exactly the edge tests' 10 s patience, so they failed 18 of 18 under load. Fix d9c014fa0, on test.
+  RULING: w-shared's (A) pieces approved. The push writers move in piece 1, one format at a time, and w-git, w-hg and w-svn get an hour's notice.
+  KILN: an outage around 00:45-00:50 cost w-rewrite-ops its close-note push. Every runner but Studio-2 was back at 00:54.
+- 2026-11-21 00:59 PST CLOSED, goal 88 (the Codex agent's Green/Work and atomic-conflict work), by w-work-cow:
+  - d8416294c: GAPS accounts for all 94 Codex branches (3 ported, 85 superseded, 1 finding, 5 outside the goal).
+  - A-796: 6823fde6f and c1e76d0a7, the merge check, guarded read and resolve as MCP tools and CLI verbs.
+  - db80da5e8: its wire-tag red fixed (98-100).
+  - 4930bf14b: the rebase_with rule (AC-6.13), and a stamp taken before a restart no longer accepted after the Work changed.
+  The UI stack can't be read from this session, so Ada marks goal 88 met. w-work-cow is asked whether the deferred-submit/post-verdict hook is on main; if not, it builds it next.
+  ALSO LANDED: d571ffbca (w-hg, piece-reading replay); 970950081 (w-git, R2 closed: the keepalive went out late).
+  RULING (w-svn): stage C waits in GAPS as a measured regression. git-2000's import takes 24.5 s vs 8.2 s, ~8 ms a revision, one F_FULLFSYNC per landing. Its two shapes belong to w-engine (the merge engine) and w-store (the barrier), both out of reach. w-svn takes stage B part 2 now.
+  NETWORK: the big Studio's Ethernet (en0) is inactive, so it's on Wi-Fi (en1). Ping to the kiln server 192.168.1.90 is 28/224/602 ms min/avg/max; kiln's link shows an 18 s round trip and a 47 s outage. Only 76 TCP sockets, so not port exhaustion. Runs there stall or get lost (w-bugs r17, main's r48 waiting). Ada's to fix physically.
+- 2026-11-21 01:03 PST
+  - KILN SERVER UNREACHABLE from the MacBook at 01:03 ("not connected to the kiln server"). Rulings go to the state branch's inboxes until it's back.
+  - FINDING (w-perf): hg's one-changeset pull takes 24.95 s (vs 0.23 s for hg serve) because `Index::get` walks every run: the learned compaction has no caller outside slates-vcs's tests, so the index never merges. The stream clone, 288 s, has the same leaves.
+  - RULING: wire the compaction once where the shared index is owned, for every tool that uses it (git and svn too if they share it): reported lookup and insert times, compaction_due then compact, sliced under the step budget. Red per tool: O(log N) runs per lookup after N seals. The view is held across turns only if it stays a consistent snapshot. inbox/w-perf-from-main-index-compaction.md.
+- 2026-11-21 01:06 PST NETWORK, the Studios only:
+  - kiln's link round trips: Studio-4 163 ms, Studio-1 265 ms, the big Studio 18 s (47 s outage). Studio-2 is disconnected; w-lint saw 50% loss to github.com there.
+  - The big Studio's Ethernet en0 is inactive, so it's on Wi-Fi.
+  - The MacBook (4.7 ms to kiln's server, 46 ms to github.com, 0% loss), jupiter (4 ms) and adacachy (0 ms) are fine. Looks like the Studios' wired path (a switch?): Ada's to check.
+  - Effects: Studio-2's seven agents show offline, kiln runs there stall or are lost, and main's 100k rerun r48 waits on the big Studio.
+  - kiln's server was unreachable from the MacBook at about 01:03 and back by 01:07.
+- 2026-11-21 01:08 PST LANDED (on main):
+  - d7acd097e plus fixes (w-git C5 2b piece 1): a client's push writes version 5 only, a shortfall is refused Unlanded, and the v4 switch is gone.
+  - b73c0a570 (w-hg, A-767 C1 step 3, first part): the hg import is written as the changegroup a push would bring, a segment at a time.
+  RULINGS (to inboxes; kiln unreachable again at 01:08):
+  - w-perf: merge first, then the stream's bytes. 155 runs: 11.8 us per lookup, 0.6 us after one compact.
+  - R3's Windows restart-spin matrix on jupiter goes to w-interop (w-lint is offline with Studio-2).
+- 2026-11-21 01:09 PST RULINGS:
+  - w-hg C1: order 3, then 1, then 2. Each import segment's record holds its index rows by identity, not a replay through the intake, which would re-hash ~4.3 GB of texts at every restart. Condition: an oracle test that the stored rows equal the intake's derivation, on every 7.2 format, and a red that a restart's replay stays flat in history (texts rebuilt = 0).
+  - w-k90-win: kiln's CI lane frees at ~01:31; main dispatches from the MacBook if no run with f16212799 starts by 01:45.
+  LANDED (w-hg): 8cb10f986 (step 0: hg refused without a store) and d571ffbca (replay a piece at a time: 790 KB read in 14 fills, peak 194 KB).
+  NETWORK: the big Studio is now off kiln entirely (its 8 agents offline); Studio-2's agents are back.
+- 2026-11-21 01:13 PST
+  - The big Studio's agents are back on kiln; only w-k90-whp is offline (its Mac).
+  - DISK: the MacBook at 39 GB free. Active slates targets: w-svn 33 GB (trim asked at 00:33, queued behind a long turn), w-hg 7.3, w-git 4.6, w-shared 3.4, w-perf 2.0. Docker's remaining 60 GB of reclaimable volumes and the ~2 GB of slates-* images aren't worth it or aren't ours. Clean-aggressive waits for 30 GB.
+  - AUDIT: agents/w-shared-exit4-derive is a pre-squash leftover; its code is on main as c592a81f0. g222's arm C waits on its A/B; w-git's C5 2b piece 2 (1e0613233) is on test.
+- 2026-11-21 01:22 PST
+  - LANDED: 9d792682f (w-svn P7: svnsync from slates over svn:// mirrors git-2000 in 270.7 s, 135 ms a revision; w-interop measured 1,068 s before) and 0476b22ca (svn DAV: HTTPv2's revision resource answers PROPFIND, which stock svnsync init over the HTTP edge needs).
+  - DISK EMERGENCY, MacBook: 39 GB free at 01:13, 21 GB at 01:18, 19 GB at 01:22, with four agents building here (w-git, w-perf, w-shared, w-hg).
+    - clean-aggressive.sh freed 2 GB (stale kiln reach copies, an old bench target). Every big target was written in the last 2 h.
+    - w-svn (33 GB target) was interrupted with an urgent trim. w-hg, w-git, w-perf and w-shared are told to keep one profile and send cold builds to the Studios.
+    - Not ours, left alone: ~/.cache/kiln-move-stuck-target (24 GB, idle since 21:04; the script skips it, no fingerprint dir), kiln-send-route-target (27 GB) and kiln-opt-target (18 GB), all kiln sessions'. Ada's call.
+- 2026-11-21 01:23 PST DISK: the MacBook back to 34Gi free. w-svn deleted 22.6 GB (release and incremental) and w-git trimmed to 3.5 GB. w-shared's target grew to 19 GB for the release lane A/B main asked for. w-svn was redirected off a stage C worktree to B2 (main's 01:02 ruling supersedes 00:36). w-interop's Windows build for R3 failed its downloads on jupiter; it retries.
+- 2026-11-21 01:28 PST
+  - LANDED: 512cd2848 (w-svn GAPS: C2 stage C waits as a measured regression with its owners; P7's three memory findings with their numbers).
+  - BUG, ruled the priority: on main 3ce898533 a whole-history git push over the HTTP edge fails 6 of 6, cut off at 57-63 s with curl 18 (it was 67-86 s before the keepalive fixes). The daemon took the data (1.9 GiB) and logged no refusal. Stock git daemon pushes it in 10.77 s. w-git takes it ahead of C5 2b's next piece: find which side closes, a red test with an injected landing delay, a bound judged on progress. w-interop's git comparison waits on it.
+  - DISK: the MacBook at 30 GB. Slates targets: w-shared 19, w-svn 19, w-perf 4.4, w-git 4.2 (all active). kiln sessions' targets: 69 GB (move-stuck 24 idle, send-route 27, opt 18). Cold builds go to the Studios.
+- 2026-11-21 01:34 PST
+  - LANDED: 35786a9dd (w-svn C2 stage B part 2 (a): a drive waits for a stored text's piece RAM doesn't hold, through the store's owner, in the svn://, svnserve -t and DAV loops) and 2d079c44 (w-fed-move A-801: the throughput wall's mechanism counted; r48 will name it).
+  - DISK: the MacBook at 27 GB. clean-aggressive freed 0: every slates target is active, and the kiln sessions' 69 GB is Ada's.
+  - LEAK FOUND: /var/folders/1s/ldpdh04d7d7219qts5t19d7h0000gn/T/ held 1,637 slates-<hex>.sock files, the macOS socket route's nodes (A-161/A-173). Killed test daemons leave them under never-reused per-pid instance names (CLAUDE.md §4 and §2 item 8). Main deleted the 971 older than 2 days (1,638 -> 667). Routed to w-bugs for GAPS, with a red test.
+- 2026-11-21 01:38 PST
+  - LANDED:
+    - f5a14f6a8 (w-git C5 2b piece 2: an ask no edge takes refuses the push too).
+    - 203c96a79 and 0d026a455 (a store replay counts the region's hold apart from its record's, so a home keeps both across a restart).
+    - 5ee55fde3 (GAPS: the socket-route node leak, w-bugs).
+    - w-shared gave w-git, w-hg and w-svn the hour's notice of chain format 6.
+  - RULING (w-fed-move): its 1,000-client stand-in is clean at 6,040 verdicts/s, so the 100k wall grows with scale. Inject the three scale knobs one at a time (bases N behind, history length, M works pinning the floor) and measure per-kind answer times; the knob whose cost grows is the mechanism and the red. r48 confirms it.
+  - DISK: the MacBook at 26 GB, every slates target active. Holding unless under 20 GB.
+- 2026-11-21 01:43 PST Quiet. No new landings on main since 01:36. w-shared's 3a release bench (r21) and w-git's r56 are running; w-shared committed its format-6 red. The MacBook disk recovered to 36 GB. w-work-cow is deaf like w-engine (an idle harness from the big Studio's 22:40 batch, pid 14504; my 01:02 message about the post-verdict hook admitted but never taken in), so main called agents_restart.
+- 2026-11-21 01:48 PST
+  - LANDED: 9061acd6c (w-svn, C2 B2 (a): get-file waits for a stored text's piece RAM lacks and reads it through the store).
+  - REASSIGNED: the deferred-submit hook (svn_made's acceptance and git's made commits wait for the store's landing; one hook) moves from w-work-cow, deaf after agents_restart, to w-rewrite-ops, whose A-787 park is the nearest mechanism. Red first; svn_made adopts it; git drops version 2 in the same series. Not on main yet (searched).
+  - w-git's push cut-off: small pushes are fine on main (cut-1.0 in 5.1 s); r56 with every counter is running.
+  - The MacBook disk is 34 GB.
+- 2026-11-21 01:53 PST
+  - LANDED: 08d65411e (w-perf, hg serve's first landing): the index merge is made a table at a time and kept up on its owner shard, lends report to the learned rule, and a pull is made from what it sends. A/B against hg serve running.
+  - THE PUSH CUT-OFF, NAMED (w-git): about 65 s in, an answer step refuses the 611 MB push PastAdmission (its working set outgrew the room its shard admitted). The reply's head was already out, so the 413 can't be sent and the edge aborts: curl 18.
+  - RULING: layer 1 now: every refusal after the head in git's own words, never an aborted connection. Layer 2 before C5 2b piece 3: the answer phases slice over the pack held once and charge only the slice (A-719, Ada's tens-of-thousands-of-large-pushes rule). Red: the 611 MB push lands within its room; A/B against stock git's 10.77 s.
+  - DISK: the MacBook at 26 GB; w-svn's target regrew to 27 GB. It deletes incremental and builds with CARGO_INCREMENTAL=0.
+- 2026-11-21 02:03 PST
+  - w-engine is BACK (took the 89b ruling). Its fold now finishes in 0.9-1.6 s on a deadline-sized share. A/B against main:
+    - Z=50 ms: p99 under 1 ms for every kind, 5 of 5 rounds (main at most 2); SubmitAccepted p999 1.4-9.2 ms vs 64.7-89.5.
+    - Z=20 ms: SubmitAccepted p99 5.4-9.7 ms vs 2.5-4.5, WORSE; p999 better.
+  - RULING: (b): subtract a key's old entry at first change, half the hashing and no history reads, no format change. Measure again; (a) and (b) land together only if Z=20 p99 is no worse. (c), the format change, only if needed and inside w-shared's format 6 bump. Push through the MacBook (Studio-4 unreliable).
+  - LANDED: 302da8b45 (w-svn B2 (a): DAV GET reads a stored text's piece through the store). kiln CI: run 44887857088 on a0d114abb, carrying w-k90-win's w2/w7 fix, holds the lane; no dispatch needed.
+  - The MacBook disk back to 44 GB.

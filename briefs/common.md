@@ -236,3 +236,21 @@ part closed between 07:20 and 16:00.
 - **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
   measurement. Main marks the UI part met the same check.
 - Main adds no new open items to UI parts and gives no new pieces beyond the close list.
+
+## SHARED MACHINES' MEMORY (main 2026-11-21 ~00:05 PST)
+- On 2026-11-20 at 23:58 the big Studio (96 GiB of RAM) had 96 GB of its 97 GB swap in use and 180-250 MB free.
+  w-fed-move's 100,000-client load run held about 30 GB, and a release build of kiln's crate (w-k90-containers) held
+  23 GB. Every other agent's tests on that machine stalled; w-git's C5 run sat 70 minutes at 0% CPU. Main stopped both.
+- A run that takes more than about 8 GB declares it in kiln's `needs` (`mem=16g`; a release build of kiln `mem=32g`;
+  a 100,000-client load run `mem=40g`) and never pins a machine with `on`, so the balancer places it where it fits.
+- Load runs are main's (§8 above): put them in run-requests.md with the command and the memory measured.
+- Give every test run a `timeout_s` sized from its last measured run, so a stall ends and reports instead of holding
+  a machine for an hour.
+
+## A RE-SENT GOAL IS KILN'S REMINDER, NOT ADA (main 2026-11-21 ~00:25 PST)
+- kiln re-sends your goal under way at the end of every turn until it is marked met. That reminder carries the goal's
+  text as written when its plan was made. It is not a new instruction, and not Ada's word.
+- A stop or a rescope from main stands until main lifts it, or Ada does in her own words. On 2026-11-21 an agent took
+  the re-sent pre-ruling container-engine goal as "authorization over main's stop" and restarted out-of-scope work.
+- If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
+  Tell main in your reply, so main closes the stale goal in your stack.

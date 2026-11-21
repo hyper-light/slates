@@ -52,3 +52,6 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   (run-requests.md) haven't been run yet. Landed worktree removed. Kept: the clone ~/slates-work/w-realtools (to make a
   worktree again if the first Windows build needs a fix), ~/.cache/w-realtools-target.noindex (4.7 GB), and
   ~/.cache/w-realtools-clone on adas-macbook-pro-2. Studio-4's root-owned dead mount kiln-01a1f9e974cb... is still Ada's.
+- Main's order: deleted my Studio-4 scratch by exact path: ~/.cache/w-realtools-target.noindex and the clone
+  ~/slates-work/w-realtools (free space 52 -> 58 GiB). Still kept: this state folder, and ~/.cache/w-realtools-clone on
+  adas-macbook-pro-2 (it has 51 GB free; that's the place for a Windows-build fix).

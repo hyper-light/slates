@@ -1,5 +1,14 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## ACTIVE 2026-11-21 00:57 PST: lane (A) by reference, piece 1 (chain entry format 6), approved by main 00:58. Worktree
+  ~/slates-work/w-shared-byref, branch agents/w-shared-byref off origin/main 544020bd2. Design: the increment is held in
+  the shard's one content hold under the green's object by its inputs identity, before the verdict (typed refusal at the
+  shard's room), the hold published before the entry appends (the db entry is durable at append, the hold only at a
+  publication), released when its entry folds into a checkpoint and no entry above names it, and at recovery any owned
+  green's held content no entry names goes. Push writers (w-git, w-hg, w-svn) move in this piece; told the hour before
+  landing. Red first: a real-process kill -9 of the owner with an unfolded version (crates/cli/tests/cli.rs). Kiln r15
+  (3a release bench) and r14 (family 3 Linux) still queued.
+
 ## LANDED 2026-11-20: sweep family 2 (stragglers woken by their reports) = 54b9d8b2b (main ab30bfb75). Reports to main now
   go as inbox/main-from-w-shared-<topic>.md on this branch (main moved to the Studio; SendMessage no longer reaches it).
   Family 3 (fuse helper exit via ExitWatch) on agents/w-shared-sweep-3 215556146, worktree ~/slates-work/w-shared-sweep-3;
@@ -368,3 +377,33 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## LANDED 2026-11-20 ~23:20 PST (machine clock): lane step three = c3db76bcd (receiver copies). Lane ~1.31 GB/s median
   quiet (from ~1.07). Asked main: batch datagrams per syscall next, or close the lane item. Kiln: r4 family three on
   adacachy (running), r3 exit 4 (queued for this MacBook).
+
+## 2026-11-20 ~23:50 PST: EXIT 4 LOCALIZED (kiln r3, main 90e9b72): 128/256/320 MiB exit 4, shard 1 spinning ~1.0-1.1 s
+  CPU in the task at identities.rs:243 (read_then_route: a session's first submit runs whole inline in one poll). 64 MiB:
+  exit 101 with 1,652 ms near miss. Record-plane fix did not cover it. Next: sample a 128 MiB submit, slice the step.
+  inbox/main-from-w-shared-exit4.md. Family three: kiln r4 still running on adacachy.
+
+## LANDED 2026-11-21 ~00:35 PST: exit 4 = c592a81f0 (main 5ab1c23b5): deriver's piece list blocked (√ops), runs merged.
+  Bench 64-320 MiB all pass on Studio-1. CLOSED (note in close file). Lane: in-place forward ~105-150 MB/s; asked main.
+  Family three: kiln r4 still on adacachy.
+
+## 2026-11-21 ~01:05 PST: lane in place: 320 MiB holder submit refused Overloaded 1 of 2 runs (forward ~3.1 s; transfer
+  ~2.2 s ~150 MB/s vs 1.3 GB/s raw). Reported; next: time the forward's phases on both ends. Family three: r4 running.
+
+## 2026-11-21 ~01:20 PST: family three's Linux run is kiln r14 (queued: adacachy, the one Linux runner, at load 60-93;
+  r4 stopped: its 30 min test timeout covered a starved compile). r14 builds first, then times the tests; green then red.
+  Waiting on: r14; main's answers on the lane (in-place forward refusals at 320 MiB, next step proposed).
+
+## 2026-11-21 ~03:00 PST: LANE (main's ruling 23:50): step 1 landed 47b87f28d (main 948711996). 3a on branch
+  agents/w-shared-lane-live (worktree ~/slates-work/w-shared-lane-live): task_to_its_end + acked request bytes as
+  progress; red test a_holders_submit_still_crossing_is_not_refused_by_a_size_independent_bound flaky because the
+  OWNER's step is 4-7 s in one control-shard step (debug, 32 MiB) -> lane gives up silent. NEXT: measure the owner's
+  step by part (decode / judge / append / record checksum), slice or by-reference the biggest; land 3a with it.
+  Family three: kiln r14 (queued, adacachy). Plan + update: inbox/main-from-w-shared-lane-plan.md.
+
+## LANDED 2026-11-21 ~03:40 PST: lane 3a = 71e55b6c2 (main ed3fbc616). NEXT: by-reference increment (owner's durable
+  step small): design note inbox/main-from-w-shared-lane-byref.md first, then build; red = 32 MiB holder submit 10/10.
+
+## 2026-11-21 ~04:05 PST: WAITING on main: owner's durable step, shape (A) by-reference chain entry vs (B) sliced db
+  append (inbox/main-from-w-shared-lane-byref.md; both reach crates/db or the chain format, overlapping A-767/w-store).
+  Family three: kiln r14 queued (adacachy not answering). A-658 3c: waits on w-store wiring.

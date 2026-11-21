@@ -70,6 +70,40 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Run requests for main: the Linux smaps arm (resident::tests::a_mapping_read_whole_agrees_with_its_page_walk on
   Linux), the Windows build of resident.rs's fallback arm, xtask unsafe (slates-mem 87), clippy.
 
+## 2026-11-21: 85a's two named costs (main's order), counted and A/B'd -- docs landed f656820d3
+- w-lint's three reds on 7ac3900ee fixed and landed cdbcc722f (smaps via rustix; slates-mem budget 88; live_fleet's two
+  fixed-window sleeps removed).
+- Exchange on the data shard (one shard a daemon): REJECTED (Linux -15 us, Studio +10 us at the median).
+- The reply's "65 us wake" was each run's one 100.45 ms first reply (the record period) averaged over 2,051 writes; per
+  write 6-8 us. Poll-while-due: REJECTED (no gain).
+- Linux legs ran as GitHub CI diag runs: branches diag-g228-live-1..9 (workflow .github/workflows/diag-g228.yml on those
+  branches only), results pushed to diag-results/diag-g228-live-N-<run>; read with `git fetch`.
+- Experiment branches deleted (agents/g228-one-shard-probe, agents/g228-reply-split); their commits stay in my clone.
+- Next: per-write percentiles of each hop (the hop counters are sums, which one long write skews), then cut the largest
+  (the entry's build ~45-90 us mean, the exchange ~50-170 us mean).
+
+## 2026-11-21 later: per-hop percentiles landed e1f246ca8; medians in BENCHMARKS 41167afaa
+- Added p50: ubuntu-latest 106.7-113.4 us (holds kept); Studio 168.5-205.4 us (holds declined).
+- Exchange p50 57-61 (Linux) / 107-115 (macOS), holder's serve 8-12; build ~25; to control 8-9 / 25-31; reply 7-8 / 8-21.
+- Next: split the exchange's ~30 us of daemon overhead (Linux) against the transport bench's 23-27 us; then the build.
+
+## 2026-11-21 ~01:40 PST: main's 00:30 order, items 1-3 (branch agents/g228-exchange-split, not landed)
+- Item 1, exchange split (a40c07faa): per-write hops exchange.borrow / round_trip / collect / settle. Diag run 11
+  (ubuntu-latest): borrow 0.6, round_trip 98.3, collect 7.7-13.3, settle 0.5 us at p50; a holder's serve 12-15 us. The
+  lane's own tasks are small; the round trip is the transport plus the holder's control shard. Run 13 (pushed) adds the
+  transport bench (`replication_bench 1000 0`, "live ship" rows) on the same runner each round, as the reference.
+- Item 2, the entry's build: placement cache + zero-alloc acks (4949613ae): 250 -> 134 extra allocator calls a 2 KiB
+  write on its owner (plain 34). A/B pending: diag run 12 (ubuntu-latest) and Studio r3 (d1323898), split vs cache.
+  Next cut in the worktree (unlanded, tests running r5): the payload was copied four times a holder (entry encode,
+  exchange `to_vec`, `Endpoint::begin` `to_vec`, `open_exchange` `to_vec`); now moved whole to the stream
+  (`begin_owned`/`request_owned`, `request_within(Vec)`, `exchange` by value), one copy a holder; the record commit,
+  prepare and content dispatch lose a copy each too.
+- Item 3: inbox/g222-from-g228-spin.md sent (one slates-rt primitive; g222 builds it as arm C or I build to its spec).
+- Disk: Studio-4 was at 26 GiB free; my ~/.cache/g228-local-target (18.8 GiB, debug only) removed with `cargo clean`.
+  Builds go to kiln runners with disk=50g since.
+
+## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
+
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
 shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).
 Proposed: arm the background sweep only for a request asking for the memory report (a DaemonStatus field: wire change),

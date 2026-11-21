@@ -228,3 +228,34 @@ Red: a focused server test landing a large named text: no step past the quantum,
   content_ranges 2/2, git_push 23/23; earlier at 33465d641: pace+rt all, merge lib 248, git receive 49, named_objects 1.
   content_ranges' sweep test failed on main's own 33465d641 too (grouped, 2 of 2); main's next change fixed it.
 - C1 and C2 CLOSED (inbox/main-from-w-engine-close.md). NEXT: P3 89b (A-579), pacing as the lever.
+## P3, goal 89b (A-579), 2026-11-20 21:15-22:20 -- MECHANISM FOUND (counters), cut next
+- A/B (release load_bench, recorded command, Z 50/20 ms, 3 rounds, alternating; A = cc29bfc4c with A-783 reverted,
+  B = cc29bfc4c; load 12-79; runs in ~/.cache/w-engine-p3-runs/ab.txt): dead even, as expected (A-783 paces only the
+  git push build). SubmitAccepted server p99 Z=50: A 31.90/3.35/1.21, B 2.88/1.88/5.68 ms; every run on both sides
+  p999 57-141 ms, max 81-176 ms.
+- Diagnostic build (scratch worktree ~/slates-work/w-engine-p3-diag, never landed): long polls by task label, host-clock
+  gaps and steps per shard, owner batches, owner_floor and checkpoint parts timed, the bench's --events with its epoch.
+  Result: the slow submits come in 1-2 clusters a run (63+109 of 172 slow >50 ms), each starting with ONE poll on the
+  green's owner shard (19): the cross-shard call running verbs::owner_floor -> merge_service::checkpoint_green, 76-112
+  ms. Split (diag6): build 4.17, head_identity 73.66, encode 4.79, record 16.07 ms; 36,256,116 bytes, floor 806,
+  first checkpoint (held 0). Owner batches (A-388) are not it: one >=10 ms batch in a run, 1 verdict of 22 ms.
+- Why head_identity costs 74 ms: A-202 folds the identity only when read; nothing reads it between checkpoints, so the
+  first read pays every changed file's entry at the last read and at the head (hash + history reconstruction).
+- Cut planned: a paced identity fold on the owner (per-key folded-at versions so partial folds stay exact; oracle =
+  head_identity_from_scratch), then the 16 ms record. Then the A/B (release, interleaved, best of N, load recorded).
+- Finding (GAPS, main's): the bench's end-of-run read hung twice (Client::round_trip waits forever, every shard parked:
+  diag2 at 21:35 and diag5), the same hang as provision_bench's.
+- 22:15-23:20 CUT 1 built, committed LOCALLY 507110661 (not pushed; main's review): Green::fold_identity_step (exact
+  partial folds, per-key folded-at versions; identity oracle with partial folds, red-checked) + the checkpoint's
+  identity fold paced on the owner, finished in turns (merge.checkpoint.in_turns / identity_steps /
+  in_turns_longest_ns); server test a_checkpoint_with_someone_waiting_folds_the_identity_in_turns (red on the old
+  one-step checkpoint). A/B 5 rounds (A 585b89299, B + cut; ~/.cache/w-engine-p3-runs/ab-cut.txt): SubmitAccepted p999
+  Z=50 82.1/70.6/76.1/97.7/59.6 -> 3.3/4.5/7.3/12.0/23.9 ms, Z=20 124.5/142.8/109.2/102.9/118.8 -> 19.7/39.3/30.3/21.7/
+  28.1; max Z=20 133-162 -> 43-63. OPEN: (1) the fold in turns takes 7.2-13.0 s under contention (one key a queue
+  cycle), so the checkpoint lands late (a chain at its cap would force Doubling::Now's one-step fold); a fixed 0.5 ms
+  slice (scratch C) took 0.62 s but raised p99 (24 ms once): a design question for main (background progress under
+  "yield when someone waits"); (2) SubmitAccepted p50 at Z=20 B 2.68-3.13 vs A 2.00-2.35 in pass 1, 1.04-1.66 vs
+  0.90-1.17 in pass 2: not resolved, the host at load 17-28; not forced identity folds (counted 0). (3) Left after the
+  cut (B diag): the checkpoint's last step 42.6 ms (build 5.7, encode 9.5, record 24.4 of 49 MB); single key folds up
+  to 13.4 ms.
+- Server lib: 5 repository/paths tests fail on main 585b89299 itself (Overloaded at write), with or without the cut.
