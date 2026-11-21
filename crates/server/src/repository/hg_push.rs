@@ -1397,6 +1397,26 @@ async fn land_on_disk(
   };
   let (version, payload) = &mut forked.changegroup;
   let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
+  // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
+  // A-767; fa5fd0023): its place is in this changeset's payload, named by the same identity the reference names.
+  let payload_identity = *blake3::hash(payload).as_bytes();
+  let texts: Vec<slates_store::texts::TextEntry> = forked
+    .intaken
+    .texts
+    .iter()
+    .map(|kept| slates_store::texts::TextEntry {
+      path: kept.path.clone(),
+      tool_id: kept.node.to_vec(),
+      text: kept.identity,
+      len: kept.len,
+      base: kept.base,
+      place: slates_store::texts::Place {
+        payload: payload_identity,
+        offset: u64::try_from(kept.place.start).unwrap_or(u64::MAX),
+        len: u64::try_from(kept.place.len()).unwrap_or(u64::MAX),
+      },
+    })
+    .collect();
   let header = slates_store::log::Header {
     tool: slates_store::log::Tool::Mercurial,
     repository: u128::from_be_bytes(repository.bytes),
@@ -1415,6 +1435,10 @@ async fn land_on_disk(
     (
       slates_store::log::SectionKind::Payload,
       core::mem::take(payload),
+    ),
+    (
+      slates_store::log::SectionKind::Texts,
+      slates_store::texts::encode(&texts),
     ),
   ];
   let landed = disk.land(header, parts).await;
