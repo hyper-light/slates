@@ -1,5 +1,8 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## ACTIVE 2026-11-21 10:07 PST: lane 3b on agents/w-shared-3b (269f12e3f off 8f73b6928), worktree ~/slates-work/w-shared-3b.
+  kiln r24 red+green; r23 A/B of A-825 (895b80994 vs 545cf46c5) queued. Map in ~/slates-work/w-shared-scratch/3b-map.md.
+
 ## LANDED 2026-11-21 09:40 PST: lane (A) piece 1 = A-825 chain entry format 6, main 545cf46c5 (tested 000d0e442, kiln r19).
   3a bench (r13): 320 MiB 9/10, 512 MiB 0/10, liveness open. NEXT: 3b content ahead by identity, then slicing, then
   the bench. Family three (agents/w-shared-sweep-3) still waits for a Linux runner (adacachy refuses runs).

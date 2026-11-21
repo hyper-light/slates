@@ -188,3 +188,11 @@ identity) and the slicing, re-measured at these five sizes x 10.
 - Either way the GAPS line: a holder-route submit of 320 MiB and above does not complete: its request crosses the
   forward lane whole and the lane gives up on silence. That is 3b's job (the request names the increment; the owner
   fetches chunks by identity on the content plane), so 3b may come before the owner-step slicing. I'll confirm with r23.
+
+## 10:07 PST: 3b built (agents/w-shared-3b 269f12e3f off main 8f73b6928), red and green queued (kiln r24); r23 (A/B of A-825) still queued
+- SubmitComputed names the increment (identity, length) instead of carrying it; the holder holds it under that identity
+  (refused typed at its room); the owner's control shard, before the verb, fetches what the owner shard lacks from the
+  asking node on the content plane (the resumable hedged fetch), the owner shard holds it once, the verb reads it from
+  its store; not had whole is Overloaded, nothing started. Red test: an 8 MiB holder submit's forwarded request under
+  64 KiB and the owner fetching it once. Server crate type-checks; the A-number gets claimed in amendments.tsv before
+  any doc names it. Then the release bench at 64-512 MiB x 10 on it.
