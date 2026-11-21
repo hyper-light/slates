@@ -1534,7 +1534,7 @@ mod tests {
 
   use crate::greens::ReleaseProgress;
   use crate::state::ShardState;
-  use crate::verbs::{dispatch, to_db_volume};
+  use crate::verbs::to_db_volume;
 
   fn owner() -> Principal {
     Principal::Uid {

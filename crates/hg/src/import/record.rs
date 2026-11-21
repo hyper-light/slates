@@ -1289,6 +1289,31 @@ enum Kind {
   Revisions(Box<Revisions>),
   /// A push's changegroup as it arrived.
   Changegroup(Box<Retaken>),
+  /// A changeset's payload being framed, a chunk a step, before its intake begins ([`Replay::begin_sectioned`]).
+  Framing(Box<Framing>),
+}
+
+/// A changeset's changegroup being framed from its payload as far as its source holds it (`crate::framing`): the walk,
+/// what it has placed, and the room the push's intake ran within.
+struct Framing {
+  /// The walk.
+  walk: crate::framing::Framing,
+  /// What it has placed.
+  framed: crate::framing::Framed,
+  /// The room the push's intake ran within, each revision placed charged to it.
+  room: Admission,
+}
+
+/// Whether a changeset's replay has more to take ([`Replay::step_sectioned`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Progress {
+  /// More units follow.
+  More,
+  /// Every unit is taken: [`Replay::finish`] gives the fork.
+  Done,
+  /// The step needs these bytes of the payload, which its source does not hold: nothing was taken; put them in and
+  /// step again (`crate::framing::Window`).
+  Wanted(core::ops::Range<u64>),
 }
 
 /// A push's changegroup taken again through the intake (A-729 part 2).
@@ -1334,16 +1359,12 @@ impl Replay {
   }
 
   /// Starts replaying a push landed on the changeset log (A-767 C4): `record` its `Record` section
-  /// ([`write_push_record`]), `payload` its `Payload` section, the changegroup as it arrived, taken again through the
-  /// live push's intake into a fork of `index`. Each [`Replay::step`] is then handed `payload`, read in place.
-  pub fn begin_sectioned(
-    record: &[u8],
-    payload: &[u8],
-    index: &mut HgIndex,
-    store: &mut ContentStore,
-  ) -> Result<Replay, Refused> {
+  /// ([`write_push_record`]), its changegroup the changeset's `Payload` section, read a piece at a time as the store
+  /// lends it (A-767 C1, R2: no payload held whole): framed a chunk a step, then taken again through the live push's
+  /// intake into a fork of the index ([`Replay::step_sectioned`]).
+  pub fn begin_sectioned(record: &[u8]) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: record };
-    let (version, source, mut room) = head(&mut reader)?;
+    let (version, source, room) = head(&mut reader)?;
     if version != SECTIONED_VERSION || source != Source::Push {
       return Err(Refused::Version { version });
     }
@@ -1354,21 +1375,69 @@ impl Replay {
     if !reader.rest.is_empty() {
       return Err(Refused::Trailing);
     }
-    let first = (
-      index.len(store, Log::Changelog),
-      index.len(store, Log::Manifest),
-    );
-    let intake =
-      Intake::begin((changegroup, payload), index, store, &mut room).map_err(Refused::Intake)?;
     Ok(Replay {
-      kind: Kind::Changegroup(Box::new(Retaken {
-        intake,
-        payload: 0..payload.len(),
+      kind: Kind::Framing(Box::new(Framing {
+        walk: crate::framing::Framing::new(changegroup, false),
+        framed: crate::framing::Framed::default(),
         room,
-        first,
-        done: false,
       })),
     })
+  }
+
+  /// Takes the next unit of a changeset's replay ([`Replay::begin_sectioned`]) from `payload`, its changegroup as far
+  /// as the source holds it: a chunk of its framing, then, once framed, its intake's units into a fork of `index`.
+  /// Refused, its owner gives the fork back ([`Replay::abandon`]).
+  pub fn step_sectioned<S: crate::framing::Source + ?Sized>(
+    &mut self,
+    payload: &S,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Progress, Refused> {
+    match &mut self.kind {
+      Kind::Framing(framing) => {
+        let Framing { walk, framed, room } = &mut **framing;
+        let mut sink = crate::framing::Collect {
+          framed,
+          admission: room,
+        };
+        match walk.step(payload, &mut sink) {
+          Ok(true) => Ok(Progress::More),
+          Ok(false) => {
+            let Framing { framed, room, .. } = *core::mem::replace(
+              framing,
+              Box::new(Framing {
+                walk: crate::framing::Framing::new(Version::V01, false),
+                framed: crate::framing::Framed::default(),
+                room: Admission::new(0),
+              }),
+            );
+            let first = (
+              index.len(store, Log::Changelog),
+              index.len(store, Log::Manifest),
+            );
+            let intake = Intake::begin_framed(framed, index, store).map_err(Refused::Intake)?;
+            self.kind = Kind::Changegroup(Box::new(Retaken {
+              intake,
+              payload: 0..0,
+              room,
+              first,
+              done: false,
+            }));
+            Ok(Progress::More)
+          }
+          Err(crate::framing::Halt::Wanted(wanted)) => Ok(Progress::Wanted(wanted.range)),
+          Err(crate::framing::Halt::Refused(refusal)) => {
+            Err(Refused::Intake(crate::push::intake::Refused::Unverified(
+              crate::push::verify::Unverified::Changegroup(refusal),
+            )))
+          }
+        }
+      }
+      Kind::Changegroup(retaken) => retaken.step_on(payload, store),
+      Kind::Revisions(_) => Err(Refused::Version {
+        version: SECTIONED_VERSION,
+      }),
+    }
   }
 
   /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given, or the payload
@@ -1378,6 +1447,9 @@ impl Replay {
     match &mut self.kind {
       Kind::Revisions(revisions) => revisions.step(bytes, store),
       Kind::Changegroup(retaken) => retaken.step(bytes, store),
+      Kind::Framing(_) => Err(Refused::Version {
+        version: SECTIONED_VERSION,
+      }),
     }
   }
 
@@ -1386,6 +1458,7 @@ impl Replay {
     match self.kind {
       Kind::Revisions(revisions) => revisions.finish(index, store),
       Kind::Changegroup(retaken) => retaken.finish(index, store),
+      Kind::Framing(_) => Err(Refused::Truncated),
     }
   }
 
@@ -1394,6 +1467,8 @@ impl Replay {
     match self.kind {
       Kind::Revisions(revisions) => revisions.abandon(store),
       Kind::Changegroup(retaken) => retaken.intake.abandon(store),
+      // Framing makes no fork.
+      Kind::Framing(_) => Ok(()),
     }
   }
 }
@@ -1431,18 +1506,38 @@ impl Retaken {
     })
   }
 
-  /// Takes the next unit of the changegroup in `bytes`: whether more follow.
+  /// Takes the next unit of the changegroup in `bytes`, a record holding it whole: whether more follow.
   fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
-    if self.done {
-      return Ok(false);
-    }
     let payload = bytes.get(self.payload.clone()).ok_or(Refused::Truncated)?;
-    let stepped = self
+    match self.step_on(payload, store)? {
+      Progress::More => Ok(true),
+      Progress::Done => Ok(false),
+      // A record holds its changegroup whole: a want names bytes past its end.
+      Progress::Wanted(_) => Err(Refused::Truncated),
+    }
+  }
+
+  /// Takes the next unit of the changegroup, `payload` as far as its source holds it.
+  fn step_on<S: crate::framing::Source + ?Sized>(
+    &mut self,
+    payload: &S,
+    store: &mut ContentStore,
+  ) -> Result<Progress, Refused> {
+    if self.done {
+      return Ok(Progress::Done);
+    }
+    match self
       .intake
       .step(payload, store, &mut self.room)
-      .map_err(Refused::Intake)?;
-    self.done = stepped == Stepped::Done;
-    Ok(!self.done)
+      .map_err(Refused::Intake)?
+    {
+      Stepped::More => Ok(Progress::More),
+      Stepped::Done => {
+        self.done = true;
+        Ok(Progress::Done)
+      }
+      Stepped::Wanted(range) => Ok(Progress::Wanted(range)),
+    }
   }
 
   /// The fork in the index's place, what was replayed answered.
