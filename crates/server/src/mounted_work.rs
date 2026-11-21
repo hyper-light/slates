@@ -14,11 +14,11 @@
 //!
 //! **The declaration.** A submit of a mounted work first declares what the mount changed ([`declare_mount`]): the
 //! overlay's diverged set (created, copied-up, whiteouted entries, §4.5 AC-1.10), each declared through the work's own
-//! `edit` and `declare` verbs, so it is recorded in the work's log and charged as a declared change is. A file is
-//! declared as the one splice that turns the work's bytes into the mount's ([`changed_span`]), so an editor's save
-//! (written whole to a temporary and renamed over the original) is the span it changed. The declaration compares, so
-//! it is idempotent: a second submit declares only what differs from the work by then. A finer minimiser (several
-//! spans a file, D-O17) replaces [`changed_span`] at its one call site.
+//! `edit` and `declare` verbs, so it is recorded in the work's log and charged as a declared change is. A changed file
+//! is declared as the whole-file replacement it is, and the composition recovers the edits it was (D-O17, A-776's
+//! `slates_merge::refine`: token-grain, sliced), so an editor's save changing two lines is two edits, never one span
+//! over another editor's line between them. The declaration compares, so it is idempotent: a second submit declares
+//! only what differs from the work by then.
 //!
 //! **A restart (main's order 2, A-127).** A mount's writes are published at each barrier as any volume's are (the tree
 //! host fingerprints a directory without its tree), and recovery rebuilds a mounted work's slot from that image after
@@ -222,35 +222,6 @@ pub(crate) fn source<'a>(
   Some((greens.get(&pin.green)?, pin.version))
 }
 
-/// The one splice that turns `old` into `new`: `(at, delete_len, insert)` with `insert` the range of `new` put at
-/// `at`, keeping the longest common prefix and then the longest common suffix of what is left; `None` when they are
-/// equal. Linear in the shorter of the two, and allocates nothing.
-pub(crate) fn changed_span(old: &[u8], new: &[u8]) -> Option<(u64, u64, std::ops::Range<usize>)> {
-  let prefix = old
-    .iter()
-    .zip(new.iter())
-    .take_while(|(a, b)| a == b)
-    .count();
-  if prefix == old.len() && prefix == new.len() {
-    return None;
-  }
-  let old_rest = old.get(prefix..).unwrap_or_default();
-  let new_rest = new.get(prefix..).unwrap_or_default();
-  let suffix = old_rest
-    .iter()
-    .rev()
-    .zip(new_rest.iter().rev())
-    .take_while(|(a, b)| a == b)
-    .count();
-  let deleted = old_rest.len().saturating_sub(suffix);
-  let inserted = new_rest.len().saturating_sub(suffix);
-  Some((
-    u64::try_from(prefix).ok()?,
-    u64::try_from(deleted).ok()?,
-    prefix..prefix.saturating_add(inserted),
-  ))
-}
-
 /// Declares into `work` what its mount changed (the module doc). Nothing to do for a work with no mount. A refusal of
 /// any declaration is the submit's: what was declared before it stays declared (each is recorded as its verb records
 /// it), and a retry compares again and declares the rest.
@@ -412,8 +383,15 @@ fn declare_entry(
       let span = {
         let w = state.works.get(&id).ok_or(Refusal::NotFound)?;
         crate::merge_service::with_work_base(state, w, |base| {
+          // A changed file is declared as the whole-file replacement it is; the composition recovers the edits it
+          // was (D-O17, A-776's `slates_merge::refine`), so one save changing two lines is two edits.
           w.files.get(base, path).map(|old| match old {
-            Some(old) => changed_span(&old, &mounted),
+            Some(old) if *old == *mounted => None,
+            Some(old) => Some((
+              0,
+              u64::try_from(old.len()).unwrap_or(u64::MAX),
+              0..mounted.len(),
+            )),
             None => Some((0, 0, 0..mounted.len())),
           })
         })
@@ -658,39 +636,3 @@ pub(crate) fn release(state: &mut ShardState, id: DbVolumeId) {
 
 /// The head version each green's landing view holds, by green ([`ensure_green_view`]).
 pub(crate) type GreenViews = std::collections::BTreeMap<DbVolumeId, u64>;
-
-#[cfg(test)]
-mod tests {
-  use super::changed_span;
-
-  /// A-774. Do: compare an editor's save with the file it replaced. Expect: the splice spans exactly the changed
-  /// bytes, the common prefix and suffix kept; equal files give none; a pure insertion or deletion deletes or inserts
-  /// nothing on the other side; and applying the splice to the old bytes gives the new.
-  #[test]
-  fn a_save_is_declared_as_the_span_it_changed() {
-    let cases: [(&[u8], &[u8]); 6] = [
-      (b"a\nb\nc\n", b"a\nB\nc\n"),
-      (b"same", b"same"),
-      (b"abc", b"abXc"),
-      (b"abXc", b"abc"),
-      (b"", b"new"),
-      (b"aaaa", b"aa"),
-    ];
-    for (old, new) in cases {
-      match changed_span(old, new) {
-        None => assert_eq!(old, new),
-        Some((at, deleted, inserted)) => {
-          let at = usize::try_from(at).unwrap();
-          let deleted = usize::try_from(deleted).unwrap();
-          let mut spliced = old[..at].to_vec();
-          spliced.extend_from_slice(&new[inserted.clone()]);
-          spliced.extend_from_slice(&old[at + deleted..]);
-          assert_eq!(spliced, new, "{old:?} -> {new:?}");
-          assert!(deleted + inserted.len() <= old.len().max(new.len()));
-        }
-      }
-    }
-    assert_eq!(changed_span(b"a\nb\nc\n", b"a\nB\nc\n"), Some((2, 1, 2..3)));
-    assert_eq!(changed_span(b"abc", b"abXc"), Some((2, 0, 2..3)));
-  }
-}
