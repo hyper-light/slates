@@ -17295,6 +17295,46 @@ ahead in 4 of 5 rounds by 2.7-14.7 µs and behind in one by 16.0, inside the run
 A few 2 KiB copies cost well under a microsecond each, below what a live write's median can show, so the cut stays off
 main under the rule that a dead-even A/B does not land. The entry's build (about 20-27 µs) is not its copies.
 
+**Measured and rejected: the macOS busy harvest's interval and a user-space ring watch before the idle spin** (85a
+item 3, main's ruling (c); agents/g228-macos-hold cf981488d, not landed; g228, 2026-11-21). The cause first, counted
+(`fleet.live.hop.exchange.{spawn,wake}`, ae4a05cdb, kiln r17, adas-mac-studio-2, five rounds): the exchange's collect,
+28.7-30.7 µs at the median on macOS against Linux's 6, is two halves of 14.3-16.4 µs each. Each is one empty zero-timeout
+`kevent`: `Shard::run` harvests the driver once a quantum (the wake estimate, a few µs) has passed since its last wait,
+stamped before the harvest, so every busy step after the first sleeps. A probe outside the tree (Studio-4, load 6-7,
+5,000 calls a round, three rounds) priced each way of asking, ns a call / involuntary switches a call: rustix `kevent`
+zero timeout with nothing ready 12,281-13,101 / 1.00, with an event ready 206-207 / 0; rustix `poll` zero timeout
+8,306-8,979 / 1.00; rustix `ioctl(FIONREAD)` 145-148 / 0; rustix `recv(PEEK | DONTWAIT)` 264-268 / 0; libc `kevent64`
+`KEVENT_FLAG_IMMEDIATE` 144-153 / 0. So no new system call was needed. The candidate had two rules, no driver change:
+a busy shard harvests no more often than its measured empty harvest costs (stamped after it); each idle moment first
+watches its rings and pollers in user space for at most the wake estimate, then spins and parks as before.
+
+Base ae4a05cdb against cf981488d, the contract command, release, CARGO_BUILD_JOBS=4, five rounds a condition, arms
+interleaved, order alternating (kiln r19, adas-mac-studio-2.local, 14 cores, 16:33-16:51 UTC). Loaded: 14 busy loops,
+one a core. Background: the test under `taskpolicy -b`. Added at the median, µs (FAILED: the test's NFS write gave up,
+`server/tests/common/nfs.rs:156`):
+
+| round | quiet base | quiet candidate | loaded base | loaded candidate | `-b` base | `-b` candidate | `-b` loaded base | `-b` loaded candidate |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 159.1 | 139.2 | 258.8 | 317.0 | 339.1 | 336.4 | 1,224.7 | 1,407.7 |
+| 2 | 161.3 | 153.9 | 469.1 | 265.6 | 320.7 | 307.5 | 1,529.4 | FAILED |
+| 3 | 166.4 | 149.4 | 491.0 | 959.5 | 327.1 | 290.7 | 1,047.5 | 2,399.5 |
+| 4 | 171.2 | 146.3 | 320.7 | 114.8 | 378.2 | 309.3 | 963.5 | FAILED |
+| 5 | 162.3 | 145.4 | 328.7 | 221.6 | 336.3 | 296.1 | 1,449.0 | FAILED |
+
+Live p999, loaded: base 17,655 / 9,124 / 3,350 / 2,365 / 2,562 µs, candidate 4,133 / 1,280 / 6,504 / 553 / 18,875 (one
+write over 50 ms). Per hop, quiet, at the median: collect 24.6-30.7 against 10.2 µs (spawn 10.2-16.4 against 2.8, wake
+15.4 against 1.7-2.0); the hop to the control shard 22.5 against 24.6, unchanged. The owner's CPU over the stream,
+quiet: base 300-320 ms, candidate 340-360; loaded round 3: base 640, candidate 2,130. The watch's own counts: quiet,
+146-147 caught of about 9,700 on the owner; loaded, up to 1.70 s of watching on one daemon in a round of a few seconds.
+
+**Reading.** Rejected: it loses under contention. With no core free it failed the test in three of five rounds where
+main failed none, and doubled the median in one loaded round with three times the owner's CPU. The two rules
+separate in the counters. The busy interval is what won quiet and in the background rounds (collect from about 30 to
+10 µs, 7-25 µs off the median in every quiet round). The ring watch caught about 1.5 % of idle moments, left the hop to
+the control shard where it was, and under load spun long. Its bound is the wake estimate, and the wake estimate grows
+with the very queueing that means no core is free (A-218's finding again). Item 3 closes as (a) by main's ruling: the
+macOS collect stays a recorded cost.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
