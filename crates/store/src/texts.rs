@@ -34,6 +34,10 @@ const IDENTITY: usize = 32;
 const ABSENT: u8 = 0;
 /// Format: the mark of a present base.
 const PRESENT: u8 = 1;
+/// Shape: the most a coalesced read of places reads, as a multiple of the bytes its places ask ([`Store::places_bytes`]):
+/// the gaps between them (in a changegroup, each chunk's header before its delta) at most as many bytes as the places,
+/// so one read stands for many and never reads more than double what was asked.
+const COALESCED_SPAN_TIMES: u64 = 2;
 /// Format: the fewest bytes an entry takes: the path's and the tool id's lengths, the identity and length, the mark,
 /// and the place.
 const ENTRY_FEWEST: usize = LONG + LONG + IDENTITY + LONG + 1 + IDENTITY + LONG + LONG;
@@ -234,14 +238,17 @@ type HunkParts<'e> = (u64, u64, &'e [u8], &'e [u8]);
 /// The next hunk of `edit`: its start, end and bytes, and what follows it.
 fn hunk(edit: &[u8]) -> Result<HunkParts<'_>, TextsRefused> {
   let (head, rest) = edit.split_at_checked(HUNK_HEAD).ok_or(TextsRefused::Hunk)?;
-  let field = |at: usize| -> Result<u64, TextsRefused> {
-    let bytes: [u8; 4] = head
-      .get(at..at.saturating_add(4))
+  // Derived: a hunk's head is three big-endian u32 words (start, end, length), each a u32's width in turn.
+  const WORD: usize = size_of::<u32>();
+  let field = |n: usize| -> Result<u64, TextsRefused> {
+    let at = n.saturating_mul(WORD);
+    let bytes: [u8; WORD] = head
+      .get(at..at.saturating_add(WORD))
       .and_then(|bytes| bytes.try_into().ok())
       .ok_or(TextsRefused::Hunk)?;
     Ok(u64::from(u32::from_be_bytes(bytes)))
   };
-  let (start, end, len) = (field(0)?, field(4)?, field(8)?);
+  let (start, end, len) = (field(0)?, field(1)?, field(2)?);
   let (data, after) = rest
     .split_at_checked(index(len)?)
     .ok_or(TextsRefused::Hunk)?;
@@ -326,8 +333,17 @@ const REPOSITORY: usize = 16;
 const TEXT_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY;
 /// Format: a text row's value: the sequence, the length, the base's mark and identity, the place.
 const TEXT_VALUE_BYTES: usize = LONG + LONG + 1 + IDENTITY + IDENTITY + LONG + LONG;
-/// Format: a history row's key: the tag, the repository, the path's BLAKE3, the sequence (big-endian, so in order).
-const HISTORY_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG;
+/// Format: the bytes of an entry's place in its changeset's `Texts` section, a big-endian `u32` in a key (a section holds
+/// at most `u32::MAX` entries, refused past it).
+const ORDINAL: usize = 4;
+/// Format: a history row's key: the tag, the repository, the path's BLAKE3, the sequence and the entry's place in the
+/// changeset's section (each big-endian, so in order: a push's several versions of one path are each a row).
+const HISTORY_KEY_BYTES: usize = 1 + REPOSITORY + IDENTITY + LONG + ORDINAL;
+/// Format: the tool id table's tag: a repository's version of a path by its tool's id (Mercurial's node), to the version
+/// as it landed: its text's identity and its own row (its base is a version of the same path, as a revlog's is).
+const TOOLS: u8 = b'I';
+/// Format: a tool id row's key before the id: the tag, the repository, the path's BLAKE3 (the id's bytes follow).
+const TOOL_KEY_FIXED: usize = 1 + REPOSITORY + IDENTITY;
 
 /// How a landed text is made ([`Store::text_row`]): the changeset that kept it, its length, its edit's base (none for a
 /// whole), and where the edit or the whole lies.
@@ -424,15 +440,31 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
   let entries = decode(bytes).map_err(|_| StoreError::BadRow)?;
   let mut value = Vec::with_capacity(TEXT_VALUE_BYTES);
   let mut held = Vec::with_capacity(TEXT_VALUE_BYTES);
-  for entry in entries {
+  for (ordinal, entry) in entries.into_iter().enumerate() {
+    let ordinal = u32::try_from(ordinal).map_err(|_| StoreError::BadRow)?;
     rows.put(
       &history_key(
         header.repository,
         blake3::hash(&entry.path).as_bytes(),
-        header.sequence,
+        (header.sequence, ordinal),
       ),
       &entry.text,
     )?;
+    // The version of its path by its tool's id, as it landed (its own base and place, never another path's: a text
+    // two paths share keeps one `T` row, whose base may be a version of the other), the first landing's.
+    if !entry.tool_id.is_empty() {
+      let key = tool_key(
+        header.repository,
+        blake3::hash(&entry.path).as_bytes(),
+        &entry.tool_id,
+      );
+      if !rows.get(&key, &mut held)? {
+        value.clear();
+        value.extend_from_slice(&entry.text);
+        put_row_value(&mut value, header.sequence, &entry);
+        rows.put(&key, &value)?;
+      }
+    }
     // A text's row is the first changeset's that kept it, never replaced: a text that comes back (a file reverted, a
     // copy, a version with its base's bytes) is made as it first was, so every base names an older row and no chain
     // loops (A, then B against A, then A against B would otherwise make A and B each other's base).
@@ -440,24 +472,30 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
       continue;
     }
     value.clear();
-    value.extend_from_slice(&header.sequence.to_le_bytes());
-    value.extend_from_slice(&entry.len.to_le_bytes());
-    match entry.base {
-      Some(base) => {
-        value.push(PRESENT);
-        value.extend_from_slice(&base);
-      }
-      None => {
-        value.push(ABSENT);
-        value.extend_from_slice(&[0; IDENTITY]);
-      }
-    }
-    value.extend_from_slice(&entry.place.payload);
-    value.extend_from_slice(&entry.place.offset.to_le_bytes());
-    value.extend_from_slice(&entry.place.len.to_le_bytes());
+    put_row_value(&mut value, header.sequence, &entry);
     rows.put(&text_key(header.repository, &entry.text), &value)?;
   }
   Ok(())
+}
+
+/// Appends a text row's value of `entry`, landed at `sequence`: the sequence, the length, the base's mark and identity,
+/// the place ([`TEXT_VALUE_BYTES`]).
+fn put_row_value(value: &mut Vec<u8>, sequence: u64, entry: &TextEntry) {
+  value.extend_from_slice(&sequence.to_le_bytes());
+  value.extend_from_slice(&entry.len.to_le_bytes());
+  match entry.base {
+    Some(base) => {
+      value.push(PRESENT);
+      value.extend_from_slice(&base);
+    }
+    None => {
+      value.push(ABSENT);
+      value.extend_from_slice(&[0; IDENTITY]);
+    }
+  }
+  value.extend_from_slice(&entry.place.payload);
+  value.extend_from_slice(&entry.place.offset.to_le_bytes());
+  value.extend_from_slice(&entry.place.len.to_le_bytes());
 }
 
 /// A text row's key.
@@ -474,7 +512,11 @@ fn text_key(repository: u128, text: &Identity) -> [u8; TEXT_KEY_BYTES] {
 }
 
 /// A history row's key.
-fn history_key(repository: u128, path: &Identity, sequence: u64) -> [u8; HISTORY_KEY_BYTES] {
+fn history_key(
+  repository: u128,
+  path: &Identity,
+  (sequence, ordinal): (u64, u32),
+) -> [u8; HISTORY_KEY_BYTES] {
   let mut key = [0u8; HISTORY_KEY_BYTES];
   let (tag, rest) = key.split_at_mut(1);
   if let Some(tag) = tag.first_mut() {
@@ -482,10 +524,43 @@ fn history_key(repository: u128, path: &Identity, sequence: u64) -> [u8; HISTORY
   }
   let (repo, rest) = rest.split_at_mut(REPOSITORY);
   repo.copy_from_slice(&repository.to_be_bytes());
-  let (hash, seq) = rest.split_at_mut(IDENTITY);
+  let (hash, rest) = rest.split_at_mut(IDENTITY);
   hash.copy_from_slice(path);
+  let (seq, place) = rest.split_at_mut(LONG);
   seq.copy_from_slice(&sequence.to_be_bytes());
+  place.copy_from_slice(&ordinal.to_be_bytes());
   key
+}
+
+/// A tool id row's key: the tag, the repository, the path's BLAKE3, the id's bytes.
+fn tool_key(repository: u128, path: &Identity, tool_id: &[u8]) -> Vec<u8> {
+  let mut key = Vec::with_capacity(TOOL_KEY_FIXED.saturating_add(tool_id.len()));
+  key.push(TOOLS);
+  key.extend_from_slice(&repository.to_be_bytes());
+  key.extend_from_slice(path);
+  key.extend_from_slice(tool_id);
+  key
+}
+
+/// The first key past every key that begins with `prefix`: its last byte below 0xFF raised by one, the bytes after it
+/// dropped; none where every byte is 0xFF (no key follows them all).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+  let mut end = prefix.to_vec();
+  while let Some(last) = end.pop() {
+    if let Some(raised) = last.checked_add(1) {
+      end.push(raised);
+      return Some(end);
+    }
+  }
+  None
+}
+
+/// A tool id row's value, read: the text's identity, then its own row.
+fn decode_tool_value(value: &[u8]) -> Result<(Identity, TextRow), StoreError> {
+  let (identity, row) = value.split_at_checked(IDENTITY).ok_or(StoreError::BadRow)?;
+  let identity: Identity = identity.try_into().map_err(|_| StoreError::BadRow)?;
+  let row = decode_row(row).ok_or(StoreError::BadRow)?;
+  Ok((identity, row))
 }
 
 /// A text row's value, read.
@@ -573,8 +648,8 @@ impl Store {
     limit: usize,
   ) -> Result<Vec<(u64, Identity)>, StoreError> {
     let hash = *blake3::hash(path).as_bytes();
-    let start = history_key(repository, &hash, from);
-    let end = history_key(repository, &hash, u64::MAX);
+    let start = history_key(repository, &hash, (from, 0));
+    let end = history_key(repository, &hash, (u64::MAX, u32::MAX));
     let mut out = mantle_engine::rows::Rows::default();
     let mut next = Vec::new();
     self
@@ -583,7 +658,10 @@ impl Store {
     let mut found = Vec::with_capacity(limit.min(out.len()));
     for (key, value) in out.iter() {
       let sequence = key
-        .get(HISTORY_KEY_BYTES.saturating_sub(LONG)..)
+        .get(
+          HISTORY_KEY_BYTES.saturating_sub(LONG + ORDINAL)
+            ..HISTORY_KEY_BYTES.saturating_sub(ORDINAL),
+        )
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_be_bytes)
         .ok_or(StoreError::BadRow)?;
@@ -591,6 +669,146 @@ impl Store {
       found.push((sequence, identity));
     }
     Ok(found)
+  }
+
+  /// The versions of `path` in repository `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as
+  /// they landed: each one's text identity and its own row (its base a version of the same path, its place its own
+  /// edit's); none for one no landed changeset named.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a row that does not decode; the engine's refusals.
+  pub fn texts_by_tools(
+    &mut self,
+    repository: u128,
+    path: &[u8],
+    tool_ids: &[Vec<u8>],
+  ) -> Result<Vec<Option<(Identity, TextRow)>>, StoreError> {
+    // The path's tool id rows share their key's prefix, so they are read in one scan of it, a page as large as the
+    // ask, keeping the ones asked: a stream asks for a log's every version, one random lookup each before (r27 on
+    // hg-src: about 230,000 a stream, 1.35 s of its 3.7 s waiting on the store).
+    let hash = *blake3::hash(path).as_bytes();
+    let start = tool_key(repository, &hash, &[]);
+    let end = prefix_end(&start);
+    let wanted: std::collections::BTreeSet<&[u8]> = tool_ids.iter().map(Vec::as_slice).collect();
+    let mut kept: std::collections::BTreeMap<Vec<u8>, (Identity, TextRow)> =
+      std::collections::BTreeMap::new();
+    let mut from = start.clone();
+    let mut next = Vec::new();
+    loop {
+      let mut out = mantle_engine::rows::Rows::default();
+      self.tool_read();
+      let more = self.rows_mut().scan(
+        &from,
+        end.as_deref(),
+        tool_ids.len().max(1),
+        &mut out,
+        &mut next,
+      )?;
+      for (key, value) in out.iter() {
+        let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
+          continue;
+        };
+        if wanted.contains(tool_id) {
+          kept.insert(tool_id.to_vec(), decode_tool_value(value)?);
+        }
+      }
+      if !more || kept.len() == wanted.len() {
+        break;
+      }
+      core::mem::swap(&mut from, &mut next);
+    }
+    Ok(
+      tool_ids
+        .iter()
+        .map(|tool_id| kept.get(tool_id).copied())
+        .collect(),
+    )
+  }
+
+  /// The bytes at `place` in the log (an edit or a whole as its `T` row names it), read whole: what a stream sends as a
+  /// revision's chunk, in place, no text made.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a place past its payload, or a payload no landed changeset holds; the log's refusals.
+  pub fn place_bytes(&mut self, staging: &Staging, place: &Place) -> Result<Vec<u8>, StoreError> {
+    self
+      .places_bytes(staging, core::slice::from_ref(place))?
+      .pop()
+      .ok_or(StoreError::BadRow)
+  }
+
+  /// The bytes at each of `places`, in order (a stream's chunks, read in place): each run of places in one landed
+  /// payload, in order, read in one read of the log while that read stays within [`COALESCED_SPAN_TIMES`] the bytes the
+  /// run asks, each payload's place in the log found once. A log's revisions lie in order in their push's payload,
+  /// apart only by each chunk's header, so a stream's batch is a read or a few, never a read a chunk (r25 on hg-src:
+  /// about 230,000 reads a stream, a later stream 10.7 s). A place whose payload is still in flight is read from the
+  /// staging.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a place past its payload, or a payload no landed changeset holds; the log's refusals.
+  pub fn places_bytes(
+    &mut self,
+    staging: &Staging,
+    places: &[Place],
+  ) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut out = Vec::with_capacity(places.len());
+    let mut at = 0;
+    while let Some(first) = places.get(at) {
+      if staging.get(&first.payload).is_some() {
+        let mut counted = TextCache::new(0);
+        out.push(self.read_place(staging, first, &mut counted)?);
+        at = at.saturating_add(1);
+        continue;
+      }
+      let (base, payload_len) = self
+        .content_place(&first.payload)?
+        .ok_or(StoreError::BadRow)?;
+      let span_start = first.offset;
+      let mut span_end = first
+        .offset
+        .checked_add(first.len)
+        .ok_or(StoreError::BadRow)?;
+      let mut asked = first.len;
+      let mut end = at.saturating_add(1);
+      while let Some(next) = places.get(end) {
+        let Some(next_end) = next.offset.checked_add(next.len) else {
+          break;
+        };
+        let grown = asked.saturating_add(next.len);
+        let within =
+          next_end.saturating_sub(span_start) <= grown.saturating_mul(COALESCED_SPAN_TIMES);
+        if next.payload != first.payload || next.offset < span_end || !within {
+          break;
+        }
+        span_end = next_end;
+        asked = grown;
+        end = end.saturating_add(1);
+      }
+      if span_end > payload_len {
+        return Err(StoreError::BadRow);
+      }
+      let mut span = vec![
+        0u8;
+        usize::try_from(span_end.saturating_sub(span_start))
+          .map_err(|_| StoreError::BadRow)?
+      ];
+      self.log().read_at(
+        &mut span,
+        base.checked_add(span_start).ok_or(StoreError::BadRow)?,
+      )?;
+      self.place_read();
+      for place in places.get(at..end).unwrap_or_default() {
+        let from = usize::try_from(place.offset.saturating_sub(span_start))
+          .map_err(|_| StoreError::BadRow)?;
+        let len = usize::try_from(place.len).map_err(|_| StoreError::BadRow)?;
+        let bytes = span
+          .get(from..from.checked_add(len).ok_or(StoreError::BadRow)?)
+          .ok_or(StoreError::BadRow)?;
+        out.push(bytes.to_vec());
+      }
+      at = end;
+    }
+    Ok(out)
   }
 
   /// Makes `text` and every text of its chain the cache lacks, keeping each: whether a landed changeset kept it.

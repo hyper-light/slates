@@ -40,6 +40,157 @@ pub(crate) const REFUSED: &str = "vcs_store.svn_texts.refused";
 const ENTRY_BYTES: u64 =
   (size_of::<ContentIdentity>() + 2 * size_of::<u64>() + 3 * size_of::<usize>()) as u64;
 
+/// Text pieces read through the node's changeset store for drives waiting on them (C2 stage B part 2; module docs,
+/// "Reading"): each piece by its text and the offset it starts at, with how many waiting readers hold it. Bounded by
+/// the readers waiting on the shard: a reader puts the piece it waited for ([`fetch_piece`]) and lets it go once its
+/// next step has read it ([`let_go`]).
+#[derive(Debug, Default)]
+pub(crate) struct Pieces(std::collections::BTreeMap<(ContentIdentity, u64), (Vec<u8>, usize)>);
+
+impl Pieces {
+  /// How many pieces are held.
+  #[cfg(test)]
+  pub(crate) fn len(&self) -> usize {
+    self.0.len()
+  }
+
+  /// The piece of `identity` holding `offset`, from `offset` on; none where no reader fetched it.
+  pub(super) fn at(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+    let ((_, start), (bytes, _)) = self
+      .0
+      .range(..=(*identity, offset))
+      .next_back()
+      .filter(|((text, _), _)| text == identity)?;
+    let skip = usize::try_from(offset.checked_sub(*start)?).ok()?;
+    bytes.get(skip..).filter(|rest| !rest.is_empty())
+  }
+}
+
+/// Counter: a text piece a waiting drive read through the node's changeset store (C2 stage B part 2). Format: a counter
+/// name in the status report.
+pub(crate) const PIECE_FETCHED: &str = "vcs_store.svn_texts.piece_fetched";
+/// Counter: a piece the node's store could not give (no store, its owner gone, no such text): the waiting drive's
+/// connection ends. Format: a counter name.
+pub(crate) const PIECE_UNFETCHED: &str = "vcs_store.svn_texts.piece_unfetched";
+
+/// Reads the text piece `wanted` of repository `repository` through the node's changeset store and puts it where the
+/// repository's views read it ([`Pieces`]), held once more for the reader that waited; whether it did. A busy owner is
+/// asked again after a yield. Counted.
+pub(crate) async fn fetch_piece(
+  repository: slates_db::catalog::RepositoryId,
+  wanted: slates_svn::reads::Wanted,
+) -> bool {
+  let Some(Some(disk)) = crate::state::with_state(|state| state.vcs_disk.clone()) else {
+    return false;
+  };
+  let from = u128::from_be_bytes(repository.bytes);
+  let piece = loop {
+    match disk.text(from, wanted.text, wanted.offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => break Some(piece),
+      Err(slates_store::owner::OwnerError::Busy) => slates_rt::futures::yield_now().await,
+      _ => break None,
+    }
+  };
+  crate::state::with_state(|state| {
+    let Some(piece) = piece else {
+      state.count(PIECE_UNFETCHED, 1);
+      return false;
+    };
+    let held = state
+      .vcs_stores
+      .svn_pieces
+      .0
+      .entry((wanted.text, wanted.offset))
+      .or_insert((piece, 0));
+    held.1 = held.1.saturating_add(1);
+    state.count(PIECE_FETCHED, 1);
+    true
+  })
+  .unwrap_or(false)
+}
+
+/// Reads text `identity` of `len` bytes of repository `repository` whole through the node's changeset store into the
+/// content store, a piece at a time, made whole there with one hold (C2 stage B part 2 (b)): for a reader that needs a
+/// stored text whole in one step (a commit's green increment). Whether it did, its bytes its identity's; counted as a
+/// piece fetched each. A busy owner is asked again after a yield.
+pub(crate) async fn bring_whole(
+  repository: slates_db::catalog::RepositoryId,
+  identity: ContentIdentity,
+  len: u64,
+) -> bool {
+  let Some(Some(disk)) = crate::state::with_state(|state| state.vcs_disk.clone()) else {
+    return false;
+  };
+  let from = u128::from_be_bytes(repository.bytes);
+  let mut writing = slates_vcs::Writing::default();
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(from, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      _ => break,
+    };
+    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+    let put = crate::state::with_state(|state| {
+      state.count(PIECE_FETCHED, 1);
+      state.count(BYTES_BROUGHT, brought);
+      crate::vcs_store::within_budget(state, brought, |stores| {
+        stores
+          .content_mut()
+          .is_some_and(|content| content.put_window(&mut writing, &piece).is_ok())
+      })
+    });
+    if put != Some(true) {
+      break;
+    }
+    offset = offset.saturating_add(brought);
+  }
+  crate::state::with_state(|state| {
+    let made = crate::vcs_store::within_budget(state, 0, |stores| {
+      let Some(content) = stores.content_mut() else {
+        return false;
+      };
+      if offset != len {
+        content.abandon_object(writing);
+        return false;
+      }
+      match content.finish_object(&mut writing) {
+        Ok(made) if made == slates_vcs::ContentId(identity) => true,
+        Ok(made) => {
+          let _ = content.release(&made);
+          false
+        }
+        Err(_) => false,
+      }
+    });
+    if !made {
+      state.count(PIECE_UNFETCHED, 1);
+    }
+    made
+  })
+  .unwrap_or(false)
+}
+
+/// Counter: the bytes a reader that needs a text whole brought through the node's changeset store ([`bring_whole`]: a
+/// commit's increment, a copy's restore, a hook view, an import's delta base). Format: a counter name in the status
+/// report.
+pub(crate) const BYTES_BROUGHT: &str = "vcs_store.svn_texts.bytes_brought";
+
+/// Lets go the reader's hold on the piece `wanted` it fetched ([`fetch_piece`]), the piece gone with its last hold.
+pub(crate) fn let_go(state: &mut ShardState, wanted: slates_svn::reads::Wanted) {
+  let pieces = &mut state.vcs_stores.svn_pieces.0;
+  let key = (wanted.text, wanted.offset);
+  if let Some(held) = pieces.get_mut(&key) {
+    held.1 = held.1.saturating_sub(1);
+    if held.1 == 0 {
+      pieces.remove(&key);
+    }
+  }
+}
+
 /// The Subversion sources' texts (module docs, "Reading"): the green's held table first, then the records.
 pub(crate) struct HeadTexts<'a> {
   /// The repository's green, when it is held here.
@@ -49,6 +200,9 @@ pub(crate) struct HeadTexts<'a> {
   pub(crate) store: Option<&'a slates_vcs::ContentStore>,
   /// The repository's records.
   pub(crate) records: &'a SvnRecords,
+  /// The pieces waiting drives fetched through the node's store, where a reader that can wait reads a stored text the
+  /// content store does not hold ([`fetch_piece`]); none for a reader that cannot wait.
+  pub(crate) pieces: Option<&'a Pieces>,
 }
 
 impl TextSource for HeadTexts<'_> {
@@ -81,12 +235,25 @@ impl TextSource for HeadTexts<'_> {
         if offset >= len {
           return (offset == len).then_some(Cow::Borrowed(&[]));
         }
-        self
-          .store?
-          .run_at(&slates_vcs::ContentId(*identity), len, offset)
+        let held = self
+          .store
+          .and_then(|store| store.run_at(&slates_vcs::ContentId(*identity), len, offset));
+        // A stored text the content store does not hold is read through the node's store (C2 stage B part 2).
+        held.or_else(|| self.pieces?.at(identity, offset).map(Cow::Borrowed))
       }
       None => self.records.text_at(identity, offset).map(Cow::Owned),
     }
+  }
+
+  /// A stored text's piece neither the green, the content store nor the fetched pieces hold, for a reader that can
+  /// wait: it is read through the node's changeset store (C2 stage B part 2; [`fetch_piece`]).
+  fn fetchable(&self, identity: &ContentIdentity, offset: u64) -> bool {
+    self.pieces.is_some()
+      && self
+        .records
+        .stored_len(identity)
+        .is_some_and(|len| offset < len)
+      && self.text_at(identity, offset).is_none()
   }
 
   /// [`TextSource::text_at`] for a reader keeping `cache` across its steps: the green's and the content store's runs
@@ -116,18 +283,23 @@ impl TextSource for HeadTexts<'_> {
     let Some(len) = self.records.stored_len(identity) else {
       return TextSource::read_step(self.records, identity, reading);
     };
-    // A stored text is read from the content store alone (c3: one place a text, no arm after another).
-    let store = self.store?;
-    let root = store.root_of(&slates_vcs::ContentId(*identity));
-    let window = u64::try_from(store.window()).ok()?;
     let read = reading.read();
     if read >= len {
       return Some(true);
     }
-    let piece = store.window_at(&root, len, read.checked_div(window)?)?;
-    let skip = usize::try_from(read.checked_rem(window)?).ok()?;
     let wanted = usize::try_from(len.saturating_sub(read)).ok()?;
-    let rest = piece.get(skip..)?;
+    // A stored text is read from the content store; one it does not hold, through the node's store (C2 stage B part 2):
+    // the piece a waiting reader fetched.
+    if let Some(store) = self.store {
+      let root = store.root_of(&slates_vcs::ContentId(*identity));
+      let window = u64::try_from(store.window()).ok()?;
+      if let Some(piece) = store.window_at(&root, len, read.checked_div(window)?) {
+        let skip = usize::try_from(read.checked_rem(window)?).ok()?;
+        let rest = piece.get(skip..)?;
+        return Some(reading.append(rest.get(..wanted).unwrap_or(rest), len));
+      }
+    }
+    let rest = self.pieces?.at(identity, read)?;
     Some(reading.append(rest.get(..wanted).unwrap_or(rest), len))
   }
 }
@@ -333,6 +505,7 @@ mod tests {
       green: None,
       store: Some(&store),
       records: &records,
+      pieces: None,
     };
     let mut reading = TextReading::new();
     let mut steps = 0;

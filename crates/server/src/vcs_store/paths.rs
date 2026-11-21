@@ -195,6 +195,17 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
   }
 }
 
+/// P2's "derived on first read" (A-812, A-823): a git green just made through the door (`crate::green_ready`), owing
+/// its push until it was first reached, has its map of paths made of its head as a push's version has
+/// ([`advance_after_push`]): from its whole head in the whole build's slices where it holds no map before, else over
+/// the change. Nothing for a green of no git repository.
+pub(crate) fn derive_once_made(state: &mut ShardState, green: DbVolumeId) {
+  let Some(version) = state.greens.get(&green).map(|engine| engine.head()) else {
+    return;
+  };
+  advance_after_push(state, green, version);
+}
+
 /// [`advance`] for a version a push committed (A-664's live whole builds): a version whose map must be built from the
 /// whole head is built in slices by a task of the shard ([`whole_build`]), since a push carries its own commits and
 /// nothing of its answer needs the map; a step over the change runs here, as [`advance`]'s does. A push to a green whose
@@ -271,22 +282,7 @@ pub(crate) fn needs_whole(
   before.is_none_or(|before| named(&engine, before.version, version).is_none())
 }
 
-/// Builds the map of each member green of `repository` that committed a version, from its head (module docs): what a
-/// store made again from the log holds again.
-pub(crate) fn remake(state: &mut ShardState, repository: RepositoryId) {
-  let greens: Vec<DbVolumeId> = state
-    .db
-    .partition()
-    .repositories()
-    .members_of(repository)
-    .map(|member| member.green)
-    .collect();
-  for green in greens {
-    remake_green(state, green);
-  }
-}
-
-/// [`remake`]'s unit: `green`'s map built from its head, where it committed a version.
+/// `green`'s map built from its head, where it committed a version: what a store made again from the log holds again.
 pub(crate) fn remake_green(state: &mut ShardState, green: DbVolumeId) {
   let Some(version) = state.greens.get(&green).map(|engine| engine.head()) else {
     return;
@@ -436,13 +432,151 @@ fn step(
       (store, vcs_stores),
       repository,
       (key, version, whole),
-      source,
+      (source, 0),
     )
   };
   if !charged_whole {
     state.count(super::CHARGE_SHORT, 1);
   }
   Some(answer)
+}
+
+/// Lets go of every map and git trees `repository`'s greens keep (derived data, made again on a green's next step): for a
+/// test comparing what a successor holds of the repository's records alone, since a green that owes its push on replay
+/// derives its paths on first read (P2).
+#[cfg(test)]
+pub(crate) fn forget_maps_for_test(state: &mut ShardState, repository: RepositoryId) {
+  if let Some((content, git)) = state.vcs_stores.git(repository) {
+    for head in std::mem::take(&mut git.heads).into_values() {
+      let _ = release_head(content, &head);
+    }
+  }
+  super::settle(state);
+}
+
+/// What stepping `green`'s map of `version` over a held verdict's preview needs, read from the shard before the
+/// preview is lent (C5 2b piece 3, `super::commits::make_deferred`): its repository, its key, its branch's source and
+/// the version.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OverPreview {
+  /// The repository.
+  pub(crate) repository: RepositoryId,
+  /// The green's key in the store.
+  pub(crate) key: u64,
+  /// The green it was branched from and the version it was made at, for a branch.
+  pub(crate) source: Option<(u64, u64)>,
+  /// The version the held verdict makes.
+  pub(crate) version: u64,
+}
+
+impl OverPreview {
+  /// How far below the green's numbering the preview numbers its versions: its version 0 is the green's head, the
+  /// version before, and its version 1 the held verdict (`Lineage::preview`).
+  pub(crate) fn preview_offset(&self) -> u64 {
+    self.version.saturating_sub(1)
+  }
+}
+
+/// [`OverPreview`] of `green`'s `version`; none for a green of no git repository.
+pub(crate) fn over_preview(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<OverPreview> {
+  Some(OverPreview {
+    repository: git_repository_of(state, green)?,
+    key: super::green_key(green),
+    source: branch_source(state, green),
+    version,
+  })
+}
+
+/// How the map of a held verdict's version is had over its preview (C5 2b piece 3): [`advance`]'s rule, the green at the
+/// version being the preview rather than the green, whose head is the version before until the one step applies it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverPreviewStep {
+  /// The map is of the version already.
+  Kept,
+  /// Stepped over the change from the map before: the change's cost.
+  Change,
+  /// Built from the preview's whole head: the version a root's first, so the whole is the version's own change.
+  Whole,
+  /// The map of the head before is built first, in slices (`whole_build`), then the change stepped.
+  HeadFirst,
+}
+
+/// [`OverPreviewStep`] for `over`, `engine` the preview; none where the repository's store is not held here.
+pub(crate) fn over_preview_step(
+  engine: &Green,
+  stores: &VcsStores,
+  over: &OverPreview,
+) -> Option<OverPreviewStep> {
+  let (_, git) = stores.git_ref(over.repository)?;
+  let held = git.heads.get(&over.key).copied();
+  if held.is_some_and(|head| head.version == over.version) {
+    return Some(OverPreviewStep::Kept);
+  }
+  let before = held
+    .filter(|head| head.version.checked_add(1) == Some(over.version))
+    .or_else(|| branch_before(git, held, (false, over.version), over.source));
+  let offset = over.preview_offset();
+  let named_over = |before: Head| {
+    named(
+      engine,
+      before.version.saturating_sub(offset),
+      over.version.saturating_sub(offset),
+    )
+  };
+  if before.is_some_and(|before| named_over(before).is_some()) {
+    return Some(OverPreviewStep::Change);
+  }
+  Some(if over.version <= 1 {
+    OverPreviewStep::Whole
+  } else {
+    OverPreviewStep::HeadFirst
+  })
+}
+
+/// Steps the map of `over`'s version over `engine`, the held verdict's preview (C5 2b piece 3), and keeps it as the
+/// green's head in the store before the version is durable: the made commit's objects are read from it. `whole` builds
+/// it from the preview's whole head. Whether it was kept, and whether the shard took every byte the step left held.
+pub(crate) fn step_over_preview(
+  engine: &Green,
+  (store, stores): (&mut Store, &mut VcsStores),
+  over: &OverPreview,
+  whole: bool,
+) -> (bool, bool) {
+  let (answer, charged_whole) = stepped(
+    engine,
+    (store, stores),
+    over.repository,
+    (over.key, over.version, whole),
+    (over.source, over.preview_offset()),
+  );
+  (answer.is_ok(), charged_whole)
+}
+
+/// Lets go of the map kept for `green` at `version` over a preview whose version never became durable (a made commit
+/// given up before its one step, C5 2b piece 3): the green's next step builds its map again rather than read one of a
+/// version it never committed.
+pub(crate) fn forget_preview_head(state: &mut ShardState, green: DbVolumeId, version: u64) {
+  let Some(repository) = git_repository_of(state, green) else {
+    return;
+  };
+  let key = super::green_key(green);
+  let Some((content, git)) = state.vcs_stores.git(repository) else {
+    return;
+  };
+  if let Some(head) = git
+    .heads
+    .get(&key)
+    .copied()
+    .filter(|head| head.version == version)
+  {
+    git.heads.remove(&key);
+    let _ = release_head(content, &head);
+    super::settle(state);
+  }
 }
 
 /// The key of the green `green` was branched from and the version it was made at, for a branch.
@@ -454,7 +588,7 @@ fn branch_source(state: &ShardState, green: DbVolumeId) -> Option<(u64, u64)> {
 }
 
 /// The git repository `green` is a member of, when its store is git's.
-pub(super) fn git_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
+pub(crate) fn git_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
   let repository = state
     .db
     .partition()
@@ -475,9 +609,15 @@ fn stepped(
   (store, stores): (&mut Store, &mut VcsStores),
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
-  source: Option<(u64, u64)>,
+  (source, offset): (Option<(u64, u64)>, u64),
 ) -> (Result<Stepped, StepRefused>, bool) {
-  let plan = match plan(engine, stores, repository, (key, version, whole), source) {
+  let plan = match plan(
+    engine,
+    stores,
+    repository,
+    (key, version, whole),
+    (source, offset),
+  ) {
     Ok(plan) => plan,
     Err(refused) => return (Err(refused), true),
   };
@@ -498,7 +638,7 @@ fn plan<'g>(
   stores: &VcsStores,
   repository: RepositoryId,
   (key, version, whole): (u64, u64, bool),
-  source: Option<(u64, u64)>,
+  (source, offset): (Option<(u64, u64)>, u64),
 ) -> Result<Plan<'g>, StepRefused> {
   let (content, git) = stores.git_ref(repository).ok_or(StepRefused::NoMap)?;
   let paths = git.paths.as_ref().ok_or(StepRefused::NoMap)?;
@@ -515,10 +655,15 @@ fn plan<'g>(
   let Some(before) = before else {
     return Ok(Plan::Whole(whole_head(engine)));
   };
+  // The engine numbers its versions `offset` below the green's: none for the green itself, the version before for a
+  // held verdict's preview, whose version 0 is the green's head and its 1 the verdict (C5 2b piece 3).
   let changed = changed(
     engine,
     (content, paths, before.root),
-    (before.version, version),
+    (
+      before.version.saturating_sub(offset),
+      version.saturating_sub(offset),
+    ),
   )?;
   Ok(changed.map_or_else(
     || Plan::Whole(whole_head(engine)),

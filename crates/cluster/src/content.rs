@@ -860,6 +860,46 @@ enum Adopt {
   Manifest([u8; 16], [u8; 32]),
 }
 
+/// A chunk's fields and its payload, lent: what storing a chunk reads, whether it came off the wire owned or is lent from
+/// bytes the caller holds ([`ContentHold::hold_lent`]).
+struct ChunkView<'a> {
+  identity: [u8; 32],
+  raw_len: u64,
+  stored_len: u64,
+  encoding: Encoding,
+  level: u8,
+  dictionary: [u8; 32],
+  payload: &'a [u8],
+}
+
+impl<'a> ChunkView<'a> {
+  fn of(chunk: &'a Chunk) -> ChunkView<'a> {
+    ChunkView {
+      identity: chunk.identity,
+      raw_len: chunk.raw_len,
+      stored_len: chunk.stored_len,
+      encoding: chunk.encoding,
+      level: chunk.level,
+      dictionary: chunk.dictionary,
+      payload: &chunk.payload,
+    }
+  }
+
+  /// A raw chunk of `payload`, whose identity the caller hashed.
+  fn raw(identity: [u8; 32], payload: &'a [u8]) -> ChunkView<'a> {
+    let len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
+    ChunkView {
+      identity,
+      raw_len: len,
+      stored_len: len,
+      encoding: Encoding::Raw,
+      level: 0,
+      dictionary: [0; 32],
+      payload,
+    }
+  }
+}
+
 /// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
 /// length), the fields a `Chunk` carries besides its payload, how many objects reference it, and how many
 /// stages have it verified and kept (AUD-29-55). Its block goes when both counts are zero.
@@ -1174,6 +1214,65 @@ impl ContentHold {
     outcome
   }
 
+  /// [`hold`](Self::hold) of an archive whose chunks the caller holds as bytes (lane (A), format 6: an owner holding its
+  /// version's increment as the version's inputs): `manifest` is the archive with no chunks, its one file's extents
+  /// raw chunks over `pieces` in order, each piece's identity the BLAKE3 of its bytes (the inputs archive's rule). Each
+  /// piece the hold lacks is hashed, checked against the manifest's references and copied once, into its block; no
+  /// chunk is built around it. The same admission, charges and refusals as `hold`, and the same identity back.
+  pub fn hold_lent<'a>(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    placed: Placed,
+    manifest: &Archive,
+    pieces: impl IntoIterator<Item = &'a [u8]>,
+  ) -> Result<[u8; 32], ContentRefusal> {
+    if !manifest.chunks.is_empty() {
+      return Err(ContentRefusal::Unreferenced);
+    }
+    let identity = manifest.manifest_identity();
+    let (opened, created) = self.open_stage(space, object, placed, manifest)?;
+    if let Opened::Held = opened {
+      return Ok(identity);
+    }
+    let mut outcome = Ok(identity);
+    for piece in pieces {
+      let view = ChunkView::raw(*blake3::hash(piece).as_bytes(), piece);
+      if let Err(refusal) = self.stage_view(space, object, &identity, view, None) {
+        outcome = Err(refusal);
+        break;
+      }
+    }
+    let outcome = outcome.and_then(|_| self.promote(space, object));
+    if outcome.is_err() && created {
+      self.drop_stage(space, object);
+    }
+    outcome
+  }
+
+  /// A chunk's raw payload as stored for a manifest held for `object`, lent from `arena`: `None` unless the object
+  /// holds that manifest whole, its held content references the chunk, and the chunk is stored raw (AUD-29-45, as
+  /// [`held_chunk`](Self::held_chunk)). What an owner reads its version's increment through (format 6), copied nowhere.
+  pub fn held_raw<'a>(
+    &self,
+    arena: &'a ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: &[u8; 32],
+  ) -> Option<&'a [u8]> {
+    let held = self.objects.get(&object)?;
+    if !held.manifests.contains_key(identity) || !held.chunks.contains_key(chunk) {
+      return None;
+    }
+    let stored = self.chunks.get(chunk)?;
+    if stored.encoding != Encoding::Raw {
+      return None;
+    }
+    arena
+      .bytes(stored.extent)?
+      .get(..usize::try_from(stored.stored_len).ok()?)
+  }
+
   /// The arena block length `len` bytes take, as a charge; `NoCapacity` when no block class fits.
   fn block_bytes(arena: &ChunkArena, len: u64) -> Result<u64, ContentRefusal> {
     usize::try_from(len)
@@ -1357,6 +1456,19 @@ impl ContentHold {
     manifest: &[u8; 32],
     chunk: Chunk,
   ) -> Result<u64, ContentRefusal> {
+    self.stage_view(space, object, manifest, ChunkView::of(&chunk), Some(&chunk))
+  }
+
+  /// [`stage_chunk`](Self::stage_chunk) over a chunk's view: `owned` is the chunk to verify when it came off the wire,
+  /// `None` for a raw chunk lent from bytes the caller hashed into its identity ([`ContentHold::hold_lent`]).
+  fn stage_view(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    chunk: ChunkView<'_>,
+    owned: Option<&Chunk>,
+  ) -> Result<u64, ContentRefusal> {
     let identity = chunk.identity;
     let Some(stage) = self
       .stages
@@ -1387,7 +1499,7 @@ impl ContentHold {
         stored.staged = stored.staged.saturating_add(1);
       }
     } else {
-      self.store_new_chunk(space, &chunk, entry)?;
+      self.store_new_chunk(space, &chunk, owned, entry)?;
     }
     let Some(stage) = self.stages.get_mut(&object) else {
       return Err(ContentRefusal::Unstaged);
@@ -1406,7 +1518,8 @@ impl ContentHold {
   fn store_new_chunk(
     &mut self,
     space: &mut HoldSpace<'_>,
-    chunk: &Chunk,
+    chunk: &ChunkView<'_>,
+    owned: Option<&Chunk>,
     entry: u64,
   ) -> Result<(), ContentRefusal> {
     let block = Self::block_bytes(space.arena, chunk.stored_len)?;
@@ -1417,13 +1530,15 @@ impl ContentHold {
     };
     let index = chunk_entry_bytes().saturating_add(entry);
     self.take(space, block, scratch, index)?;
-    if let Err(refusal) = Self::verify(space, &[chunk], scratch) {
+    if let Some(owned) = owned
+      && let Err(refusal) = Self::verify(space, &[owned], scratch)
+    {
       self.give(space, block, scratch, index);
       return Err(refusal);
     }
     // Verification is done: its scratch goes back before anything is stored.
     space.budget.credit_replicated(scratch);
-    let extent = match self.place_bytes(space.arena, &chunk.payload, Adopt::Chunk(chunk.identity)) {
+    let extent = match self.place_bytes(space.arena, chunk.payload, Adopt::Chunk(chunk.identity)) {
       Ok(extent) => extent,
       Err(refusal) => {
         self.give(space, block, 0, index);

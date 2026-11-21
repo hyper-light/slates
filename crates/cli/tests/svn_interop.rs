@@ -760,6 +760,74 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   round_trip(&svn, &format!("svn://127.0.0.1:{port}/{REPOSITORY}"));
 }
 
+/// P7's finding (1), main's interop case of 2026-11-21 (10:55, condition 1): a copy from an older revision, made by the
+/// server from the head and set back from the records, as stock `svn` 1.15 sees it. Do: start an anchor with its
+/// `svn://` listener; as stock `svn`, commit a directory `d` holding [`FILE`] (`one`) as revision 1; change the file to
+/// `two` (revision 2); add `d/later` (revision 3); then copy `d` at revision 1 to `e` (revision 4). Expect: the copy
+/// committed as revision 4; `e` listing [`FILE`] alone, its text `one`; `d`'s text still `two`; and revision 4's log
+/// naming `/e` added from `/d:1`, as `svnserve` names a copy. Skips loudly without stock Subversion 1.15.
+#[test]
+fn stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping stock svn's copy from an older revision: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  let instance = format!("svn-old-copy-{}", std::process::id());
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = svn_listener_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "stock svn's copy from an older revision") else {
+    return;
+  };
+  create_repository(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
+  let scratch = Scratch::new("svn-old-copy");
+  let svn = Svn::new(&scratch, "copy", credentials(id, token));
+  let url = format!("svn://127.0.0.1:{port}/{REPOSITORY}");
+  let copy = svn.copy("work");
+  svn.ok(&svn.scratch, &["checkout", &url, &copy]);
+  svn.ok(&copy, &["mkdir", "d"]);
+  let within = format!("{copy}/d");
+  put(&within, "one\n");
+  svn.ok(&within, &["add", FILE]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "d"]),
+    "Committed revision 1.",
+  );
+  put(&within, "two\n");
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "two"]),
+    "Committed revision 2.",
+  );
+  svn.ok(&within, &["mkdir", "later"]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "later"]),
+    "Committed revision 3.",
+  );
+  let copied = svn.ok(
+    &svn.scratch,
+    &[
+      "copy",
+      "--revision",
+      "1",
+      &format!("{url}/d"),
+      &format!("{url}/e"),
+      "--message",
+      "from 1",
+    ],
+  );
+  expect_line(&copied, "Committed revision 4.");
+  let listed = svn.ok(&svn.scratch, &["list", &format!("{url}/e")]);
+  assert_eq!(listed, format!("{FILE}\n"), "e's listing");
+  let text = svn.ok(&svn.scratch, &["cat", &format!("{url}/e/{FILE}")]);
+  assert_eq!(text, "one\n", "e's text");
+  let head = svn.ok(&svn.scratch, &["cat", &format!("{url}/d/{FILE}")]);
+  assert_eq!(head, "two\n", "d's text");
+  let logged = svn.ok(&svn.scratch, &["log", "--verbose", "--revision", "4", &url]);
+  expect_line(&logged, "   A /e (from /d:1)");
+}
+
 /// §4.17.4 item 14 over `http://` (item 5's HTTP: the WebDAV site on the shared HTTP edge, a repository under the
 /// URL's first segment, as `SVNParentPath` serves one). Do: start an anchor with its HTTP edge on loopback
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at
@@ -1059,6 +1127,122 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
   );
 }
 
+/// Shape: the revisions of the repository a hook's first view is laid out for: git/git's newest 2,000 first-parent
+/// commits as a dump were the repository whose hooks the owner shard's one liveness budget refused (w-interop's svn
+/// matrix, release, Mac Studio, 2026-11-20: "its owner shard did not answer in time"), and a debug build lays each out
+/// slower than that release did.
+const MANY_REVISIONS: u64 = 2_000;
+
+/// Shape: the files of the one directory every revision of [`many_revisions_dump`] changes a file of: as many as
+/// git/git's tree holds at f7de81456940 (4,872), the dump the matrix met the refusal with. Every revision's file in an
+/// FSFS view carries the listing of each directory on a changed path, so each revision costs the view as much as this
+/// listing; a history of one file lays 2,000 revisions out inside a liveness budget even in a debug build (this test
+/// with one file passed on main a51023f57, 22.8 s).
+const MANY_REVISIONS_FILES: u64 = 4_872;
+
+/// A dump of `revisions` revisions under `trunk/`: the first adds [`MANY_REVISIONS_FILES`] files, each later one
+/// changes one of them: the history a hook's first view must lay out a revision at a time.
+fn many_revisions_dump(revisions: u64) -> Vec<u8> {
+  let props = |log: &str| format!("K 7\nsvn:log\nV {}\n{log}\nPROPS-END\n", log.len());
+  let file = |path: String, action: &str, body: &str| {
+    format!(
+      "Node-path: {path}\nNode-kind: file\nNode-action: {action}\nText-content-length: {0}\nContent-length: {0}\n\n\
+       {body}\n\n",
+      body.len()
+    )
+  };
+  let mut out = String::from(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-0000000064a6\n\nRevision-number: 0\n\
+     Prop-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n",
+  );
+  for revision in 1..=revisions {
+    let log = props(&format!("r{revision}"));
+    out.push_str(&format!(
+      "Revision-number: {revision}\nProp-content-length: {0}\nContent-length: {0}\n\n{log}\n",
+      log.len()
+    ));
+    if revision == 1 {
+      out.push_str(
+        "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\n\
+         PROPS-END\n\n",
+      );
+      for at in 0..MANY_REVISIONS_FILES {
+        out.push_str(&file(format!("trunk/f{at:05}"), "add", &format!("{at}\n")));
+      }
+    } else {
+      let at = revision % MANY_REVISIONS_FILES;
+      out.push_str(&file(
+        format!("trunk/f{at:05}"),
+        "change",
+        &format!("{at} r{revision}\n"),
+      ));
+    }
+  }
+  out.into_bytes()
+}
+
+/// A-645 (a), a hook's first view of a long history (w-interop's svn matrix, 2026-11-21). Do: start an anchor with its
+/// HTTP edge and a store directory; import a repository of [`MANY_REVISIONS`] revisions (`slates repository import`);
+/// configure a start-commit hook that copies `$1/db/current` (its `REPOS-PATH`'s youngest) to a file and refuses; POST
+/// `( create-txn )` to `!svn/me`, so the hook asks for the repository's first view; then unmount the view. Expect the
+/// hook to have read the youngest revision through the view and the unmount to succeed: the wait for the view is
+/// judged on its progress, however long its history. Red on main a51023f57: the first view had one liveness budget of
+/// the owner shard's time, so the hook was refused unrun ("its owner shard did not answer in time"), the file never
+/// written.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-long-view-{}", std::process::id());
+  let scratch = Scratch::new("svn-long-view");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "a long history's first view") else {
+    return;
+  };
+  create_repository(&instance);
+  let dump = format!("{}/many.dump", scratch.path);
+  std::fs::write(&dump, many_revisions_dump(MANY_REVISIONS)).unwrap();
+  let imported = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+  assert_eq!(imported.0, 0, "import: {imported:?}");
+  let (_, token) = minted_token(&instance, &issuer);
+  let read = format!("{}/view-read", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\ncat \"$1/db/current\" > \"{read}\"\nexit 1\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let seen = std::fs::read_to_string(&read).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert_eq!(
+    (seen.as_str(), unmounted.0),
+    (format!("{MANY_REVISIONS}\n").as_str(), 0),
+    "answer: {answer}; unmount: {unmounted:?}"
+  );
+}
+
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`: a repository with no pre-revprop-change hook refuses every
 /// revision property change). Do: over the svn:// listener, with revision 1 committed and no hook configured, change
 /// its `svn:log` with stock `svn propset --revprop` (ra_svn's `change-rev-prop2`). Expect it refused in svnserve's words
@@ -1221,6 +1405,206 @@ fn a_large_commit_measured() {
       LARGE_COMMIT_BYTES >> 10,
       out.trim(),
       err.trim()
+    );
+  }
+}
+
+/// P7 of Ada's close list (A-772's daemon peak against the dump; a measurement, not a gate). Do: start an anchor whose
+/// daemon holds a changeset store, create a Subversion repository, and import the dump `SLATES_SVN_IMPORT_DUMP` names
+/// through the CLI (`slates repository import`), sampling the daemon's resident bytes while it runs; then ask the daemon
+/// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
+/// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
+/// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
+/// With `SLATES_SVN_IMPORT_HOLD` naming a path, the daemon is held after the import for main's heap attribution (P7's
+/// finding (2)): its pid written to the path, and the daemon kept until the path is deleted, at most [`PATIENCE`].
+#[test]
+#[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+#[allow(clippy::disallowed_methods)] // test code: the hold's pid file, at the path the measurer names
+fn an_import_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
+    eprintln!("skipping the import's measurement: SLATES_SVN_IMPORT_DUMP names no dump");
+    return;
+  };
+  let dump_bytes = std::fs::metadata(&dump).unwrap().len();
+  let instance = format!("svn-import-{}", std::process::id());
+  let (_anchor, _lines, _issuer) = start_anchor(&instance, &[]);
+  create_repository(&instance);
+  let before = daemon_rss_kib(&instance);
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "repository",
+      "import",
+      REPOSITORY,
+      &dump,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let started = Instant::now();
+  let mut peak = 0;
+  let code = loop {
+    peak = peak.max(daemon_rss_kib(&instance));
+    if let Some(status) = child.try_wait().unwrap() {
+      break status.code().unwrap_or(-1);
+    }
+    pause();
+  };
+  let seconds = started.elapsed().as_secs_f64();
+  let after = daemon_rss_kib(&instance);
+  let (_, memory, _) = slates(&instance, &["status", "--memory"]);
+  let kinds: Vec<&str> = memory
+    .lines()
+    .filter(|line| {
+      [
+        "heap", "arena", "segment", "content", "region", "memory", "budget",
+      ]
+      .iter()
+      .any(|word| line.contains(word))
+    })
+    .collect();
+  println!(
+    "an_import_measured: exit {code} in {seconds:.1} s; dump {} KiB; daemon RSS {before} KiB before, peak {peak} KiB, \
+     after {after} KiB\n  import: {}{}\n  memory: {kinds:#?}",
+    dump_bytes >> 10,
+    out.join().unwrap().trim(),
+    err.join().unwrap().trim()
+  );
+  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
+    let pid = daemon_pid(&instance).expect("the daemon's pid");
+    std::fs::write(&hold, format!("{pid}\n")).unwrap();
+    println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
+    let held = Instant::now();
+    while std::path::Path::new(&hold).exists() && held.elapsed() < PATIENCE {
+      pause();
+    }
+    let _ = std::fs::remove_file(&hold);
+  }
+}
+
+/// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
+fn daemon_pid(instance: &str) -> Option<u32> {
+  let listed = Command::new("ps")
+    .args(["-A", "-o", "pid=,command="])
+    .output()
+    .ok()?;
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(instance) && !line.contains(" anchor"))
+    .find_map(|line| line.split_whitespace().next()?.parse().ok())
+}
+
+/// P7 of Ada's close list (A-772: svnsync over the matrix took 524 s over HTTP and 1,068 s over svn://; a measurement,
+/// not a gate). Do: for svn:// and the HTTP edge in turn, start an anchor whose daemon holds a changeset store, create a
+/// Subversion repository and import the dump `SLATES_SVN_SYNC_DUMP` names through the CLI; then mirror it with stock
+/// `svnsync` 1.15 into a local FSFS repository (`svnadmin create`, a pre-revprop-change hook allowing every change,
+/// `svnsync init`, then `svnsync sync` timed), sampling the daemon's resident bytes. Expect nothing: print each scheme's
+/// import seconds, the sync's answer, seconds and seconds a revision, the mirror's youngest revision, and the daemon's
+/// resident bytes before and at its peak. Skips loudly without stock Subversion 1.15 or the dump.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)] // test code: the mirror's hook, in the test's own scratch directory
+#[ignore = "a measurement: SLATES_SVN_SYNC_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_svnsync_measured --nocapture"]
+fn an_svnsync_measured() {
+  use std::os::unix::fs::PermissionsExt;
+  let Ok(dump) = std::env::var("SLATES_SVN_SYNC_DUMP") else {
+    eprintln!("skipping svnsync's measurement: SLATES_SVN_SYNC_DUMP names no dump");
+    return;
+  };
+  if !stock_svn() || !stock_svnserve() {
+    eprintln!(
+      "skipping svnsync's measurement: no stock Subversion 1.15 here (svn, svnadmin, svnsync)"
+    );
+    return;
+  }
+  for scheme in ["svn", "http"] {
+    let instance = format!("svn-sync-{scheme}-{}", std::process::id());
+    let edge = format!("--vcs-{scheme}");
+    let (_anchor, lines, issuer) = start_anchor(&instance, &[&edge, "127.0.0.1:0"]);
+    let Some(issuer) = issuer_or_skip(issuer, "svnsync's measurement") else {
+      return;
+    };
+    create_repository(&instance);
+    let importing = Instant::now();
+    let (code, out, err) = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+    assert_eq!(code, 0, "repository import: {out}{err}");
+    let imported = importing.elapsed().as_secs_f64();
+    let (id, token) = minted_token(&instance, &issuer);
+    let (user, url) = match scheme {
+      "svn" => (
+        id,
+        format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
+      ),
+      _ => (
+        USER.to_owned(),
+        format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
+      ),
+    };
+    let scratch = Scratch::new(&format!("svn-sync-{scheme}"));
+    let mirror = format!("{}/mirror", scratch.path);
+    let made = Command::new("svnadmin")
+      .args(["create", &mirror])
+      .output()
+      .unwrap();
+    assert!(made.status.success(), "svnadmin create: {made:?}");
+    let hook = format!("{mirror}/hooks/pre-revprop-change");
+    std::fs::write(&hook, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mirror_url = format!("file://{mirror}");
+    let options = [
+      "--non-interactive".to_owned(),
+      "--no-auth-cache".to_owned(),
+      "--config-dir".to_owned(),
+      format!("{}/svn-config", scratch.path),
+      "--source-username".to_owned(),
+      user,
+      "--source-password".to_owned(),
+      token,
+    ];
+    let init = Command::new("svnsync")
+      .args(["init", &mirror_url, &url])
+      .args(&options)
+      .env("LC_ALL", "C")
+      .output()
+      .unwrap();
+    assert!(init.status.success(), "svnsync init: {init:?}");
+    let before = daemon_rss_kib(&instance);
+    let mut child = Command::new("svnsync")
+      .args(["sync", &mirror_url])
+      .args(&options)
+      .env("LC_ALL", "C")
+      .stdin(Stdio::null())
+      .stdout(Stdio::null())
+      .stderr(Stdio::piped())
+      .spawn()
+      .unwrap();
+    let err = read_on_a_thread(child.stderr.take().unwrap());
+    let started = Instant::now();
+    let mut peak = 0;
+    let code = loop {
+      peak = peak.max(daemon_rss_kib(&instance));
+      if let Some(status) = child.try_wait().unwrap() {
+        break status.code().unwrap_or(-1);
+      }
+      pause();
+    };
+    let seconds = started.elapsed().as_secs_f64();
+    let youngest = Command::new("svnlook")
+      .args(["youngest", &mirror])
+      .output()
+      .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+      .unwrap_or_default();
+    let revisions = youngest.parse::<f64>().unwrap_or(0.0).max(1.0);
+    println!(
+      "an_svnsync_measured {scheme}: import {imported:.1} s; svnsync exit {code} in {seconds:.1} s, {:.1} ms a revision; \
+       mirror at r{youngest}; daemon RSS {before} KiB before, peak {peak} KiB\n  svnsync: {}",
+      seconds * 1e3 / revisions,
+      err.join().unwrap().trim()
     );
   }
 }

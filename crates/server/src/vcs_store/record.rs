@@ -52,14 +52,23 @@ const VERSION: u32 = 2;
 /// Format: the first version, each object's bytes inflated: still read, since a segment holds entries written by it.
 const VERSION_INFLATED: u32 = 1;
 
-/// Format: version 4 (A-722's record v4, main's pack-homing ruling of 2026-11-20; it replaces version 3, A-724 piece 8c,
-/// which named the names alone and carried the pack): the objects' names kept as one content (`super::record_names`)
-/// and the push's pack as another (the one its staging put in the store, its objects' rows naming places in it), the
-/// record holding each one's identity (the BLAKE3 of its bytes, the identity rule) and the names' count and the pack's
-/// length; written only once both are durable at `f + 1` homes in the region (`super::homes`), so a replay on any node
-/// can read them. The record so holds no object and no pack: its append is O(moves).
+/// Format: version 5 (A-767 C5, git onto the changeset store; it replaces version 4, A-722's record v4, which replaced
+/// version 3, A-724 piece 8c): the objects' names kept as one content (`super::record_names`) and the push's pack as
+/// another (the one its staging put in the store, its objects' rows naming places in it), the record holding each one's
+/// identity (the BLAKE3 of its bytes, the identity rule) and the names' count and the pack's length, then the sequence of
+/// the changeset the node's store landed them as (its `Names` and `Payload` sections; 0 where the daemon holds no
+/// store). Written only once both contents are durable at `f + 1` homes in the region (`super::homes`), so a replay on
+/// any node can read them, and once the store answered the landing durable, so the register names only a changeset
+/// that is there (main's ruling of 2026-11-20: land first, then the entry naming the sequence). The record so holds no
+/// object and no pack: its append is O(moves). An append that brings no object the repository lacks (a delete, a ref
+/// moved to a commit it holds, a non-atomic push's later appends) names none: the names' and the pack's identities all
+/// zeros with a count and a length of 0, and a sequence of 0 (C5 part 2b).
 /// Format: this version's number on the wire.
-const VERSION_PACKED: u32 = 4;
+const VERSION_LANDED: u32 = 5;
+
+/// Format: a version-5 record's identity of names or of a pack it does not name (an append that brings no object): all
+/// zeros, which no BLAKE3 output is in practice.
+const NONE: ContentId = ContentId([0; IDENTITY_BYTES]);
 
 /// Format: the bytes of a word: the magic, the version.
 const WORD_BYTES: usize = size_of::<u32>();
@@ -153,13 +162,16 @@ pub(crate) struct RecordedObject<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Record<'a> {
   /// Version 2's objects, named by type, content identity and length, in the order they were admitted; empty for
-  /// version 1, whose objects carry their bytes, and for version 3, whose names are a content ([`Record::named`]).
+  /// version 1, whose objects carry their bytes, and for version 5, whose names are a content ([`Record::named`]).
   pub(crate) names: Vec<(Kind, ContentId, u64)>,
-  /// Version 4's names: the identity of the content holding them (`super::record_names`) and their count.
+  /// Version 5's names: the identity of the content holding them (`super::record_names`) and their count.
   pub(crate) named: Option<(ContentId, u64)>,
-  /// Version 4's pack: the identity of the content holding it and its length, read from the store where a version 2
+  /// Version 5's pack: the identity of the content holding it and its length, read from the store where a version 2
   /// record's pack is read from its bytes ([`Record::pack`]).
   pub(crate) packed: Option<(ContentId, u64)>,
+  /// Version 5's changeset: the sequence the node's store landed the names and the pack as; 0 for none (a daemon with
+  /// no store, and every other version).
+  pub(crate) sequence: u64,
   /// Version 2's pack as the client sent it, compressed and with its deltas, which a replay reads its objects from;
   /// empty for version 1, and for a record that brought no object.
   pub(crate) pack: &'a [u8],
@@ -214,26 +226,30 @@ impl RecordWriter {
       .collect()
   }
 
-  /// The record as version 4 (module docs' [`VERSION_PACKED`]): `deepest` and `moves`, then the names the content
+  /// The record as version 5 (module docs' [`VERSION_LANDED`]): `deepest` and `moves`, then the names the content
   /// `named` holds (its identity and count) and the pack the content `packed` holds (its identity and length), both put
-  /// and homed by the caller before, in place of each name and of the pack's bytes.
+  /// and homed by the caller before, in place of each name and of the pack's bytes, then `sequence`, the changeset the
+  /// node's store landed them as (0 for none).
   pub(crate) fn finish_packed(
     (deepest, moves): (u64, &[RecordedMove]),
-    named: (ContentId, u64),
-    packed: (ContentId, u64),
+    named: Option<(ContentId, u64)>,
+    packed: Option<(ContentId, u64)>,
+    sequence: u64,
   ) -> Result<Vec<u8>, WriteRefused> {
     let len = record_len(moves, &[], 0)
       .and_then(|len| len.checked_add(2 * IDENTITY_BYTES))
+      .and_then(|len| len.checked_add(LONG_BYTES))
       .ok_or(WriteRefused::Allocation)?;
     let mut out = Vec::new();
     out
       .try_reserve_exact(len)
       .map_err(|_| WriteRefused::Allocation)?;
-    write_head(&mut out, VERSION_PACKED, (deepest, moves));
-    for (identity, count) in [named, packed] {
+    write_head(&mut out, VERSION_LANDED, (deepest, moves));
+    for (identity, count) in [named, packed].map(|named| named.unwrap_or((NONE, 0))) {
       out.extend_from_slice(&identity.0);
       out.extend_from_slice(&count.to_le_bytes());
     }
+    out.extend_from_slice(&sequence.to_le_bytes());
     Ok(out)
   }
 
@@ -428,7 +444,7 @@ impl<'a> Record<'a> {
       return Err(RecordRefused::Magic);
     }
     let version = reader.word()?;
-    if version != VERSION && version != VERSION_INFLATED && version != VERSION_PACKED {
+    if version != VERSION && version != VERSION_INFLATED && version != VERSION_LANDED {
       return Err(RecordRefused::Version { version });
     }
     let deepest = reader.long()?;
@@ -437,13 +453,16 @@ impl<'a> Record<'a> {
     for _ in 0..count {
       moves.push(reader.one_move(format)?);
     }
-    let (mut objects, mut names, mut named, mut packed) = (Vec::new(), Vec::new(), None, None);
-    let count = if version == VERSION_PACKED {
+    let (mut objects, mut names, mut named, mut packed, mut sequence) =
+      (Vec::new(), Vec::new(), None, None, 0);
+    let count = if version == VERSION_LANDED {
       for kept in [&mut named, &mut packed] {
         let identity =
           ContentId::from_slice(reader.take(IDENTITY_BYTES)?).ok_or(RecordRefused::Truncated)?;
-        *kept = Some((identity, reader.long()?));
+        let count = reader.long()?;
+        *kept = (identity != NONE).then_some((identity, count));
       }
+      sequence = reader.long()?;
       0
     } else {
       reader.count(OBJECT_MIN_BYTES)?
@@ -459,7 +478,7 @@ impl<'a> Record<'a> {
         names.push(reader.name()?);
       }
     }
-    let pack = if version == VERSION_INFLATED || version == VERSION_PACKED {
+    let pack = if version == VERSION_INFLATED || version == VERSION_LANDED {
       &[][..]
     } else {
       let len = usize::try_from(reader.long()?).map_err(|_| RecordRefused::Count)?;
@@ -472,6 +491,7 @@ impl<'a> Record<'a> {
       names,
       named,
       packed,
+      sequence,
       pack,
       deepest,
       moves,

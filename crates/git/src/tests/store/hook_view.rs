@@ -1061,6 +1061,7 @@ fn a_base_pack_made_again_stays_readable_and_its_seal_is_refused_by_kind() {
     .repository
     .commit(&mut built.store, &mut push, &[admitted])
     .unwrap();
+  super::derive_all(&built.repository, &mut built.store);
   built
     .repository
     .rebuild_base(&mut built.store, MAIN_GREEN, &mut Ticks(0), EXCHANGE)

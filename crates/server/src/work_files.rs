@@ -137,6 +137,210 @@ fn push(pieces: &mut Vec<Piece>, piece: Piece) {
   pieces.push(piece);
 }
 
+/// One run of a held file as its parts name it ([`HeldParts`]): `len` bytes from `at` of the origin's base file, or of
+/// the written bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PiecePart {
+  /// A range of the origin's base file.
+  Base {
+    /// Where in the base file.
+    at: u64,
+    /// Its length.
+    len: u64,
+  },
+  /// A range of the written bytes.
+  Own {
+    /// Where in the written bytes.
+    at: u64,
+    /// Its length.
+    len: u64,
+  },
+}
+
+/// A held file's parts (A-806): the base path its base pieces read (`None` when none do), its pieces in order, the
+/// bytes it wrote, and its length. What a rebase answers for a changed file and a restatement logs, in place of the
+/// file's bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldParts {
+  /// The base path its base pieces read.
+  pub origin: Option<String>,
+  /// The pieces, in order.
+  pub pieces: Vec<PiecePart>,
+  /// The written bytes the own pieces name.
+  pub written: Vec<u8>,
+  /// The file's length.
+  pub len: u64,
+}
+
+impl HeldParts {
+  /// `bytes` held whole: one own piece, no base.
+  pub fn whole(bytes: Vec<u8>) -> HeldParts {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let pieces = if len == 0 {
+      Vec::new()
+    } else {
+      vec![PiecePart::Own { at: 0, len }]
+    };
+    HeldParts {
+      origin: None,
+      pieces,
+      written: bytes,
+      len,
+    }
+  }
+
+  /// The file's bytes, its base pieces read from `base` (the origin's base bytes), or `None` when a base piece reads
+  /// past them. For tests and checks.
+  pub fn materialize(&self, base: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(usize::try_from(self.len).ok()?);
+    for piece in &self.pieces {
+      let (from, at, len) = match *piece {
+        PiecePart::Base { at, len } => (base, at, len),
+        PiecePart::Own { at, len } => (self.written.as_slice(), at, len),
+      };
+      let start = usize::try_from(at).ok()?;
+      let end = start.checked_add(usize::try_from(len).ok()?)?;
+      out.extend_from_slice(from.get(start..end)?);
+    }
+    Some(out)
+  }
+}
+
+/// Format: the run [`equal_run`] compares at once before looking at bytes, a page, so the comparison runs at the
+/// machine's `memcmp` speed over the equal runs, which are most of a file a small edit changed.
+const COMPARE_CHUNK: usize = 4096;
+
+/// How many leading bytes `a` and `b` share: whole chunks compared at once, then the bytes of the first chunk that
+/// differs.
+fn equal_run(a: &[u8], b: &[u8]) -> usize {
+  let limit = a.len().min(b.len());
+  let mut at = 0usize;
+  while at < limit {
+    let end = at.saturating_add(COMPARE_CHUNK).min(limit);
+    if a.get(at..end) == b.get(at..end) {
+      at = end;
+      continue;
+    }
+    return at.saturating_add(
+      a.get(at..end)
+        .unwrap_or_default()
+        .iter()
+        .zip(b.get(at..end).unwrap_or_default())
+        .take_while(|(x, y)| x == y)
+        .count(),
+    );
+  }
+  limit
+}
+
+/// How many trailing bytes `a` and `b` share, at most `room`: [`equal_run`] from the end.
+fn equal_tail(a: &[u8], b: &[u8], room: usize) -> usize {
+  let mut shared = 0usize;
+  while shared < room {
+    let step = COMPARE_CHUNK.min(room.saturating_sub(shared));
+    let a_end = a.len().saturating_sub(shared);
+    let b_end = b.len().saturating_sub(shared);
+    let a_chunk = a.get(a_end.saturating_sub(step)..a_end).unwrap_or_default();
+    let b_chunk = b.get(b_end.saturating_sub(step)..b_end).unwrap_or_default();
+    if a_chunk == b_chunk {
+      shared = shared.saturating_add(step);
+      continue;
+    }
+    return shared.saturating_add(
+      a_chunk
+        .iter()
+        .rev()
+        .zip(b_chunk.iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count(),
+    );
+  }
+  room
+}
+
+/// `bytes`, a file's content at a work's new base, as parts over `base`, the same path's bytes at that base (A-806): the
+/// runs they share are base pieces, and only the runs that differ are written. The common prefix and suffix are found
+/// first; inside them, equal runs longer than a piece's own cost ([`PIECE_BYTES`]) are kept as base pieces when the two
+/// lengths agree (overwrites, the common edit), and the middle is written whole when they do not. Exact whatever the
+/// content: the parts read back as `bytes`.
+pub fn parts_over_base(path: &str, base: Option<&[u8]>, bytes: Vec<u8>) -> HeldParts {
+  let Some(base) = base else {
+    return HeldParts::whole(bytes);
+  };
+  let len = bytes.len();
+  let prefix = equal_run(base, &bytes);
+  let room = len.min(base.len()).saturating_sub(prefix);
+  let suffix = equal_tail(base, &bytes, room);
+  let mut pieces: Vec<PiecePart> = Vec::new();
+  let mut written: Vec<u8> = Vec::new();
+  let to_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+  let base_run = |pieces: &mut Vec<PiecePart>, at: usize, run: usize| {
+    if run > 0 {
+      pieces.push(PiecePart::Base {
+        at: to_u64(at),
+        len: to_u64(run),
+      });
+    }
+  };
+  let mut own_run = |pieces: &mut Vec<PiecePart>, run: &[u8]| {
+    if !run.is_empty() {
+      pieces.push(PiecePart::Own {
+        at: to_u64(written.len()),
+        len: to_u64(run.len()),
+      });
+      written.extend_from_slice(run);
+    }
+  };
+  base_run(&mut pieces, 0, prefix);
+  let middle_end = len.saturating_sub(suffix);
+  if len == base.len() {
+    // Same length: walk the middle, keeping equal runs worth a piece as base pieces.
+    let mut at = prefix;
+    let mut own_from = prefix;
+    while at < middle_end {
+      let equal = equal_run(
+        base.get(at..middle_end).unwrap_or_default(),
+        bytes.get(at..middle_end).unwrap_or_default(),
+      );
+      if equal > PIECE_BYTES {
+        own_run(&mut pieces, bytes.get(own_from..at).unwrap_or_default());
+        base_run(&mut pieces, at, equal);
+        at = at.saturating_add(equal);
+        own_from = at;
+      } else {
+        let differ = base
+          .get(at..middle_end)
+          .unwrap_or_default()
+          .iter()
+          .zip(bytes.get(at..middle_end).unwrap_or_default())
+          .skip(equal)
+          .take_while(|(a, b)| a != b)
+          .count();
+        at = at.saturating_add(equal.saturating_add(differ).max(1));
+      }
+    }
+    own_run(
+      &mut pieces,
+      bytes.get(own_from..middle_end).unwrap_or_default(),
+    );
+  } else {
+    own_run(
+      &mut pieces,
+      bytes.get(prefix..middle_end).unwrap_or_default(),
+    );
+  }
+  base_run(&mut pieces, base.len().saturating_sub(suffix), suffix);
+  HeldParts {
+    origin: pieces
+      .iter()
+      .any(|piece| matches!(piece, PiecePart::Base { .. }))
+      .then(|| path.to_owned()),
+    pieces,
+    written,
+    len: to_u64(len),
+  }
+}
+
 /// Shape: what one piece costs a work's charge: its size in memory.
 const PIECE_BYTES: usize = std::mem::size_of::<Piece>();
 
@@ -178,6 +382,48 @@ impl Held {
   }
 
   /// A file held whole, every byte the work's (a restatement's or a rebase's).
+  /// The held file `parts` name (A-806), its pieces merged where they continue each other.
+  fn from_parts(parts: HeldParts) -> Held {
+    let mut pieces = Vec::with_capacity(parts.pieces.len());
+    for piece in parts.pieces {
+      push(
+        &mut pieces,
+        match piece {
+          PiecePart::Base { at, len } => Piece::Base { at, len },
+          PiecePart::Own { at, len } => Piece::Own { at, len },
+        },
+      );
+    }
+    let origin = parts.origin.filter(|_| {
+      pieces
+        .iter()
+        .any(|piece| matches!(piece, Piece::Base { .. }))
+    });
+    Held {
+      origin,
+      pieces,
+      written: parts.written,
+      len: parts.len,
+    }
+  }
+
+  /// This held file's parts (A-806).
+  fn parts(&self) -> HeldParts {
+    HeldParts {
+      origin: self.origin.clone(),
+      pieces: self
+        .pieces
+        .iter()
+        .map(|piece| match *piece {
+          Piece::Base { at, len } => PiecePart::Base { at, len },
+          Piece::Own { at, len } => PiecePart::Own { at, len },
+        })
+        .collect(),
+      written: self.written.clone(),
+      len: self.len,
+    }
+  }
+
   fn whole(bytes: Vec<u8>) -> Held {
     let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     let mut pieces = Vec::new();
@@ -404,6 +650,10 @@ pub struct Base<'a> {
   pub fetched: Option<&'a FetchedBase>,
   /// The base version.
   pub version: u64,
+  /// The work's kept base entries at that version (A-247; `WorkState::entries`), each naming its path's length there:
+  /// where a length is read when neither the green nor this verb's fetch has it, so an edit after a rebase asks no one
+  /// for a length the rebase already gave (A-808). `None` where no work's entries apply.
+  pub entries: Option<&'a BTreeMap<String, slates_merge::increment::Base>>,
 }
 
 impl<'a> Base<'a> {
@@ -428,20 +678,36 @@ impl<'a> Base<'a> {
     if let Some(green) = self.green {
       return Ok(green.content_len_at(path, self.version).map(as_u64));
     }
-    let fetched = self
-      .fetched
-      .filter(|fetched| !fetched.gone)
-      .ok_or(BaseGone)?;
-    if let Some(len) = fetched.lengths.get(path) {
-      return Ok(*len);
+    let fetched = self.fetched.filter(|fetched| !fetched.gone);
+    if let Some(fetched) = fetched {
+      if let Some(len) = fetched.lengths.get(path) {
+        return Ok(*len);
+      }
+      if let Some(file) = fetched.files.get(path) {
+        return Ok(file.as_ref().map(|bytes| as_u64(bytes.len())));
+      }
+      if let Some(page) = fetched.page.as_ref().filter(|page| page.path == path) {
+        return Ok(page.answer.as_ref().map(|(_, total)| *total));
+      }
     }
-    if let Some(file) = fetched.files.get(path) {
-      return Ok(file.as_ref().map(|bytes| as_u64(bytes.len())));
+    // A fetch that says the green is gone is the answer: no base.
+    if self.fetched.is_some_and(|fetched| fetched.gone) {
+      return Err(BaseGone);
     }
-    match &fetched.page {
-      Some(page) if page.path == path => Ok(page.answer.as_ref().map(|(_, total)| *total)),
-      _ => Err(BaseGone),
-    }
+    self.entry_len(path).ok_or(BaseGone)
+  }
+
+  /// `path`'s length at the base from the work's kept entry of it (A-808): `Some(Some(len))` for a file there,
+  /// `Some(None)` for an entry that holds no file of that path, `None` when no entry of `path` is kept.
+  pub(crate) fn entry_len(self, path: &str) -> Option<Option<u64>> {
+    let entry = self.entries?.get(path)?;
+    Some(
+      entry
+        .files
+        .iter()
+        .find(|(file, _)| file == path)
+        .map(|(_, len)| *len),
+    )
   }
 
   /// The base's bytes of `path` in `[at, at + len)`, which a held file's piece names: copied out of that range alone,
@@ -818,6 +1084,26 @@ impl WorkFiles {
     self.changed.contains_key(path)
   }
 
+  /// A work holding `changed`, each file as its parts (A-806): what a rebase answers and a restatement logs, so the work
+  /// holds, and its log carries, what it wrote and the pieces naming its base, never the file.
+  pub fn from_parts(changed: BTreeMap<String, Option<HeldParts>>) -> WorkFiles {
+    WorkFiles {
+      changed: changed
+        .into_iter()
+        .map(|(path, parts)| (path, parts.map(Held::from_parts)))
+        .collect(),
+    }
+  }
+
+  /// What the work holds of its own, each file as its parts (A-806), in path order.
+  pub fn parts(&self) -> BTreeMap<String, Option<HeldParts>> {
+    self
+      .changed
+      .iter()
+      .map(|(path, held)| (path.clone(), held.as_ref().map(Held::parts)))
+      .collect()
+  }
+
   /// A work's delta as a clean rebase leaves it (`Rebased::changed`), or as a restatement in its log replays it
   /// (A-207): per path its bytes where they differ from the base, `None` where it removes the base's file.
   pub fn from_changed(changed: BTreeMap<String, Option<Vec<u8>>>) -> WorkFiles {
@@ -859,6 +1145,75 @@ mod tests {
     clippy::indexing_slicing
   )]
   use super::*;
+
+  /// The bytes `edits` (offset share, length, kind: overwrite, insert or delete) make of `base`.
+  fn edited(base: &[u8], edits: &[(u16, u8, u8)]) -> Vec<u8> {
+    let mut bytes = base.to_vec();
+    for (share, len, kind) in edits {
+      let at = if bytes.is_empty() {
+        0
+      } else {
+        usize::from(*share) % (bytes.len() + 1)
+      };
+      let len = usize::from(*len % 32);
+      match kind % 3 {
+        0 => {
+          for (offset, byte) in bytes.iter_mut().skip(at).take(len).enumerate() {
+            *byte = byte
+              .wrapping_add(1)
+              .wrapping_add(u8::try_from(offset % 7).unwrap());
+          }
+        }
+        1 => {
+          let insert: Vec<u8> = (0..len).map(|n| u8::try_from(n % 251).unwrap()).collect();
+          bytes.splice(at..at, insert);
+        }
+        _ => {
+          let end = (at + len).min(bytes.len());
+          bytes.drain(at..end);
+        }
+      }
+    }
+    bytes
+  }
+
+  proptest::proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig::default()))]
+    /// A-806 (the oracle of a rebased file's parts). Do: from a generated base, make a file by generated overwrites,
+    /// inserts and deletes, and take its parts over the base (`parts_over_base`). Expect: the parts read back as the
+    /// file exactly, never write more than the file, name the base only through the file's own path, and a file the
+    /// edits left unchanged writes nothing.
+    #[test]
+    fn a_rebased_files_parts_read_back_as_the_file(
+      base in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..2048),
+      edits in proptest::collection::vec((proptest::prelude::any::<u16>(), proptest::prelude::any::<u8>(), proptest::prelude::any::<u8>()), 0..6),
+    ) {
+      let bytes = edited(&base, &edits);
+      let parts = parts_over_base("f", Some(&base), bytes.clone());
+      proptest::prop_assert_eq!(parts.materialize(&base), Some(bytes.clone()));
+      proptest::prop_assert!(parts.written.len() <= bytes.len());
+      proptest::prop_assert!(parts.origin.as_deref().is_none_or(|origin| origin == "f"));
+      if bytes == base {
+        proptest::prop_assert!(parts.written.is_empty());
+      }
+    }
+  }
+
+  /// A-806. Do: overwrite 64 bytes in the middle of a 1 MiB file and take its parts over the file. Expect: 64 bytes
+  /// written and three pieces (base, written, base), reading back as the file; and a file with no base written whole.
+  #[test]
+  fn an_overwrite_of_a_large_file_is_its_written_bytes_over_the_base() {
+    let base: Vec<u8> = (0..1usize << 20)
+      .map(|n| u8::try_from(n % 251).unwrap())
+      .collect();
+    let mut bytes = base.clone();
+    bytes[1 << 19..(1 << 19) + 64].fill(b'w');
+    let parts = parts_over_base("big", Some(&base), bytes.clone());
+    assert_eq!((parts.written.len(), parts.pieces.len()), (64, 3));
+    assert_eq!(parts.materialize(&base), Some(bytes));
+    let fresh = parts_over_base("new", None, b"fresh".to_vec());
+    assert_eq!((fresh.written, fresh.origin), (b"fresh".to_vec(), None));
+  }
   use slates_merge::origin::Origin;
 
   /// Shape: a base file far larger than any edit, so a copy of it would dwarf what an edit holds.
@@ -887,6 +1242,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     let at = u64::try_from(BIG / 2).unwrap();
@@ -915,6 +1271,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     let mut last = Vec::new();
@@ -944,6 +1301,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     files.splice(base, "old", (10, 0), b"INSERT").unwrap();

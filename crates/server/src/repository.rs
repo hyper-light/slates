@@ -379,11 +379,8 @@ pub(crate) fn create_repository(
   asked: (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
-  // A Subversion repository's history is the node's changeset store (C2, A-767 item 1; main's ruling of 2026-11-20
-  // 21:05): a daemon started without the store's grant has nowhere to keep it, and keeps no second copy in the
-  // register.
-  if matches!(asked.1, VcsTool::Subversion) && state.vcs_disk.is_none() {
-    return refused(unstored_subversion());
+  if let Some(refusal) = no_store_for(state, asked.1) {
+    return refused(refusal);
   }
   let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
     Some(Ok(id)) => Some(id),
@@ -398,6 +395,35 @@ pub(crate) fn create_repository(
     return land_then_record(state, (disk, principal), asked, (adopted, ids));
   }
   record_created(state, principal, asked, (adopted, ids), Vec::new())
+}
+
+/// Format: the refusal's words for a Mercurial repository a daemon without a changeset store cannot keep (C1; main's
+/// ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1).
+const NEEDS_A_STORE: &str = "a Mercurial repository's history is kept on the node's changeset store: start the daemon \
+                             with --vcs-store DIR";
+
+/// Format: the refusal's words for a git repository a daemon without a changeset store cannot keep (C5; the same
+/// ruling: one rule for all three tools).
+const GIT_NEEDS_A_STORE: &str = "a git repository's history is kept on the node's changeset store: start the daemon \
+                                 with --vcs-store DIR";
+
+/// A repository a daemon without a changeset store refuses (main's ruling of 2026-11-20, decision 1): a Mercurial or a
+/// Subversion repository's history is the node's store (C1, C2), and a register-held copy for a daemon without one
+/// would be a second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`, for all three tools (git's
+/// since C5: its pushes land on the store, A-767).
+fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
+  if state.vcs_disk.is_some() {
+    return None;
+  }
+  match tool {
+    VcsTool::Subversion => Some(unstored_subversion()),
+    VcsTool::Mercurial => Some(Refusal::Unsupported {
+      feature: NEEDS_A_STORE.to_owned(),
+    }),
+    VcsTool::Git => Some(Refusal::Unsupported {
+      feature: GIT_NEEDS_A_STORE.to_owned(),
+    }),
+  }
 }
 
 /// The refusal of a Subversion repository on a daemon started without `--vcs-store` (C2; main's ruling of 2026-11-20
@@ -499,6 +525,76 @@ fn land_then_record(
           .to_owned(),
     });
   };
+  let (header, parts, svn_created) = match creation_changeset(
+    state,
+    (&disk, principal),
+    (name, tool, format, default_branch),
+    (repository, minted),
+  ) {
+    Ok(changeset) => changeset,
+    Err(reply) => return *reply,
+  };
+  let principal = principal.clone();
+  let asked = (name.to_owned(), default_branch.to_owned());
+  let task = async move {
+    let landed = disk.land(header, parts).await;
+    #[cfg(test)]
+    if KILL_BETWEEN_LANDING_AND_RECORD.with(std::cell::Cell::get) {
+      crate::state::with_state(|state| state.count(CREATION_KILLED, 1));
+      return;
+    }
+    let answered = crate::state::with_state_counted(move |state| {
+      state.count(
+        if landed.is_ok() {
+          CREATION_LANDED
+        } else {
+          CREATION_UNLANDED
+        },
+        1,
+      );
+      let reply = recorded_after_landing(
+        state,
+        &principal,
+        (&asked.0, tool, format, &asked.1),
+        (adopted, (repository, minted)),
+        (landed.is_ok(), Some(request), svn_created),
+      );
+      (reply, state.shard)
+    });
+    if let Some((reply, here)) = answered {
+      crate::told::deliver_to(route, reply, here);
+    }
+  };
+  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      ReplyBody::Acknowledged
+    }
+    Err(_) => {
+      state.count(CREATION_UNRUN, 1);
+      refused(Refusal::Overloaded { shard: state.shard })
+    }
+  }
+}
+
+/// A new repository's creation changeset (A-767 item 7): its record judged (a name already taken lands nothing, its
+/// refusal the answer), its ids reserved (`ShardState::family_reserved_through`), and the changeset's header (sequence
+/// 0, the store's standing grant) and sections: the store's own `Record` ([`creation_record`]) and, for a Subversion
+/// repository, its creation record after it (C2), which is given back too, since the repository is recorded from it.
+fn creation_changeset(
+  state: &mut ShardState,
+  (disk, principal): (&slates_store::owner::StoreHandle, &Principal),
+  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+  (repository, minted): (RepositoryId, Option<DbVolumeId>),
+) -> Result<
+  (
+    slates_store::log::Header,
+    Vec<slates_store::owner::Part>,
+    Vec<u8>,
+  ),
+  Box<ReplyBody>,
+> {
   let judged = admits(
     state,
     &Op::RepositoryCreated {
@@ -515,7 +611,7 @@ fn land_then_record(
     },
   );
   if let Err(refusal) = judged {
-    return refused(refusal);
+    return Err(Box::new(refused(refusal)));
   }
   // The repository's number and its root's, so nothing minted while the landing runs takes either.
   let reserved = minted.unwrap_or(DbVolumeId {
@@ -548,7 +644,7 @@ fn land_then_record(
   let svn_created = match tool {
     VcsTool::Subversion => match svn_created(state, repository) {
       Ok(created) => created,
-      Err(refusal) => return refused(refusal),
+      Err(refusal) => return Err(Box::new(refused(refusal))),
     },
     VcsTool::Git | VcsTool::Mercurial => Vec::new(),
   };
@@ -556,61 +652,75 @@ fn land_then_record(
   if !svn_created.is_empty() {
     parts.push((slates_store::log::SectionKind::Record, svn_created.clone()));
   }
-  let principal = principal.clone();
-  let asked = (name.to_owned(), default_branch.to_owned());
-  let task = async move {
-    let landed = disk.land(header, parts).await;
-    #[cfg(test)]
-    if KILL_BETWEEN_LANDING_AND_RECORD.with(std::cell::Cell::get) {
-      crate::state::with_state(|state| state.count(CREATION_KILLED, 1));
-      return;
-    }
-    let answered = crate::state::with_state_counted(move |state| {
-      state.count(
-        if landed.is_ok() {
-          CREATION_LANDED
-        } else {
-          CREATION_UNLANDED
-        },
-        1,
-      );
-      let (origin, id) = request;
-      state.db.begin();
-      let reply = match landed {
-        Ok(_) => record_created(
-          state,
-          &principal,
-          (&asked.0, tool, format, &asked.1),
-          (adopted, (repository, minted)),
-          svn_created,
-        ),
-        Err(_) => refused(Refusal::Overloaded { shard: state.shard }),
-      };
-      let reply = crate::verbs::record_completion(state, origin, id, reply);
-      let reply = match state.db.commit(&mut state.segment) {
-        Ok(_) => reply,
-        Err(error) => {
-          crate::verbs::reconcile_unpublished_effects(state);
-          refused(refusal_of_db(&error))
-        }
-      };
-      (reply, state.shard)
-    });
-    if let Some((reply, here)) = answered {
-      crate::told::deliver_to(route, reply, here);
-    }
+  Ok((header, parts, svn_created))
+}
+
+/// A landed creation recorded (A-767 item 7, the second step): in one transaction the repository, its root and, for a
+/// client's `request`, its completion, a Subversion repository's from its creation record `svn_created` (C2); a
+/// creation the store refused answered `Overloaded`, nothing recorded of it.
+fn recorded_after_landing(
+  state: &mut ShardState,
+  principal: &Principal,
+  asked: (&str, VcsTool, ObjectFormat, &str),
+  ids: (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
+  (landed, request, svn_created): (
+    bool,
+    Option<(u64, slates_wire::request::RequestId)>,
+    Vec<u8>,
+  ),
+) -> ReplyBody {
+  state.db.begin();
+  let reply = if landed {
+    record_created(state, principal, asked, ids, svn_created)
+  } else {
+    refused(Refusal::Overloaded { shard: state.shard })
   };
-  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
-    Ok(()) => {
-      state.reply_route = None;
-      state.acceptance_deferred = true;
-      ReplyBody::Acknowledged
-    }
-    Err(_) => {
-      state.count(CREATION_UNRUN, 1);
-      refused(Refusal::Overloaded { shard: state.shard })
+  let reply = match request {
+    Some((origin, id)) => crate::verbs::record_completion(state, origin, id, reply),
+    None => reply,
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => reply,
+    Err(error) => {
+      crate::verbs::reconcile_unpublished_effects(state);
+      refused(refusal_of_db(&error))
     }
   }
+}
+
+/// [`create_repository`] for a test's synchronous history on a shard of a node keeping a store (A-767 item 7's one
+/// landing order): the creation's changeset landed and waited for on a thread of its own
+/// (`crate::test_store::land_blocking`), then recorded, so the repository stands when this returns, as a client's
+/// creation stands when it is answered.
+#[cfg(test)]
+pub(crate) fn create_blocking(
+  state: &mut ShardState,
+  (disk, principal): (slates_store::owner::StoreHandle, &Principal),
+  asked: (&str, VcsTool, ObjectFormat, &str),
+  green: Option<VolumeId>,
+) -> ReplyBody {
+  let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
+    Some(Ok(id)) => Some(id),
+    Some(Err(refusal)) => return refused(refusal),
+    None => None,
+  };
+  let ids = match creation_ids(state, adopted) {
+    Ok(ids) => ids,
+    Err(refusal) => return refused(refusal),
+  };
+  let (header, parts, svn_created) = match creation_changeset(state, (&disk, principal), asked, ids)
+  {
+    Ok(changeset) => changeset,
+    Err(reply) => return *reply,
+  };
+  let landed = crate::test_store::land_blocking(disk, header, parts);
+  recorded_after_landing(
+    state,
+    principal,
+    asked,
+    (adopted, ids),
+    (landed, None, svn_created),
+  )
 }
 
 /// Format: a repository's creation record in its store (A-767): one line each of a marker, the name, the default
@@ -806,6 +916,13 @@ fn spelled(record: &RepositoryRecord, name: &str) -> String {
   }
 }
 
+/// Whether `from` names a branch of `record` as Mercurial resolves a name ([`hg_source`]): a Mercurial repository's
+/// name its namespace does not spell already.
+pub(crate) fn named_as_mercurial_resolves(record: &RepositoryRecord, from: &str) -> bool {
+  let spelled_already = hg_push::line_of(from).is_some() || hg_push::bookmark_of(from).is_some();
+  record.tool == slates_db::catalog::VcsTool::Mercurial && !spelled_already
+}
+
 /// The green a branch named `from` is made from (A-575): a name the namespace spells, or any name of a repository of
 /// a tool other than Mercurial, as given; a Mercurial repository's other names as Mercurial resolves them
 /// ([`hg_source`]). `NotFound` for a name nothing binds.
@@ -814,8 +931,7 @@ fn source_of(
   record: &RepositoryRecord,
   from: &str,
 ) -> Result<DbVolumeId, Refusal> {
-  let spelled_already = hg_push::line_of(from).is_some() || hg_push::bookmark_of(from).is_some();
-  if record.tool != slates_db::catalog::VcsTool::Mercurial || spelled_already {
+  if !named_as_mercurial_resolves(record, from) {
     return state
       .db
       .partition()
@@ -1424,7 +1540,7 @@ mod tests {
 
   use crate::greens::ReleaseProgress;
   use crate::state::ShardState;
-  use crate::verbs::{dispatch, to_db_volume};
+  use crate::verbs::to_db_volume;
 
   fn owner() -> Principal {
     Principal::Uid {
@@ -1441,7 +1557,7 @@ mod tests {
   }
 
   fn ask(state: &mut ShardState, principal: &Principal, body: RequestBody) -> ReplyBody {
-    dispatch(state, 1, principal, body)
+    crate::test_store::create(state, principal, body)
   }
 
   fn refusal(reply: ReplyBody) -> Refusal {
@@ -1459,7 +1575,7 @@ mod tests {
   }
 
   fn create(state: &mut ShardState, name: &str, default: &str) -> ReplyBody {
-    ask(
+    crate::test_store::create(
       state,
       &owner(),
       RequestBody::CreateRepository {
@@ -1559,7 +1675,7 @@ mod tests {
   /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
   #[test]
   fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let at_one = branches_read_their_versions(state);
       retired_and_bound_again(state, at_one);
       wrong_verbs_refused_by_kind(state);
@@ -1697,7 +1813,7 @@ mod tests {
   /// adopted green's line, another one.
   #[test]
   fn a_repository_and_every_green_made_for_it_share_one_line() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "linux", "main"));
       let topic = green_of(branch(state, ("linux", "topic", "main"), None));
       let other = green_of(branch(state, ("linux", "other", "main"), None));
@@ -1774,7 +1890,7 @@ mod tests {
   /// move no log of the repository; and no verb or lone version is an atomic record.
   #[test]
   fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "tree", "main"));
       let repo = repository(state, "tree");
       let names = |state: &ShardState| {
@@ -1917,7 +2033,7 @@ mod tests {
   /// owed; no unit frees more than one node; once the release is done the lineage holds what the root alone held.
   #[test]
   fn a_destroyed_branch_is_released_a_node_a_unit_and_its_source_is_pinned_until_then() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "kernel", "main"));
       write(state, root, b"root bytes", 1);
       let repo = repository(state, "kernel");
@@ -2005,7 +2121,7 @@ mod tests {
   /// none served.
   #[test]
   fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let members = members_made_past_a_held_checkpoint(state);
       assert_rebuilt_as_before(state, members);
       let [root, ..] = members;
@@ -2085,7 +2201,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       green_of(create(state, "linux", "main"));
       let first = first_policy_held(state);
       assert_eq!(
@@ -2257,7 +2373,8 @@ mod tests {
     use slates_ipc::protocol::{
       DatabaseRefusal, HookConfig, HookPointName, HooksEnvSection, HooksEnvVariable,
     };
-    crate::daemon::audit_on_shard(|state| {
+    // A Subversion repository: a node keeping a store (C2; main's ruling of 2026-11-20).
+    crate::test_store::audit_on_stored_shard("vcs", |state| {
       let svn = RequestBody::CreateRepository {
         name: "svn".to_owned(),
         tool: VcsTool::Subversion,
@@ -2265,7 +2382,7 @@ mod tests {
         default_branch: "trunk".to_owned(),
         green: None,
       };
-      green_of(ask(state, &owner(), svn));
+      green_of(crate::test_store::create(state, &owner(), svn));
       let program = std::env::current_exe()
         .unwrap()
         .to_string_lossy()
@@ -2420,6 +2537,46 @@ mod tests {
     }
   }
 
+  /// C1, C2, C5 (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1: one rule for all three tools).
+  /// Do: on a daemon started without a changeset store, create a Mercurial, a Subversion and a git repository. Expect
+  /// each refused `Unsupported`, naming `--vcs-store`, and no repository recorded for any. Red before: the daemon made a
+  /// Mercurial repository whose history it kept in its register, and (before C5's part 2) a git one.
+  #[test]
+  fn a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag() {
+    let (hg, svn, git, recorded) = crate::daemon::audit_on_shard(|state| {
+      let made = [VcsTool::Mercurial, VcsTool::Subversion, VcsTool::Git].map(|tool| {
+        ask(
+          state,
+          &owner(),
+          RequestBody::CreateRepository {
+            name: format!("{tool:?}"),
+            tool,
+            format: ObjectFormat::Sha1,
+            default_branch: "main".to_owned(),
+            green: None,
+          },
+        )
+      });
+      let recorded = ["Mercurial", "Subversion", "Git"].map(|name| {
+        state
+          .db
+          .partition()
+          .repositories()
+          .repository_named(name)
+          .is_some()
+      });
+      let [hg, svn, git] = made;
+      (hg, svn, git, recorded)
+    });
+    for reply in [hg, svn, git] {
+      let Refusal::Unsupported { feature } = refusal(reply) else {
+        panic!("refused by kind");
+      };
+      assert!(feature.contains("--vcs-store"), "{feature}");
+    }
+    assert_eq!(recorded, [false, false, false]);
+  }
+
   /// A-644 (§4.17.2 "Protected branches", configured through A-622's policy). Do: set a git repository's policy with
   /// rules denying merge commits and unsigned commits on `main` and three signers, one repeated; set one whose signer
   /// is no key; create a Mercurial repository and set its policy with a signer, then with a rule denying merge commits.
@@ -2429,7 +2586,8 @@ mod tests {
   #[test]
   fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
     use slates_ipc::protocol::{PolicyNames, PolicyRight};
-    crate::daemon::audit_on_shard(|state| {
+    // A Mercurial repository among them: a node keeping a store (main's ruling of 2026-11-20).
+    crate::test_store::audit_on_stored_shard("vcs", |state| {
       green_of(create(state, "linux", "main"));
       let rules = vec![
         denying(
@@ -2475,7 +2633,7 @@ mod tests {
   /// refused `BadRequest` and the rule by the database's guard, naming it.
   fn assert_mercurial_refuses_signers_and_protections(state: &mut ShardState) {
     use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
-    let created = ask(
+    let created = crate::test_store::create(
       state,
       &owner(),
       RequestBody::CreateRepository {
@@ -2509,7 +2667,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_read_and_set_by_its_owner_alone() {
     use slates_ipc::protocol::{HookConfig, HookPointName};
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       assert!(matches!(
         create(state, "policy", "main"),
         ReplyBody::GreenCreated { .. }
@@ -2572,5 +2730,118 @@ mod tests {
         )
       );
     });
+  }
+
+  /// Writes one version of `green` that sets `files` distinct paths (`/d0`, `/d1`, ...) through one work, destroyed
+  /// after: a version that changes as many identity keys as files.
+  fn write_files(state: &mut ShardState, green: VolumeId, files: usize, serial: u32) -> u64 {
+    let ReplyBody::WorkCreated { id: work, .. } = ask(
+      state,
+      &owner(),
+      RequestBody::CreateWork {
+        green,
+        name: format!("work-{serial}"),
+      },
+    ) else {
+      panic!("no work over {green:?}")
+    };
+    for file in 0..files {
+      let edited = ask(
+        state,
+        &owner(),
+        RequestBody::Edit {
+          work,
+          path: format!("/d{file}"),
+          at: 0,
+          delete_len: 0,
+          bytes: format!("file {file} at {serial}").into_bytes(),
+        },
+      );
+      assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+    }
+    let submitted = ask(
+      state,
+      &owner(),
+      crate::identities::authored(work, "many files"),
+    );
+    crate::vcs_store::paths::whole_build::settle(state);
+    let ReplyBody::Submitted {
+      version: Some(version),
+      ..
+    } = submitted
+    else {
+      panic!("not accepted: {submitted:?}")
+    };
+    let destroyed = ask(state, &owner(), RequestBody::Destroy { volume: work });
+    assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+    version
+  }
+
+  /// A-579 (goal 89b: the server's own p99 under load; a green's first checkpoint at 1,000 clients folded its identity's
+  /// backlog in one 73.7 ms step on its owner, and every request the owner served waited behind it). Do: with another
+  /// task ready on the shard throughout (someone waiting), write a green a version that changes 400 files through a
+  /// work and destroy the work, which moves the green's floor and so asks its checkpoint (`verbs::owner_floor`, the
+  /// path the 1,000-client run took). Expect: the destroy returns with the checkpoint's identity fold paced, not taken
+  /// whole (the green marked as checkpointing, keys left to fold, no checkpoint yet); the shard then finishes it in turns
+  /// (`merge.checkpoint.in_turns` 1, more than one identity step) and takes the checkpoint, the identity then equal to
+  /// its recount. Before, the destroy folded every key and recorded the checkpoint in its own step.
+  #[test]
+  fn a_checkpoint_with_someone_waiting_folds_the_identity_in_turns() {
+    /// Shape: the files the version changes: many keys against a step quantum of a few microseconds.
+    const FILES: usize = 400;
+    /// Shape: the looks the test waits for the turns to end, each after a shard's step has run.
+    const LOOKS: usize = 10_000;
+    // A git repository's history is kept on the node's changeset store: a store-backed audit daemon.
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let green = crate::daemon::observe_first(&daemon, |state| {
+      // Someone waits: a task ready on this shard, polled only once this closure has returned.
+      let waiting = slates_rt::futures::spawn(async {}).unwrap();
+      let _ = slates_rt::futures::detach(waiting);
+      let root = green_of(create(state, "tree", "main"));
+      let id = to_db_volume(root);
+      let floor_before = state.db.partition().green_floor(id);
+      write_files(state, root, FILES, 1);
+      let backlog = state
+        .greens
+        .get(&id)
+        .map_or(0, |engine| engine.identity_backlog());
+      assert!(
+        state.merge.checkpointing.contains(&id),
+        "the checkpoint was taken whole with someone waiting"
+      );
+      assert!(backlog > 0, "no key left to fold in turns");
+      assert_eq!(
+        state.db.partition().green_floor(id),
+        floor_before,
+        "taken in the destroy"
+      );
+      id
+    });
+    let mut looks = 0;
+    while crate::daemon::observe_first(&daemon, move |state| {
+      state.merge.checkpointing.contains(&green)
+    }) {
+      looks += 1;
+      assert!(looks < LOOKS, "the checkpoint's turns never ended");
+    }
+    let (in_turns, steps, taken, identity) = crate::daemon::observe_first(&daemon, move |state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let identity = state
+        .greens
+        .get_mut(&green)
+        .map(|mut engine| (engine.head_identity(), engine.head_identity_from_scratch()));
+      (
+        count(crate::merge_service::CHECKPOINT_IN_TURNS),
+        count(crate::merge_service::CHECKPOINT_IDENTITY_STEPS),
+        count(crate::merge_service::CHECKPOINT_TAKEN),
+        identity,
+      )
+    });
+    daemon.stop();
+    assert_eq!(in_turns, 1);
+    assert!(steps > 1, "{steps} identity steps");
+    assert!(taken >= 1, "no checkpoint taken");
+    let (running, recount) = identity.unwrap();
+    assert_eq!(running, recount);
   }
 }

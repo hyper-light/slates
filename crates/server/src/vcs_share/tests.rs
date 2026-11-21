@@ -28,7 +28,7 @@ fn answered_intake(state: &mut ShardState, repository: RepositoryId, bytes: u64)
 /// fast path, counted, and nothing divided.
 #[test]
 fn t_a724_a_repository_alone_is_admitted_all_the_shard_can_hold_by_the_fast_path() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
     let toy = git_repository(state, "toy");
     let own = Live::begin(toy);
     let admittable = state.store.admittable();
@@ -47,7 +47,7 @@ fn t_a724_a_repository_alone_is_admitted_all_the_shard_can_hold_by_the_fast_path
 /// everything by the fast path.
 #[test]
 fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_their_traffic() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
     let monorepo = git_repository(state, "monorepo");
     let toy = git_repository(state, "toy");
     let admittable = state.store.admittable();
@@ -83,7 +83,7 @@ fn t_a724_a_repositorys_room_is_its_share_while_others_push_and_learns_from_thei
 /// leaves the other alone again.
 #[test]
 fn t_a724_a_push_is_live_from_its_start_until_it_drops() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
     let pushed = git_repository(state, "pushed");
     let other = git_repository(state, "other");
     let mut advertised = Vec::new();
@@ -139,7 +139,7 @@ fn encoded_and_learned(state: &mut ShardState, id: RepositoryId) -> u64 {
 fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_costs_less_than_the_room()
  {
   use crate::vcs_store::git_encode::{DROPPED, kept_bytes, relieve};
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_share", |state| {
     let pushed = git_repository(state, "pushed");
     crate::git_push::tests::pushed_from_the_fixtures(state, pushed, &["create", "update"]);
     let kept = encoded_and_learned(state, pushed);
@@ -168,7 +168,8 @@ fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_cost
 /// snapshot and naming it; beside another, at most that, the slot divided between them.
 #[test]
 fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
-  crate::daemon::audit_on_shard_configured(
+  crate::test_store::audit_on_stored_shard_configured(
+    "vcs_share",
     |state| {
       let toy = git_repository(state, "toy");
       let other = git_repository(state, "other");

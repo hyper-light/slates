@@ -1,6 +1,8 @@
 //! The git object store held to a map model over generated histories (A-614, §4.17.2 piece 5 part 1): commits made on
-//! a ref's head, on any earlier commit (a rewrite) or as roots, refs moved to other refs' heads, deletes and refused
-//! pushes, in both object formats. The model is a map from each object to what it names; reachability is its plain
+//! a ref's head, on any earlier commit (a rewrite) or as roots, refs moved to other refs' heads, tags at any earlier
+//! commit (annotated, a tag object pushed, or lightweight, the ref at the commit: A-614 amended, a create admitted with
+//! no walk and derived on first read), deletes and refused pushes, in both object formats, and the store made again from
+//! its pushes as a restart's replay makes it. The model is a map from each object to what it names; reachability is its plain
 //! closure, D(k) the difference of two closures, generation numbers its own recursion. After every step: each ref's
 //! versions, heads and D(k), its reached set, every commit's row, no row for an object never committed, and every path
 //! at each ref's head read as the model's files say.
@@ -17,7 +19,8 @@ use crate::store::{Found, Repository};
 use crate::unpack::{NoIndex, read_whole};
 
 use super::{
-  EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, pack_of, push_and_move, sealed, store, tree,
+  EXCHANGE, Made, Ticks, blob, brought_by, commit, ids, made, pack_of, push_and_move, sealed,
+  store, tree,
 };
 
 /// Shape: the paths the generated histories edit: two at the top, two in `d`, one in `d/e`, one in `f`.
@@ -54,12 +57,19 @@ pub(super) enum Op {
   At { green: u64, other: u64 },
   /// `green` deleted.
   Delete { green: u64 },
+  /// `green` moved to, or made at, a tag of a commit made so far (any of them, so often an old one): an annotated tag
+  /// object pushed, or the commit itself where `annotated` is false.
+  Tag {
+    green: u64,
+    at: usize,
+    annotated: bool,
+  },
 }
 
 pub(super) fn op() -> impl Strategy<Value = Op> {
   let edit = (0..PATHS.len(), proptest::option::of(0..CONTENTS.len()));
   (
-    (0u8..9, 0..GREENS, 0..GREENS, 0u8..5, any::<usize>()),
+    (0u8..11, 0..GREENS, 0..GREENS, 0u8..5, any::<usize>()),
     (
       proptest::collection::vec(edit, 0..4),
       proptest::bool::weighted(0.15),
@@ -79,7 +89,12 @@ pub(super) fn op() -> impl Strategy<Value = Op> {
           refuse,
         },
         6..8 => Op::At { green, other },
-        _ => Op::Delete { green },
+        8 => Op::Delete { green },
+        _ => Op::Tag {
+          green,
+          at,
+          annotated: refuse || at % 2 == 0,
+        },
       }
     })
 }
@@ -193,6 +208,27 @@ impl Model {
       .and_then(|heads| heads.last().copied().flatten())
   }
 
+  /// The commit `id` peels to: itself, or the one a tag names.
+  fn peel(&self, id: ObjectId) -> ObjectId {
+    match self.objects.get(&id) {
+      Some(made) if made.kind == Kind::Tag => self.names[&id][0],
+      _ => id,
+    }
+  }
+
+  /// An annotated tag of `target`, a commit, recorded.
+  fn make_tag(&mut self, target: ObjectId) -> ObjectId {
+    self.seconds += 1;
+    let text = format!(
+      "object {target}\ntype commit\ntag t{}\ntagger A <a@example.com> {} +0000\n\nm\n",
+      self.seconds, self.seconds
+    );
+    self.record(
+      made(self.format, Kind::Tag, text.into_bytes()),
+      vec![target],
+    )
+  }
+
   fn commit_at(&self, at: usize) -> Option<ObjectId> {
     (!self.commits.is_empty()).then(|| self.commits[at % self.commits.len()])
   }
@@ -232,11 +268,60 @@ impl Model {
   }
 }
 
+/// A push committed: its objects, and its moves (each ref's position and where it moved to).
+pub(super) type CommittedPush = (Vec<Made>, Vec<(u64, Option<ObjectId>)>);
+
 /// The real side.
 pub(super) struct Real {
   pub(super) store: ContentStore,
   pub(super) repository: Repository,
   pub(super) clock: Ticks,
+  /// Every push committed, in order: its objects and its moves, what a restart's replay commits again.
+  pub(super) pushes: Vec<CommittedPush>,
+}
+
+impl Real {
+  /// An empty repository of `format` in an empty store.
+  pub(super) fn new(format: ObjectFormat) -> Real {
+    Real {
+      store: store(),
+      repository: Repository::new(format),
+      clock: Ticks(0),
+      pushes: Vec::new(),
+    }
+  }
+
+  /// `objects` pushed and `moves` committed ([`push_and_move`]), and kept for a replay.
+  fn pushed(&mut self, objects: Vec<Made>, moves: &[(u64, Option<ObjectId>)]) {
+    self.pushes.push((objects.clone(), moves.to_vec()));
+    push_and_move(&mut self.repository, &mut self.store, objects, moves).unwrap();
+  }
+
+  /// The store made again from the pushes this one committed, in order, as a restart's replay makes it (A-614
+  /// amended): each sealed, admitted and committed with no reader between, so no set admitted with no walk is derived;
+  /// and the objects its admissions walked meanwhile.
+  pub(super) fn replayed(&self, format: ObjectFormat) -> (Real, u64) {
+    let mut again = Real::new(format);
+    for (objects, moves) in &self.pushes {
+      let mut push = sealed(&again.repository, &mut again.store, objects.clone());
+      let admitted: Vec<crate::store::Move> = moves
+        .iter()
+        .map(|(green, to)| {
+          again
+            .repository
+            .admit(&again.store, &push, *green, *to)
+            .unwrap()
+        })
+        .collect();
+      again
+        .repository
+        .commit(&mut again.store, &mut push, &admitted)
+        .unwrap();
+    }
+    let walked = again.repository.counters().walked;
+    again.pushes = self.pushes.clone();
+    (again, walked)
+  }
 }
 
 fn commit_op(
@@ -248,7 +333,7 @@ fn commit_op(
   refuse: bool,
 ) {
   let base = match base {
-    Base::Head => model.head(green),
+    Base::Head => model.head(green).map(|head| model.peel(head)),
     Base::Commit(at) => model.commit_at(at),
     Base::Root => None,
   };
@@ -266,13 +351,7 @@ fn commit_op(
     return;
   }
   model.indexed.extend(objects.iter().map(|object| object.id));
-  push_and_move(
-    &mut real.repository,
-    &mut real.store,
-    objects,
-    &[(green, Some(head))],
-  )
-  .unwrap();
+  real.pushed(objects, &[(green, Some(head))]);
   model.heads.entry(green).or_default().push(Some(head));
 }
 
@@ -280,13 +359,22 @@ fn at_op(real: &mut Real, model: &mut Model, green: u64, other: u64) {
   let Some(head) = model.head(other).filter(|_| green != other) else {
     return;
   };
-  push_and_move(
-    &mut real.repository,
-    &mut real.store,
-    Vec::new(),
-    &[(green, Some(head))],
-  )
-  .unwrap();
+  real.pushed(Vec::new(), &[(green, Some(head))]);
+  model.heads.entry(green).or_default().push(Some(head));
+}
+
+fn tag_op(real: &mut Real, model: &mut Model, green: u64, at: usize, annotated: bool) {
+  let Some(commit) = model.commit_at(at) else {
+    return;
+  };
+  let head = if annotated {
+    model.make_tag(commit)
+  } else {
+    commit
+  };
+  let objects = model.unindexed(head);
+  model.indexed.extend(objects.iter().map(|object| object.id));
+  real.pushed(objects, &[(green, Some(head))]);
   model.heads.entry(green).or_default().push(Some(head));
 }
 
@@ -294,13 +382,7 @@ fn delete_op(real: &mut Real, model: &mut Model, green: u64) {
   if model.head(green).is_none() {
     return;
   }
-  push_and_move(
-    &mut real.repository,
-    &mut real.store,
-    Vec::new(),
-    &[(green, None)],
-  )
-  .unwrap();
+  real.pushed(Vec::new(), &[(green, None)]);
   model.heads.entry(green).or_default().push(None);
 }
 
@@ -314,9 +396,17 @@ pub(super) fn apply(real: &mut Real, model: &mut Model, op: &Op) {
     } => commit_op(real, model, *green, *base, edits, *refuse),
     Op::At { green, other } => at_op(real, model, *green, *other),
     Op::Delete { green } => delete_op(real, model, *green),
+    Op::Tag {
+      green,
+      at,
+      annotated,
+    } => tag_op(real, model, *green, *at, *annotated),
   }
   let green = match op {
-    Op::Commit { green, .. } | Op::At { green, .. } | Op::Delete { green } => *green,
+    Op::Commit { green, .. }
+    | Op::At { green, .. }
+    | Op::Delete { green }
+    | Op::Tag { green, .. } => *green,
   };
   if let Some(version) = real.repository.versions(green).checked_sub(1) {
     let encoded = real.repository.encode_fragments(
@@ -384,6 +474,15 @@ fn check_paths(real: &Real, model: &Model, green: u64) {
     return;
   };
   let version = model.heads[&green].len() - 1;
+  // A tag's head has no tree of its own: a version's tree is its head commit's.
+  if model
+    .objects
+    .get(&head)
+    .is_some_and(|made| made.kind == Kind::Tag)
+  {
+    assert_eq!(real.repository.tree(&real.store, green, version), None);
+    return;
+  }
   assert_eq!(
     real.repository.tree(&real.store, green, version),
     Some(model.names[&head][0])
@@ -440,23 +539,33 @@ fn check(real: &Real, model: &Model) {
 proptest! {
   #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(64), ..ProptestConfig::default() }))]
 
-  /// A-614, §4.17.2 items 2 and 3. Do: run generated histories over three refs in either object format: commits on a
-  /// ref's head, on any earlier commit and as roots, refs moved to other refs' heads, deletes, and pushes admitted then
-  /// abandoned. Expect: after every step every version's head and D(k), every reached set, every commit's row and every
-  /// path at every head as the map model computes them; no row for an object no push committed; an abandoned push
-  /// changing no byte of the store; and the store empty once the repository is released.
+  /// A-614, §4.17.2 items 2 and 3; A-614 amended (main's ruling (A) of 2026-11-21, its condition 1: on generated
+  /// histories with branches, lightweight and annotated tags and tags at old commits, a set derived on first read is the
+  /// eager walk's, before and after a restart). Do: run generated histories over three refs in either object format:
+  /// commits on a ref's head, on any earlier commit and as roots, refs moved to other refs' heads, tags (annotated or
+  /// lightweight) at any earlier commit, deletes, and pushes admitted then abandoned, each version's sets derived on
+  /// first read; then make the store again from its pushes as a restart's replay does, and derive every version there.
+  /// Expect: after every step every version's head and D(k), every reached set (each its head's closure), every
+  /// commit's row and every path at every head as the map model computes them; no row for an object no push committed;
+  /// an abandoned push changing no byte of the store; the replay walking nothing, and the store it made reading as the
+  /// model too; and each store empty once its repository is released.
   #[test]
   fn the_git_store_reads_as_its_map_model_over_every_history(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..24)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
+    let mut real = Real::new(format);
     let mut model = Model::new(format);
     for op in &ops {
       apply(&mut real, &mut model, op);
       check(&real, &model);
     }
-    let Real { mut store, repository, .. } = real;
-    repository.release(&mut store).unwrap();
-    prop_assert!(store.is_empty());
+    let (mut again, walked) = real.replayed(format);
+    prop_assert_eq!(walked, 0, "a replay admits every move with no walk");
+    crate::served::derive_all(&again.repository, &mut again.store);
+    check(&again, &model);
+    for Real { mut store, repository, .. } in [real, again] {
+      repository.release(&mut store).unwrap();
+      prop_assert!(store.is_empty());
+    }
   }
 }
 

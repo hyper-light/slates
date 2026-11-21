@@ -173,6 +173,17 @@ pub(crate) trait SvnStores {
   /// A repository's landing turn (C2, `repository::svn_commit::landing::Turn`), held from a verb's judgment to its
   /// record's landing.
   type Turn;
+  /// Reads the text piece `wanted` of repository `id` through the node's changeset store, where the repository's
+  /// sources read it until [`SvnStores::let_go`] (C2 stage B part 2): whether it did; none to read where the sources
+  /// hold every text in memory (the default).
+  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+    let _ = (id, wanted);
+    false
+  }
+  /// Lets go a piece [`SvnStores::fetch`] read, once the call that waited for it has read it.
+  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
+    let _ = wanted;
+  }
   /// Repository `id`'s landing turn, once no other landing holds it; none when its store is not held here.
   async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn>;
   /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step, holding its
@@ -307,6 +318,9 @@ pub(crate) struct SvnCommand<R, V> {
   repositories: R,
   /// Where their stores are lent.
   stores: V,
+  /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held until the next call has read
+  /// it.
+  fetched: Option<slates_svn::reads::Wanted>,
   /// The principal the client's key proved, which the repository's policy judges.
   principal: Principal,
   /// Its name, the tunnel's user.
@@ -343,6 +357,8 @@ enum Received {
   Took(usize),
   /// Output was written and nothing taken.
   Wrote,
+  /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2).
+  Waiting(slates_svn::reads::Wanted),
   /// The client answered the greeting with this URL.
   Opened {
     /// The URL.
@@ -396,6 +412,7 @@ impl Received {
         Received::Took(consumed)
       }
       Turn::Wrote => Received::Wrote,
+      Turn::Waiting(wanted) => Received::Waiting(wanted),
       Turn::Opened { open, consumed } => Received::Opened {
         url: open.url.to_vec(),
         consumed,
@@ -427,6 +444,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     Some(Self {
       repositories,
       stores,
+      fetched: None,
       principal: principal.clone(),
       user: crate::lfs::owner_name(principal).into_bytes(),
       connection,
@@ -448,9 +466,28 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     if let Some(status) = self.exit {
       return exited(status);
     }
-    let consumed = match self.received() {
+    let previous = self.fetched.take();
+    let received = self.received();
+    // The piece the last wait fetched was read by this call (C2 stage B part 2).
+    if let Some(wanted) = previous {
+      self.stores.let_go(wanted);
+    }
+    let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
       Received::Wrote => 0,
+      Received::Waiting(wanted) => {
+        let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+          self.not_held();
+          return self.consumed(0);
+        };
+        // A piece the node's store cannot give ends the session: the drive would wait for it again.
+        if self.stores.fetch(id, wanted).await {
+          self.fetched = Some(wanted);
+        } else {
+          self.not_held();
+        }
+        0
+      }
       Received::Took(consumed) => consumed,
       Received::Opened { url, consumed } => {
         self.open(&url);

@@ -9,8 +9,8 @@
 //! removed, its first parent the parent's manifest; the changeset, naming the manifest, the user, the time in whole
 //! seconds at UTC, the branch where it is not `default`, the paths touched in their order, and the message. Each node is
 //! 7.2's (SHA-1 of the parents and the text). A file whose text is its parent revision's makes no revision (7.2's
-//! `filelog.cmp`): with the parent's flag too it is not listed, with another only its flag changes. What the version brought is a [`Verified`], which the server keeps and records as a push's (`commit::fork_with`,
-//! `import::record::write_made`).
+//! `filelog.cmp`): with the parent's flag too it is not listed, with another only its flag changes. What the version brought is a [`Verified`], which the server lands on the changeset store as a push's changeset,
+//! through its changegroup ([`changegroup`]) and the push's intake (A-767 C1).
 //!
 //! **Not made** ([`Unmade`]): a parent the index does not hold, a field 7.2 would not write as it is, a version that
 //! changed no tracked file.
@@ -285,3 +285,62 @@ fn changeset_text(
 #[cfg(test)]
 #[path = "made_tests.rs"]
 mod tests;
+
+/// Format: the changegroup version a made changeset is written in: 03, which names each delta's base and carries
+/// revision flags, as the import's is (`crate::import::emit::VERSION`).
+pub const CHANGEGROUP_VERSION: crate::changegroup::Version = crate::changegroup::Version::V03;
+
+/// The changegroup of the revisions `verified` holds, a made changeset's (A-767 C1: a made changeset lands on the node's
+/// changeset store as a push does, through the push's own intake and landing): the changelog's group, the manifest
+/// log's, version 03's empty tree list, then each file log's group in the order the changeset made them, each
+/// revision its full text against the null base, which every reader takes (`mdiff.trivialdiffheader`); `admission`
+/// charged for the bytes before they are written.
+pub fn changegroup(
+  verified: &Verified,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, crate::changegroup::EncodeRefusal> {
+  use crate::changegroup::{self as cg, Revision};
+  let texts = verified
+    .changesets
+    .iter()
+    .chain(&verified.manifests)
+    .chain(verified.files.iter().flat_map(|(_, revisions)| revisions))
+    .map(|arrived| arrived.text.len())
+    .fold(0_usize, usize::saturating_add);
+  admission
+    .charge(to_u64(texts))
+    .map_err(|_| cg::EncodeRefusal::TooLong { len: to_u64(texts) })?;
+  let mut out = Vec::new();
+  let whole = |arrived: &Arrived, out: &mut Vec<u8>| {
+    let revision = Revision {
+      node: arrived.node,
+      p1: arrived.p1,
+      p2: arrived.p2,
+      base: NULL_NODE,
+      link: arrived.link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: &arrived.text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&revision, CHANGEGROUP_VERSION, out)
+  };
+  for group in [&verified.changesets, &verified.manifests] {
+    for arrived in group {
+      whole(arrived, &mut out)?;
+    }
+    cg::put_end(&mut out);
+  }
+  // Version 03's tree list: a made manifest is flat, so the list is empty.
+  cg::put_end(&mut out);
+  for (path, revisions) in &verified.files {
+    cg::put_name(path, &mut out)?;
+    for arrived in revisions {
+      whole(arrived, &mut out)?;
+    }
+    cg::put_end(&mut out);
+  }
+  cg::put_end(&mut out);
+  Ok(out)
+}

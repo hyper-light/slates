@@ -2731,7 +2731,7 @@ fn owed_catalog(
     local,
   );
   let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-    head.sequence == record.catalog_version && head.placed_under(config, catalog)
+    head.sequence == record.catalog_version && head.placed_under(state, catalog)
   });
   let ready = owed.is_none() || committed;
   (owed, ready)
@@ -4638,7 +4638,7 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let head = state.placed_heads.get(object)?;
-      if head.sequence != job.sequence || !head.placed_under(state.fleet.configuration(), *object) {
+      if head.sequence != job.sequence || !head.placed_under(state, *object) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();
@@ -13633,9 +13633,8 @@ mod state_log_tests {
 
   /// A repository `name` made on `state`'s shard with its default branch `main`, and a branch `topic` of it: its id.
   fn repository_and_branch(state: &mut ShardState, name: &str) -> RepositoryId {
-    let created = crate::verbs::dispatch(
+    let created = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.to_owned(),
@@ -13682,7 +13681,7 @@ mod state_log_tests {
   /// hold it, the second still owed to both; and no acknowledgement of a part kept as a head's placement.
   #[test]
   fn an_owners_state_log_records_are_owed_to_the_repositorys_candidates_in_order() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("fleet-state-log", |state| {
       let (local, [b, c]) = region_of_three(state);
       let repo = repository_and_branch(state, "shipped");
       crate::state_log::take_made(state);
@@ -13755,7 +13754,7 @@ mod state_log_tests {
   /// the retire, the record owed again at 6 to both.
   #[test]
   fn an_owners_repository_record_is_owed_to_its_familys_candidates_at_each_change() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("fleet-state-log", |state| {
       let (local, [b, c]) = region_of_three(state);
       let repo = repository_and_branch(state, "recorded");
       let object = ObjectId(repo.bytes);

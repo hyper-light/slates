@@ -15,7 +15,6 @@ use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
 
 use super::{LfsAccess, LfsCall, answer, id_of};
 use crate::state::ShardState;
-use crate::verbs::dispatch;
 
 /// Shape: room enough for every request and answer these tests make.
 const ROOM: u64 = 1 << 20;
@@ -48,7 +47,7 @@ fn repository(state: &mut ShardState) -> RepositoryId {
     default_branch: "main".to_owned(),
     green: None,
   };
-  let reply = dispatch(state, 1, &owner(), create);
+  let reply = crate::test_store::create(state, &owner(), create);
   assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
   let repositories = state.db.partition().repositories();
   repositories.repository_named("repo.git").unwrap().id
@@ -118,7 +117,7 @@ fn logged(state: &ShardState, repository: RepositoryId) -> usize {
 /// holding none.
 #[test]
 fn the_owner_takes_lists_and_releases_a_lock_in_the_repository_s_locks_log() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("lfs", |state| {
     let repository = repository(state);
     let owner = owner();
     let me = Some(&owner);
@@ -141,7 +140,7 @@ fn the_owner_takes_lists_and_releases_a_lock_in_the_repository_s_locks_log() {
 /// edge's challenge, and `404`; and nothing in the locks log.
 #[test]
 fn a_stranger_is_refused_and_a_request_without_credentials_is_asked_for_them() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("lfs", |state| {
     let repository = repository(state);
     let lock: &[u8] = br#"{"path":"a.bin"}"#;
     let refused = serve(state, Some(&stranger()), ("POST", LOCKS, lock));
@@ -166,7 +165,7 @@ fn a_stranger_is_refused_and_a_request_without_credentials_is_asked_for_them() {
 /// (`404`) though its path is locked, and the second to release the lock.
 #[test]
 fn an_id_names_its_own_lock_and_never_one_taken_after_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("lfs", |state| {
     repository(state);
     let owner = owner();
     let me = Some(&owner);
@@ -283,7 +282,7 @@ fn object_bytes() -> Vec<u8> {
 /// the download `200` with the object's bytes and the batch naming a download for it.
 #[test]
 fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("lfs", |state| {
     let repository = repository(state);
     let owner = owner();
     let me = Some(&owner);
@@ -329,7 +328,7 @@ fn an_uploaded_object_is_durable_and_served_after_the_store_is_made_again() {
 /// download `404`: nothing of the bytes was kept or recorded.
 #[test]
 fn an_upload_whose_bytes_are_not_its_oid_is_refused_and_nothing_is_recorded() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("lfs", |state| {
     let repository = repository(state);
     let owner = owner();
     let me = Some(&owner);

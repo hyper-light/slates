@@ -3477,17 +3477,28 @@ mod tests {
         replace: true,
       }
     );
+    the_merge_verbs_after_an_edit_parse(id, vid);
+  }
+
+  /// The merge grammar's submit, rebase, check and resolve, of the volume `id` (`vid`).
+  fn the_merge_verbs_after_an_edit_parse(id: &str, vid: slates_client::VolumeId) {
     assert_eq!(
-      verb(&format!("submit {id}")),
+      client_verb(&format!("submit {id}")),
       Verb::Submit {
         work: vid,
         evidence: Vec::new(),
       }
     );
-    assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
-    assert_eq!(verb(&format!("check {id}")), Verb::CheckMerge { work: vid });
     assert_eq!(
-      verb("resolve {}"),
+      client_verb(&format!("rebase {id}")),
+      Verb::Rebase { work: vid }
+    );
+    assert_eq!(
+      client_verb(&format!("check {id}")),
+      Verb::CheckMerge { work: vid }
+    );
+    assert_eq!(
+      client_verb("resolve {}"),
       Verb::ResolveMerge {
         resolution: "{}".into(),
       }

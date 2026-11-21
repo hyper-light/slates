@@ -4879,8 +4879,9 @@ pub enum ImportFault {
   /// The import was given back before its end: its repository was freed.
   Abandoned,
   /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
-  /// number, the revision being loaded, and the path the refusal names. The revisions committed before it stay, as
-  /// `svnadmin load` keeps them. Appended.
+  /// number, the revision being loaded, and the path the refusal names. No daemon of this build sends it: since C2
+  /// stage C an import lands its revisions in batches, and refuses as [`ImportFault::SubversionLanded`] does, naming
+  /// what landed. Appended.
   Subversion {
     /// Subversion's error number (`svn_error_codes.h`).
     code: u32,
@@ -4888,6 +4889,21 @@ pub enum ImportFault {
     revision: Option<u64>,
     /// The path the refusal names, empty where it names none.
     path: String,
+  },
+  /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3; C2 stage C):
+  /// Subversion's error number, the revision being loaded, the path the refusal names, and the last revision that
+  /// landed. An import lands its revisions a batch at a time, a batch one changeset and atomic, so the revisions of the
+  /// batch the refusal ended are given up, where `svnadmin load` keeps each as it goes; the repository stands at
+  /// `landed`, and the same dump imported again resumes after it. Appended.
+  SubversionLanded {
+    /// Subversion's error number (`svn_error_codes.h`).
+    code: u32,
+    /// The revision being loaded; none before the stream's first revision record.
+    revision: Option<u64>,
+    /// The path the refusal names, empty where it names none.
+    path: String,
+    /// The repository's youngest revision as the refusal left it: the last that landed.
+    landed: u64,
   },
 }
 

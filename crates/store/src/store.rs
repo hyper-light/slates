@@ -205,6 +205,11 @@ pub struct Store {
   value: Vec<u8>,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
+  /// The log reads that answered places ([`Store::places_bytes`]): the counter its coalescing is held to.
+  place_reads: u64,
+  /// The engine reads (a lookup, or a page of a scan) that answered versions by their tool ids
+  /// ([`Store::texts_by_tools`]): the counter its scan is held to.
+  tool_reads: u64,
 }
 
 /// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
@@ -249,6 +254,8 @@ impl Store {
       log,
       rows,
       value,
+      place_reads: 0,
+      tool_reads: 0,
       grant: GrantRow {
         id: 0,
         issued_ns: 0,
@@ -263,6 +270,26 @@ impl Store {
   /// The standing grant the store's directory is written under, as first recorded (its `G` row).
   pub fn grant(&self) -> &GrantRow {
     &self.grant
+  }
+
+  /// The log reads that answered places so far ([`Store::places_bytes`]).
+  pub fn place_reads(&self) -> u64 {
+    self.place_reads
+  }
+
+  /// The engine reads that answered versions by their tool ids so far ([`Store::texts_by_tools`]).
+  pub fn tool_reads(&self) -> u64 {
+    self.tool_reads
+  }
+
+  /// Counts one engine read that answered versions by their tool ids.
+  pub(crate) fn tool_read(&mut self) {
+    self.tool_reads = self.tool_reads.saturating_add(1);
+  }
+
+  /// Counts one log read that answered places.
+  pub(crate) fn place_read(&mut self) {
+    self.place_reads = self.place_reads.saturating_add(1);
   }
 
   /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the engine so it is

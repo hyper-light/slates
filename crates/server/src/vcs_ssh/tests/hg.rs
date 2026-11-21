@@ -283,14 +283,6 @@ impl Repository for Probed {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Probed {
@@ -1042,9 +1034,8 @@ fn owner() -> Principal {
 /// Makes Mercurial repository `name` on `state`'s shard holding what 7.2's server held before `ssh-push`: `base` and
 /// `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record.
 fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1085,7 +1076,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared);
+  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"
@@ -1179,7 +1170,7 @@ fn push_capabilities(hello: &[u8]) -> (CapabilityValues, Option<Vec<u8>>) {
 /// consumed and exit 0; and `default`'s line at `third` afterwards.
 #[test]
 fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let record =
     crate::daemon::observe_first(&daemon, |state| drafted_history(state, "pushed-over-ssh"));
   let id = record.id;
@@ -1233,9 +1224,8 @@ fn one_file_history(
   name: &str,
   bytes: &'static [u8],
 ) -> (RepositoryRecord, Node) {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1266,7 +1256,7 @@ fn one_file_history(
   let terms = (false, HISTORY_PUSH, u64::MAX);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared);
+  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"
@@ -1318,7 +1308,7 @@ fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
     })
     .collect();
   let large: &'static [u8] = Box::leak(large.into_boxed_slice());
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
     one_file_history(state, "cloned-over-ssh", large)
   });
@@ -1490,17 +1480,58 @@ impl Repository for Grown {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Grown {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
+  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the bytes (a whole kept raw).
+  fn stored_now(
+    &self,
+    want: &slates_hg::render::Want,
+  ) -> Option<slates_hg::serve::getbundle::Given> {
+    use slates_hg::render::{StoredPlace, StoredRevision, Want};
+    use slates_hg::serve::getbundle::Given;
+    let identity = *blake3::hash(&self.bytes).as_bytes();
+    let len = u64::try_from(self.bytes.len()).ok()?;
+    Some(match want {
+      Want::Rows { logs } => Given::Rows(
+        logs
+          .iter()
+          .map(|(path, nodes)| {
+            nodes
+              .iter()
+              .map(|node| {
+                self
+                  .files
+                  .iter()
+                  .any(|(held, file)| held == path && file == node)
+                  .then_some(StoredRevision {
+                    text: identity,
+                    base: None,
+                    place: StoredPlace {
+                      payload: identity,
+                      offset: 0,
+                      len,
+                    },
+                  })
+              })
+              .collect()
+          })
+          .collect(),
+      ),
+      // A stored whole is its raw text (the store's contract, A-767 C1).
+      Want::Chunks { places } => Given::Chunks(places.iter().map(|_| self.bytes.clone()).collect()),
+      Want::Texts { texts, most } => {
+        let total = (self.bytes.len() as u64).saturating_mul(texts.len() as u64);
+        if total > *most {
+          Given::TextsPast
+        } else {
+          Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect())
+        }
+      }
+    })
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,

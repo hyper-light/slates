@@ -173,6 +173,12 @@ pub fn answer(
       let mut body = Vec::new();
       loop {
         match streamed.step(store, admission, &mut body) {
+          // A step that asks the changeset store between steps cannot be answered whole (`Store::stored_now`).
+          Ok(true) if crate::render::StoreWants::wants(&*streamed).is_some() => {
+            return error(Refused::Serve(super::Refusal::Store {
+              what: "a file revision read from the changeset store between steps",
+            }));
+          }
           Ok(true) => {}
           Ok(false) => {
             return Answered {
@@ -212,6 +218,32 @@ pub struct Streamed {
   pending: Option<(Vec<u8>, bool)>,
   /// The answer.
   answering: session::Producing,
+}
+
+impl crate::render::StoreWants for Streamed {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.answering.wants()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    self.answering.give_rows(rows);
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    self.answering.give_chunks(chunks);
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.answering.give_texts(texts);
+  }
+
+  fn texts_past(&mut self) {
+    self.answering.texts_past();
+  }
+
+  fn reads_tags(&self) -> bool {
+    self.answering.reads_tags()
+  }
 }
 
 impl Streamed {
@@ -292,6 +324,26 @@ pub fn begin(
       pending: None,
       answering: session::Producing::Revlogs(Box::default()),
     }));
+  }
+  if command == b"lookup"
+    && let Some(key) = arguments.get(spec, b"key")
+  {
+    // A name that reaches the tags reads the heads' `.hgtags` from the changeset store first (A-767 C1, main's ruling
+    // (A)), between steps; its answer is 7.2's string answer, `application/mercurial-0.1` uncompressed.
+    match session::lookup_begun(store, key, transport, admission) {
+      Ok(Some(looking)) => {
+        return Begun::Streamed(Box::new(Streamed {
+          media_type: MEDIA_TYPE_V1,
+          head: None,
+          compressor: compression::StreamCompressor::Uncompressed,
+          engine: Engine::Uncompressed,
+          pending: None,
+          answering: looking,
+        }));
+      }
+      Ok(None) => {}
+      Err(refusal) => return Begun::Answered(error(Refused::Serve(refusal))),
+    }
   }
   if command == b"getbundle" {
     let asked = session::getbundle_asked(&arguments);

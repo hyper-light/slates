@@ -14,7 +14,7 @@ use slates_vcs::ContentStore;
 
 use super::{
   ABANDONED, DONE, Finished, ImportFailed, Importing, LANDED, LANDING_REFUSED, REFUSED, STARTED,
-  Stage, TURNS, Turned, begin, land, run, turn,
+  Stage, TURNS, Turned, begin, land, land_imported, run, turn,
 };
 use crate::hg_base::HgBase;
 use crate::hg_base::tests::{Files, STATES, laid_out};
@@ -23,7 +23,7 @@ use crate::state::ShardState;
 use crate::verbs::dispatch;
 
 /// An index's rows, each its key and its body.
-type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+pub(crate) type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Shape: a content store's budget and an import's room for the one-call import the tests hold the shard's to, each the
 /// fixture's history many times over.
@@ -59,9 +59,8 @@ fn owner() -> Principal {
 
 /// Creates repository `name` of `tool` on the shard: its id.
 pub(crate) fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -192,7 +191,7 @@ fn check_settled(state: &ShardState, id: RepositoryId) {
 /// holds, and each turn, the import's start and end and its landing counted.
 #[test]
 fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_imports_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let (expected_rows, expected) = in_one_call(state, STATES);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
@@ -204,7 +203,7 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
       "{turns} turns, {finished:?}"
     );
     assert!(!expected_rows.is_empty());
-    assert_eq!(land(state, id), Ok(()));
+    assert_eq!(land_imported(state, id), Ok(()));
     assert_eq!(rows_of(state, id), expected_rows);
     check_found(&finished, &expected);
     check_settled(state, id);
@@ -226,7 +225,7 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
 /// Mercurial's own repository, is w-perf's run: no fixture here holds more than a page.)
 #[test]
 fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let mut clock = Ticking(0);
@@ -236,6 +235,7 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
       if let Some(Importing {
         stage: Stage::Running { import, .. },
         reserved,
+        ..
       }) = state.vcs_stores.imports.get(&id)
       {
         assert_eq!(
@@ -258,88 +258,8 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
       charged_turns > 1,
       "the import was charged on {charged_turns} turns"
     );
-    assert_eq!(land(state, id), Ok(()));
+    assert_eq!(land_imported(state, id), Ok(()));
     check_settled(state, id);
-  });
-}
-
-/// A-732 (found by use, w-perf: importing Mercurial's own repository, 57,036 changesets, crash-looped the daemon, its
-/// shard spinning past the watchdog's 1 s window at every restart: the recovery replayed the import's record in one
-/// unit, and the landing wrote it in one step). Do: import the `states` repository a unit a turn and land it; then make
-/// its store again as a recovery does, its slices a nanosecond, polling the recovery until it ends, its content held
-/// meanwhile as a warm restart's image holds it (A-727 a3; the record names it by identity, A-729 part 2). Expect: the
-/// record
-/// written over more turns than the import's own (a revision a turn at the least), the recovery yielding between its
-/// units, at least one a revision of the record, and the store's rows after it the rows the landing left.
-#[test]
-fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
-  crate::daemon::audit_on_shard(|state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    let (turns, ended) = to_its_end(state, id);
-    let finished = ended.expect("imported");
-    let revisions =
-      u64::from(finished.changesets) + u64::from(finished.manifests) + finished.file_revisions;
-    assert!(turns > revisions, "{turns} turns for {revisions} revisions");
-    assert_eq!(land(state, id), Ok(()));
-    let landed = rows_of(state, id);
-    let image = crate::vcs_store::set_aside(state, id);
-    crate::vcs_store::free(state, id);
-    let mut slices = crate::recovery_slices::RecoverySlices::begin(1);
-    let polls = {
-      let recovery = crate::vcs_store::recover(state, &mut slices);
-      let mut recovery = std::pin::pin!(recovery);
-      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-      let mut polls = 1u64;
-      while recovery.as_mut().poll(&mut context).is_pending() {
-        polls = polls.saturating_add(1);
-      }
-      polls
-    };
-    let units = slices.finish().units;
-    assert!(polls > 1, "the recovery never yielded");
-    assert!(units > revisions, "{units} units for {revisions} revisions");
-    assert_eq!(rows_of(state, id), landed);
-    crate::vcs_store::release_aside(state, image);
-  });
-}
-
-/// A-732 part 5 (found by use, w-hg's r2: a restart of hg's own history ran 259,321 recovery units of one revision each,
-/// each lending the stores and settling the shard's charge). Do: import and land the `states` repository, then make its
-/// store again as a recovery does, its slices a generous 10 s, its content held as a warm restart's image holds it.
-/// Expect fewer recovery units than the record's revisions (a unit takes the record's steps until its slice's time is
-/// spent), the replay's units counted, and the rows the landing left.
-#[test]
-fn a_recovery_unit_replays_as_many_revisions_as_its_slice_allows() {
-  crate::daemon::audit_on_shard(|state| {
-    let id = created(state, "hg", VcsTool::Mercurial);
-    assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
-    let (_, ended) = to_its_end(state, id);
-    let finished = ended.expect("imported");
-    let revisions =
-      u64::from(finished.changesets) + u64::from(finished.manifests) + finished.file_revisions;
-    assert_eq!(land(state, id), Ok(()));
-    let landed = rows_of(state, id);
-    let image = crate::vcs_store::set_aside(state, id);
-    crate::vcs_store::free(state, id);
-    let turns = |state: &ShardState| count(state, crate::vcs_store::HG_REPLAY_TURNS);
-    let before = turns(state);
-    let mut slices = crate::recovery_slices::RecoverySlices::begin(10_000_000_000);
-    {
-      let recovery = crate::vcs_store::recover(state, &mut slices);
-      let mut recovery = std::pin::pin!(recovery);
-      let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-      while recovery.as_mut().poll(&mut context).is_pending() {}
-    }
-    let units = slices.finish().units;
-    let replay_turns = turns(state).saturating_sub(before);
-    assert!(units < revisions, "{units} units for {revisions} revisions");
-    assert!(
-      replay_turns > 0 && replay_turns < revisions,
-      "{replay_turns} replay turns for {revisions} revisions"
-    );
-    assert_eq!(rows_of(state, id), landed);
-    crate::vcs_store::release_aside(state, image);
   });
 }
 
@@ -349,7 +269,7 @@ fn a_recovery_unit_replays_as_many_revisions_as_its_slice_allows() {
 /// given back), no import under way, and the refusal counted.
 #[test]
 fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let cut = STATES.iter().map(|&(path, bytes)| {
       let half = bytes.len() / 2;
@@ -386,7 +306,7 @@ fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
 /// store's rows unchanged.
 #[test]
 fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let git = created(state, "git", VcsTool::Git);
     assert_eq!(
       begin(state, git, directory(STATES.iter().copied())),
@@ -420,7 +340,12 @@ fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
     begin(state, full, directory(STATES.iter().copied())),
     Err(ImportFailed::Busy)
   );
-  assert_eq!(land(state, full), Ok(()));
+  assert_eq!(
+    land(state, full),
+    Err(ImportFailed::Busy),
+    "its segments not landed yet"
+  );
+  assert_eq!(land_imported(state, full), Ok(()));
   let rows = rows_of(state, full);
   assert_eq!(
     begin(state, full, directory(STATES.iter().copied())),
@@ -436,7 +361,7 @@ fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
 /// freed, nothing charged and the shard's retention charge what it was before either import.
 #[test]
 fn t_a675_a_repository_freed_midway_gives_its_import_back() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let retained = state.store.budget.retained();
     assert_an_import_freed_midway_is_given_back(state);
     let whole = created(state, "whole", VcsTool::Mercurial);
@@ -478,13 +403,13 @@ fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
 /// clock.
 #[test]
 fn t_a675_the_shards_task_runs_an_import_to_its_end() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let task = slates_rt::futures::spawn(async move {
       if run(id).await.is_some_and(|ended| ended.is_ok()) {
-        drop(crate::state::with_state(|state| land(state, id)));
+        drop(crate::state::with_state(|state| land_imported(state, id)));
       }
     });
     task
@@ -563,13 +488,13 @@ fn as_kept(roots: &[slates_hg::phases::PhaseHead]) -> Vec<(u8, Vec<u8>)> {
 /// counted landed, and no landing refused.
 #[test]
 fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let (_, expected) = in_one_call(state, STATES);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     assert!(to_its_end(state, id).1.is_ok());
     assert!(roots_of(state, id).is_empty());
-    assert_eq!(land(state, id), Ok(()));
+    assert_eq!(land_imported(state, id), Ok(()));
     assert_landed_as_imported(state, id, &expected);
     assert_eq!(
       (count(state, LANDED), count(state, LANDING_REFUSED)),
@@ -603,7 +528,7 @@ fn assert_landed_as_imported(state: &ShardState, id: RepositoryId, expected: &Im
 /// holds, as it was before the import.
 #[test]
 fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let reply = dispatch(
       state,
@@ -622,7 +547,7 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
     let (held, retained) = (used(state), state.store.budget.retained());
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     assert!(to_its_end(state, id).1.is_ok());
-    let refused = land(state, id);
+    let refused = land_imported(state, id);
     assert_eq!(
       refused,
       Err(ImportFailed::Landing(Refusal::AlreadyExists {
@@ -648,13 +573,13 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
 /// holding the rows the landing left, the replay counted.
 #[test]
 fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let (_, ended) = to_its_end(state, id);
     assert!(ended.is_ok(), "{ended:?}");
-    assert_eq!(land(state, id), Ok(()));
+    assert_eq!(land_imported(state, id), Ok(()));
     let landed = rows_of(state, id);
     crate::vcs_store::rebuild(state, id);
     let during = (

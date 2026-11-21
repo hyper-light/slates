@@ -104,8 +104,23 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   let mut said = Vec::new();
   let (green, head, second) = collided(client, instance, shards, "h");
   let base = head - 1;
+  let check = checked_conflicting(client, (green, head, base), second, &mut said);
+  views_named(client, &check, &mut said);
+  clean_checked(client, green, base, &mut said);
+  resolved_and_landed(client, (green, head, second), &check, &mut said);
+  let late = refused_once_moved(client, green, &mut said);
+  kept_conflict(client, green, late, &mut said);
+  said
+}
 
-  // A check of the conflicting work: the windows, the head and base it judged, nothing changed.
+/// A check of the conflicting work `second`: the windows, the head and base it judged, nothing changed, nothing
+/// published.
+fn checked_conflicting(
+  client: &mut Client,
+  (green, head, base): (VolumeId, u64, u64),
+  second: VolumeId,
+  said: &mut Vec<String>,
+) -> slates_client::MergeCheck {
   let check = client.check_merge(second).unwrap();
   said.push(format!(
     "check: head {} base {} conflicts {} declaration {}",
@@ -132,7 +147,11 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     "a check publishes nothing"
   );
 
-  // The views it names.
+  check
+}
+
+/// The views the check names: the green's and the work's.
+fn views_named(client: &mut Client, check: &slates_client::MergeCheck, said: &mut Vec<String>) {
   let theirs = client
     .read_merge_check(check.stamp, MergeView::Green, FILE)
     .unwrap();
@@ -146,8 +165,10 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   ));
   assert_eq!(theirs, b"aaaa XXXX cccc\n");
   assert_eq!(mine, b"aaaa YYYY cccc\n");
+}
 
-  // A clean work's check: no window, and its base stays where it was (a check is not a rebase).
+/// A clean work's check: no window, and its base stays where it was (a check is not a rebase).
+fn clean_checked(client: &mut Client, green: VolumeId, base: u64, said: &mut Vec<String>) {
   let (clean, _) = client.create_work(green, "h-clean").unwrap();
   client.edit(clean, "other", 0, 0, b"own\n").unwrap();
   let clean_check = client.check_merge(clean).unwrap();
@@ -157,9 +178,16 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     clean_check.stamp.base - base
   ));
   assert!(clean_check.conflicts.is_empty());
+}
 
-  // A resolution bound to the check: retire every operation of the work on the file, write the agent's own bytes at
-  // the head, then submit.
+/// A resolution bound to the check: every operation of the work on the file retired, the agent's own bytes written at
+/// the head, then submitted, and landed as the agent wrote it.
+fn resolved_and_landed(
+  client: &mut Client,
+  (green, head, second): (VolumeId, u64, VolumeId),
+  check: &slates_client::MergeCheck,
+  said: &mut Vec<String>,
+) {
   let discard: Vec<u64> = check
     .declaration
     .iter()
@@ -194,8 +222,11 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     b"aaaa ZZZZ cccc\n",
     "the resolution lands as the agent wrote it"
   );
+}
 
-  // A check whose head then moves: the resolution and the views are refused, and the work is unchanged.
+/// A check whose head then moves, then one whose work then changes: the resolution and the views refused, the work
+/// unchanged. The late work.
+fn refused_once_moved(client: &mut Client, green: VolumeId, said: &mut Vec<String>) -> VolumeId {
   let (late, _) = client.create_work(green, "h-late").unwrap();
   client.edit(late, FILE, AT, LEN, b"LLLL").unwrap();
   let late_check = client.check_merge(late).unwrap();
@@ -226,8 +257,12 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   assert!(stale(changed));
   assert!(stale(read));
 
-  // A resolution that keeps the conflicting operation: another work writes the contested range first; the windows, and
-  // nothing changed.
+  late
+}
+
+/// A resolution that keeps the conflicting operation: another work writes the contested range first; the windows, and
+/// nothing changed.
+fn kept_conflict(client: &mut Client, green: VolumeId, late: VolumeId, said: &mut Vec<String>) {
   let (rival, _) = client.create_work(green, "h-rival").unwrap();
   client.edit(rival, FILE, AT, LEN, b"RRRR").unwrap();
   accepted(client, rival);
@@ -243,7 +278,6 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     client.read(late, FILE, ReadAt::Head).unwrap(),
     b"aaaa LLLL cccc\n"
   );
-  said
 }
 
 /// §4.16, A-796 (the Codex agent's early-conflict check and conditional resolution). Do: the history above on one
@@ -261,4 +295,97 @@ fn a_merge_check_publishes_nothing_and_a_resolution_is_bound_to_what_was_checked
   let one = run(ONE_SHARD, "one");
   let many = run(MANY_SHARDS, "many");
   assert_eq!(one, many, "one shard and eight answer the same");
+}
+
+/// A-796 across a restart (the Codex agent's "lost Work observations after restart"). Do: a work's one edit, checked;
+/// the daemon restarted over its anchor (the work rebuilt from its log); one more edit; a resolution naming the check's
+/// stamp. Expect `StaleMergeView` and the work unchanged: a stamp taken before the restart never names the work after
+/// it changed, however many changes it took to get there.
+#[test]
+fn a_stamp_from_before_a_restart_never_names_the_work_after_it_changed() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-merge-check-restart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(ONE_SHARD));
+  let anchor = common::anchor::held_anchor("merge-check-restart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("restart-green", false).unwrap();
+  let (work, _) = client.create_work(green, "restart-work").unwrap();
+  client.edit(work, "a", 0, 0, b"one\n").unwrap();
+  let stamp = client.check_merge(work).unwrap().stamp;
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  let mut client = connect(&instance);
+  client.edit(work, "b", 0, 0, b"two\n").unwrap();
+  let resolved = client.resolve_merge(stamp, &[], Vec::new());
+  assert!(
+    stale(resolved.clone()),
+    "a pre-restart stamp named the changed work: {resolved:?}"
+  );
+  assert_eq!(client.read(work, "b", ReadAt::Head).unwrap(), b"two\n");
+  drop(client);
+  second.stop();
+}
+
+/// A-796's metadata rule (the Codex agent's `rebase_with`; AC-6.13). Do: the head removes a file; a work set its mode
+/// before it saw that; the work's check conflicts; a resolution keeps the mode and writes the file anew at the head.
+/// Expect the resolution to rebase (the kept mode is judged against the file the replacement establishes, not the one
+/// the head removed) and its submit to land the new file.
+#[test]
+fn a_kept_mode_on_a_file_the_resolution_writes_anew_is_not_a_conflict() {
+  let (daemon, instance) = daemon(ONE_SHARD, "meta");
+  let mut client = connect(&instance);
+  let green = client.create_green("meta-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "meta-seed").unwrap();
+  client.edit(seed, FILE, 0, 0, BASE).unwrap();
+  accepted(&mut client, seed);
+  let (work, _) = client.create_work(green, "meta-work").unwrap();
+  let (remover, _) = client.create_work(green, "meta-remover").unwrap();
+  client
+    .declare(
+      work,
+      slates_client::WorkOp::SetMode {
+        path: FILE.to_owned(),
+        mode: 0o100_755,
+      },
+    )
+    .unwrap();
+  client
+    .declare(
+      remover,
+      slates_client::WorkOp::Unlink {
+        path: FILE.to_owned(),
+      },
+    )
+    .unwrap();
+  let head = accepted(&mut client, remover);
+  let check = client.check_merge(work).unwrap();
+  assert!(
+    !check.conflicts.is_empty(),
+    "a mode on a removed file conflicts"
+  );
+  let resolved = client
+    .resolve_merge(
+      check.stamp,
+      &[],
+      vec![WorkChange::Edit {
+        path: FILE.to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"anew\n".to_vec(),
+      }],
+    )
+    .unwrap();
+  assert_eq!(resolved, Rebased::Rebased(head));
+  let merged = accepted(&mut client, work);
+  assert_eq!(
+    client
+      .read(green, FILE, ReadAt::Version { version: merged })
+      .unwrap(),
+    b"anew\n"
+  );
+  drop(client);
+  daemon.stop();
 }

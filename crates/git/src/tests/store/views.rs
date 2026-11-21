@@ -103,6 +103,7 @@ fn commit(store: &mut ContentStore, repository: &mut Repository, mut push: Push,
   repository.seal(store, &mut push).unwrap();
   let moved = repository.admit(store, &push, GREEN, Some(head)).unwrap();
   repository.commit(store, &mut push, &[moved]).unwrap();
+  crate::served::derive_all(repository, store);
 }
 
 /// Commits a tree of the blobs `files` (each a name in git's order and its bytes) as [`GREEN`]'s next version: each
