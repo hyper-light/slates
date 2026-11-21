@@ -6,6 +6,9 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- C4 groundwork landed: 6ad443338 (w-lint literals fixed), baa28bfab (owner thread + StoreHandle). Replies sent:
+  w-perf AGREE (they build texts.rs T/H rows), w-hg/w-svn wiring, w-lint fixed. NEXT: daemon holds the StoreOwner
+  (config store dir, StoreGrant at enrollment, Sizing from machine profile); then RSS red tests with each tool agent.
 - C3 CLOSED 6370667fc (arm C decided; close note appended). NEXT C4 (hg) with w-hg, then C5 git, C6 svn.
 - C3 steps landed: 6ce6bd170 (changeset log), 6ada9dc42 (store: land, C rows, recovery), 67ba19d3a (seam: staging,
   land from staged, P rows, piece). Tests: slates-store unit 7/7, integration 4/4. A/B arm C (derived per-file form)
