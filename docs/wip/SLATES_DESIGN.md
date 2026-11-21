@@ -58757,3 +58757,30 @@ its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget
   encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
 - **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
   one `sendto` and one `recvfrom` a datagram.
+
+### §4.8 amended — A received packet is opened where it arrived, its stream bytes delivered once and a message taken whole by move (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput, its third step; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's receiving), GAPS (the sweep's lane line), BENCHMARKS (the bulk
+row's fourth row), `crates/transport/src/endpoint.rs` (`unprotect_in_place`, `ingest`, `fold_or_discard`, `drain`,
+`take_reply`, `reply_bytes_read`, `Exchange::received`, `arriving` a set; `unprotect_packet` now the tests' copying
+wrapper), `crates/transport/src/session.rs` (`FrameRef`, `frame_refs`, `validate_frames`; `decode_frames` the owning
+view of them), `crates/transport/src/connection.rs` (`handle_frames`, `advance_stream`, `take_stream`;
+`handle_incoming` and `read_stream` built on them), `crates/transport/src/stream.rs` (`StreamAssembler`'s delivered
+bytes, `advance`, `read` by move), `crates/transport/src/reset.rs` (`tail_of`, `is_reset_tail`).
+- **What was there.** A received packet was copied whole, its header and payload copied again, and the payload opened
+  in the copy. Each stream frame's bytes were copied out into a frame of their own, again into a reassembly segment,
+  again into each read's output, and each read chunk copied onto its message.
+- **Change.** The packet is opened in place in the datagram it arrived in (`unprotect_in_place`); the payload is checked
+  to decode whole (`validate_frames`), so a packet is taken whole or refused whole as before, then applied from there,
+  a stream frame's bytes lent (`frame_refs`, `FrameRef`). A stream's reassembler appends bytes that reach its cursor
+  straight to its delivered bytes, their one copy, and buffers apart only bytes past a gap. The endpoint slides each
+  stream's window as bytes are delivered (`advance_stream`) and takes a reply or a request whole, by move, when it
+  completes (`take_stream`). The receiver holds the same bytes as before, a message's worth. A failed open may leave
+  the datagram rewritten, so the bytes a stateless reset is told by (its length and last token's worth) are kept on
+  the stack before it, and checked from there (`reset::tail_of`, `is_reset_tail`).
+- **Measured** (BENCHMARKS, Studio-1, quiet): goodput median 1,092 to 1,308 MB/s, min 927 to 966, max 1,206 to
+  1,382; a 64 MiB transfer's p50 about 61 to 51 ms; `memmove` 0.53 of `sendto`'s samples before, 0.36 after.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test (lib 148 of 148; admission,
+  amplification, exchanges, handshake_levels, key_update, receive_refusal, session, stateless_reset). `slates-cluster`
+  lib 248 of 248 and `--test live` 4 of 4, real exchanges over the changed path.
+- **Owed.** One `sendto` and one `recvfrom` a datagram, the profile's top now; and a datagram's copy out of the shard's
+  receive buffer into its own allocation (`crate::receive`).

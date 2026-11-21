@@ -129,6 +129,29 @@ pub fn is_reset(datagram: &[u8], token: &ResetToken) -> bool {
     == 0
 }
 
+/// The last token's worth of `datagram`, kept before the datagram is opened in place, so [`is_reset_tail`] can tell a
+/// stateless reset after a failed open has rewritten its bytes; `None` for a datagram too short to be one.
+pub fn tail_of(datagram: &[u8]) -> Option<ResetToken> {
+  if datagram.len() < MIN_RESET_BYTES {
+    return None;
+  }
+  datagram
+    .get(datagram.len().saturating_sub(RESET_TOKEN_BYTES)..)
+    .and_then(|tail| ResetToken::try_from(tail).ok())
+}
+
+/// [`is_reset`] of a datagram of `length` bytes whose last token's worth was `tail` ([`tail_of`]).
+pub fn is_reset_tail(length: usize, tail: Option<&ResetToken>, token: &ResetToken) -> bool {
+  length >= MIN_RESET_BYTES
+    && tail.is_some_and(|tail| {
+      tail
+        .iter()
+        .zip(token)
+        .fold(0u8, |differ, (a, b)| differ | (a ^ b))
+        == 0
+    })
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
