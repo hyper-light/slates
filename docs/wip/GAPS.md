@@ -129,6 +129,25 @@
 > (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
 > reads the record back and puts every row, as replay does). Owed: the release timing on Mercurial's history against the per-file arm's 91 µs.
 >
+> **C1 / A-767 C4, hg onto the changeset store (2026-11-20, w-hg; w-store's wiring baa28bfab, d3accba0e, 046628f88,
+> bc0677af9; w-perf's Texts encoder fa5fd0023). BUILT.** A push to a daemon holding a store (`--vcs-store`) lands as one
+> changeset before the register's entry: Record the push's head (record v6), Payload the changegroup as it arrived,
+> moved into the store's request and never copied, Texts each kept revision's text identity, base and place
+> (`push::intake::KeptText`). The entry then holds a reference (record v7: the payload's identity and length and the
+> changeset's sequence), never the changegroup. A crash between the two leaves an unnamed changeset that replay skips.
+> A recovery or a rebuild meeting a reference reads the payload back by `StoreHandle::piece` and replays it through
+> the push's intake, a unit a slice (`ReplayRefused::Unlanded` where it cannot). The library side is `slates_hg::landed`
+> (the `ChangesetLog` seam, tested over a double), `record::write_push_record`, `Replay::begin_sectioned`,
+> `write_push_reference` and `reference_of`.
+> Red first by use: `crates/cli/tests/hg_interop.rs`
+> `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them` (stock hg 7.2: two changesets
+> pushed and counted `hg_push.landed`, the daemon killed, a clone after the restart holding both). Without a store, a
+> push records as before (A-729 part 2's v2 record).
+> Owed:
+> - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
+>   reads;
+> - an import as changesets (R2's 5.73 GB peak, w-perf);
+> - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
 > standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed

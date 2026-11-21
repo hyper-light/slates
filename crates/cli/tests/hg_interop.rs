@@ -808,7 +808,7 @@ fn stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_th
     "the push did not land on the store: {status}"
   );
   let daemon = Command::new("pgrep")
-    .args(["-f", &format!("--instance {instance} daemon")])
+    .args(["-f", "--", &format!("--instance {instance} daemon")])
     .output()
     .unwrap();
   let killed = String::from_utf8_lossy(&daemon.stdout)
