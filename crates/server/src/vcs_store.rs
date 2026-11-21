@@ -112,6 +112,7 @@ pub(crate) mod hg_import;
 pub(crate) mod hg_made;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
+pub(crate) mod index_upkeep;
 pub(crate) mod lfs_record;
 pub(crate) mod named_objects;
 pub(crate) mod owed;
@@ -265,6 +266,9 @@ pub(crate) struct VcsStores {
   /// Each Subversion repository's deltify job between its slices ([`svn_deltify`]): one a repository, so bounded by the
   /// partition's repositories.
   svn_deltifies: svn_deltify::Deltifies,
+  /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
+  /// partition's repositories.
+  index_upkeep: index_upkeep::Upkeep,
   /// Each HTTP commit under way (A-681 part C: a transaction a POST made, between its requests), by repository and
   /// transaction name, with the key of the principal that made it and the monotonic instant of its last step: at most
   /// one a repository and principal, a new POST replacing the older ([`VcsStores::begin_dav_commit`]), so bounded by the
@@ -3372,9 +3376,10 @@ async fn fetch_text(
   })
 }
 
-/// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
-/// replay is; whether it was served.
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]), and its
+/// stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's replay is; whether it was served.
 fn replay_ended(state: &mut ShardState, id: RepositoryId) -> bool {
+  index_upkeep::built(state, id);
   let held = hold_svn_stored(state, id);
   match held {
     Ok(()) => true,
@@ -4201,6 +4206,7 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
   }
   crate::state::with_state(|state| {
     state.vcs_stores.rebuilding.remove(&id);
+    index_upkeep::built(state, id);
     state.vcs_stores.index_changed(id);
     release_aside(state, aside);
   })

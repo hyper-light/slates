@@ -35,7 +35,7 @@ use crate::log::Section;
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
-use crate::texts::{TextCache, TextRow};
+use crate::texts::{Place, TextCache, TextRow};
 
 /// A landed changeset's section as a replay reads it: its kind, where its bytes are in the log and their length, and
 /// the bytes themselves when they fit one read piece ([`PIECE_BYTES`]: a record, a small `Texts`); a longer section is
@@ -118,6 +118,16 @@ enum Request {
     from: u64,
     limit: usize,
     answer: Sender<Result<Vec<(u64, Identity)>, StoreError>>,
+  },
+  TextsByTool {
+    repository: u128,
+    path: Vec<u8>,
+    tool_ids: Vec<Vec<u8>>,
+    answer: Sender<Result<Vec<Option<(Identity, TextRow)>>, StoreError>>,
+  },
+  Places {
+    places: Vec<Place>,
+    answer: Sender<Result<Vec<Vec<u8>>, StoreError>>,
   },
 }
 
@@ -219,6 +229,19 @@ impl fmt::Debug for Request {
         .debug_struct("PathTexts")
         .field("repository", repository)
         .field("from", from)
+        .finish_non_exhaustive(),
+      Request::TextsByTool {
+        repository,
+        tool_ids,
+        ..
+      } => f
+        .debug_struct("TextsByTool")
+        .field("repository", repository)
+        .field("tool_ids", &tool_ids.len())
+        .finish_non_exhaustive(),
+      Request::Places { places, .. } => f
+        .debug_struct("Places")
+        .field("places", &places.len())
         .finish_non_exhaustive(),
       Request::Read { offset, len, .. } => f
         .debug_struct("Read")
@@ -410,6 +433,25 @@ fn serve(
         answer,
       } => {
         let _ = answer.try_send(store.path_texts(repository, &path, from, limit));
+      }
+      Request::TextsByTool {
+        repository,
+        path,
+        tool_ids,
+        answer,
+      } => {
+        let found: Result<Vec<_>, StoreError> = tool_ids
+          .iter()
+          .map(|tool_id| store.text_by_tool(repository, &path, tool_id))
+          .collect();
+        let _ = answer.try_send(found);
+      }
+      Request::Places { places, answer } => {
+        let read: Result<Vec<_>, StoreError> = places
+          .iter()
+          .map(|place| store.place_bytes(&staging, place))
+          .collect();
+        let _ = answer.try_send(read);
       }
       Request::Read {
         offset,
@@ -684,6 +726,35 @@ impl StoreHandle {
         answers,
       )
       .await
+  }
+
+  /// Each version of `path` in `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as it landed
+  /// ([`Store::text_by_tool`]), none for one no landed changeset named. A batch, so a stream asks once for a log's rows
+  /// (bounded by the log's length).
+  pub async fn texts_by_tool(
+    &self,
+    repository: u128,
+    path: Vec<u8>,
+    tool_ids: Vec<Vec<u8>>,
+  ) -> Result<Vec<Option<(Identity, TextRow)>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::TextsByTool {
+          repository,
+          path,
+          tool_ids,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// The bytes at each of `places` ([`Store::place_bytes`]), in order: a stream's chunks, read in place.
+  pub async fn places(&self, places: Vec<Place>) -> Result<Vec<Vec<u8>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self.ask(Request::Places { places, answer }, answers).await
   }
 
   /// A path's history in `repository` from sequence `from` on, at most `limit` ([`Store::path_texts`]).

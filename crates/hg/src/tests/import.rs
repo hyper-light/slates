@@ -1389,6 +1389,52 @@ fn a_rendered_repository_imports_back_to_the_same_index() {
   }
 }
 
+/// Goal 93 perf (main's order of 2026-11-21 00:22: a one-changeset pull that scales with the history). An index built
+/// whole (an import, a replay) ends with its runs merged, so a lookup reads one run, not every seal's. Do: import a
+/// repository into a store whose small window seals many runs; count the runs a lookup of each changeset visits; then
+/// merge it as the server's upkeep merges an index built whole, a table at a time, and count again. Expect: more than two runs visited before; at most two (the
+/// tail and the merged run) after, one merge counted, and every changeset read back alike.
+#[test]
+fn an_index_built_whole_is_read_from_one_merged_run() {
+  let mut repository = repository(REPOSITORIES[0]);
+  // Shape: a window of a few rows, so each log's group seals a run of its own.
+  let mut store = ContentStore::new(1 << 24, 1 << 10).unwrap();
+  let mut imported = import(&mut repository, &mut store, room()).unwrap();
+  let count = imported.changesets;
+  let visited = |imported: &mut Imported, store: &ContentStore| -> (u64, Vec<Vec<u8>>) {
+    let mut most = 0u64;
+    let mut read = Vec::new();
+    for rev in 0..count {
+      let before = imported.index.rows().visits();
+      let row = imported
+        .index
+        .changeset(store, rev)
+        .map(|row| row.node.to_vec());
+      most = most.max(imported.index.rows().visits().saturating_sub(before));
+      read.push(row.unwrap());
+    }
+    (most, read)
+  };
+  let (before, rows_before) = visited(&mut imported, &store);
+  let seals = imported.index.rows().counters().seals;
+  assert!(seals > 2, "the small window seals many runs: {seals}");
+  assert!(before > 2, "a lookup visits every run first: {before}");
+  // The server's upkeep merges an index built whole a table at a time (`vcs_store::index_upkeep`): the same steps here.
+  let rows = imported.index.rows();
+  let mut merge = rows.merge_begin(&store, usize::MAX).unwrap();
+  while rows.merge_step(&mut store, &mut merge).unwrap() == slates_vcs::MergeStep::More {}
+  let (after, rows_after) = visited(&mut imported, &store);
+  assert_eq!(
+    (
+      after <= 2,
+      imported.index.rows().counters().compactions,
+      rows_after
+    ),
+    (true, 1, rows_before),
+    "visited {after} runs after the merge"
+  );
+}
+
 /// A clock that stands still, so a turn ends only with its work.
 struct StandingClock;
 
