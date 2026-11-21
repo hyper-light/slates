@@ -7169,3 +7169,16 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   Red looks like: any FAIL row; r16 predicts on git/git `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
   `ls-remote`, and `clone`/`clone-ssh`/`partial` ("possible repository corruption on the remote side"). Each red row
   -> w-git as its own inbox file with the row's text.
+
+## w-provision-gate (goal 93, git correctness by use; landed e1754f418): stock git carries a whole repository over each edge
+- **Command** (release, from current origin/main):
+  `SLATES_TEST_GIT_DATASET=<a git/git clone> cargo test --release --locked -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge --nocapture`.
+  Optionally `SLATES_TEST_GIT_EDGES=http` or `ssh`; the default is both.
+- **Platform:** Linux, adacachy (main's assignment; w-sessionlog runs macOS). It needs stock git, plus OpenSSH and curl
+  for the SSH leg and the advertisement compare.
+- **Dataset:** a full clone of https://github.com/git/git (every branch and tag).
+- **Green:** "whole-repository session over HTTP: every step held" and the same for SSH, then test ok.
+- **Red, as it stands:** the push is refused for refs/tags/junio-gpg-pub (git/git's tag of a blob) and for the test's
+  own refs/tags/slates-blob and slates-nested: "names neither a commit nor a tree" (inbox/w-git-from-w-provision-gate-tag-kinds.md).
+  Any other red names its step: the listing compare, fsck, fetch, shallow, partial archive bytes, or the advertisement
+  byte compare against http-backend. Send each to w-git.
