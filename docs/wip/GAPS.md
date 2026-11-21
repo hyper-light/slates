@@ -2912,6 +2912,12 @@
 > changeset, its replay, the import driver adopting the batch, the daemon-level red of one landing an import, and the
 > crash oracle).
 >
+> **C2 stage C BUILT (A-822, 2026-11-21, w-svn over A-814): an import lands a batch as one changeset and one register
+> entry, bounded by the import's admission; a batch is atomic, differing from `svnadmin load`, which keeps each revision
+> as it goes: a refusal names the last revision landed (`SubversionLanded`) and the same dump resumes after it.** A
+> refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
+> name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
+> (main's run), which closes P7's finding (3) or not. The entry below is its history.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").

@@ -15468,6 +15468,20 @@ and export by landing).
 > to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
 > volume and landed under a grant; built since, below); an import resumed across a restart.
 >
+> **Status (2026-11-21, C2 stage C, the records' side, A-822; the green's side A-814).** An import lands its revisions a
+> batch at a time: each batch one changeset on the node's store (its texts' `Payload` and `Texts`, then a `Record`
+> section a revision) and one register entry naming every version (`repository::svn_commit::staging`,
+> `import_batch::ImportBatch`). The batch is bounded by the import's admission (main's ruling of 08:17): its increments'
+> post-state bytes are charged as the import's holding beside the texts the content store charges, and it lands before a
+> revision the shard could not admit, at 65,533 records, before a record that moves no version, and at the stream's end
+> (`repository.svn_import.flushed_{admission,sections,end}`). Replay drains a changeset's records in order. **Differs from
+> `svnadmin load`: a batch is atomic.** A refusal gives up the revisions of the batch it ends, where `svnadmin load`
+> keeps each as it goes. So the refusal names the last revision that landed (`ImportRefused { SubversionLanded { code,
+> revision, path, landed } }`, contract 59), and the same dump imported again resumes after it: the revisions it holds
+> already are read through, each held to the repository's revision properties (a stream that differs is refused
+> `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
+> session reads a revision the register has not committed.
+>
 > **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
 > revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
 > `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
@@ -59446,6 +59460,41 @@ Applied in the same change to:
   rebuilt from the node's store: whole, a hostile deltify record at changeset 2, revision 1's texts inline at changeset
   1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
   (slates-svn).
+
+### A-822 — A Subversion import lands a batch of revisions as one changeset and one entry, atomic, resumable (2026-11-21, w-svn; main 01:02, 08:17 and its conditions; C2 stage C, A-814)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit/staging.rs` (new): `Staging`, its bound and its flush counters.
+- `crates/server/src/repository/svn_commit/landing.rs`: `land_changeset` takes a revision's records, `changeset_records`.
+- `crates/server/src/repository/svn_commit.rs`: the increment's head read from the records (an import batch's scratch
+  member counts from 0).
+- `crates/server/src/import_batch.rs`: `with_engine_in`; a work's `Copy` versions moved into the scratch member's
+  numbering for its verdict and back (A-814 staged no copy).
+- `crates/server/src/vcs_store.rs`: replay drains a changeset's records (`svn_fetched` a queue, `svn_more`).
+- `crates/server/src/vcs_store/svn_import.rs`: the import stages its revisions and lands at the bound; `LoadFailed`
+  names the last landed revision.
+- `crates/server/src/vcs_store/svn_view.rs`: no session while a repository imports.
+- `crates/svn/src/migration/import.rs`: a stream resumes over revisions held already, their properties held to the
+  repository's.
+- `crates/ipc/src/protocol.rs`, `crates/api/src/lib.rs`: `ImportFault::SubversionLanded`, contract 59.
+- `docs/wip/GAPS.md`: C2 stage C; P7's finding (3).
+
+- **Why.** git-2000's import landed 2,001 changesets, about 8 ms each (24.5 s against 8.2 s before the store), and
+  held each revision's whole texts at once (P7's finding (3)).
+- **What.** Each revision is staged:
+  - its texts are put into the content store and named stored;
+  - its copies are planned (A-820);
+  - it is checked and applied to the records in RAM;
+  - its increment is built against the batch's scratch member and staged there.
+  The batch lands as one changeset and commits as one register entry, at the bound of the import's admission. A refusal
+  gives the batch up and makes the records again from the register. It names the last revision that landed, and the
+  same dump resumes after it.
+- **Evidence.** In `vcs_store::svn_import::tests`:
+  - `full.dump` and `deltas.dump` exported byte for byte after batched imports.
+  - `part1.dump`'s three revisions in one changeset of three records.
+  - `t_c2c_imports_under_a_small_and_a_large_admission_end_alike_and_resume_after_what_landed`: a tight admission
+    flushes before revision 8, its cut import names revision 7, and the resumed import ends as the roomy one does.
+  - `t_c2c_a_refused_import_names_what_landed_and_the_same_dump_resumes_after_it`.
+  - `t_c2c_a_repository_serves_no_session_while_it_imports`.
 
 ### A-820 — A Subversion copy from an older revision is made from the head and set back from the records; a Subversion green keeps no version for copies (2026-11-21, w-svn; main 10:55 PST, P7's finding (1); A-586, A-626, §4.16 delta retention)
 Applied in the same change to:
