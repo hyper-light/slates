@@ -1634,3 +1634,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - first push: 113-128 vs 10.6-14.1 s (about 10x slower, the largest hg gap);
     - the daemon ends at 5.9 GiB resident.
   - NEXT for w-perf: the pull A/B with needs (no Studio-2 pin), then profile the push by phase and hand w-hg the named step, or fix it if it lies outside C1's files.
+- 2026-11-21 03:38 PST LANDED:
+  - b0405dcad (w-fed-move, goal 86b): an edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched. At 10 hot files, owner asks fell from 69.4 to 48.5 a client.
+  - 4e32bd101 (w-lint round 14 at 89269ab1b: db, vcs, store, merge, ipc and hg back under the wall; literals derived). Round 14's pieces went to w-provision-gate (a disallowed std::thread::sleep in its A-798 spin_kick test; nudged through kiln), w-git and w-hg.
+  - A-809 claimed by w-rewrite-ops (A-803's fix, the layered anchor). w-perf's pull A/B now runs off Studio-2; the push profile is next.
