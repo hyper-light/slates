@@ -39,6 +39,15 @@ Signing: kiln's GIT_CONFIG_* env beats `-c commit.gpgsign=false`; use `git commi
    slates-vfs/db as fresh); the A/B's before side uses ~/.cache/w-work-mount-ab-target.noindex (delete after).
    NEXT (part 3): landing of a green without a head copy: land crate needs a read-only base host beside the target
    host (Source::read_at uses landing.host) + PlanWalk listing untouched tree-base entries as created.
+   PART 3 DESIGN (17:15): green landing view = overlay over the tree host (like a mount, pin = head; reuse
+   mounted_work::lend). Land crate: (a) PlanWalk::materializing(vol, source): a stage walking the merged tree through
+   Overlay::readdir (host = the tree lens) emitting Diverged{Created} for every entry, then the existing Entries stage;
+   (b) Beginning::materializing + Beginning::unit_over(host, base: Option<&mut dyn HostFs>, ..): plan reads via base;
+   (c) LandingRun::step_over(.., base) threading base to copy_window's Source::read_at (engine.rs ~1903); finish skips
+   the overlay advance for a materialized plan (flag carried Beginning -> Planned -> LandingRun, NOT a LandingRequest
+   field: ~25 literals). Server landing.rs: green view path like a scratch volume's (prepared.os, Writer::Own), and
+   lend the tree lens at beginning.unit (~2010), run.step (~2135), finish_step (~2194). Red: presenting/landing the
+   64 MiB green adds <= 8 MB resident (was +69 MB); ten-editor test still lands == oracle.
 2. Restart durability of unsubmitted mount writes (red: save, restart, submit, save is there; A-127 anchor segment).
 3. D-O17 multi-span: w-rewrite-ops' minimiser on main 561c655a3, one call site (`changed_span` in mounted_work.rs).
 4. Kernel-mount real-editors variant -> run-requests.md only.
