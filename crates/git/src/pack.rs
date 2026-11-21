@@ -303,11 +303,26 @@ pub fn of_whole<'b>(
   format: ObjectFormat,
   objects: impl ExactSizeIterator<Item = (crate::object_name::Kind, &'b [u8])>,
 ) -> Result<Vec<u8>, WholeRefused> {
+  of_whole_placed(format, objects).map(|(pack, _)| pack)
+}
+
+/// [`of_whole`], with where each object's entry begins in the pack, in order: what a push holds an object it was handed
+/// whole by, once written as a pack (A-722's record v4: every push's objects are a pack's, the client's or the
+/// server's).
+///
+/// # Errors
+/// [`WholeRefused`].
+pub fn of_whole_placed<'b>(
+  format: ObjectFormat,
+  objects: impl ExactSizeIterator<Item = (crate::object_name::Kind, &'b [u8])>,
+) -> Result<(Vec<u8>, Vec<u64>), WholeRefused> {
   let count = u32::try_from(objects.len()).map_err(|_| WholeRefused::Count)?;
+  let mut offsets = Vec::with_capacity(objects.len());
   let mut out = Vec::new();
   let mut writer = Writer::new(format, count, &mut out);
   let mut at = PACK_HEADER_LEN;
   for (kind, bytes) in objects {
+    offsets.push(at);
     let mut head = Vec::new();
     let header = crate::entry::Header {
       representation: crate::entry::Representation::Whole(kind),
@@ -323,7 +338,7 @@ pub fn of_whole<'b>(
       .saturating_add(to_u64(data.len()));
   }
   writer.finish().map_err(WholeRefused::Collision)?;
-  Ok(out)
+  Ok((out, offsets))
 }
 
 #[cfg(test)]

@@ -116,6 +116,20 @@ impl SvnStores for ServedRecords {
     .flatten()
   }
 
+  fn transaction_of_activity(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    activity: &str,
+  ) -> Option<String> {
+    crate::state::with_state(|state| {
+      state
+        .vcs_stores
+        .dav_commit_of_activity(id, &principal.key(), activity)
+    })
+    .flatten()
+  }
+
   fn on_commit<T>(
     &mut self,
     id: RepositoryId,

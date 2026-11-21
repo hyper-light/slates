@@ -292,13 +292,13 @@ impl GitHookView {
     };
     let passed = {
       let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
-      let (content, _) = lent
+      let (content, git) = lent
         .stores
         .git_ref(self.repository)
         .ok_or(GitHookRefused::NoStore)?;
       self
         .view
-        .seal_step(&mut sealing, content, quantum)
+        .seal_step(&mut sealing, (content, &git.repository), quantum)
         .map_err(GitHookRefused::Seal)?
     };
     if !passed {
@@ -340,12 +340,12 @@ impl GitHookView {
     range: (u64, u64),
     out: &mut Vec<u8>,
   ) -> Result<(), GitHookRefused> {
-    let (content, _) = stores
+    let (content, git) = stores
       .git_ref(self.repository)
       .ok_or(GitHookRefused::NoStore)?;
     self
       .view
-      .read(content, &self.seals, path, range, out)
+      .read((content, &git.repository), &self.seals, path, range, out)
       .map_err(GitHookRefused::Read)
   }
 

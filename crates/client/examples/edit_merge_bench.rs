@@ -71,6 +71,11 @@ const MIN_SAMPLES: usize = 200;
 const GOAL_PREFERRED_NS: u64 = 50_000;
 /// Shape: Ada's required bound for a full edit and merge (2026-11-04).
 const GOAL_REQUIRED_NS: u64 = 1_000_000;
+/// The pause before each verdict sample (`--pause-ns N`, set once, in `main`; none by default): past the shards' idle
+/// window, so each sample meets parked shards and pays the doorbell and the wake, as an agent's edits do between its
+/// thinking (the paced form of 2026-11-06, A-226; goal 84b's quiet-Mac run).
+static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+
 /// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
 /// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
 const SPIN_NS: u64 = GOAL_REQUIRED_NS;
@@ -636,6 +641,9 @@ fn measure(
       if n >= MIN_SAMPLES && started.elapsed() > RUN_BUDGET {
         break;
       }
+      if let Some(pause) = PAUSE.get() {
+        std::thread::park_timeout(*pause);
+      }
       let sample = fixture.sample(form, n % files);
       edits.push(sample.edit);
       submits.push(sample.submit);
@@ -847,7 +855,8 @@ struct Selection {
 }
 
 impl Selection {
-  /// `--quiet-only`, `--loaded-only`, `--spinners-per-core N` (the loaded form's spinners, one by default),
+  /// `--quiet-only`, `--loaded-only`, `--spinners-per-core N` (the loaded form's spinners, one by default), `--pause-ns
+  /// N` (a pause before each verdict sample, so each meets parked shards),
   /// `--files N` (repeatable; the shapes instead of [`GREEN_FILES`]) and `--form NAME`
   /// (repeatable; `accept`, `ranged`, `identical`, `conflict`, `rebase`, `new_file`, `one_file`): a profile run selects one
   /// form on one shape. With no `--form`, every form runs.
@@ -866,6 +875,13 @@ impl Selection {
       match arg.as_str() {
         "--quiet-only" => selection.loaded = false,
         "--loaded-only" => selection.quiet = false,
+        "--pause-ns" => {
+          let ns: u64 = args
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("--pause-ns takes nanoseconds");
+          let _ = PAUSE.set(Duration::from_nanos(ns));
+        }
         "--spinners-per-core" => {
           selection.spinners_per_core = args
             .next()

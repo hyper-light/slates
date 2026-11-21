@@ -3223,17 +3223,6 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
-  /// every shard of this node serves the works of greens another node owns (`work_home::green_elsewhere`): a creation is
-  /// made on its client's partition and admitted by the green's owner over the fleet, and the work's base reads are
-  /// answered by this node's replica of the green. `Ok` once every shard has it, else the first typed refusal.
-  pub fn serve_works_on_holders(&self, on: bool) -> Result<(), ObserveError> {
-    for shard in &self.shards {
-      self.observe(Some(*shard), move |s| s.work_home.on_holders = on)?;
-    }
-    Ok(())
-  }
-
   /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
   /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
   pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {
@@ -4987,6 +4976,7 @@ async fn init_shard(
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
+    refining: crate::refining::Refining::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -7746,13 +7736,14 @@ mod tests {
     assert_eq!(read_back.map(|bytes| bytes == object), Ok(true));
   }
 
-  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20). Do: on a daemon over a retained
-  /// anchor segment, with version 3 on, push the fixtures' `create`: its record names its names by identity, appended only
-  /// once the names are durable (`vcs_store::content_durable`, through the homing); then stop the daemon without
-  /// publishing anything more, as a crash between the push and anything after it, and start a successor over the same
-  /// segment. Expect: the successor replays the record whole from the content its image holds: the repository recovered,
-  /// `main` at the pushed commit, no replay refused and no names missing, the record version 3. Without the barrier (the
-  /// entry appended right after the names were put) the names are in no image and the replay is refused `Names`.
+  /// A-727 slice b (the content plane's durability barrier; main's order of 2026-11-20) and A-722's record v4. Do: on a
+  /// daemon over a retained anchor segment, with version 4 on, push the fixtures' `create`: its record names its names
+  /// and its pack by identity, appended only once both are durable (`vcs_store::content_durable`, through the homing);
+  /// then stop the daemon without publishing anything more, as a crash between the push and anything after it, and start
+  /// a successor over the same segment. Expect: the successor replays the record whole from the content its image holds:
+  /// the repository recovered, `main` at the pushed commit, no replay refused and nothing missing, the record version 4.
+  /// Without the barrier (the entry appended right after the contents were put) they are in no image and the replay is
+  /// refused.
   #[test]
   fn t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names() {
     use slates_anchor::AnchorSegment;
@@ -7779,7 +7770,7 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_3_for_test(true);
+        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "barrier");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -7855,7 +7846,7 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![3])));
+    assert_eq!(seen, Some((true, true, 0, 0, vec![4])));
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained

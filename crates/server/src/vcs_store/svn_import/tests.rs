@@ -31,7 +31,7 @@ pub(crate) const PART2: &[u8] = include_bytes!("../../../../svn/fixtures/dump/pa
 pub(crate) const FULL: &[u8] = include_bytes!("../../../../svn/fixtures/dump/full.dump");
 
 /// Shape: the dump's file name on the simulated host.
-const DUMP: &str = "repository.dump";
+pub(crate) const DUMP: &str = "repository.dump";
 
 /// Shape: the path the verb's tests name, whose directory only the simulated host opens.
 const PATH: &str = "/dumps/repository.dump";
@@ -89,7 +89,7 @@ pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, D
 }
 
 /// A simulated host holding `dump` as [`DUMP`] in its root: the host and its root.
-fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
+pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
   let mut host = SimHost::new();
   host.replace_file(&format!("/{DUMP}"), dump);
   let root = host.root();
@@ -144,6 +144,7 @@ fn logged_kinds(state: &ShardState, id: RepositoryId) -> Vec<&'static str> {
     Ok(Record::RevisionProperties { .. }) => "properties",
     Ok(Record::Revision(_)) => "revision",
     Ok(Record::Locks(_)) => "locks",
+    Ok(Record::Deltified { .. }) => "deltified",
     Err(_) => "refused",
   };
   let repositories = state.db.partition().repositories();

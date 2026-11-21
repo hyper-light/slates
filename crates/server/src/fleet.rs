@@ -3530,13 +3530,14 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
-      // A copy frozen for a move (A-291) is the move's to place: before the switch its handoff places it
-      // ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal from here would
-      // contend with (a frozen copy's heal republished its head once its target died, 2026-11-18).
+      // A copy with a move under way (A-291), prepared or frozen (A-784), is the move's to place: before the switch its
+      // handoff places it ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal
+      // from here would contend with (a frozen copy's heal republished its head once its target died, 2026-11-18; a
+      // prepared one's left a second snapshot that refused the move `Snapshots`, 2026-11-20).
       if record.epoch == 0
         || record.state == VolumeState::Destroying
         || state.seals.contains_key(&object)
-        || crate::moves::frozen(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
+        || crate::moves::moving(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
       {
         return None;
       }
@@ -10467,6 +10468,9 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     s.answers_given
       .retain_members(members, slates_machine::clock::monotonic_ns());
     s.fanned.observe_lease(&s.lease);
+    let mut fanned = std::mem::take(&mut s.fanned);
+    fanned.observe_holding(s);
+    s.fanned = fanned;
     // This shard's own parked lease reads meet the evidence it just pruned and observed.
     crate::lease_wait::resolve(s);
     let mut fans = Vec::new();
@@ -10509,13 +10513,14 @@ pub(crate) const FAN_UNCHANGED: &str = "fleet.fan.unchanged";
 pub(crate) const FAN_REFUSED: &str = "fleet.fan.refused";
 
 /// What one shard last received of the configuration fan: the placement and root versions, the readiness
-/// flag, and the lease's generation.
+/// flag, the lease's generation, and the generation of the list of greens this node replicates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivered {
   placement: u64,
   root: u64,
   ready: Option<bool>,
   lease: u64,
+  holding: u64,
 }
 
 /// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
@@ -10527,6 +10532,11 @@ pub(crate) struct Fanned {
   shards: std::collections::BTreeMap<u16, Delivered>,
   lease: crate::lease::OwnerLease,
   lease_generation: u64,
+  /// The greens this node replicates, each with its owner as the control shard's routing names it, as last fanned
+  /// (A-697 part f: `work_home::green_elsewhere`, the rule "replicated here"), and a generation counting its changes.
+  /// Bounded by the greens this node replicates.
+  holding: std::collections::BTreeMap<ObjectId, HostId>,
+  holding_generation: u64,
   /// The failover delay each other shard last received from the beat's own fan ([`fan_failover`], A-574). Bounded by
   /// the daemon's shards.
   failover: std::collections::BTreeMap<u16, u64>,
@@ -10541,6 +10551,31 @@ impl Fanned {
     }
   }
 
+  /// Notes the greens this node replicates now, with their owners (the control shard's `merge.replicas`, each owner
+  /// as its routing names it, else the green's creator): a change since the last fanned list is a new generation. An
+  /// unchanged list, a period's usual case, is compared in place and copies nothing.
+  fn observe_holding(&mut self, state: &ShardState) {
+    let now = state.merge.replicas.keys().map(|object| {
+      (
+        *object,
+        state
+          .fleet
+          .object_owner(*object)
+          .unwrap_or_else(|| object.creator()),
+      )
+    });
+    if self
+      .holding
+      .iter()
+      .map(|(object, owner)| (*object, *owner))
+      .eq(now.clone())
+    {
+      return;
+    }
+    self.holding = now.collect();
+    self.holding_generation = self.holding_generation.saturating_add(1);
+  }
+
   /// The fan `shard` is owed now — only the parts newer than what it last received — or `None` when it holds
   /// everything already.
   fn owed(&self, state: &ShardState, shard: u16) -> Option<Fan> {
@@ -10553,11 +10588,13 @@ impl Fanned {
       root: (root.version > had.root).then(|| root.clone()),
       ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
       lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
+      holding: (self.holding_generation > had.holding).then(|| self.holding.clone()),
       now: Delivered {
         placement: placement.version,
         root: root.version,
         ready: Some(state.consensus_ready),
         lease: self.lease_generation,
+        holding: self.holding_generation,
       },
     };
     fan.carries().then_some(fan)
@@ -10586,12 +10623,17 @@ struct Fan {
   root: Option<slates_db::register::RootConfiguration>,
   ready: Option<bool>,
   lease: Option<crate::lease::OwnerLease>,
+  holding: Option<std::collections::BTreeMap<ObjectId, HostId>>,
   now: Delivered,
 }
 
 impl Fan {
   fn carries(&self) -> bool {
-    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
+    self.placement.is_some()
+      || self.root.is_some()
+      || self.ready.is_some()
+      || self.lease.is_some()
+      || self.holding.is_some()
   }
 
   fn delivered(&self) -> Delivered {
@@ -10626,6 +10668,50 @@ impl Fan {
     // shortens the lease on that shard until the next period re-fans it (never lengthens it).
     if let Some(lease) = self.lease {
       s.lease = lease;
+    }
+    // The greens this node replicates, which decide where a work over one of them is served (A-697 part f).
+    if let Some(holding) = self.holding {
+      s.work_home.holding = holding;
+    }
+  }
+}
+
+/// Counter: the list of greens this node replicates fanned to a shard at once, when a replica the last fanned list lacked
+/// advanced (A-697 part f; [`fan_holding_at_once`]).
+pub(crate) const HOLDING_FAN_SENT: &str = "fleet.holding_fan.sent";
+/// Counter: a shard's bounded channel refused that fan; the period's configuration fan carries the list instead.
+pub(crate) const HOLDING_FAN_REFUSED: &str = "fleet.holding_fan.refused";
+
+/// On the control shard, when its replica of `object` advanced (`work_home::replica_reached`): if the list of greens
+/// this node replicates last fanned to the other shards lacks `object`, fans the current list to each of them now, so a
+/// creation over the green is served here as its holder from the replica's first version on (A-697 part f), not a
+/// period later. A green already listed costs one lookup, the usual case of a replica's every later version. A shard
+/// whose channel refuses the list gets it with the period's configuration fan ([`fan_configs_to_shards`]).
+pub(crate) fn fan_holding_at_once(state: &mut ShardState, object: ObjectId) {
+  if state.fanned.holding.contains_key(&object) {
+    return;
+  }
+  let mut fanned = std::mem::take(&mut state.fanned);
+  fanned.observe_holding(state);
+  state.fanned = fanned;
+  let generation = state.fanned.holding_generation;
+  let origin = state.shard;
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|shard| *shard != origin)
+    .collect();
+  for shard in others {
+    let holding = state.fanned.holding.clone();
+    match run_on(origin, shard, move |s| s.work_home.holding = holding) {
+      Ok(()) => {
+        if let Some(delivered) = state.fanned.shards.get_mut(&shard) {
+          delivered.holding = generation;
+        }
+        count_refusal_in(state, HOLDING_FAN_SENT);
+      }
+      Err(_) => count_refusal_in(state, HOLDING_FAN_REFUSED),
     }
   }
 }
@@ -13406,6 +13492,39 @@ mod tests {
     });
   }
 
+  /// A-697 part f (the rule "replicated here"): the greens a node replicates reach its other shards with their owners.
+  /// Do: the control shard takes a replica of a green; the period's fan is asked for another shard and installed; the
+  /// next period is asked again. Expect: the fan carries the list, and the receiver then holds the green under its
+  /// creator, as owner (no routing names another); once delivered, the unchanged list is owed no more.
+  #[test]
+  fn a_replica_taken_reaches_the_other_shards_with_its_owner_once() {
+    crate::daemon::audit_on_shard(|s| {
+      let green = ObjectId::new(HostId(7), 1);
+      s.merge
+        .replicas
+        .insert(green, slates_merge::engine::Green::new());
+      let mut fanned = std::mem::take(&mut s.fanned);
+      fanned.observe_holding(s);
+      s.fanned = fanned;
+      let fan = s.fanned.owed(s, OTHER_SHARD).expect("the list changed");
+      let holding = fan.holding.clone().expect("the fan carries the list");
+      assert_eq!(holding.get(&green), Some(&HostId(7)));
+      let delivered = fan.delivered();
+      s.fanned.record(OTHER_SHARD, delivered);
+      fan.install(s);
+      assert_eq!(s.work_home.holding.get(&green), Some(&HostId(7)));
+      let mut fanned = std::mem::take(&mut s.fanned);
+      fanned.observe_holding(s);
+      s.fanned = fanned;
+      assert!(
+        s.fanned
+          .owed(s, OTHER_SHARD)
+          .is_none_or(|fan| fan.holding.is_none()),
+        "an unchanged list is not fanned again"
+      );
+    });
+  }
+
   /// AUD-29-29. Do: install a fan carrying only a lease on a shard whose lease is empty. Expect: the shard's
   /// lease is the fanned one and nothing else it holds changes.
   #[test]
@@ -13422,6 +13541,7 @@ mod tests {
         root: None,
         ready: None,
         lease: Some(fanned.clone()),
+        holding: None,
         now: Delivered::default(),
       }
       .install(s);

@@ -785,6 +785,37 @@ impl LocalRuntime {
       .spawn_local(crate::shard::boxed(future), None)
   }
 
+  /// Runs `future` on this shard to its end and gives back its output (hyper-rt's `LocalRuntime::block_on`, for the
+  /// vendored engine's tests and a cold caller, A-767 piece C2): the future runs as a detached task, the shard steps
+  /// while it has work and parks in its driver while it waits, so a wake from another thread (a channel, a
+  /// completion) is what resumes it, never a spin. Refused `WorkerFailed` when the task ends without its output (it
+  /// was cancelled or its poll unwound).
+  pub fn block_on<T: 'static>(
+    &self,
+    future: impl Future<Output = T> + 'static,
+  ) -> Result<T, RtError> {
+    let (sent, output) = std::sync::mpsc::sync_channel(1);
+    let id = self.spawn(async move {
+      let _ = sent.send(future.await);
+    })?;
+    self.context().detach(id)?;
+    loop {
+      match output.try_recv() {
+        Ok(value) => return Ok(value),
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+          return Err(RtError::WorkerFailed {
+            shard: self.shard_id().0,
+          });
+        }
+        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+      }
+      let outcome = self.context().step();
+      if !outcome.did_work {
+        self.context().park(outcome.next_deadline_ns);
+      }
+    }
+  }
+
   /// Runs until no task, timer or message is pending.
   pub fn run_until_idle(&self) {
     self.context().run_until_idle();

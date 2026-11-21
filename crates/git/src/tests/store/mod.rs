@@ -389,6 +389,7 @@ fn commit_row() -> ObjectRow {
     kind: Kind::Commit,
     len: 210,
     position: 7,
+    offset: None,
     commit: Some(CommitRow {
       tree: 5,
       date: 1_700_000_000,

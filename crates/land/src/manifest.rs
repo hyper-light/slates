@@ -483,6 +483,9 @@ pub fn plan(
 pub struct PlanWalk {
   source: Source,
   stage: PlanStage,
+  /// How the walked entries are judged: by their witnesses, or by content for a materializing plan (A-774 part 3),
+  /// whose entries the target holds no witness of and whose volume the landing leaves as it was.
+  basis: Judged,
 }
 
 #[derive(Debug)]
@@ -530,6 +533,22 @@ impl PlanWalk {
     Ok(PlanWalk {
       source,
       stage: PlanStage::Diverged(walk),
+      basis: Judged::Witness,
+    })
+  }
+
+  /// A plan of `source`'s whole tree (A-774 part 3): every entry it holds planned as created, its untouched base entries
+  /// too, read through the base host the plan is lent; what a volume over a tree base lands into a directory that is not
+  /// its base (a green's landing view). The tree must be loaded before `source`'s snapshot is taken.
+  pub fn materializing(vol: &Volume, source: Source) -> Result<PlanWalk, VfsError> {
+    let walk = match source {
+      Source::Head => vol.whole_walk(),
+      Source::Snapshot(id) => vol.whole_walk_in(id)?,
+    };
+    Ok(PlanWalk {
+      source,
+      stage: PlanStage::Diverged(walk),
+      basis: Judged::Content,
     })
   }
 
@@ -551,6 +570,7 @@ impl PlanWalk {
     let changed = base.search(tree);
     Ok(PlanWalk {
       source,
+      basis: Judged::Content,
       stage: PlanStage::CaptureChanges {
         base,
         source: tree,
@@ -597,7 +617,11 @@ impl PlanWalk {
         mut filtered_out,
       } => {
         let Some(d) = diverged.get(next) else {
-          return Ok(Some(Manifest::from_entries(entries, filtered_out)));
+          return Ok(Some(Manifest::from_judged(
+            entries,
+            filtered_out,
+            self.basis,
+          )));
         };
         if !filter.keeps(&d.path) {
           filtered_out = filtered_out.saturating_add(1);

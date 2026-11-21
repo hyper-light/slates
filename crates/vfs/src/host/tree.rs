@@ -41,6 +41,9 @@ const LINK_PERMISSIONS: u32 = 0o777;
 /// Format: the one instant every entry of a tree shows: a fixed time, never zero (hosts report zero for "no birth time
 /// recorded", so a real stamp is never it); its value is the tree's, never compared with a clock's.
 const TREE_INSTANT_NS: i64 = 1_000_000_000;
+/// Format: the host clock's reading, one second past every entry's instant, so no entry is ever within a timestamp
+/// granularity of a reading (the racy rule, §4.5: a tree never changes, so nothing it shows is racy).
+const TREE_CLOCK_NS: i64 = 2_000_000_000;
 /// Format: the root directory's handle.
 const ROOT: HostDir = HostDir(1);
 
@@ -80,6 +83,9 @@ pub struct TreeHost {
   files: BTreeMap<u64, String>,
   /// The next handle given out.
   next: u64,
+  /// The tree's generation (a mounted work's pinned version): every entry's times move with it, so once a mount is
+  /// re-pinned ([`TreeHost::move_to`]) the base plane finds each directory changed and lists it again.
+  generation: i64,
 }
 
 impl TreeHost {
@@ -93,6 +99,7 @@ impl TreeHost {
       dirs,
       files: BTreeMap::new(),
       next: ROOT.0.saturating_add(1),
+      generation: 0,
     }
   }
 
@@ -106,6 +113,24 @@ impl TreeHost {
     HostFacts {
       timestamp_granularity_ns: 1,
     }
+  }
+
+  /// Moves the tree to `generation` (a re-pinned mount's new version): the source the host is next lent with is that
+  /// version, and every entry's times show it.
+  pub fn move_to(&mut self, generation: u64) {
+    self.generation = i64::try_from(generation).unwrap_or(i64::MAX);
+  }
+
+  /// The instant every entry shows in this generation.
+  fn instant(&self) -> i64 {
+    TREE_INSTANT_NS.saturating_add(self.generation)
+  }
+
+  /// The host's clock: past every entry's instant by more than any granularity (the racy rule).
+  fn clock(&self) -> i64 {
+    self
+      .instant()
+      .saturating_add(TREE_CLOCK_NS.saturating_sub(TREE_INSTANT_NS))
   }
 
   /// The host lent with its tree for one request.
@@ -142,8 +167,8 @@ impl TreeHost {
       dev: self.identity,
       ino: path_number(path),
       size: len,
-      mtime_ns: TREE_INSTANT_NS,
-      ctime_ns: TREE_INSTANT_NS,
+      mtime_ns: self.instant(),
+      ctime_ns: self.instant(),
       mode: type_bits,
       uid: self.owner.0,
       gid: self.owner.1,
@@ -233,7 +258,7 @@ impl HostFs for TreeHost {
   }
 
   fn now_ns(&mut self) -> i64 {
-    TREE_INSTANT_NS
+    self.clock()
   }
 }
 
@@ -331,6 +356,6 @@ impl HostFs for TreeLens<'_> {
   }
 
   fn now_ns(&mut self) -> i64 {
-    TREE_INSTANT_NS
+    self.host.clock()
   }
 }
