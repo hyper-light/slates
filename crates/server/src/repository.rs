@@ -371,11 +371,12 @@ fn adoptable(
 }
 
 /// `CreateRepository` (module docs): the repository, its root and the default branch's binding, then the root's engine
-/// in a new lineage. Answered `GreenCreated` with the root.
+/// in a new lineage. Answered `GreenCreated` with the root. With the node's changeset store, in the one landing order
+/// (A-767 item 7): the creation landed as changeset 0 first, then recorded, then answered ([`land_then_record`]).
 pub(crate) fn create_repository(
   state: &mut ShardState,
   principal: &Principal,
-  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+  asked: (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
   let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
@@ -383,27 +384,51 @@ pub(crate) fn create_repository(
     Some(Err(refusal)) => return refused(refusal),
     None => None,
   };
-  let repository = match repository_id(state, adopted) {
-    Ok(id) => id,
+  let ids = match creation_ids(state, adopted) {
+    Ok(ids) => ids,
     Err(refusal) => return refused(refusal),
   };
+  if let Some(disk) = state.vcs_disk.clone() {
+    return land_then_record(state, (disk, principal), asked, (adopted, ids));
+  }
+  record_created(state, principal, asked, (adopted, ids))
+}
+
+/// A creation's ids: the repository's, and its new root's (the number after it, in its family) unless a green is
+/// adopted.
+fn creation_ids(
+  state: &mut ShardState,
+  adopted: Option<DbVolumeId>,
+) -> Result<(RepositoryId, Option<DbVolumeId>), Refusal> {
+  let repository = repository_id(state, adopted)?;
+  let root = match adopted {
+    Some(_) => None,
+    None => Some(
+      crate::verbs::fresh_family_id_at(state, crate::verbs::family_of(repository.bytes), 1)
+        .ok_or_else(crate::verbs::family_ids_exhausted)?,
+    ),
+  };
+  Ok((repository, root))
+}
+
+/// Records a creation in the partition and installs its root: `GreenCreated`, or the refusal.
+fn record_created(
+  state: &mut ShardState,
+  principal: &Principal,
+  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+  (adopted, (repository, minted)): (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
+) -> ReplyBody {
   match record_repository(
     state,
     principal,
     (repository, name, tool, format, default_branch),
-    adopted,
+    (adopted, minted),
   ) {
     Ok(root) => {
       install_root(state, repository, root, adopted.is_some());
-      let created = ReplyBody::GreenCreated {
+      ReplyBody::GreenCreated {
         id: to_wire_volume(root),
-      };
-      land_creation(
-        state,
-        repository,
-        (name, tool, format, default_branch),
-        created,
-      )
+      }
     }
     Err(refusal) => refused(refusal),
   }
@@ -414,24 +439,74 @@ pub(crate) const CREATION_LANDED: &str = "repository.create.landed";
 /// Counter: creations the store refused (its owner busy or gone, or its write failed): the repository stands in its
 /// partition, and its store holds no creation for it.
 pub(crate) const CREATION_UNLANDED: &str = "repository.create.unlanded";
+/// Counter: creations whose landing task a test ended between its two steps ([`KILL_BETWEEN_LANDING_AND_RECORD`]).
+#[cfg(test)]
+pub(crate) const CREATION_KILLED: &str = "repository.create.killed";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's kill between a creation's landing and its record: the landing task ends there, nothing after it run, as a
+  /// `kill -9` leaves the register (main's red test of 2026-11-20).
+  pub(crate) static KILL_BETWEEN_LANDING_AND_RECORD: std::cell::Cell<bool> =
+    const { std::cell::Cell::new(false) };
+}
+
 /// Counter: creations whose landing task could not be spawned (the shard's arena full).
 pub(crate) const CREATION_UNRUN: &str = "repository.create.unrun";
 
-/// Lands a new repository's creation into the node's version-control store when the daemon has one (A-767 item 7, main's
-/// ruling of 2026-11-20): one changeset, sequence 0, whose record names the repository as the client asked for it, under
-/// the node's store grant. The repository's record is the partition's already; the request is answered once the
-/// creation is durable in the store too (the verb defers its acceptance, AUD-11, and the task records its completion),
-/// so a client told a repository exists finds its history begun. Without a store the reply is `created` at once. A
-/// request with no reply route (a verb dispatched by the shard itself) is answered at once and its landing counted.
-fn land_creation(
+/// Lands a new repository's creation into the node's version-control store, then records it (A-767 item 7, the one
+/// landing order; main's order of 2026-11-20 after w-svn's finding): one changeset, sequence 0, whose record names the
+/// repository as the client asked for it, under the node's store grant; once it is durable, the repository is recorded
+/// in its partition, its root installed and its completion recorded in one transaction, and the client answered. A
+/// kill between the two leaves a changeset no repository names, which recovery passes over, and no repository the
+/// store cannot recover; the client's retry creates it afresh. The repository's record is judged before the landing (a
+/// name already taken lands nothing), and judged again when it is recorded, since another creation may have taken the
+/// name meanwhile. Its ids are reserved now (`ShardState::family_reserved_through`). The verb defers its acceptance
+/// (AUD-11) and the client is answered by its reply route once the creation is recorded. Every creation has one: a
+/// repository's verbs are served on the node the client reached, on the partition its name hashes to (A-575;
+/// `RequestBody::volume` names no volume for them, so `verbs::serve_forward` never carries one to another node), and a
+/// same-node forward between shards carries its route; so a fleet answers a creation as a laptop does (R8). A dispatch
+/// with no request or no route (a shard's own call) is refused `Unsupported`, typed, on every node alike.
+fn land_then_record(
   state: &mut ShardState,
-  repository: RepositoryId,
+  (disk, principal): (slates_store::owner::StoreHandle, &Principal),
   (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
-  created: ReplyBody,
+  (adopted, (repository, minted)): (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
 ) -> ReplyBody {
-  let Some(disk) = state.vcs_disk.clone() else {
-    return created;
+  let Some((request, route)) = state.current_request.zip(state.reply_route) else {
+    return refused(Refusal::Unsupported {
+      feature:
+        "a repository created with no client request to answer once it is landed (A-767 item 7)"
+          .to_owned(),
+    });
   };
+  let judged = admits(
+    state,
+    &Op::RepositoryCreated {
+      record: RepositoryRecord {
+        index_bits: 0,
+        id: repository,
+        name: name.to_owned(),
+        tool: db_tool(tool),
+        format: db_format(format),
+        default_branch: Some(default_branch.to_owned()),
+        owner: principal.clone(),
+        policy: RepositoryPolicy::default(),
+      },
+    },
+  );
+  if let Err(refusal) = judged {
+    return refused(refusal);
+  }
+  // The repository's number and its root's, so nothing minted while the landing runs takes either.
+  let reserved = minted.unwrap_or(DbVolumeId {
+    bytes: repository.bytes,
+  });
+  if let Some(number) = slates_db::register::ObjectId(reserved.bytes).family_number() {
+    state.family_reserved_through = state
+      .family_reserved_through
+      .max(u64::from(number).saturating_add(1));
+  }
   let header = slates_store::log::Header {
     tool: match tool {
       VcsTool::Git => slates_store::log::Tool::Git,
@@ -441,14 +516,15 @@ fn land_creation(
     repository: u128::from_be_bytes(repository.bytes),
     sequence: 0,
     judged_over: 0,
-    grant: 0,
+    // The store's standing grant (its `G` row, R10): the landing's provenance.
+    grant: disk.grant(),
     work: 0,
     time_ns: slates_rt::futures::now_ns(),
     sections: 0,
   };
   let record = creation_record(name, tool, format, default_branch);
-  let deferred = state.current_request.zip(state.reply_route);
-  let reply = created.clone();
+  let principal = principal.clone();
+  let asked = (name.to_owned(), default_branch.to_owned());
   let task = async move {
     let landed = disk
       .land(
@@ -456,6 +532,11 @@ fn land_creation(
         vec![(slates_store::log::SectionKind::Record, record)],
       )
       .await;
+    #[cfg(test)]
+    if KILL_BETWEEN_LANDING_AND_RECORD.with(std::cell::Cell::get) {
+      crate::state::with_state(|state| state.count(CREATION_KILLED, 1));
+      return;
+    }
     let answered = crate::state::with_state_counted(move |state| {
       state.count(
         if landed.is_ok() {
@@ -465,10 +546,15 @@ fn land_creation(
         },
         1,
       );
-      let ((origin, id), route) = deferred?;
+      let (origin, id) = request;
       state.db.begin();
       let reply = match landed {
-        Ok(_) => reply,
+        Ok(_) => record_created(
+          state,
+          &principal,
+          (&asked.0, tool, format, &asked.1),
+          (adopted, (repository, minted)),
+        ),
         Err(_) => refused(Refusal::Overloaded { shard: state.shard }),
       };
       let reply = crate::verbs::record_completion(state, origin, id, reply);
@@ -479,23 +565,21 @@ fn land_creation(
           refused(refusal_of_db(&error))
         }
       };
-      Some((route, reply, state.shard))
-    })
-    .flatten();
-    if let Some((route, reply, here)) = answered {
+      (reply, state.shard)
+    });
+    if let Some((reply, here)) = answered {
       crate::told::deliver_to(route, reply, here);
     }
   };
   match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
-    Ok(()) if deferred.is_some() => {
+    Ok(()) => {
       state.reply_route = None;
       state.acceptance_deferred = true;
       ReplyBody::Acknowledged
     }
-    Ok(()) => created,
     Err(_) => {
       state.count(CREATION_UNRUN, 1);
-      created
+      refused(Refusal::Overloaded { shard: state.shard })
     }
   }
 }
@@ -548,7 +632,7 @@ fn record_repository(
     ObjectFormat,
     &str,
   ),
-  adopted: Option<DbVolumeId>,
+  (adopted, minted): (Option<DbVolumeId>, Option<DbVolumeId>),
 ) -> Result<DbVolumeId, Refusal> {
   // A Subversion repository's creation's record is made first, for the same reason (A-655 part 2b).
   let created = match tool {
@@ -559,10 +643,8 @@ fn record_repository(
   let root_created = match adopted {
     Some(_) => None,
     None => {
-      // In the repository's family, the number after the repository's own, which is not recorded yet.
-      let id =
-        crate::verbs::fresh_family_id_at(state, crate::verbs::family_of(repository.bytes), 1)
-          .ok_or_else(crate::verbs::family_ids_exhausted)?;
+      // In the repository's family, the number after the repository's own, minted with it (`creation_ids`).
+      let id = minted.ok_or_else(crate::verbs::family_ids_exhausted)?;
       let named = member_name(name, default_branch, id)?;
       let created = Op::VolumeCreated {
         record: member_record(state, principal, (id, named), false),

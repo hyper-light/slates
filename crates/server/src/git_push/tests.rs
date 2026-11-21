@@ -1749,10 +1749,12 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 }
 
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
-/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog). Do: create `main`
-/// at a flat tree of [`FLAT_FILES`] files, then push a commit changing every file, answering a step at a time. Expect:
-/// both `ok`; the work builds took more turns than the files they wrote (a unit at a time, before the verdicts), none
-/// past its budget by more than its longest unit and the scheduler's own overrun (`push.build.past_budget` 0).
+/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
+/// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
+/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
+/// build a unit at a time (more quanta than files), in a tenth as many turns as quanta or fewer (no one waited, so each
+/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
+/// budget (`push.build.past_budget` 0).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let daemon = crate::daemon::audit_daemon();
@@ -1783,9 +1785,22 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   assert_eq!(reasons(&created), [b"ok"]);
   assert_eq!(reasons(&updated), [b"ok"]);
   let turns = after.turns - before.turns;
+  let quanta = (after.more_quanta - before.more_quanta) + turns;
+  // A unit at a time still: more quanta than files, each quantum asked once whether anyone waits.
   assert!(
-    turns > FLAT_FILES as u64,
-    "the update's work was built in {turns} turns for {FLAT_FILES} files"
+    quanta > FLAT_FILES as u64,
+    "the update's work took {quanta} quanta for {FLAT_FILES} files"
+  );
+  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  assert!(
+    turns * 10 < quanta,
+    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+  );
+  let ceiling = crate::daemon::HEARTBEAT_NS;
+  assert!(
+    after.longest_ns <= ceiling + after.longest_unit_ns + after.longest_opening_ns,
+    "a turn of {} ns past its {ceiling} ns ceiling",
+    after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
 }

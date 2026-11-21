@@ -1201,7 +1201,9 @@ mod tests {
   #[test]
   fn a_whole_replace_keeps_the_block_it_replaced() {
     let mut files = Files::default();
-    let first: Vec<u8> = (0..4096u32).map(|n| (n % 251) as u8).collect();
+    let first: Vec<u8> = (0..4096u32)
+      .map(|n| u8::try_from(n % 251).unwrap())
+      .collect();
     let mut chunks = Chunks::default();
     let mut values = vec![first_value(&mut chunks, &mut files, &first)];
     assert_eq!(chunks.owned_bytes(), 0, "naming the block copies nothing");
@@ -1228,11 +1230,21 @@ mod tests {
       "the replaced version's block and the replacing file's"
     );
     files.remove("f");
-    for (value, expected) in values.iter().zip([&first, &next, &replaced]) {
-      assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+    read_back_then_released(&mut chunks, &mut files, values, &[&first, &next, &replaced]);
+  }
+
+  /// Every one of `values` reads back as its `expected` bytes; then each is released, and nothing is left.
+  fn read_back_then_released(
+    chunks: &mut Chunks,
+    files: &mut Files,
+    values: Vec<Value>,
+    expected: &[&Vec<u8>],
+  ) {
+    for (value, expected) in values.iter().zip(expected) {
+      assert_eq!(&&value.materialize(chunks, files.blocks()), expected);
     }
     for value in values {
-      value.release(&mut chunks, files.blocks_mut());
+      value.release(chunks, files.blocks_mut());
     }
     assert_eq!((chunks.bytes(), files.blocks().live()), (0, 0));
   }

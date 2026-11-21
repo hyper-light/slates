@@ -16447,8 +16447,31 @@ loaded to count. It showed two things to measure on a quiet machine:
   small datagrams.
 - At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
   lane on loopback.
-The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
-datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
+The UDP receive buffer was a suspect and is ruled out: over six 64 MiB transfers (about 5 s, load 22) the full-socket-
+buffer drops rose by 8, the rate an idle 20 s showed (32). The "~200 MB/s" was a loaded machine's figure.
+
+**On a quiet Mac, and the per-packet copies removed** (macOS arm64, Studio-1 `adas-mac-studio.local`, 14 cores, the
+command above with `REPLICATION_BENCH_BULK_MIB=64,64,64,64,64,64,64,64` and `replication_bench 20`: eight rows of five
+timed 64 MiB requests after a warm-up, 40 in all; a 6 s `/usr/bin/sample` of the process during them):
+
+| tree | load average | goodput min / median / max (MB/s) | 64 MiB wall p50 range | `memmove` samples | `sendto` | `recvfrom` | AES-GCM enc / dec |
+|---|---|---|---|---|---|---|---|
+| main `55038e0` (before) | 3.70 | 874 / 1,066.5 / 1,131 | 61.9–65.5 ms | 604 | 798 | 344 | 189 / 197 |
+| `e39f4ae` (after: frames encoded in place, packets sealed in one reused buffer) | 3.05 to 2.96 | 961 / 1,103 / 1,217 | 58.9–62.5 ms | 491 | 852 | 356 | 224 / 237 |
+| `6f9261a` (then: stream data carried as spans of the sender's bytes until acknowledged) | 3.33 to 3.14 | 927 / 1,092 / 1,206 | 59.3–63.2 ms | 433 | 811 | 382 | 247 / 233 |
+
+What it means:
+- The lane does about 1.1 GB/s on loopback, one direction, one session, on a quiet Mac.
+- The stops are mostly "nothing queued" (about 8,000 of 7,300 packets' turns), with the window rarely the stop.
+- The step removed a clone of every reliable frame (a stream frame's 9 KB) into each packet, and the allocation of
+  each packet's payload and datagram: `memmove` fell 19% (604 to 491 samples), `realloc` and `RawVec::reserve` left
+  the top of the profile. The median moved 3.4% and the minimum 10%. MEMORY SIZING bans the copies whatever they cost.
+- The second step removed the copy of each stream frame's bytes out of its sender: a packet in flight now names its
+  stream data as a span (stream, offset, length), encoded from the sender's buffer when the packet is built and again
+  if it is resent. `memmove` fell 12% more (491 to 433, 28% from 604). Goodput is level with the first step (median
+  1,103 to 1,092 MB/s, inside run-to-run noise): the copy was banned, not slow.
+- What the profile names now, in order: `sendto` (one syscall a datagram), `recvfrom` (likewise), AES-GCM, and the
+  receiver's copies (the frame decode's and the reassembly's) inside `memmove`.
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
@@ -16775,3 +16798,114 @@ against 2,614-3,096 µs, CPU over the stream a third lower. **Still open (GAPS):
 them during the stream, at the writes' expense): a status request still costs every shard a sweep of tens of GiB of
 address space, and an idle slice still delays the next message by up to half a step quantum. The live write's 50 µs goal
 needs no sweep armed by a plain status request at all.
+
+## A status does residency work only when asked: a live write under a burst of plain statuses (main's ruling on g228's finding; A-744; 2026-11-20)
+
+**Command (the contract):** the live-shipping measurement as above, release, CARGO_BUILD_JOBS=4, and its sibling
+`measure_what_live_shipping_adds_under_a_burst_of_plain_statuses` (the same stream while a thread asks the owner a
+plain `slates status` again and again). **Arms:** main (a664be6f2, with 7ac3900ee's measurement file only) and asked
+(7ac3900ee). **Hardware:** adas-mac-studio.local-2, Apple silicon, 32 cores, macOS, load 9-11; five rounds interleaved.
+Each cell: added at the median (µs); live p999; every daemon's CPU over the stream; in the 1.5 s after it.
+
+| round | main, contract | asked, contract | main, status burst (statuses) | asked, status burst (statuses) |
+|---|---|---|---|---|
+| 1 | 2,220.4; 4.8 ms; 5.0-5.4 s; 0.6-1.2 s | 204.9; 441 µs; 0.11-0.44 s; 20-30 ms | 2,815.1; 5.7 ms (755) | 292.6; 1,450 µs (161) |
+| 2 | 1,940.5; 7.1 ms; 4.6-5.0 s; 1.5 s | 182.3; 402 µs; 0.12-0.40 s; 20-30 ms | 1,902.8; 5.4 ms (571) | 196.2; 713 µs (104) |
+| 3 | 1,681.8; 3.0 ms; 4.0-4.4 s; 1.4 s | 172.2; 343 µs; 0.09-0.35 s; 20 ms | 1,523.8; 3.1 ms (519) | 177.6; 638 µs (100) |
+| 4 | 1,353.0; 2.7 ms; 3.5-3.8 s; 1.4 s | 177.9; 368 µs; 0.08-0.36 s; 20 ms | 1,407.3; 3.1 ms (488) | 193.4; 650 µs (102) |
+| 5 | 1,465.3; 2.7 ms; 3.7-3.9 s; 1.5 s | 177.0; 445 µs; 0.10-0.37 s; 20-30 ms | 1,099.3; 2.4 ms (404) | 184.0; 2,713 µs (101) |
+
+**Reading.** Main's status-armed sweeps cost every live write about 1.1-2.8 ms at the median and 2.4-7.1 ms at p999,
+burst or none (the measurement's own status polls before the stream arm them), and every daemon about a core for 1.5 s
+after the stream. With residency only for a memory request: 172-205 µs added (9.5x), p999 342-445 µs, the daemons back
+at 10-30 ms of CPU a second when idle; under a status burst 178-293 µs, p999 under 1 ms in 4 of 5 rounds. The added
+median is back where b402afc7c stood before a48bcdc52 (168-205 µs at load 16-31). 85a's 50 µs median is still 3.4-4x
+away on this Mac: the round's exchange (about 100 µs, the transport and two control shards' wakes, A-387 declining
+macOS holds) and the held reply's wake (65-116 µs) are what remain (the round counted hop by hop above).
+
+## Paced work yields only when someone waits: a push's build in a twentieth of the turns, newcomers held (A-783; main's pacing call of 2026-11-20 15:35, condition (d); 2026-11-20)
+
+- **The builds:** A = main at 779840fba; B = the same tree with A-783 (`slates-pace`, the runtime's probe and ceiling,
+  the push build on them). Both carry the same measurement, the runtime's counters as status rows (`rt.steps`,
+  `rt.polls`, `rt.long_steps`, `rt.poll_log2.*`; landed with A-783), release, each in its own target directory.
+- **The command:** `crates/cli/bench/pacing_ab.py A_SLATES A_BENCH B_SLATES B_BENCH ~/.cache/g309-scale/src.git
+  'v1.0.0^{commit}' --rounds N --pushes 8 --load idle|both`: a fresh daemon a side a round, the sides alternating their
+  order each round; 8 pushes of git/git cut at v1.0.0 (12,232 objects, 3.4 MB) at once, each to its own repository;
+  meanwhile a newcomer, a ref advertisement of an idle repository, one after another, timed from its send to the
+  answer's first byte; the runtime's and the build's counters from `slates status` before and after; then
+  `provision_bench`'s single-client spinning p99 (R9's gated row, the bench stopped once it prints). `cores` adds as
+  many CPU burners as cores (`yes`).
+- **The machine:** the big Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), shared with other agents' builds and
+  a live chaos run: load at each pass's start and end below. Every round shown.
+
+**Pass 1** (16:36–16:43 PST, load 5.5 at the start): B before the batch fix (below).
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms |
+|---|---|---|---|---|
+| idle 1 | 6.124 | 3.038 | 8.27 / 18.93 | 8.74 / 42.03 |
+| idle 2 | 5.236 | 2.940 | 4.30 / 11.19 | 6.75 / 37.40 |
+| idle 3 | 5.983 | 5.237 | 3.40 / 17.24 | 2.66 / 92.08 |
+| idle 4 | 6.280 | 6.060 | 3.13 / 12.02 | 2.47 / 92.29 |
+| idle 5 | 6.493 | 4.712 | 3.34 / 11.85 | 2.96 / 105.54 |
+| cores 1 | 18.642 | 4.170 | 6.57 / 52.58 | 8.77 / 62.40 |
+| cores 2 | 7.210 | 4.576 | 9.01 / 41.77 | 8.28 / 74.31 |
+| cores 3 | 16.692 | 12.579 | 21.62 / 130.10 | 22.09 / 147.94 |
+| cores 4 | 19.247 | 14.751 | 11.63 / 81.80 | 19.40 / 123.68 |
+| cores 5 | 13.849 | 13.071 | 25.06 / 108.79 | 10.70 / 125.51 |
+
+Walls fell, but B's newcomer max rose to about the ceiling (100 ms) idle, while its builds yielded 0 to 3 times a
+round in most rounds. **Found:** a shard's step takes a batch of ready tasks out of its queue and polls them in turn, so
+the tasks after the one running a paced turn were in neither the queue nor the control channel, and the probe never saw
+them. The daemon's log (a scratch diagnostic build, never landed) showed it: a newcomer's connection, moved to its
+repository's shard just as a build turn began there, was taken into that step's batch; the turn asked 4,263 times over
+80 ms and found no one; the newcomer was first polled 94 ms after its move was sent. Fixed in B (the probe counts the
+batch's tasks not yet polled; red first, `a_task_ready_in_the_same_batch_is_seen_waiting`).
+
+**Pass 2** (17:16–17:32, load 15.8 at the start, 41.8 at the end, the box's other work rising through it): B fixed.
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms | B turns that yielded |
+|---|---|---|---|---|---|
+| idle 1 | 10.551 | 4.312 | 1.91 / 12.18 | 8.52 / 20.70 | 68 |
+| idle 2 | 5.542 | 6.810 | 48.91 / 111.29 | 105.80 / 144.65 | 55 |
+| idle 3 | 4.675 | 5.642 | 34.64 / 82.80 | 42.39 / 57.60 | 44 |
+| idle 4 | 4.270 | 4.070 | 46.34 / 70.70 | 40.16 / 49.04 | 37 |
+| idle 5 | 4.080 | 4.025 | 28.46 / 35.66 | 37.94 / 59.19 | 62 |
+| cores 1 | 8.465 | 11.266 | 80.60 / 126.49 | 74.50 / 127.22 | 12 |
+| cores 2 | 9.313 | 6.118 | 17.84 / 129.15 | 48.96 / 132.48 | 88 |
+| cores 3 | 8.215 | 4.495 | 20.05 / 70.52 | 26.16 / 63.63 | 110 |
+| cores 4 | 11.656 | 7.643 | 8.75 / 51.64 | 14.57 / 40.79 | 35 |
+| cores 5 | 6.992 | 6.234 | 27.22 / 62.13 | 25.07 / 64.32 | 75 |
+
+The host's own load dominates these rounds (A's newcomer p50 went from 0.78 to 5.5 ms between rounds 1 and 2): even
+at load, best wall 6.992 s (A) against 4.495 s (B); idle about even.
+
+**Pass 3** (17:34–17:39, load 11.5 at the start, 20.8 at the end): B fixed, idle, seven rounds, the build's own turns
+read too (`push.build.turns`, both sides).
+
+| round | A wall s | B wall s | A build turns | B build turns | A newcomer p99 / max ms | B newcomer p99 / max ms | A / B provision p99 µs |
+|---|---|---|---|---|---|---|---|
+| 1 | 7.864 | 7.195 | 370,207 | 89,140 | 2.81 / 12.52 | 3.07 / 15.11 | 197.9 / 173.5 |
+| 2 | 8.704 | 7.061 | 371,069 | 62,828 | 2.41 / 12.89 | 2.21 / 13.62 | 176.4 / 183.5 |
+| 3 | 9.869 | 6.011 | 371,480 | 22,643 | 2.29 / 13.12 | 2.53 / 11.51 | 173.0 / 188.1 |
+| 4 | 9.204 | 6.648 | 371,456 | 18,682 | 2.22 / 34.41 | 5.28 / 20.23 | 165.7 / 176.4 |
+| 5 | 8.888 | 8.056 | 371,345 | 128,776 | 2.51 / 29.34 | 1.99 / 12.70 | 173.0 / 172.3 |
+| 6 | 9.948 | 9.549 | 370,669 | 118,865 | 2.54 / 12.85 | 2.76 / 12.06 | 191.3 / 183.0 |
+| 7 | 10.766 | 12.255 | 370,951 | 369,786 | 2.80 / 14.27 | 2.10 / 15.74 | 200.8 / 265.2 |
+
+- **What it says.** The build's turns fall 3 to 20 times in six rounds of seven, and the wall with them: best 7.864 s
+  (A) against 6.011 s (B), median 9.204 against 7.195 s. Newcomers hold: p99 median 2.51 ms (A) against 2.53 ms (B), max
+  median 13.12 against 13.62 ms. Provisioning holds (R9's row, median 176.4 against 183.0 µs; both above the 50 µs
+  floor on this loaded host, A as much as B). Kept: B.
+- **Owed.** In round 7 every one of B's turns yielded at its first ask (369,778 of 369,786), so it gained nothing: some
+  task on those shards was ready at nearly every quantum. Which one, and whether it is a real waiter or a task that
+  yields for its own sake, is the next measure (GAPS, A-783). The longest-step column is the shard's since its start,
+  the boot's on both sides, so it is not in the tables; the poll histograms put p999 at 0.5 to 2 ms on both.
+- **Not this change's.** `provision_bench`'s 8-client form hung on both sides (pass 1 and its own timing run): one
+  client waits in `Client::round_trip` for a reply that never comes, every shard parked in `kevent`, the main thread
+  joining it (reported to main with both stacks).
+
+**85a against its done-when on the landed commit** (origin/main 218256bab, the contract command, release, adas-mac-studio.local-2,
+32 cores, macOS, load 6-10, 2026-11-21 04:59-05:05 UTC). Added at the median; live p999: 186.5 µs, 375 µs; 188.7 µs,
+384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
+and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
+(`do_freezer_trap`) and was stopped unbuilt.

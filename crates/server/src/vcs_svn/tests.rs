@@ -24,6 +24,7 @@ const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// ~60, w-perf 2026-11-20) a hook's process took past the ten windows these tests once waited, 1 run in 3, and the read
 /// that timed out returned the answer part-way, read as a wrong answer (R3, the hook test flake). Sixty windows hold
 /// three times the longest seen (22 s a test against 2.3 s).
+#[cfg(unix)]
 const HOOK_PATIENCE_NS: u64 = 60 * PATIENCE_NS;
 /// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`RECORDED_URL`] under a root holding no
 /// repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).

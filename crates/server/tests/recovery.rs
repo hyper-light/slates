@@ -3834,9 +3834,9 @@ fn a_file_deleted_after_its_burst_went_idle_takes_its_reserve_with_it() {
 /// after this call began, so the figures are of now.
 #[cfg(target_os = "linux")]
 fn arena_figures(client: &mut Client) -> (u64, u64) {
-  let completed = counter(client, "content_range.sweep.completed");
+  let completed = memory_counter(client, "content_range.sweep.completed");
   let started = Instant::now();
-  while counter(client, "content_range.sweep.completed") <= completed {
+  while memory_counter(client, "content_range.sweep.completed") <= completed {
     assert!(
       started.elapsed() < Duration::from_secs(10),
       "a sweep of the shard's slice completed"
@@ -3847,6 +3847,21 @@ fn arena_figures(client: &mut Client) -> (u64, u64) {
     counter(client, "content_range.arena.allocated"),
     counter(client, "content_range.arena.resident"),
   )
+}
+
+/// [`counter`] read from a status that asks for the memory report, which alone advances and arms the residency sweep
+/// (A-744; main's ruling on g228's finding).
+#[cfg(target_os = "linux")]
+fn memory_counter(client: &mut Client, kind: &str) -> u64 {
+  client
+    .daemon_memory_status()
+    .unwrap()
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|refusal| refusal.kind == kind)
+    .map(|refusal| refusal.count)
+    .sum()
 }
 
 /// MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing). Do: on a

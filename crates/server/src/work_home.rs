@@ -7,6 +7,13 @@
 //! answer resumes the verb under its own completion key (the `lease_wait` pattern), so no verb awaits and no await
 //! holds a partition's state.
 //!
+//! **A forwarded creation is placed by its name (A-794).** A work made through another node (one that does not hold
+//! the green's replica, so its creation is forwarded to the owner) is made on the partition its name hashes to, as a
+//! create is placed, and its verbs then park here for the green's shard like any client's; the forward's exchange
+//! waits for its parked verb and is answered when the verb resumes ([`attach_forwarded`]). Before, it was made on the
+//! green's own shard: at 100,000 clients over the Linux kernel 76,955 works were made on the primary's one partition,
+//! whose merge budget, the green's chain's too, then refused 60,349 edits, 3,883 rebases and 7,544 accepted submits.
+//!
 //! **Order.** While one verb of a work is parked, every later verb of that work parks behind it, and they resume in
 //! arrival order. So an edit never overtakes a submit pipelined after it, and no edit lands during a submit's verdict.
 //!
@@ -206,6 +213,10 @@ pub(crate) struct Unbuilt {
 pub(crate) struct WorkHome {
   queues: BTreeMap<DbVolumeId, Queue>,
   by_request: BTreeMap<(u64, u32, u32), DbVolumeId>,
+  /// The exchanges of verbs forwarded from another node that wait for their parked verb here, each as its control shard
+  /// and awaited call (A-794, [`attach_forwarded`]): answered from the verb's completion when its queue resumes it. A
+  /// subset of `by_request`'s keys, each leaving with its verb, so bounded as the parked verbs are.
+  forwarded: BTreeMap<(u64, u32, u32), (u16, u64)>,
   parked: usize,
   /// The work whose parked verb is being resumed now: it may park again at the front of its own queue.
   resuming: Option<DbVolumeId>,
@@ -2427,6 +2438,10 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     } = head;
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
+    let forwarded = home
+      .forwarded
+      .remove(&key(verb.origin, verb.id))
+      .map(|waiter| (verb.origin, verb.id, waiter));
     home.parked = home.parked.saturating_sub(1);
     let verb_key = (verb.origin, verb.id.client, verb.id.sequence);
     if state
@@ -2446,6 +2461,9 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = named;
     home.resuming = Some(work);
     crate::lease_wait::run_resumed(state, verb, refused, None);
+    if let Some((origin, id, waiter)) = forwarded {
+      answer_forwarded(state, (origin, id), waiter);
+    }
     let home = &mut state.work_home;
     home.resuming = None;
     home.fetched = None;
@@ -2455,6 +2473,47 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = None;
   }
 }
+
+/// Attaches the exchange of a verb forwarded from another node, waiting as `waiter` (its control shard and awaited
+/// call), to the verb `(origin, id)` parked here (A-794): answered when its queue resumes it ([`answer_forwarded`]).
+/// False when no such verb is parked here. Before, such an exchange answered `Overloaded` at once and only the origin's
+/// resend under the id met the completion, so every forwarded verb of a work whose green lives on another shard of this
+/// node cost its client a retry pause.
+pub(crate) fn attach_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> bool {
+  let home = &mut state.work_home;
+  if !home.by_request.contains_key(&key(origin, id)) {
+    return false;
+  }
+  home.forwarded.insert(key(origin, id), waiter);
+  state.count(FORWARDED_ATTACHED, 1);
+  true
+}
+
+/// Answers a forwarded verb's waiting exchange once its parked verb ran (A-794): with the completion it recorded; else,
+/// parked again here, the exchange waits for that; else, its acceptance deferred to a fleet commit, the exchange waits
+/// for the commit (`merge_service::await_forwarded`); else `Overloaded`, unrecorded, which its origin's resend runs again.
+fn answer_forwarded(state: &mut ShardState, (origin, id): (u64, RequestId), waiter: (u16, u64)) {
+  use crate::merge_service::ForwardedAcceptance;
+  let answer = match crate::merge_service::await_forwarded(state, (origin, id), waiter) {
+    ForwardedAcceptance::Completed(bytes) => <ReplyBody as slates_wire::Wire>::from_bytes(&bytes)
+      .unwrap_or_else(|_| crate::verbs::refused(Refusal::DuplicateRequest)),
+    ForwardedAcceptance::Waiting => return,
+    ForwardedAcceptance::Gone if attach_forwarded(state, (origin, id), waiter) => return,
+    ForwardedAcceptance::Gone => crate::verbs::refused(Refusal::Overloaded { shard: state.shard }),
+  };
+  crate::xshard::answer_awaited(waiter.0, waiter.1, answer);
+  state.count(FORWARDED_ANSWERED, 1);
+}
+
+/// Format: a forwarded verb's exchange attached to its verb parked here ([`attach_forwarded`]), the non-vacuity count
+/// of A-794's event-driven answer.
+pub(crate) const FORWARDED_ATTACHED: &str = "merge.work.forwarded_attached";
+/// Format: a forwarded verb's exchange answered when its parked verb resumed ([`answer_forwarded`]).
+pub(crate) const FORWARDED_ANSWERED: &str = "merge.work.forwarded_answered";
 
 /// Keeps the base entries a verb fetched with the work (A-247), charged as the work's: the refusal its verb answers when
 /// the budget cannot hold them.
@@ -2649,7 +2708,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 1234,
         },
-        body: slates_ipc::protocol::RequestBody::DaemonStatus,
+        body: slates_ipc::protocol::RequestBody::DaemonStatus { memory: false },
       },
       fetched: None,
       verdict: None,

@@ -904,7 +904,7 @@ fn secure(
 /// A work's held verdict: accepted and held, or accepted before as a version.
 enum Verdict {
   /// Accepted, held until the commit.
-  Held(Judged),
+  Held(Box<Judged>),
   /// Accepted before as this version.
   Before(u64),
 }
@@ -929,7 +929,7 @@ fn judge(
       .map(|mut engine| engine.judge(work));
     let why = match judgment {
       Some(Judgment::Accepted(judged)) => {
-        verdicts.push(Some(Verdict::Held(judged)));
+        verdicts.push(Some(Verdict::Held(Box::new(judged))));
         continue;
       }
       Some(Judgment::AcceptedBefore { version }) => {
@@ -1101,7 +1101,7 @@ fn commit(
         let done = state
           .greens
           .get_mut(&green)
-          .map(|mut engine| engine.commit_judged(judged));
+          .map(|mut engine| engine.commit_judged(*judged));
         match done {
           Some(Ok((version, applied))) => Some((version, applied, false)),
           // Confirmed above in this same step; counted should it ever be met.
