@@ -259,3 +259,13 @@ Red: a focused server test landing a large named text: no step past the quantum,
   cut (B diag): the checkpoint's last step 42.6 ms (build 5.7, encode 9.5, record 24.4 of 49 MB); single key folds up
   to 13.4 ms.
 - Server lib: 5 repository/paths tests fail on main 585b89299 itself (Overloaded at write), with or without the cut.
+- 2026-11-21 01:30-02:40: part 1b committed LOCALLY 310288b17 (not landed): the fold's turn budget = the fold left
+  (backlog x measured cost a key) spread over the turns before its doubling deadline (turn_budget_ns, unit test); svn
+  chain-fold test now lands each revision in its own look (a checkpoint in turns runs between, as in the daemon).
+  A/B 5 rounds, load 14-17 (~/.cache/w-engine-p3-runs/ab-deadline.txt): Z=50 every kind's server p99 < 1 ms in 5/5
+  (A <= 2/5), SubmitAccepted p999 64.7-89.5 -> 1.4-9.2; Z=20 fold 0.9-1.6 s, p50 restored, p99 WORSE (SubmitAccepted
+  2.48-4.47 -> 5.43-9.73, ReadHead 1.04-1.94 -> 3.09-4.38), p999/max better. The owner is saturated at Z=20: the fold's
+  74 ms costs wherever it lands. Profile (A, sample): fold_identity 109 samples: BLAKE3 over the changed files' bytes
+  (old and new) most, content_ref_at (history reconstruction) 30. Options to cut the work, for main: (a) land 1b;
+  (b) subtract a key's old entry when a commit first dirties it (no format change; commits pay ~one file hash a key an
+  interval); (c) an entry's lanes from a stored 32-byte digest (identity format change: golden vectors, records).

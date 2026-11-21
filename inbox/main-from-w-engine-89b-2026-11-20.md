@@ -24,3 +24,19 @@ starting it when the backlog's measured cost passes a quantum. Also unresolved: 
 every shard parked: twice tonight, the provision_bench hang's shape); 5 server lib tests fail on main 585b89299
 (repository::tests::{each_verb..., branches_share..., a_recovery_rebuilds..., a_destroyed_branch...},
 vcs_store::paths::tests::t_a664_holders...: Overloaded at write).
+
+## Update 2026-11-21 02:40: deadline-paced fold measured; the remaining lever needs your call
+
+- Part 1b (local 310288b17): the fold paced to end within its doubling interval (budget = work left x turn gap / time
+  left; all measured). Fold 7-9 s -> 0.9-1.6 s at Z=20.
+- A/B (5 rounds each, alternating, load 14-17): **Z=50: every kind's server p99 under 1 ms in 5 of 5 rounds** (A at
+  most 2 of 5; SubmitAccepted 0.84-0.98 vs 0.79-3.98 ms), p999 64.7-89.5 -> 1.4-9.2 ms, p50 equal. **Z=20: p50 equal
+  again, p999/max better (72.9-100.8 -> 43.5-53.4; 85-121 -> 53-65), but p99 worse** (SubmitAccepted 2.48-4.47 ->
+  5.43-9.73, ReadHead 1.04-1.94 -> 3.09-4.38): the owner is saturated at 3,500 verdicts/s, so the fold's 74 ms of work
+  hurts p999 done at once and p99 spread out. Scheduling can't fix that; less work can.
+- Profile: the fold is BLAKE3 over every changed file's old and new bytes (history reconstruction 30 of 109 samples).
+  Options: (a) land 1b as is (bar met at Z=50; Z=20 p99 x2); (b) subtract a key's old entry when a commit first dirties
+  it (no format change; halves the fold, removes the history reads; each commit pays about one file hash a key an
+  interval); (c) derive an entry's lanes from a stored 32-byte digest (no old-content hash at all; changes the
+  identity's format: golden vectors, the identities in merge records and checkpoints). My recommendation: (b), then
+  re-measure; (c) only with your and Ada's word on the format.
