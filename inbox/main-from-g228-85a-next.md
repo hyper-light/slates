@@ -36,3 +36,7 @@ build 26.6, to control 8-9, collect 6-7, reply 6, to owner 4, lane/borrow/settle
 
 **For you to delete:** agents/g228-busy-interval (landed), agents/g228-macos-hold, agents/g228-exchange-split,
 agents/g228-land-cache, agents/g228-copy-rejected, diag-g228-live-10..14 and their diag-results branches.
+
+**Update 2026-11-21 ~10:35 PST, for main 01a1ff2e** (origin/main 8cb874d3f): the interval's amendment is **A-829**
+(claimed in amendments.tsv; A-826 is w-shared's), renumbered on main in 8cb874d3f. The ruling question above still
+stands. Per the brief I'm starting (i), counting only (no change lands without an A/B), until you rule.

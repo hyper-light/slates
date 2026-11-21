@@ -1,0 +1,1 @@
+g227, 2026-11-21 10:24 PST, Studio-4: freed 0, nothing of mine left to free. No worktrees, no target dirs (all deleted after each landing, 2026-11-20), no datasets; only my 278 MB clone ~/slates-work/g227-transport-reports-durability remains. Free there then: 12 GiB.
