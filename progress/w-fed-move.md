@@ -1,5 +1,17 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~00:20 PST: A-797 LANDED slates main 086089ba; main STOPPED my 100k run (swap); load runs are main's now
+- A-797: the green's owner answers a batch of asks within its step budget, the rest handed back (the primary had been
+  killed by its watchdog: shard 0 spun 1,055 ms in one batch). Unit test red->green; 42 fleet tests pass.
+- Partial evidence, not proof (run on main 8a18edcc + A-797, ~22:49-00:03, stopped by main: the Studio was at 96 of 97
+  GB swap; the run held ~30 GB): no `is spinning` and no kill in 3,110 s (the run before: six reports, one kill);
+  1,570,311 batches handed back. Latencies confounded by swap. Open walls it showed (GAPS A-797): ~2,700 submits never
+  answered (client node: forwards resolved 9,116,579, delivered home 9,113,196, 3,383 lost); one 300 MB work log;
+  10.1 M owner asks.
+- Log summary recorded here; the 100k rung is filed in run-requests.md (mem=40g). I do not run it again.
+- Next: my close list has C1 (this) and R2 (closed). Next piece on C1 that needs no load run: the lost forwarded reply
+  (3,383 between resolved and delivered_home), found with unit/integration tests only.
+
 ## 2026-11-20 ~23:00 PST: C1 continued
 - A-794 LANDED slates main 8a18edcc (dc4f6eb0): forwarded CreateWork placed by its name's partition, not the green's
   (76,955 works had filled the primary's one partition: TableAtCapacity 71,776 -> 0); a forwarded verb parked at its
