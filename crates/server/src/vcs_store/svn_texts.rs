@@ -136,6 +136,7 @@ pub(crate) async fn bring_whole(
     let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
     let put = crate::state::with_state(|state| {
       state.count(PIECE_FETCHED, 1);
+      state.count(BYTES_BROUGHT, brought);
       crate::vcs_store::within_budget(state, brought, |stores| {
         stores
           .content_mut()
@@ -172,6 +173,11 @@ pub(crate) async fn bring_whole(
   })
   .unwrap_or(false)
 }
+
+/// Counter: the bytes a reader that needs a text whole brought through the node's changeset store ([`bring_whole`]: a
+/// commit's increment, a copy's restore, a hook view, an import's delta base). Format: a counter name in the status
+/// report.
+pub(crate) const BYTES_BROUGHT: &str = "vcs_store.svn_texts.bytes_brought";
 
 /// Lets go the reader's hold on the piece `wanted` it fetched ([`fetch_piece`]), the piece gone with its last hold.
 pub(crate) fn let_go(state: &mut ShardState, wanted: slates_svn::reads::Wanted) {

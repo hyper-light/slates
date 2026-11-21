@@ -59447,6 +59447,36 @@ Applied in the same change to:
   1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
   (slates-svn).
 
+### A-820 — A Subversion copy from an older revision is made from the head and set back from the records; a Subversion green keeps no version for copies (2026-11-21, w-svn; main 10:55 PST, P7's finding (1); A-586, A-626, §4.16 delta retention)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit/restore.rs` (new): the restore walk, `Restore`, `CopyPlan`, counted
+  `repository.svn_commit.restore_slices`.
+- `crates/server/src/repository/svn_commit.rs`: `Building::copy` from the head and the restores merged with the
+  revision's rows (`over_restore`, `restored`); `planned` (the landing turn taken, the copies planned and their texts
+  brought) for `land_work` and `land_revision`; `fold_to_readers` after each landing, counted
+  `repository.svn_commit.folded_bytes`; `landed` folded into `landed_with`.
+- `crates/server/src/vcs_store/svn_texts.rs`: `vcs_store.svn_texts.bytes_brought`.
+- `docs/wip/GAPS.md`: P7's finding (1).
+
+- **Why.** A copy from an older revision was the engine's `Copy` of the source at that version, which the engine
+  rebuilt from the history it kept (`CopyFix`). So a Subversion green kept every version a copy might name: 440 MB for
+  git-2000's 35 MB of history (P7). When a tight budget folded it, a copy was refused `CopyRefused VersionFolded`.
+  Since C2 stage B every text is readable through the records and the node's store.
+- **What.** The copy is made from the source at the head, then each path whose node at the head is not the copied
+  revision's is set back: removed, made, or given the revision's text and property list. The two trees are walked
+  together from the copy's root, and a subtree whose node-revision is equal in both is skipped whole (the index bubbles
+  changes up). So the work is the paths the source changed since, not its size. The walk runs a slice at a time under
+  the shard's step budget, holding the landing turn. Rows of the same revision that change a restored path merge into
+  it. A Subversion green then folds its history to its live readers' floor after every landing.
+- **Evidence.** `copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then`: 24 seeds, 14 generated
+  revisions each, with additions, edits, property sets, deletions, copies of any node from any earlier revision
+  (copies of copies among them) and copies changed in their own revision. After each revision the green has folded to
+  its head and equals the model's tree. It is red without the restores and red without the fold.
+  `a_copy_from_an_older_revision_commits_after_the_green_folded_its_history` was red before: `CopyRefused
+  VersionFolded`. `stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol` is stock svn 1.15 on the big
+  Studio. The A/B (main's condition 3) is `measure_copies_from_older_revisions`: the A side is 3bf21428b, the B side
+  this change.
+
 ### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
 
 - **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
