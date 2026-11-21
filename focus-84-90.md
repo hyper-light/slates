@@ -1621,3 +1621,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - NEXT for w-fed-move: owner asks per client grow ~6x with scale (17.5 at 1k, ~101 at 100k). Inject contention to find the kind that grows.
   - DISK: the MacBook back to 42 GB. The kiln-build container is still running at 47 min, 14.3 GB.
 - 2026-11-21 03:18 PST LANDED: 564cc74af (w-fed-move: the stale role test judges a green's landing as any volume's, so it expects the missing target refused, not Unsupported: A-774 part 3's rule; stale since f401f798c). w-fed-faults acknowledged an old message late; its list stays closed. w-git's r22 (the git/git push on the 8baa1cf16 diagnostic) is running. The MacBook disk is 55 GB.
+- 2026-11-21 03:23 PST
+  - LANDED: dbfac3e13 (w-rewrite-ops, A-807: Mercurial's made changesets take the deferred-submit hook). Piece 1, the dirty read during a held landing, isn't visible on main; asked whether it's inside A-807, and if not it comes before A-803.
+  - RUN: main queued w-work-mount's Linux FUSE C1 test as kiln r2 (needs linux,mem=16g,disk=30g; adacachy under strain, so queued): a fresh clone of main, then fuse_mount's a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save. A skip is not green. jupiter's r1 (the WinFsp test) hasn't reported yet.
+  - The MacBook disk is 53 GB.
