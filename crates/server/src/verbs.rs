@@ -4480,6 +4480,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(crate::live_ship::hop_rows(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -5301,7 +5302,14 @@ fn dispatch_inner(
       increment,
       computed,
       carried,
-    } => submit_computed(state, (work, green), (&increment, computed), carried),
+    } => {
+      // The owner's whole step for a holder's submit (main's ruling on the lane, 2026-11-20: measured on both ends).
+      let start = slates_machine::clock::monotonic_ns();
+      let reply = submit_computed(state, (work, green), (&increment, computed), carried);
+      let step_ns = slates_machine::clock::monotonic_ns().saturating_sub(start);
+      crate::merge_service::count_phase(state, SUBMIT_OWNER_STEP, step_ns);
+      reply
+    }
     RequestBody::Edit {
       work,
       path,
@@ -9003,8 +9011,12 @@ fn report_first_work_log_refusal(state: &ShardState) {
     return;
   }
   let held = state.db.partition().merge_budget_held();
+  let largest = held
+    .largest_work
+    .map(|work| crate::work_log::describe_log(state.db.partition().work_log(work)))
+    .unwrap_or_default();
   slates_machine::log_line!(
-    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?}",
+    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?} largest log: {largest}",
     state.shard
   );
 }
@@ -10031,7 +10043,7 @@ fn submit(
         return refused(refusal);
       }
       // A whole-file rewrite is refined first, a slice a turn, by a job of this shard (A-787 part 2): the submit waits.
-      if let Some(owed) = refinement_owed(state, (work_id, green_id)) {
+      if let Some(owed) = parkable_refinement(state, (work_id, green_id)) {
         let kind = ParkedKind::Local {
           principal: principal.clone(),
           work,
@@ -10627,7 +10639,7 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
     Some(answer) => answer,
     None => {
       if state.greens.contains_key(&green_id)
-        && let Some(owed) = refinement_owed(state, (work_id, green_id))
+        && let Some(owed) = parkable_refinement(state, (work_id, green_id))
       {
         let kind = ParkedKind::LocalRebase {
           principal: principal.clone(),
@@ -11351,6 +11363,12 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
 /// 3b), the non-vacuity count of [`judge_submission`]'s computed path.
 pub(crate) const TAKEN_BY_POSITION: &str = "merge.verdict.taken_by_position";
 
+/// Counter pair: a holder's `SubmitComputed` served on this owner, and its steps' time in all, nanoseconds (the decode,
+/// the verdict taken by position, the append), measured on both ends of the forward (main's ruling on the lane,
+/// 2026-11-20).
+pub(crate) const SUBMIT_OWNER_STEP: (&str, &str) =
+  ("merge.submit.owner_step", "merge.submit.owner_step_ns");
+
 /// `SubmitComputed` (A-697 part c; A-658 part 3b): the node holding a work over this green sends the work's increment and
 /// the verdict its replica computed, and the owner judges and commits it as a submit asked from a work's shard is
 /// ([`judge_submission`]), the verdict taken by position. Only as a forward from another node (its completion record
@@ -11746,6 +11764,18 @@ fn park_on_refinement(
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The refinement a local verb of `work` parks behind (A-787 part 2): the one its journal owes, when the verb runs in a
+/// recorded request. A verb dispatched outside one has no route its answer could be sent on after the job, so it is
+/// not parked: it composes unrefined, as a remote edit-and-submit does, and is answered now. Refusing it `Overloaded`
+/// (as `park_on_refinement` would) refused every whole-file rewrite such a dispatch submitted, whatever its size.
+fn parkable_refinement(
+  state: &ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+) -> Option<crate::refining::Owed> {
+  state.current_request?;
+  refinement_owed(state, (work, green))
 }
 
 /// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.

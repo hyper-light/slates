@@ -16412,6 +16412,8 @@ const LIVE_HOLDER_HOP: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.
 /// round, and the hops' nanoseconds adding up to the rounds' exactly: each is the difference of consecutive stamps on the
 /// host's one monotonic clock, so a hop measured across shards is as sound as one within a shard. And a holder's serve
 /// timed too. These are the counters a run of the contract command reads the round's hops apart by.
+/// Each hop also publishes its per-write p50, p999 and maximum (g228: a hop's sum alone is a mean, which one long write
+/// skewed by 49 us a write), ordered and within the hop's own time.
 #[test]
 fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   let _serial = serialize_fleet_tests();
@@ -16458,6 +16460,33 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.0),
     count(&daemons[0], LIVE_ROUND.1),
   );
+  // Each hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time.
+  // Read from the owner's status report, where they are published.
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
+    panic!("the owner reported its status");
+  };
+  let figure = |name: String| -> u64 {
+    report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|row| row.kind == name)
+      .map(|row| row.count)
+      .max()
+      .unwrap_or(0)
+  };
+  let percentiles: Vec<(u64, u64, u64)> = LIVE_HOPS
+    .iter()
+    .map(|(timed, _)| {
+      (
+        figure(format!("{timed}.p50_ns")),
+        figure(format!("{timed}.p999_ns")),
+        figure(format!("{timed}.max_ns")),
+      )
+    })
+    .collect();
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
@@ -16483,6 +16512,16 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert_eq!(
     summed, round.1,
     "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  );
+  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(&hops) {
+    assert!(
+      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
+      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
+    );
+  }
+  assert!(
+    percentiles.iter().any(|(p50, _, _)| *p50 > 0),
+    "the hops' medians were recorded: {percentiles:?}"
   );
   assert!(
     holders.iter().any(|served| *served > 0),
@@ -22563,9 +22602,20 @@ const BENCH_EDIT_BYTES: usize = 3800;
 
 /// The phase counters the A-697 bench reads (`merge_service::SUBMIT_JUDGE` and its siblings, `work_home::SUBMIT_COMPOSE`
 /// and its): each pair's count and its sum.
-const BENCH_PHASES: [(&str, &str, &str); 9] = [
+const BENCH_PHASES: [(&str, &str, &str); 12] = [
   ("compose", "merge.submit.compose", "merge.submit.compose_ns"),
   ("compute", "merge.submit.compute", "merge.submit.compute_ns"),
+  (
+    "build",
+    "merge.submit.forward_build",
+    "merge.submit.forward_build_ns",
+  ),
+  (
+    "owner_step",
+    "merge.submit.owner_step",
+    "merge.submit.owner_step_ns",
+  ),
+  ("beat_late", "daemon.beat.late", "daemon.beat.late_ns"),
   ("forward", "merge.submit.forward", "merge.submit.forward_ns"),
   ("judge", "merge.submit.judge", "merge.submit.judge_ns"),
   ("append", "merge.submit.append", "merge.submit.append_ns"),

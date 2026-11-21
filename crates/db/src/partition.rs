@@ -73,6 +73,8 @@ pub struct MergeBudgetHeld {
   pub work_log_bytes: usize,
   /// The largest one log's bytes.
   pub largest_work_log: usize,
+  /// The work whose log that is.
+  pub largest_work: Option<VolumeId>,
   /// Their logs' entries.
   pub work_log_entries: usize,
 }
@@ -648,6 +650,11 @@ impl Partition {
         .map(bytes)
         .fold(0, usize::saturating_add),
       largest_work_log: self.work_logs.values().map(bytes).max().unwrap_or(0),
+      largest_work: self
+        .work_logs
+        .iter()
+        .max_by_key(|(_, log)| bytes(log))
+        .map(|(work, _)| *work),
       work_log_entries: self
         .work_logs
         .values()

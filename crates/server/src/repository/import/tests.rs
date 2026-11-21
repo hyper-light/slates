@@ -58,9 +58,8 @@ fn stranger() -> Principal {
 
 /// Creates repository `name` of `tool` on the shard: its id.
 fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -132,7 +131,7 @@ fn count(state: &ShardState, name: &str) -> u64 {
 /// times, and the host's refusal naming the directory; none deferred, and the directory opened by none but the last.
 #[test]
 fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     created(state, "hg", VcsTool::Mercurial);
     created(state, "git", VcsTool::Git);
     let own = owner();
@@ -192,7 +191,7 @@ fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
 /// directory being opened again, and request 2 refused `UnderWay`, not deferred.
 #[test]
 fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let own = owner();
     routed(state, 1, NO_CLIENT);
@@ -231,7 +230,7 @@ fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
 /// held request let go, and the store holding the imported history.
 #[test]
 fn t_a678_the_held_request_is_answered_when_the_import_ends() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     routed(state, 1, NO_CLIENT);
@@ -513,7 +512,7 @@ fn check_served(served: &Served, imported: &Imported) {
 /// record replayed and counted.
 #[test]
 fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     routed(state, 1, NO_CLIENT);
