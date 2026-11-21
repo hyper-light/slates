@@ -8,17 +8,28 @@
 > its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
 > proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
 > Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
-> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). Still open, owner w-provision-gate: a recovery over a
-> base of ~192k directories reopens them in one step and overruns the 1 s liveness window, so adacachy's restarted
-> daemon is killed every ~1 s and the anchor counts each restart as recovered. Witnessed descriptors are still bounded
-> only by the large-class copies a volume holds.
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
+> daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
+> Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
+> its source path without following links, held to the record by `same_object`, else `BaseUnavailable` with its
+> untouched entries), and an unreacquired one's record goes into the next image unchanged, with no `fstat`. Red on main:
+> 201 host handles after recovering 200 listed directories; green: 1
+> (`a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use`).
+> **Still open (main):** (1) a directory listed in this daemon's life keeps its listing and its open directory until the
+> directory leaves the volume: bounded by the directories used, not by a derived budget; the listings need an idle
+> close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
+> recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
+> (4) `image()` still `fstat`s every reacquired directory at each publication.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
 > `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
 > agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
-> The same test on origin/main alone: kiln r29.
+> **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
+> round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
+> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
 > **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
 > fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
 > passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
@@ -92,12 +103,12 @@
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
 >   exists (R10), and A-224's short slice was rejected. Owed: the Linux bound's question to main.
-> - **Windows** (w-k90-win, A-828): a timed wait ends at its deadline now -- the IOCP driver's wait went through
->   `GetQueuedCompletionStatusEx`'s whole milliseconds (a 200 µs wait's shortest 1.5-2.5 ms); a high-resolution waitable
->   timer's wait completion packet now wakes the port (red then green on jupiter, windows-latest, windows-11-arm). It
->   leaves the loaded p999 where it was (24-34 ms on windows-latest, accept and conflict; 15-34 ms conflict on
->   windows-11-arm, whose accept p999 32 ms -> 0.75-0.89 ms): the 31.6 ms quantum a woken thread waits behind spinners
->   (A-361), not the wait's timer. In flight: per-wake stamps for its mechanism.
+> - **Windows: met** (w-k90-win, A-828 and A-834). A-828: a timed wait ends at its deadline (the IOCP wait went through
+>   `GetQueuedCompletionStatusEx`'s whole milliseconds; a high-resolution waitable timer's wait completion packet now
+>   wakes the port). A-834: a shard stays one level above normal while it runs, where A-361 put it back before it ran
+>   and a runnable shard lost a 31.6 ms quantum to normal-priority load (stamps: 12-22 requests a round queued over
+>   10 ms, 16-22 over 10 ms mid-service). Loaded p999 18-85 ms -> 304-699 µs, p99 174-319 µs, quiet unchanged, on
+>   windows-latest and windows-11-arm, 3 interleaved rounds each (diag run 44948887874; BENCHMARKS).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -440,8 +451,8 @@
 > (A-824, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
-> retry lands once (`t_c5b_p3_a_kill_…`). Owed (w-git): `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
-> `after_submit`'s owed commit, `push_through`); the change step over the preview in one turn; the replay reading the pack a piece at
+> retry lands once (`t_c5b_p3_a_kill_…`). Part 2 BUILT (A-824): every made commit lands, version 2 is written by no path and
+> refused `Retired` at replay with version 1. Owed (w-git): the change step over the preview in one turn; the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
@@ -608,7 +619,7 @@
 >
 > **A-642 (Ada, 2026-11-19): changesets in write-ahead logs, lock-free incremental commits, no global references.** BUILT on the owner (A-635): each green's own log in place of A-603's repository-wide position; an atomic push one entry on each green it moves, appended only at the positions it read; the repository's state in logs of its own. The fleet half's protocol BUILT (A-636 part 1): each log replicated on its own, every record whole at the holders' joins, replicas refusing split cuts. Its live plane's first piece BUILT (A-636 part 2a): the state logs a register class of the repository, placed and taken over as it is; each log's promise on the wire; takeovers a log at a time, adopting every log or none. The partition's records shipped a log at a time BUILT (A-636 part 2b): each state log's record of each operation, carrying the operation's identity and spans, held by its holders as a prefix of the log; every server dispatch by the register's class. OWED: a repository's greens placed on its holders at their joins (A-636 part 2b-2), then the server's takeover by the rule, every log of a repository following one successor (2c).
 >
-> **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`; the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
+> **A-662 (2026-11-19, g258; shared piece 3 on the owner shard): each repository's store, made, charged, durable and recovered.** BUILT: `crates/server/src/vcs_store.rs`, one map on `ShardState` (`vcs_stores`): one `slates_vcs::ContentStore` a shard (window the content plane's chunk) and one entry a repository, git's A-614 store with its `Derivations` (A-647's reach sets kept as each version commits), Mercurial's A-588 `HgIndex` with its `Derivations`, Subversion's A-553 index; made by `CreateRepository` on the owner shard; charged to the shard's budget as retention (lent the room the shard can admit for a step, trued up to what the store holds after it); a git push's record (`vcs_store::record`: its deepest chain, carried by each of its records, its moves, and the objects the repository lacks when the append commits, by content identity, in admission order, with their bytes read back from the content store then) held by its entry (`RepositoryEntry::objects`, kept by the partition's register for the repository's life, carried by its snapshot, charged to the merge budget); the store's commit between the register's guard and the entry's apply inside A-635's append; recovery (`rebuild_recovered`) and a refused record (`vcs_store::rebuild`) replaying every record through the live path's own steps, the objects the admission would record compared with the logged ones; the store's versions of each green charged to its budget. OWED: a snapshot carrying each store's sealed tables by identity, so a recovery replays only the log's suffix; the replay sliced within a record, and the owner's seal and compaction of each store's index (its tail grows until then); a version's pack fragments encoded again after a recovery, off the answer's path (with A-654); Mercurial's records and replay (g304), refused `Owed` until then (Subversion's built, A-655 part 2b: the creation's and each revision's record, replayed through the commit step); the Subversion index charged by its bytes once slates-svn measures them (its entries bounded meanwhile, A-655 part 2b); a record naming a blob a work's post-state holds by reference rather than holding its bytes twice; a destroy verb for a repository calling `vcs_store::free`, and letting go of its git records' own holds of their names and packs (`vcs_store::release_record_holds`, test-only until then: a free leaves them, since a rebuild replays the same records); the fleet half (A-636: holders replaying the same records in the owner's order, since the store's positions are repository-wide).
 >
 > **A-722 memory B1 (2026-11-20, w-git).** BUILT: an object read in place from a held pack (`store::packed`, one
 > `PackSource` seam for RAM and w-store's disk). B2's in-flight half BUILT (2026-11-20): a push holds the client's pack
@@ -684,10 +695,11 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
-> - A-818 (A-803 (c)) pieces 1 and 2a: a persistent piece tree a version (`crate::piece_tree`) and the index of where
->   each byte identity's bytes are now (`crate::byte_places`), both pure; the engine switch (2b) and the A/B (2c) are
->   left. Measured gap to watch: an old read through the index is O(fragments × depth), where today's re-anchor
->   compacts a fragmented value at write time.
+> - A-818 (A-803 (c)) pieces 1 and 2a landed (`crate::piece_tree`, `crate::byte_places`). Piece 2b, the engine switch
+>   with the re-anchor deleted, is on the branch `agents/w-rewrite-ops-a818-2b` (c4278fd3c) and NOT landed: its A/B
+>   (BENCHMARKS, 2026-11-21) wins writes (35.2 ms against 9.0 µs a change at 10k, alternating) but loses old reads 2 to
+>   9 times and memory a version 7 to 8 times on overwrite streams (path copying's O(log n) nodes against A-809's one
+>   layer). Paused by goal 93's focus; reopening needs O(1) space a change, not only a bounded compaction.
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
 >   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-824).
@@ -3069,6 +3081,20 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **Three more readers of whole file texts gone: made changesets, the presence check, the served view's `file` (A-767
+> C1, 2026-11-21, w-hg; main's order of 10:34). BUILT.**
+> - `push/made.rs`: whether a version's file keeps its parent's node (7.2's `filelog.cmp`) is told by the two texts'
+>   names, the metadata block's and the bytes' identities (`verify::FileNames`, `Held::file_names`), the parent's
+>   read from its index row unread (`IndexHeld::file_names`); no file text read.
+> - `push/verify.rs`: a new manifest's files are present by their rows (`file_names`), no text read. The whole
+>   `verify` has no production caller (the sliced intake replaced it); it stays as the intake's test oracle, its
+>   delta bases read from the content store there alone.
+> - `serve`: `getbundle::Store::file` is gone, and with it `Indexed::file`. `file_entry` (the row, no text) is the
+>   served view's one file read; a fetch's bytes come from the changeset store (C1 step 1).
+> - Held by the made tests (a version that changes nothing makes none; a same-text file keeps its node), the serve
+>   suites, and `texts_longer_than_a_window_are_copied_within_the_room` (file rows read with no text lent).
+> - Left before step 2: `push/tree.rs` (A-618's builder reads file bytes synchronously; main's ruling asked,
+>   inbox/main-from-w-hg-tree-through-store.md).
 > **The push intake's file delta bases through the store (A-767 C1, 2026-11-21, w-hg; main's ruling (b2) over (b1)).
 > BUILT.**
 > - A file delta whose base is not the text kept last no longer reads the fork's whole text from the content store

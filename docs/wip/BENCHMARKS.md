@@ -17920,3 +17920,118 @@ The memory report's kinds pass 67 ms after arming in the same run.
   unchanged). **84a not met on Windows:** the loaded p999 stays at 24-34 ms on windows-latest and in windows-11-arm's
   conflicts (its accept p999 lost its 32 ms rounds: 3 of 3 under 0.9 ms against 1 of 3). That is the scheduler's 31.6 ms
   quantum a woken thread waits behind the load's spinners (A-361), which no wait's timer moves; per-wake stamps next.
+
+## A Windows shard kept one level above normal while it runs: 84a's loaded tails under 1 ms (A-834; w-k90-win; 2026-11-21)
+
+- **Question.** With A-828 the timed wait keeps its deadline, yet the loaded p999 stayed at 18-34 ms. g222's stamps over
+  it (diag run 44945557697) put the tail on the shard: 12-22 requests a round of ~42,500 waited over 10 ms in the ring
+  and 16-22 over 10 ms mid-service, 30-100 ms each, multiples of the 31.6 ms quantum. A-361 raised a shard one level
+  for its blocking wait and put it back before it ran, so a runnable shard shared the CPUs round-robin with the load's
+  normal-priority spinners. Does keeping the raise (no privilege: a thread's own level within its class) end it?
+- **A/B first** (diag run 44947142869, same binary, `W90_SHARD_RAISED`): kept raised, loaded p999 238-1,011 µs against
+  0.8-33 ms, 0-4 requests a round over 10 ms against 6-20.
+- **Test, red then green** (`driver::tests::a_windows_shard_stays_one_level_up_after_a_blocking_wait`): red at the test
+  alone on windows-latest and windows-11-arm (level 0 after the wait), green with the change on both.
+- **Command** (diag run 44948887874): `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept
+  --form conflict`, then `--quiet-only`, release, BASE (main 8fb2e33db) and FIX (0689bed17) interleaved, 3 rounds. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 128 / 309 / 32,643 | 143 / 237 / 31,854 |
+| fix r1 | 123 / 174 / 579 | 141 / 215 / 305 |
+| fix r2 | 121 / 178 / 699 | 139 / 206 / 317 |
+| base r2 | 123 / 304 / 48,453 | 140 / 242 / 31,888 |
+| base r3 | 124 / 321 / 31,962 | 142 / 252 / 84,866 |
+| fix r3 | 121 / 182 / 642 | 140 / 230 / 410 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 156 / 260 / 28,233 | 155 / 271 / 19,827 |
+| fix r1 | 152 / 319 / 665 | 152 / 225 / 335 |
+| fix r2 | 151 / 248 / 665 | 153 / 223 / 304 |
+| base r2 | 150 / 250 / 31,836 | 154 / 238 / 21,929 |
+| base r3 | 150 / 269 / 4,204 | 151 / 261 / 27,304 |
+| fix r3 | 153 / 236 / 640 | 154 / 217 / 327 |
+
+  Quiet, both runners: fix p99 174-273 µs, p999 275-670 µs; base p99 171-546 µs, p999 285-1,952 µs.
+- **Verdict: landed.** 84a's bar on Windows -- a full edit and merge's loaded p99 and p999 under 1 ms -- is met on
+  windows-latest and windows-11-arm in every round; p50 unchanged. A shard's time at the raised level is bounded by its
+  work and its idle window, after which it parks.
+
+## A path's history as persistent trees of byte identities: writes win, old reads and overwrite memory lose; NOT landed (A-818 piece 2b; 2026-11-21)
+
+- **Question** (main's conditions, 09:40 and 10:35): does the engine switch, with the re-anchor deleted, win writes
+  while reads and memory don't lose, at m = 10/100/1k/10k?
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench` (the branch's file, using only APIs
+  both sides have). Main is 6a6e35215, exported with `git archive` with the branch's bench file. The branch is
+  `agents/w-rewrite-ops-a818-2b` c4278fd3c.
+- **Machine:** the Mac Studio w-rewrite-ops runs on (32 cores), release, unpinned. Load 4.8 at the start, 1.9 at the
+  end. Main 12:11:16 to 12:42:31, then the branch 12:42:31 to 12:42:35. One interleaved pair: the second pass and option
+  (i)'s rows (`leaf_chunks_bench`) were stopped by goal 93's focus (Ada, ~10:40: start no new non-93 runs). Five rounds
+  a point, all shown.
+- **Verdict: NOT LANDED.**
+  - Writes win where history matters: the alternating stream 35.2 ms against 9.0 µs a change at 10k. Overwrites win at
+    10k (15.2 against 4.2 µs) and lose about 30% at m ≤ 100.
+  - Old reads lose: version 1 after alternating changes is 2 to 9 times slower, after overwrites 1.6 to 2.6 times at
+    m ≤ 1k.
+  - Memory a version loses 7 to 8 times on overwrite streams: 1,017 to 1,297 bytes against 152. Path copying makes
+    O(log n) nodes of 48 bytes a change, where A-809's layer costs one entry. It wins on alternating streams (1,001 to
+    1,806 against 4,135 to 7,050). Many paths changed once are equal (152).
+  - A bounded compaction (main's named fix) would answer the reads, not the overwrite memory. That needs O(1) space a
+    change (DSST's node copying, or keeping A-809's layer for overwrites), a design question for main once goal 93
+    frees the piece.
+
+Main (6a6e35215):
+```
+a	read_version_1_after_overwrites	m	10	ns	1417	958	750	750	875
+a	read_version_1_after_alternating	m	10	ns	625	542	416	417	375
+a	read_version_1_after_overwrites	m	100	ns	1167	916	833	875	792
+a	read_version_1_after_alternating	m	100	ns	1833	1459	1875	1666	1334
+a	read_version_1_after_overwrites	m	1000	ns	1875	1416	1375	2333	2292
+a	read_version_1_after_alternating	m	1000	ns	8625	4417	4625	4584	4084
+a	read_version_1_after_overwrites	m	10000	ns	8917	8250	8500	7875	8208
+a	read_version_1_after_alternating	m	10000	ns	10375	13792	9542	9167	9167
+b	overwrites	history	10	ns_per_change	2952	2641	2500	2478	2456	history_bytes_per_version	152
+b	overwrites	history	100	ns_per_change	2758	2679	2643	2601	2568	history_bytes_per_version	152
+b	overwrites	history	1000	ns_per_change	4046	4142	4201	4038	4026	history_bytes_per_version	152
+b	overwrites	history	10000	ns_per_change	15283	15561	15182	15226	15243	history_bytes_per_version	152
+b	overwrite_insert_alternating	history	10	ns_per_change	236078	235758	237053	237892	234006	history_bytes_per_version	4135
+b	overwrite_insert_alternating	history	100	ns_per_change	527643	528285	530296	528977	540692	history_bytes_per_version	4904
+b	overwrite_insert_alternating	history	1000	ns_per_change	3632369	3632943	3603093	3630616	3602781	history_bytes_per_version	6546
+b	overwrite_insert_alternating	history	10000	ns_per_change	38168979	36181078	34991192	34923873	35158129	history_bytes_per_version	7050
+b	sdk_replace	history	10	ns_per_change	3147	2714	2576	2706	2542	history_bytes_per_version	152
+b	sdk_replace	history	100	ns_per_change	2882	2833	2747	2735	2726	history_bytes_per_version	152
+b	sdk_replace	history	1000	ns_per_change	4258	4052	4148	3981	3780	history_bytes_per_version	152
+b	sdk_replace	history	10000	ns_per_change	15371	15055	15355	15343	15113	history_bytes_per_version	152
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```
+Branch (c4278fd3c):
+```
+a	read_version_1_after_overwrites	m	10	ns	9708	3166	2125	2000	1792
+a	read_version_1_after_alternating	m	10	ns	3500	2875	2583	2417	2291
+a	read_version_1_after_overwrites	m	100	ns	2875	2625	2083	2875	3625
+a	read_version_1_after_alternating	m	100	ns	16125	18458	14459	16417	8833
+a	read_version_1_after_overwrites	m	1000	ns	3709	2959	2833	2750	2250
+a	read_version_1_after_alternating	m	1000	ns	14875	11583	10041	8791	8542
+a	read_version_1_after_overwrites	m	10000	ns	7958	6959	6583	6583	6625
+a	read_version_1_after_alternating	m	10000	ns	18750	17500	19459	17709	18917
+b	overwrites	history	10	ns_per_change	3808	3400	3277	3181	3171	history_bytes_per_version	1017
+b	overwrites	history	100	ns_per_change	3631	3583	3496	3483	3378	history_bytes_per_version	1098
+b	overwrites	history	1000	ns_per_change	4040	3933	3929	3956	3876	history_bytes_per_version	1249
+b	overwrites	history	10000	ns_per_change	4461	4289	4374	4173	4239	history_bytes_per_version	1297
+b	overwrite_insert_alternating	history	10	ns_per_change	3678	3366	3167	3117	3127	history_bytes_per_version	1001
+b	overwrite_insert_alternating	history	100	ns_per_change	3686	3597	3567	3535	3499	history_bytes_per_version	1121
+b	overwrite_insert_alternating	history	1000	ns_per_change	5801	5246	5175	5143	5248	history_bytes_per_version	1459
+b	overwrite_insert_alternating	history	10000	ns_per_change	9083	8964	9002	10151	8875	history_bytes_per_version	1806
+b	sdk_replace	history	10	ns_per_change	3991	3624	3459	3247	3234	history_bytes_per_version	1017
+b	sdk_replace	history	100	ns_per_change	3747	3681	3581	3564	3486	history_bytes_per_version	1098
+b	sdk_replace	history	1000	ns_per_change	4285	4039	3999	4007	3935	history_bytes_per_version	1249
+b	sdk_replace	history	10000	ns_per_change	4463	4611	4333	4292	4309	history_bytes_per_version	1297
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```

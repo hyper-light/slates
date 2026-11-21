@@ -17,12 +17,18 @@
 //! runtime's own parked shard did, waiting out the spinners' turns of 31.6 ms; a waiter on an event or on
 //! WaitOnAddress ran one level up and took 15 µs and 6–7 µs; an event waiter with its boost disabled waited the 29 and
 //! 14 ms again; and a completion-port waiter raised one level for its wait alone took 15–17 µs and 6–7 µs. So a wait
-//! that may block raises a thread at the normal level to the next for as long as it blocks, and puts it back before it
-//! runs anything ([`RaisedForWait`]): the shard is woken as Windows wakes an event's waiter and runs, as before, at its
-//! own level. A thread at another level (a test that starves a shard at IDLE) is left as it is, and a zero-timeout
-//! harvest, which never blocks, pays nothing. A raise and its restore cost 0.77–0.88 µs a pair quiet and 1.3–5.5 µs
-//! loaded, against a parked wake of 6–15 µs. No privilege is asked: a thread may set its own level within its process's
-//! class (R10).
+//! that may block raises a thread at the normal level to the next ([`raise_shard`]): the shard is woken as Windows wakes
+//! an event's waiter.
+//!
+//! **And the shard stays there while it runs (84a, A-834).** Put back to normal before it ran, as A-361 first did, a
+//! runnable shard still shared the CPUs round-robin with normal-priority load and lost a whole quantum whenever the load
+//! took its turn: under 8 spinners on 4 vCPUs, 12-22 requests a round of ~42,500 waited over 10 ms in the ring and 16-22
+//! over 10 ms mid-service (30-100 ms; g222's stamps, diag run 44945557697), the loaded p999 of a full edit and merge
+//! 18-33 ms on windows-latest and windows-11-arm. Kept one level up, the same load left 0-4 a round over 10 ms and the
+//! p999 at 238-1,011 µs, p99 115-266 µs, p50 unchanged (diag run 44947142869, interleaved, 3 rounds a runner). A
+//! shard's own time at that level is bounded by its work and its idle window, after which it parks. A thread at another
+//! level (a test that starves a shard at IDLE) is left as it is, and a zero-timeout harvest, which never blocks, pays
+//! nothing. No privilege is asked: a thread may set its own level within its process's class (R10).
 
 use std::ffi::c_void;
 use std::time::Instant;
@@ -191,8 +197,7 @@ impl IocpDriver {
     const NANOS_PER_MILLI: u64 = 1_000_000;
     /// Format: INFINITE.
     const INFINITE: u32 = u32::MAX;
-    let whole_ms =
-      |ns: u64| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1);
+    let whole_ms = |ns: u64| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1);
     let timeout_ms = match remaining_ns {
       None => INFINITE,
       Some(0) => 0,
@@ -301,9 +306,15 @@ impl Deadline {
       }
       let find = |name: &core::ffi::CStr| GetProcAddress(module, name.as_ptr().cast());
       (
-        std::mem::transmute::<FARPROC, Option<CreatePacket>>(find(c"NtCreateWaitCompletionPacket"))?,
-        std::mem::transmute::<FARPROC, Option<AssociatePacket>>(find(c"NtAssociateWaitCompletionPacket"))?,
-        std::mem::transmute::<FARPROC, Option<CancelPacket>>(find(c"NtCancelWaitCompletionPacket"))?,
+        std::mem::transmute::<FARPROC, Option<CreatePacket>>(find(
+          c"NtCreateWaitCompletionPacket",
+        ))?,
+        std::mem::transmute::<FARPROC, Option<AssociatePacket>>(find(
+          c"NtAssociateWaitCompletionPacket",
+        ))?,
+        std::mem::transmute::<FARPROC, Option<CancelPacket>>(find(
+          c"NtCancelWaitCompletionPacket",
+        ))?,
       )
     };
     // SAFETY: an unnamed timer with default security; the result is checked.
@@ -396,25 +407,12 @@ fn move_level(from: i32, to: i32) -> bool {
   }
 }
 
-/// The calling thread raised one level above normal for a wait that may block, and put back as this drops (A-361, the
-/// module doc). Holds nothing when the wait cannot block or the thread was not at the normal level.
-struct RaisedForWait(bool);
-
-impl RaisedForWait {
-  /// Raises the calling thread for a wait of `timeout_ns` (`None`: without bound) when that wait may block.
-  fn raise(timeout_ns: Option<u64>) -> RaisedForWait {
-    RaisedForWait(
-      timeout_ns != Some(0) && move_level(THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL),
-    )
-  }
-}
-
-impl Drop for RaisedForWait {
-  fn drop(&mut self) {
-    if self.0 {
-      // A level something else set during the wait is left as it is.
-      let _ = move_level(THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL);
-    }
+/// Raises the calling thread (a shard's) one level above normal before a wait of `timeout_ns` (`None`: without bound)
+/// that may block, and leaves it there (A-361 and A-834, the module doc). Nothing for a wait that cannot block, or a
+/// thread not at the normal level (already raised, or set elsewhere).
+fn raise_shard(timeout_ns: Option<u64>) {
+  if timeout_ns != Some(0) {
+    let _ = move_level(THREAD_PRIORITY_NORMAL, THREAD_PRIORITY_ABOVE_NORMAL);
   }
 }
 
@@ -461,9 +459,8 @@ impl Driver for IocpDriver {
     // waits out the rest, so a park never returns early, as the seam promises. Each further wait asks for at least a
     // millisecond, so the rest shrinks every time; a kick or a completion still ends the wait at once.
     let deadline = timeout_ns.map(|ns| self.now_ns().saturating_add(ns));
-    // One level up while the wait may block, back to normal before anything runs (A-361, the module doc); every return
-    // below drops it.
-    let raised = RaisedForWait::raise(timeout_ns);
+    // One level up before a wait that may block, and kept there (A-361, A-834, the module doc).
+    raise_shard(timeout_ns);
     let count = loop {
       let remaining = deadline.map(|due| due.saturating_sub(self.now_ns()));
       match self.dequeue(remaining)? {
@@ -474,7 +471,6 @@ impl Driver for IocpDriver {
         _ => {}
       }
     };
-    drop(raised);
     for entry in self.entries.iter().take(count) {
       match entry.lpCompletionKey {
         KICK_KEY | DEADLINE_KEY => {}
@@ -612,10 +608,20 @@ mod tests {
     };
     let took = started.elapsed();
     let taken = usize::try_from(count).unwrap();
-    let keys: Vec<usize> = entries.iter().take(taken).map(|e| e.lpCompletionKey).collect();
+    let keys: Vec<usize> = entries
+      .iter()
+      .take(taken)
+      .map(|e| e.lpCompletionKey)
+      .collect();
     eprintln!("dequeued ok={ok} count={count} keys={keys:?} took={took:?}");
     assert!(matches!(armed, Arm::Running), "the deadline didn't arm");
-    assert!(keys.contains(&DEADLINE_KEY), "no deadline packet came: {keys:?}");
-    assert!(took.as_nanos() < 1_000_000, "the deadline's packet took {took:?}");
+    assert!(
+      keys.contains(&DEADLINE_KEY),
+      "no deadline packet came: {keys:?}"
+    );
+    assert!(
+      took.as_nanos() < 1_000_000,
+      "the deadline's packet took {took:?}"
+    );
   }
 }

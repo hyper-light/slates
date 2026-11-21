@@ -219,20 +219,19 @@ impl Store for Served {
   ) -> Result<Option<Logged<'_>>, PastAdmission> {
     Ok(self.manifests.get(node).map(Kept::logged))
   }
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    _room: &mut Admission,
-  ) -> Result<Option<Logged<'_>>, PastAdmission> {
-    Ok(
-      self
-        .files
-        .get(path)
-        .and_then(|log| log.get(node))
-        .filter(|_| !self.files_lost)
-        .map(Kept::logged),
-    )
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::FileEntry> {
+    let logged = self
+      .files
+      .get(path)
+      .and_then(|log| log.get(node))
+      .filter(|_| !self.files_lost)
+      .map(Kept::logged)?;
+    Some(super::FileEntry {
+      position: logged.position,
+      parents: logged.parents,
+      link: logged.link,
+      flags: logged.flags,
+    })
   }
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     self.markers.iter().flat_map(|payload| {

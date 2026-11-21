@@ -132,12 +132,11 @@ pub fn made(
     }
     let text = file_text(bytes, admission)?;
     // The same text as the parent's revision keeps the parent's node, as 7.2's `filelog.cmp` passes it over: only a
-    // changed flag is then the change.
-    let kept = previous.filter(|(node, _)| {
-      held
-        .file_text(change.path, node)
-        .is_some_and(|held| *held == *text)
-    });
+    // changed flag is then the change. Told by the texts' names, the parent's read from its row (A-767 C1: no whole
+    // text read).
+    let names = super::verify::FileNames::of(&text);
+    let kept =
+      previous.filter(|(node, _)| names.is_some() && held.file_names(change.path, node) == names);
     let file = match kept {
       Some((node, held_flag)) => {
         if held_flag == flag {

@@ -558,34 +558,39 @@ fn every_revision(
   id: RepositoryId,
 ) -> Vec<(Vec<u8>, slates_hg::Node, Vec<u8>)> {
   use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
-  lend_in(state, id, &mut Admission::new(ROOM), |view, room| {
-    let mut revisions = Vec::new();
-    for rev in 0..view.count() {
-      let node = view.node(rev).unwrap();
-      let text = view
-        .changeset_text(rev, room)
-        .unwrap()
-        .unwrap()
-        .into_owned();
-      revisions.push((CHANGELOG_PATH.to_vec(), node, text));
-    }
-    let mut position = 0;
-    while let Some(linked) = view.manifest_linked(position) {
-      let logged = view.manifest(&linked.node, room).unwrap().unwrap();
-      revisions.push((
-        MANIFEST_PATH.to_vec(),
-        linked.node,
-        logged.text.into_owned(),
-      ));
-      position += 1;
-    }
-    let mut at = (Vec::new(), 0);
-    while let Some((path, position, linked)) = view.file_linked_from((&at.0, at.1)) {
-      let logged = view.file(&path, &linked.node, room).unwrap().unwrap();
-      revisions.push((path.clone(), linked.node, logged.text.into_owned()));
-      at = (path, position + 1);
-    }
-    revisions
+  use slates_hg::push::verify::Held;
+  let mut room = Admission::new(ROOM);
+  crate::vcs_store::lent_state(state, |state| {
+    super::with_view(state, id, &mut room, |view, held, room| {
+      let mut revisions = Vec::new();
+      for rev in 0..view.count() {
+        let node = view.node(rev).unwrap();
+        let text = view
+          .changeset_text(rev, room)
+          .unwrap()
+          .unwrap()
+          .into_owned();
+        revisions.push((CHANGELOG_PATH.to_vec(), node, text));
+      }
+      let mut position = 0;
+      while let Some(linked) = view.manifest_linked(position) {
+        let logged = view.manifest(&linked.node, room).unwrap().unwrap();
+        revisions.push((
+          MANIFEST_PATH.to_vec(),
+          linked.node,
+          logged.text.into_owned(),
+        ));
+        position += 1;
+      }
+      let mut at = (Vec::new(), 0);
+      while let Some((path, position, linked)) = view.file_linked_from((&at.0, at.1)) {
+        // The served view reads no file's text (A-767 C1); the index's own, through its content store, is the oracle.
+        let text = held.file_text(&path, &linked.node).unwrap().into_owned();
+        revisions.push((path.clone(), linked.node, text));
+        at = (path, position + 1);
+      }
+      revisions
+    })
   })
   .expect("the view lent")
 }
