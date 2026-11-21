@@ -141,6 +141,11 @@ pub struct MergeShardState {
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
+  /// The greens whose checkpoint is being taken in turns ([`checkpoint_green`], A-579): one task each, which folds the
+  /// identity's backlog a paced step at a time and takes the checkpoint at its end.
+  pub(crate) checkpointing: BTreeSet<DbVolumeId>,
+  /// What an identity key's fold costs on this shard, learned across checkpoints (`slates_pace::Costs`, A-579).
+  pub(crate) identity_costs: slates_pace::Costs<1>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -221,8 +226,86 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
-  checkpoint_green_when(state, green, Doubling::Wait);
+  if state.merge.checkpointing.contains(&green) {
+    return;
+  }
+  if fold_inputs(state, green).is_none_or(FoldInputs::waits) {
+    return;
+  }
+  // The identity's backlog first, in a paced step (A-579): a checkpoint reads the head's identity, and a green whose
+  // identity was last read thousands of versions ago hashed every file changed since in this one step (73.7 ms of a
+  // 100 ms checkpoint at 1,000 clients on the Mac Studio, 2026-11-20; every request the owner serves waited behind it).
+  // When the step's quantum ends with someone waiting, the rest is folded in turns by a task of its own.
+  if identity_folded_in_a_step(state, green) {
+    checkpoint_green_when(state, green, Doubling::Wait);
+    return;
+  }
+  match slates_rt::futures::spawn(checkpoint_in_turns(green)) {
+    Ok(task) => {
+      state.merge.checkpointing.insert(green);
+      state.count(CHECKPOINT_IN_TURNS, 1);
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No room for the task: taken here as before, whole.
+    Err(_) => checkpoint_green_when(state, green, Doubling::Wait),
+  }
 }
+
+/// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
+/// folded. A green gone is folded (its checkpoint then finds nothing to take).
+fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId) -> bool {
+  let env = crate::git_push::shard_pace_env(state);
+  let mut costs = state.merge.identity_costs;
+  let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
+    let mut step = slates_pace::Step::begin(env, (env.clock)());
+    let mut done = engine.identity_backlog() == 0;
+    while !done && step.more(IDENTITY_KEY, &mut costs) {
+      done = engine.fold_identity_step(1);
+    }
+    step.close((env.clock)(), &mut costs);
+    done
+  });
+  state.merge.identity_costs = costs;
+  state.count(CHECKPOINT_IDENTITY_STEPS, 1);
+  folded
+}
+
+/// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
+const IDENTITY_KEY: usize = 0;
+
+/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
+/// then the checkpoint itself, its doubling rule judged again then. Ends when the green or the shard state is gone.
+async fn checkpoint_in_turns(green: DbVolumeId) {
+  let began = slates_rt::futures::now_ns();
+  loop {
+    let folded = crate::state::with_state(|state| {
+      if identity_folded_in_a_step(state, green) {
+        state.merge.checkpointing.remove(&green);
+        checkpoint_green_when(state, green, Doubling::Wait);
+        let span = slates_rt::futures::now_ns().saturating_sub(began);
+        let longest = state
+          .refusals
+          .entry(CHECKPOINT_IN_TURNS_LONGEST_NS)
+          .or_insert(0);
+        *longest = (*longest).max(span);
+        return true;
+      }
+      false
+    });
+    if folded.unwrap_or(true) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: checkpoints whose identity backlog outlasted one paced step and were finished by a task in turns (A-579),
+/// the non-vacuity count of [`checkpoint_in_turns`].
+pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
+/// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
+pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+/// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
+pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 
 /// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
 #[derive(Clone, Copy, PartialEq, Eq)]

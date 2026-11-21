@@ -2535,4 +2535,116 @@ mod tests {
       );
     });
   }
+
+  /// Writes one version of `green` that sets `files` distinct paths (`/d0`, `/d1`, ...) through one work, destroyed
+  /// after: a version that changes as many identity keys as files.
+  fn write_files(state: &mut ShardState, green: VolumeId, files: usize, serial: u32) -> u64 {
+    let ReplyBody::WorkCreated { id: work, .. } = ask(
+      state,
+      &owner(),
+      RequestBody::CreateWork {
+        green,
+        name: format!("work-{serial}"),
+      },
+    ) else {
+      panic!("no work over {green:?}")
+    };
+    for file in 0..files {
+      let edited = ask(
+        state,
+        &owner(),
+        RequestBody::Edit {
+          work,
+          path: format!("/d{file}"),
+          at: 0,
+          delete_len: 0,
+          bytes: format!("file {file} at {serial}").into_bytes(),
+        },
+      );
+      assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+    }
+    let submitted = ask(
+      state,
+      &owner(),
+      crate::identities::authored(work, "many files"),
+    );
+    crate::vcs_store::paths::whole_build::settle(state);
+    let ReplyBody::Submitted {
+      version: Some(version),
+      ..
+    } = submitted
+    else {
+      panic!("not accepted: {submitted:?}")
+    };
+    let destroyed = ask(state, &owner(), RequestBody::Destroy { volume: work });
+    assert!(matches!(destroyed, ReplyBody::Destroyed), "{destroyed:?}");
+    version
+  }
+
+  /// A-579 (goal 89b: the server's own p99 under load; a green's first checkpoint at 1,000 clients folded its identity's
+  /// backlog in one 73.7 ms step on its owner, and every request the owner served waited behind it). Do: with another
+  /// task ready on the shard throughout (someone waiting), write a green a version that changes 400 files through a
+  /// work and destroy the work, which moves the green's floor and so asks its checkpoint (`verbs::owner_floor`, the
+  /// path the 1,000-client run took). Expect: the destroy returns with the checkpoint's identity fold paced, not taken
+  /// whole (the green marked as checkpointing, keys left to fold, no checkpoint yet); the shard then finishes it in turns
+  /// (`merge.checkpoint.in_turns` 1, more than one identity step) and takes the checkpoint, the identity then equal to
+  /// its recount. Before, the destroy folded every key and recorded the checkpoint in its own step.
+  #[test]
+  fn a_checkpoint_with_someone_waiting_folds_the_identity_in_turns() {
+    /// Shape: the files the version changes: many keys against a step quantum of a few microseconds.
+    const FILES: usize = 400;
+    /// Shape: the looks the test waits for the turns to end, each after a shard's step has run.
+    const LOOKS: usize = 10_000;
+    let daemon = crate::daemon::audit_daemon();
+    let green = crate::daemon::observe_first(&daemon, |state| {
+      // Someone waits: a task ready on this shard, polled only once this closure has returned.
+      let waiting = slates_rt::futures::spawn(async {}).unwrap();
+      let _ = slates_rt::futures::detach(waiting);
+      let root = green_of(create(state, "tree", "main"));
+      let id = to_db_volume(root);
+      let floor_before = state.db.partition().green_floor(id);
+      write_files(state, root, FILES, 1);
+      let backlog = state
+        .greens
+        .get(&id)
+        .map_or(0, |engine| engine.identity_backlog());
+      assert!(
+        state.merge.checkpointing.contains(&id),
+        "the checkpoint was taken whole with someone waiting"
+      );
+      assert!(backlog > 0, "no key left to fold in turns");
+      assert_eq!(
+        state.db.partition().green_floor(id),
+        floor_before,
+        "taken in the destroy"
+      );
+      id
+    });
+    let mut looks = 0;
+    while crate::daemon::observe_first(&daemon, move |state| {
+      state.merge.checkpointing.contains(&green)
+    }) {
+      looks += 1;
+      assert!(looks < LOOKS, "the checkpoint's turns never ended");
+    }
+    let (in_turns, steps, taken, identity) = crate::daemon::observe_first(&daemon, move |state| {
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let identity = state
+        .greens
+        .get_mut(&green)
+        .map(|mut engine| (engine.head_identity(), engine.head_identity_from_scratch()));
+      (
+        count(crate::merge_service::CHECKPOINT_IN_TURNS),
+        count(crate::merge_service::CHECKPOINT_IDENTITY_STEPS),
+        count(crate::merge_service::CHECKPOINT_TAKEN),
+        identity,
+      )
+    });
+    daemon.stop();
+    assert_eq!(in_turns, 1);
+    assert!(steps > 1, "{steps} identity steps");
+    assert!(taken >= 1, "no checkpoint taken");
+    let (running, recount) = identity.unwrap();
+    assert_eq!(running, recount);
+  }
 }

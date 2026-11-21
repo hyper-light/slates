@@ -962,6 +962,10 @@ pub struct Green {
   /// The keys whose entries any commit after `identity_version` changed: bounded by the keys the green's histories
   /// hold, each once however often it changed.
   identity_dirty: BTreeSet<IdentityKey>,
+  /// The keys brought up to date alone since `identity_version` ([`Green::fold_identity_step`], A-579), each with the
+  /// version its entry in `identity` was taken at: a key changed again since is moved from there, not from
+  /// `identity_version`. Empty whenever `identity` is the set hash at `identity_version` whole.
+  identity_folded: BTreeMap<IdentityKey, u64>,
   /// The current files (persistent, [`crate::dims`]).
   content: Files,
   /// The texts held by content identity (A-716, [`crate::held`]): blocks of `content`'s arena, shared with the files
@@ -2269,8 +2273,24 @@ impl Green {
   /// entry, which stands for every entry it brought, and a key it brought that changed since also gives back the entry
   /// the copy gave it (A-586, [`Green::identity_moves`]).
   fn fold_identity(&mut self) {
-    let since = self.identity_version;
-    for key in std::mem::take(&mut self.identity_dirty) {
+    while !self.fold_identity_step(usize::MAX) {}
+  }
+
+  /// Brings at most `keys` of the keys changed since the identity was last read up to the head (A-579), each moved from
+  /// the version its entry was taken at (`identity_folded`, else `identity_version`); whether none is left, the identity
+  /// then the set hash at the head. A caller with a large backlog (a checkpoint after thousands of versions) folds it a
+  /// slice a step, so no one step hashes every file the green changed since the identity was last read: each key's
+  /// move reads its entry at its own version and at the head, so commits between two steps leave every key exact.
+  pub fn fold_identity_step(&mut self, keys: usize) -> bool {
+    for _ in 0..keys {
+      let Some(key) = self.identity_dirty.pop_first() else {
+        break;
+      };
+      let since = self
+        .identity_folded
+        .get(&key)
+        .copied()
+        .unwrap_or(self.identity_version);
       let (out, into) = self.identity_moves(&key, since);
       for entry in &out {
         self.identity.remove(entry);
@@ -2278,8 +2298,19 @@ impl Green {
       for entry in &into {
         self.identity.add(entry);
       }
+      self.identity_folded.insert(key, self.head());
     }
+    if !self.identity_dirty.is_empty() {
+      return false;
+    }
+    self.identity_folded.clear();
     self.identity_version = self.head();
+    true
+  }
+
+  /// The keys changed since the identity was last brought to the head (A-579): what its next read folds.
+  pub fn identity_backlog(&self) -> usize {
+    self.identity_dirty.len()
   }
 
   /// What `key` moves the set hash by from `since` to the head (A-202, A-586): the entries out (its own at `since`, and
