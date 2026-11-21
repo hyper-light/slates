@@ -7063,3 +7063,13 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - r21 (queued, same needs): 3a release bench on origin/main, 64/128/256/320/512 MiB x 10 (r15's placement went away before it started).
 - r22 (queued, linux): family three green + red (r14 lost: adacachy restarted mid-build).
 - Local target ~/.cache/w-shared-local-target.noindex deleted at 01:38 (main's 01:23 note); exit-4 scratch deleted too. No local builds from here.
+
+## 2026-11-21 ~07:45, w-lint round 18 (main f52934d65): the wall's open reds and their owners
+- Host clippy: crates/hg/src/push/intake_tests.rs:56 `intake` returns Result and panics/unwraps inside
+  (panic_in_result_fn) -- owner w-hg (inbox/w-hg-from-w-lint.md).
+- `cargo xtask literals`: crates/store/src/texts.rs:243/248 (`4`, `4`, `8`: the hunk words' widths) -- owner w-store
+  (inbox/w-store-from-w-lint.md).
+- Fmt, structural, unsafe, the six cross targets: clean.
+- Windows (held requests): A-789's checks + red-first at 20bef898c^ (w-sizing), then w-realtools' real_tools over
+  WinFsp. r13 never started (jupiter's runner restarted while it was starting; the third such of mine) -- waiting on
+  main's answer in inbox/main-from-w-lint-jupiter.md.

@@ -318,3 +318,9 @@
   size_of; push tests GreenReads alias + owed_history split; server push test split, green_ready Copy clone. merge lib
   258, server repository::push 7 pass. w-git's helper fixed upstream. Still with owners: w-hg (intake helper), w-store
   (3 literals). Windows requests held for main's word on jupiter.
+
+## 2026-11-21 round 18 at 5b929b8d2 (landed b37c38d14, main f52934d65)
+- server import_batch dead accessor removed; push tests GreenRead alias, replica_owing_the_record, staged_batch.
+  repository::push 11 pass (the commit message says 9: wrong, it was 11), import_batch 2. Owners named in
+  run-requests.md. r13 lost to a jupiter restart before it started (third time): asked main in
+  inbox/main-from-w-lint-jupiter.md before resubmitting.
