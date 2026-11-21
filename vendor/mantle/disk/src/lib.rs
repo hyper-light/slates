@@ -2,15 +2,15 @@
 //! move to a device, with the alignment and durability the device and OS guarantee, is
 //! hyper-block's (vendor/hyper-block), which this crate measures through.
 #![cfg_attr(
-  test,
-  allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::disallowed_macros
-  )
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
 )]
 
 pub mod calibrate;

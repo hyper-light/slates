@@ -21,27 +21,27 @@ pub const UNKNOWN_FILE_CHECKSUM_FUNC_NAME: &str = "Unknown";
 /// `FileChecksumGenCrc32c`: fed the file's bytes in order, then finalized.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileChecksumGenCrc32c {
-  checksum: u32,
+    checksum: u32,
 }
 
 impl FileChecksumGenCrc32c {
-  pub fn new() -> Self {
-    Self::default()
-  }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-  /// `Update` [R util/file_checksum_helper.h:38-40].
-  pub fn update(&mut self, data: &[u8]) {
-    self.checksum = crc32c::extend(self.checksum, data);
-  }
+    /// `Update` [R util/file_checksum_helper.h:38-40].
+    pub fn update(&mut self, data: &[u8]) {
+        self.checksum = crc32c::extend(self.checksum, data);
+    }
 
-  /// `Finalize` then `GetChecksum` [R util/file_checksum_helper.h:42-51]: the CRC as 4
-  /// big-endian bytes.
-  pub fn finalize(self) -> [u8; 4] {
-    self.checksum.to_be_bytes()
-  }
+    /// `Finalize` then `GetChecksum` [R util/file_checksum_helper.h:42-51]: the CRC as 4
+    /// big-endian bytes.
+    pub fn finalize(self) -> [u8; 4] {
+        self.checksum.to_be_bytes()
+    }
 
-  /// `Name` [R util/file_checksum_helper.h:53].
-  pub fn name(&self) -> &'static str {
-    FILE_CHECKSUM_CRC32C_NAME
-  }
+    /// `Name` [R util/file_checksum_helper.h:53].
+    pub fn name(&self) -> &'static str {
+        FILE_CHECKSUM_CRC32C_NAME
+    }
 }

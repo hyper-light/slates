@@ -11,15 +11,15 @@
 // shard-hosted reads (A-767 C3); until it calls them they are unused, not wrong (vendor/mantle/README.md, local change 2).
 #![cfg_attr(not(test), allow(dead_code))]
 #![cfg_attr(
-  test,
-  allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    clippy::arithmetic_side_effects,
-    clippy::disallowed_macros
-  )
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::disallowed_macros
+    )
 )]
 
 pub mod branch;

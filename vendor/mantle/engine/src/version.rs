@@ -15,22 +15,22 @@ const PLACE: i64 = 1000;
 /// Signed, as the preprocessor computes it, so a component below zero is allowed. A result past
 /// `i64` saturates: such a version is after or before every release, which is its meaning.
 pub const fn make_version_int(major: i64, minor: i64, patch: i64) -> i64 {
-  major
-    .saturating_mul(PLACE)
-    .saturating_mul(PLACE)
-    .saturating_add(minor.saturating_mul(PLACE))
-    .saturating_add(patch)
+    major
+        .saturating_mul(PLACE)
+        .saturating_mul(PLACE)
+        .saturating_add(minor.saturating_mul(PLACE))
+        .saturating_add(patch)
 }
 
 /// `ROCKSDB_VERSION_INT` [R include/rocksdb/version.h:24-25].
 pub const ROCKSDB_VERSION_INT: i64 = make_version_int(
-  ROCKSDB_MAJOR as i64,
-  ROCKSDB_MINOR as i64,
-  ROCKSDB_PATCH as i64,
+    ROCKSDB_MAJOR as i64,
+    ROCKSDB_MINOR as i64,
+    ROCKSDB_PATCH as i64,
 );
 
 /// `ROCKSDB_VERSION_GE(x, y, z)` [R include/rocksdb/version.h:26-27]: whether this release's
 /// integer form is at or above `x.y.z`'s.
 pub const fn version_ge(major: i64, minor: i64, patch: i64) -> bool {
-  ROCKSDB_VERSION_INT >= make_version_int(major, minor, patch)
+    ROCKSDB_VERSION_INT >= make_version_int(major, minor, patch)
 }

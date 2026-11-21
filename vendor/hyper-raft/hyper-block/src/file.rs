@@ -109,9 +109,7 @@ impl DeviceFile {
         let (caching, align) = match request {
             CachingRequest::PreferDirect => match sys::make_direct(&file) {
                 Ok(()) => (Caching::Direct, align),
-                Err(e)
-                    if sys::refuses_direct(&e) || e.kind() == std::io::ErrorKind::Unsupported =>
-                {
+                Err(e) if sys::refuses_direct(&e) || e.kind() == std::io::ErrorKind::Unsupported => {
                     (Caching::Buffered, Alignment::BYTE)
                 }
                 Err(source) => {
@@ -128,12 +126,7 @@ impl DeviceFile {
     }
 
     /// What every open file goes through once it is open (`open`'s own steps, shared with `adopt`).
-    fn finish(
-        file: File,
-        path: &Path,
-        caching: Caching,
-        align: Alignment,
-    ) -> Result<Self, DiskError> {
+    fn finish(file: File, path: &Path, caching: Caching, align: Alignment) -> Result<Self, DiskError> {
         let wrap = |op: &'static str| {
             let path = path.to_path_buf();
             move |source| DiskError::Io { op, path, source }
