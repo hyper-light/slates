@@ -12297,10 +12297,10 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
-> A stored text a later revision moves past is deltified (A-761's deltify job, main's ruling, form (A)): made a skip-delta
-> svndiff a window a slice (`vcs_store::svn_deltify`), landed as its own entry (`Record::Deltified`, the delta held by the
-> records as every other text is), then its store hold given back; a replay holds the texts still stored after its
-> whole log.
+> A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
+> part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
+> the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
+> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule

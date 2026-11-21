@@ -215,9 +215,9 @@ impl Uncommitted {
 /// of 2026-11-20): its texts put from the commit's sink `texts` into the repository's content store a copy slice a step,
 /// the shard served between steps; the content made durable before any entry names it (the content plane's barrier);
 /// then the revision, which names the texts, made at the owner's instant, judged again with the commit's locks then,
-/// and landed through the step ([`landed`]: the store, then the register). A
-/// refused landing gives back every text it put; a text the records came to hold meanwhile gives back its extra hold.
-/// None where the shard's state is gone (its shutdown).
+/// and landed through the step ([`landed`]: the store, then the register). Committed or refused, the content store
+/// lets go every text the landing put: a committed text is its changeset's on the node's store, read through it (C2
+/// stage B part 2 (b)). None where the shard's state is gone (its shutdown).
 pub(crate) async fn land_work(
   (principal, repository): (&Principal, RepositoryId),
   work: Work,
@@ -248,13 +248,11 @@ pub(crate) async fn land_work(
     }
   };
   // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
-  // entry names a text that is durable only in the shard's image, and a recovery reads one the content store lacks back
-  // from there (`vcs_store::fetch_stored_texts`). The texts the records already held landed with the changeset that
-  // put them.
+  // entry names a text that is durable only in the shard's image, and every reader reads one RAM does not hold back
+  // from there (C2 stage B part 2). The texts the records already held landed with the changeset that put them.
   let carried = texts_carried(&work, &storing.put);
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
-  // the store and committed in the register (`landing`); the texts held twice given back once it stands, every text
-  // the landing put given back where it was refused.
+  // the store and committed in the register (`landing`); every text the landing put given back once it ends.
   let storing = core::cell::Cell::new(Some(storing));
   let give_back = |state: &mut ShardState| {
     if let Some(storing) = storing.take() {
@@ -270,14 +268,12 @@ pub(crate) async fn land_work(
       prepare_revision(state, repository, revision, Some((&locks, now)))
     },
     |state, reference, prepared| {
-      let twice = storing
-        .take()
-        .map(|storing| (held_twice(state, repository, &storing), storing));
       let committed = commit_prepared(state, (principal, repository), reference, prepared);
-      match (&committed, twice) {
-        (Ok(_), Some((twice, _))) => release_texts(state, None, &twice),
-        (Err(_), Some((_, storing))) => release_stored(state, storing),
-        (_, None) => {}
+      // Committed or refused, the content store lets go what the commit put (C2 stage B part 2 (b)): a committed
+      // revision's texts are its changeset's on the node's store, read through it from now on, and the head's files
+      // are the green's.
+      if let Some(storing) = storing.take() {
+        release_stored(state, storing);
       }
       committed
     },
@@ -512,9 +508,10 @@ fn corrupt() -> Uncommitted {
 
 /// A commit's texts being put into the repository's content store from its sink, a slice a step, before its revision
 /// lands (§4.17.1 "A push's intake"; main's ruling (B) of 2026-11-20): the texts still to put, the one being put, and
-/// those put whole, each holding one count of the store, which the records keep as their reference once the revision
-/// lands and a refused landing gives back ([`release_stored`]). Until the sink writes into the store itself (w-perf's
-/// wiring), this is where a text's bytes enter it.
+/// those put whole, each holding one count of the store until the landing ends, committed or refused
+/// ([`release_stored`]): the changeset streams them to the node's store from there, and the records name them by
+/// identity and length, read through that store (C2 stage B part 2 (b)). Until the sink writes into the store itself
+/// (w-perf's wiring), this is where a text's bytes enter it.
 #[derive(Debug, Default)]
 pub(crate) struct Storing {
   /// The texts still to put, each with its length.
@@ -616,26 +613,7 @@ fn store_refused(refused: &slates_vcs::ContentRefused) -> Uncommitted {
   }
 }
 
-/// The texts `storing` put whole that repository `repository`'s records hold already (another commit of the same text
-/// landed meanwhile): their store holds are one too many once this revision lands, since the records reference a text
-/// once. Read just before the revision's commit, on the same step.
-pub(crate) fn held_twice(
-  state: &ShardState,
-  repository: RepositoryId,
-  storing: &Storing,
-) -> Vec<ContentIdentity> {
-  let Some(records) = state.vcs_stores.subversion_records(repository) else {
-    return Vec::new();
-  };
-  storing
-    .put
-    .iter()
-    .filter(|identity| records.holds(identity))
-    .copied()
-    .collect()
-}
-
-/// Gives back every text `storing` put whole and the one it was putting: a landing that was refused.
+/// Gives back every text `storing` put whole and the one it was putting: a landing that ended, committed or refused.
 pub(crate) fn release_stored(state: &mut ShardState, storing: Storing) {
   let Storing { current, put, .. } = storing;
   release_texts(state, current.map(|(_, _, writing, _)| writing), &put);
@@ -1095,10 +1073,7 @@ fn applied(
   } else {
     None
   };
-  if made == Some(Ok(answer.revision)) {
-    // The stored texts this revision moved past, handed to the deltify job (`vcs_store::svn_deltify`).
-    crate::vcs_store::svn_deltify::after_revision(state, repository, answer.revision);
-  } else {
+  if made != Some(Ok(answer.revision)) {
     state.count(if moved { APPLY_REFUSED } else { DIVERGED }, 1);
     crate::vcs_store::rebuild(state, repository);
   }

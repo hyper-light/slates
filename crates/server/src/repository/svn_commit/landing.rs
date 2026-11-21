@@ -25,8 +25,9 @@
 //! every text its history names ([`land_changeset`]): a `Payload` section of the texts' bytes, each whole, streamed from
 //! the content store a piece at a time (never one copy of them all); a `Texts` section naming each by its path, identity
 //! and length and its place in that payload (`slates_store::texts`, the format every tool shares), which the store
-//! indexes so it makes any of them again (`StoreHandle::text`); then the `Record`. One flush commits the three. A
-//! recovery reads a stored text the content store lacks back from there (`vcs_store::fetch_stored_texts`).
+//! indexes so it makes any of them again (`StoreHandle::text`); then the `Record`. One flush commits the three. Every
+//! reader reads a stored text a piece at a time back from there (C2 stage B part 2), and nothing keeps it in RAM once
+//! its revision stands.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;

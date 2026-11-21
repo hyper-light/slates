@@ -1546,3 +1546,123 @@ fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is
     );
   });
 }
+
+/// C2 stage B part 2 (b), P3 (a committed text is its changeset's on the node's store, not the content store's). Do: on
+/// a daemon holding a store, commit a revision adding `/trunk/a.bin`, its text put through the content store as a
+/// client's commit puts it; then read the text as a session does through the repository's view, waiting for any piece
+/// the view does not hold. Expect revision 1, the content store holding nothing of the text once the commit answered,
+/// the green's file the text, and the session's read whole (the head's files are the green's; a text nothing in RAM
+/// holds is read through the store, held by the stage's (a) tests). Before, the content store held every committed text
+/// until the deltify job made it a delta in RAM.
+#[test]
+fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "let-go",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let bytes = crate::test_store::noise(200 << 10);
+  let committed = bytes.clone();
+  let named = text(&bytes);
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage().unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, named.identity).unwrap();
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            ChangedPath {
+              path: "/trunk/a.bin".to_owned(),
+              action: Action::Add,
+              kind: NodeKind::File,
+              copy_from: None,
+              text: Some(named),
+              properties: None,
+              mergeinfo_modified: false,
+            },
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"let go".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      super::land_work((&owner(), id), work, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)))
+  });
+  let file = crate::daemon::observe_first(&daemon, move |state| {
+    green_file(state, green, "trunk/a.bin")
+  });
+  // A session's read: a piece at a time, waiting for each piece the view does not hold (C2 stage B part 2 (a)).
+  let read = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut out = Vec::new();
+      let mut fetched = Vec::new();
+      while u64::try_from(out.len()).unwrap() < named.size {
+        let at = u64::try_from(out.len()).unwrap();
+        let piece = crate::state::with_state(|state| {
+          crate::vcs_store::svn_view::lend_in(state, id, |lent| {
+            let repository = lent.repository;
+            match slates_svn::reads::Repository::text(repository, &named.identity, at) {
+              Some(piece) => Ok(piece.into_owned()),
+              None => Err(slates_svn::reads::Repository::fetchable(
+                repository,
+                &named.identity,
+                at,
+              )),
+            }
+          })
+        })
+        .flatten();
+        match piece {
+          Some(Ok(piece)) if !piece.is_empty() => out.extend_from_slice(&piece),
+          Some(Err(true)) => {
+            let wanted = slates_svn::reads::Wanted {
+              text: named.identity,
+              offset: at,
+            };
+            assert!(crate::vcs_store::svn_texts::fetch_piece(id, wanted).await);
+            fetched.push(wanted);
+          }
+          other => panic!("the read at {at} answered {other:?}"),
+        }
+      }
+      crate::state::with_state(|state| {
+        for wanted in fetched {
+          crate::vcs_store::svn_texts::let_go(state, wanted);
+        }
+      })
+      .map(|()| out)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert!(matches!(landed, Some(Ok(1))), "{landed:?}");
+  assert!(!kept, "the content store kept the committed text");
+  assert!(
+    file.as_deref() == Some(bytes.as_slice()),
+    "the green's file is not the text"
+  );
+  assert!(read == Some(bytes), "the read is not the text");
+}
