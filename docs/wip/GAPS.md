@@ -175,8 +175,11 @@
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
 > made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
 > accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
-> a consistent snapshot while a push lands; the stream clone's chunks as stored deltas (store side done locally: `H`
-> rows per entry, `I` rows by node).
+> a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
+> the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
+> the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
+> whole; a log the store does not keep (an imported repository's, until w-hg's C1 step 3) serves no stream (`1\n`,
+> which stock `hg clone --stream` takes as "operation forbidden by server").
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
