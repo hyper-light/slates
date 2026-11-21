@@ -60,3 +60,14 @@
 - Replay from the store waits on w-store for a section read through the owner, and on your ruling with w-store on
   whether recovery replays from the store or the register (inbox w-store-from-w-svn-replay-2026-11-20.md).
 - Next while waiting: green-made versions' changesets. Then an import as one changeset (its sequence rule asked).
+
+## P6 CLOSED (2026-11-21 ~01:20): svn:// update 5.6 s vs 2.7 s
+- Commit on origin/main: e69375553 (in 40c3f8d1e): `measure_svnsync_replay_range_over_the_tunnel` now also times an
+  update across `SLATES_SVN_UPDATE` (FROM:TO) and a checkout, as stock svn asks them, through the daemon's tunnel site.
+- Measurement (BENCHMARKS "Subversion on the changeset store", release, MacBook Pro 2, load 20-30, git-2000):
+  update r1000..r1500 0.14 s (2.3 MB, the edit whole), checkout r1500 0.46 s (24.6 MB). w-bugs' run 13 (base
+  2d3f218cb, before w-perf's per-reader WindowCache b51f908f2) was 5.6 s for a stock client's whole update, its longest
+  step a window unit; the server's drive is now 0.14 s of that. Re-running w-bugs' diag harness end to end on main is
+  yours if you want the stock-client wall.
+- My earlier "not whole" 524 bytes was my script's: the client's closing success sent during the drive (E210004, as
+  svnserve answers it).
