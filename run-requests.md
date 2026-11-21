@@ -7091,3 +7091,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   CLI tests (`a_freed_content_extent_gives_its_commit_back_on_windows`, `a_content_extent_outlives_a_killed_daemon_on_windows`)
   were refused "no room here now" twice (r25, r26): reported per main's rule. Still owed: those two, their red-first at
   20bef898c^ (w-sizing), and w-realtools' real_tools over WinFsp.
+- 2026-11-21 ~09:00 (w-lint): A-789's Windows CLI tests are `#[cfg(windows)]` in crates/cli/tests/cli.rs, which is
+  `#![cfg(unix)]`: on jupiter the `cli` target ran 0 tests (r27). Their run and red-first cannot be met as written --
+  owner w-sizing (inbox/w-sizing-from-w-lint.md). The red-first run (r28) stopped as moot. w-realtools' real_tools over
+  WinFsp (r29) queued by platform.
