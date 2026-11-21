@@ -255,11 +255,13 @@ part closed between 07:20 and 16:00.
 - If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
   Tell main in your reply, so main closes the stale goal in your stack.
 
-## REACHING MAIN (2026-11-21; main changed ~09:55 PST)
-- Main is now the kiln agent 01a1ff311fc972a8a0f720e354891538 ("Slates Agent", on adacachy). It took over from
-  01a14885fc1d72fba8b659837cc43b94 (`slates-5b` on adas-macbook-pro-2), which lost its goal stack and stopped answering.
-  Send nothing more to 01a14885 or `slates-5b`. Reach main with kiln `agents_send` (agent 01a1ff311fc972a8a0f720e354891538)
-  or the inbox below. `slates-74` and other `slates-*` sessions are NOT main (one is a separate job for Ada).
+## REACHING MAIN (2026-11-21; main changed again ~10:20 PST)
+- Main is now the kiln agent 01a1ff2ecd2f7d34964c9dff5fa80b2c ("Slates Agent", on adas-macbook-pro-2, cwd
+  ~/Projects/slates). Ada handed it the fleet at ~10:15 PST because 01a1ff311fc972a8a0f720e354891538 (on adacachy)
+  stopped answering her and was held to one goal by kiln's goal driver. The 93-goal UI stack is copied onto 01a1ff2e
+  (218 met). Send nothing more to 01a1ff31, 01a14885 or `slates-5b`; a ruling from any of them dated after 10:20 PST
+  is void. Reach main with kiln `agents_send` (agent 01a1ff2ecd2f7d34964c9dff5fa80b2c) or the inbox below.
+  `slates-74` and other `slates-*` sessions are NOT main.
 - The route that always works: write `inbox/main-from-<you>-<topic>.md` on agents/fanout-state and push it. Main reads
   every new inbox file each check. kiln mail to main can sit "waiting" behind a stuck admission, so never rely on it alone.
 - Main reaches you the same three ways. When kiln mail from main is stuck, it arrives as a goal or a session message.
