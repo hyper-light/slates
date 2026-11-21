@@ -286,6 +286,9 @@ pub(crate) enum Gate {
 /// What a verb needs of the owner. A sealed work is boxed: it is far larger than any other need.
 enum Need {
   Files(Vec<String>),
+  /// The base's lengths and entries of these paths, never their bytes: what an edit or a declaration of a file the
+  /// work has not changed needs (its first edit holds the base's ranges as pieces, `crate::work_files`).
+  Lengths(Vec<String>),
   Page {
     path: String,
     offset: u64,
@@ -413,7 +416,7 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   let fetched = home.fetched.is_some();
   let file_if_unheld = |path: &str| {
     let key = canonical_path(path);
-    (!fetched && !w.files.holds(key)).then(|| Need::Files(vec![key.to_owned()]))
+    (!fetched && !w.files.holds(key)).then(|| Need::Lengths(vec![key.to_owned()]))
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
@@ -576,10 +579,23 @@ fn page_if_unheld(
   want: u64,
 ) -> Option<Need> {
   let key = canonical_path(path);
-  (!fetched && !w.files.holds(key)).then(|| Need::Page {
-    path: key.to_owned(),
-    offset,
-    want,
+  if fetched {
+    return None;
+  }
+  if !w.files.holds(key) {
+    return Some(Need::Page {
+      path: key.to_owned(),
+      offset,
+      want,
+    });
+  }
+  // A file the work changed reads its own bytes, and the base's ranges its pieces name: the span of them this read
+  // takes, asked in the base's own offsets.
+  let (origin, at, len) = w.files.base_span(key, (offset, want))?;
+  Some(Need::Page {
+    path: origin,
+    offset: at,
+    want: len,
   })
 }
 
@@ -589,9 +605,9 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
     return None;
   }
   match op {
-    WorkOp::Unlink { path } => Some(Need::Files(vec![canonical_path(path).to_owned()])),
+    WorkOp::Unlink { path } => Some(Need::Lengths(vec![canonical_path(path).to_owned()])),
     WorkOp::Rename { from, to } if from != to => {
-      Some(Need::Files(vec![canonical_path(from).to_owned()]))
+      Some(Need::Lengths(vec![canonical_path(from).to_owned()]))
     }
     _ => None,
   }
@@ -616,13 +632,9 @@ fn refine_owed(state: &ShardState, sealed: &SealedWork) -> Option<crate::refinin
   )
 }
 
-/// The base bytes of `path` the owner sent `work`'s parked verb (A-247), for its refinement's copy
-/// (`crate::refining`): `None` when no verb of the work is parked, or its fetch holds no such file.
-pub(crate) fn parked_fetch<'s>(
-  state: &'s ShardState,
-  work: DbVolumeId,
-  path: &str,
-) -> Option<&'s [u8]> {
+/// What the owner sent `work`'s parked verb (A-247), for its refinement's copy (`crate::refining`): `None` when no verb
+/// of the work is parked or it fetched nothing.
+pub(crate) fn parked_fetched(state: &ShardState, work: DbVolumeId) -> Option<&FetchedBase> {
   state
     .work_home
     .queues
@@ -630,12 +642,17 @@ pub(crate) fn parked_fetch<'s>(
     .waiting
     .front()?
     .fetched
-    .as_ref()?
-    .files
-    .get(path)?
-    .as_deref()
+    .as_ref()
 }
 
+/// The base bytes of `path` the owner sent `work`'s parked verb (A-247): `None` when none was sent.
+pub(crate) fn parked_fetch<'s>(
+  state: &'s ShardState,
+  work: DbVolumeId,
+  path: &str,
+) -> Option<&'s [u8]> {
+  parked_fetched(state, work)?.files.get(path)?.as_deref()
+}
 /// The work's refinement job ended (`crate::refining`): the verb parked on it runs again.
 pub(crate) fn refined(state: &mut ShardState, work: DbVolumeId) {
   resolve(state, work, Some(Answered::Refined));
@@ -680,13 +697,14 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     }
     // This verb fetched already: what it lacks is only a whole-replaced path's bytes. Asked again, the answer replaces
     // the verb's fetch, so the ask keeps everything the fetch holds (an edit-and-submit's sealed copy reads its file
-    // from it).
+    // from it): the files it holds, and the paths it holds only the lengths of (A-790), asked now as files.
     Some(fetched) => {
       if whole.iter().all(|path| fetched.files.contains_key(path)) {
         return None;
       }
       wanted.extend(whole);
       wanted.extend(fetched.files.keys().cloned());
+      wanted.extend(fetched.lengths.keys().cloned());
       Some(Need::Files(wanted.into_iter().collect()))
     }
   }
@@ -775,10 +793,9 @@ fn sealed_with_edit(
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
   };
-  let old = sealed.files.get(base, key).ok()?;
+  let old_len = sealed.files.len(base, key).ok()?;
   let inserted = u64::try_from(bytes.len()).ok()?;
-  let ops = crate::work_log::edit_ops(key, old.as_deref(), (at, delete_len, inserted));
-  drop(old);
+  let ops = crate::work_log::edit_ops(key, old_len, (at, delete_len, inserted));
   crate::work_log::apply_edit(
     (&mut sealed.files, &mut sealed.journal),
     base,
@@ -1299,10 +1316,12 @@ fn start_ask(
       queue,
       Some(crate::verbs::owner_of_name(name, state.shards.len())),
     ),
-    Need::Files(_) | Need::Page { .. } | Need::Sizes => match state.works.get(&queue) {
-      Some(w) => (w.green, None),
-      None => return false,
-    },
+    Need::Files(_) | Need::Lengths(_) | Need::Page { .. } | Need::Sizes => {
+      match state.works.get(&queue) {
+        Some(w) => (w.green, None),
+        None => return false,
+      }
+    }
     // The owner holds nothing of a work's route (A-298): `park` meets it on this shard. A refinement was started above.
     Need::Route | Need::Refine(_) => return false,
   };
@@ -2109,8 +2128,10 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     back,
     ..
   } = item;
-  if matches!(need, Need::Files(_) | Need::Page { .. } | Need::Sizes)
-    && green_elsewhere(state, green)
+  if matches!(
+    need,
+    Need::Files(_) | Need::Lengths(_) | Need::Page { .. } | Need::Sizes
+  ) && green_elsewhere(state, green)
   {
     // A holder's base read, answered by its replica of the green (A-697 part a), once that holds the work's base.
     let holds = state
@@ -2126,6 +2147,9 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
   }
   match need {
     Need::Files(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_files(
+      state, green, version, &paths,
+    ))),
+    Need::Lengths(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_lengths(
       state, green, version, &paths,
     ))),
     Need::Page { path, offset, want } => Outcome::Answered(Answered::Base(

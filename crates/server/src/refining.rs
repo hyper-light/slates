@@ -247,16 +247,25 @@ fn copy_step(
   (copy, side, slice): (&mut Copy, Side, usize),
 ) -> Option<bool> {
   match side {
-    Side::Post => {
+    Side::Post => with_base(state, (work, green, base_version), |base| {
+      // The work's file read a slice at a time over its base: a changed file may be pieces over the base (A-790).
       let w = state.works.get(&work)?;
-      let none = crate::work_files::Base {
-        green: None,
-        fetched: None,
-        version: base_version,
-      };
-      let bytes = w.files.get(none, &copy.path).ok().flatten()?;
-      copy_from(bytes, &mut copy.post, slice)
-    }
+      let total = usize::try_from(w.files.len(base, &copy.path).ok()??).ok()?;
+      if copy.post.capacity() < total {
+        copy
+          .post
+          .reserve_exact(total.saturating_sub(copy.post.len()));
+      }
+      let from = copy.post.len();
+      let to = from.saturating_add(slice).min(total);
+      copy.post.resize(to, 0);
+      let into = copy.post.get_mut(from..to)?;
+      let got = w
+        .files
+        .copy_range(base, &copy.path, u64::try_from(from).ok()?, into)
+        .ok()??;
+      (got == to.saturating_sub(from)).then_some(to == total)
+    }),
     Side::Base => {
       if let Some(engine) = state.greens.get(&green) {
         let bytes = engine.content_ref_at(&copy.base_path, base_version)?;
@@ -274,6 +283,37 @@ fn copy_step(
       copy_from(std::borrow::Cow::Borrowed(bytes), &mut copy.base, slice)
     }
   }
+}
+
+/// `f` over `work`'s base: its green's version on this shard, a replica's, or what the owner sent its parked verb.
+fn with_base<R>(
+  state: &ShardState,
+  (work, green, version): (DbVolumeId, DbVolumeId, u64),
+  f: impl FnOnce(crate::work_files::Base<'_>) -> Option<R>,
+) -> Option<R> {
+  if let Some(engine) = state.greens.get(&green) {
+    return f(crate::work_files::Base {
+      green: Some(&*engine),
+      fetched: None,
+      version,
+    });
+  }
+  if let Some(replica) = state
+    .merge
+    .replicas
+    .get(&slates_db::register::ObjectId(green.bytes))
+  {
+    return f(crate::work_files::Base {
+      green: Some(replica),
+      fetched: None,
+      version,
+    });
+  }
+  f(crate::work_files::Base {
+    green: None,
+    fetched: crate::work_home::parked_fetched(state, work),
+    version,
+  })
 }
 
 /// The job's task and the key it runs under.

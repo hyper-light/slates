@@ -1789,18 +1789,19 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   assert_eq!(after.past_budget, 0, "{after:?}");
 }
 
-/// A-724 piece 8c (main's ruling of 2026-11-20 (ii): a record names its names only once they are durable at `f + 1` in
-/// the region). Do: with version 3 on for the shard, push stock git's `create` and `update`, driving each answer as an
-/// edge does (a turn, a yield, the names it asks to home homed in the region, the home publishing itself), then make
-/// the store again from the log. Expect: both pushes answered `ok`; each record that names objects version 3, naming
-/// them by the identity the region homed; and the store made again from those records equal to the live one. Every wait
+/// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once
+/// they are durable at `f + 1` in the region). Do: with version 4 on for the shard, push stock git's `create` and
+/// `update`, driving each answer as an edge does (a turn, a yield, the names and then the pack it asks to home homed in
+/// the region, the home publishing itself), then make the store again from the log. Expect: both pushes answered `ok`;
+/// each record that names objects version 4, naming its names and its pack by the identities the region homed; and
+/// the store made again from those records equal to the live one. Every wait
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let daemon = crate::daemon::audit_daemon_of(1);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "homed");
     let requests: Vec<Vec<u8>> = chain()
       .into_iter()
@@ -1849,7 +1850,7 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 3),
+    versions.iter().all(|version| *version == 4),
     "versions {versions:?}"
   );
 }
@@ -1937,7 +1938,7 @@ fn pushed_v3_at(
 ) -> (RepositoryId, slates_vcs::ContentId, u16) {
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, name);
     let request = chain()
       .into_iter()
@@ -2006,7 +2007,7 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
 #[test]
 fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
   crate::daemon::audit_on_shard(|state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "untaken");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let records = crate::vcs_store::tests::records(state, repository);
@@ -2022,6 +2023,6 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
         .copied(),
       Some(1)
     );
-    crate::vcs_store::write_version_3_for_test(false);
+    crate::vcs_store::write_version_4_for_test(false);
   });
 }

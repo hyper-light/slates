@@ -16194,6 +16194,18 @@ Kept: A-787.
   about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
   carrying the pack (part A).
 
+## A push's record names its homed pack: 141 bytes, the landing step halved (A-722's record v4, part A; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic with record version 4 on and the
+  homing driven as the edge drives it, over git/git's v1.5.0 push; the landing step's phases timed (`push_planned`).
+
+| | record bytes | landing step | entry and record | store commit | apply |
+|---|---|---|---|---|---|
+| part B (92f7a756b) | about 11 MiB | 27.3 ms | 1.7 ms | 0.6 ms | 18.6 ms |
+| part A | 141 | 13.2 ms | 1.8 ms | 1.2 ms | 8.1 ms |
+
+- **What it says.** The entry's write is no longer O(the pack). The apply's 8.1 ms is the greens' commit and the work's
+  encode (w-engine's), and the entry-and-record's 1.8 ms the names checked against the homed ones; each is the next cut.
+
 
 ## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
 
@@ -16217,3 +16229,71 @@ the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 
   to 7.9 ms. Every sample answered as the model said.
 - What is left at the paced p99 (0.2 to 1.9 ms) is the kicked park's own wake on macOS, part of goal 84a's open
   loaded and paced tail (GAPS), not the late wake this run was owed for.
+
+## A work's first edit as pieces over its base against a whole-file copy (A-790; main's dispatch of 2026-11-20 15:20; 2026-11-20)
+- **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents' builds
+  (load not quiesced; the A and B runs interleave, so drift hits both).
+- **Binaries.** Release `cargo test --locked --release -p slates-server --test work_edit_cow --no-run`. A: main
+  1de9e5e6f (a first edit copies the whole file into the work) with the same test file; B: A-790 on that main.
+- **Command.** `~/.cache/w-work-cow-ab-run/ab.sh`: for each file size, five rounds, each round A then B, every run a
+  fresh process (one daemon, one green holding one file, four works each requested and overwriting one byte at the
+  file's middle): `SLATES_WORK_EDIT_COW_FILE_BYTES=<size> SLATES_WORK_EDIT_COW_WORKS=4 <binary> --nocapture`.
+- **Measures.** Live heap a work: the allocator's bytes in use (`slates_mem::heap::stats().in_use`) added by the four
+  works, over four. Resident memory is shown too, and hides A's copies: macOS's allocator hands the seed's freed blocks
+  back to them, so A's resident grows by kilobytes while its live heap grows by the file per work. Time: request to the
+  edit's reply, per work.
+- **Result.** B holds 2.6 to 2.9 KB a work at every size (the work's record, journal and three pieces); A holds the
+  file (1,050,496 B, 16,787,328 B, 268,445,760 B a work). Best mean of five: 1 MiB A 261 us, B 113 us; 16 MiB A 455 us,
+  B 132 us; 256 MiB A 5.15 ms, B 173 us. B's time does not grow with the file; A's does. Kept: B.
+
+| file | binary | round | live heap a work | resident (4 works) | mean a first edit | slowest |
+|---|---|---|---|---|---|---|
+| 1 MiB | A | 1 | 1,050,496 B | 2,146,304 B | 318.593 µs | 464.458 µs |
+| 1 MiB | B | 1 | 2,672 B | 65,536 B | 237.604 µs | 277.916 µs |
+| 1 MiB | A | 2 | 1,050,496 B | 3,375,104 B | 398 µs | 557 µs |
+| 1 MiB | B | 2 | 2,672 B | 49,152 B | 112.635 µs | 134.792 µs |
+| 1 MiB | A | 3 | 1,050,496 B | 1,130,496 B | 267.76 µs | 289.917 µs |
+| 1 MiB | B | 3 | 2,672 B | 65,536 B | 141.948 µs | 225.458 µs |
+| 1 MiB | A | 4 | 1,050,496 B | 1,097,728 B | 261 µs | 414.875 µs |
+| 1 MiB | B | 4 | 2,672 B | 65,536 B | 152.072 µs | 201.875 µs |
+| 1 MiB | A | 5 | 1,050,496 B | 2,719,744 B | 262.583 µs | 297.041 µs |
+| 1 MiB | B | 5 | 2,672 B | 81,920 B | 225.385 µs | 396.458 µs |
+| 16 MiB | A | 1 | 16,787,328 B | 81,920 B | 455.052 µs | 481.334 µs |
+| 16 MiB | B | 1 | 2,608 B | 81,920 B | 132.27 µs | 190.625 µs |
+| 16 MiB | A | 2 | 16,787,328 B | 49,152 B | 473.728 µs | 551.333 µs |
+| 16 MiB | B | 2 | 2,656 B | 65,536 B | 279.218 µs | 427.291 µs |
+| 16 MiB | A | 3 | 16,787,328 B | 98,304 B | 560.916 µs | 718.833 µs |
+| 16 MiB | B | 3 | 2,608 B | 81,920 B | 248.354 µs | 317.708 µs |
+| 16 MiB | A | 4 | 16,787,336 B | 114,688 B | 548.26 µs | 657.375 µs |
+| 16 MiB | B | 4 | 2,624 B | 114,688 B | 229.593 µs | 327.75 µs |
+| 16 MiB | A | 5 | 16,787,328 B | 114,688 B | 483.198 µs | 538.292 µs |
+| 16 MiB | B | 5 | 2,656 B | 98,304 B | 236.541 µs | 325.208 µs |
+| 256 MiB | A | 1 | 268,445,760 B | 32,768 B | 6.769229 ms | 7.308125 ms |
+| 256 MiB | B | 1 | 2,868 B | 131,072 B | 173.406 µs | 225.708 µs |
+| 256 MiB | A | 2 | 268,445,776 B | 65,536 B | 5.148739 ms | 5.259292 ms |
+| 256 MiB | B | 2 | 2,784 B | 81,920 B | 182.437 µs | 236.458 µs |
+| 256 MiB | A | 3 | 268,445,760 B | 32,768 B | 5.17801 ms | 5.371792 ms |
+| 256 MiB | B | 3 | 2,864 B | 114,688 B | 181.073 µs | 261.709 µs |
+| 256 MiB | A | 4 | 268,445,760 B | 65,536 B | 15.27751 ms | 24.87775 ms |
+| 256 MiB | B | 4 | 2,856 B | 65,536 B | 234.458 µs | 436.792 µs |
+| 256 MiB | A | 5 | 268,445,792 B | 32,768 B | 13.308385 ms | 23.680417 ms |
+| 256 MiB | B | 5 | 2,832 B | 98,304 B | 347.718 µs | 755.375 µs |
+
+## The forward lane's bulk throughput: the instrument (2026-11-20, w-shared; A-697 item 4, main's sweep)
+
+`replication_bench`'s bulk row sends one request of N MiB on a warm session. The holder takes the request whole and
+answers nothing, so the row times one direction. For each sample it prints the goodput, the session's path MTU and
+congestion window, and why its sending stopped (`Endpoint::send_stops`: the packet budget, the window, the pacer,
+the credit, nothing to send). The command, release, best of the five timed samples after one warm-up:
+
+    cargo build --release -p slates-cluster --example replication_bench
+    REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200
+
+No numbers are recorded yet. The first run (macOS arm64, this MacBook, load average 74, base 5d29b9572) was too
+loaded to count. It showed two things to measure on a quiet machine:
+- The path MTU reached 9,209 bytes, at macOS's `net.inet.udp.maxdgram` of 9,216. So the lane is not bound by
+  small datagrams.
+- At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
+  lane on loopback.
+The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
+datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.

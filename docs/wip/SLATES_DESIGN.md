@@ -11851,6 +11851,10 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > work: the 64 KiB file it changed plus about 10 KiB) in 0.58 ms mean per work. With a copy of the green per work put
 > back, the same run added 975 MB in 4.46 ms. Release, macOS arm64, Mac Studio. Held by
 > `crates/server/tests/work_cow.rs`: N x (64 KiB + file) + 8 MiB, below one copy of the green.
+> **A-790 (2026-11-20): a first edit costs what it wrote, never the file.** A changed file is pieces over its base
+> (the base's ranges and the bytes written), so 8 works each overwriting one byte of a 64 MiB file add 32 KiB, not
+> 201 MB (`crates/server/tests/work_edit_cow.rs`); off the green's shard an edit asks the owner for the file's length
+> alone. The A/B is in BENCHMARKS.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
@@ -23404,9 +23408,11 @@ edit_merge_bench.rs` (its verdict forms), `crates/client/tests/merge_identity.rs
     O(1); a rebase keeps what differs from the head. A work is charged for what it holds (A-84's rule, unchanged):
     a new or recovered work holds nothing, so its creation and its rebuild after a restart are charged nothing and
     cannot be refused (the `merge.work_rebuild_refused` count is gone with the case); its first edit of a green's file
-    copies that file and is charged for it, and refused `BudgetExceeded` when the budget cannot hold it. A submit
+    holds the file as pieces over the base and is charged for what it wrote and the pieces, never the file (A-790),
+    and refused `BudgetExceeded` when the budget cannot hold that. A submit
     secures no bound for the reset (A-84 secured the green's files). A work whose green is gone cannot read its base:
-    a file it did not change answers `UnknownBase`, as its submit does, and the files it changed stay readable.
+    a file it did not change answers `UnknownBase`, as its submit does, and a file it changed reads only where the work
+    wrote all of it (A-790).
 - **Measured** (adas-macbook-pro-2, macOS arm64, 18 cores, shared, load 5 to 9; release harness `--quiet-only` (then `merge_bench`),
   1,000 samples a run, three runs a binary, binaries interleaved A B A B A B; total of edit and submit, p50; all
   runs in BENCHMARKS): accept at 1,000 files 14.0, 14.8, 13.9 ms → 0.97, 0.93, 0.99 ms with the identity deferred →
@@ -55997,6 +56003,30 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's record v4, part A — the record names its homed pack; the append is O(moves) (2026-11-20, w-git for UI goal 93; main's pack-homing ruling)
+- **Why.** After part B the longest step of git/git's v1.5.0 push was its landing (27 ms), most of it the entry's
+  apply: the record carried the whole 9.4 MiB pack, so the state log's write was O(its bytes) in one step.
+- **Change.**
+  - Record version 4 (`record::VERSION_PACKED`) replaces version 3 with no second path: the head, the moves, the
+    names' identity and count, and the pack's identity and length, and nothing else. Version 3 is no longer read.
+  - The push's pack is the content its staging put in the store (part B). The decision homes it in the region after
+    the names, a second homing round through the same edge path (`Homing::PackDue`, `PackAsked`, `PackWaiting`;
+    `SealedPush::pack_to_home`, `pack_homed_as`), with a hold taken for the record (`vcs_store::hold_for_record`).
+  - The record is version 4 when both are homed and still the push's (`SealedPush::record`), else version 2 inline.
+  - A replay reads a version-4 record's pack from the store by its identity: the stepped replay a window a unit
+    (`git_replay`), the whole one at once. Both contents are held for the record when nothing holds them, and a
+    rebuild fetches either from its region homes before the record's replay begins (`names_to_fetch`).
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic with version 4 on, homing driven as the edge drives
+  it, over v1.5.0's push): the record 141 bytes (about 11 MiB before); the landing step 13.2 ms (27 ms), of which
+  the entry and record 1.8 ms, the store's commit 1.2 ms, the apply 8.1 ms (the greens' commit and the work's encode,
+  w-engine's; the log's write of the entry no longer O(the pack)).
+- **Tests.** `slates-server` `vcs_store::tests::t_a722_a_version_4_record_names_its_names_and_its_pack_by_their_contents_identity`
+  (the encoding; version 3 refused), `t_a722_a_version_4_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them`,
+  `git_push::tests::t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region` (every record version
+  4), `daemon::tests::t_a727b_a_crash_after_an_entry_naming_content_by_identity_loses_nothing_it_names` (a crash
+  after the entry, the successor replaying the version-4 record from its image); `slates-server --lib` 1,037 passed
+  (one dialer test failed once under the suite and passed twice alone).
+
 ### A-722's record v4, part B — rows by pack place: a landed object is where it lies in its push's pack (2026-11-20, w-git for UI goal 93; main's pack-homing ruling: content once, the store's bytes a push must not grow)
 - **Why.** A push's staging put every object new to the repository in the content store inflated (git/git's v1.5.0:
   309 MiB for a 9.4 MiB pack), its row naming that copy. Main's ruling for record v4: the landed objects are places
@@ -58221,3 +58251,33 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   `crates/cli/tests/load_scale.rs`, one primary, two replicas, one client node, the kernel v7.4-rc4, one round, 10,000
   clients, `--hot-files 8000 --per-connection 32`): wall 201 s to 75 s, the primary's CPU 175 s to 53 s, verdicts 192
   to 228 a second, edits p50 1.04 s to 0.60 s, the cycle's p99 43.9 s to 23.6 s; oracle failures 0 in both.
+
+### A-790 — A work's changed file is pieces over its base: a first edit costs what it wrote (2026-11-20, w-work-cow; main's dispatch after the Slates-vs-Sapling comparison; §4.16 "Role", failure matrix; D-5; MEMORY SIZING)
+Applied in the same change to: §4.16 (the work as a delta; its A-247 status), `crates/server/src/work_files.rs`,
+`work_log.rs` (`edit_ops` takes the old length; a restatement is written from a rebase's files), `work_home.rs`
+(`Need::Lengths`; a read of a changed file asks for the base span its pieces name; `base_missing`'s second ask, A-776
+C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit`,
+`owner_lengths`, the post-state's per-operation copy), `work_charge.rs`, GAPS GAP-A9-14, BENCHMARKS.
+- **Why (measured).** A work's first edit of a base file copied the whole file into the work (`WorkFiles::splice`),
+  though the edit's operations need only the file's length: 8 works each overwriting one byte of a 64 MiB file added
+  201,490,432 B resident, 2.38 ms a work (`tests/work_edit_cow.rs`, red, release, Mac Studio 32 cores). Off the green's
+  shard the owner sent the whole file across shards for the same edit.
+- **Rule.** A changed file is a piece table: ranges of its origin's base bytes (the path, or the path it was renamed
+  from), pinned at the work's base version by its floor, and ranges of an append-only buffer of the bytes the work
+  wrote. The buffer is compacted to its live bytes once its dead bytes outnumber them, keeping the count of pieces, so
+  the charge foreseen before an edit is the charge after it, and a file rewritten again and again holds at most twice
+  what it shows of its own. A work is charged for the path, the origin's name, the written bytes and the pieces. An
+  edit, a rename and an unlink read only the base's length; off the green's shard they ask the owner for lengths and
+  entries (`Need::Lengths`), never bytes. A read of a changed file reads its pieces, and off the green's shard asks for
+  the span of base bytes the read's pieces name, in the base's offsets. A submit's post-state copies each operation's
+  range alone (`WorkFiles::copy_range`). A rebase's changed files are held whole, as before, and restated whole.
+- **Measured (A/B, BENCHMARKS).** Release, interleaved, five rounds, Mac Studio: live heap a work after a one-byte
+  first edit, A (whole-file copy) 1,050,496 / 16,787,328 / 268,445,760 B for 1 / 16 / 256 MiB files, B (pieces) 2.6 to
+  2.9 KB at every size; best mean time 261 us / 455 us / 5.15 ms against 113 us / 132 us / 173 us.
+- **Failure matrix.** With its green destroyed, a file the work changed reads only where the work wrote all of it:
+  its other pieces are the green's bytes. Its submit already answered `UnknownBase` then.
+- **Tests.** `work_files::tests` (a one-byte edit of a 1 MiB base file holds the byte and three pieces, charge foreseen
+  equals held; 100 whole rewrites stay within twice the file; a rename moves the pieces and a read names its base span
+  in the base's offsets); `work_charge`'s oracle (the charge equals a recount and the view a plain map after every
+  generated edit, unlink and rename, with distinct base and written bytes); `tests/work_edit_cow.rs` (red above; green:
+  +32,768 B, 0.15 ms mean); `tests/works_off_owner.rs` (one history on one shard and on eight, reply for reply).
