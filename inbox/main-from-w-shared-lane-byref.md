@@ -202,3 +202,16 @@ identity) and the slicing, re-measured at these five sizes x 10.
   256 MiB: 3/3 both; owner step 667-681 ms before, 437-476 ms after; late beat 1.19-1.21 s every round before, 0.55 s
   twice and none once after; wall 3.5-4.3 s before, 3.3-3.4 s after. 320 and 512 MiB: 0/3 both (before also one exit 4).
 - GAPS line on agents/w-shared-3b, commit a5402c4c8 (my kiln message said ffa3b5c by mistake). A-826 closes it.
+
+## 12:35 PST: A-826 before/after (kiln r32, interleaved A/B, cut by the big Studio's restart after 2 full rounds)
+65133486d (before 3b) vs 156007d (A-826), release holder route, big Studio, load 4-13, wall (forward):
+| MiB | before | after |
+|---|---|---|
+| 64 | 2/2, 410-466 ms (299-357) | 2/2, 319-408 ms (188-274) |
+| 128 | 2/2, 810-863 ms (584-649) | 2/2, 601-613 ms (339-346) |
+| 256 | 2/2, 2.41-2.52 s (~2.0 s) | 2/2, 1.25-1.29 s (0.72 s) |
+| 320 | 2/2, 3.52-3.61 s (~3.0 s) | 2/2, 1.51-1.53 s (0.85-0.89 s) |
+| 512 | 0/2, refused Overloaded | 0/2: the submit completes (2.4 s, owner step 0.66 s, holder build 0.59 s) and the watchdog then exits 4 (late beats 1.6-2.1 s, 2-3 of them) |
+512 MiB is now a watchdog kill: a correctness failure (the daemon dies), so the step slicing moves up from
+performance. kiln r33 reruns 512 MiB x 3 capturing the watchdog's "spinning ... in task spawned at" line to name the
+step, then I slice that step under a derived bound (with the before/after for 320 and 512).
