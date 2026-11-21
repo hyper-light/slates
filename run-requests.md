@@ -7024,3 +7024,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
   suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
   taken partial, or a stalled exchange (its progress now counted on delivery).
+
+## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
+- clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
+- Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.

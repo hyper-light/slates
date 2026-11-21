@@ -18,7 +18,7 @@
 - Finding (GAPS, not worked): one submit of a 1 GiB or 100k-file changeset holds its shard 1,097 ms past its
   1,025 ms window; the watchdog ends the daemon. The grid seeds in parts of 16 MiB / 5,000 files.
 
-## Codex goal (Green/Work + atomic-conflict work, Codex 01a1bdab on adacachy) -- IN FLIGHT (classification landed)
+## Codex goal (Green/Work + atomic-conflict work, Codex 01a1bdab on adacachy) -- CLOSED
 Inventory: 476 branches (work/slates-*, experiment/*, codex/*) in ~/Projects/slates, none on origin; 1,387 commits not on
 main cc29bfc4c, 6,394 behind. Read only (git -C reads; a --shared bare copy under my ~/.cache). 94 carry Green/Work or
 conflict work; 382 are VFS/DAX/FUSE/catalog/reclaim/runtime, outside the goal, untouched. Full list with tips: GAPS
@@ -26,7 +26,7 @@ conflict work; 382 are VFS/DAX/FUSE/catalog/reclaim/runtime, outside the goal, u
 
 | strand (branches) | verdict | evidence on main |
 |---|---|---|
-| conflict check + head-conditional resolution: work/slates-atomic-conflicts 6420b7ee7, conflict-cli 0d5ab5141, conflict-mutants 65472f43a (3) | **LAND**: main has no non-publishing check and no resolution bound to the observed head; port in flight, red first (`CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept-verdict paging reused, not duplicated) | -- |
+| conflict check + head-conditional resolution: work/slates-atomic-conflicts 6420b7ee7, conflict-cli 0d5ab5141, conflict-mutants 65472f43a (3) | **LANDED** as A-796: 6823fde6f (via 68ce3d585) server/client/protocol; c1e76d0a7 (via d2ad10da4) MCP tools + CLI verbs | `crates/server/tests/merge_check.rs` (1 and 8 shards, same answers; red: dropping the stamped-head check let a moved head's resolution through); `crates/mcp/tests/mcp.rs` assert_merge_check_resolves_over_mcp; CLI the_grammar_parses_the_merge_verbs |
 | owned merge verdict / verdict-* / runtime-step-verdict / server-root-publication (7) | superseded | A-257 + A-782: `green_checkpoint.rs` (0782fdb0c), `recovery.rs` |
 | Green publication / preparation / physical fill / prepared head / source issuer / capture & pin release / snapshot-view / trusted & held publication / accepted content (38) | superseded | A-201 `checkout.rs` merged_pushes_are_checked_out_and_land_on_the_servers_disk (11468ac0d); A-774 p2/p3 `green_landing_cow.rs` (1c3734ca7), `mounted_work.rs` ten_editors_on_mounted_works_submit_and_a_grant_lands_the_green (a2415c930) |
 | namespace fill / directory recreation / pure rename (10) | superseded | A-612/A-631/A-643/A-646 `replaced_node_tests.rs` a_directory_made_again_after_a_works_base_is_not_removed (aa9de3fb4); `green_post_state.rs` renames (26c0eff4f) |
@@ -35,3 +35,9 @@ conflict work; 382 are VFS/DAX/FUSE/catalog/reclaim/runtime, outside the goal, u
 | nfs-work-lease-holder-phased-v4 4bf73859d (1) | finding, not worked (test-only: an old Work mount writing under another holder's lease) | GAPS |
 | reclaim-* / holder-reentrant-drop-green (5) | outside the goal's scope | -- |
 None of what lands duplicates A-255, A-257 or A-263-A-267.
+
+Landed for the goal: d8416294c (GAPS record of all 94 branches), 6823fde6f/68ce3d585 (A-796 check + resolution),
+c1e76d0a7/d2ad10da4 (MCP slates.merge.check/read_check/resolve, CLI slates check/resolve). Pushed as merges onto main
+through studio-3, never as agents/codex-* branches (nothing of the Codex trees was pushed: the port is new commits on
+main). Not ported, recorded in GAPS: the Codex rebase_with refinement (a kept op conflicting only on a path the
+replacement re-establishes answers the windows instead). A-255, A-257, A-263-A-267 untouched (A-267's kept verdict reused).
