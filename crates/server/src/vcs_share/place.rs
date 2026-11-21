@@ -64,7 +64,7 @@ impl Drop for Decoding {
       // A drop only follows its own begin, so the count never goes below zero; saturate all the same.
       let _ = count
         .0
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
           Some(held.saturating_sub(1))
         });
     }

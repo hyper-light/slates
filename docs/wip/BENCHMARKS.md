@@ -15896,3 +15896,206 @@ the anchor's reclaim answered 0 and the second's 170, `ERROR_BUSY`).
 Decided by them (w-sizing, 2026-11-20): Linux keeps one memfd with its free extents removed through the shard's view
 (`MADV_REMOVE`, today's design); Windows needs a section per extent, the commit returned only by closing it; macOS an
 object per extent (w-sizing's `agents/w-sizing-extents`).
+## A mounted work reads its green where it lies: a mount costs its divergence (A-774 part 2; main's order 1; 2026-11-20)
+
+`crates/server/tests/mounted_work_cow.rs`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a side, all
+shown. A 64 MiB green of 1,024 files of 64 KiB; 8 works each requested, mounted over the daemon's NFS, one file read
+through the mount and saved by temp file and rename. Before: main 3406df928 (each mount's slot seeded with a copy of the
+work's files, a2415c930). After: the slot an overlay over the green's pinned version (`slates_vfs::host::tree`).
+
+| side | resident added by 8 mounts (MB) | mount made, median, 64 MiB green (ms) | over a 16-file green (ms) |
+|---|---|---|---|
+| before | 547.0, 547.1, 547.0, 547.1, 547.1 | 11.14, 9.45, 12.94, 9.38, 10.41 | 0.54, 0.65, 0.58, 0.67, 0.68 |
+| after | 0.75, 0.75, 0.72, 0.82, 0.79 | 0.53, 0.78, 0.69, 0.60, 0.71 | 0.32, 0.56, 0.46, 0.42, 6.91 |
+
+Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.
+
+
+## R9's loaded p99 on macOS: where it goes, and the immediate poll A/B (A-786; R9; 2026-11-20, w-provision-gate)
+
+**Machine and load.** This MacBook: Apple M4 Max, 14 CPUs (10 P + 4 E), 36 GB, macOS 26. Release builds,
+`provision_bench`, 9 shards (derived). The host's own load was 4 to 54 from other agents' builds through the day, so "quiet"
+below is the machine as it was, not a quiesced one. "Loaded" adds `PROVISION_BENCH_LOAD=2`: 28 busy processes at default
+priority (two a logical CPU), started after the daemon's boot. Each figure is the median of the bench's three runs, and
+the arms ran interleaved round by round. Diagnostic code (hop stamps, harvest counters, the arms' switches) lived only in
+the scratch tree, and the arms' binaries were compared by MD5 before running.
+
+**Red on main (base 37c84db43; host load 36-38).** Quiet 1-client spinning p50/p99/p999
+88.5 µs / 616 µs / 1.92 ms; parked p99 683 µs. Loaded: spinning 85.0 µs / 1.62 ms / 13.4 ms; parked p99 939 µs. Bound
+616 + (939 - 683) = 873 µs: FAIL.
+
+**Whose time.** A-559's stamps split each create: the creates at or past the loaded p99 spent 1.1 to 1.7 ms in the
+daemon at the median and 14 to 28 µs in the client (all of them parked their client). Stamps at each hop of a
+forwarded create, at the tail median (loaded): pickup by the client's shard 16-64 µs, the forward to the owner 7-13 µs,
+the owner's create 13-30 µs, the reply's task back on the client's shard 6-21 µs, from that task to the shard's serve task
+**0.77-1.37 ms** (quiet: 15 µs at the median, every create), the write into the client's ring 1 µs.
+
+**Why.** `Shard::run` harvests the driver with a zero-timeout wait whenever it has been busy a step quantum, and that ran
+between the two tasks. On macOS that wait is `kevent` with a zero timespec, which sleeps 12-15 µs with an involuntary
+switch (A-218). Counted in one 3-run form: quiet, 0 of 79,591 harvests over 100 µs (max 89 µs); loaded, 2,695 of 59,622
+(max 9.1 ms).
+
+**The A/B (loaded, three interleaved rounds, host load 41-54).** Arms: main; `immediate` (every zero-timeout wait on the
+queue is `kevent64` with `KEVENT_FLAG_IMMEDIATE`, the registrations and the kick moved to `kevent64` with it); and
+`immediate, no hold` (the same, with the closed-loop hold at 0).
+
+| arm | p50 µs | p99 ms | p999 ms | CPU, thousandths of a core |
+|---|---|---|---|---|
+| main | 114.8 / 82.3 / 77.8 | 1.04 / 0.49 / 0.91 | 2.74 / 2.26 / 7.78 | 773-1,167 / 2-1,017 / 656-811 |
+| immediate | 80.7 / 57.9 / 85.8 | 0.43 / 0.54 / 0.73 | 12.1 / 10.6 / 12.0 | 2,084-4,918 / 2,176-2,388 / 1,717-2,488 |
+| immediate, no hold | 29.6 / 68.3 / 58.9 | 0.17 / 0.38 / 0.27 | 0.30 / 11.3 / 6.65 | 1,358-3,093 / 1,270-3,518 / 1,202-2,458 |
+
+Slow harvests (over 100 µs) fell from 1,410-5,832 a form on main to 3-19 with the immediate poll. An earlier round of the
+same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against 0.67 / 0.46 / 0.74 ms, p999 13-18 against
+26-36 ms.
+
+**Measured and rejected:**
+- `immediate` with a `sched_yield` in each idle-spin turn. Quiet, it gave the best p50 (35 µs) at 0.1-0.9 cores. Loaded,
+  every p99 was 10.1 ms: each yield gave a spinner macOS's whole 10 ms quantum.
+- Zero-timeout polls of two forms on one queue (`IMMEDIATE` for the busy harvest, a zero timespec for the spin's turn, to
+  keep the spin's nap). 3 of 3 runs hung at the first create, every shard parked in `kevent64` and the client waiting: a
+  kick was lost. Not chased.
+
+**Reading.** The immediate poll removes the hop's millisecond tail. Alone, it makes A-387 keep holds, since turns now cost
+0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
+next piece; the immediate poll lands with it, not before.
+
+## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
+  three `slates anchor --fleet` processes at f = 1 over loopback UDP with their HTTPS version-control edges, formed and
+  bootstrapped; on a node not the bootstrap's, one push of git/git cut at v1.0.0 (3,434,551 bytes, 12,232 objects, about
+  500 KB of names), then ten at once, each to its own repository, over TLS, each timed from its connection to its whole
+  answer; then that node's homing counters. Studio-2 (14 cores), shared with other agents: load 10 to 16, so a build's
+  own rounds spread by up to 15 s; read the medians and the counters, never one round.
+- **Found first:** six of eleven version-3 homings fell short (`homes.homed_short`), their records version 2: the region
+  half of a homing took the record sessions on the repository's owner shard, where none is. Fixed in 3406df928 (the
+  region half runs on the control shard and waits for a lent session); after it, eleven of eleven `homed_in_region` in
+  every round below.
+- **v2 against v3** (v2 = f95edf68e, v3 = the switch on with 3406df928's fix), ten rounds:
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 2.847 | 2.376 | 5.523 | 6.787 | 8.345 | 7.902 |
+| 2 | 1.733 | 2.036 | 4.582 | 6.119 | 7.445 | 7.216 |
+| 3 | 1.719 | 2.044 | 4.910 | 5.849 | 6.862 | 6.554 |
+| 4 | 1.672 | 2.314 | 4.894 | 6.084 | 7.040 | 6.637 |
+| 5 | 1.732 | 2.082 | 4.829 | 8.733 | 6.483 | 9.971 |
+| 6 | 3.615 | 2.500 | 6.296 | 5.869 | 8.188 | 6.871 |
+| 7 | 1.952 | 2.426 | 4.312 | 7.409 | 6.631 | 8.573 |
+| 8 | 1.737 | 3.828 | 6.709 | 6.761 | 9.421 | 8.564 |
+| 9 | 4.217 | 2.278 | 10.972 | 5.646 | 15.167 | 6.045 |
+| 10 | 5.281 | 2.195 | 11.364 | 8.447 | 12.430 | 10.010 |
+
+- **Coalescing homings** (a per-member queue on the control shard, one `PutMany` a batch, the member publishing once
+  for the batch: branch `agents/w-balance-coalesce`, 962c37a07, never on main), a second ten rounds with each homing
+  timed inside (`homes.homing_local_ns`, `homes.homing_region_ns`, landed):
+
+| round | v2 10, p50 | v3 10, p50 | v3 coalesced 10, p50 | v2 1 push | v3 1 push | v3 coalesced 1 push |
+|---|---|---|---|---|---|---|
+| 1 | 9.193 | 12.633 | 13.815 | 4.588 | 4.161 | 5.935 |
+| 2 | 5.563 | 7.306 | 26.068 | 2.314 | 3.078 | 5.259 |
+| 3 | 6.670 | 15.004 | 18.836 | 2.946 | 5.626 | 4.031 |
+| 4 | 5.531 | 11.372 | 11.631 | 1.869 | 3.523 | 4.637 |
+| 5 | 20.257 | 7.777 | 11.360 | 2.431 | 4.363 | 2.886 |
+| 6 | 6.321 | 10.022 | 10.994 | 2.938 | 2.691 | 3.313 |
+| 7 | 5.054 | 5.329 | 6.109 | 2.319 | 2.052 | 2.327 |
+| 8 | 5.041 | 5.810 | 7.321 | 1.960 | 1.996 | 2.653 |
+| 9 | 4.363 | 6.453 | 5.774 | 1.738 | 2.321 | 2.168 |
+| 10 | 5.758 | 8.333 | 7.084 | 4.436 | 2.666 | 2.647 |
+
+- **What it says.** Medians, ten at once p50: 5.66 s (v2), 8.06 s (v3), 11.18 s (v3 coalesced), at load 10.5 to 11 with
+  v2's own rounds from 4.4 to 20.3 s. Each homing measured inside takes about 10 to 16 ms (11 a round: the local halves
+  16 to 66 ms, the region halves 71 to 174 ms a round), so the homing is not where a version-3 push's added time, if it
+  is real under this noise, goes; and the coalescer carried one item an exchange (14 exchanges for 14 items in most
+  rounds): the homings of concurrent pushes arrive spread over their checks and seldom overlap, so there is nothing to
+  coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
+  next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
+  the candidates), measured on a quiet host before anything is changed.
+## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
+
+
+## A partial clone back under its time before A-722 part 3: no row read for a type or an unread size (main's order 1; w-perf's A/B; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2 (shared, load 33-36), release; w-perf's `git_scale.sh` on
+  git/git cut at v1.0.0 (2,930 commits, 12,233 objects), its steps (push, clone, incremental push and fetch, shallow,
+  partial), then ten `git clone --bare --filter=blob:none` against the same daemon, each timed and the daemon's CPU
+  (`ps -o time`) taken before and after. main ab760dc65 against the change (a2fb50583).
+
+| | daemon CPU a partial clone (ten) | wall (ten) |
+|---|---|---|
+| main | 740, 700, 740, 760, 730, 740, 750, 730, 740, 720 ms | 0.967, 0.958, 1.028, 1.044, 1.011, 1.019, 1.048, 1.051, 1.020, 0.978 s |
+| after | 260, 270, 290, 250, 340, 330, 320, 340, 360, 350 ms | 0.489, 0.510, 0.514, 0.500, 0.633, 0.581, 0.584, 0.580, 0.615, 0.595 s |
+
+- **What it says.** w-perf measured 0.62-0.72 s before part 3 and 0.93-1.04 s after; the walk now reads no row for a
+  type (its landing's runs) and none for a size `blob:none` does not use, so the partial clone is under its time before
+  part 3. The scale script's own interleaved rounds on the shared machine were too noisy to compare by wall time (a
+  full clone of either arm took 6.4 to 28 s), so the daemon's CPU is the comparison.
+`crates/server/tests/green_landing_cow.rs` (measured as `mounted_work_cow.rs presenting` before its move to a binary of its own), release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
+side, all shown. A 64 MiB green of 1,024 files of 64 KiB; its landing presented into a fresh directory, then granted and
+landed. Before: main 7f8eb5cbb (the landing view a scratch volume holding a copy of the head, a2415c930). After: the
+view an overlay over the green's head, planned whole and read through the tree host beside the writer.
+
+| side | presenting adds (MB) | the granted landing adds (MB) |
+|---|---|---|
+| before | 69.34, 69.35, 69.29, 69.21, 69.26 | 1.57, 1.77, 1.61, 1.70, 1.62 |
+| after | 1.74, 1.67, 1.82, 1.61, 1.51 | 1.08, 1.06, 1.05, 1.00, 2.80 |
+
+Bound the test holds: 16.8 MB (a fixed 8 MiB and 8 MiB of windows and entries).
+
+## A rewrite's refinement sliced under its owner's turns: longest step 10-99 µs up to 4 MiB, per save 1.15-1.5x (A-787; 2026-11-20)
+
+Command: `cargo run --release -p slates-merge --example rewrite_slices`, built at A-787 and at A-776 (561c655a3, the
+example's sliced half stubbed), each tree from `git archive`. Run interleaved, three runs a side, five rounds a case,
+on adas-mac-studio-2 (Apple M4 Max, 14 cores, macOS arm64), load 13 to 14, 16:30 PST. Cases: each source file of the
+merge crate re-indented with every hundredth line's first word changed, and the same at 1, 4 and 12 MiB generated.
+"whole" is the refinement in one call (best of five, ms). "longest unit" is `Pace::longest_unit_ns` driving the paced
+refinement on the real clock with 250 µs turns.
+
+| case | A-776 whole ms (3 runs) | A-787 whole ms (3 runs) | A-787 longest unit µs, each round (3 runs × 5) |
+|---|---|---|---|
+| engine.rs (304 KiB) | 13.84, 14.63, 14.26 | 20.80, 20.83, 21.05 | 30.8 31.1 32.0 30.6 31.0; 34.8 46.4 30.5 31.0 30.3; 30.9 30.9 30.9 32.9 31.4 |
+| verdict.rs (6 KiB) | 0.21, 0.21, 0.21 | 0.31, 0.31, 0.32 | 11.5 10.2 10.2 10.1 10.2; 10.7 10.1 10.0 19.5 14.8; 10.7 10.2 10.1 10.2 10.2 |
+| increment.rs (89 KiB) | 3.87, 4.11, 3.97 | 5.92, 5.82, 6.00 | 29.7 31.0 30.7 29.5 29.4; 32.4 31.9 34.7 31.4 31.3; 29.2 29.6 29.4 29.5 29.7 |
+| 1 MiB | 11.69, 12.53, 11.19 | 17.21, 17.43, 17.67 | 33.0 32.8 30.8 32.0 46.7; 32.0 31.7 37.5 32.0 31.1; 57.2 31.5 51.0 32.2 34.9 |
+| 4 MiB | 46.47, 51.80, 49.55 | 67.87, 67.28, 67.16 | 89.8 33.5 37.5 35.0 33.1; 38.8 36.0 75.4 43.8 99.2; 61.8 33.3 37.9 33.3 33.9 |
+| 12 MiB | 165.88, 182.10, 183.00 | 205.25, 202.21, 199.54 | 164.8 291.0 1814.2 2826.1 97.2; 47.1 43.9 42.3 41.4 40.3; 71.0 49.2 66.5 2522.1 43.2 |
+
+Under A-776 the longest step is the whole call: 14 ms at 304 KiB, 166 to 211 ms at 12 MiB. Under A-787 it stays tens
+of µs and does not grow with the file, apart from three 12 MiB rounds of 15 with one unit of 1.8 to 2.8 ms. Those are
+not explained yet: preemption at load 13 on 14 cores, or the release of a large buffer, both unmeasured. The paced
+refinement costs 1.45 to 1.5 times the one-call refinement on source files and at 1 MiB, 1.35 times at 4 MiB and 1.15
+times at 12 MiB. Its search makes the same steps (2,365,669 for `engine.rs` in both trees), so the cost is the meter's
+bookkeeping per comparison. The same A/B on this Mac at load 35 to 58 gave the same per-save ratios, with preemption
+outliers of up to 80 ms in the longest unit.
+
+Rejected, measured:
+- A heapsort in place for the anchors: 165 to 185 ms against 14 ms for a 1 MiB rewrite.
+- Restructuring the Myers rounds to await once per unit rather than per diagonal: no change (25.9 against 26.1 ms).
+- A hash table for the anchors: its rehash is one step that grows with the file.
+
+Kept: A-787.
+
+## The fragments' encoder, its level timed per object against chosen from measured rates: even on CPU, one output (main's ruling; A-718; 2026-11-20)
+
+- **The machine and builds.** adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores; placed by kiln, no `on`), release
+  builds of `crates/git/examples/encode_bench.rs` on two branches: A, agents/w-k90-ab-A (slates 8ebf8a1c6, the encoder's
+  zlib level and delta window learned from each sample and trial timed on the clock), B, agents/w-k90-ab-B (7c37b6fee,
+  chosen from the bytes they saved and `learn::Rates` measured once a process), each with `Repository::fragments_len`.
+  Dataset: git/git cut at v2.0.0 (`echo v2.0.0 | git pack-objects --revs --stdout`, 55,872,412 bytes; head
+  e156455ea491), its 2,301,445,716 bytes of objects pushed as one version and its fragments encoded once a process.
+- **The command.** `encode_bench <head> < v2.pack`, A then B, three rounds (kiln run r24; its script in the run). The
+  machine was not quiet: other agents' builds held its load at 22 to 58.
+
+| round | load at its start | A: ns a MiB in | A: fragments | B: ns a MiB in | B: fragments |
+|---|---|---|---|---|---|
+| 1 | 41 / 58 | 114,257,366 (250.8 s) | 1,918,502,639 B | 109,622,545 (240.6 s) | 1,918,502,639 B |
+| 2 | 56 / 55 | 111,023,658 (243.7 s) | 1,914,198,588 B | 64,824,161 (142.3 s) | 1,918,502,639 B |
+| 3 | 22 / 38 | 58,649,771 (128.7 s) | 1,918,502,639 B | 58,563,455 (128.5 s) | 1,918,502,639 B |
+
+- **What it says.** Best of three, the two are even on CPU (128.7 s against 128.5 s, 58.6 ms a MiB of objects; the
+  rest is the load), so the change is not one for speed: a dead-even A/B, kept for its correctness. B wrote the same
+  1,918,502,639 bytes in every round; A wrote 4,304,051 bytes fewer in round 2, its level a timed choice the load moved,
+  which is what main's ruling removed (one input, one output; A-745 rule 4's held answer now byte for byte). Both write
+  fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
+  to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
+  (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.

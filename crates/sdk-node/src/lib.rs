@@ -38,6 +38,8 @@
 // exception 2, `slates-transport::handshake`).
 #![allow(clippy::disallowed_types)]
 
+mod session_log;
+
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::driver::{Begin, Driver, Event};
@@ -806,6 +808,16 @@ impl Client {
     let id = parse_volume(&volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
     volume_status(report)
+  }
+
+  /// The session log (A-773), the view `slates log --json` prints, in camelCase: `needsYou` first (collided works,
+  /// merges held for approval, landings awaiting a grant, each with its `kind`), then `greens` (each `head` and its
+  /// `works`: `base`, `behind`, `mark`) and `awaitingGrant`. A read walked a page at a time: it approves and grants
+  /// nothing (R10).
+  #[napi]
+  pub fn session_log(&mut self) -> Result<session_log::SessionLogView> {
+    let log = self.inner.session_log().map_err(refusal)?;
+    session_log::view_of(&log)
   }
 
   /// Reads an overlay's whole drift (§4.4 `status`, A-267) as a [`DriftedResult`]: a status carries the first drifted

@@ -135,9 +135,9 @@ pub struct MergeShardState {
   /// (`crate::green_adopt::readopt_at_boot`). Every verb on it is answered `Overloaded` meanwhile. Bounded by the greens
   /// this shard owns; empty once the boot has re-adopted or fenced each.
   pub(crate) awaiting_adoption: BTreeMap<DbVolumeId, crate::green_adopt::AwaitingAdoption>,
-  /// The base snapshot of each mounted work of this shard (A-774, `crate::mounted_work`): what its mount changed is its
-  /// slot's op log since it. One entry a mounted work, dropped with the work.
-  pub(crate) mounted: crate::mounted_work::MountedBases,
+  /// Each mounted work's pin (A-774, `crate::mounted_work::MountPin`): the green version its mount's base reads, kept
+  /// readable while the mount lives ([`reachable_floor`]). One entry a mounted work, dropped with its slot.
+  pub(crate) mounted: crate::mounted_work::MountedPins,
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
@@ -177,7 +177,15 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   let oldest_work = state.db.partition().oldest_work_floor(green);
   // A live branch of the green's lineage made at a version keeps it, so a recovery branches it there again (A-575).
   let oldest_branch = state.db.partition().repositories().branch_floor(green);
+  // A mounted work's base reads its green at its pin (A-774).
+  let mounts = state
+    .merge
+    .mounted
+    .values()
+    .filter(|pin| pin.green == green)
+    .map(|pin| pin.version);
   pins
+    .chain(mounts)
     .chain(oldest_work)
     .chain(oldest_branch)
     .min()
@@ -2137,6 +2145,70 @@ impl MergeShardState {
   }
 }
 
+/// Format: a holder node's composed increment held as its version's inputs before its owner commits it (A-697 (1)), the
+/// non-vacuity count of [`hold_composed_inputs`].
+pub(crate) const INPUTS_HELD_AT_COMPOSE: &str = "merge.inputs.held_at_compose";
+/// Format: such a hold the content plane refused (no room): the owner's shipment carries what it lacks, as before.
+const INPUTS_HELD_AT_COMPOSE_REFUSED: &str = "merge.inputs.held_at_compose_refused";
+/// Format: a version's owner told that the node which composed its increment lacks none of its inputs (A-697 (1)).
+pub(crate) const INPUTS_HELD_BY_COMPOSER: &str = "merge.inputs.held_by_composer";
+/// Format: the input chunks a version's shipments carried, summed over their targets (A-697 (1)'s red: none to the node
+/// that composed the increment).
+pub(crate) const INPUTS_CHUNKS_SHIPPED: &str = "merge.inputs.chunks_shipped";
+
+/// Holds `increment`, which this holder node composed and sends its owner (A-697 part c), as the inputs of `green`'s
+/// next version (`sequence`, the version this node's replica expects; the owner's offer refreshes the placement to the
+/// version it commits): the archive its owner names the version's inputs by ([`MergeShardState::inputs_identity`],
+/// whose identity is the bytes' alone), in this node's held content. So the owner's record reaches this node with no
+/// chunks (`inputs_held_by`), where before the version's inputs crossed back, a copy of what this node had just sent.
+/// A refusal (no room) only leaves them to the owner's shipment, counted.
+pub(crate) fn hold_composed_inputs(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  increment: &[u8],
+  sequence: u64,
+) {
+  let archive = MergeShardState::inputs_archive(increment, 0, archive_page(state));
+  let held = state.held_content.hold(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    ObjectId(green.bytes),
+    slates_cluster::content::Placed { sequence },
+    archive,
+  );
+  state.count(
+    if held.is_ok() {
+      INPUTS_HELD_AT_COMPOSE
+    } else {
+      INPUTS_HELD_AT_COMPOSE_REFUSED
+    },
+    1,
+  );
+}
+
+/// Tells `green`'s pending `version` that `host`, the node which composed its increment and held it as the version's
+/// inputs (`hold_composed_inputs`), lacks none of them: its shipment carries the offer and no chunk, which that node
+/// acknowledges from its hold. A node that could not hold them answers the offer with what it lacks, and the next
+/// shipment carries that (the content plane's ordinary path).
+pub(crate) fn inputs_held_by(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  host: HostId,
+) {
+  let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&ObjectId(green.bytes))
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  else {
+    return;
+  };
+  if pending.inputs.candidates.contains(&host) && !pending.inputs.acked.contains(&host) {
+    pending.lacking.insert(host, Vec::new());
+    state.count(INPUTS_HELD_BY_COMPOSER, 1);
+  }
+}
+
 /// The inputs a version references, as the chain holds them: the origin for version 0 (none for a
 /// scratch green), the increment's chain entry for version N.
 fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<u8>> {
@@ -2720,6 +2792,9 @@ fn ship_version(
   for (targets, inputs) in shipments {
     if let Some(inputs) = &inputs {
       state.count(INPUTS_UNPLACED, 1);
+      let chunks =
+        u64::try_from(inputs.chunks.len().saturating_mul(targets.len())).unwrap_or(u64::MAX);
+      state.count(INPUTS_CHUNKS_SHIPPED, chunks);
       if !inputs.whole {
         state.count(INPUTS_PARTIAL, 1);
       }

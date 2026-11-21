@@ -679,15 +679,30 @@ pub(crate) fn capture_of(
 /// A landing's beginning: against its capture for a captured clone ([`capture_of`]), else from the volume's own
 /// diverged entries.
 fn landing_beginning(
-  vol: &slates_vfs::volume::Volume,
+  slot: &crate::state::VolumeSlot,
   target: &slates_land::engine::LandingTarget,
   request: &LandingRequest,
   against: Option<slates_vfs::captured::CaptureBase>,
 ) -> Result<slates_land::engine::Beginning, slates_land::engine::LandingRefusal> {
+  let vol = &slot.volume;
   match against {
     Some(base) => slates_land::engine::Beginning::against_capture(vol, target, request, base),
+    // A green's landing view lands its whole tree, read from the green (A-774 part 3).
+    None if over_tree(slot) => slates_land::engine::Beginning::materializing(vol, target, request),
     None => slates_land::engine::Beginning::new(vol, target, request),
   }
+}
+
+/// Whether `slot`'s volume is an overlay whose base is a tree the shard holds (a green's landing view, A-774 part 3):
+/// its base is never the landing's target, so it lands as a scratch volume does, its files read through the tree.
+fn over_tree(slot: &crate::state::VolumeSlot) -> bool {
+  matches!(slot.host, Some(BaseHost::Tree(_)))
+}
+
+/// Whether `slot`'s volume is an overlay whose base is the directory it lands into (§4.15 step 9): its host is lent to
+/// the landing's writer.
+fn base_is_target(slot: &crate::state::VolumeSlot) -> bool {
+  slot.volume.is_overlay() && !over_tree(slot)
 }
 
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
@@ -714,6 +729,8 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     return refused(Refusal::NotFound);
   };
   let (source, implicit) = match prepared.source {
+    // A green's landing view has no writer: its head is the state it lands, read where it lies (A-774 part 3).
+    Source::Head if over_tree(slot) => (Source::Head, None),
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
       Err(e) => {
@@ -723,7 +740,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     },
     named => (named, None),
   };
-  let was_overlay = slot.volume.is_overlay();
+  let was_overlay = base_is_target(slot);
   // One host per volume: an overlay's base names its directories by the handles of the host its slot holds, so the
   // writer is built inside that host, with the target walked again under the same containment, and the host goes back
   // to the slot between units.
@@ -762,7 +779,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
+  let beginning = match landing_beginning(slot, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
@@ -1722,6 +1739,8 @@ fn begin_granted(
   // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
   // between slices do not move.
   let (source, implicit) = match prepared.source {
+    // A green's landing view has no writer: its head is the state it lands, read where it lies (A-774 part 3).
+    Source::Head if over_tree(slot) => (Source::Head, None),
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
       Err(e) => {
@@ -1734,7 +1753,7 @@ fn begin_granted(
     },
     named => (named, None),
   };
-  let was_overlay = slot.volume.is_overlay();
+  let was_overlay = base_is_target(slot);
   let (os, land_target) = if was_overlay {
     let Some(host) = take_disk_host(slot) else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
@@ -1774,7 +1793,7 @@ fn begin_granted(
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
+  let beginning = match landing_beginning(slot, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
@@ -2007,14 +2026,26 @@ fn step_beginning(
     },
     Writer::Out => return Some(Err(LandingRefusal::HostAway)),
   };
-  let stepped = beginning.unit(
+  // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
+  let lent_green =
+    crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
+  let tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut lens = None;
+  let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
+    (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),
+    _ => None,
+  };
+  let stepped = beginning.unit_over(
     &mut os,
+    base,
     &mut slot.volume,
     &mut state.store,
-    &mut state.landing.grants,
-    &mut state.landing.audit,
+    (&mut state.landing.grants, &mut state.landing.audit),
   );
-  *writer = if slot.volume.is_overlay() {
+  drop(lens);
+  *writer = if base_is_target(slot) {
     let (host, away) = os.lend();
     slot.host = Some(BaseHost::Disk(host));
     Writer::Lent(away)
@@ -2132,13 +2163,25 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
     return Stepped::Ended(Box::new(Err(LandingRefusal::HostAway)));
   }
   let began = state.clock.monotonic_ns();
-  let stepped = granted.run.step(
+  // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
+  let lent_green =
+    crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
+  let tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut lens = None;
+  let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
+    (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),
+    _ => None,
+  };
+  let stepped = granted.run.step_over(
     &mut slot.volume,
     &mut state.store,
-    &mut state.landing.audit,
-    &mut granted.spans,
+    (&mut state.landing.audit, &mut granted.spans),
     budget_ns,
+    base,
   );
+  drop(lens);
   if granted.was_overlay {
     lend_back(slot, granted);
   }
@@ -2227,7 +2270,7 @@ fn complete_finish(
   drain_land_spans(state, spans);
   let mut rebased = false;
   if let Ok(slot) = state.volumes.get_mut(granted.handle) {
-    if slot.volume.is_overlay() {
+    if base_is_target(slot) {
       rebased = !granted.was_overlay;
       if let Some(os) = granted.run.take_host() {
         let mut host = os.into_host();

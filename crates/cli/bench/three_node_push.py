@@ -39,7 +39,8 @@ HTTPS_EDGE = re.compile(r"the version-control HTTP edge serves HTTPS on 127\.0\.
 ISSUER = "slates anchor: issuer surface: export "
 DAEMON_PID = re.compile(r"daemon pid (\d+)")
 # Format: the counters a round reads from the pushing node.
-WATCHED = re.compile(r"homes\.(homed_in_region|homed_short|published_for_ticket|homing_untaken)|state_log\.push_uncommitted")
+WATCHED = re.compile(r"homes\.(homed_in_region|homed_short|published_for_ticket|homing_untaken|homing_local_ns|"
+                     r"homing_region_ns)|state_log\.push_uncommitted")
 
 
 def run(slates, instance, args, env=None, check=False):

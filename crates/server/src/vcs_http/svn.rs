@@ -194,6 +194,18 @@ pub(crate) trait SvnStores {
     None
   }
 
+  /// The name of the transaction `principal` holds in repository `id` that is DeltaV v1's `activity` (A-766 part 2);
+  /// none where this lender serves no commits or `principal` holds none by that activity.
+  fn transaction_of_activity(
+    &mut self,
+    id: RepositoryId,
+    principal: &Principal,
+    activity: &str,
+  ) -> Option<String> {
+    let _ = (id, principal, activity);
+    None
+  }
+
   /// Runs `step` on repository `id`'s transaction `name`, which `principal` made, over the records, keeping it unless
   /// it ended: none where this lender serves no commits or does not hold `id`'s records, `Some(None)` where no such
   /// transaction is open for `principal`.
@@ -600,8 +612,10 @@ pub(crate) struct SvnExchange<S: SvnStores> {
 /// A PUT whose body is streamed into its transaction (A-681): the transaction, the path below its root, whether its file
 /// is begun, and the refusal its drive met, after which the body's runs are read and dropped.
 struct Streamed {
-  /// The transaction's name.
+  /// The transaction's name; DeltaV v1's activity where `activity` (A-766 part 2).
   transaction: String,
+  /// Whether `transaction` names a DeltaV v1 activity, whose transaction is found at the PUT's first step.
+  activity: bool,
   /// The path below the transaction's root.
   path: String,
   /// Whether the file's delta is open.
@@ -610,17 +624,21 @@ struct Streamed {
   refused: Option<HttpAnswer>,
 }
 
-/// The streamed PUT `method` on `path` names, when it is a PUT under a transaction's root (`!svn/txr/NAME/...`).
+/// The streamed PUT `method` on `path` names, when it is a PUT under a transaction's root (`!svn/txr/NAME/...`) or a
+/// DeltaV v1 working resource (`!svn/wrk/ID/...`, A-766 part 2).
 fn streamed_put(method: &str, path: &str) -> Option<Streamed> {
   if method != "PUT" {
     return None;
   }
   let segments: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
-  let [first, "txr", name, rest @ ..] = segments.as_slice() else {
-    return None;
+  let (name, rest, activity) = match segments.as_slice() {
+    [first, "txr", name, rest @ ..] if *first == site::SPECIAL => (*name, rest, false),
+    [first, "wrk", activity, rest @ ..] if *first == site::SPECIAL => (*activity, rest, true),
+    _ => return None,
   };
-  (*first == site::SPECIAL).then(|| Streamed {
-    transaction: (*name).to_owned(),
+  Some(Streamed {
+    transaction: name.to_owned(),
+    activity,
     path: format!("/{}", rest.join("/")),
     begun: false,
     refused: None,
@@ -724,6 +742,36 @@ const KEEP_LOCKS: &str = "keep-locks";
 const LOCK_UNWRITABLE: u32 = 160_000;
 /// Format: `SVN_ERR_UNSUPPORTED_FEATURE`, the error a commit meeting a configured hook is refused with.
 const UNSUPPORTED_FEATURE: u32 = 200_007;
+/// `SVN_ERR_INCOMPLETE_DATA`: a DeltaV v1 CHECKOUT naming no activity.
+/// Format: `svn_error_codes.h`, the miscellaneous category's start (200,000) plus 3.
+const SVN_ERR_INCOMPLETE_DATA: u32 = 200_003;
+/// `SVN_ERR_INCORRECT_PARAMS`: a DeltaV v1 CHECKOUT naming more than one activity, or an href that is none.
+/// Format: `svn_error_codes.h`, the miscellaneous category's start plus 4.
+const SVN_ERR_INCORRECT_PARAMS: u32 = 200_004;
+/// `SVN_ERR_APMOD_ACTIVITY_NOT_FOUND`: a DeltaV v1 CHECKOUT into an activity that does not exist.
+/// Format: `svn_error_codes.h`, the `mod_dav_svn` category's start (190,000) plus 2.
+const SVN_ERR_APMOD_ACTIVITY_NOT_FOUND: u32 = 190_002;
+/// `SVN_ERR_APMOD_BAD_BASELINE`: a DeltaV v1 CHECKOUT of a baseline that is not the youngest.
+/// Format: `svn_error_codes.h`, the `mod_dav_svn` category's start plus 3.
+const SVN_ERR_APMOD_BAD_BASELINE: u32 = 190_003;
+/// OK.
+/// Format: RFC 9110 §15.3.1.
+const HTTP_OK: u16 = 200;
+/// No Content.
+/// Format: RFC 9110 §15.3.5.
+const HTTP_NO_CONTENT: u16 = 204;
+/// Bad Request.
+/// Format: RFC 9110 §15.5.1.
+const HTTP_BAD_REQUEST: u16 = 400;
+/// Method Not Allowed.
+/// Format: RFC 9110 §15.5.6.
+const HTTP_METHOD_NOT_ALLOWED: u16 = 405;
+/// Conflict.
+/// Format: RFC 9110 §15.5.10.
+const HTTP_CONFLICT: u16 = 409;
+/// Not Implemented.
+/// Format: RFC 9110 §15.6.2.
+const HTTP_NOT_IMPLEMENTED: u16 = 501;
 /// The words a commit is refused with at a point where the repository configures a hook, which this site does not run
 /// yet, as the svn+ssh tunnel words it.
 const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
@@ -761,6 +809,11 @@ impl<S: SvnStores> SvnExchange<S> {
     }
     Some(match (method.as_str(), segments.as_slice()) {
       ("POST", [first, "me"]) if *first == site::SPECIAL => self.post(gone).await,
+      ("MKACTIVITY", [first, "act", activity]) if *first == site::SPECIAL => {
+        let activity = (*activity).to_owned();
+        self.make_activity(&activity, gone).await
+      }
+      ("CHECKOUT", _) => self.checkout(&segments),
       ("MERGE", _) => self.merge(gone).await,
       ("LOCK", _) => self.lock(gone).await,
       ("UNLOCK", _) => self.unlock(gone).await,
@@ -784,6 +837,21 @@ impl<S: SvnStores> SvnExchange<S> {
       (method, [first, "txr", name, rest @ ..]) if special(first) => {
         self.on_transaction_root(method, name, &format!("/{}", rest.join("/")))
       }
+      // DeltaV v1 (A-766 part 2): an activity's DELETE ends it; its working baseline takes the revision properties; a
+      // working resource is its transaction's root.
+      ("DELETE", [first, "act", activity]) if special(first) => self.delete_activity(activity),
+      ("PROPPATCH", [first, "wbl", activity, _]) if special(first) => {
+        self.working_baseline_proppatch(activity)
+      }
+      (_, [first, "wbl", _, _]) if special(first) => {
+        commit::unserved("This request on a working baseline")
+      }
+      (method, [first, "wrk", activity, rest @ ..]) if special(first) => {
+        match self.transaction_of_activity(activity) {
+          Some(name) => self.on_transaction_root(method, &name, &format!("/{}", rest.join("/"))),
+          None => commit::no_such_transaction(activity),
+        }
+      }
       _ => return None,
     })
   }
@@ -803,11 +871,26 @@ impl<S: SvnStores> SvnExchange<S> {
   /// A POST making a transaction: its revision properties from the body's skel, the principal its author.
   async fn post(&mut self, gone: ClientGone<'_>) -> HttpAnswer {
     let user = crate::lfs::owner_name(&self.principal);
-    let hook_user = user.clone();
     let properties = match commit::transaction_properties(&self.body, Some(&user)) {
       Ok(properties) => properties,
       Err(_) => return commit::unserved("A POST whose body is no create-txn skel"),
     };
+    match self.begin_transaction(properties, gone).await {
+      Ok(transaction) => commit::created(&transaction),
+      Err(refused) => refused,
+    }
+  }
+
+  /// Begins a transaction with the revision properties `properties` (a POST's, or a DeltaV v1 MKACTIVITY's author
+  /// alone, `dav_svn__create_txn`): made, its start-commit hook run where it is due (A-733), and kept; its name, or the
+  /// answer that refused it.
+  async fn begin_transaction(
+    &mut self,
+    properties: Vec<(Vec<u8>, Vec<u8>)>,
+    gone: ClientGone<'_>,
+  ) -> Result<String, HttpAnswer> {
+    let user = crate::lfs::owner_name(&self.principal);
+    let hook_user = user.clone();
     let (root, name, room) = (
       self.root.clone(),
       self.name.clone(),
@@ -834,11 +917,11 @@ impl<S: SvnStores> SvnExchange<S> {
         .begin_commit(self.repository, &self.principal, setup_of)
       {
         Some(Ok(begun)) => begun,
-        Some(Err(refused)) => return refused,
-        None => return commit::unserved("Commits"),
+        Some(Err(refused)) => return Err(refused),
+        None => return Err(commit::unserved("Commits")),
       };
     let Some(due) = due else {
-      return commit::created(&transaction);
+      return Ok(transaction);
     };
     // start-commit, run where `mod_dav_svn` runs it: once the transaction is made (A-733). Its capabilities are
     // `mergeinfo`, which every stock client announces in its requests' `DAV` header.
@@ -881,10 +964,10 @@ impl<S: SvnStores> SvnExchange<S> {
       &transaction,
       |commit, world| commit.resume_begin(world, answer),
     ) {
-      Some(Some(Ok(()))) => commit::created(&transaction),
-      Some(Some(Err(refused))) => refused,
-      Some(None) => commit::no_such_transaction(&transaction),
-      None => commit::unserved("Commits"),
+      Some(Some(Ok(()))) => Ok(transaction),
+      Some(Some(Err(refused))) => Err(refused),
+      Some(None) => Err(commit::no_such_transaction(&transaction)),
+      None => Err(commit::unserved("Commits")),
     }
   }
 
@@ -903,6 +986,151 @@ impl<S: SvnStores> SvnExchange<S> {
       Some(Some(answer)) => answer,
       Some(None) => commit::no_such_transaction(name),
       None => commit::unserved("Commits"),
+    }
+  }
+
+  /// The transaction this principal holds that is DeltaV v1's `activity` (A-766 part 2), if any.
+  fn transaction_of_activity(&mut self, activity: &str) -> Option<String> {
+    self
+      .stores
+      .transaction_of_activity(self.repository, &self.principal, activity)
+  }
+
+  /// DeltaV v1's MKACTIVITY of `activity` (`activity.c`, `version.c` `make_activity`): a transaction begun with the
+  /// principal as its author alone (`dav_svn__create_txn`), start-commit run as a POST's is, named the activity, and
+  /// answered `201` as `mod_dav`'s `dav_created` answers ("Activity ... has been created."). An activity already open
+  /// is refused `405`, as `mod_dav` refuses MKACTIVITY of a resource that exists.
+  async fn make_activity(&mut self, activity: &str, gone: ClientGone<'_>) -> HttpAnswer {
+    if self.transaction_of_activity(activity).is_some() {
+      return bare_status(HTTP_METHOD_NOT_ALLOWED);
+    }
+    let user = crate::lfs::owner_name(&self.principal);
+    let Ok(properties) = commit::transaction_properties(b"( create-txn )", Some(&user)) else {
+      return commit::unserved("An activity's transaction");
+    };
+    let transaction = match self.begin_transaction(properties, gone).await {
+      Ok(transaction) => transaction,
+      Err(refused) => return refused,
+    };
+    let named = self.on_transaction(&transaction, |commit, _, _| {
+      commit.set_activity(activity);
+      bare_status(HTTP_OK)
+    });
+    if named.status != HTTP_OK {
+      return named;
+    }
+    let uri = format!(
+      "{}/{}/act/{}",
+      self.root.trim_end_matches('/'),
+      site::SPECIAL,
+      activity
+    );
+    slates_svn::dav::response::created("Activity", &uri, &uri)
+  }
+
+  /// DeltaV v1's CHECKOUT (`mod_dav.c` `dav_method_checkout`, `version.c` `dav_svn__checkout`) of the resource at
+  /// `segments` into the activity its body names: the VCC (with `DAV:apply-to-version`) or the youngest baseline into
+  /// the activity's working baseline, a version resource `!svn/ver/REV/PATH` into the working resource of `PATH`, its
+  /// revision kept as the base its later requests are judged against; each answered `201` with the working resource's
+  /// URL. Refused as `mod_dav_svn` refuses: no activity, more than one, one that does not exist, a baseline not the
+  /// youngest, any other resource.
+  fn checkout(&mut self, segments: &[&str]) -> HttpAnswer {
+    let bounds = xml_bounds(self.request_room);
+    let Ok(request) = slates_svn::dav::request::checkout(&self.body, &bounds) else {
+      return bare_status(HTTP_BAD_REQUEST);
+    };
+    if request.new_activity {
+      return slates_svn::dav::locking::error_answer(
+        HTTP_NOT_IMPLEMENTED,
+        true,
+        UNSUPPORTED_FEATURE,
+        "CHECKOUT cannot create an activity at this time. Use MKACTIVITY first",
+      );
+    }
+    let activity = match request.activities.as_slice() {
+      [] => {
+        return v1_conflict(
+          SVN_ERR_INCOMPLETE_DATA,
+          "An activity must be provided for checkout",
+        );
+      }
+      [href] => href.clone(),
+      _ => {
+        return v1_conflict(
+          SVN_ERR_INCORRECT_PARAMS,
+          "Only one activity may be specified within the CHECKOUT",
+        );
+      }
+    };
+    let activity = below_root(&activity, &self.root).and_then(|path| {
+      let parts: Vec<&str> = path.split('/').filter(|name| !name.is_empty()).collect();
+      match parts.as_slice() {
+        [first, "act", id] if *first == site::SPECIAL => Some((*id).to_owned()),
+        _ => None,
+      }
+    });
+    let Some(activity) = activity else {
+      return v1_conflict(
+        SVN_ERR_INCORRECT_PARAMS,
+        "The provided href is not an activity URI",
+      );
+    };
+    let Some(transaction) = self.transaction_of_activity(&activity) else {
+      return v1_conflict(
+        SVN_ERR_APMOD_ACTIVITY_NOT_FOUND,
+        "The specified activity does not exist",
+      );
+    };
+    let root = self.root.clone();
+    let target = checkout_target(segments, request.apply_to_version);
+    self.on_transaction(&transaction, |commit, world, _| {
+      let youngest = world.index.youngest();
+      let working = match target {
+        Some(CheckoutTarget::Baseline(revision)) => {
+          if revision.unwrap_or(youngest) != youngest {
+            return v1_conflict(
+              SVN_ERR_APMOD_BAD_BASELINE,
+              "The specified baseline is not the latest baseline, so it may not be checked out",
+            );
+          }
+          slates_svn::dav::activity::working_baseline_uri(&root, &activity, youngest)
+        }
+        Some(CheckoutTarget::Version(revision, path)) => {
+          commit.check_out(&path, revision);
+          slates_svn::dav::activity::working_uri(&root, &activity, &path)
+        }
+        None => {
+          return v1_conflict(
+            UNSUPPORTED_FEATURE,
+            "CHECKOUT can only be performed on a version resource",
+          );
+        }
+      };
+      slates_svn::dav::response::created("Checked-out resource", &working, &working)
+    })
+  }
+
+  /// DeltaV v1's PROPPATCH of `activity`'s working baseline: the commit's revision properties
+  /// (`DavCommit::proppatch_revision_properties`).
+  fn working_baseline_proppatch(&mut self, activity: &str) -> HttpAnswer {
+    let Some(transaction) = self.transaction_of_activity(activity) else {
+      return commit::no_such_transaction(activity);
+    };
+    let body = std::mem::take(&mut self.body);
+    let bounds = xml_bounds(self.request_room);
+    self.on_transaction(&transaction, |commit, _, _| {
+      commit.proppatch_revision_properties((&body, &bounds))
+    })
+  }
+
+  /// DeltaV v1's DELETE of `activity` (`activity.c` `dav_svn__delete_activity`): its transaction aborted where it is
+  /// still open, `204` either way, a merged activity's transaction being already gone.
+  fn delete_activity(&mut self, activity: &str) -> HttpAnswer {
+    match self.transaction_of_activity(activity) {
+      Some(transaction) => self.on_transaction(&transaction, |commit, world, hooks| {
+        commit.abort(world, hooks)
+      }),
+      None => bare_status(HTTP_NO_CONTENT),
     }
   }
 
@@ -942,12 +1170,18 @@ impl<S: SvnStores> SvnExchange<S> {
       .split('/')
       .filter(|name| !name.is_empty())
       .collect();
-    let [first, "txr", name, rest @ ..] = segments.as_slice() else {
-      return commit::unserved("A COPY whose Destination is no transaction's");
+    let (name, rest) = match segments.as_slice() {
+      [first, "txr", name, rest @ ..] if *first == site::SPECIAL => ((*name).to_owned(), rest),
+      // DeltaV v1's COPY names a working resource (A-766 part 2).
+      [first, "wrk", activity, rest @ ..] if *first == site::SPECIAL => {
+        match self.transaction_of_activity(activity) {
+          Some(name) => (name, rest),
+          None => return commit::no_such_transaction(activity),
+        }
+      }
+      _ => return commit::unserved("A COPY whose Destination is no transaction's"),
     };
-    if *first != site::SPECIAL {
-      return commit::unserved("A COPY whose Destination is no transaction's");
-    }
+    let name = name.as_str();
     let target = format!("/{}", rest.join("/"));
     self.on_transaction(name, |commit, world, hooks| {
       commit.copy(world, hooks, (source, revision), &target)
@@ -965,13 +1199,17 @@ impl<S: SvnStores> SvnExchange<S> {
       return commit::unserved("A MERGE of something outside this repository");
     };
     let segments: Vec<&str> = source.split('/').filter(|name| !name.is_empty()).collect();
-    let [first, "txn", name] = segments.as_slice() else {
-      return commit::unserved("A MERGE of an activity");
+    let name = match segments.as_slice() {
+      [first, "txn", name] if *first == site::SPECIAL => (*name).to_owned(),
+      // DeltaV v1 merges its activity (A-766 part 2).
+      [first, "act", activity] if *first == site::SPECIAL => {
+        match self.transaction_of_activity(activity) {
+          Some(name) => name,
+          None => return commit::no_such_transaction(activity),
+        }
+      }
+      _ => return commit::unserved("A MERGE of something but a transaction or an activity"),
     };
-    if *first != site::SPECIAL {
-      return commit::unserved("A MERGE of an activity");
-    }
-    let name = (*name).to_owned();
     let target = self.path.clone();
     let keep = self
       .commit_headers
@@ -1096,39 +1334,51 @@ impl<S: SvnStores> SvnExchange<S> {
       return refused;
     }
     let hooks = self.hooks();
-    self.on_transaction(&streamed.transaction, |commit, world, _| {
-      commit.end_put(world, &hooks)
-    })
+    let name = match self.streamed_transaction(&streamed) {
+      Ok(name) => name,
+      Err(refused) => return refused,
+    };
+    self.on_transaction(&name, |commit, world, _| commit.end_put(world, &hooks))
+  }
+
+  /// The transaction a streamed PUT is on: its own name, or the one DeltaV v1's activity names (A-766 part 2).
+  fn streamed_transaction(&mut self, streamed: &Streamed) -> Result<String, HttpAnswer> {
+    if !streamed.activity {
+      return Ok(streamed.transaction.clone());
+    }
+    self
+      .stores
+      .transaction_of_activity(self.repository, &self.principal, &streamed.transaction)
+      .ok_or_else(|| commit::no_such_transaction(&streamed.transaction))
   }
 
   /// One step of a streamed PUT on its transaction: the file begun where it is not yet, then `run` as the delta's next
   /// chunk where one is given.
   fn put_step(&mut self, streamed: &Streamed, run: Option<&[u8]>) -> Result<(), HttpAnswer> {
+    let name = self.streamed_transaction(streamed)?;
     let headers = self.commit_headers.clone();
     let hooks = self.hooks();
     let (begun, path) = (streamed.begun, streamed.path.as_str());
-    let stepped = self.stores.on_commit(
-      self.repository,
-      &self.principal,
-      &streamed.transaction,
-      |commit, world| {
-        if !begun {
-          for token in DavCommit::if_tokens(headers.presented.as_deref().unwrap_or_default()) {
-            commit.present(path, token);
+    let stepped =
+      self
+        .stores
+        .on_commit(self.repository, &self.principal, &name, |commit, world| {
+          if !begun {
+            for token in DavCommit::if_tokens(headers.presented.as_deref().unwrap_or_default()) {
+              commit.present(path, token);
+            }
+            let start = PutStart {
+              base_md5: headers.base_md5.as_deref(),
+              result_md5: headers.result_md5.as_deref(),
+              version_name: headers.version_name.or_else(|| commit.checked_out(path)),
+            };
+            commit.begin_put(world, &hooks, path, &start)?;
           }
-          let start = PutStart {
-            base_md5: headers.base_md5.as_deref(),
-            result_md5: headers.result_md5.as_deref(),
-            version_name: headers.version_name,
-          };
-          commit.begin_put(world, &hooks, path, &start)?;
-        }
-        run.map_or(Ok(()), |run| commit.put_chunk(world, &hooks, run))
-      },
-    );
+          run.map_or(Ok(()), |run| commit.put_chunk(world, &hooks, run))
+        });
     match stepped {
       Some(Some(stepped)) => stepped,
-      Some(None) => Err(commit::no_such_transaction(&streamed.transaction)),
+      Some(None) => Err(commit::no_such_transaction(&name)),
       None => Err(commit::unserved("Commits")),
     }
   }
@@ -1448,6 +1698,48 @@ impl HeadView for IndexHead<'_> {
   }
 }
 
+/// An answer of `status` alone, with no body.
+fn bare_status(status: u16) -> HttpAnswer {
+  HttpAnswer {
+    status,
+    headers: Vec::new(),
+    body: Vec::new(),
+  }
+}
+
+/// What a DeltaV v1 CHECKOUT names (A-766 part 2): a baseline (the VCC's checked-in one, `None`, or `!svn/bln/REV`), or
+/// a version resource's revision and path.
+enum CheckoutTarget {
+  /// A baseline: of the revision named, or the youngest's.
+  Baseline(Option<u64>),
+  /// A version resource: its revision and repository path.
+  Version(u64, String),
+}
+
+/// What a CHECKOUT of `segments` (the request's path below the repository root) checks out; none for a resource no
+/// CHECKOUT takes (`version.c`: "CHECKOUT can only be performed on a version resource").
+fn checkout_target(segments: &[&str], apply_to_version: bool) -> Option<CheckoutTarget> {
+  let (first, rest) = segments.split_first()?;
+  if *first != site::SPECIAL {
+    return None;
+  }
+  match rest {
+    ["vcc", "default"] if apply_to_version => Some(CheckoutTarget::Baseline(None)),
+    ["bln", revision] => Some(CheckoutTarget::Baseline(Some(revision.parse().ok()?))),
+    ["ver", revision, path @ ..] => Some(CheckoutTarget::Version(
+      revision.parse().ok()?,
+      format!("/{}", path.join("/")),
+    )),
+    _ => None,
+  }
+}
+
+/// `409` with Subversion's error `code` and `message`, as `mod_dav_svn` refuses a DeltaV v1 CHECKOUT
+/// (`dav_svn__new_error_svn(..., HTTP_CONFLICT, ...)`).
+fn v1_conflict(code: u32, message: &str) -> HttpAnswer {
+  slates_svn::dav::locking::error_answer(HTTP_CONFLICT, true, code, message)
+}
+
 /// One request on a transaction's root (a MKCOL, DELETE or PROPPATCH at `path`; a PUT is streamed), its headers' tokens
 /// presented.
 fn transaction_root_step(
@@ -1456,10 +1748,12 @@ fn transaction_root_step(
   (method, path): (&str, &str),
   (headers, body, bounds): (&CommitHeaders, &[u8], &XmlBounds),
 ) -> HttpAnswer {
+  // A DeltaV v1 working resource's base is the revision it was checked out in (A-766 part 2).
+  let version = headers.version_name.or_else(|| commit.checked_out(path));
   match method {
     "MKCOL" => commit.mkcol(world, hooks, path),
-    "DELETE" => commit.delete(world, hooks, path, headers.version_name),
-    "PROPPATCH" => commit.proppatch(world, hooks, (path, headers.version_name), (body, bounds)),
+    "DELETE" => commit.delete(world, hooks, path, version),
+    "PROPPATCH" => commit.proppatch(world, hooks, (path, version), (body, bounds)),
     _ => commit::unserved("This method on a transaction"),
   }
 }

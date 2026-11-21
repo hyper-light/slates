@@ -7,7 +7,7 @@
 //! `--json` is the same view as one object whose keys and shapes are stable (`needs_you`, `greens`, `awaiting_grant`),
 //! so a harness reads the decision list without scraping text.
 
-use slates_client::{LogWork, NeedsYou, SessionLog, VolumeId, WorkMark};
+use slates_client::{NeedsYou, SessionLog, VolumeId, WorkMark};
 
 use crate::format::volume_id_text;
 
@@ -51,6 +51,43 @@ fn mark_text(mark: &WorkMark) -> String {
   }
 }
 
+/// One item that needs the human, as its text line.
+fn need_line(need: &NeedsYou) -> String {
+  match need {
+    NeedsYou::Collided {
+      name,
+      path,
+      windows,
+      behind,
+      ..
+    } => format!(
+      "  ! {name}: collided at {path} ({windows} window{}); its green moved {behind} version{} past it",
+      if *windows == 1 { "" } else { "s" },
+      if *behind == 1 { "" } else { "s" }
+    ),
+    NeedsYou::AwaitingApproval {
+      name,
+      identity,
+      paths,
+      ..
+    } => format!(
+      "  ! {name}: merge held for approval: increment {} ({paths} path{})",
+      manifest_text(identity),
+      if *paths == 1 { "" } else { "s" }
+    ),
+    NeedsYou::AwaitingGrant {
+      landing,
+      volume,
+      target,
+      manifest,
+    } => format!(
+      "  ! landing {landing} of {} into {target} awaits a grant: slates grant {landing} {}",
+      volume_id_text(*volume),
+      manifest_text(manifest)
+    ),
+  }
+}
+
 /// The view as text lines.
 pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   let mut lines = Vec::new();
@@ -60,39 +97,7 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   } else {
     lines.push(format!("needs you ({}):", needs.len()));
     for need in &needs {
-      lines.push(match need {
-        NeedsYou::Collided {
-          name,
-          path,
-          windows,
-          behind,
-          ..
-        } => format!(
-          "  ! {name}: collided at {path} ({windows} window{}); its green moved {behind} version{} past it",
-          if *windows == 1 { "" } else { "s" },
-          if *behind == 1 { "" } else { "s" }
-        ),
-        NeedsYou::AwaitingApproval {
-          name,
-          identity,
-          paths,
-          ..
-        } => format!(
-          "  ! {name}: merge held for approval: increment {} ({paths} path{})",
-          manifest_text(identity),
-          if *paths == 1 { "" } else { "s" }
-        ),
-        NeedsYou::AwaitingGrant {
-          landing,
-          volume,
-          target,
-          manifest,
-        } => format!(
-          "  ! landing {landing} of {} into {target} awaits a grant: slates grant {landing} {}",
-          volume_id_text(*volume),
-          manifest_text(manifest)
-        ),
-      });
+      lines.push(need_line(need));
     }
   }
   for green in greens_of(log) {
@@ -121,119 +126,10 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   lines
 }
 
-/// A work's mark as JSON: `{"state": "open" | "accepted" | "identical" | "collided" | "awaiting_approval", ...}`.
-fn mark_json(mark: &WorkMark) -> serde_json::Value {
-  match mark {
-    WorkMark::Open => serde_json::json!({ "state": "open" }),
-    WorkMark::Accepted { version } => {
-      serde_json::json!({ "state": "accepted", "version": version })
-    }
-    WorkMark::Identical { version } => {
-      serde_json::json!({ "state": "identical", "version": version })
-    }
-    WorkMark::AwaitingApproval { identity, paths } => serde_json::json!({
-      "state": "awaiting_approval",
-      "identity": manifest_text(identity),
-      "paths": paths,
-    }),
-    WorkMark::Collided {
-      verdict,
-      windows,
-      first,
-    } => serde_json::json!({
-      "state": "collided",
-      "verdict": verdict,
-      "windows": windows,
-      "first": first.as_ref().map(|w| serde_json::json!({ "path": w.path, "at": w.at, "len": w.len, "class": w.class })),
-    }),
-  }
-}
-
-/// A work as JSON.
-fn work_json(log: &SessionLog, work: &LogWork) -> serde_json::Value {
-  serde_json::json!({
-    "id": volume_id_text(work.id),
-    "name": work.name,
-    "base": work.base,
-    "behind": log.behind(work),
-    "mark": mark_json(&work.mark),
-  })
-}
-
-/// The view as one JSON object: `needs_you` (each `{"kind": "collided" | "awaiting_grant", ...}`), `greens` (each with
-/// its head and works) and `awaiting_grant`.
+/// The view as one JSON object (`slates_mcp::session_log_json`): the MCP tool `slates.log` and the SDKs answer the same
+/// shape, one definition (§4.12 schema parity).
 pub(crate) fn json(log: &SessionLog) -> serde_json::Value {
-  let needs: Vec<serde_json::Value> = log
-    .needs_you()
-    .iter()
-    .map(|need| match need {
-      NeedsYou::Collided {
-        work,
-        name,
-        green,
-        path,
-        windows,
-        behind,
-      } => serde_json::json!({
-        "kind": "collided",
-        "work": volume_id_text(*work),
-        "name": name,
-        "green": volume_id_text(*green),
-        "path": path,
-        "windows": windows,
-        "behind": behind,
-      }),
-      NeedsYou::AwaitingApproval {
-        work,
-        name,
-        green,
-        identity,
-        paths,
-      } => serde_json::json!({
-        "kind": "awaiting_approval",
-        "work": volume_id_text(*work),
-        "name": name,
-        "green": volume_id_text(*green),
-        "identity": manifest_text(identity),
-        "paths": paths,
-      }),
-      NeedsYou::AwaitingGrant {
-        landing,
-        volume,
-        target,
-        manifest,
-      } => serde_json::json!({
-        "kind": "awaiting_grant",
-        "landing": landing,
-        "volume": volume_id_text(*volume),
-        "target": target,
-        "manifest": manifest_text(manifest),
-      }),
-    })
-    .collect();
-  let greens: Vec<serde_json::Value> = greens_of(log)
-    .into_iter()
-    .map(|green| {
-      serde_json::json!({
-        "id": volume_id_text(green),
-        "head": log.head_of(green),
-        "works": log.works.iter().filter(|w| w.green == green).map(|w| work_json(log, w)).collect::<Vec<_>>(),
-      })
-    })
-    .collect();
-  let waiting: Vec<serde_json::Value> = log
-    .landings
-    .iter()
-    .map(|landing| {
-      serde_json::json!({
-        "landing": landing.landing,
-        "volume": volume_id_text(landing.volume),
-        "target": landing.target,
-        "manifest": manifest_text(&landing.manifest),
-      })
-    })
-    .collect();
-  serde_json::json!({ "needs_you": needs, "greens": greens, "awaiting_grant": waiting })
+  slates_mcp::session_log_json(log)
 }
 
 #[cfg(test)]
@@ -244,6 +140,7 @@ mod tests {
   use slates_ipc::protocol::MergeWindow;
 
   use super::*;
+  use slates_client::LogWork;
 
   fn id(n: u8) -> VolumeId {
     VolumeId { bytes: [n; 16] }
