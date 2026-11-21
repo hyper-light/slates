@@ -46,6 +46,14 @@ pub const ROWS_FILE: &str = "rows";
 const CHANGESETS: u8 = b'C';
 /// Format: the content table's tag: a payload section's identity to its place in the log.
 const CONTENTS: u8 = b'P';
+/// Format: the tag of a standing grant's row (A-767's `G`: the grant the store's directory was opened under, R10).
+const GRANTS: u8 = b'G';
+/// Format: a grant row's key: the tag and the grant's id.
+const GRANT_KEY_BYTES: usize = AFTER_TAG + U64;
+/// Format: a grant row's value: when it was first issued, the directory's device and inode.
+const GRANT_VALUE_BYTES: usize = U64 + U64 + U64;
+/// Format: the BLAKE3 key-derivation context of a standing grant's id, from its directory's device and inode.
+const GRANT_ID_CONTEXT: &str = "slates 2026-11-20 store standing grant id";
 /// Format: a `u64` field's width.
 const U64: usize = size_of::<u64>();
 /// Format: a repository id's width (`u128`, A-515).
@@ -195,11 +203,28 @@ pub struct Store {
   rows: ShardDb<DeviceFile>,
   /// Reused for every row's value.
   value: Vec<u8>,
+  /// The standing grant its directory is written under, as first recorded.
+  grant: GrantRow,
+}
+
+/// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
+/// header names as its `grant`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantRow {
+  /// The grant's id: its directory's device and inode, hashed.
+  pub id: u64,
+  /// When it was first issued (monotonic ns of the issuing process): kept as first recorded.
+  pub issued_ns: u64,
+  /// The directory's device.
+  pub device: u64,
+  /// The directory's inode.
+  pub inode: u64,
 }
 
 impl Store {
-  /// Opens the store in the granted directory `root`, creating its files on first use, and recovers: the engine at its
-  /// checkpoint, then the log's records past it applied again.
+  /// Opens the store in the granted directory `root`, creating its files on first use, and recovers: the engine at its checkpoint, the log replayed from there, and the standing grant
+  /// `root` was opened under recorded durably as its `G` row the first time (checkpointed before the store serves), or
+  /// found as first recorded every time after.
   pub fn open(root: StoreRoot, sizing: Sizing) -> Result<Self, StoreError> {
     let log_file = adopt(&root, LOG_FILE)?;
     let rows_existed = root.exists(ROWS_FILE)?;
@@ -219,12 +244,65 @@ impl Store {
       }
     })?;
     replayed?;
-    Ok(Self {
+    let mut store = Self {
       root,
       log,
       rows,
       value,
-    })
+      grant: GrantRow {
+        id: 0,
+        issued_ns: 0,
+        device: 0,
+        inode: 0,
+      },
+    };
+    store.grant = store.record_grant()?;
+    Ok(store)
+  }
+
+  /// The standing grant the store's directory is written under, as first recorded (its `G` row).
+  pub fn grant(&self) -> &GrantRow {
+    &self.grant
+  }
+
+  /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the engine so it is
+  /// durable before anything lands.
+  fn record_grant(&mut self) -> Result<GrantRow, StoreError> {
+    let grant = self.root.grant();
+    let id = grant_id(grant.target.device, grant.target.inode);
+    let mut key = [0u8; GRANT_KEY_BYTES];
+    put(&mut key, 0, &[GRANTS]);
+    put(&mut key, AFTER_TAG, &id.to_be_bytes());
+    if self.rows.get(&key, &mut self.value)? {
+      let word = |at: usize| -> Result<u64, StoreError> {
+        let bytes = self
+          .value
+          .get(at..at.saturating_add(U64))
+          .ok_or(StoreError::BadRow)?;
+        Ok(u64::from_le_bytes(
+          bytes.try_into().map_err(|_| StoreError::BadRow)?,
+        ))
+      };
+      return Ok(GrantRow {
+        id,
+        issued_ns: word(0)?,
+        device: word(U64)?,
+        inode: word(U64 + U64)?,
+      });
+    }
+    let row = GrantRow {
+      id,
+      issued_ns: grant.issued_ns,
+      device: grant.target.device,
+      inode: grant.target.inode,
+    };
+    let mut value = [0u8; GRANT_VALUE_BYTES];
+    put(&mut value, 0, &row.issued_ns.to_le_bytes());
+    put(&mut value, U64, &row.device.to_le_bytes());
+    put(&mut value, U64 + U64, &row.inode.to_le_bytes());
+    self.rows.put(&key, &value)?;
+    self.checkpoint()?;
+    Ok(row)
   }
 
   /// The granted directory.
@@ -511,6 +589,19 @@ fn engine_sizing(
       leaf_entries,
     },
   ))
+}
+
+/// A standing grant's id (its `G` row's key, and what each landing's header names as its `grant`): its directory's
+/// device and inode, hashed (so a directory replaced at the same path is another
+/// grant's).
+pub fn grant_id(device: u64, inode: u64) -> u64 {
+  let mut hasher = blake3::Hasher::new_derive_key(GRANT_ID_CONTEXT);
+  hasher.update(&device.to_le_bytes());
+  hasher.update(&inode.to_le_bytes());
+  let hash = hasher.finalize();
+  let mut id = [0u8; U64];
+  id.copy_from_slice(hash.as_bytes().get(..U64).unwrap_or(&[0u8; U64]));
+  u64::from_le_bytes(id)
 }
 
 /// The changeset row's key.

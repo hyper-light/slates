@@ -10608,6 +10608,26 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
 > mount over a socket pair on an audit shard and expects a kept request answered before the device's.
 
+> **Status (2026-11-20, A-791: a volume over an S3 base made through the wire).** Built: `CreateOverS3` (appended to
+> the wire's requests) names the base (`S3BaseSpec`: the endpoint, region, bucket, prefix, addressing and the
+> authorities for TLS) and hands the credential its fetches are signed with (`S3Credential`, whose `Debug` names the
+> access key alone); the client's `create_over_s3` sends it. The volume's owner shard makes the overlay over an
+> `S3Host` of the base (`verbs::open_s3_base`: the root's facts need no fetch; the host's cache is the volume's byte
+> bound within what the shard could admit, refused `BudgetExceeded` below one chunk), puts the host in the slot
+> (`BaseHost::S3`), and starts the base's fetch driver over the store client (`verbs::s3_client_of`, `base_wait::
+> spawn_driver`) before the volume is published, so a full task arena refuses the create `Overloaded` with nothing
+> made. The client's requests may be as late as the daemon's liveness window and never take longer in all than the
+> shard's failover delay, the longest a parked request waits. The catalog records the base alone
+> (`BaseRecord::S3`, appended); the credential is held in RAM by the owner shard and never written (R1). A recovery
+> over an S3 base holds the volume unavailable (`BaseUnavailable`, naming the base) until the credential is handed
+> again, and a clone of such an overlay is refused `BaseUnavailable`: the host's fetch state and its credential are
+> not duplicated. An image of the volume records each listed directory by its identity (`HostFs::identify_dir`: the
+> device, number and birth a recovery holds it to), which an S3 base answers with no fetch; it recorded the whole
+> fingerprint, whose listing had not landed, so every create over an S3 base was skipped by the shard's publication
+> (`EAGAIN`) and answered `ContentUnavailable`. A host directory's identity is its fingerprint, as before. Owed: the anchor's hold of the credential across a daemon restart and the recovery that uses it;
+> name resolution (a host that is not an IPv4 address is refused `BaseUnavailable`) and the platform's trust roots
+> (the caller hands the authorities); the library's `VolumeSpec` over an S3 base.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -57942,6 +57962,23 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
 > end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
+> **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
+> (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
+> `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
+> into a set bounded by the caller's derived `most`, least recently used let go first, a range past the bound refused
+> `PastBound`, an unknown pack `Missing`; `piece` lends from the set alone and answers `None` on a miss, the caller's
+> cue to await a fill and step again. One way to the bytes (R6). The pack is named by plain BLAKE3 of its `Payload`
+> section, the store's `P` key. Held by `a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time`
+> (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
+> fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
+
+> **Status (2026-11-20, the standing grant's `G` row).** `StoreRoot` keeps the grant it was opened under;
+> `Store::open` finds its `G` row (keyed by `grant_id`: the directory's device and inode, hashed) or puts it and
+> checkpoints the engine before anything lands, so the grant is recorded once and kept as first issued;
+> `StoreHandle::grant` is the id each landing's header names (the creation's since this change). Held by
+> `a_stores_standing_grant_is_recorded_once_and_found_after_a_crash` (`tests/store.rs`) and the creation test's
+> provenance check (`repository/store_tests.rs`). Owed: the audit position (a standing-grant audit kind) and revocation.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -58567,6 +58604,35 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
   (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+
+### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
+- **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing
+  made a volume over an S3 base: no request named one, `spawn_driver` had no caller, and `BaseHost::S3` was built only
+  by tests.
+- **The change.** `RequestBody::CreateOverS3` (appended, tag 97) names the base (`S3BaseSpec`) and hands its credential
+  (`S3Credential`, its `Debug` naming the access key alone); the client's `create_over_s3` sends it. The owner shard
+  makes the overlay over an `S3Host` (`verbs::open_s3_base`; its cache the volume's byte bound within the shard's
+  admittable room, refused `BudgetExceeded` below one chunk), starts the fetch driver with the store client before the
+  volume is published (`verbs::s3_client_of`: the endpoint's host an IPv4 address, plain HTTP to loopback alone, HTTPS
+  with the caller's authorities; requests as late as the liveness window and no longer in all than the failover
+  delay), and records `BaseRecord::S3` (appended, tag 3) without the credential (R1). A recovery holds such a volume
+  unavailable until the credential is handed again; a clone of it is refused `BaseUnavailable`.
+- **Found by its test, fixed in the same change.** The shard's publication imaged each listed base directory with its
+  whole fingerprint, which over S3 needs the directory's listing, so the new volume was skipped (`EAGAIN`) and the
+  create answered `ContentUnavailable`. A recovery holds a directory to its identity alone (`same_object`), so the
+  image now records that (`HostFs::identify_dir`, defaulting to `fingerprint_dir`; an S3 base's needs no fetch).
+- **Applied in the same change to:** §4.15's status (a block after A-555's third piece), GAPS (A-464's owed list:
+  the create and the hand-off built; the anchor's hold, recovery, clone, the library's spec and name resolution owed),
+  `crates/ipc` (the request and its types, tag published), `crates/db` (`BaseRecord::S3`, tag published),
+  `crates/client` (`create_over_s3`), `crates/vfs` (`identify_dir`, the base image), `crates/base` (`S3Host` and
+  `BaseHost` answer it), `crates/server` (the create, the routing, recovery's and the clone's arms, `Lens`).
+- **Evidence (macOS arm64, adas-macbook-pro-2 through kiln run r52, 2026-11-20).** `cargo test --locked -p
+  slates-server --test s3_base`: red with the driver not started (the read still `Unpublished` at its 30 s bound,
+  32.93 s), green 2 of 2 in 5.04 s (`a_volume_made_over_an_s3_base_reads_its_objects_from_the_store` over a loopback
+  store answering `ListObjectsV2` and ranged `GetObject`; `a_credential_s_debug_text_never_names_its_secret`); before
+  the identity fix the create was refused `ContentUnavailable`. `-p slates-base --lib -- s3::host` 16 of 16 (the new
+  `a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s`); `-p slates-ipc --test wire_order` and `-p
+  slates-db --test wire_order` 2 of 2 each; rustfmt's layout applied.
 
 ### §4.16 amended — A version's inputs are archived once for every shipment, their chunks lent from the chain, never rebuilt a pass at a time (2026-11-20, w-shared for UI goal 93; main's close list, exit 4 at 64 MiB; A-286)
 Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound), GAPS (the sweep's exit 4 line),

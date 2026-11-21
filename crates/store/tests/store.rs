@@ -280,3 +280,41 @@ fn a_changeset_landed_in_slices_is_indexed_as_one_landed_whole() {
     payload
   );
 }
+
+/// Opens the store in `dir` under a standing grant issued at `issued_ns`.
+fn open_issued(dir: &Path, issued_ns: u64) -> Store {
+  let grant = StoreGrant {
+    repository: 1,
+    target: StoreRoot::identify(dir).unwrap(),
+    issued_ns,
+  };
+  Store::open(
+    StoreRoot::open(dir, &grant).unwrap(),
+    Sizing {
+      memory: 8 << 20,
+      disk: 1 << 30,
+      extent_bytes: 128 << 10,
+      fanout: 8,
+    },
+  )
+  .unwrap()
+}
+
+/// A-767's `G` row (R10: the standing grant recorded). Do: open a store under a grant issued at 5 and drop it with no
+/// stop (nothing checkpointed after its open, as a `kill -9` leaves it); open it again under a grant issued at 9; open
+/// a store in another directory. Expect: the grant recorded at the first open is the one found after the crash (issued
+/// at 5, same id, the directory's device and inode); the other directory's grant is another id.
+#[test]
+fn a_stores_standing_grant_is_recorded_once_and_found_after_a_crash() {
+  let dir = scratch("grant");
+  let target = StoreRoot::identify(&dir).unwrap();
+  let first = *open_issued(&dir, 5).grant();
+  assert_eq!(first.issued_ns, 5);
+  assert_eq!((first.device, first.inode), (target.device, target.inode));
+  let again = *open_issued(&dir, 9).grant();
+  assert_eq!(again, first, "the grant as first recorded, after a crash");
+  let other = scratch("grant-other");
+  let elsewhere = *open_issued(&other, 9).grant();
+  assert_ne!(elsewhere.id, first.id, "another directory, another grant");
+  assert_eq!(elsewhere.issued_ns, 9);
+}

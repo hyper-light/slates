@@ -165,7 +165,7 @@
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
 > `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6); the
+> refuses `Unsupported` there); each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
 > start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
 > `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
@@ -175,6 +175,15 @@
 > (`tests/owner.rs` `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing`). Owed: the log's group commit
 > (concurrent landings sharing one flush, its window from the device's measured flush time), which is where a device
 > rate belongs; the memtable holds rows, never a landing's bytes, so its size is the engine's unit of work.
+> C5's store side BUILT (2026-11-20, main's split): `crates/server/src/vcs_store/store_packs.rs`, git's `PackSource`
+> over the store's owner (an awaited `fill` of a range into a bounded least-recently-used set of store pieces, the
+> synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6). Owed (w-git): the
+> push landed as a changeset before its entry, recovery of named sequences, the replay through the adapter, and the
+> pack named by the plain BLAKE3 of its `Payload`.
+> The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
+> checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
+> (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
+> standing-grant kind yet), and its revocation.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -15590,7 +15599,8 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 > - **Owed.**
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
->     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
+>     to `base_wait::land` (`spawn_driver`). Started where a volume over an S3 base is made (A-791); its start at a
+>     recovery waits on the credential's hold across a restart (below).
 >   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
 >     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
 >     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
@@ -15604,8 +15614,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
 >   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
->     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
->     fetches on the client and handing each answer to `base_wait::land` (A-555); the base plane's host calls audited for
+>     hand-off are built (A-791: `CreateOverS3`, the owner shard's `S3Host` and driver, `BaseRecord::S3` without the
+>     credential); owed: the credential held by the anchor across a restart and the recovery over an S3 base that uses
+>     it (until then such a volume recovers unavailable, `BaseUnavailable`), a clone of such an overlay (refused
+>     `BaseUnavailable` now), the library's `VolumeSpec` over an S3 base, name resolution of the endpoint's host (an
+>     IPv4 address alone today); the base plane's host calls audited for
 >     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
 >     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
 >     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential
