@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "main:e1f246ca8"
+      ARMS: "split:a40c07faa"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -52,7 +52,7 @@ jobs:
               for h in ["reply_wake","reply_poll","reply_tail","reply_fold_rest"]:
                   n=d.get("hop."+h,0); ns=d.get("hop."+h+"_ns",0)
                   if n: out.append(f"{h} {ns/n/1000:.1f}")
-              out.append("| p50/p99 " + ", ".join(f"{h} {d.get('hop.'+h+'.p50_ns',0)/1000:.1f}/{d.get('hop.'+h+'.p99_ns',0)/1000:.1f}" for h in ["build","to_control","lane","exchange","to_owner","round","reply","holder"] if 'hop.'+h+'.p50_ns' in d))
+              out.append("| p50/p99 " + ", ".join(f"{h} {d.get('hop.'+h+'.p50_ns',0)/1000:.1f}/{d.get('hop.'+h+'.p99_ns',0)/1000:.1f}" for h in ["build","to_control","lane","exchange","exchange.borrow","exchange.round_trip","exchange.collect","exchange.settle","to_owner","round","reply","holder"] if 'hop.'+h+'.p50_ns' in d))
               for k in ["hold.declined","hold.answer","hold.exchange","hold.dispatches","hold.entries","hop.reply_timed"]:
                   if k in d: out.append(f"{k}={d[k]}")
               out += [f"{k.split('.')[-1]}={v}" for k,v in d.items() if "woken_by" in k or "reply_pending" in k or "reply_poll" in k or "reply_between" in k]
