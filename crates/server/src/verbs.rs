@@ -1031,27 +1031,28 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Ok(placed) => placed,
     Err(refusal) => return encode_body(&*refusal),
   };
-  // A holder's submit names its increment (lane (A) 3b): the owner shard holds it, fetched from the asking node by
-  // identity, before the verb runs. Not had is answered retryable, nothing started; a retry asks only for what is lacking.
-  if let RequestBody::SubmitComputed {
-    work,
-    green,
-    increment,
-    increment_len,
-    ..
-  } = &body
-    && let Err(refusal) = fetch_named_increment(
-      (control, shard),
-      ObjectId(work.bytes).creator(),
-      (*green, *increment, *increment_len),
-    )
-    .await
-  {
+  if let Err(refusal) = holders_increment_fetched(&body, (control, shard)).await {
     return encode_body(&*refusal);
   }
-  let origin_host = origin.0;
   let id = RequestId::from_word(request);
-  let reply = if is_forwardable_read(&body) {
+  let reply = forward_reply(
+    (control, shard),
+    (origin.0, id),
+    (principal, body, volume, made_on),
+    (ack_up_to, ack_owed),
+  )
+  .await;
+  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The owner shard's reply to a forwarded verb: a read served there, a write run there exactly once, or a peer's reap.
+async fn forward_reply(
+  (control, shard): (u16, u16),
+  (origin_host, id): (u64, RequestId),
+  (principal, body, volume, made_on): (Principal, RequestBody, VolumeId, Option<VolumeId>),
+  acks: (Option<u32>, Vec<u32>),
+) -> ReplyBody {
+  if is_forwardable_read(&body) {
     match call_owner(control, shard, move |s| {
       serve_forwarded_read(s, &principal, body, volume)
     })
@@ -1065,14 +1066,38 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       (control, shard),
       (origin_host, id),
       (principal, body, made_on),
-      (ack_up_to, ack_owed),
+      acks,
     )
     .await
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
+  }
+}
+
+/// A holder's submit names its increment (lane (A) 3b): the owner shard holds it, fetched from the asking node by
+/// identity, before the verb runs. Not had is answered retryable, nothing started; a retry asks only for what is lacking.
+/// Any other verb has nothing to fetch.
+async fn holders_increment_fetched(
+  body: &RequestBody,
+  (control, shard): (u16, u16),
+) -> Result<(), Box<ReplyBody>> {
+  let RequestBody::SubmitComputed {
+    work,
+    green,
+    increment,
+    increment_len,
+    ..
+  } = body
+  else {
+    return Ok(());
   };
-  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+  fetch_named_increment(
+    (control, shard),
+    ObjectId(work.bytes).creator(),
+    (*green, *increment, *increment_len),
+  )
+  .await
 }
 
 /// Format: an increment a holder's submit named, fetched from that node by identity onto this owner's content store
@@ -3114,6 +3139,35 @@ pub(crate) fn run_recorded_for_test(
   run_recorded(state, origin, id, 1, principal, body)
 }
 
+/// `body` back to run now, or parked until what it owes is made (its reply then, if any).
+fn parked_or_body(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  (client_id, principal): (u32, &Principal),
+  body: RequestBody,
+) -> Result<RequestBody, Box<Option<ReplyBody>>> {
+  // The one door to a green's content (P2, `crate::green_ready`): a request on a green that owes a push, or on a work
+  // over one, starts its materialization and parks until it is made; nothing of it runs before.
+  if let Some(green) = crate::green_ready::owing_green_of(state, &body)
+    && crate::green_ready::green_ready(state, green)
+      == crate::green_ready::GreenReady::Materializing
+  {
+    state.current_request = Some((origin, id));
+    let parked = crate::green_ready::park_request(state, green, (client_id, principal, body));
+    state.current_request = None;
+    return Err(Box::new(parked));
+  }
+  // A Mercurial name that reaches the tags reads the heads' `.hgtags` from the changeset store first, between turns
+  // (A-767 C1, `crate::vcs_store::hg_tags`): the request parks until the read is done, nothing of it run before.
+  if let Some(owed) = crate::vcs_store::hg_tags::owing(state, &body) {
+    state.current_request = Some((origin, id));
+    let parked = crate::vcs_store::hg_tags::park_request(state, owed, (client_id, principal, body));
+    state.current_request = None;
+    return Err(Box::new(parked));
+  }
+  Ok(body)
+}
+
 /// Runs a verb on this shard with its effects and its completion record in one durable step
 /// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
 fn run_recorded(
@@ -3129,25 +3183,10 @@ fn run_recorded(
   if let Some(refusal) = crate::live_ship::refuse_over_bound(state, &body) {
     return Some(refusal);
   }
-  // The one door to a green's content (P2, `crate::green_ready`): a request on a green that owes a push, or on a work
-  // over one, starts its materialization and parks until it is made; nothing of it runs before.
-  if let Some(green) = crate::green_ready::owing_green_of(state, &body)
-    && crate::green_ready::green_ready(state, green)
-      == crate::green_ready::GreenReady::Materializing
-  {
-    state.current_request = Some((origin, id));
-    let parked = crate::green_ready::park_request(state, green, (client_id, principal, body));
-    state.current_request = None;
-    return parked;
-  }
-  // A Mercurial name that reaches the tags reads the heads' `.hgtags` from the changeset store first, between turns
-  // (A-767 C1, `crate::vcs_store::hg_tags`): the request parks until the read is done, nothing of it run before.
-  if let Some(owed) = crate::vcs_store::hg_tags::owing(state, &body) {
-    state.current_request = Some((origin, id));
-    let parked = crate::vcs_store::hg_tags::park_request(state, owed, (client_id, principal, body));
-    state.current_request = None;
-    return parked;
-  }
+  let body = match parked_or_body(state, (origin, id), (client_id, principal), body) {
+    Ok(body) => body,
+    Err(parked) => return *parked,
+  };
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`

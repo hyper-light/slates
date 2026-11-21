@@ -1878,6 +1878,16 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
+> `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
+> `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
+> over SSH, every step's status, state and printed bytes compared, over `bench/hg_correctness_fixture.sh`'s repository
+> or `SLATES_TEST_HG_SOURCES`. Its first focused run (the fixture, macOS arm64, debug, 67fa7f75a): 30 passed, 50
+> failed, all from one cause. **Open, w-hg's (inbox/w-hg-from-w-balance-push-spin.md):** a push of 64 MiB and 32 MiB
+> random binaries spins shard 8 past the watchdog (3,170 ms of CPU in one poll of `hg_push::take`, then
+> `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
+> unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
+>
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
