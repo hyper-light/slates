@@ -17920,3 +17920,40 @@ The memory report's kinds pass 67 ms after arming in the same run.
   unchanged). **84a not met on Windows:** the loaded p999 stays at 24-34 ms on windows-latest and in windows-11-arm's
   conflicts (its accept p999 lost its 32 ms rounds: 3 of 3 under 0.9 ms against 1 of 3). That is the scheduler's 31.6 ms
   quantum a woken thread waits behind the load's spinners (A-361), which no wait's timer moves; per-wake stamps next.
+
+## A Windows shard kept one level above normal while it runs: 84a's loaded tails under 1 ms (A-834; w-k90-win; 2026-11-21)
+
+- **Question.** With A-828 the timed wait keeps its deadline, yet the loaded p999 stayed at 18-34 ms. g222's stamps over
+  it (diag run 44945557697) put the tail on the shard: 12-22 requests a round of ~42,500 waited over 10 ms in the ring
+  and 16-22 over 10 ms mid-service, 30-100 ms each, multiples of the 31.6 ms quantum. A-361 raised a shard one level
+  for its blocking wait and put it back before it ran, so a runnable shard shared the CPUs round-robin with the load's
+  normal-priority spinners. Does keeping the raise (no privilege: a thread's own level within its class) end it?
+- **A/B first** (diag run 44947142869, same binary, `W90_SHARD_RAISED`): kept raised, loaded p999 238-1,011 µs against
+  0.8-33 ms, 0-4 requests a round over 10 ms against 6-20.
+- **Test, red then green** (`driver::tests::a_windows_shard_stays_one_level_up_after_a_blocking_wait`): red at the test
+  alone on windows-latest and windows-11-arm (level 0 after the wait), green with the change on both.
+- **Command** (diag run 44948887874): `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept
+  --form conflict`, then `--quiet-only`, release, BASE (main 8fb2e33db) and FIX (0689bed17) interleaved, 3 rounds. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 128 / 309 / 32,643 | 143 / 237 / 31,854 |
+| fix r1 | 123 / 174 / 579 | 141 / 215 / 305 |
+| fix r2 | 121 / 178 / 699 | 139 / 206 / 317 |
+| base r2 | 123 / 304 / 48,453 | 140 / 242 / 31,888 |
+| base r3 | 124 / 321 / 31,962 | 142 / 252 / 84,866 |
+| fix r3 | 121 / 182 / 642 | 140 / 230 / 410 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 156 / 260 / 28,233 | 155 / 271 / 19,827 |
+| fix r1 | 152 / 319 / 665 | 152 / 225 / 335 |
+| fix r2 | 151 / 248 / 665 | 153 / 223 / 304 |
+| base r2 | 150 / 250 / 31,836 | 154 / 238 / 21,929 |
+| base r3 | 150 / 269 / 4,204 | 151 / 261 / 27,304 |
+| fix r3 | 153 / 236 / 640 | 154 / 217 / 327 |
+
+  Quiet, both runners: fix p99 174-273 µs, p999 275-670 µs; base p99 171-546 µs, p999 285-1,952 µs.
+- **Verdict: landed.** 84a's bar on Windows -- a full edit and merge's loaded p99 and p999 under 1 ms -- is met on
+  windows-latest and windows-11-arm in every round; p50 unchanged. A shard's time at the raised level is bounded by its
+  work and its idle window, after which it parks.

@@ -103,12 +103,12 @@
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
 >   exists (R10), and A-224's short slice was rejected. Owed: the Linux bound's question to main.
-> - **Windows** (w-k90-win, A-828): a timed wait ends at its deadline now -- the IOCP driver's wait went through
->   `GetQueuedCompletionStatusEx`'s whole milliseconds (a 200 µs wait's shortest 1.5-2.5 ms); a high-resolution waitable
->   timer's wait completion packet now wakes the port (red then green on jupiter, windows-latest, windows-11-arm). It
->   leaves the loaded p999 where it was (24-34 ms on windows-latest, accept and conflict; 15-34 ms conflict on
->   windows-11-arm, whose accept p999 32 ms -> 0.75-0.89 ms): the 31.6 ms quantum a woken thread waits behind spinners
->   (A-361), not the wait's timer. In flight: per-wake stamps for its mechanism.
+> - **Windows: met** (w-k90-win, A-828 and A-834). A-828: a timed wait ends at its deadline (the IOCP wait went through
+>   `GetQueuedCompletionStatusEx`'s whole milliseconds; a high-resolution waitable timer's wait completion packet now
+>   wakes the port). A-834: a shard stays one level above normal while it runs, where A-361 put it back before it ran
+>   and a runnable shard lost a 31.6 ms quantum to normal-priority load (stamps: 12-22 requests a round queued over
+>   10 ms, 16-22 over 10 ms mid-service). Loaded p999 18-85 ms -> 304-699 µs, p99 174-319 µs, quiet unchanged, on
+>   windows-latest and windows-11-arm, 3 interleaved rounds each (diag run 44948887874; BENCHMARKS).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
