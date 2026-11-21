@@ -275,6 +275,14 @@
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:58): NFSv3 replies framed in place (w-sizing).** Today
+>   each v3 request copies its arguments into a Vec and encodes its results into a second one. Then
+>   `bridge-nfs::rpc::reply_record` (from `reply_for` in `crates/server/src/nfs.rs`) allocates a third Vec and copies the
+>   results into it behind the record head. The held reply and `nfs_replay::record` keep further copies. NFSv4 already
+>   encodes after reserved head room and frames in place (`XdrWriter::continuing`, `finish_success_record`). Plan: v3
+>   procedures write after the same head room and `reply_for` frames in place. The held reply and the replay record
+>   keep that one framed buffer, and the arguments are read where they arrive. Red first: a count of allocations per
+>   READ, then per READDIR.
 > - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
 >   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
 >   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
