@@ -135,6 +135,10 @@ pub(crate) async fn land_changeset(
   record: Vec<u8>,
   texts: &[LandedText],
 ) -> Result<(), Uncommitted> {
+  #[cfg(test)]
+  if REFUSE_LANDING.with(std::cell::Cell::get) {
+    return Err(Uncommitted::Unstored);
+  }
   if texts.is_empty() {
     return land(
       disk,
@@ -156,6 +160,12 @@ pub(crate) async fn land_changeset(
     }
   });
   landed
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's store that refuses every changeset (as a full or failed disk does): [`land_changeset`] answers `Unstored`.
+  pub(crate) static REFUSE_LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Shape: the sections of a changeset that brings texts: its `Payload`, its `Texts` and its `Record`.

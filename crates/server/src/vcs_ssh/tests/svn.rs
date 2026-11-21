@@ -1615,7 +1615,7 @@ fn resident_kib() -> u64 {
 #[test]
 fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
   let bytes = crate::test_store::noise(200 << 10);
-  let (_store, daemon) =
+  let (_store, daemon, _) =
     crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())
@@ -1670,7 +1670,7 @@ fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
 #[test]
 fn a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store() {
   let bytes = crate::test_store::noise(200 << 10);
-  let (_store, daemon) =
+  let (_store, daemon, _) =
     crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())
@@ -1725,7 +1725,7 @@ fn a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store() {
 #[test]
 fn a_get_file_reads_a_text_ram_does_not_hold_through_the_store() {
   let bytes = crate::test_store::noise(200 << 10);
-  let (_store, daemon) =
+  let (_store, daemon, _) =
     crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())

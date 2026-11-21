@@ -2648,8 +2648,20 @@
 > deltify job BUILT too: a window's target piece the content store does not hold is fetched through the node's store
 > between slices, the target read so far kept, a text whose piece cannot be given passed over; held by
 > `a_stored_text_the_content_store_let_go_is_deltified_through_the_store` (red without it: passed over, left stored
-> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. Owed: (b), the
-> records keep history on the store. Stage C,
+> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. (b), the
+> records keep history on the store (w-svn's plan, inbox b2b-plan-corrected: the store holds every text whole already,
+> a commit's in its Payload and an import's in its Record, so the records' RAM deltas and the deltify job go): P1 BUILT,
+> a commit's green increment brings back whole a stored text the content store let go (a copy, a revert;
+> `svn_texts::bring_whole`), given back after its step; held by
+> `a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment` (red without it: `Corrupt`).
+> P2 BUILT: the hook view keeps a layout naming a stored text the content store let go, brings the text back whole
+> between its turns, then writes and holds it (`svn_presenter::show`, `ViewTurn::Bringing`); held by
+> `a_hook_view_brings_back_a_stored_text_the_content_store_let_go` (red without it: never shown). Its cost, recorded:
+> a view pins in RAM every stored text it shows while it lives (views live as long as the shard), since its mount's
+> reads are the vfs's synchronous referenced reads; reads that wait on the store need vfs work, not yet owned.
+> Owed: P3 the content store lets go a
+> commit's texts once its changeset lands, recovery stops reading them back; P4 imports land texts as Payload with
+> Texts rows, the records keep none in RAM, the deltify job retired. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
@@ -2668,11 +2680,15 @@
 > `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`,
 > `a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once` and
 > `a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back` (each red before: answered
-> with the version durable before the landing; a kill left version 1 with no revision). Owed (A-804): (a) the verdict
-> is applied in memory, not computed pure (`Green::compute`) and committed by position after the land, so while the
-> landing runs a read of the green sees the version before it is durable; (b) a submit dispatched outside a recorded
-> request (no answer waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's
-> made changeset (`hg_made`) commits in the submit's step; git's adopts the hook (w-git, removing its version-2 path). A creation lands its changeset 0 before the register
+> with the version durable before the landing; a kill left version 1 with no revision). Since A-805 (2026-11-21, main
+> 02:37 piece 1) the verdict is judged and held, never applied before the one commit: the revision is read from a
+> preview of the held verdict (`Lineage::preview`, a branch at the head, retired in the submit's step) and the verdict is
+> applied at the commit as its chain entry records it; held by `a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head`
+> and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
+> submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
+> waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
+> (`hg_made`) commits in the submit's step; git's adopts the hook (w-git, removing its version-2 path); (d)
+> performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a

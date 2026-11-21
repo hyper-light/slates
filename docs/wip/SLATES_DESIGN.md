@@ -59028,3 +59028,25 @@ Applied in the same change to: `crates/server/src/made_commit.rs` (new: the hook
   back).
 - **Owed** (GAPS C2): the verdict computed pure and committed by position after the land, so reads never see the version
   before it is durable; a bare dispatch's submit; Mercurial's made changeset; git adopts the hook (w-git).
+
+### A-805 — A server-made commit's verdict is held with its landing and shown to no reader before its one commit (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 1; the landing order's "never expose a revision that was never committed"; A-804, A-635, A-658)
+Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::preview`, `LineageRefused::Moved`),
+`crates/server/src/greens.rs` (`Greens::preview`, `with_preview`, `retire_preview`), `crates/server/src/verbs.rs`
+(`verdict_of`'s held verdict, `held_outcome`, `apply_accepted`), `crates/server/src/made_commit.rs`,
+`crates/server/src/vcs_store/svn_made.rs` (`revision_held`, `revision_from`), `crates/server/src/repository/svn_commit/landing.rs`
+(a test's refusing store), GAPS (C2).
+- **Why.** A-804 applied the verdict to the green in the submit's step and committed it after the landing, so a read
+  during the landing saw a version that a crash or a refused landing then took back.
+- **What.** With the repository's landing turn held, the verdict is judged and held (`Green::judge`,
+  `judge_computed`), nothing applied. The revision is read from a preview: a branch of the green's lineage at its head
+  (O(1), A-534) with the held verdict committed into it as its version 1, which reads as the green will once the verdict
+  commits; it is retired in the submit's step. At the one commit the verdict is applied to the green as its chain entry
+  records it (`Green::apply_recorded`, what a recovery replays), refused where the green moved since, then the durable
+  parts follow in the same step. A refused landing leaves the green as it was: the secured retention is credited back.
+- **Red, then green.** `repository::svn_commit::tests`: a read of the green in the submit's step saw head 1 and the
+  work's bytes (now head 0, no file, then head 1 with the bytes once committed); a refused landing had been seen in the
+  submit's step (now nothing, and its retry lands once). `engine::branch::tests`: a held verdict's preview reads as its
+  commit (file, identity, changed paths) while its green shows nothing, and a preview of a moved green is refused.
+- **Cost.** The preview's branch is O(1) and its release is the version's own nodes; the mapped files are made twice
+  (owed, GAPS C2 (d)).
+
