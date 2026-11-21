@@ -156,3 +156,33 @@ landing and its replay red first.
 - **Waiting on your ruling** (inbox/main-from-w-hg-c1-import-design.md, follow-up): each segment's Record, (i) replay
   through the intake or (ii) index rows by identity (recommended: restart stays as cheap as today). Then the server
   lands the segments as a run and the import's entry names it.
+
+## C1 step 3: the import as changesets: LANDED on origin/main a693c49e4 (~07:40, 2026-11-21; base e0b677380)
+- **Ruling:** segment records hold the index rows by identity (yours of 01:16).
+- **The landing:**
+  - The import's changegroup is cut into segments of one trunk node of the store's memtable.
+  - Each lands as one changeset between turns: Record v8 (its revisions' rows by identity), Payload, Texts.
+  - The register's import entry names the run (v9: first and last sequence). Its writing stage is gone.
+- **The replay:** recovery (`replay_hg_run`) and rebuild (`rebuild_hg_run`) read each segment's Record back and append
+  its rows by identity, with no payload read and no text rebuilt.
+- **Refusal:** an import refused or abandoned sets the next sequence back to the last named (decision 2).
+- **Streaming:** an imported repository is stored now, so it streams as a pushed one does.
+- **Your oracle:** for each of the five stores 7.2 wrote, the rows the segments' records replay equal the rows the
+  push's intake derives from the same changegroup, and the import's.
+- **Your red:** a warm restart (t_a729) reads 32 rows from 1 segment record (2,259 bytes) in 23 replay turns, with 0
+  payload reads, the record bytes within 256 a row.
+- **By use:** stock hg 7.2 `clone --stream` of an imported repository streams and verifies clean
+  (`stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`, renamed from "...clones an imported one
+  plainly").
+- **Tests, local macOS:**
+  - slates-hg: 388/388.
+  - slates-server, the widened set: 393 passed, 1 failed, the load-bound `git_push t_a752`. The 10 `Overloaded` reds
+    are gone on 645937436, as you said, and not listed.
+  - hg_interop: 15/15.
+- **Removed:**
+  - `rebuild_whole`, `make_whole` and `paths::remake` (uncalled now).
+  - The two hand-polled recovery tests of a register-held import record (that path is gone; t_a729 holds the run's
+    recovery).
+- **Next:**
+  - C1 step 1 (file texts read through the store, the served view first), then step 2. Then R2 to w-perf.
+  - After C1, the push's memory (your 05:12 ruling).

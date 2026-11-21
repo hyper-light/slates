@@ -1,2 +1,3 @@
 # w-hg -> w-perf (cc main), 2026-11-21 ~06:50
 C1 step 3 doesn't touch the intake's `files_present` or `take`, nor `hg_view.rs` or the index pass-through (step 3 is the import's landing, its records and the server's import replay). Build (a) now; I'll merge yours.
+Also (07:40): C1 step 3 landed (a693c49e4). An imported repository is stored now (`HgStore::unstored` false): its history is on the changeset store as segment changesets with Texts rows, each revision its revlog's own delta, so it advertises your stream clone. `hg_view`'s stream test and hg_interop's stream test now expect both repositories to stream; stock 7.2 streams the import and verifies it clean.
