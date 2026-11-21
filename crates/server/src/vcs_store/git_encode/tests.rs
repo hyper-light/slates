@@ -8,7 +8,7 @@ use super::{BEHIND, Turned, UNITS_PAST_BUDGET, encode_within, turn};
 /// it started encodes every version (none unencoded), then lets the repository go from the set it keeps.
 #[test]
 fn t_a718_a_fetch_that_stops_waiting_leaves_a_task_that_finishes_the_encoding() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = crate::git_push::tests::git_repository(state, "behind");
     crate::git_push::tests::pushed_from_the_fixtures(state, id, &["create", "update"]);
@@ -82,7 +82,7 @@ fn a718_no_unit_of_a_56_mb_packs_encoding_outgrows_the_step_quantum() {
   drop(pack);
   // The shard's task sends the outcome once; this test thread waits for it.
   let (told, done) = std::sync::mpsc::channel();
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   crate::daemon::observe_first(&daemon, move |state| {
     let id = crate::git_push::tests::git_repository(state, "large");
     let task = async move {

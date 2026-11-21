@@ -11427,6 +11427,9 @@ pub(crate) const TAKEN_BY_POSITION: &str = "merge.verdict.taken_by_position";
 /// 2026-11-20).
 pub(crate) const SUBMIT_OWNER_STEP: (&str, &str) =
   ("merge.submit.owner_step", "merge.submit.owner_step_ns");
+/// Counter pair: the owner's decode of a holder's increment within that step ([`SUBMIT_OWNER_STEP`]).
+pub(crate) const SUBMIT_OWNER_DECODE: (&str, &str) =
+  ("merge.submit.owner_decode", "merge.submit.owner_decode_ns");
 
 /// `SubmitComputed` (A-697 part c; A-658 part 3b): the node holding a work over this green sends the work's increment and
 /// the verdict its replica computed, and the owner judges and commits it as a submit asked from a work's shard is
@@ -11448,7 +11451,11 @@ fn submit_computed(
       feature: "a node's verb from a client".to_owned(),
     });
   }
-  let inc = match slates_merge::engine::Increment::decode(increment) {
+  let decode_start = slates_machine::clock::monotonic_ns();
+  let decoded = slates_merge::engine::Increment::decode(increment);
+  let decode_ns = slates_machine::clock::monotonic_ns().saturating_sub(decode_start);
+  crate::merge_service::count_phase(state, SUBMIT_OWNER_DECODE, decode_ns);
+  let inc = match decoded {
     Ok(inc) => inc,
     Err(error) => {
       return refused(Refusal::BadRequest {

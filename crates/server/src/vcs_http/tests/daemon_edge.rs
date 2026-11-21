@@ -80,48 +80,24 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
-fn daemon(identity: EdgeIdentity) -> Daemon {
+fn daemon(identity: EdgeIdentity) -> crate::test_store::StoredDaemon {
   daemon_named(Some(identity)).0
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
-fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+fn daemon_named(identity: Option<EdgeIdentity>) -> (crate::test_store::StoredDaemon, String) {
   daemon_configured(identity, |_| {})
 }
 
-/// [`daemon_named`], its configuration changed by `configure` before it starts.
+/// [`daemon_named`], its configuration changed by `configure` before it starts. Every daemon here holds a changeset
+/// store (`crate::test_store`): a repository's history lands there, and a daemon without one makes no repository of any
+/// tool (C1, C2, C5).
 fn daemon_configured(
   identity: Option<EdgeIdentity>,
   configure: impl FnOnce(&mut crate::DaemonConfig),
-) -> (Daemon, String) {
-  let (profile, config, instance) = edge_config(identity, configure);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: instance.clone(),
-    },
-  )
-  .expect("the daemon starts");
-  daemon
-    .bootstrap(true)
-    .expect("the daemon creates its initial group");
-  (daemon, instance)
-}
-
-/// A daemon of [`SHARDS`] shards as [`daemon_named`] starts one, holding a changeset store: a Subversion repository's
-/// history lands there (C2), and a daemon without one makes no Subversion repository.
-fn stored_daemon(identity: Option<EdgeIdentity>) -> crate::test_store::StoredDaemon {
-  stored_daemon_named(identity).0
-}
-
-/// [`stored_daemon`] and its instance name, as [`daemon_named`] gives a daemon's: a Mercurial or Subversion repository's
-/// history lands on the store (C1, C2), so a test making one starts its daemon here.
-fn stored_daemon_named(
-  identity: Option<EdgeIdentity>,
 ) -> (crate::test_store::StoredDaemon, String) {
-  let (profile, config, instance) = edge_config(identity, |_| {});
+  let (profile, config, instance) = edge_config(identity, configure);
   let daemon = crate::test_store::StoredDaemon::start(
     "vcs-http",
     &profile,
@@ -167,8 +143,7 @@ fn name_on_the_repositorys_partition() -> String {
     .expect("a name routes there")
 }
 
-/// Creates the git repository `name` on its partition, owned by [`owner`] (on a daemon holding a store, landed then
-/// recorded in place: `crate::test_store::create`).
+/// Creates the git repository `name` on its partition, owned by [`owner`].
 fn create(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
@@ -1188,7 +1163,7 @@ const STATES_SERVED_HEADS: &str = "b252f2a7c3d2e773bea91bf42aaa0acb39463176\n";
 #[test]
 fn a_mercurial_repositorys_store_is_served_over_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
   let hg = hg_name_on_the_repositorys_partition();
   let git = name_on_the_repositorys_partition();
@@ -1342,7 +1317,7 @@ fn history_bundle(made: &[Made], revs: &[usize]) -> Vec<u8> {
 #[test]
 fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = stored_daemon_named(Some(identity));
+  let (daemon, instance) = daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1388,7 +1363,7 @@ fn a_mercurial_push_larger_than_one_ring_region_lands_through_the_daemons_edge()
 #[test]
 fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = stored_daemon_named(Some(identity));
+  let (daemon, instance) = daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1452,7 +1427,7 @@ fn a_mercurial_clone_larger_than_one_ring_region_is_answered_through_the_daemons
 #[test]
 fn a_mercurial_stream_clone_larger_than_one_ring_region_is_answered_through_the_daemons_edge() {
   let (identity, certificate) = identity();
-  let (daemon, instance) = stored_daemon_named(Some(identity));
+  let (daemon, instance) = daemon_named(Some(identity));
   let room = super::bounds_of(&crate::DaemonConfig::derive(
     &crate::daemon::test_profile(),
     &instance,
@@ -1614,7 +1589,7 @@ fn challenges_in(head: &str) -> Vec<String> {
 #[test]
 fn a_stock_mercurial_push_over_the_daemons_edge_lands_on_its_repositorys_shard() {
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_empty_hg(&daemon, &name);
@@ -1805,7 +1780,7 @@ fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic
     );
     return;
   };
-  let daemon = stored_daemon(None);
+  let daemon = daemon_named(None).0;
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_hg_from_states(&daemon, &name);
@@ -1995,7 +1970,7 @@ fn a_dav_posts_start_commit_hook_that_refuses_refuses_the_transaction_in_svnserv
   let refusing =
     crate::vcs_svn::tests::hook_script(&dir.path, "start-commit", "echo 'not today' >&2\nexit 1");
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge serves");
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let name = svn_name_on_the_repositorys_partition();
@@ -2046,7 +2021,7 @@ fn a_dav_commit_runs_its_repositorys_commit_hooks_as_mod_dav_svn_runs_them() {
   let post =
     crate::vcs_svn::tests::hook_script(&dir.path, "post-commit", "echo 'post said no' >&2\nexit 1");
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge serves");
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let name = svn_name_on_the_repositorys_partition();
@@ -2108,7 +2083,7 @@ fn a_dav_lock_runs_pre_lock_and_its_refusal_answers_the_lock() {
   let refusing =
     crate::vcs_svn::tests::hook_script(&dir.path, "pre-lock", "echo 'no locks here' >&2\nexit 1");
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge serves");
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let name = svn_name_on_the_repositorys_partition();
@@ -2318,7 +2293,7 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
 #[test]
 fn a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it() {
   let (identity, certificate) = identity();
-  let daemon = stored_daemon(Some(identity));
+  let daemon = daemon(identity);
   let port = daemon.vcs_http_port().expect("the edge serves");
   let edge = (port, &certificate);
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
@@ -2485,7 +2460,7 @@ fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
     );
     return;
   }
-  let daemon = stored_daemon(None);
+  let daemon = daemon_named(None).0;
   let port = daemon.vcs_http_port().expect("the edge started");
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let name = (0u32..)

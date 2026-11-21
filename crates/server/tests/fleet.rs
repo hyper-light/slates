@@ -22889,6 +22889,75 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
 }
 
+/// Main's ruling on the lane (2026-11-20, A-697's release bench refused 320 MiB holder submits about half the time): a
+/// holder's submit is not refused by a bound that does not grow with its increment while the increment is still
+/// crossing. Do: in a two-node `f = 1` fleet, A's green replicated by B, B's work writes an 8 MiB file; B's failover
+/// delay, the bound its forward was held to, injected at 300 ms (a debug build's forward takes longer); B submits. Expect: answered `Submitted` at version 2,
+/// the forward and the owner's step timed (both counters moved). Before, the forward was refused `Overloaded` at the
+/// bound, its bytes still moving, and a retry sent them all again into the same bound.
+#[test]
+fn a_holders_submit_still_crossing_is_not_refused_by_a_size_independent_bound() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "crossing-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let work = bench_work(&mut holder, green, "crossing-work", 8 << 20);
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let (forwards_before, owner_steps_before) = (
+    count("merge.submit.forward"),
+    count("merge.submit.owner_step"),
+  );
+  daemon_b.inject_failover(Some(300_000_000)).unwrap();
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  daemon_b.inject_failover(None).unwrap();
+  let counted = bench_counters([&daemon_a, &daemon_b]);
+  let given_up: Vec<(&&str, &u64)> = counted
+    .iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.forward.given_up")
+        || name.starts_with("fleet.forward.batch_given_up")
+        || name.starts_with("merge.acceptance")
+        || name.contains("overloaded")
+        || name.contains("Overloaded")
+    })
+    .collect();
+  eprintln!("give-ups and acceptance: {given_up:?}");
+  let (forwards, owner_steps) = (
+    count("merge.submit.forward") - forwards_before,
+    count("merge.submit.owner_step") - owner_steps_before,
+  );
+  eprintln!(
+    "forward {} ms, owner step {} ms (decode {} judge {} append {}), build {} ms, settle {} ms",
+    count("merge.submit.forward_ns") / 1_000_000,
+    count("merge.submit.owner_step_ns") / 1_000_000,
+    count("merge.submit.owner_decode_ns") / 1_000_000,
+    count("merge.submit.judge_ns") / 1_000_000,
+    count("merge.submit.append_ns") / 1_000_000,
+    count("merge.submit.forward_build_ns") / 1_000_000,
+    count("merge.submit.settle_ns") / 1_000_000
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  assert!(
+    forwards >= 1 && owner_steps >= 1,
+    "the forward and the owner's step were timed: {forwards}, {owner_steps}"
+  );
+}
+
 /// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of
 /// 2026-11-20 after A-697's release bench, which measured a holder version's inputs shipped back in three shipments).
 /// Do: in a two-node `f = 1` fleet, B serving works over A's green as its replica's holder, a work on B writes a file of 256

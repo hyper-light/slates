@@ -402,9 +402,15 @@ pub(crate) fn create_repository(
 const NEEDS_A_STORE: &str = "a Mercurial repository's history is kept on the node's changeset store: start the daemon \
                              with --vcs-store DIR";
 
+/// Format: the refusal's words for a git repository a daemon without a changeset store cannot keep (C5; the same
+/// ruling: one rule for all three tools).
+const GIT_NEEDS_A_STORE: &str = "a git repository's history is kept on the node's changeset store: start the daemon \
+                                 with --vcs-store DIR";
+
 /// A repository a daemon without a changeset store refuses (main's ruling of 2026-11-20, decision 1): a Mercurial or a
 /// Subversion repository's history is the node's store (C1, C2), and a register-held copy for a daemon without one
-/// would be a second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`; git's as its C item lands.
+/// would be a second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`, for all three tools (git's
+/// since C5: its pushes land on the store, A-767).
 fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
   if state.vcs_disk.is_some() {
     return None;
@@ -414,7 +420,9 @@ fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
     VcsTool::Mercurial => Some(Refusal::Unsupported {
       feature: NEEDS_A_STORE.to_owned(),
     }),
-    VcsTool::Git => None,
+    VcsTool::Git => Some(Refusal::Unsupported {
+      feature: GIT_NEEDS_A_STORE.to_owned(),
+    }),
   }
 }
 
@@ -1526,7 +1534,7 @@ mod tests {
 
   use crate::greens::ReleaseProgress;
   use crate::state::ShardState;
-  use crate::verbs::{dispatch, to_db_volume};
+  use crate::verbs::to_db_volume;
 
   fn owner() -> Principal {
     Principal::Uid {
@@ -1543,7 +1551,7 @@ mod tests {
   }
 
   fn ask(state: &mut ShardState, principal: &Principal, body: RequestBody) -> ReplyBody {
-    dispatch(state, 1, principal, body)
+    crate::test_store::create(state, principal, body)
   }
 
   fn refusal(reply: ReplyBody) -> Refusal {
@@ -1661,7 +1669,7 @@ mod tests {
   /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
   #[test]
   fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let at_one = branches_read_their_versions(state);
       retired_and_bound_again(state, at_one);
       wrong_verbs_refused_by_kind(state);
@@ -1799,7 +1807,7 @@ mod tests {
   /// adopted green's line, another one.
   #[test]
   fn a_repository_and_every_green_made_for_it_share_one_line() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "linux", "main"));
       let topic = green_of(branch(state, ("linux", "topic", "main"), None));
       let other = green_of(branch(state, ("linux", "other", "main"), None));
@@ -1876,7 +1884,7 @@ mod tests {
   /// move no log of the repository; and no verb or lone version is an atomic record.
   #[test]
   fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "tree", "main"));
       let repo = repository(state, "tree");
       let names = |state: &ShardState| {
@@ -2019,7 +2027,7 @@ mod tests {
   /// owed; no unit frees more than one node; once the release is done the lineage holds what the root alone held.
   #[test]
   fn a_destroyed_branch_is_released_a_node_a_unit_and_its_source_is_pinned_until_then() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "kernel", "main"));
       write(state, root, b"root bytes", 1);
       let repo = repository(state, "kernel");
@@ -2107,7 +2115,7 @@ mod tests {
   /// none served.
   #[test]
   fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let members = members_made_past_a_held_checkpoint(state);
       assert_rebuilt_as_before(state, members);
       let [root, ..] = members;
@@ -2187,7 +2195,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       green_of(create(state, "linux", "main"));
       let first = first_policy_held(state);
       assert_eq!(
@@ -2523,10 +2531,10 @@ mod tests {
     }
   }
 
-  /// C1, C2 (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1). Do: on a daemon started without
-  /// a changeset store, create a Mercurial, a Subversion and a git repository. Expect Mercurial's and Subversion's
-  /// refused `Unsupported`, each naming `--vcs-store`, and no repository recorded for either; git's created. Red before:
-  /// the daemon made a Mercurial repository whose history it kept in its register.
+  /// C1, C2, C5 (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1: one rule for all three tools).
+  /// Do: on a daemon started without a changeset store, create a Mercurial, a Subversion and a git repository. Expect
+  /// each refused `Unsupported`, naming `--vcs-store`, and no repository recorded for any. Red before: the daemon made a
+  /// Mercurial repository whose history it kept in its register, and (before C5's part 2) a git one.
   #[test]
   fn a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag() {
     let (hg, svn, git, recorded) = crate::daemon::audit_on_shard(|state| {
@@ -2543,7 +2551,7 @@ mod tests {
           },
         )
       });
-      let recorded = ["Mercurial", "Subversion"].map(|name| {
+      let recorded = ["Mercurial", "Subversion", "Git"].map(|name| {
         state
           .db
           .partition()
@@ -2554,14 +2562,13 @@ mod tests {
       let [hg, svn, git] = made;
       (hg, svn, git, recorded)
     });
-    for reply in [hg, svn] {
+    for reply in [hg, svn, git] {
       let Refusal::Unsupported { feature } = refusal(reply) else {
         panic!("refused by kind");
       };
       assert!(feature.contains("--vcs-store"), "{feature}");
     }
-    assert!(matches!(git, ReplyBody::GreenCreated { .. }), "{git:?}");
-    assert_eq!(recorded, [false, false]);
+    assert_eq!(recorded, [false, false, false]);
   }
 
   /// A-644 (§4.17.2 "Protected branches", configured through A-622's policy). Do: set a git repository's policy with
@@ -2654,7 +2661,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_read_and_set_by_its_owner_alone() {
     use slates_ipc::protocol::{HookConfig, HookPointName};
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       assert!(matches!(
         create(state, "policy", "main"),
         ReplyBody::GreenCreated { .. }
