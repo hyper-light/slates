@@ -57679,6 +57679,27 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > later behind the same names) is the sections' content. Tests: `slates-store --lib log` 6/6 over the simulated file with
 > power-loss semantics: round trip, every crash mode, a record interrupted before its commit, a cut at every byte of
 > the last record, a flipped bit in a header, a payload or a trailer, out-of-order appends.
+>
+> **Status (2026-11-20, piece C3 step 2: the store).** `store.rs`: the granted directory's two files, the changeset
+> log (`changesets`) and mantle's engine (`rows`), both opened through `slates_land::store_root` and adopted as
+> buffered device files; a landing appends and commits the record (one flush), then applies its rows to the engine,
+> whose write-ahead log the changeset log is; the engine checkpoints at the log's end, and opening the store replays
+> the log from the checkpoint's offset. The `C` table (repository and sequence big-endian, so a repository's
+> changesets are one ordered range) names each record's offset, length, identity, tool and work. The engine's sizing:
+> page = the file's layout block, extents bounded by the grant's disk allowance, leaves by the shard's memory over a
+> row's bytes; extent pages (32, mantle's) and fanout (8, SplinterDB's) cited, learned owed (GAPS). Tests:
+> `slates-store --test store` 3/3 on real directories in the build output (rows by repository with a payload read
+> back; recovery from the log alone; a checkpoint and the log after it, every row once).
+>
+> **Status (2026-11-20, piece C3 step 3: the seam).** `staging.rs`: changes in flight by identity (BLAKE3 of the
+> bytes), moved in as the tool's own `Vec` (no copy), held once however many stage them, bounded by the budget the
+> caller derives and refused `Full` with the bytes back past it. `Store::land` takes each section as bytes or a staged
+> content and writes it from there; every payload section gets a `P` row (identity to its place in the log), rebuilt
+> on replay by hashing the replayed payloads (the tail since the checkpoint only). `Store::piece(identity, len,
+> offset)` is w-git's `PackSource` shape: borrowed from staging while in flight, read from the log (at most a
+> 64 KiB piece) once landed; `Store::changesets(repository, from)` reads the `C` rows. Tests: `slates-store` 7/7 unit
+> and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
+> release) and recovered with and without a checkpoint.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

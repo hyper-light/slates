@@ -41,13 +41,13 @@ fn append(log: &mut ChangesetLog<SimFile>, sequence: u64, payload: &[u8], piece:
 
 fn recovered(file: SimFile) -> (ChangesetLog<SimFile>, Vec<Located>) {
   let mut found = Vec::new();
-  let log = ChangesetLog::recover(file, 0, |located| found.push(*located)).unwrap();
+  let log = ChangesetLog::recover(file, 0, |_, located| found.push(*located)).unwrap();
   (log, found)
 }
 
 fn payload(seed: u8, len: usize) -> Vec<u8> {
   (0..len)
-    .map(|at| (at as u8).wrapping_mul(31).wrapping_add(seed))
+    .map(|at| at.to_le_bytes()[0].wrapping_mul(31).wrapping_add(seed))
     .collect()
 }
 
@@ -172,6 +172,14 @@ fn a_damaged_record_ends_the_log_before_it() {
   }
 }
 
+/// A record of two sections committed with one: refused out of order.
+fn a_short_record_is_refused(log: &mut ChangesetLog<SimFile>) {
+  let mut short = log.begin(header(1, 2)).unwrap();
+  short.section(SectionKind::Work, 1).unwrap();
+  short.piece(b"a").unwrap();
+  assert!(matches!(short.commit(), Err(LogError::OutOfOrder(_))));
+}
+
 /// Do: append out of order: bytes with no section, a section past the header's count, bytes past a section's length,
 /// a commit with a section missing. Expect: each refused, and nothing committed.
 #[test]
@@ -187,10 +195,7 @@ fn out_of_order_appends_are_refused_and_commit_nothing() {
     Err(LogError::OutOfOrder(_))
   ));
   drop(record);
-  let mut short = log.begin(header(1, 2)).unwrap();
-  short.section(SectionKind::Work, 1).unwrap();
-  short.piece(b"a").unwrap();
-  assert!(matches!(short.commit(), Err(LogError::OutOfOrder(_))));
+  a_short_record_is_refused(&mut log);
   assert_eq!(log.end(), 0);
   let (_, found) = recovered(log.into_file());
   assert!(found.is_empty());

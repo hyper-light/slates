@@ -244,6 +244,15 @@ impl Drop for Room {
 mod tests {
   use super::*;
 
+  /// Two holders of `room` granted in turn: the first, then the other, then no one waits.
+  fn grants_go_round(room: &Room, (first, second): (usize, usize)) {
+    assert!(room.grant_one());
+    assert!(room.granted(first) && !room.granted(second));
+    assert!(room.grant_one(), "the next grant goes to the other holder");
+    assert!(room.granted(second));
+    assert!(!room.grant_one(), "no one waits now");
+  }
+
   /// Do: hold both places of a two-place room, grant, wait again, let go. Expect: a full room refuses, grants go
   /// round the places, and both places are free again after.
   #[test]
@@ -253,11 +262,7 @@ mod tests {
     let first = room.hold().unwrap();
     let second = room.hold().unwrap();
     assert_eq!(room.hold(), None, "two places, two holders");
-    assert!(room.grant_one());
-    assert!(room.granted(first) && !room.granted(second));
-    assert!(room.grant_one(), "the next grant goes to the other holder");
-    assert!(room.granted(second));
-    assert!(!room.grant_one(), "no one waits now");
+    grants_go_round(&room, (first, second));
     room.wait_again(first);
     assert!(!room.granted(first));
     assert!(!room.release(first), "let go without a grant");

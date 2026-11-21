@@ -1113,6 +1113,8 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   // A round's gather runs a slice a turn (A-562), timed against the shard's live quantum as every clock-bounded slice is.
   let slice_ns = s.config.copy_slice_ns();
   let turned = {
+    // A mounted work whose base moved shows its new base (A-774 R4).
+    crate::mounted_work::refresh(s, mount.volume);
     let ShardState {
       store,
       volumes,

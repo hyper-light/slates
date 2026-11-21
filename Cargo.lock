@@ -686,6 +686,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mantle-engine"
+version = "0.1.0"
+dependencies = [
+ "hyper-block",
+ "mantle-crc",
+ "rustix",
+ "slates-machine",
+ "slates-rt",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1965,6 +1978,7 @@ dependencies = [
  "blake3",
  "hyper-block",
  "mantle-crc",
+ "mantle-engine",
  "slates-land",
 ]
 

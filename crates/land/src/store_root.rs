@@ -171,6 +171,6 @@ fn identity_of(dir: &OwnedFd, key: String) -> Result<TargetIdentity, StoreRootRe
   Ok(TargetIdentity {
     key: key.into_boxed_str(),
     device: u64::try_from(stat.st_dev).unwrap_or(u64::MAX),
-    inode: u64::try_from(stat.st_ino).unwrap_or(u64::MAX),
+    inode: stat.st_ino,
   })
 }

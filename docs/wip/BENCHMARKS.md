@@ -16010,6 +16010,34 @@ same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against
 0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
 next piece; the immediate poll lands with it, not before.
 
+### R9's loaded p99 on macOS, the candidates (A-786; 2026-11-20 evening, w-provision-gate)
+
+Same MacBook, host load 10-26. `provision_bench` with `PROVISION_BENCH_LOAD=2` (quiet forms, then loaded ones), three
+rounds interleaved. Each cell is the median of the bench's three runs.
+
+The arms:
+- **main:** origin/main's runtime.
+- **time:** kqueue on `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait (`agents/w-provision-gate-kqueue`),
+  plus A-387's turn estimate with a memory of spinning time: each turn decays both sums by (H - T)/H, with H the longest
+  hold asked. It is unit-tested: after a 1 ms preemption and 1,000 polling turns, the old estimate read 400 ns.
+- **nap:** the immediate kqueue, A-387 unchanged, and on macOS an idle-spin turn that found nothing sleeps the OS's
+  shortest sleep (`sleep(1 ns)`, about 15 µs), the nap main's `kevent` took. The nap moves to the idle spin, so it never
+  sits between two tasks of a request.
+
+| arm | quiet p50 µs | quiet p99 µs | quiet p999 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|---|---|
+| main | 41.9 / 42.4 / 42.8 | 111 / 103 / 99 | 147 / 136 / 138 | 1.30 / 1.34 / 1.06 | 2.47 / 2.46 / 2.12 | 1.66-1.72 |
+| time | 16.7 / 14.0 / 15.2 | 36 / 28 / 43 | 65 / 51 / 103 | 0.44 / 0.32 / 0.25 | 10.3 / 5.6 / 6.0 | 7.3-10.0 |
+| nap | 19.2 / 18.2 / 18.5 | 40 / 39 / 38 | 55 / 50 / 48 | 0.33 / 0.33 / 0.46 | 16.1 / 10.1 / 23.4 | 3.3-4.2 |
+
+The loaded bound (the loaded spinning p99 against the loaded parked p99 and the quiet spinning p99): main fails 3 of 3,
+time and nap pass 6 of 6. An earlier round of time alone (host load 34-50) read loaded p99 2.00 -> 0.46 ms and loaded
+p999 13.0 -> 37.3 ms.
+
+**Measured, not landed.** Both arms meet R9's floor quiet at nine shards, which main never has, and cut the loaded p99
+3-5x. Both lose the loaded p999 and spend 2-6x the quiet CPU. Under the data rule neither lands. The loaded p999 is the
+open item; its hop is still to be named.
+
 ## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
@@ -16166,3 +16194,26 @@ Kept: A-787.
   about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
   carrying the pack (part A).
 
+
+## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
+
+**What it is.** A-226's paced form (2026-11-06, above: "The macOS paced tail was the recovery give-back") on the quietest
+Mac kiln gave: each sample meets parked shards, so each edit and submit pays the doorbell and a kicked shard's wake.
+Before A-226 its p99 samples held 17 to 31 ms between the doorbell's wake and the shard's read; A-226 removed the cause
+and the run on a quiet Mac was owed.
+
+**Command.** `edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept --form conflict`, release,
+built from main `f47668e74` with `--pause-ns` restored (this change), 3 invocations × 3 runs × 1,000 samples, run after
+the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 14 CPUs, macOS; 9 shards derived),
+2026-11-21 02:14 to 02:19 UTC, load 2.00 / 1.75 / 1.98 at each invocation's start and 2.58 after.
+
+| invocation | accept total p50 / p99 / max per run (µs) | conflict total p50 / p99 / max per run (µs) |
+|---|---|---|
+| 1 | 91 / 196 / 331; 99 / 200 / 307; 178 / 1,209 / 2,748 | 187 / 782 / 1,974; 190 / 859 / 2,353; 172 / 803 / 1,928 |
+| 2 | 329 / 1,644 / 2,939; 327 / 1,592 / 3,674; 329 / 1,429 / 10,202 | 179 / 646 / 1,466; 191 / 1,237 / 7,950; 185 / 942 / 2,609 |
+| 3 | 333 / 1,530 / 3,673; 336 / 1,527 / 3,525; 329 / 1,919 / 3,895 | 182 / 779 / 2,924; 188 / 849 / 2,854; 191 / 816 / 2,624 |
+
+- **No sample in 17–31 ms**: the largest of the 18,000 is 10.2 ms (one accept run); every other run's largest is 0.3
+  to 7.9 ms. Every sample answered as the model said.
+- What is left at the paced p99 (0.2 to 1.9 ms) is the kicked park's own wake on macOS, part of goal 84a's open
+  loaded and paced tail (GAPS), not the late wake this run was owed for.

@@ -21780,6 +21780,40 @@ fn assert_answered_once_replicated<E: std::fmt::Debug>(
   );
 }
 
+/// `work` submitted by `holder` until answered within the placement deadline: the holder's routing learns the green's
+/// new owner within the takeover, and until then its ask is answered retryable, so the submit is resent. Whether it was
+/// answered, and the last reply.
+fn submit_until_answered(
+  holder: &mut Client,
+  survivors: &[&Daemon],
+  work: VolumeId,
+) -> (bool, Option<ReplyBody>) {
+  let mut submitted = None;
+  let answered = poll_until(survivors, PLACEMENT_DEADLINE, || {
+    let reply = holder
+      .try_call(&RequestBody::submit(work, Vec::new()), *DEADLINE_NS)
+      .unwrap_or_else(|e| refused_placeholder(&e));
+    let done = matches!(reply, ReplyBody::Submitted { .. });
+    submitted = Some(reply);
+    Ok(done)
+  });
+  (answered, submitted)
+}
+
+/// The submit answered at version 2.
+fn assert_submitted_at_two(submitted: Option<&ReplyBody>) {
+  assert!(
+    matches!(
+      submitted,
+      Some(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      })
+    ),
+    "{submitted:?}"
+  );
+}
+
 /// A-697 part f (takeover; §4.8 "Promotion and takeover"): a holder's work goes on after its green's owner dies, its
 /// verdict taken by position at the green's successor. Do: three nodes at `f = 1`; on a, a green at version 1 (`f`
 /// holding "hello") shared with the fleet; the survivor that does not take the green over (the holder) makes a work
@@ -21831,17 +21865,7 @@ fn a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies() {
   let computed_before = count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap();
   let taken_before =
     count_on(&daemons[successor_index], "merge.verdict.taken_by_position").unwrap();
-  // The holder's routing learns the green's new owner within the takeover; until then its ask is answered retryable,
-  // so the submit is resent until it is answered.
-  let mut submitted = None;
-  let answered = poll_until(&survivors, PLACEMENT_DEADLINE, || {
-    let reply = holder
-      .try_call(&RequestBody::submit(work, Vec::new()), *DEADLINE_NS)
-      .unwrap_or_else(|e| refused_placeholder(&e));
-    let done = matches!(reply, ReplyBody::Submitted { .. });
-    submitted = Some(reply);
-    Ok(done)
-  });
+  let (answered, submitted) = submit_until_answered(&mut holder, &survivors, work);
   let computed =
     count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap() - computed_before;
   let taken =
@@ -21860,16 +21884,13 @@ fn a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies() {
   );
   assert!(taken_over, "the successor took the green over");
   assert!(answered, "the holder's submit was answered: {submitted:?}");
-  assert!(
-    matches!(
-      submitted,
-      Some(ReplyBody::Submitted {
-        version: Some(2),
-        ..
-      })
-    ),
-    "{submitted:?}"
-  );
+  assert_submitted_at_two(submitted.as_ref());
+  assert_committed_by_successor((computed, taken), &view);
+}
+
+/// The verdict computed on the holder's replica (`computed` moved) and taken by position at the successor (`taken`
+/// moved); the successor's green at version 2, reading "hello world".
+fn assert_committed_by_successor((computed, taken): (u64, u64), view: &TakenOverGreenView) {
   assert!(
     computed >= 1,
     "the verdict was computed on the holder's replica"
@@ -21896,7 +21917,7 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   let all: Vec<&Daemon> = daemons.iter().collect();
   assert_replicated_at_version_one(&all, [daemon_b, daemon_c], green);
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
+  let work = holders_work_at_base_one(daemon_b, &mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),

@@ -2042,7 +2042,7 @@ mod tests {
   fn a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name() {
     /// Shape: the extent, large enough that its pages dwarf a page of noise.
     const EXTENT: usize = 64 << 20;
-    let page = usize::try_from(rustix::param::page_size()).unwrap();
+    let page = rustix::param::page_size();
     let content = Handoff::Name(format!("/wsz-ext-{}", std::process::id()));
     let extent = extent_handoff(&content, 7).expect("macOS names its extents");
     let _ = unlink_handoff(&extent);
