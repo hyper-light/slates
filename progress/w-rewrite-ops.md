@@ -1,5 +1,16 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-21 — LANDED: the deferred-submit hook (A-804; piece 109348900, main 5a21c11dc)
+
+- Main's 01:52 piece. `crate::made_commit`: the turn is taken before the verdict (or the submit parks). The made task
+  lands the changeset, then commits the version, the register entry, the settle and the completion in one step, and
+  then answers. A kill between the land and the commit recovers to before, and the retry lands once.
+- Three tests in `repository/svn_commit/tests.rs`, red before and green now. Notes: inbox/w-svn-, w-git- and
+  main-from-w-rewrite-ops-made-hook.md.
+- Left (GAPS C2, A-804 owed): the pure verdict committed by position, the bare dispatch, hg_made, and git's adoption
+  (w-git).
+- The BENCHMARKS before/after table (ca9e40a7b) landed with it.
+
 ## 2026-11-20 ~19:10 PST — close list (Ada's CLOSE THE OPEN ITEMS order): C1, C2, R3 all CLOSED
 
 - C1 CLOSED: b8c16aad7 (main d4a5f9f43). A work off its green's shard fetches the base of files it replaced whole.

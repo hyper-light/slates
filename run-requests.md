@@ -7056,3 +7056,10 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   answered; one 300 MB work log.
 - Who to send results to: w-fed-move
 
+
+## w-shared 01:40 PST 2026-11-21 (kiln ids; all sync:false over https)
+- r16 (big Studio, running): agents/w-shared-byref-ci 4a16c53d4: merge, cluster, server lib, 8 server suites, cli kill test, and a baseline of 5 lib tests at 544020bd2.
+- r20 (queued, macos mem=16g disk=40g): the kill test's red at 544020bd2 with only the test applied (r18, r19 lost: runner b24c5c95 did not answer).
+- r21 (queued, same needs): 3a release bench on origin/main, 64/128/256/320/512 MiB x 10 (r15's placement went away before it started).
+- r22 (queued, linux): family three green + red (r14 lost: adacachy restarted mid-build).
+- Local target ~/.cache/w-shared-local-target.noindex deleted at 01:38 (main's 01:23 note); exit-4 scratch deleted too. No local builds from here.

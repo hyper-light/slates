@@ -284,3 +284,8 @@
   - HTTP edge (vcs_http.rs:850) under hg: spins at the connection task's polls 1 and 7, one right after a restart. Each
     hg request makes a view (`Indexed::new`) and answers a whole command in one poll. Diag build timing both per command
     runs on adacachy under its load (kiln r16).
+- 2026-11-21 01:40 queued from main (after the current three: P1's last unit, start_shard, the HTTP edge spin under hg):
+  killed test daemons leave macOS socket-route nodes (`slates-<hex>.sock`, crates/ipc/src/route.rs) in TMPDIR, an
+  unbounded set (1,637 on the MacBook). Recorded in GAPS, 5ee55fde3. Red owed: SIGKILL a test daemon, assert its node
+  gone once the harness ends; shapes: the harness removes its node at its end, or the route sweeps dead instances'
+  nodes at bind (bounded, owner-only).

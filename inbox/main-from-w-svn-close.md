@@ -79,3 +79,15 @@
   longest shard step 1.91 s. kiln r8 (load 8-14): DAV's daemon restarted within that step, E160007.
 - Left, outside svn and recorded in GAPS/BENCHMARKS: the green's apply of the landing in one step (w-engine's 1b),
   and the text carried twice in the register's log (chain entry and checkpoint, 524 MB each; P7's finding).
+
+## P7 (2026-11-21 ~01:20 PST): svnsync and the daemon peak, measured; what is left is outside svn or recorded
+- svnsync over svn://, stock 1.15 on the big Studio, git-2000: 270.7 s, 135 ms a revision, mirror at r2000 (main
+  1bfe51f88; BENCHMARKS 9d792682f) against w-interop's 1,068 s. The server's replay is 2.4-2.8 ms of each revision.
+- svnsync over HTTP: `svnsync init` was refused (HTTPv2 revision resource unserved): FIXED red-first, 2dafcad02. `sync`
+  cannot run: the DAV site serves no `replay-report` (a new finding: GAPS and progress only, per Ada's order). If you
+  want it built, assign it.
+- Daemon peak against the dump: real daemon 1,570 MiB for a 437 MiB dump (8508a8d52); half is the segment, where the
+  green's chain entries carry each revision's file bytes; folding an svn green's history was measured and rejected
+  (copies from older revisions read those versions, c9f79f925). The chain carrying texts is the register's/merge
+  engine's (yours to assign).
+Close P7 if this is the measurement you wanted; otherwise say which part to take further.

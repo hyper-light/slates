@@ -312,3 +312,19 @@
   green 18/18 at load 29-33). Next: C5 part 2b piece 1 (pushes v5 only; carried shortfalls refuse; names race
   refuses; moves-only v5; the v4 test switch removed; v2 left for made commits and sync test drivers' untaken asks),
   then 2b-2 (sync drivers async), then made commits onto w-svn's deferred-submit hook.
+- 2026-11-21 01:10 C5 2b piece 1 LANDED 3ce898533 (pushes v5 only; shortfalls Unlanded; switch gone). Next: piece 2,
+  the tests' synchronous push drivers (answered/pushed/pushed_from_the_fixtures and the in-test loops, ~30 sites)
+  made async on stored daemons, and an untaken homing ask refusing; piece 3 waits for w-svn's deferred-submit hook.
+- 2026-11-21 C5 2b piece 2 LANDED f5a14f6a8 (untaken asks refuse Unlanded; carry helpers; region holds apart in
+  replay). Piece 3 (made commits onto the deferred-submit hook, record_of/v2 removed) waits for the hook on main.
+- 2026-11-21 01:31 PRIORITY, the push cut-off (w-interop: git/git whole-history push over HTTP cut at ~60 s, curl 18).
+  Diagnosed by a DIAG build (Studio-2 ~/.cache/w-git-relwt, patches ~/.cache/w-git-diag/{cut,phase_cut}_patch.py,
+  binary slates-phasediag, repro push_repro.sh into ~/.cache/w-git-diag/pushrepro). The cause: an answer step refused
+  PastAdmission after the 200 head, so the edge aborted. Phase: the checks (`unbegun/checking`) asked 485,230,824 B
+  with 300,809,433 left; it is the connectivity walk's whole-pack edge table (slates_git receive::connect begin_edges).
+- 02:20 Layer 1 LANDED 379087733 (merge df349a9fe): refusals after the body go out as band 3 words / unpack+ng
+  report, the reply ends clean, counted; git_push::words shared with SSH. Red 2/2 at 94ff89fe5, green 2/2; focused
+  51/51 + git 49/49 on the merged tree. main and w-interop told (inbox *-push-cut*).
+- NEXT (main 01:56): layer 2 before C5 2b piece 3. The checks a slice at a time over the pack held once, charging
+  only the slice (no whole edge table); red = the 611 MB push refused today, then landing within its room; A/B vs
+  stock git (release, interleaved, all N). Merge w-shared format 6 piece 1 when it lands.
