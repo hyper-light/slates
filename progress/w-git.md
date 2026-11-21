@@ -298,3 +298,9 @@
   chunked body (daemon_edge.rs:571 -> chunked_body), not the fetch. Suspects: Receive::answer_until awaits that skip the
   keepalive deadline: turns::take, home_in_region (names + pack), names_committed_within. Diag r140
   (~/.cache/w-git-diag/r2_patch.py, never for main) times each.
+- 2026-11-21 00:45 C5 part 1 LANDED origin/main 0e7120bdd (record v5 + changeset landing + store recovery; red test
+  t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store; r13 green 211 passed, 6 A-664
+  failures that also fail on main). Close note in inbox/main-from-w-git-close.md. Next: C5 part 2 (store-less git
+  creation refused + git leg of w-hg's test; v2 and sequence 0 removed; git tests onto test_store; StorePacks replay),
+  then R2 (edge tests under load: push answer_until awaits skip the keepalive deadline; r139 repro 19/24).
+  Studio-4: my old target, clone and worktree deleted (58 GiB free there after).

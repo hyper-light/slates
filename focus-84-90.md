@@ -1403,3 +1403,13 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - g222: land B (park at once) now. It holds R9 at 31.6-37.7 us and takes Linux arm64's loaded p99 from 2.1-3.2 ms to 0.36-0.43 ms; its quiet p50 cost of +10-30 us is recorded. Then C wins that back or goes in as measured-and-rejected. Next, Linux x86_64's one-shard derivation on 4 cores (A/B the shard count), macOS split by hop, then p999.
   - w-shared's lane plan approved, with step 4 (content by identity) before step 3 (slicing), so the copies step 4 deletes are never sliced.
   w-engine: deaf a third time, its harness alive but idle and not taking in mail. Main ended that idle harness (pid 14495, checked against its session path) and restarted it (pid 76811, 00:11).
+- 2026-11-21 00:14 PST (the "00:16" stamp above was written at 00:12; stamps come from `date` from here on). LANDED (on main):
+  - f660401d4 (w-bugs P1, A-745 item 4): a fetch's pack marks a part's wanted entries a window at a time, so a deepen's pack no longer spins its shard.
+  - 95babc5ab (w-git's r5 hang): the test store owner's stop is bounded, and a leaked handle is a failure, not a hang.
+  - ecbeed926: one test_store declaration (w-svn's).
+  GOAL STACKS: two of the vendoring plan's per-agent goals still carried the pre-ruling text, and kiln kept re-sending them, which is why the container-engine work kept coming back.
+  - w-k90-containers' "OCI/Docker engine" goal (01a1fa58d068, plan 01a1fa365f56 step 2) is marked MET with the 20:58 attach evidence: macOS bind r70 at kiln fa86489f5; export as an NFS volume r49 at kiln 2f589baa6; Linux rootless podman.
+  - w-k90-a520's "A-520 piece 5" goal (01a1fa36855a, step 3) is REMOVED (skipped), as it was in the UI at 20:58.
+  - w-k90-a520 was interrupted before it ran the bind-vs-export A/B on the MacBook.
+  - No other w-* agent holds an open goal except w-k90-pin-2's vendoring CI on every platform.
+  RULING: w-k90-win frees kiln's CI lane. It cancels pre-fix run 44867288588 once w-k90-pin-2 confirms it needs nothing from it, then starts one run with the w2/w7 fix (f16212799). w-shared is told to land its exit-4 docs branch, 38 min old.

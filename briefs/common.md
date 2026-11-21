@@ -246,3 +246,11 @@ part closed between 07:20 and 16:00.
 - Load runs are main's (§8 above): put them in run-requests.md with the command and the memory measured.
 - Give every test run a `timeout_s` sized from its last measured run, so a stall ends and reports instead of holding
   a machine for an hour.
+
+## A RE-SENT GOAL IS KILN'S REMINDER, NOT ADA (main 2026-11-21 ~00:25 PST)
+- kiln re-sends your goal under way at the end of every turn until it is marked met. That reminder carries the goal's
+  text as written when its plan was made. It is not a new instruction, and not Ada's word.
+- A stop or a rescope from main stands until main lifts it, or Ada does in her own words. On 2026-11-21 an agent took
+  the re-sent pre-ruling container-engine goal as "authorization over main's stop" and restarted out-of-scope work.
+- If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
+  Tell main in your reply, so main closes the stale goal in your stack.
