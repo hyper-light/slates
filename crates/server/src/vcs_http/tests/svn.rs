@@ -696,6 +696,66 @@ fn the_daemons_lender_serves_a_repositorys_committed_records() {
   );
 }
 
+/// C2 stage B part 2 (a DAV GET reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose repository `stored` has a revision 1 adding `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), GET `/stored/trunk/a.bin` as its owner through the daemon's own
+/// lender and finder (`ServedRecords`, `ShardRepositories`), on its shard. Expect `200` and the text whole, read
+/// through the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go
+/// after. Before, the reply's first piece RAM did not hold failed the GET `503`.
+#[test]
+fn a_get_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), "stored", &bytes);
+  let (status, reply) = crate::test_store::run_on_first(
+    &daemon,
+    || async {
+      let mut site = SvnSite::new(
+        REALM.to_owned(),
+        ROOM,
+        Tokens,
+        super::super::daemon_edge::ShardRepositories,
+        ServedRecords,
+      );
+      let owner = basic("alice", OWNER_TOKEN);
+      let asked = request("GET", "/stored/trunk/a.bin", &[owner.as_str()]);
+      let Answer::Serve { mut exchange, .. } = site.answer(&head(&asked)).await.answer else {
+        panic!("the GET not served");
+      };
+      exchange.body_end(ClientGone::never()).await.unwrap();
+      let status = exchange.reply_status().code;
+      let mut reply = Vec::new();
+      while exchange
+        .reply(&mut reply, ClientGone::never())
+        .await
+        .unwrap()
+      {}
+      (status, reply)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  assert_eq!(status, 200);
+  assert!(
+    reply == bytes,
+    "{} bytes answered of {}",
+    reply.len(),
+    bytes.len()
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
 /// What the owner's served `method target` with `depth` and `body` answers: its status, its fields and its reply's
 /// bytes, and how many reply runs it took.
 fn exchanged(

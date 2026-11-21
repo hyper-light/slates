@@ -1294,3 +1294,80 @@ fn connectivity_is_complete_against_the_server_and_missing_against_nothing() {
   .unwrap();
   assert_eq!(nothing, [Connected::Missing]);
 }
+
+/// Shape: the blobs every tree of [`wide_trees`] names.
+const SHARED_BLOBS: usize = 256;
+
+/// Shape: the trees of [`wide_trees`], each naming every shared blob: the pack's edges are about their product.
+const WIDE_TREES: usize = 64;
+
+/// A commit over a root tree of [`WIDE_TREES`] trees, each naming the same [`SHARED_BLOBS`] blobs under names of its
+/// own, so the pack's edges (16,449) far outnumber its objects (322); with `absent`, the last blob left out of the
+/// pack, which nothing holds. The request creating `main` at the commit.
+fn wide_trees(absent: bool) -> Vec<u8> {
+  let id = |kind, text: &[u8]| name_of(ObjectFormat::Sha1, kind, text).unwrap();
+  let blobs: Vec<Vec<u8>> = (0..SHARED_BLOBS)
+    .map(|at| format!("blob {at}\n").into_bytes())
+    .collect();
+  let kept = if absent {
+    SHARED_BLOBS - 1
+  } else {
+    SHARED_BLOBS
+  };
+  let mut objects: Vec<(Kind, Vec<u8>)> = blobs
+    .iter()
+    .take(kept)
+    .map(|blob| (Kind::Blob, blob.clone()))
+    .collect();
+  let mut root = Vec::new();
+  for tree in 0..WIDE_TREES {
+    let mut content = Vec::new();
+    for (at, blob) in blobs.iter().enumerate() {
+      content.extend_from_slice(format!("100644 f{tree:02}-{at:04}\0").as_bytes());
+      content.extend_from_slice(id(Kind::Blob, blob).as_bytes());
+    }
+    root.extend_from_slice(format!("40000 d{tree:02}\0").as_bytes());
+    root.extend_from_slice(id(Kind::Tree, &content).as_bytes());
+    objects.push((Kind::Tree, content));
+  }
+  let commit = commit_text(id(Kind::Tree, &root), &[]);
+  let tip = id(Kind::Commit, &commit);
+  objects.push((Kind::Tree, root));
+  objects.push((Kind::Commit, commit));
+  let listed: Vec<(Kind, &[u8])> = objects
+    .iter()
+    .map(|(kind, content)| (*kind, content.as_slice()))
+    .collect();
+  let command: [(ObjectId, ObjectId, &[u8]); 1] = [(zero(), tip, b"refs/heads/main")];
+  request(&[], &command, b" report-status", &[], &pack_of(&listed))
+}
+
+/// [`wide_trees`]'s push read and checked against an empty repository, then its connectivity checked again within
+/// `room` bytes an object of the pack: each command's state, or the refusal.
+fn wide_connectivity(absent: bool, room: u64) -> Result<Vec<Connected>, Refusal> {
+  let bytes = wide_trees(absent);
+  let repository = Repo::default();
+  let mut session = super::Session::new(&ADVERTISED, &HIDDEN);
+  assert_eq!(
+    session.input(&bytes, &repository, &mut unbounded()),
+    Ok(true)
+  );
+  assert_eq!(checked_in_turns(&mut session, &repository).1, Ok(true));
+  let checked = session.checked().unwrap();
+  let objects = checked.objects();
+  let pushed = Pushed::new(objects, Some(session.kept()), &mut unbounded()).unwrap();
+  let mut admission = Admission::new(room.saturating_mul(wide(objects.len())));
+  connectivity(&checked.request, &pushed, &repository, &mut admission)
+}
+
+/// A-719 (main's order 01:56 PST, 2026-11-21: a push's working set is bounded by the slice in flight, never by its
+/// history; w-interop's whole-history push of git/git was refused in its checks, which asked 485,230,824 bytes for a
+/// table of every edge in its pack with 300,809,433 left). Do: check the connectivity of a push whose pack holds 322
+/// objects and 16,449 edges among them, within 8 bytes an object; then of the same push with one blob nothing holds,
+/// within 64 bytes an object. Expect: `Complete` for the first, `Missing` for the second, neither refused for its
+/// room: the check charges a few bytes an object, never a word an edge.
+#[test]
+fn the_connectivity_check_charges_its_objects_never_its_edges() {
+  assert_eq!(wide_connectivity(false, 8), Ok(vec![Connected::Complete]));
+  assert_eq!(wide_connectivity(true, 64), Ok(vec![Connected::Missing]));
+}

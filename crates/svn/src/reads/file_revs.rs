@@ -57,7 +57,7 @@ use crate::handshake::ClientCapabilities;
 use crate::index::{Node, NodeKind, PropertyList, Revision, Text};
 use crate::mergeinfo::{Compare, Mergeinfo, MergeinfoInheritance, mergeinfo_at};
 use crate::ra_svn::{ItemError, Value, write};
-use crate::report::drive::{Delta, WindowWork, window_unit};
+use crate::report::drive::{Delta, Halt, WindowWork, window_unit};
 use crate::report::exchange::{Budget, Slice};
 use crate::svndiff::{Compression, Encoder, Version};
 use std::collections::{BTreeSet, VecDeque};
@@ -267,6 +267,7 @@ impl FileRevsStream {
           return Ok(Progress::Close);
         }
         Err(Stop::Unwritten(error)) => return Err(error),
+        Err(Stop::Waiting(wanted)) => return Ok(Progress::Waiting(wanted)),
       }
       steps = steps.saturating_add(1);
       let spent = reads.out.len().saturating_sub(start).saturating_add(steps);
@@ -430,13 +431,21 @@ impl FileRevsStream {
       sent,
       header_sent,
     };
-    window_unit(
+    let made = window_unit(
       window,
       unit,
       ((self.version, self.compression), reads.repository),
       &mut sink,
-    )
-    .map_err(|_| Failure::corrupt())?;
+    );
+    match made {
+      Ok(()) => {}
+      // The window's work, its pieces read so far among it, stays with the delta for the step that reads on.
+      Err(Halt::Waiting(wanted)) => {
+        self.sending = Some(delta);
+        return Err(Stop::Waiting(wanted));
+      }
+      Err(Halt::Failed(_)) => return Err(Stop::Refused(Failure::corrupt())),
+    }
     self.sending = Some(delta);
     Ok(())
   }
@@ -759,6 +768,9 @@ enum Stop {
   Aborted,
   /// An item the writer refused.
   Unwritten(ItemError),
+  /// A text's piece the repository reads asynchronously is waited for (C2 stage B part 2): the revision's delta is
+  /// kept, and the step reads on once the caller fetched it.
+  Waiting(crate::reads::Wanted),
 }
 
 impl From<Failure> for Stop {

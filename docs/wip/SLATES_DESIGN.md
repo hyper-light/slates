@@ -58905,3 +58905,97 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
   and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
   works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.
+
+### A-802 — A destroy asks its tenant's volume count, kept with the records, instead of collecting every volume of the partition; the load harness injects what grows at scale (2026-11-21, w-fed-move, goal 86b; main's order 01:41 PST; A-92's tenant erase)
+- **How it was found.** Main's order: inject into the 1,000-client stand-in, one at a time, the three things that only
+  grow at scale, and see which one's cost grows. The load harness gained the injections: `--idle-works M` (M works made
+  before the run and kept idle, pinning the floor), `--preload V` (V versions committed before the run, folded unless
+  idle works hold the floor), `--lagged-submit` (each idle work submits after the run, its base everything behind), and
+  the owner's per-kind counters printed after each phase (A-801). Release, in-process, this Mac Studio, the kernel's
+  `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32 --hot-files 300`, 2026-11-21:
+  - (a) bases behind: 1,000 idle works submitting from bases 10, 100 and 1,000 versions behind (up to about 2,700 by the
+    last of them): the verdict 28.5, 22.9 and 25.9 µs, submit p50 384, 332 and 334 µs. Flat.
+  - (b) history: 10^4 versions ahead, folded: verdict 63.4 µs, 3,713 verdicts/s; unfolded: 46.7 µs, 6,260/s; 10^5
+    unfolded: 89.5 µs, 5,217/s; the preload's own cost flat at 300 to 470 µs a version. The verdict grows about twice
+    over 10^5 versions; nothing else.
+  - (c) works pinning the floor: 10^3 idle works: verdict 41.5 µs, 6,513/s, cycle p99 150 ms; 10^4: verdict 84.0 µs,
+    lengths 6.9 µs (2.5 before), rebase 32.9 µs, 2,506/s, cycle p99 501 ms. Every kind of answer two to three times
+    slower: the one that grows. Sampled, the works' shards were in `erase_volume_keys` under `destroy_volume`:
+    `Art::collect` of the partition's volume records.
+- **Why.** A destroy erases its tenant's sealing key with its tenant's last volume (A-92), and to know whether it was
+  the last, it collected every volume record of the partition and scanned them: each work's destroy cost O(volumes
+  held), at the 100k rung up to 100,000 records a destroy.
+- **Change.** `crates/db/src/partition.rs`: `tenant_volumes`, each tenant's volume count, kept by `insert_volume` and
+  `remove_volume` (the only two ways a record comes and goes, a snapshot's restore included); `erase_volume_keys` asks
+  it.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-db --test model
+  a_destroys_cost_does_not_grow_with_the_partitions_other_volumes` (64 destroys beside 8,192 other volumes against
+  alone: 171.7 ms against 1.33 ms before, 129 times for 128 times the volumes; within 4 times after);
+  `a_tenants_key_is_erased_with_its_last_volume_on_the_partition` still passes; `cargo test -p slates-db` all pass.
+- **A/B by use** (same stand-in, 10^4 idle works): verdicts 2,506 to 5,956 a second, verdict 84.0 to 44.2 µs, rebase
+  32.9 to 20.3 µs, lengths 6.9 to 3.2 µs, cycle p99 501 to 212 ms; 10^3 idle works after: 5,697/s. Flat in M now. The
+  history's verdict growth (b) is the next candidate; main's rerun (r48) confirms on the topology.
+
+### A-722 amended — A push refused after its body is answered in git's words, never a cut connection (2026-11-21, w-git for UI goal 93; main's priority 01:31 PST and ruling 01:56 PST; found by use, w-interop)
+
+**Found.** A whole-history push of git/git (611 MB) over the HTTP edge failed 6 of 6, cut off at 57 to 63 s with
+curl's error 18 and no word of why. A diagnostic build on Studio-2 (base 94ff89fe5) logged the body read whole in
+2.8 s, the answer kept alive for 45 s, then the answer's step refused `PastAdmission` and the exchange failed `413`.
+The reply's `200` head had gone out before the body was read (A-722's `StatusMode::AtHead`, as `http-backend` writes
+its own), so the engine could only end the connection short.
+
+**Rule.** A push refused once its body was read whole (its checks, seal, decision, homing or landing, or the wait for
+its records at `f + 1`) is answered in git's words, and the reply ends cleanly:
+- under side-band-64k, on band 3, git's band for a fatal error after which the stream ends (`sideband.c`'s "remote
+  error");
+- without it, when a report was asked, as git reports a pack its unpacking refused: `unpack <words>`, each command
+  `ng <ref> <words>`, a flush (`slates_git::receive::write_refused_report`). The commands' names are kept for that
+  case alone, charged to the push's room, since the request moves on through the answer.
+
+The words are the SSH site's, now one module both edges write (`crate::git_push::words`). A refusal while the body is
+still read still cuts the connection, as git's own does when receive-pack dies while `http-backend` pipes it the body.
+Counted `vcs_http.git.push_refused_after_body`.
+
+**Test.** `vcs_http::git::receive::tests`: the site's exchange on a stored daemon's shard, its shard fenced for the
+one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, nothing answered, nothing counted). Green
+2 of 2.
+
+**Layer 2, measured, open.** The refusal itself was the pack's checks: one charge of 485,230,824 bytes asked with
+300,809,433 left, the connectivity walk's edge table (`receive::connect`, `begin_edges`, a `usize` for every tree
+entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
+are to work a slice at a time over the pack held once (GAPS).
+
+**Layer 2, piece 1: the connectivity check charges its objects, never its edges** (`slates_git::receive::connect`).
+- The first pass reads each pushed object once and judges its own edges out of the pack.
+- When no object is incomplete of its own, no tip can reach one, so every pushed tip is complete and the walk ends
+  there. That covers every push of a complete history, git/git's included, and needs no second read and no table but
+  one state per object.
+- Otherwise the worst state is carried back from each pushed tip, depth first. Each object is read once more as it is
+  opened, and each child's state is folded into the exit frame of the object that opened it. The stack holds the open
+  path and the children it waits on, charged as it grows: bounded by the history's depth times its widest object,
+  never by its edges.
+- Red: 322 objects and 16,449 edges within 8 bytes an object asked 134,176 bytes with 2,254 left. Green.
+- A-719's turn test now asks two turns an object (fsck and the first pass), since a complete push has no propagation.
+
+Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
+`crates/git/src/receive/tests/session.rs`.
+
+Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
+`crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
+`crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
+
+### A-803 — The verdict's growth with history named: the re-anchor walks every value of a changed path (2026-11-21, w-fed-move, goal 86b; main's order 02:11 PST, injection (b); A-793, A-802)
+- **Why.** Injection (b) of A-802 (a long history ahead of the 1,000-client stand-in, held unfolded by one idle work)
+  doubled the owner's verdict over 10^5 versions. `2c32af2b5` (A-787 part 2, the re-anchor's remap indexed) was in
+  the build measured, so it is not that scan.
+- **Change.** Counters only: `merge.reanchor.values_walked` (the history values a submit's commit re-anchored,
+  `Green::history_reanchored_values`) and `merge.submit.secure` / `_ns` (the retention a submit secures before its
+  verdict, timed); the load harness prints them after each phase.
+- **Measured** (release, in-process, this Mac Studio, 2026-11-21 ~02:40, `kernel/` (754 files), 1,000 clients, one
+  round, `--per-connection 32 --hot-files 300 --idle-works 1`): preload 0, 10^4, 10^5 versions: judge 24.0, 31.7, 70.9
+  µs; values re-anchored a verdict 7.9, 30.2, 231.4; compose 57.1, 54.3, 50.3 µs; secure 1.0, 1.3, 1.0 µs; append
+  about 5 µs. The growing step is the re-anchor (about 0.2 µs a value walked): a change rewrites every value of its
+  path's history (A-793), so a path's k-th change costs O(k) while a reader pins the floor.
+- **At the 100k rung** a path's history is short (about 31,000 accepts of four edits over 42,000 hot files, a few
+  values a path), so this is not that rung's wall; it is the wall of a long-lived hot file. The fix's design (an
+  indirection so a length-preserving change moves only the pieces it overwrote) is with main before it is built.

@@ -213,18 +213,23 @@ impl TextSource for HeadTexts<'_> {
     let Some(len) = self.records.stored_len(identity) else {
       return TextSource::read_step(self.records, identity, reading);
     };
-    // A stored text is read from the content store alone (c3: one place a text, no arm after another).
-    let store = self.store?;
-    let root = store.root_of(&slates_vcs::ContentId(*identity));
-    let window = u64::try_from(store.window()).ok()?;
     let read = reading.read();
     if read >= len {
       return Some(true);
     }
-    let piece = store.window_at(&root, len, read.checked_div(window)?)?;
-    let skip = usize::try_from(read.checked_rem(window)?).ok()?;
     let wanted = usize::try_from(len.saturating_sub(read)).ok()?;
-    let rest = piece.get(skip..)?;
+    // A stored text is read from the content store; one it does not hold, through the node's store (C2 stage B part 2):
+    // the piece a waiting reader fetched.
+    if let Some(store) = self.store {
+      let root = store.root_of(&slates_vcs::ContentId(*identity));
+      let window = u64::try_from(store.window()).ok()?;
+      if let Some(piece) = store.window_at(&root, len, read.checked_div(window)?) {
+        let skip = usize::try_from(read.checked_rem(window)?).ok()?;
+        let rest = piece.get(skip..)?;
+        return Some(reading.append(rest.get(..wanted).unwrap_or(rest), len));
+      }
+    }
+    let rest = self.pieces?.at(identity, read)?;
     Some(reading.append(rest.get(..wanted).unwrap_or(rest), len))
   }
 }

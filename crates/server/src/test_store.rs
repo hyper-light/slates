@@ -451,3 +451,100 @@ pub(crate) fn create(
     other => crate::verbs::dispatch(state, 1, principal, other),
   }
 }
+
+/// A store-holding daemon over `owner`'s repository `name`, whose revision 1 adds `/trunk/a.bin` with `bytes` (a stored text, which
+/// its changeset carries), every hold RAM has on the text let go after: the green's held table's and the content
+/// store's (C2 stage B part 2). The store's guard comes first; keep it alive past the daemon's stop.
+pub(crate) fn a_text_only_the_store_holds(
+  owner: &slates_db::catalog::Principal,
+  name: &str,
+  bytes: &[u8],
+) -> (TestStore, crate::Daemon) {
+  use slates_svn::commit::drive::TextSink;
+  let (store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    name,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, green) = crate::test_store::create_on(&daemon, 0, owner, asked);
+  let committed = bytes.to_vec();
+  let landing = owner.clone();
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let text = slates_svn::commit::drive::text_of(&committed).unwrap();
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage().unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, text.identity).unwrap();
+      let row = |path: &str, kind, text| slates_svn::index::ChangedPath {
+        path: path.to_owned(),
+        action: slates_svn::index::Action::Add,
+        kind,
+        copy_from: None,
+        text,
+        properties: None,
+        mergeinfo_modified: false,
+      };
+      let work = slates_svn::commit::drive::Work {
+        head: 0,
+        record: slates_svn::index::RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", slates_svn::index::NodeKind::Directory, None),
+            row(
+              "/trunk/a.bin",
+              slates_svn::index::NodeKind::File,
+              Some(text),
+            ),
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"noise".to_vec())],
+        texts: std::iter::once(text.identity).collect(),
+        property_lists: std::collections::BTreeMap::new(),
+        locks: slates_svn::lock::CommitLocks::default(),
+      };
+      let landed = crate::repository::svn_commit::land_work((&landing, id), work, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision));
+      // Every hold RAM has on the text let go: the green's held table's and the content store's.
+      crate::state::with_state(|state| {
+        if let Some(mut engine) = state.greens.get_mut(&green) {
+          while engine.held(&text.identity).is_some() {
+            let _ = engine.release_held(&text.identity);
+          }
+        }
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          if let Some(content) = stores.content_mut() {
+            let content_id = slates_vcs::ContentId(text.identity);
+            while content.contains(&content_id) {
+              if content.release(&content_id).is_err() {
+                break;
+              }
+            }
+          }
+        });
+      });
+      landed
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(landed, Some(Ok(1)));
+  (store, daemon)
+}
+
+/// Shape: the text the store-read tests commit: noise, so a drive's svndiff carries its bytes as they are.
+pub(crate) fn noise(len: usize) -> Vec<u8> {
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  (0..len)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect()
+}

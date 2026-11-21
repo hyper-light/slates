@@ -137,6 +137,7 @@ mod hooks;
 pub(crate) mod intake;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod words;
 
 #[cfg(unix)]
 pub(crate) use hooks::{HookAnswer, HookCall};
@@ -224,6 +225,11 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   quarantine: Option<GitPush>,
   /// The store's refusal of an object the pack brought, which answers every command.
   unadmitted: Option<GitRefused>,
+  /// The commands' names, kept once the request is read for a client that asked a report but not side-band-64k, and
+  /// charged to the push's room: what a refusal after the push's body answers each command with
+  /// ([`ReceivePack::refused_report`]), since the request itself moves on through the answer. None under side-band,
+  /// whose refusal is band 3's words alone.
+  refusal_names: Option<Vec<Vec<u8>>>,
 }
 
 /// The shard's clock as the store's and the checks' passes read it: the runtime's monotonic
@@ -496,6 +502,7 @@ impl<P> ReceivePack<P> {
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
+      refusal_names: None,
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -517,7 +524,49 @@ impl<P> ReceivePack<P> {
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     charge_step(state, self.repository, began, bytes_in);
-    read
+    let read = read?;
+    self.keep_refusal_names()?;
+    Ok(read)
+  }
+
+  /// Keeps the commands' names for a refusal's report (`refusal_names`) once the request is read, charged to the push's
+  /// room, for a client that asked a report but not side-band-64k; nothing otherwise, or once kept.
+  fn keep_refusal_names(&mut self) -> Result<(), PushFailed> {
+    if self.refusal_names.is_some() {
+      return Ok(());
+    }
+    let Some(request) = self.session.request() else {
+      return Ok(());
+    };
+    let requested = &request.requested;
+    if requested.side_band_64k || !(requested.report_status || requested.report_status_v2) {
+      return Ok(());
+    }
+    let bytes = request.commands.iter().fold(0u64, |total, command| {
+      total.saturating_add(u64::try_from(command.name.len()).unwrap_or(u64::MAX))
+    });
+    self
+      .admission
+      .charge(bytes)
+      .map_err(|past| PushFailed::Exchange(receive::Refusal::PastAdmission(past)))?;
+    self.refusal_names = Some(
+      request
+        .commands
+        .iter()
+        .map(|command| command.name.clone())
+        .collect(),
+    );
+    Ok(())
+  }
+
+  /// The report of a push refused after its body was read, `why`, for a client that asked a report but not
+  /// side-band-64k: `unpack <why>` and each command `ng` with it (`slates_git::receive::write_refused_report`); none
+  /// for any other client, or before the request was read.
+  pub(crate) fn refused_report(&self, why: &str) -> Option<Vec<u8>> {
+    let names = self.refusal_names.as_ref()?;
+    let mut report = Vec::new();
+    receive::write_refused_report(names, why.as_bytes(), &mut report).ok()?;
+    Some(report)
   }
 
   /// The client's bytes have ended: whether the push is now read whole. A request cut short ends the
@@ -528,7 +577,9 @@ impl<P> ReceivePack<P> {
       session.end_into(site, admission)
     });
     charge_step(state, self.repository, began, 0);
-    ended
+    let ended = ended?;
+    self.keep_refusal_names()?;
+    Ok(ended)
   }
 
   /// Runs `call` of the session over the push's intake site, read only over the repository's index
