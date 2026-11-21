@@ -8507,7 +8507,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > the real-process runs of both faults are main's (run-requests.md): the store-destroyed flows exist, and the client
 > killed mid-write is `a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover` (`live_chaos.rs`,
 > 2026-11-19: its write killed between sent and answered by the owner's `fleet.live.awaited`, the owner then lost, the
-> next owner judged by every invariant). The owner's `put_wal` is its `Local` records,
+> next owner judged by every invariant). **Run green across real processes (2026-11-20, w-fed-faults, goal 85c):**
+> macOS arm64, Mac Studio, over slates main d4a5f9f43, `SLATES_TEST_CLI=1 cargo test -p slates-cli --test live_chaos --
+> --exact a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover`, 1 passed in 9.3 s: the
+> client's write reached the owner and parked there before the kill, the successor served from 2.6 s after the owner's
+> loss, every acknowledged write whole and the killed client's absent or whole (NoLoss), its first head 21 past the
+> last durable 19 under epoch 2 (Continuity), and every survivor's reads its own bytes (ReadSafety). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
