@@ -1711,3 +1711,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - Git half: a deferred create, a TreeSource over the git store, replay, an oracle for branches and tags; red: the 611 MB push lands.
   RULING: w-rewrite-ops takes the engine half BEFORE svn stage C (a push that can't land outranks a 3x slowdown), unless stage C is already near green. Added: an untouched green's materialized content may drop back and re-derive (MEMORY SIZING), with materializations and drops counted.
 - 2026-11-21 05:18 PST w-rewrite-ops took P2's engine half: interface sent to w-git, stage C to follow, w-svn told. No agent waiting on main; no landings since 05:04. w-engine's mail is still stuck. The MacBook disk is 55 GB.
+- 2026-11-21 05:23 PST LANDED: 3c4753671 (w-perf, the hg stream's ~37x: a stream asks the store by its room, never once a log). w-git answered w-rewrite-ops on P2's interface. No agent waiting on main. The MacBook disk is 54 GB.
