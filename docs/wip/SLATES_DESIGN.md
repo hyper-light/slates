@@ -59221,6 +59221,12 @@ What changes where:
 - **Fresh objects of a create** are attributed to the push's first move in the landing map. Upload then offers that
   move's fragment and encodes the rest loose: correct, maybe slower (GAPS).
 
+**Paced** (r52: a clone of git/git's branches took 465 s, its 8 derivations 3,024,021 turns of a few units each, each
+paying the shard's lend, its settle and a yield). The server's derivation turn goes on while nobody else waits on the
+shard, to the step's ceiling, as A-783 paces a push's build (`vcs_store::git_derive`).
+`git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`: red 2,404 turns
+for one version of a 600-commit line; green at most 8.
+
 **Tests** (main's conditions):
 1. The map-model oracle (`store::tests::oracle`) has tags (annotated and lightweight, at old commits) and a replay. Every
    derived set equals the model's closures before and after the replay, and the replay walks nothing.
