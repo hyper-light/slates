@@ -760,6 +760,74 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   round_trip(&svn, &format!("svn://127.0.0.1:{port}/{REPOSITORY}"));
 }
 
+/// P7's finding (1), main's interop case of 2026-11-21 (10:55, condition 1): a copy from an older revision, made by the
+/// server from the head and set back from the records, as stock `svn` 1.15 sees it. Do: start an anchor with its
+/// `svn://` listener; as stock `svn`, commit a directory `d` holding [`FILE`] (`one`) as revision 1; change the file to
+/// `two` (revision 2); add `d/later` (revision 3); then copy `d` at revision 1 to `e` (revision 4). Expect: the copy
+/// committed as revision 4; `e` listing [`FILE`] alone, its text `one`; `d`'s text still `two`; and revision 4's log
+/// naming `/e` added from `/d:1`, as `svnserve` names a copy. Skips loudly without stock Subversion 1.15.
+#[test]
+fn stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping stock svn's copy from an older revision: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  let instance = format!("svn-old-copy-{}", std::process::id());
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = svn_listener_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "stock svn's copy from an older revision") else {
+    return;
+  };
+  create_repository(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
+  let scratch = Scratch::new("svn-old-copy");
+  let svn = Svn::new(&scratch, "copy", credentials(id, token));
+  let url = format!("svn://127.0.0.1:{port}/{REPOSITORY}");
+  let copy = svn.copy("work");
+  svn.ok(&svn.scratch, &["checkout", &url, &copy]);
+  svn.ok(&copy, &["mkdir", "d"]);
+  let within = format!("{copy}/d");
+  put(&within, "one\n");
+  svn.ok(&within, &["add", FILE]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "d"]),
+    "Committed revision 1.",
+  );
+  put(&within, "two\n");
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "two"]),
+    "Committed revision 2.",
+  );
+  svn.ok(&within, &["mkdir", "later"]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "later"]),
+    "Committed revision 3.",
+  );
+  let copied = svn.ok(
+    &svn.scratch,
+    &[
+      "copy",
+      "--revision",
+      "1",
+      &format!("{url}/d"),
+      &format!("{url}/e"),
+      "--message",
+      "from 1",
+    ],
+  );
+  expect_line(&copied, "Committed revision 4.");
+  let listed = svn.ok(&svn.scratch, &["list", &format!("{url}/e")]);
+  assert_eq!(listed, format!("{FILE}\n"), "e's listing");
+  let text = svn.ok(&svn.scratch, &["cat", &format!("{url}/e/{FILE}")]);
+  assert_eq!(text, "one\n", "e's text");
+  let head = svn.ok(&svn.scratch, &["cat", &format!("{url}/d/{FILE}")]);
+  assert_eq!(head, "two\n", "d's text");
+  let logged = svn.ok(&svn.scratch, &["log", "--verbose", "--revision", "4", &url]);
+  expect_line(&logged, "   A /e (from /d:1)");
+}
+
 /// §4.17.4 item 14 over `http://` (item 5's HTTP: the WebDAV site on the shared HTTP edge, a repository under the
 /// URL's first segment, as `SVNParentPath` serves one). Do: start an anchor with its HTTP edge on loopback
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at

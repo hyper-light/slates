@@ -1605,6 +1605,145 @@ fn resident_kib() -> u64 {
     .unwrap_or(0)
 }
 
+/// Measurement, not a gate (P7's finding (1), main's condition 3 of 2026-11-21 10:55: what a copy from an older
+/// revision costs, against the green's kept versions). Do: on a daemon's shard, import the dump `SLATES_SVN_COPY_DUMP`
+/// names into `repo`; add `/copies`; then copy `/trunk` from the revision each of `SLATES_SVN_COPY_DISTANCES` names
+/// before the import's youngest (comma-separated; `all` the first revision; `10,1000,all` by default) to
+/// `/copies/d<distance>`, one revision each. Printed: the green's retention charge, the history it has folded below and
+/// this process's resident set after the import and after the copies; and each copy's wall time and what it read
+/// (text pieces fetched through the store, the bytes brought whole, the restore walk's slices), by counter name, so the
+/// same test reads both the green's own copy and the copy set back from the records.
+#[test]
+#[ignore = "measurement: needs SLATES_SVN_COPY_DUMP"]
+fn measure_copies_from_older_revisions() {
+  let path = std::env::var("SLATES_SVN_COPY_DUMP").expect("SLATES_SVN_COPY_DUMP");
+  let distances: Vec<String> = std::env::var("SLATES_SVN_COPY_DISTANCES")
+    .unwrap_or_else(|_| "10,1000,all".to_owned())
+    .split(',')
+    .map(str::to_owned)
+    .collect();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (id, green, loaded) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::vcs_store::svn_import::tests::{imported, subversion};
+      let (id, green) = subversion(REPOSITORY).await;
+      let dump = std::fs::read(&path).expect("the dump");
+      (id, green, imported(id, dump).await.0)
+    },
+    std::time::Duration::from_secs(3600),
+  );
+  assert!(loaded.is_ok(), "{loaded:?}");
+  let seen = |daemon: &crate::Daemon| {
+    crate::daemon::observe_first(daemon, move |state| {
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let engine = state.greens.get(&green);
+      (
+        state
+          .vcs_stores
+          .subversion_records(id)
+          .map_or(0, slates_svn::migration::Repository::youngest),
+        engine
+          .as_ref()
+          .map_or(0, |engine| engine.retention_charge()),
+        engine.as_ref().map_or(0, |engine| engine.folded_below()),
+        [
+          counted("vcs_store.svn_texts.piece_fetched"),
+          counted("vcs_store.svn_texts.bytes_brought"),
+          counted("repository.svn_commit.restore_slices"),
+        ],
+      )
+    })
+  };
+  let (youngest, retention, folded, _) = seen(&daemon);
+  println!(
+    "MEASURE imported youngest {youngest} green_retention_bytes {retention} folded_below {folded} resident_kib {}",
+    resident_kib()
+  );
+  let row =
+    |path: &str, copy_from: Option<slates_svn::index::CopySource>| slates_svn::index::ChangedPath {
+      path: path.to_owned(),
+      action: slates_svn::index::Action::Add,
+      kind: slates_svn::index::NodeKind::Directory,
+      copy_from,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+  let commit = |head: u64, rows: Vec<slates_svn::index::ChangedPath>| {
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let revision = slates_svn::commit::revision::Revision {
+          head,
+          record: slates_svn::index::RevisionRecord {
+            transaction: format!("{head}-1"),
+            changes: rows,
+          },
+          properties: std::collections::BTreeMap::from([
+            (b"svn:author".to_vec(), b"alice".to_vec()),
+            (
+              b"svn:date".to_vec(),
+              b"2026-11-21T12:00:00.000000Z".to_vec(),
+            ),
+            (b"svn:log".to_vec(), b"a copy".to_vec()),
+          ]),
+          contents: std::collections::BTreeMap::new(),
+          stored: std::collections::BTreeMap::new(),
+          lock_entries: Vec::new(),
+        };
+        crate::repository::svn_commit::tests::commit(
+          (&crate::repository::svn_commit::tests::owner(), id),
+          revision,
+          None,
+        )
+        .await
+        .map(|committed| committed.revision)
+      },
+      std::time::Duration::from_secs(3600),
+    )
+  };
+  let mut head = youngest;
+  assert_eq!(commit(head, vec![row("/copies", None)]), Ok(head + 1));
+  head += 1;
+  for distance in &distances {
+    let from = match distance.as_str() {
+      "all" => 1,
+      distance => youngest
+        .saturating_sub(distance.parse().expect("a distance"))
+        .max(1),
+    };
+    let (_, _, _, before) = seen(&daemon);
+    let began = std::time::Instant::now();
+    let source = slates_svn::index::CopySource {
+      path: "/trunk".to_owned(),
+      revision: from,
+    };
+    let committed = commit(
+      head,
+      vec![row(&format!("/copies/d{distance}"), Some(source))],
+    );
+    let wall = began.elapsed();
+    let (_, _, _, after) = seen(&daemon);
+    println!(
+      "MEASURE copy distance {distance} from r{from} committed {committed:?} wall_ms {:.1} pieces_fetched {} \
+       bytes_brought {} restore_slices {}",
+      wall.as_secs_f64() * 1000.0,
+      after[0] - before[0],
+      after[1] - before[1],
+      after[2] - before[2],
+    );
+    assert_eq!(committed, Ok(head + 1));
+    head += 1;
+  }
+  let (_, retention, folded, _) = seen(&daemon);
+  println!(
+    "MEASURE copied green_retention_bytes {retention} folded_below {folded} resident_kib {}",
+    resident_kib()
+  );
+  daemon.stop();
+}
+
 /// C2 stage B part 2 (a text the content store does not hold is read through the node's changeset store, R6: never a
 /// sync path). Do: on a daemon holding a store, land a client's commit adding `/trunk/a.bin` (a stored text, which its
 /// changeset carries), let go every hold RAM has on the text (the green's held table and the content store), then

@@ -2924,7 +2924,11 @@
 > import on the real daemon"; main's order: after C2 stage B part 2, completion then robustness then performance).**
 > Owed, each measured on git-2000's import (437 MiB dump, 2,000 revisions): (1) the green charges 440 MB of retention
 > for a history the records keep in 35 MB (12x): its kept versions serve copies from older revisions (folding them was
-> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first;
+> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first. BUILT
+> (A-820): a copy from an older revision is made from the head and set back from the records, and a Subversion green
+> folds to its live readers' floor after each landing. It also fixed the robustness bug the fold exposed: a copy was
+> refused `VersionFolded` once a tight budget had folded the green. Owed: the A/B of main's condition 3 (main's run,
+> `measure_copies_from_older_revisions` at 3bf21428b against A-820's commit) and the memory it frees;
 > (2) 593 MB of live small allocations with no owner attributed; (3) ~1 GB of whole-text transients during the import
 > (a revision's whole texts, its record's encoding and the reader's buffer held at once) and 1.5 GB of freed large
 > blocks the test binary's allocator keeps (the daemon's own allocator gives them back; the real daemon peaks at

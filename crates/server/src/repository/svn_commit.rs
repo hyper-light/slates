@@ -34,8 +34,10 @@
 //!
 //! **The green's version** (item 1). Files hold Subversion's repository-normal bytes; a node's property list is named in
 //! the reserved attribute [`PROPS`] by its content identity, the list itself held by the records; a copy is the engine's
-//! `Copy` of the source's tree at its revision, by reference (A-586), over what the destination holds with `REPLACE`
-//! (A-626); every operation is node-exclusive (A-542), so the engine judges each as touching its whole node, as FSFS
+//! `Copy` of the source's tree at the head, by reference (A-586), over what the destination holds with `REPLACE`
+//! (A-626), and a copy from an older revision is then set back, path by path, where its source changed since
+//! ([`restore`], P7's finding (1)): the green keeps no version for a copy, so it folds its history to its live readers'
+//! floor after every landing ([`fold_to_readers`]); every operation is node-exclusive (A-542), so the engine judges each as touching its whole node, as FSFS
 //! does. The rows are read in path order, parents first. A deletion removes its node and everything beneath it, named one
 //! by one, since a node-exclusive removal of a directory needs the same increment to empty it (`Green::beneath` lists
 //! what stands there; the engine drops a removed node's attributes itself). An addition without history creates its
@@ -45,8 +47,10 @@
 //!
 //! **Not declared yet** (refused typed, [`Uncommitted::Unsupported`], counted [`UNSUPPORTED`], nothing changed; GAPS
 //! §4.17.4): a directory deleted or replaced beneath a copy the same revision made from a revision older than the head,
-//! whose tree no public read of the engine lists at that version; and a replacement without history that changes a
-//! node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
+//! whose tree no public read of the engine lists at that version; a node of another kind beneath a copy from an older
+//! revision than the head holds there, a replacement by a copy of a source the head no longer holds, and an addition
+//! or replacement by a row of the same revision over a path the copy sets back ([`restore`]); and a replacement without
+//! history that changes a node's kind, which the engine refuses as `TypeChanged` (GAPS §8f).
 //!
 //! **A client's work** ([`land_work`], A-698): what both ra_svn transports call with the work their connection
 //! accepted at `close-edit`, `svn://` and `svnserve -t` through the SSH tunnel sharing A-656's connection. The revision
@@ -78,6 +82,7 @@ use super::push::{
 use crate::state::ShardState;
 
 pub(crate) mod landing;
+pub(crate) mod restore;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -98,6 +103,10 @@ const REVISION_DATE: &[u8] = b"svn:date";
 
 /// Format: the revision property a commit's author is (`SVN_PROP_REVISION_AUTHOR`, `svn_props.h`).
 const REVISION_AUTHOR: &[u8] = b"svn:author";
+
+/// Counter: the history bytes a Subversion green folded after a landing, to its reachable floor (P7's finding (1),
+/// [`fold_to_readers`]): the versions it no longer keeps. Format: a counter name in the status report.
+pub(crate) const FOLDED_BYTES: &str = "repository.svn_commit.folded_bytes";
 
 /// Counter: a Subversion repository whose green was not at its records' youngest revision, or answered a version other
 /// than the revision's: zero in every correct use, since only the step moves the green. Format: a counter name.
@@ -215,7 +224,7 @@ impl Uncommitted {
 /// of 2026-11-20): its texts put from the commit's sink `texts` into the repository's content store a copy slice a step,
 /// the shard served between steps; the content made durable before any entry names it (the content plane's barrier);
 /// then the revision, which names the texts, made at the owner's instant, judged again with the commit's locks then,
-/// and landed through the step ([`landed`]: the store, then the register). Committed or refused, the content store
+/// and landed through the step ([`landed_with`]: the store, then the register). Committed or refused, the content store
 /// lets go every text the landing put: a committed text is its changeset's on the node's store, read through it (C2
 /// stage B part 2 (b)). None where the shard's state is gone (its shutdown).
 pub(crate) async fn land_work(
@@ -253,19 +262,30 @@ pub(crate) async fn land_work(
   let carried = texts_carried(&work.record.changes, &storing.put);
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
   // the store and committed in the register (`landing`); every text the landing put given back once it ends.
+  let (turn, plans, restoring) = match planned(repository, &work.record.changes).await? {
+    Ok(planned) => planned,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| {
+        release_stored(state, storing);
+        release_texts(state, None, &brought);
+      });
+      return Some(Err(refused));
+    }
+  };
   let storing = core::cell::Cell::new(Some(storing));
   let give_back = |state: &mut ShardState| {
     if let Some(storing) = storing.take() {
       release_stored(state, storing);
     }
   };
-  let landed = landed(
+  let landed = landed_with(
+    turn,
     (repository, carried),
     |state| {
       let now = AprTime::from_wall_ns(slates_vfs::clock::Clock::wall_ns(&mut state.clock));
       let locks = work.locks.clone();
       let revision = Revision::of_work(work, now).map_err(Uncommitted::Step)?;
-      prepare_revision(state, repository, revision, Some((&locks, now)))
+      prepare_revision(state, repository, (revision, plans), Some((&locks, now)))
     },
     |state, reference, prepared| {
       let committed = commit_prepared(state, (principal, repository), reference, prepared);
@@ -280,8 +300,36 @@ pub(crate) async fn land_work(
     give_back,
   )
   .await;
-  let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+  let _ = crate::state::with_state(|state| {
+    release_texts(state, None, &brought);
+    release_texts(state, None, &restoring);
+  });
   landed
+}
+
+/// Repository `repository`'s landing turn, taken for a revision whose rows are `changes`, with the restores of its
+/// copies from older revisions planned under it ([`restore::plan`]) and the texts they name brought whole through the
+/// node's store ([`bring_texts`]), each holding one count the caller gives back once the commit's step ran. None where
+/// the shard's state is gone; refused with the turn given back and nothing held.
+async fn planned(
+  repository: RepositoryId,
+  changes: &[ChangedPath],
+) -> Option<Result<(landing::Turn, restore::CopyPlans, Vec<ContentIdentity>), Uncommitted>> {
+  let turn = landing::turn(repository).await?;
+  let plans = match restore::plan(repository, changes).await? {
+    Ok(plans) => plans,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| turn.give_back(state));
+      return Some(Err(refused));
+    }
+  };
+  match bring_texts(repository, restore::texts_of(&plans).into_iter()).await? {
+    Ok(restoring) => Some(Ok((turn, plans, restoring))),
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| turn.give_back(state));
+      Some(Err(refused))
+    }
+  }
 }
 
 /// Brings back into the content store, whole, every text `changes` name that repository `repository`'s records keep
@@ -293,11 +341,19 @@ async fn bring_stored(
   repository: RepositoryId,
   changes: &[ChangedPath],
 ) -> Option<Result<Vec<ContentIdentity>, Uncommitted>> {
+  bring_texts(repository, changes.iter().filter_map(|change| change.text)).await
+}
+
+/// [`bring_stored`] for `texts` (a copy's restore names them, `restore::texts_of`).
+async fn bring_texts(
+  repository: RepositoryId,
+  texts: impl Iterator<Item = Text>,
+) -> Option<Result<Vec<ContentIdentity>, Uncommitted>> {
   let wanted: Vec<(ContentIdentity, u64)> = crate::state::with_state(|state| {
     let records = state.vcs_stores.subversion_records(repository);
     let content = state.vcs_stores.content();
     let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
-    for text in changes.iter().filter_map(|change| change.text) {
+    for text in texts {
       let lacking = records.is_some_and(|records| records.stored_len(&text.identity).is_some())
         && !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(text.identity)))
         && !wanted
@@ -320,21 +376,6 @@ async fn bring_stored(
   Some(Ok(brought))
 }
 
-/// Lands one changeset of repository `repository` (module docs of [`landing`]): its landing turn awaited; `prepare`d
-/// (checked, its record's bytes made) in one step; landed on the node's store, durable; then `commit`ted in the
-/// register by an entry naming its sequence, in one step, where no other changeset was named meanwhile. A refusal
-/// before the commit runs `undo` with what `prepare` made, where it made something. None where the shard's state is
-/// gone (its shutdown).
-async fn landed<P, T>(
-  (repository, texts): (RepositoryId, Vec<landing::LandedText>),
-  prepare: impl FnOnce(&mut ShardState) -> Result<(Vec<u8>, P), Uncommitted>,
-  commit: impl FnOnce(&mut ShardState, Vec<u8>, P) -> Result<T, Uncommitted>,
-  undo: impl FnOnce(&mut ShardState),
-) -> Option<Result<T, Uncommitted>> {
-  let turn = landing::turn(repository).await?;
-  landed_with(turn, (repository, texts), prepare, commit, undo).await
-}
-
 /// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
 /// path a row sets it at, with its length: what its changeset carries (C2 stage B).
 fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landing::LandedText> {
@@ -354,7 +395,11 @@ fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landin
   carried
 }
 
-/// [`landed`] holding repository `repository`'s landing turn `turn` already.
+/// Lands one changeset of repository `repository` (module docs of [`landing`]) holding its landing turn `turn`, taken by
+/// the caller: `prepare`d (checked, its record's bytes made) in one step; landed on the node's store, durable; then
+/// `commit`ted in the register by an entry naming its sequence, in one step, where no other changeset was named
+/// meanwhile. A refusal before the commit runs `undo` with what `prepare` made, where it made something. None where the
+/// shard's state is gone (its shutdown).
 pub(crate) async fn landed_with<P, T>(
   turn: landing::Turn,
   (repository, texts): (RepositoryId, Vec<landing::LandedText>),
@@ -399,7 +444,7 @@ pub(crate) async fn landed_with<P, T>(
 
 /// A `revision` landed on repository `repository` by `principal`: judged again with a commit's locks at an instant
 /// (`judged`), or as made (`None`, an import's, A-652 part 3, `crate::vcs_store::svn_import`); checked, landed on the
-/// node's store, then committed as the green's next version ([`landed`]).
+/// node's store, then committed as the green's next version ([`landed_with`]).
 pub(crate) async fn land_revision(
   (principal, repository): (&Principal, RepositoryId),
   revision: Revision,
@@ -424,9 +469,20 @@ pub(crate) async fn land_revision(
       release_stored(state, storing);
     }
   };
-  let landed = landed(
+  let (turn, plans, restoring) = match planned(repository, &revision.record.changes).await? {
+    Ok(planned) => planned,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| {
+        give_back(state);
+        release_texts(state, None, &brought);
+      });
+      return Some(Err(refused));
+    }
+  };
+  let landed = landed_with(
+    turn,
     (repository, carried),
-    |state| prepare_revision(state, repository, revision, judged),
+    |state| prepare_revision(state, repository, (revision, plans), judged),
     |state, reference, prepared| {
       let committed = commit_prepared(state, (principal, repository), reference, prepared);
       give_back(state);
@@ -438,6 +494,7 @@ pub(crate) async fn land_revision(
   let _ = crate::state::with_state(|state| {
     give_back(state);
     release_texts(state, None, &brought);
+    release_texts(state, None, &restoring);
   });
   landed
 }
@@ -539,6 +596,8 @@ pub(crate) struct Prepared {
   brought: u64,
   /// The records' generation and youngest revision at the check.
   stamp: Option<(u64, u64)>,
+  /// The restores of its copies from older revisions, planned holding the landing turn ([`restore::plan`]).
+  plans: restore::CopyPlans,
 }
 
 /// The records' generation and youngest revision: what a prepared revision's commit finds unchanged.
@@ -557,7 +616,7 @@ fn stamp(state: &ShardState, repository: RepositoryId) -> Option<(u64, u64)> {
 fn prepare_revision(
   state: &mut ShardState,
   repository: RepositoryId,
-  revision: Revision,
+  (revision, plans): (Revision, restore::CopyPlans),
   judged: Option<(&CommitLocks, AprTime)>,
 ) -> Result<(Vec<u8>, Prepared), Uncommitted> {
   green_of(state, repository)?;
@@ -573,6 +632,7 @@ fn prepare_revision(
     identity: identity(&record),
     brought,
     stamp: stamp(state, repository),
+    plans,
   };
   Ok((record, prepared))
 }
@@ -599,6 +659,7 @@ fn commit_prepared(
     (principal, repository),
     green,
     (prepared.checked, prepared.identity, reference),
+    prepared.plans,
   );
   crate::vcs_store::settle_svn(state, repository);
   landed
@@ -766,7 +827,7 @@ pub(crate) fn release_texts(
 
 /// The step for a record that moves no version (module docs; A-652 part 3): `record`, the repository's UUID, a
 /// revision's properties set whole or a lock verb's entries, landed on the node's store and committed
-/// on `repository`'s register by `principal`, its owner ([`landed`]). A creation or a revision is refused `Corrupt`: a
+/// on `repository`'s register by `principal`, its owner ([`landed_with`]). A creation or a revision is refused `Corrupt`: a
 /// creation is made once, by `CreateRepository`, and a revision moves the green ([`land_revision`]).
 pub(crate) async fn land_record(
   (principal, repository): (&Principal, RepositoryId),
@@ -943,7 +1004,14 @@ pub(crate) async fn land_made<T>(
   let landed = landed_with(
     turn,
     (repository, carried),
-    |state| prepare_revision(state, repository, revision, None),
+    |state| {
+      prepare_revision(
+        state,
+        repository,
+        (revision, restore::CopyPlans::new()),
+        None,
+      )
+    },
     |state, reference, prepared| {
       let entry = MadeEntry {
         repository,
@@ -1149,8 +1217,9 @@ fn land(
   (principal, repository): (&Principal, RepositoryId),
   green: DbVolumeId,
   (checked, identity, reference): (Checked, [u8; 32], Vec<u8>),
+  plans: restore::CopyPlans,
 ) -> Result<Committed, Uncommitted> {
-  let work = version_of(state, (repository, green), &checked, identity)?;
+  let work = version_of(state, (repository, green), (&checked, plans), identity)?;
   // The reference is the repository's content in the partition's register, charged to this shard's memory budget
   // (`vcs_store::settle_objects`).
   crate::vcs_store::admit_objects(state, reference.len())
@@ -1183,6 +1252,7 @@ fn land(
       // Fold the green's chain by the merge service's doubling rule as every accepted version does (W3), so a
       // repository's chain stays bounded however many revisions it takes.
       crate::merge_service::checkpoint_green(state, green);
+      fold_to_readers(state, green);
       Ok(applied(state, repository, checked, &appended))
     }
     Err(refused) => {
@@ -1190,6 +1260,23 @@ fn land(
       Err(Uncommitted::Append(refused))
     }
   }
+}
+
+/// Folds a Subversion green's history to its reachable floor and settles its retention charge (P7's finding (1)): no copy
+/// reads a version it kept (`restore`: a copy from an older revision is made from the head and set back from the
+/// records), and svn's reads are the records', so only a live reader's version (a work's base, a pinned attachment, a
+/// mount) is kept. Before, it folded only past its retention budget, so git-2000's import kept 440 MB of versions.
+fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
+  let floor = crate::merge_service::reachable_floor(state, green);
+  let folded = state
+    .greens
+    .get_mut(&green)
+    .map_or(0, |mut engine| engine.fold_history_before(floor));
+  if folded > 0 {
+    state.count(FOLDED_BYTES, u64::try_from(folded).unwrap_or(u64::MAX));
+  }
+  // A charge the budget cannot take leaves the fold, which only releases, and is charged again at the next settle.
+  let _ = crate::merge_service::settle_green_retention(state, green);
 }
 
 /// The records once the entry recorded the revision: applied, as the check made certain; the answer `commit-info`
@@ -1239,7 +1326,7 @@ fn answer(checked: &Checked) -> Committed {
 fn version_of(
   state: &mut ShardState,
   (repository, green): (RepositoryId, DbVolumeId),
-  checked: &Checked,
+  (checked, plans): (&Checked, restore::CopyPlans),
   identity: [u8; 32],
 ) -> Result<Increment, Uncommitted> {
   // Built with the content store's chunks lent, so a text the commit stored reads from it (A-727's lend).
@@ -1252,7 +1339,7 @@ fn version_of(
     let engine = state.greens.get(&green).ok_or(Uncommitted::NotHeld)?;
     let head = records.youngest();
     if engine.head() == head {
-      Building::new((records, store), &engine, checked).build(head, identity)
+      Building::new((records, store), &engine, (checked, plans)).build(head, identity)
     } else {
       Err(Uncommitted::Diverged)
     }
@@ -1293,7 +1380,7 @@ fn moved(found: &str, from: &str, to: &str) -> Option<String> {
 
 /// What stood at a path before the revision changed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stood {
+pub(crate) struct Stood {
   /// Whether a directory stood there.
   directory: bool,
   /// Its text's length, for a file.
@@ -1321,6 +1408,11 @@ struct Building<'b> {
   post: Vec<u8>,
   /// The green paths the revision removes, unless a later row makes them again.
   gone: BTreeMap<String, Stood>,
+  /// The restores of the revision's copies from older revisions, by their rows' paths ([`restore::plan`]), each taken
+  /// as its copy is made.
+  plans: restore::CopyPlans,
+  /// The green paths a copy from an older revision sets back, merged with the rows that change them, made at the end.
+  restores: BTreeMap<String, restore::Restore>,
 }
 
 impl<'b> Building<'b> {
@@ -1328,7 +1420,7 @@ impl<'b> Building<'b> {
   fn new(
     (records, store): (&'b Repository, Option<&'b slates_vcs::ContentStore>),
     engine: &'b Green,
-    checked: &'b Checked,
+    (checked, plans): (&'b Checked, restore::CopyPlans),
   ) -> Self {
     let rows = checked
       .changes()
@@ -1344,6 +1436,8 @@ impl<'b> Building<'b> {
       doc: OpsDoc::default(),
       post: Vec::new(),
       gone: BTreeMap::new(),
+      plans,
+      restores: BTreeMap::new(),
     }
   }
 
@@ -1352,6 +1446,9 @@ impl<'b> Building<'b> {
     let checked = self.checked;
     for row in checked.changes() {
       self.row(row)?;
+    }
+    for (path, restore) in core::mem::take(&mut self.restores) {
+      self.restored(&path, restore)?;
     }
     for (path, stood) in core::mem::take(&mut self.gone) {
       let kind = if stood.directory {
@@ -1375,6 +1472,10 @@ impl<'b> Building<'b> {
 
   /// One row (module docs).
   fn row(&mut self, row: &ChangedPath) -> Result<(), Uncommitted> {
+    let path = green_path(&row.path);
+    if let Some(restore) = self.restores.get(path).copied() {
+      return self.over_restore(row, restore);
+    }
     match (row.action, &row.copy_from) {
       (Action::Delete, _) => self.remove(row, true),
       (Action::Add | Action::Replace, Some(source)) => self.copy(row, source),
@@ -1477,7 +1578,29 @@ impl<'b> Building<'b> {
     let replace = row.action == Action::Replace || !held.is_empty();
     let from = self.doc.paths.intern(green_path(&source.path));
     let flags = if replace { REPLACE } else { 0 };
-    self.op_at(OpKind::Copy, &path, (source.revision, 0, from), flags);
+    // A copy from an older revision is made from the head and set back where its source changed since (P7's
+    // finding (1), `restore`): the green keeps no version for it.
+    let head = self.records.youngest();
+    let version = match self.plans.remove(&row.path) {
+      Some(plan) if source.revision < head => {
+        if !plan.from_head && replace {
+          return Err(Uncommitted::Unsupported {
+            path: row.path.clone(),
+          });
+        }
+        self.restores.extend(plan.restores);
+        plan.from_head.then_some(head)
+      }
+      None if source.revision >= head => Some(source.revision),
+      _ => return Err(corrupt()),
+    };
+    if let Some(version) = version {
+      self.op_at(OpKind::Copy, &path, (version, 0, from), flags);
+    }
+    if let Some(restore) = self.restores.get(&path).copied() {
+      // The copy's own root is set back: the row's text and list go over the revision's.
+      return self.over_restore(row, restore);
+    }
     let brought = self
       .stood(&source.path, source.revision)?
       .ok_or_else(corrupt)?;
@@ -1486,6 +1609,131 @@ impl<'b> Building<'b> {
     }
     self.properties(&path, row.properties, brought.props);
     Ok(())
+  }
+
+  /// A row of the revision over a path a copy from an older revision sets back (`restore`): a change in place goes over
+  /// the restore (its text and its list where it names them), a deletion removes what the copy brought there, and a
+  /// copy's own root takes its row's text and list; an addition or a replacement there is not declared yet.
+  fn over_restore(
+    &mut self,
+    row: &ChangedPath,
+    restore: restore::Restore,
+  ) -> Result<(), Uncommitted> {
+    let path = green_path(&row.path).to_owned();
+    let copied_root = row.copy_from.is_some() && self.restores.contains_key(&path);
+    match (row.action, restore) {
+      (
+        Action::Modify,
+        restore::Restore::Set {
+          brought,
+          directory,
+          text,
+          props,
+        },
+      )
+      | (
+        Action::Add | Action::Replace,
+        restore::Restore::Set {
+          brought,
+          directory,
+          text,
+          props,
+        },
+      ) if row.action == Action::Modify || copied_root => {
+        let text = if row.text.is_some() { row.text } else { text };
+        let props = row.properties.unwrap_or(props);
+        self.restores.insert(
+          path,
+          restore::Restore::Set {
+            brought,
+            directory,
+            text,
+            props,
+          },
+        );
+        Ok(())
+      }
+      (
+        Action::Delete,
+        restore::Restore::Set {
+          brought, directory, ..
+        },
+      ) => {
+        let beneath: Vec<String> = self
+          .restores
+          .range(format!("{path}/")..)
+          .take_while(|(found, _)| found.starts_with(&format!("{path}/")))
+          .map(|(found, _)| found.clone())
+          .collect();
+        if !beneath.is_empty() || directory {
+          return Err(Uncommitted::Unsupported {
+            path: row.path.clone(),
+          });
+        }
+        match brought {
+          Some(brought) => {
+            self.restores.insert(
+              path,
+              restore::Restore::Remove {
+                directory: brought.directory,
+              },
+            );
+          }
+          None => {
+            self.restores.remove(&path);
+          }
+        }
+        Ok(())
+      }
+      _ => Err(Uncommitted::Unsupported {
+        path: row.path.clone(),
+      }),
+    }
+  }
+
+  /// A path a copy from an older revision sets back, made (`restore`): removed with what the head held there, or made
+  /// as the copied revision held it, over what the copy from the head brought.
+  fn restored(&mut self, path: &str, restore: restore::Restore) -> Result<(), Uncommitted> {
+    match restore {
+      restore::Restore::Remove { directory } => {
+        let stood = Stood {
+          directory,
+          len: 0,
+          props: false,
+        };
+        self.gone.insert(path.to_owned(), stood);
+        Ok(())
+      }
+      restore::Restore::Set {
+        brought: None,
+        directory,
+        text,
+        props,
+      } => {
+        if directory {
+          self.op(OpKind::Mkdir, path);
+        } else {
+          self.op(OpKind::Create, path);
+          if let Some(text) = &text {
+            self.insert(path, text)?;
+          }
+        }
+        self.properties(path, Some(props), false);
+        Ok(())
+      }
+      restore::Restore::Set {
+        brought: Some(brought),
+        directory,
+        text,
+        props,
+      } => {
+        if !directory {
+          self.replace_text(path, brought.len, text.as_ref())?;
+        }
+        self.properties(path, Some(props), brought.props);
+        Ok(())
+      }
+    }
   }
 
   /// A replacement without history: the node changed in place ([`Building::remake`]), what stood beneath it removed.
