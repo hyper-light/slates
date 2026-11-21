@@ -205,3 +205,23 @@
   mode, server fill_window; red test 789,956 B payload in 14 fills, window at most 193,859 B), and the daemon_edge hg
   tests green via w-git's C5 part 2a. Close note written. Waiting on main's ruling for C1's order (3, 1, 2) and the
   import's shape; next by default: step 3, the import as a run of changesets.
+- 2026-11-21 LANDED 6a0600ff1 (segment records v8, run reference v9, main's oracle on all five 7.2 formats) and
+  a693c49e4 (C1 step 3 server half: the import lands as a run of segment changesets; recovery and rebuild read the
+  segment records, 0 payload reads; imports stream). main confirmed. The push memory work went to w-perf whole;
+  t_a752 is w-bugs'.
+- C1 step 1 (main approved 08:45, inbox/main-from-w-hg-c1-step1-design.md, with the pull condition): getbundle's file
+  revisions come from the changeset store through w-perf's render::StoreWants (Want::Rows via texts_by_tool,
+  Want::Chunks via places), answered by hg_view::answer_store_wants between turns (vcs_http/hg.rs:653,
+  vcs_ssh/hg.rs:184).
+  - A stored delta is sent as it stands when its base is known by node (a revision sent earlier in this answer, or p1
+    or p2 whose link is served). Ask rows for (path, [node, p1, p2]).
+  - Otherwise send a whole text, made by the store (`StoreHandle::text`), against null: a new Want variant beside
+    w-perf's; tell w-perf.
+  - Counters: whole texts made; revisions sent whole.
+  - main wants a measurement of a one-changeset pull touching a large file, slates' bytes against stock's.
+  - Plan:
+    - 1a: the by-links walk (clone): Walk::file in serve/getbundle.rs, plus Producing::Bundle's StoreWants in
+      serve/session.rs.
+    - 1b: the pull path (named_changegroup, built whole and synchronous today) rebuilt as a stepwise walk with wants.
+    - Then lookup's .hgtags, the intake's base text, made changesets.
+    - Then step 2, after w-perf's intake change lands.
