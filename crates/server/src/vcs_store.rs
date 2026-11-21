@@ -1642,10 +1642,12 @@ impl SealedPush {
   ) -> bool {
     let repository = self.repository;
     let push = &mut self.push;
-    let room = state
-      .vcs_stores
-      .git_ref(repository)
-      .map_or(0, |(_, store)| store.repository.stage_room(push));
+    // Nothing to stage again, and none under way: current at once, no room reckoned (each decision step asks).
+    let room = match state.vcs_stores.git_ref(repository) {
+      Some((_, store)) if staging.is_none() && !store.repository.needs_stage(push) => return true,
+      Some((_, store)) => store.repository.stage_room(push),
+      None => 0,
+    };
     let turned = within_budget(state, room, |stores| {
       let (content, store) = stores.git(repository).ok_or(GitRefused::NoStore)?;
       let mut begun = match staging.take() {

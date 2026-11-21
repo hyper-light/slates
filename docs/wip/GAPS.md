@@ -314,9 +314,15 @@
 > object is incomplete of its own, every pushed tip is complete and the walk ends after its first pass. Otherwise it
 > carries the worst state back from each tip depth first, a frame an object, its stack charged as it grows. Red:
 > `receive::tests::the_connectivity_check_charges_its_objects_never_its_edges` (322 objects, 16,449 edges, 8 B an
-> object) asked 134,176 B with 2,254 left at df349a9fe; green. Owed: what else the answer holds for the whole pack
-> (the next wall the 611 MB push meets, measured); red, that push landing within its room; an A/B against stock git
-> (10.77 s).
+> object) asked 134,176 B with 2,254 left at df349a9fe; green. Piece 2 BUILT (2026-11-21): the push then landed its
+> changeset and decided its 1,027 refs at about 0.5 ms a step, unanswered after 1,200 s (r13/r14 at b7d2ae37e, Studio-2;
+> a stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits): `restage_turn`, asked every
+> decision step, reckoned `Repository::stage_room` by a pass over every commit pushed. Now the push keeps its commits'
+> parents as they arrive and the room is two counts; `restage_turn` reckons none when no stage is due. Measured: about
+> 30 µs a decision step (6.9 M steps, 210 s stepping, in 350 s). Owed, the next wall: a created ref whose head descends
+> from no green's head (git/git's old tags) walks its whole history for its green's reached set (A-614), so the
+> decision is about refs times history; design to main. Then red, that push landing within its room; an A/B against
+> stock git (10.77 s). Also measured: the checks take 16 s and the seal 3.7 s of that push.
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no

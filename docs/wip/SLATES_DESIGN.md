@@ -58980,6 +58980,20 @@ are to work a slice at a time over the pack held once (GAPS).
 Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
 `crates/git/src/receive/tests/session.rs`.
 
+**Layer 2, piece 2: a decision step reckons its stage's room from counts** (`slates_git::store::Push::commit_parts`,
+`Repository::stage_room`, `crate::vcs_store::SealedPush::restage_turn`).
+- Found: with the checks fixed, git/git's push landed its changeset and then decided its 1,027 refs at about 0.5 ms a
+  step, unanswered after 1,200 s. A stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits:
+  every decision step first asks whether the push's stage must be made again (A-722 part 4e), and that reckoned the
+  stage's room by a pass over every commit pushed, about 75,000.
+- Now the push keeps the parents its commits name as they arrive, and the room is two counts. A step with no stage due
+  reckons no room at all. Measured on the same push: about 30 µs a decision step.
+- The next wall, measured and owed (GAPS): creating a ref whose head descends from no green's head walks the whole
+  history it reaches for that green's reached set (A-614), so deciding many old tags is about refs times history.
+
+Also applied to: `crates/git/src/store/push.rs`, `crates/git/src/store/repository.rs`,
+`crates/server/src/vcs_store.rs`.
+
 Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
 `crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
 `crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
