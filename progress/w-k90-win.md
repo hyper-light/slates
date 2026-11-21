@@ -103,3 +103,9 @@
 - r2 (jupiter, main 4af73427b+): SLATES_E2E=1 slates_e2e bare_metal, then Windows clippy. Watching. Also GitHub ci.yml
   run on 4af73427b's descendants: `windows (Slates tests)` job.
 - For main to delete: ~/fanout-state-w-k90-win (half clone), ~/kiln-work/w-k90-win-kiln (broken blobless clone).
+
+## 2026-11-20 ~20:20 PST: C1 CLOSED (inbox/main-from-w-k90-win-close.md)
+- jupiter r3 at main eb7194f00: slates_e2e bare_metal 2/2 passed (93 s), WinFsp 2.1.25156, Python 3.15.2.
+- GitHub run 44851246181 job 136703754349 (4f5e58c1b): slates_e2e 25/25 incl. both bare_metal drives.
+- mod bare_metal is cfg(any(unix, windows)).
+- Follow-up in flight: workspace::tests w2/w7 '/'-joined expectations fail on Windows (98/100) -> fb3460e9e, jupiter r4.
