@@ -162,6 +162,63 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   );
 }
 
+/// C2 stage B part 2 (the export reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose repository `stored` has a revision 1 adding `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), ask for revisions 0 to 1 in each format, each into a volume of
+/// its own. Expect both held, then within the wait both published, format 2's dump file carrying the text whole and
+/// format 3's its first and last KiB (its svndiff windows: noise, which none compresses), read through
+/// the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after.
+/// Before, the export's first read of the text refused it `Corrupt`, and nothing was published.
+#[test]
+fn an_export_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon) = crate::test_store::a_text_only_the_store_holds(&owner(), "stored", &bytes);
+  let asked = crate::daemon::observe_first(&daemon, |state| {
+    routed(state, 1);
+    let two = ask(state, (&owner(), "stored"), ((0, 1), false), "two");
+    routed(state, 2);
+    let three = ask(state, (&owner(), "stored"), ((0, 1), true), "three");
+    [two, three]
+  });
+  let held = (ReplyBody::Acknowledged, true);
+  assert_eq!(asked, [held.clone(), held]);
+  let began = Instant::now();
+  let made = loop {
+    let made = crate::daemon::observe_first(&daemon, |state| {
+      [dump_of(state, "two"), dump_of(state, "three")]
+    });
+    if made.iter().all(Option::is_some) || began.elapsed() > TASK_WAIT {
+      break made;
+    }
+  };
+  let (counted, fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      counters(state),
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let carries = |dump: &Option<Vec<u8>>, run: &[u8]| {
+    dump
+      .as_ref()
+      .is_some_and(|dump| dump.windows(run.len()).any(|window| window == run))
+  };
+  let [two, three] = &made;
+  let lengths = (two.as_ref().map(Vec::len), three.as_ref().map(Vec::len));
+  assert!(carries(two, &bytes), "format 2; {lengths:?}; {counted:?}");
+  assert!(
+    carries(three, &bytes[..1024]) && carries(three, &bytes[bytes.len() - 1024..]),
+    "format 3; {lengths:?}; {counted:?}"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
 /// The shard's counters a failed export test names: the export's, the image tasks' and the replies'.
 fn counters(state: &mut ShardState) -> Vec<String> {
   state

@@ -288,6 +288,25 @@
 > the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
 > held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
+> The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
+> push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
+> push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
+> once its body was read whole is answered in git's words on band 3 under side-band-64k, or as the report
+> `unpack <words>` with each command `ng` without it, and the reply ends cleanly, counted
+> `vcs_http.git.push_refused_after_body`; one wording for both edges (`git_push::words`, the SSH site's). Red 2 of 2 on
+> 94ff89fe5 (`vcs_http::git::receive::tests`, the body's end failed, nothing answered), green 2 of 2. Owed: a refusal
+> while the body is still read still cuts the connection, as git's `http-backend` does when receive-pack dies mid-body.
+> Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
+> at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
+> 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
+> edge, every tree entry of the whole pack, about 60.6 M for git/git), sized by the pack's history rather than by the
+> slice in flight (A-719). Piece 1 BUILT (2026-11-21): the walk charges a state an object and no edge table. When no
+> object is incomplete of its own, every pushed tip is complete and the walk ends after its first pass. Otherwise it
+> carries the worst state back from each tip depth first, a frame an object, its stack charged as it grows. Red:
+> `receive::tests::the_connectivity_check_charges_its_objects_never_its_edges` (322 objects, 16,449 edges, 8 B an
+> object) asked 134,176 B with 2,254 left at df349a9fe; green. Owed: what else the answer holds for the whole pack
+> (the next wall the 611 MB push meets, measured); red, that push landing within its room; an A/B against stock git
+> (10.77 s).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -2616,7 +2635,14 @@
 > held by `a_get_reads_a_text_ram_does_not_hold_through_the_store` (red without it: `503`). `get-file-revs` BUILT
 > too (svn:// and DAV): a delta's window that waits keeps its work with the revision's delta and the stream answers the
 > wait, held by `a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is
-> corrupt"). Owed in (a): the exporter, the deltify job; then (b), the records keep history on the store. Stage C,
+> corrupt"). The export BUILT too: a text's reading that meets a piece its source reads asynchronously answers
+> `Exporting::Waiting`, and the export's task fetches it between slices, lets it go after the next, and refuses
+> `ContentUnavailable` a walk that waits again for the piece just fetched; held by
+> `an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump` (slates-svn: the same dump as the records'
+> own text, in formats 2 and 3) and `an_export_reads_a_text_ram_does_not_hold_through_the_store` (red without it:
+> nothing published). Found while building it (2026-11-21, w-svn): the svn://, `svnserve -t` and DAV loops have no such
+> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. Owed in
+> (a): the deltify job; then (b), the records keep history on the store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one

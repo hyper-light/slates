@@ -436,6 +436,96 @@ fn a_stored_text_exports_through_the_store_beside_the_records_as_a_kept_one_does
   );
 }
 
+/// C2 stage B part 2 (the export reads a stored text a store reads asynchronously, waiting for each piece). Do: commit
+/// [`first`] with its text `alpha\n` stored beside the records, and export it whole in formats 2 and 3 through a source
+/// that holds none of its pieces until the export, having waited for one ([`Exporting::Waiting`]), has it fetched: two
+/// bytes a piece, kept once fetched. Expect: the dump byte for byte the one of the text kept in the records; each wait
+/// for the piece the reading had reached and appending nothing, three in all for the six bytes (any later reading of
+/// the text finds its pieces fetched).
+#[test]
+fn an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump() {
+  use std::cell::RefCell;
+  use std::collections::BTreeSet;
+
+  use crate::dump::Format;
+  use crate::migration::{Exporter, Exporting, TextReading, TextSource};
+  /// Shape: the bytes a fetched piece holds.
+  const PIECE: u64 = 2;
+  /// The records, and one text stored beside them whose pieces are read only once fetched.
+  struct Withheld<'a> {
+    records: &'a Repository,
+    stored: (ContentIdentity, Vec<u8>),
+    fetched: RefCell<BTreeSet<u64>>,
+  }
+  impl TextSource for Withheld<'_> {
+    fn text(&self, identity: &ContentIdentity) -> Option<std::borrow::Cow<'_, [u8]>> {
+      if *identity == self.stored.0 {
+        return None;
+      }
+      TextSource::text(self.records, identity)
+    }
+
+    fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
+      if *identity != self.stored.0 {
+        return TextSource::read_step(self.records, identity, reading);
+      }
+      let (read, len) = (reading.read(), u64::try_from(self.stored.1.len()).unwrap());
+      if read >= len {
+        return Some(true);
+      }
+      if !self.fetched.borrow().contains(&read) {
+        return None;
+      }
+      let end = (read + PIECE).min(len);
+      let piece = &self.stored.1[usize::try_from(read).unwrap()..usize::try_from(end).unwrap()];
+      Some(reading.append(piece, len))
+    }
+
+    fn fetchable(&self, identity: &ContentIdentity, offset: u64) -> bool {
+      *identity == self.stored.0 && !self.fetched.borrow().contains(&offset)
+    }
+  }
+  let mut kept = created();
+  let checked = kept.check(first()).unwrap();
+  kept.apply(checked).unwrap();
+  let (identity, bytes) = content(b"alpha\n");
+  let mut naming = first();
+  naming.contents.remove(&identity);
+  naming
+    .stored
+    .insert(identity, u64::try_from(bytes.len()).unwrap());
+  let mut stored = created();
+  let checked = stored.check(naming).unwrap();
+  stored.apply(checked).unwrap();
+  for format in [Format::Two, Format::Three] {
+    let mut whole = Exporter::new(&kept, 0, kept.youngest(), format).unwrap();
+    let mut expected = Vec::new();
+    while whole.export(&kept, &kept, &mut expected).unwrap() != Exporting::Done {}
+    let withheld = Withheld {
+      records: &stored,
+      stored: (identity, bytes.clone()),
+      fetched: RefCell::new(BTreeSet::new()),
+    };
+    let mut exporter = Exporter::new(&stored, 0, stored.youngest(), format).unwrap();
+    let (mut out, mut waits) = (Vec::new(), Vec::new());
+    loop {
+      let before = out.len();
+      match exporter.export(&stored, &withheld, &mut out).unwrap() {
+        Exporting::Waiting(wanted) => {
+          assert_eq!(out.len(), before, "a waiting call appended");
+          assert_eq!(wanted.text, identity);
+          waits.push(wanted.offset);
+          withheld.fetched.borrow_mut().insert(wanted.offset);
+        }
+        Exporting::Wrote(_) => {}
+        Exporting::Done => break,
+      }
+    }
+    assert_eq!(out, expected, "{format:?}");
+    assert_eq!(waits, vec![0, 2, 4], "{format:?}");
+  }
+}
+
 /// main's order of 2026-11-20 (w-bugs' runs 10/11: svn checkout and update 3 to 12 times as slow after c2, the fetch's
 /// 1,024-byte steps each making the whole text through its chain). Do: commit revision 1, then 20 edits of [`FILE`], a
 /// 300 KiB text changing one line in each; read every revision's text through the read source in 1,024-byte pieces,

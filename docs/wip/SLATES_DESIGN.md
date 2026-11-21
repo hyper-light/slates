@@ -58936,6 +58936,54 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   32.9 to 20.3 µs, lengths 6.9 to 3.2 µs, cycle p99 501 to 212 ms; 10^3 idle works after: 5,697/s. Flat in M now. The
   history's verdict growth (b) is the next candidate; main's rerun (r48) confirms on the topology.
 
+### A-722 amended — A push refused after its body is answered in git's words, never a cut connection (2026-11-21, w-git for UI goal 93; main's priority 01:31 PST and ruling 01:56 PST; found by use, w-interop)
+
+**Found.** A whole-history push of git/git (611 MB) over the HTTP edge failed 6 of 6, cut off at 57 to 63 s with
+curl's error 18 and no word of why. A diagnostic build on Studio-2 (base 94ff89fe5) logged the body read whole in
+2.8 s, the answer kept alive for 45 s, then the answer's step refused `PastAdmission` and the exchange failed `413`.
+The reply's `200` head had gone out before the body was read (A-722's `StatusMode::AtHead`, as `http-backend` writes
+its own), so the engine could only end the connection short.
+
+**Rule.** A push refused once its body was read whole (its checks, seal, decision, homing or landing, or the wait for
+its records at `f + 1`) is answered in git's words, and the reply ends cleanly:
+- under side-band-64k, on band 3, git's band for a fatal error after which the stream ends (`sideband.c`'s "remote
+  error");
+- without it, when a report was asked, as git reports a pack its unpacking refused: `unpack <words>`, each command
+  `ng <ref> <words>`, a flush (`slates_git::receive::write_refused_report`). The commands' names are kept for that
+  case alone, charged to the push's room, since the request moves on through the answer.
+
+The words are the SSH site's, now one module both edges write (`crate::git_push::words`). A refusal while the body is
+still read still cuts the connection, as git's own does when receive-pack dies while `http-backend` pipes it the body.
+Counted `vcs_http.git.push_refused_after_body`.
+
+**Test.** `vcs_http::git::receive::tests`: the site's exchange on a stored daemon's shard, its shard fenced for the
+one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, nothing answered, nothing counted). Green
+2 of 2.
+
+**Layer 2, measured, open.** The refusal itself was the pack's checks: one charge of 485,230,824 bytes asked with
+300,809,433 left, the connectivity walk's edge table (`receive::connect`, `begin_edges`, a `usize` for every tree
+entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
+are to work a slice at a time over the pack held once (GAPS).
+
+**Layer 2, piece 1: the connectivity check charges its objects, never its edges** (`slates_git::receive::connect`).
+- The first pass reads each pushed object once and judges its own edges out of the pack.
+- When no object is incomplete of its own, no tip can reach one, so every pushed tip is complete and the walk ends
+  there. That covers every push of a complete history, git/git's included, and needs no second read and no table but
+  one state per object.
+- Otherwise the worst state is carried back from each pushed tip, depth first. Each object is read once more as it is
+  opened, and each child's state is folded into the exit frame of the object that opened it. The stack holds the open
+  path and the children it waits on, charged as it grows: bounded by the history's depth times its widest object,
+  never by its edges.
+- Red: 322 objects and 16,449 edges within 8 bytes an object asked 134,176 bytes with 2,254 left. Green.
+- A-719's turn test now asks two turns an object (fsck and the first pass), since a complete push has no propagation.
+
+Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
+`crates/git/src/receive/tests/session.rs`.
+
+Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
+`crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
+`crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
+
 ### A-803 — The verdict's growth with history named: the re-anchor walks every value of a changed path (2026-11-21, w-fed-move, goal 86b; main's order 02:11 PST, injection (b); A-793, A-802)
 - **Why.** Injection (b) of A-802 (a long history ahead of the 1,000-client stand-in, held unfolded by one idle work)
   doubled the owner's verdict over 10^5 versions. `2c32af2b5` (A-787 part 2, the re-anchor's remap indexed) was in
