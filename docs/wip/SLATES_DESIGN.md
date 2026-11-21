@@ -59597,6 +59597,34 @@ Applied in the same change to:
   landed (CLAUDE.md §5: a dead-even A/B does not land); the patch is kept outside the tree
   (`~/slates-work/w-fed-move-a817-rejected-drop.patch`, w-fed-move's machine) and its rule is not in the rebase section.
 
+### A-818 piece 2a — Where each byte identity's bytes are now: the location index (2026-11-21, w-rewrite-ops; main's ruling of 10:35 PST, option (ii))
+
+- **Why (ii).** A piece tree whose runs name immutable chunks would keep a whole earlier block a path touched while a
+  reader pins the floor. That is the retention A-793 removed (goal 86b: 94,877 of 100,000 refused `BudgetExceeded`),
+  and it breaks MEMORY SIZING.
+- **What.** `crates/merge/src/byte_places.rs`, a pure module:
+  - A path's bytes carry identities, each given once. A version is a piece tree of identity runs (piece 1).
+  - One index a path says where each identity's bytes are now. Either they are in the newest block, at their node's
+    rank in a treap of the latest order (Seidel and Aragon 1996), so an insert shifts nothing stored. Or they are
+    stored by the caller, copied out once by the change that removed them.
+  - A change hands each removed range to the caller to store, re-points those identities, and inserts the added runs
+    with new identities: O((parts + nodes removed) × depth), with no version walked.
+  - An identity a change stored is read only by versions before it, so once the floor passes that change it is
+    retired, with its chunks.
+  - Its charged bytes (`bytes`) are the entries, the nodes and the log, at their sizes. The bound is two entries a part
+    for each retained change, plus the latest's nodes.
+  - Its caller to come is the content history's engine switch (piece 2b).
+- **Evidence.**
+  - `byte_places::tests::every_version_reads_its_bytes_through_the_places`: a serial model with retirement, the entry
+    bound, and the charge back to the latest's after release.
+  - `history::tests::every_identity_version_reads_as_the_reanchored_history`: main's oracle. Every retained version,
+    whole and at a range, built by the engine's own `segments`, equals the re-anchored value's and `apply`'s, and the
+    stored bytes never pass what the changes removed.
+  - Moving a stored or a current place by one byte fails the oracles.
+- **Open (GAPS).** An old version's read is O(fragments × depth). Today's re-anchor compacts a fragmented value at
+  write time, so today an old read is O(pieces) with pieces bounded by the value's bytes. Main's A/B (piece 2c)
+  decides whether the read loses; the run is requested in `run-requests.md`.
+
 ### A-821 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
 Applied in the same change to:
 - `crates/git/src/receive/works.rs`: a create builds nothing; its entry carries the push it owes (`DeferredPush`),
@@ -59636,6 +59664,14 @@ Applied in the same change to:
     record whichever base it has, so A-753's bound holds. The default branch, the base every create falls back to, is
     made first through the door.
   - A `CreateBranch` request made from a green that owes its push parks at the door like any request on such a green.
+  - Paths derived on first read: a git green the door has just made gets its map of paths made of its head, as a push's
+    version does (`paths::derive_once_made` over `advance_after_push`: the whole build's slices where it holds no map
+    before). A successor replays a created green owing its push again and holds no map of it until it is read
+    (`t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image` asserts both halves: the records' windows
+    back from the shard image, and the map back, the same version and tree, after the first read;
+    `t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart`: a pushed create's 1 MiB
+    object absent until `main` is read, whole by its identity once it is, on both daemons). A-727 a3b's object is now a
+    submitted version's, whose map is made with it and again by the replay.
 - **Evidence.**
   - `t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`: 1,500 files; the push takes at
     most its command's one turn (red on main: 14,273 quanta, the green holding the tree at once), the green owes,
@@ -59650,3 +59686,48 @@ Applied in the same change to:
     their makes in one poll met the watchdog's 3.5 s window.
 - **Owed** (GAPS, A-812): a replayed owing green made over a restarted node's shares (the restart test); git/git's push
   landing (the red) and the A/B against stock git's 10.77 s.
+
+### A-822 — A git commit the server makes takes the deferred-submit hook: landed on the node's store before its version commits (2026-11-21, w-git; C5 part 2b piece 3; main 07:27, 09:10 PST; A-804, A-805, A-816, A-767 C5, A-664)
+Applied in the same change to:
+- `crate::made_commit`: `Tool::Git`; `with_held_preview_and_stores` (the preview with the shard's store and the
+  repositories' stores lent beside it); `committing` (a made commit's one step).
+- `crate::vcs_store::commits`: `make_deferred`, its task (`made_landing`, `made_before_step`, `map_turn`, `sealed_made`,
+  `home_and_land`), `record_and_commit` split from `recorded`; `after_submit` stands aside in a made commit's step;
+  counter `vcs_commits.made_landed`.
+- `crate::vcs_store::paths`: `OverPreview`, `over_preview_step`, `step_over_preview`, `forget_preview_head`; `stepped`
+  and `plan` take the engine's numbering offset.
+- `crate::git_push`: `landing_of` and `Landing::sequence` shared with the made commit.
+- GAPS (C5 part 2b).
+
+- **Why.** A git commit the server made of a submitted version was made, recorded inline (record version 2) and the
+  submit answered in the verb's own step: the one register-held path left once a client's push landed on the node's
+  store (C5 part 2b), and a reply before the commit stood. Main's landing order (A-804): check, the store lands, the
+  register commits naming the sequence, the answer.
+- **What.**
+  - A recorded submit to a git repository's green takes the repository's landing turn and holds its verdict (A-805); the
+    preview of it is kept across turns (A-816).
+  - A task holding the turn steps the version's map over the preview a turn at a time. A preview numbers its own
+    versions (its 0 the green's head, its 1 the verdict), so the step's change is read `version - 1` below the green's
+    numbers (`plan`'s offset). Where the head before holds a map, the change is stepped; a root's first version is built
+    whole, its whole being its own change; otherwise the head's map is built first in the whole build's slices, once.
+  - The commit is made over that map as before (its parent, the submit's message and identity, the owner's instant), its
+    objects admitted to a push of their own as a pack of whole objects (`GitPush::admit_all`), sealed, and its move
+    admitted. Its names and its pack are homed in the region and landed on the node's store as one changeset, through
+    the edges' own `git_push::carry`.
+  - Then one step (`made_commit::commit`): the verdict applied, the version committed, the record naming the changeset
+    (version 5) judged by the register's guard, the store committed and the entry appended, the request's completion,
+    one transaction; then the answer.
+  - Given up before its step (the region or the store refused, the green moved, the daemon stopping): nothing durable,
+    the homed holds and the push given back, the map kept for the version let go, so the retry builds again, and the
+    request answered `Overloaded`, unrecorded. A commit not made (its identity, its map) leaves the version standing
+    alone, counted `vcs_commits.unmade`, as before.
+- **Evidence.**
+  - `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`: in the verb's step nothing
+    answered or durable (the durable head 0, no store version); then answered, the durable head 1, the green at its
+    first store version, the record version 5. Red on main: answered in the verb's step, recorded version 2.
+  - `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build`: a submit parked behind a push's whole build runs
+    again, takes the hook, and a stock clone reads the pushed files with the edit made (red while the preview's
+    numbering was taken as the green's: the commit held the pushed tree).
+- **Owed** (GAPS, C5 part 2b): the kill test between the landing and the step; `record_of` and version 2 removed with
+  the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
+  test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).
