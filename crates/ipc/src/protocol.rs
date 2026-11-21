@@ -1388,8 +1388,12 @@ pub enum RequestBody {
     work: VolumeId,
     /// Its green.
     green: VolumeId,
-    /// The increment, as `Increment::encode` writes it.
-    increment: Vec<u8>,
+    /// The increment, by the identity its inputs archive is held under on the asking node (its manifest identity, the
+    /// one the version's merge record and chain entry name; lane (A) 3b): the owner fetches what it lacks from that node
+    /// by identity on the content plane and stores it once, so the forward carries no increment.
+    increment: [u8; 32],
+    /// The increment's encoding's length in bytes.
+    increment_len: u64,
     /// Its verdict, as `Computed::encode` writes it (A-658 part 3a).
     computed: Vec<u8>,
     /// What the owner judges the write policy, the signature and the commit by.

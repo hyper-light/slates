@@ -23047,6 +23047,66 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
 }
 
+/// Lane (A) 3b, content ahead by identity (main's rulings of 2026-11-20 23:50 and 2026-11-21 00:52): a holder's submit
+/// names its increment, and the owner fetches what it lacks from the holder by identity on the content plane, storing
+/// it once, so the forward lane never carries the increment. Do: in a two-node `f = 1` fleet, A's green replicated by
+/// B, B's work writes an 8 MiB file and B submits. Expect: answered `Submitted` at version 2; the request B forwarded
+/// under 64 KiB (`merge.submit.forward_request_bytes`); the owner fetched the increment from B once
+/// (`merge.inputs.fetched_from_holder` 1, at least 8 MiB in `merge.inputs.fetched_from_holder_bytes`). Before, the
+/// request carried the increment's whole encoding (r21, 2026-11-21: at 320 MiB and above the lane resent it in place on
+/// silence until its bound and the submit was refused `Overloaded`).
+#[test]
+fn a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "by-identity-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let work = bench_work(&mut holder, green, "by-identity-work", 8 << 20);
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let after = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let request_bytes = after.0 - before.0;
+  assert!(
+    request_bytes > 0 && request_bytes < 64 << 10,
+    "the forwarded request named the increment, {request_bytes} bytes"
+  );
+  assert_eq!(
+    after.1 - before.1,
+    1,
+    "the owner fetched the increment once"
+  );
+  assert!(
+    after.2 - before.2 >= 8 << 20,
+    "the owner fetched the increment's bytes from the holder: {}",
+    after.2 - before.2
+  );
+}
+
 /// Main's ruling on the lane (2026-11-20, A-697's release bench refused 320 MiB holder submits about half the time): a
 /// holder's submit is not refused by a bound that does not grow with its increment while the increment is still
 /// crossing. Do: in a two-node `f = 1` fleet, A's green replicated by B, B's work writes an 8 MiB file; B's failover

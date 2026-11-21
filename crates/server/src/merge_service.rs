@@ -2340,7 +2340,8 @@ impl MergeShardState {
 /// Format: a holder node's composed increment held as its version's inputs before its owner commits it (A-697 (1)), the
 /// non-vacuity count of [`hold_composed_inputs`].
 pub(crate) const INPUTS_HELD_AT_COMPOSE: &str = "merge.inputs.held_at_compose";
-/// Format: such a hold the content plane refused (no room): the owner's shipment carries what it lacks, as before.
+/// Format: such a hold the content plane refused (no room): the submit is refused typed, since its owner fetches the
+/// increment from this hold (lane (A) 3b).
 const INPUTS_HELD_AT_COMPOSE_REFUSED: &str = "merge.inputs.held_at_compose_refused";
 /// Format: a version's owner told that the node which composed its increment lacks none of its inputs (A-697 (1)).
 pub(crate) const INPUTS_HELD_BY_COMPOSER: &str = "merge.inputs.held_by_composer";
@@ -2348,33 +2349,42 @@ pub(crate) const INPUTS_HELD_BY_COMPOSER: &str = "merge.inputs.held_by_composer"
 /// that composed the increment).
 pub(crate) const INPUTS_CHUNKS_SHIPPED: &str = "merge.inputs.chunks_shipped";
 
-/// Holds `increment`, which this holder node composed and sends its owner (A-697 part c), as the inputs of `green`'s
-/// next version (`sequence`, the version this node's replica expects; the owner's offer refreshes the placement to the
-/// version it commits): the archive its owner names the version's inputs by ([`MergeShardState::inputs_identity`],
-/// whose identity is the bytes' alone), in this node's held content. So the owner's record reaches this node with no
-/// chunks (`inputs_held_by`), where before the version's inputs crossed back, a copy of what this node had just sent.
-/// A refusal (no room) only leaves them to the owner's shipment, counted.
+/// Holds `increment`, which this holder node composed and names to its owner (A-697 part c; lane (A) 3b), as the inputs
+/// of `green`'s next version (`sequence`, the version this node's replica expects; the owner's offer refreshes the
+/// placement to the version it commits): the archive its owner names the version's inputs by
+/// ([`MergeShardState::inputs_identity`], whose identity is the bytes' alone), in this node's held content, each chunk
+/// copied once from `increment` into its block (`ContentHold::hold_lent`). The owner fetches what it lacks from here by
+/// that identity, and the owner's record reaches this node with no chunks (`inputs_held_by`). The identity held, or the
+/// refusal at this node's room (`BudgetExceeded`), counted: the submit cannot name content it does not hold.
 pub(crate) fn hold_composed_inputs(
   state: &mut ShardState,
   green: DbVolumeId,
   increment: &[u8],
   sequence: u64,
-) {
-  let archive = MergeShardState::inputs_archive(increment, 0, archive_page(state));
-  let held = state.held_content.hold(
+) -> Result<[u8; 32], Refusal> {
+  let manifest = crate::merge_origin::inputs_manifest_archive(increment, 0, archive_page(state));
+  let held = state.held_content.hold_lent(
     &mut crate::content_holder::hold_space(&mut state.store),
     ObjectId(green.bytes),
     slates_cluster::content::Placed { sequence },
-    archive,
+    &manifest,
+    increment.chunks(crate::merge_origin::inputs_chunk_bytes().max(1)),
   );
-  state.count(
-    if held.is_ok() {
-      INPUTS_HELD_AT_COMPOSE
-    } else {
-      INPUTS_HELD_AT_COMPOSE_REFUSED
-    },
-    1,
-  );
+  match held {
+    Ok(identity) => {
+      state.count(INPUTS_HELD_AT_COMPOSE, 1);
+      Ok(identity)
+    }
+    Err(refusal) => {
+      state.count(INPUTS_HELD_AT_COMPOSE_REFUSED, 1);
+      Err(match refusal {
+        slates_cluster::content::ContentRefusal::NoCapacity { available, .. } => {
+          Refusal::BudgetExceeded { available }
+        }
+        _ => Refusal::ContentUnavailable,
+      })
+    }
+  }
 }
 
 /// Tells `green`'s pending `version` that `host`, the node which composed its increment and held it as the version's
