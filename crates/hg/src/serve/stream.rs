@@ -23,6 +23,7 @@ const FORBIDDEN: &[u8] = b"1\n";
 /// Writes `stream_out`'s answer (module docs) whole: [`crate::render::Streaming`]'s steps at once, within `admission`.
 pub fn stream_out(
   store: &impl Store,
+  source: &mut impl crate::render::StoredSource,
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refusal> {
@@ -31,11 +32,15 @@ pub fn stream_out(
     return Ok(());
   };
   let mut streaming = crate::render::Streaming::default();
-  while streaming
-    .step(index, content, admission, out)
-    .map_err(revlog_refused)?
-  {}
-  Ok(())
+  loop {
+    crate::render::answer_want(&mut streaming, source).map_err(revlog_refused)?;
+    if !streaming
+      .step(index, content, admission, out)
+      .map_err(revlog_refused)?
+    {
+      return Ok(());
+    }
+  }
 }
 
 /// A rendering's refusal as a command's: past the admission as it is, any other as the store's.

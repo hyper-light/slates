@@ -175,8 +175,11 @@
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
 > made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
 > accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
-> a consistent snapshot while a push lands; the stream clone's chunks as stored deltas (store side done locally: `H`
-> rows per entry, `I` rows by node).
+> a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
+> the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
+> the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
+> whole; a log the store does not keep (an imported repository's, until w-hg's C1 step 3) serves no stream (`1\n`,
+> which stock `hg clone --stream` takes as "operation forbidden by server").
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
@@ -2641,6 +2644,19 @@
 > `an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump` (slates-svn: the same dump as the records'
 > own text, in formats 2 and 3) and `an_export_reads_a_text_ram_does_not_hold_through_the_store` (red without it:
 > nothing published). Found while building it (2026-11-21, w-svn): the svn://, `svnserve -t` and DAV loops have no such
+> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. The
+> deltify job BUILT too: a window's target piece the content store does not hold is fetched through the node's store
+> between slices, the target read so far kept, a text whose piece cannot be given passed over; held by
+> `a_stored_text_the_content_store_let_go_is_deltified_through_the_store` (red without it: passed over, left stored
+> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. Owed: (b), the
+> records keep history on the store. Stage C,
+> an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
+> today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
+> between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
+> landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
+> the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
+> `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
+
 > guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. Owed in
 > (a): the deltify job; then (b), the records keep history on the store. Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
