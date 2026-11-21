@@ -29,9 +29,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
 mod base_hints;
-mod base_wait;
 mod carry;
 pub mod catalog;
 pub mod config;
@@ -59,6 +57,10 @@ mod anchor_hold;
 #[cfg(windows)]
 #[path = "anchor_hold_windows.rs"]
 mod anchor_hold;
+// The content pool's extents as sections of their own on Windows, held by the anchor across a restart (A-789).
+#[cfg(windows)]
+#[path = "content_extents_windows.rs"]
+mod content_extents;
 pub mod dns;
 pub mod doorbell;
 pub mod error;
@@ -83,13 +85,18 @@ pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+pub(crate) mod placement_cache;
 // A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
 // pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+mod green_ready;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod identities;
 mod image;
+#[cfg_attr(not(test), allow(dead_code))]
+// Its caller outside tests is svn's import driver (w-svn, C2 stage C).
+mod import_batch;
 pub mod landing;
 mod landing_entries;
 pub mod lease;
@@ -97,6 +104,7 @@ mod lease_wait;
 mod lfs;
 mod live_hold;
 mod live_ship;
+mod made_commit;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
 mod merge_origin;
@@ -107,6 +115,7 @@ mod mounted_work;
 mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
 mod readmission;
+mod refining;
 mod remote_attach;
 mod work_home;
 // The writes acknowledged since the last publication, kept in anchor RAM (A-63): a FUSE mount's (Linux) and a Shards
@@ -140,6 +149,8 @@ mod nfs_writeback;
 pub mod observe;
 mod owner_location;
 mod staging;
+#[cfg(test)]
+pub(crate) mod test_store;
 mod work_charge;
 pub mod work_files;
 mod work_log;

@@ -12,7 +12,7 @@ use slates_ipc::protocol::{
 };
 use slates_merge::push::{HEAD_ATTRIBUTE, ROOT};
 use slates_vcs::ContentStore;
-use slates_vfs::host::{FetchId, HostError};
+use slates_vfs::host::HostError;
 use slates_wire::request::RequestId;
 
 use super::{ANSWERED, HELD, Opened, REJOINED, import_with, refusal_of, reply_of};
@@ -58,9 +58,8 @@ fn stranger() -> Principal {
 
 /// Creates repository `name` of `tool` on the shard: its id.
 fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -132,7 +131,7 @@ fn count(state: &ShardState, name: &str) -> u64 {
 /// times, and the host's refusal naming the directory; none deferred, and the directory opened by none but the last.
 #[test]
 fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     created(state, "hg", VcsTool::Mercurial);
     created(state, "git", VcsTool::Git);
     let own = owner();
@@ -192,7 +191,7 @@ fn t_a678_the_verb_refuses_by_kind_before_anything_is_opened() {
 /// directory being opened again, and request 2 refused `UnderWay`, not deferred.
 #[test]
 fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let own = owner();
     routed(state, 1, NO_CLIENT);
@@ -231,7 +230,7 @@ fn t_a678_a_started_import_holds_its_reply_and_a_resend_takes_the_route_over() {
 /// held request let go, and the store holding the imported history.
 #[test]
 fn t_a678_the_held_request_is_answered_when_the_import_ends() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     routed(state, 1, NO_CLIENT);
@@ -267,14 +266,13 @@ fn t_a678_the_held_request_is_answered_when_the_import_ends() {
 }
 
 /// A-678 (each failure's refusal on the wire): do map every way an import fails or ends. Expect `ContentUnavailable` for
-/// a store not held, `NotEmpty`, `UnderWay`, the budget's room, `PastRoom` with the import's room, `Pending` for a fetch
-/// still pending, `Damaged` naming the path a refusal names (a name not UTF-8 read lossily), `Format` for a censored
+/// a store not held, `NotEmpty`, `UnderWay`, the budget's room, `PastRoom` with the import's room, `Damaged` naming the path a refusal names (a name not UTF-8 read lossily), `Format` for a censored
 /// revision, a landing's own refusal as it is (A-687), `Abandoned` for an import that ended or was given back, and what
 /// a finished import took.
 #[test]
 fn t_a678_each_import_failure_maps_to_its_refusal() {
   let refused = |refusal| ImportFailed::Refused(refusal);
-  let cases: [(ImportFailed, Refusal); 10] = [
+  let cases: [(ImportFailed, Refusal); 9] = [
     (ImportFailed::NoStore, Refusal::ContentUnavailable),
     (
       ImportFailed::NotEmpty,
@@ -299,14 +297,6 @@ fn t_a678_each_import_failure_maps_to_its_refusal() {
       })),
       Refusal::ImportRefused {
         fault: ImportFault::PastRoom { room: ROOM },
-      },
-    ),
-    (
-      refused(ImportRefused::Host(BaseRefused::Host(HostError::Pending(
-        FetchId(3),
-      )))),
-      Refusal::ImportRefused {
-        fault: ImportFault::Pending,
       },
     ),
     (
@@ -456,7 +446,8 @@ fn served(state: &mut ShardState, id: RepositoryId) -> Served {
 }
 
 /// A recovery's own steps over this shard (A-575, A-662): every green rebuilt from its records in recovery's order
-/// into empty engines, then repository `id`'s store made again from the partition's log.
+/// into empty engines, then repository `id`'s store made again from the partition's log by the shard's task (its
+/// import's segments read back from the changeset store, A-767 C1 step 3), which the caller waits out.
 fn recovered(state: &mut ShardState, id: RepositoryId) {
   drop(std::mem::take(&mut state.greens));
   let mut greens: Vec<VolumeRecord> = state
@@ -471,7 +462,7 @@ fn recovered(state: &mut ShardState, id: RepositoryId) {
   for record in &greens {
     drop(crate::verbs::rebuild_member(state, record));
   }
-  crate::vcs_store::rebuild_whole(state, id);
+  crate::vcs_store::rebuild(state, id);
 }
 
 /// The `states` repository imported in one call through the same adapter: what it found.
@@ -522,7 +513,7 @@ fn check_served(served: &Served, imported: &Imported) {
 /// record replayed and counted.
 #[test]
 fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     routed(state, 1, NO_CLIENT);
@@ -539,14 +530,24 @@ fn t_a687_an_import_and_a_recovery_serve_the_same_repository() {
       "still importing after {TASK_WAIT:?}"
     );
   }
-  let (answered, before, after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
+  let (answered, before, replayed_before) = crate::daemon::observe_first(&daemon, move |state| {
     let answered = count(state, ANSWERED);
     let before = served(state, id);
     let replayed = count(state, crate::vcs_store::REPLAYED);
     recovered(state, id);
+    (answered, before, replayed)
+  });
+  let began = Instant::now();
+  while crate::daemon::observe_first(&daemon, move |state| state.vcs_stores.rebuilding(id)) {
+    assert!(
+      began.elapsed() < TASK_WAIT,
+      "still rebuilding after {TASK_WAIT:?}"
+    );
+  }
+  let (after, replayed) = crate::daemon::observe_first(&daemon, move |state| {
     let after = served(state, id);
-    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed);
-    (answered, before, after, replayed)
+    let replayed = count(state, crate::vcs_store::REPLAYED).saturating_sub(replayed_before);
+    (after, replayed)
   });
   daemon.stop();
   assert_eq!(answered, 1);

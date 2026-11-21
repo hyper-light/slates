@@ -16,6 +16,11 @@
 //!
 //! The anchor answers waiting claims once a turn of its loop ([`IssuerRoute::answer_waiting`]), never waiting on a
 //! client longer than the patience it passes; a refused claim is closed unanswered, which the client reads as a refusal.
+//!
+//! A signal that interrupts a read or write of the claim on either side (`EINTR`) is no refusal: the call is made
+//! again within the claim's patience ([`uninterrupted`]). A client whose anchor answers slowly sits in `recvmsg` long
+//! enough for one to land: on a loaded Linux host (load 80, the anchor's turns seconds apart) stock-client matrices'
+//! `slates credential token` and `key` were refused "recvmsg issuer refused (code 4)" (w-interop, 2026-11-20).
 
 use std::io::{IoSlice, IoSliceMut};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -94,6 +99,21 @@ fn address(name: &str) -> Result<SocketAddrUnix, IpcError> {
   SocketAddrUnix::new_abstract_name(name.as_bytes()).map_err(|e| refused("abstract name", e))
 }
 
+/// `call`'s result, `call` made again while a signal interrupts it (`EINTR`) before `deadline`; an interruption at or
+/// past the deadline is `TIMEDOUT`, as the socket's own timeout would have ended the wait there.
+fn uninterrupted<T>(
+  deadline: std::time::Instant,
+  mut call: impl FnMut() -> Result<T, rustix::io::Errno>,
+) -> Result<T, rustix::io::Errno> {
+  loop {
+    match call() {
+      Err(rustix::io::Errno::INTR) if std::time::Instant::now() < deadline => {}
+      Err(rustix::io::Errno::INTR) => return Err(rustix::io::Errno::TIMEDOUT),
+      other => return other,
+    }
+  }
+}
+
 /// The socket a client waits on, read and written within `patience`.
 fn with_patience(socket: &OwnedFd, patience: std::time::Duration) -> Result<(), IpcError> {
   rustix::net::sockopt::set_socket_timeout(
@@ -154,6 +174,14 @@ impl IssuerRoute {
     &self.name
   }
 
+  /// The listener, readable while a claim waits: the anchor polls it beside its other wake sources, so a claim is
+  /// answered as it arrives rather than at the anchor's next look at its daemon, which a running daemon's lapse bound
+  /// puts up to the observation budget away, as long as the claim's own patience (w-interop's loaded Linux matrices,
+  /// 2026-11-20: `recvmsg issuer refused` with `ETIMEDOUT`, code 110).
+  pub fn readiness(&self) -> BorrowedFd<'_> {
+    self.listener.as_fd()
+  }
+
   /// Answers every claim waiting now, each read and written within `patience`: a peer of this user that sends
   /// `secret` is answered with `segment` and its `len`; any other is closed unanswered. Returns at once when none
   /// waits; a refused accept ends the turn.
@@ -194,11 +222,15 @@ impl IssuerRoute {
       });
     }
     with_patience(peer, patience)?;
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(patience).unwrap_or(now);
     let mut offered = [0u8; SECRET_BYTES];
     let mut read = 0usize;
     while read < SECRET_BYTES {
       let rest = offered.get_mut(read..).unwrap_or_default();
-      match rustix::net::recv(peer, rest, RecvFlags::empty()) {
+      match uninterrupted(deadline, || {
+        rustix::net::recv(peer, &mut *rest, RecvFlags::empty())
+      }) {
         Ok((0, _)) | Err(_) => break,
         Ok((got, _)) => read = read.saturating_add(got),
       }
@@ -217,12 +249,14 @@ impl IssuerRoute {
         reason: "the issuer route's answer had no room for the segment",
       });
     }
-    rustix::net::sendmsg(
-      peer,
-      &[IoSlice::new(&body)],
-      &mut control,
-      SendFlags::NOSIGNAL,
-    )
+    uninterrupted(deadline, || {
+      rustix::net::sendmsg(
+        peer,
+        &[IoSlice::new(&body)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+      )
+    })
     .map_err(|e| refused("sendmsg issuer", e))?;
     Ok(())
   }
@@ -244,9 +278,13 @@ pub fn claim(
   )
   .map_err(|e| refused("socket", e))?;
   with_patience(&socket, patience)?;
+  let now = std::time::Instant::now();
+  let deadline = now.checked_add(patience).unwrap_or(now);
   rustix::net::connect(&socket, &address(name)?).map_err(|e| refused("connect issuer", e))?;
-  let sent = rustix::net::send(&socket, secret, SendFlags::NOSIGNAL)
-    .map_err(|e| refused("send issuer", e))?;
+  let sent = uninterrupted(deadline, || {
+    rustix::net::send(&socket, secret, SendFlags::NOSIGNAL)
+  })
+  .map_err(|e| refused("send issuer", e))?;
   if sent != SECRET_BYTES {
     return Err(IpcError::Layout {
       reason: "the issuer secret was sent short",
@@ -255,12 +293,14 @@ pub fn claim(
   let mut body = [0u8; LENGTH_BYTES];
   let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
   let mut control = RecvAncillaryBuffer::new(&mut space);
-  let received = rustix::net::recvmsg(
-    &socket,
-    &mut [IoSliceMut::new(&mut body)],
-    &mut control,
-    RecvFlags::CMSG_CLOEXEC,
-  )
+  let received = uninterrupted(deadline, || {
+    rustix::net::recvmsg(
+      &socket,
+      &mut [IoSliceMut::new(&mut body)],
+      &mut control,
+      RecvFlags::CMSG_CLOEXEC,
+    )
+  })
   .map_err(|e| refused("recvmsg issuer", e))?;
   let mut segment = None;
   for message in control.drain() {
@@ -302,6 +342,76 @@ mod tests {
     flipped[SECRET_BYTES - 1] ^= 1;
     assert!(!same_secret(&flipped, &secret));
     assert!(!same_secret(&secret[..SECRET_BYTES - 1], &secret));
+  }
+
+  /// A-754 (w-interop's loaded Linux matrices, 2026-11-20: a claim refused "recvmsg issuer refused (code 4)"). Do:
+  /// make a call that a signal interrupts twice before it answers, within its deadline; make one interrupted every time
+  /// with its deadline already past; make one that fails another way. Expect: the first answered, after three calls;
+  /// the second ended `TIMEDOUT` after one call; the third's own error at once.
+  #[test]
+  fn an_interrupted_call_is_made_again_within_its_deadline() {
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut calls = 0;
+    let answered = uninterrupted(later, || {
+      calls += 1;
+      if calls < 3 {
+        Err(rustix::io::Errno::INTR)
+      } else {
+        Ok(calls)
+      }
+    });
+    let mut past_calls = 0;
+    let past = uninterrupted(std::time::Instant::now(), || {
+      past_calls += 1;
+      Err::<(), _>(rustix::io::Errno::INTR)
+    });
+    let mut other_calls = 0;
+    let other = uninterrupted(later, || {
+      other_calls += 1;
+      Err::<(), _>(rustix::io::Errno::PIPE)
+    });
+    assert_eq!(
+      (answered, calls, past, past_calls, other, other_calls),
+      (
+        Ok(3),
+        3,
+        Err(rustix::io::Errno::TIMEDOUT),
+        1,
+        Err(rustix::io::Errno::PIPE),
+        1
+      )
+    );
+  }
+
+  /// A-754 (a claim wakes its anchor). Do: bind a route; from another thread, claim it; poll the route's readiness with
+  /// a patience far past any scheduling delay, then answer what waits. Expect: the readiness readable before the
+  /// patience ends, and the claim granted by the one turn it woke.
+  #[test]
+  fn a_waiting_claim_makes_its_route_readable() {
+    let instance = format!("issuer-route-wake-{}", std::process::id());
+    let route = IssuerRoute::bind(&instance).unwrap();
+    let segment =
+      rustix::fs::memfd_create("issuer-route-wake", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+    rustix::fs::ftruncate(&segment, 4096).unwrap();
+    let patience = std::time::Duration::from_secs(30);
+    let claimer = {
+      let name = route.name().to_owned();
+      std::thread::spawn(move || claim(&name, &[5u8; SECRET_BYTES], patience))
+    };
+    let readiness = route.readiness();
+    let mut interest = [rustix::event::PollFd::new(
+      &readiness,
+      rustix::event::PollFlags::IN,
+    )];
+    let timeout = rustix::event::Timespec::try_from(patience).unwrap();
+    let ready = rustix::event::poll(&mut interest, Some(&timeout)).unwrap();
+    let answered = route.answer_waiting(&[5u8; SECRET_BYTES], segment.as_fd(), 4096, patience);
+    let claimed = claimer.join().unwrap();
+    assert_eq!(
+      (ready, answered.granted, claimed.map(|(_, len)| len).ok()),
+      (1, 1, Some(4096))
+    );
   }
 
   /// A-754 across a socket. Do: bind a route; from another thread, claim it with the right secret, then with a wrong

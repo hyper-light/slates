@@ -362,3 +362,162 @@ fn an_imports_record_names_its_revisions_by_identity_whatever_their_bytes() {
   index.release(&mut store).unwrap();
   short.release(&mut short_store).unwrap();
 }
+
+/// Takes the made revisions `verified` into `index` as their changegroup through the push's intake
+/// (`super::changegroup`, A-767 C1: a made changeset lands as a push's does), the fork put in the index's place.
+fn taken_as_changegroup(
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  verified: &crate::push::verify::Verified,
+) {
+  use crate::push::intake::{Intake, Stepped};
+  let payload = super::changegroup(verified, &mut room()).unwrap();
+  let mut intake = Intake::begin(
+    (super::CHANGEGROUP_VERSION, &payload),
+    index,
+    store,
+    &mut room(),
+  )
+  .unwrap();
+  loop {
+    match intake.step(payload.as_slice(), store, &mut room()).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+    }
+  }
+  let (fork, _) = intake.finish().ok().unwrap();
+  core::mem::replace(index, fork).release(store).unwrap();
+}
+
+/// A-767 C1 (made changesets on the changeset store: the server builds a made changeset's changegroup and lands it
+/// through the push's own intake, main's ruling of 2026-11-21 09:00). Do: make stock 7.2's `one`, `two` and `three` in
+/// one index kept by `fork_with`, and in another taken as each one's changegroup through the push's intake. Expect the
+/// two indexes row for row.
+#[test]
+fn a_made_changesets_changegroup_takes_through_the_intake_to_what_it_keeps() {
+  let mut store = ContentStore::new(1 << 24, WINDOW).unwrap();
+  let (mut kept, mut taken) = (HgIndex::new(), HgIndex::new());
+  let steps: [(&[Change<'_>], &[u8], &[u8]); 3] = [
+    (
+      &[Change {
+        path: b"a",
+        after: Some((b"a\n", Flag::Regular)),
+        copied_from: None,
+      }],
+      b"default",
+      b"one",
+    ),
+    (
+      &[
+        Change {
+          path: b"b",
+          after: Some((b"b\n", Flag::Executable)),
+          copied_from: None,
+        },
+        Change {
+          path: b"a",
+          after: Some((b"a2\n", Flag::Regular)),
+          copied_from: None,
+        },
+      ],
+      b"default",
+      b"two",
+    ),
+    (
+      &[Change {
+        path: b"a",
+        after: None,
+        copied_from: None,
+      }],
+      b"stable",
+      b"three",
+    ),
+  ];
+  let mut parent = NULL_NODE;
+  for (at, (changes, branch, message)) in steps.into_iter().enumerate() {
+    let authored = Authored {
+      user: b"Test <test@example.com>",
+      seconds: 0,
+      branch,
+      message,
+    };
+    let verified = made(
+      &IndexHeld::new(&kept, &store),
+      parent,
+      changes,
+      &authored,
+      &mut room(),
+    )
+    .unwrap();
+    assert_eq!(verified.changesets[0].node, node(STOCK[at].0));
+    let fork = fork_with(&mut kept, &mut store, &verified, &mut room()).unwrap();
+    core::mem::replace(&mut kept, fork)
+      .release(&mut store)
+      .unwrap();
+    taken_as_changegroup(&mut taken, &mut store, &verified);
+    parent = verified.changesets[0].node;
+  }
+  let rows = |index: &mut HgIndex, store: &ContentStore| -> Vec<(Vec<u8>, Vec<u8>)> {
+    index
+      .rows()
+      .iter(store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect()
+  };
+  assert_eq!(rows(&mut taken, &store), rows(&mut kept, &store));
+  kept.release(&mut store).unwrap();
+  taken.release(&mut store).unwrap();
+}
+
+/// A-767 C1 (a made changeset's record on the changeset log, `import::record::write_made_record`). Do: make stock 7.2's
+/// `one`; write its changegroup and its made record (green 7, version 3) and replay them into an empty index; write its
+/// made reference and read it back. Expect the replay to put the made node back (green 7, version 3, `one`'s node) and
+/// the index to hold `one`; the reference read back whole, naming the made green and version, its record the made
+/// record.
+#[test]
+fn a_made_changesets_record_replays_to_its_made_node() {
+  use crate::import::record::{self, Progress, Replay};
+  let mut store = ContentStore::new(1 << 24, WINDOW).unwrap();
+  let empty = HgIndex::new();
+  let authored = Authored {
+    user: b"Test <test@example.com>",
+    seconds: 0,
+    branch: b"default",
+    message: b"one",
+  };
+  let verified = made(
+    &IndexHeld::new(&empty, &store),
+    NULL_NODE,
+    &[Change {
+      path: b"a",
+      after: Some((b"a\n", Flag::Regular)),
+      copied_from: None,
+    }],
+    &authored,
+    &mut room(),
+  )
+  .unwrap();
+  let payload = super::changegroup(&verified, &mut room()).unwrap();
+  let written = record::write_made_record(1 << 20, super::CHANGEGROUP_VERSION, (7, 3));
+  let mut index = HgIndex::new();
+  let mut replay = Replay::begin_sectioned(&written).unwrap();
+  loop {
+    match replay
+      .step_sectioned(payload.as_slice(), &mut index, &mut store)
+      .unwrap()
+    {
+      Progress::More => {}
+      Progress::Done => break,
+      Progress::Wanted(range) => panic!("a whole payload wanted {range:?}"),
+    }
+  }
+  let replayed = replay.finish(&mut index, &mut store).unwrap();
+  assert_eq!(replayed.made, Some((7, 3, node(STOCK[0].0))));
+  let reference =
+    record::write_made_reference(1 << 20, (super::CHANGEGROUP_VERSION, &payload), 4, (7, 3));
+  let read = record::reference_of(&reference).unwrap();
+  assert_eq!((read.made, read.sequence), (Some((7, 3)), 4));
+  assert_eq!(read.record(), written);
+  index.release(&mut store).unwrap();
+}

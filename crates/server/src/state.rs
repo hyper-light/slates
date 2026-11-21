@@ -98,8 +98,7 @@ pub struct VolumeSlot {
   pub name: String,
   /// The volume.
   pub volume: Volume,
-  /// The read-only host of the overlay's base, for an overlay: a host directory, or the objects under an S3 base's
-  /// prefix (A-555).
+  /// The read-only host of the overlay's base, for an overlay: a host directory, or a green's tree (A-774).
   pub host: Option<BaseHost>,
   /// The reservation, for a bounded volume.
   pub reservation: Option<slates_mem::budget::Reservation>,
@@ -401,10 +400,6 @@ pub struct ShardState {
   /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
   /// call so a file-state change it makes carries the compound's record in its own transaction.
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
-  /// The fetch the NFS call this shard is serving right now met pending, with the volume whose base names it (A-555):
-  /// set by the call's export when a host call of the call was answered pending, taken by the call's serve once it
-  /// returns, so the call parks on that fetch (`crate::base_wait`). `None` between calls.
-  pub(crate) nfs_pending_base: Option<(VolumeId, slates_vfs::host::FetchId)>,
   /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
   /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
   /// replies are sent. At most a turn's mutations per held connection on this shard.
@@ -783,6 +778,14 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
+  /// handle to its owner thread, through which a repository's landings reach the changeset log.
+  pub vcs_disk: Option<slates_store::owner::StoreHandle>,
+  /// The partition's family numbers handed out but not yet recorded (`verbs::fresh_family_id_at` mints from past them):
+  /// a repository's creation reserves its ids when its verb runs and records them once its landing is durable (A-767
+  /// item 7's one landing order), so no id minted meanwhile is its. Never lowered while the process runs, so a number
+  /// whose creation never recorded is a gap, never handed out twice; a restart starts it at the recorded counter.
+  pub(crate) family_reserved_through: u64,
   /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
   /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
@@ -792,11 +795,15 @@ pub struct ShardState {
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
-  /// The root mount this daemon published (§4.6, D-1; A-645 P3): the point the host shows every volume beneath, which a
-  /// hook is handed its repository's view beneath. The daemon's own record of the mount it made, written on every shard
-  /// when it publishes the mount, never a configured value that could drift from the mount (main's ruling of
-  /// 2026-11-20). None until then, and a configured hook is refused, typed, while it is none.
-  pub(crate) root_mount: Option<std::path::PathBuf>,
+  /// Where a hook is shown its repository (A-645 (a), `crate::vcs_store::svn_presenter::HookViews`): the store's
+  /// granted directory, where the repository's view is mounted for it, or none, when a configured hook is refused, typed.
+  pub(crate) hook_views: crate::vcs_store::svn_presenter::HookViews,
+  /// The Subversion repositories whose FSFS view this shard presents for their hooks (A-645 (a)), by repository: its
+  /// volume, its layout so far and where it is mounted. Bounded by the repositories this shard owns.
+  pub(crate) svn_views: std::collections::BTreeMap<
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::svn_presenter::ViewSlot,
+  >,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
@@ -880,11 +887,14 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
-  /// Requests parked until the S3 base fetch they met lands (`crate::base_wait`; §4.15 "An S3 base", A-555), bounded by
-  /// the shard's client credit.
-  pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
+  /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
+  pub(crate) refining: crate::refining::Refining,
+  /// The shard's server-made commits waiting on their landing (the deferred-submit hook, `crate::made_commit`).
+  pub(crate) made_commits: crate::made_commit::MadeCommits,
+  /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
+  pub(crate) materializations: crate::green_ready::Materializations,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -902,6 +912,9 @@ pub struct ShardState {
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
   pub placed_heads: BTreeMap<ObjectId, crate::head::PlacedHead>,
+  /// The placements of the objects this shard asks about, one computation a configuration
+  /// ([`crate::placement_cache`]): read through [`ShardState::with_placement`].
+  pub(crate) placement_cache: std::cell::RefCell<crate::placement_cache::PlacementCache>,
   /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
   /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
   /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.
@@ -1507,6 +1520,20 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
+  /// Runs `with` on `object`'s placement under the configuration in force, computed once a configuration
+  /// ([`crate::placement_cache`]); computed afresh only while the cache is already borrowed (a nested ask).
+  pub(crate) fn with_placement<R>(
+    &self,
+    object: slates_db::register::ObjectId,
+    with: impl FnOnce(&slates_db::register::Placement) -> R,
+  ) -> R {
+    let configuration = self.fleet.configuration();
+    match self.placement_cache.try_borrow_mut() {
+      Ok(mut cache) => cache.with(configuration, object, self.placed_heads.len(), with),
+      Err(_) => with(&configuration.place(object)),
+    }
+  }
+
   /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
   /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
   /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the
@@ -1517,6 +1544,16 @@ impl ShardState {
     }
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
+  }
+
+  /// Raises the count of `kind` to `value` when it is larger: a counter that reads the most a figure reached (a longest
+  /// step), in the same report as the sums. Zero changes nothing, as [`ShardState::count`]'s does.
+  pub(crate) fn count_max(&mut self, kind: &'static str, value: u64) {
+    if value == 0 {
+      return;
+    }
+    let count = self.refusals.entry(kind).or_insert(0);
+    *count = (*count).max(value);
   }
 }
 
@@ -1691,7 +1728,7 @@ pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
 /// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
-  let server = with_state(|s| {
+  let server = try_with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
     // away on another shard; it ends when this reply is written into the client's ring.
     let ring = s.forwarded_rings.remove(&request);
@@ -1720,11 +1757,73 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       ring,
     });
     s.server_task
-  })
-  .flatten();
+  });
+  let server = match server {
+    Ok(server) => server,
+    // A reply this thread could not hand to its shard (A-800): counted, never silent. Its callers deliver from a task
+    // or a reply's run, outside any borrow, so this names a caller that broke that rule.
+    Err(StateAccess::Borrowed) => {
+      bump_undelivered(|counts| counts.borrowed = counts.borrowed.saturating_add(1));
+      None
+    }
+    Err(_) => None,
+  };
   if let Some(task) = server {
     slates_rt::registry::wake(task.0);
   }
+}
+
+std::thread_local! {
+  /// Replies this shard thread could not hand on (A-800), per thread as [`LOST_STEPS`] is: a `deliver` while the state
+  /// was borrowed, a forwarded reply resent because its run met a borrowed state, and one no shard here could take.
+  static UNDELIVERED: std::cell::Cell<Undelivered> = const { std::cell::Cell::new(Undelivered { borrowed: 0, forward_resent: 0, forward_unservable: 0 }) };
+}
+
+/// See [`UNDELIVERED`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Undelivered {
+  borrowed: u64,
+  forward_resent: u64,
+  forward_unservable: u64,
+}
+
+fn bump_undelivered(change: impl FnOnce(&mut Undelivered)) {
+  UNDELIVERED.with(|cell| {
+    let mut counts = cell.get();
+    change(&mut counts);
+    cell.set(counts);
+  });
+}
+
+/// Format: a reply `deliver` could not hand to its shard, the state borrowed (A-800).
+pub(crate) const REPLY_UNDELIVERED_BORROWED: &str = "state.reply_undelivered_borrowed";
+/// Format: a forwarded reply resent home because its run met a borrowed state (A-800).
+pub(crate) const FORWARD_RESENT_BORROWED: &str = "fleet.forward.client.resent_borrowed";
+/// Format: a forwarded reply no shard here could take: no state on the thread, or a fenced shard (A-800).
+pub(crate) const FORWARD_UNSERVABLE: &str = "fleet.forward.client.unservable";
+
+/// The replies `deliver` could not hand on, the state borrowed, on this thread so far.
+pub(crate) fn undelivered_borrowed() -> u64 {
+  UNDELIVERED.with(std::cell::Cell::get).borrowed
+}
+
+/// The forwarded replies resent because their run met a borrowed state, and those no shard here could take, on this
+/// thread so far.
+pub(crate) fn forward_undelivered() -> (u64, u64) {
+  let counts = UNDELIVERED.with(std::cell::Cell::get);
+  (counts.forward_resent, counts.forward_unservable)
+}
+
+/// Counts a forwarded reply resent home because its run met a borrowed state.
+pub(crate) fn count_forward_resent_borrowed() {
+  bump_undelivered(|counts| counts.forward_resent = counts.forward_resent.saturating_add(1));
+}
+
+/// Counts a forwarded reply no shard here could take.
+pub(crate) fn count_forward_unservable() {
+  bump_undelivered(|counts| {
+    counts.forward_unservable = counts.forward_unservable.saturating_add(1)
+  });
 }
 
 /// A taken-over green awaiting materialization (§4.16 owner-loss recovery; `ShardState::pending_green_materializations`).

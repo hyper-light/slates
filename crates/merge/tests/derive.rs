@@ -271,6 +271,51 @@ fn an_empty_journal_is_the_identity() {
   assert_eq!(apply_net(&base, &net, &base, base_len), base);
 }
 
+/// Exit 4 at 128 MiB (A-697's release bench, 2026-11-20): a path's composition costs about `√ops` an op, not its
+/// pieces. Do: compose 100,000 appends of 1 KiB (a file written a write at a time), and 10,000 inserts and deletes
+/// scattered through a growing file. Expect: the appends examine at most a few blocks and pieces each (their runs
+/// merge into one); the scattered ops at most a small multiple of `√ops` each. Before, each op walked the whole flat
+/// list from its front: the appends alone examined about 5 billion pieces.
+#[test]
+fn a_paths_composition_costs_about_root_ops_an_op_not_its_pieces() {
+  let appends: Vec<ContentOp> = (0..100_000u64)
+    .map(|at| ContentOp::Extend {
+      at: at * 1024,
+      len: 1024,
+    })
+    .collect();
+  let examined = slates_merge::derive::compose_examined(0, &appends);
+  assert!(
+    examined <= 4 * appends.len() as u64,
+    "appends examined {examined} for {} ops",
+    appends.len()
+  );
+  let mut scattered = Vec::new();
+  let mut len = 1_000_000u64;
+  let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+  for step in 0..10_000u64 {
+    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+    let at = (seed >> 11) % len.max(1);
+    if step % 3 == 2 {
+      scattered.push(ContentOp::Delete {
+        at,
+        len: 7.min(len - at),
+      });
+      len -= 7.min(len - at);
+    } else {
+      scattered.push(ContentOp::Insert { at, len: 5 });
+      len += 5;
+    }
+  }
+  let examined = slates_merge::derive::compose_examined(1_000_000, &scattered);
+  let root = u64::try_from(scattered.len()).unwrap().isqrt();
+  assert!(
+    examined <= 12 * root * scattered.len() as u64,
+    "scattered ops examined {examined} for {} ops (root {root})",
+    scattered.len()
+  );
+}
+
 proptest! {
   #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("derive.proptest-regressions")).unwrap())]
   /// T-6.1 (the deriver oracle): for any base length and any in-bounds journal, applying the net

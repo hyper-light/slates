@@ -18,7 +18,7 @@ use super::{
   CLIENT_CHANNEL, CLIENT_PACKET, CLIENT_WINDOW, HELD_SEED, HOST_SEED, ONE_SEAT, Peer, ROOM_BYTES,
   TICK_NS, Transcript, blob, put_string, query, send_data, sign, transcript,
 };
-use crate::daemon::{audit_daemon, observe_first};
+use crate::daemon::observe_first;
 use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, text};
 use crate::git_push::{ReceivePack, Unpresented};
 use crate::state::ShardState;
@@ -200,7 +200,7 @@ fn exited_cleanly(out: Vec<u8>) -> Transcript {
 /// commit names.
 #[test]
 fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
-  let daemon = audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, address, advertised) = observe_first(&daemon, serving);
   let [(create, _), ..] = chain();
   let pushed = pushed_over_ssh(address, None, create.request);
@@ -218,7 +218,7 @@ fn t_a683_stock_gits_push_over_ssh_lands_through_the_driver() {
 /// and nothing after it; and nothing landed: `main` holds no file.
 #[test]
 fn t_a683_each_protocol_is_advertised_as_gits_and_a_push_of_nothing_writes_nothing() {
-  let daemon = audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, address, advertised) = observe_first(&daemon, serving);
   let mut flush = Vec::new();
   pktline::write(Packet::Flush, &mut flush).expect("a flush");
@@ -302,7 +302,7 @@ fn t_a683_a_push_whose_shard_is_not_lent_is_refused_as_not_served() {
 /// `fatal: 'gone' does not appear to be a git repository`, with 128.
 #[test]
 fn t_a683_a_repository_gone_before_its_push_starts_is_refused_in_gits_words() {
-  let daemon = audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let refused = observe_first(&daemon, |state| {
     let mut command = ReceiveCommand::new(
       HeldState(state),
@@ -338,7 +338,7 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
   use crate::vcs_http::daemon_edge_tests::{
     LONG_HISTORY, fetch_of, fetched_pack, ids_in, long_history, packets_from,
   };
-  let daemon = audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (_, address, _) = observe_first(&daemon, |state| serving_within(state, REQUEST_ROOM));
   let (request, last) = long_history(LONG_HISTORY);
   let pushed = pushed_patiently(address, &request);

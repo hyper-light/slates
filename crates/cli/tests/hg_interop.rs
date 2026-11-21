@@ -175,6 +175,10 @@ impl Drop for Anchor {
 /// ports), and its issuer surface's variables, where this platform names them ([`PRINTS_ISSUER_SURFACE`]).
 struct Started {
   _anchor: Anchor,
+  /// The daemon's changeset store (`--vcs-store`), which a Mercurial repository needs (main's ruling of 2026-11-20:
+  /// a daemon without one refuses to create one); declared after the anchor, so the daemon is gone before it is
+  /// removed.
+  _store: Scratch,
   lines: Vec<String>,
   issuer: Option<Vec<(String, String)>>,
 }
@@ -209,8 +213,10 @@ fn value_of(text: &str, key: &str) -> String {
 /// Starts `slates anchor` whose daemon is asked for `edges` (a flag and a loopback address whose port the system
 /// picks), reads what the anchor says until its daemon serves and, where this platform names one, the anchor has named
 /// its issuer surface ([`lines_until_served`]), waits until the daemon answers verbs steadily, and makes the root
-/// consensus group as a first start does (`slates bootstrap root`).
+/// consensus group as a first start does (`slates bootstrap root`). The daemon holds a changeset store in a fresh
+/// scratch directory (`--vcs-store`), as every daemon serving Mercurial must.
 fn start_anchor(instance: &str, edges: &[&str]) -> Started {
+  let store = Scratch::new("vcs-store");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -221,6 +227,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
       SHARDS,
     ])
     .args(edges)
+    .args(["--vcs-store", &store.path])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -236,6 +243,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
   assert_eq!(code, 0, "bootstrap root: {out}{err}");
   Started {
     _anchor: anchor,
+    _store: store,
     lines,
     issuer,
   }
@@ -600,6 +608,171 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
 }
 
+/// Format: stock 7.2's warning where `clone --stream` meets a server listing no stream capability
+/// (`mercurial/streamclone.py`, `canperformstreamclone`), before it clones plainly.
+const STREAM_DISABLED_WARNING: &str =
+  "warning: stream clone requested but server has them disabled";
+
+/// The value of counter `name` in the daemon's status report (`slates status --json`, each counter an object
+/// `{"count":N,"kind":"name"}`, one a shard that counted it): their sum, zero where none counted.
+fn counter(instance: &str, name: &str) -> u64 {
+  let (code, status, err) = slates(instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status: {err}");
+  let kind = format!("\"kind\":\"{name}\"");
+  status
+    .match_indices(&kind)
+    .filter_map(|(at, _)| {
+      let object = &status[status[..at].rfind('{')?..at];
+      let count = &object[object.find("\"count\":")? + "\"count\":".len()..];
+      count
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum()
+}
+
+/// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
+const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+
+/// Format: the daemon's counter of the asks a fetch's answer made of the changeset store, each a batch of rows or of
+/// chunks (`crate::vcs_store::hg_view::STORE_ASKS` in `slates-server`): a stream's, and since A-767 C1 step 1a a plain
+/// clone's file section's.
+const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
+/// Shape: the most turns the pushed repository's stream clone may take: its store asks end a turn each (a pass's rows,
+/// the chunks) and the last turn ends the answer. A turn that yielded at its first quantum took one entry or one
+/// chunk, so this repository's stream was a turn a step before A-783's pacing reached the edge.
+const STREAM_TURNS_AT_MOST: u64 = 6;
+
+/// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
+const STREAMING_LINE: &str = "streaming all changes";
+
+/// Goal 93 perf (main's ruling of 2026-11-21 02:31) and A-767 C1 step 3. A stream clone sends each revision as the
+/// changeset store keeps it, and since C1 step 3 an import lands on the store as segment changesets, each revision its
+/// revlog's own delta, as a push's does; so an imported repository streams as a pushed one does (before, it listed no
+/// stream capability and stock 7.2 cloned it plainly with its warning). Do: over the HTTP edge, import a two-changeset
+/// history (an empty file among its files) into one repository (`slates repository import`) and push the same history
+/// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
+/// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
+/// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
+/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Then a plain
+/// `hg clone` of the pushed one (A-767 C1 step 1a): expect it to hold the source's changesets and verify, its file
+/// revisions read from the changeset store ([`STORE_ASKS`] counted). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or
+/// an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's stream clone of an imported repository: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-stream-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's stream clone") else {
+    return;
+  };
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-stream");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  std::fs::write(format!("{source}/file"), "first\n").unwrap();
+  // An empty file too: 7.2 sends its revision against the null base as an empty delta, no hunk (hg-src's
+  // `mercurial/__init__.py` at its first revision; a stream refused it, the answer's body left empty).
+  std::fs::write(format!("{source}/empty"), "").unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  std::fs::write(format!("{source}/file"), "first\nsecond\n").unwrap();
+  hg_ok(&hg, &source, &["commit", "--message", "second"]);
+  create_hg_repository(&instance, "imported");
+  let (code, out, err) = slates(
+    &instance,
+    &[],
+    &["repository", "import", "imported", &source],
+  );
+  assert_eq!(code, 0, "repository import: {out}{err}");
+  create_hg_repository(&instance, "pushed");
+  hg_ok(
+    &hg,
+    &source,
+    &with_config(&["push", &format!("{prefix}pushed")], &config),
+  );
+  let clone_stream = |name: &str| {
+    let clone = format!("{}/{name}-clone", scratch.path);
+    let url = format!("{prefix}{name}");
+    let (code, out, err) = hg_in(
+      &hg,
+      &scratch.path,
+      &with_config(&["clone", "--stream", "-U", &url, &clone], &config),
+    );
+    assert_eq!(code, 0, "clone --stream of {name}: {out}{err}");
+    let said = format!("{out}{err}");
+    let (verified, verify_out, verify_err) = hg_in(&hg, &clone, &["verify"]);
+    let verify_said = format!("{verify_out}{verify_err}");
+    (
+      said.contains(STREAM_DISABLED_WARNING),
+      said.contains(STREAMING_LINE),
+      hg_nodes(&hg, &clone) == hg_nodes(&hg, &source),
+      (verified == 0 && !verify_said.contains("warning"))
+        .then_some(())
+        .ok_or(verify_said),
+    )
+  };
+  let imported = clone_stream("imported");
+  let turns_before = counter(&instance, STREAM_TURNS);
+  let pushed = clone_stream("pushed");
+  let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
+  assert_eq!(
+    (imported, pushed),
+    ((false, true, true, Ok(())), (false, true, true, Ok(()))),
+    "(warned, streamed, whole, verified clean) for the imported repository's clone, then the pushed one's"
+  );
+  assert!(
+    (1..=STREAM_TURNS_AT_MOST).contains(&turns),
+    "the pushed repository's stream took {turns} turns"
+  );
+  // A-767 C1 step 1a (main's ruling of 2026-11-21 08:45): a plain clone's file revisions come from the changeset store
+  // as it keeps them, asked between turns, never a whole text from the content store.
+  let asks_before = counter(&instance, STORE_ASKS);
+  let plain = format!("{}/pushed-plain", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(
+      &["clone", "-U", &format!("{prefix}pushed"), &plain],
+      &config,
+    ),
+  );
+  let asks = counter(&instance, STORE_ASKS).saturating_sub(asks_before);
+  let (verified, out, err) = hg_in(&hg, &plain, &["verify"]);
+  assert_eq!(
+    (verified, hg_nodes(&hg, &plain) == hg_nodes(&hg, &source)),
+    (0, true),
+    "the plain clone holds the source's changesets and verifies: {out}{err}"
+  );
+  assert!(
+    asks > 0,
+    "the plain clone asked the changeset store {asks} times"
+  );
+}
+
 /// §4.17.3 decision 1 (a client's `--force` makes a line; main's item 6, reading (a), held to stock 7.2's `push -f`). Do:
 /// over the HTTP edge, push a first changeset from copy A; clone it into B, commit and push there, so the line moves;
 /// commit in A on the old head and push without `--force`, then with it; clone the repository again into C and pull
@@ -673,6 +846,173 @@ fn stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both() {
   assert_eq!(seen, expected, "both heads on default: {heads:?}");
   hg_ok(&hg, &b, &with_config(&["pull", &url], &config));
   assert!(hg_nodes(&hg, &b).contains(&a_tip), "B pulled A's head");
+}
+
+/// The anchor's next lines (its standard error, as `lines` forwards them), read until `instance`'s daemon says it
+/// serves: the lines read.
+#[cfg(unix)]
+fn lines_until(lines: &std::sync::mpsc::Receiver<String>, instance: &str) -> Vec<String> {
+  let serving = format!("{SERVING_LINE}{instance} serving on ");
+  let mut read = Vec::new();
+  loop {
+    let line = lines
+      .recv_timeout(PATIENCE)
+      .expect("the restarted daemon served within the test's patience");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    let served = line.starts_with(&serving);
+    read.push(line);
+    if served {
+      return read;
+    }
+  }
+}
+
+/// A-767 C4 (main's order of 19:50: hg's push onto the changeset store, red first on the real store). Do: start an
+/// anchor whose daemon holds a changeset store in a fresh directory beside the test binary (`--vcs-store`); push two
+/// changesets of stock hg 7.2 over the HTTP edge; read the push's landing count; kill the daemon (`SIGKILL`) and, once
+/// the anchor's restarted daemon serves, clone the repository afresh. Expect the push landed as a changeset on the
+/// store (`hg_push.landed` counted), and the clone after the restart holding both changesets: the recovery read the
+/// push's changegroup back from the store, the register holding only its reference. Skips loudly without stock hg 7.2
+/// ([`STOCK_HG`]) or an issuer surface.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping the changeset store's hg push: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-store-{}", std::process::id());
+  let binary = std::env::current_exe().unwrap();
+  let store = binary
+    .parent()
+    .unwrap()
+    .join(format!("vcs-store-hg-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&store);
+  std::fs::create_dir_all(&store).unwrap();
+  let store = store.canonicalize().unwrap();
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .args([
+      "--vcs-http",
+      "127.0.0.1:0",
+      "--vcs-store",
+      store.to_str().unwrap(),
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = child.stderr.take().unwrap();
+  let (send, lines) = std::sync::mpsc::channel();
+  let reader = std::thread::spawn(move || {
+    for line in std::io::BufReader::new(stderr)
+      .lines()
+      .map_while(Result::ok)
+    {
+      let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+      if send.send(line).is_err() {
+        break;
+      }
+    }
+  });
+  let _anchor = Anchor {
+    child,
+    drain: Some(reader),
+  };
+  let mut first = lines_until(&lines, &instance);
+  while PRINTS_ISSUER_SURFACE && !first.iter().any(|line| issuer_surface(line).is_some()) {
+    first.push(lines.recv_timeout(PATIENCE).unwrap());
+  }
+  let issuer = first.iter().find_map(|line| issuer_surface(line));
+  settle(&instance, _anchor.child.id());
+  let (code, out, err) = slates(&instance, &[], &["bootstrap", "root"]);
+  assert_eq!(code, 0, "bootstrap root: {out}{err}");
+  let Some(issuer) = issuer else {
+    eprintln!("skipping the changeset store's hg push: no issuer surface on this platform");
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let config_for = |port: u16| -> Vec<String> {
+    let prefix = format!("http://127.0.0.1:{port}/");
+    [
+      format!("auth.slates.prefix={prefix}"),
+      format!("auth.slates.username={HG_USER}"),
+      format!("auth.slates.password={token}"),
+    ]
+    .into_iter()
+    .flat_map(|item| ["--config".to_owned(), item])
+    .collect()
+  };
+  let port = http_edge_port(&first);
+  let scratch = Scratch::new("hg-store");
+  let local = format!("{}/local", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &local,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  std::fs::write(format!("{local}/file"), "first\nsecond\n").unwrap();
+  hg_ok(&hg, &local, &["commit", "--message", "second"]);
+  let url = format!("http://127.0.0.1:{port}/r");
+  hg_ok(
+    &hg,
+    &local,
+    &with_config(&["push", &url], &config_for(port)),
+  );
+  let (code, status, err) = slates(&instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status: {err}");
+  assert!(
+    status.contains("\"hg_push.landed\""),
+    "the push did not land on the store: {status}"
+  );
+  let daemon = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} daemon")])
+    .output()
+    .unwrap();
+  let killed = String::from_utf8_lossy(&daemon.stdout)
+    .split_whitespace()
+    .next()
+    .expect("the daemon's pid")
+    .to_owned();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let restarted = lines_until(&lines, &instance);
+  let port = port_after(&restarted, VCS_HTTP_LINE).unwrap_or(port);
+  settle(&instance, _anchor.child.id());
+  let clone = format!("{}/clone", scratch.path);
+  let url = format!("http://127.0.0.1:{port}/r");
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", &url, &clone], &config_for(port)),
+  );
+  assert_eq!(
+    hg_nodes(&hg, &clone),
+    hg_nodes(&hg, &local),
+    "the restarted daemon replayed the push from the store"
+  );
+  let _ = std::fs::remove_dir_all(&store);
 }
 
 /// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
@@ -1352,5 +1692,120 @@ fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
     (&url, &config),
     send,
     (0, expected, true),
+  );
+}
+
+/// Format: the daemon's counter of the file revisions a pull sent whole against the null base
+/// (`crate::vcs_store::hg_view::PULL_WHOLE_TEXTS` in `slates-server`, A-767 C1 step 1b).
+const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
+
+/// Shape: the lines of the large file [`a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`]
+/// edits, about 2 MB, so a whole text would dwarf any delta.
+const LARGE_FILE_LINES: usize = 40_000;
+
+/// The size of the changegroup part stock hg took in a `pull --debug`'s words (`bundle2-input-part: total payload
+/// size N` after the part's `"changegroup"` line).
+fn changegroup_payload(said: &str) -> u64 {
+  let mut lines = said.lines();
+  lines
+    .find(|line| line.starts_with("bundle2-input-part: \"changegroup\""))
+    .unwrap_or_else(|| panic!("no changegroup part taken: {said}"));
+  lines
+    .find_map(|line| line.strip_prefix("bundle2-input-part: total payload size "))
+    .and_then(|size| size.trim().parse().ok())
+    .unwrap_or_else(|| panic!("no changegroup payload size: {said}"))
+}
+
+/// A-767 C1 step 1b (main's ruling of 2026-11-21 08:45: measure a pull of one changeset that touches a large file,
+/// slates' bytes against stock's). Do: over the HTTP edge, push a first changeset holding a file of
+/// [`LARGE_FILE_LINES`] lines, clone it, then push a second changeset changing one line of it; pull the second into the
+/// clone with `--debug`; pull the same changeset from the source by stock 7.2 itself into a clone of its first. Expect
+/// the slates clone to hold the source's changesets and verify clean, no file revision sent whole
+/// ([`PULL_WHOLE_TEXTS`] unmoved), and slates' changegroup within twice stock's; both sizes printed. Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping a large file's pull against stock's: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-pull-large-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "a large file's pull against stock's") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let url = format!("{prefix}r");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-pull-large");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  let lines: Vec<String> = (0..LARGE_FILE_LINES)
+    .map(|line| format!("line {line} of a large file, long enough to matter\n"))
+    .collect();
+  std::fs::write(format!("{source}/large"), lines.concat()).unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(&hg, &source, &with_config(&["push", &url], &config));
+  let ours = format!("{}/ours", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &ours], &config),
+  );
+  let theirs = format!("{}/theirs", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &["clone", "-U", "--rev", "0", &source, &theirs],
+  );
+  let mut edited = lines;
+  if let Some(line) = edited.get_mut(LARGE_FILE_LINES / 2) {
+    *line = "a changed line in the middle\n".to_owned();
+  }
+  std::fs::write(format!("{source}/large"), edited.concat()).unwrap();
+  hg_ok(&hg, &source, &["commit", "--message", "second"]);
+  hg_ok(&hg, &source, &with_config(&["push", &url], &config));
+  let whole_before = counter(&instance, PULL_WHOLE_TEXTS);
+  let (code, out, err) = hg_in(
+    &hg,
+    &ours,
+    &with_config(&["pull", "--debug", &url], &config),
+  );
+  assert_eq!(code, 0, "pull from slates: {out}{err}");
+  let slates_bytes = changegroup_payload(&format!("{out}{err}"));
+  let whole = counter(&instance, PULL_WHOLE_TEXTS).saturating_sub(whole_before);
+  let (code, out, err) = hg_in(&hg, &theirs, &["pull", "--debug", &source]);
+  assert_eq!(code, 0, "pull from the source: {out}{err}");
+  let stock_bytes = changegroup_payload(&format!("{out}{err}"));
+  eprintln!(
+    "a one-changeset pull of a {LARGE_FILE_LINES}-line file: slates {slates_bytes} bytes, stock 7.2 {stock_bytes}"
+  );
+  let (verified, out, err) = hg_in(&hg, &ours, &["verify"]);
+  assert_eq!(
+    (verified, hg_nodes(&hg, &ours) == hg_nodes(&hg, &source)),
+    (0, true),
+    "the slates clone holds the source's changesets and verifies: {out}{err}"
+  );
+  assert_eq!(whole, 0, "file revisions a pull sent whole");
+  assert!(
+    slates_bytes <= stock_bytes.saturating_mul(2),
+    "slates sent {slates_bytes} bytes where stock 7.2 sent {stock_bytes}"
   );
 }

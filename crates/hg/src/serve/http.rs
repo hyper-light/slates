@@ -173,6 +173,12 @@ pub fn answer(
       let mut body = Vec::new();
       loop {
         match streamed.step(store, admission, &mut body) {
+          // A step that asks the changeset store between steps cannot be answered whole (`Store::stored_now`).
+          Ok(true) if crate::render::StoreWants::wants(&*streamed).is_some() => {
+            return error(Refused::Serve(super::Refusal::Store {
+              what: "a file revision read from the changeset store between steps",
+            }));
+          }
           Ok(true) => {}
           Ok(false) => {
             return Answered {
@@ -212,6 +218,24 @@ pub struct Streamed {
   pending: Option<(Vec<u8>, bool)>,
   /// The answer.
   answering: session::Producing,
+}
+
+impl crate::render::StoreWants for Streamed {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.answering.wants()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    self.answering.give_rows(rows);
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    self.answering.give_chunks(chunks);
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.answering.give_texts(texts);
+  }
 }
 
 impl Streamed {

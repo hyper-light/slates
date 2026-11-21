@@ -2327,7 +2327,7 @@ fn arg(name: &str) -> Option<String> {
 /// at the end of a run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. Since A-232 a client waits
 /// for a lost reply while its daemon lives, so a run's latencies alone do not show one (goal 238: about 4,200
 /// `xshard.reply_dropped` a run of the 3,000-client rung on main before the carrier).
-const LOSS_COUNTERS: [&str; 15] = [
+const LOSS_COUNTERS: [&str; 21] = [
   "xshard.reply_dropped",
   "xshard.keep_refused",
   "xshard.unstarted_unanswered",
@@ -2343,6 +2343,13 @@ const LOSS_COUNTERS: [&str; 15] = [
   "merge.work.park_full",
   "merge.work.pending_stuck",
   "merge.work.floor_not_sent",
+  // A-800: where a reply carried home can be lost, each counted apart (a resend is not a loss; an orphan is).
+  "xshard.reply_orphaned",
+  "xshard.reply_resent_borrowed",
+  "state.reply_undelivered_borrowed",
+  "fleet.forward.client.unservable",
+  "fleet.forward.client.resent_borrowed",
+  "fleet.forward.client.delivered_past_retention",
 ];
 
 /// Prints [`LOSS_COUNTERS`], the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over the
@@ -2371,18 +2378,256 @@ fn report_losses(client: &mut Client) {
   for name in [
     "merge.work.composed_on_work",
     "merge.work.composed_by_owner",
+    // A-800: a forwarded reply's hops on the client node, so a lost one is placed by the first count that falls behind.
+    "fleet.forward.client.to_control",
+    "fleet.forward.client.control_started",
+    "fleet.forward.client.resolved",
+    "xshard.reply_home_handed",
+    "xshard.reply_home_ran",
+    "xshard.reply_run_unstarted",
+    "fleet.forward.client.delivered_home",
   ] {
     println!("counter\t{name}\t{}", per_shard(name).sum::<u64>());
   }
+  // Every other merge counter this node moved, summed over its shards: where a work's submits waited (a replica
+  // behind, a settle or a replay awaiting it, an ask of the owner) shows here without a list to keep current.
+  let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+  for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+    if refusal.kind.starts_with("merge.") && !LOSS_COUNTERS.contains(&refusal.kind.as_str()) {
+      let total = moved.entry(refusal.kind.as_str()).or_default();
+      *total = total.saturating_add(refusal.count);
+    }
+  }
+  for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+    println!("merge_counter\t{name}\t{count}");
+  }
+}
+
+/// Format: the bytes each scale injection writes into a file's slot (A-802), a load slot's length.
+const INJECT_SLOT_BYTES: usize = 64;
+/// Format: where the preload writes in a file (its first slot) and where a lagged work writes (a slot the preload never
+/// touches, two strides on), so a lagged submit meets the preload's versions without overlapping them.
+const PRELOAD_AT: u64 = 0;
+/// See [`PRELOAD_AT`].
+const LAGGED_AT: u64 = 2 * SLOT_STRIDE;
+
+/// `--idle-works M` (A-802, injection c): M works made at the green's head before the run and kept idle through it, so
+/// the floor stays where they were made while the run's versions pile up above it. Their ids, for the lagged submits
+/// and the end's destroy.
+fn inject_idle_works(setup: &mut Client, green: VolumeId) -> Vec<VolumeId> {
+  let count: usize = arg("--idle-works").map_or(0, |m| m.parse().expect("--idle-works n"));
+  let started = Instant::now();
+  let works: Vec<VolumeId> = (0..count)
+    .map(|n| {
+      retried(|| setup.create_work(green, &format!("idle-{n}")))
+        .unwrap()
+        .0
+    })
+    .collect();
+  println!(
+    "inject	idle_works	{count}	ns	{}",
+    started.elapsed().as_nanos()
+  );
+  works
+}
+
+/// `--preload V` (A-802, injection b): V versions committed before the run, each one slot of one file, the files taken
+/// in turn, through one work (an accepted submit resets it to the new head). Folded as the run goes unless idle works
+/// hold the floor. Prints the time of each tenth, so a cost that grows with the history shows in the preload itself.
+fn inject_preload(setup: &mut Client, green: VolumeId, files: &[(String, u64)]) {
+  let versions: usize = arg("--preload").map_or(0, |v| v.parse().expect("--preload n"));
+  if versions == 0 {
+    return;
+  }
+  let eligible: Vec<&String> = files
+    .iter()
+    .filter(|(_, len)| *len >= LAGGED_AT + SLOT_STRIDE)
+    .map(|(path, _)| path)
+    .collect();
+  let (work, _) = retried(|| setup.create_work(green, "preload")).unwrap();
+  let tenth = (versions / 10).max(1);
+  let mut since = Instant::now();
+  for version in 0..versions {
+    let Some(path) = eligible.get(version % eligible.len().max(1)) else {
+      break;
+    };
+    let bytes = format!("{version:064}").into_bytes();
+    let bytes = &bytes[bytes.len() - INJECT_SLOT_BYTES..];
+    retried(|| {
+      setup.edit(
+        work,
+        path,
+        PRELOAD_AT,
+        u64::try_from(INJECT_SLOT_BYTES).unwrap(),
+        bytes,
+      )
+    })
+    .unwrap();
+    retried(|| setup.submit(work)).unwrap();
+    if (version + 1) % tenth == 0 {
+      println!(
+        "inject	preload	through	{}	ns_per_version	{}",
+        version + 1,
+        since.elapsed().as_nanos() / u128::try_from(tenth).unwrap()
+      );
+      since = Instant::now();
+    }
+  }
+  let _ = setup.destroy(work);
+}
+
+/// `--lagged-submit` (A-802, injection a): after the run, each idle work edits one slot no version touched and submits,
+/// its base the whole preload and run behind the head. Prints each submit's time (p50, p99, max) and the head it met.
+fn lagged_submits(setup: &mut Client, works: &[VolumeId], files: &[(String, u64)]) {
+  let eligible: Vec<&String> = files
+    .iter()
+    .filter(|(_, len)| *len >= LAGGED_AT + SLOT_STRIDE)
+    .map(|(path, _)| path)
+    .collect();
+  let mut times = Vec::with_capacity(works.len());
+  let mut head = 0;
+  for (n, work) in works.iter().enumerate() {
+    let Some(path) = eligible.get(n % eligible.len().max(1)) else {
+      break;
+    };
+    let bytes = vec![b'L'; INJECT_SLOT_BYTES];
+    let started = Instant::now();
+    retried(|| {
+      setup.edit(
+        *work,
+        path,
+        LAGGED_AT,
+        u64::try_from(INJECT_SLOT_BYTES).unwrap(),
+        &bytes,
+      )
+    })
+    .unwrap();
+    if let Ok(slates_client::Submitted::Accepted(version)) = retried(|| setup.submit(*work)) {
+      head = version;
+    }
+    times.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+  }
+  times.sort_unstable();
+  println!(
+    "inject	lagged_submit	{}	head	{head}	p50_ns	{}	p99_ns	{}	max_ns	{}",
+    times.len(),
+    percentile(&times, 500),
+    percentile(&times, 990),
+    times.last().copied().unwrap_or(0)
+  );
+}
+
+/// Runs `verb` again while the daemon answers retryable (`Overloaded`), as a client must: the setup's own calls.
+fn retried<T>(mut verb: impl FnMut() -> Result<T, ClientError>) -> Result<T, ClientError> {
+  loop {
+    match verb() {
+      Err(ClientError::Refused(Refusal::Overloaded { .. })) => std::thread::yield_now(),
+      other => return other,
+    }
+  }
+}
+
+/// Prints the owner's per-kind ask and answer counters as they stand (`phase\t<label>\t<counter>\t<count>`, A-802), so
+/// each injection's phase is read as the difference from the one before.
+fn print_owner_counters(setup: &mut Client, label: &str) {
+  let Ok(report) = setup.daemon_status() else {
+    println!("phase\t{label}\tunreadable");
+    return;
+  };
+  let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+  for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+    if refusal.kind.starts_with("merge.work.answered")
+      || refusal.kind.starts_with("merge.work.asked_owner")
+      || refusal.kind.starts_with("merge.submit.")
+      || refusal.kind.starts_with("merge.reanchor.")
+      || refusal.kind.starts_with("merge.work.log_peak")
+      || refusal.kind.starts_with("merge.work.base_ask")
+      || refusal.kind.starts_with("merge.work.base_missing")
+    {
+      let total = moved.entry(refusal.kind.as_str()).or_default();
+      // A peak is the most over the shards (A-806), any other counter their sum.
+      *total = if refusal.kind.contains("_peak") {
+        (*total).max(refusal.count)
+      } else {
+        total.saturating_add(refusal.count)
+      };
+    }
+  }
+  for (name, count) in moved {
+    println!("phase\t{label}\t{name}\t{count}");
+  }
+}
+
+/// The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
+/// client node's report does not show. `--report-instances` names them (the load_scale test passes its servers).
+fn report_server_counters() {
+  for instance in arg("--report-instances")
+    .unwrap_or_default()
+    .split(',')
+    .filter(|name| !name.is_empty())
+  {
+    match connect(instance).and_then(|mut client| client.daemon_status()) {
+      Ok(report) => {
+        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
+            let total = moved.entry(refusal.kind.as_str()).or_default();
+            *total = total.saturating_add(refusal.count);
+          }
+        }
+        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+          println!("server_counter\t{instance}\t{name}\t{count}");
+        }
+      }
+      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
+    }
+  }
+}
+
+/// `--clients n[,n…]`: the client counts to drive, ten by default.
+fn levels_arg() -> Vec<usize> {
+  arg("--clients")
+    .unwrap_or_else(|| "10".to_owned())
+    .split(',')
+    .map(|n| n.parse().expect("--clients n[,n…]"))
+    .collect()
+}
+
+/// The count `name` gives, or `default` without it.
+fn count_arg(name: &str, default: usize) -> usize {
+  arg(name).map_or(default, |n| n.parse().expect(name))
+}
+
+/// The daemon the bench drives: none when `external` (daemons running under their own anchors), else one started
+/// in-process under `instance` and bootstrapped.
+fn started_daemon(profile: &MachineProfile, instance: &str, external: bool) -> Option<Daemon> {
+  let cpus = profile.facts.cpus_at_once();
+  if external {
+    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
+    return None;
+  }
+  let config = DaemonConfig::derive(profile, instance, None);
+  println!(
+    "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
+    config.runtime.shards, config.clients_per_shard
+  );
+  let daemon = Daemon::start(
+    profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  Some(daemon)
 }
 
 fn main() {
   let tree = arg("--tree").unwrap_or_default();
-  let levels: Vec<usize> = arg("--clients")
-    .unwrap_or_else(|| "10".to_owned())
-    .split(',')
-    .map(|n| n.parse().expect("--clients n[,n…]"))
-    .collect();
+  let levels = levels_arg();
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -2390,39 +2635,16 @@ fn main() {
   })
   .expect("the machine profile measures");
   let cpus = profile.facts.cpus_at_once();
-  let workers: usize =
-    arg("--workers").map_or((cpus / 4).max(1), |w| w.parse().expect("--workers n"));
-  let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
-  let hot_files: usize =
-    arg("--hot-files").map_or(HOT_FILES, |h| h.parse().expect("--hot-files n"));
+  let workers = count_arg("--workers", (cpus / 4).max(1));
+  let rounds = count_arg("--rounds", ROUNDS);
+  let hot_files = count_arg("--hot-files", HOT_FILES);
   // `--instance <name>[,<name>…]` drives daemons already running under their own anchors (`slates --instance <name> anchor`), so a
   // chaos script can kill the daemon process mid-run and the anchor restart it; without it the daemon is in-process.
   let external = arg("--instance");
   let instance = external
     .clone()
     .unwrap_or_else(|| format!("load-bench-{}", std::process::id()));
-  let daemon = if external.is_some() {
-    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
-    None
-  } else {
-    let config = DaemonConfig::derive(&profile, &instance, None);
-    println!(
-      "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
-      config.runtime.shards, config.clients_per_shard
-    );
-    let daemon = Daemon::start(
-      &profile,
-      config,
-      SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
-      },
-    )
-    .unwrap();
-    daemon
-      .bootstrap(true)
-      .expect("the fixture explicitly creates its local consensus group");
-    Some(daemon)
-  };
+  let daemon = started_daemon(&profile, &instance, external.is_some());
   let mut setup = connect(first_instance(&instance)).unwrap();
   // `--green <32 hex>` drives a green that already exists, on this node or another node of its fleet (the client
   // node forwards every verb to the green's owner, A-201's filesystem server); without it the harness seeds its own
@@ -2439,6 +2661,12 @@ fn main() {
     step.elapsed().as_nanos(),
     files.len()
   );
+  // The scale injections (A-802; main's order 01:41 PST): each grows one thing a 100,000-client run grows, so the owner's
+  // per-kind answer times show which cost grows with it. Off unless asked.
+  let idle_works = inject_idle_works(&mut setup, green);
+  print_owner_counters(&mut setup, "after_idle_works");
+  inject_preload(&mut setup, green, &files);
+  print_owner_counters(&mut setup, "after_preload");
   let mut failures = 0;
   for n in levels {
     failures += level(
@@ -2449,7 +2677,16 @@ fn main() {
       workers.min(n),
     );
   }
+  print_owner_counters(&mut setup, "after_run");
+  if std::env::args().any(|flag| flag == "--lagged-submit") {
+    lagged_submits(&mut setup, &idle_works, &files);
+    print_owner_counters(&mut setup, "after_lagged");
+  }
+  for work in idle_works {
+    let _ = setup.destroy(work);
+  }
   report_losses(&mut setup);
+  report_server_counters();
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();

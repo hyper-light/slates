@@ -402,6 +402,7 @@ fn a_landed_push_is_read_where_it_lies_in_its_stored_pack() {
     .id;
   let moved = repository.admit(&store, &push, 1, Some(commit)).unwrap();
   repository.commit(&mut store, &mut push, &[moved]).unwrap();
+  super::derive_all(&repository, &mut store);
   push.abandon(&mut store).unwrap();
   for object in &whole.objects {
     let (kind, stored, len) = repository.stored(&store, &object.id).unwrap();

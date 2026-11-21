@@ -528,8 +528,8 @@ const TEST_ROOT: &str = "/slates-root";
 impl SvnStores for Lends {
   type Green<'a> = View;
 
-  fn root_mount(&self) -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(TEST_ROOT))
+  fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews {
+    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from(TEST_ROOT))
   }
 
   fn holds(&self, id: RepositoryId) -> bool {
@@ -563,8 +563,15 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_record(
+  type Turn = ();
+
+  async fn turn(&mut self, id: RepositoryId) -> Option<()> {
+    self.holds(id).then_some(())
+  }
+
+  async fn land_record(
     &mut self,
+    (): (),
     id: RepositoryId,
     _principal: &Principal,
     record: slates_svn::commit::record::Record,
@@ -720,6 +727,47 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
 fn tunnel<S: SshSite>(site: &mut S, asker: &Principal, runs: &[&[u8]]) -> Ended {
   match site.dispatch(asker, &Asked::Subversion, None) {
     Dispatched::Run(mut command) => drive(&mut command, runs),
+    Dispatched::Refuse(refused) => (
+      Answered {
+        err: refused.stderr,
+        status: Some(refused.exit_status),
+        ..Answered::default()
+      },
+      0,
+    ),
+  }
+}
+
+/// [`drive`] awaiting each step: a site whose landing waits on the node's changeset store (C2), as the daemon's does.
+async fn drive_awaited<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
+  let mut answered = Answered::default();
+  let mut consumed = 0;
+  let mut runs = runs.iter();
+  let mut next = Next::More;
+  for _ in 0..MOST_STEPS {
+    take(command, &mut answered);
+    match next {
+      Next::Exited(status) => {
+        answered.status = Some(status);
+        return (answered, consumed);
+      }
+      Next::Input => hand_over(command, runs.next()),
+      Next::More => {}
+    }
+    let stepped = command
+      .step(ClientGone::never())
+      .await
+      .expect("a tunnel ends as svnserve ends, never failed");
+    consumed += stepped.consumed;
+    next = stepped.next;
+  }
+  panic!("a tunnel that never exits: {answered:?}");
+}
+
+/// [`tunnel`] awaiting each step ([`drive_awaited`]).
+async fn tunnel_awaited<S: SshSite>(site: &mut S, asker: &Principal, runs: &[&[u8]]) -> Ended {
+  match site.dispatch(asker, &Asked::Subversion, None) {
+    Dispatched::Run(mut command) => drive_awaited(&mut command, runs).await,
     Dispatched::Refuse(refused) => (
       Answered {
         err: refused.stderr,
@@ -1100,37 +1148,19 @@ fn realm_of(bytes: &[u8]) -> Vec<u8> {
 /// Before this the daemon's site refused `svnserve -t` as not served.
 #[test]
 fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
-  let daemon = crate::daemon::audit_daemon();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let created = crate::verbs::dispatch(
-      state,
-      1,
-      &principal(OWNER),
-      slates_ipc::protocol::RequestBody::CreateRepository {
-        name: REPOSITORY.to_owned(),
-        tool: slates_ipc::protocol::VcsTool::Subversion,
-        format: slates_ipc::protocol::ObjectFormat::Sha1,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    );
-    assert!(
-      !matches!(created, slates_ipc::protocol::ReplyBody::Refused { .. }),
-      "{created:?}"
-    );
-    let record = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(REPOSITORY)
-      .cloned();
-    record.expect("the repository").id
-  });
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    REPOSITORY,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, _) = crate::test_store::create_on(&daemon, 0, &principal(OWNER), asked);
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
       let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
-      let _ = sent.send(tunnel(&mut site, &principal(OWNER), &[MKDIR_CLIENT]));
+      let _ = sent.send(tunnel_awaited(&mut site, &principal(OWNER), &[MKDIR_CLIENT]).await);
     })
     .expect("the tunnel's task");
     slates_rt::futures::detach(task).expect("detached");
@@ -1360,8 +1390,11 @@ fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
 /// Measurement, not a gate (main's order of 2026-11-20: svnsync over the matrix took 0.54 s a revision of
 /// git-2000.dump). Do: on a daemon's shard, create `repo` and import the dump `SLATES_SVN_REPLAY_DUMP` names; then,
 /// through the daemon's SSH site, hand `svnserve -t` the recorded tunnel handshake and one
-/// `replay-range ( 1 LAST 0 true )`, as `svnsync synchronize` asks (`SLATES_SVN_REPLAY_LAST`, 200 by default).
-/// Printed: the import's and the replay's wall time, the replay's bytes and its mean a revision.
+/// `replay-range ( 1 LAST 0 true )`, as `svnsync synchronize` asks (`SLATES_SVN_REPLAY_LAST`, 200 by default); then an
+/// update across `SLATES_SVN_UPDATE` (`FROM:TO`, 1000:1500 by default) and a checkout at `TO`, as stock svn asks them
+/// (P6 of Ada's close list). Printed: the import's wall time and the changesets it landed on the store (C2: one a
+/// record), the replay's wall time, bytes and mean a revision, each fetch's wall time and bytes, and this process's
+/// resident set at each step against the dump's bytes (P7).
 #[test]
 #[ignore = "measurement: needs SLATES_SVN_REPLAY_DUMP"]
 fn measure_svnsync_replay_range_over_the_tunnel() {
@@ -1370,33 +1403,85 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .ok()
     .and_then(|last| last.parse().ok())
     .unwrap_or(200);
-  let dump = std::fs::read(&path).expect("the dump");
-  let daemon = crate::daemon::audit_daemon();
+  let dump_bytes = std::fs::metadata(&path).expect("the dump").len();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let started_kib = resident_kib();
   let importing = std::time::Instant::now();
-  // The import a turn a call, as the server runs it: one call of all of it spins the shard past its watchdog window.
-  let id = crate::daemon::observe_first(&daemon, move |state| {
-    use crate::vcs_store::svn_import::tests::{DUMP, host_holding, owner, subversion};
-    let (id, _) = subversion(state, REPOSITORY);
-    let (host, root) = host_holding(&dump);
-    crate::vcs_store::svn_import::begin(state, (&owner(), id), (Box::new(host), root, DUMP))
-      .expect("the import begun");
-    id
+  // The import a turn at a time with a yield between, each record landed on the store before the next turn (C2).
+  let (id, loaded) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::vcs_store::svn_import::tests::{imported, subversion};
+      let (id, _) = subversion(REPOSITORY).await;
+      // Read here, once: the history's closure is cloned to run, and a dump captured by it would be held twice more.
+      let dump = std::fs::read(&path).expect("the dump");
+      (id, imported(id, dump).await.0)
+    },
+    std::time::Duration::from_secs(3600),
+  );
+  assert!(loaded.is_ok(), "{loaded:?}");
+  let import = importing.elapsed();
+  let imported_kib = resident_kib();
+  // Where the import's memory is (P7): the heap, the shard's budget, its arena's extents, the stores' charges and the
+  // records' own bytes, then the process's regions by type.
+  let attributed = crate::daemon::observe_first(&daemon, move |state| {
+    let heap = slates_mem::heap::stats();
+    let arena = state.store.content.arena();
+    let extents: u64 = arena
+      .region_ids()
+      .iter()
+      .filter_map(|region| arena.region(*region))
+      .map(|region| u64::try_from(region.len()).unwrap_or(0))
+      .sum();
+    format!(
+      "heap_in_use {} heap_reserved {} budget_committed {} budget_retained {} arena_extents {} vcs_charged {} \
+       objects_charged {} records_held {:?} register_objects_bytes {}",
+      heap.in_use,
+      heap.reserved,
+      state.store.budget.committed(),
+      state.store.budget.retained(),
+      extents,
+      state.vcs_stores.charged(),
+      state.vcs_stores.objects_charged(id),
+      state
+        .vcs_stores
+        .subversion_records(id)
+        .map(slates_svn::migration::Repository::held),
+      state.db.partition().repositories().objects_bytes(id),
+    )
   });
-  loop {
-    let turned =
-      crate::daemon::observe_first(
-        &daemon,
-        move |state| match crate::vcs_store::svn_import::turn(state, id) {
-          Some(Ok(crate::vcs_store::svn_import::Turned::More)) => None,
-          other => Some(format!("{other:?}")),
-        },
-      );
-    if let Some(ended) = turned {
-      assert!(ended.starts_with("Some(Ok(Done"), "{ended}");
-      break;
+  println!("MEASURE attributed {attributed}");
+  if let Ok(out) = std::process::Command::new("vmmap")
+    .args(["-summary", &std::process::id().to_string()])
+    .output()
+  {
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines().filter(|line| {
+      line.contains("TOTAL")
+        || line.contains("MALLOC")
+        || line.contains("VM_ALLOCATE")
+        || line.contains("mapped file")
+        || line.contains("Stack")
+        || line.contains("__DATA")
+        || line.contains("shared memory")
+        || line.contains("Physical footprint")
+    }) {
+      println!("MEASURE vmmap {line}");
     }
   }
-  let import = importing.elapsed();
+  let (text_bytes, landed) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state
+        .vcs_stores
+        .subversion_records(id)
+        .map(|records| records.text_bytes()),
+      state
+        .refusals
+        .get(crate::repository::svn_commit::landing::LANDED)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())
     .position(|window| window == b"( commit")
@@ -1418,6 +1503,70 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .recv_timeout(std::time::Duration::from_secs(3600))
     .expect("the tunnel ended");
   let replay = replaying.elapsed();
+  let replayed_kib = resident_kib();
+  // An update and a checkout as stock svn asks them (the recorded update-alice session's commands; P6: svn:// update
+  // 2.7 s at w-bugs' run 8, 5.6 s at run 13). The client's closing `success` is a run of its own, handed over only once
+  // the server waits after its drive: sent with the report, it arrives during the drive, which svnserve answers
+  // E210004 "Successful edit status returned too soon" and aborts.
+  let (from, to): (u64, u64) = std::env::var("SLATES_SVN_UPDATE")
+    .ok()
+    .and_then(|range| {
+      let (from, to) = range.split_once(':')?;
+      Some((from.parse().ok()?, to.parse().ok()?))
+    })
+    .unwrap_or((1000, 1500));
+  let fetch = |report: String| {
+    let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+    client.extend_from_slice(report.as_bytes());
+    let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+    let began = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let task = slates_rt::futures::spawn(async move {
+        let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+        let owner = crate::vcs_store::svn_import::tests::owner();
+        let closing: &[u8] = b"( success ( ) ) ";
+        let _ = sent.send(tunnel_awaited(&mut site, &owner, &[&client, closing]).await);
+      })
+      .expect("the fetch's task");
+      slates_rt::futures::detach(task).expect("detached");
+    });
+    let (answered, _) = outcome
+      .recv_timeout(std::time::Duration::from_secs(3600))
+      .expect("the fetch ended");
+    let whole = answered
+      .out
+      .windows(b"( close-edit ( ) )".len())
+      .any(|window| window == b"( close-edit ( ) )");
+    if !whole {
+      println!(
+        "MEASURE fetch not whole: {}",
+        String::from_utf8_lossy(
+          answered
+            .out
+            .get(answered.out.len().saturating_sub(800)..)
+            .unwrap_or_default()
+        )
+      );
+    }
+    (began.elapsed(), answered.out.len(), whole)
+  };
+  let updated = fetch(format!(
+    "( update ( ( {to} ) 0: true unknown false false ) ) ( set-path ( 0: {from} false ( ) infinity ) ) \
+     ( finish-report ( ) ) "
+  ));
+  let checked_out = fetch(format!(
+    "( update ( ( {to} ) 0: true unknown false false ) ) ( set-path ( 0: {to} true ( ) infinity ) ) \
+     ( finish-report ( ) ) "
+  ));
+  println!(
+    "MEASURE update r{from}..r{to} wall_s {:.2} bytes {} whole {} checkout r{to} wall_s {:.2} bytes {} whole {}",
+    updated.0.as_secs_f64(),
+    updated.1,
+    updated.2,
+    checked_out.0.as_secs_f64(),
+    checked_out.1,
+    checked_out.2
+  );
   let youngest = crate::daemon::observe_first(&daemon, move |state| {
     state
       .vcs_stores
@@ -1431,12 +1580,331 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .filter(|window| *window == b"finish-replay")
     .count();
   println!(
-    "MEASURE import_s {:.1} youngest {youngest:?} replay r1..r{last} wall_s {:.2} mean_ms {:.1} out_bytes {} \
-     finished {finished} err {}",
+    "MEASURE dump_bytes {dump_bytes} resident_kib started {started_kib} imported {imported_kib} replayed \
+     {replayed_kib} records_text_bytes {text_bytes:?}"
+  );
+  println!(
+    "MEASURE import_s {:.1} changesets_landed {landed} youngest {youngest:?} replay r1..r{last} wall_s {:.2} \
+     mean_ms {:.1} out_bytes {} finished {finished} err {}",
     import.as_secs_f64(),
     replay.as_secs_f64(),
     replay.as_secs_f64() * 1e3 / last as f64,
     answered.out.len(),
     String::from_utf8_lossy(&answered.err)
   );
+}
+
+/// This process's resident set in KiB, as `ps` reads it; 0 where it cannot be read (a measurement's checkpoint).
+fn resident_kib() -> u64 {
+  std::process::Command::new("ps")
+    .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+    .output()
+    .ok()
+    .and_then(|out| String::from_utf8(out.stdout).ok())
+    .and_then(|text| text.trim().parse().ok())
+    .unwrap_or(0)
+}
+
+/// Measurement, not a gate (P7's finding (1), main's condition 3 of 2026-11-21 10:55: what a copy from an older
+/// revision costs, against the green's kept versions). Do: on a daemon's shard, import the dump `SLATES_SVN_COPY_DUMP`
+/// names into `repo`; add `/copies`; then copy `/trunk` from the revision each of `SLATES_SVN_COPY_DISTANCES` names
+/// before the import's youngest (comma-separated; `all` the first revision; `10,1000,all` by default) to
+/// `/copies/d<distance>`, one revision each. Printed: the green's retention charge, the history it has folded below and
+/// this process's resident set after the import and after the copies; and each copy's wall time and what it read
+/// (text pieces fetched through the store, the bytes brought whole, the restore walk's slices), by counter name, so the
+/// same test reads both the green's own copy and the copy set back from the records.
+#[test]
+#[ignore = "measurement: needs SLATES_SVN_COPY_DUMP"]
+fn measure_copies_from_older_revisions() {
+  let path = std::env::var("SLATES_SVN_COPY_DUMP").expect("SLATES_SVN_COPY_DUMP");
+  let distances: Vec<String> = std::env::var("SLATES_SVN_COPY_DISTANCES")
+    .unwrap_or_else(|_| "10,1000,all".to_owned())
+    .split(',')
+    .map(str::to_owned)
+    .collect();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (id, green, loaded) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::vcs_store::svn_import::tests::{imported, subversion};
+      let (id, green) = subversion(REPOSITORY).await;
+      let dump = std::fs::read(&path).expect("the dump");
+      (id, green, imported(id, dump).await.0)
+    },
+    std::time::Duration::from_secs(3600),
+  );
+  assert!(loaded.is_ok(), "{loaded:?}");
+  let seen = |daemon: &crate::Daemon| {
+    crate::daemon::observe_first(daemon, move |state| {
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      let engine = state.greens.get(&green);
+      (
+        state
+          .vcs_stores
+          .subversion_records(id)
+          .map_or(0, slates_svn::migration::Repository::youngest),
+        engine
+          .as_ref()
+          .map_or(0, |engine| engine.retention_charge()),
+        engine.as_ref().map_or(0, |engine| engine.folded_below()),
+        [
+          counted("vcs_store.svn_texts.piece_fetched"),
+          counted("vcs_store.svn_texts.bytes_brought"),
+          counted("repository.svn_commit.restore_slices"),
+        ],
+      )
+    })
+  };
+  let (youngest, retention, folded, _) = seen(&daemon);
+  println!(
+    "MEASURE imported youngest {youngest} green_retention_bytes {retention} folded_below {folded} resident_kib {}",
+    resident_kib()
+  );
+  let row =
+    |path: &str, copy_from: Option<slates_svn::index::CopySource>| slates_svn::index::ChangedPath {
+      path: path.to_owned(),
+      action: slates_svn::index::Action::Add,
+      kind: slates_svn::index::NodeKind::Directory,
+      copy_from,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    };
+  let commit = |head: u64, rows: Vec<slates_svn::index::ChangedPath>| {
+    crate::test_store::run_on_first(
+      &daemon,
+      move || async move {
+        let revision = slates_svn::commit::revision::Revision {
+          head,
+          record: slates_svn::index::RevisionRecord {
+            transaction: format!("{head}-1"),
+            changes: rows,
+          },
+          properties: std::collections::BTreeMap::from([
+            (b"svn:author".to_vec(), b"alice".to_vec()),
+            (
+              b"svn:date".to_vec(),
+              b"2026-11-21T12:00:00.000000Z".to_vec(),
+            ),
+            (b"svn:log".to_vec(), b"a copy".to_vec()),
+          ]),
+          contents: std::collections::BTreeMap::new(),
+          stored: std::collections::BTreeMap::new(),
+          lock_entries: Vec::new(),
+        };
+        crate::repository::svn_commit::tests::commit(
+          (&crate::repository::svn_commit::tests::owner(), id),
+          revision,
+          None,
+        )
+        .await
+        .map(|committed| committed.revision)
+      },
+      std::time::Duration::from_secs(3600),
+    )
+  };
+  let mut head = youngest;
+  assert_eq!(commit(head, vec![row("/copies", None)]), Ok(head + 1));
+  head += 1;
+  for distance in &distances {
+    let from = match distance.as_str() {
+      "all" => 1,
+      distance => youngest
+        .saturating_sub(distance.parse().expect("a distance"))
+        .max(1),
+    };
+    let (_, _, _, before) = seen(&daemon);
+    let began = std::time::Instant::now();
+    let source = slates_svn::index::CopySource {
+      path: "/trunk".to_owned(),
+      revision: from,
+    };
+    let committed = commit(
+      head,
+      vec![row(&format!("/copies/d{distance}"), Some(source))],
+    );
+    let wall = began.elapsed();
+    let (_, _, _, after) = seen(&daemon);
+    println!(
+      "MEASURE copy distance {distance} from r{from} committed {committed:?} wall_ms {:.1} pieces_fetched {} \
+       bytes_brought {} restore_slices {}",
+      wall.as_secs_f64() * 1000.0,
+      after[0] - before[0],
+      after[1] - before[1],
+      after[2] - before[2],
+    );
+    assert_eq!(committed, Ok(head + 1));
+    head += 1;
+  }
+  let (_, retention, folded, _) = seen(&daemon);
+  println!(
+    "MEASURE copied green_retention_bytes {retention} folded_below {folded} resident_kib {}",
+    resident_kib()
+  );
+  daemon.stop();
+}
+
+/// C2 stage B part 2 (a text the content store does not hold is read through the node's changeset store, R6: never a
+/// sync path). Do: on a daemon holding a store, land a client's commit adding `/trunk/a.bin` (a stored text, which its
+/// changeset carries), let go every hold RAM has on the text (the green's held table and the content store), then
+/// check revision 1 out through the daemon's `svnserve -t` site, as stock svn asks it. Expect the edit whole (its
+/// `close-edit`), the text's bytes in it, and the text read through the store a piece at a time
+/// (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after. Before, a text RAM did not
+/// hold ended the drive "Filesystem is corrupt".
+#[test]
+fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(
+    b"( update ( ( 1 ) 0: true unknown false false ) ) ( set-path ( 0: 1 true ( ) infinity ) ) ( finish-report ( ) ) ",
+  );
+  let (answered, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      let closing: &[u8] = b"( success ( ) ) ";
+      tunnel_awaited(&mut site, &principal(OWNER), &[&client, closing]).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let out = &answered.out;
+  let whole = out
+    .windows(b"( close-edit ( ) )".len())
+    .any(|window| window == b"( close-edit ( ) )");
+  let carried = out.windows(1024).any(|window| window == &bytes[..1024]);
+  assert!(
+    whole,
+    "{}",
+    String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
+  );
+  assert!(carried, "the text's bytes are not in the edit");
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
+/// C2 stage B part 2 (`get-file-revs` reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// ([`crate::test_store::a_text_only_the_store_holds`]), ask `get-file-revs` of it from revision 1 to 1 through the
+/// daemon's `svnserve -t` site. Expect the answer whole, as `svnserve` ends it (the delta's empty string, `done`,
+/// `( success ( ) )`), the text's first and last KiB in its svndiff (noise, which no window compresses), read through
+/// the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after.
+/// Before, the delta's first window ended the answer "Filesystem is corrupt".
+#[test]
+fn a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(b"( get-file-revs ( 11:trunk/a.bin ( 1 ) ( 1 ) ) ) ");
+  let (answered, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      tunnel_awaited(&mut site, &principal(OWNER), &[&client]).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let out = &answered.out;
+  let carries = |run: &[u8]| out.windows(run.len()).any(|window| window == run);
+  assert!(
+    out.ends_with(b"0: done ( success ( ) ) "),
+    "{}",
+    String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
+  );
+  assert!(
+    carries(&bytes[..1024]),
+    "the text's first KiB is not in the delta"
+  );
+  assert!(
+    carries(&bytes[bytes.len() - 1024..]),
+    "the text's last KiB is not in the delta"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
+/// C2 stage B part 2 (`get-file` reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// ([`crate::test_store::a_text_only_the_store_holds`]), ask `get-file` of it at revision 1 through the daemon's `svnserve -t` site. Expect
+/// the text whole, as `svnserve` writes it (its strings of 4,096 bytes in order, the empty string, `( success ( ) )`),
+/// read through the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let
+/// go after. Before, the stream ended "Filesystem is corrupt" at the first byte RAM did not hold.
+#[test]
+fn a_get_file_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(b"( get-file ( 11:trunk/a.bin ( 1 ) false true ) ) ");
+  let (answered, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      tunnel_awaited(&mut site, &principal(OWNER), &[&client]).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  // The strings `svnserve`'s `get_file` writes: 4,096 bytes each, the last what is left, then the empty one.
+  let mut strings = Vec::new();
+  for run in bytes.chunks(4_096) {
+    strings.extend_from_slice(format!("{}:", run.len()).as_bytes());
+    strings.extend_from_slice(run);
+    strings.push(b' ');
+  }
+  strings.extend_from_slice(b"0: ( success ( ) ) ");
+  let out = &answered.out;
+  assert!(
+    out.ends_with(&strings),
+    "{}",
+    String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
 }

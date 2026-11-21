@@ -41,6 +41,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   copy WORK FROM TO [--version N] [--replace] [--json]   declare a copy of FROM's tree to TO (the work's base when no N)
   submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
+  check WORK [--json]                              check a work against its green's head; publishes nothing
+  resolve JSON [--json]                            resolve a checked conflict (stamp, discard, replacement)
   checkout GREEN VOLUME ATTACHMENT --snapshot N [--json]   write a green's head into the volume it was made from
   advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
@@ -203,7 +205,11 @@ pub(crate) enum Verb {
   /// List.
   List,
   /// The daemon's status (`status` with no volume).
-  DaemonStatus,
+  DaemonStatus {
+    /// `--memory`: the memory report's residency read now, which only such a request costs the daemon (A-744; main's
+    /// ruling on g228's finding).
+    memory: bool,
+  },
   /// Explicitly create a consensus group bound to the daemon's current identity (§4.8, AUD-07).
   Bootstrap {
     /// Also create the root group, exactly once for a new fleet.
@@ -379,6 +385,16 @@ pub(crate) enum Verb {
   Rebase {
     /// The work volume.
     work: slates_client::VolumeId,
+  },
+  /// Check a work against its green's head and publish nothing (A-796): its stamp, windows and canonical declaration.
+  CheckMerge {
+    /// The work volume.
+    work: slates_client::VolumeId,
+  },
+  /// Resolve a checked conflict (A-796), the resolution given as `slates.merge.resolve`'s JSON object.
+  ResolveMerge {
+    /// The JSON object: `stamp`, `discard`, `replacement`.
+    resolution: String,
   },
   /// Check a green's head out into the volume and snapshot it was created from, through the caller's write
   /// attachment of that volume (§4.16 A-201); the volume then lands like any other.
@@ -838,6 +854,7 @@ const VALUES: &[&str] = &[
   "--vcs-http",
   "--vcs-ssh",
   "--vcs-svn",
+  "--vcs-store",
   "--bounded",
   "--dynamic",
   "--base",
@@ -885,6 +902,7 @@ const SWITCHES: &[&str] = &[
   "--write",
   "--admin",
   "--drift",
+  "--memory",
   "--mirror",
   "--session",
   "--require-evidence",
@@ -2171,6 +2189,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           "--vcs-http",
           "--vcs-ssh",
           "--vcs-svn",
+          "--vcs-store",
         ],
         switches: &["--quick"],
       })?;
@@ -2182,6 +2201,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
         vcs_ssh: vcs_ssh_of(&taken)?,
         vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
+        vcs_store: taken.value("--vcs-store").map(str::to_owned),
         fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
@@ -2319,8 +2339,16 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       ))
     }
     ["status"] => {
-      taken.only(&NONE)?;
-      Ok(client(&taken, Verb::DaemonStatus))
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--memory"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::DaemonStatus {
+          memory: taken.switch("--memory"),
+        },
+      ))
     }
     ["bootstrap", "root"] => {
       taken.only(&NONE)?;
@@ -2598,6 +2626,24 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         &taken,
         Verb::Rebase {
           work: volume(work)?,
+        },
+      ))
+    }
+    ["check", work] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::CheckMerge {
+          work: volume(work)?,
+        },
+      ))
+    }
+    ["resolve", resolution] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::ResolveMerge {
+          resolution: (*resolution).to_owned(),
         },
       ))
     }
@@ -3062,6 +3108,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert_eq!(
@@ -3172,6 +3219,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert!(matches!(
@@ -3202,6 +3250,7 @@ mod tests {
         vcs_http: Some(loopback),
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3243,6 +3292,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: Some(loopback),
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3282,6 +3332,7 @@ mod tests {
         vcs_http: Some(loopback(8080)),
         vcs_ssh: None,
         vcs_svn: Some(loopback(3690)),
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3426,14 +3477,32 @@ mod tests {
         replace: true,
       }
     );
+    the_merge_verbs_after_an_edit_parse(id, vid);
+  }
+
+  /// The merge grammar's submit, rebase, check and resolve, of the volume `id` (`vid`).
+  fn the_merge_verbs_after_an_edit_parse(id: &str, vid: slates_client::VolumeId) {
     assert_eq!(
-      verb(&format!("submit {id}")),
+      client_verb(&format!("submit {id}")),
       Verb::Submit {
         work: vid,
         evidence: Vec::new(),
       }
     );
-    assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
+    assert_eq!(
+      client_verb(&format!("rebase {id}")),
+      Verb::Rebase { work: vid }
+    );
+    assert_eq!(
+      client_verb(&format!("check {id}")),
+      Verb::CheckMerge { work: vid }
+    );
+    assert_eq!(
+      client_verb("resolve {}"),
+      Verb::ResolveMerge {
+        resolution: "{}".into(),
+      }
+    );
   }
 
   /// The refusals: a size without a binary unit, an unknown flag, a missing size, an extra
@@ -3944,7 +4013,15 @@ mod tests {
       Ok(Command::Client(ClientRequest {
         instance: "run".into(),
         json: false,
-        verb: Verb::DaemonStatus,
+        verb: Verb::DaemonStatus { memory: false },
+      }))
+    );
+    assert_eq!(
+      parse(&args("--instance run status --memory")),
+      Ok(Command::Client(ClientRequest {
+        instance: "run".into(),
+        json: false,
+        verb: Verb::DaemonStatus { memory: true },
       }))
     );
   }

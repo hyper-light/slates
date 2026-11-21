@@ -7,10 +7,13 @@
 //!
 //! [`log`] is the changeset log: its record format, a record appended in slices and visible only once its commit mark
 //! is durable, and recovery to the last committed record. [`store`] is the granted directory holding the log and the
-//! engine that indexes it: a landing, and recovery of the rows from the log.
+//! engine that indexes it: a landing, and recovery of the rows from the log. [`staging`] holds changes in flight by
+//! identity; [`owner`] is the thread a node keeps its store on, and the handle its shards reach it by.
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod log;
+pub mod owner;
 pub mod staging;
 pub mod store;
+pub mod texts;

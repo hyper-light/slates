@@ -1468,7 +1468,6 @@ dependencies = [
  "serde_json",
  "slates-anchor",
  "slates-archive",
- "slates-base",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-oci",
@@ -1477,11 +1476,13 @@ dependencies = [
  "slates-client",
  "slates-db",
  "slates-ipc",
+ "slates-land",
  "slates-machine",
  "slates-mem",
  "slates-merge",
  "slates-rt",
  "slates-server",
+ "slates-store",
  "slates-transport",
  "slates-vfs",
  "slates-wire",
@@ -1503,19 +1504,12 @@ dependencies = [
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
- "aws-lc-rs",
  "blake3",
  "libc",
- "proptest",
- "rcgen",
  "rustix",
- "rustls",
  "slates-bridge-oci",
  "slates-machine",
  "slates-mem",
- "slates-rt",
- "slates-test-seeds",
- "slates-transport",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]
@@ -1730,6 +1724,7 @@ dependencies = [
  "sha1-checked",
  "slates-http",
  "slates-merge",
+ "slates-pace",
  "slates-test-seeds",
  "slates-vcs",
 ]
@@ -1871,8 +1866,13 @@ dependencies = [
  "proptest",
  "shuttle",
  "slates-merge",
+ "slates-pace",
  "slates-test-seeds",
 ]
+
+[[package]]
+name = "slates-pace"
+version = "0.1.0"
 
 [[package]]
 name = "slates-rt"
@@ -1920,6 +1920,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "hyper-block",
  "hyper-datagram",
  "hyper-seal",
  "libc",
@@ -1950,9 +1951,11 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-merge",
+ "slates-pace",
  "slates-rt",
  "slates-seal",
  "slates-ssh",
+ "slates-store",
  "slates-svn",
  "slates-test-seeds",
  "slates-transport",
@@ -1979,7 +1982,10 @@ dependencies = [
  "hyper-block",
  "mantle-crc",
  "mantle-engine",
+ "slates-hg",
  "slates-land",
+ "slates-machine",
+ "slates-rt",
 ]
 
 [[package]]

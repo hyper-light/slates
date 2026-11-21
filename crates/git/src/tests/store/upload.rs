@@ -623,6 +623,72 @@ fn a_parts_wanted_entries_are_marked_over_units_and_read_over_words() {
   repository.release(&mut store).unwrap();
 }
 
+/// A-745 item 4 (module docs, **Slices**: a window's worth of the answer's handles read a unit). Do: push one version
+/// of twelve windows' worth of files, encode it, and answer every third file one by one, a set kept as a bit table
+/// whose runs are four windows' worth; stream it a unit a turn. Expect: read back, exactly the files answered; no unit
+/// of reading the answer read more than a window's worth of its kept units, where the reader had made every run of the
+/// set again each unit (a deepen's plan of 32,000 scattered runs, all 32,000 made each window).
+#[test]
+fn a745_reading_a_scattered_answer_reads_a_window_a_unit_never_the_whole_set() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  // Shape: one unit reads a window's worth of handles, eight bytes each (`store::upload`'s `handles`); every third of
+  // twelve windows' worth of files makes four windows' worth of runs, more than one unit reads.
+  let handles = WINDOW / size_of::<u64>();
+  let (repository, files) = files_in_one_version(format, &mut store, handles * 12);
+  let mut by_position: Vec<(u64, ObjectId)> = files
+    .iter()
+    .map(|file| {
+      (
+        repository.object(&store, &file.id).unwrap().position,
+        file.id,
+      )
+    })
+    .collect();
+  by_position.sort_unstable();
+  let wanted: BTreeSet<ObjectId> = by_position.iter().step_by(3).map(|(_, id)| *id).collect();
+  let positions = positions_of(&repository, &store, &wanted);
+  assert!(positions.runs() >= handles * 4, "{} runs", positions.runs());
+  let answer = Answer::objects(&positions);
+  let (pack, counters) = streamed(&repository, &store, answer, 0);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert!(
+    counters.objects_read_most <= u64::try_from(handles).unwrap(),
+    "{counters:?}"
+  );
+  repository.release(&mut store).unwrap();
+}
+
+/// A-745 (found by use: `git fetch --deepen 100` of git v2.0.0 held a poll of the HTTP edge past a second of CPU, five
+/// times a fetch, 365 ms and 1.1 s, the watchdog killing the daemon once, each in a unit marking a part's wanted
+/// entries; module docs, **Slices**). Do: push one version of twelve windows' worth of files, encode it, and answer
+/// every other file one by one, its part read entry by entry; stream it a unit a turn. Expect: read back, exactly the
+/// files answered; no unit of marking read more than a window's worth of the part's entries in position order, where
+/// it had searched the whole order afresh for each of a window's worth of positions (about 11 reads each here).
+#[test]
+fn a745_marking_a_parts_wanted_entries_reads_a_window_a_unit() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let handles = WINDOW / size_of::<u64>();
+  let (repository, files) = files_in_one_version(format, &mut store, handles * 12);
+  let wanted: BTreeSet<ObjectId> = files.iter().step_by(2).map(|file| file.id).collect();
+  let answer = Answer::objects(&positions_of(&repository, &store, &wanted));
+  let (pack, counters) = streamed(&repository, &store, answer, 0);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert_eq!(counters.parts_by_entry, 1, "{counters:?}");
+  assert!(
+    counters.marks_read_most > 0 && counters.marks_read_most <= u64::try_from(handles).unwrap(),
+    "{counters:?}"
+  );
+  repository.release(&mut store).unwrap();
+}
+
 /// A ref whose history a client holds at version 0, then rewritten twice: version 1 a new root over a file `p`,
 /// version 2 that file edited (a reference delta against version 1's in its fragment), version 3 a new root again
 /// keeping version 2's file and adding `q`, so version 1's file is in neither the client's history nor the wanted one.
@@ -973,7 +1039,7 @@ proptest! {
   #[test]
   fn every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..20), bases in proptest::collection::vec(any::<bool>(), 3), caps in proptest::collection::vec((any::<bool>(), any::<bool>(), 0u8..5, 0u8..3), 1..8)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
+    let mut real = Real::new(format);
     let mut model = Model::new(format);
     let half = ops.len() / 2;
     for (at, op) in ops.iter().enumerate() {

@@ -2081,8 +2081,8 @@ fn take_for_slice(slot: &mut crate::state::VolumeSlot, granted: &mut GrantedRun)
 }
 
 /// Takes an overlay's directory host from its volume's slot for the landing's writer, which is built inside it (one host
-/// per volume): `None` when the slot holds none, or holds an S3 base's host, which stays in the slot, since a landing
-/// writes a host directory and never an S3 base (§4.15 "An S3 base", A-555).
+/// per volume): `None` when the slot holds none, or holds a tree host (A-774), which stays in the slot, since a landing
+/// writes a host directory.
 fn take_disk_host(slot: &mut crate::state::VolumeSlot) -> Option<OsHost> {
   match slot.host.take()?.into_disk() {
     Ok(host) => Some(host),
@@ -3291,9 +3291,6 @@ fn answer_of(error: HostError) -> HostAnswer {
       slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
       slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },
-    // A landing writes a directory host, which never answers a pending fetch (an S3 base's, A-524); were one to, it is
-    // a refusal no errno names.
-    HostError::Pending(_) => HostAnswer::Errno { errno: 0 },
   }
 }
 
@@ -4549,7 +4546,7 @@ mod tests {
         "another attempt"
       );
       take_target_lease(state, target(3), 11, LONG_TERM_NS, deadline).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 2);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 2);
       release_target_lease(state, &target(2), 11).unwrap();
       assert_eq!(
         take_target_lease(state, target(2), 12, LONG_TERM_NS, deadline),
@@ -4561,7 +4558,7 @@ mod tests {
       assert!(c.generation > a.generation, "{c:?} after {a:?}");
       release_target_lease(state, &target(2), 12).unwrap();
       release_target_lease(state, &target(3), 11).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 0);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 0);
     });
   }
 
@@ -4761,10 +4758,10 @@ mod tests {
       if stalled {
         assert!(held < TARGETS, "the stall outlasted no term: {held} held");
       }
-      assert_eq!(crate::verbs::shard_report(state).target_leases, held);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, held);
       pause_past_a_short_term();
       take_target_lease(state, target(TARGETS), TARGETS, LONG_TERM_NS, deadline).unwrap();
-      assert_eq!(crate::verbs::shard_report(state).target_leases, 1);
+      assert_eq!(crate::verbs::shard_report(state, false).target_leases, 1);
     });
   }
 

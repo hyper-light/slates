@@ -159,6 +159,11 @@ pub struct Push {
   format: ObjectFormat,
   quarantine: Quarantine,
   commits: BTreeMap<ObjectId, Arrived>,
+  /// The parents the held commits name, all together: what their rows' parts take beside their count
+  /// ([`Push::commit_parts`], `Repository::stage_room`), kept as each commit arrives so no step of a push's decision
+  /// counts them again (it did, every step: git/git's whole history, about 75,000 commits, decided at about 0.5 ms a
+  /// step, its 1,027 refs unanswered after 1,200 s; w-git, 2026-11-21).
+  parents_held: usize,
   sealed: bool,
   /// The deepest delta chain the push's source carried.
   deepest: u64,
@@ -188,6 +193,7 @@ impl Push {
       format,
       quarantine: Quarantine::new(),
       commits: BTreeMap::new(),
+      parents_held: 0,
       sealed: false,
       deepest: 0,
       staged: None,
@@ -401,12 +407,13 @@ impl Push {
     let commit = Commit::parse(content, &mut Admission::new(room)).map_err(|_| bad())?;
     let tree = commit.tree(self.format).ok_or_else(bad)?;
     let parents: Vec<ObjectId> = commit.parents(self.format).collect();
+    let named = parents.len();
     let date = commit
       .committer()
       .and_then(|line| Ident::parse(line).ok())
       .map(|ident| ident.seconds)
       .ok_or_else(bad)?;
-    self.commits.insert(
+    let replaced = self.commits.insert(
       id,
       Arrived {
         tree,
@@ -415,6 +422,8 @@ impl Push {
         generation: 0,
       },
     );
+    let gone = replaced.map_or(0, |replaced| replaced.parents.len());
+    self.parents_held = self.parents_held.saturating_sub(gone).saturating_add(named);
     Ok(())
   }
 
@@ -464,6 +473,11 @@ impl Push {
   /// The commits held, with what was read of each.
   pub(crate) fn commits(&self) -> &BTreeMap<ObjectId, Arrived> {
     &self.commits
+  }
+
+  /// The commits held and the parents they name, all together: what their rows' parts take.
+  pub(crate) fn commit_parts(&self) -> (usize, usize) {
+    (self.commits.len(), self.parents_held)
   }
 
   /// Seals the push with every commit's generation number.
@@ -545,7 +559,7 @@ impl Push {
   }
 
   /// The pack as the staging put it in the content store, held by the push: its identity and length.
-  pub(crate) fn stored_pack(&self) -> Option<(ContentId, u64)> {
+  pub fn stored_pack(&self) -> Option<(ContentId, u64)> {
     self.stored_pack
   }
 
@@ -559,6 +573,7 @@ impl Push {
   /// whatever its objects' count, and each object held whole.
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.commits.clear();
+    self.parents_held = 0;
     let placed = self.release_placed(store);
     self.quarantine.abandon(store).and(placed)
   }

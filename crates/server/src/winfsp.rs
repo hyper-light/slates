@@ -83,7 +83,6 @@ use slates_mem::SparseObject;
 use slates_mem::slab::Slab;
 use slates_rt::futures;
 use slates_vfs::clock::Clock;
-use slates_vfs::host::HostFs;
 use slates_vfs::ids::{InodeNo, RefOwner};
 
 use crate::state::{self, ShardState};

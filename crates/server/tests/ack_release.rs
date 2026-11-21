@@ -549,7 +549,10 @@ fn a_grants_listing_whose_part_cannot_be_sent_is_refused_overloaded() {
 fn a_daemon_status_whose_part_cannot_be_sent_is_refused_overloaded() {
   check_typed_refusal(
     "status",
-    scattered_with_the_other_shard_full("status-full", &RequestBody::DaemonStatus),
+    scattered_with_the_other_shard_full(
+      "status-full",
+      &RequestBody::DaemonStatus { memory: false },
+    ),
   );
 }
 
@@ -575,7 +578,7 @@ fn a_status_on_a_starved_shard_is_refused_overloaded_on_time() {
   STARVING.store(true, Ordering::Release);
   let caller = std::thread::spawn(move || {
     let started = Instant::now();
-    let (_, reply) = client.call(&RequestBody::DaemonStatus);
+    let (_, reply) = client.call(&RequestBody::DaemonStatus { memory: false });
     let took = started.elapsed();
     STARVING.store(false, Ordering::Release);
     (reply, took)

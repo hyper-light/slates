@@ -59,6 +59,9 @@ pub enum Exporting {
   Wrote(Revision),
   /// The range is written; nothing was appended.
   Done,
+  /// A text's piece the source reads asynchronously is waited for (C2 stage B part 2; [`TextSource::fetchable`]):
+  /// nothing was appended, and the caller fetches the piece and calls again, which reads on from where it waited.
+  Waiting(crate::reads::Wanted),
 }
 
 /// An export of a range of a repository's revisions (the module documentation).
@@ -114,6 +117,9 @@ struct Loaded {
   held: Vec<(ContentIdentity, Vec<u8>)>,
   /// The text being read, and where its reading stands.
   reading: Option<(ContentIdentity, TextReading)>,
+  /// The piece of the text being read that its source reads asynchronously, waited for (C2 stage B part 2): the call's
+  /// answer ([`Exporting::Waiting`]).
+  waiting: Option<crate::reads::Wanted>,
 }
 
 /// A delta's svndiff length being measured a window a call, no window kept: its texts, where the deltifier stands, and
@@ -224,7 +230,13 @@ impl Exporter {
         self.refused = Some(refusal.clone());
         Err(refusal)
       }
-      Ok(false) => Ok(Exporting::Wrote(revision)),
+      Ok(false) => {
+        let waiting = self
+          .drive
+          .as_mut()
+          .and_then(|pending| pending.texts.waiting.take());
+        Ok(waiting.map_or(Exporting::Wrote(revision), Exporting::Waiting))
+      }
       Ok(true) => {
         self.drive = None;
         self.next = if revision < self.last {
@@ -866,9 +878,18 @@ fn load(
     texts.reading = Some((missing.identity, TextReading::new()));
   }
   let (identity, reading) = texts.reading.as_mut().ok_or(MigrationRefusal::Corrupt)?;
-  let whole = repository
-    .read_step(identity, reading)
-    .ok_or(MigrationRefusal::Corrupt)?;
+  let Some(whole) = repository.read_step(identity, reading) else {
+    let offset = reading.read();
+    if !repository.fetchable(identity, offset) {
+      return Err(MigrationRefusal::Corrupt);
+    }
+    // The reading keeps what it read; the step after the fetch reads on from it.
+    texts.waiting = Some(crate::reads::Wanted {
+      text: *identity,
+      offset,
+    });
+    return Ok(false);
+  };
   if whole {
     let (identity, reading) = texts.reading.take().ok_or(MigrationRefusal::Corrupt)?;
     texts.held.push((identity, reading.into_bytes()));

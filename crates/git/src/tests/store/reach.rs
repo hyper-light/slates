@@ -18,8 +18,8 @@ use crate::store::{Positions, ReachRefused, ReachSets, Repository, Sets};
 
 use super::oracle::{GREENS, Model, Real, apply, op};
 use super::{
-  BUDGET, Made, Ticks, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store,
-  tree, wide,
+  BUDGET, Made, WINDOW, blob, commit, ids, line_and_branch, push_and_move, sorted, store, tree,
+  wide,
 };
 
 /// A read's answer as the tests take it.
@@ -94,7 +94,10 @@ fn keep_new(real: &mut Real, kept: &mut Derivations, ty: &ReachSets, before: &[u
     if real.repository.versions(green) == before[usize::try_from(green).unwrap()] {
       continue;
     }
-    let (version, root) = real.repository.reach_value(&mut real.store, green).unwrap();
+    // A version admitted with no walk has no value to keep as it commits (A-614 amended): its first reader derives it.
+    let Some((version, root)) = real.repository.reach_value(&mut real.store, green).unwrap() else {
+      continue;
+    };
     let answer = kept.keep(
       &mut real.store,
       ty,
@@ -124,8 +127,12 @@ fn check(real: &mut Real, derived: &mut Derivations, kept: &Derivations, ty: &mu
         Ok(sets.reached),
         real.repository.reached(&real.store, green, at)
       );
+      // A version admitted with no walk keeps no value as it commits (A-614 amended); one that did keeps this one.
       let kept = kept.value(&real.store, ty, &real.repository, version);
-      assert_eq!(kept, Ok(Some(root)), "the store's value is the derived one");
+      assert!(
+        kept == Ok(None) || kept == Ok(Some(root)),
+        "the store's value is the derived one: {kept:?}"
+      );
     }
   }
 }
@@ -154,27 +161,31 @@ proptest! {
   /// both object formats); after each step keep the moved green's newest value from the store's own sets, and read every
   /// version's value through the type. Expect: every derived value is the store's D(k), and at the newest version its
   /// reached set, and is the value the store kept, identity for identity; each step derives exactly the versions it made
-  /// (the non-vacuity counter: every earlier value is reused, never derived again), and a version's derivation walks
-  /// exactly what its admission walked, so it stops where the admission stopped (at its parent's set, and at the set it
-  /// was remade from); a fill from nothing reaches the same newest values; and once all is released the store is empty.
+  /// (the non-vacuity counter: every earlier value is reused, never derived again), and a version walked at its
+  /// admission (a fast-forward over sets known) is derived walking exactly what its admission walked, so it stops where
+  /// the admission stopped, at its parent's set (one admitted with no walk, A-614 amended, its first reader derived
+  /// beyond whatever known commit it searched back to, so the type's walk from its recorded parents is no measure of
+  /// it); a fill from nothing reaches the same newest values; and once all is released the store is empty.
   #[test]
   fn t_a647_every_versions_d_k_is_its_derived_value(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..24)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
+    let mut real = Real::new(format);
     let mut model = Model::new(format);
     let mut ty = ReachSets::declare(WINDOW, Mode::Eager);
     let (mut kept, mut derived) = (Derivations::new(), Derivations::new());
     for op in &ops {
       let before = versions(&real.repository);
       let admitting = walks(&real.repository);
+      let deferring = real.repository.counters().deferred;
       apply(&mut real, &mut model, op);
       let admitted = walks(&real.repository).since(admitting);
+      let unwalked = real.repository.counters().deferred - deferring;
       keep_new(&mut real, &mut kept, &ty, &before);
       let (counted, deriving) = (derived.counters().derived, walks(&real.repository));
       check(&mut real, &mut derived, &kept, &mut ty);
       let made: usize = versions(&real.repository).iter().sum::<usize>() - before.iter().sum::<usize>();
       prop_assert_eq!(derived.counters().derived - counted, made as u64);
-      if made == 1 {
+      if made == 1 && unwalked == 0 {
         prop_assert_eq!(walks(&real.repository).since(deriving), admitted);
       }
     }
@@ -211,10 +222,11 @@ fn rewritten() -> (ContentStore, Repository) {
   (store, repository)
 }
 
-/// A-647 part 2. Do: A-614's rewrite scenario, then a lazy read of the rewrite's value. Expect: the history names each
-/// fast-forward's parent the version before it, no parent for a create with no base, and for the rewrite ref 1's
-/// version 2 and ref 2's version 0, the version its set was remade from; the read derives all five versions from
-/// nothing; and the value is the store's own sets.
+/// A-647 part 2, A-614 amended (main's ruling (A) of 2026-11-21: a rewrite is admitted with no walk, so no base is
+/// searched for at its admission). Do: A-614's rewrite scenario, then a lazy read of the rewrite's value. Expect: the
+/// history names each fast-forward's parent the version before it, no parent for a create with no base, and for the
+/// rewrite ref 1's version 2 alone; the read derives ref 1's four versions from nothing; and the value is the store's
+/// own sets, which its first reader derived from ref 2's set, the nearest known commit back from the new head.
 #[test]
 fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
   let (mut store, repository) = rewritten();
@@ -222,12 +234,12 @@ fn t_a647_a_rewrite_is_derived_from_its_previous_version_and_its_sets_base() {
   assert_eq!(parents((1, 0)), Some(Vec::new()));
   assert_eq!(parents((1, 2)), Some(vec![(1, 1)]));
   assert_eq!(parents((2, 0)), Some(Vec::new()));
-  assert_eq!(parents((1, 3)), Some(vec![(1, 2), (2, 0)]));
+  assert_eq!(parents((1, 3)), Some(vec![(1, 2)]));
   assert_eq!(parents((1, 4)), None);
   let mut ty = ReachSets::declare(WINDOW, Mode::Lazy);
   let mut values = Derivations::new();
   let root = read_to_end(&mut values, &mut ty, &repository, &mut store, (1, 3)).unwrap();
-  assert_eq!(values.counters().derived, 5);
+  assert_eq!(values.counters().derived, 4);
   let sets = Sets::read(&store, &root).unwrap();
   let store_sets = (
     repository.brought(&store, 1, 3),

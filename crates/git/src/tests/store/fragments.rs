@@ -150,6 +150,7 @@ fn a_chain_carried_by_a_push_of_no_object_teaches_the_depth() {
     repository
       .commit(&mut store, &mut push, &[admitted])
       .unwrap();
+    super::derive_all(&repository, &mut store);
     assert_eq!(repository.learned_depth(), learned);
   }
 }
@@ -332,6 +333,7 @@ fn similar_files_in_one_version_are_offset_deltas_within_the_learned_depth() {
   repository.seal(&store, &mut push).unwrap();
   let moved = repository.admit(&store, &push, 1, Some(head.id)).unwrap();
   repository.commit(&mut store, &mut push, &[moved]).unwrap();
+  super::derive_all(&repository, &mut store);
   repository
     .encode_fragments(&mut store, (1, 0), &mut Ticks(0), EXCHANGE)
     .unwrap();

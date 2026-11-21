@@ -57,7 +57,7 @@ mod tests;
 pub use export::{Exporter, Exporting};
 pub use import::{Importer, Importing};
 pub use records::{
-  Before, Checked, DeltaWriter, Deltifiable, Properties, Repository, Room, TextReading, TextSource,
+  Before, Checked, Properties, Repository, RevisionReplay, Room, TextReading, TextSource,
   WithTexts, before,
 };
 

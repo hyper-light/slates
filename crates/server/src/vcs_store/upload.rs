@@ -108,8 +108,12 @@ impl StoreLender for ShardStores {
 
   /// A-718: every version of repository `id` encoded as its fragments and kept, a turn at a time, before a fetch's answer
   /// is made, so the answer copies them rather than searching its objects for deltas ([`super::git_encode`]); waited for
-  /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it.
+  /// at most one liveness window, past which the answer begins and a task finishes the encoding behind it. First (A-614
+  /// amended), every version admitted with no walk has its sets derived, a turn at a time ([`super::git_derive`]), waited
+  /// for whole: the answer is made from them.
   async fn encode(&mut self, id: RepositoryId) {
+    // A-614 amended: the sets of versions admitted with no walk derived first, which the answer and the encoding read.
+    super::git_derive::derive_for_read(id).await;
     super::git_encode::encode_for_fetch(id).await;
   }
 }
@@ -135,6 +139,8 @@ pub(crate) fn lend_on<R>(
     state
       .vcs_usage
       .stepped(&id, Work::Fetch, (now.saturating_sub(began), 0), now);
+    // The step's lookups over the store's own index, reported to its merge rule (`super::index_upkeep`).
+    super::index_upkeep::looked_up(state, id, now.saturating_sub(began));
   }
   lent
 }

@@ -422,6 +422,9 @@ pub enum BaseRecord {
     /// The snapshot imaged.
     snapshot: SnapshotId,
   },
+  /// Removed (2026-11-20, Ada: the S3 base was never asked for). Tag 3 was `S3`, an overlay's base read from an S3
+  /// base's objects; the tag stays reserved, never reused, and no daemon of this build records it.
+  RemovedS3,
 }
 
 /// The volume state machine (§4.4).

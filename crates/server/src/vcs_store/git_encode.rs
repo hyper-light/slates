@@ -10,8 +10,10 @@
 //!
 //! **What it does.** Before a fetch's answer is made, the request drives [`turn`] until it answers [`Turned::Idle`]
 //! (or its wait ends, "A bounded wait" below): each turn takes the repository's first version whose fragments are not kept (`Repository::first_unencoded`, by green
-//! and then version), begins its encoding if none is under way, and advances it one turn (`Encoding::advance`): units of
-//! work until the shard's quantum (§4.3's step budget) is spent on the shard's clock, at least one, lent every byte the
+//! and then version), begins its encoding if none is under way, and advances it one turn (`Encoding::advance`, paced
+//! by A-783: to the quantum while someone waits on the shard, on to its ceiling while no one does): units of work, each
+//! sized by its measured cost within the shard's quantum (§4.3's step budget; A-718, main's ruling of 2026-11-21 07:30),
+//! at least one, lent every byte the
 //! shard could admit now, then the arena grown by what the turn kept and the charge trued up, as the map's every step is
 //! (`super::lend`, `super::settle`). The request yields between turns. A version is encoded once; every fetch after it
 //! copies its fragments. So the first fetch after a push pays the search once, and the result is kept with the objects
@@ -70,6 +72,14 @@ const FETCH_WAIT_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// that alone took longer than its turn's quantum, the step budget (A-718: a turn may overrun its quantum by its last
 /// unit, and no unit may outgrow the quantum). Format: a counter name.
 pub(crate) const UNITS_PAST_BUDGET: &str = "vcs_store.git_encode.units_past_budget";
+/// Counters: [`UNITS_PAST_BUDGET`] by the stage the unit was in (`slates_git::store::EncodingCounters`'s order: the
+/// walk, the gather, the encoding, the keeping), so the unit to split is named. Format: counter names.
+pub(crate) const UNITS_PAST_BUDGET_BY_STAGE: [&str; 4] = [
+  "vcs_store.git_encode.units_past_budget.walk",
+  "vcs_store.git_encode.units_past_budget.gather",
+  "vcs_store.git_encode.units_past_budget.encode",
+  "vcs_store.git_encode.units_past_budget.keep",
+];
 /// Counter: an encoding refused, its version left unencoded. Format: a counter name.
 pub(crate) const REFUSED: &str = "vcs_store.git_encode.refused";
 
@@ -98,6 +108,11 @@ pub(crate) enum Turned {
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
+  // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
+  if super::git_derive::turn(state, id) == super::git_derive::Turned::More {
+    return Turned::More;
+  }
   let began = slates_rt::futures::now_ns();
   let (turned, kept) = turn_uncounted(state, id);
   // A-724 piece 4: the turn's time and, once a version's fragments are kept, their bytes, on the repository's usage row,
@@ -159,22 +174,46 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
+  let mut past_by_stage = [0_u64; 4];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
       let before = encoding.counters().units_past_quantum;
-      let advanced = encoding.advance(
-        &mut store.repository,
-        content,
-        Turn {
-          clock,
-          exchange,
-          quantum_ns,
-        },
-      );
+      let before_by_stage = encoding.counters().units_past_quantum_by_stage;
+      // A-783: advances of a quantum each, to the quantum while someone waits on the shard, on to its ceiling while
+      // no one does, so units sized within the quantum (A-718) are not each a turn of their own.
+      let mut costs = super::TurnCosts::ZERO;
+      let mut paced = super::paced_turn(quantum_ns, slates_rt::futures::now_ns());
+      let advanced = loop {
+        if !paced.more(super::ANSWER_STEP, &mut costs) {
+          break Ok(Progress::More);
+        }
+        match encoding.advance(
+          &mut store.repository,
+          content,
+          Turn {
+            clock: &mut *clock,
+            exchange,
+            quantum_ns,
+          },
+        ) {
+          Ok(Progress::More) => {}
+          other => break other,
+        }
+      };
+      paced.close(slates_rt::futures::now_ns(), &mut costs);
       past = encoding
         .counters()
         .units_past_quantum
         .saturating_sub(before);
+      for ((now, was), into) in encoding
+        .counters()
+        .units_past_quantum_by_stage
+        .iter()
+        .zip(before_by_stage)
+        .zip(&mut past_by_stage)
+      {
+        *into = now.saturating_sub(was);
+      }
       advanced
     });
   let turned = match advanced {
@@ -196,6 +235,9 @@ fn turn_lent(
   }
   if past > 0 {
     state.count(UNITS_PAST_BUDGET, past);
+    for (name, by) in UNITS_PAST_BUDGET_BY_STAGE.iter().zip(past_by_stage) {
+      state.count(name, by);
+    }
   }
   state.count(TURNS, 1);
   super::settle(state);

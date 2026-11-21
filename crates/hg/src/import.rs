@@ -90,6 +90,7 @@ use crate::revlog::{self, Entry, NONE, Outline, Slices, Source};
 use crate::store::{self, FncacheRefused, Layout, Listing, RequiresRefused, Shape};
 use crate::{Admission, NULL_NODE, Node, PastAdmission};
 
+pub mod emit;
 pub mod record;
 
 /// Format: the requirements file's name, under `.hg` and under `.hg/store`.
@@ -208,7 +209,7 @@ const DECIMAL_RADIX: u32 = 10;
 pub enum FileRefused<R> {
   /// The file is longer than the room the import has left: refused before a byte of it was held.
   PastAdmission(PastAdmission),
-  /// The host's own refusal (§4.15's `HostError`: a fetch still pending on an S3 base, the host unavailable).
+  /// The host's own refusal (§4.15's `HostError`: the host unavailable, among others).
   Host(R),
 }
 
@@ -275,6 +276,8 @@ pub enum ImportRefused<R> {
   PastAdmission(PastAdmission),
   /// The requirements refused.
   Requirements(RequiresRefused),
+  /// A revision the import's changegroup could not carry ([`emit`]).
+  Unemitted(emit::EmitRefused),
   /// A file the repository names that is not there: the store's requirements under `share-safe`, the index file of a
   /// revlog the listing names, or a file a file index's docket names. Its path under `.hg`, as the host was asked.
   Missing {
@@ -574,6 +577,8 @@ pub struct Import {
   turns: u64,
   /// Units of work done.
   units: u64,
+  /// The history written as a changegroup a segment at a time, where the caller asked for it ([`Import::emitting`]).
+  emitter: Option<emit::Emitter>,
 }
 
 /// A clock that stands still, so a turn of it ends only with its work: [`import`]'s.
@@ -640,7 +645,26 @@ impl Import {
       stage: Stage::Open(Which::Changelog),
       turns: 0,
       units: 0,
+      emitter: None,
     })
+  }
+
+  /// The import, writing its history as the changegroup a push of it would bring, cut in segments of at least `bound`
+  /// bytes ([`emit`]): what the caller lands on the node's changeset store as each is cut ([`Import::take_segment`]).
+  pub fn emitting(mut self, bound: usize) -> Self {
+    self.emitter = Some(emit::Emitter::new(bound));
+    self
+  }
+
+  /// The next segment of the history's changegroup cut and not yet taken ([`Import::emitting`]); none while the
+  /// segment being written is short of its bound, and none for an import that writes none.
+  pub fn take_segment(&mut self) -> Option<emit::Segment> {
+    self.emitter.as_mut()?.take()
+  }
+
+  /// The changegroup's bytes written in all ([`Import::emitting`]).
+  pub fn emitted(&self) -> u64 {
+    self.emitter.as_ref().map_or(0, emit::Emitter::written)
   }
 
   /// One turn: units of work until `turn`'s quantum is spent on its clock, at least one; `Done` once the store is
@@ -669,6 +693,12 @@ impl Import {
   /// listing, and while a log is read, what opening its revlog took and the text it keeps for the next revision. Its
   /// owner charges its shard this, trued up after each turn, since the room itself is only a bound.
   pub fn holding(&self) -> u64 {
+    let emitting = self.emitter.as_ref().map_or(0, emit::Emitter::holding);
+    emitting.saturating_add(self.held())
+  }
+
+  /// [`Import::holding`] apart from the stream's segments.
+  fn held(&self) -> u64 {
     match &self.stage {
       Stage::Log(log) => {
         let cached = log
@@ -750,6 +780,9 @@ impl Import {
     };
     let mut room = self.room;
     let (outline, bytes) = open_revlog(files, self.shape, &radix, listed, &mut room)?;
+    if let Some(emitter) = self.emitter.as_mut() {
+      emitter.log_opened();
+    }
     Ok(Stage::Log(Box::new(LogInProgress {
       which,
       radix,
@@ -782,6 +815,13 @@ impl Import {
   /// A log read whole: its count kept, a named file's log held to hold a revision, and the next stage.
   fn finish_log<R>(&mut self, log: &LogInProgress) -> Result<Stage, ImportRefused<R>> {
     let revisions = log.outline.len();
+    if let Some(emitter) = self.emitter.as_mut() {
+      emitter.group_ended(match log.which {
+        Which::Changelog => Log::Changelog,
+        Which::Manifest => Log::Manifest,
+        Which::File(_) => Log::File(&[]),
+      });
+    }
     Ok(match log.which {
       Which::Changelog => {
         self.imported.changesets = revisions;
@@ -863,6 +903,16 @@ impl Import {
       self.name(path)?;
     }
     let (p1, p2) = parents(files, &reading, &entry, &mut room)?;
+    if let Some(emitter) = self.emitter.as_mut() {
+      let read = (Log::Changelog, rev, entry.node, (p1, p2), entry.node);
+      emit_revision(
+        emitter,
+        files,
+        &reading,
+        (read, &entry, &text),
+        &mut log.room,
+      )?;
+    }
     let mut held = Held::default();
     let index = &mut self.imported.index;
     let outcome = held.put(store, &text).and_then(|text_id| {
@@ -881,6 +931,7 @@ impl Import {
     });
     held.give_back(store, outcome)?;
     log.cached = Some((rev, text));
+    self.cut_when_due(store, false)?;
     Ok(())
   }
 
@@ -920,6 +971,16 @@ impl Import {
         link: entry.link,
       })?;
     let (p1, p2) = parents(files, &reading, &entry, &mut room)?;
+    if let Some(emitter) = self.emitter.as_mut() {
+      let read = (reading.log, rev, entry.node, (p1, p2), link);
+      emit_revision(
+        emitter,
+        files,
+        &reading,
+        (read, &entry, &text),
+        &mut log.room,
+      )?;
+    }
     let (bytes, block) = match reading.log {
       Log::File(_) => {
         let split = filerev::split(&text).map_err(|refusal| ImportRefused::FileRevision {
@@ -948,6 +1009,7 @@ impl Import {
     });
     held.give_back(store, outcome)?;
     log.cached = Some((rev, text));
+    self.cut_when_due(store, false)?;
     Ok(())
   }
 
@@ -978,6 +1040,33 @@ impl Import {
     self.phase_roots(files, store)?;
     self.bookmarks(files, store)?;
     self.imported.markers = self.markers(files, store)?;
+    if let Some(emitter) = self.emitter.as_mut() {
+      emitter.finished();
+    }
+    self.cut_when_due(store, true)
+  }
+
+  /// Cuts the changegroup's segment being written ([`emit`]) once it reaches its bound, or at the stream's end
+  /// (`last`), with its record: the index rows of the revisions whose deltas it holds, by identity, and the markers in
+  /// the last.
+  fn cut_when_due<R>(&mut self, store: &ContentStore, last: bool) -> Result<(), ImportRefused<R>> {
+    let Some(emitter) = self.emitter.as_mut() else {
+      return Ok(());
+    };
+    if !last && !emitter.due() {
+      return Ok(());
+    }
+    let index = &self.imported.index;
+    let refused = |refused| ImportRefused::Unemitted(emit::EmitRefused::Record(refused));
+    let mut writer =
+      record::Writer::begin_segment(&emitter.ranges(), self.initial, last).map_err(refused)?;
+    while writer.step(index, store).map_err(refused)? {}
+    let written = writer
+      .finish()
+      .ok_or(ImportRefused::Unemitted(emit::EmitRefused::Record(
+        record::WriteRefused::Allocation,
+      )))?;
+    emitter.cut(written);
     Ok(())
   }
 
@@ -1220,6 +1309,40 @@ fn holds<F: RepositoryFiles>(
 /// its node; then its text rebuilt and held to its node by the reader, from the text rebuilt before it where its chain
 /// passes through that one (7.2's revision cache, counted in `cache_hits`), the cached text charged to `room` beside the
 /// rebuild.
+/// A revision the walk read, as [`emit_revision`] writes it: its log, number, node, parents and link.
+type EmittedRevision<'l> = (Log<'l>, u32, Node, (Node, Node), Node);
+
+/// Writes one revision the walk read into the import's changegroup ([`emit`]): its log, number, node, parents and
+/// link (`read`), its revlog's chunk read and its delta's parent named, its text as rebuilt; what is kept charged to the
+/// log's `room`.
+fn emit_revision<F: RepositoryFiles>(
+  emitter: &mut emit::Emitter,
+  files: &mut F,
+  reading: &Reading<'_>,
+  ((log, rev, node, parents, link), entry, text): (EmittedRevision<'_>, &Entry, &[u8]),
+  room: &mut Admission,
+) -> Result<(), ImportRefused<F::Refused>> {
+  let mut scratch = *room;
+  let chunk = reading
+    .outline
+    .chunk(&mut Reader::new(files, reading.bytes), rev, &mut scratch)
+    .map_err(|refused| read_refused(reading.radix, refused))?;
+  let read = emit::Read {
+    log,
+    rev,
+    node,
+    parents,
+    link,
+    flags: entry.flags,
+    delta_parent: reading.outline.delta_parent(rev, entry),
+    chunk: &chunk,
+    text,
+  };
+  emitter
+    .revision(&read, room)
+    .map_err(ImportRefused::Unemitted)
+}
+
 fn rebuild<F: RepositoryFiles>(
   files: &mut F,
   reading: &Reading<'_>,

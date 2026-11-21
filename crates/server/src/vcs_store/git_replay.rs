@@ -60,6 +60,8 @@ pub(crate) struct GitReplay {
   moves: Vec<RecordedMove>,
   /// Where the record's pack begins in its bytes.
   pack_at: usize,
+  /// A version-4 record's pack: its identity and length in the content store, where it is read from.
+  packed: Option<(ContentId, u64)>,
   /// What comes next.
   stage: Stage,
 }
@@ -182,7 +184,8 @@ pub(crate) struct Turn {
 pub(crate) fn stepped(bytes: &[u8], format: ObjectFormat) -> bool {
   !super::owed::is_owed(bytes)
     && !super::lfs_record::is_lfs(bytes)
-    && Record::decode(bytes, format).is_ok_and(|record| !record.pack.is_empty())
+    && Record::decode(bytes, format)
+      .is_ok_and(|record| !record.pack.is_empty() || record.packed.is_some())
 }
 
 impl GitReplay {
@@ -204,13 +207,15 @@ impl GitReplay {
     };
     let mut push = Push::new(format);
     push.carried(record.deepest);
-    // The pack is the record's last field (`Record::decode` refuses trailing bytes), so it ends where the bytes do.
+    // The pack is the record's last field (`Record::decode` refuses trailing bytes), so it ends where the bytes do; a
+    // version-4 record's is read from the store by its identity instead (A-722's record v4).
     let pack_at = bytes.len().saturating_sub(record.pack.len());
     Ok(Box::new(Self {
       push,
       remade: RecordWriter::default(),
       names,
       named,
+      packed: record.packed,
       moves: record.moves,
       pack_at,
       stage: Stage::Reading {
@@ -229,13 +234,20 @@ impl GitReplay {
     bytes: &[u8],
     (turn, now): (Turn, &mut dyn FnMut() -> u64),
   ) -> Result<Stepped, ReplayRefused> {
-    if let Some(identity) = self.named.take()
-      && content.holders(&identity) == 0
-      && let Err(refused) = content.hold(&identity)
-    {
-      return Err(ReplayRefused::Git(GitRefused::Object(
-        PushRefused::Content(refused),
-      )));
+    let held = self
+      .named
+      .take()
+      .into_iter()
+      .chain(self.packed.map(|(identity, _)| identity));
+    for identity in held.collect::<Vec<_>>() {
+      // The region's own hold (this shard its home) is not the record's (`super::replay_push`'s rule).
+      if content.holders(&identity) <= super::homes::region_holds_here(&identity)
+        && let Err(refused) = content.hold(&identity)
+      {
+        return Err(ReplayRefused::Git(GitRefused::Object(
+          PushRefused::Content(refused),
+        )));
+      }
     }
     loop {
       match self.unit((content, store), bytes, turn.chunk) {
@@ -270,9 +282,29 @@ impl GitReplay {
         mut admission,
         read,
       } => {
-        let pack = bytes.get(self.pack_at..).unwrap_or_default();
-        let rest = pack.get(read..).unwrap_or_default();
-        let piece = rest.get(..chunk.max(1)).unwrap_or(rest);
+        // A version-4 record's pack is read a window at a time from the store, where the record names it.
+        let mut stored = None;
+        let piece: &[u8] = match self.packed {
+          Some((identity, len)) => {
+            let offset = u64::try_from(read).unwrap_or(u64::MAX);
+            stored =
+              slates_git::store::packed::PackSource::piece(&*content, &identity, len, offset);
+            match &stored {
+              Some(window) => window.get(..chunk.max(1)).unwrap_or(window),
+              None if offset >= len => &[],
+              None => {
+                return Err(ReplayRefused::Pack(unpack::Refusal::Truncated {
+                  at: offset,
+                }));
+              }
+            }
+          }
+          None => {
+            let pack = bytes.get(self.pack_at..).unwrap_or_default();
+            let rest = pack.get(read..).unwrap_or_default();
+            rest.get(..chunk.max(1)).unwrap_or(rest)
+          }
+        };
         let (took, queue) = {
           let mut site = self.site(content, store);
           let took = reader
@@ -281,10 +313,12 @@ impl GitReplay {
           (took, site.queue)
         };
         self.push.extend_pack(piece.get(..took).unwrap_or_default());
+        let piece_was_empty = piece.is_empty();
+        drop(stored);
         self.admit_queued((content, store), queue, &mut admission)?;
         if reader.is_whole() {
           (Stage::Resolving { reader, admission }, None)
-        } else if piece.is_empty() || took == 0 {
+        } else if piece_was_empty || took == 0 {
           // No more to give it: ended, a pack cut short refused by its end.
           let mut site = self.site(content, store);
           reader

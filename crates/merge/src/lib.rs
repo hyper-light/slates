@@ -31,6 +31,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
+mod byte_places;
 pub mod chain_entry;
 pub mod checkpoint;
 pub mod derive;
@@ -45,6 +46,7 @@ pub mod named;
 pub mod ops_doc;
 pub mod origin;
 pub mod pace;
+mod piece_tree;
 pub mod ptrie;
 pub mod push;
 pub mod range;
@@ -54,6 +56,7 @@ pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
+pub use engine::HeadUnder;
 pub use engine::{
   ComputeRefused, Computed, ConflictWindow, Green, HeadMoved, Increment, Judged, Judgment, Outcome,
   PositionRefused, ReanchorRefused, Reanchored,

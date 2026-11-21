@@ -7,6 +7,13 @@
 //! answer resumes the verb under its own completion key (the `lease_wait` pattern), so no verb awaits and no await
 //! holds a partition's state.
 //!
+//! **A forwarded creation is placed by its name (A-794).** A work made through another node (one that does not hold
+//! the green's replica, so its creation is forwarded to the owner) is made on the partition its name hashes to, as a
+//! create is placed, and its verbs then park here for the green's shard like any client's; the forward's exchange
+//! waits for its parked verb and is answered when the verb resumes ([`attach_forwarded`]). Before, it was made on the
+//! green's own shard: at 100,000 clients over the Linux kernel 76,955 works were made on the primary's one partition,
+//! whose merge budget, the green's chain's too, then refused 60,349 edits, 3,883 rebases and 7,544 accepted submits.
+//!
 //! **Order.** While one verb of a work is parked, every later verb of that work parks behind it, and they resume in
 //! arrival order. So an edit never overtakes a submit pipelined after it, and no edit lands during a submit's verdict.
 //!
@@ -135,6 +142,20 @@ pub(crate) struct SealedWork {
   /// The verdict of `composed` a holder computed on its replica, in its wire form (A-658 part 3a), when the work lives
   /// on a node that holds a replica of a green another node owns (A-697 part c): the owner takes it by position.
   pub(crate) computed: Option<Vec<u8>>,
+  /// A merge check's or resolution's ask (A-796), when the rebase is one: what the green's half does beyond a rebase.
+  pub(crate) merge: Option<MergeAsk>,
+}
+
+/// What a merge check or a resolution asks of the green's half beyond a rebase (A-796).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MergeAsk {
+  /// The head a resolution's check judged: the green's half refuses `StaleMergeView` when its head is another. `None`
+  /// for a check, which judges the head as it is.
+  pub(crate) head: Option<u64>,
+  /// The canonical operations to retire, strictly increasing.
+  pub(crate) discard: Vec<u64>,
+  /// The agent's changes, applied at the head after the kept operations.
+  pub(crate) replacement: Vec<slates_ipc::protocol::WorkChange>,
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
@@ -143,8 +164,8 @@ pub(crate) enum RebaseAnswer {
   Rebased {
     /// The green's head the work is now based on.
     version: u64,
-    /// The files that still differ from the head.
-    changed: BTreeMap<String, Option<Vec<u8>>>,
+    /// The files that still differ from the head, each as its parts over the head (A-806), `None` for a removal.
+    changed: BTreeMap<String, Option<crate::work_files::HeldParts>>,
     /// The operations restated over the head.
     journal: Vec<VolumeOp>,
     /// The base entries at the head of every path the restated journal names, for a work that composes its own
@@ -153,6 +174,16 @@ pub(crate) enum RebaseAnswer {
   },
   /// A conflict or a refusal: the reply, with the work unchanged.
   Reply(ReplyBody),
+  /// A merge check's answer (A-796): the head it judged, the canonical declaration, and the conflicting reply when a
+  /// submit now would conflict (`None` when it would be accepted). Nothing moves.
+  Checked {
+    /// The green's head the check judged.
+    head: u64,
+    /// The work's canonical declaration, by index.
+    declaration: Vec<slates_ipc::protocol::MergeOp>,
+    /// The conflict, as a rebase answers one.
+    conflict: Option<ReplyBody>,
+  },
 }
 
 /// The owner's answer to a work's creation: the work's id, minted before the ask, and its base.
@@ -206,6 +237,10 @@ pub(crate) struct Unbuilt {
 pub(crate) struct WorkHome {
   queues: BTreeMap<DbVolumeId, Queue>,
   by_request: BTreeMap<(u64, u32, u32), DbVolumeId>,
+  /// The exchanges of verbs forwarded from another node that wait for their parked verb here, each as its control shard
+  /// and awaited call (A-794, [`attach_forwarded`]): answered from the verb's completion when its queue resumes it. A
+  /// subset of `by_request`'s keys, each leaving with its verb, so bounded as the parked verbs are.
+  forwarded: BTreeMap<(u64, u32, u32), (u16, u64)>,
   parked: usize,
   /// The work whose parked verb is being resumed now: it may park again at the front of its own queue.
   resuming: Option<DbVolumeId>,
@@ -286,6 +321,9 @@ pub(crate) enum Gate {
 /// What a verb needs of the owner. A sealed work is boxed: it is far larger than any other need.
 enum Need {
   Files(Vec<String>),
+  /// The base's lengths and entries of these paths, never their bytes: what an edit or a declaration of a file the
+  /// work has not changed needs (its first edit holds the base's ranges as pieces, `crate::work_files`).
+  Lengths(Vec<String>),
   Page {
     path: String,
     offset: u64,
@@ -316,6 +354,9 @@ enum Need {
   /// work's own shard, which holds the register, before the owner is asked for a verdict, so the merge record that
   /// carries the submit's completion never exists before its route does.
   Route,
+  /// The refinement the work's composition owes (A-787 part 2, R3; `crate::refining`): met on the work's own shard by a
+  /// job of its own, a slice a turn, before the owner is asked for the verdict or the rebase it composes.
+  Refine(Box<crate::refining::Owed>),
 }
 
 fn key(origin: u64, id: RequestId) -> (u64, u32, u32) {
@@ -381,7 +422,12 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     RequestBody::Submit { .. }
     | RequestBody::SubmitSigned { .. }
     | RequestBody::SubmitHeld { .. }
-    | RequestBody::Rebase { .. } => require_work(state, principal, volume, false, "ask").is_ok(),
+    | RequestBody::Rebase { .. }
+    | RequestBody::CheckMerge { .. }
+    | RequestBody::ReadMergeCheck { .. } => {
+      require_work(state, principal, volume, false, "ask").is_ok()
+    }
+    RequestBody::ResolveMerge { .. } => require_work(state, principal, volume, true, "ask").is_ok(),
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
     // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
     RequestBody::SubmitApproved {
@@ -410,7 +456,9 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   let fetched = home.fetched.is_some();
   let file_if_unheld = |path: &str| {
     let key = canonical_path(path);
-    (!fetched && !w.files.holds(key)).then(|| Need::Files(vec![key.to_owned()]))
+    // A length the work's kept entry of the path names (its base's, A-247) is read there, not asked (A-808).
+    (!fetched && !w.files.holds(key) && !w.entries.contains_key(key))
+      .then(|| Need::Lengths(vec![key.to_owned()]))
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
@@ -455,16 +503,51 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         (evidence, approval, signature, authorship),
       ))
     }
+    RequestBody::CheckMerge { .. } => merge_need(state, work, MergeAsk::default()),
+    RequestBody::ResolveMerge {
+      stamp,
+      discard,
+      replacement,
+    } => {
+      // A stale stamp asks nothing: the verb refuses it on this shard.
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      merge_need(
+        state,
+        work,
+        MergeAsk {
+          head: Some(stamp.head),
+          discard: discard.clone(),
+          replacement: replacement.clone(),
+        },
+      )
+    }
+    RequestBody::ReadMergeCheck {
+      stamp,
+      path,
+      offset,
+      max,
+    } => {
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      page_if_unheld(w, fetched, path, *offset, (*max).min(page_room()))
+    }
     RequestBody::Rebase { .. } => {
       if home.rebased.is_some() {
         return None;
       }
       let sealed = seal(state, work);
-      Some(
-        base_missing(state, &sealed).unwrap_or_else(|| Need::Rebase {
-          sealed: Box::new(composed(state, sealed, Vec::new())),
-        }),
-      )
+      if let Some(need) = base_missing(state, &sealed) {
+        return Some(need);
+      }
+      if let Some(owed) = refine_owed(state, &sealed) {
+        return Some(Need::Refine(Box::new(owed)));
+      }
+      Some(Need::Rebase {
+        sealed: Box::new(composed(state, sealed, Vec::new())),
+      })
     }
     RequestBody::EditSubmit {
       path,
@@ -548,10 +631,35 @@ fn verdict_need(
   if !route_committed(state, work) {
     return Need::Route;
   }
+  if let Some(need) = base_missing(state, &sealed) {
+    return need;
+  }
+  if let Some(owed) = refine_owed(state, &sealed) {
+    return Need::Refine(Box::new(owed));
+  }
   base_missing(state, &sealed).unwrap_or_else(|| Need::Verdict {
     evidence: evidence.to_vec(),
     sealed: Box::new(composed(state, sealed, evidence.to_vec())),
     policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
+  })
+}
+
+/// What a merge check or a resolution needs of the green's owner (A-796): a rebase's base and refinement first, then the
+/// rebase itself carrying `ask`.
+fn merge_need(state: &ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Need> {
+  if state.work_home.rebased.is_some() {
+    return None;
+  }
+  let mut sealed = seal(state, work);
+  if let Some(need) = base_missing(state, &sealed) {
+    return Some(need);
+  }
+  if let Some(owed) = refine_owed(state, &sealed) {
+    return Some(Need::Refine(Box::new(owed)));
+  }
+  sealed.merge = Some(ask);
+  Some(Need::Rebase {
+    sealed: Box::new(composed(state, sealed, Vec::new())),
   })
 }
 
@@ -563,10 +671,23 @@ fn page_if_unheld(
   want: u64,
 ) -> Option<Need> {
   let key = canonical_path(path);
-  (!fetched && !w.files.holds(key)).then(|| Need::Page {
-    path: key.to_owned(),
-    offset,
-    want,
+  if fetched {
+    return None;
+  }
+  if !w.files.holds(key) {
+    return Some(Need::Page {
+      path: key.to_owned(),
+      offset,
+      want,
+    });
+  }
+  // A file the work changed reads its own bytes, and the base's ranges its pieces name: the span of them this read
+  // takes, asked in the base's own offsets.
+  let (origin, at, len) = w.files.base_span(key, (offset, want))?;
+  Some(Need::Page {
+    path: origin,
+    offset: at,
+    want: len,
   })
 }
 
@@ -576,12 +697,57 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
     return None;
   }
   match op {
-    WorkOp::Unlink { path } => Some(Need::Files(vec![canonical_path(path).to_owned()])),
+    WorkOp::Unlink { path } => Some(Need::Lengths(vec![canonical_path(path).to_owned()])),
     WorkOp::Rename { from, to } if from != to => {
-      Some(Need::Files(vec![canonical_path(from).to_owned()]))
+      Some(Need::Lengths(vec![canonical_path(from).to_owned()]))
     }
     _ => None,
   }
+}
+
+/// The refinement `sealed`'s composition on this shard owes (A-787 part 2): none for a journal its owner composes (a
+/// copy's), a sealed copy holding more than the work, or one that replaces nothing whole or whose refinement is kept.
+fn refine_owed(state: &ShardState, sealed: &SealedWork) -> Option<crate::refining::Owed> {
+  // The job reads the writer's bytes from the work: a sealed copy holding more than the work (an edit-and-submit's
+  // edit, applied to the copy alone) composes unrefined.
+  let own = state
+    .works
+    .get(&sealed.work)
+    .is_some_and(|w| w.journal.len() == sealed.journal.len());
+  if !own || holds_copy(&sealed.journal) {
+    return None;
+  }
+  crate::refining::owed(
+    state,
+    (sealed.work, sealed.green, sealed.base_version),
+    &sealed.journal,
+  )
+}
+
+/// What the owner sent `work`'s parked verb (A-247), for its refinement's copy (`crate::refining`): `None` when no verb
+/// of the work is parked or it fetched nothing.
+pub(crate) fn parked_fetched(state: &ShardState, work: DbVolumeId) -> Option<&FetchedBase> {
+  state
+    .work_home
+    .queues
+    .get(&work)?
+    .waiting
+    .front()?
+    .fetched
+    .as_ref()
+}
+
+/// The base bytes of `path` the owner sent `work`'s parked verb (A-247): `None` when none was sent.
+pub(crate) fn parked_fetch<'s>(
+  state: &'s ShardState,
+  work: DbVolumeId,
+  path: &str,
+) -> Option<&'s [u8]> {
+  parked_fetched(state, work)?.files.get(path)?.as_deref()
+}
+/// The work's refinement job ended (`crate::refining`): the verb parked on it runs again.
+pub(crate) fn refined(state: &mut ShardState, work: DbVolumeId) {
+  resolve(state, work, Some(Answered::Refined));
 }
 
 /// The paths a sealed work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
@@ -612,10 +778,40 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     .map(|path| (*path).to_owned())
     .collect();
   // With every entry known, the composition says which paths it replaces whole: their base bytes are wanted too.
-  let whole = slates_merge::increment::Base::for_names(&named, &w.entries)
+  // Only a replacement whose declared base length is the base file's (as the work's kept entry names it) is one the
+  // refinement refines; any other it keeps as declared, so its base bytes would be asked for nothing (A-817: an overwrite
+  // at offset 0 shorter than its file asked them at every rebase and submit).
+  let whole: Vec<String> = slates_merge::increment::Base::for_names(&named, &w.entries)
     .and_then(|base| slates_merge::increment::compose_volume_planned(&base, &sealed.journal).ok())
-    .map(|(doc, _)| slates_merge::refine::whole_replaced_paths(&doc))
-    .unwrap_or_default();
+    .map(|(doc, _)| slates_merge::refine::whole_replaced_lengths(&doc))
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|(path, base_len)| {
+      let known = crate::work_files::Base {
+        green: None,
+        fetched: None,
+        version: sealed.base_version,
+        entries: Some(&w.entries),
+      }
+      .entry_len(path);
+      // Unknown length, or one equal to what the replacement replaces: the refinement may read it.
+      known.is_none_or(|len| len == Some(*base_len))
+    })
+    .map(|(path, _)| path)
+    .collect();
+  // Why a file is asked (A-817's measure), counted on the thread: no entry, not held, or replaced whole.
+  BASE_MISSING_WHY.with(|why| {
+    let (mut unentried, mut unheld, mut replaced) = why.get();
+    for path in &named {
+      if !w.entries.contains_key(*path) {
+        unentried = unentried.saturating_add(1);
+      } else if !sealed.files.holds(path) {
+        unheld = unheld.saturating_add(1);
+      }
+    }
+    replaced = replaced.saturating_add(u64::try_from(whole.len()).unwrap_or(u64::MAX));
+    why.set((unentried, unheld, replaced));
+  });
   match fetched {
     None => {
       wanted.extend(whole);
@@ -623,13 +819,14 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     }
     // This verb fetched already: what it lacks is only a whole-replaced path's bytes. Asked again, the answer replaces
     // the verb's fetch, so the ask keeps everything the fetch holds (an edit-and-submit's sealed copy reads its file
-    // from it).
+    // from it): the files it holds, and the paths it holds only the lengths of (A-790), asked now as files.
     Some(fetched) => {
       if whole.iter().all(|path| fetched.files.contains_key(path)) {
         return None;
       }
       wanted.extend(whole);
       wanted.extend(fetched.files.keys().cloned());
+      wanted.extend(fetched.lengths.keys().cloned());
       Some(Need::Files(wanted.into_iter().collect()))
     }
   }
@@ -658,10 +855,16 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
+  let kept = crate::refining::kept(
+    state,
+    sealed.work,
+    (sealed.base_version, sealed.journal.len()),
+  );
   let Ok(inc) = crate::verbs::compose_increment(
     (sealed.work, sealed.base_version),
-    &base,
+    (&base, kept),
     (&sealed.files, files_base),
     &sealed.journal,
     evidence,
@@ -687,6 +890,7 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
     composed: None,
     computed: None,
+    merge: None,
   }
 }
 
@@ -712,11 +916,11 @@ fn sealed_with_edit(
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
-  let old = sealed.files.get(base, key).ok()?;
+  let old_len = sealed.files.len(base, key).ok()?;
   let inserted = u64::try_from(bytes.len()).ok()?;
-  let ops = crate::work_log::edit_ops(key, old.as_deref(), (at, delete_len, inserted));
-  drop(old);
+  let ops = crate::work_log::edit_ops(key, old_len, (at, delete_len, inserted));
   crate::work_log::apply_edit(
     (&mut sealed.files, &mut sealed.journal),
     base,
@@ -761,6 +965,13 @@ pub(crate) fn gate(
     if matches!(need, Some(Need::Verdict { .. })) {
       let composed_ns = slates_machine::clock::monotonic_ns().saturating_sub(started);
       crate::merge_service::count_phase(state, SUBMIT_COMPOSE, composed_ns);
+    }
+    // A base read's ask, by the verb that asked it (A-808's measure: which verb re-asks under contention).
+    if let Some(Need::Files(_) | Need::Lengths(_)) = &need {
+      state.count(base_ask_by(&body, need.as_ref()), 1);
+    }
+    if need.is_none() && length_from_entry(state, work, &body) {
+      state.count(LENGTH_FROM_ENTRY, 1);
     }
     need
   } else {
@@ -1121,6 +1332,8 @@ enum Answered {
   Named(Result<(), Refusal>),
   /// The work's route is committed (A-298): nothing to hand the verb, which runs its gate again.
   Route,
+  /// The work's refinement ended (`crate::refining`): kept on this shard for the verb's composition.
+  Refined,
 }
 
 /// One ask waiting in a shard's outbox to its green's owner.
@@ -1165,6 +1378,92 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
+/// Format: an edit whose file's base length the work's kept entry named, asked of no one (A-808), the non-vacuity count
+/// of the read from the entry.
+pub(crate) const LENGTH_FROM_ENTRY: &str = "merge.work.length_from_entry";
+
+/// Whether `body` is an edit of a file the work does not hold whose base length its kept entry names (A-808).
+fn length_from_entry(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> bool {
+  let (RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. }) = body else {
+    return false;
+  };
+  let key = canonical_path(path);
+  state.work_home.fetched.is_none()
+    && state
+      .works
+      .get(&work)
+      .is_some_and(|w| !w.files.holds(key) && w.entries.contains_key(key))
+}
+
+std::thread_local! {
+  /// Why `base_missing` wanted a path, on this shard thread (A-817's measure): no kept entry, the work holds no file of
+  /// it, or the composition replaces it whole. Reported in status.
+  pub(crate) static BASE_MISSING_WHY: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// The counter a base read's ask (files or lengths) is counted under by the verb that asked it (A-808).
+fn base_ask_by(body: &RequestBody, need: Option<&Need>) -> &'static str {
+  let files = matches!(need, Some(Need::Files(_)));
+  match body {
+    RequestBody::Edit { .. } | RequestBody::EditStaged { .. } => {
+      if files {
+        "merge.work.base_ask.edit.files"
+      } else {
+        "merge.work.base_ask.edit.lengths"
+      }
+    }
+    RequestBody::Rebase { .. } => {
+      if files {
+        "merge.work.base_ask.rebase.files"
+      } else {
+        "merge.work.base_ask.rebase.lengths"
+      }
+    }
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::SubmitHeld { .. }
+    | RequestBody::SubmitApproved { .. }
+    | RequestBody::EditSubmit { .. }
+    | RequestBody::EditSubmitHeld { .. } => {
+      if files {
+        "merge.work.base_ask.submit.files"
+      } else {
+        "merge.work.base_ask.submit.lengths"
+      }
+    }
+    RequestBody::Declare { .. } => {
+      if files {
+        "merge.work.base_ask.declare.files"
+      } else {
+        "merge.work.base_ask.declare.lengths"
+      }
+    }
+    _ => {
+      if files {
+        "merge.work.base_ask.other.files"
+      } else {
+        "merge.work.base_ask.other.lengths"
+      }
+    }
+  }
+}
+
+/// The counter an ask of the owner is counted under by its kind, beside [`ASKED_THE_OWNER`]'s total (A-801's
+/// measure: 10,141,852 asks for 100,000 clients over the Linux kernel, about a hundred a client, named no mechanism).
+fn asked_kind(need: &Need) -> &'static str {
+  match need {
+    Need::Files(_) => "merge.work.asked_owner.files",
+    Need::Lengths(_) => "merge.work.asked_owner.lengths",
+    Need::Page { .. } => "merge.work.asked_owner.page",
+    Need::Sizes => "merge.work.asked_owner.sizes",
+    Need::Verdict { .. } => "merge.work.asked_owner.verdict",
+    Need::Rebase { .. } => "merge.work.asked_owner.rebase",
+    Need::Admit { .. } => "merge.work.asked_owner.admit",
+    Need::ReserveName { .. } => "merge.work.asked_owner.name",
+    Need::Route | Need::Refine(_) => "merge.work.asked_owner.other",
+  }
+}
+
 /// Counts where a verdict's or a rebase's sealed work was composed: on the work's shard, or by the green's owner.
 fn count_composed(state: &mut ShardState, need: &Need) {
   if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = need {
@@ -1192,6 +1491,13 @@ fn start_ask(
   let Some(need) = need else {
     return true;
   };
+  // A refinement is the work's own: a job of this shard, never an ask of the owner (A-787 part 2).
+  if let Need::Refine(owed) = need {
+    let Some(green) = state.works.get(&queue).map(|w| w.green) else {
+      return false;
+    };
+    return crate::refining::start(state, (queue, green), *owed);
+  }
   count_composed(state, &need);
   // A green another node owns admits its work there, by a forward (A-697 part a).
   if let Need::Admit {
@@ -1228,12 +1534,14 @@ fn start_ask(
       queue,
       Some(crate::verbs::owner_of_name(name, state.shards.len())),
     ),
-    Need::Files(_) | Need::Page { .. } | Need::Sizes => match state.works.get(&queue) {
-      Some(w) => (w.green, None),
-      None => return false,
-    },
-    // The owner holds nothing of a work's route (A-298): `park` meets it on this shard.
-    Need::Route => return false,
+    Need::Files(_) | Need::Lengths(_) | Need::Page { .. } | Need::Sizes => {
+      match state.works.get(&queue) {
+        Some(w) => (w.green, None),
+        None => return false,
+      }
+    }
+    // The owner holds nothing of a work's route (A-298): `park` meets it on this shard. A refinement was started above.
+    Need::Route | Need::Refine(_) => return false,
   };
   let version = state.works.get(&queue).map_or(0, |w| w.base_version);
   let owner_partition =
@@ -1260,6 +1568,7 @@ fn start_ask(
     request: id.word(),
     through_work: true,
   };
+  let asked_kind = asked_kind(&need);
   let outbox = state.work_home.outboxes.entry(owner).or_default();
   outbox.waiting.push_back(AskItem {
     queue,
@@ -1278,6 +1587,7 @@ fn start_ask(
   }
   let out = outbox.out;
   state.count(ASKED_THE_OWNER, 1);
+  state.count(asked_kind, 1);
   if full {
     return true;
   }
@@ -1420,6 +1730,12 @@ pub(crate) const SUBMIT_COMPOSE: (&str, &str) = ("merge.submit.compose", "merge.
 pub(crate) const SUBMIT_COMPUTE: (&str, &str) = ("merge.submit.compute", "merge.submit.compute_ns");
 /// See [`SUBMIT_COMPOSE`].
 pub(crate) const SUBMIT_FORWARD: (&str, &str) = ("merge.submit.forward", "merge.submit.forward_ns");
+/// See [`SUBMIT_COMPOSE`]: the control shard's step that builds the forward (the verdict computed, the increment encoded
+/// and held, the request encoded), one step today (main's ruling on the lane, 2026-11-20: measured before it is sliced).
+pub(crate) const SUBMIT_FORWARD_BUILD: (&str, &str) = (
+  "merge.submit.forward_build",
+  "merge.submit.forward_build_ns",
+);
 /// See [`SUBMIT_COMPOSE`].
 pub(crate) const SUBMIT_SETTLE: (&str, &str) = ("merge.submit.settle", "merge.submit.settle_ns");
 
@@ -1484,38 +1800,40 @@ fn verdict_over_fleet(
     if staged != Some(true) {
       return;
     }
-    let reply = crate::xshard::task_within(
-      here,
-      control,
-      move || async move {
-        let built =
-          state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
-        let forward_start = slates_machine::clock::monotonic_ns();
-        let reply = match built {
-          Some(Ok(request)) => crate::verbs::resolve_and_forward(
-            crate::verbs::to_wire_volume(green),
-            region,
-            None,
-            vec![request],
-          )
-          .await
-          .0
-          .first()
-          .clone(),
-          Some(Err(reply)) => *reply,
-          None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
-        };
-        let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
-        // The work settles on its new base only once this node's replica holds it (A-697 part d).
-        let held = state::with_state(|s| {
-          crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
-          hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
-        })
-        .unwrap_or(false);
-        (reply, held)
-      },
-      deadline,
-    )
+    // Awaited to its end: the forward bounds itself by its own progress (its lane's stall rule, which counts the request's
+    // bytes acknowledged), and the replica's wait by `deadline`. A wall deadline here, the failover delay, refused a
+    // submit whose increment was still crossing, and its retry sent the whole increment again (main's ruling on the
+    // lane, 2026-11-21).
+    let reply = crate::xshard::task_to_its_end(here, control, move || async move {
+      let build_start = slates_machine::clock::monotonic_ns();
+      let built =
+        state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
+      let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
+      state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
+      let forward_start = slates_machine::clock::monotonic_ns();
+      let reply = match built {
+        Some(Ok(request)) => crate::verbs::resolve_and_forward(
+          crate::verbs::to_wire_volume(green),
+          region,
+          None,
+          vec![request],
+        )
+        .await
+        .0
+        .first()
+        .clone(),
+        Some(Err(reply)) => *reply,
+        None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
+      };
+      let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
+      // The work settles on its new base only once this node's replica holds it (A-697 part d).
+      let held = state::with_state(|s| {
+        crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
+        hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
+      })
+      .unwrap_or(false);
+      (reply, held)
+    })
     .await;
     let _ = state::with_state_counted(|s| match reply {
       Some((_, true)) => defer_oldest(s, queue),
@@ -1949,6 +2267,31 @@ enum Outcome {
   Unanswered,
 }
 
+/// Answers `items` in order with `answer` while the clock (`now`, nanoseconds) has spent less than `budget_ns` since the
+/// first: always the first, so a batch always moves; the rest, unanswered and in order, for the asker to send again
+/// (A-797: an owner's step for a batch is bounded by its step budget, CLAUDE.md "Bounded work everywhere").
+fn answer_within<T, A>(
+  items: Vec<T>,
+  budget_ns: u64,
+  mut now: impl FnMut() -> u64,
+  mut answer: impl FnMut(T) -> A,
+) -> (Vec<A>, Vec<T>) {
+  let started = now();
+  let mut answers = Vec::with_capacity(items.len());
+  let mut items = items.into_iter();
+  for item in items.by_ref() {
+    answers.push(answer(item));
+    if now().saturating_sub(started) >= budget_ns {
+      break;
+    }
+  }
+  (answers, items.collect())
+}
+
+/// Format: a batch the green's owner answered in part within its step budget, handing the rest back to be asked again
+/// ([`answer_within`], A-797), the non-vacuity count of the bounded owner step.
+pub(crate) const BATCH_HANDED_BACK: &str = "merge.work.batch_handed_back";
+
 /// Sends `here`'s outbox to `owner` a batch at a time until it is empty: one of the at most [`BATCHES_OUT`] senders out
 /// to `owner`, each awaiting its own batch's answers (A-388).
 async fn send_batches(here: u16, owner: u16) {
@@ -1959,22 +2302,31 @@ async fn send_batches(here: u16, owner: u16) {
     }
     let keys: Vec<DbVolumeId> = batch.iter().map(|item| item.queue).collect();
     let budget = crate::lease::lease_bound_ns();
+    // The owner answers within its step budget and hands back the rest (A-797), which go out again first.
     let answers = crate::xshard::call_in_shard_time_given_room(
       here,
       owner,
       move |s| {
-        batch
-          .into_iter()
-          .map(|item| answer_on_owner(s, item))
-          .collect::<Vec<_>>()
+        let step = s.config.runtime.step_budget_ns;
+        answer_within(batch, step, slates_machine::clock::monotonic_ns, |item| {
+          answer_on_owner(s, item)
+        })
       },
       budget,
     )
     .await;
     let _ = state::with_state_counted(|s| match answers {
-      Some(answers) => {
+      Some((answers, rest)) => {
         for (queue, outcome) in keys.into_iter().zip(answers) {
           settle_outcome(s, queue, outcome);
+        }
+        if !rest.is_empty() {
+          s.count(BATCH_HANDED_BACK, 1);
+          if let Some(outbox) = s.work_home.outboxes.get_mut(&owner) {
+            for item in rest.into_iter().rev() {
+              outbox.waiting.push_front(item);
+            }
+          }
         }
       }
       None => {
@@ -2026,8 +2378,43 @@ fn staged(state: &ShardState, item: &AskItem) -> bool {
   }
 }
 
-/// One ask answered on the owner's shard.
+/// One ask answered on the owner's shard, its time counted by its kind (`merge.work.answered.<kind>` and `..._ns`, A-801's
+/// measure of where the green's shard spends its time).
 fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let kind = answered_kind(&item.need);
+  let started = slates_machine::clock::monotonic_ns();
+  let outcome = answer_ask(state, item);
+  let spent = slates_machine::clock::monotonic_ns().saturating_sub(started);
+  crate::merge_service::count_phase(state, kind, spent);
+  outcome
+}
+
+/// The counters an answered ask is timed under by its kind: its count and its nanoseconds.
+fn answered_kind(need: &Need) -> (&'static str, &'static str) {
+  match need {
+    Need::Files(_) => ("merge.work.answered.files", "merge.work.answered.files_ns"),
+    Need::Lengths(_) => (
+      "merge.work.answered.lengths",
+      "merge.work.answered.lengths_ns",
+    ),
+    Need::Page { .. } => ("merge.work.answered.page", "merge.work.answered.page_ns"),
+    Need::Sizes => ("merge.work.answered.sizes", "merge.work.answered.sizes_ns"),
+    Need::Verdict { .. } => (
+      "merge.work.answered.verdict",
+      "merge.work.answered.verdict_ns",
+    ),
+    Need::Rebase { .. } => (
+      "merge.work.answered.rebase",
+      "merge.work.answered.rebase_ns",
+    ),
+    Need::Admit { .. } => ("merge.work.answered.admit", "merge.work.answered.admit_ns"),
+    Need::ReserveName { .. } => ("merge.work.answered.name", "merge.work.answered.name_ns"),
+    Need::Route | Need::Refine(_) => ("merge.work.answered.other", "merge.work.answered.other_ns"),
+  }
+}
+
+/// [`answer_on_owner`]'s answer.
+fn answer_ask(state: &mut ShardState, item: AskItem) -> Outcome {
   let AskItem {
     need,
     green,
@@ -2038,8 +2425,10 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     back,
     ..
   } = item;
-  if matches!(need, Need::Files(_) | Need::Page { .. } | Need::Sizes)
-    && green_elsewhere(state, green)
+  if matches!(
+    need,
+    Need::Files(_) | Need::Lengths(_) | Need::Page { .. } | Need::Sizes
+  ) && green_elsewhere(state, green)
   {
     // A holder's base read, answered by its replica of the green (A-697 part a), once that holds the work's base.
     let holds = state
@@ -2055,6 +2444,9 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
   }
   match need {
     Need::Files(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_files(
+      state, green, version, &paths,
+    ))),
+    Need::Lengths(paths) => Outcome::Answered(Answered::Base(crate::verbs::owner_lengths(
       state, green, version, &paths,
     ))),
     Need::Page { path, offset, want } => Outcome::Answered(Answered::Base(
@@ -2088,6 +2480,8 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     }
     // Never asked (`start_ask` refuses it); answered, it only runs the work's gate again, which checks the route there.
     Need::Route => Outcome::Answered(Answered::Route),
+    // Never sent to an owner (the work's own job meets it): answered as met.
+    Need::Refine(_) => Outcome::Answered(Answered::Refined),
   }
 }
 
@@ -2272,7 +2666,7 @@ fn resolve(state: &mut ShardState, work: DbVolumeId, answer: Option<Answered>) {
           Answered::Rebased(rebased) => head.rebased = Some(rebased),
           Answered::Admitted(admitted) => head.admitted = Some(admitted),
           Answered::Named(named) => head.named = Some(named),
-          Answered::Route => {}
+          Answered::Route | Answered::Refined => {}
         }
       }
     }
@@ -2330,6 +2724,10 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     } = head;
     let home = &mut state.work_home;
     home.by_request.remove(&key(verb.origin, verb.id));
+    let forwarded = home
+      .forwarded
+      .remove(&key(verb.origin, verb.id))
+      .map(|waiter| (verb.origin, verb.id, waiter));
     home.parked = home.parked.saturating_sub(1);
     let verb_key = (verb.origin, verb.id.client, verb.id.sequence);
     if state
@@ -2349,6 +2747,9 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = named;
     home.resuming = Some(work);
     crate::lease_wait::run_resumed(state, verb, refused, None);
+    if let Some((origin, id, waiter)) = forwarded {
+      answer_forwarded(state, (origin, id), waiter);
+    }
     let home = &mut state.work_home;
     home.resuming = None;
     home.fetched = None;
@@ -2358,6 +2759,47 @@ fn resume_pass(state: &mut ShardState, work: DbVolumeId) {
     home.named = None;
   }
 }
+
+/// Attaches the exchange of a verb forwarded from another node, waiting as `waiter` (its control shard and awaited
+/// call), to the verb `(origin, id)` parked here (A-794): answered when its queue resumes it ([`answer_forwarded`]).
+/// False when no such verb is parked here. Before, such an exchange answered `Overloaded` at once and only the origin's
+/// resend under the id met the completion, so every forwarded verb of a work whose green lives on another shard of this
+/// node cost its client a retry pause.
+pub(crate) fn attach_forwarded(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  waiter: (u16, u64),
+) -> bool {
+  let home = &mut state.work_home;
+  if !home.by_request.contains_key(&key(origin, id)) {
+    return false;
+  }
+  home.forwarded.insert(key(origin, id), waiter);
+  state.count(FORWARDED_ATTACHED, 1);
+  true
+}
+
+/// Answers a forwarded verb's waiting exchange once its parked verb ran (A-794): with the completion it recorded; else,
+/// parked again here, the exchange waits for that; else, its acceptance deferred to a fleet commit, the exchange waits
+/// for the commit (`merge_service::await_forwarded`); else `Overloaded`, unrecorded, which its origin's resend runs again.
+fn answer_forwarded(state: &mut ShardState, (origin, id): (u64, RequestId), waiter: (u16, u64)) {
+  use crate::merge_service::ForwardedAcceptance;
+  let answer = match crate::merge_service::await_forwarded(state, (origin, id), waiter) {
+    ForwardedAcceptance::Completed(bytes) => <ReplyBody as slates_wire::Wire>::from_bytes(&bytes)
+      .unwrap_or_else(|_| crate::verbs::refused(Refusal::DuplicateRequest)),
+    ForwardedAcceptance::Waiting => return,
+    ForwardedAcceptance::Gone if attach_forwarded(state, (origin, id), waiter) => return,
+    ForwardedAcceptance::Gone => crate::verbs::refused(Refusal::Overloaded { shard: state.shard }),
+  };
+  crate::xshard::answer_awaited(waiter.0, waiter.1, answer);
+  state.count(FORWARDED_ANSWERED, 1);
+}
+
+/// Format: a forwarded verb's exchange attached to its verb parked here ([`attach_forwarded`]), the non-vacuity count
+/// of A-794's event-driven answer.
+pub(crate) const FORWARDED_ATTACHED: &str = "merge.work.forwarded_attached";
+/// Format: a forwarded verb's exchange answered when its parked verb resumed ([`answer_forwarded`]).
+pub(crate) const FORWARDED_ANSWERED: &str = "merge.work.forwarded_answered";
 
 /// Keeps the base entries a verb fetched with the work (A-247), charged as the work's: the refusal its verb answers when
 /// the budget cannot hold them.
@@ -2537,7 +2979,42 @@ fn tell_floor_over_fleet(
 
 #[cfg(test)]
 mod tests {
-  use super::{DbVolumeId, ParkedVerb, Queue, defer_oldest, release_expired_at};
+  use super::{DbVolumeId, ParkedVerb, Queue, answer_within, defer_oldest, release_expired_at};
+
+  /// A-797 (goal 86b; CLAUDE.md "Bounded work everywhere"). Do: answer a batch of ten asks, each costing 3 ns of a test
+  /// clock, under a 10 ns budget; then a batch whose first ask alone costs past the budget. Expect: the first batch
+  /// answers asks while under the budget (the first four: started at 0, 3, 6 and 9) and hands back the other six in order;
+  /// the second answers its first ask whatever it cost, so a batch always moves, and hands back the rest. At 100,000
+  /// clients over the Linux kernel one batch of asks held the green's owner shard 1,055 ms of CPU in one poll, past the
+  /// liveness window, and the anchor killed the daemon.
+  #[test]
+  fn a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back() {
+    let clock = std::cell::Cell::new(0u64);
+    let (answers, rest) = answer_within(
+      (0..10).collect::<Vec<u32>>(),
+      10,
+      || clock.get(),
+      |item| {
+        clock.set(clock.get() + 3);
+        item * 10
+      },
+    );
+    assert_eq!(
+      (answers, rest),
+      (vec![0, 10, 20, 30], vec![4, 5, 6, 7, 8, 9])
+    );
+    clock.set(0);
+    let (answers, rest) = answer_within(
+      vec![1u32, 2],
+      10,
+      || clock.get(),
+      |item| {
+        clock.set(clock.get() + 50);
+        item
+      },
+    );
+    assert_eq!((answers, rest), (vec![1], vec![2]));
+  }
 
   /// The verb a test parks: a status asked by a local client, with nowhere to reply (answered `Overloaded` at its release,
   /// nothing is sent).
@@ -2552,7 +3029,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 1234,
         },
-        body: slates_ipc::protocol::RequestBody::DaemonStatus,
+        body: slates_ipc::protocol::RequestBody::DaemonStatus { memory: false },
       },
       fetched: None,
       verdict: None,
@@ -2617,6 +3094,7 @@ mod tests {
       files: super::WorkFiles::default(),
       composed: None,
       computed: None,
+      merge: None,
     }
   }
 
@@ -2625,6 +3103,7 @@ mod tests {
     match answer {
       super::RebaseAnswer::Rebased { journal, .. } => format!("rebased to {journal:?}"),
       super::RebaseAnswer::Reply(reply) => format!("answered {reply:?}"),
+      super::RebaseAnswer::Checked { head, .. } => format!("checked at {head}"),
     }
   }
 

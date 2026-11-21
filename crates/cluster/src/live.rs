@@ -90,6 +90,9 @@ pub struct Exchanged {
   pub stragglers: Stragglers,
   /// Whether the budget ran out first.
   pub timed_out: bool,
+  /// Each answering holder's round trip as its session timed it (the request sent to its reply read), nanoseconds: what
+  /// of the exchange was the transport and the holder, the rest being this side's tasks (g228, 85a).
+  pub round_trips: Vec<(HostId, u64)>,
 }
 
 /// Sends `message` to every holder over its session and gathers the replies until `enough` (shown each reply as it
@@ -109,6 +112,7 @@ pub async fn exchange(
       unanswered: Vec::new(),
       stragglers: Stragglers::none(),
       timed_out: false,
+      round_trips: Vec::new(),
     };
   }
   let priority = if stream == LIVE_STATE_STREAM {
@@ -143,14 +147,16 @@ pub async fn exchange(
     unanswered: refused,
     stragglers: Stragglers::none(),
     timed_out: false,
+    round_trips: Vec::new(),
   };
   loop {
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
-        if reply.round_trip_ns.is_none() {
+        let Some(round_trip) = reply.round_trip_ns else {
           exchanged.unanswered.push(host);
           continue;
-        }
+        };
+        exchanged.round_trips.push((host, round_trip));
         exchanged.reusable.push((host, *endpoint));
         let done = enough(host, &reply.bytes);
         exchanged.replies.push((host, reply.bytes));
