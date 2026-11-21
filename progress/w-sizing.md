@@ -104,6 +104,11 @@
 - R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md). Remaining 6.2 GB after an hg
   history push is held content (w-hg 4,495.5 MiB content store) + register + heap; status split came back empty in r35
   (g226 is fixing the status residency).
+- 16:46: main asked to land agents/w-sizing-extents: already landed as A-789 362bd8c39 (squashed; branch deleted).
+- Disk (Studio-4): deleted my targets incl. two whose names contained "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=6" (an
+  `env $E` quoting slip made cargo use the whole string as CARGO_TARGET_DIR; 15 GB + 4.8 GB) and w-sizing-ab-target.
+  Studio-4 now 97 GiB free. Builds go through kiln with needs "macos,disk=60g" from now on.
+- g226: status residency fix choice (a) filed with main (inbox/main-from-g226-close.md); g226 frozen by the close order.
 - Worktree ~/slates-work/w-sizing-a789 (landed; removable). Scripts ~/.cache/w-sizing-logs (hgmem.sh, hgmem-cmd.txt).
 
 ## Queue
