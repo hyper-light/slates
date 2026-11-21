@@ -10848,7 +10848,19 @@ per-thread switch count, which is why it stayed unseen. Linux's `epoll_wait(0)` 
 1.04/0.49/0.91 -> 0.43/0.54/0.73 ms, but p999 2.7/2.3/7.8 -> 12.1/10.6/12.0 ms, because A-387 then keeps holds (turns
 cost 0.5 µs) and a held shard true-spins for ms. With no hold as well: p99 0.17/0.38/0.27 ms and p999 0.30/11.3/6.6 ms,
 1.2-3.5 cores against 0.7-1.2. A sched_yield per idle turn: p99 10.1 ms (a whole macOS quantum given away), rejected.
-**Next (in flight):** A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
+**The bound, made robust (2026-11-20, C1).** The bound first added the load's addition to the parked p99 (loaded minus
+quiet). On a host busy of its own the "quiet" parked p99 (1.0-2.3 ms) passed the loaded one, so the bound fell to the
+quiet spinning p99 and failed every arm alike. It is now one loaded window's comparison: the loaded spinning p99 may be
+no slower than the loaded parked p99, nor than its own quiet p99. Over ab6's 9 runs that reads red 3 of 3 on main and
+green 6 of 6 on both candidate arms.
+
+**P2's A/B, round two (2026-11-20 evening, host load 10-26, BENCHMARKS "R9's loaded p99 on macOS, the candidates"):**
+the immediate poll with a time-horizon turn estimate, and the immediate poll with an explicit macOS nap in the idle
+spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards (p99 28-43 and 38-40 µs against main's
+99-111) and cut the loaded p99 3-5x (0.25-0.46 ms against 1.06-1.34). Both make the loaded p999 worse (5.6-23.4 ms against
+2.1-2.5) and spend 2-6x main's quiet CPU (3.3-10 cores against 1.7). Neither lands under the data rule: P2 stays open.
+**Next:** the loaded p999's own hop (g222's ~1 ms timer band and the shards' priority under a true spin), with g222.
+Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
 `IMMEDIATE` and zero-timespec `kevent64` polls on one queue lose a kick (3 of 3 runs hung, every shard parked).
