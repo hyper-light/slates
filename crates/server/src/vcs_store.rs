@@ -112,6 +112,7 @@ pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
+pub(crate) mod hg_tags;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod index_upkeep;
@@ -222,9 +223,10 @@ pub(crate) struct VcsStores {
   /// Each Subversion repository's landing turn (C2 of Ada's close list, `svn_commit::landing`): one changeset landing
   /// a repository at a time, from its check to its register's commit.
   pub(crate) svn_landings: crate::repository::svn_commit::landing::Gates,
-  /// The Subversion record read back from the node's store for the record a rebuild or recovery replays next (C2),
-  /// by repository, with the register's index it is for: at most one a repository.
-  svn_fetched: BTreeMap<RepositoryId, (usize, Vec<u8>)>,
+  /// The Subversion records read back from the node's store for the register record a rebuild or recovery replays
+  /// next (C2), by repository, with the register's index they are for, in their changeset's order (a commit's one, an
+  /// import's batch's revisions, C2 stage C): at most one changeset's a repository.
+  svn_fetched: BTreeMap<RepositoryId, (usize, std::collections::VecDeque<Vec<u8>>)>,
   /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
   /// [`svn_texts::Pieces`]).
   pub(crate) svn_pieces: svn_texts::Pieces,
@@ -2433,9 +2435,13 @@ fn replay_record(
     state.vcs_stores.entries.get(&id),
     Some(RepositoryStore::Subversion(_))
   ) {
-    return Some(
-      svn_fetched_record(state, id, index)?.and_then(|bytes| replay_bytes(state, id, &bytes)),
-    );
+    loop {
+      let replayed =
+        svn_fetched_record(state, id, index)?.and_then(|bytes| replay_bytes(state, id, &bytes));
+      if replayed.is_err() || !svn_more(state, id, index) {
+        return Some(replayed);
+      }
+    }
   }
   let ShardState {
     db,
@@ -2517,10 +2523,25 @@ fn svn_fetched_record(
   if sequence != u64::try_from(index).ok() {
     return Some(Err(ReplayRefused::SvnReference));
   }
-  Some(match state.vcs_stores.svn_fetched.remove(&id) {
-    Some((at, bytes)) if at == index => Ok(bytes),
-    _ => Err(ReplayRefused::Unlanded),
-  })
+  let fetched = state.vcs_stores.svn_fetched.get_mut(&id);
+  let next = match fetched {
+    Some((at, queue)) if *at == index => queue.pop_front(),
+    _ => None,
+  };
+  if !svn_more(state, id, index) {
+    state.vcs_stores.svn_fetched.remove(&id);
+  }
+  Some(next.ok_or(ReplayRefused::Unlanded))
+}
+
+/// Whether repository `id`'s changeset for register `index` holds a record read back and not yet replayed (an import's
+/// batch, C2 stage C): its replay goes on before the next register record's.
+fn svn_more(state: &ShardState, id: RepositoryId, index: usize) -> bool {
+  state
+    .vcs_stores
+    .svn_fetched
+    .get(&id)
+    .is_some_and(|(at, queue)| *at == index && !queue.is_empty())
 }
 
 /// What repository `id`'s rebuild or recovery must read back from the node's store before its record at register
@@ -2552,16 +2573,25 @@ fn svn_to_fetch(
   Some((state.vcs_disk.clone(), sequence))
 }
 
-/// Reads repository `id`'s changeset `sequence`'s record back from the node's store `disk` for its record at register
-/// `index` (C2); nothing kept where it could not be read, and the replay then refuses it `Unlanded`, counted.
+/// Reads repository `id`'s changeset `sequence`'s records back from the node's store `disk` for its record at register
+/// `index` (C2): every `Record` section in order (an import's batch lands its revisions' together, C2 stage C), the
+/// creation's changeset its last alone (the store's own creation record comes first); nothing kept where they could not
+/// be read, and the replay then refuses it `Unlanded`, counted.
 async fn fetch_svn(
   id: RepositoryId,
   index: usize,
   (disk, sequence): (Option<slates_store::owner::StoreHandle>, u64),
-) -> Option<(usize, Vec<u8>)> {
+) -> Option<(usize, std::collections::VecDeque<Vec<u8>>)> {
   let disk = disk?;
-  match crate::repository::svn_commit::landing::changeset_record(&disk, id, sequence).await {
-    Ok(bytes) => Some((index, bytes)),
+  let read = if sequence == 0 {
+    crate::repository::svn_commit::landing::changeset_record(&disk, id, sequence)
+      .await
+      .map(|record| vec![record])
+  } else {
+    crate::repository::svn_commit::landing::changeset_records(&disk, id, sequence).await
+  };
+  match read {
+    Ok(records) => Some((index, records.into())),
     Err(why) => {
       let _ = crate::state::with_state(|state| {
         slates_machine::log_line!(
@@ -2699,6 +2729,9 @@ enum PieceStep {
   /// The step needs these bytes of the payload: the replay under way, the window to be filled
   /// ([`fill_window`]).
   Wanted(slates_hg::import::record::Replay, core::ops::Range<u64>),
+  /// The step needs a file delta's base from the node's changeset store (A-767 C1): the replay under way, its wants to
+  /// be answered ([`crate::vcs_store::hg_view::answer_wants_over`]).
+  Store(slates_hg::import::record::Replay),
   /// The changeset is replayed into the store.
   Done,
 }
@@ -2753,6 +2786,7 @@ fn hg_piece_in(
       Ok(Progress::More) if slates_rt::futures::now_ns() < deadline_ns => {}
       Ok(Progress::More) => return Ok(PieceStep::More(replay)),
       Ok(Progress::Wanted(range)) => return Ok(PieceStep::Wanted(replay, range)),
+      Ok(Progress::Store) => return Ok(PieceStep::Store(replay)),
       Ok(Progress::Done) => {
         let replayed = replay
           .finish(&mut store.index, content)
@@ -3043,6 +3077,18 @@ async fn replay_hg_referenced(
           return Err(ReplayRefused::Unlanded);
         }
         count_fill(state, &window);
+        replay = Some(more);
+      }
+      PieceStep::Store(mut more) => {
+        let repository = u128::from_be_bytes(id.bytes);
+        let answered = match more.store_wants() {
+          Some(wants) => hg_view::answer_wants_over(&disk, repository, wants).await,
+          None => false,
+        };
+        if !answered {
+          let _ = with_released(state, more);
+          return Err(ReplayRefused::Unlanded);
+        }
         replay = Some(more);
       }
       PieceStep::Done => return Ok(()),
@@ -4048,7 +4094,13 @@ fn svn_record_turn(
           return Some(RecordTurn::Replayed(Err(ReplayRefused::SvnTextsInline)));
         }
         Ok(SvnRecord::Revision(revision)) => (SvnPending::Begin(revision), brought),
-        _ => return Some(RecordTurn::Replayed(replay_bytes(state, id, &bytes))),
+        _ => {
+          let replayed = replay_bytes(state, id, &bytes);
+          return Some(match replayed {
+            Ok(()) if svn_more(state, id, index) => RecordTurn::More,
+            replayed => RecordTurn::Replayed(replayed),
+          });
+        }
       }
     }
   };
@@ -4076,6 +4128,8 @@ fn svn_record_turn(
   }
   state.count(SVN_REPLAY_TURNS, 1);
   Some(match stepped {
+    // The changeset's next revision replays at the next turn (an import's batch, C2 stage C).
+    Ok(None) if svn_more(state, id, index) => RecordTurn::More,
     Ok(None) => RecordTurn::Replayed(Ok(())),
     Ok(Some(replay)) => {
       state.vcs_stores.svn_replays.insert(id, replay);
@@ -4421,6 +4475,22 @@ async fn sectioned_unit(
         return Unit::Refused(ReplayRefused::Unlanded);
       }
       crate::state::with_state(|state| count_fill(state, window)).unwrap_or_default();
+      *replay = Some(more);
+      Unit::More
+    }
+    Some(Ok(PieceStep::Store(mut more))) => {
+      let repository = u128::from_be_bytes(id.bytes);
+      let answered = match more.store_wants() {
+        Some(wants) => hg_view::answer_wants_over(disk, repository, wants).await,
+        None => false,
+      };
+      if !answered {
+        crate::state::with_state(|state| {
+          let _ = with_released(state, more);
+        })
+        .unwrap_or_default();
+        return Unit::Refused(ReplayRefused::Unlanded);
+      }
       *replay = Some(more);
       Unit::More
     }

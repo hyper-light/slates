@@ -173,7 +173,7 @@ fn site(
       RecordedCredentials,
       ShardRepositories,
       Halves::new(
-        UploadServices::new(ShardStores, room),
+        UploadServices::new(ShardStores, room, keepalive_ns),
         ReceiveServices::new(ThisShard, keepalive_ns),
       ),
     )

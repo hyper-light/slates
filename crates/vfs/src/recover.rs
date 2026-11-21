@@ -515,6 +515,43 @@ pub struct SnapshotImage {
 
 /// A whole volume's recoverable state (§4.8, A-9). The inodes are in number order (the order the
 /// inode table yields them) and snapshots are in id order, so two images of equal state are
+/// A held head's whole record being built in steps (A-827, [`Volume::begin_held_image`]): its wire bytes so far (the
+/// `VolumeRecord::Full` tag, the image's fields before its inodes and their count, then each inode as it is imaged), the
+/// image's fields after its inodes (taken with the hold, encoded once), the held inode versions in the order the image
+/// lists them, and the next to image. Encoded as it goes, as a checkpoint streams its image
+/// ([`Volume::encode_image_into`]): built whole and encoded at the end, the encoding alone held the last step 10.5 to
+/// 17 us for 311 inodes in release.
+#[derive(Debug)]
+pub struct HeldImage {
+  bytes: Vec<u8>,
+  tail: Vec<u8>,
+  handles: Vec<Handle<Inode>>,
+  next: usize,
+}
+
+impl HeldImage {
+  /// The whole record's wire bytes (`VolumeRecord::Full { image }.to_bytes()` of the held head's standalone image), once
+  /// every inode is imaged ([`Volume::held_image_step`]).
+  pub fn finish(mut self) -> Vec<u8> {
+    self.bytes.extend_from_slice(&self.tail);
+    self.bytes
+  }
+}
+
+/// What a held inode version holds, handed to [`Volume::held_image_step`]'s caller with its image: its number, its size,
+/// its sealed extents and its open extent's offset and bytes, all as that version holds them in the step.
+#[derive(Debug)]
+pub struct HeldFile<'a> {
+  /// The inode's number.
+  pub no: InodeNo,
+  /// Its size.
+  pub size: u64,
+  /// Its sealed extents, ascending by offset.
+  pub extents: &'a [Extent],
+  /// Its open extent's offset and bytes.
+  pub open: Option<(u64, &'a [u8])>,
+}
+
 /// byte-identical (a determinism gate).
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct VolumeImage {
@@ -1279,6 +1316,12 @@ fn streamed_crc<S: ImageRead + ?Sized>(slots: &S, at: usize, len: usize) -> Resu
 const SLOT_GEN_WIDTH: usize = size_of::<u64>();
 
 /// The two slots of image memory `total` bytes long: the first half and the rest.
+/// The two slots of image memory `total` bytes long, each as `(offset, len)` ([`slots_of`]).
+pub(crate) fn slots_of_memory(total: usize) -> ((usize, usize), (usize, usize)) {
+  let (first, second) = slots_of(total);
+  ((first.offset, first.len), (second.offset, second.len))
+}
+
 fn slots_of(total: usize) -> (Slot, Slot) {
   let half = total / 2;
   (
@@ -1313,6 +1356,13 @@ impl CommittedSlot {
     let (first, second) = slots_of(total);
     let stale = if self.second { first } else { second };
     (stale.offset, stale.len)
+  }
+
+  /// This slot of image memory `total` bytes long, as `(offset, len)`.
+  pub fn slot(self, total: usize) -> (usize, usize) {
+    let (first, second) = slots_of(total);
+    let slot = if self.second { second } else { first };
+    (slot.offset, slot.len)
   }
 
   /// The same committed slot, with the generation the publisher's last publication reached (a delta logged after
@@ -1542,6 +1592,102 @@ impl Volume {
     host: Option<&mut dyn crate::host::HostFs>,
   ) -> Result<VolumeImage, VfsError> {
     self.image_with(store, host, true)
+  }
+
+  /// Begins the standalone image of the head a reader holds (A-827, [`Volume::hold_head`]): everything but its inodes,
+  /// as [`Volume::to_standalone_image`] takes it (its epoch the held one, its snapshots and base plane as they stand,
+  /// which the caller takes in the turn it held the head), and the held head's inode versions to image in steps
+  /// ([`Volume::held_image_step`]). Refused [`VfsError::Invalid`] with no hold.
+  pub fn begin_held_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+  ) -> Result<HeldImage, VfsError> {
+    let hold = self.hold.as_ref().ok_or(VfsError::Invalid)?;
+    let base = match (&self.base, host) {
+      (Some(plane), Some(host)) => Some(plane.image(host)?),
+      (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
+      (None, _) => None,
+    };
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, hold.inode_root, &mut handles);
+    let snapshots = self.capture_snapshots(store)?;
+    let root_no = store
+      .dirs
+      .get(hold.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
+    // The fields `to_standalone_image` writes, in its order, with the held epoch and root (`encode_image_into`'s).
+    let mut bytes = Vec::new();
+    crate::delta::VolumeRecord::WIRE_TAG_FULL.encode(&mut bytes);
+    IMAGE_MAGIC.encode(&mut bytes);
+    IMAGE_VERSION.encode(&mut bytes);
+    self.prefix.encode(&mut bytes);
+    policy_image(self.policy).encode(&mut bytes);
+    hold.epoch.0.encode(&mut bytes);
+    self.recorded_counter(store).encode(&mut bytes);
+    self.next_counter.encode(&mut bytes);
+    None::<u64>.encode(&mut bytes);
+    quota_image(&self.quota).encode(&mut bytes);
+    root_no.0.encode(&mut bytes);
+    self.last_snapshot.map(snap_ref).encode(&mut bytes);
+    slates_wire::codec::encode_len(handles.len(), &mut bytes);
+    let mut tail = Vec::new();
+    Vec::<u64>::new().encode(&mut tail);
+    snapshots.encode(&mut tail);
+    self
+      .orphans
+      .keys()
+      .map(|no| no.0)
+      .collect::<Vec<u64>>()
+      .encode(&mut tail);
+    base.encode(&mut tail);
+    self.attachment_references().encode(&mut tail);
+    Ok(HeldImage {
+      bytes,
+      tail,
+      handles,
+      next: 0,
+    })
+  }
+
+  /// Images up to `budget` more of the held head's inode versions ([`Volume::begin_held_image`]), each with what it
+  /// holds handed to `each` from the same version in the same step (its size, its sealed extents, its open extent's
+  /// bytes), so the image of a file and its content always agree though a copy-up may rewrite the held version between
+  /// steps (sealing its open extent). Whether every inode is imaged.
+  pub fn held_image_step(
+    &self,
+    store: &Store,
+    imaging: &mut HeldImage,
+    budget: usize,
+    mut each: impl FnMut(HeldFile<'_>),
+  ) -> Result<bool, VfsError> {
+    for _ in 0..budget.max(1) {
+      let Some(handle) = imaging.handles.get(imaging.next).copied() else {
+        return Ok(true);
+      };
+      let inode = store.inodes.get(handle)?;
+      let image = self.image_of_inode(store, inode)?;
+      let held = match &inode.body {
+        Body::Sealed(sealed) => Some((sealed.as_slice(), None)),
+        Body::Open { open, sealed } => Some((
+          sealed.as_slice(),
+          Some((open.off, store.content.open_bytes(open))),
+        )),
+        _ => None,
+      };
+      if let Some((extents, open)) = held {
+        each(HeldFile {
+          no: inode.no,
+          size: inode.attrs.size,
+          extents,
+          open,
+        });
+      }
+      image.encode(&mut imaging.bytes);
+      imaging.next = imaging.next.saturating_add(1);
+    }
+    Ok(imaging.next >= imaging.handles.len())
   }
 
   /// [`Volume::to_image`], or with `standalone` [`Volume::to_standalone_image`].

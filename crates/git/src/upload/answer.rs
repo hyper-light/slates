@@ -693,6 +693,27 @@ impl<K> Answer<K> {
     }
     streaming.written()
   }
+
+  /// Writes git's keepalive to `out` where the answer may carry one now: an empty band-1 packet, as git 2.50.1's
+  /// `create_pack_file` writes `0005\1` while `pack-objects` is silent (`uploadpack.keepAlive`; A-722's keepalive on
+  /// the fetch). It may stand only inside a banded pack's section, between its packets: once everything before the pack
+  /// is written, while the pack's objects are still chosen, or while its source has framed nothing new and the pack is
+  /// not closed. Anywhere before the `packfile` section git's client reads it as an empty line where a section's name
+  /// must stand (`crate::v2::fetch`'s module doc), and v0's bare pack has no band to carry it. Whether it was written.
+  pub fn write_keepalive(&self, out: &mut impl Out) -> bool {
+    if self.head_written < self.head.len() {
+      return false;
+    }
+    let due = match (self.choosing.as_deref(), self.pack.as_ref()) {
+      (Some(choosing), _) => {
+        choosing.before.is_none() && choosing.framing.is_some_and(Framing::is_banded)
+      }
+      (None, Some(streaming)) => streaming.framing.is_banded() && streaming.wants_data(),
+      (None, None) => false,
+    };
+    // One band byte is far within what a packet's data holds, so the write is never refused.
+    due && pktline::write(Packet::Data(&[Band::Data.byte()]), out).is_ok()
+  }
 }
 
 impl<K> Streaming<K> {

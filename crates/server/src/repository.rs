@@ -916,6 +916,13 @@ fn spelled(record: &RepositoryRecord, name: &str) -> String {
   }
 }
 
+/// Whether `from` names a branch of `record` as Mercurial resolves a name ([`hg_source`]): a Mercurial repository's
+/// name its namespace does not spell already.
+pub(crate) fn named_as_mercurial_resolves(record: &RepositoryRecord, from: &str) -> bool {
+  let spelled_already = hg_push::line_of(from).is_some() || hg_push::bookmark_of(from).is_some();
+  record.tool == slates_db::catalog::VcsTool::Mercurial && !spelled_already
+}
+
 /// The green a branch named `from` is made from (A-575): a name the namespace spells, or any name of a repository of
 /// a tool other than Mercurial, as given; a Mercurial repository's other names as Mercurial resolves them
 /// ([`hg_source`]). `NotFound` for a name nothing binds.
@@ -924,8 +931,7 @@ fn source_of(
   record: &RepositoryRecord,
   from: &str,
 ) -> Result<DbVolumeId, Refusal> {
-  let spelled_already = hg_push::line_of(from).is_some() || hg_push::bookmark_of(from).is_some();
-  if record.tool != slates_db::catalog::VcsTool::Mercurial || spelled_already {
+  if !named_as_mercurial_resolves(record, from) {
     return state
       .db
       .partition()

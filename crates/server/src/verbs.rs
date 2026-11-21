@@ -1031,9 +1031,28 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Ok(placed) => placed,
     Err(refusal) => return encode_body(&*refusal),
   };
-  let origin_host = origin.0;
+  if let Err(refusal) = holders_increment_fetched(&body, (control, shard)).await {
+    return encode_body(&*refusal);
+  }
   let id = RequestId::from_word(request);
-  let reply = if is_forwardable_read(&body) {
+  let reply = forward_reply(
+    (control, shard),
+    (origin.0, id),
+    (principal, body, volume, made_on),
+    (ack_up_to, ack_owed),
+  )
+  .await;
+  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// The owner shard's reply to a forwarded verb: a read served there, a write run there exactly once, or a peer's reap.
+async fn forward_reply(
+  (control, shard): (u16, u16),
+  (origin_host, id): (u64, RequestId),
+  (principal, body, volume, made_on): (Principal, RequestBody, VolumeId, Option<VolumeId>),
+  acks: (Option<u32>, Vec<u32>),
+) -> ReplyBody {
+  if is_forwardable_read(&body) {
     match call_owner(control, shard, move |s| {
       serve_forwarded_read(s, &principal, body, volume)
     })
@@ -1047,14 +1066,119 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       (control, shard),
       (origin_host, id),
       (principal, body, made_on),
-      (ack_up_to, ack_owed),
+      acks,
     )
     .await
   } else {
     // A peer's reap of its dead client (A-222) is the one verb served here that is neither; any other is refused.
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
+  }
+}
+
+/// A holder's submit names its increment (lane (A) 3b): the owner shard holds it, fetched from the asking node by
+/// identity, before the verb runs. Not had is answered retryable, nothing started; a retry asks only for what is lacking.
+/// Any other verb has nothing to fetch.
+async fn holders_increment_fetched(
+  body: &RequestBody,
+  (control, shard): (u16, u16),
+) -> Result<(), Box<ReplyBody>> {
+  let RequestBody::SubmitComputed {
+    work,
+    green,
+    increment,
+    increment_len,
+    ..
+  } = body
+  else {
+    return Ok(());
   };
-  encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+  fetch_named_increment(
+    (control, shard),
+    ObjectId(work.bytes).creator(),
+    (*green, *increment, *increment_len),
+  )
+  .await
+}
+
+/// Format: an increment a holder's submit named, fetched from that node by identity onto this owner's content store
+/// (lane (A) 3b), counted with its bytes.
+pub(crate) const INPUTS_FETCHED_FROM_HOLDER: &str = "merge.inputs.fetched_from_holder";
+/// Format: the bytes of [`INPUTS_FETCHED_FROM_HOLDER`]'s increments.
+pub(crate) const INPUTS_FETCHED_FROM_HOLDER_BYTES: &str = "merge.inputs.fetched_from_holder_bytes";
+/// Format: an increment a holder's submit named that the fetch did not get whole this time: the submit is answered
+/// retryable, and the fetch's verified chunks stay staged for the retry.
+pub(crate) const INPUTS_FETCH_SHORT: &str = "merge.inputs.fetch_short";
+
+/// Gives the owner `shard` the increment a holder's `SubmitComputed` names (lane (A) 3b): nothing when the shard holds it
+/// already (a retry, or a version committed before); else fetched from `from`, the member that made the work (its id's
+/// creator, the key of this node's record session to it, where the forward's session names the peer's anchor), which
+/// composed it and holds it
+/// under that identity (`merge_service::hold_composed_inputs`), on the content plane into this control shard's hold
+/// (`fleet::fetch_manifest_into_hold`: hedged, every chunk verified, a cut fetch's chunks kept for the next ask), then held
+/// once on the owner shard for the version it would make (`merge_service::hold_increment`) and released here. Owed: the
+/// fetch staged on the owner shard itself, which a session lent across shards would allow; until then the bytes cross
+/// once between this shard and that, a transient copy of what the forward used to carry. `Overloaded` (not started,
+/// retryable) when it is not had whole.
+async fn fetch_named_increment(
+  (control, shard): (u16, u16),
+  from: HostId,
+  (green, identity, len): (VolumeId, [u8; 32], u64),
+) -> Result<(), Box<ReplyBody>> {
+  let id = to_db_volume(green);
+  let object = ObjectId(green.bytes);
+  let named = slates_merge::chain_entry::Inputs { identity, len };
+  if call_owner(control, shard, move |s| {
+    s.held_content.holds_manifest(object, &identity)
+  })
+  .await?
+  {
+    return Ok(());
+  }
+  // The record session to the asking node may be out on a loan (a shipment, a link's probe): the fetch waits for its
+  // return and asks again, each ask for what the stage still lacks, within one deadline the fleet's live budget derives.
+  let budget = crate::fleet::live_budget();
+  let deadline = slates_machine::clock::monotonic_ns().saturating_add(budget.max_deadline_ns());
+  let whole = loop {
+    if crate::fleet::fetch_manifest_into_hold(object, &[from], |_| 0, identity, budget).await {
+      break true;
+    }
+    let left = deadline.saturating_sub(slates_machine::clock::monotonic_ns());
+    if left == 0 || crate::fleet::session_returned(&[from], left).await != Some(true) {
+      break false;
+    }
+  };
+  let bytes = whole
+    .then(|| {
+      crate::state::with_state(|s| {
+        crate::merge_service::increment_of(s, id, &named).map(std::borrow::Cow::into_owned)
+      })
+      .flatten()
+    })
+    .flatten();
+  let Some(bytes) = bytes else {
+    let _ = crate::state::with_state(|s| s.count(INPUTS_FETCH_SHORT, 1));
+    return Err(Box::new(refused(Refusal::Overloaded { shard: control })));
+  };
+  let held = call_owner(control, shard, move |s| {
+    let next = s.db.partition().green_head(id).saturating_add(1);
+    crate::merge_service::hold_increment(s, id, next, &bytes).map(|_| ())
+  })
+  .await?;
+  let _ = crate::state::with_state(|s| {
+    // Staged here for the move: released once the owner shard holds it, unless this shard is the owner's, whose hold it is.
+    if shard != control {
+      s.held_content.forget_manifest(
+        &mut crate::content_holder::hold_space(&mut s.store),
+        object,
+        &identity,
+      );
+    }
+    if held.is_ok() {
+      s.count(INPUTS_FETCHED_FROM_HOLDER, 1);
+      s.count(INPUTS_FETCHED_FROM_HOLDER_BYTES, len);
+    }
+  });
+  held.map_err(|refusal| Box::new(refused(refusal)))
 }
 
 /// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
@@ -3015,6 +3139,35 @@ pub(crate) fn run_recorded_for_test(
   run_recorded(state, origin, id, 1, principal, body)
 }
 
+/// `body` back to run now, or parked until what it owes is made (its reply then, if any).
+fn parked_or_body(
+  state: &mut ShardState,
+  (origin, id): (u64, RequestId),
+  (client_id, principal): (u32, &Principal),
+  body: RequestBody,
+) -> Result<RequestBody, Box<Option<ReplyBody>>> {
+  // The one door to a green's content (P2, `crate::green_ready`): a request on a green that owes a push, or on a work
+  // over one, starts its materialization and parks until it is made; nothing of it runs before.
+  if let Some(green) = crate::green_ready::owing_green_of(state, &body)
+    && crate::green_ready::green_ready(state, green)
+      == crate::green_ready::GreenReady::Materializing
+  {
+    state.current_request = Some((origin, id));
+    let parked = crate::green_ready::park_request(state, green, (client_id, principal, body));
+    state.current_request = None;
+    return Err(Box::new(parked));
+  }
+  // A Mercurial name that reaches the tags reads the heads' `.hgtags` from the changeset store first, between turns
+  // (A-767 C1, `crate::vcs_store::hg_tags`): the request parks until the read is done, nothing of it run before.
+  if let Some(owed) = crate::vcs_store::hg_tags::owing(state, &body) {
+    state.current_request = Some((origin, id));
+    let parked = crate::vcs_store::hg_tags::park_request(state, owed, (client_id, principal, body));
+    state.current_request = None;
+    return Err(Box::new(parked));
+  }
+  Ok(body)
+}
+
 /// Runs a verb on this shard with its effects and its completion record in one durable step
 /// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
 fn run_recorded(
@@ -3030,17 +3183,10 @@ fn run_recorded(
   if let Some(refusal) = crate::live_ship::refuse_over_bound(state, &body) {
     return Some(refusal);
   }
-  // The one door to a green's content (P2, `crate::green_ready`): a request on a green that owes a push, or on a work
-  // over one, starts its materialization and parks until it is made; nothing of it runs before.
-  if let Some(green) = crate::green_ready::owing_green_of(state, &body)
-    && crate::green_ready::green_ready(state, green)
-      == crate::green_ready::GreenReady::Materializing
-  {
-    state.current_request = Some((origin, id));
-    let parked = crate::green_ready::park_request(state, green, (client_id, principal, body));
-    state.current_request = None;
-    return parked;
-  }
+  let body = match parked_or_body(state, (origin, id), (client_id, principal), body) {
+    Ok(body) => body,
+    Err(parked) => return *parked,
+  };
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -4589,6 +4735,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       .chain(large_counts(state))
       .chain(content_ranges)
       .chain(crate::live_ship::hop_rows(state))
+      .chain(busy_harvest_rows())
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -5408,12 +5555,17 @@ fn dispatch_inner(
       work,
       green,
       increment,
+      increment_len,
       computed,
       carried,
     } => {
       // The owner's whole step for a holder's submit (main's ruling on the lane, 2026-11-20: measured on both ends).
       let start = slates_machine::clock::monotonic_ns();
-      let reply = submit_computed(state, (work, green), (&increment, computed), carried);
+      let named = slates_merge::chain_entry::Inputs {
+        identity: increment,
+        len: increment_len,
+      };
+      let reply = submit_computed(state, (work, green), (named, computed), carried);
       let step_ns = slates_machine::clock::monotonic_ns().saturating_sub(start);
       crate::merge_service::count_phase(state, SUBMIT_OWNER_STEP, step_ns);
       reply
@@ -9309,7 +9461,7 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
 }
 
 /// The post-state's length: past the last laid byte of a content, xattr or node op.
-fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
+pub(crate) fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
   use slates_merge::ops_doc::OpKind;
   doc
     .ops
@@ -9344,79 +9496,117 @@ fn assemble_post_state(
   (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
   journal: &[VolumeOp],
 ) -> Vec<u8> {
+  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
+  lay_ops(
+    &mut post,
+    (doc, plan),
+    (files, base),
+    journal,
+    0..doc.ops.len(),
+  );
+  post
+}
+
+/// Lays the bytes the ops of `doc` in `ops` contribute into `post` ([`assemble_post_state`]'s body, which a sliced
+/// build runs a range at a time, A-787 part 3). Returns the bytes copied, what a slice is budgeted by.
+pub(crate) fn lay_ops(
+  post: &mut [u8],
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
+  (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+  ops: std::ops::Range<usize>,
+) -> usize {
+  let mut copied = 0usize;
+  for op in doc.ops.get(ops).unwrap_or_default() {
+    copied = copied.saturating_add(lay_op(post, op, (doc, plan), (files, base), journal));
+  }
+  copied
+}
+
+/// One op's bytes laid into `post` ([`lay_ops`]): the bytes it copied.
+fn lay_op(
+  post: &mut [u8],
+  op: &slates_merge::ops_doc::Op,
+  (doc, plan): (
+    &slates_merge::ops_doc::OpsDoc,
+    &slates_merge::increment::PostStatePlan,
+  ),
+  (files, base): (&crate::work_files::WorkFiles, crate::work_files::Base<'_>),
+  journal: &[VolumeOp],
+) -> usize {
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
-  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
-  for op in &doc.ops {
-    if op.src == u64::MAX {
-      continue;
-    }
-    let Some(path) = doc.paths.path(op.path) else {
-      continue;
-    };
-    let encoded_node;
-    if is_file_content(op.kind) {
-      // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
-      // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
-      // (`build_increment` refuses a work whose green is gone).
-      let (Some(at), Ok(dst), Ok(len)) = (
-        plan.get(&op.src),
-        usize::try_from(op.src),
-        usize::try_from(op.len),
-      ) else {
-        continue;
-      };
-      if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
-        && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
-      {
-        into.fill(0);
-      }
-      continue;
-    }
-    // The bytes this op contributes, and the offset into them: an xattr's value or a node.
-    let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
-      let Some(node) = journal.iter().rev().find_map(|entry| match entry {
-        VolumeOp::Mknod {
-          path: declared,
-          node,
-          ..
-        } if declared == path => Some(node),
-        _ => None,
-      }) else {
-        continue;
-      };
-      encoded_node = node.encode();
-      (&encoded_node, 0)
-    } else if op.kind == OpKind::SetXattr {
-      // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
-      // naming more than 65,535 paths had no value laid in.
-      let Some(name) = doc.paths.path(op.at) else {
-        continue;
-      };
-      let Some(value) = declared_xattr(journal, path, name) else {
-        continue;
-      };
-      (value, 0)
-    } else {
-      continue;
-    };
-    let (Ok(from), Ok(dst), Ok(len)) = (
-      usize::try_from(source_at),
+  if op.src == u64::MAX {
+    return 0;
+  }
+  let Some(path) = doc.paths.path(op.path) else {
+    return 0;
+  };
+  let encoded_node;
+  if is_file_content(op.kind) {
+    // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
+    // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
+    // (`build_increment` refuses a work whose green is gone).
+    let (Some(at), Ok(dst), Ok(len)) = (
+      plan.get(&op.src),
       usize::try_from(op.src),
       usize::try_from(op.len),
     ) else {
-      continue;
+      return 0;
     };
-    let span = (
-      post.get_mut(dst..dst.saturating_add(len)),
-      source.get(from..from.saturating_add(len)),
-    );
-    if let (Some(into), Some(from)) = span {
-      into.copy_from_slice(from);
+    if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
+      && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
+    {
+      into.fill(0);
     }
+    return len;
   }
-  post
+  // The bytes this op contributes, and the offset into them: an xattr's value or a node.
+  let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
+    let Some(node) = journal.iter().rev().find_map(|entry| match entry {
+      VolumeOp::Mknod {
+        path: declared,
+        node,
+        ..
+      } if declared == path => Some(node),
+      _ => None,
+    }) else {
+      return 0;
+    };
+    encoded_node = node.encode();
+    (&encoded_node, 0)
+  } else if op.kind == OpKind::SetXattr {
+    // The name's index is 64 bits (A-621): until then one past 16 bits was skipped here, so an attribute of a work
+    // naming more than 65,535 paths had no value laid in.
+    let Some(name) = doc.paths.path(op.at) else {
+      return 0;
+    };
+    let Some(value) = declared_xattr(journal, path, name) else {
+      return 0;
+    };
+    (value, 0)
+  } else {
+    return 0;
+  };
+  let (Ok(from), Ok(dst), Ok(len)) = (
+    usize::try_from(source_at),
+    usize::try_from(op.src),
+    usize::try_from(op.len),
+  ) else {
+    return 0;
+  };
+  let span = (
+    post.get_mut(dst..dst.saturating_add(len)),
+    source.get(from..from.saturating_add(len)),
+  );
+  if let (Some(into), Some(from)) = span {
+    into.copy_from_slice(from);
+  }
+  len
 }
 
 /// Composes a work volume's declared operations into an increment against its green's base version
@@ -9507,9 +9697,7 @@ pub(crate) fn compose_increment(
   // reported as an accept (`docs/bugs/2026-11-04-the-same-edit-from-two-works-was-one-increment.md`).
   // Both are fixed widths, so the concatenation is unambiguous. Every work volume of a green is under one
   // exclusion filter today (none), so the filter adds nothing yet.
-  let mut hasher = blake3::Hasher::new();
-  hasher.update(&work_id.bytes);
-  hasher.update(&base_version.to_le_bytes());
+  let mut hasher = identity_hasher(work_id, base_version);
   hasher.update(&doc.encode());
   hasher.update(&post_state);
   let id = *hasher.finalize().as_bytes();
@@ -9521,6 +9709,46 @@ pub(crate) fn compose_increment(
     evidence,
     named: Default::default(),
   })
+}
+
+/// The increment [`compose_increment`] composes whole for `work`'s journal over `refined`, its refinement's document and
+/// plan, at `base_version` on the green `green` holds here: the oracle a refinement job's sliced build is held to in a
+/// debug build (A-821). `None` where the work, the green or the composition is not there.
+pub(crate) fn composed_whole(
+  state: &ShardState,
+  (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
+  refined: (
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  ),
+  evidence: Vec<[u8; 32]>,
+) -> Option<slates_merge::engine::Increment> {
+  let w = state.works.get(&work)?;
+  let engine = state.greens.get(&green)?;
+  let base = engine.base_for(base_version, &w.journal);
+  let files_base = crate::work_files::Base {
+    green: Some(&*engine),
+    fetched: None,
+    version: base_version,
+    entries: None,
+  };
+  compose_increment(
+    (work, base_version),
+    (&base, Some(refined)),
+    (&w.files, files_base),
+    &w.journal,
+    evidence,
+  )
+  .ok()
+}
+
+/// The increment identity's hasher with the work and its base taken in ([`compose_increment`]'s comment): the encoded
+/// document and then the post-state follow, whole or a slice at a time (A-787 part 3), to the same identity.
+pub(crate) fn identity_hasher(work_id: DbVolumeId, base_version: u64) -> blake3::Hasher {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&work_id.bytes);
+  hasher.update(&base_version.to_le_bytes());
+  hasher
 }
 
 /// Keeps a conflicting verdict with its work (§4.16, A-267): every window, under a fresh id, until the work's next
@@ -10286,7 +10514,26 @@ fn verdict_of(
   sealed: &crate::work_home::SealedWork,
   (inc, hold): (&slates_merge::engine::Increment, bool),
 ) -> Option<Result<(Judged, Option<slates_merge::engine::Judged>), String>> {
+  // The verdict the refinement job computed at the head it saw (A-787 part 3), taken by position: only what a later
+  // head changed is judged again, so the outcome is the one this head's own judgment reaches.
+  let local = if sealed.computed.is_none() {
+    crate::refining::take_computed(state, sealed.work, inc.id)
+  } else {
+    None
+  };
   let mut engine = state.greens.get_mut(&green_id)?;
+  if let Some(computed) = local {
+    let taken = if hold {
+      engine.judge_computed(inc, computed).map(held_outcome)
+    } else {
+      engine
+        .submit_computed(inc, computed)
+        .map(|judged| (judged, None))
+    };
+    return Some(
+      taken.map_err(|refusal| format!("the verdict is not taken by position: {refusal:?}")),
+    );
+  }
   if hold {
     let judgment = match &sealed.computed {
       None => Ok(engine.judge(inc)),
@@ -10460,6 +10707,13 @@ fn composed_here(
   if sealed.composed.is_none() && crate::work_home::holds_copy(&sealed.journal) {
     state.count(crate::work_home::COPY_COMPOSED_BY_OWNER, 1);
   }
+  // A refined submit's increment the refinement job prepared a slice a turn (A-787 part 3): composed off this step.
+  let key = (sealed.base_version, sealed.journal.len());
+  if sealed.composed.is_none()
+    && let Some(inc) = crate::refining::take_increment(state, sealed.work, key, &evidence)
+  {
+    return Ok((sealed.green, inc));
+  }
   let compose_start = state.clock.monotonic_ns();
   let built = build_increment(state, sealed, evidence)?;
   if sealed.composed.is_none() {
@@ -10473,6 +10727,174 @@ fn composed_here(
 /// the single serialized step of the green. Runs in the transaction of the verb that asked, whether on this shard or
 /// through [`owner_judge`]. The work's own reset is the caller's to settle.
 fn judge_submission(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  evidence: Vec<[u8; 32]>,
+  policy: SubmitPolicy,
+) -> ReplyBody {
+  // The submit's judgment is one step today (its verdict, its commit with the history's re-anchor, its encode): its
+  // longest, and those past the shard's derived step bound (the ceiling a paced step runs to, A-783), counted.
+  let began = slates_rt::futures::now_ns();
+  let reply = judged_submission(state, sealed, evidence, policy);
+  let took = slates_rt::futures::now_ns().saturating_sub(began);
+  state.count_max(
+    SUBMIT_LONGEST_STEP_US,
+    took / crate::daemon::NANOS_PER_MICRO,
+  );
+  if slates_rt::futures::step_ceiling_ns().is_some_and(|ceiling| took > ceiling) {
+    state.count(SUBMIT_STEPS_PAST_CEILING, 1);
+  }
+  reply
+}
+
+/// Counter: the longest step a submit's judgment took on this shard, microseconds (a maximum, not a sum). Format: a
+/// counter name in the daemon's status report.
+pub(crate) const SUBMIT_LONGEST_STEP_US: &str = "merge.submit.longest_step_us";
+/// Counter: submit judgments whose one step ran past the shard's derived step bound (`step_ceiling_ns`, A-783).
+pub(crate) const SUBMIT_STEPS_PAST_CEILING: &str = "merge.submit.steps_past_ceiling";
+
+/// `inc` admitted and held before its verdict: encoded (by the refinement job where it prepared it, A-787 part 3, else
+/// here), its chain room admitted and its retention secured, then held in the shard's content store, where its chain
+/// entry names it (lane (A), chain entry format 6), refused typed at the shard's room, the green's retention settled
+/// again on that refusal.
+fn increment_held(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<crate::merge_service::HeldIncrement, Refusal> {
+  let increment_bytes =
+    crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
+  chain_room_admitted(state, green_id, inc)?;
+  retention_secured(state, green_id, inc)?;
+  let next = state.db.partition().green_head(green_id).saturating_add(1);
+  crate::merge_service::hold_increment(state, green_id, next, &increment_bytes).inspect_err(|_| {
+    let _ = crate::merge_service::settle_green_retention(state, green_id);
+  })
+}
+
+/// The `merge.verdict` chokepoint span (§4.14) from `start` to `end`, labeled `accepted` (1) or not (0), opened within
+/// the submit's own `shard.op` span; a submit always runs inside a recorded verb, so without one its cause is declared
+/// missing.
+fn verdict_span_emitted(state: &mut ShardState, (start, end): (u64, u64), accepted: u32) {
+  let verdict = match state.current_span {
+    Some(cause) => state
+      .tracer
+      .open_within(&cause, Chokepoint::MergeVerdict, start),
+    None => state
+      .tracer
+      .open_unlinked(RequestId::default(), Chokepoint::MergeVerdict, start),
+  };
+  crate::telemetry::emit(state, verdict.end(accepted, end));
+}
+
+/// Whether green `green_id`'s chain admits an entry for `inc`, at the most it can be: its bound plus the room a copy
+/// from a version its source changed after adds (A-626 part 2), derived from what the green's histories hold.
+fn chain_room_admitted(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<(), Refusal> {
+  let room = state
+    .greens
+    .get(&green_id)
+    .map(|engine| engine.copy_entry_room(inc))
+    .ok_or(Refusal::NotFound)?;
+  let bound = slates_merge::chain_entry::entry_bound(inc).saturating_add(room);
+  let admission = Op::GreenAdvanced {
+    green: green_id,
+    increment: vec![0; bound],
+  };
+  let now = state.clock.monotonic_ns();
+  chain_admits(state, green_id, &admission, now)
+}
+
+/// The retention `inc` will take secured before the verdict: the superseded values it charges (incoming bytes do not
+/// bound the retained history: unlink carries none and a short overwrite retains the complete previous file) and the
+/// change index it grows (A-264), room made first by folding what the retention budget allows (never a live reader's
+/// version). An accepted work is reset to its green at the new version, holding nothing of its own, so nothing is
+/// secured for it.
+fn retention_secured(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<(), Refusal> {
+  let reserved = state
+    .greens
+    .get(&green_id)
+    .map(|engine| {
+      engine
+        .history_reservation(inc)
+        .saturating_add(engine.changes_reservation(inc))
+    })
+    .ok_or(Refusal::NotFound)?;
+  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
+  let secure_start = state.clock.monotonic_ns();
+  let secured_now = secure_retention(state, green_id, secured);
+  let secure_ns = state.clock.monotonic_ns().saturating_sub(secure_start);
+  crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_SECURE, secure_ns);
+  secured_now.map_err(|available| Refusal::BudgetExceeded { available })
+}
+
+/// An accepted (or identical) verdict answered: a Subversion green's held verdict deferred to the task holding the
+/// repository's landing turn (`crate::made_commit`), else committed here; the version made into the revision or
+/// changeset its repository's server makes of it; and published once its merge record is committed at the quorum.
+fn accepted_answer(
+  state: &mut ShardState,
+  (green_id, version): (DbVolumeId, u64),
+  parts: AcceptedParts,
+  (copies, held_verdict): (
+    Vec<crate::vcs_store::svn_made::MadeCopy>,
+    Option<slates_merge::engine::Judged>,
+  ),
+) -> ReplyBody {
+  let authorship = parts.authorship.clone();
+  let authorship = &authorship;
+  // A Subversion repository's green whose submit took the repository's landing turn before its verdict
+  // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
+  // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
+  // the accept is durable in this step, and the request is answered when that step commits.
+  if let Some(judged) = held_verdict {
+    match crate::made_commit::take_held(state, green_id) {
+      Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
+      // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
+      None => {
+        let committed = state
+          .greens
+          .get_mut(&green_id)
+          .map(|mut engine| engine.commit_judged(judged).is_ok());
+        if committed != Some(true) {
+          return refused(Refusal::Overloaded { shard: state.shard });
+        }
+      }
+    }
+  }
+  if let Err(refusal) = commit_accepted(state, parts) {
+    return refused(refusal);
+  }
+  // A Subversion repository's green, run outside a recorded request (a bare dispatch, which no answer waits on): the
+  // version becomes the revision the server makes of it, landed by a task after this step (`vcs_store::svn_made`).
+  crate::vcs_store::svn_made::make(state, green_id, version, authorship, &copies);
+  // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
+  // transaction (A-731, `vcs_store::hg_made`).
+  crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
+  // The acceptance is published only once the version's merge record is **committed at the
+  // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
+  // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
+  // goes now; at `f > 0` the reply and the completion record wait for the record plane
+  // (`merge_service::resolve_accepted`), so a client is never told a version a surviving quorum
+  // may not hold.
+  let object = ObjectId(green_id.bytes);
+  if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
+    crate::merge_service::defer_acceptance(state, green_id, version);
+  }
+  // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
+  // had accepted before is that first submit's.
+  crate::merge_service::accepted_reply(state, green_id, version)
+}
+
+/// [`judge_submission`]'s judgment itself.
+fn judged_submission(
   state: &mut ShardState,
   sealed: &crate::work_home::SealedWork,
   evidence: Vec<[u8; 32]>,
@@ -10521,48 +10943,11 @@ fn judge_submission(
   // submit (it cannot advance regardless of the verdict).
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
-  let increment_bytes = inc.encode();
-  // A copy from a version its source changed after records the source's values then in its entry (A-626 part 2): the
-  // green adds that room, derived from what its histories hold, never a fixed allowance.
-  let Some(room) = state
-    .greens
-    .get(&green_id)
-    .map(|engine| engine.copy_entry_room(&inc))
-  else {
-    return refused(Refusal::NotFound);
+  // Encoded by the refinement job where it prepared the increment (A-787 part 3), else here.
+  let held_increment = match increment_held(state, sealed, green_id, &inc) {
+    Ok(held) => held,
+    Err(refusal) => return refused(refusal),
   };
-  let bound =
-    slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc).saturating_add(room);
-  let admission = Op::GreenAdvanced {
-    green: green_id,
-    increment: vec![0; bound],
-  };
-  let now = state.clock.monotonic_ns();
-  if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
-    return refused(refusal);
-  }
-  // Charge superseded values before the verdict. Incoming bytes do not bound the retained
-  // history: unlink carries none and a short overwrite retains the complete previous file.
-  // The change index grows with the version too (A-264), charged with the history it indexes.
-  let Some(reserved) = state.greens.get(&green_id).map(|engine| {
-    engine
-      .history_reservation(&inc)
-      .saturating_add(engine.changes_reservation(&inc))
-  }) else {
-    return refused(Refusal::NotFound);
-  };
-  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
-  // An accepted work is reset to its green at the new version, where it holds nothing of its own
-  // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
-  // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
-  // reader's version).
-  let secure_start = state.clock.monotonic_ns();
-  let secured_now = secure_retention(state, green_id, secured);
-  let secure_ns = state.clock.monotonic_ns().saturating_sub(secure_start);
-  crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_SECURE, secure_ns);
-  if let Err(available) = secured_now {
-    return refused(Refusal::BudgetExceeded { available });
-  }
   let walked_before = state
     .greens
     .get(&green_id)
@@ -10571,15 +10956,24 @@ fn judge_submission(
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
   let hold = crate::made_commit::holds(state, green_id);
   let Some(judged) = verdict_of(state, green_id, sealed, (&inc, hold)) else {
+    crate::merge_service::release_refused_increment(state, green_id, held_increment);
     return refused(Refusal::NotFound);
   };
   let ((outcome, applied), held_verdict) = match judged {
     Ok(judged) => judged,
     Err(reason) => {
+      crate::merge_service::release_refused_increment(state, green_id, held_increment);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       return refused(Refusal::BadRequest { reason });
     }
   };
+  if !matches!(
+    &outcome,
+    slates_merge::engine::Outcome::Accepted { .. }
+      | slates_merge::engine::Outcome::Identical { .. }
+  ) {
+    crate::merge_service::release_refused_increment(state, green_id, held_increment);
+  }
   if sealed.computed.is_some() {
     state.count(TAKEN_BY_POSITION, 1);
   }
@@ -10603,18 +10997,7 @@ fn judge_submission(
     slates_merge::engine::Outcome::Accepted { .. }
       | slates_merge::engine::Outcome::Identical { .. }
   ));
-  let verdict = match state.current_span {
-    Some(cause) => state
-      .tracer
-      .open_within(&cause, Chokepoint::MergeVerdict, verdict_start),
-    // A submit always runs inside a recorded verb; without its span the cause is declared missing.
-    None => state.tracer.open_unlinked(
-      RequestId::default(),
-      Chokepoint::MergeVerdict,
-      verdict_start,
-    ),
-  };
-  crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
+  verdict_span_emitted(state, (verdict_start, verdict_end), accepted);
   match outcome {
     // An identical increment commits its (empty) version as an accept does, so retries and the chain's replay answer
     // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
@@ -10627,55 +11010,14 @@ fn judge_submission(
         green: green_id,
         work: sealed.work,
         version,
-        increment_bytes,
+        held_increment,
         increment: inc,
         applied,
         verification: signed.verification,
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
-      // A Subversion repository's green whose submit took the repository's landing turn before its verdict
-      // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
-      // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
-      // the accept is durable in this step, and the request is answered when that step commits.
-      if let Some(judged) = held_verdict {
-        match crate::made_commit::take_held(state, green_id) {
-          Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
-          // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
-          None => {
-            let committed = state
-              .greens
-              .get_mut(&green_id)
-              .map(|mut engine| engine.commit_judged(judged).is_ok());
-            if committed != Some(true) {
-              return refused(Refusal::Overloaded { shard: state.shard });
-            }
-          }
-        }
-      }
-      if let Err(refusal) = commit_accepted(state, parts) {
-        return refused(refusal);
-      }
-      // A Subversion repository's green, run outside a recorded request (a bare dispatch, which no answer waits on): the
-      // version becomes the revision the server makes of it, landed by a task after this step (`vcs_store::svn_made`).
-      let authorship = &policy.authorship;
-      crate::vcs_store::svn_made::make(state, green_id, version, authorship, &copies);
-      // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
-      // transaction (A-731, `vcs_store::hg_made`).
-      crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
-      // The acceptance is published only once the version's merge record is **committed at the
-      // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
-      // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
-      // goes now; at `f > 0` the reply and the completion record wait for the record plane
-      // (`merge_service::resolve_accepted`), so a client is never told a version a surviving quorum
-      // may not hold.
-      let object = ObjectId(green_id.bytes);
-      if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
-        crate::merge_service::defer_acceptance(state, green_id, version);
-      }
-      // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
-      // had accepted before is that first submit's.
-      crate::merge_service::accepted_reply(state, green_id, version)
+      accepted_answer(state, (green_id, version), parts, (copies, held_verdict))
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
       // The work is not reset: the bound secured for a reset is released.
@@ -10715,8 +11057,8 @@ pub(crate) struct AcceptedParts {
   pub(crate) work: DbVolumeId,
   /// The version the verdict made.
   pub(crate) version: u64,
-  /// The increment as submitted, encoded.
-  increment_bytes: Vec<u8>,
+  /// Where the content store holds the increment, as its chain entry names it (chain entry format 6).
+  held_increment: crate::merge_service::HeldIncrement,
   /// The increment.
   increment: slates_merge::engine::Increment,
   /// What its verdict resolved it to (A-257).
@@ -10730,21 +11072,25 @@ pub(crate) struct AcceptedParts {
 }
 
 impl AcceptedParts {
-  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test.
+  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test: its increment held in
+  /// `state`'s content store as a submit holds it (chain entry format 6).
   #[cfg(test)]
   pub(crate) fn for_test(
+    state: &mut ShardState,
     (green, work, version): (DbVolumeId, DbVolumeId, u64),
     (increment, applied): (
       slates_merge::engine::Increment,
       Vec<slates_merge::chain_entry::Applied>,
     ),
   ) -> AcceptedParts {
-    let increment_bytes = increment.encode();
+    let held_increment =
+      crate::merge_service::hold_increment(state, green, version, &increment.encode())
+        .expect("room for the test's increment");
     AcceptedParts {
       green,
       work,
       version,
-      increment_bytes,
+      held_increment,
       increment,
       applied: Some(applied),
       verification: slates_ipc::protocol::Verification::Unsigned,
@@ -10762,7 +11108,7 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
     green: green_id,
     work,
     version,
-    increment_bytes,
+    held_increment,
     increment: inc,
     applied,
     verification,
@@ -10770,19 +11116,25 @@ pub(crate) fn commit_accepted(state: &mut ShardState, parts: AcceptedParts) -> R
     authorship,
   } = parts;
   // The wait goes first, in this transaction, so a version is never durable without it (A-252).
-  crate::merge_service::stage_awaiting(state, green_id, version).map_err(|e| refusal_of_db(&e))?;
+  if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
+    crate::merge_service::release_refused_increment(state, green_id, held_increment);
+    return Err(refusal_of_db(&e));
+  }
   // The pre-check passed and the shard is single-threaded, so this append fits the budget; a segment-full failure
   // refuses like any other verb. A resubmit the engine answered from its idempotent accept names a version the chain
   // already holds: nothing is appended twice. The durable head is the checkpoint's version and the increments after it
   // (W3).
   let append_start = state.clock.monotonic_ns();
-  record_accepted(
+  if let Err(refusal) = record_accepted(
     state,
     (green_id, work),
     version,
-    (&increment_bytes, &inc),
+    (held_increment.inputs, &inc),
     (applied.as_deref(), &verification),
-  )?;
+  ) {
+    crate::merge_service::release_refused_increment(state, green_id, held_increment);
+    return Err(refusal);
+  }
   let appended = state.clock.monotonic_ns().saturating_sub(append_start);
   crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_APPEND, appended);
   // The version's merge record, issued only once its inputs — the increment just appended — are placed (§4.16
@@ -10843,7 +11195,10 @@ fn record_accepted(
   state: &mut ShardState,
   (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
-  (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
+  (inputs, increment): (
+    slates_merge::chain_entry::Inputs,
+    &slates_merge::engine::Increment,
+  ),
   (applied, verification): (
     Option<&[slates_merge::chain_entry::Applied]>,
     &slates_ipc::protocol::Verification,
@@ -10861,7 +11216,7 @@ fn record_accepted(
     })
     .flatten();
   let entry = slates_merge::chain_entry::encode(
-    increment_bytes,
+    inputs,
     increment,
     applied.unwrap_or_default(),
     crate::merge_service::SubmitCompletion::of_current(state, work)
@@ -10874,6 +11229,9 @@ fn record_accepted(
     green,
     increment: entry,
   };
+  // The entry names content the store must hold across a kill: the append is durable in the segment when it returns, the
+  // hold only once a publication commits its image, so the hold is published first (lane (A), condition 1).
+  publish_held_increments(state)?;
   let now = state.clock.monotonic_ns();
   state
     .db
@@ -10888,6 +11246,24 @@ fn record_accepted(
     engine.record_signature(version, signature);
   }
   Ok(())
+}
+
+/// Publishes the shard when its content store changed since its last publication (chain entry format 6): what an entry
+/// about to be appended names must be in the committed image first, since the append is durable at once and a kill
+/// before the next publication would leave the entry naming content the restarted store lacks. A refused publication
+/// refuses the append, and a green whose engine committed the version it would have recorded is made again from its
+/// durable checkpoint and chain, as after any refused publication (A-721, [`remake_greens_ahead`]).
+pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refusal> {
+  // A shard with no content object keeps no image (a degraded build): nothing it holds survives it, so there is no
+  // order to keep.
+  let (start, end) = state.content_range;
+  if state.held_content.changed_pieces().is_empty() || state.content.is_none() || end <= start {
+    return Ok(());
+  }
+  publish_shard(state).map(|_| ()).map_err(|e| {
+    remake_greens_ahead(state);
+    refusal_of_vfs(&e)
+  })
 }
 
 fn chain_admits(
@@ -11752,7 +12128,7 @@ pub(crate) const SUBMIT_OWNER_DECODE: (&str, &str) =
 fn submit_computed(
   state: &mut ShardState,
   (work, green): (VolumeId, VolumeId),
-  (increment, computed): (&[u8], Vec<u8>),
+  (named, computed): (slates_merge::chain_entry::Inputs, Vec<u8>),
   carried: slates_ipc::protocol::ComputedSubmit,
 ) -> ReplyBody {
   let forwarded = state
@@ -11763,8 +12139,15 @@ fn submit_computed(
       feature: "a node's verb from a client".to_owned(),
     });
   }
+  // The increment the request names, which the forward fetched from the asking node into this shard's content store
+  // before this step (lane (A) 3b, `fetch_named_increment`): not held (released since, or the fetch cut short) is
+  // answered retryable, nothing started, and the asking node's retry fetches it again.
+  let Some(increment) = crate::merge_service::increment_of(state, to_db_volume(green), &named)
+  else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
   let decode_start = slates_machine::clock::monotonic_ns();
-  let decoded = slates_merge::engine::Increment::decode(increment);
+  let decoded = slates_merge::engine::Increment::decode(&increment);
   let decode_ns = slates_machine::clock::monotonic_ns().saturating_sub(decode_start);
   crate::merge_service::count_phase(state, SUBMIT_OWNER_DECODE, decode_ns);
   let inc = match decoded {
@@ -12142,6 +12525,15 @@ pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
   let shard = state.shard;
   route
     .is_some_and(|route| answered_on(route, (origin, id), refused(Refusal::Overloaded { shard })))
+}
+
+/// The evidence of the first submit parked in `parked` that runs on the green's shard (A-787 part 3: the increment a
+/// refinement job prepares carries it); none when no such submit waits.
+pub(crate) fn parked_local_evidence(parked: &[ParkedSubmit]) -> Option<Vec<[u8; 32]>> {
+  parked.iter().find_map(|submit| match &submit.kind {
+    ParkedKind::Local { evidence, .. } => Some(evidence.clone()),
+    _ => None,
+  })
 }
 
 /// What a parked submit runs again: the owner's step of a submit asked from a work's shard ([`owner_judge`]), or the
@@ -18560,6 +18952,13 @@ pub(crate) async fn rebuild_recovered(
   )
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
+  // An increment held for a version whose entry a kill kept from its append names nothing (chain entry format 6): it
+  // goes, as every held increment no entry names does.
+  let greens: Vec<DbVolumeId> = state.greens.keys().copied().collect();
+  for green in greens {
+    let floor = state.db.partition().green_floor(green);
+    crate::merge_service::release_unnamed_increments(state, green, floor, None);
+  }
   slices.unit_done().await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
   // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
@@ -19088,7 +19487,23 @@ async fn rebuild_green_sliced(
   if load_steps > 0 {
     state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
   }
+  count_resolved(state, &replayed);
   install_green(state, record, replayed)
+}
+
+/// Counts the versions a replay applied, each with its increment read from the content store (chain entry format 6).
+fn count_resolved(
+  state: &mut ShardState,
+  replayed: &Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) {
+  if let Ok((_, versions)) = replayed
+    && !versions.is_empty()
+  {
+    state.count(
+      crate::merge_service::CHAIN_INPUTS_RESOLVED,
+      u64::try_from(versions.len()).unwrap_or(u64::MAX),
+    );
+  }
 }
 
 /// A green's place in its lineage's join order (A-575): 0 for a green no lineage holds.
@@ -19121,6 +19536,7 @@ async fn rebuild_member_sliced(
     if load_steps > 0 {
       state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
     }
+    count_resolved(state, &replayed);
     return install_member_root(state, record, member, replayed);
   };
   let Some(seeded) = begin_member_branch(state, record, (from, version)) else {
@@ -19647,8 +20063,14 @@ fn replay_chain_entry(
         *next = next.saturating_add(1);
         return Ok(false);
       }
+      // The increment the entry names, from the content store it was held in before its entry was appended (chain entry
+      // format 6): one the store lacks fences the green, as a corrupt entry does.
+      let inputs = slates_merge::chain_entry::inputs(bytes)
+        .map_err(|_| GreenFence::EntryCorrupt { version })?;
+      let increment = crate::merge_service::increment_of(state, id, &inputs)
+        .ok_or(GreenFence::ContentMissing { version })?;
       Box::new(
-        slates_merge::chain_entry::decode(bytes)
+        slates_merge::chain_entry::decode(bytes, &increment)
           .map_err(|_| GreenFence::EntryCorrupt { version })?,
       )
     }
@@ -27439,4 +27861,18 @@ mod resize_admission_tests {
     );
     assert_eq!(refused, 0, "no allowance was refused");
   }
+}
+
+/// This shard's busy harvests deferred because a harvest costs more than its quantum (`slates_rt::busy_harvest`), as
+/// the `rt.core.harvests_deferred` row: the longer interval's non-vacuity count. Left out at zero, as every count of the
+/// report is.
+fn busy_harvest_rows() -> Vec<RefusalCount> {
+  slates_rt::registry::with_current(|ctx| ctx.counters().harvests_deferred)
+    .filter(|deferred| *deferred > 0)
+    .map(|deferred| RefusalCount {
+      kind: "rt.core.harvests_deferred".to_owned(),
+      count: deferred,
+    })
+    .into_iter()
+    .collect()
 }

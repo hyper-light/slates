@@ -276,15 +276,31 @@ impl Stdio {
   /// What the stream's next step needs of the changeset store, if anything (a `stream_out`'s,
   /// [`crate::render::Streaming::wants`]).
   pub fn store_wants(&mut self) -> Option<&mut dyn crate::render::StoreWants> {
-    match self.answering.as_mut() {
-      Some(answering) if crate::render::StoreWants::wants(answering).is_some() => Some(answering),
+    use crate::render::StoreWants;
+    if let Some(answering) = self.answering.as_mut() {
+      return answering
+        .wants()
+        .is_some()
+        .then_some(answering as &mut dyn StoreWants);
+    }
+    match self.batching.as_mut() {
+      Some(batch) if batch.wants().is_some() => Some(batch),
       _ => None,
     }
   }
 
-  /// Whether a `getbundle`'s answer is being made (A-745): [`Stdio::stream`] makes its next slice.
+  /// Whether an answer is being made a step at a time (A-745): a `getbundle`'s, a `stream_out`'s, a `lookup`'s reading
+  /// the heads' `.hgtags`, or a `batch` waiting on them; [`Stdio::stream`] makes its next slice.
   pub fn streaming(&self) -> bool {
-    self.answering.is_some()
+    self.answering.is_some() || self.batch_waits_on_the_store()
+  }
+
+  /// Whether a `batch` waits for the heads' `.hgtags` from the changeset store ([`session::BatchStep::Store`]).
+  fn batch_waits_on_the_store(&self) -> bool {
+    self
+      .batching
+      .as_ref()
+      .is_some_and(|batch| crate::render::StoreWants::wants(batch).is_some())
   }
 
   /// Makes the next slice of the `getbundle` answer being made, within `room` (A-745), after what its standard output
@@ -295,7 +311,11 @@ impl Stdio {
       return Progress::Waiting;
     }
     let Some(answering) = self.answering.as_mut() else {
-      return Progress::Waiting;
+      // A batch whose `.hgtags` its caller has given takes its next step.
+      return match self.batching.take() {
+        Some(batch) => self.batch_step(batch, store, Admission::new(room), 0),
+        None => Progress::Waiting,
+      };
     };
     let mut admission = Admission::new(room);
     match answering.step(store, &mut admission, &mut self.stdout) {
@@ -502,6 +522,11 @@ impl Stdio {
           admission: Admission::new(self.push_room.map_or(left, |push| push.max(left))),
         };
         self.push = Pushing::Whole(push, Asked::Batch);
+        self.batching = Some(batch);
+        self.taken(Step::Answered { refused: None }, used)
+      }
+      Ok(BatchStep::Store) => {
+        // Its caller answers the batch's wants ([`Stdio::store_wants`]) and steps it again ([`Stdio::stream`]).
         self.batching = Some(batch);
         self.taken(Step::Answered { refused: None }, used)
       }

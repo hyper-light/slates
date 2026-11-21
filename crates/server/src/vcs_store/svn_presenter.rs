@@ -61,20 +61,25 @@ const FILE_MODE: u32 = 0o444;
 /// Format: why a configured hook is refused where no view can be shown (A-645 (a)): a hook is shown its repository as a
 /// view slates mounts in its store's granted directory, and this daemon was given none (`--vcs-store`). Answered with
 /// `SVN_ERR_UNSUPPORTED_FEATURE`, as the other hooks this server cannot run are; git's push says it in its reason.
+#[cfg(unix)]
 pub(crate) const UNGRANTED_WORDS: &str = "This server cannot run this repository's hooks: it holds no standing grant to show a hook its repository under (start it with --vcs-store)";
 
 /// Where a shard's hooks are shown their repository (`ShardState::hook_views`, A-645 (a)).
 #[derive(Clone, Debug, Default)]
 pub(crate) enum HookViews {
   /// No store directory was granted: no view can be shown, and a configured hook is refused, typed
-  /// ([`UNGRANTED_WORDS`]).
+  /// (`UNGRANTED_WORDS`, on Unix, where hooks run).
   #[default]
   Ungranted,
   /// The store's granted directory: the repository's view is presented and mounted there, read-only, and that mount is
-  /// the hook's `REPOS-PATH`.
+  /// the hook's `REPOS-PATH`. Its directory is read by `repos_for_hook` alone, which only Unix's hook driver calls: on
+  /// Windows no hook runs, and the variant says only that hooks could be shown (`HookViews::shows`).
+  #[cfg_attr(not(unix), allow(dead_code))]
   Granted(&'static slates_land::store_root::StoreRoot),
   /// A directory the caller made (the in-process hook tests' stand-in for a mounted view,
-  /// `Daemon::record_root_mount`): `REPOS-PATH` is the repository's name beneath it.
+  /// `Daemon::record_root_mount`): `REPOS-PATH` is the repository's name beneath it. Read by `repos_for_hook` alone, as
+  /// `Granted`'s directory is.
+  #[cfg_attr(not(unix), allow(dead_code))]
   Given(std::path::PathBuf),
 }
 
@@ -555,6 +560,7 @@ const UNSHOWN_WORDS: &str = "This server could not show this repository's hook i
 
 /// Format: the suffix of a view's mount point in the store's granted directory, after the repository's name: FSFS's
 /// own word for its repository.
+#[cfg(unix)]
 const MOUNT_POINT_SUFFIX: &str = ".svn";
 
 /// Format: the start of a view volume's name, before the repository's name and the number that routes the name to the
@@ -570,6 +576,7 @@ const REVISIONS_A_SLICE: usize = 1;
 pub(crate) struct ViewSlot {
   volume: slates_db::catalog::VolumeId,
   presented: Presented,
+  #[cfg(unix)]
   mount: Mount,
   /// Revisions laid out whose files name a stored text the content store let go: written once it is brought back (C2
   /// stage B part 2 (b)).
@@ -581,6 +588,7 @@ pub(crate) struct ViewSlot {
 
 /// Where a view is mounted.
 #[derive(Debug)]
+#[cfg(unix)]
 enum Mount {
   /// Nowhere yet.
   Unmounted,
@@ -593,6 +601,7 @@ enum Mount {
 /// The `REPOS-PATH` a hook of the repository `id`, named `name`, is handed, as `views` says (`HookViews`): the
 /// repository's view presented and mounted on its owner shard where the store's grant allows it; the name beneath a
 /// given directory for the in-process tests; refused in words, typed by the caller, where neither.
+#[cfg(unix)]
 pub(crate) async fn repos_for_hook(
   views: &HookViews,
   id: slates_db::catalog::RepositoryId,
@@ -807,6 +816,7 @@ fn slot_for(
     ViewSlot {
       volume: crate::verbs::to_db_volume(volume),
       presented: Presented::new(),
+      #[cfg(unix)]
       mount: Mount::Unmounted,
       pending: None,
       brought: Vec::new(),
@@ -1027,16 +1037,6 @@ async fn mount_once(
     )),
     Err(why) => Err(format!("{UNSHOWN_WORDS}: its view's mount helper {why}")),
   }
-}
-
-/// No hook runs on Windows yet (the hook driver is Unix's alone), so no view is mounted there.
-#[cfg(not(unix))]
-async fn mounted(
-  _root: &'static slates_land::store_root::StoreRoot,
-  _id: slates_db::catalog::RepositoryId,
-  _name: &str,
-) -> Result<std::path::PathBuf, String> {
-  Err(format!("{UNSHOWN_WORDS}: no hook runs on this platform"))
 }
 
 #[cfg(test)]

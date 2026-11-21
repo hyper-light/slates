@@ -318,6 +318,9 @@ impl Source {
 pub enum Refused {
   /// The bytes end before what they declare.
   Truncated,
+  /// A record replayed whole whose push named a file delta base landed before it, which only the node's changeset
+  /// store holds and only a replay that waits between steps reads (A-767 C1; [`Progress::Store`]).
+  StoreWanted,
   /// Bytes of another kind: the magic is not an import record's.
   Magic,
   /// A version this build does not read.
@@ -1361,6 +1364,9 @@ pub enum Progress {
   /// The step needs these bytes of the payload, which its source does not hold: nothing was taken; put them in and
   /// step again (`crate::framing::Window`).
   Wanted(core::ops::Range<u64>),
+  /// The step needs a file delta's base from the node's changeset store (`crate::push::intake::Stepped::Store`):
+  /// answer [`Replay::store_wants`] and step again.
+  Store,
 }
 
 /// A push's changegroup taken again through the intake (A-729 part 2).
@@ -1476,7 +1482,8 @@ impl Replay {
               index.len(store, Log::Changelog),
               index.len(store, Log::Manifest),
             );
-            let intake = Intake::begin_framed(framed, index, store).map_err(Refused::Intake)?;
+            let intake =
+              Intake::begin_framed(framed, index, store, room.left()).map_err(Refused::Intake)?;
             self.kind = Kind::Changegroup(Box::new(Retaken {
               intake,
               payload: 0..0,
@@ -1499,6 +1506,22 @@ impl Replay {
       Kind::Revisions(_) => Err(Refused::Version {
         version: SECTIONED_VERSION,
       }),
+    }
+  }
+
+  /// Answers the replay's store want from its fork's own texts: a test's stand-in for the node's changeset store.
+  #[cfg(test)]
+  pub(crate) fn answer_from_fork(&mut self, store: &ContentStore) {
+    if let Kind::Changegroup(retaken) = &mut self.kind {
+      retaken.intake.answer_from_fork(store);
+    }
+  }
+
+  /// What the replay's next step asks of the node's changeset store, if anything ([`Progress::Store`]).
+  pub fn store_wants(&mut self) -> Option<&mut dyn crate::render::StoreWants> {
+    match &mut self.kind {
+      Kind::Changegroup(retaken) => Some(&mut retaken.intake),
+      Kind::Revisions(_) | Kind::Framing(_) => None,
     }
   }
 
@@ -1577,6 +1600,14 @@ impl Retaken {
       Progress::Done => Ok(false),
       // A record holds its changegroup whole: a want names bytes past its end.
       Progress::Wanted(_) => Err(Refused::Truncated),
+      // A test keeps no store: the fork's own texts stand in for it.
+      #[cfg(test)]
+      Progress::Store => {
+        self.intake.answer_from_fork(store);
+        Ok(true)
+      }
+      #[cfg(not(test))]
+      Progress::Store => Err(Refused::StoreWanted),
     }
   }
 
@@ -1600,6 +1631,7 @@ impl Retaken {
         Ok(Progress::Done)
       }
       Stepped::Wanted(range) => Ok(Progress::Wanted(range)),
+      Stepped::Store => Ok(Progress::Store),
     }
   }
 

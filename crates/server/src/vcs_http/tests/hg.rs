@@ -191,14 +191,6 @@ impl Repository for Empty {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Empty {
@@ -883,14 +875,6 @@ impl Repository for Charging {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     admission.charge(TAG_READ)?;
     Ok(None)
-  }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
   }
 }
 

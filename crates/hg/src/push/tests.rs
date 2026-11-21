@@ -210,14 +210,6 @@ impl Repository for View {
   ) -> Result<Option<Node>, crate::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut crate::Admission,
-  ) -> Result<Vec<u8>, crate::serve::Refusal> {
-    Err(crate::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 /// A fixture's request, read.

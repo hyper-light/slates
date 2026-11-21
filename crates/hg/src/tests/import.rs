@@ -1471,6 +1471,7 @@ fn taken_whole(
       Stepped::More => {}
       Stepped::Done => break,
       Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+      Stepped::Store => intake.answer_from_fork(store),
     }
   }
   intake.finish().ok().unwrap()

@@ -895,6 +895,9 @@ pub struct ShardState {
   pub(crate) made_commits: crate::made_commit::MadeCommits,
   /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
   pub(crate) materializations: crate::green_ready::Materializations,
+  /// The shard's reads of Mercurial repositories' `.hgtags` for an owner's verb, and the requests parked on them
+  /// (A-767 C1, `crate::vcs_store::hg_tags`).
+  pub(crate) hg_tags: crate::vcs_store::hg_tags::HgTags,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -915,6 +918,9 @@ pub struct ShardState {
   /// The placements of the objects this shard asks about, one computation a configuration
   /// ([`crate::placement_cache`]): read through [`ShardState::with_placement`].
   pub(crate) placement_cache: std::cell::RefCell<crate::placement_cache::PlacementCache>,
+  /// Each live volume's sealing keys, unwrapped once and kept while their records stand (`crate::seal_keys::BodyKeys`;
+  /// g228, 85a: five unwraps a publication before).
+  pub(crate) body_keys: crate::seal_keys::BodyKeys,
   /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
   /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
   /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.
@@ -1544,6 +1550,16 @@ impl ShardState {
     }
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
+  }
+
+  /// Raises the count of `kind` to `value` when it is larger: a counter that reads the most a figure reached (a longest
+  /// step), in the same report as the sums. Zero changes nothing, as [`ShardState::count`]'s does.
+  pub(crate) fn count_max(&mut self, kind: &'static str, value: u64) {
+    if value == 0 {
+      return;
+    }
+    let count = self.refusals.entry(kind).or_insert(0);
+    *count = (*count).max(value);
   }
 }
 

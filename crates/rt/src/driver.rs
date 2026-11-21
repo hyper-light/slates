@@ -489,8 +489,10 @@ mod tests {
   /// shortest under one millisecond. epoll's `epoll_wait` takes whole milliseconds and rustix rounds a shorter timeout
   /// up, so every such wait lasted a full millisecond: a shard parked to the end of its idle window slept to the next
   /// millisecond with a client's request waiting (the 1.00-1.02 ms band of a loaded Linux edit and merge, GAPS 84a).
+  /// The completion port's `GetQueuedCompletionStatusEx` takes whole milliseconds too (and a short wait lasts a
+  /// timer tick, 15.6 ms by default): the IOCP driver's deadline timer is held to the same bar.
   #[test]
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[cfg_attr(miri, ignore)]
   fn a_sub_millisecond_timed_wait_ends_by_its_deadline() {
     /// Shape: one millisecond, the granularity a whole-millisecond wait rounds up to.
@@ -501,7 +503,7 @@ mod tests {
     let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     let mut out = Vec::new();
-    let shortest = (0..SUB_MILLISECOND_WAITS)
+    let mut took: Vec<u64> = (0..SUB_MILLISECOND_WAITS)
       .map(|_| {
         let started = driver.now_ns();
         driver
@@ -509,12 +511,22 @@ mod tests {
           .unwrap();
         driver.now_ns() - started
       })
-      .min()
-      .unwrap_or(u64::MAX);
+      .collect();
+    took.sort_unstable();
+    let shortest = took.first().copied().unwrap_or(u64::MAX);
     assert!(
       shortest < MILLISECOND_NS,
       "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took at least {shortest} ns every time: it waited for a whole \
        millisecond",
+      driver.kind().name()
+    );
+    // A Windows wait in whole milliseconds may also end before its timeout, on its timer's tick (iocp.rs's `wait`), so a
+    // lucky shortest proves nothing there (windows-11-arm, diag run 44934773181: the shortest under a millisecond with
+    // every wait a millisecond's): half the waits must end before one.
+    let median = took.get(took.len() / 2).copied().unwrap_or(u64::MAX);
+    assert!(
+      !cfg!(windows) || median < MILLISECOND_NS,
+      "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took {median} ns at the median: it waited for whole milliseconds",
       driver.kind().name()
     );
     drop(driver);
@@ -522,9 +534,9 @@ mod tests {
   }
 
   /// Shape: a wait well under a millisecond, well over a system call's cost.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   const SUB_MILLISECOND_WAIT_NS: u64 = 200_000;
   /// Shape: the waits whose shortest is judged, so one preemption of the test thread decides nothing.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   const SUB_MILLISECOND_WAITS: usize = 50;
 }
