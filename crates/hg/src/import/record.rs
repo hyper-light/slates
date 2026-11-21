@@ -78,8 +78,11 @@ const CHANGEGROUP_VERSION: u32 = 2;
 const DELTA_VERSION: u32 = 3;
 /// Format: the version of an import's record that names each revision's content by identity and holds none of its bytes
 /// (A-729 part 2; main's ruling: since A-727 a3 the content a shard stores survives a restart in its image, recovered
-/// before the records, so a record names what the store holds, never a second copy in the log).
-const IDENTITY_VERSION: u32 = 4;
+/// before the records, so a record names what the store holds, never a second copy in the log). Version 5 since main's
+/// ruling B of 2026-11-20: each manifest's and file revision's row names its whole text's identity and whether that text
+/// begins with a NUL byte beside what it stores (file revisions kept as deltas, `HgIndex::append_revisions`), so a
+/// replay appends the row whole; version 4's rows lack them and are refused by version.
+const IDENTITY_VERSION: u32 = 5;
 /// Format: the form byte of a revision given whole.
 const TEXT_FORM: u8 = 0;
 /// Format: the form byte of a revision given as its delta, its base's node after the byte.
@@ -508,7 +511,8 @@ fn write_kept_revision(out: &mut Vec<u8>, store: &ContentStore, kept: &Kept) -> 
 /// One revision as a [`IDENTITY_VERSION`] record names it (A-729 part 2): its node, its parents' nodes, a manifest's or
 /// file revision's link's node, 7.2's flags and its text's length; then a changeset's text by its identity, or a
 /// manifest's or file revision's row as the index stores it: its delta fields (base number, delta length, chain bytes),
-/// its content's identity (the text, a file revision's bytes, or a delta), and a file revision's metadata block's
+/// its whole text's identity and a byte saying whether that text begins with a NUL, its content's identity (the text, a
+/// file revision's bytes, or a delta), and a file revision's metadata block's
 /// identity behind a byte that says whether it has one. None where the index lacks the row or a parent.
 fn write_identity_revision(
   out: &mut Vec<u8>,
@@ -545,6 +549,8 @@ fn write_identity_revision(
   out.extend_from_slice(&row.base.to_le_bytes());
   out.extend_from_slice(&row.stored.to_le_bytes());
   out.extend_from_slice(&row.chain.to_le_bytes());
+  out.extend_from_slice(&row.text.0);
+  out.push(u8::from(row.nul_led));
   out.extend_from_slice(&row.bytes.0);
   match row.block {
     Some(block) => {
@@ -1569,7 +1575,20 @@ impl Revisions {
     let link = reader.node()?;
     let flags = flags_of(reader)?;
     let len = reader.long()?;
-    let stored = (reader.word()?, reader.long()?, reader.long()?);
+    let (base, delta, chain) = (reader.word()?, reader.long()?, reader.long()?);
+    let text = identity_of(reader)?;
+    let nul_led = match reader.byte()? {
+      0 => false,
+      1 => true,
+      tag => return Err(Refused::Tag { tag }),
+    };
+    let stored = crate::index::Stored {
+      base,
+      delta,
+      chain,
+      text,
+      nul_led,
+    };
     let bytes = identity_of(reader)?;
     let block = match reader.byte()? {
       0 => None,

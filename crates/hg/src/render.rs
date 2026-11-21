@@ -425,24 +425,19 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
 /// A revision's chunk length in its data file, from its row alone: its text's length, and one byte more for the `u`
 /// that marks a text stored as it is, unless the text is empty or begins with a NUL. A changeset's text begins with its
 /// manifest's hexadecimal node, a manifest's with a path, and a file revision's with a metadata block's marker where it
-/// has one, none of them a NUL; a file revision's bytes otherwise begin as the store's first window of them does.
+/// has one, none of them a NUL; a file revision's bytes otherwise begin as its row says (`index::Stored::nul_led`).
 fn chunk_len(index: &HgIndex, store: &ContentStore, (log, rev): (Log<'_>, u32)) -> Option<u64> {
   let (len, leading) = match log {
     Log::Changelog => (index.changeset(store, rev)?.len, None),
     Log::Manifest => (index.revision(store, log, rev)?.len, None),
     Log::File(_) => {
       let row = index.revision(store, log, rev)?;
-      let leading = match row.block {
-        Some(_) => None,
-        None => store
-          .windows(&row.bytes)
-          .next()
-          .and_then(|window| window.first().copied()),
-      };
-      (row.len, leading)
+      // A row names whether its whole text begins with a NUL (`index::Stored::nul_led`), whatever it stores: a file
+      // revision kept as a delta holds no text to look at.
+      (row.len, Some(row.block.is_none() && row.nul_led))
     }
   };
-  let marked = len > 0 && leading != Some(0);
+  let marked = len > 0 && leading != Some(true);
   Some(len.saturating_add(u64::from(marked)))
 }
 

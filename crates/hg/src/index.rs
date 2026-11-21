@@ -109,8 +109,16 @@ const CHANGESET_BYTES: usize = COMMON_BYTES + NODE_LEN + 1;
 
 /// Format: a manifest's or file revision's row payload: the common part, the link, whether it has a block, then its
 /// delta's base (A-729: a manifest's previous revision, [`NONE`] for a whole text), its content's length when it is a
-/// delta, and its chain's delta bytes since the whole text it rests on.
-const REVISION_BYTES: usize = COMMON_BYTES + REV_BYTES + 1 + REV_BYTES + LEN_BYTES + LEN_BYTES;
+/// delta, and its chain's delta bytes since the whole text it rests on; then its whole text's identity and whether that
+/// text begins with a NUL byte ([`Stored`]).
+const REVISION_BYTES: usize = COMMON_BYTES
+  + REV_BYTES
+  + 1
+  + REV_BYTES
+  + LEN_BYTES
+  + LEN_BYTES
+  + slates_vcs::content::IDENTITY_BYTES
+  + 1;
 
 #[cfg(test)]
 std::thread_local! {
@@ -255,6 +263,10 @@ pub struct RevisionRow {
   pub stored: u64,
   /// The delta bytes of its chain since the whole text it rests on.
   pub chain: u64,
+  /// Its whole text's identity, whatever its content is ([`Stored::text`]).
+  pub text: ContentId,
+  /// Whether its whole text begins with a NUL byte.
+  pub nul_led: bool,
 }
 
 /// Why a group was refused; nothing of it was written.
@@ -588,25 +600,29 @@ impl HgIndex {
     previous: Option<(&Node, &[u8])>,
   ) -> Result<Vec<u32>, Refused> {
     let (revs, mut planned) = self.planned(store, log, group.iter())?;
-    let previous = match (log, planned.first()) {
-      (Log::Manifest, Some(first)) if first.rev > 0 => {
+    let previous = match planned.first() {
+      Some(first) if first.rev > 0 && log != Log::Changelog => {
         let rev = first.rev.saturating_sub(1);
         let row = self
           .revision(store, log, rev)
           .ok_or(Refused::Unread { rev })?;
-        let text = match previous {
-          Some((node, text)) if *node == row.node => Cow::Borrowed(text),
-          _ => {
-            #[cfg(test)]
-            PREVIOUS_REBUILT.with(|count| count.set(count.get().saturating_add(1)));
-            Cow::Owned(
-              self
-                .revision_text(store, log, rev)
-                .ok_or(Refused::Unread { rev })?,
-            )
-          }
-        };
-        Some((rev, text, row.chain))
+        if row.block.is_some() {
+          None
+        } else {
+          let text = match previous {
+            Some((node, text)) if *node == row.node => Cow::Borrowed(text),
+            _ => {
+              #[cfg(test)]
+              PREVIOUS_REBUILT.with(|count| count.set(count.get().saturating_add(1)));
+              Cow::Owned(
+                self
+                  .revision_text(store, log, rev)
+                  .ok_or(Refused::Unread { rev })?,
+              )
+            }
+          };
+          Some((rev, text, row.chain))
+        }
       }
       _ => None,
     };
@@ -634,10 +650,9 @@ impl HgIndex {
       let stored = group
         .iter()
         .find(|(revision, _)| revision.node == row.node)
-        .map_or(WHOLE, |(_, stored)| *stored);
-      row.payload.extend_from_slice(&stored.0.to_le_bytes());
-      row.payload.extend_from_slice(&stored.1.to_le_bytes());
-      row.payload.extend_from_slice(&stored.2.to_le_bytes());
+        .map(|(_, stored)| *stored)
+        .ok_or(Refused::Unread { rev: row.rev })?;
+      stored.write(&mut row.payload);
     }
     self.write(store, log, &planned).map(|()| revs)
   }
@@ -889,19 +904,56 @@ fn common_payload(node: Node, p1: u32, p2: u32, flags: u16, len: u64) -> Vec<u8>
   payload
 }
 
-/// How a revision's content is stored (A-729): the number of its delta's base ([`NONE`] for a whole text), the delta's
-/// length, and the delta bytes of its chain since the whole text it rests on.
-pub type Stored = (u32, u64, u64);
+/// How a revision's content is stored (A-729; main's ruling B of 2026-11-20): whether its content is a delta, and its
+/// whole text's identity, which a row names whatever it stores.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stored {
+  /// The number of its delta's base, [`NONE`] for a whole text.
+  pub base: u32,
+  /// The delta's length, where its content is one.
+  pub delta: u64,
+  /// The delta bytes of its chain since the whole text it rests on.
+  pub chain: u64,
+  /// Its whole text's identity: its plain BLAKE3 (a file revision's bytes, its block aside), as `put_object` names it.
+  pub text: ContentId,
+  /// Whether its whole text begins with a NUL byte (a revlog chunk's `u` marker turns on it, `crate::render`).
+  pub nul_led: bool,
+}
 
-/// Format: a whole text's delta fields: no base, no delta, no chain.
-const WHOLE: Stored = (NONE, 0, 0);
+impl Stored {
+  /// A whole text's fields: no base, no delta, no chain.
+  pub fn whole(text: ContentId, nul_led: bool) -> Stored {
+    Stored {
+      base: NONE,
+      delta: 0,
+      chain: 0,
+      text,
+      nul_led,
+    }
+  }
 
-/// Each planned manifest kept as a delta against the one before it where its chain allows, else whole (A-729): the
-/// delta put as content and named in the row's place of the text, its base, length and chain added to the payload;
-/// every other row's payload given the whole text's fields. Derived: a delta is kept while its chain's delta bytes stay
-/// within the text's own length, so a text is rebuilt from at most its own length of deltas over the whole text it rests
-/// on (7.2's `deltas.py` refuses a delta longer than its text by the same bound). The puts' holds, for the caller to
-/// give back once the rows hold their contents.
+  /// The fields appended to a row's payload, in [`REVISION_BYTES`]'s order.
+  fn write(&self, payload: &mut Vec<u8>) {
+    payload.extend_from_slice(&self.base.to_le_bytes());
+    payload.extend_from_slice(&self.delta.to_le_bytes());
+    payload.extend_from_slice(&self.chain.to_le_bytes());
+    payload.extend_from_slice(&self.text.0);
+    payload.push(u8::from(self.nul_led));
+  }
+}
+
+/// Each planned manifest, and each file revision with no metadata block, kept as a delta against the revision before it
+/// in its log where its chain allows, else whole (A-729; main's ruling B of 2026-11-20: the head whole, history
+/// compressed; a push of hg's history kept 4.5 GB of whole file texts for a 162 MB bundle): the delta put as content
+/// and named in the row's place of the text, its base, length and chain added to the payload, then the whole text's
+/// identity (its plain BLAKE3, the identity it was put under) and whether the text begins with a NUL byte, so a row
+/// names its text's identity whatever it stores. A file revision with a block, or one whose previous revision has one,
+/// is kept whole: its text is framed, so a delta's base would differ from its bytes. Derived: a delta is kept while its
+/// chain's delta bytes stay within the text's own length, so a text is rebuilt from at most its own length of deltas
+/// over the whole text it rests on (7.2's `deltas.py` refuses a delta longer than its text by the same bound). Each
+/// text is read whole to be compared with the one before it: a line delta compares two texts, so no shape without them
+/// exists; it is dropped once the next row's delta is made. The puts' holds, for the caller to give back once the rows
+/// hold their contents.
 fn kept_as(
   store: &mut ContentStore,
   log: Log<'_>,
@@ -910,18 +962,22 @@ fn kept_as(
 ) -> Result<Vec<ContentId>, Refused> {
   let mut puts = Vec::new();
   for row in planned.iter_mut() {
-    let mut fields = WHOLE;
-    if log == Log::Manifest {
+    let whole_id = row
+      .contents
+      .first()
+      .copied()
+      .ok_or(Refused::Unread { rev: row.rev })?;
+    let mut fields = Stored::whole(whole_id, false);
+    let blocked = row.contents.len() > 1;
+    if log != Log::Changelog && !blocked {
       let len = row
         .payload
         .get(COMMON_BYTES - LEN_BYTES..COMMON_BYTES)
         .and_then(|len| len.try_into().ok().map(u64::from_le_bytes));
-      let text = row
-        .contents
-        .first()
-        .zip(len)
-        .and_then(|(id, len)| store.object_bytes(id, len))
+      let text = len
+        .and_then(|len| store.object_bytes(&whole_id, len))
         .ok_or(Refused::Unread { rev: row.rev })?;
+      fields.nul_led = text.first() == Some(&0);
       if let Some((rev, prior, chain)) = &previous
         && rev.checked_add(1) == Some(row.rev)
       {
@@ -937,14 +993,16 @@ fn kept_as(
           if let Some(content) = row.contents.first_mut() {
             *content = put;
           }
-          fields = (*rev, crate::read::to_u64(delta.len()), grown);
+          fields.base = *rev;
+          fields.delta = crate::read::to_u64(delta.len());
+          fields.chain = grown;
         }
       }
-      previous = Some((row.rev, Cow::Owned(text), fields.2));
+      previous = Some((row.rev, Cow::Owned(text), fields.chain));
+    } else {
+      previous = None;
     }
-    row.payload.extend_from_slice(&fields.0.to_le_bytes());
-    row.payload.extend_from_slice(&fields.1.to_le_bytes());
-    row.payload.extend_from_slice(&fields.2.to_le_bytes());
+    fields.write(&mut row.payload);
   }
   Ok(puts)
 }
@@ -1023,7 +1081,12 @@ fn read_revision(row: &RowRef<'_>) -> Option<RevisionRow> {
   let (has_block, rest) = rest.split_first()?;
   let (base, rest) = rest.split_first_chunk::<REV_BYTES>()?;
   let (stored, rest) = rest.split_first_chunk::<LEN_BYTES>()?;
-  let (chain, _) = rest.split_first_chunk::<LEN_BYTES>()?;
+  let (chain, rest) = rest.split_first_chunk::<LEN_BYTES>()?;
+  let (text, rest) = rest.split_first_chunk::<{ slates_vcs::content::IDENTITY_BYTES }>()?;
+  let (nul_led, _) = rest.split_first()?;
+  if *nul_led > 1 {
+    return None;
+  }
   let mut contents = row.contents();
   let bytes = contents.next()?;
   let block = contents.next();
@@ -1042,5 +1105,7 @@ fn read_revision(row: &RowRef<'_>) -> Option<RevisionRow> {
     base: u32::from_le_bytes(*base),
     stored: u64::from_le_bytes(*stored),
     chain: u64::from_le_bytes(*chain),
+    text: ContentId(*text),
+    nul_led: *nul_led == 1,
   })
 }
