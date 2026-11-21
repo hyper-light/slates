@@ -78,6 +78,7 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
+mod green_tree;
 pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
@@ -101,6 +102,7 @@ mod member_task;
 mod merge_origin;
 pub mod merge_service;
 mod mirror;
+mod mounted_work;
 /// The planned move of a volume to another fleet member (§4.10, A-291).
 mod moves;
 // A host admitted again under its own id yields the volumes it catalogued (A-334, §4.8 "Authority scope").
@@ -157,6 +159,7 @@ mod reap;
 // The repository verbs (§4.17.1; A-575). What a client's create names by default is public (A-685, `slates repository
 // create`): each tool's object formats and the namespace name a new repository's root is bound to.
 mod repository;
+mod session_log;
 pub use repository::{RootRefused, object_formats, root_binding};
 // git's `dowild` transcribed line for line, the oracle `vcs_policy`'s tests hold its glob rules to (A-597): the file
 // that `slates_vcs::wildmatch`'s own tests read as their `reference`, compiled into this crate's tests too, so both

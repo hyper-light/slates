@@ -127,24 +127,25 @@ impl Increment {
     out
   }
 
-  /// The post-state's inline bytes: all of it while no run is named, else those before the first run (A-760).
+  /// The post-state's inline bytes: the post-state itself, since a named run's bytes are read into a buffer of their
+  /// own (A-760, `crate::named::Read`).
   fn inline_post_state(&self) -> &[u8] {
-    if self.named.is_empty() {
-      return &self.post_state;
-    }
-    let inline = usize::try_from(self.named.inline_len).unwrap_or(usize::MAX);
-    self.post_state.get(..inline).unwrap_or(&self.post_state)
+    &self.post_state
   }
 
-  /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them. Refused (none) once any
-  /// named byte is read, since a run is placed after those named before it.
+  /// The post-state as the engine reads it: the inline bytes, then each named run's as read (A-760).
+  pub fn post(&self) -> crate::named::Post<'_> {
+    crate::named::Post::of(&self.post_state, &self.named.read.0)
+  }
+
+  /// The bytes of the `at`th named run read so far (A-760): what a turn's reader measures its progress by.
+  pub fn read_run(&self, at: usize) -> Option<&[u8]> {
+    self.named.read.0.get(at).map(Vec::as_slice)
+  }
+
+  /// Names `run` as the post-state's next bytes (A-760): the offset an op's `src` gives them.
   pub fn push_named(&mut self, run: crate::named::NamedRun) -> Option<u64> {
-    if self.named.is_empty() {
-      self.named.inline_len = u64::try_from(self.post_state.len()).ok()?;
-    }
-    if u64::try_from(self.post_state.len()).ok()? != self.named.inline_len {
-      return None;
-    }
+    self.named.inline_len = u64::try_from(self.post_state.len()).ok()?;
     let src = self.named.inline_len.checked_add(self.named.len())?;
     self.named.runs.push(run);
     Some(src)
@@ -152,63 +153,50 @@ impl Increment {
 
   /// The first named run whose bytes are not all read yet (A-760): none once the post-state is whole.
   pub fn unread(&self) -> Option<&crate::named::NamedRun> {
-    let read = u64::try_from(self.post_state.len())
-      .unwrap_or(u64::MAX)
-      .saturating_sub(self.named.inline_len);
-    let mut start = 0u64;
-    for run in &self.named.runs {
-      let end = start.saturating_add(run.len);
-      if read < end {
-        return Some(run);
-      }
-      start = end;
-    }
-    None
+    self.named.runs.iter().enumerate().find_map(|(at, run)| {
+      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      (u64::try_from(read).unwrap_or(u64::MAX) < run.len).then_some(run)
+    })
   }
 
-  /// Reads the next at most `slice` bytes of the named runs from `objects` onto the post-state (A-760; a step of the
-  /// owner's, its copy slice): whether every run is read. The post-state is reserved once at its whole length.
+  /// Reads the next at most `slice` bytes of the named runs from `objects` (A-760; a step of the owner's, its copy
+  /// slice), each run into a buffer of its own reserved once at the run's length (a large one is mapped, its pages made
+  /// only as they are written): whether every run is read. A refused read appends nothing.
   pub fn read_step(
     &mut self,
     objects: &impl crate::named::Objects,
     slice: u64,
   ) -> Result<bool, crate::named::ObjectMissing> {
-    let whole = self.named.inline_len.saturating_add(self.named.len());
-    let held = u64::try_from(self.post_state.len()).unwrap_or(u64::MAX);
-    // The run the bytes read so far end in, and where it starts in the post-state.
-    let mut start = self.named.inline_len;
-    let mut next = None;
-    for run in &self.named.runs {
-      let end = start.saturating_add(run.len);
-      if held < end {
-        next = Some(*run);
-        break;
-      }
-      start = end;
-    }
-    let Some(run) = next else {
+    let Some(at) = self.named.runs.iter().enumerate().position(|(at, run)| {
+      let read = self.named.read.0.get(at).map_or(0, Vec::len);
+      u64::try_from(read).unwrap_or(u64::MAX) < run.len
+    }) else {
+      return Ok(true);
+    };
+    let Some(run) = self.named.runs.get(at).copied() else {
       return Ok(true);
     };
     let missing = crate::named::ObjectMissing {
       identity: run.identity,
     };
-    if held == self.named.inline_len {
-      let more = usize::try_from(whole.saturating_sub(held)).map_err(|_| missing)?;
-      self
-        .post_state
-        .try_reserve_exact(more)
-        .map_err(|_| missing)?;
+    while self.named.read.0.len() <= at {
+      self.named.read.0.push(Vec::new());
     }
-    let done = held.saturating_sub(start);
+    let buffer = self.named.read.0.get_mut(at).ok_or(missing)?;
+    if buffer.capacity() == 0 {
+      let whole = usize::try_from(run.len).map_err(|_| missing)?;
+      buffer.try_reserve_exact(whole).map_err(|_| missing)?;
+    }
+    let done = u64::try_from(buffer.len()).map_err(|_| missing)?;
     let take = run.len.saturating_sub(done).min(slice.max(1));
-    let from = usize::try_from(held).map_err(|_| missing)?;
+    let from = buffer.len();
     let to = from
       .checked_add(usize::try_from(take).map_err(|_| missing)?)
       .ok_or(missing)?;
-    self.post_state.resize(to, 0);
-    let into = self.post_state.get_mut(from..to).ok_or(missing)?;
+    buffer.resize(to, 0);
+    let into = buffer.get_mut(from..to).ok_or(missing)?;
     if let Err(refused) = objects.read(&run.identity, run.offset.saturating_add(done), into) {
-      self.post_state.truncate(from);
+      buffer.truncate(from);
       return Err(refused);
     }
     Ok(self.unread().is_none())
@@ -264,7 +252,7 @@ impl Increment {
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
     for op in doc.ops.iter().filter(|op| op.kind == OpKind::Mknod) {
-      special_payload(&doc, &post_state, op)?;
+      special_payload(&doc, crate::named::Post::of(&post_state, &[]), op)?;
     }
     let evidence_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     if evidence_count > reader.remaining() / EVIDENCE_BYTES {
@@ -330,6 +318,7 @@ fn decode_named(
   Ok(Named {
     inline_len: u64::try_from(inline).map_err(|_| DocDecodeError::Truncated)?,
     runs,
+    read: crate::named::Read::default(),
   })
 }
 
@@ -350,6 +339,13 @@ pub struct ConflictWindow {
 pub enum Outcome {
   /// The increment was merged; the green's new head version.
   Accepted {
+    /// The committed version.
+    version: u64,
+  },
+  /// The increment was accepted and changed nothing: every operation it declared was already at the head, the same edit
+  /// or a convergent one (D-27's "identical" verdict, A-782). It is committed as the next version, as an accept is, so a
+  /// retry and the chain's replay answer alike; the version's effects are empty. Appended.
+  Identical {
     /// The committed version.
     version: u64,
   },
@@ -402,6 +398,8 @@ pub struct Judged {
   /// The increment's post-state, from which the commit makes each mapped file ([`Effect::SetContent`]): its added bytes
   /// only, never a file.
   post_state: Vec<u8>,
+  /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
+  read: Vec<Vec<u8>>,
 }
 
 impl Judged {
@@ -1410,7 +1408,7 @@ fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
 }
 
 /// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
-fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
+fn apply(base: &[u8], ops: &[Op], post_state: crate::named::Post<'_>) -> Vec<u8> {
   let base_len = base.len() as u64;
   let mut out = Vec::new();
   let mut pos = 0u64;
@@ -1442,25 +1440,51 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   out
 }
 
+/// The length [`apply`] makes of a base of `base_len` bytes under `ops`, without making it (A-760).
+fn applied_len(base_len: u64, ops: &[Op]) -> u64 {
+  let mut out = 0u64;
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      out = out.saturating_add(op.at.min(base_len).saturating_sub(pos.min(base_len)));
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        out = out.saturating_add(op.len);
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => out = out.saturating_add(op.len),
+      _ => {}
+    }
+  }
+  out.saturating_add(base_len.saturating_sub(pos))
+}
+
+/// The named run `ops` make a base of `base_len` bytes into, whole and alone, by its place in `post`: one op adds
+/// exactly that run's bytes and the file is no longer than it, so nothing else of the base or the post-state is in it.
+fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<usize> {
+  let mut adding = ops
+    .iter()
+    .filter(|op| matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend));
+  let op = adding.next()?;
+  if adding.next().is_some() || applied_len(base_len, ops) != op.len {
+    return None;
+  }
+  post.whole_run(op.src, op.len)
+}
+
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
 #[cfg(test)]
 pub(crate) fn apply_for_tests(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
-  apply(base, ops, post_state)
+  apply(base, ops, crate::named::Post::of(post_state, &[]))
 }
 
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
-fn push_slice(out: &mut Vec<u8>, from: &[u8], src: u64, len: u64) {
-  out.extend_from_slice(span_bytes(from, src, len));
-}
-
-/// The `len` bytes at `src` of `from`, clamped to `from`'s bounds (an op's declared bytes in a
-/// post-state). Used by the per-range verdict's byte check and by [`apply`]'s splice.
-fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
-  let start = usize::try_from(src).unwrap_or(usize::MAX).min(from.len());
-  let end = start
-    .saturating_add(usize::try_from(len).unwrap_or(0))
-    .min(from.len());
-  from.get(start..end).unwrap_or_default()
+fn push_slice(out: &mut Vec<u8>, from: crate::named::Post<'_>, src: u64, len: u64) {
+  out.extend_from_slice(&from.span(src, len));
 }
 
 /// The node a hard link names (A-646): the path of its node record, and whether the work makes
@@ -3220,7 +3244,12 @@ impl Green {
   /// the history's last, which every writer of the content pushes with it (`commit`, `restore_file`). A path with no
   /// history has held the head's bytes since version 0 (the one history rule, A-534), so its value at `base` is the
   /// head's.
-  fn lands_on_head(&self, path: &str, base: u64, ops_and_post: (&[Op], &[u8])) -> bool {
+  fn lands_on_head(
+    &self,
+    path: &str,
+    base: u64,
+    ops_and_post: (&[Op], crate::named::Post<'_>),
+  ) -> bool {
     let history = self.content_history.get(path);
     let Some(history) = history.filter(|_| self.covered_since(path, last_entry(history)).is_none())
     else {
@@ -3359,7 +3388,7 @@ impl Green {
       let path = name(op.path);
       match op.kind {
         _ if is_content(op.kind) => r.content.entry(path).or_default().push(*op),
-        OpKind::Mknod => match special_payload(&inc.doc, &inc.post_state, op) {
+        OpKind::Mknod => match special_payload(&inc.doc, inc.post(), op) {
           Ok(node) => {
             r.specials.insert(path, node);
           }
@@ -3398,7 +3427,7 @@ impl Green {
           r.renames.insert(path, name(op.src));
         }
         OpKind::SetXattr => {
-          let value = post_slice(&inc.post_state, op.src, op.len);
+          let value = post_slice(inc.post(), op.src, op.len);
           r.xattr_sets.push((path, name(op.at), value));
         }
         OpKind::RemoveXattr => r.xattr_removes.push((path, name(op.at))),
@@ -3511,7 +3540,7 @@ impl Green {
   fn merge_rename(
     &self,
     (dst, ops): (&str, &[Op]),
-    (base, post_state): (u64, &[u8]),
+    (base, post_state): (u64, crate::named::Post<'_>),
     (from, cleared): (&str, &BTreeSet<String>),
     effects: &mut Vec<Effect>,
   ) -> Result<(), ConflictWindow> {
@@ -3608,20 +3637,26 @@ impl Green {
   fn merge_create(
     &self,
     path: &str,
-    bytes: Vec<u8>,
-    declared: &[Op],
+    (declared, post): (&[Op], crate::named::Post<'_>),
   ) -> Result<Option<Effect>, ConflictWindow> {
     if self.occupied_by_nonfile(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     match self.content.get(path) {
-      Some(current) if current == bytes.as_slice() => Ok(None),
-      Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
+      // A file stands there: the create is the same file or a conflict, which only its bytes tell.
+      Some(current) => {
+        if current == apply(&[], declared, post).as_slice() {
+          Ok(None)
+        } else {
+          Err(Green::window(path, MergeConflictClass::CreateCreate))
+        }
+      }
+      // None does: the file's bytes are made at the commit (A-760: a 500 MB text is never made in a verdict).
       None => {
-        let ops = vec![insert_whole(bytes.len() as u64)];
+        let ops = vec![insert_whole(applied_len(0, declared))];
         Ok(Some(Effect::SetContent(
           path.to_owned(),
-          Some(bytes),
+          None,
           ops,
           ContentSource::Created(declared.to_vec()),
         )))
@@ -3778,7 +3813,7 @@ impl Green {
     // A length-changing op overlapped: the whole-file identity check decides the path (owed: full
     // per-range identity for shifting ops), so a currently-accepted convergent case never regresses.
     if let Some(range) = shifting_overlap {
-      if self.lands_on_head(path, inc.base, (ops, &inc.post_state)) {
+      if self.lands_on_head(path, inc.base, (ops, inc.post())) {
         return Ok(None);
       }
       return Err(vec![ConflictWindow {
@@ -3822,10 +3857,10 @@ impl Green {
     candidates
       .iter()
       .filter(|(op, head_start)| {
-        let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
+        let agent_bytes = inc.post().span(op.src, op.len);
         let start = usize::try_from(*head_start).unwrap_or(usize::MAX);
         let end = start.saturating_add(agent_bytes.len());
-        current.get(start..end) != Some(agent_bytes)
+        current.get(start..end) != Some(agent_bytes.as_ref())
       })
       .map(|(op, _)| ConflictWindow {
         path: path.to_owned(),
@@ -4131,7 +4166,7 @@ impl Green {
   /// created path edits nothing, a renamed-into path edits its source, and a link a node passes to with the work's
   /// writes edits the node's home ([`Green::handed_home`], A-669).
   fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
-    let post_len = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+    let post_len = inc.post().len();
     let cleared = r.cleared();
     r.content
       .iter()
@@ -4312,7 +4347,7 @@ impl Green {
           return position::Unit::default();
         };
         let unlinked = r.unlinks.contains(home);
-        match self.merge_handed((heir, ops), (home, unlinked), (inc.base, &inc.post_state)) {
+        match self.merge_handed((heir, ops), (home, unlinked), (inc.base, inc.post())) {
           Ok(effects) => position::Unit {
             effects,
             ..position::Unit::default()
@@ -4348,7 +4383,7 @@ impl Green {
           Err(Green::window(dst, MergeConflictClass::RenameRename))
         } else {
           let source = (from.as_str(), cleared);
-          let moved = (base, inc.post_state.as_slice());
+          let moved = (base, inc.post());
           self.merge_rename((dst, ops), moved, source, &mut unit.effects)
         };
         if let Err(window) = merged {
@@ -4360,8 +4395,7 @@ impl Green {
     for path in &r.creates {
       units.unit(position::Footprint::path(path), |_| {
         let content = r.content.get(path).map(Vec::as_slice).unwrap_or(&[]);
-        let bytes = apply(&[], content, &inc.post_state);
-        position::Unit::of(self.merge_create(path, bytes, content))
+        position::Unit::of(self.merge_create(path, (content, inc.post())))
       });
     }
     for path in &r.unlinks {
@@ -4435,7 +4469,7 @@ impl Green {
     &self,
     (heir, ops): (&str, &[Op]),
     (home, unlinked): (&str, bool),
-    (base, post_state): (u64, &[u8]),
+    (base, post_state): (u64, crate::named::Post<'_>),
   ) -> Result<Vec<Effect>, ConflictWindow> {
     let link_changed = self.changed_last(self.hardlink_changed.get(heir), heir) > base;
     if link_changed || self.changed_after(home, base) {
@@ -4642,11 +4676,17 @@ impl Green {
   /// file is the one the verdict would have made. Making it in the verdict built every clean path's new file before the
   /// verdict was known: 91 of 283 engine samples of W1's owner at 3,000 clients were that `apply` (perf, 2026-11-11), and
   /// 82% of those verdicts conflicted.
-  fn make_mapped(&self, effects: &mut [Effect], post_state: &[u8]) {
+  fn make_mapped(&self, effects: &mut [Effect], post_state: crate::named::Post<'_>) {
     for effect in effects.iter_mut() {
-      if let Effect::SetContent(path, bytes @ None, ops, _) = effect {
-        let current = self.content.get(path).unwrap_or_default();
-        *bytes = Some(apply(current, ops, post_state));
+      if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
+        let made = match source {
+          // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
+          ContentSource::Created(declared) => apply(&[], declared, post_state),
+          ContentSource::Mapped | ContentSource::Copied(..) => {
+            apply(self.content.get(path).unwrap_or_default(), ops, post_state)
+          }
+        };
+        *bytes = Some(made);
         self
           .mapped_files_made
           .set(self.mapped_files_made.get().saturating_add(1));
@@ -4654,7 +4694,7 @@ impl Green {
     }
   }
 
-  fn commit(&mut self, mut effects: Vec<Effect>, version: u64, post_state: &[u8]) {
+  fn commit(&mut self, mut effects: Vec<Effect>, version: u64, post_state: crate::named::Post<'_>) {
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
     self.make_mapped(&mut effects, post_state);
     let moves = self.node_moves(&effects);
@@ -5206,8 +5246,15 @@ impl Green {
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     match judgment {
       Judgment::Accepted(judged) => {
+        // Nothing to apply: every operation was already at the head (pass two's identical spans, an identical create).
+        let identical = judged.effects.is_empty();
         let (version, applied) = self.commit_held(judged);
-        (Outcome::Accepted { version }, Some(applied))
+        let outcome = if identical {
+          Outcome::Identical { version }
+        } else {
+          Outcome::Accepted { version }
+        };
+        (outcome, Some(applied))
       }
       Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
@@ -5290,7 +5337,11 @@ impl Green {
     {
       return Err(PositionRefused::NotRecorded { version });
     }
-    Ok(self.hold_computed(inc, computed))
+    let mut judgment = self.hold_computed(inc, computed);
+    if let Judgment::Accepted(held) = &mut judgment {
+      held.read = inc.named.read.0.clone();
+    }
+    Ok(judgment)
   }
 
   /// The units judged again at a later head than the one they were computed at ([`Green::judge_computed`]): the
@@ -5305,6 +5356,25 @@ impl Green {
   /// green never made), unavailable; anything else is the verdict this green computes at its head ([`Green::compute`],
   /// A-658), held in a [`Judged`] for [`Green::commit_judged`]. The owner judging is the owner computing: one verdict.
   pub fn judge(&mut self, inc: &Increment) -> Judgment {
+    let mut judgment = self.judge_held(inc);
+    if let Judgment::Accepted(held) = &mut judgment {
+      held.read = inc.named.read.0.clone();
+    }
+    judgment
+  }
+
+  /// [`Green::judge`] taking the work's named runs' bytes into the verdict held (A-760), so the commit makes a whole
+  /// text's file of its buffer with no copy; [`Green::judge`] copies them, leaving the work as it was.
+  pub fn judge_named(&mut self, inc: &mut Increment) -> Judgment {
+    let mut judgment = self.judge_held(inc);
+    if let Judgment::Accepted(held) = &mut judgment {
+      held.read = core::mem::take(&mut inc.named.read.0);
+    }
+    judgment
+  }
+
+  /// [`Green::judge`]'s verdict, held without the named runs' bytes, which its callers give it.
+  fn judge_held(&mut self, inc: &Increment) -> Judgment {
     // The cache answers a conflict it holds before anything is judged, unless the same increment was accepted since,
     // which the computation answers first (a submit's order since A-635).
     if !self.accepted.contains_key(&inc.id)
@@ -5362,6 +5432,7 @@ impl Green {
           effects,
           applied,
           post_state: inc.post_state.clone(),
+          read: Vec::new(),
         })
       }
       Err(windows) => {
@@ -5447,9 +5518,59 @@ impl Green {
   fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
     // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
     let version = judged.at.saturating_add(1);
-    self.commit(judged.effects, version, &judged.post_state);
-    self.accepted.insert(judged.id, version);
-    (version, judged.applied)
+    let Judged {
+      id,
+      effects,
+      applied,
+      post_state,
+      read,
+      ..
+    } = judged;
+    let mut effects = effects;
+    let mut read = read;
+    self.take_whole_runs(&mut effects, &post_state, &mut read);
+    self.commit(effects, version, crate::named::Post::of(&post_state, &read));
+    self.accepted.insert(id, version);
+    (version, applied)
+  }
+
+  /// Makes each file whose bytes are exactly one named run's, and no other file's, of that run's buffer, moved (A-760):
+  /// a whole text becomes the green's file with no copy, so a landing holds the text once. Every other file is made
+  /// by [`Green::make_mapped`] as before.
+  fn take_whole_runs(&self, effects: &mut [Effect], inline: &[u8], read: &mut [Vec<u8>]) {
+    if read.is_empty() {
+      return;
+    }
+    let mut wanted: Vec<(usize, usize)> = Vec::new();
+    {
+      let post = crate::named::Post::of(inline, read);
+      for (place, effect) in effects.iter().enumerate() {
+        let Effect::SetContent(path, None, ops, source) = effect else {
+          continue;
+        };
+        let (base_len, ops) = match source {
+          ContentSource::Created(declared) => (0, declared.as_slice()),
+          ContentSource::Mapped => (
+            u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
+            ops.as_slice(),
+          ),
+          ContentSource::Copied(..) => continue,
+        };
+        if let Some(run) = sole_run(base_len, ops, &post) {
+          wanted.push((place, run));
+        }
+      }
+    }
+    for &(place, run) in &wanted {
+      if wanted.iter().filter(|(_, other)| *other == run).count() != 1 {
+        continue;
+      }
+      if let (Some(Effect::SetContent(_, bytes @ None, ..)), Some(buffer)) =
+        (effects.get_mut(place), read.get_mut(run))
+      {
+        *bytes = Some(core::mem::take(buffer));
+      }
+    }
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -5476,10 +5597,10 @@ impl Green {
     let copies = copy::EntryCopies::of(applied);
     let effects = applied
       .iter()
-      .map(|effect| self.effect_of(effect, (&inc.post_state, &copies)))
+      .map(|effect| self.effect_of(effect, (inc.post(), &copies)))
       .collect();
     let version = self.head().saturating_add(1);
-    self.commit(effects, version, &inc.post_state);
+    self.commit(effects, version, inc.post());
     self.accepted.insert(inc.id, version);
     version
   }
@@ -5504,11 +5625,22 @@ impl Green {
     self.signatures.get(&version).copied()
   }
 
+  /// Whether committed version `version` changed nothing (A-782: an identical increment's version, [`Outcome::Identical`]),
+  /// read from the change index, which holds an entry for every version that changed a path. `None` where that can no
+  /// longer be told: version 0 (the origin), a version past the head, or one at or below the floor the index was folded
+  /// or restored to, where entries of versions whose paths changed again are gone. One lookup.
+  pub fn changed_nothing_at(&self, version: u64) -> Option<bool> {
+    if version == 0 || version > self.head() || version <= self.folded_below {
+      return None;
+    }
+    Some(!self.changes.contains_key(&version))
+  }
+
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.
   fn effect_of(
     &self,
     applied: &crate::chain_entry::Applied,
-    (post_state, copies): (&[u8], &copy::EntryCopies<'_>),
+    (post_state, copies): (crate::named::Post<'_>, &copy::EntryCopies<'_>),
   ) -> Effect {
     use crate::chain_entry::Applied;
     match applied {
@@ -6019,7 +6151,7 @@ impl Green {
     self.fast_path_hits.set(fast_path_before);
     match decision {
       Err(windows) => Rebased::Conflict { windows },
-      Ok(effects) => self.rebased_from(effects, to, &inc.post_state),
+      Ok(effects) => self.rebased_from(effects, to, inc.post()),
     }
   }
 
@@ -6054,7 +6186,12 @@ impl Green {
   /// then the home's removal ([`Green::handed_in`], A-669). A node the work's removal or replacement
   /// of its home hands on to a link is in the changes at that link, holding the node's bytes, and in
   /// no operation of the journal ([`Green::heirs_of`], A-677). The green is not touched.
-  fn rebased_from(&self, mut effects: Vec<Effect>, to: u64, post_state: &[u8]) -> Rebased {
+  fn rebased_from(
+    &self,
+    mut effects: Vec<Effect>,
+    to: u64,
+    post_state: crate::named::Post<'_>,
+  ) -> Rebased {
     use crate::increment::VolumeOp;
     self.make_mapped(&mut effects, post_state);
     // The links the version's removals and replacements hand a node to, as the commit hands it on (A-669's rule).
@@ -6341,30 +6478,28 @@ fn insert_whole(len: u64) -> Op {
 }
 
 /// `post_state[src .. src + len]`, clamped to bounds.
-fn post_slice(post_state: &[u8], src: u64, len: u64) -> Vec<u8> {
-  let start = usize::try_from(src)
-    .unwrap_or(usize::MAX)
-    .min(post_state.len());
-  let end = start
-    .saturating_add(usize::try_from(len).unwrap_or(0))
-    .min(post_state.len());
-  post_state.get(start..end).unwrap_or_default().to_vec()
+fn post_slice(post_state: crate::named::Post<'_>, src: u64, len: u64) -> Vec<u8> {
+  post_state.span(src, len).into_owned()
 }
 
 /// Read an IPC payload exactly. A saturated or truncated range must never become valid metadata.
 fn special_payload(
   doc: &OpsDoc,
-  post: &[u8],
+  post: crate::named::Post<'_>,
   op: &Op,
 ) -> Result<SpecialNode, crate::ops_doc::DocDecodeError> {
   use crate::ops_doc::DocDecodeError;
   if doc.paths.path(op.path).is_none() {
     return Err(DocDecodeError::BadPath);
   }
-  let start = usize::try_from(op.src).map_err(|_| DocDecodeError::Truncated)?;
-  let len = usize::try_from(op.len).map_err(|_| DocDecodeError::Truncated)?;
-  let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
-  SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
+  let end = op
+    .src
+    .checked_add(op.len)
+    .ok_or(DocDecodeError::Truncated)?;
+  if end > post.len() {
+    return Err(DocDecodeError::Truncated);
+  }
+  SpecialNode::decode(&post.span(op.src, op.len))
 }
 
 mod branch;

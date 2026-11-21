@@ -19,7 +19,7 @@
 //! wall clock ([`CredentialRecord::live_at`]), never in `apply`, where a decision from the clock would replay
 //! differently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{CredentialKind, CredentialRecord, Principal};
 use crate::error::DbError;
@@ -30,9 +30,16 @@ use crate::op::Op;
 pub struct Credentials {
   /// The records, by id.
   records: BTreeMap<[u8; 32], CredentialRecord>,
-  /// The bytes the records hold, charged to the partition's table byte budget.
+  /// The ids revoked here (A-764): a revoked credential is never enrolled again, here or, offered by a member that
+  /// missed its revocation, anywhere a member holds its tombstone; and the region's healer offers each, so such a member
+  /// lets its stale record go. Charged [`TOMBSTONE_BYTES`] each.
+  tombstones: BTreeSet<[u8; 32]>,
+  /// The bytes the records and tombstones hold, charged to the partition's table byte budget.
   bytes: usize,
 }
+
+/// Derived: the bytes a tombstone charges, its id (A-764).
+const TOMBSTONE_BYTES: usize = size_of::<[u8; 32]>();
 
 /// The bytes a credential charges (the module doc's bounds): its record (a token's contexts among its own bytes), its
 /// key's blob and algorithm name, and a SID principal's text.
@@ -67,6 +74,16 @@ impl Credentials {
     self.records.get(id)
   }
 
+  /// Whether the credential named `id` was revoked here (A-764).
+  pub fn revoked(&self, id: &[u8; 32]) -> bool {
+    self.tombstones.contains(id)
+  }
+
+  /// Every id revoked here, in order, as a snapshot carries them and the region's healer offers them (A-764).
+  pub fn tombstones(&self) -> impl Iterator<Item = &[u8; 32]> + '_ {
+    self.tombstones.iter()
+  }
+
   /// Every credential, in id order, as a snapshot carries them.
   pub fn records(&self) -> impl Iterator<Item = &CredentialRecord> + '_ {
     self.records.values()
@@ -82,7 +99,14 @@ impl Credentials {
   pub fn charge(&self, op: &Op) -> (usize, usize) {
     match op {
       Op::CredentialEnrolled { record } => (0, record_bytes(record)),
-      Op::CredentialRevoked { id } => (self.records.get(id).map_or(0, record_bytes), 0),
+      Op::CredentialRevoked { id } | Op::CredentialTombstoned { id } => (
+        self.records.get(id).map_or(0, record_bytes),
+        if self.tombstones.contains(id) {
+          0
+        } else {
+          TOMBSTONE_BYTES
+        },
+      ),
       _ => (0, 0),
     }
   }
@@ -91,7 +115,9 @@ impl Credentials {
   /// `NotFound`; another table's operation passes.
   pub fn check(&self, op: &Op) -> Result<(), DbError> {
     match op {
-      Op::CredentialEnrolled { record } if self.records.contains_key(&record.id) => {
+      Op::CredentialEnrolled { record }
+        if self.records.contains_key(&record.id) || self.tombstones.contains(&record.id) =>
+      {
         Err(DbError::AlreadyExists {
           existing: named(&record.id),
         })
@@ -115,19 +141,40 @@ impl Credentials {
       Op::CredentialRevoked { id } => {
         let removed = self.records.remove(id).ok_or(DbError::NotFound)?;
         self.bytes = self.bytes.saturating_sub(record_bytes(&removed));
+        self.tombstone(*id);
+        Ok(())
+      }
+      Op::CredentialTombstoned { id } => {
+        if let Some(removed) = self.records.remove(id) {
+          self.bytes = self.bytes.saturating_sub(record_bytes(&removed));
+        }
+        self.tombstone(*id);
         Ok(())
       }
       _ => Ok(()),
     }
   }
 
-  /// The table a snapshot carries, rebuilt with its bytes counted as when each record was enrolled.
-  pub fn restore(records: &[CredentialRecord]) -> Result<Credentials, DbError> {
+  /// `id` held as revoked, charged once.
+  fn tombstone(&mut self, id: [u8; 32]) {
+    if self.tombstones.insert(id) {
+      self.bytes = self.bytes.saturating_add(TOMBSTONE_BYTES);
+    }
+  }
+
+  /// The table a snapshot carries, rebuilt with its bytes counted as when each record was enrolled and each id revoked.
+  pub fn restore(
+    records: &[CredentialRecord],
+    tombstones: &[[u8; 32]],
+  ) -> Result<Credentials, DbError> {
     let mut credentials = Credentials::new();
     for record in records {
       credentials.apply(&Op::CredentialEnrolled {
         record: record.clone(),
       })?;
+    }
+    for id in tombstones {
+      credentials.apply(&Op::CredentialTombstoned { id: *id })?;
     }
     Ok(credentials)
   }
@@ -217,6 +264,32 @@ mod tests {
     }
   }
 
+  /// A-764 (a revoked credential never comes back). Do: enroll a token and revoke it; enroll the same record again (what
+  /// a member that missed the revocation offers the region when it rejoins); rebuild from the snapshot and try again.
+  /// Expect the second enrollment refused `AlreadyExists` both times, and the token never held again.
+  #[test]
+  fn a764_a_revoked_credential_is_never_enrolled_again() {
+    let mut partition = Partition::new(caps(), 0);
+    run(&mut partition, &enrolled(token(4, 501, None))).unwrap();
+    run(&mut partition, &Op::CredentialRevoked { id: [4; 32] }).unwrap();
+    assert!(
+      matches!(
+        run(&mut partition, &enrolled(token(4, 501, None))),
+        Err(DbError::AlreadyExists { .. })
+      ),
+      "a revoked id enrolled again"
+    );
+    assert_eq!(partition.credentials().get(&[4; 32]), None);
+    let mut partition = rebuilt(&partition);
+    assert!(
+      matches!(
+        run(&mut partition, &enrolled(token(4, 501, None))),
+        Err(DbError::AlreadyExists { .. })
+      ),
+      "a snapshot forgot the revocation"
+    );
+  }
+
   /// A-625 part 3. Do: enroll an SSH key and an HTTP token for two principals, look each up by its id, rebuild the
   /// partition from its snapshot, revoke the key, rebuild again. Expect: each id finds its own record (its principal,
   /// kind and expiry), an id never enrolled finds none, the rebuilt partition finds the same, and after the revocation
@@ -288,7 +361,16 @@ mod tests {
         table: "credentials"
       })
     );
+    // A revocation gives back its record's room less its tombstone's (A-764), so one key of the same size does not fit
+    // yet; a second revocation gives the room it needs.
     run(&mut partition, &Op::CredentialRevoked { id: [0; 32] }).unwrap();
+    assert_eq!(
+      run(&mut partition, &enrolled(key(enrolled_keys, 501))),
+      Err(DbError::Capacity {
+        table: "credentials"
+      })
+    );
+    run(&mut partition, &Op::CredentialRevoked { id: [1; 32] }).unwrap();
     assert_eq!(
       run(&mut partition, &enrolled(key(enrolled_keys, 501))),
       Ok(())
@@ -316,10 +398,12 @@ mod tests {
     Token(u8),
     /// Revoke serial.
     Revoke(u8),
+    /// Tombstone serial: its revocation elsewhere in the region (A-764).
+    Tombstone(u8),
   }
 
   /// Format: the kinds of step a history draws, each as likely.
-  const STEP_KINDS: u8 = 3;
+  const STEP_KINDS: u8 = 4;
   /// Shape: the serials a history names: few, so enrollments meet held ids and revocations meet unheld ones.
   const SERIALS: u8 = 8;
 
@@ -327,36 +411,59 @@ mod tests {
     (0..STEP_KINDS, 0..SERIALS).prop_map(|(kind, serial)| match kind {
       0 => Step::Key(serial),
       1 => Step::Token(serial),
-      _ => Step::Revoke(serial),
+      2 => Step::Revoke(serial),
+      _ => Step::Tombstone(serial),
     })
   }
 
-  /// The design's rules over a plain map: an id is held once; a revocation needs it held; the bytes fit the budget.
+  /// The design's rules over a plain map and set: an id is held once and never again once revoked (A-764); a revocation
+  /// needs it held, a tombstone does not; every revocation keeps a tombstone; the bytes, records' and tombstones', fit
+  /// the budget.
   #[derive(Default)]
   struct Model {
     held: BTreeMap<[u8; 32], CredentialRecord>,
+    revoked: std::collections::BTreeSet<[u8; 32]>,
   }
 
   impl Model {
+    fn used(&self) -> usize {
+      let records: usize = self.held.values().map(record_bytes).sum();
+      records + self.revoked.len() * TOMBSTONE_BYTES
+    }
+
+    fn revoke(&mut self, id: [u8; 32], needs_held: bool) -> Result<(), DbError> {
+      if needs_held && !self.held.contains_key(&id) {
+        return Err(DbError::NotFound);
+      }
+      let released = self.held.get(&id).map_or(0, record_bytes);
+      let added = if self.revoked.contains(&id) {
+        0
+      } else {
+        TOMBSTONE_BYTES
+      };
+      if self.used() - released + added > caps().green_chain_bytes {
+        return Err(DbError::Capacity {
+          table: "credentials",
+        });
+      }
+      self.held.remove(&id);
+      self.revoked.insert(id);
+      Ok(())
+    }
+
     fn step(&mut self, step: Step) -> Result<(), DbError> {
       let record = match step {
         Step::Key(serial) => key(serial, 501),
         Step::Token(serial) => token(serial, 502, Some(NOW_NS)),
-        Step::Revoke(serial) => {
-          return self
-            .held
-            .remove(&[serial; 32])
-            .map(|_| ())
-            .ok_or(DbError::NotFound);
-        }
+        Step::Revoke(serial) => return self.revoke([serial; 32], true),
+        Step::Tombstone(serial) => return self.revoke([serial; 32], false),
       };
-      if self.held.contains_key(&record.id) {
+      if self.held.contains_key(&record.id) || self.revoked.contains(&record.id) {
         return Err(DbError::AlreadyExists {
           existing: named(&record.id),
         });
       }
-      let used: usize = self.held.values().map(record_bytes).sum();
-      if used + record_bytes(&record) > caps().green_chain_bytes {
+      if self.used() + record_bytes(&record) > caps().green_chain_bytes {
         return Err(DbError::Capacity {
           table: "credentials",
         });
@@ -371,6 +478,7 @@ mod tests {
       Step::Key(serial) => enrolled(key(serial, 501)),
       Step::Token(serial) => enrolled(token(serial, 502, Some(NOW_NS))),
       Step::Revoke(serial) => Op::CredentialRevoked { id: [serial; 32] },
+      Step::Tombstone(serial) => Op::CredentialTombstoned { id: [serial; 32] },
     }
   }
 

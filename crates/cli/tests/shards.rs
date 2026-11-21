@@ -18,18 +18,18 @@
   clippy::string_slice
 )]
 
+#[path = "support/process_wait.rs"]
+mod process_wait;
+
 use std::io::{BufRead, Write};
 use std::os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle};
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
-/// Shape: how long an attachment gets to end after its end closes: ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s),
-/// as the Unix CLI tests' `WAIT_FOR`.
-const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls of a change or a start.
 const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answers to `volume list` a start waits for, so the anchor's one startup restart has settled.
@@ -208,23 +208,29 @@ fn attachments_of(instance: &str, id: &str) -> String {
   value_of(&out, "attachments")
 }
 
-/// Polls `holds` at the test's pace until it holds or [`WAIT_FOR`] passes; whether it held.
-fn wait_for(mut holds: impl FnMut() -> bool) -> bool {
-  let deadline = Instant::now() + WAIT_FOR;
-  while Instant::now() < deadline {
+/// Polls `holds` at the test's pace while `instance`'s daemon gains CPU (`process_wait::Judged` on the pid its `status`
+/// names: Windows lists no instance's processes by command line, and a live daemon's watchdog keeps it moving, so it
+/// is waited on while it lives, A-232); whether it held. Until 2026-11-20 within `WAIT_FOR`, ten liveness budgets.
+fn wait_for(instance: &str, mut holds: impl FnMut() -> bool) -> bool {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "status: {err}");
+  let mut judged = process_wait::Judged::of(value_of(&out, "pid").parse().unwrap());
+  loop {
     if holds() {
       return true;
     }
+    if !matches!(judged.judge(), process_wait::Verdict::Waiting { .. }) {
+      return holds();
+    }
     pause();
   }
-  holds()
 }
 
 /// The attachment `attachment` is gone: the volume's count back to `before` within the wait, and a `detach` of it
 /// refused.
 fn the_attachment_ends(instance: &str, id: &str, before: &str, attachment: &str) {
   assert!(
-    wait_for(|| attachments_of(instance, id) == before),
+    wait_for(instance, || attachments_of(instance, id) == before),
     "attachment {attachment} ended with its program's end: {} attachments, {before} before",
     attachments_of(instance, id)
   );
@@ -400,7 +406,7 @@ fn the_attachment_ends_when_the_handle_closes_while_the_command_runs(
   let (announced, _) = read_until(&mut lines, CLOSED_LINE);
   let attachment = value_of(&announced, "attachment");
   assert!(
-    wait_for(|| attachments_of(instance, id) == before),
+    wait_for(instance, || attachments_of(instance, id) == before),
     "attachment {attachment} ended once the program closed its handle"
   );
   assert!(
@@ -477,7 +483,7 @@ fn the_refusals_leave_no_attachment(instance: &str, id: &str, before: &str) {
   );
   assert_eq!(code, 4, "a program that cannot run is a failure: {err}");
   assert!(
-    wait_for(|| attachments_of(instance, id) == before),
+    wait_for(instance, || attachments_of(instance, id) == before),
     "the handle of a program that never ran closed, ending its attachment"
   );
   let (code, _, err) = run(
@@ -682,9 +688,6 @@ const RESYNC_PLACEHOLDER: &str = "{resync}";
 /// Format: the line the resyncer prints once it has read the file through its first stream and its channel's
 /// `Attached`.
 const READY_LINE: &str = "shards-resync-ready";
-/// Shape: how long the test waits for the anchor's next daemon to serve the stream again and the resyncer to read the
-/// file through it: a restart's recovery on a loaded runner, well past `WAIT_FOR`.
-const RESYNC_WAIT: Duration = Duration::from_secs(120);
 
 /// A-433, the Windows stream's resync across a real daemon's death (§4.6, A-316's channel on Windows). Do: under
 /// `slates anchor`, run `slates shards ID -- <this binary> ... {handle} {resync}`, the probe reading the file through
@@ -716,7 +719,7 @@ fn slates_shards_resyncs_its_programs_stream_after_its_daemon_is_killed() {
 
 /// Runs `slates shards` under a fresh anchor of `instance` over a volume holding the file, the command this test binary
 /// re-invoked as `test` in `role` with its stream and resync ends as its last two arguments; once the probe says it is
-/// ready, kills the daemon (`TerminateProcess`, as `kill -9`) and waits, within [`RESYNC_WAIT`], for the bytes the
+/// ready, kills the daemon (`TerminateProcess`, as `kill -9`) and waits, while the probe lives, for the bytes the
 /// probe reads through its resynced stream. The bytes, the command's exit, and the anchor's guard, so the caller reads
 /// the next daemon's counters before it goes.
 fn read_across_a_kill(
@@ -756,7 +759,8 @@ fn read_across_a_kill(
   let (code, status, error) = run(instance, &["status"]);
   assert_eq!(code, 0, "status: {error}");
   kill_hard(value_of(&status, "pid").parse().unwrap());
-  let started = Instant::now();
+  // Each line is read without a timeout: the probe writes while it lives, and its end closes its output, which ends the
+  // read. Until 2026-11-20 each line was also checked against a 120 s `RESYNC_WAIT`, only after it had come.
   let mut read = None;
   while read.is_none() {
     line.clear();
@@ -767,10 +771,6 @@ fn read_across_a_kill(
     read = line
       .find(READ_TAG)
       .map(|at| unhex(line[at + READ_TAG.len()..].trim()));
-    assert!(
-      started.elapsed() < RESYNC_WAIT,
-      "the resync came within the bound"
-    );
   }
   (
     read.unwrap_or_default(),

@@ -473,3 +473,99 @@ proptest! {
     let _read = revlog::read_docket(&docket);
   }
 }
+
+/// An inline revlog with general delta of `links` revisions: revision 0 the whole `text` (stored `u`-marked), each later
+/// one a delta against the one before it that changes one byte, so the last revision's chain is every revision.
+fn one_chain(text: &[u8], links: u32) -> Vec<u8> {
+  let mut index = Vec::new();
+  let mut current = text.to_vec();
+  let mut previous = crate::NULL_NODE;
+  let mut offset = 0_u64;
+  for rev in 0..links {
+    let chunk = if rev == 0 {
+      [b"u".as_slice(), text].concat()
+    } else {
+      let at = usize::try_from(rev).unwrap() % current.len();
+      current[at] = current[at].wrapping_add(1);
+      let mut delta = Vec::new();
+      crate::delta::encode_hunk(
+        &crate::delta::Hunk {
+          start: u32::try_from(at).unwrap(),
+          end: u32::try_from(at + 1).unwrap(),
+          data: &current[at..=at],
+        },
+        &mut delta,
+      )
+      .unwrap();
+      delta
+    };
+    let node = crate::node::compute(&previous, &crate::NULL_NODE, &current).unwrap();
+    let mut entry = Vec::new();
+    if rev == 0 {
+      entry.extend_from_slice(&0x0003_0001_u32.to_be_bytes());
+      entry.extend_from_slice(&[0; 4]);
+    } else {
+      entry.extend_from_slice(&(offset << 16).to_be_bytes());
+    }
+    let base = if rev == 0 {
+      0
+    } else {
+      i32::try_from(rev - 1).unwrap()
+    };
+    let p1 = if rev == 0 {
+      -1
+    } else {
+      i32::try_from(rev - 1).unwrap()
+    };
+    for field in [
+      i32::try_from(chunk.len()).unwrap(),
+      i32::try_from(current.len()).unwrap(),
+      base,
+      i32::try_from(rev).unwrap(),
+      p1,
+      -1,
+    ] {
+      entry.extend_from_slice(&field.to_be_bytes());
+    }
+    entry.extend_from_slice(&node);
+    entry.extend_from_slice(&[0; 12]);
+    index.extend_from_slice(&entry);
+    index.extend_from_slice(&chunk);
+    previous = node;
+    offset += u64::try_from(chunk.len()).unwrap();
+  }
+  index
+}
+
+/// A-630, main's order of 2026-11-20 15:40 (the hg import's memory): do rebuild the last revision of a 64-link chain over
+/// a 4 KiB text. Expect it read under a room of its chunks and a few texts: a chain's deltas apply into the two texts it
+/// alternates between, not a new text a link charged on top of every text before it.
+#[test]
+fn a_chains_deltas_are_applied_within_two_texts_not_one_a_link() {
+  let text: Vec<u8> = (0..4096_u32)
+    .map(|n| b'a' + u8::try_from(n % 26).unwrap())
+    .collect();
+  let links = 64;
+  let index = one_chain(&text, links);
+  let log = Revlog::open(&index, &[], &mut room()).unwrap();
+  let last = links - 1;
+  assert_eq!(
+    log.chain(last, &mut room()).unwrap().len(),
+    64,
+    "the chain is every revision"
+  );
+  let mut measured = room();
+  let rebuilt = log.text(last, &mut measured).unwrap();
+  assert_eq!(rebuilt.len(), text.len());
+  let need = (1 << 24) - measured.left();
+  // Derived: every chunk charged twice at most (its stored segment and its copy), two texts, and a revision's entry and
+  // chain slot each; one text a link would be 64 texts.
+  let text_len = u64::try_from(text.len()).unwrap();
+  let chunks = u64::try_from(index.len()).unwrap();
+  let bound = 2 * chunks + 2 * text_len + 64 * u64::from(links);
+  assert!(
+    need <= bound,
+    "a 64-link chain's read charged {need} bytes, past {bound}"
+  );
+  assert!(log.text(last, &mut Admission::new(bound)).is_ok());
+}

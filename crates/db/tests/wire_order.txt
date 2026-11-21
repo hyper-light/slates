@@ -62,12 +62,14 @@ LandingState 6 Done
 LandingState 7 Partial
 LandingState 8 Refused
 LandingState 9 Aborted
+LandingState 10 Superseded
 LogName 0 Green
 LogName 1 State
 LoggedChange 0 Joined
 LoggedChange 1 Named
 LoggedChange 2 Left
 LoggedChange 3 Changed
+LoggedChange 4 Objects
 MemberOrigin 0 Root
 MemberOrigin 1 Branch
 NameChange 0 Bind
@@ -181,6 +183,8 @@ Op 99 CredentialEnrolled
 Op 100 CredentialRevoked
 Op 101 RepositoryRebuilt
 Op 102 RepositoryIndexCut
+Op 103 CredentialTombstoned
+Op 104 LandingSuperseded
 PlacementState 0 Local
 PlacementState 1 Placed
 PolicyEffect 0 Allow

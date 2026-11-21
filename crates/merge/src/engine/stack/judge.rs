@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::moved::Change;
 use crate::engine::{
   ConflictWindow, Green, Increment, Resolved, at_head, is_content, node_exclusive_paths,
-  span_bytes, touched_range,
+  touched_range,
 };
 use crate::map::{Mapped, map_range};
 use crate::ops_doc::{Op, OpKind};
@@ -348,7 +348,7 @@ impl Green {
         ))),
         Mapped::Overlaps => {
           let base = file.get_or_insert_with(|| self.content_ref_at(frame, against.at));
-          if !identical(op, (&edits, base.as_deref()), &work.post_state) {
+          if !identical(op, (&edits, base.as_deref()), work.post()) {
             windows.range(path, touched_range(op));
           }
           moved.push(None);
@@ -386,7 +386,11 @@ fn upper_node_exclusive(work: &Increment, against: &Against<'_>, windows: &mut W
 
 /// Whether `op`, an overwrite meeting a change, writes exactly the bytes the new base holds where its start lands: the
 /// verdict's identical case (§4.16 "The verdict", pass two), read in `base`, the new base's file.
-fn identical(op: &Op, (edits, base): (&[&[Op]], Option<&[u8]>), post_state: &[u8]) -> bool {
+fn identical(
+  op: &Op,
+  (edits, base): (&[&[Op]], Option<&[u8]>),
+  post_state: crate::named::Post<'_>,
+) -> bool {
   if op.kind != OpKind::Overwrite {
     return false;
   }
@@ -398,5 +402,5 @@ fn identical(op: &Op, (edits, base): (&[&[Op]], Option<&[u8]>), post_state: &[u8
     return false;
   };
   let held = base.and_then(|base| base.get(start..start.checked_add(len)?));
-  held == Some(span_bytes(post_state, op.src, op.len))
+  held == Some(post_state.span(op.src, op.len).as_ref())
 }

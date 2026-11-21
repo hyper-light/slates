@@ -630,8 +630,9 @@ fn the_repositorys_state_is_charged_to_the_merge_budget_and_given_back_with_it()
 /// A-662 (§4.17.1 "Durability and residency": a push's objects held as a version holds its files' contents). Do: append
 /// two pushes, each a version of the root and its objects; then one whose objects alone pass the merge budget; rebuild
 /// the partition from its snapshot; destroy the repository. Expect: the objects read back in the order the register
-/// received them, and their bytes counted (`Repositories::objects_bytes`); a push of one green and its objects is no
-/// atomic record, since the objects take no position; the one past the merge budget is kept, since objects are the
+/// received them, and their bytes counted (`Repositories::objects_bytes`); a push of one green and its objects one
+/// atomic record of the green and the names log, since the objects ride the names log to the repository's candidates
+/// (A-724 piece 8c), so a takeover keeps or drops the push whole; the one past the merge budget is kept, since objects are the
 /// repository's content, charged by its owner shard to its memory budget, never the merge budget the partition's
 /// chains share (found by use: a Subversion import of 5,000 revisions refused `green_chains` at 1,685); the rebuilt
 /// partition reads the same objects; the destroy drops them.
@@ -645,7 +646,20 @@ fn a_pushs_objects_are_kept_in_order_carried_by_a_snapshot_and_never_charged_to_
     pushed.objects = vec![byte; 50];
     advance(&mut partition, pushed).unwrap();
   }
-  assert_eq!(partition.repositories().atomic_at(a, 1), None);
+  let atomic = partition
+    .repositories()
+    .atomic_at(a, 1)
+    .expect("the push is one atomic record");
+  assert!(
+    atomic.spans.iter().any(|span| matches!(
+      span.log,
+      LogName::State {
+        log: StateLog::Names,
+        ..
+      }
+    )),
+    "{atomic:?}"
+  );
   let kept: Vec<Vec<u8>> = partition
     .repositories()
     .objects(repo)

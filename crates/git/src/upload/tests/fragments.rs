@@ -427,8 +427,9 @@ fn a_plan_past_its_admission_is_refused() {
 
 /// A-745 (§4.17.1 "A fetch's answer", rule 1: nothing holds a list of every object a fetch sends). Do: begin through the
 /// source the pack of every object of A-582's repository, and the pack of none, each with room to spare, and read what
-/// each charged. Expect: what every object costs past none is one run's bytes for each run its positions make, a few
-/// words however many objects the runs hold, where the plan's copy had charged a handle an object.
+/// each charged. Expect: what every object costs past none is what its set costs in its form, never more than one
+/// run's bytes for each run its positions make: a few words however many objects the runs hold, where the plan's copy
+/// had charged a handle an object.
 #[test]
 fn a745_a_plans_objects_are_charged_as_runs_never_an_object_at_a_time() {
   let fixture = served::served();
@@ -455,9 +456,9 @@ fn a745_a_plans_objects_are_charged_as_runs_never_an_object_at_a_time() {
   };
   let run_bytes = crate::to_u64(core::mem::size_of::<(u64, u64)>());
   let past_none = charged(&every) - charged(&none);
-  assert_eq!(
-    past_none,
-    run_bytes * crate::to_u64(every.runs()),
+  assert_eq!(past_none, every.bytes());
+  assert!(
+    past_none <= run_bytes * crate::to_u64(every.runs()),
     "{} objects in {} runs",
     every.len(),
     every.runs()
@@ -465,5 +466,42 @@ fn a745_a_plans_objects_are_charged_as_runs_never_an_object_at_a_time() {
   assert!(
     every.len() > crate::to_u64(every.runs()) * 2,
     "the repository's objects make fewer runs than objects"
+  );
+}
+
+/// A-745 (§4.17.1 "A fetch's answer", rule 1: tables are a bit or a word an object; rule 3: a request's room bounds a
+/// slice, never a repository). Do: begin through the source a pack of single objects scattered as a deepened
+/// history's are, every third of 96,000 positions (32,000 runs, as `git fetch --deepen 100` of git v2.0.0 chose about
+/// every third object of the store), within 64 KiB. Expect: begun, its objects charged as the bit table they cost least
+/// in, where the plan's copy as runs had asked 512,000 bytes and been refused (git v2.0.0's deepen asked 525,472 of a
+/// ring region's 278,528 and the client read "bad pack header").
+#[test]
+fn a745_a_deepenings_scattered_objects_are_planned_within_a_slices_room() {
+  const SPAN: u64 = 96_000;
+  const ROOM: u64 = 64 * 1024;
+  let fixture = served::served();
+  let objects = crate::positions::Positions::of((0..SPAN).step_by(3).collect());
+  assert_eq!(objects.runs(), 32_000);
+  let plan = PackPlan {
+    runs: &[],
+    objects: &objects,
+    filter: None,
+    thin: true,
+    ofs_delta: true,
+  };
+  let served = serving(&fixture, &REFS, MAIN_REF);
+  let mut clock = Ticks(0);
+  let mut source = Fragments {
+    clock: &mut clock,
+    exchange: EXCHANGE,
+    quantum_ns: LONG_TURN,
+  };
+  let mut admission = Admission::new(ROOM);
+  let begun = source.begin(&served, &plan, &mut admission);
+  assert!(begun.is_ok(), "{:?}", begun.err());
+  assert!(
+    ROOM - admission.left() <= SPAN / 8 + 64,
+    "charged {}",
+    ROOM - admission.left()
   );
 }

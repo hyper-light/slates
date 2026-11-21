@@ -259,8 +259,8 @@ xmlns:lp2=\"http://subversion.tigris.org/xmlns/dav/\">\n<D:href>/repo/!svn/rvr/1
 <D:lockscope><D:exclusive/></D:lockscope>\n<D:locktype><D:write/></D:locktype>\n</D:lockentry>\n</D:supportedlock>\n\
 <D:lockdiscovery/>\n</D:prop>\n<D:status>HTTP/1.1 200 OK</D:status>\n</D:propstat>\n</D:response>\n\
 </D:multistatus>\n",
-    hex(&text.md5),
-    hex(&text.sha1)
+    hex_of(&text.md5),
+    hex_of(&text.sha1)
   );
   assert_eq!((answer.status, text_of(&answer)), (207, expected));
 }
@@ -945,4 +945,11 @@ fn deltav_v1_an_unknown_vcc_or_a_future_baseline_is_refused() {
   let other = fixture.anonymous("PROPFIND", "/!svn/vcc/other", Some("0"), PROPFIND_VERSION);
   let future = fixture.anonymous("PROPFIND", "/!svn/bln/7", Some("0"), PROPFIND_BASELINE);
   assert_eq!((other.status, future.status), (500, 404));
+}
+
+/// `bytes` in lowercase hexadecimal, as the digests are written.
+fn hex_of(bytes: &[u8]) -> String {
+  let mut out = String::new();
+  push_hex(&mut out, bytes);
+  out
 }

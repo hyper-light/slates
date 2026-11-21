@@ -192,8 +192,8 @@ impl<'r> StoreGraph<'r> {
     }
     admission.charge(row.len)?;
     let place = Place::Indexed { row, content };
-    match Repository::bytes_of(self.store, id, &place) {
-      Ok(bytes) => Ok(Some(bytes)),
+    match self.repository.bytes_of(self.store, id, &place) {
+      Ok(bytes) => Ok(Some(bytes.into_owned())),
       Err(refused) => {
         self.failed(GraphFault::Store(refused));
         Ok(None)
@@ -310,7 +310,11 @@ impl Graph for StoreGraph<'_> {
   }
 
   fn kind(&self, node: u64) -> Kind {
-    self.row(node).map_or(Kind::Blob, |(_, row)| row.kind)
+    // Read from the landing's runs by type, no row read: a walk asks every entry's type (A-722 part 3's partial clone).
+    self.repository.kind_at(node).unwrap_or_else(|| {
+      self.failed(GraphFault::NoRow { position: node });
+      Kind::Blob
+    })
   }
 
   fn commit(&self, node: u64) -> Option<CommitRow<u64>> {

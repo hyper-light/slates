@@ -552,7 +552,7 @@ fn resubmitted((head, volume): (Head, &Inodes), restated: &Restatement) -> Resul
   )?
   .map_err(|refused| format!("the restated journal does not compose: {refused:?}"))?;
   match green.submit(&increment) {
-    Outcome::Accepted { .. } => Ok(seen_in(&green)),
+    Outcome::Accepted { .. } | Outcome::Identical { .. } => Ok(seen_in(&green)),
     other => Err(format!("the restated journal was answered {other:?}")),
   }
 }
@@ -619,7 +619,7 @@ fn restate(head: Head, steps: &[Step]) -> Result<Restated, String> {
         changed,
         journal,
       },
-      Outcome::Accepted { .. },
+      Outcome::Accepted { .. } | Outcome::Identical { .. },
     ) => {
       let restated = Restatement {
         version,

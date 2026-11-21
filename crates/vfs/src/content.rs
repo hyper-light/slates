@@ -31,6 +31,19 @@ pub struct Chunk {
   pub identity: Option<[u8; 32]>,
   /// How the bytes are sealed in the arena (A-99), or `None` when they are in the clear.
   pub seal: Option<ChunkSeal>,
+  /// The readers holding it beyond the head that may have let it go (A-768: a live log's whole capture, read in turns):
+  /// a chunk freed while pinned stays readable until its last pin goes ([`ChunkStore::unpin_chunk`]).
+  pub pins: Pins,
+}
+
+/// A chunk's pins (A-768): how many readers hold it, and whether it was freed while they did. Held in the chunk record
+/// itself, so a pin allocates nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pins {
+  /// The readers holding it.
+  pub held: u32,
+  /// Whether it was freed while held: it is freed when the last pin goes.
+  pub freed: bool,
 }
 
 /// Format: a content key's identity, what a recovery image names the key by: the volume id's 16 bytes, then the
@@ -258,6 +271,10 @@ pub struct ChunkStore {
   /// Bytes a trim would have given back but the arena declined, because an image may name the block or it is locked
   /// (A-118): the economy left on the table.
   trim_declined_bytes: u64,
+  /// The pins held on chunks now ([`ChunkStore::pin_chunk`], A-768).
+  pinned: u64,
+  /// Chunks freed while pinned, so far.
+  freed_while_pinned: u64,
   /// The buffer a seal encrypts a copy of the chunk in before any byte of the chunk changes (one chunk's bytes at most,
   /// kept for the store's life), zeroed after every seal.
   seal_scratch: Vec<u8>,
@@ -323,6 +340,8 @@ impl ChunkStore {
       replaced_unread: 0,
       trim_refusals: 0,
       trim_declined_bytes: 0,
+      pinned: 0,
+      freed_while_pinned: 0,
       seal_scratch: Vec::new(),
     }
   }
@@ -939,6 +958,7 @@ impl ChunkStore {
           block,
           identity: None,
           seal,
+          pins: Pins::default(),
         })
         .map_err(|refusal| {
           // The hold goes back with the refused record.
@@ -1095,6 +1115,24 @@ impl ChunkStore {
     Ok(open)
   }
 
+  /// The bytes of a sealed extent lent in place from the arena, borrowed, nothing copied (A-727; Ada's ruling of
+  /// 2026-11-20: a read lends a window, it allocates nothing): a chunk in the clear. None for a chunk sealed under the
+  /// cipher (A-99), whose bytes are only ever opened into a caller's buffer (`read_extent_into`), and for a zero extent.
+  pub fn chunk_bytes_lent(&self, extent: &Extent) -> Option<&[u8]> {
+    let ExtentSrc::Chunk { chunk, at } = extent.src else {
+      return None;
+    };
+    let chunk = self.chunk(chunk)?;
+    if chunk.seal.is_some() {
+      return None;
+    }
+    let bytes = self
+      .arena
+      .span(chunk.block, usize::try_from(chunk.len).ok()?)?;
+    let start = usize::try_from(at).ok()?;
+    bytes.get(start..start.checked_add(usize::try_from(extent.len).ok()?)?)
+  }
+
   /// The chunk behind an extent.
   pub fn chunk(&self, handle: Handle<Chunk>) -> Option<&Chunk> {
     self.chunks.get(handle).ok()
@@ -1123,8 +1161,68 @@ impl ChunkStore {
     Ok(u64::from(chunk.len))
   }
 
-  /// Frees a chunk and its block unconditionally (the deadlist walker's terminal step).
+  /// Frees a chunk and its block (the deadlist walker's terminal step); a pinned chunk is freed when its last pin goes
+  /// ([`ChunkStore::unpin_chunk`]), readable by its pinners until then (A-768).
   pub fn free_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
+    let chunk = self.chunks.get_mut(handle)?;
+    if chunk.pins.held > 0 {
+      chunk.pins.freed = true;
+      self.freed_while_pinned = self.freed_while_pinned.saturating_add(1);
+      return Ok(());
+    }
+    self.free_record(handle)
+  }
+
+  /// Pins a chunk for a reader that outlives the head's hold on it (A-768): it stays readable, freed or not, until the
+  /// reader unpins it. Refused for a chunk already freed or one at the most pins a count holds.
+  pub fn pin_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
+    let chunk = self.chunks.get_mut(handle)?;
+    if chunk.pins.freed {
+      return Err(VfsError::StaleHandle);
+    }
+    chunk.pins.held = chunk.pins.held.checked_add(1).ok_or(VfsError::Invalid)?;
+    self.pinned = self.pinned.saturating_add(1);
+    Ok(())
+  }
+
+  /// Lets go of a pin ([`ChunkStore::pin_chunk`]); the last pin of a chunk freed meanwhile frees it.
+  pub fn unpin_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
+    let chunk = self.chunks.get_mut(handle)?;
+    chunk.pins.held = chunk.pins.held.checked_sub(1).ok_or(VfsError::Invalid)?;
+    self.pinned = self.pinned.saturating_sub(1);
+    if chunk.pins.held == 0 && chunk.pins.freed {
+      return self.free_record(handle);
+    }
+    Ok(())
+  }
+
+  /// Unpins the chunk of each extent that names one ([`ChunkStore::unpin_chunk`]): every one is tried, and the first
+  /// refusal is returned.
+  pub fn unpin_extents(&mut self, extents: &[Extent]) -> Result<(), VfsError> {
+    let mut first = Ok(());
+    for extent in extents {
+      if let ExtentSrc::Chunk { chunk, .. } = extent.src {
+        let unpinned = self.unpin_chunk(chunk);
+        if first.is_ok() {
+          first = unpinned;
+        }
+      }
+    }
+    first
+  }
+
+  /// The pins held on this store's chunks (A-768): zero whenever no capture is in progress.
+  pub fn pinned(&self) -> u64 {
+    self.pinned
+  }
+
+  /// Chunks freed while pinned, so far: the non-vacuity count of a pin.
+  pub fn freed_while_pinned(&self) -> u64 {
+    self.freed_while_pinned
+  }
+
+  /// Frees a chunk's record and its block.
+  fn free_record(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
     let chunk = self.chunks.remove(handle)?;
     if self.is_trimmed(&chunk) {
       self.arena.free_trimmed(

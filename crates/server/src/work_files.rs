@@ -66,7 +66,7 @@ pub struct Base<'a> {
 impl<'a> Base<'a> {
   /// The base's bytes of `path`: `Ok(None)` when the base has no such file, `Err(BaseGone)` when the green is gone
   /// and the base cannot be read.
-  fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
+  pub(crate) fn file(self, path: &str) -> Result<Option<Cow<'a, [u8]>>, BaseGone> {
     if let Some(green) = self.green {
       return Ok(green.content_ref_at(path, self.version));
     }

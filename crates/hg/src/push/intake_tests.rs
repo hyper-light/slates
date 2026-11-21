@@ -348,3 +348,31 @@ fn a_pushs_record_holds_its_changegroup_and_replays_through_the_intake() {
   }
   assert_eq!(store.len(), 0, "a hold was kept");
 }
+
+/// A-732, found by use: a restart's replay of hg's own history spent 130 s of CPU, its longest step 277 ms, each
+/// manifest's predecessor rebuilt from its delta chain (a chain is up to its text's length of deltas, each applied over
+/// a copy of the whole text). Do: take stock 7.2's bundle a step at a time. Expect no manifest's predecessor rebuilt: the
+/// intake hands each append the text it kept last; and the bundle holding at least two manifests, so the count is not
+/// vacuous.
+#[test]
+fn the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it() {
+  let part = stock();
+  let verified = verify(&part, &Nothing, &mut room()).unwrap();
+  assert!(
+    verified.manifests.len() >= 2,
+    "{}",
+    verified.manifests.len()
+  );
+  let mut store = store();
+  let mut index = HgIndex::new();
+  crate::index::PREVIOUS_REBUILT.with(|count| count.set(0));
+  let (fork, _, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let rebuilt = crate::index::PREVIOUS_REBUILT.with(std::cell::Cell::get);
+  assert_eq!(
+    rebuilt, 0,
+    "manifest predecessors rebuilt from their chains"
+  );
+  for index in [fork, index] {
+    index.release(&mut store).unwrap();
+  }
+}

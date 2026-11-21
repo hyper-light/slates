@@ -29,18 +29,17 @@
 use std::fmt;
 
 pub use slates_bridge_oci::runtime::{
-  Endpoint, Engine, HardLinkRule, IdentityRule, ProfileRefusal, RuntimeProfile, TestedProfile,
+  Endpoint, Engine, ExportProfile, HardLinkRule, IdentityRule, MountsFrom, ProfileRefusal,
+  RuntimeProfile, TestedProfile,
 };
 
 use crate::error::Note;
 
 /// Format: the environment variable that names the Docker CLI's endpoint, overriding its context (Docker's CLI
 /// reference, "Environment variables", tier B).
-#[cfg(any(unix, test))]
 const ENDPOINT_VARIABLE: &str = "DOCKER_HOST";
 
 /// Format: the template that asks the current context for its engine endpoint, as a JSON string.
-#[cfg(any(unix, test))]
 const CONTEXT_ENDPOINT: [&str; 4] = [
   "context",
   "inspect",
@@ -50,7 +49,6 @@ const CONTEXT_ENDPOINT: [&str; 4] = [
 
 /// Format: the template that asks the engine for the four facts the judge reads, as one JSON object. Measured answer:
 /// 116 bytes from Docker Desktop 29.3.1 (2026-10-01).
-#[cfg(any(unix, test))]
 const ENGINE_FACTS: [&str; 3] = [
   "info",
   "--format",
@@ -61,7 +59,6 @@ const ENGINE_FACTS: [&str; 3] = [
 /// `info`'s Go fields (`libpod/define/info.go`: `Host.OS`, `Version.Version`, `Host.Security.Rootless`,
 /// `Host.Security.SELinuxEnabled`, `Host.ServiceIsRemote`; podman-info(1)'s JSON names them `os`, `Version`,
 /// `rootless`, `selinuxEnabled`, `serviceIsRemote`). Its whole `info` would pass the one page an answer may hold.
-#[cfg(any(unix, test))]
 const PODMAN_FACTS: [&str; 3] = [
   "info",
   "--format",
@@ -70,7 +67,6 @@ const PODMAN_FACTS: [&str; 3] = [
 
 /// Format: the endpoint a profile names for a runtime that runs its containers on this host itself (podman whose
 /// service is not remote), where no engine is reached at an endpoint.
-#[cfg(any(unix, test))]
 const LOCAL: &str = "local";
 
 /// A container engine's profile and the evidence it holds ([`engine_profile`]).
@@ -82,6 +78,18 @@ pub struct EngineProfile {
   pub profile: RuntimeProfile,
   /// The evidence the profile holds: the test that ran a container workload through it, and its rules.
   pub tested: TestedProfile,
+}
+
+/// A container engine that mounts a volume's NFS export as a volume of its own, and from where ([`export_engine`]; A-520's
+/// export route).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportEngine {
+  /// The endpoint the runtime's command line reaches, as it named it.
+  pub endpoint: String,
+  /// The profile the engine's statement establishes.
+  pub profile: RuntimeProfile,
+  /// The export route's evidence for it, and where it mounts the export from.
+  pub tested: ExportProfile,
 }
 
 /// Why no profile was established, or why the one established holds no evidence ([`engine_profile`]).
@@ -153,8 +161,45 @@ pub fn engine_profile(_runtime: &str) -> Result<EngineProfile, EngineFault> {
   })
 }
 
+/// Asks `runtime`'s engine for its profile and judges whether it mounts a volume's NFS export as a volume of its own,
+/// and from where (A-520's export route, `slates_bridge_oci::runtime::judge_export`): the same questions in the same
+/// order as [`engine_profile`], on every host, Windows' Docker Desktop over its named pipe among them, since no host
+/// mount is bound into the container. `runtime` is the command line's executable, by name or path (`docker`).
+pub fn export_engine(runtime: &str) -> Result<ExportEngine, EngineFault> {
+  let named = std::env::var(ENDPOINT_VARIABLE)
+    .ok()
+    .filter(|endpoint| !endpoint.is_empty());
+  export_engine_of(
+    runtime,
+    named,
+    slates_bridge_oci::runtime::Host::this(),
+    &mut |args| ask(runtime, args),
+  )
+}
+
+/// [`export_engine`] over `ask`, on `host`: the profile [`established`], judged for the export route.
+fn export_engine_of(
+  runtime: &str,
+  named: Option<String>,
+  host: slates_bridge_oci::runtime::Host,
+  ask: &mut dyn FnMut(&[&str]) -> Answer,
+) -> Result<ExportEngine, EngineFault> {
+  let (endpoint, profile) = established(runtime, named, ask)?;
+  match slates_bridge_oci::runtime::judge_export(&profile, host) {
+    Ok(tested) => Ok(ExportEngine {
+      endpoint,
+      profile,
+      tested,
+    }),
+    Err(refusal) => Err(EngineFault::Untested {
+      endpoint,
+      profile: Box::new(profile),
+      refusal,
+    }),
+  }
+}
+
 /// What one query of the runtime's command line answers: its output, or the fault.
-#[cfg(any(unix, test))]
 type Answer = Result<Vec<u8>, EngineFault>;
 
 /// The profile `runtime`'s engine establishes on `host`, in the module's order: the runtime's interface by its name;
@@ -170,13 +215,24 @@ fn profile_of(
   host: slates_bridge_oci::runtime::Host,
   ask: &mut dyn FnMut(&[&str]) -> Answer,
 ) -> Result<EngineProfile, EngineFault> {
+  let (endpoint, profile) = established(runtime, named, ask)?;
+  judged(endpoint, profile, host)
+}
+
+/// The endpoint and the profile `runtime`'s engine establishes, in the module's order (see [`profile_of`]), before any
+/// judge: what [`engine_profile`] and [`export_engine`] judge each by its own rules.
+fn established(
+  runtime: &str,
+  named: Option<String>,
+  ask: &mut dyn FnMut(&[&str]) -> Answer,
+) -> Result<(String, RuntimeProfile), EngineFault> {
   let interface =
     slates_bridge_oci::runtime::runtime_interface(runtime).map_err(EngineFault::Refused)?;
   if interface == slates_bridge_oci::runtime::Interface::Podman {
     let facts = parse_podman_facts(&ask(&PODMAN_FACTS)?)?;
     let profile =
       slates_bridge_oci::runtime::podman_profile(&facts).map_err(EngineFault::Refused)?;
-    return judged(LOCAL.to_owned(), profile, host);
+    return Ok((LOCAL.to_owned(), profile));
   }
   let endpoint_text = match named {
     Some(endpoint) => endpoint,
@@ -185,8 +241,10 @@ fn profile_of(
   let endpoint = slates_bridge_oci::runtime::admit_endpoint(runtime, &endpoint_text)
     .map_err(EngineFault::Refused)?;
   let facts = parse_engine_facts(&ask(&ENGINE_FACTS)?)?;
-  let profile = slates_bridge_oci::runtime::runtime_profile(endpoint, &facts);
-  judged(endpoint_text, profile, host)
+  Ok((
+    endpoint_text,
+    slates_bridge_oci::runtime::runtime_profile(endpoint, &facts),
+  ))
 }
 
 /// `profile`, reached at `endpoint`, judged on `host`: the evidence it holds, or the profile with the judge's refusal.
@@ -212,7 +270,6 @@ fn judged(
 
 /// Podman's facts from the [`PODMAN_FACTS`] template's answer, or why they are not there (A-520): every field present,
 /// the strings non-empty and the flags booleans, never a profile built from a guess.
-#[cfg(any(unix, test))]
 fn parse_podman_facts(
   answer: &[u8],
 ) -> Result<slates_bridge_oci::runtime::PodmanFacts, EngineFault> {
@@ -237,7 +294,6 @@ fn parse_podman_facts(
 }
 
 /// The endpoint the context answers with: a JSON string.
-#[cfg(any(unix, test))]
 fn parse_endpoint(answer: &[u8]) -> Result<String, EngineFault> {
   match serde_json::from_slice::<serde_json::Value>(answer) {
     Ok(serde_json::Value::String(endpoint)) => Ok(endpoint),
@@ -250,7 +306,6 @@ fn parse_endpoint(answer: &[u8]) -> Result<String, EngineFault> {
 
 /// The engine's facts from the [`ENGINE_FACTS`] template's answer, or why they are not there: an engine that reports
 /// server errors did not answer as an engine.
-#[cfg(any(unix, test))]
 fn parse_engine_facts(
   answer: &[u8],
 ) -> Result<slates_bridge_oci::runtime::EngineFacts, EngineFault> {
@@ -318,6 +373,95 @@ fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
   }
   let _ = child.wait();
   outcome
+}
+
+/// Runs `runtime args` within the observe budget, its answer at most one page (4096 bytes: no template answer comes
+/// near it) on a host with no Unix pipes to poll (Windows): the child's two pipes are read to their ends on threads of
+/// their own, each keeping at most the cap and one byte more, while this thread waits on the child within the budget,
+/// killing it past the bound. The decision is the answer's, as on Unix.
+#[cfg(not(unix))]
+fn ask(runtime: &str, args: &[&str]) -> Result<Vec<u8>, EngineFault> {
+  use std::io::Read as _;
+  // Shape: one page, 4 KiB on Windows (x86_64 and arm64), as [`answer_cap`] is a page on Unix.
+  const CAP: usize = 4096;
+  let unreachable = |why: String| EngineFault::Unreachable(Note::new(why));
+  let mut child = std::process::Command::new(runtime)
+    .args(args)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .map_err(|e| unreachable(format!("{runtime}: {e}")))?;
+  // Each pipe is read to its end (or the cap and one byte more) on a thread of its own, which sends what it read, by
+  // which pipe (0 the answer, 1 the complaint), when the pipe closes: the condition this thread waits on, under the
+  // budget, as `Command::output` reads both pipes to their ends before it waits on the child.
+  let (said, heard) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+  let read = |which: usize, pipe: Option<Box<dyn std::io::Read + Send>>| {
+    let said = said.clone();
+    std::thread::spawn(move || {
+      let mut bytes = Vec::new();
+      if let Some(pipe) = pipe {
+        let _ = pipe
+          .take(u64::try_from(CAP.saturating_add(1)).unwrap_or(u64::MAX))
+          .read_to_end(&mut bytes);
+      }
+      let _ = said.send((which, bytes));
+    })
+  };
+  let readers = [
+    read(
+      0,
+      child
+        .stdout
+        .take()
+        .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ),
+    read(
+      1,
+      child
+        .stderr
+        .take()
+        .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+    ),
+  ];
+  drop(said);
+  let budget = std::time::Duration::from_nanos(slates_server::daemon::OBSERVE_BUDGET_NS);
+  let began = std::time::Instant::now();
+  let (mut answer, mut complaint) = (Vec::new(), Vec::new());
+  let mut overran = false;
+  for _ in 0..readers.len() {
+    match heard.recv_timeout(budget.saturating_sub(began.elapsed())) {
+      Ok((0, bytes)) => answer = bytes,
+      Ok((_, bytes)) => complaint = bytes,
+      Err(_) => {
+        overran = true;
+        break;
+      }
+    }
+  }
+  // Past the budget, or past the cap (its reader stopped reading, so the child may wait on a full pipe): stopped.
+  if overran || answer.len() > CAP {
+    let _ = child.kill();
+  }
+  let _ = child.wait();
+  for reader in readers {
+    let _ = reader.join();
+  }
+  if overran {
+    return Err(unreachable(format!(
+      "{runtime} did not answer within {budget:?}"
+    )));
+  }
+  if answer.len() > CAP {
+    return Err(EngineFault::TooLarge);
+  }
+  if answer.is_empty() {
+    return Err(unreachable(format!(
+      "{runtime} answered nothing: {}",
+      String::from_utf8_lossy(&complaint).trim()
+    )));
+  }
+  Ok(answer)
 }
 
 /// One open pipe of the child's: its descriptor, and what it has said so far.
@@ -791,5 +935,116 @@ mod tests {
       parse_endpoint(b"null"),
       Err(EngineFault::Unreadable(_))
     ));
+  }
+
+  /// Format: Docker Desktop's named pipe on Windows as its context names it.
+  const DESKTOP_PIPE: &str = "npipe:////./pipe/dockerDesktopLinuxEngine";
+
+  /// A-520's export route (main's ruling, 2026-11-20). Do: judge, for the export route, Docker Desktop on Windows over
+  /// its named pipe, on macOS over its socket, and a rootful Docker Engine on its own Linux host. Expect each to mount the
+  /// export (Desktop from its VM, the Engine from the host's kernel), the context asked first and the engine second.
+  #[test]
+  fn the_export_route_takes_docker_desktop_on_windows_and_macos_from_its_vm_and_a_rootful_linux_engine_from_the_host()
+   {
+    let cases = [
+      (
+        "docker.exe",
+        DESKTOP_PIPE,
+        DESKTOP,
+        Host::Windows,
+        MountsFrom::DesktopVm,
+      ),
+      (
+        "docker",
+        DESKTOP_SOCKET,
+        DESKTOP,
+        Host::MacOs,
+        MountsFrom::DesktopVm,
+      ),
+      (
+        "docker",
+        "unix:///var/run/docker.sock",
+        ENGINE,
+        Host::Linux,
+        MountsFrom::HostKernel,
+      ),
+    ];
+    for (runtime, endpoint, facts, host, from) in cases {
+      let mut asked = Vec::new();
+      let context = format!("{endpoint:?}");
+      let judged = export_engine_of(
+        runtime,
+        None,
+        host,
+        &mut engine(context.as_bytes(), facts, &mut asked),
+      );
+      let judged = judged.unwrap_or_else(|e| panic!("{runtime} on {host:?}: {e}"));
+      assert_eq!(
+        (judged.endpoint.as_str(), judged.tested.mounts_from),
+        (endpoint, from),
+        "{runtime} on {host:?}"
+      );
+      assert_eq!(asked, ["context", "info"]);
+    }
+  }
+
+  /// A-520's export route. Do: judge, for the export route, a rootless Docker Engine, rootless podman, and Docker Desktop
+  /// on a host it doesn't run on as named (Linux). Expect the rootless two refused `RootlessCannotMount` (a rootless
+  /// engine can't mount a file system), the last `ProfileUntested`, each with its profile.
+  #[test]
+  fn the_export_route_refuses_a_rootless_engine_and_an_unnamed_host_typed() {
+    let mut asked = Vec::new();
+    let context = format!("{:?}", "unix:///run/user/1000/docker.sock");
+    let rootless = export_engine_of(
+      "docker",
+      None,
+      Host::Linux,
+      &mut engine(context.as_bytes(), ROOTLESS, &mut asked),
+    );
+    assert!(
+      matches!(
+        rootless,
+        Err(EngineFault::Untested {
+          refusal: ProfileRefusal::RootlessCannotMount,
+          ..
+        })
+      ),
+      "{rootless:?}"
+    );
+    let mut asked = Vec::new();
+    let podman = export_engine_of(
+      "podman",
+      None,
+      Host::Linux,
+      &mut engine(b"null", ROOTLESS_PODMAN, &mut asked),
+    );
+    assert!(
+      matches!(
+        podman,
+        Err(EngineFault::Untested {
+          refusal: ProfileRefusal::RootlessCannotMount,
+          ..
+        })
+      ),
+      "{podman:?}"
+    );
+    let mut asked = Vec::new();
+    let context = format!("{DESKTOP_SOCKET:?}");
+    let elsewhere = export_engine_of(
+      "docker",
+      None,
+      Host::Linux,
+      &mut engine(context.as_bytes(), DESKTOP, &mut asked),
+    );
+    assert!(
+      matches!(
+        elsewhere,
+        Err(EngineFault::Untested {
+          refusal: ProfileRefusal::ProfileUntested { .. },
+          ..
+        })
+      ),
+      "{elsewhere:?}"
+    );
   }
 }

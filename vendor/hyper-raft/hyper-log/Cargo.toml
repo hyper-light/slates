@@ -1,0 +1,31 @@
+[package]
+name = "hyper-log"
+description = "The shared Raft log: one log per device, shared by every group on it, so that one flush commits every group's writes"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[dependencies]
+crc32c = "0.6"
+getrandom = "0.4"
+hyper-block = { path = "../hyper-block" }
+# Sealing at rest: a sealed log's records, session keys and framing MACs (hyper-raft docs/seal.md §5).
+hyper-seal = { path = "../hyper-seal" }
+# The histograms the log's statistics keep (`LogStats`, docs/durable.md §13.1).
+hyper-timing = { path = "../hyper-timing" }
+thiserror = "2.0"
+
+# loom builds only for the library's own tests under `RUSTFLAGS="--cfg loom"`, for the owner's
+# wake's interleavings (`src/wake.rs`): a test-only dependency, so no consumer resolves it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(shuttle)", "cfg(fuzzing)"] }
+
+# A root of its own: a vendored snapshot of hyper-raft (SNAPSHOT), outside any consumer workspace.
+[workspace]

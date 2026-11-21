@@ -111,12 +111,14 @@ impl CredentialMessage {
   /// is refused: a member never holds a record under a name it does not have.
   pub fn decode(bytes: &[u8]) -> Result<CredentialMessage, CredentialWireError> {
     let (&kind, rest) = bytes.split_first().ok_or(CredentialWireError::Truncated)?;
+    // Format: the message's credential id, 32 bytes (`CredentialMessage::id`'s `[u8; 32]`).
     let (id, rest) = rest
       .split_first_chunk::<32>()
       .ok_or(CredentialWireError::Truncated)?;
     let id = *id;
     let (message, rest) = match kind {
       KIND_ENROLL => {
+        // Format: the record's length, a little-endian `u32` (4 bytes).
         let (length, rest) = rest
           .split_first_chunk::<4>()
           .ok_or(CredentialWireError::Truncated)?;

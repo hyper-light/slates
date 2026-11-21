@@ -109,6 +109,8 @@ pub enum LandingStage {
   Refused,
   /// Cancelled or crashed; a resume continues it.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it (A-779).
+  Superseded,
 }
 
 /// The daemon's grant listing, typed.
@@ -164,6 +166,7 @@ fn stage_of(stage: wire::LandingStage) -> LandingStage {
     wire::LandingStage::Partial => LandingStage::Partial,
     wire::LandingStage::Refused => LandingStage::Refused,
     wire::LandingStage::Aborted => LandingStage::Aborted,
+    wire::LandingStage::Superseded => LandingStage::Superseded,
   }
 }
 
@@ -241,6 +244,7 @@ mod tests {
       (wire::LandingStage::Partial, LandingStage::Partial),
       (wire::LandingStage::Refused, LandingStage::Refused),
       (wire::LandingStage::Aborted, LandingStage::Aborted),
+      (wire::LandingStage::Superseded, LandingStage::Superseded),
     ] {
       assert_eq!(
         audit_of(entry(wire::AuditKind::LandingFinished, Some(typed))).outcome,

@@ -967,6 +967,32 @@ impl Repositories {
     }
   }
 
+  /// [`Self::apply_advanced`]'s namespace half: `entry`'s members joined and its names changed here, in order, and the
+  /// changes its names log takes for them (with the push's record, if it carries one).
+  fn namespace_changes(&mut self, entry: &crate::catalog::RepositoryEntry) -> Vec<LoggedChange> {
+    let mut namespace = Vec::with_capacity(entry.joined.len().saturating_add(entry.names.len()));
+    for member in &entry.joined {
+      self.join(member);
+      namespace.push(LoggedChange::Joined {
+        member: member.clone(),
+      });
+    }
+    for change in &entry.names {
+      self.name_changed(entry.repository, change);
+      namespace.push(LoggedChange::Named {
+        change: change.clone(),
+      });
+    }
+    // A push's record rides the names log (A-724 piece 8c): shipped to the repository's candidates with the operation's
+    // identity and spans, so a successor holds it exactly when it holds the rest of the operation, and replays it.
+    if !entry.objects.is_empty() {
+      namespace.push(LoggedChange::Objects {
+        record: entry.objects.clone(),
+      });
+    }
+    namespace
+  }
+
   /// Applies an entry the guard admitted (A-603, A-642), unconditionally: its members join, its names change and its
   /// state moves, in order, each change taking its own log's next position; its versions are the partition's chains,
   /// which moved each green in `greens` (`Repositories::green_spans`). An entry that moved two logs or more, a green's
@@ -987,19 +1013,7 @@ impl Repositories {
     if !self.records.contains_key(&entry.repository) {
       return Err(DbError::NotFound);
     }
-    let mut namespace = Vec::with_capacity(entry.joined.len().saturating_add(entry.names.len()));
-    for member in &entry.joined {
-      self.join(member);
-      namespace.push(LoggedChange::Joined {
-        member: member.clone(),
-      });
-    }
-    for change in &entry.names {
-      self.name_changed(entry.repository, change);
-      namespace.push(LoggedChange::Named {
-        change: change.clone(),
-      });
-    }
+    let namespace = self.namespace_changes(entry);
     self.log_names(entry.repository, namespace);
     self.made_greens.clone_from(&greens);
     let mut bytes = StateBytes::default();
@@ -1017,9 +1031,9 @@ impl Repositories {
           });
         }
       }
-      // The objects ride with the entry and take no position (A-662), so they never make it an atomic record. They are
-      // the repository's content, charged by its owner shard to its memory budget, never to the merge budget
-      // ([`Repositories::objects_bytes`]).
+      // The objects are kept here for the owner's replay and take a position of the names log (above), so they ship to
+      // the candidates (A-724 piece 8c). They are the repository's content, charged by its owner shard to its memory
+      // budget, never to the merge budget ([`Repositories::objects_bytes`]).
       if !entry.objects.is_empty() {
         register.objects.push(entry.objects.clone());
       }
@@ -1308,6 +1322,8 @@ impl Repositories {
       LoggedChange::Changed { change } => {
         register.apply(change);
       }
+      // A push's record a successor takes back (A-724 piece 8c): kept as the owner kept it, for the store's replay.
+      LoggedChange::Objects { record } => register.objects.push(record.clone()),
     }
   }
 
@@ -1373,7 +1389,7 @@ impl Repositories {
             NameChange::Retire { .. } | NameChange::Default { .. } => true,
           }
       }
-      LoggedChange::Left { .. } => log == StateLog::Names,
+      LoggedChange::Left { .. } | LoggedChange::Objects { .. } => log == StateLog::Names,
       LoggedChange::Changed { change } => state_log_of(change) == log,
     }
   }

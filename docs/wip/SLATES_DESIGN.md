@@ -70,6 +70,15 @@ the two cross-cutting sections keep their numbers.
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
 | R10 | Disk is written only on a user permission grant, and the grant follows the mode the user gave the agent (A-285). | A grant is a database record bound to the exact manifest it is about to write; the launcher's write policy decides whether the daemon issues it at once (bypass), answers an approval request that the harness presents (ask) or refuses (a forbidding mode); an agent can never raise its own policy; every grant, manifest, and outcome is in the audit log (§4.15). |
 
+> **R9's gate, built (A-786, 2026-11-20).** The histogram is its own ratcheted lane, `cargo xtask ratchet --provision`:
+> `provision_bench` alone, every gated row (spinning and parked p50, p99, p999; max informational) held to its machine's
+> ceilings, which only tighten, every run's rows kept (`target/provision-histogram.tsv`); the bench itself fails past the
+> 50 µs floor and, run with `PROVISION_BENCH_LOAD=<n>`, past a loaded bound derived from the quiet run and the load (the
+> load may add to the spinning 1-client p99 at most what it adds to the parked p99). Wiring the lane into CI on a
+> reference machine is a run request (w-lint, main). **Open, in flight:** the loaded p99 misses its bound on main
+> (macOS arm64: 1.62 ms against 0.87 ms; GAPS 8a-r9-gate), measured to macOS's zero-timeout `kevent` in the shard's busy
+> harvest.
+
 > **R1's reading for repositories (A-767, 2026-11-20, Ada's storage ruling; designed, not built).** A version-control
 > repository's history is kept on disk: a node's store directory is a landing target granted once (R10's record) and
 > written only by landings of accepted changesets and by the derived store's fills under it, through `slates-store`
@@ -4571,6 +4580,12 @@ reaches the daemon through the rendezvous's socket file (A-187).
 > Since its third piece (`CONTRACT` = 48) the judge holds rootless podman on its own Linux host too, the profile
 > `a_rootless_container_reads_and_writes_the_volume_through_its_mount` ran through (2026-10-19): the container's root
 > is the user who mounted the volume, so a host runs its container as the container's root over an unshared mount.
+> Since A-769 (2026-11-20, `CONTRACT` = 57, kiln's export route by Ada's ruling) the judge answers a second question
+> for a host whose engine mounts the volume's NFS export as a volume of its own rather than binding a host mount:
+> `container_engine::export_engine` (`slates_bridge_oci::runtime::judge_export`), on every host, Windows' Docker Desktop
+> over its named pipe among them, answering where the engine mounts the export from (`MountsFrom`: the host's kernel,
+> or Docker Desktop's VM at `host.docker.internal`) or a typed refusal (`RootlessCannotMount`, appended). The bind's
+> profiles stay for Slates' own bind form.
 
 **A VMM with no folder sharing: the disk-image form (A-160).** A volume reaches a VM as a host mount shared in by the
 VMM (`docs/wip/virtiofs.md` §8 item 7). Firecracker shares no folder: it has only block and pmem devices backed by
@@ -9686,8 +9701,10 @@ server, not inferred from command names.
 > acknowledged once `f + 1` members hold it, a revocation only once every member has let it go (a member that kept it
 > would go on proving a revoked credential); short of that each is refused `CredentialUnreplicated` and asked again
 > reaches the rest. At each configuration change every member offers what it holds, so one that joined holds what the
-> region holds. Owed: a member partitioned through a revocation and back with its state keeps the record until the
-> revocation is asked again; a revocation's tombstone would close it (GAPS).
+> region holds. A revocation leaves a tombstone on every member that applies it (`CredentialTombstoned`, appended), which
+> the healer offers too, so a revoked credential is never enrolled again: not by a member that missed its revocation
+> and rejoins with the record (it lets the record go), and not by that member's offer of it (refused where the
+> tombstone is). Tombstones are charged to the credentials' table byte budget and carried in the partition's snapshot.
 
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
@@ -10148,6 +10165,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 > behavior is unchanged; see `docs/bugs/2026-09-20-telemetry-drain-counts-its-own-spans.md`.
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
+
+> **Status (2026-11-20, A-779: a newer presentation supersedes the older).** A presentation of a volume into a target,
+> by any client, supersedes every earlier one of that volume and target still awaiting its grant: each leaves
+> `AwaitingGrant` for `Superseded`, naming the newer (`Op::LandingSuperseded`), drops off the session log (A-773), and a
+> grant of it is refused `LandingSuperseded { newer }`, so an older state never lands over a newer one. Nothing expires
+> on a clock (R3). A granted landing's presentation kept for its resume is not superseded. The session log lists only
+> the presentations a grant can still take, read from the shard's held presentations.
 
 **Special names (A-26).** A landing containing FIFO/socket creation refuses before its
 first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
@@ -11103,6 +11127,31 @@ Applying or replicating an increment cannot import a live endpoint from the work
 such kind with its number (A-294): the number is part of its canonical identity, so two works making one path with two
 numbers conflict, and the same node made twice converges.
 
+> **Status (2026-11-20, A-773: the session log).** `slates log [--json]` shows a supervisor what needs them and
+> nothing else, as Sapling's Smartlog does: each work's base, how far its green moved past it and how its last
+> submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
+> collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
+> `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
+> shows a pending grant and never makes one (R10). A-788: the same view over MCP (`slates.log`, read-only, the JSON
+> `slates log --json` prints, one definition: `slates_mcp::session_log_json`) and in the SDKs' sync clients (Python
+> `session_log()`, Node `sessionLog()`, the same keys in each one's case). Owed: the async SDK forms (the async clients
+> carry single requests; the log is a paged walk, as `drifted` is, sync alone too).
+
+> **Status (2026-11-20, A-785: held merges in the session log).** A submission an ask policy holds for approval
+> (A-285) needs the human as a collision and a waiting landing do: the work remembers the held increment's identity and
+> paths at its revision (`WorkState::held`), the log marks it `awaiting_approval` and names it under "needs you", and
+> an edit, a submit or a rebase, which moves the revision and so the increment an approval would bind, retires the mark.
+> The log never approves (R10): the launcher's proof does.
+
+> **Status (2026-11-20, A-782: identical told from accepted).** D-27's verdict is accept, identical or conflict, and the
+> submit now says which: an accepted increment whose verdict left no effect (every operation already at the head: pass
+> two's identical spans, an identical create, a remove of what is gone, an identical mode or attribute) is
+> `Outcome::Identical`, committed as its version as an accept is, so the chain, its replay and a retry are unchanged. The
+> reply's `identical` is read from the green's change index (`Green::changed_nothing_at`), so a first answer, a
+> deferred one and a resend agree. The client answers `Submitted::Identical`, the API `MergeOutcome::Identical`, MCP, the
+> CLI and both SDKs `identical: true`, and the session log marks the work `identical`. A write of the head's own bytes
+> with nothing intervening is still an accept with an effect (the engine applies it), so it answers `Accepted`.
+
 > **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
 > timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
 > increment's post-state, with no content operations. The engine preserves it through identity,
@@ -11177,6 +11226,30 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > shuttle form: sixteen agents through one green's owner, 200 seeded schedules, the commit order
 > linearizable and the fast-path counter equal to the oracle's disjoint count
 > (`crates/merge/tests/shuttle_green.rs`).
+
+> **Status (2026-11-20, A-774 part 2).** A mount reads its green where it lies: a mounted work's slot is an overlay
+> whose base is its green at the work's base version, pinned while the mount lives (counted in the reachable floor),
+> served through a tree host (`slates_vfs::host::tree`) lent with the green for each NFS or FUSE request
+> (`crates/server/src/green_tree.rs`); a submit declares the overlay's diverged set. 8 mounts over a 64 MiB green add
+> 1.5 MB resident (548 MB when each copied the green) and a mount is made in 1.3 ms (34 ms), against 0.6 ms over a
+> 16-file green (`crates/server/tests/mounted_work_cow.rs`). A green's landing view is the same overlay over the
+> green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
+> judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
+> a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
+> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
+
+> **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
+> (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
+> holding its files over its base, served by every bridge, and snapshotted as the mount's base; a submit first
+> declares what the mount changed since that base (the deriver names the touched paths, each file declared as the one
+> splice between the work's bytes and the mount's, so an editor's temp-and-rename save is the span it changed), then
+> runs as any submit. `land` of a green lands its head through a store-backed view under the green's id, presented
+> and granted as any volume's landing (R10). By use (`crates/server/tests/mounted_work.rs`): ten editors on ten
+> mounted works over one green, saving by temp file and rename over the daemon's NFS, submit with no declaration:
+> accepted, identical and conflict as the edits call for; a grant lands the head, equal to the oracle. Owed: the
+> mount's seed copies the work's files (copy-on-write base, w-work-cow), the slot and unsubmitted mount writes do not
+> survive a restart, a mount is not refreshed when its work's base moves, several spans a file (D-O17, w-rewrite-ops).
 
 > **Status (2026-09-13).** The pure core is a green-volume *service* (`crates/server/src/merge_service.rs`;
 > GAP-A9-14): every verb enforces the catalog role — an edit, declaration, write attachment, snapshot or
@@ -11526,7 +11599,19 @@ splits; a truncate cancels operations beyond the new length; a rename maps the p
 operations; a create followed by an unlink cancels; a whole-file rewrite (truncate to zero and
 write, or write-and-rename) composes to one `Delete` of the base length and one `Insert` of the
 new bytes. Composition of declared operations is arithmetic on facts; comparing file states to
-reconstruct operations is inference and does not exist in slates. The same journal yields the
+reconstruct operations is inference and does not exist in slates. One step at the seal reads bytes, and it is not
+that inference (A-776, D-O17): a path whose composed ops are exactly a replacement of its whole base content (any route:
+truncate and write, a rewrite in place, write-and-rename, an SDK `edit` of the whole file) is recovered as the edit the
+writer made, the minimal token-grain ranges in which the file it wrote differs from the base it was given
+(`slates_merge::refine`: a trim of the common prefix and suffix, Myers' linear-space search over tokens, and, when Myers
+alone runs out of its budget, anchors on tokens unique to both files with Myers between them; the cost bounded linear
+in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
+merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
+base yields the writer's file byte for byte (the property test). A path with namespace ops, node-exclusive flags, or a
+base the sealing shard cannot read keeps its whole replacement. The refinement runs a unit at a time under its
+owner's turns (A-787): every piece of its work is metered and asks for the next unit at `refine::WORK_PER_TICK` of it, so
+its longest step stays tens of microseconds whatever the file's size. The submit still calls it in one step until
+A-787 part 2 drives it over the shard's turns. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -11741,6 +11826,13 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > and a first read of a base file are the green's: a verb that needs either is parked on the work's shard and resumed
 > by the owner's answer (`crates/server/src/work_home.rs`). Each work's base is held by a durable floor on the green's
 > partition. Across nodes (a work on the creating client's node) is not built.
+>
+> **Measured (2026-11-20, w-work-cow): a work costs its divergence, never its green.** A work starts as an empty delta
+> over its green's pinned base and copies a file only when it changes it (`crate::work_files`). 16 works over a 64 MiB
+> green (1,024 files of 64 KiB), each requested, reading one file and editing it, added 1.2 MB resident (74 KiB per
+> work: the 64 KiB file it changed plus about 10 KiB) in 0.58 ms mean per work. With a copy of the green per work put
+> back, the same run added 975 MB in 4.46 ms. Release, macOS arm64, Mac Studio. Held by
+> `crates/server/tests/work_cow.rs`: N x (64 KiB + file) + 8 MiB, below one copy of the green.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
@@ -17339,7 +17431,8 @@ committed across hosts, holder recomputation on other nodes, submission across h
   increment has a new identity; conflicts leave the work volume unchanged (catches: rebase
   corruption).
 - AC-6.10 The deriver never diffs: an architecture test proves no code path compares file
-  states to produce operations; whole-file tool rewrites produce one delete plus one insert
+  states to produce operations; whole-file tool rewrites compose to one delete plus one insert, which the seal
+  recovers as the writer's own token-grain edit against its base (A-776; never a third state, never a merge)
   (catches: the banned inference returning).
 - AC-6.11 Merge-path latency: verdict p99 and seal-to-reply p99 on the reference laptop are
   recorded and ratcheted; the fast path stays within one ring round trip plus the seal
@@ -17384,7 +17477,9 @@ recorded; the merge oracle runs in CI with shrinking.
 
 **Risks and fallbacks.** Whole-file rewrites by tools inflate the conflict rate on shared files:
 measured by source, mitigated by `edit` in the skills and by streaming; a high measured rate
-reopens the ergonomics (D-O17). The size budget for increments is derived from measured cost;
+reopens the ergonomics (D-O17). Since A-776 (2026-11-20) the seal recovers a whole-file rewrite as the edit it was: on
+the A/B's corpus no pair of rewrites of different lines or tokens, or a formatter pass beside an edit, conflicts, and
+every pair editing one token still does. The size budget for increments is derived from measured cost;
 if real increments routinely exceed it, the SDK's per-path split is the fallback.
 
 **A-9 required acceptance and regression cases (open; 2026-09-05).**
@@ -21004,7 +21099,9 @@ Status: built 2026-10-06, Linux; macOS by A-110, Windows by A-205.
   back.
 - Amended by A-214 (2026-11-05): an idle shard keeps its last write burst's net growth of free pages pre-faulted, and
   the purge gives back every free block beyond it.
-- Amended by A-765 (2026-11-20, w-sizing): that reserve decays. It is the burst whole for one sweep interval after the
+- Amended by A-777 (2026-11-20, w-sizing): the reserve is removed; the purge gives every free block back and nothing is
+  kept pre-faulted (BENCHMARKS, "The idle prefault reserve against none").
+- Amended by A-765 (2026-11-20, w-sizing), superseded by A-777: that reserve decays. It is the burst whole for one sweep interval after the
   pass that closed it, then halved each interval (`daemon::decayed_reserve`), and the sweep stays armed while a
   reserve is held, so an idle shard gives a burst's pages back within log2(burst / discard size) intervals.
 - Owed:
@@ -23470,6 +23567,11 @@ Status: built 2026-11-06.
 
 ### A-214 — An idle shard keeps its last write burst's worth of free content pages pre-faulted (accepted 2026-11-05, VFS plan step 11; amends A-105)
 
+> **Status (2026-11-20): removed by A-777.** Measured against none on the big Studio, the reserve bought about 5% on
+> writes landing right after idle and nothing on the provisioning p99, for 512 MiB more peak RSS in the NFS bench; after
+> hg's history push it held the whole 4,931.4 MiB burst resident (w-hg). Ada's MEMORY SIZING rule: a burst leaves
+> nothing resident behind it.
+>
 > **Status (2026-11-05): reverted from main, then re-landed on `agents/nfs-write` with two fixes.** Main CI 42119714654
 > found its reserve keeping deleted files' pages resident, against A-205's give-back on both Windows lanes, and its
 > arena test failing under Miri.
@@ -28757,6 +28859,9 @@ Applied in the same change to:
   longer holds answers `ENOENT`; recovery refuses an overlay whose loaded base directory changed after its last
   publication.
 - **Evidence.** See the bug record's verification.
+- **Status (2026-11-20, A-781).** Without a birth time, an untouched entry whose change time (sub-second) and size
+  match what its inode recorded is proven its file and keeps its number across a takeover; only one the disk changed or
+  stamped in whole seconds is renumbered, as before.
 
 ### A-150 — An inode number goes out only under a published reservation (accepted 2026-10-22)
 Applied in the same change to:
@@ -55232,6 +55337,30 @@ Applied in the same change to:
   `vcs_share::turns::tests::a_repositorys_pushes_share_one_turn_a_round_of_the_shard` (three pushes of one repository
   took 3 turns between the small one's, now at most 1). Tests: slates-server `vcs_share:: git_push:: vcs_http::git
   vcs_ssh::` 106 of 106. The cap-3 and cap-10 by-use proof follows in BENCHMARKS.md.
+- **Acknowledged pushes lost at a takeover, found and fixed (2026-11-20; main's order: top item, A-636's author gone).**
+  `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` processes at f = 1, stock git over their HTTPS edges,
+  the owner SIGKILLed with a push in flight) was red on version-2 records: the successor adopted and rebuilt the
+  repository (`fleet.takeover.repository_adopted`, `repository_rebuilt`) and served it with no refs at all. The counters
+  named the cause: no record replayed (`vcs_store.replayed` absent, `repository_records` 0 on every partition). A push's
+  records were kept only in the owner partition's register ("the objects take no position", A-662), so nothing shipped
+  them. Fixed: a push's record is a change of the names log (`LoggedChange::Objects`, appended; db wire order pinned),
+  so it ships to the repository's candidates with the operation's identity and spans, a takeover keeps or drops the push
+  whole, and the successor's adoption puts the record back for the store's replay. A first run of the fix kept only the
+  first push: pushes acknowledged before their parts shipped were lost, so a push is now answered only once its names
+  log is held at f + 1 (`state_log::names_committed_within`, §4.8's commit rule; the HTTP and SSH edges wait on it before
+  the report). The test passes, 3 of 3 runs: every acknowledged push on the successor, in order, its clone whole by
+  `git fsck`. The test grants every principal read and push before the kill, a workaround until w-fed-faults' fix:
+  a credential minted on the owner is unknown to the successor (401) and a survivor's own token names its own account
+  (403). Tests: slates-db 18 suites; slates-server `takeover state_log vcs_store:: git_push:: vcs_http::git vcs_ssh::`
+  236 of 236.
+- **Record version 3 on (2026-11-20; main's ruling (ii)).** `vcs_store::write_version_3` is true: a push's names are
+  homed in the region at f + 1 before its record names them, and the record holds their BLAKE3 and count. The takeover
+  test passes with it, 4 of 4 runs. One run's counts: the successor replayed 3 records (`vcs_store.replayed`) and read one
+  record's names from a region home (`vcs_store.names_fetched` 1); each survivor homed 2 objects, served 19 region
+  exchanges, and its homing waits published its home shard themselves 11 and 13 times (`published_for_ticket`). The first
+  runs hung: main's refactor of the HTTP answer loop (`answer_until`) had dropped the edge's `take_homing`, so a decision
+  waited for a homing nobody ran. The edge homes again, and a decision whose asked homing is not taken by its next turn
+  now gives the names back and writes version 2 (`vcs_store.homes.homing_untaken`), never waits.
 
 ### A-723 — Content once and a push a work, the end state and the push bound; S1: a git entry holds its pack as sent, not its objects inflated (2026-11-20, w-perf for UI goal 93; §4.17 "Role" and D-28, §4.11, §4.17.1 "Objects" and "Durability and residency"; A-64, A-618, A-662, A-716, A-718)
 
@@ -55843,6 +55972,123 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `slates-git` `store::tests::packed::every_object_read_in_place_from_a_held_pack_is_the_object_read_whole`
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
+
+### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
+- **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
+  cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
+  adopt its index fork sealed into tables, where the rows had stayed in the index's tail; a row read is now a search of
+  each run, newest first.
+- **The profile** (`sample` of the daemon during the partial clone, release, main ab760dc65): the answer's object walk
+  (`Negotiating::step`) was `Index::get` and `ContentStore::get` under `StoreGraph::kind` (two rows an object: the id
+  by position, then its row) and under the tree entries' positions; and each blob's size was read (two rows more) for
+  a filter that sends no blob whatever its size.
+- **Change.** A blob's size is read only where the filter reads sizes (`Filter::reads_size`: `blob:limit`, alone or
+  combined; the object walk and the runs' carried objects). A position's type is read from its landing's runs
+  (`Repository::kind_at`): a landing gives positions by type, then id (A-639), so staging records each type's run
+  (`Staged::kinds`) and the landing keeps it (four runs at most a landing, charged with the landing map), and
+  `StoreGraph::kind` reads no row.
+- **Tests.** `slates-git` `negotiation::tests::a_filter_that_reads_no_size_asks_none` (red before: 40 sizes asked
+  under `blob:none`) and `store::repository::graph::tests::a_type_is_read_from_its_landing_with_no_row_read` (red
+  before: 24 index visits for 12 objects); `slates-git --lib` 582 passed; `slates-server --lib -- git vcs_store vcs_http` 220 passed.
+- **By use** (adas-mac-studio.local-2, release, w-perf's `git_scale.sh` on git/git cut at v1.0.0 with ten partial
+  clones each against one daemon after its steps, load 33-36): the daemon's CPU a partial clone 700-760 ms on main
+  (ab760dc65) and 250-360 ms after; wall 0.96-1.05 s and 0.49-0.63 s, under the 0.62-0.72 s before part 3.
+
+### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
+- **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
+  (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
+  the content store as it was admitted: a v1.5.0 record held its 304.6 MiB of objects twice at its replay's peak.
+- **Change.** The replay reads its record's pack a chunk at a time into a site of its own (`git_replay::Site`: a
+  queue by pack position, the push and the repository read only through the live intake's `Quarantined`, the
+  repository's objects as a thin pack's bases), each chunk's bytes added to the push's own copy of the pack
+  (`Push::extend_pack`) and each object admitted as it resolves where it lies there (`admit_object` with its offset,
+  `Push::keep_read`), its hold given back; the waiting deltas resolve a unit at a time (`Reader::resolve_turn`) and are
+  admitted the same way; `Reader::finish_into` ends the pack. Its names are compared as sets (the replay order fix
+  above), so admitting in its own turns' order is the live push's own. Staging then puts what lands in resolution order,
+  as a live push's does.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic: a v1.5.0 push, then its repository's store made
+  again from the log, each replay turn 1 ms): the process's peak RSS grew by 189.6 MiB across the replay before (772.6
+  to 962.2 MiB, 2,712 turns) and by 0.1 MiB after (781.8 to 781.9 MiB, 1,921 turns, 2.43 s); the content store's peak
+  is 309.0 MiB either way, what lands. The time before (6.39 s) was taken with every core busy, so the turns and the
+  resident bytes are the comparison.
+- **Tests.** `slates-server --lib -- git vcs_store` 163 passed, the replays of `t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved`
+  and `t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` among them (kiln, adas-mac-studio.local-2).
+
+### A-722's replay order — a pack record's names compared as sets (2026-11-20, w-git for UI goal 93; found reading B2's replay)
+- **The bug.** A live push admits its pack's objects as they resolve: those read whole, or from a base already read,
+  in pack order as the client's bytes arrive; a thin pack's waiting deltas (a REF_DELTA whose base is outside the pack)
+  once the pack is whole, in the turns that resolve them. Its record names the objects in that order. A replay admitted
+  them in pack order and compared the names in order, so a thin pack whose waiting delta was not its last object was
+  refused as diverged, and the repository's store with it: after a restart its refs were gone. Thin pushes are git's
+  usual second and later pushes.
+- **Change.** A pack record's names are compared with what the replay would record as sets
+  (`vcs_store::names_alike`, sorting both); a push holds an object once, so each name is once on each side. A version-1
+  record, whose objects are admitted in its own order, is still compared in order.
+- **Tests.** `slates-server` `git_push::tests::t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed` (the
+  fixture `update` with its thin delta moved first; red before: no ref advertised after the rebuild); `slates-server
+  --lib -- git vcs_store` 163 passed (kiln, adas-mac-studio.local-2).
+
+### A-722's landing step — a commit takes what a move's walk found staged, not each id in its step (2026-11-20, w-git for UI goal 93; main's queue: Repository::commit's O(objects) passes)
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, a push's last step timed by
+  phase): the push's longest step is its last, `push_planned`, 35.8 ms: make, secure and judge 1.3 ms; entry and
+  record 1.7 ms; the store's commit 14.0 ms (landed runs 2.6, the plan's members by position 6.2, the holds' release
+  3.4, values 1.7); the entry's apply 18.2 ms; the paths map 0.3 ms.
+- **Change.** A move's walk (`Admitting`, the judge's turns) notes each new object's position as the push's stage gives
+  it, with that stage (its base and how many positions it gives; `Members::staged`); a commit adopting the same stage
+  takes those positions (`members_positions`), merging sorted sets, rather than looking each id up in its step. A stage
+  made again at the same base gives the same positions (no landing since gave any), so the base and count name it. One
+  move lands one run (`landed_runs`: every fresh object is the move's, or the first move's, the same); several moves'
+  runs take the staged positions too. Before it (00e6da185), the landing's runs were kept by position, not an id map.
+- **After.** The same push's commit: landed runs 0.01 ms, plan 0.003 ms, the store's commit 5.5 ms (now the holds'
+  release, 5.2 ms); its longest step 27.8 ms, of which the entry's apply is 18.6 ms: the record carries the whole pack
+  (9.4 MiB), so the apply is O(its bytes). Owed: the pack homed as content before the append, as version 3 homes the
+  names (asked of main: w-git under the current record, or w-store's changeset payload); the holds' release in turns
+  after the commit (releasing each at its row would make a restage read every object again), built below.
+- **Tests.** `slates-git --lib` 579 passed; `slates-server --lib -- git vcs_store` 161 passed (kiln,
+  adas-mac-studio.local-2).
+- **Then the holds** (the next landing). A live push gives its pack's holds back a unit at a time after its landing
+  (`Push::give_back_in_turns`, set when its decision begins; `Push::give_back_turn`, turned by the decision before it
+  gives the push back): the landing sets them aside rather than releasing each in its step. Every other owner of a push
+  (a replay, the server's own commits) still releases at the landing, so no push dropped after it holds anything; a
+  live push's abandon gives back what is set aside. The same v1.5.0 push: the store's commit 0.63 ms (from 14.0 ms),
+  the landing's step 23.4 ms, of which the entry's apply is 19.0 ms (the pack in the record, owed above). Test:
+  `store::tests::packed::a_landed_push_gives_its_holds_back_in_turns_not_in_the_landing`; `slates-git --lib` 580
+  passed; `slates-server --lib -- git vcs_store` 161 passed.
+
+### A-722's memory per push, B2's in-flight half — A push read where it lies in its pack while it is judged (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING, storage and changesets rulings)
+- **Why.** B1 measured a push of git/git's v1.5.0 (9.4 MiB pack, 34,296 objects) putting every object inflated in the
+  content store as it arrived (304.6 MiB). Ada's storage ruling keeps a change in RAM while it is in flight; her
+  changesets ruling makes what lands changesets, git's packs and objects derived. B2's in-flight half: the quarantine
+  holds the pack the client sent and where each object lies in it, never the objects inflated beside it.
+- **Change.** `slates_git::store::Push` keeps the client's pack (`extend_pack`: the server hands it each call's pack
+  bytes, which the receive session no longer copies; `Session::pack_len`) and each pack object's place, type, length
+  and content identity (`admit_placed`: named, checked and read as a commit from the reader's bytes, nothing put). An
+  object is read through the push (`Push::bytes`: `packed::read` over the push as a `PackSource`, a REF_DELTA's base an
+  entry of the pack, an object the push holds, or the repository's, `IndexBases`), so the pack's checks, the
+  connectivity walk, the verdicts' pushed-tree reads (`PushedObjects`) and a commit's tree and tag reads
+  (`Repository::bytes_of`) read it in place. A chain is resolved from the objects read lately
+  (`packed::Recent`, git's delta base cache): each object the reader resolves is kept there taken whole, each object a
+  read builds copied in, held to the pack's length, so a push's resident is at most twice its pack. Staging puts each
+  object new to the repository in the content store before its census, an object a unit, in the order the pack's reader
+  resolved them (`Push::placed_in_order`, `Step::Putting`), each read just after its base so the objects read lately
+  hold its chain (`Push::put_placed`; in its name's order each was its whole chain again, +45% CPU on v1.5.0),
+  and the hook view's pushed pack is made from those. The record writes the push's own pack (`RecordWriter::finish`'s
+  `pack`), as before byte for byte. Objects no pack brought (the server's own commits, a replay's) are held in the
+  content store as before.
+- **Measured** (adas-mac-studio.local-2, 2026-11-20). Before: a push held each object inflated in the content store as
+  it arrived (B1's run: git/git's v1.5.0, 9.4 MiB of pack, left 309 MiB). After: held in place, the store grows by
+  nothing until staging; the bound test's 64 objects of 64 KiB (4,194,304 bytes inflated, a 41,568-byte pack) hold
+  4,194,304 bytes in the store before and 41,568 bytes, the pack, after. The v1.5.0 rerun of B1's diagnostic is owed
+  in BENCHMARKS.md.
+- **Owed.** The landed half (w-store: the changesets a clone's pack is derived from; rows naming a pack place in place
+  of an inflated content); a replay reading its record's pack whole (`git_replay`'s `Unpacked`) and holding its objects
+  in the store, as the live push did before.
+- **Tests.** `slates-git` `store::tests::packed::b2_every_object_of_a_push_read_where_it_lies_in_its_pack_is_the_object_read_whole`
+  (six captured pushes, their packs handed seven bytes a call, thin bases among them; the store holds nothing more) and
+  `b2_an_in_flight_push_holds_its_pack_and_not_its_objects_inflated` (64 blobs of 64 KiB: held in the store 4,194,304
+  bytes, held in place 41,568, the pack; bound: twice the pack).; `slates-git --lib` 579
+  passed; `slates-server --lib -- git vcs_store vcs_http` 218 passed; check clean; clippy clean on the changed crates
+  (one finding on main outside them, `live_ship.rs`); fmt clean (kiln, adas-mac-studio.local-2).
 
 ### A-722's head at once — A git service's reply head is written before its body is read (2026-11-20, w-git for UI goal 93; main's ruling)
 - **Why.** The edge's engine wrote a reply's status and headers only once the service's reply began, after the whole
@@ -57066,10 +57312,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
 - **Measured.** `named_tests::a_named_text_is_read_a_slice_a_step_then_lands_whole`: a 4 MiB text read in 64 steps of
   at most 64 KiB, refused `ContentUnread` before, accepted after with the green's file the text's bytes; its encoding
   under 4 KiB (the names), decoded with its run unread again.
-- **Owed, named.** Part 2: the commit building the green's file blocks a slice a unit off the green and publishing in
-  one step (today `Green::commit` copies the file's bytes in one call); the server's `Objects` over vcs_store's plane
-  and the landing's turns (w-svn's `svn.land.*` counters); replay reading a chain entry's runs before
-  `apply_recorded`; items 3-7 then name the plane's object from the green's block with no copy.
+- **Part 2, held once and landed in turns** (main's piece; Ada's sizing rule: a landing's memory bounded by a slice
+  beside the file, never the file twice). A run is read into a buffer of its own (`named::Read`, one a run, reserved at
+  its length, pages made as written), never onto the post-state; the engine reads every added byte through one view
+  (`named::Post`: the inline bytes, then the runs). `Green::judge_named` moves the runs' buffers into the verdict held
+  (`Green::judge` copies them, so no caller loses bytes), and the commit makes each file whose bytes are exactly one
+  run's, made by no other file, of that buffer, moved (`take_whole_runs`): the text is the green's file with no copy.
+  A created file's bytes are made at the commit, not in the verdict (`merge_create` builds them only to compare with
+  a file standing there). The server reads a run from vcs_store's content plane (`vcs_store::named_objects::
+  PlaneObjects`: identity -> the node-local root, `ContentStore::window_range_in` reading a window's range straight
+  into the run's buffer, so a read copies its own bytes); a recovery's replay, which holds the shard read-only, reads
+  with the shard's chunk store given in place of a lent one (`WindowStorage::read_range_in`'s `kept_in`), the entry
+  kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
+  `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
+  in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
+- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
+  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
@@ -57144,10 +57402,19 @@ install, refresh and removals, `take_campaign_sessions`), `crates/server/src/for
   owner's token used throughout: before, both survivors answered 401; after, each survivor counts
   `credential.fleet.applied` and the successor authenticates the owner's token (`ls-remote` exit 0). The test's own
   verdict still fails on the refs a takeover loses, w-balance's half. macOS arm64, Mac Studio, local.
-- **Owed.** A member partitioned through a revocation that comes back with its state keeps the record until the
-  revocation is asked again: a revocation's tombstone, kept and offered as enrollments are, closes it. The healer
-  offers every credential at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
-  in the test's run).
+- **Tombstones (the same day, w-fed-faults).** As first landed (51a061d), the healer would have brought a revoked
+  credential back: a member partitioned through a revocation rejoins holding the record and offers it, and every other
+  member, holding nothing under its id, enrolled it again. A revocation now leaves a tombstone (`Op::CredentialRevoked`
+  keeps the id; `Op::CredentialTombstoned`, appended, wire tag 103, keeps it for a revocation from elsewhere, held or
+  not); an enrollment of a tombstoned id is refused (`AlreadyExists` at the guard; answered not held to a member, counted
+  `credential.fleet.revoked_refused`), and the healer offers tombstones as revocations, so the rejoining member lets its
+  record go. A tombstone charges its id's 32 bytes to the table byte budget, so a revocation gives back a record's room
+  less that, and the snapshot carries them (`credential_tombstones`, appended). Red first:
+  `slates-db --lib a764_a_revoked_credential_is_never_enrolled_again` (a revoked id enrolled again); the model test
+  states the rule (`the_credentials_equal_the_rules_over_every_history`, a tombstone step drawn), and
+  `slates-server --lib a764_a_member_never_brings_back_a_credential_revoked_here`. The healer still offers every
+  credential and tombstone at each configuration version, idempotent but repeated while a fleet forms (13 and 14 offers
+  in the takeover test's run).
 
 
 ### A-767 — One unit, the changeset: changes in RAM, the repository's history an append-only changeset log on disk, everything else derived, metadata in Mantle's K/V engine (2026-11-20, w-store; Ada's storage ruling ~12:40 PST, her changeset ruling ~13:35 PST, her memory-sizing ruling ~12:15 PST; §4.17.1 "Objects", "Durability and residency"; R1, R10; CLAUDE.md §2 item 3; A-581, A-645, A-647, A-662, A-716, A-765)
@@ -57255,6 +57522,27 @@ Measured: import time; RSS, peak and idle; disk bytes; clone throughput; an old 
 history's first, middle and last tenth, cold and warm); checkpoint spacing as learned and its disk cost. Beside them the
 stock servers' numbers (`hg serve`, `git daemon`, `svnserve` over FSFS). The numbers go in BENCHMARKS and this entry.
 
+> **Status (2026-11-20, item 7's phase 1 measured; proposed to w-hg, w-git and w-svn, not yet agreed; BENCHMARKS "A
+> changeset's stored form").** Main's A/B (raw payload plus a work index, against normalized per-path edits or wholes
+> held once by identity) over hg's history, the same history by git, and git v2.0.0 with v2.1.0 as a second
+> repository, in one store. One tool alone: equal (about 46 MB for hg's history normalized at K=256, 44.6 MB as hg's
+> zstd bundle; w-hg's and w-svn's release arms: 0 to 5 % apart). Across tools: the second tool's push adds 85.2 MB raw
+> and **no text bytes** normalized. Across repositories of one project: 57.9 MB raw against **0.49 MB**. Serving: a git
+> pack computed from normalized content 6.3 s against 0.94 s reusing a stored one (git v2.0.0). Proposed, on that data:
+> - **On disk the changeset is normalized:** its `record` (the tool's own bytes), its `work`, and for each touched path
+>   the edit against p1's text, or a whole held once by identity where the path is new or its chain since its last
+>   whole would pass its length (w-hg's rule; K=256 measured at +7.7 % for hg, +3.7 % for git); a changeset record is
+>   itself held by identity, so forks share theirs. The received `payload` is not kept on disk.
+> - **The hybrid on the push's path:** in flight the payload stays as received and is read in place (w-git's B1,
+>   w-svn's `TextSource`); landing normalizes it in bounded slices, using the tool's own deltas where they are already
+>   against p1 (hg: no diff at the server), and is acknowledged once the normalized changeset is durable (item 4).
+> - **Wire forms are derived, cached by identity:** the received pack or bundle seeds the cache, so the first clone
+>   after a push reuses it; an evicted one is computed again from the changesets.
+> - **Layout:** changeset order, with the `O` rows naming each path's text by (changeset, offset) and a decoded-segment
+>   cache sized from a clone's working set, since changeset order decodes 6 (svn) to 10 (hg) times the segments a
+>   per-file order does (w-svn, w-hg).
+> - Owed before building: git's normalization timed in Rust (w-git), and agreement from w-hg, w-git and w-svn.
+
 **8. RAM: the change in flight and a bounded, learned cache (Ada's memory-sizing ruling).**
 - **In flight:** held as received, so a push of N bytes holds at most k·N + B, with k and B derived (k about 2: the
   received bytes and one decode window). An import holds one slice.
@@ -57293,6 +57581,27 @@ two owners); the lint wall; each `unsafe` with its SAFETY line. Counted at Mantl
 the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Arc`, `Mutex`, `RwLock` or `Rc` (chunk
 30, engine 22, disk 1, block 1), 72 `unsafe` sites (block 32, disk 21, engine 19).
 
+> **Status (2026-11-20, piece 2a: the log's substrate vendored).** `hyper-block`, `hyper-log` and `hyper-sim` are in
+> `vendor/hyper-raft/` at hyper-raft `5e40eb9` (mantle `87ab09e1`'s copies), `hyper-block` without its device issuer
+> and so without `hyper-rt` (two local changes, `vendor/hyper-raft/README.md`); no slates crate links them until
+> `slates-store` (piece 3) does, with R1's table. Owed (2b): the engine, chunk and disk crates, which need the issuer and
+> `hyper-rt`'s cross-thread channel, whose ring is `unsafe impl Send`/`Sync` (CLAUDE.md §3 forbids it): a decision for
+> main between porting a safe channel into `slates-rt` and driving `ShardDb` inline with no worker pool.
+
+> **Status (2026-11-20, piece C2 step 1: `slates_rt::sync`).** Main's ruling on 2b: no `hyper-rt`, no `unsafe impl
+> Send`/`Sync`; the vendored seams are ported onto `slates_rt`. `crates/rt/src/sync` carries upstream's channel
+> surface (`channel`, `channel_with`, `Sender`, `ChannelReceiver`, `SyncError`) with no `unsafe`: values cross through
+> the standard library's bounded channel, a waiting task's word sits in upstream's generational cell table (ported,
+> safe), sender tasks waiting for room hold places granted in turn (upstream's room, its places cells of that table),
+> and a plain thread blocks inside the standard channel. Tests 11 of 11 (`cargo test -p slates-rt --lib sync::`, macOS
+> arm64, Adas-Mac-Studio-2): thread to thread, task from thread, task waiting for room, closes, cells given back.
+> Next: the issuer, crc, codec, disk, chunk and engine on it (vendor patches), then the land seam for their files.
+> Step 2 (2026-11-20): `slates_rt::retirement` (upstream's cold-owned native thread retirement, `RetirementLease`,
+> `OriginalAdoption`, `OriginalLease`, `OriginalFence`; its owners held by a `Reaper` rather than the runtime), with
+> `RtError::Capacity`, and `futures::race2`/`Either` (pinned on its own frame, no pin-projection crate). The engine's
+> machine facts are already `slates_machine::facts` by the same names (hyper-rt took them from slates). Tests:
+> retirement 2/2, race 1/1, sync 11/11.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -57300,3 +57609,374 @@ its RSS red test.
 
 **Applied in the same change to:** this entry; §4.17.1 "Objects" and "Durability and residency" (status lines); R1's
 reading (a status line); GAPS' §4.17 entry; `research/vcs-store-prior-art.md` (new).
+
+### A-768 — A live log's whole capture is read in turns from pinned chunks (2026-11-20, w-forming; main's order: slice the whole-record capture; §4.10 "Live shipping"; A-377, A-757, A-763)
+Applied in the same change to: GAPS (the live owner's long-turn line), `crates/vfs/src/content.rs` (`Chunk::pins`,
+`Pins`, `ChunkStore::pin_chunk`, `unpin_chunk`, `unpin_extents`, `pinned`, `freed_while_pinned`; `free_chunk` waits for
+the last pin), `crates/vfs/src/volume.rs` (`Volume::pin_extents`, `PinnedFile`), `crates/vfs/src/recover.rs` and
+`crates/server/src/vcs_store/arena_windows.rs` (a chunk record made unpinned), `crates/server/src/live_ship.rs`
+(`Capture`, `begin_capture`, `start_capture`, `advance_capture`, `pinned_capture`, `read_capture`, `finish_capture`,
+`release_capture`, `publish_body`, `whole_image`; `WholeBuild::capture`; `drop_build`, `forget` and a volume no longer
+live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
+- **What was there.** A whole publication of a live volume (its first, a checkpoint, one owed after a refusal) read
+  every byte of the volume in the publication's own turn (`content_runs` over the whole record): 4.5 to 6 ms of a debug
+  owner's CPU for 0.56 to 1.25 MB of body, beside 2.0 to 3.0 ms for the image itself (w-forming's probe, `taskpolicy -b`,
+  base 51a061d36; seal quanta are 14 to 784 us), and it was most of the takeover's `published_before_served` turn (21 ms).
+- **The change.** The image is taken in the publication's turn, and with it each chunked file's sealed extents, every
+  chunk pinned (`Volume::pin_extents`), and a copy of its open extent, which the next write changes in place. A pin is a
+  count in the chunk record itself, so it allocates nothing; a chunk freed while pinned (a write replaced it, a
+  publication or the deadlist walk let it go) stays readable and is freed when its last pin goes. The runs are then read
+  from the pinned extents a quantum a turn (`config::wrap_slice_ns` of the seal quantum, pieces sized by the measured
+  rate, an archive page at least: `piece_bytes`), as the volume's build (`WholeBuild::capture`), so the publications made
+  meanwhile queue behind it as they do behind a sealing build. They are the runs `content_runs` reads, in its order, so a
+  successor rebuilds the same state. Read whole within the first turn's quantum, the entry is made at once as before;
+  otherwise, at its last turn its pins go and its body heads the build's queue, made into its entry as the queue is (a
+  body of more than one piece sealed in turns, A-377), its install image not refreshed, since the volume has moved on.
+  The pins are bounded by the record and let go at the capture's last turn or wherever its build ends unread
+  (`drop_build`, `forget`, a volume no longer live-shipped).
+- **Still in one turn.** The image itself (`to_standalone_image`, 2.0 to 3.0 ms debug for 30 to 57 KB of record), a whole
+  publication made while a build runs (`queue_behind_build` captures it in its own turn), and a large delta's runs
+  (3.3 ms debug for a 1.25 MB body, the same probe).
+- **Tests.** `live_ship::tests::a_whole_capture_read_in_turns_reads_the_head_it_began_on` (the oracle: the body read in
+  turns at a zero quantum, the first file overwritten and the second unlinked after its first turn, equals the one-turn
+  read at the same head byte for byte; at most one 64 KiB piece a turn: 9 turns for 524,288 sealed bytes; red with the
+  read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
+  first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
+  holds nothing: the overwrite freed the pinned chunk at once).
+
+### A-769 — The export route's judge: whether a container engine mounts a volume's NFS export as a volume of its own, and from where, asked on every host (2026-11-20, w-k90-a520; main's ruling on kiln's export route, Ada's ruling ~09:30 PST; §4.6 A-9, A-520, A-521, A-115, A-184; `CONTRACT` = 57)
+Applied in the same change to: §4.6 (A-520's form through the library: a status line), GAPS (the library's container
+entry), `crates/bridge-oci/src/runtime.rs` (`MountsFrom`, `ExportProfile`, `judge_export`, `ProfileRefusal::
+RootlessCannotMount` appended) and `crates/api/src/container_engine.rs` (`ExportEngine`, `export_engine`, the
+profile's establishment shared by both judges, an `ask` for a host with no Unix pipes to poll, and their tests),
+`crates/api/src/lib.rs` (`CONTRACT` = 57).
+- **Why.** kiln's container engine no longer binds the machine's mount into a container (Ada's ruling, 2026-11-20): the
+  engine mounts the volume's NFS export (`Instance::export`, A-521) as a volume of its own, as kubelet does for kiln's
+  Kubernetes engine. The judge asked only the bind's question, which has no answer on Windows (no host mount is bound
+  into a container there, G-mount step 4), so `engine_profile` refused Windows `Unsupported` before asking any engine,
+  and a Windows runner with Docker Desktop could never run an agent's container though its VM reaches the host's NFS
+  export (Slates' NFS server runs on Windows: A-184).
+- **The question.** Whether the engine can mount the export itself from where it runs, and where that is: a rootful
+  Docker Engine, or podman as root, on its own Linux host from the host's kernel at its loopback; Docker Desktop on
+  macOS (its socket) and on Windows (its named pipe) from its Linux VM, reaching the host's loopback as
+  `host.docker.internal`. No share of the host's folders plays a part, so none of the bind's identity or hard-link
+  rules does: the container runs as the uid the export is bound to, every other id a stranger (A-115). Refused, typed:
+  a rootless engine (`RootlessCannotMount`: the kernel mounts a file system for a process with `CAP_SYS_ADMIN` in its
+  initial user namespace alone), a remapping one (`UserNamespaceUntested`), a labelling one (`SelinuxLabelsUntested`),
+  a remote one (`RemoteEngine`, as before), and any engine on a host not named (`ProfileUntested`).
+- **Rejected.** Removing the bind's profiles with kiln's bind: Slates' own bind form (`slates attach --oci-source`,
+  `slates oci-runtime`, the conformance suite, the transports' report) still uses them, so they go when that form does.
+  Taking the engine's word from `docker info` in kiln itself on Windows: the judge stays one implementation (A-520).
+- **Tests.** Red first, on a copy whose `judge_export` refused every profile: `the_export_route_takes_docker_desktop_
+  on_windows_and_macos_from_its_vm_and_a_rootful_linux_engine_from_the_host` and `the_export_route_refuses_a_rootless_
+  engine_and_an_unnamed_host_typed` failed; green with this change: `cargo test --locked -p slates-api --lib --
+  container_engine contract_history` 10 passed, `cargo test --locked -p slates-bridge-oci` all passed (macOS arm64,
+  Adas-Mac-Studio-4, local). Owed: the Windows `ask`'s run on Windows (main's, §8), and the export route's live run there
+  (kiln's container drive on jupiter, w-k90-containers).
+
+### A-771 — A live takeover's rebuild applies a payload, and hashes its archive's content, in steps (2026-11-20, w-forming; main's order, item (a): the takeover's rebuild turn; §4.10 "Live shipping", g251's rebuild in turns, A-374)
+Applied in the same change to: GAPS (the live owner's long-turn line), `crates/cluster/src/sealed.rs` (`RawOpening`),
+`crates/server/src/live_ship.rs` (`Rebuilding::advance`, `step`, `apply_publication`, `lay_step`; `Applying`, `Begun`,
+`begin_applying`, `apply_record`, `Laying`, `hashed_chunk`, `open_step_bytes`; `apply_payload` and `open_payload` gone),
+`crates/server/src/fleet.rs` (`rebuild_in_turns`' doc), `crates/cluster/tests/sealed.rs`.
+- **What was there.** g251 made a live log's rebuild a slice a turn, with a payload as its unit, and laid the rebuilt
+  volume out as an archive in one turn after it. A whole entry carries the volume's every byte, so it was one step: a
+  1.39 MB whole entry's open took 59 ms of one debug successor turn and a 1.75 MB one's 56 ms (its decode 1.5 to 1.7 ms,
+  its runs' overlay 0.8 to 1.1 ms). The archive's layout hashed every content chunk in its turn, 93 to 99 ms for 1.5 to
+  1.75 MB of runs (w-forming's probe, debug under `taskpolicy -b`, live_chaos's takeover flow, base a7df9ccf0). A
+  1 MiB sealed piece's open measured 13 ms in a debug build, nearly all of it the identity's BLAKE3.
+- **The change.** A payload is applied in steps, the slice's clock read between them. A sealed body's pieces are opened
+  by `slates_cluster::sealed::RawOpening`, which opens segments, then hashes the content against its identity, a budget
+  of bytes a call (an archive page a step), and accepts and refuses what `open_chunk` does for a raw chunk, the form a
+  body is sealed in. The record is applied once the body is open, and each run is laid over the rebuild's as a step of
+  its own. Once every payload is applied, the image's content spans are gathered from the runs and hashed, a page a
+  step (`Laying`), and the archive's layout makes each chunk from its span's bytes and the identity hashed for it, with
+  no hash of its own.
+- **Tests.** `slates-cluster` sealed `a_raw_chunk_opened_in_steps_is_the_chunk_opened_whole` (the oracle against
+  `open_chunk`: lengths about the segment and up to 1 MiB, budgets of a byte to everything, each segment's bit flipped,
+  the last cut, another tenant's naming). `live_ship::tests::a_rebuilds_large_payload_is_applied_in_steps_and_lays_out_the_same_volume`
+  (a whole body of two 512 KiB files, clear and sealed, rebuilt at a slice never spent and at one spent every step: the
+  same archive, every chunk verified against its identity; 27 and 64 steps, at least a page each. Red: one call a
+  payload; with the payload stepped and the archive hashed whole, 6 steps for 16 pages). The server fleet tests'
+  live takeovers and rebuilds (32 passed).
+
+### A-773 — The session log: what needs the human, named first, read from what it shows (2026-11-20, w-sessionlog; Ada's dispatch after the Slates-vs-Sapling comparison; §4.16, §4.15; R10)
+Ten agents over one green left their supervisor cross-referencing volume ids, `versions`, a conflict's JSON and the
+audit to find the one decision that was theirs. `slates log` is that view: a collided work and a landing awaiting its
+grant are named first; every work follows with its base, how far behind its green it is and its last submission's end.
+The daemon answers `SessionLog` a page at a time, each shard's part its works (`WorkState::accepted` is the version its
+last accepted submission made) merged in key order with its landings in `AwaitingGrant`, which the partition indexes
+(`Partition::awaiting_grant_from`, kept by `apply` and rebuilt at restore), so a page costs its lines. The client joins
+each named green's head once (`Client::session_log`, `SessionLog::needs_you`); the CLI prints it as text or one JSON
+object (`needs_you`, `greens`, `awaiting_grant`). The view never grants (R10).
+Applied in the same change to: §4.16 (a status line), GAPS (the owed items), `docs/cli.md`, `crates/ipc` (the verb,
+`LogLine`, `WorkMark`, `LogCursor`, published tags), `crates/db` (the index and its model check), `crates/server`
+(`session_log`, the scatter), `crates/client` (`session_log`), `crates/cli` (`log`, `log_view`).
+Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (two shards, ten works, one collision,
+one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
+every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
+`args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
+Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
+(`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
+the bug record, GAPS.
+
+Status: built 2026-11-20.
+- Why: on macOS a shared-memory object lives while its name does, and only its creator, the anchor, removed the names.
+  Four `SIGKILL`ed anchors held 21 GB of the big Studio with no process alive.
+- The rule: when the anchor is gone, its daemon removes the names of the segment and the content object before it
+  stops. Nobody adopts them after the anchor, so their memory goes back with the daemon's own mappings. Linux and
+  Windows objects carry no name that outlives their holders.
+
+### A-777 — An idle shard keeps nothing pre-faulted; A-214's reserve removed (2026-11-20, w-sizing; MEMORY SIZING; amends A-105, removes A-214 and A-765)
+Applied in the same change to: `crates/server/src/daemon.rs` (the purge gives every free block back; the reserve, its
+refill and the burst measure gone), `state.rs`, `config.rs` (`prefault_slice_pages`, `page_fault_ns`),
+`content_ranges.rs` (the `arena.prefault_reserve` row), `crates/mem/src/arena.rs` (`prefault`, `upcoming`, `KeptRun`, the
+purge's keep set), `buddy.rs` (`upcoming`), the tests (`a_burst_leaves_nothing_resident_behind_it_but_its_data`; A-214's
+own removed), `crates/cli/examples/nfs_large_write.rs`, BENCHMARKS, GAPS.
+
+Status: built 2026-11-20.
+- Why: after a push of hg's history the reserve held the whole last burst, 4,931.4 MiB, and faulted 3.5 GB more in at
+  idle (w-hg, release 1d4909821). A-765's decay still held a burst whole for a sweep interval.
+- Measured (BENCHMARKS, "The idle prefault reserve against none"): the provisioning p99 is the same with and without it;
+  the NFS bench's peak RSS fell 1,137-1,139 to 625-627 MiB; writes landing right after idle ran about 5% slower.
+- The rule now: an idle shard gives every free block back (A-105); a burst after idle faults its own pages.
+
+### A-776 — A whole-file rewrite is judged as the edit it was (2026-11-20, w-rewrite-ops; main's brief on the Slates-vs-Sapling comparison, gap D-O17; §4.16 "Composition at seal", AC-6.10, D-27)
+
+- **The gap.** An editor saves by writing a temporary file and renaming it over the original; formatters and codemods
+  write the whole file. The deriver composes every route into one `Delete` of the base length and one `Insert`, so a
+  one-token change judged beside any concurrent edit of the file was an `Overlap` conflict over the whole file. Ordinary
+  tools could not merge as precisely as SDK `edit`s.
+- **The change.** At the seal (`compose_increment` in `crates/server/src/verbs.rs`, shared by submit and rebase), a path
+  whose ops are exactly a whole-base replacement is rewritten by `slates_merge::refine::refine_rewrites` into the
+  canonical ops of the ranges the writer changed, at token grain (runs of word bytes, runs of blanks, every other byte
+  alone), and the post-state is relaid compactly. The increment's identity covers the refined document.
+- **Why this is not the banned inference (D-27, CLAUDE.md §2 item 11).** It compares two states of one writer, the base
+  it was handed and the file it wrote; no third state is read and nothing is merged. The result is a set of declared
+  ranges the verdict judges unchanged, and its application to the base is the writer's file byte for byte.
+  AC-6.10's "one delete plus one insert" now describes the composition before the seal's recovery.
+- **The shape, settled by A/B** (`crates/merge/examples/rewrite_ab.rs`, BENCHMARKS "Whole-file rewrites recovered"):
+  1,920 rewrite pairs over the merge crate's own sources (462 KiB), four workloads, judged by the real green. Token grain
+  is the only arm with no false conflict on different lines, different tokens of one line, or a formatter pass beside
+  an edit, and no silent merge when both change one token. Byte grain accepted all 240 one-token clashes (a word neither
+  wrote). Line grain (and so patience and histogram, which anchor on lines) conflicted all 240 same-line pairs. Myers
+  alone kept 148 of 240 formatter passes whole at its budget, so the search anchors on unique tokens when Myers alone
+  runs out: 0 of 240.
+- **Bounds.** The trim allocates nothing. The units of the differing middle (4 bytes each) and, when anchoring, a
+  table of distinct units are scratch dropped with the submit: measured 2.6 bytes of scratch a file byte on the corpus,
+  5.3 at most in the tests. Search steps are charged against budgets linear in the middle's units; a gap past them is
+  kept as one range. Cost a save (M3 Ultra, release): median 0.48 µs/KiB, p99 51 µs/KiB (a formatter pass over a
+  275 KiB file). `git diff --no-index` of that same pass takes 10 to 40 ms a process at line grain.
+- **Applied in the same change to:** §4.16 "Composition at seal"; AC-6.10; Phase 6 "Risks and fallbacks"; GAPS D-O17;
+  BENCHMARKS; `crates/merge/src/refine.rs` (new), `crates/server/src/verbs.rs`, `crates/server/src/work_files.rs`.
+- **Tests.** Red first: `two_whole_file_rewrites_of_different_lines_merge_as_their_edits`
+  (`crates/server/tests/green_post_state.rs`) failed with the seal's recovery disabled. The editor's save was
+  `Conflict([MergeWindow { path: "f", at: 0, len: 7580, .. }])`. Green with it: `cargo test --locked -p slates-server
+  --test green_post_state` 6 passed; `cargo test --locked -p slates-merge --lib refine` 8 passed (the reproduction
+  property at three grains and anchored; one token; a re-indent anchored and only blanks with scratch bounded; the
+  budget's fallback counted; different lines, different tokens and a formatter beside an edit accepted through the real
+  green; one token clashing still a conflict; unknown bytes keep the replacement). macOS arm64, this Mac, local.
+- **Owed (main's, §8):** clippy over the new module; the Linux and Windows runs of the two filters above. A mounted Work
+  reaches the seal through w-work-mount's journal (A-774), which this serves unchanged.
+
+### A-775 — A taken-over volume given up while its cohorts' members were away is judged afresh once one is heard again (2026-11-20, w-forming; main's order, item (b): the takeover stall with no survivor serving; §4.8 "Promotion and takeover", §4.10; the 2026-11-18 bound, A-304's fresh judgement)
+Applied in the same change to: §4.8's promise-wait paragraph (by this entry: a given-up volume is also judged afresh
+when a cohort member is heard again), GAPS, `docs/bugs/2026-11-20-a-live-volume-given-up-while-its-holder-was-away-was-never-served.md`,
+`crates/server/src/fleet.rs` (`judge_given_up_afresh`, `VolumeWait::waits_on_members`, `give_up_taken_over` keeps the
+volume and its catalog), `crates/server/src/state.rs` (`GivenUpVolume`, `ShardState::given_up_volumes`,
+`injected_live_silence`), `crates/server/src/daemon.rs` (`Daemon::inject_live_silence`), `crates/server/src/live_ship.rs`
+(a silenced report or fetch, `fleet.live.silenced_by_fault`), `crates/server/tests/fleet.rs`.
+- **What was there.** Past the failover SLO's worth of attempts without progress a taken-over volume was given up,
+  recorded unrecovered and dropped with its adopted catalog register; only a new configuration judged it afresh. A
+  holder of its log paused about the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s against a 30-period
+  bound) left the volume `NotRecovered` for good once the holder came back with every acknowledged write.
+- **The change.** A volume given up while it waited on its takeover cohorts' members (its live log's holders, its
+  catalog register's or that register's placement's, its content's) keeps its pending record, its adopted catalog
+  register and the incarnation each cohort member was heard at. A member heard alive at a later incarnation has it
+  judged afresh at the next period: its owner shard's `TakeoverIncomplete` record goes, so the verbs on it wait for its
+  materialization again (A-548), and it is pending again with its catalog and its attempts from zero, counted
+  `fleet.materialize.judged_afresh`. A record gone another way (the volume destroyed) or a volume adopted again by a new
+  configuration's round is not taken up. Bounded as the round's own fresh judgement is: once per member's later
+  incarnation, each with the failover SLO's worth of attempts. A green given up is unchanged (its siblings' note in the
+  bug record).
+- **Tests.** `fleet` `a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again` (red on
+  main: given up after 23 attempts waiting on its live, unserved through the serve deadline; after: judged afresh once,
+  served, 24 of 24 files read back), with `Daemon::inject_live_silence`; the given-up, retired-owner and live-takeover
+  fleet tests unchanged.
+- **Greens too (2026-11-20, main's next piece).** A taken-over green given up while it waited on its inputs or its
+  catalog register is kept the same way, the members it waits on being its sources (the survivors that reported its
+  adopted version, which hold the inputs it lacks), and judged afresh once one is heard again (`merge.takeover_judged_afresh`).
+  One record for both kinds (`ShardState::given_up_taken_over`, `GivenUpRecord`); the injection became
+  `Daemon::inject_holder_silence`, which also leaves the asker's content requests unanswered. Test:
+  `fleet` `a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again` (red with greens
+  never kept: given up after 25 attempts waiting on its inputs, `NotRecovered` once the holder was back; after: judged
+  afresh once, placed at version 3, served with the owner's bytes, 8.06 s).
+
+### §4.8 amended — A dispatch's stragglers are waited for by their own reports' wakes, never a tick or a poll interval at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family two of three)
+Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), GAPS (the sweep's line),
+`crates/cluster/src/lib.rs` (`Stragglers::reported`, `waits`, `settle`, the collector kept), `crates/cluster/tests/live.rs`,
+`crates/server/src/owner_location.rs` (`ask`).
+- **What was there.** A dispatch's reply channel already wakes its collector, the task that dispatched, at every send
+  (`ReplyTx::send`), but the waits for its stragglers did not use it: `Stragglers::settle`, which a live lane runs
+  before its task ends, looked once a timer tick; a location round's straggler loop looked once a poll interval (a
+  tenth of a period, 10 ms), so a report landing just after a look waited out the rest of it.
+- **Change.** `Stragglers` keeps its collector's task, read where the dispatch made it. `Stragglers::reported(left)` waits
+  until a straggler may have reported: in the collector, until its next send wakes it (`futures::idle` within `left`);
+  in any other task, which the sends do not wake, one timer tick, as before. `settle` and the location round wait so;
+  the round stops once its span is spent. `Stragglers::waits` counts the waits each way, the test's non-vacuity count.
+- **Tests** (macOS arm64, this Mac, local, 2026-11-20). `slates-cluster --test live
+  a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back` now holds the settle to its reports' wakes (woken
+  at least once, ticked never) as well as every session back; `slates-cluster --lib` 247 of 247. The server's
+  `owner_location` lib tests, fmt and the red (the collector's wake disabled: the lane test must fail on its ticks) ran
+  on a kiln runner, this Mac being at 7 GiB free; their results are in the landing's commit.
+
+
+### A-779 — A newer presentation of a volume into a target supersedes the older, whose grant is refused by kind (2026-11-20, w-sessionlog; main's ruling 15:20 PST; §4.15 steps 2–3; AUD-29-07, A-773, R3, R10)
+Until A-779 only the same client's re-presentation replaced its earlier one, in the shard's memory alone: the earlier
+record still read `AwaitingGrant` (so the session log listed it), and another client's re-presentation left it
+grantable. Now any presentation of the same volume into the same target supersedes the earlier ones awaiting a grant:
+`Op::LandingSuperseded { id, by }` moves each record to `LandingState::Superseded` with `superseded_by` (both
+appended), the partition's waiting index drops it, and `grant` answers `Refusal::LandingSuperseded { newer }`
+(`slates_api::Stale::Superseded`). The session log reads the shard's held presentations, which are exactly the
+grantable ones (an abandoned one, AUD-29-07, is not there either). No clock expires a presentation (R3).
+Applied in the same change to: §4.15 (a status line), GAPS (A-773's owed presentation item closed), `crates/db`
+(`Superseded`, `superseded_by`, `Op::LandingSuperseded`, its model step), `crates/ipc` (`LandingStage::Superseded`,
+`Refusal::LandingSuperseded`, tags published), `crates/api` (`Stale::Superseded`, `LandingStage::Superseded`),
+`crates/server` (`superseded_by_presentation`, the grant's refusal, the log's source), `crates/server/tests/
+presentations.rs` (the replaced presentation is refused by kind).
+Evidence: `cargo test --locked -p slates-server --test session_log` 2 passed, the new
+`a_newer_presentation_supersedes_the_older_whose_grant_is_refused` red with the supersede disabled (`Refused(NotFound)`)
+and green with it; `--test presentations` 10 passed; `-p slates-db --test model every_recovery` 2 and `--test
+wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe` 2 (macOS arm64, this Mac, local).
+
+### A-781 — Without a birth time, an unchanged base file keeps its number across a takeover (2026-11-20, w-realtools; Ada's dispatch after the Slates-vs-Sapling comparison; amends A-151)
+- **What it answers.** EdenFS's own record (`eden/fs/docs/InodeStorage.md`): unstable inode numbers broke C++
+  `#pragma once`, which tells a header by its device and inode number. Under A-151, a recovered overlay over a disk that
+  records no birth time (tmpfs, NFS, older filesystems) renumbered every untouched entry at its first listing, in lookup
+  order. So a compiler that read `inc/s.h` before a daemon restart and `sub/../inc/s.h` after it saw two files and
+  included the header twice. Red: `without_birth_times_an_unchanged_base_file_keeps_its_number_and_times_across_a_takeover`
+  (three headers, numbers ...595-597 before, ...600-598 after; times unchanged).
+- **The change.** `Overlay::unprovable` also takes the change time as proof. An entry with no descriptor and no birth
+  time whose listed change time has a sub-second part and equals, with its size, what the inode recorded keeps its
+  number. The kernel stamps the change time when a file is made and at each change to it, so a file made at a freed
+  number later carries a later one. A whole-second stamp proves nothing: the reused file could share its second.
+- **What A-151 rejected stays rejected.** A-151 ruled out the change time *in place of* the birth time, because an
+  in-place edit would renumber the file. Here the change time is only an extra proof when there is no birth time. A
+  file whose change time moved is renumbered as before, so nothing that held under A-151 is weakened.
+- **Tests.** `base_identity`: the red test above, now green; `without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover`
+  (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
+  as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
+  to main's run requests.
+
+### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
+The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
+"changed". `Outcome::Identical { version }` (appended) is the accept whose verdict left no effect; the server commits it
+exactly as an accept (holders' replay checks take either), and `accepted_reply` reads `identical` (appended to
+`Submitted` and `SubmittedSigned`) from the green's change index, `Green::changed_nothing_at`, which answers only above
+the folded floor. One new outcome, no second path: the compiler found every match, constructor and pattern (API,
+MCP, CLI, both SDKs, the client, the server, the tests); tests whose case was identical by construction now expect
+`Identical`, and oracles take either as committed. The session log's `WorkMark::Identical` (appended) shows it.
+Applied in the same change to: §4.16 (a status line), GAPS (A-773's owed item closed), `docs/cli.md`, `crates/merge`,
+`crates/ipc` (tags published), `crates/server`, `crates/client`, `crates/api`, `crates/mcp`, `crates/cli`,
+`crates/sdk-node` (`index.d.ts`), `crates/sdk-python`.
+Evidence: `cargo test --locked -p slates-server --test session_log an_identical_submission_is_told_from_an_accepted_one`
+red with the engine's identical check disabled (`Accepted(3)` for `Identical(3)`), green with it; `-p slates-merge` all
+passed; `-p slates-server --test session_log` 3, `presentations` 10, `mounted_work` 1, `merge_load` 5,
+`works_off_owner` 15, `verdict_pages` 5, `green_checkpoint` 6; `-p slates-client --test merge_identity` 1, `--lib
+session_log` 1; `-p slates-api --lib` 104; `-p slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 2; `-p
+slates-ipc --test wire_order` 2; `cargo check --workspace --tests --examples` clean (macOS arm64, this Mac, local).
+
+
+### A-785 — A merge held for approval is named in the session log (2026-11-20, w-sessionlog; main's order 15:20 PST, item 3; §4.16, A-285, A-773; R10)
+An ask policy answers a submit `MergeApprovalRequired` and keeps nothing, so a supervisor saw a held merge only in the
+submitting agent's own reply. The work now notes it (`WorkState::held`: the increment's identity, its paths and the
+work's revision then) where its submit settles; `WorkMark::AwaitingApproval` (appended) stands while the work's revision
+does, and `NeedsYou::AwaitingApproval` names it with the collisions and the waiting landings. Approving stays the
+launcher's (`submit_approved` under its proof).
+Applied in the same change to: §4.16 (a status line), GAPS, `crates/ipc` (the mark, its tag published),
+`crates/server` (`note_held`, `HeldMerge`, the mark), `crates/client` (`NeedsYou::AwaitingApproval`), `crates/cli`
+(`log_view`).
+Evidence: `cargo test --locked -p slates-server --test session_log a_merge_held_for_approval_needs_the_human_until_approved`
+red with the note disabled (the log named nothing), green with it; `--test session_log` 4 passed; `-p slates-cli --bin
+slates log_view` 3; `-p slates-client --lib session_log` 1; `-p slates-ipc --test wire_order` 2 (macOS arm64, this
+Mac, local).
+
+### A-788 — The session log over MCP and in the SDKs (2026-11-20, w-sessionlog; main's order 15:20 PST, item 4; A-773, §4.12, R10)
+`slates.log` is an MCP tool answering the JSON `slates log --json` prints, from one definition moved into `slates-mcp`
+(`session_log_json`), which the CLI now calls. The Python and Node SDKs link the client alone, so each builds the same
+keys from the typed log (`session_log.rs` in each): Python `Client.session_log()` a dict, Node `Client.sessionLog()` a
+typed object (`index.d.ts`). No tool or verb approves or grants (R10); the tool list's no-grant check holds. The async
+clients carry single requests; the log is a paged walk and stays sync, as `drifted` is.
+Found by use in this change: A-782's `identical` key broke `crates/mcp/tests/mcp.rs`'s exact comparison of a submit's
+JSON; fixed here.
+Applied in the same change to: §4.16 (A-773's status line), GAPS, `crates/mcp` (the tool, `session_log_json`, its test),
+`crates/cli` (`log_view` calls it), `crates/sdk-python` (`session_log`, its test), `crates/sdk-node` (`sessionLog`,
+`index.d.ts`, its test).
+Evidence: `cargo test --locked -p slates-mcp --test mcp` red with the tool's dispatch removed, green with it; `-p
+slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 3; workspace `cargo check --tests --examples` clean (macOS
+arm64, this Mac, local). The SDK tests need a built wheel and addon with a daemon: run requested from main.
+
+### A-697 (1) — A holder's composed increment crosses once: the inputs it composed are never shipped back to it (2026-11-20, w-shared for UI goal 93; main's ruling after A-697's release bench)
+Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), GAPS (A-247's step two),
+`crates/server/src/work_home.rs` (`computed_request`), `crates/server/src/merge_service.rs` (`hold_composed_inputs`,
+`inputs_held_by`, the chunk count in `ship_version`), `crates/server/src/verbs.rs` (`judge_submission`),
+`crates/server/tests/fleet.rs`.
+- **What was measured.** A-697's release bench (BENCHMARKS, 2026-11-20): a holder's 64 MiB version took three input
+  shipments to place, a local one one. The holder had composed the increment and sent it to the owner, and the owner's
+  record plane then shipped the same bytes back to it as the version's inputs, chunk by chunk, before the record.
+- **Change.** The inputs a record names are the increment's own bytes (`inputs_of`: `chain_entry::increment_bytes`), and
+  the archive's identity is the bytes' alone, so the holder can hold exactly what the owner will name before the owner
+  judges. `computed_request` encodes the increment once and holds it as the archive of the green's next version in the
+  node's held content (`hold_composed_inputs`; the owner's offer refreshes the placement to the version it commits),
+  then forwards the same bytes. The owner, committing a verdict a holder computed, marks that holder (the work id's
+  creator, which the node-verb authority guarantees sent it) as lacking none of the inputs (`inputs_held_by`), so its
+  shipment carries the offer and no chunk, which the holder acknowledges from its hold, with the record. A hold the
+  content plane refused (no room) is counted, and the holder's answer to the offer names what it lacks, which the next
+  shipment carries: the ordinary path.
+- **Memory.** One held copy of the inputs on the holder, where before the owner's chunks made the same copy after a
+  round trip; the encoded increment is made once, for the hold and the forward both. The archive builder's own
+  chunking is the owner's as well (owed with the record plane's per-pass archive build, below).
+- **Counters.** `merge.inputs.held_at_compose`, `merge.inputs.held_by_composer`, `merge.inputs.chunks_shipped` (the
+  test's red), `merge.inputs.held_at_compose_refused`.
+- **Owed (found reading).** The owner's record plane builds a version's inputs archive afresh at every pass that ships
+  chunks (`cut_shipments` → `inputs_of` → `inputs_archive`: every byte hashed and chunked again) to ship one shipment's
+  bound of it: work of the order of the size squared over the bound for a large increment. Main's lane-throughput
+  item.
+
+### A-787 — A whole-file rewrite's refinement sliced under its owner's turns (2026-11-20, w-rewrite-ops; main's pushback on A-776 at 15:20 PST, item 1; §4.3's step budget, CLAUDE.md §3 "Bounded work everywhere", A-752, A-776)
+
+- **The gap.** A-776's refinement ran in one step. Measured release on an Apple M4 Max: 14 ms for a 300 KiB source file
+  re-indented, 47 to 52 ms at 4 MiB and 166 to 211 ms at 12 MiB, against a shard's quantum of its measured wake.
+- **The change (part 1, `slates_merge::refine`).**
+  - **Metered work.** Every piece of work is charged to a meter that asks the owner's turn for the next unit
+    (`pace::Ticks`) every `WORK_PER_TICK` (4,096) of it: a byte scanned or compared, a diagonal visited, a word hashed.
+    The hot loops run synchronously up to the unit's room and await only between units. `Refiner::refine_paced` and
+    `refine_rewrites_paced` are the paced forms; the sync forms run the same code under no turn.
+  - **No single charge past a unit.** A token is cut at 4,096 bytes. No vector doubles in one step: units are counted,
+    then laid; ranges sit in chunks that double from 64 to 4,096. No hash table rehashes: the anchors are a paced
+    least-significant-digit radix sort of 32-bit hashes of word units. A base-to-writer map is zeroed in order. The
+    relaid post-state's sort and the document's order are the paced ones.
+- **Rejected, measured.**
+  - A heapsort in place for the anchors: 12 times slower on a 1 MiB rewrite.
+  - A hash table: its rehash is one step that grows with the file.
+  - Hashing blank and punctuation units: about double the sort for anchors that almost never exist.
+- **A/B** (BENCHMARKS "A rewrite's refinement sliced"). Release, interleaved with A-776 (561c655a3), three runs of five
+  rounds, all shown there.
+  - Longest step: the whole save before; after, 10 to 46 µs on the crate's sources and 31 to 99 µs at 1 and 4 MiB. At
+    12 MiB it is typically 40 to 300 µs, but 3 of 15 rounds had one unit of 1.8 to 2.8 ms, not yet explained.
+  - Per-save time: 1.45 to 1.5 times A-776's on sources and at 1 MiB, 1.35 times at 4 MiB, 1.15 times at 12 MiB. The
+    search's steps are identical (2,365,669 for `engine.rs`), so the cost is the meter's per-comparison bookkeeping.
+  - The corpus verdicts are unchanged: 0 of 720 false conflicts, 240 of 240 one-token clashes still conflicting.
+- **Tests.** `a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time`: a 3.1 MiB rewrite driven a turn at a time
+  spans many turns, no unit does more than three units' work or a 64th of the file's, and the document and plan equal
+  the unpaced refinement's. Red with the asks disabled (one unit did all the work), green with them. Plus A-776's
+  eight. macOS arm64, this Mac, local.
+- **Part 2 (next, in flight):** the submit drives `refine_rewrites_paced` over the shard's turns. Today
+  `verbs::compose_increment` runs it in one step. Shape proposed: the work's gate parks a submit whose journal replaces
+  a file whole, local green or not; a task of the work's shard refines copies of the two files, a turn at a time; the
+  verb resumes with the ranges, as an owner's answer resumes it (A-247). To use A-783's pacing primitive once it lands.
+- **Applied in the same change to:** §4.16 "Composition at seal"; GAPS D-O17; BENCHMARKS; `crates/merge/src/refine.rs`,
+  its tests, `examples/rewrite_slices.rs` (new), `examples/rewrite_ab.rs`.
+

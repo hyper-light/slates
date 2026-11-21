@@ -774,6 +774,57 @@ fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved()
   });
 }
 
+/// Format: where the fixture `update`'s pack's three entries begin (`git verify-pack -v`): its commit, its tree, then
+/// its blob, a REF_DELTA whose base is outside the pack (the thin delta).
+const UPDATE_ENTRIES: [usize; 3] = [12, 153, 196];
+
+/// The fixture `update`'s request with its pack's thin delta moved first: the same objects, the delta now waiting on its
+/// base before the commit and tree that follow it (a REF_DELTA names its base by id, so its place in the pack is free;
+/// git's own thin packs put such deltas where the object order puts them).
+fn update_with_its_delta_first() -> Vec<u8> {
+  let request = scenario!("update").request;
+  let at = request
+    .windows(4)
+    .position(|magic| magic == b"PACK")
+    .unwrap();
+  let pack = &request[at..];
+  let end = pack.len() - ObjectFormat::Sha1.raw_len();
+  let [commit, _, delta] = UPDATE_ENTRIES;
+  let mut moved = pack[..commit].to_vec();
+  moved.extend_from_slice(&pack[delta..end]);
+  moved.extend_from_slice(&pack[commit..delta]);
+  let mut hasher = slates_git::object_name::Hasher::raw(ObjectFormat::Sha1);
+  hasher.update(&moved);
+  moved.extend_from_slice(hasher.finish().unwrap().as_bytes());
+  let mut out = request[..at].to_vec();
+  out.extend_from_slice(&moved);
+  out
+}
+
+/// A-722 (found by reading B2's replay: a push admits a thin pack's waiting deltas once its pack is whole, after every
+/// object resolved as it was read, and its record names its objects in that order; a replay admitted them in pack
+/// order and compared the two in order). Do: push the fixtures' `create`, then `update` with its thin delta first in its
+/// pack; make the store again from the log. Expect: both pushes `ok`; the refs advertised after as before. Red before
+/// the change: the replay refused as diverged, the second push's ref lost.
+#[test]
+fn t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "thin-first");
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let received = pushed(state, repository, &update_with_its_delta_first());
+    assert!(
+      reasons(&received).iter().all(|reason| reason == b"ok"),
+      "{:?}",
+      received.outcomes
+    );
+    let before = super::advertised_refs(state, repository);
+    crate::vcs_store::rebuild(state, repository);
+    while crate::vcs_store::rebuild_turn_once_within(state, repository, 0) {}
+    crate::vcs_store::paths::whole_build::settle(state);
+    assert_eq!(super::advertised_refs(state, repository), before);
+  });
+}
+
 /// Shape: the partition's green-chain budget in [`t_a753_a_repository_takes_branch_creates_past_its_chain_budget`]:
 /// small, so a few creates' works pass it.
 const SMALL_CHAIN_BUDGET: usize = 64 << 10;
@@ -906,15 +957,21 @@ fn script(point: HookPointName, name: &str, body: &str) -> Script {
   Script { _dir: dir, config }
 }
 
-/// Shape: how long a test waits for a push whose hooks run: a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten
-/// liveness budgets) for each of its three hooks and one for the push itself. Unix alone, as its one reader is.
-#[cfg(unix)]
-const PUSH_WAIT_NS: u64 = 4 * 10 * crate::daemon::LIVENESS_BUDGET_NS;
-
 /// What a push driven with its hooks answered: what the driver wrote, what it received, and how
 /// many views the presenter showed and withdrew; or why the drive stopped.
 #[cfg(unix)]
 type Driven = Result<(Vec<u8>, Received, (u32, u32)), String>;
+
+/// What the driver of a push with its hooks tells its test as it goes: each step it took or hook it ran, then the end.
+/// The test's deadline is derived from these (the push's own answer): a test's bound for each, so a push of more steps
+/// is waited for longer and one that stops is given up on one bound after its last.
+#[cfg(unix)]
+enum Progress {
+  /// A step of the push taken, or one of its hooks run.
+  Went,
+  /// The push answered, or its drive stopped.
+  Done(Box<Driven>),
+}
 
 /// `request` pushed to `repository` by its owner as the HTTP edge pushes one
 /// (`vcs_http::git::receive`): a task on the daemon's shard drives the push a step at a time, the
@@ -929,20 +986,44 @@ fn pushed_with_hooks(daemon: &crate::Daemon, repository: RepositoryId, request: 
       slates_rt::futures::spawn(drive(repository, request, sent)).expect("the push's task");
     slates_rt::futures::detach(task).expect("the task detached");
   });
-  got
-    .recv_timeout(std::time::Duration::from_nanos(PUSH_WAIT_NS))
-    .unwrap_or_else(|_| Err("the push did not answer within the test's bound".to_owned()))
+  // Each step or hook within a test's bound (`git_hooks::tests::TEST_BOUND_NS`, ten liveness budgets) of the last: the
+  // deadline the push's own steps make, never a fixed whole.
+  let bound = std::time::Duration::from_nanos(crate::git_hooks::tests::TEST_BOUND_NS);
+  let mut went = 0u64;
+  loop {
+    match got.recv_timeout(bound) {
+      Ok(Progress::Went) => went += 1,
+      Ok(Progress::Done(driven)) => return *driven,
+      Err(_) => {
+        return Err(format!(
+          "the push went no further within the test's bound after {went} steps"
+        ));
+      }
+    }
+  }
 }
 
-/// Drives the push of [`pushed_with_hooks`] and sends what it answered on `sent`.
+/// Drives the push of [`pushed_with_hooks`], telling `sent` of each step, then what it answered.
 #[cfg(unix)]
-async fn drive(repository: RepositoryId, request: Vec<u8>, sent: std::sync::mpsc::Sender<Driven>) {
-  let _ = sent.send(driven(repository, &request).await);
+async fn drive(
+  repository: RepositoryId,
+  request: Vec<u8>,
+  sent: std::sync::mpsc::Sender<Progress>,
+) {
+  let driven = driven(repository, &request, &sent).await;
+  let _ = sent.send(Progress::Done(Box::new(driven)));
 }
 
-/// The push of [`pushed_with_hooks`], driven.
+/// The push of [`pushed_with_hooks`], driven, `progress` told of each step and hook.
 #[cfg(unix)]
-async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
+async fn driven(
+  repository: RepositoryId,
+  request: &[u8],
+  progress: &std::sync::mpsc::Sender<Progress>,
+) -> Driven {
+  let went = || {
+    let _ = progress.send(Progress::Went);
+  };
   use crate::state::with_state;
   let presenter = crate::git_hooks::tests::ScratchPresenter::default();
   let mut push = with_state(|state| {
@@ -960,6 +1041,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
     with_state(|state| push.input(state, piece))
       .ok_or("no state for the request")?
       .map_err(|failed| format!("not taken: {failed:?}"))?;
+    went();
   }
   with_state(|state| push.end(state))
     .ok_or("no state for the end")?
@@ -969,6 +1051,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
     let step = with_state(|state| push.answer_step(state, &mut answer))
       .ok_or("no state for a step")?
       .map_err(|failed| format!("a step failed: {failed:?}"))?;
+    went();
     match step {
       Answering::Answered(received) => break *received,
       Answering::Turned => slates_rt::futures::yield_now().await,
@@ -977,6 +1060,7 @@ async fn driven(repository: RepositoryId, request: &[u8]) -> Driven {
         with_state(|state| push.hook_ran(state, ran, &mut answer))
           .ok_or("no state for the hook's answer")?
           .map_err(|failed| format!("its answer not taken: {failed:?}"))?;
+        went();
       }
     }
   };
@@ -1883,4 +1967,61 @@ fn pushed_v3_at(
     let home = crate::vcs_store::homes::home_of(&state.shards, &identity).expect("a home");
     (repository, identity, home)
   })
+}
+
+/// A-724 piece 8c (the takeover test's fix): a push's records ride its repository's names log. Do: push stock git's
+/// `create`, then take the state logs' records the partition handed on. Expect: a names-log record carrying the push's
+/// record (`LoggedChange::Objects`), the same bytes the repository's register keeps.
+#[test]
+fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
+  crate::daemon::audit_on_shard(|state| {
+    let repository = git_repository(state, "shipped");
+    let _ = state.db.take_state_log_records();
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let records = state.db.take_state_log_records();
+    let carried: Vec<Vec<u8>> = records
+      .iter()
+      .filter(|record| {
+        record.repository == repository && record.log == slates_db::catalog::StateLog::Names
+      })
+      .flat_map(|record| record.changes.iter())
+      .filter_map(|change| match change {
+        slates_db::catalog::LoggedChange::Objects { record } => Some(record.clone()),
+        _ => None,
+      })
+      .collect();
+    let kept: Vec<Vec<u8>> = crate::vcs_store::tests::records(state, repository);
+    assert!(
+      !carried.is_empty(),
+      "no names record carried the push's record: {records:?}"
+    );
+    assert_eq!(carried, kept);
+  });
+}
+
+/// A-724 piece 8c (a decision never waits for a homing nobody runs: found by the takeover test, where the HTTP edge had
+/// lost its homing in a refactor and a version-3 push hung). Do: with version 3 on, push stock git's `create` through a
+/// driver that never takes the homing its decision asks for (`pushed`). Expect: answered `ok`, its record version 2,
+/// the untaken homing counted.
+#[test]
+fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
+  crate::daemon::audit_on_shard(|state| {
+    crate::vcs_store::write_version_3_for_test(true);
+    let repository = git_repository(state, "untaken");
+    pushed_from_the_fixtures(state, repository, &["create"]);
+    let records = crate::vcs_store::tests::records(state, repository);
+    let versions: Vec<u32> = records
+      .iter()
+      .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
+      .collect();
+    assert_eq!(versions, vec![2]);
+    assert_eq!(
+      state
+        .refusals
+        .get(crate::vcs_store::homes::HOMING_UNTAKEN)
+        .copied(),
+      Some(1)
+    );
+    crate::vcs_store::write_version_3_for_test(false);
+  });
 }

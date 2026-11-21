@@ -81,18 +81,29 @@ impl TextSource for HeadTexts<'_> {
         if offset >= len {
           return (offset == len).then_some(Cow::Borrowed(&[]));
         }
-        let store = self.store?;
-        let root = store.root_of(&slates_vcs::ContentId(*identity));
-        let window = u64::try_from(store.window()).ok()?;
-        let piece = store.window_at(&root, len, offset.checked_div(window)?)?;
-        let from = usize::try_from(offset.checked_rem(window)?).ok()?;
-        match piece {
-          Cow::Borrowed(bytes) => bytes.get(from..).map(Cow::Borrowed),
-          Cow::Owned(bytes) => bytes.get(from..).map(|rest| Cow::Owned(rest.to_vec())),
-        }
+        self
+          .store?
+          .run_at(&slates_vcs::ContentId(*identity), len, offset)
       }
       None => self.records.text_at(identity, offset).map(Cow::Owned),
     }
+  }
+
+  /// [`TextSource::text_at`] for a reader keeping `cache` across its steps: the green's and the content store's runs
+  /// lent in place as `text_at` lends them; a text the records keep, the delta window the reader is in made once into
+  /// its cache and lent from there.
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut slates_svn::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    let kept_by_records = self.records.stored_len(identity).is_none()
+      && self.green.and_then(|green| green.held(identity)).is_none();
+    if kept_by_records {
+      return self.records.text_in(identity, offset, cache);
+    }
+    self.text_at(identity, offset)
   }
 
   /// A step of the same order: the green's held text a window's room copied, the content store's a window of the

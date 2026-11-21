@@ -414,6 +414,8 @@ enum Step {
   LandingLease(u32, u64),
   Landing(usize),
   LandingState(usize, u8),
+  /// A-779: a landing superseded by another.
+  LandingSuperseded(usize, usize),
   Audit(u8),
   GreenAdvance(usize),
   GreenOriginate(usize),
@@ -477,6 +479,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..2u32, 1..100u64).prop_map(|(h, t)| Step::LandingLease(h, t)),
     1 => (0..8usize).prop_map(Step::Landing),
     1 => (0..8usize, 0..10u8).prop_map(|(l, s)| Step::LandingState(l, s)),
+    1 => (0..8usize, 0..8usize).prop_map(|(l, by)| Step::LandingSuperseded(l, by)),
     1 => (0..7u8).prop_map(Step::Audit),
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
@@ -721,6 +724,7 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::LandingLease(..)
     | Step::Landing(..)
     | Step::LandingState(..)
+    | Step::LandingSuperseded(..)
     | Step::Audit(..)
     | Step::GreenAdvance(..)
     | Step::GreenOriginate(..)
@@ -799,9 +803,14 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           state: LandingState::Planning,
           written: 0,
           conflicts: 0,
+          superseded_by: None,
         },
       }
     }
+    Step::LandingSuperseded(l, by) => Op::LandingSuperseded {
+      id: (*l as u64).checked_rem(ids.next_landing.max(1))?,
+      by: (*by as u64).checked_rem(ids.next_landing.max(1))?,
+    },
     Step::LandingState(l, s) => Op::LandingStateChanged {
       id: (*l as u64).checked_rem(ids.next_landing.max(1))?,
       state: landing_state(*s),
@@ -1169,13 +1178,36 @@ fn every_recovery_equals_the_live_partition_under(
     }
   }
   let live = db.partition().to_snapshot(0);
+  awaiting_index_matches(db.partition())?;
   let seq = db.next_seq();
   drop(db);
   let (recovered, _) = recover(&mut seg, 0, caps(), now_ns).map_err(failed)?;
   prop_assert_eq!(recovered.partition().to_snapshot(0), live);
+  awaiting_index_matches(recovered.partition())?;
   prop_assert_eq!(recovered.next_seq(), seq);
   prop_assert!(usize::try_from(seq).map_err(failed)? >= applied);
   routes_match_their_records(&recovered)?;
+  Ok(())
+}
+
+/// A-773: the landings the session log reads as awaiting a grant (`Partition::awaiting_grant_from`) are exactly the
+/// landings whose state is `AwaitingGrant`, by volume then id, live and after a recovery.
+fn awaiting_index_matches(
+  partition: &slates_db::partition::Partition,
+) -> Result<(), TestCaseError> {
+  let mut expected: Vec<(VolumeId, u64)> = partition
+    .to_snapshot(0)
+    .landings
+    .iter()
+    .filter(|l| l.state == LandingState::AwaitingGrant)
+    .map(|l| (l.volume, l.id))
+    .collect();
+  expected.sort();
+  let indexed: Vec<(VolumeId, u64)> = partition
+    .awaiting_grant_from(std::ops::Bound::Unbounded)
+    .map(|l| (l.volume, l.id))
+    .collect();
+  prop_assert_eq!(indexed, expected);
   Ok(())
 }
 

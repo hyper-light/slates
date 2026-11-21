@@ -139,6 +139,17 @@ impl Filter {
     }
   }
 
+  /// Whether the filter reads a blob's size to decide it (`blob:limit`, alone or combined): a walk asks a blob's size
+  /// only then, since a store reads its row for it (A-722 part 3's partial clone: four index lookups a blob under
+  /// `blob:none`, which sends no blob whatever its size).
+  pub fn reads_size(&self) -> bool {
+    match self {
+      Filter::BlobLimit(_) => true,
+      Filter::Combine(filters) => filters.iter().any(Filter::reads_size),
+      _ => false,
+    }
+  }
+
   /// Whether the filter sends an object of `kind` and `size`, met `depth` below its commit's root tree (trees and blobs;
   /// commits and tags take any depth).
   pub fn admits(&self, kind: Kind, size: u64, depth: u64) -> bool {

@@ -306,6 +306,8 @@ impl Graph for TestGraph {
 struct Counted<'g> {
   graph: &'g TestGraph,
   reads: std::cell::Cell<u64>,
+  /// Each object's size asked (a store reads its row for it).
+  sizes: std::cell::Cell<u64>,
 }
 
 impl Counted<'_> {
@@ -346,6 +348,7 @@ impl Graph for Counted<'_> {
     self.graph.named_entries(tree)
   }
   fn size(&self, blob: u32) -> u64 {
+    self.sizes.set(self.sizes.get() + 1);
     self.graph.size(blob)
   }
   fn target(&self, tag: u32) -> Option<u32> {
@@ -2312,6 +2315,7 @@ fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_c
     let counted = Counted {
       graph: &graph,
       reads: std::cell::Cell::new(0),
+      sizes: std::cell::Cell::new(0),
     };
     let mut admission = Admission::new(u64::MAX);
     let begun = super::begin(&counted, &request, &mut admission);
@@ -2334,5 +2338,92 @@ fn a745_begin_reads_what_the_request_names_and_each_step_one_unit_of_ready_the_c
     assert!(most <= 2, "case {case}: a step read {most}");
     assert!(steps > 500, "case {case}: {steps} steps");
     assert_eq!(stepped, whole, "case {case}");
+  }
+}
+
+/// A-745 (found by use: w-interop's stock-git matrix on git v2.0.0, row deepen, and w-bugs' own run of it on a release
+/// daemon: `git fetch --deepen 100` from a `--depth 1` clone exited 128, `the request needs more room than the server
+/// admits`; on git's history a depth of 100 reaches 24,885 of its 36,430 commits). Do: make git's shape, a main line of
+/// 4,000 commits, each after the first a merge of the line and a one-commit topic branched 150 commits back (so every
+/// two levels of the walk reach 150 commits further back), each commit with a tree of its own blob; then, as a shallow
+/// clone of the tip, ask `deepen 100` with `deepen-relative`, the tip had, within 32 KiB. Expect: the oracle's answer,
+/// its shallow-info and its pack: the deepening's walk keeps the commits it meets and keeps whole as runs or bits,
+/// where it had charged a depth entry and more a commit: 65,445 bytes before, 23,373 now (measured).
+#[test]
+fn a745_a_deepening_through_a_merge_heavy_history_is_negotiated_within_a_few_kilobytes() {
+  const MAINLINE: usize = 4_000;
+  const BACK: usize = 150;
+  // Shape: between what the answer needs now (23,373 bytes, measured: the walk's sets as bits across the history's
+  // 24,000 positions) and what it needed with an entry a commit met (65,445 bytes).
+  const ROOM: u64 = 32 * 1024;
+  let mut graph = TestGraph::default();
+  let mut made = 0u64;
+  let mut commit = |graph: &mut TestGraph, parents: &[u32]| {
+    made += 1;
+    let blob = graph.new_blob(made);
+    let tree = graph.new_tree(&[blob]);
+    graph.new_commit(parents, tree, made)
+  };
+  let mut main = vec![commit(&mut graph, &[])];
+  for at in 1..MAINLINE {
+    let topic = commit(&mut graph, &[main[at.saturating_sub(BACK)]]);
+    let merge = commit(&mut graph, &[main[at - 1], topic]);
+    main.push(merge);
+  }
+  let tip_node = *main.last().unwrap();
+  graph.tips.push(tip_node);
+  let tip = graph.id(tip_node);
+  let asks = Asks {
+    wants: vec![tip],
+    haves: vec![tip],
+    shallow: vec![tip],
+    deepen: Some(OwnedDeepen::Depth(100, true)),
+    done: true,
+    ..Asks::default()
+  };
+  let expected = oracle(&graph, &asks).unwrap();
+  let outcome = negotiate(&graph, &asks.request(), &mut Admission::new(ROOM)).unwrap();
+  assert!(outcome.answer == expected.answer, "the oracle's answer");
+  let Answer::Pack(pack) = outcome.answer else {
+    panic!("not a pack")
+  };
+  assert!(pack.objects.len() > 6_000, "{} objects", pack.objects.len());
+}
+
+/// A-722 part 3's partial clone (w-perf's A/B: `--filter=blob:none` 1.4-1.5 times slower since its landings sealed
+/// into tables; the profile: each blob's kind and size read from its row, four index lookups, for a filter that sends
+/// no blob whatever its size). Do: clone a commit of a tree of 40 blobs under `blob:none`, then under `blob:limit=2`,
+/// counting the sizes the walk asks. Expect: none under `blob:none`; every blob's under `blob:limit` (the filter that
+/// reads it); the same objects sent as an uncounted graph sends. Red before the change: one size asked a blob under
+/// `blob:none`.
+#[test]
+fn a_filter_that_reads_no_size_asks_none() {
+  let mut graph = TestGraph::default();
+  let blobs: Vec<u32> = (0..40).map(|size| graph.new_blob(size)).collect();
+  let tree = graph.new_tree(&blobs);
+  let commit = graph.new_commit(&[], tree, 1);
+  let wants = [graph.id(commit)];
+  for (filter, sizes) in [(Filter::BlobNone, 0), (Filter::BlobLimit(2), 40)] {
+    let request = Request {
+      wants: &wants,
+      haves: &[],
+      done: true,
+      wait_for_done: false,
+      shallow: &[],
+      deepen: None,
+      filter: Some(&filter),
+      sparse: None,
+      include_tag: false,
+      thin: false,
+    };
+    let counted = Counted {
+      graph: &graph,
+      reads: std::cell::Cell::new(0),
+      sizes: std::cell::Cell::new(0),
+    };
+    let sent = negotiate(&counted, &request, &mut Admission::new(u64::MAX)).unwrap();
+    let whole = negotiate(&graph, &request, &mut Admission::new(u64::MAX)).unwrap();
+    assert_eq!(counted.sizes.get(), sizes, "{filter:?}");
+    assert_eq!(sent, whole, "{filter:?}");
   }
 }

@@ -441,7 +441,11 @@ impl Taker {
       self.intaken.logs.push((named, self.fork.len(store, log)));
       self.logged = true;
     }
-    keep_one(&mut self.fork, store, log, &arrived, &mut room)?;
+    let previous = self
+      .last
+      .as_ref()
+      .map(|(node, text)| (node, text.as_slice()));
+    keep_one(&mut self.fork, store, log, (&arrived, previous), &mut room)?;
     admission.charge_items::<Node>(1)?;
     self.brought.insert(revision.node);
     self.intaken.kept = self.intaken.kept.saturating_add(1);

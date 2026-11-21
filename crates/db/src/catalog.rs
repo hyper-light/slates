@@ -1003,6 +1003,10 @@ pub enum LandingState {
   Refused,
   /// Stopped mid-way; every entry old or new.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it, so an
+  /// older state never lands over a newer one (A-779, main's ruling 2026-11-20). Never granted; nothing expires it on a
+  /// clock. Appended.
+  Superseded,
 }
 
 /// A landing record.
@@ -1026,6 +1030,8 @@ pub struct LandingRecord {
   pub written: u32,
   /// Entries in conflict.
   pub conflicts: u32,
+  /// The newer presentation that superseded it, once `Superseded` (A-779). Appended.
+  pub superseded_by: Option<u64>,
 }
 
 /// What the audit log records (§4.14, §4.15).
@@ -2219,6 +2225,13 @@ pub enum LoggedChange {
   Changed {
     /// The change.
     change: StateChange,
+  },
+  /// A push's record (the names log; A-724 piece 8c, the takeover test's fix): the objects an entry brought, as its
+  /// register keeps them (`RepositoryEntry::objects`), so they ride the replicated log to the repository's candidates
+  /// and a successor replays them, never only the owner's own partition. Appended.
+  Objects {
+    /// The record's bytes.
+    record: Vec<u8>,
   },
 }
 

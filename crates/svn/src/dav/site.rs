@@ -76,9 +76,9 @@ use super::locking::{
   DAV_XML_CONTENT_TYPE, HttpAnswer, convert_status, error_answer, lockdiscovery,
 };
 use super::request::{self, PropertyName, PropfindRequest, Report as Asked, svn_time};
-use super::response::{self, Body, BulkUpdates, Capability, Httpv2, live_prop};
+use super::response::{self, Body, BulkUpdates, Capability, Httpv2};
 use super::update::{UpdateWalk, Walked};
-use super::xml::{base64_lines, is_xml_safe, quote};
+use super::xml::{is_xml_safe, quote};
 use super::{Bounds, CUSTOM_PROPS, DAV, DavRefusal, SVN_DAV, SVN_PROPS};
 use crate::authz::{PrincipalRules, may_read};
 use crate::index::{Index, Node, NodeKind, NodeRelation, PropertyList, Revision, Text};
@@ -86,6 +86,7 @@ use crate::lock::{AprTime, LockTable};
 use crate::reads::{DavLog, DavLogProgress, Repository};
 use crate::report::drive::history as copies;
 pub use crate::report::exchange::{Budget, Quantum};
+use std::fmt::Write;
 
 /// The special URI's name: where `mod_dav_svn` keeps every resource that is no node's public URL.
 /// Format: `SVNSpecialURI`'s default, `!svn` (`mod_dav_svn.c`).
@@ -701,7 +702,7 @@ fn text_headers(subject: &Subject<'_>) -> Headers {
   };
   headers.push(("Cache-Control", String::from(cache)));
   if subject.place.public
-    && let Some(modified) = subject.date.as_deref().and_then(rfc1123)
+    && let Some(modified) = subject.date.and_then(rfc1123)
   {
     headers.push(("Last-Modified", modified));
   }
@@ -837,34 +838,38 @@ fn at_or_beneath(path: &str, ancestor: &str) -> bool {
 impl Subject<'_> {
   /// `dav_svn__getetag`: weak for a directory, the created revision and the path.
   fn etag(&self) -> String {
-    let weak = if self.collection { "W/" } else { "" };
-    format!(
-      "{weak}\"{}/{}\"",
-      self.created,
-      quote(&self.place.path, true)
-    )
+    let mut etag = String::new();
+    self.push_etag(&mut etag);
+    etag
+  }
+
+  /// [`Subject::etag`] written into `out`.
+  fn push_etag(&self, out: &mut String) {
+    if self.collection {
+      out.push_str("W/");
+    }
+    let _ = write!(out, "\"{}/", self.created);
+    push_quoted(out, &self.place.path, true);
+    out.push('"');
   }
 
   /// The media type a GET gives (`set_headers`): a directory's, else the file's valid `svn:mime-type`, else
   /// `text/plain`.
   fn media_type(&self) -> String {
-    self
-      .live_media_type()
-      .unwrap_or_else(|| String::from(PLAIN_TYPE))
+    self.live_media_type().unwrap_or(PLAIN_TYPE).to_owned()
   }
 
   /// `getcontenttype` (`liveprops.c`): a directory's type, the file's `svn:mime-type`, or `text/plain` without one;
   /// none where its `svn:mime-type` is not valid.
-  fn live_media_type(&self) -> Option<String> {
+  fn live_media_type(&self) -> Option<&str> {
     if self.collection {
-      return Some(String::from(DIRECTORY_TYPE));
+      return Some(DIRECTORY_TYPE);
     }
     match self.own(MIME_TYPE) {
-      None => Some(String::from(PLAIN_TYPE)),
+      None => Some(PLAIN_TYPE),
       Some(value) => std::str::from_utf8(value)
         .ok()
-        .filter(|value| valid_mime_type(value))
-        .map(str::to_owned),
+        .filter(|value| valid_mime_type(value)),
     }
   }
 
@@ -911,6 +916,17 @@ fn valid_mime_type(value: &str) -> bool {
 /// A date as stored (`svn_time_to_cstring`'s form) in RFC 1123's form, `getlastmodified`'s and `Last-Modified`'s
 /// (`liveprops.c` `get_last_modified_time`); none for a date in no form `svn_time_from_cstring` reads here.
 fn rfc1123(date: &str) -> Option<String> {
+  let mut out = String::new();
+  push_rfc1123(&mut out, date).then_some(out)
+}
+
+/// [`rfc1123`] written into `out`; false, and nothing written, where `date` is not one.
+fn push_rfc1123(out: &mut String, date: &str) -> bool {
+  push_rfc1123_parts(out, date).is_some()
+}
+
+/// [`push_rfc1123`]'s fields, none where a field cannot be made.
+fn push_rfc1123_parts(out: &mut String, date: &str) -> Option<()> {
   let micros = u64::try_from(svn_time(date)?.0).ok()?;
   let seconds = micros / MICROSECONDS_PER_SECOND;
   let days = seconds / super::time::SECONDS_PER_DAY;
@@ -920,9 +936,11 @@ fn rfc1123(date: &str) -> Option<String> {
   let weekday =
     DAY_NAMES.get(usize::try_from(days.saturating_add(EPOCH_WEEKDAY).checked_rem(week)?).ok()?)?;
   let month_name = MONTH_NAMES.get(usize::try_from(month.checked_sub(1)?).ok()?)?;
-  Some(format!(
+  let _ = write!(
+    out,
     "{weekday}, {day:02} {month_name} {year} {hour:02}:{minute:02}:{second:02} GMT"
-  ))
+  );
+  Some(())
 }
 
 /// The PROPFIND answer (the module doc).
@@ -955,11 +973,19 @@ fn propfind<R: Repository + ?Sized>(
   if depth == Depth::Infinity && collection {
     return bare(HTTP_FORBIDDEN);
   }
-  match described(served, place, &node, &asked, depth) {
-    Ok((responses, headers)) => multistatus(&responses, headers, room),
+  let mut body = Body::new(room);
+  if let Err(refused) = body.push(MULTISTATUS_OPEN) {
+    return refused_body(&refused);
+  }
+  match described(served, (place, &node), &asked, depth, &mut body) {
+    Ok(headers) => multistatus(body, headers),
     Err(refused) => refused,
   }
 }
+
+/// A multistatus's first line and opening element (`dav_begin_multistatus`).
+const MULTISTATUS_OPEN: &str =
+  "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n";
 
 /// A PROPFIND of DeltaV v1's VCC or a baseline (`repos.c` `prep_vcc`, `prep_version`): one response, neither being a
 /// collection, its live properties those its kind has; a baseline's dead properties are its revision's properties
@@ -1024,8 +1050,17 @@ fn private_propfind<R: Repository + ?Sized>(
     safe_created: revision,
     kind,
   };
-  match one_response(served, &subject, &asked, href_of(&place.url, false)) {
-    Ok((described, headers)) => multistatus(&[described], headers, room),
+  let mut body = Body::new(room);
+  let mut described = Described::default();
+  let answered = one_response(served, &subject, &asked, &mut described).and_then(|headers| {
+    body
+      .push(MULTISTATUS_OPEN)
+      .and_then(|()| write_response(&described, &href_of(&place.url, false), &mut body))
+      .map_err(|refused| refused_body(&refused))
+      .map(|()| headers)
+  });
+  match answered {
+    Ok(headers) => multistatus(body, headers),
     Err(refused) => refused,
   }
 }
@@ -1041,16 +1076,16 @@ fn depth_of(header: Option<&str>) -> Option<Depth> {
   }
 }
 
-/// One `D:response` of a multistatus: its href, the namespaces declared on it, and its two propstats' properties.
+/// One `D:response` of a multistatus being written: the namespaces declared on it, and its two propstats' properties.
+/// One is kept for a whole multistatus and cleared between its responses, so a PROPFIND makes its buffers once however
+/// many responses and properties it answers, and every value is written into them in place (MEMORY SIZING).
 #[derive(Debug, Default)]
-struct Described {
-  /// The href, URL-encoded.
-  href: String,
+struct Described<'a> {
   /// The live properties' namespaces declared on it, each a prefix and a URI, as they were first used.
-  live: Vec<(String, String)>,
+  live: Vec<(&'static str, &'static str)>,
   /// The other namespaces declared on it (`dav_xmlns_info`'s: the dead properties' `S`, `C`, `V` and the `gN` of the
-  /// properties not found), as they were added.
-  namespaces: Vec<(String, String)>,
+  /// properties not found), as they were added; a generated one's URI is the request's own.
+  namespaces: Vec<(Prefix, &'a str)>,
   /// Whether `namespaces` are declared before `live`, as `dav_get_allprops` gathers them; after, as `dav_get_props`.
   namespaces_first: bool,
   /// The properties found, written.
@@ -1061,70 +1096,136 @@ struct Described {
   missing: String,
 }
 
-impl Described {
+/// A namespace's prefix on a response: one `mod_dav_svn` names, or the `gN` `dav_xmlns_add_uri` generates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Prefix {
+  /// A named prefix (`S`, `C`, `V`).
+  Named(&'static str),
+  /// The `N`th generated prefix, `gN`.
+  Generated(usize),
+}
+
+impl<'a> Described<'a> {
+  /// Ready for the next response: everything written cleared, its buffers kept.
+  fn clear(&mut self) {
+    self.live.clear();
+    self.namespaces.clear();
+    self.namespaces_first = false;
+    self.found.clear();
+    self.any_found = false;
+    self.missing.clear();
+  }
+
   /// Declares the live properties' `prefix` for `uri`, once.
-  fn declare_live(&mut self, prefix: &str, uri: &str) {
-    if !self.live.iter().any(|(declared, _)| declared == prefix) {
-      self.live.push((prefix.to_owned(), uri.to_owned()));
+  fn declare_live(&mut self, prefix: &'static str, uri: &'static str) {
+    if !self.live.iter().any(|(declared, _)| *declared == prefix) {
+      self.live.push((prefix, uri));
     }
   }
 
   /// Declares `prefix` for `uri` among the other namespaces, once.
-  fn declare(&mut self, prefix: &str, uri: &str) {
+  fn declare(&mut self, prefix: Prefix, uri: &'a str) {
     if !self
       .namespaces
       .iter()
-      .any(|(declared, _)| declared == prefix)
+      .any(|(declared, _)| *declared == prefix)
     {
-      self.namespaces.push((prefix.to_owned(), uri.to_owned()));
+      self.namespaces.push((prefix, uri));
     }
   }
 
   /// Declares the dead properties' namespaces (`deadprops.c` `db_define_namespaces`).
   fn declare_dead(&mut self) {
-    self.declare("S", SVN_PROPS);
-    self.declare("C", CUSTOM_PROPS);
-    self.declare("V", SVN_DAV);
-  }
-
-  /// Every declaration in the order `mod_dav` writes them on the response.
-  fn declarations(&self) -> impl Iterator<Item = &(String, String)> {
-    let (first, second) = if self.namespaces_first {
-      (&self.namespaces, &self.live)
-    } else {
-      (&self.live, &self.namespaces)
-    };
-    first.iter().chain(second.iter())
+    self.declare(Prefix::Named("S"), SVN_PROPS);
+    self.declare(Prefix::Named("C"), CUSTOM_PROPS);
+    self.declare(Prefix::Named("V"), SVN_DAV);
   }
 
   /// The prefix declared for `uri`, a new `gN` when none is (`dav_xmlns_add_uri`).
-  fn prefix_of(&mut self, uri: &str) -> String {
-    if let Some((prefix, _)) = self.namespaces.iter().find(|(_, declared)| declared == uri) {
-      return prefix.clone();
+  fn prefix_of(&mut self, uri: &'a str) -> Prefix {
+    if let Some((prefix, _)) = self
+      .namespaces
+      .iter()
+      .find(|(_, declared)| *declared == uri)
+    {
+      return *prefix;
     }
     let generated = self
       .namespaces
       .iter()
-      .filter(|(prefix, _)| prefix.starts_with('g'))
+      .filter(|(prefix, _)| matches!(prefix, Prefix::Generated(_)))
       .count();
-    let prefix = format!("g{generated}");
-    self.declare(&prefix, uri);
+    let prefix = Prefix::Generated(generated);
+    self.declare(prefix, uri);
     prefix
+  }
+
+  /// Writes every declaration in the order `mod_dav` writes them on the response.
+  fn write_declarations(&self, body: &mut Body) -> Result<(), DavRefusal> {
+    let live = self
+      .live
+      .iter()
+      .map(|(prefix, uri)| (Prefix::Named(prefix), *uri));
+    let other = self.namespaces.iter().copied();
+    let declarations: &mut dyn Iterator<Item = (Prefix, &str)> = if self.namespaces_first {
+      &mut other.chain(live)
+    } else {
+      &mut live.chain(other)
+    };
+    for (prefix, uri) in declarations {
+      body.push(" xmlns:")?;
+      push_prefix(body, prefix)?;
+      body.push("=\"")?;
+      body.push(&quote(uri, true))?;
+      body.push("\"")?;
+    }
+    Ok(())
   }
 }
 
-/// The responses a PROPFIND of `node` at `place` writes at `depth`, and the lock headers its own lock gives.
+/// `prefix` written into `body`.
+fn push_prefix(body: &mut Body, prefix: Prefix) -> Result<(), DavRefusal> {
+  match prefix {
+    Prefix::Named(name) => body.push(name),
+    Prefix::Generated(number) => {
+      body.push("g")?;
+      let mut digits = [0u8; 20];
+      body.push(decimal_in(&mut digits, number))
+    }
+  }
+}
+
+/// `number` in decimal, written into `digits` and lent from it.
+fn decimal_in(digits: &mut [u8; 20], mut number: usize) -> &str {
+  let mut at = digits.len();
+  loop {
+    at = at.saturating_sub(1);
+    // Format: decimal, base 10.
+    if let Some(digit) = digits.get_mut(at) {
+      *digit = b'0'.saturating_add(u8::try_from(number % 10).unwrap_or(0));
+    }
+    number /= 10;
+    if number == 0 || at == 0 {
+      break;
+    }
+  }
+  std::str::from_utf8(digits.get(at..).unwrap_or_default()).unwrap_or_default()
+}
+
+/// The responses a PROPFIND of `node` at `place` writes at `depth`, each written into `body` as it is described through
+/// one [`Described`]; the lock headers its own lock gives.
 fn described<R: Repository + ?Sized>(
   served: &Served<'_, R>,
-  place: &Place,
-  node: &Node<'_>,
+  (place, node): (&Place, &Node<'_>),
   asked: &PropfindRequest,
   depth: Depth,
-) -> Result<(Vec<Described>, Headers), HttpAnswer> {
+  body: &mut Body,
+) -> Result<Headers, HttpAnswer> {
+  let mut scratch = Described::default();
   let target = subject(served, place, node)?;
   let href = href_of(&place.url, target.collection);
-  let (first, headers) = one_response(served, &target, asked, href.clone())?;
-  let mut responses = vec![first];
+  let headers = one_response(served, &target, asked, &mut scratch)?;
+  write_response(&scratch, &href, body).map_err(|refused| refused_body(&refused))?;
   if depth == Depth::One && target.collection {
     for name in children(served, place) {
       let child = Place {
@@ -1140,10 +1241,12 @@ fn described<R: Repository + ?Sized>(
       let child_subject = subject(served, &child, &child_node)?;
       let slash = if child_subject.collection { "/" } else { "" };
       let child_href = format!("{href}{}{slash}", uri_encode(&name));
-      responses.push(one_response(served, &child_subject, asked, child_href)?.0);
+      scratch.clear();
+      one_response(served, &child_subject, asked, &mut scratch)?;
+      write_response(&scratch, &child_href, body).map_err(|refused| refused_body(&refused))?;
     }
   }
-  Ok((responses, headers))
+  Ok(headers)
 }
 
 /// The names of the directory at `place` the principal may read, in name order.
@@ -1175,17 +1278,13 @@ fn href_of(url: &str, collection: bool) -> String {
   href
 }
 
-/// One response for `subject` at `href`, with the lock headers its lock gives.
-fn one_response<R: Repository + ?Sized>(
+/// One response for `subject`, described into `described`, with the lock headers its lock gives.
+fn one_response<'a, R: Repository + ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
-  asked: &PropfindRequest,
-  href: String,
-) -> Result<(Described, Headers), HttpAnswer> {
-  let mut described = Described {
-    href,
-    ..Described::default()
-  };
+  asked: &'a PropfindRequest,
+  described: &mut Described<'a>,
+) -> Result<Headers, HttpAnswer> {
   let discovery = lockdiscovery(
     served.locks.get_lock(&subject.place.path, served.now),
     served.now,
@@ -1193,15 +1292,15 @@ fn one_response<R: Repository + ?Sized>(
   .map_err(|refused| refused_body(&refused))?;
   let lock = (discovery.property, discovery.headers);
   match asked {
-    PropfindRequest::AllProp => all_properties(served, subject, &lock.0, false, &mut described),
-    PropfindRequest::PropName => all_properties(served, subject, &lock.0, true, &mut described),
+    PropfindRequest::AllProp => all_properties(served, subject, &lock.0, false, described),
+    PropfindRequest::PropName => all_properties(served, subject, &lock.0, true, described),
     PropfindRequest::Prop(names) => {
       for name in names {
-        named_property(served, subject, &lock.0, name, &mut described);
+        named_property(served, subject, &lock.0, name, described);
       }
     }
   }
-  Ok((described, lock.1))
+  Ok(lock.1)
 }
 
 /// Where a live property is written: `mod_dav`'s own (`D:`), or a provider's (`lp1` for `DAV:`, `lp2` for
@@ -1256,101 +1355,131 @@ fn all_properties<R: ?Sized>(
   subject: &Subject<'_>,
   lock: &str,
   names_only: bool,
-  described: &mut Described,
+  described: &mut Described<'_>,
 ) {
   described.namespaces_first = true;
   described.declare_dead();
   described.declare_live("lp1", DAV);
   described.declare_live("lp2", SVN_DAV);
   for (name, value) in &subject.properties {
-    described
-      .found
-      .push_str(&dead_property(name, value, names_only));
+    push_dead(&mut described.found, name, value, names_only);
     described.any_found = true;
   }
   for (group, name) in ALL_LIVE {
-    if let Some(value) = live_value(served, subject, lock, group, name) {
-      let written = if names_only { String::new() } else { value };
-      described
-        .found
-        .push_str(&live_element(group, name, &written));
-      described.any_found = true;
-    }
+    let written = write_live(&mut described.found, (group, name), names_only, |out| {
+      live_value(served, subject, (lock, group, name), out)
+    });
+    described.any_found |= written;
   }
 }
 
-/// A live property's element as its group writes it, an empty value an empty element.
-fn live_element(group: Group, name: &str, value: &str) -> String {
-  match group {
-    Group::Core if value.is_empty() => format!("<D:{name}/>\n"),
-    Group::Core => format!("<D:{name}>{value}</D:{name}>\n"),
-    Group::Dav => live_prop(true, name, value),
-    Group::Svn => live_prop(false, name, value),
+/// A live property's element as its group writes it, written into `out` with the value `value` writes, an empty value
+/// an empty element and `names_only` none; false, and nothing written, where `value` says the property is not defined.
+fn write_live(
+  out: &mut String,
+  (group, name): (Group, &str),
+  names_only: bool,
+  value: impl FnOnce(&mut String) -> bool,
+) -> bool {
+  let prefix = match group {
+    Group::Core => "D",
+    Group::Dav => "lp1",
+    Group::Svn => "lp2",
+  };
+  let mark = out.len();
+  let _ = write!(out, "<{prefix}:{name}>");
+  let opened = out.len();
+  if !value(out) {
+    out.truncate(mark);
+    return false;
   }
+  if names_only {
+    out.truncate(opened);
+  }
+  if out.len() == opened {
+    out.truncate(opened.saturating_sub(1));
+    out.push_str("/>\n");
+  } else {
+    let _ = writeln!(out, "</{prefix}:{name}>");
+  }
+  true
 }
 
-/// A node's own property as `deadprops.c` writes it: `svn:` names in `S:`, others in `C:`; an empty value an empty
-/// element; a value XML cannot carry in base64.
-fn dead_property(name: &[u8], value: &[u8], names_only: bool) -> String {
+/// A node's own property as `deadprops.c` writes it, into `out`: `svn:` names in `S:`, others in `C:`; an empty value
+/// an empty element; a value XML cannot carry in base64.
+fn push_dead(out: &mut String, name: &[u8], value: &[u8], names_only: bool) {
   let name = String::from_utf8_lossy(name);
   let (prefix, local) = match name.strip_prefix(SVN_PREFIX) {
     Some(local) => ("S", local),
     None => ("C", name.as_ref()),
   };
   if names_only || value.is_empty() {
-    return format!("<{prefix}:{local}/>\n");
+    let _ = writeln!(out, "<{prefix}:{local}/>");
+    return;
   }
   match std::str::from_utf8(value)
     .ok()
     .filter(|_| is_xml_safe(value))
   {
-    Some(text) => format!(
-      "<{prefix}:{local}>{}</{prefix}:{local}>\n",
-      quote(text, false).replace('\r', "&#13;")
-    ),
-    None => format!(
-      "<{prefix}:{local} V:encoding=\"base64\">{}</{prefix}:{local}>\n",
-      base64_lines(value)
-    ),
+    Some(text) => {
+      let _ = write!(out, "<{prefix}:{local}>");
+      for character in text.chars() {
+        match character {
+          '&' => out.push_str("&amp;"),
+          '<' => out.push_str("&lt;"),
+          '>' => out.push_str("&gt;"),
+          '\r' => out.push_str("&#13;"),
+          other => out.push(other),
+        }
+      }
+      let _ = writeln!(out, "</{prefix}:{local}>");
+    }
+    None => {
+      let _ = write!(out, "<{prefix}:{local} V:encoding=\"base64\">");
+      super::xml::push_base64_lines(out, value);
+      let _ = writeln!(out, "</{prefix}:{local}>");
+    }
   }
 }
 
 /// One property a PROPFIND names (`dav_get_props`): live, else the node's own, else missing.
-fn named_property<R: ?Sized>(
+fn named_property<'a, R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   lock: &str,
-  name: &PropertyName,
-  described: &mut Described,
+  name: &'a PropertyName,
+  described: &mut Described<'a>,
 ) {
-  if let Some(group) = live_group(&name.namespace, &name.name)
-    && let Some(value) = live_value(served, subject, lock, group, &name.name)
-  {
-    if let Some((prefix, uri)) = declared_as(group) {
-      described.declare_live(prefix, uri);
+  if let Some(group) = live_group(&name.namespace, &name.name) {
+    let written = write_live(&mut described.found, (group, &name.name), false, |out| {
+      live_value(served, subject, (lock, group, &name.name), out)
+    });
+    if written {
+      if let Some((prefix, uri)) = declared_as(group) {
+        described.declare_live(prefix, uri);
+      }
+      described.any_found = true;
+      return;
     }
-    described
-      .found
-      .push_str(&live_element(group, &name.name, &value));
-    described.any_found = true;
-    return;
   }
-  if let Some(value) = own_named(subject, name) {
+  if let Some((found, value)) = own_named(subject, name) {
     described.declare_dead();
-    let full = full_name(name).unwrap_or_default();
-    described
-      .found
-      .push_str(&dead_property(full.as_bytes(), value, false));
+    push_dead(&mut described.found, found, value, false);
     described.any_found = true;
     return;
   }
-  let element = if name.namespace.is_empty() {
-    format!("<{}/>\n", name.name)
+  if name.namespace.is_empty() {
+    let _ = writeln!(described.missing, "<{}/>", name.name);
   } else {
-    let prefix = described.prefix_of(&name.namespace);
-    format!("<{prefix}:{}/>\n", name.name)
-  };
-  described.missing.push_str(&element);
+    match described.prefix_of(&name.namespace) {
+      Prefix::Named(prefix) => {
+        let _ = writeln!(described.missing, "<{prefix}:{}/>", name.name);
+      }
+      Prefix::Generated(number) => {
+        let _ = writeln!(described.missing, "<g{number}:{}/>", name.name);
+      }
+    }
+  }
 }
 
 /// The group of the live property `name` in `namespace`, if a provider or `mod_dav` defines one.
@@ -1363,63 +1492,77 @@ fn live_group(namespace: &str, name: &str) -> Option<Group> {
     .map(|(group, _)| *group)
 }
 
-/// The Subversion name a requested dead property has (`deadprops.c` `get_value`): `svn:` and the name in Subversion's
-/// namespace, the name alone in the custom one; none in any other.
-fn full_name(name: &PropertyName) -> Option<String> {
-  if name.namespace == SVN_PROPS {
-    Some(format!("{SVN_PREFIX}{}", name.name))
+/// The node's own property a requested dead property names (`deadprops.c` `get_value`: `svn:` and the name in
+/// Subversion's namespace, the name alone in the custom one; none in any other), with its stored name, found with no
+/// name made.
+fn own_named<'s>(subject: &'s Subject<'_>, name: &PropertyName) -> Option<(&'s [u8], &'s [u8])> {
+  let svn = if name.namespace == SVN_PROPS {
+    true
   } else if name.namespace == CUSTOM_PROPS {
-    Some(name.name.clone())
+    false
   } else {
-    None
-  }
+    return None;
+  };
+  let wanted = name.name.as_bytes();
+  subject
+    .properties
+    .iter()
+    .find(|(found, _)| match svn {
+      true => found.strip_prefix(SVN_PREFIX.as_bytes()) == Some(wanted),
+      false => *found == wanted,
+    })
+    .map(|(found, value)| (*found, *value))
 }
 
-/// The node's own property a requested dead property names, if it has it.
-fn own_named<'s>(subject: &'s Subject<'_>, name: &PropertyName) -> Option<&'s [u8]> {
-  subject.own(full_name(name)?.as_bytes())
-}
-
-/// The value of the live property `name` of `group` for `subject`, written as `liveprops.c` and `mod_dav` write it;
-/// none where it is not defined for the node (`DAV_PROP_INSERT_NOTDEF`, `NOTSUPP`).
+/// The value of the live property `name` of `group` for `subject`, written into `out` as `liveprops.c` and `mod_dav`
+/// write it; false, and nothing written, where it is not defined for the node (`DAV_PROP_INSERT_NOTDEF`, `NOTSUPP`).
+/// Every value is written in place: no property makes a string of its own (MEMORY SIZING, Ada 2026-11-20).
 fn live_value<R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
-  lock: &str,
-  group: Group,
-  name: &str,
-) -> Option<String> {
+  (lock, group, name): (&str, Group, &str),
+  out: &mut String,
+) -> bool {
   match (subject.kind, group) {
-    (Kind::Vcc, Group::Dav) => vcc_value(served, name),
-    (Kind::Vcc, Group::Svn) => (name == "repository-uuid").then(|| served.uuid.to_owned()),
-    (Kind::Vcc, Group::Core) => None,
-    (Kind::Baseline, Group::Dav) => baseline_value(served, subject, name),
-    (Kind::Baseline, Group::Svn) => (name == "repository-uuid").then(|| served.uuid.to_owned()),
+    (Kind::Vcc, Group::Dav) => vcc_value(served, name, out),
+    (Kind::Vcc | Kind::Baseline, Group::Svn) => {
+      let defined = name == "repository-uuid";
+      if defined {
+        out.push_str(served.uuid);
+      }
+      defined
+    }
+    (Kind::Vcc, Group::Core) => false,
+    (Kind::Baseline, Group::Dav) => baseline_value(served, subject, name, out),
     (Kind::Version, Group::Dav)
       if matches!(name, "checked-in" | "version-controlled-configuration") =>
     {
-      None
+      false
     }
     (Kind::Version, Group::Svn) if matches!(name, "baseline-relative-path" | "deadprop-count") => {
-      None
+      false
     }
-    (_, Group::Core) => core_value(subject, lock, name),
-    (_, Group::Dav) => dav_value(served, subject, name),
-    (_, Group::Svn) => svn_value(served, subject, name),
+    (_, Group::Core) => core_value(subject, lock, name, out),
+    (_, Group::Dav) => dav_value(served, subject, name, out),
+    (_, Group::Svn) => svn_value(served, subject, name, out),
   }
 }
 
 /// The VCC's one live property in `DAV:` (`liveprops.c`): `checked-in`, the youngest baseline. Every other is not
 /// supported there, `resourcetype` too (`std_liveprop.c` defines none for a private resource); `getcontentlength`,
 /// which `liveprops.c` would compute as a file's length at `/` and fail, is answered not found.
-fn vcc_value<R: ?Sized>(served: &Served<'_, R>, name: &str) -> Option<String> {
-  (name == "checked-in").then(|| {
-    format!(
-      "<D:href>{}/{SPECIAL}/{BASELINE}/{}</D:href>",
-      quote(&uri_encode(served.root), true),
-      served.index.youngest()
-    )
-  })
+fn vcc_value<R: ?Sized>(served: &Served<'_, R>, name: &str, out: &mut String) -> bool {
+  if name != "checked-in" {
+    return false;
+  }
+  out.push_str("<D:href>");
+  push_quoted(out, &uri_encode(served.root), true);
+  let _ = write!(
+    out,
+    "/{SPECIAL}/{BASELINE}/{}</D:href>",
+    served.index.youngest()
+  );
+  true
 }
 
 /// A baseline's live properties in `DAV:` (`liveprops.c`, `std_liveprop.c`): `resourcetype` `D:baseline`, its
@@ -1429,38 +1572,45 @@ fn baseline_value<R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   name: &str,
-) -> Option<String> {
+  out: &mut String,
+) -> bool {
   let revision = subject.place.revision;
   match name {
-    "resourcetype" => Some(String::from("<D:baseline/>")),
-    "getetag" => Some(String::new()),
-    "creationdate" | "getlastmodified" | "creator-displayname" => dav_value(served, subject, name),
-    "baseline-collection" => Some(format!(
-      "<D:href>{}/{SPECIAL}/bc/{revision}/</D:href>",
-      quote(&uri_encode(served.root), true)
-    )),
-    "version-name" => Some(revision.to_string()),
-    _ => None,
+    "resourcetype" => out.push_str("<D:baseline/>"),
+    "getetag" => {}
+    "creationdate" | "getlastmodified" | "creator-displayname" => {
+      return dav_value(served, subject, name, out);
+    }
+    "baseline-collection" => {
+      out.push_str("<D:href>");
+      push_quoted(out, &uri_encode(served.root), true);
+      let _ = write!(out, "/{SPECIAL}/bc/{revision}/</D:href>");
+    }
+    "version-name" => {
+      let _ = write!(out, "{revision}");
+    }
+    _ => return false,
   }
+  true
 }
 
 /// `mod_dav`'s own: `supportedlock` (`lock.c` `get_supportedlock`: a file's exclusive write lock) and
 /// `lockdiscovery`.
-fn core_value(subject: &Subject<'_>, lock: &str, name: &str) -> Option<String> {
+fn core_value(subject: &Subject<'_>, lock: &str, name: &str, out: &mut String) -> bool {
   match name {
-    "supportedlock" if !subject.collection => Some(String::from(
+    "supportedlock" if !subject.collection => out.push_str(
       "\n<D:lockentry>\n<D:lockscope><D:exclusive/></D:lockscope>\n<D:locktype><D:write/></D:locktype>\n\
        </D:lockentry>\n",
-    )),
-    "lockdiscovery" => Some(
+    ),
+    "lockdiscovery" => out.push_str(
       lock
         .strip_prefix("<D:lockdiscovery>")
         .and_then(|rest| rest.strip_suffix("</D:lockdiscovery>\n"))
-        .unwrap_or_default()
-        .to_owned(),
+        .unwrap_or_default(),
     ),
-    _ => None,
+    _ => return false,
   }
+  true
 }
 
 /// A provider's property in `DAV:` (`liveprops.c`; `resourcetype` `mod_dav`'s standard provider's).
@@ -1468,27 +1618,30 @@ fn dav_value<R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   name: &str,
-) -> Option<String> {
+  out: &mut String,
+) -> bool {
   match name {
-    "resourcetype" => Some(String::from(if subject.collection {
-      "<D:collection/>"
-    } else {
-      ""
-    })),
-    "getcontentlength" if !subject.collection => {
-      Some(subject.text.map_or(0, |text| text.size).to_string())
+    "resourcetype" => {
+      if subject.collection {
+        out.push_str("<D:collection/>");
+      }
     }
-    "getcontenttype" => subject
-      .live_media_type()
-      .map(|media| quote(&media, false).into_owned()),
-    "getetag" => Some(subject.etag()),
-    "creationdate" => subject
-      .date
-      .as_deref()
-      .map(|date| quote(date, true).into_owned()),
-    "getlastmodified" => subject.date.as_deref().and_then(rfc1123),
-    _ => dav_version_value(served, subject, name),
+    "getcontentlength" if !subject.collection => {
+      let _ = write!(out, "{}", subject.text.map_or(0, |text| text.size));
+    }
+    "getcontenttype" => match subject.live_media_type() {
+      Some(media) => push_quoted(out, media, false),
+      None => return false,
+    },
+    "getetag" => subject.push_etag(out),
+    "creationdate" => match subject.date {
+      Some(date) => push_quoted(out, date, true),
+      None => return false,
+    },
+    "getlastmodified" => return subject.date.is_some_and(|date| push_rfc1123(out, date)),
+    _ => return dav_version_value(served, subject, name, out),
   }
+  true
 }
 
 /// The DeltaV properties in `DAV:` (`liveprops.c`).
@@ -1496,42 +1649,57 @@ fn dav_version_value<R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   name: &str,
-) -> Option<String> {
+  out: &mut String,
+) -> bool {
   let root = uri_encode(served.root);
   match name {
-    "checked-in" => Some(format!(
-      "<D:href>{}</D:href>",
-      quote(
-        &format!(
-          "{root}/{SPECIAL}/ver/{}{}",
-          subject.safe_created,
-          uri_encode(&subject.place.path)
-        ),
-        true
-      )
-    )),
-    "version-controlled-configuration" => Some(format!(
-      "<D:href>{root}/{SPECIAL}/vcc/{DEFAULT_VCC}</D:href>"
-    )),
-    "version-name" => Some(subject.created.to_string()),
-    "creator-displayname" => subject.author.as_deref().map(author_value),
-    _ => None,
+    "checked-in" => {
+      out.push_str("<D:href>");
+      push_quoted(out, &root, true);
+      let _ = write!(out, "/{SPECIAL}/ver/{}", subject.safe_created);
+      push_quoted(out, &uri_encode(&subject.place.path), true);
+      out.push_str("</D:href>");
+    }
+    "version-controlled-configuration" => {
+      let _ = write!(out, "<D:href>{root}/{SPECIAL}/vcc/{DEFAULT_VCC}</D:href>");
+    }
+    "version-name" => {
+      let _ = write!(out, "{}", subject.created);
+    }
+    "creator-displayname" => match subject.author {
+      Some(author) => push_author(out, author),
+      None => return false,
+    },
+    _ => return false,
+  }
+  true
+}
+
+/// `dav_svn__fuzzy_escape_author` for an svn client, written into `out`: control characters dropped from an author XML
+/// cannot carry, then quoted.
+fn push_author(out: &mut String, author: &[u8]) {
+  let text = String::from_utf8_lossy(author);
+  let safe = is_xml_safe(author);
+  let mut kept = [0u8; 4];
+  for character in text.chars() {
+    if !safe && character.is_ascii_control() {
+      continue;
+    }
+    push_quoted(out, character.encode_utf8(&mut kept), true);
   }
 }
 
-/// `dav_svn__fuzzy_escape_author` for an svn client: control characters dropped from an author XML cannot carry, then
-/// quoted.
-fn author_value(author: &[u8]) -> String {
-  let text = String::from_utf8_lossy(author);
-  let kept: String = if is_xml_safe(author) {
-    text.into_owned()
-  } else {
-    text
-      .chars()
-      .filter(|character| !character.is_ascii_control())
-      .collect()
-  };
-  quote(&kept, true).into_owned()
+/// `text` quoted for XML into `out` as [`quote`] quotes it (`apr_xml_quote_string`), with no copy aside.
+fn push_quoted(out: &mut String, text: &str, quotes: bool) {
+  for character in text.chars() {
+    match character {
+      '&' => out.push_str("&amp;"),
+      '<' => out.push_str("&lt;"),
+      '>' => out.push_str("&gt;"),
+      '"' if quotes => out.push_str("&quot;"),
+      other => out.push(other),
+    }
+  }
 }
 
 /// `mod_dav_svn`'s own properties (`liveprops.c`).
@@ -1539,30 +1707,40 @@ fn svn_value<R: ?Sized>(
   served: &Served<'_, R>,
   subject: &Subject<'_>,
   name: &str,
-) -> Option<String> {
+  out: &mut String,
+) -> bool {
   let file_text = (!subject.collection).then_some(subject.text).flatten();
   match name {
-    "baseline-relative-path" => Some(
-      quote(
-        subject.place.path.strip_prefix('/').unwrap_or_default(),
-        true,
-      )
-      .into_owned(),
+    "baseline-relative-path" => push_quoted(
+      out,
+      subject.place.path.strip_prefix('/').unwrap_or_default(),
+      true,
     ),
     "md5-checksum" if !subject.collection => {
-      Some(file_text.map_or_else(|| hex(&EMPTY_MD5), |text| hex(&text.md5)))
+      push_hex(
+        out,
+        file_text
+          .as_ref()
+          .map_or(&EMPTY_MD5[..], |text| &text.md5[..]),
+      );
     }
     "sha1-checksum" if !subject.collection => {
-      Some(file_text.map_or_else(|| hex(&EMPTY_SHA1), |text| hex(&text.sha1)))
+      push_hex(
+        out,
+        file_text
+          .as_ref()
+          .map_or(&EMPTY_SHA1[..], |text| &text.sha1[..]),
+      );
     }
-    "repository-uuid" => Some(served.uuid.to_owned()),
-    "deadprop-count" => Some(String::from(if subject.properties.is_empty() {
-      "0"
+    "repository-uuid" => out.push_str(served.uuid),
+    "deadprop-count" => out.push(if subject.properties.is_empty() {
+      '0'
     } else {
-      "1"
-    })),
-    _ => None,
+      '1'
+    }),
+    _ => return false,
   }
+  true
 }
 
 /// The MD5 of no bytes, a file with no text's.
@@ -1578,19 +1756,17 @@ const EMPTY_SHA1: [u8; 20] = [
   0xaf, 0xd8, 0x07, 0x09,
 ];
 
-/// `bytes` in lowercase hexadecimal, as `svn_checksum_to_cstring` writes a digest.
-fn hex(bytes: &[u8]) -> String {
-  bytes.iter().fold(String::new(), |mut text, byte| {
-    text.push_str(&format!("{byte:02x}"));
-    text
-  })
+/// `bytes` in lowercase hexadecimal into `out`, as `svn_checksum_to_cstring` writes a digest.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+  for byte in bytes {
+    let _ = write!(out, "{byte:02x}");
+  }
 }
 
-/// The multistatus of `responses` (`dav_begin_multistatus`, `dav_send_one_response`), `207` with `headers` after its
-/// content type.
-fn multistatus(responses: &[Described], headers: Headers, room: usize) -> HttpAnswer {
-  let mut body = Body::new(room);
-  match write_multistatus(responses, &mut body) {
+/// The multistatus `body` holds, its responses written, closed (`dav_finish_multistatus`): `207` with `headers` after
+/// its content type.
+fn multistatus(mut body: Body, headers: Headers) -> HttpAnswer {
+  match body.push("</D:multistatus>\n") {
     Ok(()) => {
       let mut all = vec![("Content-Type", String::from(DAV_XML_CONTENT_TYPE))];
       all.extend(headers);
@@ -1604,32 +1780,31 @@ fn multistatus(responses: &[Described], headers: Headers, room: usize) -> HttpAn
   }
 }
 
-/// Writes the multistatus of `responses` into `body`.
-fn write_multistatus(responses: &[Described], body: &mut Body) -> Result<(), DavRefusal> {
-  body.push("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<D:multistatus xmlns:D=\"DAV:\">\n")?;
-  for response in responses {
-    body.push("<D:response")?;
-    for (prefix, uri) in response.declarations() {
-      body.push(&format!(" xmlns:{prefix}=\"{}\"", quote(uri, true)))?;
-    }
-    body.push(&format!(
-      ">\n<D:href>{}</D:href>\n",
-      quote(&response.href, false)
-    ))?;
-    if response.any_found || response.missing.is_empty() {
-      body.push(&propstat(&response.found, "200 OK"))?;
-    }
-    if !response.missing.is_empty() {
-      body.push(&propstat(&response.missing, "404 Not Found"))?;
-    }
-    body.push("</D:response>\n")?;
+/// One response, described in `described`, written into `body` at `href` (`dav_send_one_response`).
+fn write_response(
+  described: &Described<'_>,
+  href: &str,
+  body: &mut Body,
+) -> Result<(), DavRefusal> {
+  body.push("<D:response")?;
+  described.write_declarations(body)?;
+  body.push(">\n<D:href>")?;
+  body.push(&quote(href, false))?;
+  body.push("</D:href>\n")?;
+  if described.any_found || described.missing.is_empty() {
+    write_propstat(body, &described.found, "200 OK")?;
   }
-  body.push("</D:multistatus>\n")
+  if !described.missing.is_empty() {
+    write_propstat(body, &described.missing, "404 Not Found")?;
+  }
+  body.push("</D:response>\n")
 }
 
-/// One propstat holding `properties`, with `status`.
-fn propstat(properties: &str, status: &str) -> String {
-  format!(
-    "<D:propstat>\n<D:prop>\n{properties}</D:prop>\n<D:status>HTTP/1.1 {status}</D:status>\n</D:propstat>\n"
-  )
+/// One propstat holding `properties`, with `status`, written into `body`.
+fn write_propstat(body: &mut Body, properties: &str, status: &str) -> Result<(), DavRefusal> {
+  body.push("<D:propstat>\n<D:prop>\n")?;
+  body.push(properties)?;
+  body.push("</D:prop>\n<D:status>HTTP/1.1 ")?;
+  body.push(status)?;
+  body.push("</D:status>\n</D:propstat>\n")
 }

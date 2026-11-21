@@ -584,16 +584,10 @@ fn verified(
 
 /// Every object the store holds, by position, and the push's.
 fn every_object(built: &Built) -> BTreeSet<ObjectId> {
-  let format = built.repository.format();
   let mut ids: BTreeSet<ObjectId> = (0..built.repository.next_position())
     .map(|position| built.repository.id_at(&built.store, position).unwrap())
     .collect();
-  ids.extend(
-    built
-      .push
-      .held()
-      .map(|(id, ..)| ObjectId::from_bytes(format, id).unwrap()),
-  );
+  ids.extend(built.push.held().map(|(id, _)| id));
   ids
 }
 
