@@ -96,7 +96,8 @@
 > with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
 > onto it with an RSS red test. Piece 2a (2026-11-20): `hyper-block` (no issuer), `hyper-log`, `hyper-sim` vendored at
 > hyper-raft `5e40eb9`; 2b: engine, chunk, disk, crc, codec vendored and ported onto `slates_rt` (main's ruling: no hyper-rt, no
-> `unsafe impl Send`/`Sync`), their unit tests green here; owed: their file creation behind `land`'s write seam.
+> `unsafe impl Send`/`Sync`), their unit tests green here; their files opened through `slates_land::store_root` under a
+> `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.

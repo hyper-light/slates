@@ -57651,7 +57651,14 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `slates_rt`'s or `slates_machine`'s (`vendor/mantle/README.md`, `vendor/hyper-raft/README.md`, "Local changes");
 > `ranges` stays upstream. No `hyper-rt` and no `unsafe impl Send`/`Sync` anywhere. Unit tests on slates' runtime:
 > engine 155/155, chunk 52/52, `hyper-block` 101/101 (issuer included), slates-rt sync 11/11 and retirement 3/3.
-> Owed in C2: the engine's and the chunk store's file creation behind `land`'s write seam, under the grant.
+> Step 4 (2026-11-20), the write seam: none of the vendored crates opens a file in its production code (the
+> engine, the chunk store and the log are handed `BlockFile`s), except `hyper-block`'s own openers and `mantle-disk`'s
+> calibration scratch. So the store's files are opened by `slates_land::store_root`: the granted directory walked as
+> a landing target is (no symlink, no `..`, owned, on none of the daemon's mounts), checked against its `StoreGrant`
+> (device and inode), and every file created or opened as one plain name relative to its handle (`openat`,
+> `O_NOFOLLOW`), a new name made durable with the directory; `hyper-block`'s `DeviceFile::adopt` takes such a file
+> (local change 3). Tests: `slates-land --test store_root` 3/3. A store file is one `DeviceFile` for now; segmented
+> files over the root (mantle's answer to APFS's first-write stalls) are a performance item (GAPS).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
