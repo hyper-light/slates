@@ -300,6 +300,9 @@ pub enum ReportProgress {
   Refused(HttpAnswer),
   /// Refused after some of it was written: the connection ends there (`dav_method_report` aborts it).
   Broken,
+  /// Its walk waits for a text's piece the repository reads asynchronously (C2 stage B part 2): write what `out`
+  /// holds, fetch the piece and make it readable to the repository, then resume it again.
+  Waiting(crate::reads::Wanted),
 }
 
 impl Report {
