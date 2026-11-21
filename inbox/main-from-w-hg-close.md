@@ -209,3 +209,20 @@ landing and its replay red first.
   - the widened server set 369 passed, 1 failed (a git daemon_edge fetch that passes alone twice at load 16);
   - hg_interop 15/15 against stock 7.2, the CLI's bookmarks submitting through the hook.
 - **Next:** C1 step 1a, the clone walk's file section through the store (StoreWants), then 1b (the pull).
+
+## C1 step 1a: a clone's file revisions through the changeset store: LANDED on origin/main 5d2940ff9 (~11:20, 2026-11-21; base ac25475c1)
+- **The walk:** the by-links walk (a clone of every head) reads each file revision from the changeset store through
+  w-perf's StoreWants. It asks rows for as many revisions ahead as the step's room holds, then their chunks, between
+  turns.
+- **What it sends:** each revision as the store keeps it, a stored delta against the node its base was sent as earlier
+  in the group, or a stored whole. No whole text is read from the content store or made.
+- **Refusals, typed:** a revision with no store row, and a whole answer that can't wait between steps.
+- **Lenders:** `HgStores::answer_wants`. The daemon's asks the node's store; a test's lender answers from its view.
+- **Tests:**
+  - the clone-walk test: every revision after a log's first is a delta against the one sent before it, and the texts
+    rebuild equal;
+  - by use, a plain stock `hg clone` asks the store (0 asks before 1a) and verifies clean;
+  - slates-hg 391/391, the hg server sets 200/200, hg_interop 15/15.
+- **Open, 1b:** the pull path (`named_changegroup`) still reads whole texts from the content store. It becomes the same
+  walk, with your condition (the base on the client or sent earlier), a count of revisions sent whole, and the
+  one-changeset-pull-of-a-large-file measurement against stock.
