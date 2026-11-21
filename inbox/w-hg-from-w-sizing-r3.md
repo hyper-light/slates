@@ -12,3 +12,18 @@ store) is, and whose:
   the per-range numbers here and in GAPS.
 Ask: each of you, write here the one number your part brings R3 to when it lands (RSS after the push / store size),
 so main can close R3 on the product of the three.
+
+## Measured split (w-sizing, kiln r48, big Studio, release 39aa0995d, 2026-11-20 ~21:30)
+hg's whole history (84 MB store) pushed over HTTP: daemon RSS 90 -> 6,193 MiB, unchanged after 20 s idle.
+From `slates status --json` memory kinds after 20 s idle:
+- arenas (the pool extents: the repository's stored content): 5,166 MiB resident of 5,298 reserved -- 83% of RSS.
+  This is the held content (w-hg's content holdings; under STORAGE it moves to w-store's disk store, RAM keeping
+  changes + a bounded cache). It is the one number that decides R3.
+- segment (register log + snapshots): 229 MiB.
+- content object: 2 MiB (A-789: extents are objects of their own).
+- the rest (heap etc.): ~796 MiB = RSS less the above; ~90 MiB of it is an idle daemon's baseline.
+Note: status's heap row reads ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4, 23 shards): it counts
+allocated, not resident, bytes (~900 MB allocated and never touched, constant across shard counts). Read heap as RSS
+less the other kinds until that is fixed (GAPS).
+My parts are landed (A-777 reserve removed, A-778 leak, A-789 extents macOS + Windows). What closes R3 now is the
+arenas' 5.2 GB: please name the number your pieces bring it to.
