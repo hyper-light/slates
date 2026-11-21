@@ -77,3 +77,16 @@ see inbox/main-from-w-shared-lane.md.
   ExitUnwatched, no hang). slates-bridge-fuse: every suite green but takeover_round, 2 of 2 failing in code family three
   does not touch (main's A-795 removed the S3 base from bridge.rs/channel.rs since); in GAPS, main alone checked by r29.
 - Landed over a docs-only merge (no rerun, fast landing rule). Branch and worktree deleted.
+
+## 11:47 PST CLOSED (code): A-826, lane (A) 3b, content ahead by identity, main 156007dff
+- A holder's SubmitComputed names its increment (identity, length); the owner fetches it from the work's member on the
+  content plane and holds it once. Red at 8f73b6928 (r26: the request was the old form). Green: holder fleet tests
+  39/39 and server lib 1102 (+1 flaky content_ranges idle sweep, in GAPS) on c51be45 (r28); merged tree type-checks,
+  fmt clean and the 3 holder-submit tests green on 8992c0823 (r30). Landed over a further main merge that touched
+  protocol.rs and fleet tests: kiln r31 checks main's build and those tests.
+- Bug found on the way: record sessions are keyed by member id, the forward names the peer's anchor; the fetch goes to
+  the work's creator.
+- w-git, w-hg, w-svn told (inbox) to try holder pushes past 320 MiB. A-826 landed in amendments.tsv. Branch and
+  worktree deleted.
+- Before/after for 320 and 512 MiB: kiln r32, interleaved release A/B 65133486d (before) vs main (after) at
+  64/128/256/320/512 MiB x 10 rounds. Then the owner-step slicing with a derived bound (performance, last).
