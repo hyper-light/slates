@@ -33,3 +33,37 @@ texts; and a counter: whole texts made while streaming = 0.
 
 ## 2. One-changeset pull: profiling now (Studio, release 948711996, `sample` during the pull, a no-change pull and the
 stream). I'll name the step that scales with the history before proposing anything; it follows in this file.
+
+## 2. One-changeset pull: the step that scales with the history, NAMED (2026-11-21 ~01:00 PST)
+**Measured** (big Studio, release main 948711996, `--vcs-store`, hg-src imported; `sample` on the daemon, 1 ms; load
+15-31; logs `~/.cache/w-perf/prof/hgserve-20261121T083526/`): pull of one new changeset **24.95 s**; pull with nothing
+new 0.20 s (x4); stream clone 288 s. Discovery is cheap; the cost is the bundle's turns.
+**Where** (pull.sample, on-CPU under `vcs_http::hg::HgExchange::turn`, 6,500 samples): `serve::indexed::Indexed::new`
+5,281 (the served view rebuilt *every turn*), inside it `HgIndex::markers_len` 5,279 and `HgIndex::len`; and at the
+leaves `slates_vcs::Index::get` + `ContentStore::get` + `memcmp` (2,191 + 1,955 + 1,353 ...). The stream's sample is the
+same leaves (`ContentStore::get` 18,320, `Index::get` 16,598).
+**Why each lookup is O(history):** `Index::get` reads the tail, then **every run from the newest** (a fence search and a
+table read each) until one holds the key. The learned merge (`slates_vcs::rule`, `Index::compaction_due` /
+`compact`) has **no caller anywhere outside slates-vcs's own tests**: nobody reports `lookups_took` / `inserts_took` /
+`compaction_took` or asks `compaction_due`, so Mercurial's index never merges and an import leaves one run a seal. Every
+`get` (and `markers_len`'s and `len`'s logarithmic searches are a dozen gets each) walks them all, on every turn.
+(index_runs example running now for the numbers: seals after the hg-src import, runs a lookup visits, and the same after
+one `compact`.)
+**Fix I propose** (metadata in K/V, no content copied; survives C1, since your default (a) keeps HgIndex as the entry
+source): wire the learned rule for Mercurial's index on the owner shard. After each served turn the lender reports the
+turn's time as that batch's lookup time (`lookups_took`), and the import's and a push's groups report their inserts;
+then `compaction_due` -> `compact`, timed into `compaction_took`, before the view is lent again. Rent-or-buy keeps the
+run count logarithmic in what lookups paid for. Plus: `Indexed::new` once a fetch, not once a turn, if its view can be
+held across turns (it is rebuilt today because the lend is per turn).
+Files: `crates/server/src/vcs_store/hg_view.rs` (the lend and the report), a pass-through on `HgIndex`
+(`crates/hg/src/index.rs`), the import's and intake's group ends. **Are any of those C1's?** If not I build it red first
+(a lookup after N seals visits O(log N) runs, counted; a one-changeset pull's turns flat in history).
+
+## 3. The stream clone: building on your defaults (main 00:33), no open question
+(a) entries from HgIndex, chunks from the store; (b) a base's revision derived per stream from the log's own rows;
+(c) confirmed in your code: the Texts identity is the framed text verification rebuilt, so the stored delta is the
+chunk as it lies. Store side done locally (not yet landed): a push's several versions of one path are each an `H` row
+(they collided), and an `I` row finds a path's version by its node as it landed (its own base and place, keyed by path
+and node, so a text two paths share never lends one path's base to the other). A repository whose revisions have no
+rows (imported before your C1 step 3) answers `1\n` (stream not served; the client clones), one path, no whole-text
+fallback. Your C1 step 1 (texts through the store) can read through the same `StoreHandle::texts_by_tool` / `places`.
