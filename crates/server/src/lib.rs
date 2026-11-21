@@ -31,6 +31,8 @@
 
 // A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
 mod base_hints;
+#[doc(hidden)]
+pub mod g222_diag;
 mod base_wait;
 mod carry;
 pub mod catalog;
