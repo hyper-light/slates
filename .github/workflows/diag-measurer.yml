@@ -10,6 +10,7 @@ on:
 env:
   CARGO_TERM_COLOR: never
   ROUNDS: "3"
+  # Round 2 of the stamps run: the shard kept one level up while it runs (W90_SHARD_RAISED) against main's raise-for-the-wait.
 
 jobs:
   windows-84a-stamps:
@@ -85,13 +86,20 @@ jobs:
           print('%0A'.join(out))
           PY
           B=target/release/examples/edit_merge_bench.exe
+          all=""
           for round in $(seq 1 "$ROUNDS"); do
-            L="$W/loaded-r$round.log"; D="$W/stamps-r$round.tsv"
-            G222_DIAG="$(cygpath -w "$D")" timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L" 2>&1
-            st=$?
-            tails=$(grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b" "$L" | awk -F'\t' '{printf "%s=%.0fus ", $2, $4/1000}')
-            echo "::notice title=${{ matrix.os }} r$round::exit=$st $tails%0A$(python "$W/sum.py" "$D")"
+            case $round in 2) modes="raised normal";; *) modes="normal raised";; esac
+            for mode in $modes; do
+              unset W90_SHARD_RAISED; [ $mode = raised ] && export W90_SHARD_RAISED=1
+              L="$W/loaded-$mode-r$round.log"; D="$W/stamps-$mode-r$round.tsv"
+              G222_DIAG="$(cygpath -w "$D")" timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L" 2>&1
+              st=$?
+              tails=$(grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b" "$L" | awk -F'\t' '{printf "%s=%.0f ", $2, $4/1000}' | sed 's/merge\.//g; s/_f10_loaded_total//g')
+              ring=$(python "$W/sum.py" "$D" | tr '%' '\n' | grep -E "ring\.(queued|served)" | sed 's/^0A//' | awk '{print $1, $4, $6, $7}' | tr '\n' ' ')
+              all="${all}r$round $mode exit=$st: $tails| $ring%0A"
+            done
           done
+          echo "::notice title=${{ matrix.os }} raised A/B::$all"
       - name: Keep the logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

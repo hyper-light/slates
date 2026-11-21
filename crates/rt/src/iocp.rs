@@ -409,9 +409,15 @@ impl RaisedForWait {
   }
 }
 
+/// Diagnostic only (w-k90-win 84a, never main): `W90_SHARD_RAISED` keeps a shard one level up after its wait.
+fn w90_keep_raised() -> bool {
+  static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+  *KEEP.get_or_init(|| std::env::var_os("W90_SHARD_RAISED").is_some())
+}
+
 impl Drop for RaisedForWait {
   fn drop(&mut self) {
-    if self.0 {
+    if self.0 && !w90_keep_raised() {
       // A level something else set during the wait is left as it is.
       let _ = move_level(THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL);
     }
