@@ -36,3 +36,12 @@ Tests (macOS arm64, local; on the merged tree):
   `a_replica_taken_reaches_the_other_shards_with_its_owner_once`); fmt clean.
 - Red, with the rule off: both holder tests failed ("the work's id names B", "the work was made on the holder").
 A-697 is complete with this (parts a1-f). Please mark it met.
+
+## Landed 2026-11-20 ~19:40 PST: the lane's instrument (replication_bench's bulk row), not the lane item itself
+Commit 3a9e5bf21 on origin/main (squash of agents/w-shared-lane). The bulk row times one N MiB request on a warm
+session, one direction, and prints goodput, path MTU, congestion window and `send_stops` deltas. BENCHMARKS has the
+command and no numbers yet: the first run was at load 74. Focused check: built, and ran at 1 MiB locally (debug);
+fmt clean.
+The lane item (~200 MB/s) stays open, under performance in the close order. The lead: the congestion window bounds the
+lane on loopback (64 MiB: about 6,800 window stops), and the suspect is the UDP receive buffer left at the OS default
+(~85 datagrams; this Mac has dropped 11.4 M datagrams on full socket buffers since boot).
