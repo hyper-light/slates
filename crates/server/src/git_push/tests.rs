@@ -1582,7 +1582,7 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
 /// them by; a test's daemon is one node, whose content store already holds them, and the region's crossing is held by
 /// the async drivers' tests, [`homed_drive`]), and its changeset landed on the node's store for real, from a thread of
 /// its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked nothing.
-pub(crate) fn carry_blocking(state: &mut ShardState, push: &mut ReceivePack) {
+pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
   let Some(asked) = push.take_homing() else {
     return;
   };
@@ -1607,7 +1607,7 @@ pub(crate) fn carry_blocking(state: &mut ShardState, push: &mut ReceivePack) {
 
 /// The edge's carry as a test's async driver runs it ([`super::carry`]): the homing or the landing the push asked,
 /// handed back. Refused only where the shard's state is not lent.
-pub(crate) async fn carry_awaited(push: &mut ReceivePack) -> Result<(), String> {
+pub(crate) async fn carry_awaited<P>(push: &mut ReceivePack<P>) -> Result<(), String> {
   use crate::state::with_state;
   if let Some(asked) = push.take_homing() {
     let (origin, shards) =
