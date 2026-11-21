@@ -357,3 +357,9 @@
   reference(seq)}); refusal: batch.abandon + vcs_store::rebuild + release storing; (4) svn readers refused while
   importing (as hg_view.rs:346). Tests: imports export byte for byte, register names few changesets, recovery equal,
   crash before commit leaves nothing.
+- 2026-11-21 ~10:40 (date clock): P7 (3) / C2 stage C records side LANDED as A-822 e2410cb8b: an import lands batches
+  (one changeset + one register entry each, bounded by the import's admission, counted by cause), atomic (differs from
+  svnadmin load: a refusal names the last landed revision, SubversionLanded, contract 59; the same dump resumes,
+  reading held revisions through), no svn session while importing, ImportBatch::stage renumbers Copy ops. Owed: main's
+  git-2000 re-measure (time, peak), the A/B for A-820, the heap attribution for (2). Then (2), then KeptText.
+  Seen under load ~30: vcs_svn hook tests flake in the full suite, pass alone (15/15 in 4.7 s).
