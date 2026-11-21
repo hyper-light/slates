@@ -10597,7 +10597,7 @@ fn judge_submission(
         increment_bytes,
         increment: inc,
         applied,
-        verification: signed.verification.clone(),
+        verification: signed.verification,
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
@@ -11352,6 +11352,12 @@ fn canonical_declaration(
     .collect()
 }
 
+/// A work's changed files (each its held parts, none: removed) and its journal of ops.
+type ChangedWork = (
+  std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
+  Vec<VolumeOp>,
+);
+
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
 /// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
@@ -11359,18 +11365,9 @@ fn canonical_declaration(
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
-  (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
+  (changed, mut journal): ChangedWork,
   replacement: &[slates_ipc::protocol::WorkChange],
-) -> Result<
-  (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
-  Refusal,
-> {
+) -> Result<ChangedWork, Refusal> {
   use slates_ipc::protocol::WorkChange;
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
