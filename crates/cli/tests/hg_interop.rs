@@ -619,10 +619,12 @@ const STREAMING_LINE: &str = "streaming all changes";
 /// Goal 93 perf (main's ruling of 2026-11-21 02:31). A stream clone sends each revision as the changeset store keeps
 /// it, and the store keeps no revision of an imported history until w-hg's C1 step 3 lands imports as changesets, so
 /// such a repository must list no stream capability: stock 7.2 then clones plainly with its own warning, where it had
-/// aborted ("operation forbidden by server"). Do: over the HTTP edge, import a two-changeset history into one
+/// aborted ("operation forbidden by server"). Do: over the HTTP edge, import a two-changeset history (an empty file
+/// among its files) into one
 /// repository (`slates repository import`) and push the same history into another; `hg clone --stream` each. Expect the
 /// imported one's clone to succeed with 7.2's warning and no stream, and the pushed one's to stream as before, each
-/// clone holding the source's changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+/// clone holding the source's changesets and passing `hg verify` without a warning (the empty file's log streamed
+/// split left its `.d` out of the client's fncache, two warnings on hg-src's prefix). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly() {
@@ -652,6 +654,9 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_
   let source = format!("{}/source", scratch.path);
   hg_ok(&hg, &scratch.path, &["init", &source]);
   std::fs::write(format!("{source}/file"), "first\n").unwrap();
+  // An empty file too: 7.2 sends its revision against the null base as an empty delta, no hunk (hg-src's
+  // `mercurial/__init__.py` at its first revision; a stream refused it, the answer's body left empty).
+  std::fs::write(format!("{source}/empty"), "").unwrap();
   hg_ok(
     &hg,
     &source,
@@ -682,16 +687,21 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_
     );
     assert_eq!(code, 0, "clone --stream of {name}: {out}{err}");
     let said = format!("{out}{err}");
+    let (verified, verify_out, verify_err) = hg_in(&hg, &clone, &["verify"]);
+    let verify_said = format!("{verify_out}{verify_err}");
     (
       said.contains(STREAM_DISABLED_WARNING),
       said.contains(STREAMING_LINE),
       hg_nodes(&hg, &clone) == hg_nodes(&hg, &source),
+      (verified == 0 && !verify_said.contains("warning"))
+        .then_some(())
+        .ok_or(verify_said),
     )
   };
   assert_eq!(
     (clone_stream("imported"), clone_stream("pushed")),
-    ((true, false, true), (false, true, true)),
-    "(warned, streamed, whole) for the imported repository's clone, then the pushed one's"
+    ((true, false, true, Ok(())), (false, true, true, Ok(()))),
+    "(warned, streamed, whole, verified clean) for the imported repository's clone, then the pushed one's"
   );
 }
 

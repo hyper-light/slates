@@ -181,7 +181,10 @@
 > whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
 > stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
 > `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
-> kept such a revision bare). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> kept such a revision bare). An empty text comes with no hunk (an empty delta), sent as it is, and a log whose every
+> chunk is empty is sent inline, as 7.2 keeps it: at hg-src's scale the first refused the stream (an empty body, "unexpected
+> response from remote server: empty string", `mercurial/__init__.py`) and the second left two warnings in `hg verify`
+> (A/B r13 on 8968640c0; reproduced on hg's first 2987 changesets, which now stream and verify clean). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
 > the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
 > stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
 > warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by

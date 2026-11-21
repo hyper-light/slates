@@ -4,8 +4,9 @@
 //!
 //! **The shape.** `.hg/requires` names a store 7.2 makes by default without `share-safe`: `dotencode`, `fncache`,
 //! `generaldelta`, `revlogv1`, `sparserevlog` and `store`. Every log is a revlog version 1 with generaldelta, split (an
-//! index file of 64-byte entries and a data file), never inline: 7.2 reads either, and one shape keeps the renderer one
-//! path. Each revision is stored whole (its delta base itself, a full snapshot, which `sparserevlog` allows), its chunk
+//! index file of 64-byte entries and a data file), never inline but where the data file would be empty (every text
+//! empty): that log is inline, its index file alone, as 7.2 keeps it, since a client lists in its fncache the files it
+//! was sent and a split log missing its data file there fails `hg verify` (hg-src's `mercurial/__init__.py`). Each revision is stored whole (its delta base itself, a full snapshot, which `sparserevlog` allows), its chunk
 //! as 7.2's `revlog.compress` stores what it does not compress: `u` and the text, or the text itself when it is empty or
 //! begins with a NUL. Its entry holds the chunk's offset, the revision's flags, the chunk's and the text's lengths, the
 //! base, the link (a changeset's own number), the parents' numbers (-1 for none) and the node, all big-endian, the
@@ -46,6 +47,9 @@ const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevl
 const DECIMAL_BYTES: u64 = 20;
 /// Format: the index header: revlog version 1 with generaldelta (`FLAG_GENERALDELTA`, bit 17), big-endian.
 const HEADER: [u8; 4] = [0, 2, 0, 1];
+/// Format: the index header of a log whose every chunk is empty: [`HEADER`] with the inline flag (`FLAG_INLINE_DATA`,
+/// bit 16), as 7.2 keeps such a log (its data, none, inside the index file). Module docs, "The shape".
+const INLINE_HEADER: [u8; 4] = [0, 3, 0, 1];
 /// Format: a version 1 index entry's bytes: the node's field is 32 bytes, its last 12 zero.
 const ENTRY_BYTES: usize = 64;
 /// Format: the node field's padding after the node.
@@ -59,6 +63,8 @@ const UNCOMPRESSED: u8 = b'u';
 /// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
 /// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
 /// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`).
+/// An empty text comes with no hunk at all, an empty delta (7.2's `hg debugbundle --all`: an empty file's delta is of
+/// length 0), which is sent as it is: refused, it left hg-src's stream empty (`mercurial/__init__.py`'s first revision).
 const TRIVIAL_HUNK_BYTES: u64 = 12;
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
@@ -236,7 +242,11 @@ fn revlog(
     entry.write(&mut entries)?;
   }
   if let Some(header) = entries.get_mut(..HEADER.len()) {
-    header.copy_from_slice(&HEADER);
+    header.copy_from_slice(if data.is_empty() {
+      &INLINE_HEADER
+    } else {
+      &HEADER
+    });
   }
   Ok((entries, data))
 }
@@ -679,8 +689,10 @@ impl Streaming {
       }
     };
     // A revision against the null base is sent as its text alone: its place must be the trivial hunk and the text.
+    let whole_text =
+      row.place.len == 0 && text == 0 || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES);
     let chunk = sent_len(row)
-      .filter(|_| based || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES))
+      .filter(|_| based || whole_text)
       .ok_or_else(unreadable)?;
     let entry = Entry {
       offset,
@@ -697,7 +709,9 @@ impl Streaming {
     if rev == 0
       && let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len()))
     {
-      header.copy_from_slice(&HEADER);
+      // Once a log, at its first entry: inline where no revision has a chunk to send.
+      let no_data = stored.revisions.iter().all(|row| sent_len(row) == Some(0));
+      header.copy_from_slice(if no_data { &INLINE_HEADER } else { &HEADER });
     }
     Ok(Stage::Index(
       log,
@@ -819,10 +833,10 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
 }
 
 /// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a delta against
-/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]); none for a place too short to hold
-/// that hunk.
+/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]; an empty delta, an empty text's, as it
+/// is); none for a place too short to hold that hunk.
 fn sent_len(row: &StoredRevision) -> Option<u64> {
-  let sent = if row.base.is_some() {
+  let sent = if row.base.is_some() || row.place.len == 0 {
     row.place.len
   } else {
     row.place.len.checked_sub(TRIVIAL_HUNK_BYTES)?
@@ -831,8 +845,11 @@ fn sent_len(row: &StoredRevision) -> Option<u64> {
 }
 
 /// The text a delta against the null base carries ([`TRIVIAL_HUNK_BYTES`]): what follows its one hunk, which must
-/// replace bytes 0 to 0 with exactly the rest; none for anything else.
+/// replace bytes 0 to 0 with exactly the rest; an empty delta, an empty text's, as it is; none for anything else.
 fn text_after_trivial_hunk(delta: &[u8]) -> Option<&[u8]> {
+  if delta.is_empty() {
+    return Some(delta);
+  }
   let header = usize::try_from(TRIVIAL_HUNK_BYTES).ok()?;
   let (hunk, text) = (delta.get(..header)?, delta.get(header..)?);
   let words: Vec<u32> = hunk
