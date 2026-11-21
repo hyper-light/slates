@@ -1,3 +1,7 @@
+# 2026-11-21 14:25 (w-forming): IN GOAL 93's RESERVE (main 14:21): no runs. main runs vcs_concurrency's focused case
+# (hg on its MacBook, svn on the big Studio) and 85b's C3/P4 rounds; a red comes back to w-forming. Studio-4 scratch
+# deleted (kept: ~/.cache/w-forming-runs/takeover-stall-pr15-run1.log, cited by A-775's bug record; the clone).
+
 # 2026-11-21 ~12:00 (w-forming): NOT DONE. Goal 93 piece: vcs_concurrency.rs LANDED 7f1e5a13e (compiles clean),
 # focused case NEVER RUN -- BLOCKED: no reachable machine has stock svn 1.15 / hg 7.2 (kiln runners: none; Studio-4
 # none; Studios .local/-2 at 2 GB / 80 MB free, not answering; d1323898 dead); installs need Ada. Asked main
