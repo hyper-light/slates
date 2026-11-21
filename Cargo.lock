@@ -1922,6 +1922,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "hyper-block",
  "hyper-datagram",
  "hyper-seal",
  "libc",
@@ -1982,6 +1983,7 @@ dependencies = [
  "hyper-block",
  "mantle-crc",
  "mantle-engine",
+ "slates-hg",
  "slates-land",
  "slates-machine",
  "slates-rt",

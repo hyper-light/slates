@@ -8908,11 +8908,12 @@ fn record_work_change(
     entry: slates_wire::Wire::to_bytes(&entry),
   };
   let now = state.clock.monotonic_ns();
-  state
-    .db
-    .partition()
-    .check(&op, now)
-    .map_err(|e| refusal_of_db(&e))?;
+  state.db.partition().check(&op, now).map_err(|e| {
+    if matches!(e, slates_db::DbError::Capacity { .. }) {
+      report_first_work_log_refusal(state);
+    }
+    refusal_of_db(&e)
+  })?;
   crate::work_charge::grow(state, work, added)
     .map_err(|available| Refusal::BudgetExceeded { available })?;
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
@@ -8920,6 +8921,22 @@ fn record_work_change(
     return Err(refusal_of_db(&e));
   }
   Ok(())
+}
+
+/// Logs, once a process, what holds this partition's merge budget when a work's log is first refused at its cap
+/// (A-793 part 2; the debugging protocol's logging first): at 100,000 clients over the Linux kernel, 63,145 edits and
+/// 7,060 rebases were refused `TableAtCapacity` on the client node, whose work logs of about 130 bytes an edit could not
+/// have filled 373 MB a partition alone.
+fn report_first_work_log_refusal(state: &ShardState) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  let held = state.db.partition().merge_budget_held();
+  slates_machine::log_line!(
+    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?}",
+    state.shard
+  );
 }
 
 /// The `WorkRestated` record of `work` restated as `entry` (A-207): what an accepted submit or a rebase records.

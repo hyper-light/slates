@@ -2,7 +2,8 @@
 //!
 //! **A record** (all integers little-endian):
 //! - a header of [`HEADER_BYTES`]: magic `SLCS`, the format, the tool, a flags byte, then the repository, the
-//!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (each a `u64`), the
+//!   changeset's sequence in it, the sequence it was judged over, the grant, the work and the time (the repository a
+//!   `u128`, the rest each a `u64`), the
 //!   section count (`u16`), two zero bytes, and the CRC-32C of everything before it;
 //! - its sections, each a head of [`SECTION_HEAD_BYTES`] (the kind, three zero bytes, the length as a `u64`, the CRC-32C
 //!   of the section's bytes) followed by the bytes;
@@ -41,6 +42,8 @@ const U16: usize = size_of::<u16>();
 const U32: usize = size_of::<u32>();
 /// Format: a `u64` field's width.
 const U64: usize = size_of::<u64>();
+/// Format: a `u128` field's width (a repository's id: its creator host, owner partition and counter, A-515).
+const U128: usize = size_of::<u128>();
 /// Format: an identity's width (BLAKE3).
 const IDENTITY: usize = blake3::OUT_LEN;
 
@@ -53,7 +56,7 @@ const H_FLAGS: usize = H_TOOL + 1;
 /// Format: the header's repository, after the flags.
 const H_REPOSITORY: usize = H_FLAGS + 1;
 /// Format: the header's sequence, after the repository.
-const H_SEQUENCE: usize = H_REPOSITORY + U64;
+const H_SEQUENCE: usize = H_REPOSITORY + U128;
 /// Format: the header's judged-over sequence, after the sequence.
 const H_JUDGED: usize = H_SEQUENCE + U64;
 /// Format: the header's grant, after the judged-over sequence.
@@ -175,8 +178,8 @@ impl SectionKind {
 pub struct Header {
   /// The tool.
   pub tool: Tool,
-  /// The repository.
-  pub repository: u64,
+  /// The repository (slates' 128-bit repository id, A-515).
+  pub repository: u128,
   /// The changeset's sequence in its repository.
   pub sequence: u64,
   /// The sequence of the changeset it was judged over.
@@ -637,7 +640,7 @@ fn encode_header(header: &Header, out: &mut [u8; HEADER_BYTES]) {
   put_bytes(out, 0, &MAGIC);
   put_u16(out, H_FORMAT, FORMAT);
   put_bytes(out, H_TOOL, &[header.tool.byte()]);
-  put_u64(out, H_REPOSITORY, header.repository);
+  put_bytes(out, H_REPOSITORY, &header.repository.to_le_bytes());
   put_u64(out, H_SEQUENCE, header.sequence);
   put_u64(out, H_JUDGED, header.judged_over);
   put_u64(out, H_GRANT, header.grant);
@@ -660,7 +663,7 @@ fn decode_header(bytes: &[u8; HEADER_BYTES]) -> Option<Header> {
   }
   Some(Header {
     tool: Tool::from_byte(*bytes.get(H_TOOL)?)?,
-    repository: get_u64(bytes, H_REPOSITORY)?,
+    repository: get_array(bytes, H_REPOSITORY).map(u128::from_le_bytes)?,
     sequence: get_u64(bytes, H_SEQUENCE)?,
     judged_over: get_u64(bytes, H_JUDGED)?,
     grant: get_u64(bytes, H_GRANT)?,

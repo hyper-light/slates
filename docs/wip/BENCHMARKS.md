@@ -8830,6 +8830,56 @@ installs; diag-82's owner hooks found that tail (215,997 bytes at head 16,526). 
 diag-81 (`agents/live-durability-catchup-record`) was withdrawn on 2026-11-19: diag-84 supersedes it, and its "about
 100% of a CPU" reading had counted a window that began before the resume.
 
+### The catch-up on today's main: the pair against the pair reverted, interleaved (A-200; 2026-11-20, g227)
+
+**The question.** On the Nov 12 trees the pair caught a holder up slower than main did: 9.4–13.3 s on arm against
+2.2–2.4 s. Does that hold on today's main, and is the pair worth keeping?
+
+**The command.** `SLATES_TEST_CLI=1 SLATES_CATCH_UP_BACKLOG=20000 cargo test --release --locked -p slates-cli --test
+live_chaos -- --nocapture --test-threads=1 --exact a_resumed_holders_catch_up_beside_a_busy_volume`, run in ABBA order,
+4 runs each, a separate target directory each.
+
+**Trees.**
+- A: main with the flow fixed (ec1f2ab1, landed in b80f5699; d33d2a48 on GitHub, the same tree plus the diag workflow).
+- B: the same tree with the pair's three changes reverted (`agents/g227-catchup-baseline-2`, 837c3be2): `fold_reply`,
+  the per-entry retain bound, and `retains_after` without building.
+
+Both trees build the flow, but the scripts' up-front `cargo build --release --locked -p slates-cli --bin slates --tests`
+exited 101 on both GitHub runners for both trees. That build covers every test target, and some other target failed to
+build; the flow's own target built when it ran.
+
+**Machines.**
+- GitHub `ubuntu-24.04-arm` (aarch64) and `ubuntu-latest` (x86_64), 4 CPUs each, load about 2, 2026-11-20 23:20 UTC
+  (`diag-g227-catchup-2`; results on `diag-results/g227-catchup-2-{arm,x86}`).
+- Adas-Mac-Studio (Apple silicon, 32 CPUs), shared, load 9–49 (kiln, 2026-11-21 00:45 UTC).
+
+A Linux x86_64 leg on adacachy (load 72–77) did not finish its first release build in kiln's 4 hours, and gave no runs.
+
+| leg | A: catch-up, each run (s) | A: installs | B: each run |
+|---|---|---|---|
+| GitHub arm | 2.73 3.86 4.19 8.95 | 0 1 0 0 | timed out at 1,200 s, 4 of 4 |
+| GitHub x86 | 4.47 3.43 3.84 3.89 | 1 0 1 1 | timed out at 1,200 s, 4 of 4 |
+| Studio | 38.33 82.98 8.76 20.65 (load 10.7, 48.2, 29.0, 8.9) | 0 0 1 1 | 24.01 23.54 17.80 8.82 (load 14.4, 20.2, 15.5, 12.2); installs 1 2 1 2 |
+
+- **A's other figures.** Per MiB behind: 15.1–49.1 ms on GitHub arm, 19.1–25.2 ms on x86. The owner's two shards spent
+  442–1,247 CPU ticks over each catch-up (Linux).
+- **B's 20,000 writes with the holder stopped.** On GitHub they never finished inside 1,200 s, 8 of 8. On the Studio
+  they took 344, 1,134, 344 and 925 s, against A's 19.5, 42.9, 18.4 and 40.0 s.
+- **Neighbour volume during the catch-up, on the Studio.** A: 3,031–4,690 writes, p50 3.0–16.1 ms. B: 1,668–2,899
+  writes, p50 4.9–10.3 ms.
+
+**Reading.**
+- The arm gap of Nov 12 is gone on today's main. On GitHub's arm runner, A's best catch-up (2.73 s) sits in the old
+  main's 2.2–2.4 s range. Its median is about 4.0 s, under half the Nov 12 trees' 9.4–13.3 s.
+- Reverting the pair costs far more than any catch-up difference. Without the reply fold's fix, every reply of the
+  stopped holder clones its whole backlog, and once it resumes, the writes behind it crawl: 8 to 60 times A's time on
+  the Studio, and past 1,200 s on 4-CPU runners.
+- On the loaded Studio both trees' best catch-up is 8.8 s. A's two slowest runs were its two most loaded (48 and 11).
+- **Verdict:** the pair stays (already on main since 59ec7871). Reverting it is measured and rejected.
+- **Not pursued, recorded:** each exchange to a lagging holder is capped at one congestion window (`take_batch`), so a
+  catch-up runs at about a window a round trip. With the arm gap gone there is no measured cost to remove, so it is
+  noted here and in GAPS, not worked.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -16555,6 +16605,58 @@ All runs:
 | after | 1 GiB | 100,000 | 100 | 2 | 3,655 B | 2,310,144 B | 133 us |
 | after | 1 GiB | 100,000 | 100 | 3 | 3,441 B | 2,211,840 B | 130 us |
 
+## R9's loaded p99 on macOS: options 2 and 3 measured and rejected, main's nap kept (A-786, P2 closed; 2026-11-20 night, w-provision-gate)
+
+**The question (main, 20:03 PST).** Should the non-sleeping poll land? Option 3 lands it only where a shard keeps its
+core, and declines holds when it cannot. It lands only if all four hold against main:
+1. quiet CPU no higher than main's;
+2. loaded p999 no worse than main's;
+3. loaded p99 better;
+4. quiet p99 at or under R9's 50 µs in every round.
+
+Otherwise option 1 stands: main's nap.
+
+**The arms.** Both were built from one tree (origin/main 9070b9e35's merge), differing only in `crates/rt`:
+- **main:** origin/main's runtime.
+- **option 3:**
+  - `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait (the busy harvest never naps);
+  - a per-shard measure of whether it keeps its core while spinning (`core_kept`: each idle spin's wall time against
+    the thread's CPU time, decayed over the longest hold asked; it keeps its core while spinning through one window
+    loses less off the core than one wake);
+  - an idle turn that polls without sleeping while the shard keeps its core, and naps otherwise (macOS: `sleep(1 ns)`);
+  - holds declined while it does not keep its core.
+
+**Conditions.** `provision_bench` with `PROVISION_BENCH_LOAD=2`, release, on this MacBook (Apple M4 Max, 14 CPUs, 9
+shards), host load 2.7-21.7 (quiet for this machine). Three rounds interleaved, each the bench's three runs, all shown.
+
+| round, arm | quiet p50 µs | quiet p99 µs | quiet p999 µs | loaded p99 µs | loaded p999 ms | quiet CPU, thousandths of a core |
+|---|---|---|---|---|---|---|
+| 1 main | 43.3, 42.2, 42.1 | 143.7, 102.7, 112.5 | 481.9, 139.3, 142.7 | 334, 161, 1,507 | 2.54, 0.35, 2.12 | 1,677, 1,680, 1,698 |
+| 1 option 3 | 22.8, 20.1, 17.7 | 182.5, 46.6, 46.8 | 425.5, 79.3, 89.9 | 409, 463, 614 | 10.43, 2.16, 10.15 | 7,525, 8,575, 8,564 |
+| 2 main | 43.4, 42.1, 41.9 | 227.6, 92.3, 89.1 | 781.8, 134.3, 146.8 | 794, 1,273, 1,255 | 3.40, 2.43, 3.47 | 1,672, 1,667, 1,669 |
+| 2 option 3 | 19.6, 14.8, 15.6 | 204.4, 39.3, 82.3 | 509.0, 62.6, 129.6 | 474, 472, 695 | 11.22, 13.65, 4.52 | 5,729, 7,937, 7,764 |
+| 3 main | 42.8, 42.9, 42.8 | 102.4, 99.0, 101.2 | 225.6, 142.2, 129.9 | 413, 1,099, 1,349 | 4.20, 2.21, 2.25 | 1,662, 1,714, 1,642 |
+| 3 option 3 | 16.5, 15.0, 15.1 | 193.5, 36.1, 37.7 | 391.3, 76.8, 73.3 | 530, 736, 534 | 12.96, 10.92, 12.73 | 7,884, 9,957, 9,930 |
+
+**Verdict: option 3 fails all four.**
+1. Quiet CPU is 3.4-6.0 times main's. Per create it is about 120-170 core-µs against main's 70, so faster creates do
+   not explain it: the shards keep their cores quiet, so they true-spin and keep holds. A paced client (1 ms) costs the
+   same in both arms, 0.05-0.14 cores.
+2. The loaded p999 is 10.1-12.7 ms against main's 2.1-3.4 ms at the median.
+3. The loaded p99 is better in rounds 2 and 3 (0.47-0.53 against 1.10-1.25 ms) and worse in round 1 (0.46 against 0.33).
+4. The quiet p99 is 82.3 µs in round 2's median.
+
+**Option 2** (the immediate poll with the time-horizon turn estimate, landed nowhere) fails the same way: quiet 6.1-10.0
+cores and loaded p999 5.6-12.2 ms (the tables above, "the candidates" and "per hop").
+
+**Measured and rejected, both.** Main's nap stays. Kept here for whoever comes back to it:
+- the mechanism of the loaded p99: the busy harvest's nap between a forwarded reply's two tasks, 0.77-1.37 ms at the tail;
+- the mechanism of the candidates' p999: cross-shard hops to a shard that never sleeps and that macOS demoted, 7-29 ms;
+- that QoS user-interactive moves neither;
+- that on g222's edit-and-merge path the immediate poll alone emptied the 1 ms band (queued p99 1.05-1.17 ms -> 22-23
+  µs).
+
+The candidates' code is deleted with its branch (`agents/w-provision-gate-kqueue`, b01a0ef7b).
 ## What live shipping adds to a stable write, after A-396's holds: macOS, and main's regression since b402afc7c (85a; g228; 2026-11-20)
 
 **Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary>
@@ -16637,4 +16739,3 @@ against 2,614-3,096 µs, CPU over the stream a third lower. **Still open (GAPS):
 them during the stream, at the writes' expense): a status request still costs every shard a sweep of tens of GiB of
 address space, and an idle slice still delays the next message by up to half a step quantum. The live write's 50 µs goal
 needs no sweep armed by a plain status request at all.
-
