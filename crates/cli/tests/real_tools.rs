@@ -70,6 +70,10 @@ const ADOPTED_A_RESTART: u64 = if cfg!(windows) { 1 } else { 0 };
 /// Format: the C compilers the held compile runs, each where it is on the PATH (clang and gcc, as EdenFS's record
 /// names `#pragma once` for both; on macOS `gcc` is Apple's clang under that name), and `cc`, the system's own.
 const COMPILERS: [&str; 3] = ["clang", "gcc", "cc"];
+/// Shape: the longest one tool's step over the mount may run before the test calls the mount stalled: a cold
+/// `cargo build` of the fixture's one-function crate, the slowest step, takes seconds; five minutes is far past any
+/// loaded host's.
+const TOOL_WAIT: Duration = Duration::from_secs(300);
 /// Whether the flows build with `make` here: Unix's own tool (Windows ships none).
 const BUILDS_WITH_MAKE: bool = cfg!(unix);
 /// Format: the tools the flows drive on this platform.
@@ -312,11 +316,54 @@ fn fresh_dir(name: &str) -> PathBuf {
 }
 
 fn tool(dir: &Path, program: &str, args: &[&str]) -> Output {
-  Command::new(program)
-    .args(args)
-    .current_dir(dir)
-    .output()
-    .unwrap()
+  bounded(
+    Command::new(program).args(args).current_dir(dir),
+    &format!("{program} {args:?} in {dir:?}"),
+  )
+}
+
+/// Runs `command` to its end and gives its output, failing the test naming `what` if it runs past [`TOOL_WAIT`]: a
+/// tool over a stalled mount blocks in the kernel for good (on two Mac Studios, 2026-11-20 and -21, a fresh mount's
+/// first `opendir` never returned), and the test says so and ends rather than hang its run. The mount is `intr`, so the
+/// kill takes.
+fn bounded(command: &mut Command, what: &str) -> Output {
+  let mut child = command
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stdout = child.stdout.take().unwrap();
+  let mut stderr = child.stderr.take().unwrap();
+  let out = std::thread::spawn(move || {
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stdout, &mut bytes);
+    bytes
+  });
+  let err = std::thread::spawn(move || {
+    let mut bytes = Vec::new();
+    let _ = std::io::Read::read_to_end(&mut stderr, &mut bytes);
+    bytes
+  });
+  let started = std::time::Instant::now();
+  let status = loop {
+    if let Some(status) = child.try_wait().unwrap() {
+      break status;
+    }
+    if started.elapsed() > TOOL_WAIT {
+      let _ = child.kill();
+      let _ = child.wait();
+      panic!(
+        "{what} ran past {TOOL_WAIT:?}: the mount may be stalled (nfsstat -m names a stalled NFS mount; see GAPS, \
+         w-realtools' stalled first opendir)"
+      );
+    }
+    pause();
+  };
+  Output {
+    status,
+    stdout: out.join().unwrap(),
+    stderr: err.join().unwrap(),
+  }
 }
 
 fn text(output: &Output) -> String {
@@ -392,16 +439,17 @@ fn make_base(base: &Path, root: &Path) {
 /// directory, build jobs and flags are not the crate's, so they are taken out of its environment (incremental on, the
 /// dev profile's default).
 fn cargo_build(mount: &Path) -> Output {
-  Command::new("cargo")
-    .args(["build", "--offline"])
-    .current_dir(mount.join("krate"))
-    .env_remove("CARGO_TARGET_DIR")
-    .env_remove("CARGO_INCREMENTAL")
-    .env_remove("CARGO_BUILD_JOBS")
-    .env_remove("RUSTFLAGS")
-    .env_remove("CARGO_ENCODED_RUSTFLAGS")
-    .output()
-    .unwrap()
+  bounded(
+    Command::new("cargo")
+      .args(["build", "--offline"])
+      .current_dir(mount.join("krate"))
+      .env_remove("CARGO_TARGET_DIR")
+      .env_remove("CARGO_INCREMENTAL")
+      .env_remove("CARGO_BUILD_JOBS")
+      .env_remove("RUSTFLAGS")
+      .env_remove("CARGO_ENCODED_RUSTFLAGS"),
+    "cargo build of the fixture's crate",
+  )
 }
 
 /// The first build over the mount: make's object, cargo's crate, and git's index refreshed by a status.
@@ -680,13 +728,44 @@ fn held_compile(
 /// Lets the held compile go on (opening the FIFO for writing releases its include; closing it ends it) and expects it
 /// to compile: `sub/../inc/once.h`, read after the events, is the header it read before them.
 #[cfg(unix)]
-fn compiled_once(root: &Path, compiler: &str, compile: std::process::Child) {
-  std::fs::OpenOptions::new()
-    .write(true)
-    .open(gate_of(root, compiler))
-    .unwrap()
-    .write_all(b"/* the gate */\n")
-    .unwrap();
+fn compiled_once(root: &Path, compiler: &str, mut compile: std::process::Child) {
+  use std::os::unix::fs::OpenOptionsExt;
+  let started = std::time::Instant::now();
+  // Opened without blocking: a FIFO with no reader answers ENXIO, so a compiler that never reached its include (it
+  // ended, or it is held by a stalled mount) is named instead of waited on for good.
+  let mut gate = loop {
+    match std::fs::OpenOptions::new()
+      .write(true)
+      .custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed())
+      .open(gate_of(root, compiler))
+    {
+      Ok(gate) => break gate,
+      Err(refused) if refused.raw_os_error() == Some(libc::ENXIO) => {
+        if let Some(status) = compile.try_wait().unwrap() {
+          let ended = compile.wait_with_output().unwrap();
+          panic!(
+            "{compiler} ended ({status}) before it read its gate: {}",
+            text(&ended)
+          );
+        }
+        assert!(
+          started.elapsed() < TOOL_WAIT,
+          "{compiler} never opened its gate within {TOOL_WAIT:?}: the mount may be stalled"
+        );
+        pause();
+      }
+      Err(other) => panic!("opening {compiler}'s gate: {other}"),
+    }
+  };
+  gate.write_all(b"/* the gate */\n").unwrap();
+  drop(gate);
+  while compile.try_wait().unwrap().is_none() {
+    if started.elapsed() > TOOL_WAIT {
+      let _ = compile.kill();
+      panic!("{compiler} ran past {TOOL_WAIT:?} after its gate opened: the mount may be stalled");
+    }
+    pause();
+  }
   let compiled = compile.wait_with_output().unwrap();
   assert!(
     compiled.status.success(),
