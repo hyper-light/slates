@@ -219,7 +219,7 @@ impl crate::render::StoreWants for Streamed {
     self.answering.wants()
   }
 
-  fn give_rows(&mut self, rows: Vec<Option<crate::render::StoredRevision>>) {
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
     self.answering.give_rows(rows);
   }
 

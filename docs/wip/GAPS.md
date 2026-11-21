@@ -184,7 +184,13 @@
 > kept such a revision bare). An empty text comes with no hunk (an empty delta), sent as it is, and a log whose every
 > chunk is empty is sent inline, as 7.2 keeps it: at hg-src's scale the first refused the stream (an empty body, "unexpected
 > response from remote server: empty string", `mercurial/__init__.py`) and the second left two warnings in `hg verify`
-> (A/B r13 on 8968640c0; reproduced on hg's first 2987 changesets, which now stream and verify clean). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> (A/B r13 on 8968640c0; reproduced on hg's first 2987 changesets, which now stream and verify clean). The stream asks
+> the store by its room, never once a log: r20 (94c1696bb, hg-src, 15.66 s against stock's 0.44-0.49 s) found the
+> serving shard idle half the stream on about 12,000 asks (each log's rows in both passes, its chunks), each a turn with
+> its view made afresh, and `HgIndex::len` searched for every entry written; a rows ask now holds as many logs as the
+> step's room does and a chunk batch runs on into the logs held after it (`StoreHandle::texts_by_tool` takes many logs),
+> a log's length its held rows'. OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
+> against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
 > the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
 > stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
 > warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by

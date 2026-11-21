@@ -51,8 +51,9 @@ pub struct SectionAt {
 /// A section of a landing: its kind and its bytes, moved in.
 pub type Part = (SectionKind, Vec<u8>);
 
-/// The rows a texts-by-tool ask answers: each tool id's text identity and row, none where it has none.
-type TextsAnswer = Result<Vec<Option<(Identity, TextRow)>>, StoreError>;
+/// The rows a texts-by-tool ask answers: for each log asked, each tool id's text identity and row, none where it has
+/// none.
+type TextsAnswer = Result<Vec<Vec<Option<(Identity, TextRow)>>>, StoreError>;
 
 /// A request to the owner, with the channel its answer goes back on.
 enum Request {
@@ -124,8 +125,7 @@ enum Request {
   },
   TextsByTool {
     repository: u128,
-    path: Vec<u8>,
-    tool_ids: Vec<Vec<u8>>,
+    logs: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
     answer: Sender<TextsAnswer>,
   },
   Places {
@@ -234,13 +234,11 @@ impl fmt::Debug for Request {
         .field("from", from)
         .finish_non_exhaustive(),
       Request::TextsByTool {
-        repository,
-        tool_ids,
-        ..
+        repository, logs, ..
       } => f
         .debug_struct("TextsByTool")
         .field("repository", repository)
-        .field("tool_ids", &tool_ids.len())
+        .field("logs", &logs.len())
         .finish_non_exhaustive(),
       Request::Places { places, .. } => f
         .debug_struct("Places")
@@ -439,13 +437,17 @@ fn serve(
       }
       Request::TextsByTool {
         repository,
-        path,
-        tool_ids,
+        logs,
         answer,
       } => {
-        let found: Result<Vec<_>, StoreError> = tool_ids
+        let found: Result<Vec<Vec<_>>, StoreError> = logs
           .iter()
-          .map(|tool_id| store.text_by_tool(repository, &path, tool_id))
+          .map(|(path, tool_ids)| {
+            tool_ids
+              .iter()
+              .map(|tool_id| store.text_by_tool(repository, path, tool_id))
+              .collect()
+          })
           .collect();
         let _ = answer.try_send(found);
       }
@@ -731,22 +733,21 @@ impl StoreHandle {
       .await
   }
 
-  /// Each version of `path` in `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as it landed
-  /// ([`Store::text_by_tool`]), none for one no landed changeset named. A batch, so a stream asks once for a log's rows
-  /// (bounded by the log's length).
+  /// For each log of `logs` (a path and the versions its tool names, Mercurial's nodes), each version in `repository`
+  /// as it landed ([`Store::text_by_tool`]), in order, none for one no landed changeset named. One batch for many logs,
+  /// so a stream asks by its room, never once a log (r20 on hg-src: about 12,000 asks, the serving shard idle half the
+  /// stream); bounded by what the asker's room holds.
   pub async fn texts_by_tool(
     &self,
     repository: u128,
-    path: Vec<u8>,
-    tool_ids: Vec<Vec<u8>>,
-  ) -> Result<Vec<Option<(Identity, TextRow)>>, OwnerError> {
+    logs: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+  ) -> Result<Vec<Vec<Option<(Identity, TextRow)>>>, OwnerError> {
     let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
     self
       .ask(
         Request::TextsByTool {
           repository,
-          path,
-          tool_ids,
+          logs,
           answer,
         },
         answers,

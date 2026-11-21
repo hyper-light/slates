@@ -131,29 +131,47 @@ pub(crate) async fn answer_store_wants(
   while let Some(want) = wants.wants().cloned() {
     let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
     match (want, disk) {
-      (Want::Rows { log, nodes }, Some(disk)) => {
-        let asked = nodes.iter().map(|node| node.to_vec()).collect();
-        let Ok(found) = disk.texts_by_tool(repository, log, asked).await else {
+      (Want::Rows { logs }, Some(disk)) => {
+        let asked = logs
+          .iter()
+          .map(|(log, nodes)| {
+            (
+              log.clone(),
+              nodes.iter().map(|node| node.to_vec()).collect(),
+            )
+          })
+          .collect();
+        let Ok(found) = disk.texts_by_tool(repository, asked).await else {
           return false;
         };
         wants.give_rows(
           found
             .into_iter()
-            .map(|row| {
-              row.map(|(text, row)| StoredRevision {
-                text,
-                base: row.base,
-                place: StoredPlace {
-                  payload: row.place.payload,
-                  offset: row.place.offset,
-                  len: row.place.len,
-                },
-              })
+            .map(|log| {
+              log
+                .into_iter()
+                .map(|row| {
+                  row.map(|(text, row)| StoredRevision {
+                    text,
+                    base: row.base,
+                    place: StoredPlace {
+                      payload: row.place.payload,
+                      offset: row.place.offset,
+                      len: row.place.len,
+                    },
+                  })
+                })
+                .collect()
             })
             .collect(),
         );
       }
-      (Want::Rows { nodes, .. }, None) => wants.give_rows(vec![None; nodes.len()]),
+      (Want::Rows { logs }, None) => wants.give_rows(
+        logs
+          .iter()
+          .map(|(_, nodes)| vec![None; nodes.len()])
+          .collect(),
+      ),
       (Want::Chunks { places }, Some(disk)) => {
         let asked = places
           .iter()
