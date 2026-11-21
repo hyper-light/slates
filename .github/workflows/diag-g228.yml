@@ -4,13 +4,15 @@ name: diag-g228
 on:
   push:
     branches: ["diag-g228-*"]
+permissions:
+  contents: write
 jobs:
   live:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "main:HEAD"
+      ARMS: "split:63d19f184"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -24,6 +26,7 @@ jobs:
         shell: bash
         run: |
           set -u
+          exec > >(tee ../results.txt) 2>&1
           echo "runner $(nproc) cores, $(free -g | awk '/Mem/{print $2}') GiB, load $(cat /proc/loadavg)"
           for pair in $ARMS; do
             arm=${pair%%:*}; commit=${pair#*:}
@@ -46,8 +49,12 @@ jobs:
               for h in ["build","to_control","lane","exchange","to_owner","round","reply","holder"]:
                   n=d.get("hop."+h,0); ns=d.get("hop."+h+"_ns",0)
                   if n: out.append(f"{h} {ns/n/1000:.1f}")
-              for k in ["hold.declined","hold.answer","hold.exchange","hold.dispatches","hold.entries"]:
+              for h in ["reply_wake","reply_poll","reply_tail"]:
+                  n=d.get("hop."+h,0); ns=d.get("hop."+h+"_ns",0)
+                  if n: out.append(f"{h} {ns/n/1000:.1f}")
+              for k in ["hold.declined","hold.answer","hold.exchange","hold.dispatches","hold.entries","hop.reply_timed"]:
                   if k in d: out.append(f"{k}={d[k]}")
+              out += [f"{k.split('.')[-1]}={v}" for k,v in d.items() if "woken_by" in k]
               print(f"  {who}: "+", ".join(out))
           PY
           for r in $(seq 1 "$ROUNDS"); do
@@ -61,3 +68,12 @@ jobs:
               done
             done
           done
+      - name: publish the results to a branch
+        if: always()
+        shell: bash
+        run: |
+          git config user.name "diag-g228"; git config user.email "diag-g228@users.noreply.github.com"
+          blob=$(git hash-object -w ../results.txt)
+          tree=$(printf "100644 blob %s\tresults.txt\n" "$blob" | git mktree)
+          commit=$(git commit-tree "$tree" -m "diag results: ${GITHUB_REF_NAME} run ${GITHUB_RUN_ID}")
+          git push origin "$commit:refs/heads/diag-results/${GITHUB_REF_NAME}-${GITHUB_RUN_ID}"
