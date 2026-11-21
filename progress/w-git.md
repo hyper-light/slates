@@ -304,3 +304,7 @@
   creation refused + git leg of w-hg's test; v2 and sequence 0 removed; git tests onto test_store; StorePacks replay),
   then R2 (edge tests under load: push answer_until awaits skip the keepalive deadline; r139 repro 19/24).
   Studio-4: my old target, clone and worktree deleted (58 GiB free there after).
+- 2026-11-21 01:05 C5 part 2a LANDED cf6b3c98a: git refused without --vcs-store; 76 tests onto test_store; edge suite
+  StoredDaemon; v3_takeover/git_interop anchors with --vcs-store. Next: C5 part 2b (v2 + seq 0 removed, homing/landing
+  mandatory, StorePacks replay), then R2 (keepalive across answer_until's awaits: carry homing/landing,
+  names_committed_within; the edge tests fail under load; landing's flush makes it longer).

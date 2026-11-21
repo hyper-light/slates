@@ -41,3 +41,23 @@
   - versions 2 and sequence 0 removed;
   - git's tests moved onto `test_store`;
   - the replay's pack read a piece at a time through `StorePacks`.
+
+## C5 part 2a: a store-less daemon refuses git's creation, and git's tests are on the store: LANDED (2026-11-21 ~01:05 PST)
+- **Commit:** origin/main cf6b3c98a (branch agents/w-git-c5b, deleted).
+- **Runs:** the full slates-server lib suite (kiln r22, MacBook, tree 74eef05aa over 0e7120bdd and the later merges):
+  1052 passed, 4 failed. Three of the failures are R2's load-only edge tests: `a_long_history_pushed_...`,
+  `a_partial_clones_lazy_fetch_...` and `a_push_of_a_long_history_and_many_branches_...`. Two of those fail on main too,
+  and `a_long_history_pushed_...` passes alone (r20). The fourth "failure" is just the suite's result line. The four
+  `repository::tests` and the A-664 tests are green after 645937436. The format check is clean, and the two changed
+  CLI tests compile (2dd14a1af). The final merge touched none of the files I changed.
+- **The refusal:** `repository::no_store_for` now refuses git, `Unsupported` naming `--vcs-store`, as it refuses
+  Mercurial and Subversion. Red first: w-hg's `a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag`
+  now expects all three refused and none recorded. It failed on git's `GreenCreated` until the refusal landed (r15).
+- **Tests moved onto the one helper:** 76 tests across 16 modules move onto `crate::test_store`, using
+  `audit_on_stored_shard[_configured]`, `audit_daemon_stored`, `audit_daemon_of_stored` (new) and `create`. The
+  HTTP edge suite's daemons are now all `StoredDaemon`s; this also fixed the six Mercurial edge tests that fail on main
+  (w-hg told, inbox/w-hg-from-w-git-edge-suite.md). git_interop's and v3_takeover's anchors now pass `--vcs-store`.
+- **One test restated:** the rebuild test is now `t_a767_c5_a_rebuild_reads_a_records_names_back_from_the_nodes_store`.
+  It reads the changeset back from the node's store; the region-home read is owed a test of its own (in GAPS).
+- **C5 part 2b, next:** remove versions 2 and sequence 0, so a homing or landing that falls short refuses the push; and
+  read the replay's pack a piece at a time through `StorePacks`.
