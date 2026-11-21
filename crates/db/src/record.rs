@@ -95,6 +95,36 @@ pub struct Replayed {
   pub next_seq: u64,
 }
 
+/// Where a replay of a ring stands between its steps ([`LogRing::replay_step`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ReplayCursor {
+  /// The ring's head when the replay began.
+  head: u64,
+  /// The offset of the next record.
+  at: u64,
+  /// The records handed to `apply` so far.
+  records: u64,
+  /// The sequence the next record takes.
+  next_seq: u64,
+  /// Whether the walk ended at a record that did not verify.
+  torn: bool,
+  /// Whether the walk has ended.
+  done: bool,
+}
+
+impl ReplayCursor {
+  /// What the replay walked so far, as [`LogRing::replay`] reports it.
+  pub fn replayed(&self) -> Replayed {
+    Replayed {
+      records: self.records,
+      bytes: self.at.saturating_sub(self.head),
+      torn: self.torn,
+      verified_end: self.at,
+      next_seq: self.next_seq,
+    }
+  }
+}
+
 /// The ring words, read once.
 #[derive(Clone, Copy, Debug)]
 struct Words {
@@ -209,41 +239,71 @@ impl LogRing {
   /// first refusal of `apply`, which it returns. A record is dropped once applied, so a replay holds one decoded
   /// record, never the whole tail, and repeats for each the work its commit timed (its read, checksum, decode and
   /// apply; A-420). It collected every decoded record before applying the first, a tail's worth of live allocations
-  /// that no commit had measured.
+  /// that no commit had measured. The walk is [`LogRing::replay_step`]'s, taken to its end at once.
   pub fn replay(
     &self,
     segment: &AnchorSegment,
     from_seq: u64,
     mut apply: impl FnMut(&LogEntry) -> Result<(), DbError>,
   ) -> Result<Replayed, DbError> {
+    let mut cursor = self.replay_cursor(segment)?;
+    while !self.replay_step(segment, from_seq, &mut cursor, usize::MAX, &mut apply)? {}
+    Ok(cursor.replayed())
+  }
+
+  /// Where a replay begins: the ring's head (A-228 continued: a recovery replays its log in steps).
+  pub fn replay_cursor(&self, segment: &AnchorSegment) -> Result<ReplayCursor, DbError> {
     let w = self.words(segment)?;
-    let mut at = w.head;
-    let mut records = 0u64;
-    let mut next_seq = w.seq_base;
-    let mut torn = false;
-    while at < w.tail {
-      match self.record_at(segment, w, at, next_seq) {
+    Ok(ReplayCursor {
+      head: w.head,
+      at: w.head,
+      records: 0,
+      next_seq: w.seq_base,
+      torn: false,
+      done: false,
+    })
+  }
+
+  /// One step of a replay ([`LogRing::replay`]'s walk) from `cursor`: at most `records` records handed to `apply` (those
+  /// before `from_seq` passed over, each counted against the step too, since each is read and verified), the cursor
+  /// moved past them. Whether the walk has ended: at the ring's tail, or at a record that does not verify. A refusal of
+  /// `apply` is returned, the cursor left at the record refused. A recovery steps it between its slices, so a shard's
+  /// start yields within its log's replay however long the log is (A-228 continued).
+  pub fn replay_step(
+    &self,
+    segment: &AnchorSegment,
+    from_seq: u64,
+    cursor: &mut ReplayCursor,
+    records: usize,
+    apply: &mut impl FnMut(&LogEntry) -> Result<(), DbError>,
+  ) -> Result<bool, DbError> {
+    if cursor.done {
+      return Ok(true);
+    }
+    let w = self.words(segment)?;
+    let mut read = 0_usize;
+    while cursor.at < w.tail {
+      if read >= records {
+        return Ok(false);
+      }
+      read = read.saturating_add(1);
+      match self.record_at(segment, w, cursor.at, cursor.next_seq) {
         Ok((seq, entry, size)) => {
           if seq >= from_seq {
             apply(&entry)?;
-            records = records.saturating_add(1);
+            cursor.records = cursor.records.saturating_add(1);
           }
-          next_seq = seq.saturating_add(1);
-          at = at.saturating_add(size);
+          cursor.next_seq = seq.saturating_add(1);
+          cursor.at = cursor.at.saturating_add(size);
         }
         Err(_) => {
-          torn = true;
+          cursor.torn = true;
           break;
         }
       }
     }
-    Ok(Replayed {
-      records,
-      bytes: at.saturating_sub(w.head),
-      torn,
-      verified_end: at,
-      next_seq,
-    })
+    cursor.done = true;
+    Ok(true)
   }
 
   /// Decodes and verifies the record at `at`, expecting sequence `expect_seq`.

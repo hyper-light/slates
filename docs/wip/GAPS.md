@@ -4005,6 +4005,9 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
+> at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
+> change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
 
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
