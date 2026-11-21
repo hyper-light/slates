@@ -59,3 +59,6 @@ try:
         lab=lambda i: '<1us' if i==0 else f'{2**(i-1)}-{2**i}us'
         print('  harvests n',t,'| '+' '.join(f'{lab(i)}:{c}' for i,c in enumerate(h) if c), '| >=512us', sum(h[10:]), '>=1ms', sum(h[11:]))
 except (OSError,IndexError): pass
+if P:
+    w=sorted(int(r[4]) for r in P if len(r)>4 and int(r[4])<2**63)
+    if w: print(f'  shard kicked parks n {len(w)} kick->run p50/p99/p999/max us {pc(w,.5)/1e3:.0f} {pc(w,.99)/1e3:.0f} {pc(w,.999)/1e3:.0f} {w[-1]/1e3:.0f}; >=1ms {sum(1 for x in w if x>=1e6)}')

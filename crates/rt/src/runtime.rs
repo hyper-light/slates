@@ -429,6 +429,12 @@ fn run_worker(
       return Err(error);
     }
   };
+  // Diagnostic only (g222): G222_SLICE_NS=step asks the shard's own step quantum as its slice.
+  #[cfg(target_os = "linux")]
+  #[allow(clippy::disallowed_methods)]
+  if std::env::var("G222_SLICE_NS").ok().as_deref() == Some("step") {
+    crate::g222_set_slice("shard", ctx.quantum_ns());
+  }
   // The shard's CPU clock, for observers that count their budget in its own time (§4.14).
   crate::registry::record_cpu_clock(id);
   let _ = ready.send((id, Ok(())));

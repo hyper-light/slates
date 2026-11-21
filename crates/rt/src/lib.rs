@@ -142,6 +142,11 @@ pub mod g222_parks {
 pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64)) {
   use std::sync::atomic::Ordering::Relaxed;
   let n = g222_parks::N.fetch_add(1, Relaxed);
+  #[cfg(target_os = "linux")]
+  #[allow(clippy::disallowed_methods)]
+  if n > 0 && n % 20_000 == 0 && std::env::var_os("G222_SLICE_NS").is_some() {
+    eprintln!("g222 slice shard after {n} parks: held {:?}", g222_held_slice());
+  }
   if let Some(row) = g222_parks::ROWS.get(n) {
     row[0].store(timeout, Relaxed);
     row[1].store(waited, Relaxed);
@@ -152,41 +157,65 @@ pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64))
 }
 
 /// Diagnostic only (g222, never main): asks the calling thread for the EEVDF slice `G222_SLICE_NS` (A-224's
-/// `sched_runtime` for a `SCHED_OTHER` thread, its policy and nice kept, no privilege), and counts the answer.
+/// `sched_runtime` for a `SCHED_OTHER` thread, its policy and nice kept, no privilege).
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction, clippy::disallowed_methods)]
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn g222_slice() {
-  #[repr(C)]
-  #[derive(Clone, Copy, Default)]
-  struct SchedAttr {
-    size: u32,
-    policy: u32,
-    flags: u64,
-    nice: i32,
-    priority: u32,
-    runtime: u64,
-    deadline: u64,
-    period: u64,
-    util_min: u32,
-    util_max: u32,
+  if let Some(slice) = std::env::var("G222_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) {
+    g222_set_slice("shard", slice);
   }
-  let Some(slice) = std::env::var("G222_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) else {
-    return;
-  };
-  let mut attr = SchedAttr::default();
-  let size = std::mem::size_of::<SchedAttr>() as u32;
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct G222SchedAttr {
+  size: u32,
+  policy: u32,
+  flags: u64,
+  nice: i32,
+  priority: u32,
+  runtime: u64,
+  deadline: u64,
+  period: u64,
+  util_min: u32,
+  util_max: u32,
+}
+
+/// Diagnostic only (g222, never main): the calling thread's (policy, sched_runtime), as the kernel holds them.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction)]
+pub fn g222_held_slice() -> Option<(u32, u64)> {
+  let mut attr = G222SchedAttr::default();
+  let size = std::mem::size_of::<G222SchedAttr>() as u32;
   // SAFETY: diagnostic; pid 0 is the calling thread, `attr` is a repr(C) sched_attr of `size` bytes.
   let got = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
+  (got == 0).then_some((attr.policy, attr.runtime))
+}
+
+/// Diagnostic only (g222, never main): asks the calling thread for slice `slice` ns, and says what the kernel holds.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction, clippy::disallowed_methods)]
+pub fn g222_set_slice(who: &str, slice: u64) {
+  let mut attr = G222SchedAttr::default();
+  let size = std::mem::size_of::<G222SchedAttr>() as u32;
+  // SAFETY: as in `g222_held_slice`.
+  let got = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
   if got != 0 {
-    eprintln!("g222 slice: sched_getattr refused: {}", std::io::Error::last_os_error());
+    eprintln!("g222 slice {who}: sched_getattr refused: {}", std::io::Error::last_os_error());
     return;
   }
+  let before = attr.runtime;
   attr.size = size;
   attr.policy = 0;
   attr.runtime = slice;
   // SAFETY: as above; the kernel reads `size` bytes.
   let set = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
   if set != 0 {
-    eprintln!("g222 slice: sched_setattr({slice}) refused: {}", std::io::Error::last_os_error());
+    eprintln!("g222 slice {who}: sched_setattr({slice}) refused: {}", std::io::Error::last_os_error());
+    return;
   }
+  eprintln!("g222 slice {who}: asked {slice} ns, was {before}, held {:?}", g222_held_slice());
 }
