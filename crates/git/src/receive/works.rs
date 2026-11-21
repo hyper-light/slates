@@ -20,7 +20,7 @@
 //!   its push states the whole difference against that version's tree, so the new green holds
 //!   exactly the client's tree; in a repository whose default branch is unborn, over an empty
 //!   green. The push is not built here: the new green owes it, based at its own version 0, and is
-//!   made when first reached (P2, A-812, A-820). A create of a ref that names a green is a ref
+//!   made when first reached (P2, A-812, A-821). A create of a ref that names a green is a ref
 //!   that moved, as git's lock refuses a ref that exists (A-654, main's ruling of 2026-11-19);
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!

@@ -59571,7 +59571,7 @@ Applied in the same change to:
   landed (CLAUDE.md §5: a dead-even A/B does not land); the patch is kept outside the tree
   (`~/slates-work/w-fed-move-a817-rejected-drop.patch`, w-fed-move's machine) and its rule is not in the rebase section.
 
-### A-820 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
+### A-821 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
 Applied in the same change to:
 - `crates/git/src/receive/works.rs`: a create builds nothing; its entry carries the push it owes (`DeferredPush`),
   based at the new green's version 0; a create's turn reaches the greens its verdict will read.

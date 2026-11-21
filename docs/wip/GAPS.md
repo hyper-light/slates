@@ -531,11 +531,11 @@
 > A-774 part 3), reported to main.
 >
 > **A-812, P2's engine half (2026-11-21, w-rewrite-ops; main's order of 05:16, w-git's request). BUILT, engine and
-> server; git's half BUILT (A-820, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
+> server; git's half BUILT (A-821, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
 > and is made when first reached, through one door (`crate::green_ready`). The made green is the eager create's by
 > construction, and requests park until it is made. The full description and tests are in the design entry A-812.
 > Owed:
-> - (a) FIXED by A-820 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
+> - (a) FIXED by A-821 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
 >   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door (a command whose
 >   wait ends with the build refused is declined, not retried). Owed from it: a replayed owing green has not been made
 >   over a restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met

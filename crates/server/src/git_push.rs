@@ -69,7 +69,7 @@
 //! **A create** is made at the version of the member whose head its first parent is, where it can still be branched
 //! from (the default branch's first, then the members as they joined), else at the default branch's newest version
 //! (A-654 part 1), and appended as A-635's new branch made at that version, owing the push that moves it to the pushed
-//! tree (P2, A-820: `BranchChange::CreateDeferred`, made when first reached through `crate::green_ready`). While the
+//! tree (P2, A-821: `BranchChange::CreateDeferred`, made when first reached through `crate::green_ready`). While the
 //! default branch is unborn, a create's push is over an empty green, made from the default branch's green, which must be
 //! empty at its version 0: the default branch itself owes the push as its next version (`BranchChange::UpdateDeferred`),
 //! any other ref is a new branch made at that empty version. A default branch that holds files no git commit names
