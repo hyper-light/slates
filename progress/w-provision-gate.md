@@ -26,6 +26,13 @@
   stopped); kiln r3 (`macos exclusive`, `--record`) queued — when it ends, commit its ratchets.toml diff to main, then
   write inbox/main-from-w-provision-gate-close.md for C1. Worktree ~/slates-work/w-provision-gate-ci.
 
+- ~18:30: P2 in ~/slates-work/w-provision-gate-land (branch has b01a0ef7b kqueue; uncommitted: shard.rs idle_turn_rest =
+  macOS explicit sleep(1ns) per idle-spin turn). Saved variants in ~/.cache/w-provision-gate-fix/p2/ (held_turn.timew.rs +
+  shard.timew.rs = time-horizon estimator, unit tests 7/7, red vs old 400 ns). ab5 r1 (kqueue+timew): loaded p99 2.00 ->
+  0.46 ms but p999 13.0 -> 37.3 ms. ab6 running: p2main / p2fix(timew) / p2nap (kqueue + explicit macOS nap, old
+  estimator), 3 rounds, ~/.cache/w-provision-gate-arms/ab6.txt. r3 (macOS exclusive --record baseline) lost its runner,
+  requeued.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
