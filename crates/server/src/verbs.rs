@@ -2271,8 +2271,8 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   if !(is_forwardable_read(body) || is_forwardable_write(body)) {
     return None;
   }
-  // A work over a green another node owns is made here, on the client's own partition, and admitted by the green's
-  // owner (A-697 part a; with `WorkHome::on_holders` on, until its last piece).
+  // A work over a green another node owns and this node replicates is made here, on the client's own partition, and
+  // admitted by the green's owner (A-697 part a; the rule "replicated here", part f).
   if let RequestBody::CreateWork { green, .. } = body
     && crate::work_home::green_elsewhere(state, to_db_volume(*green))
   {
@@ -10783,7 +10783,7 @@ fn admit_work(
 }
 
 /// The engine a work's base reads are answered from (A-247): the green's own, on its owner shard; or, for a work on a
-/// holder node (A-697 part a, with `WorkHome::on_holders` on), this node's replica of the green, on the control shard
+/// holder node (A-697 part a; `work_home::green_elsewhere`), this node's replica of the green, on the control shard
 /// that holds it, which `work_home::answer_on_owner` has checked holds the work's base version.
 enum BaseEngine<'a> {
   Owned(crate::greens::GreenRef<'a>),
@@ -10806,7 +10806,7 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
   if let Some(engine) = state.greens.get(&green) {
     return Some(BaseEngine::Owned(engine));
   }
-  if !state.work_home.on_holders {
+  if !crate::work_home::green_elsewhere(state, green) {
     return None;
   }
   state
