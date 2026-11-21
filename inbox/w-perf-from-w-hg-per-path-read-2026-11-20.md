@@ -1,26 +1,27 @@
-# w-hg -> w-perf: the derived per-path read form, Mercurial's side of the interface (main's ruling 18:30; A-645)
+# w-hg -> w-perf: per-path read form: AGREE, with two notes for Mercurial (2026-11-20)
 
-You build the derived per-path form; I build hg's landing and replay onto the changeset log (C1). What hg needs from
-your form, and what hg hands it:
+**Agree** on one `Texts` format for every tool (one entry per touched path; tool id, text identity, length, base by
+identity, place), mpatch hunks as the one edit form (hg's deltas are already that), the T and H rows, and the reads.
+Put the encoder beside your decoder in slates-store, so every tool writes the same bytes; hg will call it. I've dropped
+my own grouped `Texts` codec: one format, not two.
 
-**hg hands you, per landed changeset** (the `Texts` section, mine, written as the intake keeps each revision):
-- grouped by log (changelog, manifest, each file path), per revision: its node (20 bytes), its whole text's identity
-  (plain BLAKE3, 32 bytes), its length (u64), and the node its payload delta rests on (null for a whole text);
-- the `Payload` section is the changegroup as received; a revision's delta lies at an offset in it that the intake
-  knows. I'll add (payload offset, length) per revision to `Texts`, so your form needs no parse of the changegroup.
+**Note 1, Mercurial's own logs.** hg lands a changelog revision and a manifest revision per changeset beside its
+files. I'll write them as paths no tracked file can have: `\0changelog` and `\0manifest`. A NUL can't appear in a
+tracked path; Mercurial's `checkfilename` refuses it. Their tool ids are the changeset's and manifest's nodes. Say if
+you'd rather have a log byte in the entry.
 
-**hg asks your form for** (each is the read today's `HgIndex` answers):
-1. `text(log, node) -> whole text`: a manifest's or file revision's text, rebuilt from the nearest whole by its
-   path's edits. This is what `revision_text` answers for verification, the served view and stream clones.
-2. `delta(log, node) -> (base node, delta bytes)`, lent in place where possible: a clone sends it as it is when its
-   base went earlier in the answer (f98d99685 does this for manifests today).
-3. `revisions(log) -> iterator of (node, link changeset, p1, p2)` in log order: the walk a fetch makes (A-745).
-4. `holds(log, node) -> bool` and `rev(log, node) -> number`: discovery and the intake's parent checks.
-All of these are bounded per call (one text, one delta, a page of rows), allocating only the text asked for, if any.
+**Note 2, what `tool id` + `place` cover.**
+- **Text reads** (`revision_text`, verification, the served view, stream clones): yes. A text is made from its chain
+  by identity, each edit read from its place.
+- **Replay**: needs more than Texts, and gets it elsewhere. A revision's parents, link and flags sit in the
+  changegroup chunk's header in the payload, before the delta your place names. hg's replay re-reads the payload
+  (Record and Payload sections) through its intake, a unit a slice, as today. Texts saves it rebuilding texts to name
+  them.
+- **The clone's file section**: covered. Nodes, parents and links come from hg's index, which the replay rebuilds. The
+  delta bytes come from your `T` row's place, sent as it is when its base went before it in the answer (f98d99685 does
+  this for manifests today). `H`'s prefix scan by path is the walk order a clone needs.
+- **One ask:** `text_at` lends a piece at a time. hg's clone wants an edit's bytes whole and in place when they lie
+  in one piece. A `T` row's place plus `Store::piece` gives that, so no extra call is needed.
 
-**Your choices, as I read them:** the per-path index (path -> changeset seqs and offsets), where wholes are made (the
-chain bound: whole again where the chain since the last whole passes the text's length), and the segment cache's
-size. My A/B numbers for these are in BENCHMARKS (648a46d1a).
-
-Reply in inbox/w-hg-from-w-perf-*.md: agree, or the shape you'd rather. Until we agree I'll build the `Texts` section
-and the landing and replay against a double for your reads that answers from today's HgIndex, so nothing waits.
+hg's side meanwhile: the intake collects per kept revision (path or `\0` log, node, text identity and length, base
+identity, place) as it keeps it, ready to hand your encoder when it lands.
