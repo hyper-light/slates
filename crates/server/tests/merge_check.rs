@@ -262,3 +262,96 @@ fn a_merge_check_publishes_nothing_and_a_resolution_is_bound_to_what_was_checked
   let many = run(MANY_SHARDS, "many");
   assert_eq!(one, many, "one shard and eight answer the same");
 }
+
+/// A-796 across a restart (the Codex agent's "lost Work observations after restart"). Do: a work's one edit, checked;
+/// the daemon restarted over its anchor (the work rebuilt from its log); one more edit; a resolution naming the check's
+/// stamp. Expect `StaleMergeView` and the work unchanged: a stamp taken before the restart never names the work after
+/// it changed, however many changes it took to get there.
+#[test]
+fn a_stamp_from_before_a_restart_never_names_the_work_after_it_changed() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-merge-check-restart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(ONE_SHARD));
+  let anchor = common::anchor::held_anchor("merge-check-restart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), common::anchor::source_of(&anchor)).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("restart-green", false).unwrap();
+  let (work, _) = client.create_work(green, "restart-work").unwrap();
+  client.edit(work, "a", 0, 0, b"one\n").unwrap();
+  let stamp = client.check_merge(work).unwrap().stamp;
+  drop(client);
+  first.stop();
+  let second = Daemon::start(&profile, config, common::anchor::source_of(&anchor)).unwrap();
+  let mut client = connect(&instance);
+  client.edit(work, "b", 0, 0, b"two\n").unwrap();
+  let resolved = client.resolve_merge(stamp, &[], Vec::new());
+  assert!(
+    stale(resolved.clone()),
+    "a pre-restart stamp named the changed work: {resolved:?}"
+  );
+  assert_eq!(client.read(work, "b", ReadAt::Head).unwrap(), b"two\n");
+  drop(client);
+  second.stop();
+}
+
+/// A-796's metadata rule (the Codex agent's `rebase_with`; AC-6.13). Do: the head removes a file; a work set its mode
+/// before it saw that; the work's check conflicts; a resolution keeps the mode and writes the file anew at the head.
+/// Expect the resolution to rebase (the kept mode is judged against the file the replacement establishes, not the one
+/// the head removed) and its submit to land the new file.
+#[test]
+fn a_kept_mode_on_a_file_the_resolution_writes_anew_is_not_a_conflict() {
+  let (daemon, instance) = daemon(ONE_SHARD, "meta");
+  let mut client = connect(&instance);
+  let green = client.create_green("meta-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "meta-seed").unwrap();
+  client.edit(seed, FILE, 0, 0, BASE).unwrap();
+  accepted(&mut client, seed);
+  let (work, _) = client.create_work(green, "meta-work").unwrap();
+  let (remover, _) = client.create_work(green, "meta-remover").unwrap();
+  client
+    .declare(
+      work,
+      slates_client::WorkOp::SetMode {
+        path: FILE.to_owned(),
+        mode: 0o100_755,
+      },
+    )
+    .unwrap();
+  client
+    .declare(
+      remover,
+      slates_client::WorkOp::Unlink {
+        path: FILE.to_owned(),
+      },
+    )
+    .unwrap();
+  let head = accepted(&mut client, remover);
+  let check = client.check_merge(work).unwrap();
+  assert!(
+    !check.conflicts.is_empty(),
+    "a mode on a removed file conflicts"
+  );
+  let resolved = client
+    .resolve_merge(
+      check.stamp,
+      &[],
+      vec![WorkChange::Edit {
+        path: FILE.to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: b"anew\n".to_vec(),
+      }],
+    )
+    .unwrap();
+  assert_eq!(resolved, Rebased::Rebased(head));
+  let merged = accepted(&mut client, work);
+  assert_eq!(
+    client
+      .read(green, FILE, ReadAt::Version { version: merged })
+      .unwrap(),
+    b"anew\n"
+  );
+  drop(client);
+  daemon.stop();
+}
