@@ -1503,3 +1503,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   RULINGS (to inboxes; kiln unreachable again at 01:08):
   - w-perf: merge first, then the stream's bytes. 155 runs: 11.8 us per lookup, 0.6 us after one compact.
   - R3's Windows restart-spin matrix on jupiter goes to w-interop (w-lint is offline with Studio-2).
+- 2026-11-21 01:09 PST RULINGS:
+  - w-hg C1: order 3, then 1, then 2. Each import segment's record holds its index rows by identity, not a replay through the intake, which would re-hash ~4.3 GB of texts at every restart. Condition: an oracle test that the stored rows equal the intake's derivation, on every 7.2 format, and a red that a restart's replay stays flat in history (texts rebuilt = 0).
+  - w-k90-win: kiln's CI lane frees at ~01:31; main dispatches from the MacBook if no run with f16212799 starts by 01:45.
+  LANDED (w-hg): 8cb10f986 (step 0: hg refused without a store) and d571ffbca (replay a piece at a time: 790 KB read in 14 fills, peak 194 KB).
+  NETWORK: the big Studio is now off kiln entirely (its 8 agents offline); Studio-2's agents are back.
