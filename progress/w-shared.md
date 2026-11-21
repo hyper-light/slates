@@ -306,3 +306,10 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   local output ~/slates-work/g308-scratch/run-p3k.out.
 - NEXT on green: fresh worktree off origin/main, `git merge --squash agents/g308-a664p3c`, runs bullet, one commit, push.
   Then piece: mode fix (test ~/slates-work/g308-scratch/mode-test-for-next-piece.rs).
+
+## 2026-11-20 ~16:55 PST: CLOSE LIST order (Ada). Closed: inputs at B (f26544b65), sleep-and-look 1 (c03a8953b), 2 (54b9d8b2b);
+  inbox/main-from-w-shared-close.md. Working now: A-697 f (completion), in ~/slates-work/w-shared-a697f.
+  Lane note for item 4 (local, load 74, NOT a reported number; base 5d29b9572, agents/w-shared-lane 3421049f1): path MTU
+  reached 9209 (the 1.1 KB-datagram hypothesis is refuted); 64 MiB stops: window ~6800, pacer ~600, budget ~7340, credit 0,
+  goodput 34-60 MB/s; 4 MiB 18-476 MB/s. The congestion window bounds the lane on loopback: look at loss and cwnd
+  collapse next, on a quiet machine.
