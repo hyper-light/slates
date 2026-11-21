@@ -405,3 +405,17 @@
   NEXT: red = git/git's 611 MB push lands (Studio, push_clone_repro.sh), then A/B vs stock git 10.77 s (main's runs);
   then C5 2b piece 3 on A-816 (red on agents/w-git-piece3-red). MacBook target trimmed 5.7 -> 5.4 GB; removed
   ~/.cache/w-git-wt, w-git-clone, w-git-diag (clean, nothing unpushed).
+- 2026-11-21 ~12:00 PST: main 08:20: r61 (git/git push red, release) queued by main; A/B after. Fold t_a614a's
+  wall-time bound into piece 3's series. PIECE 3 STARTED in ~/slates-work/w-git-p2 (from main 30d2e4100; red test
+  applied from cf289fb7d, uncommitted). Design:
+  * made_commit: Tool::Git (made_repository_of via vcs_store::paths::git_repository_of); defer -> commits::make_deferred.
+  * make_deferred: hold_preview(judged); spawn task holding the turn.
+  * task turn 1 (map): paths::stepped(&preview_engine, (store, vcs_stores), ...) through a new made_commit lend giving
+    the preview engine + &mut store/vcs_stores (disjoint fields). Change step if the head before has a map; whole over
+    the preview for a root's first version; else whole_build::start(head version) sliced first, poll, then the change.
+  * then commit_objects -> GitPush::admit_all (already a pack of whole objects) -> seal -> sealed.admit(moves).
+  * homing in the task: names_now/put_names + keep_for_region, pack_to_home/hold_for_record + keep_for_region,
+    landing_of + disk.land(...).await, sealed.landed_as(seq).
+  * step: made_commit::commit(state, pending, |state| sealed.record (v5) -> check -> super::commit(store) -> mutate).
+  * abandon before the step: drop the kept head (paths) so a retry builds again; release homed; sealed.abandon.
+  Later sub-pieces: the kill test; removing record_of/v2 and after_submit/staged/owed; t_a614a wall-time bound.
