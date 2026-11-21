@@ -175,3 +175,5 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - 3 device-pressure seam: NOT DONE.
 - 4 zero-alloc: idle purge DONE (2dc414a84); NFS reply path (results Vec + framed record Vec per request) NOT DONE.
 - Resuming 2 -> 3 -> 4, each red first, landed within ~30 min a piece.
+- A-839 LANDED b5249f883 (merge 6a6483574): macOS content slice without the arena range; one-shard content object 139,264 -> 106,496 MiB (big Studio, red then green). Slip: my A-number claim loop ran `git reset --hard` on my clean state clone (banned; nothing lost); removed from my scripts.
+- NEXT in item 2: image slots (2R), delta log (R), write log (R/4) need growable objects (recovery format) -- design first; then item 3 (pressure seam), item 4 (NFSv3 in-place framing).
