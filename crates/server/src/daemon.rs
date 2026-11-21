@@ -7805,7 +7805,6 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "barrier");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -7922,7 +7921,6 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "landed");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -8357,15 +8355,17 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    let before = first
+    first
       .observe(shard, |state| {
         let repository = crate::git_push::tests::git_repository(state, "kept");
         crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
         crate::vcs_store::paths::whole_build::settle(state);
-        windows(state)
       })
       .unwrap();
     first.publish_every_shard().unwrap();
+    // Read once the shard has had its turns since the pushes: a landed push gives its pack's holds back in turns after
+    // its landing (ccd07b58c), which a synchronous history holding the shard never lets run.
+    let before = first.observe(shard, windows).unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     // The successor's own shard: shard ids are the process's, and another test's daemon may take the first's.

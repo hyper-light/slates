@@ -234,12 +234,19 @@ fn lend_in<R>(
   if !held(state, id) {
     return None;
   }
+  let started = slates_rt::futures::now_ns();
   let made = super::lent_state(state, |state| {
     with_view(state, id, room, |view, _, room| step(view, room))
   });
   if made.is_none() {
     crate::fleet::count_refusal_in(state, UNMADE);
   }
+  // The lend's lookups over the store's own index, reported to its merge rule (`super::index_upkeep`).
+  super::index_upkeep::looked_up(
+    state,
+    id,
+    slates_rt::futures::now_ns().saturating_sub(started),
+  );
   made
 }
 

@@ -314,13 +314,10 @@ impl<L: ShardLender> Receive<L> {
           return Ok(true);
         }
         Answering::Turned => {
-          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
-          if due || *sent < given.len() && silent_until.is_some() {
-            return Ok(false);
-          }
-          turn.yield_holding().await;
           // The push's names and pack homed in the region, then landed on the node's store, before its record names
-          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top.
+          // them (A-724 piece 8c; A-767 C5), by a task of its own off the shard's step, awaited at the loop's top. Taken
+          // before the keepalive's return, so an ask made in the step the keepalive came due in is never left untaken
+          // (which refuses the push, C5 part 2b).
           if let Some(asked) = push.take_homing() {
             let (origin, shards) = lender
               .lend(|state| (state.shard, state.shards.clone()))
@@ -333,6 +330,11 @@ impl<L: ShardLender> Receive<L> {
             .map_err(|_| unavailable())?;
             *carrying = Some(outcome);
           }
+          let due = silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until);
+          if due || *sent < given.len() && silent_until.is_some() {
+            return Ok(false);
+          }
+          turn.yield_holding().await;
         }
         #[cfg(unix)]
         Answering::Hook(call) => {

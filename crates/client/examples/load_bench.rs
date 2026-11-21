@@ -2477,6 +2477,29 @@ fn main() {
     );
   }
   report_losses(&mut setup);
+  // The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
+  // client node's report above does not show. `--report-instances` names them (the load_scale test passes its servers).
+  for instance in arg("--report-instances")
+    .unwrap_or_default()
+    .split(',')
+    .filter(|name| !name.is_empty())
+  {
+    match connect(instance).and_then(|mut client| client.daemon_status()) {
+      Ok(report) => {
+        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
+            let total = moved.entry(refusal.kind.as_str()).or_default();
+            *total = total.saturating_add(refusal.count);
+          }
+        }
+        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+          println!("server_counter\t{instance}\t{name}\t{count}");
+        }
+      }
+      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
+    }
+  }
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();

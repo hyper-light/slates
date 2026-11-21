@@ -168,6 +168,16 @@ impl<'reads, R: Repository + ?Sized> Reads<'reads, R> {
   }
 }
 
+/// What [`TextStream`]'s gathering of its next string came to.
+enum Gathered {
+  /// The string.
+  String(Vec<u8>),
+  /// A piece the repository reads asynchronously is waited for (C2 stage B part 2).
+  Waiting(crate::reads::Wanted),
+  /// The repository does not hold the text.
+  Missing,
+}
+
 /// A file's text still to write: its identity and length, how much is written, and whether its end is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct TextStream {
@@ -181,6 +191,9 @@ pub(super) struct TextStream {
   ended: bool,
   /// The text's window its reads are in, made once and lent across its strings (main's order of 2026-11-20).
   cache: crate::reads::WindowCache,
+  /// The next string's bytes gathered before a wait for a piece the repository reads asynchronously (C2 stage B part
+  /// 2): kept, so the resumed read goes on from them and never needs a piece it let go again.
+  partial: Vec<u8>,
 }
 
 impl TextStream {
@@ -192,6 +205,7 @@ impl TextStream {
       at: 0,
       ended: false,
       cache: crate::reads::WindowCache::new(),
+      partial: Vec::new(),
     }
   }
 
@@ -207,8 +221,10 @@ impl TextStream {
       if self.at >= self.size {
         return self.finish(out, None);
       }
-      let Some(piece) = self.next_string(repository) else {
-        return self.finish(out, Some(&Failure::corrupt()));
+      let piece = match self.next_string(repository) {
+        Gathered::String(piece) => piece,
+        Gathered::Waiting(wanted) => return Ok(Progress::Waiting(wanted)),
+        Gathered::Missing => return self.finish(out, Some(&Failure::corrupt())),
       };
       write(&Value::String(&piece), out)?;
       let written = u64::try_from(piece.len()).unwrap_or(u64::MAX);
@@ -220,23 +236,38 @@ impl TextStream {
     Ok(Progress::Done)
   }
 
-  /// The next string: [`STRING_BYTES`] of the text, or what is left of it, gathered from the green's pieces; `None`
-  /// when the green does not hold them.
-  fn next_string<R: Repository + ?Sized>(&mut self, repository: &R) -> Option<Vec<u8>> {
+  /// The next string: [`STRING_BYTES`] of the text, or what is left of it, gathered from the green's pieces into
+  /// [`TextStream::partial`]; a wait for a piece the repository reads asynchronously, the bytes gathered kept; missing
+  /// where the repository does not hold it.
+  fn next_string<R: Repository + ?Sized>(&mut self, repository: &R) -> Gathered {
     let left = self.size.saturating_sub(self.at);
     let want = usize::try_from(left).map_or(STRING_BYTES, |left| left.min(STRING_BYTES));
-    let identity = self.identity.as_ref()?;
-    let mut piece = Vec::with_capacity(want);
-    while piece.len() < want {
-      let offset = self.at.checked_add(u64::try_from(piece.len()).ok()?)?;
-      let held = repository.text_in(identity, offset, &mut self.cache)?;
-      let take = held.len().min(want.saturating_sub(piece.len()));
-      if take == 0 {
-        return None;
-      }
-      piece.extend_from_slice(held.get(..take)?);
+    let Some(identity) = self.identity else {
+      return Gathered::Missing;
+    };
+    while self.partial.len() < want {
+      let Some(offset) = u64::try_from(self.partial.len())
+        .ok()
+        .and_then(|read| self.at.checked_add(read))
+      else {
+        return Gathered::Missing;
+      };
+      let Some(held) = repository.text_in(&identity, offset, &mut self.cache) else {
+        if repository.fetchable(&identity, offset) {
+          return Gathered::Waiting(crate::reads::Wanted {
+            text: identity,
+            offset,
+          });
+        }
+        return Gathered::Missing;
+      };
+      let take = held.len().min(want.saturating_sub(self.partial.len()));
+      let Some(run) = held.get(..take).filter(|run| !run.is_empty()) else {
+        return Gathered::Missing;
+      };
+      self.partial.extend_from_slice(run);
     }
-    Some(piece)
+    Gathered::String(std::mem::take(&mut self.partial))
   }
 
   /// The text's end: the empty string, then the second response, `( success ( ) )`, or the refusal.

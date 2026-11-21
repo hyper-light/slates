@@ -57759,8 +57759,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > store is `crate::test_store` (main's ruling 1's helper). Part 2a (2026-11-21): a daemon without `--vcs-store`
 > refuses a git repository's creation, `Unsupported` naming the flag, as it refuses Mercurial's and Subversion's (one
 > rule for the three tools), and git's tests run on store-backed daemons through that helper; a rebuild on a node whose
-> store holds the changeset reads it from there, not from the region. Owed (part 2b): versions 2 and a sequence of 0
-> gone (a homing or landing that falls short refuses the push); the replay's pack read a piece at a time through
+> store holds the changeset reads it from there, not from the region. Part 2b piece 1 (2026-11-21): a client's push
+> writes version 5 alone, any shortfall of its homing or landing (or names changed since the homing) refusing it
+> `Unlanded` for its client's retry; an append that brings no object names none. Piece 2: an ask no edge takes refuses
+> the push as well, so a client's push never writes version 2. Owed: server-made commits (A-664) still write version 2
+> until they take the deferred submit's landing order (piece 3); the replay's pack read a piece at a time through
 > `StorePacks`.
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
@@ -57855,6 +57858,27 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `land_then_record` runs). Recovery applies only the sequences the register names (decision 2), as C4's replay already
 > did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
 > hg test on the helper. Git's create follows as its C item lands.
+
+> **Status (2026-11-21, C1: a changeset replayed from its payload a piece at a time; R2's replay half).** A replay
+> holds no payload whole. `slates_hg::framing` is the one walk of a changegroup's chunks (7.2's `changegroup.py`
+> order), over a `Source` that answers a range or `Wanted`: a slice never wants (a push's bundle, a whole decoding,
+> which counts in one walk and builds in a second, charged exactly between), and a `Window` holds a forward run its
+> driver fills. A step reads only from where it began and changes nothing on a want, so the driver lets go of what is
+> before the want and steps again. The intake reads each delta through it (`Stepped::Wanted`; a file group opens in
+> a step of its own, its path kept), and `record::Replay::begin_sectioned` / `step_sectioned` frame a changeset's
+> payload, then take it. The server fills the window from `StoreHandle::piece` (`vcs_store::fill_window`) for both
+> recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
+> fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
+
+> **Status (2026-11-21, C1 step 3, first part: an import written as a push's changegroup).** `slates_hg::import::emit`:
+> as the import walks a repository's revlogs (changelog, manifest log, each file log: a changegroup's order), it
+> writes each revision as its revlog stores it, the chunk against its delta parent (7.2's `deltaparent`: none for a
+> full snapshot, the base under generaldelta, else the revision before), a full snapshot as its text against the null
+> base, so nothing is diffed or rebuilt to write it. The stream is cut into segments of at least a bound, only between
+> chunks, each naming its texts (identity, length, delta parent's identity, place) as a push's `Texts` section does.
+> The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
+> (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
+> replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58865,3 +58889,19 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   build step (0.2 to 1.9 s) are each one control-shard step, so the beat is late; and a retry after a real stall
   still re-sends the content. Next: the content placed ahead and stored once by identity, the record naming it rather
   than holding it, so the owner's durable step is small.
+
+### A-801 — A green owner's asks counted by kind and its answers timed by kind; the load harness reports the server nodes' merge counters (2026-11-21, w-fed-move, goal 86b; main's order 00:48 PST, the throughput walls; A-247, A-797)
+- **Why.** At 100,000 clients on one primary and two replicas the green's owner was asked 10,141,852 times (about a
+  hundred asks a client) and verdicts held at 153 a second, but no counter named which asks or where the owner's time
+  went, and the load harness printed only the client node's counters, while the owner's work is on the primary.
+- **Change.** `crates/server/src/work_home.rs`: every ask is counted by its kind beside the total
+  (`merge.work.asked_owner.<files|lengths|page|sizes|verdict|rebase|admit|name>`), and the owner times each answer by
+  kind (`merge.work.answered.<kind>`, `..._ns`). `crates/client/examples/load_bench.rs`: `--report-instances` prints
+  each named node's merge counters (`server_counter` rows); `crates/cli/tests/load_scale.rs` passes its three servers.
+- **Measured** (release, in-process daemon, this Mac Studio, 2026-11-21 ~01:00, the kernel's `kernel/` directory, 754
+  files, 1,000 clients, one round, `--per-connection 32 --hot-files 300`, oracle clean, 6,040 verdicts a second):
+  17,545 asks, 17.5 a client. By kind: lengths 7,736 (2.6 µs each to answer), files 3,173 (5.1 µs), verdict 2,458
+  (41.2 µs), rebase 2,256 (17.9 µs), admit 968 (1.6 µs), name 954 (5.6 µs). The owner spends about 185 ms answering
+  in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
+  and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
+  works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.

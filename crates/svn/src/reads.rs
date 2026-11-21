@@ -424,6 +424,25 @@ pub trait Repository: Contents {
   ) -> Option<std::borrow::Cow<'a, [u8]>> {
     self.text(identity, offset)
   }
+
+  /// Whether a read of the text `identity` from `offset` that [`Repository::text_in`] answered none for is a piece the
+  /// source reads asynchronously from a store it does not hold in memory (C2 stage B part 2: the node's changeset store,
+  /// read through its owner), so the reader waits for it ([`Wanted`]) rather than fails: none of a source that holds
+  /// every text it names in memory, the default.
+  fn fetchable(&self, _identity: &ContentIdentity, _offset: u64) -> bool {
+    false
+  }
+}
+
+/// A piece of a text a reader waits for (C2 stage B part 2): its source reads it asynchronously
+/// ([`Repository::fetchable`]); the reader's caller fetches it, makes it readable to the source, and steps the reader
+/// again, which reads on from where it waited, nothing it made lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wanted {
+  /// The text.
+  pub text: ContentIdentity,
+  /// Where in it the read waits.
+  pub offset: u64,
 }
 
 /// The one window a reader of a text is in, made once from its delta and lent across the reader's steps (main's order

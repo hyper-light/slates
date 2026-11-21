@@ -344,15 +344,25 @@ pub(crate) fn land_blocking(
   header: slates_store::log::Header,
   parts: Vec<slates_store::owner::Part>,
 ) -> bool {
+  land_answered_blocking(disk, header, parts).is_ok()
+}
+
+/// [`land_blocking`]'s landing with the store's answer: where it was committed, or why the owner refused it (`Gone` for
+/// a waiting thread that could not run it).
+pub(crate) fn land_answered_blocking(
+  disk: StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
   std::thread::scope(|scope| {
     scope
       .spawn(move || {
         waiting_runtime()
-          .block_on(async move { disk.land(header, parts).await.is_ok() })
-          .unwrap_or(false)
+          .block_on(async move { disk.land(header, parts).await })
+          .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
       })
       .join()
-      .unwrap_or(false)
+      .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
   })
 }
 
