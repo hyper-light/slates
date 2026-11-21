@@ -2833,10 +2833,10 @@
 > a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
 > shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
 > (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
-> nothing keeps one in RAM but the green's head and a hook view's pins. Left for main's call (w-svn, inbox b2b-p4):
-> the records' `KeptText`, `Record::Deltified` and the deltify APIs (`deltify_after`, `deltify_candidates`,
-> `kept_range`, `check_deltified`) now serve only logs written before P4a; retiring them makes such logs unreplayable.
-> Stage C,
+> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-817, main 09:20): the deltify record
+> and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
+> (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
+> standing alone, which a daemon's no longer reach. Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in

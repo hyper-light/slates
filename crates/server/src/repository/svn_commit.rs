@@ -22,7 +22,7 @@
 //!
 //! **A record that moves no version** ([`record`], A-652 part 3): the repository's UUID, or a revision's properties set
 //! whole, as an import names a repository that holds no revision but 0 by its stream's UUID and sets revision 0's
-//! properties to its stream's ([`land_record`]; a lock verb's entries and a deltified text too). Checked against the
+//! properties to its stream's ([`land_record`]; a lock verb's entries too). Checked against the
 //! records first (a revision they hold, the room), landed on the store, checked again, its growth charged, one entry
 //! holding its reference alone and moving no green, then applied.
 //!
@@ -762,7 +762,7 @@ pub(crate) fn release_texts(
 }
 
 /// The step for a record that moves no version (module docs; A-652 part 3): `record`, the repository's UUID, a
-/// revision's properties set whole, a lock verb's entries or a deltified text, landed on the node's store and committed
+/// revision's properties set whole or a lock verb's entries, landed on the node's store and committed
 /// on `repository`'s register by `principal`, its owner ([`landed`]). A creation or a revision is refused `Corrupt`: a
 /// creation is made once, by `CreateRepository`, and a revision moves the green ([`land_revision`]).
 pub(crate) async fn land_record(
@@ -833,7 +833,6 @@ fn record_checked(
       bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
     }
     Record::Uuid(_) | Record::Locks(_) => 0,
-    Record::Deltified { delta, .. } => u64::try_from(delta.len()).unwrap_or(u64::MAX),
     Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
   };
   if !crate::vcs_store::lend_svn(state, repository, brought) {
@@ -867,9 +866,6 @@ fn record_growth(
       properties,
     } => records
       .check_revision_properties(*revision, properties)
-      .map_err(Uncommitted::Step),
-    Record::Deltified { text, base, delta } => records
-      .check_deltified(text, base.as_ref(), delta)
       .map_err(Uncommitted::Step),
     Record::Created { .. } | Record::Revision(_) => Err(corrupt()),
   }
