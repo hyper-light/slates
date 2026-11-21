@@ -133,8 +133,9 @@ fn check_brought(intaken: &Intaken, verified: &Verified, steps: u64) {
 }
 
 /// A-720 (the working set). Do: find the least admission the whole verification takes stock 7.2's bundle within, and the
-/// least the intake does. Expect the intake's less: what it holds across steps is a node or two a revision, and each
-/// step's texts are let go when it ends, where verification holds every arrived text at once.
+/// least the intake does. Expect the intake's less, apart from the `Texts` section it writes for the landing (A-767 C4,
+/// the changeset's own section, O(revisions) as the record is): what it holds across steps is a node or two a
+/// revision, and each step's texts are let go when it ends, where verification holds every arrived text at once.
 #[test]
 fn the_intake_holds_less_than_verification_whole() {
   let part = stock();
@@ -151,6 +152,13 @@ fn the_intake_holds_less_than_verification_whole() {
     high
   };
   let verifying = least(&|room| verify(&part, &Nothing, &mut Admission::new(room)).is_ok());
+  let texts = {
+    let mut store = store();
+    let mut index = HgIndex::new();
+    let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+    fork.release(&mut store).unwrap();
+    intaken.texts_charged()
+  };
   let taking = least(&|room| {
     let mut store = store();
     let mut index = HgIndex::new();
@@ -161,7 +169,8 @@ fn the_intake_holds_less_than_verification_whole() {
       }
       Err(_) => false,
     }
-  });
+  })
+  .saturating_sub(texts);
   assert!(
     taking < verifying,
     "the intake took {taking}, verification {verifying}"
@@ -372,6 +381,63 @@ fn the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it() {
     rebuilt, 0,
     "manifest predecessors rebuilt from their chains"
   );
+  for index in [fork, index] {
+    index.release(&mut store).unwrap();
+  }
+}
+
+/// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
+/// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
+/// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
+/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
+#[test]
+fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
+  use std::collections::BTreeMap;
+  let part = stock();
+  let verified = verify(&part, &Nothing, &mut room()).unwrap();
+  let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+  let mut paths: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+  for arrived in &verified.changesets {
+    texts.insert(arrived.node, arrived.text.clone());
+    paths.insert(arrived.node, super::CHANGELOG_PATH.to_vec());
+  }
+  for arrived in &verified.manifests {
+    texts.insert(arrived.node, arrived.text.clone());
+    paths.insert(arrived.node, super::MANIFEST_PATH.to_vec());
+  }
+  for (path, revisions) in &verified.files {
+    for arrived in revisions {
+      texts.insert(arrived.node, arrived.text.clone());
+      paths.insert(arrived.node, path.clone());
+    }
+  }
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let mut deltas: BTreeMap<Node, (Node, &[u8])> = BTreeMap::new();
+  for range in [&decoded.changelog, &decoded.manifests] {
+    for revision in decoded.group(range) {
+      deltas.insert(revision.node, (revision.base, revision.data));
+    }
+  }
+  for group in &decoded.files {
+    for revision in decoded.group(&group.revisions) {
+      deltas.insert(revision.node, (revision.base, revision.data));
+    }
+  }
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  assert_eq!(u64::try_from(intaken.texts.len()).unwrap(), intaken.kept);
+  for kept in &intaken.texts {
+    let text = &texts[&kept.node];
+    assert_eq!(kept.identity, *blake3::hash(text).as_bytes());
+    assert_eq!(kept.len, u64::try_from(text.len()).unwrap());
+    assert_eq!(kept.path, paths[&kept.node]);
+    let (base, data) = deltas[&kept.node];
+    let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
+    assert_eq!(kept.base, base_identity, "{:?}", kept.node);
+    assert_eq!(&part.payload[kept.place.clone()], data);
+  }
   for index in [fork, index] {
     index.release(&mut store).unwrap();
   }
