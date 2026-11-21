@@ -305,3 +305,6 @@
     weaker suspect. Stronger: the test's members are `local ^ (n << 16)` from a per-boot random host id, and its first
     assertion needs one of them outside the role rule at scatter 3, which placement over those ids may not give. To
     count: run it a few hundred times alone and in the parallel suite, capture which assertion fails.
+- 2026-11-21 landed (ordinary commits, focused test each): P1 653f1fa90 (main 60cee837a), start_shard 96df5abcd (main
+  984c8590c), t_a752 963ef2675 (main 26db6c2a8); close notes in inbox. Left of the four: the HTTP edge spin under hg,
+  waiting on main's request-timing run (run-requests.md). Parked (not 93): pair-dialer test, socket-route nodes.
