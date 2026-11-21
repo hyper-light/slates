@@ -1428,3 +1428,20 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - w-bugs starts the HTTP edge spin while its r5 queues.
     - w-git declares disk for cold builds; r15's cold build is on the MacBook, which has 43 GB free.
   - STOPPED: w-k90-containers' Windows container build on jupiter (task started 00:13 from the stale re-sent goal, kiln-work/w-k90-containers-win). Main ended its process tree by exact path: taskkill /T on bash 537332 after checking its command line; cargo 533828 and its rustc children gone; jupiter's idle cores went from 20 to 28 of 32. kiln refuses another agent's run id ("no run"). w-k90-containers' harness hasn't taken main's 00:23 stop yet.
+- 2026-11-21 00:25 PST LANDED (on main):
+  - 85b88770e: A-799, 84a arm B. A client's sync wait parks at once unless its caller names a spin.
+  - 645937436: w-fed-faults, the 10 Overloaded server reds fixed. A-787's park now composes unrefined outside a recorded request. Bisected to 2a498b90f.
+  - 47b87f28d: w-shared lane step 1. The forward is timed on both ends; a 32 MiB holder submit's build step measured at 909 ms.
+  - e460c0501: w-svn P7, an import's memory attributed by region.
+  - f656820d3 and 41167afaa: g228, 85a's costs A/B'd and both shapes rejected. A live write adds 107-113 us at the median on Linux and 169-205 us on the Studio, against the 50 us target.
+  - A-792, A-793, A-794 and A-797 from w-fed-move.
+  CLOSED: w-fed-faults' list (A-795 and the bisect); w-reaper's list; w-k90-a520's list; w-interop's HTTP v2 rows. 86b C1 is NOT met: 153 verdicts/s, and p99 in tens of seconds at 100k.
+  RULINGS:
+  - w-fed-move: the 3,383 lost replies come first, a correctness bug. Find every drop site on the control-to-client-shard hop, add a counter per site, and write small injected red tests. Main reruns 100k once the counters land.
+  - g228: split the ~30 us of exchange overhead against the transport bench, then the entry's 25 us; the macOS park shares g222's spin primitive.
+  - w-perf: the stream clone sends stored deltas in place (4.3 GiB of whole texts becomes about 94 MiB); the bar is parity with hg serve.
+  - w-interop fixes repos_for_hook's fixed one-second budget (a literal, and size-independent): judged on progress, red first, then reruns the revprop rows.
+  REDS ON MAIN ROUTED:
+  - w-rewrite-ops: A-787's refinement job runs 3.5 s of CPU without a step (exit 4 in green_post_state, debug); slice it.
+  - w-work-cow: A-796's wire tags unpublished (wire_order red).
+  - w-hg: five daemon_edge hg tests, in step 0.
