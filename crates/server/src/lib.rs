@@ -172,10 +172,6 @@ pub use repository::{RootRefused, object_formats, root_binding};
 #[cfg(test)]
 #[path = "../../vcs/src/wildmatch/reference.rs"]
 mod wildmatch_reference;
-// The one store-backed test daemon's store (A-767; main's ruling of 2026-11-20): a directory beside the test binary and
-// an owner over it, removed when the test ends.
-#[cfg(test)]
-mod test_store;
 // §4.17.1's policy by name pattern, each tool's own precedence, indexed (A-597), and the push's check point over the
 // policy the repository's record holds (`admit`, A-622). git's receive-pack asks it through the push driver the
 // daemon's HTTP site calls (A-654 part 3), and upload-pack's lender which refs a reader may read through the same
