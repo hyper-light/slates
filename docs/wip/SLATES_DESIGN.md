@@ -7977,6 +7977,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > Since 2026-11-21 (g228) each hop also keeps a bounded per-write histogram (`crate::histogram::DurationHistogram`)
 > and the status report publishes its `p50_ns`, `p99_ns`, `p999_ns` and `max_ns` beside the sums: a sum is a mean,
 > which each run's first held reply (the 100 ms record period) had skewed by 49 µs a write.
+> The exchange hop is split four ways (`fleet.live.hop.exchange.{borrow,round_trip,collect,settle}`; the round trip is
+> the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
+> cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
+> placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
+> placement (g228, 2026-11-21).
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -57898,6 +57903,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
+> **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
+> makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
+> a push's changeset (made record, `Payload`, `Texts`), named by a made reference in the register's entry, through the
+> one deferred-submit hook (A-804/A-805), made from a preview of the held verdict. The register-held made record (v3)
+> and `HgStore::unstored` are gone: every Mercurial history is on the store, so every repository streams, and step 1's
+> rule (a revision with no store row is refused) refuses nothing a repository holds.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -59467,6 +59479,35 @@ Applied in the same change to:
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
+
+
+### A-818 — A path's history as a persistent piece tree a version, piece 1: the pure module and its oracle (2026-11-21, w-rewrite-ops; main 09:40 PST, A-803 (c); A-793, A-809)
+
+- **Why.** A change that moves bytes re-anchors every earlier value of its path (A-793): 101 to 2,551 values walked a
+  change at 100 to 5,000 versions. Offset-shift layers made the change flat but an old read 58 ms at 10,000 changes
+  (A-803 (b), measured and rejected, BENCHMARKS).
+- **What (piece 1).** `crates/merge/src/piece_tree.rs`, a pure module:
+  - Each version is a join-based AVL tree of runs over an arena with holder counts (Blelloch, Ferizovic and Sun 2016).
+  - Path copying (Driscoll, Sarnak, Sleator and Tarjan 1989) makes every version persistent, sharing every subtree a
+    change did not touch.
+  - A change is `rebuild`: kept slices of the version before and added runs, the engine's `segments`, at
+    O(parts × log n).
+  - A read is O(log n + runs), whatever came after.
+  - The module doc gives what each source decided, and VS Code's piece tree as tier C.
+  - Its caller to come is the content history (piece 2: the engine switch, the re-anchor walk deleted in the same
+    series, no mode switch).
+- **Open for piece 2.** What a run names: an immutable chunk (VS Code's choice), or a byte identity located through
+  one index per path. The question is with main (`inbox/main-from-w-rewrite-ops-a818-anchor.md`).
+- **Evidence.**
+  - `every_version_reads_as_the_model_however_many_came_after`: a serial model, the AVL height bound, a read's visits
+    bounded, and nothing alive after release.
+  - `a_change_shares_every_subtree_it_did_not_touch`: copies are counted, with a few paths of new nodes a change, not
+    4,096.
+  - `history::tests::every_piece_tree_version_reads_as_the_reanchored_history`: main's oracle. Every version and range
+    is read through trees built from the engine's own `segments`, and equals the re-anchored value's and `apply`'s.
+  - Breaking path copying (always taking a node apart) or a run's cut offset fails the oracles.
+- **Applied in the same change to** `crates/merge/src/engine.rs` (`Segment` and `segments` crate-visible for the
+  oracle) and `crates/merge/src/lib.rs`.
 
 ### A-817 — A work asks for a file's base bytes only for a whole-file replacement whose declared base length is the file's; the identical-op drop measured and rejected (2026-11-21, w-fed-move, goal 86b; main's rulings 03:16 and 03:46 PST; A-787, A-808, D-27)
 - **How it was found.** After A-808, rebases and submits still asked the green's owner for files: 17.2 a client at 10

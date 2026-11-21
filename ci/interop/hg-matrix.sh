@@ -56,8 +56,11 @@ row() {
   echo "${ROWS[${#ROWS[@]}-1]}"
 }
 
+# The store directory (A-767's standing grant): a repository's history is kept on the node's changeset store under it,
+# and the daemon refuses `repository create` without one (main 5b929b8d2: "start the daemon with --vcs-store DIR").
+mkdir -p "$WORK/store"
 "$SLATES" --instance "$INSTANCE" anchor --quick --shards 2 --vcs-http 127.0.0.1:0 --vcs-ssh 127.0.0.1:0 \
-  >/dev/null 2>"$WORK/anchor.log" &
+  --vcs-store "$WORK/store" >/dev/null 2>"$WORK/anchor.log" &
 ANCHOR=$!
 trap 'kill $ANCHOR 2>/dev/null; wait $ANCHOR 2>/dev/null' EXIT
 for _ in $(seq 600); do

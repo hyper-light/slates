@@ -2731,7 +2731,7 @@ fn owed_catalog(
     local,
   );
   let committed = state.placed_heads.get(&catalog).is_some_and(|head| {
-    head.sequence == record.catalog_version && head.placed_under(config, catalog)
+    head.sequence == record.catalog_version && head.placed_under(state, catalog)
   });
   let ready = owed.is_none() || committed;
   (owed, ready)
@@ -4638,7 +4638,7 @@ fn record_placed_seals(state: &mut ShardState) {
         return None;
       }
       let head = state.placed_heads.get(object)?;
-      if head.sequence != job.sequence || !head.placed_under(state.fleet.configuration(), *object) {
+      if head.sequence != job.sequence || !head.placed_under(state, *object) {
         return None;
       }
       let region = job.content.acked.iter().map(|host| host.0).collect();

@@ -15751,7 +15751,7 @@ fn committed_placed(state: &ShardState, object: ObjectId, sequence: u64) -> bool
     .placed_heads
     .get(&object)
     .filter(|head| head.sequence == sequence)
-    .is_some_and(|head| head.placed_under(state.fleet.configuration(), object))
+    .is_some_and(|head| head.placed_under(state, object))
     || state.fleet.configuration().quorum.f == 0
 }
 

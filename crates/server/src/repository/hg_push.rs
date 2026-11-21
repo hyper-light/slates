@@ -1413,10 +1413,29 @@ pub(crate) fn changeset_of(
   repository: RepositoryId,
   forked: &mut Forked,
 ) -> Option<Changeset> {
+  changeset_landing(state, repository, forked, None)
+}
+
+/// [`changeset_of`] for a changeset the server made of `green`'s `version` (`made`, a green's key and the version;
+/// A-767 C1, `vcs_store::hg_made`): its record and reference name the made green and version, so a replay puts the made
+/// node back, and it lands as a push's does otherwise.
+pub(crate) fn changeset_landing(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+  made: Option<(u64, u64)>,
+) -> Option<Changeset> {
   let disk = state.vcs_disk.clone()?;
   let sequence = state.vcs_stores.next_changeset(repository)?;
   let (version, payload) = &mut forked.changegroup;
-  let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
+  let reference = match made {
+    Some(made) => record::write_made_reference(forked.room, (*version, payload), sequence, made),
+    None => record::write_push_reference(forked.room, (*version, payload), sequence),
+  };
+  let section_record = match made {
+    Some(made) => record::write_made_record(forked.room, *version, made),
+    None => record::write_push_record(forked.room, *version),
+  };
   // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
   // A-767; fa5fd0023): its place is in this changeset's payload, named by the same identity the reference names.
   let payload_identity = *blake3::hash(payload).as_bytes();
@@ -1448,10 +1467,7 @@ pub(crate) fn changeset_of(
     sections: 0,
   };
   let parts = vec![
-    (
-      slates_store::log::SectionKind::Record,
-      record::write_push_record(forked.room, *version),
-    ),
+    (slates_store::log::SectionKind::Record, section_record),
     (
       slates_store::log::SectionKind::Payload,
       core::mem::take(payload),
@@ -1858,8 +1874,8 @@ fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
 }
 
 /// `changegroup` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's
-/// state.
-#[cfg(test)]
+/// state: the tests', and a changeset the server made (`vcs_store::hg_made`), one version's change, taken in its task's
+/// step.
 pub(crate) fn take_whole(
   state: &mut ShardState,
   repository: RepositoryId,
