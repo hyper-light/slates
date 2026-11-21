@@ -13,3 +13,11 @@
   (a) I push 39321f431 + cd842b111 now: the merge had no conflict in the piece's own hunks, and you build after merges.
   (b) I wait for r10.
   Without an answer I wait for r10 and push when it is green, then write main-from-g226-free.md.
+
+## 11:55 PST update
+- Four macOS attempts at the focused rerun, all placed on d1323898 (adas-mac-studio.local-2), all ended before running:
+  r9, r10 and r12 "did not answer the sync in 60s"; r13 "didn't answer place ... in 1920 ms". kiln listed every other Mac
+  as link down, not answering, barred for disk, or full.
+- I have stopped retrying. The branch stays at cd842b111 (b5220bd92 + merge 39321f431 + GAPS line), unpushed, in
+  ~/slates-work/g226-live-shipped-volume on Studio-4.
+- Your call, unchanged: (a) push now, with you building after the merge; or (b) I rerun when a Mac answers.
