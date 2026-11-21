@@ -133,6 +133,18 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   heap) after the push and after 20 s idle, rev 39aa0995d: script ~/.cache/w-sizing-logs/hgmem.sh (+ hgmem-cmd.txt).
   Blocked at 20:40: the big Studio had 5 GB free (needs ~6.2 GB at peak); it is the only runner with uvx and the
   dataset (~/.cache/w-hg-mem/hg). w-hg/w-store have not answered inbox/w-hg-from-w-sizing-r3.md yet.
+- R3 measurement QUEUED as kiln r46 on d1323898 (main's order): `on` + mem refuses at once when memory is short, so the
+  run asks no memory and waits on the machine itself until 8 GiB is free (<= 2 h, then NO-ROOM), then pushes hg's
+  history at 39aa0995d and prints RSS + status memory kinds after the push and after 20 s idle. Kiln reports its end.
+- r46 (big Studio, release 39aa0995d, hg history 84 MB): RSS 90 -> 6,191 MiB after the push (179 s), 6,191 after 20 s
+  idle; after the anchor's SIGKILL system free came back (66 -> 5,173 MiB), no names left. Memory-kind split printed
+  empty: the rows' fields are resident_bytes/reserved_bytes/modified_bytes/measured (parser fixed). Rerun r48 queued.
+- r46's build showed `content_pool::parts_of` dead on macOS (since 20bef898c): gated to Windows, LANDED 6008a67d5
+  (merge f68722759); xwin check of slates-server clean of it.
+- R3 measured (r48): RSS 6,193 after the push = arenas 5,166 + segment 229 + content 2 + rest ~796. Idle heap check
+  (1/4/23 shards): RSS 35/40/87 MiB vs status heap 920/925/961 -> heap row counts allocated bytes. GAPS c7e7f3b4c; split
+  to w-hg/w-store; close note updated. R3 waits on w-hg (content holdings) and w-store (disk store).
+- Branches: agents/w-sizing-r2win already deleted at landing; agents/w-sizing-r2hold (red experiment) deleted; none left.
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =

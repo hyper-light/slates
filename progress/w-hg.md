@@ -171,3 +171,33 @@
 - ~20:50 C1 on branch agents/w-hg-c1: 3ffb95c4b (land first, v7 reference in the entry, replay from the store by
   piece), a9620fbb1 (Texts section). By-use test blocked: the store refuses every landing on this Mac (memtable past
   4 GiB; reported to w-store). Lands on main when it passes.
+- ~21:20 LANDED 242f4a173: C1's push onto the changeset store (by-use test with stock hg 7.2 passes; suites green).
+  NEXT: the import onto the store (rest of C1; R2's peak).
+- ~21:45 main's ruling (inbox/w-svn-from-main-c2-rulings.md, decision 1) applies to C1: no repository without
+  --vcs-store (a typed refusal naming it), no register-held history path for hg, and tests on store-backed daemons
+  through ONE shared helper (repository::store_tests' directory, made shared with a removal guard). Not small for hg:
+  every hg server test runs on a store-less shard through the sync push path (unbundle_in). Plan: the very next
+  commit after C1 lands. Recovery rule already matches decision 2 (next sequence = named + 1; unnamed changesets
+  dropped).
+- C1 remaining order:
+  1. file texts read through the store (T rows) instead of the content store;
+  2. the intake keeps no whole text with a store;
+  3. the import as changesets (R2).
+  Then the no-store path dropped.
+- 2026-11-21 ~00:20 LANDED 8cb10f986: C1 step 0, the no-store commit. One `repository::no_store_for` refuses hg and svn
+  without --vcs-store. The v2 path is gone. hg tests are on store-backed daemons through the one shared helper
+  (w-svn's test_store.rs plus mine: audit_on_stored_shard, land_blocking, create → repository::create_blocking).
+  Close note written, with the siblings: 10 failures already on main 68ce3d585 (whole_build's park bound) and the
+  load-bound git_push t_a752.
+- ~00:30 asked main (inbox/main-from-w-hg-c1-order.md) to order C1 as 3, then 1, then 2: step 1 alone can't serve an
+  imported repo, whose texts aren't on the store until 3.
+- ~00:45 step 3 design sent to main and w-store (inbox/main-from-w-hg-c1-import-design.md): the import lands as a run
+  of bounded changesets whose payloads, concatenated, are one cg3 changegroup; the register's one import entry names
+  the run; replay goes through the push intake reading pieces.
+- NOW: the piece-reading intake (needed by both 1 and 3).
+  - slates_hg: a `Source` (bytes by range, or Wanted{range}) and a forward `Window`.
+  - The changegroup framing decoded in steps from a cursor over a Source.
+  - Intake::step reads its delta through a Source; a step asks for its bytes before changing any state.
+  - Server replay (vcs_store replay_hg_referenced / replay_sliced, payload_of): a window filled by
+    `StoreHandle::piece` on Wanted. No whole payload is held.
+  - Red test: a replay's peak bytes against the payload's length.

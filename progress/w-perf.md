@@ -12,6 +12,12 @@
     window, the anchor kills it). r26: ps-only series + vmmap/footprint at done and landed only.
   - Dependency: w-store's slates-store (piece 3) not built (2b waits on main: hyper-rt sync channel); hg onto it is
     w-hg's C item. The cut through the payload waits on both; any non-whole-text share is cut now, red first.
+- Main's 18:30 order, the derived per-path read form: DONE. fa5fd0023 (codec, T/H rows, reads, owner requests),
+  c5d746f8b (first-landing T rows; reverted-text loop), 33465d641 (BENCHMARKS: p50 85-87 µs vs bar 91, 0/6,000 outside
+  chain), 4f57efa69 (GAPS). w-store reviewed: keep as landed; closed begin/applied rows in bc0677af9.
+- R2 now: w-store's memtable fix 71db6d157 unblocks w-hg. Waiting on w-hg's C1 to move the IMPORT onto the store
+  (agents/w-hg-c1 has the push); asked w-hg 21:00. Then: measure import peak RSS vs .hg 87.8 MB (release, big Studio,
+  ~/.cache/w-perf/bench/hgmem.sh, ps-only + footprint at landed).
 - New findings (GAPS only, not worked): A-722 p3's partial clone 1.4-1.5x slower (sent to w-git; now on w-git's P list);
   same per-link apply loop in hg index.rs ~710 and import/record.rs ~1629 (told w-hg).
 Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to "slates-7a".

@@ -1,3 +1,15 @@
+# 2026-11-20 ~21:40 (w-forming), 85b C3: replay r16 (114153f4a) stalled 5/5 at live_chaos.rs:2465 after takeovers
+# (no_credit -> owed whole -> whole builds, held_back.whole). Cause mine (A-768: a capture counted 0 bytes in the
+# queue's credit). FIXED 8e4da57ae (red test; fleet a_live_ 11/11 -- the GAPS 'fails on main' finding was this,
+# corrected). Replay r19 queued: 5 seeds + 2 fresh, NEMESIS_ONLY.
+
+# 2026-11-20 ~21:00 (w-forming), 85b C3: chaos run r7 (Adas-Mac-Studio.local, c9c9554d8): 7 targeted flows PASS with
+# every invariant held (replicas offline x3, volume failure x3, client disconnect); nemesis 0/3 on progress checks, no
+# safety violation. Seeds 1256052866610850298 + 5939796479076166087: install images dropped stale 1055/1055 under the
+# stream (my A-757 p5) -> FIXED bbdea3259 (db live red test). Seed 10263252121351842258: after a takeover in a lossy
+# phase the old owner's forwards were refused 571x (owner_location.route_dropped.refused), the new owner a never got
+# a write (durable stuck 906) -- forwarding, blocks C3; replay r16 queued (3 seeds + 2 fresh).
+
 # 2026-11-20 20:00 (w-forming): P4 image measured in release (kiln r9, M4 Max, load 5.7): 311 inodes / 55,654 B record,
 # image 26-36 us + encode 10.5-17 us in one turn. Asked main: (a) build the CoW reader-epoch hold, or (b) close P4 with
 # this measurement. C3 (r7) and the takeover A/B (r2) still queued on kiln.

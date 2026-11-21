@@ -1,5 +1,31 @@
 # w-store progress (brief: briefs/w-store.md)
 
+## State (2026-11-20 ~23:59 PST)
+- LANDED 174459b36 (merge 9bfcbb9be): restart test (orphan's id minted again, rows give the newest: green, no change);
+  forwarded-create refusal shown unreachable (repository verbs never cross nodes), owed line removed. NEXT: grant
+  AuditKind + revocation.
+
+## State (2026-11-20 ~23:30 PST)
+- LANDED e4cfbd38d: creation in the one landing order (land seq 0, then record + completion, then answer; ids reserved
+  via ShardState::family_reserved_through). Red/green kill test; store_tests 3/3; repository:: 58/62 (the 4 known).
+  NEXT: AuditKind for the standing grant + revocation; then pairing C4-C6.
+
+## State (2026-11-20 ~22:30 PST)
+- LANDED ad1d9e7a6: C5 store side, crates/server/src/vcs_store/store_packs.rs (StorePacks: async fill into a bounded
+  LRU of store pieces, sync PackSource::piece lends; main's split, w-git builds git's side on it; shape posted
+  inbox/w-git-from-w-store-store-packs-2026-11-20.md). server --lib store_packs 1/1.
+- LANDED e5baf401c: the standing grant's G row (recorded at first open, checkpointed, found after a crash);
+  StoreHandle::grant() named by the creation's header; tools told. slates-store 21/21, server store_tests 2/2.
+- NEXT: pair on C4 (w-hg rerun), C5 (w-git on StorePacks), C6 (w-svn import on the sliced landing). Mine owed: holders
+  landing replicated changesets (A-767 item 5, f>=1), a standing-grant audit kind + revocation, group commit (perf),
+  Windows store_root (main's lane), unnamed changesets' log space (cleaner).
+
+## State (2026-11-20 ~21:30 PST)
+- LANDED 71db6d157: memtable held at 8/128 GiB profiles (slates-api store_sizing test; red 128 GiB Gone on the old
+  formula); owner's sliced landing (StoreHandle::begin -> SlicedLanding section/part/commit, drop abandons). slates-store
+  20/20. Told w-hg, w-perf, w-svn; close note appended. NEXT: C4 with w-hg (rerun its store test on main), C5 w-git,
+  C6 w-svn import over the sliced landing. GAPS owed: group commit (device flush rate), Windows store_root, grant audit.
+
 ## State (2026-11-20 ~19:30 PST) — CLOSE LIST (briefs/close-list.md): C2, C3, C4-C6
 - C2 landed in steps on origin/main: a9fd63be1 (slates_rt::sync, safe channel), 1b02c30b4 (retirement Reaper,
   RtError::Capacity, race2), ee0661c06 (vendor/mantle engine/chunk/disk/crc/codec @ mantle 87ab09e1; hyper-block issuer

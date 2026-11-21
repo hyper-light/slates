@@ -60,6 +60,14 @@
   land) and ~/slates-work/w-provision-gate-ci, the clone ~/slates-work/w-provision-gate, ~/.cache/w-provision-gate-*
   (arms, fix, targets).
 
+- ~22:00: per main, deleted my scratch on Studio-4 by exact path: ~/.cache/w-provision-gate-target.noindex (4.8 GiB),
+  -arms, -fix, the kqueue .rs copies, and the clone ~/slates-work/w-provision-gate. Nothing of mine left to delete there.
+
+- ~22:45: main's new item (bench end-of-run lost wake) FIXED and LANDED 931e52ed6 (A-798): the idle spin's harvest
+  swallowed a client's kick; harvest-then-look. Red deterministic 3/3 (crates/rt/tests/spin_kick.rs), green 3/3. Close
+  note appended; w-engine told. Clone ~/slates-work/w-provision-gate (clean, at main) and
+  ~/.cache/w-provision-gate-target.noindex + ~/.cache/w-provision-gate-wake are mine: delete when main says.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh

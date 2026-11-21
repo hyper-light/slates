@@ -37,3 +37,25 @@ Next on my list: the deltify job (C1, and svn's P), then R2 (the hg import's pea
 
 C1 is now closed whole (svn storage A/B, c3, deltify job). Next: R2, the hg import's 5.73 GB, through w-store's
 payload (the per-phase profile is rerunning as kiln r20).
+
+## Main's 18:30 order: the derived per-path read form (A-645 on A-767): BUILT on the node's store, measured
+- Commits on origin/main: **fa5fd0023** (the `Texts` codec and edit form, `T`/`H` rows at landing and replay,
+  `Store::text_at`/`text_row`/`path_texts`, the owner's `text`/`text_row`/`path_texts` requests for shards),
+  **c5d746f8b** (a `T` row is its first landing's: a reverted text made a chain loop on Mercurial's history; red
+  `a_text_that_comes_back_keeps_its_first_row_and_no_chain_loops`), **33465d641** (BENCHMARKS).
+- Tests (macOS arm64, this MacBook): `an_old_file_revision_is_read_from_its_own_chain_alone` (the changesets read equal
+  the version's chain, again after a reopen), `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
+  (red with no rows: no landed text), the codec's two; slates-store all green.
+- Measurement (release, big Studio, kiln r32, Mercurial's history landed as 54,728 changesets): old read on a cold cache
+  **p50 85 / 87 µs** (rounds 2 and 3; the bar 91 µs), p99 4.05 ms (arm A 3.7 ms), 0 of 6,000 reads outside their chain.
+  Round 1, the log read from the device for the first time: p50 234 µs, p99 20 ms. Landing 17.9 ms a changeset (one
+  full flush each: landings sharing a flush are w-store's).
+- Interface agreed with w-hg; w-hg's intake writes `Texts` on agents/w-hg-c1. w-store never answered; the change to its
+  `store.rs`/`owner.rs` is listed for its review (inbox/w-store-from-w-perf-per-path-landed-2026-11-20.md), with one gap
+  for it: changesets landed through `begin`/`applied` get no `P` or `T`/`H` rows.
+
+## R2 (the hg import's 5.73 GB): waits on w-hg's hg onto the store
+Attributed (3d39e0f62: 91 % the content store's whole texts). The cut is hg's intake and replay on the changeset store
+with the derived reads above; w-hg has the intake writing `Texts` and is blocked on this Mac by the store refusing every
+landing ("a memtable past 4 GiB", reported to w-store). I'll measure R2's peak against the `.hg`'s bytes the moment
+w-hg's C1 lands.

@@ -145,3 +145,57 @@ get a CPU for a millisecond. The ping-pong threads sleep between hand-offs and a
 My earlier "park at once" zeroed only the window; the holds still spun. Running now (diag-measurer-g222-10): no window
 **and** no hold (`G222_NO_SPIN`, `G222_NO_HOLD`) against main's, one binary, the floor each round. If the band empties,
 Linux's fix is the hold rule (yours, A-387) telling an oversubscribed machine not to spin — we should land it together.
+
+## 2026-11-20 21:35 PST — finding 8: Linux's band is none of: the epoll ms (fixed, on main), idle spin, holds, a 100 µs slice, pinning
+
+All on CI ubuntu-24.04-arm, A-224's lane (the bench reports 4 cores and starts 8 spinners and 3 shards: the user
+scope's `AllowedCPUs` is not enforced there, so the lane is 4 CPUs at two spinners each), one binary per run with the
+timerfd fix, env-switched, interleaved 3 rounds; "1 ms parks" = parks that waited 0.95–1.10 ms of ~100,000 a run.
+
+| run | arm | queued p99 µs | queued p999 µs | 1 ms parks a run |
+|---|---|---|---|---|
+| 44861831509 | main / no spin + no hold | 1,010–1,011 / 1,008 | 1,040–1,233 / 1,026–1,215 | 12,700–13,800 / 14,900–16,200 |
+| 44863105516 | main / slice 100 µs / slice + no spin | 1,010–1,011 / 1,005–1,009 / 1,001–1,003 | 1,026–1,197 / 1,019–1,026 / 1,008–1,024 | 13,000–15,000 / 12,100–12,900 / 14,000–16,200 |
+| 44865071559 | main / unpinned | 1,010–1,011 / 1,012–1,014 | 1,024–1,191 / 2,996–3,000 | 13,600–14,700 / 4,100–6,000 |
+
+- Unpinned shards cut the 1 ms parks threefold but make the queued p999 and the submit p99 worse (accept 5.2–11.0 ms).
+- The lane's own floor (ping-pong beside the bench, every run): p99 4.6–5.1 µs, p999 0.8–2.8 ms. So on this lane the
+  daemon's p99 can be < 1 ms by the floor, and the p999 floor is above 1 ms (0.8–2.8 ms).
+- Open: what holds a woken shard thread for one tick when a woken ping-pong thread runs at once. Next I'd stamp the
+  scheduler's own view (`/proc/self/task/*/schedstat` wait time per shard thread) around a band request.
+
+## 2026-11-20 22:30 PST — finding 9: Linux's 1 ms band is the client's own reply spin holding the CPU its shard needs
+
+Per-park stamps of the kick and the wake (CI run 44867818237): in the ~1 ms parks, the kick lands anywhere from 0 to
+1 ms after the wait began and the wake takes the rest, so the shard runs ~1 ms after it parked whatever the kick's time:
+it runs when the CPU it needs is given up. The bench client spins for its reply up to `SPIN_NS` = 1 ms. One binary,
+the client's spin switched (CI ubuntu-24.04-arm, A-224's lane, 3 interleaved rounds):
+
+| client spin | queued (landing → taken) mode | queued p99 µs | accept p99 ms (median run) | conflict p99 ms |
+|---|---|---|---|---|
+| 1 ms (the harness's) | 1.0 ms (2,400–3,000 a run) | 1,010–1,012 | 4.0–8.0 | 4.0–6.0 |
+| 200 µs | 0.2 ms (25,700–27,500 a run) | 222–990 | 2.3–4.0 | 2.0–4.0 |
+| library default (its wake estimate) | 0.1 ms (5,500–7,900) and 1.0 ms (300–940) | 999–1,002 | 4.0–4.1 | 2.2–2.7 |
+| 0 (park at once) | none | 17–22 | **0.32–0.33** | **0.32–0.69** |
+
+(runs 44868692669 and 44869944205). With the client parked at once, Linux's loaded p99 is under 1 ms; p999 3.0–4.0 ms
+(the lane's floor p999 0.8–2.8 ms). The library's own default spin starves the shard too. Testing now: the spin
+yielding its CPU each turn (`std::thread::yield_now`), with the default and the harness's spin. Your provisioning
+client: if its sync waits spin first (SDK default), it pays the same; your harness parks, which is why your client part
+was small and your daemon part (the shard waiting for the CPU) large.
+
+## 2026-11-20 23:35 PST — finding 10: on Linux only a client that parks at once gets the loaded p99 under 1 ms
+
+CI ubuntu-24.04-arm, A-224's lane, one binary, 3 interleaved rounds (runs 44871159397, 44873199369), medians per round:
+
+| client wait | loaded accept p99 ms | loaded conflict p99 ms | quiet accept p50 / p99 µs |
+|---|---|---|---|
+| library default (wake estimate) | 1.7–5.1 | 2.2–2.5 | 77–92 / 132 |
+| yield each spin turn | 12.0–18.0 | 12.0–15.0 | — |
+| capped at 50 µs | 1.9–2.1 | 1.6–2.2 | 60–79 / 118–130 |
+| park at once | **0.32–0.39** | **0.30–0.91** | 90–96 / 130–136 |
+
+The yield is far worse (the yielder goes to the back of the queue each turn) and rejected. Parking at once costs the
+quiet median 15–30 µs and the quiet p99 ~5–15 µs. Loaded p999 is 0.9–4.0 ms in every arm (the lane's floor p999
+0.8–2.8 ms). This changes the client's sync wait (§4.7's 2-competitive spin) and touches R9's spinning provisioning
+form, so I've put it to main with a recommendation rather than land it.

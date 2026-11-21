@@ -1,5 +1,31 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-20 ~23:00 PST: C1 continued
+- A-794 LANDED slates main 8a18edcc (dc4f6eb0): forwarded CreateWork placed by its name's partition, not the green's
+  (76,955 works had filled the primary's one partition: TableAtCapacity 71,776 -> 0); a forwarded verb parked at its
+  work's gate answers its exchange at resume. CreateWork p50 18.3 -> 10.0 s. Next: 64,072 accepted submits refused
+  BudgetExceeded (a retention-cap first-occurrence log line is in A-794).
+- A-797 (claimed; in progress, uncommitted in ~/slates-work/w-fed-move-slates): the primary was KILLED by its watchdog
+  -- shard 0 spun 1,055 ms in one poll answering a batch of work asks (xshard.rs:926) -> answer_within: a batch answered
+  within the owner's step budget, the rest handed back. Unit test red->green; 42 fleet work/forward tests pass. Running:
+  100k (~/slates-work/w-fed-move-c1-100k-a797.log).
+- MISTAKE, fixed: my state push 339b8fd0 carried amendments.tsv conflict markers (~10 min); fixed in 02895150. Now
+  pushing state only via ~/.cache/w-fed-move-state-push.sh (stops on any conflict or marker).
+
+## 2026-11-20 ~22:30 PST: C1 (goal 86b) in progress -- two walls fixed and LANDED, the third diagnosed next
+- A-792 LANDED slates main 60586cdd (3b3e0f4f): a green's listing at its head reads the directory's subtree
+  (Green::head_under). 10k clients: wall 201 -> 75 s, primary CPU 175 -> 53 s, oracle clean.
+- First 100k rung (base 60586cdd, log ~/slates-work/w-fed-move-c1-100k-a792.log): 94,877 of 100,000 submits refused
+  BudgetExceeded after 5,123 accepts (the green's retention cap, 373 MB; ~73 KB a version: every touched file's earlier
+  block kept whole by A-728 part 2's forward chain while 100k works hold the floor).
+- A-793 LANDED slates main e4c2ad76 (23e9ed81): history::reanchor -- a change re-anchors its path's history on the new
+  block, the earlier block cut to what the change overwrote. 100k (log ...-c1-100k-a793.log): BudgetExceeded 0,
+  accepted 29,795, conflicts 70,205, verdicts 13 -> 131/s, CreateWork p50 84.5 -> 25.1 s, oracle clean, wall 944 s.
+- Next wall: the 70,205 conflicted clients refused TableAtCapacity resolving (63,145 Edit, 7,060 Rebase): the client
+  node's merge budget (green_chain_bytes 373 MB a partition, shared by work logs). A-793 added a first-occurrence log
+  line (Partition::merge_budget_held). Running: 100k on e4c2ad76 with it (~/slates-work/w-fed-move-c1-100k-diag.log).
+- Then: CreateWork 25 s and every p99 (seconds to minutes) toward < 1 ms at >= 1,000 verdicts/s.
+
 ## 2026-11-20 ~19:00 PST: CLOSE LIST (Ada's order). My items: C1 goal 86b; R2 unplaced (CLOSED, inbox/main-from-w-fed-move-close.md)
 - C1: 100,000 clients, 1 primary + 2 replicas, the Linux kernel tree, every p99 < 1 ms, conflicts judged right (oracle).
   State found (GAPS ~6224+, BENCHMARKS 13870/14213): single in-process node reaches 10,000 clients (p99 200-440 ms);
