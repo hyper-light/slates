@@ -745,6 +745,9 @@ pub struct Walk {
   pull: Option<Pull>,
 }
 
+/// The revisions whose rows are asked: each log's path, and its revisions' positions and nodes, in the walk's order.
+type AskedRows = Vec<(Vec<u8>, Vec<(u64, Node)>)>;
+
 /// The file section's reads of the changeset store (A-767 C1 step 1; main's ruling of 2026-11-21 08:45): each file
 /// revision sent as the store keeps it, its stored delta against the revision its base text was sent as earlier in
 /// this answer (an earlier revision of the same log), or its stored whole against the null base; no whole text read or
@@ -757,7 +760,7 @@ struct Files {
   /// What the next step asks of the store.
   want: Option<crate::render::Want>,
   /// The revisions whose rows are asked, each log's path and its revisions' positions and nodes, in the walk's order.
-  asked: Vec<(Vec<u8>, Vec<(u64, Node)>)>,
+  asked: AskedRows,
   /// The revisions read ahead, in the walk's order.
   ahead: std::collections::VecDeque<Ahead>,
   /// How many of `ahead`'s front revisions have their chunks asked.
@@ -783,7 +786,7 @@ impl Files {
         break;
       }
       bytes = bytes.saturating_add(ahead.row.place.len);
-      places.push(ahead.row.place.clone());
+      places.push(ahead.row.place);
     }
     self.chunks_asked = self
       .ahead
@@ -1160,10 +1163,14 @@ impl Walk {
   /// Asks the store for the rows of the file revisions from `from` on that a missing changeset links, as many as
   /// `room` holds (one at least), each log's in turn.
   fn ask_rows(&mut self, store: &impl Store, (path, position): (&[u8], u64), room: u64) {
-    let most = usize::try_from(room / to_u64(core::mem::size_of::<Ahead>()).max(1))
-      .unwrap_or(usize::MAX)
-      .max(1);
-    let mut asked: Vec<(Vec<u8>, Vec<(u64, Node)>)> = Vec::new();
+    let most = usize::try_from(
+      room
+        .checked_div(to_u64(core::mem::size_of::<Ahead>()).max(1))
+        .unwrap_or(room),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
+    let mut asked: AskedRows = Vec::new();
     let mut taken = 0_usize;
     let mut at = (path.to_vec(), position);
     while taken < most {
@@ -1477,9 +1484,13 @@ impl Pull {
 
   /// Asks the rows of as many planned revisions from `at` on as `room` holds (one at least), and their parents'.
   fn ask_rows(&mut self, room: u64) {
-    let most = usize::try_from(room / to_u64(core::mem::size_of::<Batched>()).max(1))
-      .unwrap_or(usize::MAX)
-      .max(1);
+    let most = usize::try_from(
+      room
+        .checked_div(to_u64(core::mem::size_of::<Batched>()).max(1))
+        .unwrap_or(room),
+    )
+    .unwrap_or(usize::MAX)
+    .max(1);
     let (mut group, mut index) = self.at;
     let mut asked: Vec<(Vec<u8>, Vec<Node>)> = Vec::new();
     while self.batch.len() < most {
@@ -1542,7 +1553,7 @@ impl Pull {
       let send = match row.base {
         None => Sending::Stored {
           base: NULL_NODE,
-          place: row.place.clone(),
+          place: row.place,
         },
         Some(base) => {
           let sent = (group == current)
@@ -1574,7 +1585,7 @@ impl Pull {
           match sent.or(earlier).or(held_parent) {
             Some(base) => Sending::Stored {
               base,
-              place: row.place.clone(),
+              place: row.place,
             },
             None => Sending::Whole { text: row.text },
           }
@@ -1602,7 +1613,7 @@ impl Pull {
           break;
         }
         bytes = bytes.saturating_add(place.len);
-        places.push(place.clone());
+        places.push(*place);
         asked.push(at);
       }
     }
