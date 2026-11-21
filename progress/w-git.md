@@ -308,3 +308,7 @@
   StoredDaemon; v3_takeover/git_interop anchors with --vcs-store. Next: C5 part 2b (v2 + seq 0 removed, homing/landing
   mandatory, StorePacks replay), then R2 (keepalive across answer_until's awaits: carry homing/landing,
   names_committed_within; the edge tests fail under load; landing's flush makes it longer).
+- 2026-11-21 01:00 R2 CLOSED 970950081 (first keepalive after the body was 2 intervals = 10 s; r28 red 18/18 -> r29
+  green 18/18 at load 29-33). Next: C5 part 2b piece 1 (pushes v5 only; carried shortfalls refuse; names race
+  refuses; moves-only v5; the v4 test switch removed; v2 left for made commits and sync test drivers' untaken asks),
+  then 2b-2 (sync drivers async), then made commits onto w-svn's deferred-submit hook.
