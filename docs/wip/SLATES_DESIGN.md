@@ -11990,6 +11990,10 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
 > resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
 > (one history on one shard and on eight).
+> The same three are MCP tools (`slates.merge.check`, `slates.merge.read_check`, `slates.merge.resolve`) and CLI verbs
+> (`slates check WORK`, `slates resolve JSON`, the resolution as the tool's JSON object), one JSON shape for both
+> (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
+> (`assert_merge_check_resolves_over_mcp`).
 
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
