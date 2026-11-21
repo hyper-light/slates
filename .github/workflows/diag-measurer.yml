@@ -1,0 +1,53 @@
+name: diag-measurer
+
+# w-k90-win's 84a landing check (never main): the landing tree's Windows tests and slates-rt clippy, on windows-latest
+# and windows-11-arm, each result an annotation.
+
+on:
+  push:
+    branches: ["diag-measurer-w-k90-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  windows-84a-land:
+    name: 84a landing check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Tests and clippy
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          set +e
+          cargo test --locked -p slates-rt --lib -- driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline iocp::tests > t.log 2>&1; t=$?
+          cargo clippy --locked -p slates-rt --all-targets -- -D warnings > c.log 2>&1; c=$?
+          tests=$(grep -E "^test |test result|took" t.log | tr '\n' ' ' | cut -c1-600)
+          lint=$(grep -E "^(error|warning)|-->" c.log | grep -v "^warning: .*generated" | head -20 | tr '\n' ' ' | cut -c1-1500)
+          echo "::notice title=${{ matrix.os }} landing::tests exit=$t: $tests%0Aclippy exit=$c: $lint"
+          [ $t -eq 0 ] && [ $c -eq 0 ]
