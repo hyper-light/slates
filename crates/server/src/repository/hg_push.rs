@@ -163,6 +163,9 @@ const UNLANDED: &[u8] = b"the push could not be landed on the repository's chang
 
 /// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
 pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
+/// Counter: the slices a push's intake took (A-783's paced turn): a slice that yielded at its first quantum took one
+/// step, so a push of hg-src's history was a slice a revision. Format: a counter name in the status report.
+pub(crate) const INTAKE_SLICES: &str = "hg_push.intake_slices";
 /// Counter: pushes the changeset log refused, answered `UNLANDED`: nothing of them is in the register.
 pub(crate) const PUSH_UNLANDED: &str = "hg_push.unlanded";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
@@ -1722,6 +1725,8 @@ pub(crate) struct Taking {
   room: u64,
   /// The generation of the index it forked.
   generation: u64,
+  /// An intake step's measured cost, across its slices (A-783's paced turn).
+  costs: vcs_store::TurnCosts,
 }
 
 impl Taking {
@@ -1736,18 +1741,27 @@ impl Taking {
     let intake = self.intake.as_mut()?;
     let (_, payload) = self.changegroup.as_ref()?;
     let quantum = vcs_store::hg_import::quantum_of(state);
-    let start = slates_rt::futures::now_ns();
-    vcs_store::within_budget(state, lend, |stores| {
+    // A-783: steps to the quantum while someone waits on the shard, on to its ceiling while no one does; a slice that
+    // yielded at its first quantum (2.2 us on an M4 Max) was one step, a turn a revision for hg-src's ~230,000.
+    let mut paced = vcs_store::paced_turn(quantum, slates_rt::futures::now_ns());
+    let costs = &mut self.costs;
+    let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       Some(loop {
+        if !paced.more(vcs_store::ANSWER_STEP, costs) {
+          break Ok(Stepped::More);
+        }
         match intake.step(payload.as_slice(), content, room) {
-          Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          Ok(Stepped::More) => {}
           // A push's changegroup arrived whole: a want names bytes past its end, a truncation.
           Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
           other => break other,
         }
       })
-    })
+    });
+    paced.close(slates_rt::futures::now_ns(), costs);
+    state.count(INTAKE_SLICES, 1);
+    sliced
   }
 
   /// The fork once every unit is taken.
@@ -1821,6 +1835,7 @@ fn begin_intake(
           changegroup: Some(changegroup),
           room: before,
           generation,
+          costs: vcs_store::TurnCosts::ZERO,
         }),
         Err(refused) => Err(intake_refused(&refused)),
       },

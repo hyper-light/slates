@@ -16561,14 +16561,39 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.1),
   );
   let percentiles = hop_percentiles(&mut client);
+  // The build split into its steps (capture, seal, append, send; g228, 85a): timed for entries made in their
+  // publication's own turn, each step's nanoseconds within the build's.
+  let build_steps: Vec<(u64, u64)> = [
+    "fleet.live.hop.build.capture",
+    "fleet.live.hop.build.keys",
+    "fleet.live.hop.build.seal",
+    "fleet.live.hop.build.append",
+    "fleet.live.hop.build.send",
+  ]
+  .iter()
+  .map(|step| {
+    (
+      count(&daemons[0], step),
+      count(&daemons[0], &format!("{step}_ns")),
+    )
+  })
+  .collect();
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
     .collect();
+  // A sealed volume's keys are unwrapped once and kept for its later publications (`seal_keys::BodyKeys`).
+  let body_keys = (
+    count(&daemons[0], "fleet.live.body_keys.kept"),
+    count(&daemons[0], "fleet.live.body_keys.fetched"),
+  );
   for daemon in daemons {
     daemon.stop();
   }
-  eprintln!("hops: (timed, ns) {hops:?}; round {round:?}; holders' serves {holders:?}");
+  eprintln!(
+    "hops: (timed, ns) {hops:?}; round {round:?}; build steps {build_steps:?}; body keys (kept, fetched) {body_keys:?}; \
+     holders' serves {holders:?}"
+  );
   assert!(
     replies
       .iter()
@@ -16584,6 +16609,21 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert!(
     holders.iter().any(|served| *served > 0),
     "a holder's serves were timed: {holders:?}"
+  );
+  let build_ns = hops.first().map_or(0, |(_, ns)| *ns);
+  let steps_timed = build_steps.first().map_or(0, |(timed, _)| *timed);
+  assert!(
+    steps_timed > 0 && build_steps.iter().all(|(timed, _)| *timed == steps_timed),
+    "every build step was timed, as often as each other: {build_steps:?}"
+  );
+  assert!(
+    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
+    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
+  );
+  let steps_ns: u64 = build_steps.iter().map(|(_, ns)| ns).sum();
+  assert!(
+    steps_ns <= build_ns,
+    "the build's steps add up to no more than the build: {steps_ns} ns against {build_ns} ns ({build_steps:?})"
   );
 }
 
@@ -23045,6 +23085,66 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
     "each forward woken by the session's return: {before:?} then {after:?}"
   );
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
+/// Lane (A) 3b, content ahead by identity (main's rulings of 2026-11-20 23:50 and 2026-11-21 00:52): a holder's submit
+/// names its increment, and the owner fetches what it lacks from the holder by identity on the content plane, storing
+/// it once, so the forward lane never carries the increment. Do: in a two-node `f = 1` fleet, A's green replicated by
+/// B, B's work writes an 8 MiB file and B submits. Expect: answered `Submitted` at version 2; the request B forwarded
+/// under 64 KiB (`merge.submit.forward_request_bytes`); the owner fetched the increment from B once
+/// (`merge.inputs.fetched_from_holder` 1, at least 8 MiB in `merge.inputs.fetched_from_holder_bytes`). Before, the
+/// request carried the increment's whole encoding (r21, 2026-11-21: at 320 MiB and above the lane resent it in place on
+/// silence until its bound and the submit was refused `Overloaded`).
+#[test]
+fn a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "by-identity-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let work = bench_work(&mut holder, green, "by-identity-work", 8 << 20);
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let before = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  let after = (
+    count("merge.submit.forward_request_bytes"),
+    count("merge.inputs.fetched_from_holder"),
+    count("merge.inputs.fetched_from_holder_bytes"),
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  let request_bytes = after.0 - before.0;
+  assert!(
+    request_bytes > 0 && request_bytes < 64 << 10,
+    "the forwarded request named the increment, {request_bytes} bytes"
+  );
+  assert_eq!(
+    after.1 - before.1,
+    1,
+    "the owner fetched the increment once"
+  );
+  assert!(
+    after.2 - before.2 >= 8 << 20,
+    "the owner fetched the increment's bytes from the holder: {}",
+    after.2 - before.2
+  );
 }
 
 /// Main's ruling on the lane (2026-11-20, A-697's release bench refused 320 MiB holder submits about half the time): a
