@@ -1,5 +1,11 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-21 ~04:30 PST — main 04:02: the checkpoint failure FIXED (A-810, main d9bc5f00c)
+- The index's model asked specialness timelessly; the index was right; it was not the restore. Seeded red, named test,
+  0 failures in 25 runs. Bug record in docs/bugs.
+- A-803 (a) and (b) are not measured gaps (GAPS corrected, fd031603d); stopped there per main's condition.
+- Note: inbox/main-from-w-rewrite-ops-a810.md.
+
 ## 2026-11-21 ~04:00 PST — main 02:37: all three pieces LANDED
 - Piece 1: A-805, 31c0acd50.
 - Piece 2: A-807, dbfac3e13.
