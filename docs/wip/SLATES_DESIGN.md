@@ -11239,7 +11239,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
 > judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
 > a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
-> A mount's unsaved-to-the-green writes survive a restart: recovery rebuilds a mounted work's slot from its
+> A changed file is declared as the whole-file replacement it is and refined at composition (D-O17, A-776), so one
+> save changing two lines is two edits (`one_save_changing_two_lines_does_not_cover_another_editors_line_between`).
+> A mount's unsubmitted writes survive a restart: recovery rebuilds a mounted work's slot from its
 > published image, its base reacquired through the green at the work's durable base
 > (`tests/mounted_work.rs` `a_save_through_a_mount_survives_a_daemon_restart`). Owed: a green landed again into a
 > directory holding an earlier landing plans every file again (identical ones are
@@ -57656,7 +57658,38 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `slates_rt`'s or `slates_machine`'s (`vendor/mantle/README.md`, `vendor/hyper-raft/README.md`, "Local changes");
 > `ranges` stays upstream. No `hyper-rt` and no `unsafe impl Send`/`Sync` anywhere. Unit tests on slates' runtime:
 > engine 155/155, chunk 52/52, `hyper-block` 101/101 (issuer included), slates-rt sync 11/11 and retirement 3/3.
-> Owed in C2: the engine's and the chunk store's file creation behind `land`'s write seam, under the grant.
+> Step 4 (2026-11-20), the write seam: none of the vendored crates opens a file in its production code (the
+> engine, the chunk store and the log are handed `BlockFile`s), except `hyper-block`'s own openers and `mantle-disk`'s
+> calibration scratch. So the store's files are opened by `slates_land::store_root`: the granted directory walked as
+> a landing target is (no symlink, no `..`, owned, on none of the daemon's mounts), checked against its `StoreGrant`
+> (device and inode), and every file created or opened as one plain name relative to its handle (`openat`,
+> `O_NOFOLLOW`), a new name made durable with the directory; `hyper-block`'s `DeviceFile::adopt` takes such a file
+> (local change 3). Tests: `slates-land --test store_root` 3/3. A store file is one `DeviceFile` for now; segmented
+> files over the root (mantle's answer to APFS's first-write stalls) are a performance item (GAPS).
+>
+> **Status (2026-11-20, piece C3 step 1: the changeset log).** `crates/store` (`slates-store`), `log.rs`: item 2's
+> record (a 64-byte header with its CRC-32C; sections, each a head of kind, length and CRC-32C; a 48-byte trailer
+> holding the identity, BLAKE3 of the header and each section's kind, length and bytes, the commit magic, the length
+> and a CRC-32C), appended a section and a piece at a time, committed by the trailer and one `sync_data` before the
+> log's end moves, recovered from a trusted offset to the first record that does not verify. It is built on
+> `hyper-block`'s file directly, not on `hyper-log`: hyper-log is a Raft log whose groups retain a bounded suffix
+> (`group_entries`, `group_bytes`) truncated once applied, and the changeset log is the repository's whole history,
+> never truncated (hyper-log stays vendored for the fleet's replication). The agreed format (w-hg: an edit's named
+> base and a `Texts` section of each touched path's full-text identity; w-git: v4's payload homed by identity, normalized
+> later behind the same names) is the sections' content. Tests: `slates-store --lib log` 6/6 over the simulated file with
+> power-loss semantics: round trip, every crash mode, a record interrupted before its commit, a cut at every byte of
+> the last record, a flipped bit in a header, a payload or a trailer, out-of-order appends.
+>
+> **Status (2026-11-20, piece C3 step 2: the store).** `store.rs`: the granted directory's two files, the changeset
+> log (`changesets`) and mantle's engine (`rows`), both opened through `slates_land::store_root` and adopted as
+> buffered device files; a landing appends and commits the record (one flush), then applies its rows to the engine,
+> whose write-ahead log the changeset log is; the engine checkpoints at the log's end, and opening the store replays
+> the log from the checkpoint's offset. The `C` table (repository and sequence big-endian, so a repository's
+> changesets are one ordered range) names each record's offset, length, identity, tool and work. The engine's sizing:
+> page = the file's layout block, extents bounded by the grant's disk allowance, leaves by the shard's memory over a
+> row's bytes; extent pages (32, mantle's) and fanout (8, SplinterDB's) cited, learned owed (GAPS). Tests:
+> `slates-store --test store` 3/3 on real directories in the build output (rows by repository with a payload read
+> back; recovery from the log alone; a checkpoint and the log after it, every row once).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

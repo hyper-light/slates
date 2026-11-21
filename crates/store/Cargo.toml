@@ -1,0 +1,26 @@
+[package]
+name = "slates-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "The version-control store: changes in RAM, each repository's history an append-only changeset log on disk under its standing grant, its rows in mantle's engine (A-767)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+blake3 = { workspace = true }
+# The block layer the log and the engine's file are written through (vendor/hyper-raft): aligned I/O and the
+# platform's full flush (`F_FULLFSYNC` on macOS).
+hyper-block = { path = "../../vendor/hyper-raft/hyper-block" }
+# CRC-32C of every header, section and trailer (vendor/mantle).
+mantle-crc = { path = "../../vendor/mantle/crc" }
+# The engine the store's rows live in (vendor/mantle; A-767 item 3).
+mantle-engine = { path = "../../vendor/mantle/engine" }
+slates-land = { workspace = true }
+
+[dev-dependencies]
+# The simulated file with power-loss semantics the log's crash tests run on.
+hyper-block = { path = "../../vendor/hyper-raft/hyper-block", features = ["sim"] }
+
+[lints]
+workspace = true

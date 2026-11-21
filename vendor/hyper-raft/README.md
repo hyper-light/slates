@@ -57,6 +57,11 @@ sources return to upstream's bytes:
 2. `hyper-block`'s `threads::macos::thread_cpu` reads the kernel's thread CPU clock as given, without hyper-rt's
    restatement at the kernel's tick rate, which only a process Rosetta 2 translates needs; slates ships native arm64
    and x86_64 builds only. Its test times the spin by `std::time::Instant` (3 of 3 `threads` tests pass).
+3. `hyper-block`'s `DeviceFile::adopt` takes a file another crate opened (slates' `land`, relative to a store root its
+   standing grant names, `slates_land::store_root`), made direct after the open where asked and the platform can
+   (`F_NOCACHE` on macOS, `O_DIRECT` through `F_SETFL` on Linux) and buffered elsewhere, as `open` falls back; `open`
+   and `adopt` share the steps after the open (`finish`). So the store's files are never opened by path in a vendored
+   crate (A-767 C2; main's ruling: the engine's disk writes sit behind `land`'s write seam).
 
 A change slates needs in one of these crates is proposed to hyper-raft's owner, lands there once every consumer's suite
 passes, and reaches slates as a new snapshot in its own gated commit.
