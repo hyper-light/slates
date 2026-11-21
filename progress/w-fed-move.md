@@ -1,5 +1,11 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~02:50 PST: A-803 LANDED slates main 081542c5 ((b) named: the re-anchor walks every value)
+- Counters: merge.reanchor.values_walked, merge.submit.secure. Values per verdict 7.9 -> 231 over 10^5 versions,
+  judge 24 -> 71 µs, compose and secure flat. Not the 100k wall (a few values a path there).
+- Design options sent to main: inbox/main-from-w-fed-move-b-design.md (I recommend waiting for r48, then the anchor
+  indirection). Waiting on main's call and r48's rows.
+
 ## 2026-11-21 ~02:30 PST: A-802 LANDED slates main fd0dd8eb (injections; the destroy's O(volumes) scan)
 - Harness injections: --idle-works M, --preload V, --lagged-submit; the owner's per-kind counters printed after each
   phase. Results: (a) flat; (b) verdict about 2x at 10^5; (c) 10^4 idle works cut 6,513 to 2,506 verdicts/s, which
