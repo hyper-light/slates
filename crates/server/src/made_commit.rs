@@ -202,6 +202,85 @@ pub(crate) struct Pending {
   local: Option<DbVolumeId>,
   /// The version's durable parts.
   parts: AcceptedParts,
+  /// The held verdict's preview, where the tool keeps one across turns ([`hold_preview`]): what its made commit is built
+  /// against while the verdict is held, retired in the one step ([`commit`]) or when the accept is given up.
+  preview: HeldPreview,
+}
+
+/// A held verdict's preview kept across turns (P2, main's ruling of 2026-11-21 07:30: git's made commit builds its path
+/// map, a slice a turn, against the version the verdict makes, before the one step applies it). Given back in the step
+/// that ends the accept; one dropped otherwise (a task ended early) gives its scratch member back as it drops, where the
+/// shard's state is not borrowed then.
+#[derive(Default)]
+struct HeldPreview {
+  /// The preview.
+  preview: Option<crate::greens::Preview>,
+  /// Whether it has been lent after the submit's step: the counter's.
+  #[cfg_attr(not(test), allow(dead_code))]
+  // Read by `with_held_preview`, whose caller is git's made commit (w-git).
+  lent_later: bool,
+}
+
+impl HeldPreview {
+  /// Retires the preview in this step, once.
+  fn retire(&mut self, state: &mut ShardState) {
+    if let Some(preview) = self.preview.take() {
+      state.greens.retire_preview(preview);
+    }
+  }
+}
+
+impl Drop for HeldPreview {
+  fn drop(&mut self) {
+    if let Some(preview) = self.preview.take() {
+      let _ = crate::state::with_state_counted(|state| state.greens.retire_preview(preview));
+    }
+  }
+}
+
+/// Counter: a held verdict's preview lent after the submit's step that made it, i.e. kept across a turn or more (P2's
+/// non-vacuity counter for main's 07:30 ruling). Format: a counter name in the daemon's status report.
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's made commit (w-git, C5 2b piece 3).
+pub(crate) const PREVIEW_HELD_ACROSS_TURNS: &str = "vcs.made.preview_held_across_turns";
+
+/// Keeps a preview of `judged`, the accept's held verdict, with `pending` across turns: the green made as the verdict
+/// would make it, while the green itself shows nothing of it (`Greens::preview`, A-805). For a tool whose made commit is
+/// built a slice a turn against the version (git's path map). Whether one is held.
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's made commit (w-git, C5 2b piece 3).
+pub(crate) fn hold_preview(
+  state: &mut ShardState,
+  pending: &mut Pending,
+  judged: slates_merge::engine::Judged,
+) -> bool {
+  pending.preview.retire(state);
+  let green = pending.parts.green;
+  pending.preview.preview = state.greens.preview(&green, judged).ok();
+  pending.preview.preview.is_some()
+}
+
+/// `read` over `pending`'s held preview, on any turn until its one step: the green as its held verdict makes it. The
+/// first lend counts [`PREVIEW_HELD_ACROSS_TURNS`]. None where no preview is held or its lineage is busy.
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's made commit (w-git, C5 2b piece 3).
+pub(crate) fn with_held_preview<R>(
+  state: &mut ShardState,
+  pending: &mut Pending,
+  read: impl FnOnce(&slates_merge::engine::Green) -> R,
+) -> Option<R> {
+  let preview = pending.preview.preview.as_ref()?;
+  let lent = state.greens.with_preview(preview, read).ok()?;
+  if !pending.preview.lent_later {
+    pending.preview.lent_later = true;
+    state.count(PREVIEW_HELD_ACROSS_TURNS, 1);
+  }
+  Some(lent)
+}
+
+/// Gives `pending` up before its step: its preview retired, then [`abandon`].
+#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's made commit (w-git, C5 2b piece 3).
+pub(crate) fn give_up(state: &mut ShardState, mut pending: Pending) {
+  pending.preview.retire(state);
+  let green = pending.parts.green;
+  abandon(state, (pending.request(), green));
 }
 
 /// Hands the running submit's accept of `parts` to the made task holding `held`'s turn (module docs, 2): its route
@@ -226,6 +305,7 @@ pub(crate) fn defer(
     route: state.reply_route.take(),
     local: held.local,
     parts,
+    preview: HeldPreview::default(),
   };
   state.acceptance_deferred = true;
   state.made_commits.deferred = true;
@@ -244,6 +324,21 @@ pub(crate) fn defer(
     }
   }
   crate::lease_wait::parked_reply()
+}
+
+impl Pending {
+  /// A pending accept of `parts` with no request (a test's), answered nowhere.
+  #[cfg(test)]
+  pub(crate) fn for_test(parts: AcceptedParts) -> Pending {
+    Pending {
+      origin: 0,
+      id: RequestId::default(),
+      route: None,
+      local: None,
+      parts,
+      preview: HeldPreview::default(),
+    }
+  }
 }
 
 /// A pending accept's request: its completion key and where its answer goes.
@@ -272,6 +367,19 @@ impl Pending {
 /// refused or the green was made again meanwhile (then nothing of the tool's ran).
 pub(crate) fn commit<T, E>(
   state: &mut ShardState,
+  mut pending: Pending,
+  tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
+) -> Option<Result<T, E>> {
+  // The held preview, if any, lives until this step and is retired in it, whatever the step does.
+  let mut preview = std::mem::take(&mut pending.preview);
+  let made = commit_held(state, pending, tool);
+  preview.retire(state);
+  made
+}
+
+/// [`commit`]'s step, its preview held by the caller.
+fn commit_held<T, E>(
+  state: &mut ShardState,
   pending: Pending,
   tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
 ) -> Option<Result<T, E>> {
@@ -288,6 +396,7 @@ pub(crate) fn commit<T, E>(
     route,
     local,
     parts,
+    ..
   } = pending;
   state.db.begin();
   state.current_request = Some((origin, id));

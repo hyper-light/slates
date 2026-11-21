@@ -100,11 +100,6 @@ impl ImportBatch {
     })
   }
 
-  /// The green.
-  pub(crate) fn green(&self) -> DbVolumeId {
-    self.green
-  }
-
   /// The version the next work is based at, in the green's numbering: its head and every revision staged.
   pub(crate) fn head(&self) -> u64 {
     self

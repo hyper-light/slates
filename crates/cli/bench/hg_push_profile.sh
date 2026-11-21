@@ -65,6 +65,7 @@ if [ "$STEP" = stream ]; then
     t=$(now)
     said=$("${H[@]}" "${AUTH[@]}" clone -U --stream --debug "$URL" "$OUT/round-clone" 2>&1 | grep -E "^\(sent |files to transfer|abort")
     echo "slates stream $round $(perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$t" "$(now)") s; $(echo "$said" | tr '\n' ' ')"
+    echo "  counters after round $round: $("$SLATES" --instance "$instance" status --json | grep -oE '"count":[0-9]+,"kind":"vcs_store.(hg_stream_|index_upkeep.)[a-z_]+"' | sed -E 's/"count":([0-9]+),"kind":"vcs_store.(hg_stream_|index_upkeep.)([a-z_]+)"/\3=\1/' | tr '\n' ' ')"
     [ "$round" = 1 ] && echo "slates stream verify: $("${H[@]}" -R "$OUT/round-clone" verify 2>&1 | grep -E 'checked|warning|error|integrity' | tr '\n' ' ')"
   done
   rm -rf "$OUT/round-clone"

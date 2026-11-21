@@ -147,6 +147,15 @@ impl Greens {
     self.lend_mut(id)?.defer(push)
   }
 
+  /// The members `repository`'s lineage holds, its previews among them: a test's view.
+  #[cfg(test)]
+  pub fn lineage_len(&mut self, repository: RepositoryId) -> usize {
+    self
+      .lineages
+      .get_mut(&repository)
+      .map_or(0, |lineage| lineage.get_mut().len())
+  }
+
   /// Whether `id`'s green owes a push (P2): held, and not materialized.
   pub fn is_owing(&self, id: &VolumeId) -> bool {
     self.lend(id).is_some_and(|lent| !lent.is_materialized())

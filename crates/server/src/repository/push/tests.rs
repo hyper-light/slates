@@ -1171,6 +1171,73 @@ fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again
   );
 }
 
+/// A holder's replica at version 0 given the owing green's shipped `inputs` (the push's record) and `identity`: its
+/// base's identity; it then owes version 1, stands for it with the record's identity, and refuses a later increment
+/// (made from `built`) while it owes, nothing applied. The replica.
+fn replica_owing_the_record(
+  (inputs, identity): (&[u8], [u8; 32]),
+  built: &slates_merge::engine::Increment,
+) -> slates_merge::engine::Green {
+  let mut replica = slates_merge::engine::Green::new();
+  assert_eq!(
+    identity,
+    replica.head_identity(),
+    "the owing green's identity is its base's"
+  );
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, inputs, 1),
+    Ok(())
+  );
+  assert!(!replica.is_materialized());
+  assert_eq!(replica.reached(), 1, "the replica stands for version 1");
+  assert_eq!(
+    replica.head_identity(),
+    identity,
+    "its identity is the record's"
+  );
+  let mut later = built.clone();
+  later.id = [9; 32];
+  later.base = 1;
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
+    Err(crate::merge_service::REPLICA_OWES)
+  );
+  assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+  replica
+}
+
+/// An import batch over `batch_main` (at its first version) with three revisions staged a revision at a time: the
+/// green shows nothing of them, and a replay of its durable chain (a crash's recovery) reaches the first version alone.
+fn staged_batch(
+  state: &mut ShardState,
+  batch_main: DbVolumeId,
+  (trees, store): (&[ObjectKey], &Store),
+) -> crate::import_batch::ImportBatch {
+  let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
+  for n in 1..4u8 {
+    let index = usize::from(n);
+    let next = batch_work(
+      state,
+      &batch,
+      (trees[index - 1], trees[index], &[n]),
+      (store, n + 1),
+    );
+    assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
+  }
+  assert_eq!(
+    green_reads(state, batch_main).0,
+    1,
+    "the green shows nothing of a staged batch"
+  );
+  // A crash now recovers to before the batch: what a replay of the durable chain reaches.
+  assert_eq!(
+    crate::verbs::replay_green_for_test(state, batch_main),
+    Some((1, None)),
+    "nothing of it durable"
+  );
+  batch
+}
+
 /// P2 at f > 0 (main's order of 05:51, R8: laptop and fleet one code path). Do: push an eager create and an owed create
 /// of the same tree; take the merge record the owner ships holders for the owed version 1 (`enqueue_record`'s inputs and
 /// identity); apply it to a holder's replica of the green at version 0 as a holder does (`apply_inputs`, the record's
@@ -1224,31 +1291,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
       slates_merge::push::DeferredPush::is_record(&inputs),
       "the push's record is the inputs"
     );
-    let mut replica = slates_merge::engine::Green::new();
-    assert_eq!(
-      identity,
-      replica.head_identity(),
-      "the owing green's identity is its base's"
-    );
-    assert_eq!(
-      crate::merge_service::apply_inputs(&mut replica, &inputs, 1),
-      Ok(())
-    );
-    assert!(!replica.is_materialized());
-    assert_eq!(replica.reached(), 1, "the replica stands for version 1");
-    assert_eq!(
-      replica.head_identity(),
-      identity,
-      "its identity is the record's"
-    );
-    let mut later = built.clone();
-    later.id = [9; 32];
-    later.base = 1;
-    assert_eq!(
-      crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
-      Err(crate::merge_service::REPLICA_OWES)
-    );
-    assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+    let mut replica = replica_owing_the_record((&inputs, identity), &built);
     let mut building = replica
       .materializing(slates_merge::pace::Pace::unbounded())
       .expect("it owes a push");
@@ -1402,11 +1445,11 @@ fn batch_work(
   built
 }
 
+/// A green as a test compares it: head, files, head identity, durable head.
+type GreenRead = (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64);
+
 /// Reads a green as a test compares it: head, files, head identity, durable head (its checkpoint and chain).
-fn green_reads(
-  state: &mut ShardState,
-  green: DbVolumeId,
-) -> (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64) {
+fn green_reads(state: &mut ShardState, green: DbVolumeId) -> GreenRead {
   let durable = state.db.partition().green_head(green);
   let mut engine = state.greens.get_mut(&green).expect("the green");
   let files = engine
@@ -1476,28 +1519,7 @@ fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() 
       )
       .expect("a revision, one entry");
     }
-    let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
-    for n in 1..4u8 {
-      let index = usize::from(n);
-      let next = batch_work(
-        state,
-        &batch,
-        (trees[index - 1], trees[index], &[n]),
-        (&store, n + 1),
-      );
-      assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
-    }
-    assert_eq!(
-      green_reads(state, batch_main).0,
-      1,
-      "the green shows nothing of a staged batch"
-    );
-    // A crash now recovers to before the batch: what a replay of the durable chain reaches.
-    assert_eq!(
-      crate::verbs::replay_green_for_test(state, batch_main),
-      Some((1, None)),
-      "nothing of it durable"
-    );
+    let batch = staged_batch(state, batch_main, (&trees, &store));
     let made = batch
       .commit(state, (&owner(), batched), reference(9))
       .expect("committed");
@@ -1576,4 +1598,114 @@ fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
     batch.abandon(state);
     assert_eq!(green_reads(state, main), before);
   });
+}
+
+thread_local! {
+  /// The preview test's pending accept, kept on the shard's thread from one step to the next.
+  static HELD_PENDING: std::cell::RefCell<Option<crate::made_commit::Pending>> = const { std::cell::RefCell::new(None) };
+}
+
+/// P2's preview lifetime (main's ruling of 2026-11-21 07:30, for w-git's C5 2b piece 3: a made commit's path map is
+/// built a slice a turn against the version the held verdict makes). Do: on a git green at version 1, judge a second
+/// work and hold its verdict's preview with a pending accept (`made_commit::hold_preview`); in a later step of the shard,
+/// read through it (`with_held_preview`); in a third, commit the accept (`made_commit::commit`). Expect:
+/// - while held, the preview reads as version 2 (the work's bytes), the green still at version 1 with its own bytes,
+///   and its lineage holds one member more (the preview);
+/// - the read in a later step counts `vcs.made.preview_held_across_turns` once;
+/// - committed, the green is at version 2 with the work's bytes, and the preview is retired (the lineage back to its
+///   members).
+#[test]
+fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (main, repo, members) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "held-preview");
+    let mut store = Store::default();
+    let one = store.put_tree(&[("f", b"one")]);
+    let two = store.put_tree(&[("f", b"two"), ("g", b"new")]);
+    let first = work(state, main, (0, None), (one, b"h1"), (&store, 1));
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![BranchChange::Update {
+        green: main,
+        work: first,
+      }],
+      EntryParts::default(),
+    )
+    .expect("version 1");
+    let members = state.greens.lineage_len(repo);
+    let second = work(state, main, (1, Some(one)), (two, b"h2"), (&store, 2));
+    let judged = match state
+      .greens
+      .get_mut(&main)
+      .expect("the green")
+      .judge(&second)
+    {
+      slates_merge::engine::Judgment::Accepted(judged) => judged,
+      other => panic!("not accepted: {other:?}"),
+    };
+    let parts =
+      crate::verbs::AcceptedParts::for_test((main, main, 2), (second, judged.applied().to_vec()));
+    let mut pending = crate::made_commit::Pending::for_test(parts);
+    assert!(
+      crate::made_commit::hold_preview(state, &mut pending, judged),
+      "a preview held"
+    );
+    assert_eq!(
+      state.greens.lineage_len(repo),
+      members + 1,
+      "the preview is a member while held"
+    );
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (main, repo, members)
+  });
+  let later = crate::daemon::observe_first(&daemon, move |state| {
+    let mut pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let previewed = crate::made_commit::with_held_preview(state, &mut pending, |engine| {
+      engine.content("g").map(<[u8]>::to_vec)
+    });
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("f").map(<[u8]>::to_vec)));
+    let counted = state
+      .refusals
+      .get(crate::made_commit::PREVIEW_HELD_ACROSS_TURNS)
+      .copied();
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (previewed, green, counted)
+  });
+  let committed = crate::daemon::observe_first(&daemon, move |state| {
+    let pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let made = crate::made_commit::commit(state, pending, |_| Ok::<(), ()>(()));
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("g").map(<[u8]>::to_vec)));
+    (made, green, state.greens.lineage_len(repo))
+  });
+  daemon.stop();
+  assert_eq!(
+    later.0,
+    Some(Some(b"new".to_vec())),
+    "the preview reads as version 2 in a later step"
+  );
+  assert_eq!(
+    later.1,
+    Some((1, Some(b"one".to_vec()))),
+    "the green shows version 1 while the verdict is held"
+  );
+  assert_eq!(later.2, Some(1), "held across a turn, counted once");
+  assert_eq!(committed.0, Some(Ok(())));
+  assert_eq!(
+    committed.1,
+    Some((2, Some(b"new".to_vec()))),
+    "committed in the one step"
+  );
+  assert_eq!(committed.2, members, "the preview retired in the one step");
 }

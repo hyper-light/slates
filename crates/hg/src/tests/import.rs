@@ -1479,9 +1479,10 @@ fn taken_whole(
 
 /// A-767 C1 step 3 (the import as the changegroup a push of it would bring, `crate::import::emit`). Do: import each of
 /// the five stores 7.2 wrote, writing its history in segments of at least 512 bytes; concatenate the segments and take
-/// them through the push's intake into an empty index. Expect the intake's index the import's row for row; every
-/// segment but the last at least its bound; every text a segment names lying within it; and the stream as long as its
-/// segments.
+/// them through the push's intake into an empty index; and replay the segments' records in order into another (main's
+/// oracle of the two encodings). Expect the intake's index the import's row for row, and the records' the intake's;
+/// every segment but the last at least its bound; every text a segment names lying within it; and the stream as long
+/// as its segments.
 #[test]
 fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
   const BOUND: usize = 512;
@@ -1520,6 +1521,53 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
       .iter(&taken_store)
       .map(|row| (row.key().to_vec(), row.body().to_vec()))
       .collect();
-    assert_eq!(taken, rows(&mut imported, &store), "{name}");
+    let expected = rows(&mut imported, &store);
+    assert_eq!(taken, expected, "{name}");
+    // Main's oracle (two encodings, ruling of 2026-11-21 01:16): the rows the segments' records store, replayed in
+    // order by identity with no payload read and no text rebuilt, are the rows the intake derives from the same
+    // changegroup.
+    let mut by_records = crate::index::HgIndex::new();
+    for segment in &segments {
+      crate::import::record::replay(&segment.record, &mut by_records, &mut store).unwrap();
+    }
+    let recorded: Rows = by_records
+      .rows()
+      .iter(&store)
+      .map(|row| (row.key().to_vec(), row.body().to_vec()))
+      .collect();
+    assert_eq!(
+      recorded, taken,
+      "{name}: the segments' records against the intake"
+    );
   }
+}
+
+/// A-767 C1 step 3 (an import's run in the register, `record::write_run_reference`). Do: write a run's reference, read
+/// it back; cut it at every length, add a byte, and name a run whose last precedes its first; replay the reference as
+/// a record. Expect the run read back whole; every damaged one read as no run; and the replay refused by version (the
+/// register's reference is not a record of revisions).
+#[test]
+fn an_imports_run_reference_reads_back_whole_or_not_at_all() {
+  use crate::import::record::{Refused, Run, replay, run_of, write_run_reference};
+  let written = write_run_reference(1 << 20, (3, 9));
+  assert_eq!(
+    run_of(&written),
+    Some(Run {
+      room: 1 << 20,
+      first: 3,
+      last: 9
+    })
+  );
+  for cut in 0..written.len() {
+    assert_eq!(run_of(&written[..cut]), None, "cut at {cut}");
+  }
+  let mut trailing = written.clone();
+  trailing.push(0);
+  assert_eq!(run_of(&trailing), None);
+  assert_eq!(run_of(&write_run_reference(1 << 20, (9, 3))), None);
+  let mut empty = crate::index::HgIndex::new();
+  assert!(matches!(
+    replay(&written, &mut empty, &mut store()),
+    Err(Refused::Version { version: 9 })
+  ));
 }
