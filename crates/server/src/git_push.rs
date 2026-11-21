@@ -341,7 +341,9 @@ enum Homing {
   PackAsked(Vec<u8>, (slates_vcs::ContentId, u64), Vec<u8>),
   /// The pack taken by the edge, its outcome awaited, with the names' rows.
   PackWaiting((slates_vcs::ContentId, u64), Vec<u8>),
-  /// Both homed: the changeset for the edge to land.
+  /// Both homed: the changeset to ask of the edge at the decision's next turn.
+  LandDue(Box<Landing>),
+  /// Asked: the changeset for the edge to land.
   LandAsked(Box<Landing>),
   /// The changeset taken by the edge, the store's answer awaited, at its sequence.
   LandWaiting(u64),
@@ -849,6 +851,11 @@ impl<P> ReceivePack<P> {
         }
         _ => Ok(true),
       },
+      // The changeset asked of the edge, as the names and the pack are, in the turn before the edge takes it.
+      Homing::LandDue(landing) => {
+        decision.homing = Homing::LandAsked(landing);
+        Ok(false)
+      }
       // A changeset no edge took: no edge lands it, so the record names none (sequence 0), as a daemon with no store's.
       Homing::LandAsked(_) => {
         crate::vcs_store::homes::count_untaken(state);
@@ -916,7 +923,7 @@ impl<P> ReceivePack<P> {
         }
         decision.sealed.pack_homed_as((identity, len));
         decision.homing = match landing_of(state, repository, (names, homed.bytes)) {
-          Some(landing) => Homing::LandAsked(Box::new(landing)),
+          Some(landing) => Homing::LandDue(Box::new(landing)),
           None => Homing::Done,
         };
       }
