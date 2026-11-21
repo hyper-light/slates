@@ -17765,7 +17765,7 @@ measured, bound ten liveness budgets).
 | Mac Studio (Studio-4), macOS arm64 | origin/main 40c3f8d1e, one status | resident 0, measured false | 1 | never in that status |
 | Mac Studio (Studio-4), macOS arm64 | 40c3f8d1e, looking again | 286,785,536 (the regions whole, freed pages too) | 20 | 1.15 s |
 | Mac Studio (Studio-4), macOS arm64 | the fix, 3 runs | 268,435,456 of 268,435,456 | 2, 2, 2 | 86, 86, 76 ms |
-| adacachy, Linux x86_64 (load 45) | the fix | kiln r8 in flight at landing (compiling) | | |
+| adacachy, Linux x86_64 (load 45, kiln r8) | b5220bd92 | 268,435,456 of 268,435,456 (region 16 GiB) | 2 | 35 ms |
 | jupiter, Windows x86_64 | the fix | with w-lint (run-requests 2026-11-21T01:10Z) | | |
 
 What the sweep walks a shard on the test daemon (`content_range.<range>.bytes`): write log 1,276,423,222, image slots
