@@ -2654,7 +2654,12 @@
 > a commit's green increment brings back whole a stored text the content store let go (a copy, a revert;
 > `svn_texts::bring_whole`), given back after its step; held by
 > `a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment` (red without it: `Corrupt`).
-> Owed: P2 the hook view brings an evicted stored text back before it holds it; P3 the content store lets go a
+> P2 BUILT: the hook view keeps a layout naming a stored text the content store let go, brings the text back whole
+> between its turns, then writes and holds it (`svn_presenter::show`, `ViewTurn::Bringing`); held by
+> `a_hook_view_brings_back_a_stored_text_the_content_store_let_go` (red without it: never shown). Its cost, recorded:
+> a view pins in RAM every stored text it shows while it lives (views live as long as the shard), since its mount's
+> reads are the vfs's synchronous referenced reads; reads that wait on the store need vfs work, not yet owned.
+> Owed: P3 the content store lets go a
 > commit's texts once its changeset lands, recovery stops reading them back; P4 imports land texts as Payload with
 > Texts rows, the records keep none in RAM, the deltify job retired. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
