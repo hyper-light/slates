@@ -264,9 +264,8 @@
 >   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
 >   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
 > - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the device-pressure seam that sizes consult
->   (w-sizing).** Today the sampler (A-570) only sets the admission hold. A shard gives memory back only at its next
->   idle pass: the release run, A-778 r2hold on the big Studio, kept 591 and 340 MiB resident after a destroy until the
->   idle pass ran. Plan: one seam with the same code on a laptop and in a fleet. A pressure report makes every shard
+>   (w-sizing).** Today the sampler (A-570) only sets the admission hold. A shard gives free extents back only at its next
+>   idle pass (`release_idle`), and no sizing site reads the device's pressure. Plan: one seam with the same code on a laptop and in a fleet. A pressure report makes every shard
 >   give back what it can at once (the free extents `release_idle` returns, the idle purge). Each sizing site reads the
 >   seam's ceiling before it grows. Past the hold, admission refuses with a typed error before the machine swaps. Red
 >   first: an injected pressure fall frees a deleted volume's extents with no idle pass, and a growth past the ceiling
