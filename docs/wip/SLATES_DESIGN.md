@@ -59231,3 +59231,28 @@ What changes where:
 Also applied to: `crates/git/src/store/{repository,admitting,deriving,protect,reach,mod}.rs`, the git store's tests,
 `crates/server/src/vcs_store.rs`, `crates/server/src/vcs_store/{git_derive,git_encode,upload,tests}.rs`,
 `docs/wip/GAPS.md`.
+
+### A-238 amended — A push makes the chains room before its append, a green a turn (2026-11-21, w-git for UI goal 93; main's order 04:58 PST; found by use: git/git's whole-history push)
+
+**Found.** git/git's whole-history push had its daemon killed by the watchdog, in two runs: "shard 10 is spinning:
+1,142 ms of CPU without a step" (and 1,095 ms, 1,124 ms). Stack samples in one-second windows up to the kill put 748 of
+762 samples in one append (`repository::push::admit`). Its entry met `green_chains` at its cap, so it checkpointed every
+member green of the repository (A-753), about a thousand, in the append's one step, each folding its identity whole
+(`Green::head_identity`).
+
+**Rule.** A push's judge makes the room before the append (`git_push`'s `ServerJudge::room_turn`, after the command's
+work is built):
+- Where the chains have less room than the built work's entry can take (`Preparing::entry_bound`, as a Subversion
+  commit sizes its own), it checkpoints one member green a turn, counted `git_push.room_checkpointed`, until there is
+  room or every member is done.
+- The append's own A-238 guard stays as the guard. A green it still checkpoints in its step is counted
+  `repository.push.append_checkpointed`.
+- Each checkpoint's own fold is w-engine's to run in turns (`fold_identity_step`, landing).
+
+**Test.** `git_push::tests::t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`: 16 creates,
+each its own 64-file tree, against a 64 KiB chain budget. Red at 30e89672f: every create ok, 73 greens checkpointed
+inside appends. Green: none inside an append, and the room made in the turns.
+
+Also applied to: `crates/server/src/git_push.rs`, `crates/server/src/git_push/hooks.rs`,
+`crates/server/src/repository/push.rs`, `crates/git/src/receive/works.rs`, `docs/wip/GAPS.md`.
+

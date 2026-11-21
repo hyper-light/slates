@@ -328,7 +328,10 @@
 > read, sliced and memoized; a replay walks nothing. Owed, measured on 40d961807 (Studio-2): the third wall, each
 > created ref's green composing an increment and building its whole path map at the push (`slates_merge::push::
 > Building`, `vcs_store::paths::whole_build`: about 9,700 of 11,642 decision samples), refs times tree size; and a unit
-> of it running past the watchdog's window (1,142 ms, 1,095 ms: the daemon killed mid-push). Then red, that push
+> running past the watchdog's window (1,142 ms, 1,095 ms: the daemon killed mid-push), named and its loop CLOSED
+> (A-238 amended, 2026-11-21): an append meeting `green_chains` at its cap checkpointed every member green in its one
+> step; a push now makes that room in its turns before the append, a green a turn. Owed there: each checkpoint's fold
+> is still whole until w-engine's `fold_identity_step` lands (507110661, main's order to land it). Then red, that push
 > landing within its room; an A/B against stock git (10.77 s). Also measured: the checks take 15.8 s (mostly
 > `Tree::parse`, each tree parsed by fsck and by the walk) and the seal 3.8 s.
 > A-614 amended, owed: a create's fresh objects are attributed in the landing map to its push's first move, so upload
