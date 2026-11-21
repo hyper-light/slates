@@ -265,3 +265,7 @@
 - Host, fmt, structural, six cross targets clean. Still with owners: slates-store's 56 literals (w-store),
   slates-server's unsafe 8 > 6 (w-sizing, A-789).
 - Windows: jupiter is offline; r4 asks kiln for any Windows runner. Linux r60 still queued.
+
+## 2026-11-20 19:15: refine.rs table back (9f77462e4), main's order
+- Whole refinement back at pre-round-10 cost; sliced ~1.05x left (GAPS D-O17 (f) updated). Plus refine CHUNK cast,
+  refine test split, server refining.rs literals. Close note appended to inbox/main-from-w-lint-close.md.
