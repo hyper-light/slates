@@ -116,3 +116,5 @@ push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run 
   -p slates-store on jupiter; then land under the fast rule; tell w-interop to rerun its Windows matrix.
 
 - 2026-11-21 14:32 PST: main took the Windows rounds (w-k90-win keeps them). r1 (by-use proof) stays queued; I send its rows to main when it ends, then I am in goal 93 reserve. Request to w-interop withdrawn.
+
+- 2026-11-21 ~14:55 PST: r1 dropped unrun; by-use round is w-k90-win's (main 14:31). I am in goal 93 reserve; failures from that round come to me as red tests.

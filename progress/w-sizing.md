@@ -185,3 +185,13 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   write log (changes the recovery format); 3, the device-pressure seam; 4, NFSv3 in-place reply framing.
 - Holding for main's go/not now on each: the 11:09 reserve ruling says start no runs, and every red needs a kiln build.
   The NFS worktree is removed and its branch deleted (nothing was edited in it).
+- 14:55 main: 2b and 3 deferred until after goal 93. Both plans are in GAPS under the MEMORY SIZING sweep (37592d80b,
+  corrected 9ab8a0602). I stay in goal 93's reserve. Item 4 (NFSv3 in-place replies) is still unruled.
+- Found: ~/slates-work/w-sizing-main's working tree has been empty since 10:24 (7,770 staged deletions, .git intact,
+  HEAD 356b28d96). Not mine to repair under the no-reset rule; I work from fresh worktrees.
+- 14:58 main: item 4 deferred too; its GAPS line landed as c829bcdde. All three plans wait for goal 93 to end.
+- w-sizing-main cause: not a truncation. Its .git was made by a fresh `git clone` at 10:24:59-10:25:15 (the reflog's
+  only entry; on Studio-4's hostname), with no checkout after it: no index, and an empty tree. This fits a clone whose
+  checkout failed when this Mac's disk was full. It was the clone, not a worktree, so `git worktree remove` didn't
+  apply. I removed its two landed worktrees (a839, gaps4), checked that agents/w-sizing-arena's change equals main's
+  b5249f883, and deleted the folder by its exact path. The next piece starts from a fresh clone.

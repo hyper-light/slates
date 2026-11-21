@@ -404,3 +404,23 @@
   40/40. w-git told. The rest of the wall was clean.
 - VCS lane: Linux r32 running on adacachy2; Windows r31 queued, since jupiter's link is down. r29 waits for w-work-mount,
   which hasn't landed yet.
+
+## 2026-11-21 round at d4c7e1f42 (landed 876f35ef0)
+- Reds:
+  - server store_tests.rs: A-835's sleep while waiting for the kill became a yield, still bounded by its deadline.
+  - server vcs_ssh/git.rs: A-722's identical keepalive branch is one condition.
+  - cli git_correctness.rs: read_chunked split out (12/10).
+  - cli svn_interop.rs: use_slates_leg split out (11/10), plus unwrap_in_result in the harness allow.
+- Focused local: server 72, git_correctness 2. Fmt, xtask and the six cross targets were clean.
+- VCS lane: Linux r32 still running (adacachy2); Windows r31 queued, jupiter's link down. r29 waits for w-work-mount.
+- VCS lane, round at d4c7e1f42: Linux didn't run (r30 sync stuck, r32 clone broke after 66 min; in run-requests.md).
+  Windows: r31 dropped, resubmitted as r33, queued. No platform has a pass/fail count yet.
+- VCS lane, Windows: r31 dropped and its resubmit r33 died when jupiter's runner restarted (in run-requests.md).
+  No platform has a pass/fail count this round.
+
+## 2026-11-21 round at ed4661d40
+- Red: server git_push t_a836 at 11/10, split into tags_listed_peeled and fetched_ids; git_push 30/30. The rest of the
+  wall was clean.
+- VCS lane: Linux r36 dropped (adacachy didn't answer in 15 s), so I resubmitted it once as r38 (shallow clone).
+  Windows r37 is queued for jupiter.
+- Disk: 33 GB free after the round (other workers' builds), so I deleted my own debug target (19 GB, literal path): 51 GB free.

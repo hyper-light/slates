@@ -7442,3 +7442,30 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   99729edef, 1a35ab091's second parent); bisect logs `~/.cache/w-engine-p3-runs/bis-*.log`.
 - **Green:** B's Z = 20 ms SubmitAccepted p99 at or under A's (main's before A-579 measured 2.48-4.47 ms), p999/max no
   worse, Z = 50 ms every kind's p99 under 1 ms. **Red:** B's Z = 20 p99 above A's in most rounds; send it to w-engine.
+
+## 2026-11-21 w-lint: the VCS suites lane on Linux didn't run (second failure, reported per the drop rule)
+- r30 (sync from Studio-2 onto adacachy2) sat at "starting" for over an hour; stopped.
+- r32 (sync false, fresh https clone into ~/w-lint-vcs on adacachy2) ran 1h 6m and ended with "the kiln runner closed
+  the connection". The clone never finished: ~/w-lint-vcs is broken ("your current branch appears to be broken") and no
+  log was written. No test ran.
+- Owner: the runner path (kiln / adacachy2's link), not a slates test. What I need: a working clone on a Linux x86_64
+  runner, or sync that completes. Next try: next round, from a fetch into a fixed path, with --depth 1.
+- Windows r31 dropped before it started (jupiter stopped answering); I resubmitted it once as r33, which is queued.
+- Windows, second failure: r33 (the one resubmit of r31) ended with "f766f09294f2... no longer has this run (its runner
+  restarted)". jupiter has no vcs-windows.log, and ~/w-lint-win is still at 02874580e, so the run died before its
+  fetch finished. No test ran. Owner: jupiter's runner link (the R2 tunnel), not a slates test. Next try is next round.
+
+## w-shared, the lane's proof, holder route (main's round, §8; main 2026-11-21 14:56): 320 and 512 MiB x 10, release
+- Tree: origin/main at or after 2f3147b50. Needs: macos, disk=20g (release target measured 758 MB), a Studio (it is
+  a benchmark; not this MacBook). Command (sync:false, log on the machine):
+  `src=$HOME/.cache/lane-proof-src; rm -rf "$src"; git clone -q --depth 2 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/lane-proof-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=8;
+  cargo test --release -p slates-server --test fleet bench_a697 --no-run;
+  for run in $(seq 1 10); do for mib in 320 512; do r=$(SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=$mib SLATES_A697_BENCH_RUNS=1
+  cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture --test-threads=1 2>&1);
+  echo "run=$run mib=$mib $(echo "$r" | grep -a 'kind=holder' | grep -oE 'wall_ms=[0-9.]+|owner_step=[0-9.]+ms|beat_late=[0-9.]+ms/[0-9]+|forward=[0-9.]+ms' | tr '\n' ' ')
+  $(echo "$r" | grep -aoE 'shard [0-9]+ is spinning, [0-9]+ ms of CPU' | head -1)"; done; done`
+- Pass for the holder route: a `kind=holder` line every run at both sizes (the holder submit accepted) with
+  beat_late 0. The same run's local submit (the bench's second half) still exits 4 at 512 MiB until w-work-cow's
+  slicing lands: that is the local route's proof, a separate entry after it lands, not this one.
+- Last measured (kiln r2, Mac Studio-3, load 2-4, 5 rounds): holder 5/5 at 320 and 512, beat_late none.

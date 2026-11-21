@@ -1,5 +1,22 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~16:00 PST: GOAL MET -- A-840 landed (62907eeeb, merged 63437de47 on origin/main): a conflict resolved in one ask
+- The next largest owner-ask kind after A-817 was rebase (20.1 of 30.0 a client at 10 hot files). Cut by
+  `ResolveConflict { work, over, replacement }`: the windows given up, the rest resolved at the head as it is, one ask
+  with no gap (main's 10:37 ruling: take-head as one verb). Red first: `a_conflict_resolved_in_one_ask_keeps_what_its_windows_do_not_name`.
+- A/B (1,000 clients, release, kernel/, one round, --per-connection 32, three pairs each; oracle/own/starved 0 in 24):
+  | hot | owner asks: rebase arm | one ask | rebase-kind: rebase arm | one ask | verdict: rebase arm | one ask |
+  | 300 | 11.3, 11.3, 11.2 | 10.9, 11.0, 11.0 | 2.2, 2.1, 2.1 | 1.8, 1.9, 1.8 | 2.4 | 2.4 |
+  | 100 | 13.2, 13.3, 13.2 | 12.5, 12.5, 12.3 | 3.7, 3.7, 3.7 | 2.7, 2.7, 2.6 | 2.7-2.8 | 3.0 |
+  | 30  | 20.1, 19.7, 19.5 | 17.6, 17.5, 17.2 | 9.5, 9.1, 8.9 | 5.7, 5.6, 5.4 | 3.9 | 5.1-5.2 |
+  | 10  | 32.9, 33.2, 32.7 | 27.0, 26.8, 26.3 | 20.8, 20.9, 20.5 | 10.9, 10.7, 10.4 | 5.5-5.7 | 9.2-9.5 |
+- Found by the generated oracle and fixed in the same commit: a work off its green's shard laid ZEROS for base bytes it
+  did not hold when composing a rebased file held as A-806 parts (docs/bugs/2026-11-21-a-composition-laid-zeros-...);
+  and the owner's answer dropped the work's entries when it had composed (3.9 file asks a client) -- `composes_here`.
+- Next largest kind: verdict (9.2-9.5 a client at 10 hot files).
+- For main's queue: `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the
+  watchdog (debug build, load 14), on plain main too (checked with my diff taken out).
+
 ## 2026-11-21 ~14:40 PST: a third rebase cut (window bytes in the conflicting reply) -- measured, even, rejected; record on main a457405da (756cad83f)
 - No ruling from main on inbox/main-from-w-fed-move-rebase-race.md; main had said not to wait, so I built it locally:
   `Rebased` + appended `heads` (the head's bytes over each window, from the owner's engine), the daemon test red first
