@@ -17100,6 +17100,55 @@ about 30 µs of the Linux exchange is the daemon's own (the lane, the session's 
 receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
 both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
 
+**The exchange split, and a shard's placements cached (85a; g228; 2026-11-21).** The exchange is now timed apart
+(`fleet.live.hop.exchange.{borrow,round_trip,collect,settle}`: the session's borrow, its round trip as the session timed
+it, this side's tasks around it, the sessions' return). And `Configuration::place` (a fresh `Vec` and map per call, asked
+on every durability poll, every resolve and every lane's candidates) is answered from a per-shard cache keyed by
+everything `place` reads, bounded by the shard's placed heads (`crate::placement_cache`). Counted first: a 2 KiB live
+write cost its owner 250 allocator calls more than a plain write's 34; 134 after
+(`a_live_writes_allocations_on_its_owner_are_counted_against_a_plain_ones`, a per-thread counting allocator). Command:
+the contract command, release, each arm built from its commit, five rounds interleaved with the order alternating;
+ubuntu-latest, 4 cores, load 1.4-1.7 (diag-g228-live-12, run 44887905166). Microseconds; each cell added p50, live p50 /
+p999:
+
+| round | split (a40c07faa) | split + cache (4949613ae) |
+|---|---|---|
+| 1 | 124.7; 155.6 / 1,805.4 | 113.3; 143.6 / 2,988.8 |
+| 2 | 121.0; 152.5 / 2,178.6 | 114.0; 144.7 / 1,007.9 |
+| 3 | 120.9; 151.5 / 2,101.3 | 113.3; 143.8 / 1,494.3 |
+| 4 | 134.7; 163.4 / 1,332.1 | 107.5; 140.3 / 2,835.7 |
+| 5 | 128.4; 159.8 / 829.3 | 113.4; 144.3 / 1,797.4 |
+
+Per hop, p50 (bucket bounds), the same in every round of an arm: borrow 0.5, round trip 53.2-57.3, collect 5.6-7.2,
+settle 0.4 (both arms); the reply's wake 12.3-13.3 against 5.6-6.1 and the hop to the control shard 11.3-13.3 against
+8.2-9.2 (split against cache), the build 28.7-30.7 against 26.6.
+
+**Reading.** The cache takes 7-27 µs off the median added cost in every round (107.5-114.0 against 120.9-134.7): the
+durability polls and the lane's candidates no longer place. The live p999 exceeds 1 ms in both arms on this 4-core
+runner (4 of 5 rounds in each), so the p999 half of 85a is not judged here. Of the exchange, the session's borrow,
+return and this side's tasks are about 7 µs; the round trip, 57 µs of which a holder's serve is 8-15, is the rest.
+
+**The same A/B again, with the transport bench beside each round on the same runner** (diag-g228-live-13, run
+44888649901; ubuntu-latest, 4 cores, load 1.8-2.1; `replication_bench 1000 0`, release, built from the split arm, its
+"live ship" rows: `Shipper::append`, then the ship to two holders until durable, over real endpoints, no daemon):
+
+| round | transport, live ship 4 KiB p50 / p999 | split: added p50; live p50 / p999 | cache: added p50; live p50 / p999 |
+|---|---|---|---|
+| 1 | 60.6 / 78.8 | 157.0; 191.8 / 1,248.1 | 126.5; 164.2 / 1,400.3 |
+| 2 | 67.9 / 109.3 | 152.2; 187.3 / 2,271.2 | 129.1; 163.7 / 966.5 |
+| 3 | 69.2 / 127.4 | 162.8; 196.6 / 1,088.1 | 138.6; 173.6 / 1,578.6 |
+| 4 | 83.0 / 151.1 | 156.1; 190.7 / 1,293.5 | 130.1; 166.3 / 1,290.1 |
+| 5 | 69.5 / 103.8 | 154.6; 189.4 / 1,084.2 | 141.7; 175.8 / 942.3 |
+
+The daemon's exchange round trip was at most 65.5 µs at p50 (its bucket bound) in every round of both arms.
+
+**Reading.** The cache wins again in every round (126.5-141.7 against 152.2-162.8). And the exchange's round trip is the
+transport's own: the bare live ship takes 60.6-83.0 µs at p50 on the same runner, the daemon's round trip at most 65.5.
+The "about 30 µs of the daemon's own" above compared the Studio's transport bench (22.6-27.2 µs) with Linux's exchange,
+and was wrong: on this runner nothing of the daemon hides in the round trip, and its own share of the exchange is the
+7 µs of borrow, collect and settle. What 85a's Linux median holds beyond the transport is the build (26.6), the hop to
+the control shard (8-9), the reply (6) and the hop back (4).
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
