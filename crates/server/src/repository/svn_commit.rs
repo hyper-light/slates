@@ -683,11 +683,14 @@ pub(crate) fn store_step(
   })
 }
 
+/// A reader of a text's pieces: a text, an offset, at most a length; its bytes there, or none.
+type PieceOf<'a> = dyn Fn(&ContentIdentity, u64, usize) -> Option<Vec<u8>> + 'a;
+
 /// [`store_step`] reading each piece from `piece` (a text, an offset, at most a length).
 fn store_step_from(
   state: &mut ShardState,
   storing: &mut Storing,
-  piece: &dyn Fn(&ContentIdentity, u64, usize) -> Option<Vec<u8>>,
+  piece: &PieceOf<'_>,
 ) -> Result<bool, Uncommitted> {
   let slice = usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
