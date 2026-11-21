@@ -440,6 +440,11 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
+> asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
+> keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
+> (13.8 a client at 10 hot files) for journal paths whose change became the head's.
+>
 > **A-774 follow-up (2026-11-21, w-fed-move; main's order):** FIXED the stale assertion in `daemon`'s
 > `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`: a green's landing is judged as any
 > volume's (A-774 part 3), so at a missing target it is refused `Target`, no longer `Unsupported` by role.

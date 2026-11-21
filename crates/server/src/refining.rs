@@ -299,6 +299,7 @@ fn with_base<R>(
       green: Some(&*engine),
       fetched: None,
       version,
+      entries: None,
     });
   }
   if let Some(replica) = state
@@ -310,12 +311,14 @@ fn with_base<R>(
       green: Some(replica),
       fetched: None,
       version,
+      entries: None,
     });
   }
   f(crate::work_files::Base {
     green: None,
     fetched: crate::work_home::parked_fetched(state, work),
     version,
+    entries: None,
   })
 }
 
