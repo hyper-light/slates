@@ -59,7 +59,7 @@ jobs:
           EXE=""; [ "${RUNNER_OS}" = Windows ] && EXE=".exe"
           s=SELF; mkdir -p "$W/bin-$s"
           cargo build --release --locked -p slates-client --example edit_merge_bench --example g222_floor > "$W/logs/build-$s.log" 2>&1 || { tail -30 "$W/logs/build-$s.log"; exit 1; }
-          cp target/release/examples/edit_merge_bench "$W/bin-$s/edit_merge_bench"; cp target/release/examples/g222_floor "$W/bin-$s/g222_floor"
+          cp "$W/target/release/examples/edit_merge_bench" "$W/bin-$s/edit_merge_bench"; cp "$W/target/release/examples/g222_floor" "$W/bin-$s/g222_floor"
           sha256sum "$W/bin-$s/edit_merge_bench"
       - name: The machine and the load's form
         run: |
