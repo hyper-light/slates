@@ -165,6 +165,19 @@
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
 >
+> **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
+> one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
+> `slates_vcs::Index` walked every run, since the learned merge had no caller (155 runs after hg-src's import, 123 visited
+> at p50, 11.8 µs; 2 and 0.6 µs after one merge). BUILT: the merge made a table at a time (`Index::merge_begin` /
+> `merge_step`, `compact` their one caller) and the owner shard's upkeep (`vcs_store::index_upkeep`): an index built
+> whole (an import placed, a replay or rebuild ended) merged a slice at a time, and each lend over the store's own index
+> reporting its lookups to the rule, a due merge begun. (2) A pull whose client holds the history walked every manifest
+> and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
+> made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
+> accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
+> a consistent snapshot while a push lands; the stream clone's chunks as stored deltas (store side done locally: `H`
+> rows per entry, `I` rows by node).
+>
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
 > (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
@@ -2591,9 +2604,12 @@
 > through the store's owner (`svn_texts::fetch_piece`, a piece cache held by the waiting readers alone) and step it
 > again. Held by `a_drive_that_waits_for_its_texts_pieces_makes_the_same_calls` (slates-svn: the same calls as the
 > drive over a repository holding every text) and `a_checkout_reads_a_text_ram_does_not_hold_through_the_store` (a
-> checkout over the daemon's tunnel of a text neither the green nor the content store holds). Owed in (a): get-file
-> and DAV GET (`reads::file`), file-revs, the exporter, the deltify job; then (b), the records keep history on the
-> store. Stage C,
+> checkout over the daemon's tunnel of a text neither the green nor the content store holds). ra_svn's `get-file`
+> BUILT the same way (`reads::Progress::Waiting`; the string gathered so far kept across the wait): held by
+> `a_get_file_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is corrupt" after the
+> first response). A DAV GET BUILT too: its reply's read of a piece RAM does not hold fetches it and reads again,
+> held by `a_get_reads_a_text_ram_does_not_hold_through_the_store` (red without it: `503`). Owed in (a): file-revs, the
+> exporter, the deltify job; then (b), the records keep history on the store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one

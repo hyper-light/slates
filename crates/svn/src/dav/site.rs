@@ -338,6 +338,7 @@ impl Report {
     let progress = log.resume(served.index, served.repository, served.rules, out, room);
     match progress {
       DavLogProgress::More => ReportProgress::More,
+      DavLogProgress::Waiting(wanted) => ReportProgress::Waiting(wanted),
       DavLogProgress::Done => ReportProgress::Done,
       DavLogProgress::Refused { .. } if log.begun() => ReportProgress::Broken,
       DavLogProgress::Refused { code, message } => {

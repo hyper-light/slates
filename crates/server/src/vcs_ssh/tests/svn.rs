@@ -1605,19 +1605,6 @@ fn resident_kib() -> u64 {
     .unwrap_or(0)
 }
 
-/// Shape: the text the store-read test commits: noise, so the drive's svndiff carries its bytes as they are.
-fn noise(len: usize) -> Vec<u8> {
-  let mut state = 0x9e37_79b9_7f4a_7c15u64;
-  (0..len)
-    .map(|_| {
-      state ^= state << 13;
-      state ^= state >> 7;
-      state ^= state << 17;
-      state.to_le_bytes()[0]
-    })
-    .collect()
-}
-
 /// C2 stage B part 2 (a text the content store does not hold is read through the node's changeset store, R6: never a
 /// sync path). Do: on a daemon holding a store, land a client's commit adding `/trunk/a.bin` (a stored text, which its
 /// changeset carries), let go every hold RAM has on the text (the green's held table and the content store), then
@@ -1627,79 +1614,9 @@ fn noise(len: usize) -> Vec<u8> {
 /// hold ended the drive "Filesystem is corrupt".
 #[test]
 fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
-  use slates_svn::commit::drive::TextSink;
-  let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let asked = (
-    REPOSITORY,
-    slates_ipc::protocol::VcsTool::Subversion,
-    slates_ipc::protocol::ObjectFormat::Sha1,
-    "trunk",
-  );
-  let (id, green) = crate::test_store::create_on(&daemon, 0, &principal(OWNER), asked);
-  let bytes = noise(200 << 10);
-  let committed = bytes.clone();
-  let landed = crate::test_store::run_on_first(
-    &daemon,
-    move || async move {
-      let text = slates_svn::commit::drive::text_of(&committed).unwrap();
-      let texts = slates_svn::commit::drive::HeldTexts::new();
-      let staged = texts.stage().unwrap();
-      texts.append(staged, &committed).unwrap();
-      texts.seal(staged, text.identity).unwrap();
-      let row = |path: &str, kind, text| slates_svn::index::ChangedPath {
-        path: path.to_owned(),
-        action: slates_svn::index::Action::Add,
-        kind,
-        copy_from: None,
-        text,
-        properties: None,
-        mergeinfo_modified: false,
-      };
-      let work = slates_svn::commit::drive::Work {
-        head: 0,
-        record: slates_svn::index::RevisionRecord {
-          transaction: "0-1".to_owned(),
-          changes: vec![
-            row("/trunk", slates_svn::index::NodeKind::Directory, None),
-            row(
-              "/trunk/a.bin",
-              slates_svn::index::NodeKind::File,
-              Some(text),
-            ),
-          ],
-        },
-        lock_entries: Vec::new(),
-        revision_properties: vec![(b"svn:log".to_vec(), b"noise".to_vec())],
-        texts: std::iter::once(text.identity).collect(),
-        property_lists: std::collections::BTreeMap::new(),
-        locks: slates_svn::lock::CommitLocks::default(),
-      };
-      let landed = crate::repository::svn_commit::land_work((&principal(OWNER), id), work, &texts)
-        .await
-        .map(|landed| landed.map(|committed| committed.revision));
-      // Every hold RAM has on the text let go: the green's held table's and the content store's.
-      crate::state::with_state(|state| {
-        if let Some(mut engine) = state.greens.get_mut(&green) {
-          while engine.held(&text.identity).is_some() {
-            let _ = engine.release_held(&text.identity);
-          }
-        }
-        crate::vcs_store::within_budget(state, 0, |stores| {
-          if let Some(content) = stores.content_mut() {
-            let content_id = slates_vcs::ContentId(text.identity);
-            while content.contains(&content_id) {
-              if content.release(&content_id).is_err() {
-                break;
-              }
-            }
-          }
-        });
-      });
-      landed
-    },
-    std::time::Duration::from_secs(60),
-  );
-  assert_eq!(landed, Some(Ok(1)));
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())
     .position(|window| window == b"( commit")
@@ -1739,6 +1656,60 @@ fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
     String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
   );
   assert!(carried, "the text's bytes are not in the edit");
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
+/// C2 stage B part 2 (`get-file` reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// ([`crate::test_store::a_text_only_the_store_holds`]), ask `get-file` of it at revision 1 through the daemon's `svnserve -t` site. Expect
+/// the text whole, as `svnserve` writes it (its strings of 4,096 bytes in order, the empty string, `( success ( ) )`),
+/// read through the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let
+/// go after. Before, the stream ended "Filesystem is corrupt" at the first byte RAM did not hold.
+#[test]
+fn a_get_file_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(b"( get-file ( 11:trunk/a.bin ( 1 ) false true ) ) ");
+  let (answered, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      tunnel_awaited(&mut site, &principal(OWNER), &[&client]).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  // The strings `svnserve`'s `get_file` writes: 4,096 bytes each, the last what is left, then the empty one.
+  let mut strings = Vec::new();
+  for run in bytes.chunks(4_096) {
+    strings.extend_from_slice(format!("{}:", run.len()).as_bytes());
+    strings.extend_from_slice(run);
+    strings.push(b' ');
+  }
+  strings.extend_from_slice(b"0: ( success ( ) ) ");
+  let out = &answered.out;
+  assert!(
+    out.ends_with(&strings),
+    "{}",
+    String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
+  );
   assert!(fetched >= 1, "no piece read through the store");
   assert_eq!(left, 0, "a fetched piece was kept");
 }

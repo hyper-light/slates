@@ -618,6 +618,8 @@ pub(crate) fn place_imported(
         state.count(RELEASE_REFUSED, 1);
       }
       settle(state);
+      // An imported index is built whole: its runs merged a slice at a time (goal 93's pull).
+      super::index_upkeep::built(state, id);
       Ok(())
     }
     Err(refused) => {

@@ -627,8 +627,8 @@ pub(crate) struct SvnExchange<S: SvnStores> {
   request_room: u64,
   /// The answer, once made.
   answered: Option<Answered>,
-  /// The text piece a report's walk waited for and the exchange fetched (C2 stage B part 2), held until the next slice
-  /// has read it.
+  /// The text piece a report's walk or a GET's read waited for and the exchange fetched (C2 stage B part 2), held until
+  /// the next slice has read it.
   fetched: Option<slates_svn::reads::Wanted>,
   /// The repository's name, the green's name a commit's messages name.
   name: String,
@@ -2024,16 +2024,36 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
           return Ok(false);
         };
         let at = *offset;
-        let piece = self
+        let read = self
           .stores
           .lend(self.repository, &self.principal, |lent| {
-            lent
-              .repository
-              .text(&text.identity, at)
-              .map(std::borrow::Cow::into_owned)
+            match lent.repository.text(&text.identity, at) {
+              Some(piece) => TextRead::Piece(piece.into_owned()),
+              None if lent.repository.fetchable(&text.identity, at) => TextRead::Waiting,
+              None => TextRead::Missing,
+            }
           })
-          .flatten()
           .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+        // The piece the last wait fetched was read by this call (C2 stage B part 2).
+        if let Some(wanted) = self.fetched.take() {
+          self.stores.let_go(wanted);
+        }
+        let piece = match read {
+          TextRead::Piece(piece) => piece,
+          TextRead::Waiting => {
+            let wanted = slates_svn::reads::Wanted {
+              text: text.identity,
+              offset: at,
+            };
+            // A piece the node's store cannot give ends the answer: the read would wait for it again.
+            if !self.stores.fetch(self.repository, wanted).await {
+              return Err(Failed(Status::INTERNAL_SERVER_ERROR));
+            }
+            self.fetched = Some(wanted);
+            return Ok(true);
+          }
+          TextRead::Missing => return Err(Failed(Status::SERVICE_UNAVAILABLE)),
+        };
         *offset = at.saturating_add(to_u64(piece.len()));
         out.extend_from_slice(&piece);
         Ok(!piece.is_empty() && *offset < text.size)
@@ -2087,6 +2107,16 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
       None => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
     }
   }
+}
+
+/// What a GET's read of its text's next piece came to.
+enum TextRead {
+  /// The piece, from the offset to the end of the window holding it.
+  Piece(Vec<u8>),
+  /// The piece is the node's store's to read (C2 stage B part 2): fetch it, then read again.
+  Waiting,
+  /// Nothing holds the text.
+  Missing,
 }
 
 #[cfg(test)]
