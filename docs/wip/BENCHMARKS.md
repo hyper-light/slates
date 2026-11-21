@@ -17052,3 +17052,17 @@ there was no wake to remove.
 the owner (about 45-90 µs), the hop to the control shard (10-35), the exchange with the holders (about 50-170, the holder's
 own serve 12-25 of it), and the hop back (1-14); those are means, which the same kind of skew may inflate, so the next
 count is per-write percentiles of each hop.
+
+**Per-write medians of each hop on main e1f246ca8** (the hops' histograms, landed the same day; the contract command,
+release, five rounds). Microseconds, p50 (bucket upper bounds, within an eighth above the exact value):
+
+| host | added p50 | build | to control | exchange (holder's serve) | to owner | reply |
+|---|---|---|---|---|---|---|
+| ubuntu-latest, 4 cores, load 1.4-1.6, holds kept (diag-g228-live-10) | 112.2, 113.4, 107.5, 106.7, 112.8 | 24.6 | 8.2-9.2 | 57.3-61.4 (7.7-9.2) | 3.3-3.6 | 7.2-8.2 |
+| Studio, 32 cores, load 13-17, holds declined | 168.5, 195.0, 186.0, 189.2, 205.4 | 22.5-26.6 | 24.6-30.7 | 106.5-114.7 (9.2-12.3) | 6.1-8.2 | 8.2-20.5 |
+
+**Reading.** The exchange is half the median added cost and more: about 59 µs on Linux and 107 on macOS, of which the
+holder's own serve is 8-12. The transport bench makes a 4 KiB write durable on two hosts in 22.6-27.2 µs (above), so
+about 30 µs of the Linux exchange is the daemon's own (the lane, the session's borrow and return, the control shards'
+receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
+both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
