@@ -1,5 +1,19 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~14:30 PST — A-818 piece 2b BUILT on branch agents/w-rewrite-ops-a818-2b (c4278fd3c); waiting on main's A/B
+- history.rs replaced: values are identity trees over an anchor per path chain; `history::change` takes the latest
+  alone. The re-anchor, layers and their switch are deleted. Today's history is kept test-only as the oracle's
+  reference (`history_reference.rs`).
+- Charges: chunks, live nodes and indexes. The latest's own structure counts as current. Nodes are packed to
+  48/40/32 bytes, and the many-files bound in tests/engine.rs holds. Admission's bound is flat in history.
+- Counters: `history_changes()`; the server's `merge.history.nodes_made` replaces `merge.reanchor.values_walked`.
+- Tests: merge lib 265 and all merge test targets pass; server push 102, merge 42, green 45, retention 10, history 9,
+  made 33; fmt clean. The oracle fails on a wrong copy offset.
+- Bench: `history_layers_bench` prints all rounds at m = 10/100/1k/10k and runs on both sides; `leaf_chunks_bench`
+  gives (i)'s rows. The run request is updated with the branch.
+- NEXT: main's A/B verdict. If old reads lose, a bounded compaction in 2b. Then A-812's rebuilt-green gap, then the
+  one-value drift.
+
 ## ~12:30 PST — A-818 piece 2a LANDED (bb6a738df, main 945c9ad42); main's 10:35 ruling: option (ii)
 - `crates/merge/src/byte_places.rs`: byte identities given once; a treap of the latest order (rank = offset in the
   newest block); removed ranges stored once and retired when the floor passes their change; bytes charged and bounded.

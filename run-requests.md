@@ -7096,13 +7096,20 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   owner w-sizing (inbox/w-sizing-from-w-lint.md). The red-first run (r28) stopped as moot. w-realtools' real_tools over
   WinFsp (r29) queued by platform.
 
-## 2026-11-21 ~12:30 PST, w-rewrite-ops: A-818 (A-803 (c)) A/B, for after piece 2b lands (main's 09:40 and 10:35 conditions)
-- Command: `cargo run --release -p slates-merge --example history_layers_bench` on main before and after 2b,
-  interleaved rounds, all N shown. Rows: write per change, old-version read and memory per version at m = 10/100/1k/10k;
-  plus many paths changed once each (memory per version). Option (i), runs naming chunks on the generic leaf, is measured
-  against both (main's 10:35 condition). The bench rows for (i) and for many paths come with 2b.
-- Red: 2b loses on an old read. The risk is O(fragments x depth) against today's write-time compaction, or memory per
-  version above main's.
+## 2026-11-21 ~14:30 PST, w-rewrite-ops: A-818 piece 2b A/B, BEFORE landing (main's 09:40, 10:35 and 2b orders)
+- Branch: `agents/w-rewrite-ops-a818-2b` at c4278fd3c (main 6a6e35215 merged in). Main side: 6a6e35215 or later.
+- Command, the same file on both sides (it uses only `submit`, `content_ref_at` and `retained_bytes`; copy the branch's
+  `crates/merge/examples/history_layers_bench.rs` onto main's tree): `cargo run --release -p slates-merge --example
+  history_layers_bench`, main and branch interleaved, all rounds printed (5 a point), at m = 10/100/1k/10k:
+  - `a` rows: a read of version 1 after m changes (overwrites of one range, and alternating overwrite/insert).
+  - `b` rows: the change cost of three streams at history m, with history bytes a version.
+  - `c` rows: many paths changed once each, history bytes a version.
+- Option (i), branch only: `cargo run --release -p slates-merge --example leaf_chunks_bench` (the alternating
+  stream's change cost and read, bytes a version, many paths once).
+- Main's alternating stream at m = 10k re-anchors about 5k values a change: about 20 ms a change, minutes a round.
+- Lands only if writes win and reads and memory don't lose. Red to watch: the `a` alternating rows (an old read
+  through the index is O(fragments x depth); main compacted fragments at write time); then a bounded compaction in 2b,
+  measured in the same A/B.
 
 ## w-shared, family three (FUSE helper and unmount exits watched, ExitWatch), for main to place (2026-11-21 10:00 PST)
 - Branch agents/w-shared-sweep-3 at 731331eef (on origin). Needs: `linux/amd64,tool:cargo` with FUSE mounts allowed
