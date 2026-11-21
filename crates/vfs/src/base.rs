@@ -507,8 +507,20 @@ pub struct BasePlane {
   /// ([`Self::durable_change_token`]) counts it beside the versioned tables' writes, so an overlay publication
   /// takes a delta — which carries no base-plane state — only while the whole durable base plane is unchanged.
   drift_writes: u64,
-  /// Open file descriptors by inode number (large-class copies and read-through).
+  /// Open file descriptors by inode number (large-class copies and read-through). An untouched inode's is held only
+  /// while a handle holds the inode open ([`Volume::is_open`]): one opened for a verb that holds no open is closed when
+  /// that verb's overlay borrow ends ([`Self::transient`]), and an open's is closed at its last close
+  /// ([`Self::release_unopened`]). A witnessed inode's (a large-class copy-up) is kept, since the witness's bytes are
+  /// read through it. Until 2026-11-21 every base file ever read kept one: kiln's daemon on adacachy reached
+  /// 1,048,575 of its 1,048,576 descriptors and this MacBook's held 3,995, so every later open failed `EMFILE`.
   descriptors: BTreeMap<InodeNo, HostFile>,
+  /// Untouched inodes whose descriptor was opened during the current overlay borrow while no handle held them open:
+  /// at the borrow's end each one still unopened is closed. Bounded by the descriptors one borrow opens.
+  transient: Vec<InodeNo>,
+  /// Untouched inodes whose descriptor [`Overlay::open_base`] opened for the open that follows it (the bridge counts
+  /// the open after the borrow, [`Volume::open_for`]): judged at the end of the next borrow, as [`Self::transient`]
+  /// is, so an open that never came closes its descriptor. Bounded by the opens one borrow makes.
+  deferred: Vec<InodeNo>,
   /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
   /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
   closing: Vec<HostFile>,
@@ -581,6 +593,18 @@ impl BasePlane {
     self.closing.push(file);
   }
 
+  /// Queues the descriptor of an untouched inode whose last open handle closed, to be closed when the next overlay
+  /// borrow ends: nothing reads through it now, and a later read reopens the file through its home and proves it is
+  /// the file the inode was made from ([`Overlay::descriptor`], A-151). A witnessed inode keeps its descriptor.
+  pub(crate) fn release_unopened(&mut self, no: InodeNo) {
+    if self.is_witnessed(no) {
+      return;
+    }
+    if let Some(file) = self.descriptors.remove(&no) {
+      self.closing.push(file);
+    }
+  }
+
   fn new(config: BaseConfig, root_no: InodeNo) -> Self {
     let mut listings = BTreeMap::new();
     listings.insert(
@@ -607,6 +631,8 @@ impl BasePlane {
       drift_writes: 0,
       descriptors: BTreeMap::new(),
       closing: Vec::new(),
+      transient: Vec::new(),
+      deferred: Vec::new(),
       whiteouts: Versioned::default(),
       redirects: Versioned::default(),
       watch: WatchState::Unavailable,
@@ -1296,6 +1322,20 @@ pub struct Overlay<'a> {
 /// reclaim dropped the descriptor unclosed: a file descriptor leaked per unlinked base file on a real disk.
 impl Drop for Overlay<'_> {
   fn drop(&mut self) {
+    let Some(plane) = self.vol.base.as_mut() else {
+      return;
+    };
+    let judged = std::mem::take(&mut plane.transient);
+    let next = std::mem::take(&mut plane.deferred);
+    plane.transient = next;
+    for no in judged {
+      if self.vol.is_open(no) {
+        continue;
+      }
+      if let Some(plane) = self.vol.base.as_mut() {
+        plane.release_unopened(no);
+      }
+    }
     let Some(plane) = self.vol.base.as_mut() else {
       return;
     };
@@ -2665,8 +2705,20 @@ impl Overlay<'_> {
         }
       }
     }
-    self.plane()?.descriptors.insert(no, file);
+    self.hold_descriptor(no, file)?;
     Ok(file)
+  }
+
+  /// Holds `file` as untouched inode `no`'s descriptor; one no handle holds open is closed when this borrow ends
+  /// ([`BasePlane::transient`]).
+  fn hold_descriptor(&mut self, no: InodeNo, file: HostFile) -> Result<(), VfsError> {
+    let open = self.vol.is_open(no);
+    let plane = self.plane()?;
+    plane.descriptors.insert(no, file);
+    if !open && !plane.is_witnessed(no) {
+      plane.transient.push(no);
+    }
+    Ok(())
   }
 
   /// The host directory and entry name of a file inode on the disk: where its witness was
@@ -3248,7 +3300,7 @@ impl Overlay<'_> {
       .as_ref()
       .and_then(|b| b.descriptors.get(&no).copied());
     let Some(held) = held else {
-      self.plane()?.descriptors.insert(no, fresh);
+      self.hold_descriptor(no, fresh)?;
       return Ok(Current::Verified(fresh, at_path));
     };
     let served = match self.host.fstat(held) {
@@ -4502,7 +4554,14 @@ impl Overlay<'_> {
     if !untouched {
       return Ok(());
     }
-    self.descriptor(store, no).map(|_| ())
+    self.descriptor(store, no)?;
+    // The open this serves is counted after this borrow ends: judge the descriptor at the next borrow's end instead.
+    let plane = self.plane()?;
+    if let Some(at) = plane.transient.iter().rposition(|held| *held == no) {
+      plane.transient.swap_remove(at);
+      plane.deferred.push(no);
+    }
+    Ok(())
   }
 
   /// `chown` with a metadata-only copy-up: the witness is recorded and nothing is pinned (§4.5
