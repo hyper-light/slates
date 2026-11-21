@@ -76,10 +76,6 @@ pub struct State<'a> {
   pub bookmarks: &'a [(Vec<u8>, Node)],
   /// Whether the repository publishes (7.2's `phases.publish`).
   pub publishing: bool,
-  /// Whether the changeset store keeps every revision of the repository's logs, so a stream clone can send each as the
-  /// store keeps it (goal 93 perf; `crate::render::Streaming`): not for a history imported or made outside it, until
-  /// those land as changesets (w-hg's C1 step 3). Without it no stream is advertised, and a client clones plainly.
-  pub stored_logs: bool,
 }
 
 /// Why a changeset the changelog holds is not served: one of the two filters 7.2's `served` joins.
@@ -514,14 +510,13 @@ impl Store for Indexed<'_> {
   /// A stream is served unless a secret root the changelog holds makes a changeset secret (7.2's
   /// `allowservergeneration` over `phases.hassecret`); hidden changesets are streamed, as 7.2 streams them.
   fn streams(&self) -> bool {
-    self.state.stored_logs
-      && !self.state.roots.iter().any(|root| {
-        root.phase == Phase::Secret
-          && self
-            .index
-            .rev(self.store, Log::Changelog, &root.node)
-            .is_some()
-      })
+    !self.state.roots.iter().any(|root| {
+      root.phase == Phase::Secret
+        && self
+          .index
+          .rev(self.store, Log::Changelog, &root.node)
+          .is_some()
+    })
   }
 
   fn revlogs(&self) -> Option<(&HgIndex, &ContentStore)> {

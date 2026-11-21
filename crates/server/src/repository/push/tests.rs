@@ -1599,3 +1599,113 @@ fn an_import_batch_refused_or_abandoned_leaves_its_green_as_it_was() {
     assert_eq!(green_reads(state, main), before);
   });
 }
+
+thread_local! {
+  /// The preview test's pending accept, kept on the shard's thread from one step to the next.
+  static HELD_PENDING: std::cell::RefCell<Option<crate::made_commit::Pending>> = const { std::cell::RefCell::new(None) };
+}
+
+/// P2's preview lifetime (main's ruling of 2026-11-21 07:30, for w-git's C5 2b piece 3: a made commit's path map is
+/// built a slice a turn against the version the held verdict makes). Do: on a git green at version 1, judge a second
+/// work and hold its verdict's preview with a pending accept (`made_commit::hold_preview`); in a later step of the shard,
+/// read through it (`with_held_preview`); in a third, commit the accept (`made_commit::commit`). Expect:
+/// - while held, the preview reads as version 2 (the work's bytes), the green still at version 1 with its own bytes,
+///   and its lineage holds one member more (the preview);
+/// - the read in a later step counts `vcs.made.preview_held_across_turns` once;
+/// - committed, the green is at version 2 with the work's bytes, and the preview is retired (the lineage back to its
+///   members).
+#[test]
+fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (main, repo, members) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repo, main) = repository(state, "held-preview");
+    let mut store = Store::default();
+    let one = store.put_tree(&[("f", b"one")]);
+    let two = store.put_tree(&[("f", b"two"), ("g", b"new")]);
+    let first = work(state, main, (0, None), (one, b"h1"), (&store, 1));
+    push(
+      state,
+      &owner(),
+      repo,
+      vec![BranchChange::Update {
+        green: main,
+        work: first,
+      }],
+      EntryParts::default(),
+    )
+    .expect("version 1");
+    let members = state.greens.lineage_len(repo);
+    let second = work(state, main, (1, Some(one)), (two, b"h2"), (&store, 2));
+    let judged = match state
+      .greens
+      .get_mut(&main)
+      .expect("the green")
+      .judge(&second)
+    {
+      slates_merge::engine::Judgment::Accepted(judged) => judged,
+      other => panic!("not accepted: {other:?}"),
+    };
+    let parts =
+      crate::verbs::AcceptedParts::for_test((main, main, 2), (second, judged.applied().to_vec()));
+    let mut pending = crate::made_commit::Pending::for_test(parts);
+    assert!(
+      crate::made_commit::hold_preview(state, &mut pending, judged),
+      "a preview held"
+    );
+    assert_eq!(
+      state.greens.lineage_len(repo),
+      members + 1,
+      "the preview is a member while held"
+    );
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (main, repo, members)
+  });
+  let later = crate::daemon::observe_first(&daemon, move |state| {
+    let mut pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let previewed = crate::made_commit::with_held_preview(state, &mut pending, |engine| {
+      engine.content("g").map(<[u8]>::to_vec)
+    });
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("f").map(<[u8]>::to_vec)));
+    let counted = state
+      .refusals
+      .get(crate::made_commit::PREVIEW_HELD_ACROSS_TURNS)
+      .copied();
+    HELD_PENDING.with(|held| *held.borrow_mut() = Some(pending));
+    (previewed, green, counted)
+  });
+  let committed = crate::daemon::observe_first(&daemon, move |state| {
+    let pending = HELD_PENDING
+      .with(|held| held.borrow_mut().take())
+      .expect("the pending accept");
+    let made = crate::made_commit::commit(state, pending, |_| Ok::<(), ()>(()));
+    let green = state
+      .greens
+      .get(&main)
+      .map(|engine| (engine.head(), engine.content("g").map(<[u8]>::to_vec)));
+    (made, green, state.greens.lineage_len(repo))
+  });
+  daemon.stop();
+  assert_eq!(
+    later.0,
+    Some(Some(b"new".to_vec())),
+    "the preview reads as version 2 in a later step"
+  );
+  assert_eq!(
+    later.1,
+    Some((1, Some(b"one".to_vec()))),
+    "the green shows version 1 while the verdict is held"
+  );
+  assert_eq!(later.2, Some(1), "held across a turn, counted once");
+  assert_eq!(committed.0, Some(Ok(())));
+  assert_eq!(
+    committed.1,
+    Some((2, Some(b"new".to_vec()))),
+    "committed in the one step"
+  );
+  assert_eq!(committed.2, members, "the preview retired in the one step");
+}

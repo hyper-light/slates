@@ -59,7 +59,14 @@
 >   0.8–2.8). Main ruled (2026-11-20): change the wait, A/B settled. **A/B (run 44876741078; BENCHMARKS, "The
 >   client's reply wait, A/B"):** parking at once takes Linux arm64's loaded accept p99 to 0.36–0.43 ms and leaves R9
 >   unharmed, but Linux x86_64 stays at 3.2 ms, macOS at 8 ms, and no platform's p999 is under 1 ms. **Owed:** what holds
->   Linux x86_64's and macOS's loaded tails. **B landed (A-799, 2026-11-21).** C (spin only while a core is free) next.
+>   Linux x86_64's and macOS's loaded tails. **B landed (A-799, 2026-11-21).**
+>   **C (spin only while the spins catch) measured and rejected (2026-11-21, run 44884335146; BENCHMARKS "arm C"):**
+>   no better than B loaded on macOS and Linux arm64, worse on ubuntu-latest (accept p99 5.7-5.9 against 2.9-3.1 ms),
+>   far worse on both Windows runners (conflict p999 20-42 against 0.3-12 ms); it helps only macOS's quiet latency. B
+>   stays. **Open (85a):** the loaded tails sit on whole milliseconds (3,998 / 4,000 / 4,996 / 5,998 µs): the scheduler's
+>   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
+>   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325): the client's p99
+>   tail is its own wake (written -> seen, median 97 µs).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -197,9 +204,10 @@
 > 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
 > store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
 > (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
-> against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
-> the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
-> stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
+> against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). CLOSED by w-hg's C1 (imports since
+> step 3, made changesets since the made-on-store piece): a repository whose history the store did not keep (an
+> import's, a made changeset's) advertised no stream (`State::stored_logs`, from `HgStore::unstored`, both removed),
+> so stock `hg clone --stream` cloned it plainly with its own
 > warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
 > server" (main's ruling 02:31; the stock-hg test above, and
 > `a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs`). Such a clone is a plain clone's speed.
@@ -501,6 +509,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
+> replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
+> submit): file asks 17.2 to 0 a client at 10 hot files, asks a client 49.2 to 30.0. The identical-op drop main ruled was
+> built and measured and rejected (fired 0.03 a client; the engine already omits such operations). What remains is one
+> ask a rebase.
+>
 > **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
 > asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
 > keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
@@ -541,6 +555,9 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
+> - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
+>   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3.
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.
@@ -2826,9 +2843,14 @@
 > through the store between turns (`svn_import::supply_owed_base`). Held by
 > `an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere` (slates-svn) and
 > `t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte` (every imported text stored, none in
-> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. Owed: P4b a
-> server-made revision's texts (`land_made`, A-804's made commits) land the same way; the records' `KeptText` and
-> `Record::Deltified` then serve only logs written before P4a, and go with them. Stage C,
+> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. P4b BUILT:
+> a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
+> shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
+> (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
+> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-819, main 09:20): the deltify record
+> and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
+> (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
+> standing alone, which a daemon's no longer reach. Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
@@ -2847,12 +2869,35 @@
 > waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
 > takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
 > after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
-> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`), but its record is
-> still written in the register's entry, not landed on the node's store first, and a client's hg push takes no landing
-> turn, so a push in flight and a made changeset are not ordered by it (owed with w-hg: a made reference on the store
-> and its replay); git's adopts the hook (w-git, removing its version-2 path); (d)
+> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`). Since A-767 C1 its
+> changeset lands on the node's store before the step, as a push's does (w-hg, below). A client's hg push still takes no
+> landing turn: one landed between a made changeset's making and its commit leaves the made fork stale, and the version
+> stands alone, counted `vcs.hg.changeset_unmade`. git's adopts the hook (w-git, removing its version-2 path); (d)
 > performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C1, made changesets on the changeset store (2026-11-21, w-hg; main's ruling of 09:00: one hook, one path).
+> CLOSED.**
+> - A changeset the server makes of a submitted version lands on the node's store as a push's does. The made
+>   revisions' changegroup (`slates_hg::push::made::changegroup`) is taken through the push's intake into a fork, then
+>   landed with a made record (`write_made_record`: the green's key and version beside the push's head), `Payload`
+>   and `Texts`. The register's entry names it by reference (`write_made_reference`), and a replay puts the made node
+>   back.
+> - A recorded submit takes the shared deferred-submit hook (A-804/A-805/A-807): the changeset is made from a preview
+>   of the held verdict and landed by a task, then the version and the entry are committed in one step. A bare dispatch
+>   lands it from a task holding the turn.
+> - Removed, with no fallback:
+>   - the v3 made record (`record::write_made`, `DELTA_VERSION`, its `formed` reader, the revision's `base`);
+>   - `hg_made::recorded`;
+>   - `HgStore::unstored`, and the served view's `State::stored_logs` with it: every history is on the store, so every
+>     repository streams.
+> - Held by:
+>   - `push::made::tests::a_made_changesets_changegroup_takes_through_the_intake_to_what_it_keeps` (stock 7.2's three
+>     changesets, the intake's index `fork_with`'s row for row);
+>   - `a_made_changesets_record_replays_to_its_made_node`;
+>   - `hg_made::tests::t_a731_a_submitted_version_is_the_changeset_the_server_makes` (two made changesets named by
+>     reference on the store, the rebuild putting the made head back);
+>   - hg_interop 15/15 against stock hg 7.2 (the CLI's bookmark case submits through the hook).
+> - Next: C1 step 1, the served view's file texts through the store (1a, the clone walk; 1b, the pull).
 > **C2 stage C, the green's side BUILT (A-814, 2026-11-21, w-rewrite-ops; main's orders of 04:11 and 06:11; the
 > split in inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).** `crate::import_batch::ImportBatch` advances an import's
 > revisions in RAM and commits them as one entry, through a scratch member of the green's lineage, so the green shows
