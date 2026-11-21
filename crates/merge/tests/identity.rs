@@ -5,7 +5,7 @@
 //! the running form is what it compares, and these are the properties its comparison rests on.
 
 // Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
-#![allow(clippy::indexing_slicing)]
+#![allow(clippy::indexing_slicing, clippy::unwrap_used)]
 
 mod common;
 
@@ -108,7 +108,7 @@ fn paths_of(green: &Green) -> std::collections::BTreeSet<String> {
   for (path, _) in green.files() {
     let mut at = path.as_str();
     while let Some(cut) = at.rfind('/') {
-      at = &at[..cut];
+      at = at.get(..cut).unwrap();
       paths.insert(at.to_owned());
     }
     paths.insert(path);
@@ -116,16 +116,13 @@ fn paths_of(green: &Green) -> std::collections::BTreeSet<String> {
   paths
 }
 
+/// What a held accepted increment's preview shows: the paths it changes, and every path's reads.
+type Viewed = (Vec<String>, std::collections::BTreeMap<String, Reads>);
+
 /// A-805: `green` lent to a lineage, `increment` judged there and, when held accepted, viewed as it would commit
 /// (`Lineage::preview`): the paths it changes and every path's reads, the fork's numbering (the head its 0). The green
 /// is given back, judged but unchanged.
-fn view_of(
-  green: Green,
-  increment: &slates_merge::engine::Increment,
-) -> (
-  Green,
-  Option<(Vec<String>, std::collections::BTreeMap<String, Reads>)>,
-) {
+fn view_of(green: Green, increment: &slates_merge::engine::Increment) -> (Green, Option<Viewed>) {
   let (mut lineage, handle) = Lineage::new(green);
   let judgment = lineage
     .with(handle, |green| green.judge(increment))

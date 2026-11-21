@@ -2458,7 +2458,7 @@ pub(crate) enum InputsAt<'a> {
 
 impl InputsAt<'_> {
   /// The identity the version's merge record names its inputs by.
-  fn identity(&self, page: u32) -> [u8; 32] {
+  fn identity(&self, page: u32) -> [u8; blake3::OUT_LEN] {
     match self {
       InputsAt::Held(inputs) => inputs.identity,
       InputsAt::Record(bytes) => MergeShardState::inputs_identity(bytes, page),

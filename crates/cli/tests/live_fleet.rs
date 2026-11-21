@@ -409,18 +409,19 @@ fn wait_settled(instances: &[String]) {
   }
 }
 
-/// The sum over every shard of the daemon's counter `kind` (`shard N refused KIND: COUNT` in `status`).
 /// Every `fleet.live.*` counter `instance` reports, summed over its shards, by name.
 fn live_counters(instance: &str) -> std::collections::BTreeMap<String, u64> {
+  counters_named(instance, " refused fleet.live.")
+}
+
+/// Every counter `instance` reports whose `status` line holds `marker` (` refused <prefix>`), summed over its shards,
+/// by the name after the marker (`shard N refused KIND: COUNT`).
+fn counters_named(instance: &str, marker: &str) -> std::collections::BTreeMap<String, u64> {
   let (_, status, _) = run(instance, &["status"]);
   let mut counts = std::collections::BTreeMap::<String, u64>::new();
   for (kind, count) in status
     .lines()
-    .filter_map(|line| {
-      line
-        .split_once(" refused fleet.live.")
-        .map(|(_, rest)| rest)
-    })
+    .filter_map(|line| line.split_once(marker).map(|(_, rest)| rest))
     .filter_map(|rest| rest.split_once(": "))
   {
     *counts.entry(kind.to_owned()).or_default() += count.trim().parse::<u64>().unwrap_or(0);
@@ -2087,6 +2088,14 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
+  // Each daemon's busy harvests deferred (`slates_rt::busy_harvest`), summed over its shards: the longer interval's
+  // non-vacuity count.
+  for (index, instance) in fleet.instances.iter().enumerate() {
+    eprintln!(
+      "measure: daemon {index}'s core counters {:?}",
+      counters_named(instance, " refused rt.core.")
+    );
+  }
   // Each candidate's own: its serve of an entry, the publication that keeps it included (`fleet.live.hop.holder`), is
   // the part of the owner's exchange that no owner counter splits out.
   for (index, instance) in fleet.instances.iter().enumerate() {

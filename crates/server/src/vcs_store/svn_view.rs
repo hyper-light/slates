@@ -70,8 +70,7 @@ impl SvnStores for ServedRecords {
   }
 
   fn holds(&self, id: RepositoryId) -> bool {
-    crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
-      .unwrap_or(false)
+    crate::state::with_state(|state| served(state, id)).unwrap_or(false)
   }
 
   fn lend<T>(
@@ -225,13 +224,23 @@ impl SvnStores for ServedRecords {
   }
 }
 
+/// Whether repository `id`'s records are here to serve: held, and no import under way (C2 stage C: an import's batch
+/// advances the records ahead of the register, so a session never reads a revision the register has not committed),
+/// as a Mercurial store is not lent while it imports (`hg_view`).
+fn served(state: &ShardState, id: RepositoryId) -> bool {
+  state.vcs_stores.subversion_records(id).is_some() && !state.vcs_stores.importing(id)
+}
+
 /// Runs `step` over repository `id`'s records in `state` as they stand, with the owner's instant (module docs); none
-/// when `state` holds none.
+/// when `state` holds none or an import is under way ([`served`]).
 pub(crate) fn lend_in<T>(
   state: &mut ShardState,
   id: RepositoryId,
   step: impl FnOnce(&Lent<'_, SvnView<'_>>) -> T,
 ) -> Option<T> {
+  if !served(state, id) {
+    return None;
+  }
   let now = AprTime::from_wall_ns(state.clock.wall_ns());
   with_view(state, (id, None), |view| lent_of(view, now, step)).flatten()
 }
@@ -297,8 +306,12 @@ impl Drop for SvnHold {
   }
 }
 
-/// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here.
+/// Holds repository `id`'s records as `state` holds them now ([`SvnHold`]); none when they are not lent here or an import
+/// is under way ([`served`]).
 pub(crate) fn hold_in(state: &mut ShardState, id: RepositoryId) -> Option<SvnHold> {
+  if !served(state, id) {
+    return None;
+  }
   let generation = super::hold_svn(&mut state.vcs_stores, id)?;
   Some(SvnHold {
     id,
@@ -357,8 +370,7 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
   }
 
   fn holds(&self, id: RepositoryId) -> bool {
-    crate::state::with_state(|state| state.vcs_stores.subversion_records(id).is_some())
-      .unwrap_or(false)
+    crate::state::with_state(|state| served(state, id)).unwrap_or(false)
   }
 
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T> {

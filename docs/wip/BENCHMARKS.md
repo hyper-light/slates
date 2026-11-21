@@ -17047,6 +17047,64 @@ is the invocation's median of 3 runs. µs unless marked.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 
+## 84a on macOS: Mach's time-constraint policy for the shards and the client's reply wait (A-831; w-provision-gate; 2026-11-21)
+
+**What, and why.** g222's hop split put macOS's loaded tail on two things:
+- the forward to the owner shard and back, the taken-to-written hop;
+- the busy path's zero-timeout kevent, which took at least 1 ms in 9-12% of its loaded calls.
+
+A woken time-share thread behind busy neighbours runs only when their quanta end. A thread under Mach's
+`THREAD_TIME_CONSTRAINT_POLICY` is in the real-time band, needs no privilege, and runs ahead of them. The kernel refuses a
+computation below its minimum real-time quantum (50 µs on Apple silicon; `slates_machine::time_constraint`'s test), so
+the policy's terms are aperiodic, with computation = constraint = the thread's measured window doubled until the kernel
+takes it.
+
+**The runs.** CI macos-latest (3 CPUs, 2 shards), `edit_merge_bench` with two spinners a CPU, then the quiet forms and
+`provision_bench`. Three interleaved rounds per run; each cell is a round's median of three runs, every round shown.
+- Run 44934544995 (branch `diag-measurer-w-provision-gate-tc`). B = main a9a2393b8 plus a line printing the load's
+  throughput; TC = plus the client's synchronous reply wait under the policy; TB = plus the shard threads.
+- Run 44934809949 (`diag-measurer-w-provision-gate-tck`). The same arms, also counting the busy path's zero-timeout
+  harvests that took 1 ms or more.
+
+Take 1, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s |
+|---|---|---|---|---|---|
+| B | 16.76 · 16.02 · 14.31 | 20.40 · 17.45 · 17.31 | 16.39 · 15.88 · 14.43 | 19.59 · 18.94 · 18.19 | 225 · 221 · 242 |
+| TC | 1.32 · 1.47 · 0.68 | 4.69 · 5.05 · 1.12 | 1.06 · 3.55 · 1.08 | 4.94 · 17.07 · 3.07 | 161 · 141 · 158 |
+| TB | 0.69 · 0.87 · 0.41 | 0.95 · 2.16 · 0.77 | 0.67 · 0.75 · 0.55 | 1.69 · 1.70 · 1.06 | 121 · 133 · 129 |
+
+Take 2, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s | busy harvests ≥ 1 ms |
+|---|---|---|---|---|---|---|
+| B | 15.72 · 14.00 · 17.42 | 16.60 · 16.59 · 20.76 | 15.92 · 14.70 · 15.63 | 20.23 · 18.93 · 17.68 | 221 · 224 · 213 | 16,293 of 172,191 · 14,172 of 162,157 · 21,273 of 174,757 |
+| TC | 2.25 · 1.06 · 5.33 | 4.38 · 2.72 · 29.92 | 2.47 · 2.66 · 4.39 | 15.17 · 6.94 · 28.44 | 147 · 153 · 140 | 184 of 139,685 · 137 of 159,691 · 472 of 134,252 |
+| TB | 0.89 · 0.42 · 2.11 | 3.01 · 0.70 · 4.52 | 0.65 · 0.70 · 1.85 | 0.80 · 1.32 · 4.56 | 137 · 114 · 98 | 5 of 200,410 · 2 of 184,609 · 62 of 198,370 |
+
+**Quiet (every round, both runs, accept_f10 p50 µs).** The medians are unchanged.
+- Take 1: B 451 · 506 · 549; TC 831 · 516 · 642; TB 438 · 377 · 435.
+- Take 2: B 454 · 522 · 470; TC 422 · 438 · 409; TB 479 · 468 · 478.
+
+**R9's uncontended spinning p99** (`provision_bench`) is unchanged, and misses 50 µs on this 3-CPU runner in every arm,
+main included:
+- B 335 · 344 · 326 and 333 · 196 · 303 µs;
+- TC 309 · 344 · 319 and 198 · 193 · 566;
+- TB 305 · 338 · 294 and 310 · 201 · 180.
+
+No refusal and no demotion was logged by any arm.
+
+**Verdict:**
+- **TB wins every round against main** on the loaded p99 and p999 of both forms, about 15-20 times on p99, with the
+  quiet medians and R9's p99 even. It lands as A-831: a latency-tracking runtime's shards (the daemon's) and a client's
+  synchronous reply wait run under the policy on macOS. Red first: `crates/rt/tests/time_constraint.rs`, a tracking
+  runtime's shard not under the policy on main, under it after.
+- **TC (the client alone) is measured and rejected:** p999 up to 29.9 ms, conflict p99 up to 4.4 ms.
+- **The cost:** the load's own spinners got 98-137 against 213-242 million turns a second. The daemon finishes its
+  work about ten times sooner, and while it works it runs ahead of them.
+- **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
+  p999 in 4 of 12 (0.70-4.56 ms).
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
@@ -17122,6 +17180,89 @@ and every round shown, as main extracted them from the run's log.
     median both idle and loaded, and loaded p999 0.7-2.2 ms (at most 18 of 2,000 at least 1 ms late). nanosleep is late
     1.7-2.5 ms at the median (1,221-1,947 of 2,000 at least 1 ms late). On Studio-4 under kiln, kevent and ulock are
     late 54 µs at the median, nanosleep 1.60 ms. Nothing on the request path sleeps.
+- **The macOS hop split, take 2** (run 44934263888, `diag-measurer-g222-23`, `diag-g222-hops-mac` f88fcc9fd, never
+  main). The same lane and rounds, now also stamping replies written after the step that took their request (a
+  resumed or forwarded verb). Every request joins: about 41,400 sync and 16,500 deferred a round. Loaded (3 rounds;
+  bench accept p99 8.0-12.2 ms, conflict 8.0-10.2 ms):
+  - **The p99 tail (580 requests a round):** deferred 574, 580, 580. In 567-579 of them the dominant hop is
+    taken -> written. Tail medians: queued 0.94 / 1.44 / 2.70 ms, taken -> written 7.6 / 4.4 / 5.0 ms, and the client's
+    wake (written -> seen) 3 / 4 / 15 µs.
+  - **By kind:** deferred taken -> written p50 209-393 µs, p99 5.8-8.1 ms, p999 8.0-10.7 ms. Sync taken -> written
+    p99 59-176 µs. Queued (both kinds) p99 2.7-3.4 ms, p999 3.7-3.9 ms. The client's wake p99 173-737 µs.
+  - **Quiet** (3 rounds): the client's round-trip p99 235-413 µs. The tail is again deferred taken -> written (p99
+    240-464 µs); every quiet hop of a sync reply is under 160 µs at p999.
+  - **Reading:** the macOS loaded tail is the deferred reply's trip to the owner shard and back, plus the queue in
+    front of the taking shard. It is not the client's wake, which the quiet smoke run on Studio-4 had suggested before
+    the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
+    128,000-150,000 calls loaded, and in 0-8 quiet.
+
+## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
+
+**The question** (main's 84a ruling, 2026-11-21). A-224's slice was rejected on loaded p50 excursions measured while
+the client spun for its reply, which A-799 removed. Does the slice now take 84a's loaded p99 and p999 under 1 ms on
+both CI Linux runners, with the loaded p50 inside B's spread and quiet runs even?
+
+**The arms.** One binary (`diag-g222-slice`, never main: main with B plus diagnostic switches), rotated each round:
+- **b:** B (A-799) as landed.
+- **s:** each shard thread asks `sched_setattr(SCHED_NORMAL, sched_runtime)` for its own step quantum, 7.0-8.8 µs as
+  measured at start.
+- **sc:** s plus the client thread asking the same call.
+The kernel held 100 µs, its floor, for every thread asked, read back with `sched_getattr`: 3 shard reads at
+start on arm64 and 6 on x86_64, and 6 client reads on each. The shards still held it after 20,000-park intervals (21 reads). A park doesn't drop the slice.
+
+**The lane.** A-224's: `systemd-run --scope -p AllowedCPUs=0-1`, plus `MemoryMax=256M` on arm64 (on x86_64 the
+256 MB probe failed, so CPUs only), an fsync writer, and two spinners a core. Three rounds; f10, accept and conflict.
+Each cell is r1/r2/r3 in µs.
+
+**ubuntu-24.04-arm** (run 44938733403, `diag-measurer-g222-27`, kernel 7.0.0-1017-azure):
+
+| form | arm | p50 | p99 | p999 |
+|---|---|---|---|---|
+| accept loaded | b | 251/245/255 | 371/415/643 | 416/3,993/1,467 |
+| accept loaded | s | 232/233/237 | 341/325/481 | 1,129/886/3,996 |
+| accept loaded | sc | 237/234/228 | 339/327/337 | 592/869/959 |
+| conflict loaded | b | 200/197/203 | 811/727/1,250 | 1,830/1,875/2,714 |
+| conflict loaded | s | 194/192/199 | 299/285/306 | 930/314/834 |
+| conflict loaded | sc | 195/195/199 | 306/298/297 | 714/4,964/937 |
+| accept quiet | b / s / sc | 112/111/108 · 104/108/106 · 101/107/106 | 169/154/151 · 145/150/146 · 143/150/144 | 241/237/202 · 416/205/269 · 313/238/270 |
+| conflict quiet | b / s / sc | 83/82/80 · 78/80/79 · 78/79/79 | 124/126/123 · 122/123/121 · 122/120/123 | 198/142/149 · 160/142/156 · 208/135/158 |
+
+**ubuntu-latest** (kernel 7.0.0-1016-aws). Two runs: 44938733403 (`-27`), then 44940103469 (`-28`, run again so its
+stamps were dumped before the bench's 1 ms gate exits):
+
+| form | arm | p50 (-27; -28) | p99 (-27; -28) | p999 (-27; -28) |
+|---|---|---|---|---|
+| accept loaded | b | 106/109/107; 70/74/59 | 2,905/2,914/2,898; 2,587/2,940/198 | 3,092/3,151/3,340; 3,251/3,278/1,816 |
+| accept loaded | s | 115/113/111; 71/61/76 | 1,785/3,995/1,315; 1,684/234/1,793 | 2,829/3,997/2,057; 3,246/1,452/3,865 |
+| accept loaded | sc | 180/123/123; 86/93/87 | 1,189/1,264/1,248; 1,812/1,048/1,032 | 1,822/1,851/1,518; 3,997/1,755/1,717 |
+| conflict loaded | b | 88/90/90; 55/57/49 | 3,219/3,311/3,372; 3,092/3,040/188 | 4,598/5,707/5,925; 4,303/5,960/2,929 |
+| conflict loaded | s | 89/90/90; 55/56/57 | 3,000/2,213/1,253; 1,489/1,197/1,494 | 4,001/4,003/2,040; 3,950/1,912/2,783 |
+| conflict loaded | sc | 172/154/99; 168/170/122 | 1,208/1,212/1,219; 1,493/1,713/1,162 | 1,796/1,799/1,499; 1,904/2,976/1,609 |
+
+Quiet on ubuntu-latest is even across the arms (-27: accept p99 102-130 µs in every arm, conflict p99 89-111).
+
+**Per-wake stamps** (kick -> the parked shard running; per request: landed -> taken, taken -> written,
+written -> the client saw it). In B the slowest 1% of requests by round trip are almost all deferred replies (forwarded
+verbs); with a slice, sync and deferred both appear.
+- **arm64, kick -> run, p50/p99/p999 in µs:** b 913/1,995/3,001 and 914/1,996/2,997 (at least 1 ms: 864 and 937 of
+  about 34,800). s 915/1,003/1,989, 912/1,000/1,559, 911/1,001/1,560 (337-421 at least 1 ms). sc 909/1,001/1,284,
+  913/1,000/1,486, 906/1,000/1,559. A deferred reply's taken -> written: p50 about 1.0-1.1 ms in every arm; p99
+  2.98-3.12 ms in b, 1.99-2.01 ms with a slice.
+- **x86_64 (-28):** the one derived shard almost never parks (1-3 kicked parks a run); it stays runnable. The tail is
+  the queue in front of it. In b the p99 tail's median landed -> taken is 2.66-2.86 ms (queued p99 2.39-2.71 ms,
+  p999 3.0 ms). With a slice it is 0.91-1.0 ms (queued p99 0.75-1.0 ms, p999 1.01-1.11 ms).
+
+**Reading.** On both runners a ready shard gets the CPU only at a 1 ms scheduler tick, never at its wake: kick -> run's
+median is 0.91 ms, and the tails sit at exactly 1.0, 2.0 and 3.0 ms. The slice makes the shard win the first tick
+instead of waiting out the spinners' 2.1 ms default slice, so the 2-3 ms tails become about 1 ms. It can't remove the
+first tick: nothing preempts a spinner at a wake. (The CI kernel's `sched/features` such as RUN_TO_PARITY can't be
+read without privilege.) So no fair-class slice reaches 84a's bound on this lane:
+- **arm64, sc:** p99 under 1 ms in all 6 rounds and p999 in 5 of 6 (conflict r2 4,964 µs); p50 at or below B's; quiet
+  even. Close, but one p999 over.
+- **x86_64:** sc's p99 is 1.03-1.81 ms and p999 1.5-4.0 ms. Its loaded p50 is beyond B's spread (conflict 99-172
+  against 49-90 µs, accept 86-180 against 59-109). s keeps the p50 but its p99 reaches 4.0 ms.
+- **Verdict:** not taken. The remaining tick is the scheduler's own. The only classes that preempt at a wake
+  (`SCHED_FIFO`/`SCHED_RR`, `SCHED_DEADLINE`, a negative nice) need privilege (R10).
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
@@ -17353,6 +17494,47 @@ scheduler's queueing until one daemon spent 1.70 s of a round watching. "No core
 wake estimate rose before any free-core reading could fall. A spin's bound must come from something that shrinks under
 contention, or the spin must be absent; the busy interval, which spins nothing, is measured on its own next.
 
+**A busy shard asks its driver no more often than an empty ask costs: the interval alone, accepted (A-829)**
+(agents/g228-busy-interval bc64bc20c against main a8ee99bf7; kiln r21, adas-mac-studio.local-2, Apple silicon, 32 cores,
+17:06-17:20 UTC 2026-11-21; the contract command, release, CARGO_BUILD_JOBS=4, each arm built from its commit, five
+rounds a condition, arms interleaved, order alternating). Loaded: 32 busy loops, one a core, started 30 s before the
+condition's first round. Background: the test under `taskpolicy -b`. Cells: added p50; live p999 (µs); the owner's CPU
+over the stream (ms):
+
+| condition, round | base | interval |
+|---|---|---|
+| quiet 1 | 166.4; 303.1; 340 | 137.8; 297.0; 340 |
+| quiet 2 | 167.7; 290.8; 330 | 139.8; 294.3; 330 |
+| quiet 3 | 164.5; 287.3; 320 | 137.1; 289.3; 330 |
+| quiet 4 | 166.4; 316.3; 330 | 137.0; 285.5; 340 |
+| quiet 5 | 167.0; 312.2; 330 | 141.2; 239.5; 340 |
+| `-b` 1 | 383.5; 1,666.5; 1,250 | 343.9; 1,601.3; 1,060 |
+| `-b` 2 | 358.6; 1,555.1; 1,110 | 359.4; 1,806.0; 1,260 |
+| `-b` 3 | 385.6; 1,551.0; 1,250 | 461.6; 3,096.6; 1,260 |
+| `-b` 4 | 370.1; 1,603.5; 1,180 | 350.8; 1,581.8; 1,110 |
+| `-b` 5 | 381.8; 1,386.7; 1,120 | 345.1; 1,662.4; 1,100 |
+| loaded 1 | 468.3; 4,335.3; 760 | 236.0; 1,572.7; 450 |
+| loaded 2 | 537.7; 2,935.6; 680 | 140.9; 1,763.1; 400 |
+| loaded 3 | 541.7; 2,883.8; 860 | 447.5; 2,134.2; 670 |
+| loaded 4 | 800.2; 11,699.9; 930 | 250.8; 1,705.6; 440 |
+| loaded 5 | 639.8; 5,479.5; 980 | 341.8; 1,682.9; 540 |
+| `-b` loaded 1 | 10,226.0; 111,242.2; 1,180 | 10,883.7; 36,879.4; 1,030 |
+| `-b` loaded 2 | 11,237.2; 127,244.5; 1,160 | 10,994.8; 39,079.4; 1,040 |
+| `-b` loaded 3 | 11,620.6; 321,528.7; 1,210 | 10,491.5; 49,215.2; 1,050 |
+| `-b` loaded 4 | 10,736.0; 39,038.7; 1,030 | 9,481.1; 32,920.1; 1,040 |
+| `-b` loaded 5 | 10,583.5; 72,913.3; 1,060 | 9,876.6; 110,903.4; 1,050 |
+
+No test failed in either arm. Live writes over 50 ms, `-b` loaded: base 41 / 25 / 47 / 0 / 10, interval 1 / 1 / 2 / 0 /
+8. The collect at the median: quiet 28.7-30.7 against 10.2-11.3 µs; loaded 61.4-81.9 against 11.3-28.7.
+Busy harvests deferred, every round of the interval arm, 510-26,062 a daemon (`rt.core.harvests_deferred`).
+
+**Reading.** Accepted. It wins quiet in every round (137.0-141.2 against 164.5-167.7 µs, the owner's CPU equal) and
+loses no contended condition on its medians or the owner's CPU. Loaded, it wins every round with lower CPU (400-670
+against 680-980 ms) and a p999 of 1.6-2.1 ms against 2.9-11.7. Under `taskpolicy -b` with every core busy, its medians
+are ahead in 4 of 5 rounds and its slow writes far fewer. One soft spot stays on record: under `taskpolicy -b` alone
+it led 4 of 5 medians, but round 3 was 461.6 against 385.6, and that condition's p999 was higher in 3 of 5 rounds.
+macOS's median moves from about 165 to about 139 µs added, 2.8x 85a's goal.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
@@ -17573,3 +17755,93 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
   branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
   a version, A-803 (c).
+
+## 2026-11-21 — A resolution judged at the head as it is (main's ruling of 10:33 PST): measured and rejected (w-fed-move, goal 86b)
+
+The idea (main ruled it as one verb): A-796's `ResolveMerge` judged against the current head, not refused
+`StaleMergeView` when the head had moved since the check. Its discards are retired and the rest rebased onto the
+current head in the same step, refused only by a conflict on windows it did not discard. The load harness resolved each
+conflict with `CheckMerge` then `ResolveMerge` (the declaration's operations on the windows discarded, the round's own
+slots written again), against its read-and-rebase loop.
+- **Built.** The owner's `merge_answer` without the stamp-head refusal; A-796's test red first (a moved head refused,
+  then rebased there); and a generated oracle in `crates/server/tests/merge_check.rs` (slot sets of the work, of rivals
+  before the check and after it). The oracle was accepted exactly when no kept slot was touched after the check, then
+  the head's file with the work's slots; otherwise a conflict naming only those slots. 24 histories passed. The harness
+  gained `--resolve`.
+- **Kept as:** `~/slates-work/w-fed-move-resolve-at-head-rejected.patch` (w-fed-move's machine).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`;
+  each pair back to back, main 67fa7f75a, this Mac Studio under other agents' load. Oracle failures were 0 in all eight runs.
+
+| hot files | resolve | asks a client | rebase-kind asks | verdict asks | verdicts/s | rebase conflicts |
+|---|---|---|---|---|---|---|
+| 300 | read+rebase | 11.2 | 2.1 | 2.4 | 3,264 | 754 |
+| 300 | check+resolve | 11.9 | 2.9 | 2.2 | 3,656 | 199 |
+| 100 | read+rebase | 13.0 | 3.6 | 2.7 | 2,271 | 1,822 |
+| 100 | check+resolve | 13.3 | 3.9 | 2.6 | 3,342 | 284 |
+| 30 | read+rebase | 19.3 | 8.7 | 3.8 | 2,168 | 5,850 |
+| 30 | check+resolve | 17.9 | 7.2 | 4.0 | 2,084 | 529 |
+| 10 | read+rebase | 31.8 | 20.1 | 5.1 | 1,260 | 16,035 |
+| 10 | check+resolve | 26.8 | 13.2 | 7.0 | 3,607 | 584 |
+
+- **Why rejected.** Main's bar was 19.8 to about 4.6 rebase asks a client at 10 hot files; it measured 20.1 to 13.2.
+  A resolution costs two asks (the check and the resolve), and the submit after it conflicts more often (6.0 against
+  4.2 a client at 10 hot files), since the head moves on while the client re-submits. At 300 and 100 hot files, where a
+  plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
+  measured on a shared, loaded machine and is not read as a result.
+
+## 2026-11-21 — A shard-level cache of base lengths (option 3): its ceiling measured, rejected unbuilt (w-fed-move, goal 86b)
+
+After A-817 a work's first edit of each file asks its green's owner for that file's length (4.8 a client at 300 hot
+files, 4.7 at 10, in the 1,000-client stand-in: release, in-process, `kernel/`, one round). The question was whether a
+cache of lengths shared by the works on one shard would cut it. A temporary diagnostic on the owner counted, for each
+length ask, whether the same asking shard had asked the same path before at a version since which the path had not
+changed: the asks a cache with perfect invalidation could have served.
+
+| hot files | length asks sampled | reusable | share |
+|---|---|---|---|
+| 300 | 4,000 | 398 | 10% |
+| 10 | 4,000 | 704 | 18% |
+
+So even a perfect cache saves at most about 0.5 to 0.8 asks a client, and a real one less: a work's shard cannot
+know that a file is unchanged since a cached answer without asking. Not built. With the resolution at the head
+rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
+each verdict, each work's first edit of a file, and a creation's admission and name.
+
+
+## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
+
+w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read
+the arenas 0 MiB resident after a 256 MiB burst on macOS (w-sizing's report on 599603559), since the residency sweep
+walked each shard's whole slice. Debug test binaries (the test is the measurement; no release run), 2 shards, RAM only.
+
+Command: `cargo test -p slates-server --test daemon a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas -- --nocapture`
+(256 files of 1 MiB through the SDK, then a memory status every hundredth of a liveness budget until the arenas read
+measured, bound ten liveness budgets).
+
+| Machine | Tree | Arenas after the burst | Looks | Time to measured |
+|---|---|---|---|---|
+| Mac Studio (Studio-4), macOS arm64 | origin/main 40c3f8d1e, one status | resident 0, measured false | 1 | never in that status |
+| Mac Studio (Studio-4), macOS arm64 | 40c3f8d1e, looking again | 286,785,536 (the regions whole, freed pages too) | 20 | 1.15 s |
+| Mac Studio (Studio-4), macOS arm64 | the fix, 3 runs | 268,435,456 of 268,435,456 | 2, 2, 2 | 86, 86, 76 ms |
+| adacachy, Linux x86_64 (load 45, kiln r8) | b5220bd92 | 268,435,456 of 268,435,456 (region 16 GiB) | 2 | 35 ms |
+| jupiter, Windows x86_64 | the fix | with w-lint (run-requests 2026-11-21T01:10Z) | | |
+
+What the sweep walks a shard on the test daemon (`content_range.<range>.bytes`): write log 1,276,423,222, image slots
+12,884,901,888, delta log 6,442,450,944, DAX table 98,320, segment log 1,610,612,736, segment snapshots 6,442,450,944,
+rings 278,528; and of the arena only its held runs (268,435,456 on the burst's shard, where the region is 4 GiB). The
+write log and journal are whole because a fresh daemon cannot know them unwritten until its first give-back (GAPS).
+
+Step clock, measured-and-rejected: the shard's clock (`slates_machine::clock::monotonic_ns`, whole microseconds on
+macOS) for timing the sweep's steps. `cargo test -p slates-server --lib content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+on Studio-4, debug audit daemon:
+
+| Steps timed by | Whole sweep | Steps | Pages a step | Stepped | Longest true step | Steps over 100 us |
+|---|---|---|---|---|---|---|
+| the shard's clock | about 2 s | 70,909 | — | 1.24 s (fine clock) | 15.5 ms | 3,290 |
+| the step clock (`Instant`) | 13.9 s | 604,981 | 5.8 | 2.71 s | within budget (`past_budget` 0) | — |
+
+Budget a step about 1.6 us (half the debug daemon's live step quantum). The shard's clock read most steps as 0 ns, so
+each next step grew to a vector page's batch and ran milliseconds unseen; it is rejected for the step clock. The
+measured step: fixed 709-792 ns, 600-1,600 ns a page at a few pages (noise-dominated), so the floor buys about a page;
+the honest sweep's rate, about 280 K pages a second, is set by the runtime's look for work between idle slices (GAPS).
+The memory report's kinds pass 67 ms after arming in the same run.

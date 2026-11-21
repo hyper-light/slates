@@ -634,6 +634,13 @@ fn counter(instance: &str, name: &str) -> u64 {
     .sum()
 }
 
+/// Format: the daemon's counter of the slices a push's intake took (`repository::hg_push::INTAKE_SLICES`).
+const INTAKE_SLICES: &str = "hg_push.intake_slices";
+
+/// Shape: the most slices the test's one push of two changesets may take paced: the intake's steps run on while no one
+/// waits on the shard, so its few units take a slice or two, where a slice a step took one each.
+const INTAKE_SLICES_AT_MOST: u64 = 3;
+
 /// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
 const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 
@@ -735,6 +742,12 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
         .ok_or(verify_said),
     )
   };
+  // The push's intake was paced (A-783): a few slices, where a slice a step took one each of its units.
+  let slices = counter(&instance, INTAKE_SLICES);
+  assert!(
+    (1..=INTAKE_SLICES_AT_MOST).contains(&slices),
+    "the push's intake took {slices} slices"
+  );
   let imported = clone_stream("imported");
   let turns_before = counter(&instance, STREAM_TURNS);
   let pushed = clone_stream("pushed");
@@ -1808,4 +1821,178 @@ fn a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does() {
     slates_bytes <= stock_bytes.saturating_mul(2),
     "slates sent {slates_bytes} bytes where stock 7.2 sent {stock_bytes}"
   );
+}
+
+/// Format: the daemon's counter of the asks a `lookup` or a `batch` made of the changeset store for the heads'
+/// `.hgtags` (`crate::vcs_store::hg_view::LOOKUP_STORE_ASKS` in `slates-server`, A-767 C1).
+const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
+
+/// Stock hg's pulls by a tag through slates at `url` (`config` its `--config` words), with daemon `instance`'s counters:
+/// a history of three changesets pushed, the second tagging the first `v1` (`hg tag`); `hg pull -r v1` into an empty
+/// repository; then `hg pull -r v1 -r tip` into another, which 7.2 sends as one `batch` of two lookups. Fails the test
+/// unless the first holds the tagged changeset alone and the second the whole history, each pull's lookup of `v1` read
+/// the tags from the changeset store, and the batch read them in one round as the lone lookup did. The tagged node.
+fn tag_pulls(hg: &[String], scratch: &str, url: &str, config: &[String], instance: &str) -> String {
+  let source = format!("{scratch}/tagged");
+  hg_ok(hg, scratch, &["init", &source]);
+  std::fs::write(format!("{source}/file"), "first\n").unwrap();
+  hg_ok(
+    hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(hg, &source, &["tag", "--rev", "0", "v1"]);
+  std::fs::write(format!("{source}/file"), "third\n").unwrap();
+  hg_ok(hg, &source, &["commit", "--message", "third"]);
+  hg_ok(hg, &source, &with_config(&["push", url], config));
+  let history = hg_nodes(hg, &source);
+  let tagged = history.last().cloned().unwrap_or_default();
+  let pulled = |name: &str, revs: &[&str]| {
+    let copy = format!("{scratch}/{name}");
+    hg_ok(hg, scratch, &["init", &copy]);
+    let before = counter(instance, LOOKUP_STORE_ASKS);
+    let mut args = vec!["pull"];
+    for rev in revs {
+      args.extend(["-r", rev]);
+    }
+    args.push(url);
+    hg_ok(hg, &copy, &with_config(&args, config));
+    (
+      hg_nodes(hg, &copy),
+      counter(instance, LOOKUP_STORE_ASKS).saturating_sub(before),
+    )
+  };
+  let (lone, lone_asks) = pulled("by-tag", &["v1"]);
+  let (batched, batch_asks) = pulled("by-tag-and-tip", &["v1", "tip"]);
+  assert_eq!(
+    lone,
+    vec![tagged.clone()],
+    "`pull -r v1` brings the tagged changeset alone"
+  );
+  assert_eq!(
+    batched, history,
+    "`pull -r v1 -r tip` brings the whole history"
+  );
+  assert!(
+    lone_asks > 0,
+    "the lookup of v1 read the tags from the store"
+  );
+  assert_eq!(
+    batch_asks, lone_asks,
+    "the batch read the tags in one round, as the lone lookup did"
+  );
+  tagged
+}
+
+/// A-767 C1 (main's ruling (A) of 2026-11-21: lookup's `.hgtags` through the changeset store, tests by use). Do: over the
+/// HTTP edge, run [`tag_pulls`]; push bookmark `mark` at the tagged changeset (a branch is made at a changeset a line
+/// or bookmark heads, A-575); then make branch `from-tag` with the owner's verb `--from v1` and list a fresh clone's
+/// bookmarks. Expect the pulls as [`tag_pulls`] holds them, and bookmark `from-tag` at the tagged changeset, the verb's
+/// door having read the tags from the store ([`LOOKUP_STORE_ASKS`] moved). Red before the change: no counter moved (the
+/// tags were read whole from the content store). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_from_the_tag() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's pull by a tag over HTTP: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-tags-http-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's pull by a tag over HTTP") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let url = format!("{prefix}r");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-tags-http");
+  let tagged = tag_pulls(&hg, &scratch.path, &url, &config, &instance);
+  // A branch is made at a changeset a line or bookmark heads (A-575): bookmark `mark` heads the tagged one.
+  let source = format!("{}/tagged", scratch.path);
+  hg_ok(&hg, &source, &["bookmark", "--rev", "0", "mark"]);
+  let (code, out, err) = hg_in(
+    &hg,
+    &source,
+    &with_config(&["push", "-B", "mark", &url], &config),
+  );
+  assert!(code == 0 || code == 1, "push -B mark: {out}{err}");
+  let before = counter(&instance, LOOKUP_STORE_ASKS);
+  let (code, out, err) = slates(
+    &instance,
+    &[],
+    &[
+      "repository",
+      "branch",
+      "create",
+      "r",
+      "from-tag",
+      "--from",
+      "v1",
+    ],
+  );
+  assert_eq!(code, 0, "branch create --from v1: {out}{err}");
+  let asks = counter(&instance, LOOKUP_STORE_ASKS).saturating_sub(before);
+  let copy = format!("{}/bookmarks", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &copy], &config),
+  );
+  let bookmarks = hg_ok(
+    &hg,
+    &copy,
+    &["bookmarks", "--template", "{bookmark} {node}\\n"],
+  );
+  assert!(
+    bookmarks.contains(&format!("from-tag {tagged}")),
+    "the branch made at v1's changeset: {bookmarks}"
+  );
+  assert!(asks > 0, "the verb's door read the tags from the store");
+}
+
+/// A-767 C1 (main's ruling (A), tests by use). Do: over the SSH edge, run [`tag_pulls`]. Expect the pulls as it holds
+/// them. Skips loudly without stock hg 7.2 ([`STOCK_HG`]), `ssh-keygen` or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pulls_by_a_tag_over_ssh() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's pull by a tag over SSH: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let scratch = Scratch::new("hg-tags-ssh");
+  let Some((key, public)) = fresh_key(&scratch) else {
+    eprintln!("skipping stock hg's pull by a tag over SSH: no ssh-keygen here");
+    return;
+  };
+  let instance = format!("hg-tags-ssh-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+  let (port, fingerprint) = started
+    .lines
+    .iter()
+    .find_map(|line| ssh_edge_of(line))
+    .expect("the daemon named its SSH edge's port and host key");
+  let Some(issuer) = issuer_of(&started, "stock hg's pull by a tag over SSH") else {
+    return;
+  };
+  let known_hosts = known_hosts(&scratch, port, &fingerprint);
+  create_hg_repository(&instance, "r");
+  let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+  assert_eq!(code, 0, "credential key: {out}{err}");
+  let config = vec!["--config".to_owned(), ssh_command(&key, &known_hosts)];
+  let url = format!("ssh://{HG_USER}@127.0.0.1:{port}/r");
+  tag_pulls(&hg, &scratch.path, &url, &config, &instance);
 }

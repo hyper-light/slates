@@ -2,9 +2,10 @@
 //! through uvx): a repository of 18 changesets on `default`, then one on branch `feature`, bookmark `mark` at revision
 //! 3, each key sent as `lookup` to `hg -R r serve --stdio`.
 
-use super::lookup;
+use super::{TagsRead, lookup};
 use crate::phases::Phase;
 use crate::pushkey::hex_node;
+use crate::render::{StoredPlace, StoredRevision, Want};
 use crate::serve::tests::{Changeset, History, room};
 use crate::{NULL_NODE, Node};
 
@@ -58,9 +59,68 @@ fn recorded() -> History {
   history
 }
 
+/// The heads' `.hgtags` of `history` read within `most` bytes as the changeset store gives them (module docs of
+/// [`super::TagsRead`]): each text's identity the plain BLAKE3 of its bytes; the asks it took.
+fn read_tags(history: &History, most: u64) -> (TagsRead, usize) {
+  let mut read = TagsRead::begin(history, &mut crate::Admission::new(most)).unwrap();
+  let mut asks = 0;
+  while let Some(want) = read.wants().cloned() {
+    asks += 1;
+    match want {
+      Want::Rows { logs } => {
+        let rows = logs
+          .iter()
+          .map(|(path, nodes)| {
+            assert_eq!(path, b".hgtags");
+            nodes
+              .iter()
+              .map(|node| {
+                let (_, text) = history.hgtags.values().find(|(held, _)| held == node)?;
+                let identity = *blake3::hash(text).as_bytes();
+                Some(StoredRevision {
+                  text: identity,
+                  base: None,
+                  place: StoredPlace {
+                    payload: identity,
+                    offset: 0,
+                    len: 0,
+                  },
+                })
+              })
+              .collect()
+          })
+          .collect();
+        read.give_rows(rows);
+      }
+      Want::Texts { texts, most } => {
+        let found: Vec<Vec<u8>> = texts
+          .iter()
+          .map(|identity| {
+            let (_, text) = history
+              .hgtags
+              .values()
+              .find(|(_, text)| blake3::hash(text).as_bytes() == identity)
+              .unwrap();
+            text.clone()
+          })
+          .collect();
+        let total: usize = found.iter().map(Vec::len).sum();
+        if u64::try_from(total).unwrap() > most {
+          read.texts_past();
+        } else {
+          read.give_texts(found);
+        }
+      }
+      Want::Chunks { .. } => panic!("a .hgtags read asks no chunks"),
+    }
+  }
+  (read, asks)
+}
+
 fn answer(history: &History, key: &str) -> String {
+  let (tags, _) = read_tags(history, u64::MAX);
   let mut out = Vec::new();
-  lookup(history, key.as_bytes(), &mut room(), &mut out).unwrap();
+  lookup(history, Some(&tags), key.as_bytes(), &mut room(), &mut out).unwrap();
   String::from_utf8(out).unwrap()
 }
 
@@ -233,4 +293,38 @@ fn a_tag_naming_a_node_not_served_is_unknown_not_a_branch() {
     answer(&history, "default"),
     "0 unknown revision 'default'\n"
   );
+}
+
+/// A-767 C1 (main's ruling (A): a hostile or huge `.hgtags` is read under the want's room and refused typed past it).
+/// Do: in the tagged repository, begin reading the tags in the least room the reading can begin in, which leaves less
+/// than the heads' `.hgtags` hold, and look up `v1`. Expect the store told the texts are past the room and the lookup
+/// refused past its admission, never a text read whole.
+#[test]
+fn a_hgtags_past_the_room_is_refused_past_its_admission() {
+  let history = tagged();
+  let least = (0..u64::from(u16::MAX))
+    .find(|room| TagsRead::begin(&history, &mut crate::Admission::new(*room)).is_ok())
+    .unwrap();
+  let (tags, asks) = read_tags(&history, least);
+  assert_eq!(asks, 2, "rows, then texts past the room");
+  let mut out = Vec::new();
+  let refused = lookup(&history, Some(&tags), b"v1", &mut room(), &mut out).unwrap_err();
+  assert!(
+    matches!(refused, crate::serve::Refusal::PastAdmission(_)),
+    "{refused:?}"
+  );
+}
+
+/// A-767 C1. Do: look up a revision number, a full node and a bookmark in the tagged repository with no tags read.
+/// Expect each answered as before: a name resolved before the tags never needs them ([`super::needs_tags`]).
+#[test]
+fn a_name_resolved_before_the_tags_needs_none_read() {
+  let history = tagged();
+  for key in ["2", TAGGED[3], "shadow", "tip", "null"] {
+    assert!(!super::needs_tags(&history, key.as_bytes()), "{key}");
+    let mut out = Vec::new();
+    lookup(&history, None, key.as_bytes(), &mut room(), &mut out).unwrap();
+    assert!(out.starts_with(b"1 "), "{key}");
+  }
+  assert!(super::needs_tags(&history, b"v1"));
 }

@@ -619,10 +619,17 @@ pub(crate) fn answer_wants_blocking(
                     .ok()
                     .map(slates_hg::serve::getbundle::Given::Chunks)
                 }
-                Want::Texts { texts } => {
-                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts)
+                Want::Texts { texts, most } => {
+                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts, most)
                     .await
-                    .map(slates_hg::serve::getbundle::Given::Texts)
+                    .map(|made| match made {
+                      crate::vcs_store::hg_view::MadeTexts::Made(made) => {
+                        slates_hg::serve::getbundle::Given::Texts(made)
+                      }
+                      crate::vcs_store::hg_view::MadeTexts::Past => {
+                        slates_hg::serve::getbundle::Given::TextsPast
+                      }
+                    })
                 }
               }
             })
@@ -637,6 +644,7 @@ pub(crate) fn answer_wants_blocking(
       Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
       Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
       Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
+      Some(slates_hg::serve::getbundle::Given::TextsPast) => wants.texts_past(),
       None => return false,
     }
   }
