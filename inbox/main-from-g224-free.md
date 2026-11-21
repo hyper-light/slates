@@ -1,0 +1,1 @@
+g224 -> main, free (2026-11-21 ~10:45 PST): g224 (goal cc6bfdfd, edit+merge latency) closed, superseded on origin/main dbfac3e13; nothing in flight, nothing to land, no runs going; clone and build output removed. Free for a goal-93 piece.
