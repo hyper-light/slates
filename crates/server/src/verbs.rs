@@ -17837,6 +17837,11 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     if !to_serve(state, index, handle, &request) {
       continue;
     }
+    let g222_taken = slates_machine::clock::monotonic_ns();
+    let g222_landed = slates_ipc::slot::landed_ns(
+      u32::try_from(slates_ipc::endpoint::G222_LAST_STAMP.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0),
+      g222_taken,
+    );
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
     // is the entry point, its request id the replay identity. `now` (this round's single clock read,
     // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
@@ -17856,6 +17861,9 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
         if send_reply(state, index, request.request, &mut reply) {
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
+          if let Some(landed) = g222_landed {
+            crate::g222_diag::ring(landed, g222_taken, slates_machine::clock::monotonic_ns());
+          }
           let label = u32::from(state.partition);
           crate::telemetry::emit(state, ring.end(label, written_ns));
         } else {

@@ -1201,6 +1201,15 @@ impl DaemonConfig {
       tracking.idle_floor_ns = PROVISION_FLOOR_NS;
       tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
+    // Diagnostic only (g222, never main): an idle shard parks at once, no spin window.
+    #[allow(clippy::disallowed_methods)]
+    if std::env::var_os("G222_NO_SPIN").is_some() {
+      runtime.spin_ns = 0;
+      if let Some(tracking) = runtime.wake_tracking.as_mut() {
+        tracking.idle_floor_ns = 0;
+        tracking.idle_ceiling_ns = 0;
+      }
+    }
     // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
     // the loop's revisit at R9's percentile (§4.7; A-326), each owner keeping the hold only while its idle turns poll
     // faster than it wakes (A-387).
@@ -1234,7 +1243,9 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
-      closed_loop_hold_ns: loop_hold.get(),
+      // Diagnostic only (g222, never main): G222_NO_HOLD holds no shard for a closed loop.
+      #[allow(clippy::disallowed_methods)]
+      closed_loop_hold_ns: if std::env::var_os("G222_NO_HOLD").is_some() { 0 } else { loop_hold.get() },
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,

@@ -54,6 +54,48 @@ use crate::wake;
 #[cfg(unix)]
 const COMPLETION_NUDGE: [u8; 8] = 1u64.to_ne_bytes();
 
+/// Diagnostic only (g222, never main): the stamp of the last request a server end took.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_LAST_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main): client sends, and those that rang a shard announced idle.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main): the client's reply spin yields its CPU each turn.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SPIN_YIELDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Diagnostic only (g222, never main): per reply the client took, (request stamp, seen ns, parks in the wait).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_CLIENT: [[std::sync::atomic::AtomicU64; 3]; 300_000] =
+  [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 300_000];
+/// Diagnostic only (g222, never main).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_CLIENT_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Diagnostic only (g222, never main): the client's replies as TSV.
+#[doc(hidden)]
+#[allow(clippy::all, clippy::pedantic, clippy::disallowed_methods, clippy::disallowed_types)]
+pub fn g222_dump_client(path: &str) {
+  use std::io::Write;
+  let n = G222_CLIENT_N.swap(0, Ordering::Relaxed).min(G222_CLIENT.len());
+  let mut out = String::from("stamp\tseen\tparks\n");
+  for row in G222_CLIENT.iter().take(n) {
+    out.push_str(&format!("{}\t{}\t{}\n", row[0].load(Ordering::Relaxed), row[1].load(Ordering::Relaxed), row[2].load(Ordering::Relaxed)));
+  }
+  if let Ok(mut f) = std::fs::File::create(path) {
+    let _ = f.write_all(out.as_bytes());
+  }
+}
+
 /// A request as the daemon end hands it to the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -660,6 +702,10 @@ impl ClientEnd {
     let announced = self.region.daemon_parked()?;
     let parked =
       crate::doorbell::after_publishing_idle_announced(|| announced.load(Ordering::Relaxed) != 0);
+    G222_SENDS.fetch_add(1, Ordering::Relaxed);
+    if parked {
+      G222_RINGS.fetch_add(1, Ordering::Relaxed);
+    }
     if parked {
       self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
       if let Some(bell) = &self.doorbell {
@@ -722,6 +768,21 @@ impl ClientEnd {
 
   /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
   fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
+    let parks_before = self.parks;
+    let waited = self.g222_wait_ending(ends);
+    if let Ok(Waited::Reply(_)) = &waited {
+      let seen = slates_machine::clock::monotonic_ns();
+      let n = G222_CLIENT_N.fetch_add(1, Ordering::Relaxed);
+      if let Some(row) = G222_CLIENT.get(n) {
+        row[0].store(u64::from(self.request_stamp), Ordering::Relaxed);
+        row[1].store(seen, Ordering::Relaxed);
+        row[2].store(self.parks.saturating_sub(parks_before), Ordering::Relaxed);
+      }
+    }
+    waited
+  }
+
+  fn g222_wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
     let started = Instant::now();
     // A caller that names a spin gets it; by default the wait parks at once (A-799): a client spinning for its reply holds
     // the CPU the shard it just woke needs whenever the cores are all busy, so the shard ran only when the spin ended
@@ -733,7 +794,11 @@ impl ClientEnd {
       }
       let elapsed = elapsed_ns(started);
       if elapsed < spin_ns {
-        std::hint::spin_loop();
+        if G222_SPIN_YIELDS.load(Ordering::Relaxed) {
+          std::thread::yield_now();
+        } else {
+          std::hint::spin_loop();
+        }
         continue;
       }
       let look_timeout_ns = match self.before_park(ends, elapsed)? {
@@ -1286,6 +1351,7 @@ impl DaemonEnd {
     let Some(slot) = peeked.transpose()? else {
       return Ok(None);
     };
+    G222_LAST_STAMP.store(u64::from(slot.stamp), std::sync::atomic::Ordering::Relaxed);
     Ok(Some(Request {
       request: slot.request,
       kind: slot.kind,

@@ -30,6 +30,8 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 mod base_hints;
+#[doc(hidden)]
+pub mod g222_diag;
 mod carry;
 pub mod catalog;
 pub mod config;

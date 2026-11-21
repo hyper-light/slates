@@ -78,6 +78,10 @@ static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Whether a loaded form's p99 passed the required bound on a platform that gates it (84a): the run then exits 1.
 static LOADED_OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Diagnostic only (g222): the client's spin for a reply, `G222_CLIENT_SPIN_NS`, else the library's wait.
+fn g222_spin() -> Option<u64> {
+  std::env::var("G222_CLIENT_SPIN_NS").ok().and_then(|v| v.parse().ok())
+}
 /// Format: the percentiles reported, in parts per thousand.
 const PERCENTILES: &[(&str, u64)] = &[("p50", 500), ("p99", 990), ("p999", 999)];
 /// Format: parts per thousand.
@@ -215,9 +219,7 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    // The client waits as an agent's does: the library's own reply wait (84a: a spin that held the shard's CPU was the
-    // harness's, 1 ms, and the loaded band followed it).
-    client.spin_for(None);
+    client.spin_for(g222_spin());
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -791,7 +793,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(None);
+  client.spin_for(g222_spin());
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
@@ -952,7 +954,31 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
   }
 }
 
+struct G222Dump;
+impl Drop for G222Dump {
+  fn drop(&mut self) {
+    if let Ok(path) = std::env::var("G222_DIAG") {
+      slates_server::g222_diag::dump(&path);
+      slates_server::g222_diag::dump_ring(&format!("{path}.ring"));
+      slates_server::g222_diag::dump_parks(&format!("{path}.parks"));
+      slates_ipc::endpoint::g222_dump_client(&format!("{path}.client"));
+    }
+  }
+}
+
 fn main() {
+  let _g222 = G222Dump;
+  if std::env::var_os("G222_SPIN_YIELD").is_some() {
+    slates_ipc::endpoint::G222_SPIN_YIELDS.store(true, std::sync::atomic::Ordering::Relaxed);
+  }
+  #[cfg(target_os = "macos")]
+  if std::env::var_os("G222_CLIENT_QOS").is_some() {
+    // SAFETY: diagnostic only (g222); this thread's own QoS class.
+    unsafe {
+      libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+  }
+
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -998,6 +1024,11 @@ fn main() {
             std::hint::spin_loop();
           }
         });
+      }
+      // Diagnostic (g222): the client thread raised after the spinners were made, so they keep the default class.
+      #[cfg(target_os = "macos")]
+      if std::env::var_os("G222_CLIENT_QOS2").is_some() {
+        slates_server::g222_diag::raise_qos();
       }
       sweep(&instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);

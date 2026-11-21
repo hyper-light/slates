@@ -94,3 +94,99 @@ pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;
 pub use task::{Admission, AdmissionReceipt};
+
+/// Diagnostic only (g222, never main): raises this thread to macOS's user-interactive QoS class.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn g222_raise_qos() {
+  // SAFETY: diagnostic only; sets the calling thread's own QoS class.
+  unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  }
+}
+
+/// Diagnostic only (g222, never main): every park's asked timeout, how long it waited, and how it ended
+/// (0 timer or other, 1 kicked, 2 untimed, 3 found pending).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types, missing_docs)]
+pub mod g222_parks {
+  use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+  pub const CAP: usize = 600_000;
+  pub static ROWS: [[AtomicU64; 5]; CAP] = [const { [const { AtomicU64::new(0) }; 5] }; CAP];
+  pub static N: AtomicUsize = AtomicUsize::new(0);
+  /// A zero-timeout harvest's duration, binned by log2 of its microseconds (bin 0: under 1 us).
+  pub static HARVEST: [AtomicU64; 24] = [const { AtomicU64::new(0) }; 24];
+  pub fn harvested(ns: u64) {
+    let us = ns / 1000;
+    let bin = if us == 0 { 0 } else { (64 - us.leading_zeros()) as usize };
+    HARVEST[bin.min(23)].fetch_add(1, Relaxed);
+  }
+  pub fn dump(path: &str) {
+    use std::io::Write;
+    let n = N.load(Relaxed).min(CAP);
+    let bins: Vec<String> = HARVEST.iter().map(|b| b.swap(0, Relaxed).to_string()).collect();
+    let mut out = format!("# harvest_us_log2 {}\n", bins.join(" "));
+    out.push_str("timeout\twaited\tended\tkick_after\twake_after\n");
+    for row in ROWS.iter().take(n) {
+      out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed), row[3].load(Relaxed), row[4].load(Relaxed)));
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+      let _ = f.write_all(out.as_bytes());
+    }
+    N.store(0, Relaxed);
+  }
+}
+
+#[doc(hidden)]
+pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64)) {
+  use std::sync::atomic::Ordering::Relaxed;
+  let n = g222_parks::N.fetch_add(1, Relaxed);
+  if let Some(row) = g222_parks::ROWS.get(n) {
+    row[0].store(timeout, Relaxed);
+    row[1].store(waited, Relaxed);
+    row[2].store(ended, Relaxed);
+    row[3].store(kick.0, Relaxed);
+    row[4].store(kick.1, Relaxed);
+  }
+}
+
+/// Diagnostic only (g222, never main): asks the calling thread for the EEVDF slice `G222_SLICE_NS` (A-224's
+/// `sched_runtime` for a `SCHED_OTHER` thread, its policy and nice kept, no privilege), and counts the answer.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction, clippy::disallowed_methods)]
+pub(crate) fn g222_slice() {
+  #[repr(C)]
+  #[derive(Clone, Copy, Default)]
+  struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    util_min: u32,
+    util_max: u32,
+  }
+  let Some(slice) = std::env::var("G222_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) else {
+    return;
+  };
+  let mut attr = SchedAttr::default();
+  let size = std::mem::size_of::<SchedAttr>() as u32;
+  // SAFETY: diagnostic; pid 0 is the calling thread, `attr` is a repr(C) sched_attr of `size` bytes.
+  let got = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
+  if got != 0 {
+    eprintln!("g222 slice: sched_getattr refused: {}", std::io::Error::last_os_error());
+    return;
+  }
+  attr.size = size;
+  attr.policy = 0;
+  attr.runtime = slice;
+  // SAFETY: as above; the kernel reads `size` bytes.
+  let set = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+  if set != 0 {
+    eprintln!("g222 slice: sched_setattr({slice}) refused: {}", std::io::Error::last_os_error());
+  }
+}

@@ -95,6 +95,11 @@ fn run(
   stop: &Receiver<()>,
   rang_flag: &'static AtomicBool,
 ) {
+  #[cfg(target_os = "macos")]
+  #[allow(clippy::disallowed_methods, unsafe_code)]
+  if std::env::var_os("G222_BELL_QOS").is_some() {
+    slates_rt::g222_raise_qos();
+  }
   // The value last acted on: a ring that lands while the shards are being kicked shows as a
   // change on the next comparison, never lost (the wait compares against `seen`, not against
   // a fresh read).
