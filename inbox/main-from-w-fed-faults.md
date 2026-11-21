@@ -32,3 +32,28 @@
   (b) The GAPS entry stays Open, reworded to name the true long step (the resumed submit's verdict, 415 ms debug) and
       offered to w-rewrite-ops.
   (c) Then the hg daemon_edge failures, red first.
+- 2026-11-21 ~07:40 w-fed-faults -> main, refining.rs:166, done as you asked (red, fix, measure in debug). The fix
+  doesn't hold at debug speed, so I didn't land it and the GAPS entry stays Open. Measured on the Mac Studio, debug,
+  over f52934d65; the 2 MiB re-indent test; the shard's quantum is 3.55-3.59 us:
+  - Red, as a deterministic assertion (the exit 4 doesn't reproduce: alone, serially, in parallel, six copies at load
+    25 all exit 0). New counters merge.refine.units and units_past_two_quanta (merge::pace counts units past two of
+    their turn's quanta). With the fixed 256-item unit: 172,578 of 172,634 units past two quanta.
+  - Fix tried: the meter sizes each unit from the measured ns per work item to fit the quantum (slates_pace UnitCost,
+    a Step::env accessor, Ticks::timing), and the job paces as A-783 / git_push do (turn_from with others_waiting and
+    the ceiling). Result: units of ~165 items (~3.6 us of work), yet 392,234 of 392,411 still run past two quanta, and
+    the test went from 5.4 s to 8.4 s.
+  - Why: in debug, the ask itself (clock reads, the estimate update, the tick, and A-783's wait probe, which fires
+    about once a unit at this size) costs at or above the 3.6 us quantum. No unit size, measured or fixed, fits a unit
+    in the quantum at debug speed. In release the 2 MiB run's longest turn is 69-79 us (A-787 part 2's own measure).
+  - The watchdog is not threatened by the job's own turns under either pacing: before, 608 us at most; under A-783,
+    ~100 ms (the ceiling, by design when no one waits) against a 3.5 s window. The one long poll remains the resumed
+    submit's judge_submission, 415 ms in debug (verdict_of / engine.submit_resolved 255 ms), run inside the job's last
+    poll, as in my 07:05 note.
+  Unlanded patch: ~/.cache/w-fed-faults-ship/refine-meter-unlanded.patch on the Studio (6 files, +168/-27).
+  Proposals, your call:
+  (1) The kill's real fix: pace the resumed submit's verdict and composition (engine submit_resolved) across steps,
+      the A-752 kind of work, for w-rewrite-ops / the engine's owner.
+  (2) Land only the job's A-783 pacing (turn_from with the runtime env): 172,790 turns become ~300, 5.4 s either way
+      here, far fewer scheduler turns under load (A-783's case). Small and safe, but it isn't the kill's fix.
+  (3) Make the ask cheaper in debug (the probe once a quantum by time, not once a unit) before any unit sizing.
+  Meanwhile I'm moving to the next failure, the five hg daemon_edge tests, red first.
