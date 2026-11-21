@@ -83,6 +83,7 @@ use crate::state::ShardState;
 
 pub(crate) mod landing;
 pub(crate) mod restore;
+pub(crate) mod staging;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -422,7 +423,7 @@ pub(crate) async fn landed_with<P, T>(
       return Some(Err(refused));
     }
   };
-  let stored = landing::land_changeset(&disk, (repository, sequence), record, &texts).await;
+  let stored = landing::land_changeset(&disk, (repository, sequence), vec![record], &texts).await;
   crate::state::with_state(move |state| {
     let committed = match stored {
       // Another changeset named at this sequence meanwhile (none while the turn is held, in a correct use).
@@ -1533,7 +1534,9 @@ impl<'b> Building<'b> {
   /// listed (module docs, "Not declared yet").
   fn tree_beneath(&self, path: &str) -> Result<Vec<(String, Stood)>, Uncommitted> {
     let (source, revision) = self.place_before(path).ok_or_else(corrupt)?;
-    if revision != self.engine.head() {
+    // The head in the records' numbering: the green's head, or an import batch's whose scratch member counts its own
+    // versions from 0 (C2 stage C).
+    if revision != self.records.youngest() {
       return Err(Uncommitted::Unsupported {
         path: path.to_owned(),
       });

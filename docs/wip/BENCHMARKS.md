@@ -17122,6 +17122,21 @@ and every round shown, as main extracted them from the run's log.
     median both idle and loaded, and loaded p999 0.7-2.2 ms (at most 18 of 2,000 at least 1 ms late). nanosleep is late
     1.7-2.5 ms at the median (1,221-1,947 of 2,000 at least 1 ms late). On Studio-4 under kiln, kevent and ulock are
     late 54 µs at the median, nanosleep 1.60 ms. Nothing on the request path sleeps.
+- **The macOS hop split, take 2** (run 44934263888, `diag-measurer-g222-23`, `diag-g222-hops-mac` f88fcc9fd, never
+  main). The same lane and rounds, now also stamping replies written after the step that took their request (a
+  resumed or forwarded verb). Every request joins: about 41,400 sync and 16,500 deferred a round. Loaded (3 rounds;
+  bench accept p99 8.0-12.2 ms, conflict 8.0-10.2 ms):
+  - **The p99 tail (580 requests a round):** deferred 574, 580, 580. In 567-579 of them the dominant hop is
+    taken -> written. Tail medians: queued 0.94 / 1.44 / 2.70 ms, taken -> written 7.6 / 4.4 / 5.0 ms, and the client's
+    wake (written -> seen) 3 / 4 / 15 µs.
+  - **By kind:** deferred taken -> written p50 209-393 µs, p99 5.8-8.1 ms, p999 8.0-10.7 ms. Sync taken -> written
+    p99 59-176 µs. Queued (both kinds) p99 2.7-3.4 ms, p999 3.7-3.9 ms. The client's wake p99 173-737 µs.
+  - **Quiet** (3 rounds): the client's round-trip p99 235-413 µs. The tail is again deferred taken -> written (p99
+    240-464 µs); every quiet hop of a sync reply is under 160 µs at p999.
+  - **Reading:** the macOS loaded tail is the deferred reply's trip to the owner shard and back, plus the queue in
+    front of the taking shard. It is not the client's wake, which the quiet smoke run on Studio-4 had suggested before
+    the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
+    128,000-150,000 calls loaded, and in 0-8 quiet.
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
@@ -17614,3 +17629,55 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
   branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
   a version, A-803 (c).
+
+## 2026-11-21 — A resolution judged at the head as it is (main's ruling of 10:33 PST): measured and rejected (w-fed-move, goal 86b)
+
+The idea (main ruled it as one verb): A-796's `ResolveMerge` judged against the current head, not refused
+`StaleMergeView` when the head had moved since the check. Its discards are retired and the rest rebased onto the
+current head in the same step, refused only by a conflict on windows it did not discard. The load harness resolved each
+conflict with `CheckMerge` then `ResolveMerge` (the declaration's operations on the windows discarded, the round's own
+slots written again), against its read-and-rebase loop.
+- **Built.** The owner's `merge_answer` without the stamp-head refusal; A-796's test red first (a moved head refused,
+  then rebased there); and a generated oracle in `crates/server/tests/merge_check.rs` (slot sets of the work, of rivals
+  before the check and after it). The oracle was accepted exactly when no kept slot was touched after the check, then
+  the head's file with the work's slots; otherwise a conflict naming only those slots. 24 histories passed. The harness
+  gained `--resolve`.
+- **Kept as:** `~/slates-work/w-fed-move-resolve-at-head-rejected.patch` (w-fed-move's machine).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`;
+  each pair back to back, main 67fa7f75a, this Mac Studio under other agents' load. Oracle failures were 0 in all eight runs.
+
+| hot files | resolve | asks a client | rebase-kind asks | verdict asks | verdicts/s | rebase conflicts |
+|---|---|---|---|---|---|---|
+| 300 | read+rebase | 11.2 | 2.1 | 2.4 | 3,264 | 754 |
+| 300 | check+resolve | 11.9 | 2.9 | 2.2 | 3,656 | 199 |
+| 100 | read+rebase | 13.0 | 3.6 | 2.7 | 2,271 | 1,822 |
+| 100 | check+resolve | 13.3 | 3.9 | 2.6 | 3,342 | 284 |
+| 30 | read+rebase | 19.3 | 8.7 | 3.8 | 2,168 | 5,850 |
+| 30 | check+resolve | 17.9 | 7.2 | 4.0 | 2,084 | 529 |
+| 10 | read+rebase | 31.8 | 20.1 | 5.1 | 1,260 | 16,035 |
+| 10 | check+resolve | 26.8 | 13.2 | 7.0 | 3,607 | 584 |
+
+- **Why rejected.** Main's bar was 19.8 to about 4.6 rebase asks a client at 10 hot files; it measured 20.1 to 13.2.
+  A resolution costs two asks (the check and the resolve), and the submit after it conflicts more often (6.0 against
+  4.2 a client at 10 hot files), since the head moves on while the client re-submits. At 300 and 100 hot files, where a
+  plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
+  measured on a shared, loaded machine and is not read as a result.
+
+## 2026-11-21 — A shard-level cache of base lengths (option 3): its ceiling measured, rejected unbuilt (w-fed-move, goal 86b)
+
+After A-817 a work's first edit of each file asks its green's owner for that file's length (4.8 a client at 300 hot
+files, 4.7 at 10, in the 1,000-client stand-in: release, in-process, `kernel/`, one round). The question was whether a
+cache of lengths shared by the works on one shard would cut it. A temporary diagnostic on the owner counted, for each
+length ask, whether the same asking shard had asked the same path before at a version since which the path had not
+changed: the asks a cache with perfect invalidation could have served.
+
+| hot files | length asks sampled | reusable | share |
+|---|---|---|---|
+| 300 | 4,000 | 398 | 10% |
+| 10 | 4,000 | 704 | 18% |
+
+So even a perfect cache saves at most about 0.5 to 0.8 asks a client, and a real one less: a work's shard cannot
+know that a file is unchanged since a cached answer without asking. Not built. With the resolution at the head
+rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
+each verdict, each work's first edit of a file, and a creation's admission and name.
+
