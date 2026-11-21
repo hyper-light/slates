@@ -23978,14 +23978,21 @@ runs on the box at load average 74 to 93, and never alone.
 > only yields for its own sake; (3) the A/B again on a quiet machine (this one ran beside other agents' work, load 5 to
 > 45).
 
-### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — open (w-forming's finding, not worked: Ada's close order)
+### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — fixed (w-forming, the same day)
 `cargo test -p slates-server --test fleet a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`
 failed on main's own code twice of two on Adas-Mac-Studio-4 at load ~39 (base 621cb6ce6 + w-forming's delta capture
 reverse-applied): 4 of the 8 writes made while the whole entry sealed were answered, the rest refused
 `DurabilityPending` after ~4.5 s; 6 whole builds where a quiet run makes 2, `fleet.live.refused.no_credit` 1,
 `fleet.live.build_waited` 16-20. An earlier run of the same code on the same machine passed (8 of 8, 2 builds). The
 shape: under the injected zero seal quantum, a delta queued behind the build is refused for credit, the volume then
-owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. Not chased.
+owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. **Cause (w-forming's own,
+A-768):** while a whole capture read in turns, `queue_behind_build` held the deltas behind it to the larger of the
+shipper's credit and the build's body, and a capture's body is empty until its last turn, so a log whose bounds were
+not yet set (a successor's, or any before its first whole entry) refused its second delta. The seeded nemesis met it
+after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465`, `fleet.live.held_back.whole`).
+**Fixed:** a capture counts the body it will make (`Capture::body_bytes`); red-checked by
+`live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
+before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
 ### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,
