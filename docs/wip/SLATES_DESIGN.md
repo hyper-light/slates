@@ -1413,6 +1413,17 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
 > debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
 > its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+>
+> **Status (2026-11-20, g228: the sweep on the shard's idle time, spaced by its length).** Armed as a task that advanced
+> a step a turn, a status request's sweep ran half a step quantum of `mincore` ahead of every turn's ready work for as
+> long as it lasted, seconds over tens of GiB of address space, on every shard the request reached. Live writes begun
+> after a status request paid it at every hop, and every daemon burned seconds of CPU (BENCHMARKS, "What live shipping
+> adds to a stable write, after A-396's holds"). The sweep is now the shard's idle work (`ShardContext::set_idle_work`,
+> `content_ranges::idle_slice`): it advances only when the shard has nothing ready and its idle spin has run out, and a
+> sweep is armed no sooner after the last completed than that one took, so sweeps take at most half a shard's time
+> however often status is asked and a report reads figures at most two sweeps old. Counted
+> `content_range.sweep.idle_slices` and `.spaced`; held by
+> `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
