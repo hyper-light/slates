@@ -1062,6 +1062,8 @@ fn main() {
     eprintln!(
       "edit_merge_bench: a loaded full edit and merge passed the required 1 ms at its p99 (84a)"
     );
+    // Diagnostic only (g222): the stamps are dumped before the exit, which skips `_g222`'s drop.
+    drop(_g222);
     std::process::exit(1);
   }
 }

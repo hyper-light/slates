@@ -1,5 +1,5 @@
 name: diag measurer
-# g222's 84a Linux A/B, take 4 (takes 1-3 stopped in setup: a build, a copy path, an unreadable debugfs probe) (main's ruling, 2026-11-21): A-224's per-thread EEVDF slice (sched_setattr sched_runtime, no
+# g222's 84a Linux A/B, take 5: ubuntu-latest again, its stamps dumped before the bench's 1 ms gate exits (take 4, run 44938733403, lost them) (main's ruling, 2026-11-21): A-224's per-thread EEVDF slice (sched_setattr sched_runtime, no
 # privilege) on top of A-799. One binary (diag-g222-hops-mac + slice switches), three arms rotated each round:
 # b = B as landed; s = each shard asks its own step quantum as its slice (G222_SLICE_NS=step; the kernel clamps it
 # up to its 100 us floor); sc = s plus the client thread asking the kernel's floor (G222_CLIENT_SLICE_NS=1). Loaded =
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     defaults:
