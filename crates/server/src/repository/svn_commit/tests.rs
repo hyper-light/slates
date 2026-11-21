@@ -260,7 +260,8 @@ pub(crate) async fn rebuild(svn: RepositoryId) {
 /// `svn`'s changeset `sequence`'s record as the node's store holds it, once landed (a creation lands as a task).
 pub(crate) async fn stored_record(svn: RepositoryId, sequence: u64) -> Record {
   let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
-  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   loop {
     if let Ok(bytes) = super::landing::changeset_record(&disk, svn, sequence).await {
       return Record::decode(&bytes).expect("a Subversion record");
@@ -275,7 +276,8 @@ pub(crate) async fn stored_record(svn: RepositoryId, sequence: u64) -> Record {
 
 /// Waits until `svn`'s records reach revision `youngest` (a submitted version's revision lands as a task, C2).
 pub(crate) async fn youngest_reaches(svn: RepositoryId, youngest: u64) {
-  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   while on(|state| kept(state, svn).0) != youngest {
     assert!(
       slates_rt::futures::now_ns() < deadline,
@@ -1027,13 +1029,12 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
           Some(copied)
         )]
       );
-      let held = records
+      records
         .index()
         .node("/branches/b/a.txt", 2)
         .ok()
         .flatten()
-        .is_some();
-      held
+        .is_some()
     });
     assert!(held, "the copy brings /trunk/a.txt");
     let rows = vec![file("/branches/b/c.txt", Action::Add, b"gamma\n")];
@@ -1457,7 +1458,8 @@ fn a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_t
     crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
     on(|state| submit(state));
     // The killed task: its changeset lands, then the kill fires (clearing itself) where the step would commit.
-    let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
     while crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
       assert!(
         slates_rt::futures::now_ns() < deadline,
@@ -1466,7 +1468,7 @@ fn a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_t
       slates_rt::futures::yield_now().await;
     }
     // A restart: what memory held past the durable state is made again from it.
-    on(|state| crate::verbs::reconcile_unpublished_effects(state));
+    on(crate::verbs::reconcile_unpublished_effects);
     rebuild(svn).await;
     let after_kill = on(|state| {
       (
