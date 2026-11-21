@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **FIXED (A-798, 2026-11-20, w-provision-gate): a bench's client waited forever with every shard parked** (provision_bench;
+> w-engine's load_bench end-of-run read, blocking 84a, 86a, 89b's measurements). The idle spin's harvest took the kick of a
+> ring published just after the turn's look, and the spin then parked; each turn now harvests first, then looks. Red
+> deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
+> (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
+
 > **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
 > A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to
 > its shard taking it and to its reply: under two spinners a CPU the daemon's part is the queue, not the service
