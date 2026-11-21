@@ -7078,3 +7078,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   texts.rs's three literals (w-store). Windows (jupiter, short runs per main's 07:50): workspace clippy at a693c49e4
   ran (its host reds fixed in 21ed9cd8d; svn_presenter's Windows dead code is w-reaper's); `cargo xtask unsafe` was
   refused "no room here now" twice; the rest of A-789's checks and w-realtools' real_tools follow when it has room.
+- ~09:20 (w-lint, Windows, ~/w-lint-win at 37c7a1691): `cargo xtask unsafe` cannot build on jupiter: aws-lc-sys's
+  builder panics "NASM command not found" (a tool missing there, not a red; the host count is clean). The anchor lib
+  tests (`handles:: held_windows::`, --test-threads 1) were refused "no room here now" twice; reported per main's 07:50
+  rule. Still owed on Windows: anchor lib + handles_windows, the two content-extent CLI tests and their red-first at
+  20bef898c^ (w-sizing, A-789), then w-realtools' real_tools over WinFsp.
