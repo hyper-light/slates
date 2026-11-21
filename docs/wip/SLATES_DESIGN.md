@@ -1523,6 +1523,10 @@ zero-timeout `kevent` this driver makes sleeps about 15 µs a call (macOS 26.4.1
 spin is a nap of that length a turn. That is kept by measurement: a true spin (`KEVENT_FLAG_IMMEDIATE`, about 180 ns)
 cut the single-client p50 from 60–95 µs to 13–22 µs but lost every tail once the host had no idle core, and no policy
 measured kept both (A-218, measured and rejected; BENCHMARKS "The spin policy, measured and rejected").
+A shard that stays busy, and so never parks, harvests between steps no more often than the longer of its quantum and
+its measured empty harvest (its learned idle turn), counted from the harvest's end (A-829, `slates_rt::busy_harvest`):
+a macOS empty harvest is that ~13 µs sleep, and until A-829 the stamp was taken before it, so every busy step after
+the first slept. Where a harvest is cheap the quantum still governs.
 Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
@@ -59817,3 +59821,22 @@ Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the c
   in GAPS.
 - **Cost owed.** One more publication per accepted version (before its append); the release bench (A/B at 64, 128,
   256, 320 and 512 MiB) measures it with the lane.
+
+### A-829 — A busy shard asks its driver no more often than an empty ask costs (accepted 2026-11-21, g228, 85a; amends A-218's busy-step nap, §4.3 "Loop")
+Applied in the same change to: §4.3 ("Loop"), `crates/rt/src/busy_harvest.rs` (new), `crates/rt/src/shard.rs` (`run`'s
+busy harvest, `Counters::harvests_deferred`), `crates/rt/tests/busy_harvest.rs`, `crates/server/src/verbs.rs` (the
+`rt.core.harvests_deferred` status row), `crates/cli/tests/live_fleet.rs` (the measurement prints it), BENCHMARKS,
+GAPS.
+- **What was measured.** A live write's exchange collect on macOS, 28.7-30.7 µs at the median against Linux's 6, was
+  two empty zero-timeout `kevent`s of 14.3-16.4 µs each (`fleet.live.hop.exchange.{spawn,wake}`, g228). `Shard::run`
+  harvested once a quantum (the wake estimate, a few µs) had passed since its last wait, stamped before the harvest's
+  own sleep, so on macOS every busy step after the first slept. A probe priced the asks: an empty zero-timeout `kevent`
+  12.3-13.1 µs with an involuntary switch, one with an event ready 206 ns.
+- **The rule.** The busy interval is the longer of the quantum and the shard's measured empty harvest, counted from the
+  harvest's end. It spins nothing; it only skips asks that would find nothing. An I/O task waits at most one interval
+  and one harvest. On Linux and Windows the harvest is well under a microsecond, so the quantum governs as before.
+- **Decided by** the A/B in BENCHMARKS ("A busy shard asks its driver no more often than an empty ask costs"): quiet
+  137.0-141.2 against 164.5-167.7 µs added at the median, 5 of 5; loaded, `taskpolicy -b` and both, no contended
+  condition lost on its medians or the owner's CPU. A-218's nap stays everywhere else: the idle spin's turns, and a
+  harvest once the interval has passed. Beside it, a user-space ring watch (main's ruling (c)) was measured and
+  rejected; its bound, the wake estimate, grew with the contention it was meant to avoid.
