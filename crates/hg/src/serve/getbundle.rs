@@ -86,30 +86,13 @@ pub trait Store: Repository {
     room: &mut Admission,
   ) -> Result<Option<Logged<'_>>, PastAdmission>;
 
-  /// The revision of the file at `path` whose node is `node`; `None` where the store does not hold it whole.
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    room: &mut Admission,
-  ) -> Result<Option<Logged<'_>>, PastAdmission>;
-
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
 
   /// The file revision at `path` whose node is `node` as its log's row holds it, with no text read ([`FileEntry`];
-  /// A-767 C1: a fetch sends each file revision as the changeset store keeps it); none where the log lacks it. By
-  /// default read through [`Store::file`].
-  fn file_entry(&self, path: &[u8], node: &Node) -> Option<FileEntry> {
-    let mut room = Admission::new(u64::MAX);
-    let logged = self.file(path, node, &mut room).ok()??;
-    Some(FileEntry {
-      position: logged.position,
-      parents: logged.parents,
-      link: logged.link,
-      flags: logged.flags,
-    })
-  }
+  /// A-767 C1: a fetch sends each file revision as the changeset store keeps it, so the served view reads no file's
+  /// whole text); none where the log lacks it.
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<FileEntry>;
 
   /// What a whole answer, which cannot wait between its steps, reads of the changeset store where its walk asks it
   /// ([`crate::render::Want`]), at once; none where the store answers only between steps, as the daemon's does (its

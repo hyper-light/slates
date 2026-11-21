@@ -15,7 +15,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::verify::Held;
+use super::verify::{FileNames, Held};
 use crate::Node;
 use crate::index::{HgIndex, Log};
 
@@ -61,5 +61,16 @@ impl Held for IndexHeld<'_> {
 
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>> {
     self.revision_text(Log::File(path), node).map(Cow::Owned)
+  }
+
+  /// The row's own names (A-767 C1): its block's and its bytes' identities as the intake kept them, no text read.
+  fn file_names(&self, path: &[u8], node: &Node) -> Option<FileNames> {
+    let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self.index.revision(self.store, log, rev)?;
+    (row.node == *node).then_some(FileNames {
+      block: row.block,
+      bytes: row.bytes,
+    })
   }
 }

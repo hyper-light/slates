@@ -428,3 +428,47 @@ fn without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover() {
     b"the second save"
   );
 }
+
+/// A recovery reopens only the base root; every other directory the image recorded is reacquired at its first use
+/// (A-833, 2026-11-21). Do: list 200 base directories through the overlay, one file in each, publish, and let a successor
+/// recover the image; count the host's open handles; then read one file in a recorded directory and remove another
+/// recorded directory on the disk and look inside it. Expect: one open handle (the root) after the recovery, whatever the
+/// directory count; the file reads its bytes; the removed directory's entry is refused `BaseUnavailable`. Before, a
+/// recovery reopened every recorded directory in one step: kiln's daemon on adacachy recorded about 192,000, overran the
+/// liveness window and was killed a second into every restart.
+#[test]
+fn a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use() {
+  let mut host = SimHost::new();
+  for d in 0..200 {
+    host.mkdir(&format!("/d{d}"));
+    host.replace_file(&format!("/d{d}/f"), format!("file {d}").as_bytes());
+  }
+  host.advance_ns(STEP_NS);
+  let mut store = common::store();
+  let mut vol = overlay(&mut host, &mut store);
+  for d in 0..200 {
+    lookup(&mut vol, &mut host, &mut store, &format!("/d{d}/f"));
+  }
+  let image = published(&mut vol, &store, &mut host);
+  let (mut after, mut recovered) = taken_over(&store, &image, &mut host);
+  assert_eq!(
+    host.open_handles(),
+    1,
+    "the root alone: no recorded directory is reopened by the recovery"
+  );
+  let file = lookup(&mut recovered, &mut host, &mut after, "/d7/f");
+  assert_eq!(
+    read_no(&mut recovered, &mut host, &mut after, file).unwrap(),
+    b"file 7"
+  );
+  host.remove("/d9/f");
+  host.remove("/d9");
+  host.advance_ns(STEP_NS);
+  assert!(
+    matches!(
+      recovered.with_host(&mut host).resolve(&mut after, "/d9/f"),
+      Err(VfsError::BaseUnavailable(_) | VfsError::NotFound)
+    ),
+    "a recorded directory gone from the disk is refused, never served"
+  );
+}

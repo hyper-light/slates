@@ -17047,6 +17047,64 @@ is the invocation's median of 3 runs. µs unless marked.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 
+## 84a on macOS: Mach's time-constraint policy for the shards and the client's reply wait (A-831; w-provision-gate; 2026-11-21)
+
+**What, and why.** g222's hop split put macOS's loaded tail on two things:
+- the forward to the owner shard and back, the taken-to-written hop;
+- the busy path's zero-timeout kevent, which took at least 1 ms in 9-12% of its loaded calls.
+
+A woken time-share thread behind busy neighbours runs only when their quanta end. A thread under Mach's
+`THREAD_TIME_CONSTRAINT_POLICY` is in the real-time band, needs no privilege, and runs ahead of them. The kernel refuses a
+computation below its minimum real-time quantum (50 µs on Apple silicon; `slates_machine::time_constraint`'s test), so
+the policy's terms are aperiodic, with computation = constraint = the thread's measured window doubled until the kernel
+takes it.
+
+**The runs.** CI macos-latest (3 CPUs, 2 shards), `edit_merge_bench` with two spinners a CPU, then the quiet forms and
+`provision_bench`. Three interleaved rounds per run; each cell is a round's median of three runs, every round shown.
+- Run 44934544995 (branch `diag-measurer-w-provision-gate-tc`). B = main a9a2393b8 plus a line printing the load's
+  throughput; TC = plus the client's synchronous reply wait under the policy; TB = plus the shard threads.
+- Run 44934809949 (`diag-measurer-w-provision-gate-tck`). The same arms, also counting the busy path's zero-timeout
+  harvests that took 1 ms or more.
+
+Take 1, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s |
+|---|---|---|---|---|---|
+| B | 16.76 · 16.02 · 14.31 | 20.40 · 17.45 · 17.31 | 16.39 · 15.88 · 14.43 | 19.59 · 18.94 · 18.19 | 225 · 221 · 242 |
+| TC | 1.32 · 1.47 · 0.68 | 4.69 · 5.05 · 1.12 | 1.06 · 3.55 · 1.08 | 4.94 · 17.07 · 3.07 | 161 · 141 · 158 |
+| TB | 0.69 · 0.87 · 0.41 | 0.95 · 2.16 · 0.77 | 0.67 · 0.75 · 0.55 | 1.69 · 1.70 · 1.06 | 121 · 133 · 129 |
+
+Take 2, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s | busy harvests ≥ 1 ms |
+|---|---|---|---|---|---|---|
+| B | 15.72 · 14.00 · 17.42 | 16.60 · 16.59 · 20.76 | 15.92 · 14.70 · 15.63 | 20.23 · 18.93 · 17.68 | 221 · 224 · 213 | 16,293 of 172,191 · 14,172 of 162,157 · 21,273 of 174,757 |
+| TC | 2.25 · 1.06 · 5.33 | 4.38 · 2.72 · 29.92 | 2.47 · 2.66 · 4.39 | 15.17 · 6.94 · 28.44 | 147 · 153 · 140 | 184 of 139,685 · 137 of 159,691 · 472 of 134,252 |
+| TB | 0.89 · 0.42 · 2.11 | 3.01 · 0.70 · 4.52 | 0.65 · 0.70 · 1.85 | 0.80 · 1.32 · 4.56 | 137 · 114 · 98 | 5 of 200,410 · 2 of 184,609 · 62 of 198,370 |
+
+**Quiet (every round, both runs, accept_f10 p50 µs).** The medians are unchanged.
+- Take 1: B 451 · 506 · 549; TC 831 · 516 · 642; TB 438 · 377 · 435.
+- Take 2: B 454 · 522 · 470; TC 422 · 438 · 409; TB 479 · 468 · 478.
+
+**R9's uncontended spinning p99** (`provision_bench`) is unchanged, and misses 50 µs on this 3-CPU runner in every arm,
+main included:
+- B 335 · 344 · 326 and 333 · 196 · 303 µs;
+- TC 309 · 344 · 319 and 198 · 193 · 566;
+- TB 305 · 338 · 294 and 310 · 201 · 180.
+
+No refusal and no demotion was logged by any arm.
+
+**Verdict:**
+- **TB wins every round against main** on the loaded p99 and p999 of both forms, about 15-20 times on p99, with the
+  quiet medians and R9's p99 even. It lands as A-831: a latency-tracking runtime's shards (the daemon's) and a client's
+  synchronous reply wait run under the policy on macOS. Red first: `crates/rt/tests/time_constraint.rs`, a tracking
+  runtime's shard not under the policy on main, under it after.
+- **TC (the client alone) is measured and rejected:** p999 up to 29.9 ms, conflict p99 up to 4.4 ms.
+- **The cost:** the load's own spinners got 98-137 against 213-242 million turns a second. The daemon finishes its
+  work about ten times sooner, and while it works it runs ahead of them.
+- **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
+  p999 in 4 of 12 (0.70-4.56 ms).
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
@@ -17137,6 +17195,74 @@ and every round shown, as main extracted them from the run's log.
     front of the taking shard. It is not the client's wake, which the quiet smoke run on Studio-4 had suggested before
     the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
     128,000-150,000 calls loaded, and in 0-8 quiet.
+
+## 84a Linux: the per-thread fair slice on top of A-799, measured, not taken (g222; 2026-11-21)
+
+**The question** (main's 84a ruling, 2026-11-21). A-224's slice was rejected on loaded p50 excursions measured while
+the client spun for its reply, which A-799 removed. Does the slice now take 84a's loaded p99 and p999 under 1 ms on
+both CI Linux runners, with the loaded p50 inside B's spread and quiet runs even?
+
+**The arms.** One binary (`diag-g222-slice`, never main: main with B plus diagnostic switches), rotated each round:
+- **b:** B (A-799) as landed.
+- **s:** each shard thread asks `sched_setattr(SCHED_NORMAL, sched_runtime)` for its own step quantum, 7.0-8.8 µs as
+  measured at start.
+- **sc:** s plus the client thread asking the same call.
+The kernel held 100 µs, its floor, for every thread asked, read back with `sched_getattr`: 3 shard reads at
+start on arm64 and 6 on x86_64, and 6 client reads on each. The shards still held it after 20,000-park intervals (21 reads). A park doesn't drop the slice.
+
+**The lane.** A-224's: `systemd-run --scope -p AllowedCPUs=0-1`, plus `MemoryMax=256M` on arm64 (on x86_64 the
+256 MB probe failed, so CPUs only), an fsync writer, and two spinners a core. Three rounds; f10, accept and conflict.
+Each cell is r1/r2/r3 in µs.
+
+**ubuntu-24.04-arm** (run 44938733403, `diag-measurer-g222-27`, kernel 7.0.0-1017-azure):
+
+| form | arm | p50 | p99 | p999 |
+|---|---|---|---|---|
+| accept loaded | b | 251/245/255 | 371/415/643 | 416/3,993/1,467 |
+| accept loaded | s | 232/233/237 | 341/325/481 | 1,129/886/3,996 |
+| accept loaded | sc | 237/234/228 | 339/327/337 | 592/869/959 |
+| conflict loaded | b | 200/197/203 | 811/727/1,250 | 1,830/1,875/2,714 |
+| conflict loaded | s | 194/192/199 | 299/285/306 | 930/314/834 |
+| conflict loaded | sc | 195/195/199 | 306/298/297 | 714/4,964/937 |
+| accept quiet | b / s / sc | 112/111/108 · 104/108/106 · 101/107/106 | 169/154/151 · 145/150/146 · 143/150/144 | 241/237/202 · 416/205/269 · 313/238/270 |
+| conflict quiet | b / s / sc | 83/82/80 · 78/80/79 · 78/79/79 | 124/126/123 · 122/123/121 · 122/120/123 | 198/142/149 · 160/142/156 · 208/135/158 |
+
+**ubuntu-latest** (kernel 7.0.0-1016-aws). Two runs: 44938733403 (`-27`), then 44940103469 (`-28`, run again so its
+stamps were dumped before the bench's 1 ms gate exits):
+
+| form | arm | p50 (-27; -28) | p99 (-27; -28) | p999 (-27; -28) |
+|---|---|---|---|---|
+| accept loaded | b | 106/109/107; 70/74/59 | 2,905/2,914/2,898; 2,587/2,940/198 | 3,092/3,151/3,340; 3,251/3,278/1,816 |
+| accept loaded | s | 115/113/111; 71/61/76 | 1,785/3,995/1,315; 1,684/234/1,793 | 2,829/3,997/2,057; 3,246/1,452/3,865 |
+| accept loaded | sc | 180/123/123; 86/93/87 | 1,189/1,264/1,248; 1,812/1,048/1,032 | 1,822/1,851/1,518; 3,997/1,755/1,717 |
+| conflict loaded | b | 88/90/90; 55/57/49 | 3,219/3,311/3,372; 3,092/3,040/188 | 4,598/5,707/5,925; 4,303/5,960/2,929 |
+| conflict loaded | s | 89/90/90; 55/56/57 | 3,000/2,213/1,253; 1,489/1,197/1,494 | 4,001/4,003/2,040; 3,950/1,912/2,783 |
+| conflict loaded | sc | 172/154/99; 168/170/122 | 1,208/1,212/1,219; 1,493/1,713/1,162 | 1,796/1,799/1,499; 1,904/2,976/1,609 |
+
+Quiet on ubuntu-latest is even across the arms (-27: accept p99 102-130 µs in every arm, conflict p99 89-111).
+
+**Per-wake stamps** (kick -> the parked shard running; per request: landed -> taken, taken -> written,
+written -> the client saw it). In B the slowest 1% of requests by round trip are almost all deferred replies (forwarded
+verbs); with a slice, sync and deferred both appear.
+- **arm64, kick -> run, p50/p99/p999 in µs:** b 913/1,995/3,001 and 914/1,996/2,997 (at least 1 ms: 864 and 937 of
+  about 34,800). s 915/1,003/1,989, 912/1,000/1,559, 911/1,001/1,560 (337-421 at least 1 ms). sc 909/1,001/1,284,
+  913/1,000/1,486, 906/1,000/1,559. A deferred reply's taken -> written: p50 about 1.0-1.1 ms in every arm; p99
+  2.98-3.12 ms in b, 1.99-2.01 ms with a slice.
+- **x86_64 (-28):** the one derived shard almost never parks (1-3 kicked parks a run); it stays runnable. The tail is
+  the queue in front of it. In b the p99 tail's median landed -> taken is 2.66-2.86 ms (queued p99 2.39-2.71 ms,
+  p999 3.0 ms). With a slice it is 0.91-1.0 ms (queued p99 0.75-1.0 ms, p999 1.01-1.11 ms).
+
+**Reading.** On both runners a ready shard gets the CPU only at a 1 ms scheduler tick, never at its wake: kick -> run's
+median is 0.91 ms, and the tails sit at exactly 1.0, 2.0 and 3.0 ms. The slice makes the shard win the first tick
+instead of waiting out the spinners' 2.1 ms default slice, so the 2-3 ms tails become about 1 ms. It can't remove the
+first tick: nothing preempts a spinner at a wake. (The CI kernel's `sched/features` such as RUN_TO_PARITY can't be
+read without privilege.) So no fair-class slice reaches 84a's bound on this lane:
+- **arm64, sc:** p99 under 1 ms in all 6 rounds and p999 in 5 of 6 (conflict r2 4,964 µs); p50 at or below B's; quiet
+  even. Close, but one p999 over.
+- **x86_64:** sc's p99 is 1.03-1.81 ms and p999 1.5-4.0 ms. Its loaded p50 is beyond B's spread (conflict 99-172
+  against 49-90 µs, accept 86-180 against 59-109). s keeps the p50 but its p99 reaches 4.0 ms.
+- **Verdict:** not taken. The remaining tick is the scheduler's own. The only classes that preempt at a wake
+  (`SCHED_FIFO`/`SCHED_RR`, `SCHED_DEADLINE`, a negative nice) need privilege (R10).
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
@@ -17409,6 +17535,40 @@ are ahead in 4 of 5 rounds and its slow writes far fewer. One soft spot stays on
 it led 4 of 5 medians, but round 3 was 461.6 against 385.6, and that condition's p999 was higher in 3 of 5 rounds.
 macOS's median moves from about 165 to about 139 µs added, 2.8x 85a's goal.
 
+**A live write's build, split; and the volume's sealing keys kept between publications** (85a, g228, 2026-11-21; main
+01a1ff2e's ruling: split the 27 µs build, each run reported as the daemon's share and the transport floor). The build hop
+is split into its steps on the owner (`fleet.live.hop.build.{capture,keys,seal,append,send}`, per-write histograms,
+timed for an entry made in its publication's own turn). On ubuntu-latest, base 06f20620f (diag-g228-live-15, run
+44935392368, 4 cores, load 1.8-2.0), p50 / p99 µs, every round alike: capture 1.4-1.7 / 4.1-6.1, seal (keys included)
+15.4-18.4 / 36.9-49.2, append 5.1-5.6 / 6.7-18.4, send 0.9-1.0 / 28.7-36.9, of a build of 24.6-26.6. Run 17 (fbc6bc971,
+a runner about twice as slow: transport floor 112.8-138.1 µs) split the seal: keys 8.2 of a seal's 34.8 at the median.
+The keys were fetched afresh at every publication: the lineage key twice and the tenant key twice (`namer` asked the
+lineage again), the naming key once, five unwraps and three record clones. Now `seal_keys::BodyKeys` keeps each live
+volume's lineage key and namer while the tenant, lineage and naming records' key ids are the ones recorded (compared at
+every use), bounded by the volumes the shard ships live (`fleet.live.body_keys.{kept,fetched}`: 15 kept and 1 fetched in
+the fleet hop test's 16 writes).
+
+The A/B, diag-g228-live-18 (run on ubuntu-latest, 4 cores, load 2.0-2.3; the contract command, release, five rounds
+interleaved, order alternating, the transport bench's 4 KiB live ship beside each round). Each cell: added p50; the
+daemon's share (added less the transport floor); live p999 (µs):
+
+| round | transport floor | base fbc6bc971 | keys kept 8b67b484f |
+|---|---|---|---|
+| 1 | 49.8 | 113.3; 63.5; 553.2 | 108.0; 58.2; 2,045.8 |
+| 2 | 52.3 | 108.6; 56.3; 569.5 | 104.3; 52.0; 2,434.9 |
+| 3 | 51.7 | 122.0; 70.3; 2,953.2 | 103.1; 51.4; 1,196.5 |
+| 4 | 53.5 | 110.7; 57.2; 1,256.8 | 109.0; 55.5; 1,056.4 |
+| 5 | 52.7 | 112.5; 59.8; 622.7 | 126.1; 73.4; 1,012.0 |
+
+Per write, p50 / p99, every round: keys 3.8 / 4.6-5.1 against 0.4 / 0.6-0.8 µs; the build 22.5-24.6 against 20.5-22.5.
+
+**Reading.** Accepted: the keys step drops from 3.8 to 0.4 µs in every round, and the median added with it in 4 of 5.
+The live p999 swings between 0.55 and 3 ms in both arms on this 4-core runner (worse for the cache in 3 rounds,
+better in 2), and taking work out of the build cannot lengthen a tail, so it is recorded, not read. The daemon's share
+on this runner is now about 51-58 µs at the median (one round 73), against a transport floor of 50-54. What remains of
+the build is the seal itself, about 12-13 µs: each piece copied into a raw chunk and hashed for its identity, encoded and
+hashed again for its key, its key derived, sealed, and named.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
@@ -17629,3 +17789,249 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
   branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
   a version, A-803 (c).
+
+## 2026-11-21 — A resolution judged at the head as it is (main's ruling of 10:33 PST): measured and rejected (w-fed-move, goal 86b)
+
+The idea (main ruled it as one verb): A-796's `ResolveMerge` judged against the current head, not refused
+`StaleMergeView` when the head had moved since the check. Its discards are retired and the rest rebased onto the
+current head in the same step, refused only by a conflict on windows it did not discard. The load harness resolved each
+conflict with `CheckMerge` then `ResolveMerge` (the declaration's operations on the windows discarded, the round's own
+slots written again), against its read-and-rebase loop.
+- **Built.** The owner's `merge_answer` without the stamp-head refusal; A-796's test red first (a moved head refused,
+  then rebased there); and a generated oracle in `crates/server/tests/merge_check.rs` (slot sets of the work, of rivals
+  before the check and after it). The oracle was accepted exactly when no kept slot was touched after the check, then
+  the head's file with the work's slots; otherwise a conflict naming only those slots. 24 histories passed. The harness
+  gained `--resolve`.
+- **Kept as:** `~/slates-work/w-fed-move-resolve-at-head-rejected.patch` (w-fed-move's machine).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`;
+  each pair back to back, main 67fa7f75a, this Mac Studio under other agents' load. Oracle failures were 0 in all eight runs.
+
+| hot files | resolve | asks a client | rebase-kind asks | verdict asks | verdicts/s | rebase conflicts |
+|---|---|---|---|---|---|---|
+| 300 | read+rebase | 11.2 | 2.1 | 2.4 | 3,264 | 754 |
+| 300 | check+resolve | 11.9 | 2.9 | 2.2 | 3,656 | 199 |
+| 100 | read+rebase | 13.0 | 3.6 | 2.7 | 2,271 | 1,822 |
+| 100 | check+resolve | 13.3 | 3.9 | 2.6 | 3,342 | 284 |
+| 30 | read+rebase | 19.3 | 8.7 | 3.8 | 2,168 | 5,850 |
+| 30 | check+resolve | 17.9 | 7.2 | 4.0 | 2,084 | 529 |
+| 10 | read+rebase | 31.8 | 20.1 | 5.1 | 1,260 | 16,035 |
+| 10 | check+resolve | 26.8 | 13.2 | 7.0 | 3,607 | 584 |
+
+- **Why rejected.** Main's bar was 19.8 to about 4.6 rebase asks a client at 10 hot files; it measured 20.1 to 13.2.
+  A resolution costs two asks (the check and the resolve), and the submit after it conflicts more often (6.0 against
+  4.2 a client at 10 hot files), since the head moves on while the client re-submits. At 300 and 100 hot files, where a
+  plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
+  measured on a shared, loaded machine and is not read as a result.
+
+## 2026-11-21 — A shard-level cache of base lengths (option 3): its ceiling measured, rejected unbuilt (w-fed-move, goal 86b)
+
+After A-817 a work's first edit of each file asks its green's owner for that file's length (4.8 a client at 300 hot
+files, 4.7 at 10, in the 1,000-client stand-in: release, in-process, `kernel/`, one round). The question was whether a
+cache of lengths shared by the works on one shard would cut it. A temporary diagnostic on the owner counted, for each
+length ask, whether the same asking shard had asked the same path before at a version since which the path had not
+changed: the asks a cache with perfect invalidation could have served.
+
+| hot files | length asks sampled | reusable | share |
+|---|---|---|---|
+| 300 | 4,000 | 398 | 10% |
+| 10 | 4,000 | 704 | 18% |
+
+So even a perfect cache saves at most about 0.5 to 0.8 asks a client, and a real one less: a work's shard cannot
+know that a file is unchanged since a cached answer without asking. Not built. With the resolution at the head
+rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
+each verdict, each work's first edit of a file, and a creation's admission and name.
+
+
+## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
+
+w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read
+the arenas 0 MiB resident after a 256 MiB burst on macOS (w-sizing's report on 599603559), since the residency sweep
+walked each shard's whole slice. Debug test binaries (the test is the measurement; no release run), 2 shards, RAM only.
+
+Command: `cargo test -p slates-server --test daemon a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas -- --nocapture`
+(256 files of 1 MiB through the SDK, then a memory status every hundredth of a liveness budget until the arenas read
+measured, bound ten liveness budgets).
+
+| Machine | Tree | Arenas after the burst | Looks | Time to measured |
+|---|---|---|---|---|
+| Mac Studio (Studio-4), macOS arm64 | origin/main 40c3f8d1e, one status | resident 0, measured false | 1 | never in that status |
+| Mac Studio (Studio-4), macOS arm64 | 40c3f8d1e, looking again | 286,785,536 (the regions whole, freed pages too) | 20 | 1.15 s |
+| Mac Studio (Studio-4), macOS arm64 | the fix, 3 runs | 268,435,456 of 268,435,456 | 2, 2, 2 | 86, 86, 76 ms |
+| adacachy, Linux x86_64 (load 45, kiln r8) | b5220bd92 | 268,435,456 of 268,435,456 (region 16 GiB) | 2 | 35 ms |
+| jupiter, Windows x86_64 | the fix | with w-lint (run-requests 2026-11-21T01:10Z) | | |
+
+What the sweep walks a shard on the test daemon (`content_range.<range>.bytes`): write log 1,276,423,222, image slots
+12,884,901,888, delta log 6,442,450,944, DAX table 98,320, segment log 1,610,612,736, segment snapshots 6,442,450,944,
+rings 278,528; and of the arena only its held runs (268,435,456 on the burst's shard, where the region is 4 GiB). The
+write log and journal are whole because a fresh daemon cannot know them unwritten until its first give-back (GAPS).
+
+Step clock, measured-and-rejected: the shard's clock (`slates_machine::clock::monotonic_ns`, whole microseconds on
+macOS) for timing the sweep's steps. `cargo test -p slates-server --lib content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+on Studio-4, debug audit daemon:
+
+| Steps timed by | Whole sweep | Steps | Pages a step | Stepped | Longest true step | Steps over 100 us |
+|---|---|---|---|---|---|---|
+| the shard's clock | about 2 s | 70,909 | — | 1.24 s (fine clock) | 15.5 ms | 3,290 |
+| the step clock (`Instant`) | 13.9 s | 604,981 | 5.8 | 2.71 s | within budget (`past_budget` 0) | — |
+
+Budget a step about 1.6 us (half the debug daemon's live step quantum). The shard's clock read most steps as 0 ns, so
+each next step grew to a vector page's batch and ran milliseconds unseen; it is rejected for the step clock. The
+measured step: fixed 709-792 ns, 600-1,600 ns a page at a few pages (noise-dominated), so the floor buys about a page;
+the honest sweep's rate, about 280 K pages a second, is set by the runtime's look for work between idle slices (GAPS).
+The memory report's kinds pass 67 ms after arming in the same run.
+
+
+## Windows timed waits through a high-resolution timer's wait completion packet (84a, A-828; w-k90-win; 2026-11-21)
+
+- **Question.** The IOCP driver's timed wait asked `GetQueuedCompletionStatusEx` for whole milliseconds, so a shard
+  parked to the end of its idle window slept a millisecond or a 15.6 ms tick. Does a high-resolution waitable timer
+  (`CreateWaitableTimerExW`, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) whose wait completion packet
+  (`NtAssociateWaitCompletionPacket`) wakes the port, the port's wait untimed (Go's runtime since 1.23), end it at its
+  deadline, and does that move 84a's loaded tails?
+- **Test, red then green** (`driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`, 50 waits of 200 µs, on
+  Windows also judged at the median): without the timer the shortest took 1.53 ms (jupiter), 1.87 ms (windows-latest),
+  2.55 ms (jupiter, earlier); with it all 50 ran in 0.03 s on jupiter, windows-latest and windows-11-arm. On
+  windows-11-arm the old wait's shortest fell under a millisecond by an early tick (50 waits 0.79 s), hence the median.
+  `iocp::tests::a_deadline_armed_for_200_us_posts_its_packet_before_a_millisecond`: the packet in 403.5 µs (jupiter).
+- **Command** (diagnostic runs 44934773181 and 44941791157, branches `diag-measurer-w-k90-win-84a-*`, never main):
+  `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict`, then `--quiet-only`,
+  release, BASE (main without it) and FIX interleaved, 3 rounds each. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 87 / 188 / 32,430 | 109 / 207 / 33,544 |
+| fix r1 | 81 / 156 / 33,210 | 104 / 173 / 33,030 |
+| fix r2 | 81 / 184 / 33,343 | 102 / 178 / 31,858 |
+| base r2 | 81 / 154 / 31,623 | 103 / 173 / 333 |
+| base r3 | 82 / 192 / 29,132 | 102 / 172 / 33,030 |
+| fix r3 | 80 / 212 / 23,915 | 102 / 165 / 3,580 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 152 / 290 / 728 | 149 / 246 / 15,430 |
+| fix r1 | 143 / 288 / 748 | 146 / 261 / 20,552 |
+| fix r2 | 143 / 266 / 866 | 148 / 247 / 33,526 |
+| base r2 | 133 / 305 / 32,026 | 146 / 224 / 24,295 |
+| base r3 | 137 / 282 / 32,962 | 147 / 245 / 23,004 |
+| fix r3 | 144 / 286 / 889 | 141 / 255 / 23,438 |
+
+  Quiet (both runners, both arms): p99 111-264 µs, p999 224-882 µs, unchanged within the rounds' spread.
+- **Verdict: landed** for the wait itself (a deadline is kept to its nanoseconds; p99 under 1 ms loaded and quiet,
+  unchanged). **84a not met on Windows:** the loaded p999 stays at 24-34 ms on windows-latest and in windows-11-arm's
+  conflicts (its accept p999 lost its 32 ms rounds: 3 of 3 under 0.9 ms against 1 of 3). That is the scheduler's 31.6 ms
+  quantum a woken thread waits behind the load's spinners (A-361), which no wait's timer moves; per-wake stamps next.
+
+## A Windows shard kept one level above normal while it runs: 84a's loaded tails under 1 ms (A-834; w-k90-win; 2026-11-21)
+
+- **Question.** With A-828 the timed wait keeps its deadline, yet the loaded p999 stayed at 18-34 ms. g222's stamps over
+  it (diag run 44945557697) put the tail on the shard: 12-22 requests a round of ~42,500 waited over 10 ms in the ring
+  and 16-22 over 10 ms mid-service, 30-100 ms each, multiples of the 31.6 ms quantum. A-361 raised a shard one level
+  for its blocking wait and put it back before it ran, so a runnable shard shared the CPUs round-robin with the load's
+  normal-priority spinners. Does keeping the raise (no privilege: a thread's own level within its class) end it?
+- **A/B first** (diag run 44947142869, same binary, `W90_SHARD_RAISED`): kept raised, loaded p999 238-1,011 µs against
+  0.8-33 ms, 0-4 requests a round over 10 ms against 6-20.
+- **Test, red then green** (`driver::tests::a_windows_shard_stays_one_level_up_after_a_blocking_wait`): red at the test
+  alone on windows-latest and windows-11-arm (level 0 after the wait), green with the change on both.
+- **Command** (diag run 44948887874): `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept
+  --form conflict`, then `--quiet-only`, release, BASE (main 8fb2e33db) and FIX (0689bed17) interleaved, 3 rounds. µs.
+
+| windows-latest, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 128 / 309 / 32,643 | 143 / 237 / 31,854 |
+| fix r1 | 123 / 174 / 579 | 141 / 215 / 305 |
+| fix r2 | 121 / 178 / 699 | 139 / 206 / 317 |
+| base r2 | 123 / 304 / 48,453 | 140 / 242 / 31,888 |
+| base r3 | 124 / 321 / 31,962 | 142 / 252 / 84,866 |
+| fix r3 | 121 / 182 / 642 | 140 / 230 / 410 |
+
+| windows-11-arm, loaded | accept p50 / p99 / p999 | conflict p50 / p99 / p999 |
+|---|---|---|
+| base r1 | 156 / 260 / 28,233 | 155 / 271 / 19,827 |
+| fix r1 | 152 / 319 / 665 | 152 / 225 / 335 |
+| fix r2 | 151 / 248 / 665 | 153 / 223 / 304 |
+| base r2 | 150 / 250 / 31,836 | 154 / 238 / 21,929 |
+| base r3 | 150 / 269 / 4,204 | 151 / 261 / 27,304 |
+| fix r3 | 153 / 236 / 640 | 154 / 217 / 327 |
+
+  Quiet, both runners: fix p99 174-273 µs, p999 275-670 µs; base p99 171-546 µs, p999 285-1,952 µs.
+- **Verdict: landed.** 84a's bar on Windows -- a full edit and merge's loaded p99 and p999 under 1 ms -- is met on
+  windows-latest and windows-11-arm in every round; p50 unchanged. A shard's time at the raised level is bounded by its
+  work and its idle window, after which it parks.
+
+## A path's history as persistent trees of byte identities: writes win, old reads and overwrite memory lose; NOT landed (A-818 piece 2b; 2026-11-21)
+
+- **Question** (main's conditions, 09:40 and 10:35): does the engine switch, with the re-anchor deleted, win writes
+  while reads and memory don't lose, at m = 10/100/1k/10k?
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench` (the branch's file, using only APIs
+  both sides have). Main is 6a6e35215, exported with `git archive` with the branch's bench file. The branch is
+  `agents/w-rewrite-ops-a818-2b` c4278fd3c.
+- **Machine:** the Mac Studio w-rewrite-ops runs on (32 cores), release, unpinned. Load 4.8 at the start, 1.9 at the
+  end. Main 12:11:16 to 12:42:31, then the branch 12:42:31 to 12:42:35. One interleaved pair: the second pass and option
+  (i)'s rows (`leaf_chunks_bench`) were stopped by goal 93's focus (Ada, ~10:40: start no new non-93 runs). Five rounds
+  a point, all shown.
+- **Verdict: NOT LANDED.**
+  - Writes win where history matters: the alternating stream 35.2 ms against 9.0 µs a change at 10k. Overwrites win at
+    10k (15.2 against 4.2 µs) and lose about 30% at m ≤ 100.
+  - Old reads lose: version 1 after alternating changes is 2 to 9 times slower, after overwrites 1.6 to 2.6 times at
+    m ≤ 1k.
+  - Memory a version loses 7 to 8 times on overwrite streams: 1,017 to 1,297 bytes against 152. Path copying makes
+    O(log n) nodes of 48 bytes a change, where A-809's layer costs one entry. It wins on alternating streams (1,001 to
+    1,806 against 4,135 to 7,050). Many paths changed once are equal (152).
+  - A bounded compaction (main's named fix) would answer the reads, not the overwrite memory. That needs O(1) space a
+    change (DSST's node copying, or keeping A-809's layer for overwrites), a design question for main once goal 93
+    frees the piece.
+
+Main (6a6e35215):
+```
+a	read_version_1_after_overwrites	m	10	ns	1417	958	750	750	875
+a	read_version_1_after_alternating	m	10	ns	625	542	416	417	375
+a	read_version_1_after_overwrites	m	100	ns	1167	916	833	875	792
+a	read_version_1_after_alternating	m	100	ns	1833	1459	1875	1666	1334
+a	read_version_1_after_overwrites	m	1000	ns	1875	1416	1375	2333	2292
+a	read_version_1_after_alternating	m	1000	ns	8625	4417	4625	4584	4084
+a	read_version_1_after_overwrites	m	10000	ns	8917	8250	8500	7875	8208
+a	read_version_1_after_alternating	m	10000	ns	10375	13792	9542	9167	9167
+b	overwrites	history	10	ns_per_change	2952	2641	2500	2478	2456	history_bytes_per_version	152
+b	overwrites	history	100	ns_per_change	2758	2679	2643	2601	2568	history_bytes_per_version	152
+b	overwrites	history	1000	ns_per_change	4046	4142	4201	4038	4026	history_bytes_per_version	152
+b	overwrites	history	10000	ns_per_change	15283	15561	15182	15226	15243	history_bytes_per_version	152
+b	overwrite_insert_alternating	history	10	ns_per_change	236078	235758	237053	237892	234006	history_bytes_per_version	4135
+b	overwrite_insert_alternating	history	100	ns_per_change	527643	528285	530296	528977	540692	history_bytes_per_version	4904
+b	overwrite_insert_alternating	history	1000	ns_per_change	3632369	3632943	3603093	3630616	3602781	history_bytes_per_version	6546
+b	overwrite_insert_alternating	history	10000	ns_per_change	38168979	36181078	34991192	34923873	35158129	history_bytes_per_version	7050
+b	sdk_replace	history	10	ns_per_change	3147	2714	2576	2706	2542	history_bytes_per_version	152
+b	sdk_replace	history	100	ns_per_change	2882	2833	2747	2735	2726	history_bytes_per_version	152
+b	sdk_replace	history	1000	ns_per_change	4258	4052	4148	3981	3780	history_bytes_per_version	152
+b	sdk_replace	history	10000	ns_per_change	15371	15055	15355	15343	15113	history_bytes_per_version	152
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```
+Branch (c4278fd3c):
+```
+a	read_version_1_after_overwrites	m	10	ns	9708	3166	2125	2000	1792
+a	read_version_1_after_alternating	m	10	ns	3500	2875	2583	2417	2291
+a	read_version_1_after_overwrites	m	100	ns	2875	2625	2083	2875	3625
+a	read_version_1_after_alternating	m	100	ns	16125	18458	14459	16417	8833
+a	read_version_1_after_overwrites	m	1000	ns	3709	2959	2833	2750	2250
+a	read_version_1_after_alternating	m	1000	ns	14875	11583	10041	8791	8542
+a	read_version_1_after_overwrites	m	10000	ns	7958	6959	6583	6583	6625
+a	read_version_1_after_alternating	m	10000	ns	18750	17500	19459	17709	18917
+b	overwrites	history	10	ns_per_change	3808	3400	3277	3181	3171	history_bytes_per_version	1017
+b	overwrites	history	100	ns_per_change	3631	3583	3496	3483	3378	history_bytes_per_version	1098
+b	overwrites	history	1000	ns_per_change	4040	3933	3929	3956	3876	history_bytes_per_version	1249
+b	overwrites	history	10000	ns_per_change	4461	4289	4374	4173	4239	history_bytes_per_version	1297
+b	overwrite_insert_alternating	history	10	ns_per_change	3678	3366	3167	3117	3127	history_bytes_per_version	1001
+b	overwrite_insert_alternating	history	100	ns_per_change	3686	3597	3567	3535	3499	history_bytes_per_version	1121
+b	overwrite_insert_alternating	history	1000	ns_per_change	5801	5246	5175	5143	5248	history_bytes_per_version	1459
+b	overwrite_insert_alternating	history	10000	ns_per_change	9083	8964	9002	10151	8875	history_bytes_per_version	1806
+b	sdk_replace	history	10	ns_per_change	3991	3624	3459	3247	3234	history_bytes_per_version	1017
+b	sdk_replace	history	100	ns_per_change	3747	3681	3581	3564	3486	history_bytes_per_version	1098
+b	sdk_replace	history	1000	ns_per_change	4285	4039	3999	4007	3935	history_bytes_per_version	1249
+b	sdk_replace	history	10000	ns_per_change	4463	4611	4333	4292	4309	history_bytes_per_version	1297
+c	many_paths_once_history_bytes_per_version	paths	10	152
+c	many_paths_once_history_bytes_per_version	paths	100	152
+c	many_paths_once_history_bytes_per_version	paths	1000	152
+c	many_paths_once_history_bytes_per_version	paths	10000	152
+```

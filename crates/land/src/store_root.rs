@@ -13,12 +13,35 @@
 //! The store's crates (`slates-store`, and the vendored engine and block layer under it) never open a path: they are
 //! handed the files this module opens, and write into them in place. R1 still holds: disk is written only under a
 //! grant, here a standing one, and the hermeticity tracer counts writes under a granted store root as granted.
-//! Windows' counterpart (an `NtCreateFile` relative to the root's handle) is owed with the store's Windows lane; until
-//! it is written every call there refuses `Unsupported`.
+//!
+//! **Windows (the store's Windows lane).** The same contract, through the land crate's Windows seam
+//! (`crate::os`, `os_windows.rs`): the granted path is walked from its drive's root with every component opened
+//! `FILE_OPEN_REPARSE_POINT`, so a symbolic link or a junction on the way is refused (`slates_base::walk_dir`), and the
+//! directory must be owned by this process's user, compared by security identifier. Its identity is its volume's
+//! serial number and its file id (`GetFileInformationByHandleEx`, `FileIdInfo`). Every file is created or opened by
+//! `NtCreateFile` with the directory's handle as `OBJECT_ATTRIBUTES.RootDirectory` and one plain name, opened
+//! `FILE_OPEN_REPARSE_POINT` (a link under the name is opened as itself, then refused, never followed); a create is
+//! `FILE_CREATE`, refused when the name exists. Free bytes are the volume's `FileFsFullSizeInformation` for this caller.
+//!
+//! **What makes a created name durable on NTFS** (Microsoft's documentation, tier B): `FlushFileBuffers` "writes all the
+//! buffered information for a specified file to the device", through a handle that "must have the GENERIC_WRITE access
+//! right" ([FlushFileBuffers]); given a directory's handle it flushes that directory's own buffered data, its entries,
+//! which is what a create added ([Directory Handles]: a handle to a directory is opened with `FILE_FLAG_BACKUP_SEMANTICS`
+//! and takes the same calls a file's does). So a create flushes the granted directory through a handle opened again on
+//! it with `FILE_ADD_FILE` (the directory's write right), as the landing's directory sync does (`os_windows.rs`
+//! `flush_dir`). What it does not do: it makes nothing durable in another directory, and it is not a barrier for the
+//! file's own bytes, which the store flushes through the file's handle (`FlushFileBuffers`, the block layer's full
+//! flush). NTFS journals its metadata (the $LogFile), so a name whose directory was flushed survives a crash with the
+//! log's guarantees; a name that was not may be gone after one, its file's flushed bytes with it.
+//!
+//! [FlushFileBuffers]: https://learn.microsoft.com/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers
+//! [Directory Handles]: https://learn.microsoft.com/windows/win32/fileio/obtaining-a-handle-to-a-directory
 
 use std::fs::File;
 #[cfg(unix)]
 use std::os::fd::{AsFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, OwnedHandle};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -55,7 +78,7 @@ pub enum StoreRootRefusal {
     /// The OS's error code.
     code: i32,
   },
-  /// This platform has no store directory yet (Windows' handle-relative counterpart is owed, GAPS).
+  /// This platform has no store directory.
   Unsupported,
 }
 
@@ -69,7 +92,7 @@ impl std::fmt::Display for StoreRootRefusal {
       Self::BadName => f.write_str("a store file's name must be one plain name"),
       Self::Io { op, code } => write!(f, "{op}: OS error {code}"),
       Self::Unsupported => {
-        f.write_str("a version-control store directory is not supported on this platform yet")
+        f.write_str("a version-control store directory is not supported on this platform")
       }
     }
   }
@@ -82,24 +105,37 @@ impl std::error::Error for StoreRootRefusal {}
 pub struct StoreRoot {
   #[cfg(unix)]
   dir: OwnedFd,
+  #[cfg(windows)]
+  dir: OwnedHandle,
   path: PathBuf,
   target: TargetIdentity,
   /// The standing grant it was opened under, recorded by the store at its open (A-767's `G` row, R10).
   grant: StoreGrant,
 }
 
-/// Windows has no store directory yet: every call refuses [`StoreRootRefusal::Unsupported`] (its handle-relative
-/// counterpart is owed, GAPS), so the store's crates build there and a daemon given `--vcs-store` refuses at its start.
 #[cfg(windows)]
 impl StoreRoot {
-  /// Refused: no store directory on this platform yet.
-  pub fn open(_path: &Path, _grant: &StoreGrant) -> Result<Self, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// Opens the directory `path` that `grant` names (the module doc's Windows contract). Refused when the walk is (as a
+  /// landing target's), and when the directory found is not the grant's.
+  pub fn open(path: &Path, grant: &StoreGrant) -> Result<Self, StoreRootRefusal> {
+    let (dir, key) = crate::os::store_dir(path).map_err(StoreRootRefusal::Target)?;
+    let target = identity_of(&dir, key)?;
+    if target.device != grant.target.device || target.inode != grant.target.inode {
+      return Err(StoreRootRefusal::NotTheGrantsDirectory);
+    }
+    Ok(Self {
+      dir,
+      path: path.to_path_buf(),
+      target,
+      grant: grant.clone(),
+    })
   }
 
-  /// Refused: no store directory on this platform yet.
-  pub fn identify(_path: &Path) -> Result<TargetIdentity, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// The identity a standing grant for the directory at `path` binds: the walked directory's key, its volume's serial
+  /// number and its file id.
+  pub fn identify(path: &Path) -> Result<TargetIdentity, StoreRootRefusal> {
+    let (dir, key) = crate::os::store_dir(path).map_err(StoreRootRefusal::Target)?;
+    identity_of(&dir, key)
   }
 
   /// The directory's identity.
@@ -112,35 +148,74 @@ impl StoreRoot {
     &self.grant
   }
 
-  /// The path a store file is named under in messages.
+  /// The path a store file is named under in messages (never opened by it).
   pub fn path_of(&self, name: &str) -> PathBuf {
     self.path.join(name)
   }
 
-  /// Refused: no store directory on this platform yet.
-  pub fn create(&self, _name: &str) -> Result<File, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// Creates the file `name` in the directory, new and empty, for reading and writing, and makes its name durable (the
+  /// directory flushed). Refused when it exists.
+  pub fn create(&self, name: &str) -> Result<File, StoreRootRefusal> {
+    plain(name)?;
+    crate::os::store_create(self.dir.as_handle(), name)
+      .map(File::from)
+      .map_err(|error| io("create a store file", &error))
   }
 
-  /// Refused: no store directory on this platform yet.
-  pub fn open_file(&self, _name: &str) -> Result<File, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// Opens the existing file `name` in the directory for reading and writing; a link or a junction there is refused.
+  pub fn open_file(&self, name: &str) -> Result<File, StoreRootRefusal> {
+    plain(name)?;
+    crate::os::store_open(self.dir.as_handle(), name)
+      .map(File::from)
+      .map_err(|error| io("open a store file", &error))
   }
 
-  /// Refused: no store directory on this platform yet.
+  /// The bytes free to this process on the directory's volume now: the disk a store's grant can grow into.
   pub fn free_bytes(&self) -> Result<u64, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+    crate::os::store_free_bytes(self.dir.as_handle())
+      .map_err(|error| io("read the store's volume's free space", &error))
   }
 
-  /// Refused: no store directory on this platform yet.
-  pub fn exists(&self, _name: &str) -> Result<bool, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// Whether the name `name` exists in the directory (the name itself, never through a link).
+  pub fn exists(&self, name: &str) -> Result<bool, StoreRootRefusal> {
+    plain(name)?;
+    crate::os::store_exists(self.dir.as_handle(), name)
+      .map_err(|error| io("look up a store file", &error))
   }
 
-  /// Refused: no store directory on this platform yet.
-  pub fn mount_point(&self, _name: &str) -> Result<PathBuf, StoreRootRefusal> {
-    Err(StoreRootRefusal::Unsupported)
+  /// The directory `name` in the granted directory, a mount point for a view slates presents there: made empty, and its
+  /// name made durable, where missing; kept where it is already a directory and no link. The path it lies at.
+  ///
+  /// # Errors
+  /// [`StoreRootRefusal::BadName`] for a name that is not one plain name; [`StoreRootRefusal::Io`] with
+  /// `ERROR_DIRECTORY` (267) when the name holds something else, or the OS's code when it refuses the make.
+  pub fn mount_point(&self, name: &str) -> Result<PathBuf, StoreRootRefusal> {
+    plain(name)?;
+    crate::os::store_mount_point(self.dir.as_handle(), name)
+      .map_err(|error| io("make a mount point", &error))?;
+    Ok(self.path_of(name))
   }
+}
+
+/// A Windows store verb's refusal: the call and its Win32 code.
+#[cfg(windows)]
+fn io(op: &'static str, error: &slates_vfs::host::HostError) -> StoreRootRefusal {
+  StoreRootRefusal::Io {
+    op,
+    code: crate::os::store_code(error),
+  }
+}
+
+/// The walked directory's identity under `key`: its volume's serial number and its file id.
+#[cfg(windows)]
+fn identity_of(dir: &OwnedHandle, key: String) -> Result<TargetIdentity, StoreRootRefusal> {
+  let (device, inode) = crate::os::store_identity(dir.as_handle())
+    .map_err(|error| io("identify the store's directory", &error))?;
+  Ok(TargetIdentity {
+    key: key.into_boxed_str(),
+    device,
+    inode,
+  })
 }
 
 #[cfg(unix)]
@@ -276,10 +351,17 @@ impl StoreRoot {
   }
 }
 
-/// Refuses a name that is not one plain name.
-#[cfg(unix)]
+/// Refuses a name that is not one plain name: empty, `.`, `..`, a separator or a NUL in it, and on Windows a `\\`
+/// separator or a `:` (a stream or a drive).
 fn plain(name: &str) -> Result<(), StoreRootRefusal> {
-  if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+  let windows_only = cfg!(windows) && name.contains(['\\', ':']);
+  if name.is_empty()
+    || name == "."
+    || name == ".."
+    || name.contains('/')
+    || name.contains('\0')
+    || windows_only
+  {
     return Err(StoreRootRefusal::BadName);
   }
   Ok(())

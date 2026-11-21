@@ -84,6 +84,34 @@ pub trait Held {
   fn manifest_text(&self, node: &Node) -> Option<Cow<'_, [u8]>>;
   /// The text (its metadata block, then its bytes) of the revision `node` of `path`'s file log, if it holds it.
   fn file_text(&self, path: &[u8], node: &Node) -> Option<Cow<'_, [u8]>>;
+  /// The names of the revision `node` of `path`'s file log, if it holds it: its metadata block's and its bytes'
+  /// identities (the plain BLAKE3 of each, `slates_vcs::ContentId::of`), which tell two texts alike without reading
+  /// either (A-767 C1). By default named from its text; a store keeping its rows names them unread.
+  fn file_names(&self, path: &[u8], node: &Node) -> Option<FileNames> {
+    let text = self.file_text(path, node)?;
+    FileNames::of(&text)
+  }
+}
+
+/// A file revision's text named by its parts' identities: its metadata block's, if it has one, and its bytes'. Two texts
+/// are equal exactly where their names are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileNames {
+  /// The metadata block's identity, none without a block.
+  pub block: Option<slates_vcs::ContentId>,
+  /// The bytes' identity.
+  pub bytes: slates_vcs::ContentId,
+}
+
+impl FileNames {
+  /// The names of file revision text `text`; none where it does not read as one.
+  pub fn of(text: &[u8]) -> Option<FileNames> {
+    let split = crate::filerev::split(text).ok()?;
+    Some(FileNames {
+      block: split.metadata.map(slates_vcs::ContentId::of),
+      bytes: slates_vcs::ContentId::of(split.bytes),
+    })
+  }
 }
 
 /// A revision a push brought and its verification kept: its node, parents, link and full text.
@@ -647,7 +675,7 @@ fn files_present(
     for entry in entries.filter(|entry| previous.get(entry.path) != Some(&entry.node)) {
       audit(entry.path)?;
       let present = verified.file(entry.path, &entry.node).is_some()
-        || held.file_text(entry.path, &entry.node).is_some();
+        || held.file_names(entry.path, &entry.node).is_some();
       if !present {
         return Err(Unverified::MissingFile {
           path: entry.path.to_vec(),

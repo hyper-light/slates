@@ -1903,28 +1903,39 @@ fn computed_request(
   };
   state.count(COMPUTED_ON_HOLDER, 1);
   let form = computed.encode(&inc);
-  // Encoded once: the bytes this node holds as the version's inputs, then forwarded (A-697 (1)): held here, they are
-  // never shipped back to this node, which composed them.
+  // Encoded once and held here as the version's inputs (A-697 (1)), which the owner fetches by identity (lane (A) 3b):
+  // the forward names them and carries none of their bytes, and the version's record never ships them back here.
   let increment = inc.encode();
   let next = state
     .merge
     .replicas
     .get(&slates_db::register::ObjectId(green.bytes))
     .map_or(0, |replica| replica.head().saturating_add(1));
-  crate::merge_service::hold_composed_inputs(state, green, &increment, next);
-  Ok(crate::verbs::forwarded_request(
+  let identity = crate::merge_service::hold_composed_inputs(state, green, &increment, next)
+    .map_err(|refusal| Box::new(crate::verbs::refused(refusal)))?;
+  let request = crate::verbs::forwarded_request(
     state,
     id.word(),
     principal,
     RequestBody::SubmitComputed {
       work: crate::verbs::to_wire_volume(work),
       green: crate::verbs::to_wire_volume(green),
-      increment,
+      increment: identity,
+      increment_len: u64::try_from(increment.len()).unwrap_or(u64::MAX),
       computed: form,
       carried,
     },
-  ))
+  );
+  state.count(
+    SUBMIT_FORWARD_REQUEST_BYTES,
+    u64::try_from(request.len()).unwrap_or(u64::MAX),
+  );
+  Ok(request)
 }
+
+/// Format: the bytes of the `SubmitComputed` forwards this holder node made, summed (lane (A) 3b): the request names the
+/// increment, so it costs its verdict and its names, never the increment's bytes.
+pub(crate) const SUBMIT_FORWARD_REQUEST_BYTES: &str = "merge.submit.forward_request_bytes";
 
 /// What the green's owner on another node answered a `SubmitComputed` (A-697 part c): the verdict the submit settles,
 /// or `None` (answered retryable, unrecorded) for no answer and one that says the ask was not started or did not reach

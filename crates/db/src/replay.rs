@@ -18,7 +18,7 @@ use crate::catalog::StateLogRecord;
 use crate::error::DbError;
 use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
-use crate::record::{LogEntry, LogRing, Replayed};
+use crate::record::{LogEntry, LogRing, ReplayCursor};
 
 /// The recovery budget: `slates_machine::budgets::RECOVERY_BUDGET_NS` (RAMCloud's target of about a second for a crashed
 /// node, ratified as the default, GAPS §5), held there so the daemon and the workspace's tools derive from one source.
@@ -294,111 +294,181 @@ fn newest_snapshot(
 }
 
 /// Recovers partition `index` from the segment: the newest valid snapshot, then the records
-/// after it; the torn tail is cut; the replay is timed.
+/// after it; the torn tail is cut; the replay is timed. [`Recovering`]'s steps, taken at once.
 pub fn recover(
   segment: &mut AnchorSegment,
   index: u16,
   caps: PartitionCaps,
   now_ns: u64,
 ) -> Result<(Db, Recovered), DbError> {
-  let started = Instant::now();
-  let log = LogRing::new(RegionKind::Log(index));
-  let DerivedPartition {
-    partition,
-    snapshot,
-    snapshot_bytes,
-    from_seq,
-    replayed,
-    records,
-  } = derive_partition(segment, index, &log, caps, now_ns)?;
-  if replayed.torn {
-    log.truncate_to_verified(segment, replayed.verified_end)?;
-  }
-  let replay_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-  let recovered = Recovered {
-    snapshot,
-    replayed_records: records,
-    replayed_bytes: replayed.bytes,
-    replay_ns,
-    torn: replayed.torn,
-    next_seq: replayed.next_seq.max(from_seq),
-  };
-  let db = Db {
-    partition,
-    index,
-    log,
-    next_seq: recovered.next_seq,
-    pinned: None,
-    since_snapshot_bytes: replayed.bytes,
-    next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
-    snapshots_taken: 0,
-    stats: DbStats::default(),
-    replay_work_ns_since_snapshot: replay_ns,
-    recovery_budget_ns: RECOVERY_BUDGET_NS,
-    snapshot_floor_bytes: snapshot_bytes,
-    snapshot_room_refusals: 0,
-    pending: None,
-    last_now_ns: now_ns,
-    rollbacks: 0,
-    maintenance_failures: 0,
-    publication_fault: None,
-    logged: Vec::new(),
-    logged_in_transaction: Vec::new(),
-  };
-  Ok((db, recovered))
+  let mut recovering = Recovering::begin(segment, index, caps, now_ns)?;
+  while !recovering.step(segment, usize::MAX)? {}
+  recovering.finish(segment)
 }
 
-/// A partition derived from the segment's durable state: the newest valid snapshot, then the
-/// records after it, replayed in order — what [`recover`] builds at boot, and what a rolled-back
-/// publication restores ([`Db::commit`]).
-struct DerivedPartition {
+/// A partition's recovery in steps (A-228 continued; found by use: a restarted daemon's start replayed its whole log in
+/// one unit of its sliced recovery, 963 ms of CPU, past the watchdog's window on a loaded host, and was killed): the
+/// newest valid snapshot taken at [`Recovering::begin`], then the records after it a step at a time
+/// ([`Recovering::step`]), each applied as it is read, then the torn tail cut and the database made
+/// ([`Recovering::finish`]). The caller yields between steps. Its time is the work of its calls alone, never the yields
+/// between them, since the database's snapshot policy weighs a replay's work (A-420).
+pub struct Recovering {
+  /// The partition.
+  index: u16,
+  /// The partition being rebuilt.
   partition: Partition,
-  /// The snapshot slot and sequence the derivation started from, if any.
+  /// The snapshot slot and sequence it began from, if any.
   snapshot: Option<(u8, u64)>,
   /// That snapshot's encoded size (zero with none).
   snapshot_bytes: u64,
   /// The first sequence replayed from the log.
   from_seq: u64,
-  replayed: Replayed,
-  /// The records replayed.
-  records: u64,
+  /// Where the log's replay stands.
+  cursor: ReplayCursor,
+  /// The work of the calls so far, in nanoseconds.
+  work_ns: u64,
+  /// The time the recovery is made at.
+  now_ns: u64,
+}
+
+impl Recovering {
+  /// Begins recovering partition `index`: its newest valid snapshot decoded (or an empty partition), the log's replay
+  /// not yet begun.
+  pub fn begin(
+    segment: &AnchorSegment,
+    index: u16,
+    caps: PartitionCaps,
+    now_ns: u64,
+  ) -> Result<Recovering, DbError> {
+    let mut work_ns = 0;
+    let begun = timed(&mut work_ns, || -> Result<_, DbError> {
+      let log = LogRing::new(RegionKind::Log(index));
+      let cursor = log.replay_cursor(segment)?;
+      Ok(match newest_snapshot(segment, index)? {
+        Some((slot, snapshot, size)) => (
+          Partition::from_snapshot(&snapshot, caps, now_ns)?,
+          Some((slot, snapshot.seq)),
+          size,
+          snapshot.seq.saturating_add(1),
+          cursor,
+        ),
+        None => (Partition::new(caps, now_ns), None, 0, 0, cursor),
+      })
+    })?;
+    let (partition, snapshot, snapshot_bytes, from_seq, cursor) = begun;
+    Ok(Recovering {
+      index,
+      partition,
+      snapshot,
+      snapshot_bytes,
+      from_seq,
+      cursor,
+      work_ns,
+      now_ns,
+    })
+  }
+
+  /// Replays at most `records` more of the log's records (A-420: a record at a time, decoded, applied and dropped
+  /// before the next is read). Whether the replay has ended.
+  pub fn step(&mut self, segment: &AnchorSegment, records: usize) -> Result<bool, DbError> {
+    let Recovering {
+      index,
+      partition,
+      from_seq,
+      cursor,
+      work_ns,
+      ..
+    } = self;
+    let log = LogRing::new(RegionKind::Log(*index));
+    timed(work_ns, || {
+      log.replay_step(segment, *from_seq, cursor, records, &mut |entry| {
+        entry.ops().iter().try_for_each(|op| partition.apply(op))
+      })
+    })
+  }
+
+  /// The records replayed so far.
+  pub fn records(&self) -> u64 {
+    self.cursor.replayed().records
+  }
+
+  /// Ends the recovery: the torn tail cut, the database made.
+  pub fn finish(self, segment: &mut AnchorSegment) -> Result<(Db, Recovered), DbError> {
+    let Recovering {
+      index,
+      partition,
+      snapshot,
+      snapshot_bytes,
+      from_seq,
+      cursor,
+      mut work_ns,
+      now_ns,
+    } = self;
+    let log = LogRing::new(RegionKind::Log(index));
+    let replayed = cursor.replayed();
+    if replayed.torn {
+      timed(&mut work_ns, || {
+        log.truncate_to_verified(segment, replayed.verified_end)
+      })?;
+    }
+    let replay_ns = work_ns;
+    let recovered = Recovered {
+      snapshot,
+      replayed_records: replayed.records,
+      replayed_bytes: replayed.bytes,
+      replay_ns,
+      torn: replayed.torn,
+      next_seq: replayed.next_seq.max(from_seq),
+    };
+    let db = Db {
+      partition,
+      index,
+      log,
+      next_seq: recovered.next_seq,
+      pinned: None,
+      since_snapshot_bytes: replayed.bytes,
+      next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
+      snapshots_taken: 0,
+      stats: DbStats::default(),
+      replay_work_ns_since_snapshot: replay_ns,
+      recovery_budget_ns: RECOVERY_BUDGET_NS,
+      snapshot_floor_bytes: snapshot_bytes,
+      snapshot_room_refusals: 0,
+      pending: None,
+      last_now_ns: now_ns,
+      rollbacks: 0,
+      maintenance_failures: 0,
+      publication_fault: None,
+      logged: Vec::new(),
+      logged_in_transaction: Vec::new(),
+    };
+    Ok((db, recovered))
+  }
 }
 
 /// Derives partition `index` from the segment: the newest valid snapshot (or an empty partition),
-/// then every record at or after it applied in order. Pure with respect to the segment (nothing is
-/// written; a torn tail is reported in `replayed`, not cut — the caller decides).
+/// then every record at or after it applied in order: what [`recover`] builds at boot, and what a rolled-back
+/// publication restores ([`Db::commit`]). Pure with respect to the segment (nothing is written; a torn tail is not
+/// cut).
 fn derive_partition(
   segment: &AnchorSegment,
   index: u16,
   log: &LogRing,
   caps: PartitionCaps,
   now_ns: u64,
-) -> Result<DerivedPartition, DbError> {
-  let (mut partition, snapshot, snapshot_bytes, from_seq) = match newest_snapshot(segment, index)? {
-    Some((slot, snapshot, size)) => {
-      let seq = snapshot.seq;
-      (
-        Partition::from_snapshot(&snapshot, caps, now_ns)?,
-        Some((slot, seq)),
-        size,
-        seq.saturating_add(1),
-      )
-    }
-    None => (Partition::new(caps, now_ns), None, 0, 0),
+) -> Result<Partition, DbError> {
+  let (mut partition, from_seq) = match newest_snapshot(segment, index)? {
+    Some((_, snapshot, _)) => (
+      Partition::from_snapshot(&snapshot, caps, now_ns)?,
+      snapshot.seq.saturating_add(1),
+    ),
+    None => (Partition::new(caps, now_ns), 0),
   };
   // A record at a time: decoded, applied and dropped before the next is read, the work each commit timed (A-420).
-  let replayed = log.replay(segment, from_seq, |entry| {
+  log.replay(segment, from_seq, |entry| {
     entry.ops().iter().try_for_each(|op| partition.apply(op))
   })?;
-  let records = replayed.records;
-  Ok(DerivedPartition {
-    partition,
-    snapshot,
-    snapshot_bytes,
-    from_seq,
-    replayed,
-    records,
-  })
+  Ok(partition)
 }
 
 /// Runs `step`, adding its wall time to `work_ns`.
@@ -718,7 +788,7 @@ impl Db {
       self.last_now_ns,
     ) {
       Ok(derived) => {
-        self.partition = derived.partition;
+        self.partition = derived;
         DbError::Unpublished {
           seq,
           cause: Box::new(cause),
@@ -1054,6 +1124,63 @@ mod tests {
       costs[RECOVERIES / 2],
       costs[RECOVERIES - 1 - quartile] - costs[quartile],
     )
+  }
+
+  /// A-228 continued (a shard's start replays its log a record a unit). Do: write 64 records past a volume's creation,
+  /// then recover the partition at once and in steps of one record. Expect: each step replays one record at most; the
+  /// stepped recovery replays as many records and bytes, to the same next sequence, as the one at once.
+  #[test]
+  fn a_recovery_in_steps_of_one_record_is_the_recovery_at_once() {
+    let mut segment = segment_named("slates-db-replay-steps");
+    let mut db = recover(&mut segment, 0, caps(), 0).unwrap().0;
+    db.set_policy(SnapshotPolicy {
+      bytes_between_snapshots: u64::MAX,
+    });
+    let record = volume();
+    let id = record.id;
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+    for n in 0..64_u8 {
+      db.mutate(
+        &mut segment,
+        &Op::VolumeSignersSet {
+          id,
+          keys: vec![vec![n]],
+        },
+        0,
+      )
+      .unwrap();
+    }
+    drop(db);
+    let (_, whole) = recover(&mut segment, 0, caps(), 0).unwrap();
+    let mut recovering = Recovering::begin(&segment, 0, caps(), 0).unwrap();
+    let mut steps = 0_u64;
+    loop {
+      let before = recovering.records();
+      let done = recovering.step(&segment, 1).unwrap();
+      assert!(recovering.records() - before <= 1);
+      steps += 1;
+      if done {
+        break;
+      }
+    }
+    let (_, stepped) = recovering.finish(&mut segment).unwrap();
+    assert!(steps >= whole.replayed_records, "{steps} steps");
+    assert_eq!(
+      (
+        stepped.replayed_records,
+        stepped.replayed_bytes,
+        stepped.next_seq,
+        stepped.torn
+      ),
+      (
+        whole.replayed_records,
+        whole.replayed_bytes,
+        whole.next_seq,
+        whole.torn
+      )
+    );
+    assert!(whole.replayed_records >= 65, "{whole:?}");
   }
 
   /// A-420 (A-243's open line), §4.8. Do: set a volume's signers again and again to a thousand one-byte keys, with no

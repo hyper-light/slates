@@ -32,6 +32,9 @@ slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
 # The changeset A/B example (examples/changeset_ab.rs): a landed log's segments in LZ4.
 lz4_flex = { workspace = true }
+# The node-hash A/B example (examples/sha1_ab.rs): hardware SHA-1 beside the collision-detecting one the node check uses.
+aws-lc-rs = { workspace = true }
+sha1-checked = { workspace = true }
 
 [lints]
 workspace = true
