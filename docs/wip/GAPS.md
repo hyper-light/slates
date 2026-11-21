@@ -15405,7 +15405,8 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 > - **Owed.**
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
->     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
+>     to `base_wait::land` (`spawn_driver`). Started where a volume over an S3 base is made (A-791); its start at a
+>     recovery waits on the credential's hold across a restart (below).
 >   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
 >     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
 >     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
@@ -15419,8 +15420,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
 >   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
->     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
->     fetches on the client and handing each answer to `base_wait::land` (A-555); the base plane's host calls audited for
+>     hand-off are built (A-791: `CreateOverS3`, the owner shard's `S3Host` and driver, `BaseRecord::S3` without the
+>     credential); owed: the credential held by the anchor across a restart and the recovery over an S3 base that uses
+>     it (until then such a volume recovers unavailable, `BaseUnavailable`), a clone of such an overlay (refused
+>     `BaseUnavailable` now), the library's `VolumeSpec` over an S3 base, name resolution of the endpoint's host (an
+>     IPv4 address alone today); the base plane's host calls audited for
 >     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
 >     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
 >     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential

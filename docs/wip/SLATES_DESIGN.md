@@ -10570,6 +10570,26 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
 > mount over a socket pair on an audit shard and expects a kept request answered before the device's.
 
+> **Status (2026-11-20, A-791: a volume over an S3 base made through the wire).** Built: `CreateOverS3` (appended to
+> the wire's requests) names the base (`S3BaseSpec`: the endpoint, region, bucket, prefix, addressing and the
+> authorities for TLS) and hands the credential its fetches are signed with (`S3Credential`, whose `Debug` names the
+> access key alone); the client's `create_over_s3` sends it. The volume's owner shard makes the overlay over an
+> `S3Host` of the base (`verbs::open_s3_base`: the root's facts need no fetch; the host's cache is the volume's byte
+> bound within what the shard could admit, refused `BudgetExceeded` below one chunk), puts the host in the slot
+> (`BaseHost::S3`), and starts the base's fetch driver over the store client (`verbs::s3_client_of`, `base_wait::
+> spawn_driver`) before the volume is published, so a full task arena refuses the create `Overloaded` with nothing
+> made. The client's requests may be as late as the daemon's liveness window and never take longer in all than the
+> shard's failover delay, the longest a parked request waits. The catalog records the base alone
+> (`BaseRecord::S3`, appended); the credential is held in RAM by the owner shard and never written (R1). A recovery
+> over an S3 base holds the volume unavailable (`BaseUnavailable`, naming the base) until the credential is handed
+> again, and a clone of such an overlay is refused `BaseUnavailable`: the host's fetch state and its credential are
+> not duplicated. An image of the volume records each listed directory by its identity (`HostFs::identify_dir`: the
+> device, number and birth a recovery holds it to), which an S3 base answers with no fetch; it recorded the whole
+> fingerprint, whose listing had not landed, so every create over an S3 base was skipped by the shard's publication
+> (`EAGAIN`) and answered `ContentUnavailable`. A host directory's identity is its fingerprint, as before. Owed: the anchor's hold of the credential across a daemon restart and the recovery that uses it;
+> name resolution (a host that is not an IPv4 address is refused `BaseUnavailable`) and the platform's trust roots
+> (the caller hands the authorities); the library's `VolumeSpec` over an S3 base.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -58138,3 +58158,32 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
     `f = 1` end-to-end test on production routing, with `merge.verdict.taken_by_position` as its counter.
   - Every holder test runs with no hook. Each waits until B replicates the green before B's creation, since B's
     creations are A's until then.
+
+### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
+- **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing
+  made a volume over an S3 base: no request named one, `spawn_driver` had no caller, and `BaseHost::S3` was built only
+  by tests.
+- **The change.** `RequestBody::CreateOverS3` (appended, tag 97) names the base (`S3BaseSpec`) and hands its credential
+  (`S3Credential`, its `Debug` naming the access key alone); the client's `create_over_s3` sends it. The owner shard
+  makes the overlay over an `S3Host` (`verbs::open_s3_base`; its cache the volume's byte bound within the shard's
+  admittable room, refused `BudgetExceeded` below one chunk), starts the fetch driver with the store client before the
+  volume is published (`verbs::s3_client_of`: the endpoint's host an IPv4 address, plain HTTP to loopback alone, HTTPS
+  with the caller's authorities; requests as late as the liveness window and no longer in all than the failover
+  delay), and records `BaseRecord::S3` (appended, tag 3) without the credential (R1). A recovery holds such a volume
+  unavailable until the credential is handed again; a clone of it is refused `BaseUnavailable`.
+- **Found by its test, fixed in the same change.** The shard's publication imaged each listed base directory with its
+  whole fingerprint, which over S3 needs the directory's listing, so the new volume was skipped (`EAGAIN`) and the
+  create answered `ContentUnavailable`. A recovery holds a directory to its identity alone (`same_object`), so the
+  image now records that (`HostFs::identify_dir`, defaulting to `fingerprint_dir`; an S3 base's needs no fetch).
+- **Applied in the same change to:** §4.15's status (a block after A-555's third piece), GAPS (A-464's owed list:
+  the create and the hand-off built; the anchor's hold, recovery, clone, the library's spec and name resolution owed),
+  `crates/ipc` (the request and its types, tag published), `crates/db` (`BaseRecord::S3`, tag published),
+  `crates/client` (`create_over_s3`), `crates/vfs` (`identify_dir`, the base image), `crates/base` (`S3Host` and
+  `BaseHost` answer it), `crates/server` (the create, the routing, recovery's and the clone's arms, `Lens`).
+- **Evidence (macOS arm64, adas-macbook-pro-2 through kiln run r52, 2026-11-20).** `cargo test --locked -p
+  slates-server --test s3_base`: red with the driver not started (the read still `Unpublished` at its 30 s bound,
+  32.93 s), green 2 of 2 in 5.04 s (`a_volume_made_over_an_s3_base_reads_its_objects_from_the_store` over a loopback
+  store answering `ListObjectsV2` and ranged `GetObject`; `a_credential_s_debug_text_never_names_its_secret`); before
+  the identity fix the create was refused `ContentUnavailable`. `-p slates-base --lib -- s3::host` 16 of 16 (the new
+  `a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s`); `-p slates-ipc --test wire_order` and `-p
+  slates-db --test wire_order` 2 of 2 each; rustfmt's layout applied.
