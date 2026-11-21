@@ -442,3 +442,54 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
     index.release(&mut store).unwrap();
   }
 }
+
+/// A-767 C4 (a push landed on the changeset log: its `Record` section and its `Payload` section, the changegroup held
+/// once). Do: take stock 7.2's bundle through the intake; write its sectioned record (`record::write_push_record`) and
+/// replay it with the changegroup as its payload (`Replay::begin_sectioned`, a step at a time); replay the A-729 v2
+/// record of the same push too. Expect the sectioned record a few dozen bytes, never the changegroup; both replays the
+/// intake's fork row for row; the sectioned record refused by `Replay::begin` (its payload is not in it), and refused by
+/// kind cut short or with a byte after it, nothing held after.
+#[test]
+fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
+  use crate::import::record::{self, Replay};
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (mut fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let revisions = intaken.kept + intaken.passed_over;
+  let sectioned = record::write_push_record(1 << 20, part.version);
+  assert!(sectioned.len() < 64, "{} bytes", sectioned.len());
+  let mut by_sections = HgIndex::new();
+  let mut replay =
+    Replay::begin_sectioned(&sectioned, &part.payload, &mut by_sections, &mut store).unwrap();
+  while replay.step(&part.payload, &mut store).unwrap() {}
+  replay.finish(&mut by_sections, &mut store).unwrap();
+  let whole = record::write_changegroup(1 << 20, (part.version, &part.payload), revisions).unwrap();
+  let mut by_whole = HgIndex::new();
+  record::replay(&whole, &mut by_whole, &mut store).unwrap();
+  let expected = rows(&mut fork, &store);
+  assert_eq!(rows(&mut by_sections, &store), expected);
+  assert_eq!(rows(&mut by_whole, &store), expected);
+  let held = store.len();
+  let mut empty = HgIndex::new();
+  assert!(matches!(
+    Replay::begin(&sectioned, &mut empty, &mut store),
+    Err(record::Refused::Version { version: 6 })
+  ));
+  for cut in 0..sectioned.len() {
+    assert!(
+      Replay::begin_sectioned(&sectioned[..cut], &part.payload, &mut empty, &mut store).is_err(),
+      "cut at {cut}"
+    );
+  }
+  let mut trailing = sectioned.clone();
+  trailing.push(0);
+  assert!(matches!(
+    Replay::begin_sectioned(&trailing, &part.payload, &mut empty, &mut store),
+    Err(record::Refused::Trailing)
+  ));
+  assert_eq!(store.len(), held, "a refused replay held something");
+  for index in [by_sections, by_whole, fork, index, empty] {
+    index.release(&mut store).unwrap();
+  }
+}

@@ -80,6 +80,11 @@ const DELTA_VERSION: u32 = 3;
 /// (A-729 part 2; main's ruling: since A-727 a3 the content a shard stores survives a restart in its image, recovered
 /// before the records, so a record names what the store holds, never a second copy in the log).
 const IDENTITY_VERSION: u32 = 4;
+/// Format: the version of a push's record on the changeset log (A-767 C4; Ada's ruling of 2026-11-20 ~13:35, the
+/// changeset the one stored unit): the head (magic, version, the push's source, the room its intake ran within) and
+/// the changegroup's version name alone. The changegroup is the changeset's `Payload` section, held once by the
+/// changeset log, never copied into the record ([`write_push_record`], [`Replay::begin_sectioned`]).
+const SECTIONED_VERSION: u32 = 6;
 /// Format: the form byte of a revision given whole.
 const TEXT_FORM: u8 = 0;
 /// Format: the form byte of a revision given as its delta, its base's node after the byte.
@@ -803,6 +808,25 @@ impl ChangegroupWriter {
   }
 }
 
+/// A push's record as the changeset log's `Record` section holds it ([`SECTIONED_VERSION`]): its head and its
+/// changegroup's version name, the changegroup itself the changeset's `Payload` section. `room` is the room the push's
+/// intake ran within, so the replay's intake runs within it too.
+pub fn write_push_record(room: u64, version: Version) -> Vec<u8> {
+  let mut out = Vec::with_capacity(
+    WORD_BYTES
+      .saturating_add(WORD_BYTES)
+      .saturating_add(TAG_BYTES)
+      .saturating_add(LONG_BYTES)
+      .saturating_add(CHANGEGROUP_NAME_BYTES),
+  );
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&SECTIONED_VERSION.to_le_bytes());
+  out.push(Source::Push.byte());
+  out.extend_from_slice(&room.to_le_bytes());
+  out.extend_from_slice(version.name());
+  out
+}
+
 /// A push's changegroup record written whole ([`ChangegroupWriter`]'s steps at once).
 pub fn write_changegroup(
   room: u64,
@@ -1222,6 +1246,10 @@ impl Replay {
   ) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: bytes };
     let (version, source, room) = head(&mut reader)?;
+    if version == SECTIONED_VERSION {
+      // Its changegroup is the changeset's `Payload` section, not in these bytes: [`Replay::begin_sectioned`].
+      return Err(Refused::Version { version });
+    }
     let kind = if version == CHANGEGROUP_VERSION {
       Kind::Changegroup(Box::new(Retaken::begin(
         (bytes, reader),
@@ -1236,7 +1264,46 @@ impl Replay {
     Ok(Replay { kind })
   }
 
-  /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given: whether more follow. Refused, its owner
+  /// Starts replaying a push landed on the changeset log (A-767 C4): `record` its `Record` section
+  /// ([`write_push_record`]), `payload` its `Payload` section, the changegroup as it arrived, taken again through the
+  /// live push's intake into a fork of `index`. Each [`Replay::step`] is then handed `payload`, read in place.
+  pub fn begin_sectioned(
+    record: &[u8],
+    payload: &[u8],
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Replay, Refused> {
+    let mut reader = Reader { rest: record };
+    let (version, source, mut room) = head(&mut reader)?;
+    if version != SECTIONED_VERSION || source != Source::Push {
+      return Err(Refused::Version { version });
+    }
+    let name = reader.take(CHANGEGROUP_NAME_BYTES)?;
+    let changegroup = Version::from_name(name).map_err(|_| Refused::Tag {
+      tag: name.first().copied().unwrap_or_default(),
+    })?;
+    if !reader.rest.is_empty() {
+      return Err(Refused::Trailing);
+    }
+    let first = (
+      index.len(store, Log::Changelog),
+      index.len(store, Log::Manifest),
+    );
+    let intake =
+      Intake::begin((changegroup, payload), index, store, &mut room).map_err(Refused::Intake)?;
+    Ok(Replay {
+      kind: Kind::Changegroup(Box::new(Retaken {
+        intake,
+        payload: 0..payload.len(),
+        room,
+        first,
+        done: false,
+      })),
+    })
+  }
+
+  /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given, or the payload
+  /// [`Replay::begin_sectioned`] was: whether more follow. Refused, its owner
   /// gives the fork back ([`Replay::abandon`]).
   pub fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
     match &mut self.kind {
@@ -1684,6 +1751,7 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     CHANGEGROUP_VERSION,
     DELTA_VERSION,
     IDENTITY_VERSION,
+    SECTIONED_VERSION,
   ]
   .contains(&version)
   {
@@ -1698,7 +1766,7 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     },
     tag => return Err(Refused::Tag { tag }),
   };
-  if version == CHANGEGROUP_VERSION && source != Source::Push {
+  if (version == CHANGEGROUP_VERSION || version == SECTIONED_VERSION) && source != Source::Push {
     return Err(Refused::Tag { tag: source.byte() });
   }
   Ok((version, source, Admission::new(reader.long()?)))
