@@ -14,16 +14,20 @@
 //!    (`svn_commit::landing::Turn`) before its verdict applies ([`take_turn`]), so no other landing (a client's commit,
 //!    another submit) runs between the verdict and its revision. Where the turn is held, the submit parks ([`park`]) and
 //!    a task waiting for the turn runs it again (`verbs::resume_all`) holding it.
-//! 2. **The verdict in memory.** The verdict applies to the green's engine as any accept's does; nothing of it is made
-//!    durable in the submit's step. The submit's step takes the request's route, marks it deferred, and hands
-//!    the version's durable parts (`verbs::AcceptedParts`) to the made task ([`defer`]).
-//! 3. **One step after the landing.** The task makes the revision of the version, lands its changeset on the store at
-//!    the register's next sequence, then, in one transaction ([`commit`]): the version's chain entry and what goes with
-//!    it (`verbs::commit_accepted`), the register's entry naming the sequence (the tool's commit), the local work's
-//!    settle (`verbs::settle_submit`), and the request's completion. Then the answer goes on the request's route.
-//! 4. **A failed landing.** A store that refused the changeset leaves nothing durable: the green is made again from
-//!    its durable chain (`verbs::reconcile_unpublished_effects`) and the request is answered `Overloaded`, unrecorded,
-//!    so its retry runs ([`abandon`]). A revision the check refused (a version not made, counted `UNMADE`) commits the
+//! 2. **The verdict held, never shown** (A-805; main 02:37). The verdict is judged and held (`Green::judge`), nothing of
+//!    it applied: every reader of the green sees the head before it until the one step below. The revision is read
+//!    from a preview of the held verdict, a member of the green's lineage of its own, made at the head in O(1) and
+//!    retired in the submit's step (`Lineage::preview`, `Greens::preview`). The submit's step takes the request's route,
+//!    marks it deferred, and hands the version's durable parts (`verbs::AcceptedParts`) to the made task ([`defer`]).
+//! 3. **One step after the landing.** The task lands the revision's changeset on the store at the register's next
+//!    sequence, then, in one step ([`commit`]): the verdict applied to the green as its chain entry records it
+//!    (`verbs::apply_accepted`, the replay a recovery runs), the version's chain entry and what goes with it
+//!    (`verbs::commit_accepted`), the register's entry naming the sequence (the tool's commit), the local work's settle
+//!    (`verbs::settle_submit`) and the request's completion, in one transaction. Then the answer goes on the request's
+//!    route.
+//! 4. **A failed landing.** A store that refused the changeset leaves nothing applied or durable, so no reader saw
+//!    anything of it: the secured retention is credited back and the request is answered `Overloaded`, unrecorded, so
+//!    its retry runs ([`abandon`]). A revision the check refused (a version not made, counted `UNMADE`) commits the
 //!    version alone, as before.
 //!
 //! **A crash.** Before the step's commit nothing of the version is durable and the register names no new sequence, so
@@ -33,8 +37,8 @@
 //!
 //! **Not covered** (GAPS): a submit dispatched outside a recorded request (no answer waits on it) keeps the made task
 //! after its step; a Mercurial repository's green (`vcs_store::hg_made`) commits in the submit's step; git's adopts
-//! this hook (w-git). While the landing runs the green's engine stands at the version and reads see it before it is
-//! durable.
+//! this hook (w-git). The verdict's mapped files are made twice, once in the preview and once at the step (owed,
+//! performance).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -138,6 +142,15 @@ pub(crate) fn take_deferred(state: &mut ShardState) -> bool {
   std::mem::take(&mut state.made_commits.deferred)
 }
 
+/// Whether the running recorded submit holds the landing turn of `green`'s repository: its verdict is then judged and
+/// held, never applied in its step (module docs, 2).
+pub(crate) fn holds(state: &ShardState, green: DbVolumeId) -> bool {
+  state.current_request.is_some()
+    && state.made_commits.held.as_ref().is_some_and(|held| {
+      crate::vcs_store::svn_made::subversion_repository_of(state, green) == Some(held.repository)
+    })
+}
+
 /// The turn the running recorded submit holds for `green`'s repository, taken for its accept.
 pub(crate) fn take_held(state: &mut ShardState, green: DbVolumeId) -> Option<Held> {
   state.current_request?;
@@ -175,7 +188,10 @@ pub(crate) fn defer(
   state: &mut ShardState,
   held: Held,
   parts: AcceptedParts,
-  copies: Vec<crate::vcs_store::svn_made::MadeCopy>,
+  (copies, judged): (
+    Vec<crate::vcs_store::svn_made::MadeCopy>,
+    slates_merge::engine::Judged,
+  ),
 ) -> ReplyBody {
   let Some((origin, id)) = state.current_request else {
     held.turn.give_back(state);
@@ -190,7 +206,12 @@ pub(crate) fn defer(
   };
   state.acceptance_deferred = true;
   state.made_commits.deferred = true;
-  crate::vcs_store::svn_made::make_deferred(state, (held.repository, held.turn), pending, copies);
+  crate::vcs_store::svn_made::make_deferred(
+    state,
+    (held.repository, held.turn),
+    pending,
+    (copies, judged),
+  );
   crate::lease_wait::parked_reply()
 }
 
@@ -224,10 +245,10 @@ pub(crate) fn commit<T, E>(
   tool: impl FnOnce(&mut ShardState) -> Result<T, E>,
 ) -> Option<Result<T, E>> {
   let (green, version) = pending.version();
-  // A green made again from its durable chain while the landing ran (another step's refused publication) no longer
-  // stands at the version: nothing of it is committed.
-  if state.greens.get(&green).map(|engine| engine.head()) != Some(version) {
-    abandon(state, pending.request());
+  // The verdict was held, not applied (module docs, 2): it applies now, at the head it was judged at, as its chain
+  // entry records it (`Green::apply_recorded`, what a recovery replays). A green that moved meanwhile commits nothing.
+  if !crate::verbs::apply_accepted(state, &pending.parts) {
+    abandon(state, (pending.request(), green));
     return None;
   }
   let Pending {
@@ -277,10 +298,11 @@ pub(crate) fn commit<T, E>(
   made
 }
 
-/// Gives up a pending accept of `request` before its step (module docs, 4): nothing of it is durable; the green made
-/// again from its durable chain, and the request answered `Overloaded`, unrecorded, so its retry runs.
-pub(crate) fn abandon(state: &mut ShardState, (origin, id, route): Request) {
-  crate::verbs::reconcile_unpublished_effects(state);
+/// Gives up a pending accept of `request` to `green` before its step (module docs, 4): nothing of it was applied or made
+/// durable, so no reader saw it; the bytes its verdict secured are credited back, and the request answered
+/// `Overloaded`, unrecorded, so its retry runs.
+pub(crate) fn abandon(state: &mut ShardState, ((origin, id, route), green): (Request, DbVolumeId)) {
+  let _ = crate::merge_service::settle_green_retention(state, green);
   state.count(ABANDONED, 1);
   let reply = crate::verbs::refused(Refusal::Overloaded { shard: state.shard });
   answer(state, route, (origin, id), reply);

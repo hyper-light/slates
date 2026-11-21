@@ -91,6 +91,13 @@ pub enum LineageRefused {
   /// Another member's engine is out of the lineage with the arenas in it ([`Lineage::take`], [`Lent`]), so no other
   /// member can be read, written, branched or released until it is put back (A-575).
   Busy,
+  /// A held verdict's green moved since it was judged ([`Lineage::preview`]).
+  Moved {
+    /// The head it was judged at.
+    judged_at: u64,
+    /// The green's head.
+    head: u64,
+  },
 }
 
 /// Whether one dimension's key at a path has a history of its own, with the key it names there
@@ -651,6 +658,35 @@ impl Lineage {
     let (branch, reverted) = self.with(from, |green| green.branch_at(version))??;
     self.reverted = self.reverted.saturating_add(reverted);
     Ok(self.seat(branch))
+  }
+
+  /// What the held verdict `judged` makes of `from`'s head, as a member of its own (A-805): a branch at the head it was
+  /// judged at, O(1) (module docs, "What it costs"), with the verdict committed into it as its version 1, so a reader
+  /// that must see the version before it commits (a server-made commit's revision, made before its landing) reads it
+  /// there while `from` shows nothing of it. The branch reads as `from` would at the version once the verdict commits:
+  /// its head's every key, and its change index naming in `(0, 1]` what `from`'s would name in `(at, at + 1]`. Retire it
+  /// after ([`Lineage::retire`]). Refused, nothing made: [`LineageRefused::Moved`] once `from` has moved since the
+  /// verdict, or as a branch is.
+  pub fn preview(
+    &mut self,
+    from: LineageGreen,
+    judged: super::Judged,
+  ) -> Result<LineageGreen, LineageRefused> {
+    let head = self.with(from, |green| green.head())?;
+    if judged.at != head {
+      return Err(LineageRefused::Moved {
+        judged_at: judged.at,
+        head,
+      });
+    }
+    let preview = self.branch(from, head)?;
+    let mut judged = judged;
+    self.with(preview, |green| {
+      // The branch's head is its version 0: the verdict commits as the version after it.
+      judged.at = green.head();
+      green.commit_held(judged)
+    })?;
+    Ok(preview)
   }
 
   /// Retires `handle`'s green: its seat is freed and its handle stale from here on, and what it held is returned as a

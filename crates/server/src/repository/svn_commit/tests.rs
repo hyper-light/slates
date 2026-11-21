@@ -1389,11 +1389,15 @@ fn a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_t
     };
     crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
     on(|state| submit(state));
-    // The killed task's turn: let it run and end.
-    for _ in 0..64 {
+    // The killed task: its changeset lands, then the kill fires (clearing itself) where the step would commit.
+    let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+    while crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+      assert!(
+        slates_rt::futures::now_ns() < deadline,
+        "the kill never fired"
+      );
       slates_rt::futures::yield_now().await;
     }
-    crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(false));
     // A restart: what memory held past the durable state is made again from it.
     on(|state| crate::verbs::reconcile_unpublished_effects(state));
     rebuild(svn).await;
@@ -1477,5 +1481,129 @@ fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is
       (1, true, 2),
       "run again holding the turn, landed and answered"
     );
+  });
+}
+
+/// What a reader of `green`'s engine sees: its head and the bytes at `path` there.
+fn read_green(state: &ShardState, green: DbVolumeId, path: &str) -> Option<(u64, Option<Vec<u8>>)> {
+  let engine = state.greens.get(&green)?;
+  Some((engine.head(), engine.content(path).map(<[u8]>::to_vec)))
+}
+
+/// A server-made commit's verdict is held with its landing, never shown before it commits (A-805; main 02:37, piece 1;
+/// the landing order's "never expose a revision that was never committed"). Do: submit a work writing `trunk/a.txt` to
+/// a Subversion repository's green as a client's recorded request, and read the green's engine in the submit's own step,
+/// while its landing is held. Expect: the old head (0) and no `trunk/a.txt`; once the revision landed and committed,
+/// head 1 with the work's bytes. Under A-804 the verdict applied in memory at the submit, so a reader saw version 1
+/// before it was durable.
+#[test]
+fn a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head() {
+  stored(|| async move {
+    let (svn, green) = subversion("held-read").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("held-read-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let while_held = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      read_green(state, green, "trunk/a.txt")
+    });
+    youngest_reaches(svn, 1).await;
+    let after = on(|state| read_green(state, green, "trunk/a.txt"));
+    assert_eq!(
+      while_held,
+      Some((0, None)),
+      "the old head while the landing is held"
+    );
+    assert_eq!(
+      after,
+      Some((1, Some(b"alpha\n".to_vec()))),
+      "the version once committed"
+    );
+  });
+}
+
+/// A refused landing leaves nothing any reader saw (A-805; main 02:37, piece 1). Do: with the node's store refusing
+/// every changeset, submit a work to a Subversion repository's green as a client's recorded request; read the green in
+/// the submit's own step and after the landing was refused; then let the store take changesets and run the request
+/// again. Expect: every read the old head with no `trunk/a.txt`, nothing durable, the request not answered; the retry
+/// lands revision 1 once. Under A-804 a reader in the submit's step saw version 1, which the refusal then took back.
+#[test]
+fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once() {
+  stored(|| async move {
+    let (svn, green) = subversion("refused").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("refused-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let submit = move |state: &mut ShardState| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      )
+    };
+    crate::repository::svn_commit::landing::REFUSE_LANDING.with(|refuse| refuse.set(true));
+    let in_the_step = on(|state| {
+      submit(state);
+      read_green(state, green, "trunk/a.txt")
+    });
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let refused = on(|state| {
+      (
+        read_green(state, green, "trunk/a.txt"),
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        kept(state, svn).0,
+      )
+    });
+    crate::repository::svn_commit::landing::REFUSE_LANDING.with(|refuse| refuse.set(false));
+    assert_eq!(
+      in_the_step,
+      Some((0, None)),
+      "no reader saw the version in the submit's step"
+    );
+    assert_eq!(
+      refused,
+      (Some((0, None)), 0, false, 0),
+      "nothing of it after the refusal"
+    );
+    on(|state| submit(state));
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let retried = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(retried, (1, true, 2), "the retry landed once");
   });
 }
