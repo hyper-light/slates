@@ -1,4 +1,19 @@
 # w-perf (UI goal 93 part "An order of magnitude faster than competing servers, measured and recorded")
+
+## CLOSE LIST (main 16:20, Ada's order): C1 goal 93 shared; R2 the hg import's peak -- status 2026-11-20 ~17:30 PST
+- C1 CLOSED whole (inbox/main-from-w-perf-close.md):
+  - svn storage A/B vs FSFS: a4b6a9a22 + 756104912 (records' deltas 33.2 MiB raw vs stock FSFS revs 41.0 MiB).
+  - c3: 2502607c4 / 1df3d4700 (+ b51f908f2 WindowCache; replay 328 s -> 1.82 s).
+  - deltify job: 1b168038c (merged e1d896547), form (A): `vcs_store::svn_deltify`, `Record::Deltified`, replay holds
+    stored texts after the whole log. Test red (0,0,0) -> green (1,3,0).
+- R2 (hg import 5.73 GB, through w-store's payload as ruled 15:40): IN PROGRESS.
+  - b568499fe: revlog chains apply within two buffers (w-hg's question; red 263,219 -> 30,312 bytes charged).
+  - Attribution: r16/r20/r22 invalid (wrong pid; MallocStackLogging and `heap` stall the daemon past its 1 s liveness
+    window, the anchor kills it). r26: ps-only series + vmmap/footprint at done and landed only.
+  - Dependency: w-store's slates-store (piece 3) not built (2b waits on main: hyper-rt sync channel); hg onto it is
+    w-hg's C item. The cut through the payload waits on both; any non-whole-text share is cut now, red first.
+- New findings (GAPS only, not worked): A-722 p3's partial clone 1.4-1.5x slower (sent to w-git; now on w-git's P list);
+  same per-link apply loop in hg index.rs ~710 and import/record.rs ~1629 (told w-hg).
 Brief: ~/.local/state/slates-fanout/briefs/w-perf.md. Supervisor: SendMessage to "slates-7a".
 
 ## Piece 1: A-699 harness + STOCK baselines (git daemon on git/git; then hg serve, svnserve) -- started 2026-11-19
