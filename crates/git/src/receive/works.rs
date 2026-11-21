@@ -252,10 +252,7 @@ impl Preparing {
   /// what its judge makes the chains room for before the append, a green a turn (A-238, off the append's step).
   pub fn entry_bound(&self) -> Option<usize> {
     match &self.done {
-      Some(Ok(built)) => Some(slates_merge::chain_entry::entry_bound(
-        built.increment.encoded_len(),
-        &built.increment,
-      )),
+      Some(Ok(built)) => Some(slates_merge::chain_entry::entry_bound(&built.increment)),
       _ => None,
     }
   }

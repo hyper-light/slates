@@ -9,8 +9,14 @@
 //! (`crates/db/src/partition.rs`, guard-then-apply) is that a decision belongs before the append; the verdict is that
 //! decision, and this entry records its result. The position of a checkpoint no longer matters to replay.
 //!
-//! **What it holds.** The increment's own encoding, byte for byte, since a merge record's inputs are those bytes
-//! (`merge_service::inputs_of`) and a holder and a successor judge them afresh (§4.16 "Apply on holders"). Then each
+//! **What it holds.** The increment by reference (format 6, lane (A), main's ruling of 2026-11-21): its inputs identity
+//! and length, the identity the version's merge record names its inputs by (the inputs archive's manifest identity),
+//! under which the owner shard's content store holds the increment's own encoding, byte for byte, in the anchor-held
+//! segment beside the partition's log. A merge record's inputs are those bytes (`merge_service::inputs_lent`), and a
+//! holder and a successor judge them afresh (§4.16 "Apply on holders"). Until format 6 the entry carried the bytes
+//! themselves, so a 512 MiB increment was copied into the log in the owner's one durable step; now the content store
+//! holds them once, from before the verdict, and the step appends a few hundred bytes. A reader resolves the identity
+//! there and hands the bytes to [`decode`]: the effects below are read against the increment. Then each
 //! [`Applied`] effect: content by reference to the increment's post-state (the mapped ops of a splice, the declared ops
 //! of a create, the source path of a rename), a copied tree by its two paths (A-586), so no file's bytes are recorded
 //! twice; every other dimension by value.
@@ -37,8 +43,11 @@ use crate::special::SpecialNode;
 const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
 /// Format: the chain entry encoding's version; a decoder refuses any other. 2 since A-255 added the completion key, 3
 /// since A-288 added the submitting work beside it, 4 since A-321 added the signature's verdict, 5 since A-621 widened
-/// an op's path index to 64 bits (its record is the ops document's, version 2).
-const VERSION: u32 = 5;
+/// an op's path index to 64 bits (its record is the ops document's, version 2), 6 since lane (A) named the increment by
+/// its inputs identity and length in place of its bytes (module docs). A version 5 entry is refused `BadVersion`, never
+/// read by a second path: a segment is read only by the build that wrote it, its anchor restarting the daemon from its
+/// own image (§2.7; A-621's precedent).
+const VERSION: u32 = 6;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;
 /// Format: the byte that marks a head identity, a completion key or a submitting work present.
@@ -54,10 +63,11 @@ const WORK_BYTES: usize = 16;
 const COMPLETION_BYTES: usize = 8 + 4 + 4 + 1 + WORK_BYTES;
 /// Format: a signature's verdict at its largest: its marker, the verdict's kind and detail, and the signer's fingerprint.
 const SIGNATURE_BYTES: usize = 1 + 1 + 1 + HASH_BYTES;
-/// Format: the fixed bytes of an entry around its parts: magic, version, the increment's length, the effect count, the
-/// completion's marker and key, the identity's marker and hash, the signature's section, and the digest.
+/// Format: the fixed bytes of an entry around its parts: magic, version, the increment's inputs identity and length, the
+/// effect count, the completion's marker and key, the identity's marker and hash, the signature's section, and the
+/// digest.
 const ENTRY_OVERHEAD_BYTES: usize =
-  4 + 4 + 4 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + SIGNATURE_BYTES + HASH_BYTES;
+  4 + 4 + HASH_BYTES + 8 + 4 + 1 + COMPLETION_BYTES + 1 + HASH_BYTES + SIGNATURE_BYTES + HASH_BYTES;
 /// Format: an effect's largest fixed part: its tag and three length prefixes or counts.
 const EFFECT_OVERHEAD_BYTES: usize = 1 + 3 * 4;
 /// Format: the smallest an effect can encode to: its tag and one length prefix.
@@ -356,9 +366,21 @@ fn take_fix_rest(reader: &mut Reader<'_>, fix: &mut CopyFix) -> Result<(), DocDe
   Ok(())
 }
 
+/// The increment an entry names (format 6): the identity the owner shard's content store holds its encoding under, the
+/// inputs archive's manifest identity its version's merge record names, and the encoding's length.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Inputs {
+  /// The inputs archive's manifest identity (`merge_service::MergeShardState::inputs_identity`).
+  pub identity: [u8; 32],
+  /// The increment's encoding's length in bytes.
+  pub len: u64,
+}
+
 /// A decoded chain entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainEntry {
+  /// Where the increment is held.
+  pub inputs: Inputs,
   /// The increment.
   pub increment: Increment,
   /// What its verdict resolved it to.
@@ -449,7 +471,8 @@ mod tag {
 /// The largest an entry for `increment` can encode to, whatever its verdict resolves it to: what the service charges
 /// the chain before the verdict, so an accepted version is always recorded. Every effect comes from a declared op and
 /// names at most two of the document's strings; mapped ops are at most the declared ones; values are in the post-state.
-pub fn entry_bound(increment_bytes: usize, increment: &Increment) -> usize {
+/// The increment's own bytes are not in it: the content store holds them, charged there (format 6).
+pub fn entry_bound(increment: &Increment) -> usize {
   let ops = increment.doc.ops.len();
   let longest_string = increment
     .doc
@@ -462,7 +485,6 @@ pub fn entry_bound(increment_bytes: usize, increment: &Increment) -> usize {
   let per_effect =
     EFFECT_OVERHEAD_BYTES.saturating_add(longest_string.saturating_mul(STRINGS_PER_EFFECT));
   ENTRY_OVERHEAD_BYTES
-    .saturating_add(increment_bytes)
     .saturating_add(
       ops
         .saturating_mul(EFFECTS_PER_OP)
@@ -472,24 +494,24 @@ pub fn entry_bound(increment_bytes: usize, increment: &Increment) -> usize {
     .saturating_add(increment.post_state.len())
 }
 
-/// Encodes a chain entry from the increment's own encoding.
+/// Encodes a chain entry naming the increment by `inputs` (format 6: the content store holds its encoding).
 ///
 /// A splice whose ops are the ones the increment declared for that file (nothing was mapped: the common case, an increment
 /// based on the head) is recorded by its path alone.
 pub fn encode(
-  increment_bytes: &[u8],
+  inputs: Inputs,
   increment: &Increment,
   applied: &[Applied],
   completion: Option<Completion>,
   identity: Option<[u8; 32]>,
   signature: Option<Signature>,
 ) -> Vec<u8> {
-  // Reserved at the entry's bound once, never grown: the effects follow the increment's bytes, and growing past a
-  // revision-sized buffer copied it whole (A-742: 250 MiB of such copies in a 1,000-revision import).
-  let mut out = Vec::with_capacity(entry_bound(increment_bytes.len(), increment));
+  // Reserved at the entry's bound once, never grown (A-742).
+  let mut out = Vec::with_capacity(entry_bound(increment));
   out.extend_from_slice(&MAGIC.to_le_bytes());
   out.extend_from_slice(&VERSION.to_le_bytes());
-  put_bytes(&mut out, increment_bytes);
+  out.extend_from_slice(&inputs.identity);
+  out.extend_from_slice(&inputs.len.to_le_bytes());
   put_count(&mut out, applied.len());
   let declared = Declared::of(increment);
   for effect in applied {
@@ -556,16 +578,27 @@ pub(crate) fn take_signature(reader: &mut Reader<'_>) -> Result<Option<Signature
   }
 }
 
-/// The increment's own encoding within an entry, checking the entry's digest: what a merge record's inputs are.
-pub fn increment_bytes(entry: &[u8]) -> Result<&[u8], DocDecodeError> {
-  let mut reader = checked(entry)?;
-  reader_bytes(&mut reader)
+/// The increment an entry names, checking the entry's digest: where a reader resolves its bytes (format 6).
+pub fn inputs(entry: &[u8]) -> Result<Inputs, DocDecodeError> {
+  take_inputs(&mut checked(entry)?)
 }
 
-/// Decodes an entry: typed refusals, never a panic.
-pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
+fn take_inputs(reader: &mut Reader<'_>) -> Result<Inputs, DocDecodeError> {
+  let identity = <[u8; HASH_BYTES]>::try_from(reader.bytes(HASH_BYTES)?)
+    .map_err(|_| DocDecodeError::Truncated)?;
+  let len = reader.u64()?;
+  Ok(Inputs { identity, len })
+}
+
+/// Decodes an entry, its increment's encoding `increment_bytes` as the content store holds it under the entry's
+/// [`inputs`]: typed refusals, never a panic. Bytes of another length than the entry names are refused `Truncated`.
+pub fn decode(entry: &[u8], increment_bytes: &[u8]) -> Result<ChainEntry, DocDecodeError> {
   let mut reader = checked(entry)?;
-  let increment = Increment::decode(reader_bytes(&mut reader)?)?;
+  let inputs = take_inputs(&mut reader)?;
+  if u64::try_from(increment_bytes.len()).ok() != Some(inputs.len) {
+    return Err(DocDecodeError::Truncated);
+  }
+  let increment = Increment::decode(increment_bytes)?;
   let count = reader.u32()? as usize;
   // An effect is at least its tag and one length prefix, so a wild count is refused before anything is reserved.
   if count > reader.remaining() / EFFECT_MIN_BYTES {
@@ -613,6 +646,7 @@ pub fn decode(entry: &[u8]) -> Result<ChainEntry, DocDecodeError> {
     return Err(DocDecodeError::TrailingBytes);
   }
   Ok(ChainEntry {
+    inputs,
     increment,
     applied,
     completion,
@@ -897,12 +931,26 @@ pub(crate) fn take_applied(
   })
 }
 
+/// Where a test's content store would hold `bytes`: their BLAKE3 standing in for the inputs archive's identity, which
+/// this crate does not compute.
+#[cfg(test)]
+pub(crate) fn held_for_tests(bytes: &[u8]) -> Inputs {
+  Inputs {
+    identity: *blake3::hash(bytes).as_bytes(),
+    len: bytes.len() as u64,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::cell::Cell;
 
   use super::*;
   use crate::ops_doc::OpsDoc;
+
+  fn held(bytes: &[u8]) -> Inputs {
+    held_for_tests(bytes)
+  }
 
   /// A fix with a record of every kind it holds, present and absent.
   fn every_kind_fix() -> CopyFix {
@@ -993,6 +1041,115 @@ mod tests {
     );
   }
 
+  /// One file's increment: `body` written at `/f`, over version 2.
+  fn one_file(body: &[u8]) -> Increment {
+    let mut doc = OpsDoc::new();
+    let path = doc.paths.intern("f");
+    doc.ops.push(Op {
+      kind: OpKind::Overwrite,
+      flags: 0,
+      path,
+      at: 0,
+      len: body.len() as u64,
+      src: 0,
+    });
+    doc.canonicalize();
+    Increment {
+      id: [9; 32],
+      base: 2,
+      doc,
+      post_state: body.to_vec(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    }
+  }
+
+  /// Lane (A), format 6 (golden vector). Do: encode the entry of a one-file version spliced as declared, its
+  /// increment named by an identity of 32 bytes of 0xab and a length of 300, with no completion, head identity or
+  /// signature. Expect: these bytes, byte for byte: magic and version 6, the identity and the length, one effect (the
+  /// splice's tag and its path), three absent markers, then the BLAKE3 of all of it.
+  #[test]
+  fn a_format_six_entry_encodes_to_its_golden_bytes() {
+    let increment = one_file(b"abc");
+    let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
+    let inputs = Inputs {
+      identity: [0xab; 32],
+      len: 300,
+    };
+    let out = encode(inputs, &increment, &applied, None, None, None);
+    let mut golden = [
+      // "GCHN", version 6.
+      &b"GCHN\x06\x00\x00\x00"[..],
+      &[0xab; 32],
+      // The length, 300.
+      b"\x2c\x01\x00\x00\x00\x00\x00\x00",
+      // One effect: a splice as declared, of "f".
+      b"\x01\x00\x00\x00\x10\x01\x00\x00\x00f",
+      // No completion, no head identity, no signature.
+      b"\x00\x00\x00",
+    ]
+    .concat();
+    let digest = *blake3::hash(&golden).as_bytes();
+    golden.extend_from_slice(&digest);
+    assert_eq!(out, golden);
+    assert_eq!(inputs, super::inputs(&out).unwrap());
+  }
+
+  /// Lane (A), format 6. Do: record the same one-file version with a 3-byte file and with a 4 MiB one. Expect: the two
+  /// entries the same length (the increment's bytes are the content store's, not the entry's), each decoding, given its
+  /// increment's bytes, to the increment and effects recorded, and naming its increment's length.
+  #[test]
+  fn an_entrys_size_does_not_grow_with_its_increment() {
+    let mut sizes = Vec::new();
+    for body in [b"abc".to_vec(), vec![7u8; 4 << 20]] {
+      let increment = one_file(&body);
+      let applied = vec![Applied::Spliced("f".to_owned(), increment.doc.ops.clone())];
+      let increment_bytes = increment.encode();
+      let bytes = encode(
+        held(&increment_bytes),
+        &increment,
+        &applied,
+        None,
+        None,
+        None,
+      );
+      let entry = decode(&bytes, &increment_bytes).unwrap();
+      assert_eq!((entry.increment, entry.applied), (increment, applied));
+      assert_eq!(entry.inputs.len, increment_bytes.len() as u64);
+      sizes.push(bytes.len());
+    }
+    assert_eq!(sizes[0], sizes[1]);
+  }
+
+  /// Lane (A), format 6 (typed refusals). Do: decode a format-6 entry given bytes one short of the length it names; read
+  /// one whose version word is 5; and one whose identity's first byte was flipped after it was written. Expect:
+  /// `Truncated` (not the increment it names), `BadVersion` (a version 5 entry is never read by a second path) and
+  /// `Truncated` (the digest refuses it), each from `decode` and the version and digest from `inputs` too.
+  #[test]
+  fn a_format_six_entry_refuses_other_bytes_versions_and_damage() {
+    let increment = one_file(b"abc");
+    let increment_bytes = increment.encode();
+    let bytes = encode(held(&increment_bytes), &increment, &[], None, None, None);
+    assert_eq!(
+      decode(&bytes, &increment_bytes[1..]),
+      Err(DocDecodeError::Truncated)
+    );
+    let mut five = bytes.clone();
+    five[4] = 5;
+    assert_eq!(
+      decode(&five, &increment_bytes),
+      Err(DocDecodeError::BadVersion)
+    );
+    assert_eq!(super::inputs(&five), Err(DocDecodeError::BadVersion));
+    let mut damaged = bytes;
+    damaged[8] ^= 1;
+    assert_eq!(
+      decode(&damaged, &increment_bytes),
+      Err(DocDecodeError::Truncated)
+    );
+    assert_eq!(super::inputs(&damaged), Err(DocDecodeError::Truncated));
+  }
+
   thread_local! {
     /// The increment's ops an entry's index visited on this thread ([`Declared::of`]).
     static VISITS: Cell<u64> = const { Cell::new(0) };
@@ -1050,9 +1207,16 @@ mod tests {
       .collect();
     let increment_bytes = increment.encode();
     visits();
-    let bytes = encode(&increment_bytes, &increment, &applied, None, None, None);
+    let bytes = encode(
+      held(&increment_bytes),
+      &increment,
+      &applied,
+      None,
+      None,
+      None,
+    );
     let encoded = visits();
-    let entry = decode(&bytes).unwrap();
+    let entry = decode(&bytes, &increment_bytes).unwrap();
     let decoded = visits();
     assert_eq!(entry.applied, applied);
     assert_eq!((encoded, decoded), (FILES as u64, FILES as u64));
@@ -1104,8 +1268,16 @@ mod tests {
       Applied::Spliced(names[0].clone(), vec![increment.doc.ops[0]]),
       Applied::Spliced(names[names.len() - 1].clone(), vec![mapped]),
     ];
-    let bytes = encode(&increment.encode(), &increment, &applied, None, None, None);
-    let entry = decode(&bytes).unwrap();
+    let increment_bytes = increment.encode();
+    let bytes = encode(
+      held(&increment_bytes),
+      &increment,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let entry = decode(&bytes, &increment_bytes).unwrap();
     assert_eq!(entry.applied, applied);
     let Applied::Spliced(path, ops) = &entry.applied[1] else {
       panic!("not a splice: {:?}", entry.applied[1]);
