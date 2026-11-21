@@ -31,6 +31,8 @@ slates-archive = { workspace = true }
 slates-transport = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }
+# The version-control store's owner handle each shard holds (A-767).
+slates-store = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
 # The version-control servers' HTTP edge (§4.17.2 "Transports" item 1, A-625 part 2; `crate::vcs_http`): HTTP/1.1's
@@ -86,6 +88,8 @@ windows-sys = { workspace = true }
 slates-bridge-winfsp = { workspace = true }
 
 [dev-dependencies]
+# The store's log file a store test reads back after a restart (`repository/store_tests.rs`, A-767).
+hyper-block = { path = "../../vendor/hyper-raft/hyper-block" }
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
 rcgen = { workspace = true }
 # The guest-device test builds the FUSE requests a guest kernel would (the codec's ABI constants).

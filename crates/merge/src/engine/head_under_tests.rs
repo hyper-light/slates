@@ -104,8 +104,8 @@ fn fixture() -> Result<Green, String> {
 /// the directory or lie under it (every path for the root). Expect them equal, dimension by dimension, a file's length
 /// with it; and `a/b`'s far fewer than the whole green's, so the subtree is all a listing of it reads.
 #[test]
-fn a_greens_head_under_a_directory_is_its_subtree_of_the_whole_base() -> Result<(), String> {
-  let green = fixture()?;
+fn a_greens_head_under_a_directory_is_its_subtree_of_the_whole_base() {
+  let green = fixture().unwrap();
   let base = green.current_base();
   for dir in ["", "a", "a/b", "a/b/c", "ab", "top", "q"] {
     let prefix = format!("{dir}/");
@@ -154,5 +154,4 @@ fn a_greens_head_under_a_directory_is_its_subtree_of_the_whole_base() -> Result<
       .all(|(path, _)| !path.starts_with("ab")),
     "`ab` is no part of `a`"
   );
-  Ok(())
 }

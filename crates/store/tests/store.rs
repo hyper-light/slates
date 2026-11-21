@@ -34,13 +34,15 @@ fn open(dir: &Path) -> Store {
     Sizing {
       memory: 8 << 20,
       disk: 1 << 30,
+      extent_bytes: 128 << 10,
+      fanout: 8,
     },
   )
   .unwrap()
 }
 
 /// Lands one changeset of `repository` at `sequence`: a record section and a payload.
-fn land(store: &mut Store, repository: u64, sequence: u64, payload: &[u8]) -> [u8; 32] {
+fn land(store: &mut Store, repository: u128, sequence: u64, payload: &[u8]) -> [u8; 32] {
   let mut record = store
     .begin(Header {
       tool: Tool::Git,

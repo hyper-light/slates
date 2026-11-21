@@ -174,11 +174,11 @@ mod tests {
   /// The journal operations an edit records, as `crate::verbs::edit` records them.
   fn edit_ops(
     path: &str,
-    old: Option<&[u8]>,
+    old_len: Option<u64>,
     (at, delete_len, inserted): (u64, u64, usize),
   ) -> Vec<VolumeOp> {
     let mut ops = Vec::new();
-    if old.is_none() {
+    if old_len.is_none() {
       ops.push(VolumeOp::Create {
         path: path.to_owned(),
       });
@@ -219,14 +219,13 @@ mod tests {
         inserted,
       } => {
         let path = PATHS[*path];
-        let old = files
-          .get(base, path)
-          .unwrap()
-          .map(std::borrow::Cow::into_owned);
-        let ops = edit_ops(path, old.as_deref(), (*at, *delete_len, *inserted));
-        let (spliced, removed) =
-          files.splice_delta(path, old.as_deref(), (*at, *delete_len, *inserted));
-        let inserted_bytes = vec![b'x'; *inserted];
+        let old_len = files.len(base, path).unwrap();
+        let ops = edit_ops(path, old_len, (*at, *delete_len, *inserted));
+        let (spliced, removed) = files.splice_delta(path, old_len, (*at, *delete_len, *inserted));
+        // Each edit's bytes differ from every other's and from the base's, so a piece read from the wrong place shows.
+        let inserted_bytes: Vec<u8> = (0..*inserted)
+          .map(|index| u8::try_from((index + journal.len() * 7) % 200 + 50).unwrap())
+          .collect();
         files
           .splice(base, path, (*at, *delete_len), &inserted_bytes)
           .unwrap();
@@ -287,7 +286,10 @@ mod tests {
       let mut origin = Origin::default();
       let mut model: BTreeMap<String, Vec<u8>> = BTreeMap::new();
       for (path, len) in &seeded {
-        model.insert(PATHS[*path].to_owned(), vec![b'b'; *len]);
+        model.insert(
+          PATHS[*path].to_owned(),
+          (0..*len).map(|index| u8::try_from(index % 50).unwrap()).collect(),
+        );
       }
       origin.files = model.iter().map(|(path, bytes)| (path.clone(), bytes.clone())).collect();
       let green = Green::with_origin(origin.clone());

@@ -14,7 +14,7 @@
 //! name a changeset the log lacks and lack none it holds.
 //!
 //! **Rows** (item 3), keyed so a repository's rows are one contiguous range: `C`, then the repository and the
-//! changeset's sequence (each a big-endian `u64`, so the order of the bytes is the order of the numbers), whose value
+//! changeset's sequence (big-endian, a `u128` and a `u64`, so the order of the bytes is the order of the numbers), whose value
 //! is the record's offset and length in the log, its identity, its tool byte and its work; and `P`, then a payload
 //! section's identity (BLAKE3 of its bytes), whose value is where those bytes are in the log and their length, so a
 //! landed content is read by identity as a staged one is ([`Store::piece`]). The other tables of item 3
@@ -46,26 +46,38 @@ pub const ROWS_FILE: &str = "rows";
 const CHANGESETS: u8 = b'C';
 /// Format: the content table's tag: a payload section's identity to its place in the log.
 const CONTENTS: u8 = b'P';
+/// Format: a `u64` field's width.
+const U64: usize = size_of::<u64>();
+/// Format: a repository id's width (`u128`, A-515).
+const U128: usize = size_of::<u128>();
+/// Format: an identity's width (BLAKE3).
+const IDENTITY: usize = blake3::OUT_LEN;
+/// Format: a row key's first field, after its one-byte tag.
+const AFTER_TAG: usize = 1;
 /// Format: a content row's key: the tag and the identity.
-const CONTENT_KEY_BYTES: usize = 33;
-/// Format: a content row's value: the bytes' offset in the log and their length.
-const CONTENT_VALUE_BYTES: usize = 16;
+const CONTENT_KEY_BYTES: usize = AFTER_TAG + IDENTITY;
+/// Format: a content row's value: the bytes' offset in the log, then their length.
+const CONTENT_VALUE_BYTES: usize = U64 + U64;
 /// Format: the most bytes one [`Store::piece`] reads from the log: the read's unit (a caller walks pieces of any length
 /// until what it needs is whole), not a tuning of the reader.
-const PIECE_BYTES: usize = 1 << 16;
+pub const PIECE_BYTES: usize = 1 << 16;
+/// Format: a changeset row key's sequence, after the tag and the repository.
+const K_SEQUENCE: usize = AFTER_TAG + U128;
 /// Format: a changeset row's key: the tag, the repository, the sequence.
-const KEY_BYTES: usize = 17;
-/// Format: a changeset row's value: offset 8, length 8, identity 32, tool 1, work 8.
-const VALUE_BYTES: usize = 57;
-/// Cited: the bytes the engine spends a row beyond its key and value, mantle's own figure for its leaf sizing
-/// (`benches/shard_db.rs`: entries a leaf are memory over key, value and 3 bytes).
-const ROW_OVERHEAD: usize = 3;
-/// Cited: pages an extent, mantle's engine benches' extent (`benches/shard_db.rs`, `extent_pages: 32`). Learned per
-/// device with the engine's own measurement is owed (GAPS, A-767).
-const EXTENT_PAGES: u32 = 32;
-/// Cited: the trunk's fanout, SplinterDB's target fanout as mantle runs it (engine-structure.md §4, "SplinterDB chose
-/// 8"). Measured on the running hardware is owed with mantle's E-steps (GAPS, A-767).
-const FANOUT: usize = 8;
+const KEY_BYTES: usize = K_SEQUENCE + U64;
+/// Format: a changeset row value's length, after the offset.
+const V_LEN: usize = U64;
+/// Format: a changeset row value's identity, after the length.
+const V_IDENTITY: usize = V_LEN + U64;
+/// Format: a changeset row value's tool byte, after the identity.
+const V_TOOL: usize = V_IDENTITY + IDENTITY;
+/// Format: a changeset row value's work, after the tool byte.
+const V_WORK: usize = V_TOOL + 1;
+/// Format: a changeset row's value.
+const VALUE_BYTES: usize = V_WORK + U64;
+/// Format: the engine's framing of one entry beyond its key and value (mantle's memtable entry: a type byte and a
+/// one-byte length varint for each of a key and a value shorter than 128 bytes, as these rows' are).
+const ROW_OVERHEAD: usize = 1 + 1 + 1;
 
 /// What the store may hold, from its caller: the memory its shard lends it and the disk its grant allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +87,12 @@ pub struct Sizing {
   pub memory: usize,
   /// Bytes the engine's file may grow to (the grant's allowance).
   pub disk: u64,
+  /// Bytes of one engine extent, the unit its file grows and its compactions write in: the device's transfer at full
+  /// bandwidth, which the caller's machine profile measures (mantle derives it so, node.md §2.7).
+  pub extent_bytes: u64,
+  /// The engine trunk's fanout, measured on the running hardware by the caller (mantle engine-structure.md §4:
+  /// "the fanout F and the memtable size m are measured on the running hardware").
+  pub fanout: usize,
 }
 
 /// Why the store refused.
@@ -149,7 +167,7 @@ pub enum Contents<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Changeset {
   /// The repository.
-  pub repository: u64,
+  pub repository: u128,
   /// Its sequence.
   pub sequence: u64,
   /// The record's offset in the log.
@@ -328,10 +346,21 @@ impl Store {
     Ok(self.log.sections(&located)?)
   }
 
+  /// At most [`PIECE_BYTES`] of the log from `offset` (a section's bytes, by the place [`Store::sections`] gave), as
+  /// far as `len` reaches.
+  pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, StoreError> {
+    let take =
+      usize::try_from(len.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
+        .map_err(|_| StoreError::BadRow)?;
+    let mut bytes = vec![0u8; take];
+    self.log.read_at(&mut bytes, offset)?;
+    Ok(bytes)
+  }
+
   /// The repository's landed changesets from sequence `from` on, at most `limit`, in order.
   pub fn changesets(
     &mut self,
-    repository: u64,
+    repository: u128,
     from: u64,
     limit: usize,
   ) -> Result<Vec<Changeset>, StoreError> {
@@ -380,9 +409,15 @@ fn engine_sizing(
   sizing: Sizing,
 ) -> Result<(Config, usize, TrunkConfig), StoreError> {
   let page_size = file.layout_block().get();
-  let extent_bytes = u64::try_from(page_size)
-    .ok()
-    .and_then(|page| page.checked_mul(u64::from(EXTENT_PAGES)))
+  let page = u64::try_from(page_size).map_err(|_| StoreError::Sizing("a page past u64"))?;
+  let extent_pages = sizing
+    .extent_bytes
+    .checked_div(page)
+    .and_then(|pages| u32::try_from(pages).ok())
+    .filter(|pages| *pages > 1)
+    .ok_or(StoreError::Sizing("an extent under two pages"))?;
+  let extent_bytes = page
+    .checked_mul(u64::from(extent_pages))
     .ok_or(StoreError::Sizing("an extent past u64"))?;
   let max_extents = sizing
     .disk
@@ -403,29 +438,23 @@ fn engine_sizing(
   Ok((
     Config {
       page_size,
-      extent_pages: EXTENT_PAGES,
+      extent_pages,
       max_extents,
     },
     sizing.memory,
     TrunkConfig {
-      fanout: FANOUT,
+      fanout: sizing.fanout,
       leaf_entries,
     },
   ))
 }
 
 /// The changeset row's key.
-fn changeset_key(repository: u64, sequence: u64) -> [u8; KEY_BYTES] {
+fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   let mut key = [0u8; KEY_BYTES];
-  if let Some(tag) = key.get_mut(0) {
-    *tag = CHANGESETS;
-  }
-  if let Some(slot) = key.get_mut(1..9) {
-    slot.copy_from_slice(&repository.to_be_bytes());
-  }
-  if let Some(slot) = key.get_mut(9..17) {
-    slot.copy_from_slice(&sequence.to_be_bytes());
-  }
+  put(&mut key, 0, &[CHANGESETS]);
+  put(&mut key, AFTER_TAG, &repository.to_be_bytes());
+  put(&mut key, K_SEQUENCE, &sequence.to_be_bytes());
   key
 }
 
@@ -437,23 +466,20 @@ fn put_changeset<F: BlockFile>(
 ) -> Result<(), StoreError> {
   let header = &located.header;
   value.clear();
-  value.extend_from_slice(&located.offset.to_le_bytes());
-  value.extend_from_slice(&located.len.to_le_bytes());
-  value.extend_from_slice(&located.identity);
-  value.push(tool_byte(header.tool));
-  value.extend_from_slice(&header.work.to_le_bytes());
+  value.resize(VALUE_BYTES, 0);
+  put(value, 0, &located.offset.to_le_bytes());
+  put(value, V_LEN, &located.len.to_le_bytes());
+  put(value, V_IDENTITY, &located.identity);
+  put(value, V_TOOL, &[header.tool.byte()]);
+  put(value, V_WORK, &header.work.to_le_bytes());
   rows.put(&changeset_key(header.repository, header.sequence), value)?;
   Ok(())
 }
 
 /// The content row's key of `identity`.
 fn content_key(identity: &Identity, key: &mut [u8; CONTENT_KEY_BYTES]) {
-  if let Some(tag) = key.get_mut(0) {
-    *tag = CONTENTS;
-  }
-  if let Some(slot) = key.get_mut(1..33) {
-    slot.copy_from_slice(identity);
-  }
+  put(key, 0, &[CONTENTS]);
+  put(key, AFTER_TAG, identity);
 }
 
 /// Puts the content row: `identity`'s bytes are `len` bytes at `offset` in the log.
@@ -466,12 +492,8 @@ fn put_content<F: BlockFile>(
   let mut key = [0u8; CONTENT_KEY_BYTES];
   content_key(identity, &mut key);
   let mut value = [0u8; CONTENT_VALUE_BYTES];
-  if let Some(slot) = value.get_mut(0..8) {
-    slot.copy_from_slice(&offset.to_le_bytes());
-  }
-  if let Some(slot) = value.get_mut(8..16) {
-    slot.copy_from_slice(&len.to_le_bytes());
-  }
+  put(&mut value, 0, &offset.to_le_bytes());
+  put(&mut value, U64, &len.to_le_bytes());
   rows.put(&key, &value)?;
   Ok(())
 }
@@ -481,45 +503,45 @@ fn decode_content(value: &[u8]) -> Option<(u64, u64)> {
   if value.len() != CONTENT_VALUE_BYTES {
     return None;
   }
-  Some((u64_at(value, 0)?, u64_at(value, 8)?))
+  Some((u64_at(value, 0)?, u64_at(value, U64)?))
 }
 
-fn tool_byte(tool: crate::log::Tool) -> u8 {
-  match tool {
-    crate::log::Tool::Git => 1,
-    crate::log::Tool::Mercurial => 2,
-    crate::log::Tool::Subversion => 3,
+/// Writes `bytes` into `out` at `at` (a layout's field; a field past `out` is a layout fault no row reaches).
+fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
+  if let Some(slot) = at
+    .checked_add(bytes.len())
+    .and_then(|end| out.get_mut(at..end))
+  {
+    slot.copy_from_slice(bytes);
   }
+}
+
+fn field<const N: usize>(bytes: &[u8], at: usize) -> Option<[u8; N]> {
+  bytes.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
-  bytes
-    .get(at..at.checked_add(8)?)?
-    .try_into()
-    .ok()
-    .map(u64::from_le_bytes)
+  field(bytes, at).map(u64::from_le_bytes)
 }
 
 fn decode_changeset(key: &[u8], value: &[u8]) -> Result<Changeset, StoreError> {
-  let be = |at: usize| -> Option<u64> {
-    key
-      .get(at..at.checked_add(8)?)?
-      .try_into()
-      .ok()
-      .map(u64::from_be_bytes)
-  };
   if key.len() != KEY_BYTES || key.first() != Some(&CHANGESETS) || value.len() != VALUE_BYTES {
     return Err(StoreError::BadRow);
   }
+  let be = |at: usize| {
+    field(key, at)
+      .map(u64::from_be_bytes)
+      .ok_or(StoreError::BadRow)
+  };
+  let le = |at: usize| u64_at(value, at).ok_or(StoreError::BadRow);
   Ok(Changeset {
-    repository: be(1).ok_or(StoreError::BadRow)?,
-    sequence: be(9).ok_or(StoreError::BadRow)?,
-    offset: u64_at(value, 0).ok_or(StoreError::BadRow)?,
-    len: u64_at(value, 8).ok_or(StoreError::BadRow)?,
-    identity: value
-      .get(16..48)
-      .and_then(|bytes| bytes.try_into().ok())
+    repository: field(key, AFTER_TAG)
+      .map(u128::from_be_bytes)
       .ok_or(StoreError::BadRow)?,
-    work: u64_at(value, 49).ok_or(StoreError::BadRow)?,
+    sequence: be(K_SEQUENCE)?,
+    offset: le(0)?,
+    len: le(V_LEN)?,
+    identity: field(value, V_IDENTITY).ok_or(StoreError::BadRow)?,
+    work: le(V_WORK)?,
   })
 }
