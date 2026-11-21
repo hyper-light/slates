@@ -79,3 +79,9 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   Both are on branch agents/w-realtools-93. Not on main yet: the focused macOS run (the pragma test with
   SLATES_TEST_CLI=1) hasn't run, because kiln can't reach Studio-2 or adas-mac-studio.local-2 at all right now (r1, r2
   and two one-line probes: "did not answer in 15s").
+- 13:30 PST: FINDING by use (inbox/main-from-w-realtools-nfs-opendir.md): a fresh slates NFS mount stalls its first
+  opendir on Studio-2 (2/2) and Studio-4; the client sends FSSTAT over and over and never READDIR or CREATE. Added the
+  300 s bounds (7acdf392), so the test now fails in 305 s naming the stall instead of hanging. Branch
+  agents/w-realtools-93 (1d14aa65, 69a06d89, 7acdf392) waits for one green run on a Mac where mounts work (asked main
+  about adas-macbook-pro-2). r14 (the same test at 9793d9218 on Studio-2, to tell a regression from the host) is lost
+  while Studio-2 doesn't answer; I check for and clean any mount it left.
