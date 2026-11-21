@@ -613,6 +613,35 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
 const STREAM_DISABLED_WARNING: &str =
   "warning: stream clone requested but server has them disabled";
 
+/// The value of counter `name` in the daemon's status report (`slates status --json`, each counter an object
+/// `{"count":N,"kind":"name"}`, one a shard that counted it): their sum, zero where none counted.
+fn counter(instance: &str, name: &str) -> u64 {
+  let (code, status, err) = slates(instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status: {err}");
+  let kind = format!("\"kind\":\"{name}\"");
+  status
+    .match_indices(&kind)
+    .filter_map(|(at, _)| {
+      let object = &status[status[..at].rfind('{')?..at];
+      let count = &object[object.find("\"count\":")? + "\"count\":".len()..];
+      count
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum()
+}
+
+/// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
+const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+
+/// Shape: the most turns the pushed repository's stream clone may take: its store asks end a turn each (a pass's rows,
+/// the chunks) and the last turn ends the answer. A turn that yielded at its first quantum took one entry or one
+/// chunk, so this repository's stream was a turn a step before A-783's pacing reached the edge.
+const STREAM_TURNS_AT_MOST: u64 = 6;
+
 /// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
 const STREAMING_LINE: &str = "streaming all changes";
 
@@ -624,7 +653,8 @@ const STREAMING_LINE: &str = "streaming all changes";
 /// repository (`slates repository import`) and push the same history into another; `hg clone --stream` each. Expect the
 /// imported one's clone to succeed with 7.2's warning and no stream, and the pushed one's to stream as before, each
 /// clone holding the source's changesets and passing `hg verify` without a warning (the empty file's log streamed
-/// split left its `.d` out of the client's fncache, two warnings on hg-src's prefix). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+/// split left its `.d` out of the client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking
+/// at most [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly() {
@@ -698,10 +728,18 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_
         .ok_or(verify_said),
     )
   };
+  let imported = clone_stream("imported");
+  let turns_before = counter(&instance, STREAM_TURNS);
+  let pushed = clone_stream("pushed");
+  let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
   assert_eq!(
-    (clone_stream("imported"), clone_stream("pushed")),
+    (imported, pushed),
     ((true, false, true, Ok(())), (false, true, true, Ok(()))),
     "(warned, streamed, whole, verified clean) for the imported repository's clone, then the pushed one's"
+  );
+  assert!(
+    (1..=STREAM_TURNS_AT_MOST).contains(&turns),
+    "the pushed repository's stream took {turns} turns"
   );
 }
 

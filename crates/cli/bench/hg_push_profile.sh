@@ -13,7 +13,10 @@
 # With STEP=stream the push runs unmeasured first, and the step measured is a stream clone of what it landed
 # (`hg clone -U --stream`): the same timeline, samples and resident set, and the bytes the client received.
 #
-# Usage: [SAMPLE=0] [STEP=push|stream] hg_push_profile.sh SLATES HG SOURCE OUT [WINDOW]
+# ROUNDS=N (stream only) times N stream clones first, unsampled, each's wall time and the bytes its client received,
+# the first checked by `hg verify`: the A/B's slates side, all N shown.
+#
+# Usage: [SAMPLE=0] [STEP=push|stream] [ROUNDS=N] hg_push_profile.sh SLATES HG SOURCE OUT [WINDOW]
 #   SLATES  the release `slates` binary;  HG  stock hg 7.2;  SOURCE  the history pushed;  OUT  a directory made here
 #   WINDOW  seconds a sample window covers (default 20);  SAMPLE=0  no sampling (the daemon at full speed)
 set -uo pipefail
@@ -57,6 +60,14 @@ if [ "$STEP" = stream ]; then
   "${H[@]}" "${AUTH[@]}" -R "$SOURCE" push -q "$URL" || { echo "the unmeasured push failed"; exit 1; }
   echo "push (unmeasured) $(perl -e 'printf "%.1f", $ARGV[1] - $ARGV[0]' "$t" "$(now)") s"
   MEASURED=(clone -U --stream "$URL" "$OUT/stream-clone")
+  for round in $(seq 1 "${ROUNDS:-0}"); do
+    rm -rf "$OUT/round-clone"
+    t=$(now)
+    said=$("${H[@]}" "${AUTH[@]}" clone -U --stream --debug "$URL" "$OUT/round-clone" 2>&1 | grep -E "^\(sent |files to transfer|abort")
+    echo "slates stream $round $(perl -e 'printf "%.3f", $ARGV[1] - $ARGV[0]' "$t" "$(now)") s; $(echo "$said" | tr '\n' ' ')"
+    [ "$round" = 1 ] && echo "slates stream verify: $("${H[@]}" -R "$OUT/round-clone" verify 2>&1 | grep -E 'checked|warning|error|integrity' | tr '\n' ' ')"
+  done
+  rm -rf "$OUT/round-clone"
 fi
 D=$(daemon)
 echo "daemon $D; step $STEP; load $(sysctl -n vm.loadavg)"

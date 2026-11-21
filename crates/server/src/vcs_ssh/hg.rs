@@ -82,6 +82,8 @@ pub(crate) struct HgCommand<S: HgStores> {
   warning: Vec<u8>,
   /// Input that arrived after the session ended, which it dropped: given back to the window at the next step.
   dropped: usize,
+  /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
+  costs: crate::vcs_store::hg_view::TurnCosts,
 }
 
 impl<S: HgStores> HgCommand<S> {
@@ -108,6 +110,7 @@ impl<S: HgStores> HgCommand<S> {
       stdio: Stdio::new(window),
       warning,
       dropped: 0,
+      costs: crate::vcs_store::hg_view::TurnCosts::ZERO,
     }
   }
 }
@@ -169,11 +172,13 @@ fn answered_step<S: HgStores>(
 
 /// A stream's turn (A-745, §4.17.1 "A fetch's answer"): what its next step asks of the node's changeset store answered
 /// first; then a `getbundle`'s answer made a turn at a time, the view lent for the turn, each slice within the shard's
-/// room, the turn ending at its quantum or once a room's worth waits to be sent.
+/// room, the turn paced (A-783, [`crate::vcs_store::hg_view::paced_turn`]) and ending once a room's worth waits to be
+/// sent or the store is asked.
 async fn streamed_turn<S: HgStores>(
   stores: &mut S,
   (generation, repository, room): (&S::Hold, RepositoryId, u64),
   stdio: &mut Stdio,
+  costs: &mut crate::vcs_store::hg_view::TurnCosts,
 ) -> Result<Progress, Refused> {
   if let Some(wants) = stdio.store_wants()
     && !crate::vcs_store::hg_view::answer_store_wants(wants, repository).await
@@ -184,19 +189,24 @@ async fn streamed_turn<S: HgStores>(
   let mut admission = Admission::new(turn_room);
   let start = slates_rt::futures::now_ns();
   let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
-  stores
+  let mut paced = crate::vcs_store::hg_view::paced_turn(quantum, start);
+  let turned = stores
     .lend_held(generation, &mut admission, |store, _| {
       loop {
+        if !paced.more(crate::vcs_store::hg_view::ANSWER_STEP, costs) {
+          break Progress::Streamed { more: true };
+        }
         match stdio.stream(store, turn_room) {
           Progress::Streamed { more: true }
-            if slates_rt::futures::now_ns().saturating_sub(start) < quantum
-              && stdio.stdout().len() < bound
-              && stdio.store_wants().is_none() => {}
+            if stdio.stdout().len() < bound && stdio.store_wants().is_none() => {}
           other => break other,
         }
       }
     })
-    .ok_or_else(unheld)
+    .ok_or_else(unheld);
+  paced.close(slates_rt::futures::now_ns(), costs);
+  crate::vcs_store::hg_view::turn_taken();
+  turned
 }
 
 /// The words a session ends with when its store is no longer held here: the site's not-served words (its step 3).
@@ -239,6 +249,7 @@ impl<S: HgStores> Command for HgCommand<S> {
       room,
       stdio,
       dropped,
+      costs,
       ..
     } = self;
     if let Some(push_room) = stores.push_room(*repository) {
@@ -247,7 +258,7 @@ impl<S: HgStores> Command for HgCommand<S> {
     let progress = if stdio.taking_push() {
       stdio.step_push()
     } else if let (true, Some(generation)) = (stdio.streaming(), generation.as_ref()) {
-      streamed_turn(stores, (generation, *repository, *room), stdio).await?
+      streamed_turn(stores, (generation, *repository, *room), stdio, costs).await?
     } else {
       answered_step(stores, (*repository, *room), stdio, generation)?
     };
