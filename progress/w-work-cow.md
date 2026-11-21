@@ -50,3 +50,10 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
 - Next (not started): a rebase restates changed files whole (Rebased::changed full bytes; WorkFiles::from_changed) --
   a work rebased after a one-byte edit of a 1 GB file holds 1 GB again. Pieces through the rebase would bound it.
   mounted_work.rs ~389 `changed_span` materializes a changed file via `get` (w-work-mount's; told them len+page).
+
+## Close list (Ada's order 2026-11-20 16:20): C1 + P2 -- BOTH CLOSED
+- C1 = A-790 (0c5dd0cb5, main af045255b); close note pushed (bff98c3f9).
+- P2 = the grid (5aef5f02f, main f9c113ae9): 135 runs in BENCHMARKS; after 1.6-5.6 KB a work flat, before 1.5 MB-1.25 GB.
+- New finding -> GAPS only: a 1 GiB / 100k-file single submit stalls its shard past the liveness window (watchdog exit 4).
+- Cleaned: grid worktree, ~/.cache/w-work-cow-{grid-run,serve}. Kept: clone, target, push scripts.
+- Queue empty.
