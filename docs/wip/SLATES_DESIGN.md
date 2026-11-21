@@ -11232,7 +11232,12 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > served through a tree host (`slates_vfs::host::tree`) lent with the green for each NFS or FUSE request
 > (`crates/server/src/green_tree.rs`); a submit declares the overlay's diverged set. 8 mounts over a 64 MiB green add
 > 1.5 MB resident (548 MB when each copied the green) and a mount is made in 1.3 ms (34 ms), against 0.6 ms over a
-> 16-file green (`crates/server/tests/mounted_work_cow.rs`). Owed: the green's landing view still copies its head.
+> 16-file green (`crates/server/tests/mounted_work_cow.rs`). A green's landing view is the same overlay over the
+> green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
+> judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
+> a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
+> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
 
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
 > (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
@@ -11603,7 +11608,10 @@ alone runs out of its budget, anchors on tokens unique to both files with Myers 
 in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
 merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
 base yields the writer's file byte for byte (the property test). A path with namespace ops, node-exclusive flags, or a
-base the sealing shard cannot read keeps its whole replacement. The same journal yields the
+base the sealing shard cannot read keeps its whole replacement. The refinement runs a unit at a time under its
+owner's turns (A-787): every piece of its work is metered and asks for the next unit at `refine::WORK_PER_TICK` of it, so
+its longest step stays tens of microseconds whatever the file's size. The submit still calls it in one step until
+A-787 part 2 drives it over the shard's turns. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -55965,6 +55973,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
+- **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
+  cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
+  adopt its index fork sealed into tables, where the rows had stayed in the index's tail; a row read is now a search of
+  each run, newest first.
+- **The profile** (`sample` of the daemon during the partial clone, release, main ab760dc65): the answer's object walk
+  (`Negotiating::step`) was `Index::get` and `ContentStore::get` under `StoreGraph::kind` (two rows an object: the id
+  by position, then its row) and under the tree entries' positions; and each blob's size was read (two rows more) for
+  a filter that sends no blob whatever its size.
+- **Change.** A blob's size is read only where the filter reads sizes (`Filter::reads_size`: `blob:limit`, alone or
+  combined; the object walk and the runs' carried objects). A position's type is read from its landing's runs
+  (`Repository::kind_at`): a landing gives positions by type, then id (A-639), so staging records each type's run
+  (`Staged::kinds`) and the landing keeps it (four runs at most a landing, charged with the landing map), and
+  `StoreGraph::kind` reads no row.
+- **Tests.** `slates-git` `negotiation::tests::a_filter_that_reads_no_size_asks_none` (red before: 40 sizes asked
+  under `blob:none`) and `store::repository::graph::tests::a_type_is_read_from_its_landing_with_no_row_read` (red
+  before: 24 index visits for 12 objects); `slates-git --lib` 582 passed; `slates-server --lib -- git vcs_store vcs_http` 220 passed.
+- **By use** (adas-mac-studio.local-2, release, w-perf's `git_scale.sh` on git/git cut at v1.0.0 with ten partial
+  clones each against one daemon after its steps, load 33-36): the daemon's CPU a partial clone 700-760 ms on main
+  (ab760dc65) and 250-360 ms after; wall 0.96-1.05 s and 0.49-0.63 s, under the 0.62-0.72 s before part 3.
+
 ### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
 - **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
   (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
@@ -57915,4 +57944,39 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
   chunks (`cut_shipments` → `inputs_of` → `inputs_archive`: every byte hashed and chunked again) to ship one shipment's
   bound of it: work of the order of the size squared over the bound for a large increment. Main's lane-throughput
   item.
+
+### A-787 — A whole-file rewrite's refinement sliced under its owner's turns (2026-11-20, w-rewrite-ops; main's pushback on A-776 at 15:20 PST, item 1; §4.3's step budget, CLAUDE.md §3 "Bounded work everywhere", A-752, A-776)
+
+- **The gap.** A-776's refinement ran in one step. Measured release on an Apple M4 Max: 14 ms for a 300 KiB source file
+  re-indented, 47 to 52 ms at 4 MiB and 166 to 211 ms at 12 MiB, against a shard's quantum of its measured wake.
+- **The change (part 1, `slates_merge::refine`).**
+  - **Metered work.** Every piece of work is charged to a meter that asks the owner's turn for the next unit
+    (`pace::Ticks`) every `WORK_PER_TICK` (4,096) of it: a byte scanned or compared, a diagonal visited, a word hashed.
+    The hot loops run synchronously up to the unit's room and await only between units. `Refiner::refine_paced` and
+    `refine_rewrites_paced` are the paced forms; the sync forms run the same code under no turn.
+  - **No single charge past a unit.** A token is cut at 4,096 bytes. No vector doubles in one step: units are counted,
+    then laid; ranges sit in chunks that double from 64 to 4,096. No hash table rehashes: the anchors are a paced
+    least-significant-digit radix sort of 32-bit hashes of word units. A base-to-writer map is zeroed in order. The
+    relaid post-state's sort and the document's order are the paced ones.
+- **Rejected, measured.**
+  - A heapsort in place for the anchors: 12 times slower on a 1 MiB rewrite.
+  - A hash table: its rehash is one step that grows with the file.
+  - Hashing blank and punctuation units: about double the sort for anchors that almost never exist.
+- **A/B** (BENCHMARKS "A rewrite's refinement sliced"). Release, interleaved with A-776 (561c655a3), three runs of five
+  rounds, all shown there.
+  - Longest step: the whole save before; after, 10 to 46 µs on the crate's sources and 31 to 99 µs at 1 and 4 MiB. At
+    12 MiB it is typically 40 to 300 µs, but 3 of 15 rounds had one unit of 1.8 to 2.8 ms, not yet explained.
+  - Per-save time: 1.45 to 1.5 times A-776's on sources and at 1 MiB, 1.35 times at 4 MiB, 1.15 times at 12 MiB. The
+    search's steps are identical (2,365,669 for `engine.rs`), so the cost is the meter's per-comparison bookkeeping.
+  - The corpus verdicts are unchanged: 0 of 720 false conflicts, 240 of 240 one-token clashes still conflicting.
+- **Tests.** `a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time`: a 3.1 MiB rewrite driven a turn at a time
+  spans many turns, no unit does more than three units' work or a 64th of the file's, and the document and plan equal
+  the unpaced refinement's. Red with the asks disabled (one unit did all the work), green with them. Plus A-776's
+  eight. macOS arm64, this Mac, local.
+- **Part 2 (next, in flight):** the submit drives `refine_rewrites_paced` over the shard's turns. Today
+  `verbs::compose_increment` runs it in one step. Shape proposed: the work's gate parks a submit whose journal replaces
+  a file whole, local green or not; a task of the work's shard refines copies of the two files, a turn at a time; the
+  verb resumes with the ranges, as an owner's answer resumes it (A-247). To use A-783's pacing primitive once it lands.
+- **Applied in the same change to:** §4.16 "Composition at seal"; GAPS D-O17; BENCHMARKS; `crates/merge/src/refine.rs`,
+  its tests, `examples/rewrite_slices.rs` (new), `examples/rewrite_ab.rs`.
 

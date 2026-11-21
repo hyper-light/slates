@@ -16012,4 +16012,65 @@ next piece; the immediate poll lands with it, not before.
   coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
   next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
   the candidates), measured on a quiet host before anything is changed.
+## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
 
+
+## A partial clone back under its time before A-722 part 3: no row read for a type or an unread size (main's order 1; w-perf's A/B; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2 (shared, load 33-36), release; w-perf's `git_scale.sh` on
+  git/git cut at v1.0.0 (2,930 commits, 12,233 objects), its steps (push, clone, incremental push and fetch, shallow,
+  partial), then ten `git clone --bare --filter=blob:none` against the same daemon, each timed and the daemon's CPU
+  (`ps -o time`) taken before and after. main ab760dc65 against the change (a2fb50583).
+
+| | daemon CPU a partial clone (ten) | wall (ten) |
+|---|---|---|
+| main | 740, 700, 740, 760, 730, 740, 750, 730, 740, 720 ms | 0.967, 0.958, 1.028, 1.044, 1.011, 1.019, 1.048, 1.051, 1.020, 0.978 s |
+| after | 260, 270, 290, 250, 340, 330, 320, 340, 360, 350 ms | 0.489, 0.510, 0.514, 0.500, 0.633, 0.581, 0.584, 0.580, 0.615, 0.595 s |
+
+- **What it says.** w-perf measured 0.62-0.72 s before part 3 and 0.93-1.04 s after; the walk now reads no row for a
+  type (its landing's runs) and none for a size `blob:none` does not use, so the partial clone is under its time before
+  part 3. The scale script's own interleaved rounds on the shared machine were too noisy to compare by wall time (a
+  full clone of either arm took 6.4 to 28 s), so the daemon's CPU is the comparison.
+`crates/server/tests/green_landing_cow.rs` (measured as `mounted_work_cow.rs presenting` before its move to a binary of its own), release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
+side, all shown. A 64 MiB green of 1,024 files of 64 KiB; its landing presented into a fresh directory, then granted and
+landed. Before: main 7f8eb5cbb (the landing view a scratch volume holding a copy of the head, a2415c930). After: the
+view an overlay over the green's head, planned whole and read through the tree host beside the writer.
+
+| side | presenting adds (MB) | the granted landing adds (MB) |
+|---|---|---|
+| before | 69.34, 69.35, 69.29, 69.21, 69.26 | 1.57, 1.77, 1.61, 1.70, 1.62 |
+| after | 1.74, 1.67, 1.82, 1.61, 1.51 | 1.08, 1.06, 1.05, 1.00, 2.80 |
+
+Bound the test holds: 16.8 MB (a fixed 8 MiB and 8 MiB of windows and entries).
+
+## A rewrite's refinement sliced under its owner's turns: longest step 10-99 µs up to 4 MiB, per save 1.15-1.5x (A-787; 2026-11-20)
+
+Command: `cargo run --release -p slates-merge --example rewrite_slices`, built at A-787 and at A-776 (561c655a3, the
+example's sliced half stubbed), each tree from `git archive`. Run interleaved, three runs a side, five rounds a case,
+on adas-mac-studio-2 (Apple M4 Max, 14 cores, macOS arm64), load 13 to 14, 16:30 PST. Cases: each source file of the
+merge crate re-indented with every hundredth line's first word changed, and the same at 1, 4 and 12 MiB generated.
+"whole" is the refinement in one call (best of five, ms). "longest unit" is `Pace::longest_unit_ns` driving the paced
+refinement on the real clock with 250 µs turns.
+
+| case | A-776 whole ms (3 runs) | A-787 whole ms (3 runs) | A-787 longest unit µs, each round (3 runs × 5) |
+|---|---|---|---|
+| engine.rs (304 KiB) | 13.84, 14.63, 14.26 | 20.80, 20.83, 21.05 | 30.8 31.1 32.0 30.6 31.0; 34.8 46.4 30.5 31.0 30.3; 30.9 30.9 30.9 32.9 31.4 |
+| verdict.rs (6 KiB) | 0.21, 0.21, 0.21 | 0.31, 0.31, 0.32 | 11.5 10.2 10.2 10.1 10.2; 10.7 10.1 10.0 19.5 14.8; 10.7 10.2 10.1 10.2 10.2 |
+| increment.rs (89 KiB) | 3.87, 4.11, 3.97 | 5.92, 5.82, 6.00 | 29.7 31.0 30.7 29.5 29.4; 32.4 31.9 34.7 31.4 31.3; 29.2 29.6 29.4 29.5 29.7 |
+| 1 MiB | 11.69, 12.53, 11.19 | 17.21, 17.43, 17.67 | 33.0 32.8 30.8 32.0 46.7; 32.0 31.7 37.5 32.0 31.1; 57.2 31.5 51.0 32.2 34.9 |
+| 4 MiB | 46.47, 51.80, 49.55 | 67.87, 67.28, 67.16 | 89.8 33.5 37.5 35.0 33.1; 38.8 36.0 75.4 43.8 99.2; 61.8 33.3 37.9 33.3 33.9 |
+| 12 MiB | 165.88, 182.10, 183.00 | 205.25, 202.21, 199.54 | 164.8 291.0 1814.2 2826.1 97.2; 47.1 43.9 42.3 41.4 40.3; 71.0 49.2 66.5 2522.1 43.2 |
+
+Under A-776 the longest step is the whole call: 14 ms at 304 KiB, 166 to 211 ms at 12 MiB. Under A-787 it stays tens
+of µs and does not grow with the file, apart from three 12 MiB rounds of 15 with one unit of 1.8 to 2.8 ms. Those are
+not explained yet: preemption at load 13 on 14 cores, or the release of a large buffer, both unmeasured. The paced
+refinement costs 1.45 to 1.5 times the one-call refinement on source files and at 1 MiB, 1.35 times at 4 MiB and 1.15
+times at 12 MiB. Its search makes the same steps (2,365,669 for `engine.rs` in both trees), so the cost is the meter's
+bookkeeping per comparison. The same A/B on this Mac at load 35 to 58 gave the same per-save ratios, with preemption
+outliers of up to 80 ms in the longest unit.
+
+Rejected, measured:
+- A heapsort in place for the anchors: 165 to 185 ms against 14 ms for a 1 MiB rewrite.
+- Restructuring the Myers rounds to await once per unit rather than per diagonal: no change (25.9 against 26.1 ms).
+- A hash table for the anchors: its rehash is one step that grows with the file.
+
+Kept: A-787.
