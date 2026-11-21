@@ -542,6 +542,27 @@ fn tool_key(repository: u128, path: &Identity, tool_id: &[u8]) -> Vec<u8> {
   key
 }
 
+/// The first key past every key that begins with `prefix`: its last byte below 0xFF raised by one, the bytes after it
+/// dropped; none where every byte is 0xFF (no key follows them all).
+fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+  let mut end = prefix.to_vec();
+  while let Some(last) = end.pop() {
+    if let Some(raised) = last.checked_add(1) {
+      end.push(raised);
+      return Some(end);
+    }
+  }
+  None
+}
+
+/// A tool id row's value, read: the text's identity, then its own row.
+fn decode_tool_value(value: &[u8]) -> Result<(Identity, TextRow), StoreError> {
+  let (identity, row) = value.split_at_checked(IDENTITY).ok_or(StoreError::BadRow)?;
+  let identity: Identity = identity.try_into().map_err(|_| StoreError::BadRow)?;
+  let row = decode_row(row).ok_or(StoreError::BadRow)?;
+  Ok((identity, row))
+}
+
 /// A text row's value, read.
 fn decode_row(value: &[u8]) -> Option<TextRow> {
   let mut reader = Reader { rest: value };
@@ -650,27 +671,58 @@ impl Store {
     Ok(found)
   }
 
-  /// The version of `path` in repository `repository` its tool names `tool_id` (Mercurial's node), as it landed: its
-  /// text's identity and its own row (its base a version of the same path, its place its own edit's); none where no
-  /// landed changeset named it.
+  /// The versions of `path` in repository `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as
+  /// they landed: each one's text identity and its own row (its base a version of the same path, its place its own
+  /// edit's); none for one no landed changeset named.
   ///
   /// # Errors
   /// [`StoreError::BadRow`] for a row that does not decode; the engine's refusals.
-  pub fn text_by_tool(
+  pub fn texts_by_tools(
     &mut self,
     repository: u128,
     path: &[u8],
-    tool_id: &[u8],
-  ) -> Result<Option<(Identity, TextRow)>, StoreError> {
-    let mut value = Vec::with_capacity(IDENTITY + TEXT_VALUE_BYTES);
-    let key = tool_key(repository, blake3::hash(path).as_bytes(), tool_id);
-    if !self.rows_mut().get(&key, &mut value)? {
-      return Ok(None);
+    tool_ids: &[Vec<u8>],
+  ) -> Result<Vec<Option<(Identity, TextRow)>>, StoreError> {
+    // The path's tool id rows share their key's prefix, so they are read in one scan of it, a page as large as the
+    // ask, keeping the ones asked: a stream asks for a log's every version, one random lookup each before (r27 on
+    // hg-src: about 230,000 a stream, 1.35 s of its 3.7 s waiting on the store).
+    let hash = *blake3::hash(path).as_bytes();
+    let start = tool_key(repository, &hash, &[]);
+    let end = prefix_end(&start);
+    let wanted: std::collections::BTreeSet<&[u8]> = tool_ids.iter().map(Vec::as_slice).collect();
+    let mut kept: std::collections::BTreeMap<Vec<u8>, (Identity, TextRow)> =
+      std::collections::BTreeMap::new();
+    let mut from = start.clone();
+    let mut next = Vec::new();
+    loop {
+      let mut out = mantle_engine::rows::Rows::default();
+      self.tool_read();
+      let more = self.rows_mut().scan(
+        &from,
+        end.as_deref(),
+        tool_ids.len().max(1),
+        &mut out,
+        &mut next,
+      )?;
+      for (key, value) in out.iter() {
+        let Some(tool_id) = key.strip_prefix(start.as_slice()) else {
+          continue;
+        };
+        if wanted.contains(tool_id) {
+          kept.insert(tool_id.to_vec(), decode_tool_value(value)?);
+        }
+      }
+      if !more || kept.len() == wanted.len() {
+        break;
+      }
+      core::mem::swap(&mut from, &mut next);
     }
-    let (identity, row) = value.split_at_checked(IDENTITY).ok_or(StoreError::BadRow)?;
-    let identity: Identity = identity.try_into().map_err(|_| StoreError::BadRow)?;
-    let row = decode_row(row).ok_or(StoreError::BadRow)?;
-    Ok(Some((identity, row)))
+    Ok(
+      tool_ids
+        .iter()
+        .map(|tool_id| kept.get(tool_id).copied())
+        .collect(),
+    )
   }
 
   /// The bytes at `place` in the log (an edit or a whole as its `T` row names it), read whole: what a stream sends as a

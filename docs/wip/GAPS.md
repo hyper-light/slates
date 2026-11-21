@@ -207,7 +207,9 @@
 > (`vcs_store.hg_stream_turns`); hg's first 2987 changesets stream in 16 turns where they took 24,956. r25 on
 > 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
 > store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
-> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
+> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). r27 on e0b677380: 38 store
+> asks a stream, 1.35 s of its 3.7 s waiting on them, a lookup a revision's row by node; BUILT: a log's rows read in one
+> scan of its key prefix (`Store::texts_by_tools`, counted `Store::tool_reads`). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
 > against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). CLOSED by w-hg's C1 (imports since
 > step 3, made changesets since the made-on-store piece): a repository whose history the store did not keep (an
 > import's, a made changeset's) advertised no stream (`State::stored_logs`, from `HgStore::unstored`, both removed),
