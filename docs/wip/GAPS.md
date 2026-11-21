@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
+> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included. Its CI wiring is a
+> run request. **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
+> arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
+> switches between a forwarded reply's two tasks); the A/B and the next step are in 8a-r9-gate.
+
 > **REAL TOOLS ACROSS SNAPSHOTS, EVICTION AND TAKEOVER (w-realtools, 2026-11-20).** A-781 BUILT: without a birth time,
 > an unchanged base file keeps its inode number across a takeover (`#pragma once`). Open: the kernel-mount acceptance
 > runs (a `#pragma once` build, `make`, `cargo build` and `git status` over a mount across a snapshot, a restart and a
@@ -10731,7 +10737,35 @@ The virtiofs row is the one that could not have been taken before today: at its 
 and every count past ~10,000 aborted instead of running, so "deepen on demand" was true of the case count
 and not of the sweep.
 
-### 8a-r9-gate. R9's provisioning ratchet is enforced by nothing (2026-10-20, OPEN — needs Ada)
+### 8a-r9-gate. R9's provisioning ratchet is enforced by nothing (2026-10-20; the gate BUILT 2026-11-20, A-786; its loaded p99 OPEN, fix in flight)
+
+**Status (2026-11-20, A-786, w-provision-gate).** The gate exists as a lane of its own, which answers the shared-runner
+objection below: `cargo xtask ratchet --provision` runs `provision_bench` alone, N times, holds every gated row (spinning
+and parked p50/p99/p999; max informational) to the machine's recorded ceilings, which only tighten, skips loudly on a
+machine with no baseline, and appends every run's rows to `target/provision-histogram.tsv` for CI to keep. The bench
+fails past R9's floor and, with `PROVISION_BENCH_LOAD=<n>` (n busy processes a logical CPU, started after the quiet forms),
+past the loaded bound: the load may add to the spinning 1-client p99 at most what it adds to the parked one. Each
+1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`). CI wiring on
+a reference runner: run request (w-lint, main).
+
+**The loaded p99, measured (macOS arm64, Apple M4 Max 14 CPUs, this MacBook, host load 4-54 from other agents, release,
+9 shards).** Red on main: 1.62 ms against the bound 0.87 ms (quiet 616 µs, parked 683 -> 939 µs under the load). By the
+stamps, the tail is the daemon's (client part 14-28 µs). Diagnostic stamps at every hop of a forwarded create (never on
+main) put it on one hop: the reply's task on the client's shard to that shard's serve task, which writes the reply:
+15 µs at the median quiet, 0.77-1.37 ms at the tail loaded. `Shard::run`'s busy-loop harvest runs between the two, a
+zero-timeout `kevent` that sleeps 12-15 µs with an involuntary switch on macOS (A-218): 0 of 79,591 harvests passed
+100 µs quiet, 2,695 of 59,622 loaded (max 9.1 ms). The existing never-sleeps driver test skips on macOS for want of a
+per-thread switch count, which is why it stayed unseen. Linux's `epoll_wait(0)` does not sleep, so the x86 host's
+1.6 ms is another hop, to be named by the same stamps (run request).
+
+**A/B (BENCHMARKS "R9's loaded p99 on macOS").** `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait: p99
+1.04/0.49/0.91 -> 0.43/0.54/0.73 ms, but p999 2.7/2.3/7.8 -> 12.1/10.6/12.0 ms, because A-387 then keeps holds (turns
+cost 0.5 µs) and a held shard true-spins for ms. With no hold as well: p99 0.17/0.38/0.27 ms and p999 0.30/11.3/6.6 ms,
+1.2-3.5 cores against 0.7-1.2. A sched_yield per idle turn: p99 10.1 ms (a whole macOS quantum given away), rejected.
+**Next (in flight):** A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
+2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
+(`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
+`IMMEDIATE` and zero-timespec `kevent64` polls on one queue lose a kick (3 of 3 runs hung, every shard parked).
 
 R9 reads: "The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent,
 ratcheted CI gate." It is not in CI. `grep provision_bench .github/workflows/*.yml` returns nothing;
