@@ -228,6 +228,9 @@ pub(crate) struct VcsStores {
   /// none more for them ([`hold_svn_stored`]). Bounded by the records' stored texts.
   svn_fetched_texts:
     BTreeMap<RepositoryId, std::collections::BTreeSet<slates_svn::index::ContentIdentity>>,
+  /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
+  /// [`svn_texts::Pieces`]).
+  pub(crate) svn_pieces: svn_texts::Pieces,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -673,6 +676,12 @@ impl VcsStores {
       RepositoryStore::Mercurial(store) => Some((content, store)),
       _ => None,
     }
+  }
+
+  /// How many text pieces read through the node's store are held for waiting drives (C2 stage B part 2).
+  #[cfg(test)]
+  pub(crate) fn svn_pieces_held(&self) -> usize {
+    self.svn_pieces.len()
   }
 
   /// Repository `id`'s Subversion store, lent for one step.

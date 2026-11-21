@@ -195,6 +195,7 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
     green: None,
     store: None,
     records: &records,
+    pieces: None,
   };
   let source = WithTexts {
     records: &records,
@@ -257,6 +258,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
       green: None,
       store: None,
       records: &records,
+      pieces: None,
     };
     let source = WithTexts {
       records: &records,
@@ -285,6 +287,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
     green: None,
     store: None,
     records: &records,
+    pieces: None,
   };
   let source = WithTexts {
     records: &records,

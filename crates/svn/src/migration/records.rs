@@ -1536,6 +1536,13 @@ pub trait TextSource {
   /// a delta chain applied. True once `reading` holds the text whole ([`TextReading::bytes`]); none where the source
   /// holds no such text or its chain does not hold together.
   fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool>;
+
+  /// Whether a read of the text `identity` from `offset` that this source answered none for is a piece it reads
+  /// asynchronously from a store it does not hold in memory (C2 stage B part 2; `crate::reads::Repository::fetchable`):
+  /// none of a source that holds every text it names in memory, the default.
+  fn fetchable(&self, _identity: &ContentIdentity, _offset: u64) -> bool {
+    false
+  }
 }
 
 /// The records hold their own texts until the green's content index serves them (S4's second slice, A-716): a text
@@ -1742,6 +1749,10 @@ impl<T: TextSource + ?Sized> ReadSource for WithTexts<'_, T> {
     cache: &'a mut crate::reads::WindowCache,
   ) -> Option<Cow<'a, [u8]>> {
     self.texts.text_in(identity, offset, cache)
+  }
+
+  fn fetchable(&self, identity: &ContentIdentity, offset: u64) -> bool {
+    self.texts.fetchable(identity, offset)
   }
 }
 

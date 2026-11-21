@@ -405,6 +405,11 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-801 (2026-11-21, w-fed-move; goal 86b's throughput).** BUILT: owner asks counted and answers timed by kind; the
+> load harness prints the server nodes' merge counters. At 1,000 clients in-process: 17.5 asks a client (lengths 44%,
+> files 18%, verdicts 14%, rebases 13%), the owner's answering 185 ms in all: not the wall at that scale. Open: the
+> 100k wall's mechanism, to be named by main's rerun (r48) from the primary's `server_counter` rows.
+>
 > **A-800 (2026-11-21, w-fed-move; goal 86b's lost replies).** BUILT: every place a reply carried home can be lost is
 > counted apart, and the silent ones now resend: a reply task dropped while its shard's state is borrowed, a forwarded
 > reply whose run meets a borrowed state (and one a retention refusal dropped after it was taken, now delivered), a
@@ -2573,8 +2578,16 @@
 > store holds every text the history names; the commit no longer waits for the shard's image to keep its texts (A-727
 > slice b's barrier, gone for Subversion), and a recovery reads a stored text the image lacks back from the store
 > (`vcs_store::fetch_stored_texts`, counted `svn_text_fetched`). Held by the arbiter's sections and the barrier test
-> (`a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`: the text fetched once). Owed: stage B
-> part 2, the texts read async through the owner (HeadTexts; R6) so the content store need not hold them all; stage C,
+> (`a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`: the text fetched once). Stage B part 2
+> (a), the wait path, BUILT for the report/update and replay drives: a drive that meets a stored text's piece RAM does
+> not hold waits for it (`Next::Waiting`, `Stepped::Waiting`, `Turn::Waiting`, `ReportProgress::Waiting`; a view says
+> such a piece is `fetchable`), its frame and window kept, and the svn://, `svnserve -t` and DAV loops read the piece
+> through the store's owner (`svn_texts::fetch_piece`, a piece cache held by the waiting readers alone) and step it
+> again. Held by `a_drive_that_waits_for_its_texts_pieces_makes_the_same_calls` (slates-svn: the same calls as the
+> drive over a repository holding every text) and `a_checkout_reads_a_text_ram_does_not_hold_through_the_store` (a
+> checkout over the daemon's tunnel of a text neither the green nor the content store holds). Owed in (a): get-file
+> and DAV GET (`reads::file`), file-revs, the exporter, the deltify job; then (b), the records keep history on the
+> store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
@@ -2582,6 +2595,32 @@
 > the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
 > `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
+> ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
+> revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
+> svnsync and client commits land a revision at a time either way and are not affected. Two shapes take it back, each
+> outside the Subversion path and not built on svn's reading: (a) the import as one changeset, the records and the
+> green advancing in RAM ahead of the register, one transaction at its end, a refusal rolling both back (the green's
+> side is the merge engine's, w-engine); (b) a cheaper barrier than F_FULLFSYNC where the store's durability allows it
+> (w-store's call; A-130 has the history).
+> **P7's memory findings (2026-11-21, w-svn; BENCHMARKS "Where a Subversion import's memory is" and "A Subversion
+> import on the real daemon"; main's order: after C2 stage B part 2, completion then robustness then performance).**
+> Owed, each measured on git-2000's import (437 MiB dump, 2,000 revisions): (1) the green charges 440 MB of retention
+> for a history the records keep in 35 MB (12x): its kept versions serve copies from older revisions (folding them was
+> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first;
+> (2) 593 MB of live small allocations with no owner attributed; (3) ~1 GB of whole-text transients during the import
+> (a revision's whole texts, its record's encoding and the reader's buffer held at once) and 1.5 GB of freed large
+> blocks the test binary's allocator keeps (the daemon's own allocator gives them back; the real daemon peaks at
+> 1,570 MiB, half of it the segment, where the green's chain entries carry each revision's file bytes). C2 stage C holds
+> each whole text once and measures it.
+> **svnsync from slates over the HTTP edge (2026-11-21, w-svn; found by P7's `an_svnsync_measured` on the big Studio):**
+> stock `svnsync init` refused E200007 "The method 'PROPFIND' is not served here": HTTPv2's revision resource
+> (`!svn/rev/REV`, where ra_serf reads revision properties) was not served. Fixed: it is answered as the revision's
+> baseline is, under its own href (`a_revision_resource_answers_its_revisions_properties_as_its_baseline_does`). Owed,
+> not built (Ada's close order: findings recorded only): the DAV site serves no `replay-report` (at the session URL or
+> at `!svn/rev/REV`, which the site advertises with `replay-rev-resource`), so `svnsync synchronize` from slates over
+> HTTP cannot run; and DeltaV v1's revision properties (a PROPFIND of the VCC with a `Label`) answer the youngest's.
+> svnsync over svn:// mirrors git-2000 in 270.7 s (135 ms a revision; w-interop's 1,068 s before).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -3461,6 +3500,17 @@
 > `inject_memory_stall` in server roles), so the wedge is judged a wedge on any host; the A-336 tests keep driving a
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
+
+> **Killed test daemons leave their macOS socket-route nodes behind, an unbounded set (2026-11-21; OPEN, w-bugs, after
+> its current three; found by main on the MacBook).** `$TMPDIR` (`/var/folders/.../T`) held 1,637 `slates-<hex>.sock`
+> files, the macOS socket route's nodes (`crates/ipc/src/route.rs`, A-161/A-173), new ones as recent as 01:28. The route
+> removes its node when the daemon stops, and replaces one a dead daemon left under the same instance name; but test
+> daemons take unique per-pid instance names and are often killed (SIGKILL tests, aborts), so their nodes are never
+> reused or removed. That breaks CLAUDE.md §4 (tests leave nothing behind) and §2 item 8 (no unbounded set): each node
+> is 0 bytes, but the set grows with every killed test daemon. Main deleted the 971 older than two days. Shapes: the test
+> harness removes its instance's node at its end, as `AnchorProcess`'s guard reaps the anchor; or the route sweeps the
+> unanswered `slates-*.sock` nodes of dead instances at bind, bounded and owner-only. Red first: a test that SIGKILLs a
+> daemon and asserts its node is gone once the harness ends.
 
 > **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
 > and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**

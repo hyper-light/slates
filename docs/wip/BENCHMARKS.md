@@ -17143,3 +17143,21 @@ both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
   in one step: at load 8 to 14 (r8) the daemon restarted within it and the client's transaction was gone. Owed (GAPS):
   the green's apply a slice at a time (w-engine's 1b) and the chain naming the text by identity rather than carrying
   it (P7's finding, the register's), each of them outside the Subversion path.
+
+## svnsync from slates over svn://, git-2000 (P7 of Ada's close list, A-772; 2026-11-21)
+
+- **Machine, tree, command.** The big Mac Studio (adas-mac-studio.local-2, 32 cores, 96 GB), load 3 to 7, stock svn
+  1.15.0; main 1bfe51f88 from an HTTPS clone (kiln r11). `SLATES_SVN_SYNC_DUMP=~/.cache/w-svn-replay/git-2000.dump
+  cargo test --release -p slates-cli --test svn_interop -- --ignored an_svnsync_measured --nocapture`
+  (`an_svnsync_measured`: a release anchor and daemon holding a store, the dump imported through the CLI, then stock
+  `svnsync init` and `svnsync sync` into a local FSFS mirror, timed, the daemon's RSS sampled). One run.
+
+| Scheme | Import | svnsync | A revision | Mirror | Daemon RSS before, peak |
+|---|---|---|---|---|---|
+| `svn://` | 13.5 s | 270.7 s, exit 0 | 135.4 ms | r2000 | 1,637 MiB, 1,686 MiB |
+| `http://` | 13.5 s | `svnsync init` refused E200007 (fixed since, 2dafcad02); `sync` needs the DAV `replay-report` (GAPS) | | | |
+
+- **What it says.** w-interop's matrix took 1,068 s over svn:// for the same history (0.54 s a revision); stock
+  svnsync now mirrors it in 270.7 s, a quarter. The server's replay of a revision is 2.4 to 2.8 ms of it (in-process,
+  above), so most of the 135 ms a revision is outside the server's drive (the client's commit into FSFS, the round
+  trips). Over HTTP the mirror cannot run until the DAV site serves `replay-report` (recorded in GAPS, not built).
