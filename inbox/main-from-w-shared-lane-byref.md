@@ -79,3 +79,27 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
   disk changeset log is for a repository's landed history, so a repository green's increments become changesets there
   once w-store's wiring lands. I'll record that overlap in GAPS for w-store.
 - **Meanwhile:** the release bench of 3a, 64-512 MiB x 10, is kiln r15 (queued).
+
+## 00:52 PST: condition 2's upgrade question answered, and the pieces (A) takes
+- **Across an upgrade:** the design reads no other version of a durable record ("A merge record carries its own format
+  version. Another is refused typed, never decoded by a second path", §2.7), and the last chain bump did the same
+  (A-621: "a version 4 entry ... refused `BadVersion`: replaced, not layered"). An anchor restarts a daemon from its
+  own image (cli `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`), so a
+  segment is read only by the build that wrote it. Format 6 refuses format 5 typed, as every bump has. I'll state it
+  in the amendment entry.
+- **Who touches the entry's increment bytes** (origin/main): the merge engine's replay (`engine.rs`, its copies and
+  checkpoints; it applies each version's effects against the increment's post-state), the record plane
+  (`merge_service::inputs_of`), signed work (`signed_work.rs`), recovery (`daemon.rs`), and the writers: a submit
+  (`verbs::record_accepted`), a repository push (`repository/push.rs`) and a Subversion commit
+  (`repository/svn_commit.rs`). The pushes are w-git's, w-hg's and w-svn's paths.
+- **Pieces, each landed green:**
+  1. Format 6 and the owner's content: every writer holds the increment as content by its inputs identity on the
+     owner's store (retained by the version's record, A-714, typed refusal at the room), and the entry names it; every
+     reader resolves it there (replay gets a resolver; `inputs_of` lends the held archive). Red first: your recovery
+     test, a real-process kill -9 of the owner with an unfolded version. Golden vectors for format 6; the recovery
+     oracle across a restart. This changes the push writers' two call sites mechanically (they pass the work's
+     encoding today), and I'll tell w-git, w-hg and w-svn in their inboxes.
+  2. 3b: the holder's `SubmitComputed` names the content; the owner fetches what it lacks by identity from the holder
+     (the content plane's hedged fetch), stored once on arrival; a retry asks only.
+  3. Step 3's slicing of what remains on both control shards, `daemon.beat.late` the proof at 320 and 512 MiB.
+- Piece 1 is large; I'm starting on it now. Say so if you'd rather the push writers move in a piece of their own.
