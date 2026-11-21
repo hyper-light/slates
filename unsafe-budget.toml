@@ -453,7 +453,13 @@ slates-mem = 88
 #   duplicate made for its process: `share_listener`'s `WSADuplicateSocketW` (1), and `adopt_share`'s `WSASocketW` over
 #   the protocol record (`FROM_PROTOCOL_INFO`, 1). Winsock has no safe wrapper for either; the record itself crosses as
 #   bytes encoded and decoded field by field, with no unsafe view of it.
-slates-rt = 109
+slates-rt = 120
+# 2026-11-21 (+11, A-828 / 84a, compiled only for Windows; 109 -> 120): the IOCP driver's high-resolution timed wait
+#   (`iocp.rs`, 98e150baf), which no crate the workspace takes wraps: ntdll's wait-completion-packet calls bound at run
+#   time (the lookup, `NtCreateWaitCompletionPacket`, `NtAssociateWaitCompletionPacket`, `NtCancelWaitCompletionPacket`
+#   at the re-arm and at the first wait), `CreateWaitableTimerExW` and its `CloseHandle` on a refusal,
+#   `SetWaitableTimer`, the port's untimed `GetQueuedCompletionStatusEx` with its zeroed entries, and the test's own
+#   200 us arm.
 # 2026-11-06 (+1, compiled only for Windows): a datagram socket's `WSAIoctl` turning off `SIO_UDP_CONNRESET` and
 #   `SIO_UDP_NETRESET` (`netsys::ignore_earlier_datagrams_errors`), which has no safe wrapper; without it one send to a
 #   closed port failed the socket's next `recvfrom` 10054 and ended a fleet node's receive loop (run 42150662467).
