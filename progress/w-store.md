@@ -6,6 +6,8 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- C4 groundwork: 2ab6c3717 --vcs-store; daemon holds StoreOwner, ShardState::vcs_disk per shard; store_root portable
+  (Windows Unsupported). Notes sent to w-hg/w-git/w-svn. NEXT: pair on each tool's landing + RSS red test (C4 hg first).
 - C4 groundwork landed: 6ad443338 (w-lint literals fixed), baa28bfab (owner thread + StoreHandle). Replies sent:
   w-perf AGREE (they build texts.rs T/H rows), w-hg/w-svn wiring, w-lint fixed. NEXT: daemon holds the StoreOwner
   (config store dir, StoreGrant at enrollment, Sizing from machine profile); then RSS red tests with each tool agent.
