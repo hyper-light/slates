@@ -17005,6 +17005,8 @@ is the invocation's median of 3 runs. µs unless marked.
   under 1 ms, and no arm's p999 is under 1 ms anywhere (Linux 1.0–7.4 ms, macOS 8–12 ms, Windows 0.2–59 ms).
 - B costs the quiet median 10–30 µs on Linux and Windows (not on macOS) and leaves R9's uncontended spinning p99 where
   it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
+- **B landed as A-799 (2026-11-21), its measured cost the quiet median: +10–30 µs** (Linux arm64 86–92 → 100–101 µs,
+  x86_64 93–100 → 109–121, Windows x86_64 116 → 133–134; macOS not slower).
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 

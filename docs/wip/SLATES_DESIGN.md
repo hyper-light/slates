@@ -5364,8 +5364,9 @@ request landed in the command ring and when its reply landed in its own, not onl
 latency splits into the daemon's part and its own (`slates_machine::attribution`).
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
-loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
-refined from the client's own parks, A-31), then clear the reply stamp slot this park names (the two
+loop for the spin its caller names, none by default (A-799, 2026-11-21: a client spinning for its reply held the CPU the
+shard it woke needed on a busy machine; its wake estimate, seeded with `spin_ns` and refined from its own parks, A-31,
+is still learned), then clear the reply stamp slot this park names (the two
 slots alternate park by park, A-199), set `parked` to that slot's value (1 or 2), fence
 (`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
 (futex / `os_sync_wait_on_address(SHARED)` / the Event). A call that waits while its daemon lives waits on the daemon's
@@ -58755,6 +58756,18 @@ Applied in the same change to: §4.16 "Composition at seal" (the deriver's shape
   walls (GAPS, A-797): about 2,700 clients whose submits, first sent at 11 to 14 s, were never answered (the client
   node's forwards: 9,116,579 resolved on its control shard, 9,113,196 delivered home, 3,383 lost between); and a work
   whose log reached 300,898,443 bytes, filling its partition's merge budget.
+
+### A-799 — A client's sync wait parks at once unless its caller names a spin (2026-11-21, g222, 84a; main's ruling of 2026-11-21 00:14 PST)
+Applied in the same change to: §4.7 ("Wake strategy"), `crates/ipc/src/endpoint.rs` (`wait_ending`),
+`crates/client/examples/edit_merge_bench.rs` (waits as the library does; a loaded p99 over 1 ms fails the run on Linux),
+GAPS (84a), BENCHMARKS ("The client's reply wait, A/B").
+- **Why.** On a machine whose cores are all busy, the client's spin for its reply held the CPU the shard it had just
+  woken needed, so the shard ran when the spin ended: Linux's loaded queued wait sat where the spin ended (1 ms spin at
+  1.0 ms, 200 µs at 0.2 ms, none parked at once).
+- **Measured (CI run 44876741078, 3 interleaved rounds, release).** Linux arm64's loaded accept p99 2.1–3.2 → 0.36–0.43
+  ms; R9's uncontended spinning p99 unharmed (that form names its spin: Linux 31.6–37.7 µs); the cost is the quiet p50,
+  +10–30 µs on Linux and Windows. Linux x86_64 (3.2 ms) and macOS (8 ms) keep other holds (GAPS 84a).
+- **Rejected.** A spin that yields its CPU each turn (loaded p99 12–18 ms); a spin capped at 50 µs (1.9–2.1 ms).
 
 ### §4.16 amended — A holder's forward is timed on both ends, and a late beat is counted (2026-11-21, w-shared for UI goal 93; main's ruling on the lane, step 1: measure first)
 Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD_BUILD`), `crates/server/src/verbs.rs`

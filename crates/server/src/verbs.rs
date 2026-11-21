@@ -10043,7 +10043,7 @@ fn submit(
         return refused(refusal);
       }
       // A whole-file rewrite is refined first, a slice a turn, by a job of this shard (A-787 part 2): the submit waits.
-      if let Some(owed) = refinement_owed(state, (work_id, green_id)) {
+      if let Some(owed) = parkable_refinement(state, (work_id, green_id)) {
         let kind = ParkedKind::Local {
           principal: principal.clone(),
           work,
@@ -10639,7 +10639,7 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
     Some(answer) => answer,
     None => {
       if state.greens.contains_key(&green_id)
-        && let Some(owed) = refinement_owed(state, (work_id, green_id))
+        && let Some(owed) = parkable_refinement(state, (work_id, green_id))
       {
         let kind = ParkedKind::LocalRebase {
           principal: principal.clone(),
@@ -11764,6 +11764,18 @@ fn park_on_refinement(
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The refinement a local verb of `work` parks behind (A-787 part 2): the one its journal owes, when the verb runs in a
+/// recorded request. A verb dispatched outside one has no route its answer could be sent on after the job, so it is
+/// not parked: it composes unrefined, as a remote edit-and-submit does, and is answered now. Refusing it `Overloaded`
+/// (as `park_on_refinement` would) refused every whole-file rewrite such a dispatch submitted, whatever its size.
+fn parkable_refinement(
+  state: &ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+) -> Option<crate::refining::Owed> {
+  state.current_request?;
+  refinement_owed(state, (work, green))
 }
 
 /// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.
