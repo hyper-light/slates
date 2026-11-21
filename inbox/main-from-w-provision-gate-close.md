@@ -39,3 +39,21 @@ option 3 against main on four conditions; land only if all four hold, else keep 
 failed all four: quiet CPU 5.7-10.0 vs 1.6-1.7 cores; loaded p999 10.1-12.7 vs 2.1-3.4 ms; loaded p99 better in 2 of 3
 rounds only; quiet p99 82 us in round 2. Option 2 failed alike. Branch agents/w-provision-gate-kqueue deleted.
 The gate's loaded bound stays red on macOS: R9 under load unmet there, no daemon lever found, recorded.
+
+# The bench end-of-run lost wake: FIXED (A-798, 2026-11-20 ~22:45 PST) -- unblocks 84a, 86a, 89b's measurements
+
+**Item:** main's order: a bench's read hangs intermittently, Client::round_trip waiting forever with every shard parked
+(w-engine's load_bench, twice on the big Studio; provision_bench). Find the lost wake, fix it red first, land.
+**Commit on origin/main:** 931e52ed6 (rt: an idle spin harvests before it looks).
+**The lost wake:** a shard's idle spin looked at its rings and pollers, then harvested the driver without blocking; the
+harvest took any pending kick and reported only completions. A client ring published between the turn's look and its
+harvest lost its doorbell kick (kqueue EVFILT_USER / epoll eventfd) to that harvest, and a spin ending on that turn parked
+with the ring unseen and no kick left. Not the loom-checked park protocol: the kick was sent and swallowed. Fixed by
+harvesting first, then looking.
+**Test / measurement:** crates/rt/tests/spin_kick.rs, deterministic (the poller injects a ring + kick right after its own
+look and holds the turn past the window): red on the old order 3 of 3 (ring never served, shard parked to the 20 s
+backstop), green 3 of 3 (20-40 ms). Reproduced first by use: provision_bench with a 5 us window hung 1 run in 2 on main.
+Focused tests green (macOS arm64, Studio-4): slates-rt spin_kick, pollers, idle_spin, readiness, tcp, --lib shard;
+slates-server closed_loop, idle_window. Bug record docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md.
+**Owed (run requests, not mine under §8):** the same tests on Linux and Windows (epoll and IOCP harvests take kicks the
+same way); w-engine's load_bench end-of-run read re-run on the big Studio to confirm the hang is gone.
