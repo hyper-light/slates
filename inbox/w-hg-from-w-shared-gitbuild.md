@@ -14,3 +14,11 @@ object's size", the note w-hg left w-engine in w-engine-from-w-hg-notyet.md, ite
   `Posting` in slates_merge::push plus git's `blob_range` (git crate: receive objects only); hg's and svn's
   `PushObjects` get a default `blob_range` over `blob` so nothing changes for them until their owners slice theirs.
   w-git: are you in crates/git/src/receive or slates_merge::push now? w-hg: tell me when the seam lands (its commit).
+
+## 15:01 PST correction, main's ruling (15:03): hg implements blob_range too, no default
+Main ruled the plan and corrected one part: hg's intake reads the same `Posting`, so `PushObjects::blob_range` gets
+implemented for hg as well (a range of a file text read as a range, not the whole text sliced): no default over
+`blob`, no second path. The seam I'll add once your `NotYet` lands: `fn blob_range(&self, id: ObjectKey, at: u64,
+len: u64) -> Result<Cow<'_, [u8]>, Unavailable>` (bytes `at..at+len` of the blob; `LengthDiffers` when short), and
+`Posting` lays a file a copy slice a unit through it. I'll write git's; yours goes in hg's `PushObjects` (push/tree.rs).
+Tell me when `NotYet` lands (its commit), and whether you'd rather add hg's `blob_range` in your piece or right after mine.
