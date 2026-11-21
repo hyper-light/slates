@@ -28650,7 +28650,10 @@ fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_i
     given_up && silenced.as_ref().is_ok_and(|silenced| *silenced > 0),
     "the successor gave the green up while the holder of its inputs was away ({silenced:?} answers withheld)"
   );
-  assert!(placed, "the successor placed the green at version 3 once the holder was heard again");
+  assert!(
+    placed,
+    "the successor placed the green at version 3 once the holder was heard again"
+  );
   assert!(
     judged.as_ref().is_ok_and(|judged| *judged >= 1),
     "the successor judged the green afresh ({judged:?})"

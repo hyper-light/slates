@@ -18,9 +18,9 @@
 //! volume over (the first flow); memory pressure, the daemon's admission hold and the host's memory stall injected
 //! into an in-process daemon (the second).
 //!
-//! Gated: `SLATES_TEST_CLI=1` (a real anchor, its daemons and a kernel mount); macOS only for now (`mount_nfs`), the
-//! Linux FUSE and Windows WinFsp runs are main's (run-requests.md). It skips loudly where `mount_nfs`, `cc`, `make`,
-//! `cargo` or `git` is missing.
+//! Gated: `SLATES_TEST_CLI=1` (a real anchor, its daemons and a kernel mount); macOS (`mount_nfs`) and Linux (FUSE,
+//! `fusermount3`); the Linux and Windows WinFsp runs are main's (run-requests.md). It skips loudly where the mount
+//! tool, `cc`, `make`, `cargo`, `git` or `mkfifo` is missing.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -29,7 +29,7 @@
   // The fixture is a git checkout the test writes in its own build-output directory (A-50), as git_interop's are.
   clippy::disallowed_methods
 )]
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -99,10 +99,24 @@ struct Mounted(PathBuf);
 
 impl Drop for Mounted {
   fn drop(&mut self) {
-    let _ = Command::new("/sbin/umount").arg(&self.0).output();
-    let _ = Command::new("/sbin/umount").arg("-f").arg(&self.0).output();
+    for args in UNMOUNTS {
+      let _ = Command::new(args[0]).args(&args[1..]).arg(&self.0).output();
+    }
   }
 }
+
+/// Format: how the mount is taken down, then forced (macOS: `umount(8)`).
+#[cfg(target_os = "macos")]
+const UNMOUNTS: [&[&str]; 2] = [&["/sbin/umount"], &["/sbin/umount", "-f"]];
+/// Format: how the mount is taken down, then lazily (Linux: the FUSE helper).
+#[cfg(target_os = "linux")]
+const UNMOUNTS: [&[&str]; 2] = [&["fusermount3", "-u"], &["fusermount3", "-uz"]];
+/// Format: the tool `slates mount` drives on this platform (macOS: the loopback NFS mount).
+#[cfg(target_os = "macos")]
+const MOUNT_TOOL: &str = "mount_nfs";
+/// Format: the tool `slates mount` drives on this platform (Linux: FUSE through the system's helper).
+#[cfg(target_os = "linux")]
+const MOUNT_TOOL: &str = "fusermount3";
 
 fn start_anchor(instance: &str) -> Anchor {
   let child = slates()
@@ -351,7 +365,7 @@ fn runnable() -> bool {
     );
     return false;
   }
-  for needed in ["mount_nfs", "cc", "make", "cargo", "git", "mkfifo"] {
+  for needed in [MOUNT_TOOL, "cc", "make", "cargo", "git", "mkfifo"] {
     if !on_path(needed) {
       eprintln!("skipping the real-tools flow: {needed} is not on this host");
       return false;

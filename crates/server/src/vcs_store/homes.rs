@@ -997,9 +997,11 @@ pub(crate) async fn home_in_region(
   let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
   let budget_ns = budget.max_deadline_ns();
   let mut kept = 0usize;
+  let began = slates_rt::futures::now_ns();
   if homes.contains(&local) {
     kept = kept_here(origin, shards, &bytes, budget_ns).await?;
   }
+  let local_ns = slates_rt::futures::now_ns().saturating_sub(began);
   let others: Vec<slates_db::HostId> = homes
     .iter()
     .copied()
@@ -1007,6 +1009,7 @@ pub(crate) async fn home_in_region(
     .collect();
   // The other homes reached from the control shard, which holds the record sessions (`crate::fleet::take_sessions`):
   // on any other shard none is found and every homing there fell short (the three-node A/B, 2026-11-20).
+  let began = slates_rt::futures::now_ns();
   if !others.is_empty() {
     let control = shards.first().copied().unwrap_or(origin);
     kept = kept.saturating_add(
@@ -1020,6 +1023,11 @@ pub(crate) async fn home_in_region(
       .unwrap_or(0),
     );
   }
+  let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
+  crate::state::with_state(|state| {
+    state.count(HOMING_LOCAL_NS, local_ns);
+    state.count(HOMING_REGION_NS, region_ns);
+  });
   let homed = kept >= homes.len() && !homes.is_empty();
   crate::state::with_state(|state| {
     state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
@@ -1247,6 +1255,14 @@ async fn read_in_parts(
     }
   }
 }
+
+/// Counter: nanoseconds homings spent on their local home (the keep and its shard's publication), summed: with
+/// [`HOMING_REGION_NS`], where a homing's time goes (the three-node A/B, 2026-11-20: about 10 to 16 ms a homing). Format:
+/// a counter name.
+pub(crate) const HOMING_LOCAL_NS: &str = "vcs_store.homes.homing_local_ns";
+/// Counter: nanoseconds homings spent on their other homes (the exchange, their keep and publication), summed. Format: a
+/// counter name.
+pub(crate) const HOMING_REGION_NS: &str = "vcs_store.homes.homing_region_ns";
 
 /// Counter: identities the healer offered to their region homes. Format: a counter name.
 pub(crate) const HEAL_OFFERED: &str = "vcs_store.homes.heal_offered";
