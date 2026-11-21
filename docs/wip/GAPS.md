@@ -173,8 +173,8 @@
 > whole (an import placed, a replay or rebuild ended) merged a slice at a time, and each lend over the store's own index
 > reporting its lookups to the rule, a due merge begun. (2) A pull whose client holds the history walked every manifest
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
-> made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
-> accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
+> made from what it sends. Git's repository index on the same upkeep BUILT (`Repository::rows`, `upload::lend_on` reports). OWED: inserts reported
+> to the rule (`inserts_took`, its first price before a merge is timed); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
 > a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
 > the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
