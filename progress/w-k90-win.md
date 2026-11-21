@@ -116,3 +116,8 @@
   w7 failed because '/Users/..' isn't absolute on Windows (rehomed correctly skips it) -> 9ebc11e5d gives w7 drive-letter
   paths there. Its jupiter run (r7) was lost to the kiln server dropping; not yet green on Windows, not landed.
   Next: re-run `cargo test -p kiln --lib -- workspace::tests::` on jupiter at wst2, then land as its own commit.
+
+## 2026-11-20 ~21:45 PST: w2/w7 test follow-up LANDED f16212799 (main 492af26f9)
+- macOS arm64 Studio-2 local: workspace::tests:: 11/11. Windows run lost to kiln server; GitHub run 44872271307
+  (492af26f9) pending -> watching its `windows (Slates tests)` job; send w-k90-pin-2 (01a1facadebb) the green run id.
+- Re-created ~/.cache/w-k90-win-local-target.noindex for this test (Studio-2 117 GB free).
