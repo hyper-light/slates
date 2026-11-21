@@ -7095,3 +7095,11 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   `#![cfg(unix)]`: on jupiter the `cli` target ran 0 tests (r27). Their run and red-first cannot be met as written --
   owner w-sizing (inbox/w-sizing-from-w-lint.md). The red-first run (r28) stopped as moot. w-realtools' real_tools over
   WinFsp (r29) queued by platform.
+
+## 2026-11-21 ~12:30 PST, w-rewrite-ops: A-818 (A-803 (c)) A/B, for after piece 2b lands (main's 09:40 and 10:35 conditions)
+- Command: `cargo run --release -p slates-merge --example history_layers_bench` on main before and after 2b,
+  interleaved rounds, all N shown. Rows: write per change, old-version read and memory per version at m = 10/100/1k/10k;
+  plus many paths changed once each (memory per version). Option (i), runs naming chunks on the generic leaf, is measured
+  against both (main's 10:35 condition). The bench rows for (i) and for many paths come with 2b.
+- Red: 2b loses on an old read. The risk is O(fragments x depth) against today's write-time compaction, or memory per
+  version above main's.
