@@ -56,3 +56,26 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
      pending Ada.
 - Meanwhile: measure 3a (71e55b6c2) in release at 64-512 MiB, 10 runs each, all shown. If 320 and 512 pass 10 of 10,
   the liveness is closed. The owner's long step stays the bounded-work bug that (A) closes.
+
+## 00:51 PST: your ruling (A) taken; condition 1 (durability) read before building
+- **Where held content lives:** the shard's `Store`, the same `content.arena` volume content is kept in
+  (`content_holder::hold_space(&mut state.store)`), inside the anchor-held segment the db is in. Not a second store.
+- **Persistence before reply:** a content put is acknowledged only once the shard's recovery image carrying it is
+  committed into anchor-owned RAM (AUD-29-59, `content_holder.rs`); nothing more is published at shutdown
+  (`Daemon::stop` publishes nothing), so a kill -9 after the acknowledgement keeps what a clean stop keeps.
+- **Tests already holding it:** `slates-server --test recovery an_acknowledged_replica_survives_a_warm_daemon_restart`
+  (a second daemon over the same anchor segment and content object holds the replica whole; in process, so a stop,
+  not a signal); and the real-process kills of the same store in `crates/cli/tests/cli.rs`
+  (`a_closed_files_writes_survive_a_kill_from_the_write_log_alone`,
+  `a_content_extent_outlives_a_killed_daemon_on_windows`).
+- **So:** the content store's durability is the db's: same segment, same commit-before-acknowledge. Nothing to close
+  there first. Your exact test (an owner's unfolded version's increment readable after kill -9 and restart, through
+  the content store) needs the owner to hold its increment there, which is part of (A); it is that piece's first red,
+  run as a real-process kill (a child daemon over the parent's anchor segment, the CLI suite's pattern) rather than a
+  stop.
+- **Next, in your order:** (2) chain entry format 6, with the amendment entry, golden vectors and the recovery oracle; I'm
+  reading §4.8 and the anchor handoff now for whether a new daemon must read a predecessor's format-5 entries across an
+  upgrade. (3) retention as A-714. (4) A-767: a green's increment is a change in RAM, the side A-767 keeps in RAM; its
+  disk changeset log is for a repository's landed history, so a repository green's increments become changesets there
+  once w-store's wiring lands. I'll record that overlap in GAPS for w-store.
+- **Meanwhile:** the release bench of 3a, 64-512 MiB x 10, is kiln r15 (queued).
