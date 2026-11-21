@@ -637,6 +637,11 @@ fn counter(instance: &str, name: &str) -> u64 {
 /// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
 const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 
+/// Format: the daemon's counter of the asks a fetch's answer made of the changeset store, each a batch of rows or of
+/// chunks (`crate::vcs_store::hg_view::STORE_ASKS` in `slates-server`): a stream's, and since A-767 C1 step 1a a plain
+/// clone's file section's.
+const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
 /// Shape: the most turns the pushed repository's stream clone may take: its store asks end a turn each (a pass's rows,
 /// the chunks) and the last turn ends the answer. A turn that yielded at its first quantum took one entry or one
 /// chunk, so this repository's stream was a turn a step before A-783's pacing reached the edge.
@@ -653,8 +658,10 @@ const STREAMING_LINE: &str = "streaming all changes";
 /// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
 /// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
 /// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
-/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly
-/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Then a plain
+/// `hg clone` of the pushed one (A-767 C1 step 1a): expect it to hold the source's changesets and verify, its file
+/// revisions read from the changeset store ([`STORE_ASKS`] counted). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or
+/// an issuer surface.
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
@@ -740,6 +747,29 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
   assert!(
     (1..=STREAM_TURNS_AT_MOST).contains(&turns),
     "the pushed repository's stream took {turns} turns"
+  );
+  // A-767 C1 step 1a (main's ruling of 2026-11-21 08:45): a plain clone's file revisions come from the changeset store
+  // as it keeps them, asked between turns, never a whole text from the content store.
+  let asks_before = counter(&instance, STORE_ASKS);
+  let plain = format!("{}/pushed-plain", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(
+      &["clone", "-U", &format!("{prefix}pushed"), &plain],
+      &config,
+    ),
+  );
+  let asks = counter(&instance, STORE_ASKS).saturating_sub(asks_before);
+  let (verified, out, err) = hg_in(&hg, &plain, &["verify"]);
+  assert_eq!(
+    (verified, hg_nodes(&hg, &plain) == hg_nodes(&hg, &source)),
+    (0, true),
+    "the plain clone holds the source's changesets and verifies: {out}{err}"
+  );
+  assert!(
+    asks > 0,
+    "the plain clone asked the changeset store {asks} times"
   );
 }
 
@@ -1662,5 +1692,120 @@ fn stock_hg_batches_a_pushkey_over_the_ssh_edge() {
     (&url, &config),
     send,
     (0, expected, true),
+  );
+}
+
+/// Format: the daemon's counter of the file revisions a pull sent whole against the null base
+/// (`crate::vcs_store::hg_view::PULL_WHOLE_TEXTS` in `slates-server`, A-767 C1 step 1b).
+const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
+
+/// Shape: the lines of the large file [`a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`]
+/// edits, about 2 MB, so a whole text would dwarf any delta.
+const LARGE_FILE_LINES: usize = 40_000;
+
+/// The size of the changegroup part stock hg took in a `pull --debug`'s words (`bundle2-input-part: total payload
+/// size N` after the part's `"changegroup"` line).
+fn changegroup_payload(said: &str) -> u64 {
+  let mut lines = said.lines();
+  lines
+    .find(|line| line.starts_with("bundle2-input-part: \"changegroup\""))
+    .unwrap_or_else(|| panic!("no changegroup part taken: {said}"));
+  lines
+    .find_map(|line| line.strip_prefix("bundle2-input-part: total payload size "))
+    .and_then(|size| size.trim().parse().ok())
+    .unwrap_or_else(|| panic!("no changegroup payload size: {said}"))
+}
+
+/// A-767 C1 step 1b (main's ruling of 2026-11-21 08:45: measure a pull of one changeset that touches a large file,
+/// slates' bytes against stock's). Do: over the HTTP edge, push a first changeset holding a file of
+/// [`LARGE_FILE_LINES`] lines, clone it, then push a second changeset changing one line of it; pull the second into the
+/// clone with `--debug`; pull the same changeset from the source by stock 7.2 itself into a clone of its first. Expect
+/// the slates clone to hold the source's changesets and verify clean, no file revision sent whole
+/// ([`PULL_WHOLE_TEXTS`] unmoved), and slates' changegroup within twice stock's; both sizes printed. Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping a large file's pull against stock's: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-pull-large-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "a large file's pull against stock's") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let url = format!("{prefix}r");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-pull-large");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  let lines: Vec<String> = (0..LARGE_FILE_LINES)
+    .map(|line| format!("line {line} of a large file, long enough to matter\n"))
+    .collect();
+  std::fs::write(format!("{source}/large"), lines.concat()).unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  hg_ok(&hg, &source, &with_config(&["push", &url], &config));
+  let ours = format!("{}/ours", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &ours], &config),
+  );
+  let theirs = format!("{}/theirs", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &["clone", "-U", "--rev", "0", &source, &theirs],
+  );
+  let mut edited = lines;
+  if let Some(line) = edited.get_mut(LARGE_FILE_LINES / 2) {
+    *line = "a changed line in the middle\n".to_owned();
+  }
+  std::fs::write(format!("{source}/large"), edited.concat()).unwrap();
+  hg_ok(&hg, &source, &["commit", "--message", "second"]);
+  hg_ok(&hg, &source, &with_config(&["push", &url], &config));
+  let whole_before = counter(&instance, PULL_WHOLE_TEXTS);
+  let (code, out, err) = hg_in(
+    &hg,
+    &ours,
+    &with_config(&["pull", "--debug", &url], &config),
+  );
+  assert_eq!(code, 0, "pull from slates: {out}{err}");
+  let slates_bytes = changegroup_payload(&format!("{out}{err}"));
+  let whole = counter(&instance, PULL_WHOLE_TEXTS).saturating_sub(whole_before);
+  let (code, out, err) = hg_in(&hg, &theirs, &["pull", "--debug", &source]);
+  assert_eq!(code, 0, "pull from the source: {out}{err}");
+  let stock_bytes = changegroup_payload(&format!("{out}{err}"));
+  eprintln!(
+    "a one-changeset pull of a {LARGE_FILE_LINES}-line file: slates {slates_bytes} bytes, stock 7.2 {stock_bytes}"
+  );
+  let (verified, out, err) = hg_in(&hg, &ours, &["verify"]);
+  assert_eq!(
+    (verified, hg_nodes(&hg, &ours) == hg_nodes(&hg, &source)),
+    (0, true),
+    "the slates clone holds the source's changesets and verifies: {out}{err}"
+  );
+  assert_eq!(whole, 0, "file revisions a pull sent whole");
+  assert!(
+    slates_bytes <= stock_bytes.saturating_mul(2),
+    "slates sent {slates_bytes} bytes where stock 7.2 sent {stock_bytes}"
   );
 }

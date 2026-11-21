@@ -2879,6 +2879,47 @@
 > stands alone, counted `vcs.hg.changeset_unmade`. git's adopts the hook (w-git, removing its version-2 path); (d)
 > performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C1 step 1a, a clone's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45).
+> BUILT.**
+> - The by-links walk (a clone of every head, `serve::getbundle::Walk`) reads each file revision from the node's
+>   changeset store through w-perf's `StoreWants`: the rows of as many revisions ahead as the step's room holds, then
+>   their chunks, asked between turns (`hg_view::answer_store_wants`, through the lender's `HgStores::answer_wants`).
+> - Each revision is sent as the store keeps it: its stored delta against the node its base text was sent as earlier
+>   in the group, or its stored whole against null. No whole text is read from the content store or made.
+> - A revision the store keeps no row of is refused typed. A whole answer, which cannot wait between steps, is refused
+>   typed too, unless its store answers at once (`getbundle::Store::stored_now`, the tests' stand-ins).
+> - Parents and flags come from the log's row (`Store::file_entry`).
+> - Held by:
+>   - `getbundle::tests::a_clone_sends_each_file_revision_as_the_changeset_store_keeps_it` (every revision after a
+>     log's first sent as a delta against the one sent before it, the texts rebuilt equal);
+>   - hg_interop `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`: a plain `hg clone` asks the
+>     store and verifies clean (0 asks before);
+>   - hg_interop 15/15 against stock hg 7.2.
+> - 1b, BUILT below.
+> **C1 step 1b, a pull's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45 with its
+> condition on pulls). BUILT.**
+> - A pull (any fetch the links do not walk) still makes its changelog and manifests whole when it begins
+>   (`named_changegroup`); its file section is now `serve::getbundle::Pull`, taken a step at a time from the node's
+>   changeset store through the same `StoreWants`: the rows of a batch of planned revisions and of their parents, then
+>   their stored edits, then any whole texts, one at a time (the new `Want::Texts`, `give_texts`; the daemon reads the
+>   store's `text` a piece at a time to its end, `hg_view::texts_made`).
+> - A revision's stored delta is sent where its base is on the client or sent earlier in this answer, decided from the
+>   common set: the base text is an earlier revision of its group, or a parent whose changeset the client holds. Else
+>   its whole text, made by the store from its chain, is sent against null and counted (`Walk::whole_sent`, beside
+>   `stored_sent`).
+> - Held by `getbundle::tests::a_pull_sends_a_stored_delta_against_a_parent_the_client_holds` (sent against its held
+>   p1, rebuilt equal, none whole), `a_pull_sends_whole_and_counts_a_revision_whose_stored_base_the_client_lacks` (the
+>   stored base a sibling's: sent whole, counted 1), and `a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history`
+>   (a step a unit sent).
+>   The daemon counts each whole text a pull is given, `vcs_store.hg_pull_whole_texts`.
+> - Measured (main's condition; MacBook arm64, debug build, stock hg 7.2, 2026-11-21): a one-changeset pull changing
+>   one line of a 40,000-line (about 2 MB) file sent a changegroup of 554 bytes from slates and 554 from stock 7.2
+>   pulling the same changeset from its source; none sent whole. Not materially more, so no A/B arm of a delta made
+>   against p1. Held by hg_interop `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does` (within
+>   twice stock's, `vcs_store.hg_pull_whole_texts` unmoved, verify clean), and the two stock round trips over HTTP and
+>   SSH pass.
+> - Left: the other synchronous readers (lookup's
+>   `.hgtags`, the push intake's base text), then step 2.
 > **C1, made changesets on the changeset store (2026-11-21, w-hg; main's ruling of 09:00: one hook, one path).
 > CLOSED.**
 > - A changeset the server makes of a submitted version lands on the node's store as a push's does. The made

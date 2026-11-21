@@ -162,6 +162,31 @@ pub(crate) trait HgStores {
     room: &mut Admission,
     step: impl for<'s> FnOnce(&Self::Store<'s>, &mut Admission) -> R,
   ) -> Option<R>;
+
+  /// Answers what a streamed answer asks of the changeset store before its next step (`slates_hg::render::StoreWants`;
+  /// A-767 C1): by default from what `hold`'s view reads at once (a test's lender,
+  /// `slates_hg::serve::getbundle::Store::stored_now`), within `room`; the daemon's lender asks the node's changeset
+  /// store between steps (`crate::vcs_store::hg_view::answer_store_wants`). Whether every want was answered.
+  async fn answer_wants(
+    &mut self,
+    (hold, id, room): (&Self::Hold, RepositoryId, u64),
+    wants: &mut dyn slates_hg::render::StoreWants,
+  ) -> bool {
+    let _ = id;
+    while let Some(want) = wants.wants().cloned() {
+      let mut admission = Admission::new(room);
+      let given = self
+        .lend_held(hold, &mut admission, |store, _| store.stored_now(&want))
+        .flatten();
+      match given {
+        Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
+        Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
+        Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
+        None => return false,
+      }
+    }
+    true
+  }
 }
 
 /// An exchange's answer once made: whole, or a `getbundle`'s, made a turn at a time (A-745).
@@ -650,8 +675,19 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       Some(Made::Streamed(mut streamed)) => {
         // What the answer's next step asks of the node's changeset store, answered before its turn (a stream's rows and
         // chunks, read where the store keeps them).
-        if !crate::vcs_store::hg_view::answer_store_wants(&mut *streamed, self.repository.id).await
-        {
+        let answered = match self.generation.as_ref() {
+          Some(generation) => {
+            self
+              .stores
+              .answer_wants(
+                (generation, self.repository.id, self.request_room),
+                &mut *streamed,
+              )
+              .await
+          }
+          None => false,
+        };
+        if !answered {
           return Err(Failed(Status::SERVICE_UNAVAILABLE));
         }
         let more = self.turn(&mut streamed, out)?;

@@ -57910,6 +57910,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and `HgStore::unstored` are gone: every Mercurial history is on the store, so every repository streams, and step 1's
 > rule (a revision with no store row is refused) refuses nothing a repository holds.
 
+> **Status (2026-11-21, C1 step 1a: a clone's file revisions as the changeset store keeps them).** A clone of every
+> head sends each file revision from the node's changeset store, never from the content store's whole text: the walk
+> asks the rows of the revisions ahead, then their chunks, between turns (w-perf's `StoreWants`, one mechanism with the
+> stream), and sends each stored delta as it stands against the node its base was sent as, or its stored whole.
+
+> **Status (2026-11-21, C1 step 1b: a pull's file revisions as the changeset store keeps them).** A pull's file
+> section is taken a step at a time from the store too (`serve::getbundle::Pull`): a stored delta is sent where its
+> base is on the client (a parent whose changeset the common set holds) or was sent earlier in its group; otherwise the
+> revision's whole text, made by the store from its chain (`Want::Texts`), is sent against null and counted. Its
+> changelog and manifests are still made whole when it begins.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with

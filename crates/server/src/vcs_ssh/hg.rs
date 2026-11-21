@@ -181,7 +181,9 @@ async fn streamed_turn<S: HgStores>(
   costs: &mut crate::vcs_store::hg_view::TurnCosts,
 ) -> Result<Progress, Refused> {
   if let Some(wants) = stdio.store_wants()
-    && !crate::vcs_store::hg_view::answer_store_wants(wants, repository).await
+    && !stores
+      .answer_wants((generation, repository, room), wants)
+      .await
   {
     return Err(unheld());
   }
