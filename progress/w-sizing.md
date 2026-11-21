@@ -164,3 +164,4 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - 2026-11-21 10:25: main is now 01a1ff2e. w-store answered R3: content leaves RAM when w-hg lands through the store. R3 waits on w-hg; close note updated.
 - 2026-11-21 ~11:00: w-lint found the A-789 Windows CLI tests compiled out (cli.rs is cfg(unix)). Moved to crates/cli/tests/content_extents_windows.rs, LANDED acff9a6e8 (merge d3f2810e0); xwin check clean; run-requests entry updated; --list on jupiter = kiln r1 (queued). Slip: r1 detached a fresh scratch clone on jupiter with git checkout (rule: worktree add); no other tree touched.
 - 2026-11-21 11:09: main put me in goal 93 RESERVE for memory (svn import heap attribution, git client RSS red when main sends them). Start no runs meanwhile; r1 (--list on jupiter) finishes on its own.
+- 11:21: r1 stopped (main). No runs of mine in flight.
