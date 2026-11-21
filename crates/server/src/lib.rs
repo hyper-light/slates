@@ -85,6 +85,7 @@ pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
 mod held_copy;
+pub(crate) mod placement_cache;
 // A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
 // pure parts are compiled and held by every host's tests, and only its no-op seams are called.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

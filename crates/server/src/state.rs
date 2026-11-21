@@ -908,6 +908,9 @@ pub struct ShardState {
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
   pub placed_heads: BTreeMap<ObjectId, crate::head::PlacedHead>,
+  /// The placements of the objects this shard asks about, one computation a configuration
+  /// ([`crate::placement_cache`]): read through [`ShardState::with_placement`].
+  pub(crate) placement_cache: std::cell::RefCell<crate::placement_cache::PlacementCache>,
   /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
   /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
   /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.
@@ -1513,6 +1516,20 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
+  /// Runs `with` on `object`'s placement under the configuration in force, computed once a configuration
+  /// ([`crate::placement_cache`]); computed afresh only while the cache is already borrowed (a nested ask).
+  pub(crate) fn with_placement<R>(
+    &self,
+    object: slates_db::register::ObjectId,
+    with: impl FnOnce(&slates_db::register::Placement) -> R,
+  ) -> R {
+    let configuration = self.fleet.configuration();
+    match self.placement_cache.try_borrow_mut() {
+      Ok(mut cache) => cache.with(configuration, object, self.placed_heads.len(), with),
+      Err(_) => with(&configuration.place(object)),
+    }
+  }
+
   /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
   /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
   /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the

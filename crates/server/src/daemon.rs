@@ -2812,7 +2812,7 @@ impl Daemon {
     self.observe(self.shard_of_object(object), move |s| {
       s.placed_heads
         .get(&object)
-        .is_some_and(|head| head.placed_under(s.fleet.configuration(), object))
+        .is_some_and(|head| head.placed_under(s, object))
     })
   }
 
@@ -4987,6 +4987,7 @@ async fn init_shard(
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
+    placement_cache: std::cell::RefCell::default(),
     state_logs: crate::state_log::StateLogs::default(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),

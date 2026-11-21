@@ -1174,7 +1174,7 @@ fn head_placed(state: &ShardState, volume: [u8; 16]) -> bool {
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| head.placed_under(configuration, ObjectId(volume)))
+      .is_some_and(|head| head.placed_under(state, ObjectId(volume)))
 }
 
 /// A verb's reply held until its volume's log is durable where its publication put it.
@@ -1619,9 +1619,7 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| {
-        head.sequence >= sequence && head.placed_under(configuration, ObjectId(volume))
-      })
+      .is_some_and(|head| head.sequence >= sequence && head.placed_under(state, ObjectId(volume)))
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
@@ -3938,12 +3936,15 @@ fn published_whole(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool
 fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
-  let candidates: Vec<HostId> = configuration
-    .place(ObjectId(volume))
-    .candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
+  // The shard's cached placement, computed once a configuration (85a, g228).
+  let candidates: Vec<HostId> = state.with_placement(ObjectId(volume), |placement| {
+    placement
+      .candidates
+      .iter()
+      .copied()
+      .filter(|host| *host != local)
+      .collect()
+  });
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return;
   };
@@ -4174,9 +4175,9 @@ fn log_covers(
 fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item = HostId> + '_ {
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
-  configuration
-    .place(ObjectId(volume))
-    .candidates
+  // The shard's cached placement (`ShardState::with_placement`), computed once a configuration (85a, g228).
+  state
+    .with_placement(ObjectId(volume), |placement| placement.candidates.clone())
     .into_iter()
     .filter(move |candidate| *candidate != local && configuration.neighbourhood.contains(candidate))
 }
@@ -4471,7 +4472,7 @@ fn catalog_placed_at(state: &ShardState, volume: [u8; 16], version: u64) -> bool
     || state
       .placed_heads
       .get(&catalog)
-      .is_some_and(|head| head.sequence >= version && head.placed_under(configuration, catalog))
+      .is_some_and(|head| head.sequence >= version && head.placed_under(state, catalog))
 }
 
 /// A catalog register's placement moved (`fleet::record_acks_in`): when it is a live volume's and now places that
