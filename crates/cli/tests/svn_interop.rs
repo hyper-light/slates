@@ -1667,9 +1667,10 @@ struct UseLeg {
 }
 
 impl UseLeg {
-  /// `text` with this leg's URL replaced by [`USE_URL`].
+  /// `text` with this leg's URL replaced by [`USE_URL`] and each XML tag's attributes in one order
+  /// ([`canonical_tags`]).
   fn plain(&self, text: &str) -> String {
-    text.replace(&self.url, USE_URL)
+    canonical_tags(&text.replace(&self.url, USE_URL))
   }
 
   /// `svn args` against this leg (each `{url}` in `args` its URL), in `dir`: its standard output with the URL made
@@ -1687,6 +1688,54 @@ impl UseLeg {
       format!("exit {code}: {}", self.plain(&err))
     }
   }
+}
+
+/// `text` with each XML tag's attributes sorted by name and written on one line, the rest of `text` as it was: stock
+/// `svn` writes a tag's attributes from a hash (`svn_xml_make_open_tag_hash`), so their order is no part of an answer
+/// (found by the first run of this test: `svn log -v --xml`'s `<path>` attributes in two orders, the same four values).
+fn canonical_tags(text: &str) -> String {
+  let mut out = String::with_capacity(text.len());
+  let mut rest = text;
+  while let Some(open) = rest.find('<') {
+    out.push_str(&rest[..open]);
+    let Some(close) = rest[open..].find('>') else {
+      break;
+    };
+    let tag = &rest[open + 1..open + close];
+    rest = &rest[open + close + 1..];
+    let (body, empty) = match tag.strip_suffix('/') {
+      Some(body) => (body, "/"),
+      None => (tag, ""),
+    };
+    let mut words = body.split_whitespace();
+    let name = words.next().unwrap_or_default();
+    let mut attributes: Vec<String> = Vec::new();
+    let joined: Vec<&str> = words.collect();
+    let mut pending = String::new();
+    for word in joined {
+      if !pending.is_empty() {
+        pending.push(' ');
+      }
+      pending.push_str(word);
+      if pending.matches('"').count() % 2 == 0 {
+        attributes.push(std::mem::take(&mut pending));
+      }
+    }
+    if !pending.is_empty() {
+      attributes.push(pending);
+    }
+    attributes.sort();
+    out.push('<');
+    out.push_str(name);
+    for attribute in attributes {
+      out.push(' ');
+      out.push_str(&attribute);
+    }
+    out.push_str(empty);
+    out.push('>');
+  }
+  out.push_str(rest);
+  out
 }
 
 /// Every file of working copy `copy`, by its path beneath it, and its bytes; `.svn` left out.
@@ -2148,4 +2197,18 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     slates_leg.name
   );
   assert!(failed.is_empty(), "differences:\n{}", failed.join("\n"));
+}
+
+/// The comparison's own rule ([`canonical_tags`]). Do: put the two attribute orders the first run of
+/// [`a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve`] met for one `<path>` through it, and a value with
+/// a space. Expect one text for both orders, the value whole, and text outside tags as it was.
+#[test]
+fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
+  let stock = "<paths>\n<path\n   action=\"A\"\n   prop-mods=\"false\"\n   text-mods=\"false\"\n   kind=\"dir\">/branches</path>";
+  let slates = "<paths>\n<path\n   prop-mods=\"false\"\n   text-mods=\"false\"\n   kind=\"dir\"\n   action=\"A\">/branches</path>";
+  assert_eq!(canonical_tags(stock), canonical_tags(slates));
+  assert_eq!(
+    canonical_tags("x <e b=\"two words\" a=\"1\"/> y"),
+    "x <e a=\"1\" b=\"two words\"/> y"
+  );
 }
