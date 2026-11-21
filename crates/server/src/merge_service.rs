@@ -1524,7 +1524,7 @@ pub(crate) fn status_merge_volume(
 use std::collections::BTreeSet;
 
 use slates_archive::Archive;
-use slates_cluster::content::{chunk_requests, offer_request};
+use slates_cluster::content::{chunk_requests, offer_request, raw_chunk_request};
 use slates_cluster::{ClusterError, CommitBudget, commit_record_sent_as};
 use slates_db::register::{
   Acceptor, Configuration, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
@@ -2059,6 +2059,14 @@ pub struct PendingMergeRecord {
   /// The shipments that carried its inputs so far ([`SUBMIT_SHIPMENTS`]): inputs larger than one shipment's bound
   /// cross in several, one a record-plane pass.
   pub shipments: u64,
+  /// A later version's inputs archive without its chunks (`merge_origin::inputs_manifest_archive`), made once at its
+  /// first shipment that carries inputs ([`INPUTS_MANIFEST_MADE`]): what every shipment offers and names its chunks by,
+  /// each chunk cut as a view of the bytes the green's chain holds. Before 2026-11-20 every pass copied the version's
+  /// increment out of the chain and rebuilt and hashed its whole archive, so inputs of N shipments cost N times their
+  /// bytes in one owner step each (a 64 MiB version: 64 passes of 128 MB copied and 64 MB hashed). Its extents are a
+  /// chunk's in 1 MiB of inputs; `None` for version 0, whose origin archive is kept whole while it ships, and until a
+  /// shipment needs it.
+  pub inputs_manifest: Option<Archive>,
 }
 
 /// Counter pairs (how many were timed, and their nanoseconds or their count) of a submit's phases (A-697's measured
@@ -2212,6 +2220,11 @@ pub(crate) fn inputs_held_by(
 /// The inputs a version references, as the chain holds them: the origin for version 0 (none for a
 /// scratch green), the increment's chain entry for version N.
 fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<u8>> {
+  inputs_lent(state, green, version).map(<[u8]>::to_vec)
+}
+
+/// [`inputs_of`], lent: a view of the bytes the green's chain holds, copied nowhere.
+fn inputs_lent(state: &ShardState, green: DbVolumeId, version: u64) -> Option<&[u8]> {
   if version == 0 {
     // Version 0's inputs, a green's origin, are made a share at a time and kept until placed (`crate::merge_origin`,
     // A-286); a scratch green's version 0 has none.
@@ -2225,9 +2238,7 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
   let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   let entry = state.db.partition().green_chain(green).get(index)?;
   // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
-  slates_merge::chain_entry::increment_bytes(entry)
-    .ok()
-    .map(<[u8]>::to_vec)
+  slates_merge::chain_entry::increment_bytes(entry).ok()
 }
 
 /// The page the inputs archive is chunked at (informational in the header; the identity is the
@@ -2458,6 +2469,7 @@ pub(crate) fn insert_pending(
       lacking: BTreeMap::new(),
       enqueued_ns: slates_machine::clock::monotonic_ns(),
       shipments: 0,
+      inputs_manifest: None,
     },
   );
   nudge_record_plane(state);
@@ -2774,6 +2786,9 @@ fn ship_version(
     generation: config.version,
     value,
   };
+  if version > 0 && groups.keys().any(|carry| *carry != Carry::Record) {
+    make_inputs_manifest(state, object, version);
+  }
   let shipments = cut_shipments(state, (object, version), groups);
   let carrying = shipments
     .iter()
@@ -2870,15 +2885,20 @@ fn cut_shipments(
   groups: BTreeMap<Carry, Vec<HostId>>,
 ) -> Vec<(Vec<HostId>, Option<ShipInputs>)> {
   let bound = shipment_bound(state);
-  let owned;
-  let archive = if !groups.keys().any(|carry| *carry != Carry::Record) {
+  let source = if !groups.keys().any(|carry| *carry != Carry::Record) {
     None
   } else if version == 0 {
-    crate::merge_origin::made_archive(state, object)
+    crate::merge_origin::made_archive(state, object).map(InputsSource::Whole)
   } else {
-    owned = inputs_of(state, DbVolumeId { bytes: object.0 }, version)
-      .map(|bytes| MergeShardState::inputs_archive(&bytes, 0, archive_page(state)));
-    owned.as_ref()
+    let manifest = state
+      .merge
+      .pending
+      .get(&object)
+      .and_then(|pending_green| pending_green.records.get(&version))
+      .and_then(|pending| pending.inputs_manifest.as_ref());
+    manifest
+      .zip(inputs_lent(state, DbVolumeId { bytes: object.0 }, version))
+      .map(|(manifest, bytes)| InputsSource::Lent { manifest, bytes })
   };
   groups
     .into_iter()
@@ -2888,11 +2908,11 @@ fn cut_shipments(
         Carry::Inputs => None,
         Carry::Lacking(lacking) => Some(lacking),
       };
-      archive.map(|archive| {
+      source.as_ref().map(|source| {
         (
           targets,
           Some(ShipInputs::cut(
-            archive,
+            source,
             (object, version),
             lacking.as_deref(),
             bound,
@@ -2901,6 +2921,117 @@ fn cut_shipments(
       })
     })
     .collect()
+}
+
+/// Format: a later version's inputs archive made without its chunks for its shipments, once a version
+/// ([`PendingMergeRecord::inputs_manifest`]): the non-vacuity count that a version crossing in several shipments is
+/// archived once, not once a shipment.
+pub(crate) const INPUTS_MANIFEST_MADE: &str = "merge.inputs.manifest_made";
+
+/// Makes `version`'s inputs manifest on its pending record if it has none yet ([`PendingMergeRecord::inputs_manifest`]):
+/// its chunks hashed in place over the chain's bytes, nothing copied but the manifest. A version whose inputs the chain no
+/// longer holds gets none, and its shipments then carry no inputs, as before.
+fn make_inputs_manifest(state: &mut ShardState, object: ObjectId, version: u64) {
+  let made = state
+    .merge
+    .pending
+    .get(&object)
+    .and_then(|pending_green| pending_green.records.get(&version))
+    .is_some_and(|pending| pending.inputs_manifest.is_some());
+  if made {
+    return;
+  }
+  let page = archive_page(state);
+  let Some(manifest) = inputs_lent(state, DbVolumeId { bytes: object.0 }, version)
+    .map(|bytes| crate::merge_origin::inputs_manifest_archive(bytes, 0, page))
+  else {
+    return;
+  };
+  if let Some(pending) = state
+    .merge
+    .pending
+    .get_mut(&object)
+    .and_then(|pending_green| pending_green.records.get_mut(&version))
+  {
+    pending.inputs_manifest = Some(manifest);
+    state.count(INPUTS_MANIFEST_MADE, 1);
+  }
+}
+
+/// Where a shipment's inputs come from: version 0's origin archive, kept whole while it ships (A-286); or a later
+/// version's manifest with its chunks lent from the bytes the green's chain holds ([`InputsSource::Lent`]).
+enum InputsSource<'a> {
+  /// An archive holding its chunks.
+  Whole(&'a Archive),
+  /// An archive's manifest, its chunks the ranges its extents name in `bytes`.
+  Lent {
+    /// The archive without its chunks.
+    manifest: &'a Archive,
+    /// The bytes its extents name.
+    bytes: &'a [u8],
+  },
+}
+
+impl InputsSource<'_> {
+  /// The archive whose manifest the shipment offers.
+  fn archive(&self) -> &Archive {
+    match self {
+      InputsSource::Whole(archive)
+      | InputsSource::Lent {
+        manifest: archive, ..
+      } => archive,
+    }
+  }
+
+  /// Each chunk's raw length by its identity.
+  fn sizes(&self) -> BTreeMap<[u8; 32], u64> {
+    match self {
+      InputsSource::Whole(archive) => archive
+        .chunks
+        .iter()
+        .map(|chunk| (chunk.identity, chunk.raw_len))
+        .collect(),
+      InputsSource::Lent { manifest, .. } => inputs_extents(manifest)
+        .iter()
+        .map(|extent| (extent.chunk, extent.len))
+        .collect(),
+    }
+  }
+
+  /// The chunk requests of `batch`, in its order: a held archive's from its chunks; a lent one's encoded straight from
+  /// the range of the bytes each chunk's first extent names, nothing copied first.
+  fn requests(&self, (object, version): (ObjectId, u64), batch: &[[u8; 32]]) -> Vec<Vec<u8>> {
+    match self {
+      InputsSource::Whole(archive) => chunk_requests(archive, object, version, batch),
+      InputsSource::Lent { manifest, bytes } => {
+        let identity = manifest.manifest_identity();
+        let extents = inputs_extents(manifest);
+        batch
+          .iter()
+          .filter_map(|chunk| {
+            let extent = extents.iter().find(|extent| extent.chunk == *chunk)?;
+            let start = usize::try_from(extent.offset).ok()?;
+            let end = start.checked_add(usize::try_from(extent.len).ok()?)?;
+            let raw = bytes.get(start..end)?;
+            Some(raw_chunk_request((object, version), &identity, chunk, raw))
+          })
+          .collect()
+      }
+    }
+  }
+}
+
+/// The extents an inputs archive's manifest names (its one file's, `merge_origin`'s shape), or none for another shape.
+fn inputs_extents(archive: &Archive) -> &[slates_archive::manifest::Extent] {
+  match &archive.manifest {
+    slates_archive::manifest::Node::Directory(entries) => {
+      match entries.first().map(|entry| &entry.node) {
+        Some(slates_archive::manifest::Node::File(extents)) => extents,
+        _ => &[],
+      }
+    }
+    _ => &[],
+  }
 }
 
 /// Derived: the most inputs bytes one merge shipment carries (A-286) — what a holder verifies against their identities
@@ -2928,18 +3059,15 @@ impl ShipInputs {
   /// when `None`): the offer, and in reference order the chunks they lack up to `bound` bytes — at least one, so a
   /// shipment always carries something they lack.
   fn cut(
-    archive: &Archive,
+    source: &InputsSource<'_>,
     (object, version): (ObjectId, u64),
     lacking: Option<&[[u8; 32]]>,
     bound: u64,
   ) -> ShipInputs {
+    let archive = source.archive();
     let wanted: Option<BTreeSet<[u8; 32]>> =
       lacking.map(|lacking| lacking.iter().copied().collect());
-    let sizes: BTreeMap<[u8; 32], u64> = archive
-      .chunks
-      .iter()
-      .map(|chunk| (chunk.identity, chunk.raw_len))
-      .collect();
+    let sizes = source.sizes();
     let mut batch = Vec::new();
     let mut carried = 0u64;
     let mut owed = 0usize;
@@ -2961,7 +3089,7 @@ impl ShipInputs {
     }
     ShipInputs {
       offer: offer_request(archive, object, version),
-      chunks: chunk_requests(archive, object, version, &batch),
+      chunks: source.requests((object, version), &batch),
       whole: batch.len() == owed,
     }
   }
@@ -4240,6 +4368,7 @@ mod tests {
       lacking: BTreeMap::new(),
       enqueued_ns: 0,
       shipments: 0,
+      inputs_manifest: None,
     };
     assert!(carries_inputs(&pending, &[second, third]));
     assert!(!carries_inputs(&pending, &[second]));
@@ -4343,6 +4472,7 @@ mod tests {
             lacking: BTreeMap::new(),
             enqueued_ns: 0,
             shipments: 0,
+            inputs_manifest: None,
           },
         );
       }
@@ -4722,7 +4852,7 @@ mod tests {
     let ids = archive.referenced_chunks();
     let chunk = u64::try_from(crate::merge_origin::inputs_chunk_bytes()).unwrap();
     let carried = |lacking: Option<&[[u8; 32]]>, bound: u64| {
-      let cut = ShipInputs::cut(&archive, (object, 4), lacking, bound);
+      let cut = ShipInputs::cut(&InputsSource::Whole(&archive), (object, 4), lacking, bound);
       assert!(
         matches!(
           slates_cluster::content::ContentMessage::decode(&cut.offer),
@@ -4742,6 +4872,46 @@ mod tests {
     );
     assert_eq!(carried(None, u64::MAX), (ids.clone(), true));
     assert_eq!(carried(Some(&ids[2..]), chunk), (ids[2..].to_vec(), true));
+  }
+
+  /// A later version's shipments cut as views of the chain's bytes (its manifest made once, its chunks lent) are byte for
+  /// byte the shipments a whole archive of the same bytes makes: the same offer, the same chunk requests in the same
+  /// order, the same wholeness. Do: cut both ways for targets lacking every chunk and lacking only the last, under bounds
+  /// of zero, one chunk, two and past the whole, over a three-chunk input whose last chunk is short, and over one that
+  /// repeats a chunk. Expect: equal shipments every time.
+  #[test]
+  fn a_shipment_cut_from_lent_bytes_is_the_whole_archives_byte_for_byte() {
+    let chunk = crate::merge_origin::inputs_chunk_bytes();
+    let short: Vec<u8> = (0..chunk * 2 + chunk / 2)
+      .map(|at| u8::try_from(at % 253).unwrap())
+      .collect();
+    let mut repeating = vec![7u8; chunk * 2];
+    repeating.extend((0..chunk / 3).map(|at| u8::try_from(at % 251).unwrap()));
+    let object = ObjectId([43; 16]);
+    let step = u64::try_from(chunk).unwrap();
+    for bytes in [short, repeating] {
+      let whole = MergeShardState::inputs_archive(&bytes, 0, 4096);
+      let manifest = crate::merge_origin::inputs_manifest_archive(&bytes, 0, 4096);
+      let ids = whole.referenced_chunks();
+      let last = ids.last().copied().into_iter().collect::<Vec<_>>();
+      for lacking in [None, Some(last.as_slice())] {
+        for bound in [0, step, 2 * step, u64::MAX] {
+          let held = ShipInputs::cut(&InputsSource::Whole(&whole), (object, 4), lacking, bound);
+          let lent = ShipInputs::cut(
+            &InputsSource::Lent {
+              manifest: &manifest,
+              bytes: &bytes,
+            },
+            (object, 4),
+            lacking,
+            bound,
+          );
+          assert_eq!(lent.offer, held.offer, "the same offer");
+          assert_eq!(lent.chunks, held.chunks, "the same chunk requests");
+          assert_eq!(lent.whole, held.whole);
+        }
+      }
+    }
   }
 
   /// §4.16 "Commit" (A-286): the owner reads what each target answered about a version's inputs, and ships each what it
@@ -4787,6 +4957,7 @@ mod tests {
           lacking: BTreeMap::new(),
           enqueued_ns: 0,
           shipments: 0,
+          inputs_manifest: None,
         },
       );
       let ack = |holder, sequence, manifest| {

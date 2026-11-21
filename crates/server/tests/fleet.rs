@@ -22817,6 +22817,60 @@ fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
   );
 }
 
+/// §4.16 "Commit" (A-286; exit 4 at 64 MiB, main's close list): a version whose inputs cross to a holder in several
+/// shipments is archived once, its chunks cut as views of the chain's bytes, never its whole archive rebuilt and rehashed
+/// a pass at a time. Do: in a two-node `f = 1` fleet, A's work writes a file of four and a half inputs chunks and
+/// submits it. Expect: answered version 2; the version placed at the quorum; its inputs crossed to B in parts, a shipment
+/// each pass (`merge.inputs.partial` moved, more than one shipment); A made the version's inputs manifest exactly once.
+#[test]
+fn a_version_crossing_in_several_shipments_is_archived_once() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "several-shipments");
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  // Four and a half of the inputs archive's 1 MiB chunks: a shipment carries at least one, so they cross in five or more.
+  let bytes = 4 * (1 << 20) + (1 << 19);
+  let work = bench_work(&mut owner, green, "several-shipments-work", bytes);
+  let (made_before, partial_before) = (
+    count("merge.inputs.manifest_made"),
+    count("merge.inputs.partial"),
+  );
+  let shipments_before = count("merge.submit.shipments");
+  let submitted = owner.call(&RequestBody::submit(work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let made = count("merge.inputs.manifest_made") - made_before;
+  let partial = count("merge.inputs.partial") - partial_before;
+  let shipments = count("merge.submit.shipments") - shipments_before;
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  assert!(placed, "the version placed at the quorum");
+  assert!(
+    partial >= 1 && shipments > 1,
+    "the inputs crossed in parts: partial {partial}, shipments {shipments}"
+  );
+  assert_eq!(
+    made, 1,
+    "the version's inputs were archived once over {shipments} shipments"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
