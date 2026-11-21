@@ -1612,3 +1612,11 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - LANDED: dc0adee77 (w-fed-move, the work-log wall: a rebase answers each changed file as parts over the head, and a work holds and logs those parts, so its log is what it wrote).
   - Studio-2 is off kiln again (its 7 agents offline).
   - DISK: the MacBook at 27 GB. The kiln-build container elated_leakey is still running at 42 min, its layer 14.2 GB, freed when it exits. Docker images are 60 GB (36.6 reclaimable, not ours). w-git's r18 is compiling on the MacBook, non-incremental.
+- 2026-11-21 03:13 PST
+  - LANDED:
+    - A-806 (w-fed-move, 4c404823 / dc0adee77): a work's log holds what it wrote. A rebase answers changed files as pieces over the head. Largest log 752,530 -> 2,036 bytes over kernel/, 35,249,811 -> 1,957 over asic_reg. Red first: a 64-byte write into 1 MiB logged 1,048,635 bytes before, under 1,088 after.
+    - 542e1242c (w-svn B2 (b) P3: the content store lets go a commit's texts once landed, recovery reads none back, the deltify job retired).
+    - w-git's r18 is green at 8baa1cf16 (layer 2's next piece), landing.
+  - STALE TEST on main: daemon's the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier still asserts a green's landing is refused, but A-774 part 3 (f401f798c) made greens landable. w-fed-move updates only that assertion to A-774's rule, or stops and reports a design conflict.
+  - NEXT for w-fed-move: owner asks per client grow ~6x with scale (17.5 at 1k, ~101 at 100k). Inject contention to find the kind that grows.
+  - DISK: the MacBook back to 42 GB. The kiln-build container is still running at 47 min, 14.3 GB.
