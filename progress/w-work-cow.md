@@ -113,3 +113,16 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
   - rule as on main (worktree over 6a0600ff1, release): merge_check 3/3 ok, the test included. Log
     ~/.cache/w-work-cow-red/rebase-with-green.log.
 - Nothing to land for it (GAPS already closed at 24412); the close note is updated. Queue empty.
+
+## Post-view hook for w-svn (main's order 2026-11-21, w-engine unreachable)
+- Finding: A-805 (31c0acd50, w-rewrite-ops) already built it as a copy-on-write fork: Lineage::preview / Greens::preview,
+  read by svn_made::revision_from at (0, 1). Nothing in the engine changed.
+- Added main's oracle: slates-merge --lib a_held_verdicts_preview_reads_as_its_commit_over_generated_histories,
+  60733f959 on agents/w-work-cow-post-view (merged with origin/main). Every read svn's revision takes (changed paths,
+  content, kind, symlink, special, hardlink, mode, xattrs, copied, identity) equals the read after apply_recorded: 476
+  verdicts, 131 with a copy, 96 cases, debug, Mac Studio. Mutant (verdict not committed into the preview): fails at case 1.
+  engine::branch 10/10. Design A-805 has an "Oracle" bullet. No GAPS line tracked the ask.
+- Told w-svn: inbox/w-svn-from-w-work-cow-post-view-2026-11-21.md.
+- NOT LANDED YET: kiln's MCP tools have been gone since the restart, and this Studio has no other push route (SSH
+  publickey refused, HTTPS no credential). To land when kiln returns: 60733f959's merge onto main via studio-3, and this
+  state branch (also 6bec55c/e43f712's red record).
