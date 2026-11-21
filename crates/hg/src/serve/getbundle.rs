@@ -867,8 +867,6 @@ impl Walk {
     out: &mut Vec<u8>,
   ) -> Result<(), Refusal> {
     room.charge(to_u64(delta::HUNK_HEADER_LEN.saturating_add(text.len())))?;
-    let mut data = Vec::new();
-    delta::encode_full_text(text, &mut data).map_err(|_| unencodable("a full text"))?;
     let revision = Revision {
       node,
       p1: parents[0],
@@ -882,10 +880,11 @@ impl Walk {
       },
       info: None,
       protocol_flags: 0,
-      data: &data,
+      data: text,
       sidedata: None,
     };
-    changegroup::put_revision(&revision, self.version, out).map_err(|_| unencodable("a revision"))
+    changegroup::put_revision_whole(&revision, self.version, out)
+      .map_err(|_| unencodable("a revision"))
   }
 }
 

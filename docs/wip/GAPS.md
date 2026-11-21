@@ -9,8 +9,8 @@
 > starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
 
 > **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
-> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included. Its CI wiring is a
-> run request. **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
+> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
+> and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
 > switches between a forwarded reply's two tasks); the A/B and the next step are in 8a-r9-gate.
 
@@ -33,7 +33,10 @@
 > but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
 > RSS 64 -> 64). Correction (same day): those pages stay physically held (not reclaimed in 10 s under pressure), so RSS,
 > which `slates_machine::facts::resident_now` reads, is the honest holding and the footprint understates it.
-> **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> **A-789 BUILT (macOS; content as extents made on demand, piece 1):** each pool extent is an object of its own,
+> made ahead of need and given back whole at release: a 256 MiB burst's destroyed volume left 259 MiB in the content
+> object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
+> object, Windows' section per extent, a held extent's free pages. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -92,7 +95,9 @@
 > standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
 > with w-hg, w-git, w-svn; Mantle's crates vendored; `slates-store`; the A/B against per-file deltas; each tool moved
 > onto it with an RSS red test. Piece 2a (2026-11-20): `hyper-block` (no issuer), `hyper-log`, `hyper-sim` vendored at
-> hyper-raft `5e40eb9`; 2b (engine, chunk, disk: `hyper-rt`'s channel) waits on main's decision.
+> hyper-raft `5e40eb9`; 2b: engine, chunk, disk, crc, codec vendored and ported onto `slates_rt` (main's ruling: no hyper-rt, no
+> `unsafe impl Send`/`Sync`), their unit tests green here; their files opened through `slates_land::store_root` under a
+> `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -5092,7 +5097,9 @@
 > back to it (A-697 (1), 2026-11-20); the increment carried by reference
 > to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
-> that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
+> that composed them; release measurements owed before and after) is open. Part f built (2026-11-20): the rule
+> "replicated here" replaces the test hook, so production routing serves a green's works on every node that replicates
+> it; the green's successor takes a holder work's asks after a takeover.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
@@ -10814,8 +10821,14 @@ and parked p50/p99/p999; max informational) to the machine's recorded ceilings, 
 machine with no baseline, and appends every run's rows to `target/provision-histogram.tsv` for CI to keep. The bench
 fails past R9's floor and, with `PROVISION_BENCH_LOAD=<n>` (n busy processes a logical CPU, started after the quiet forms),
 past the loaded bound: the load may add to the spinning 1-client p99 at most what it adds to the parked one. Each
-1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`). CI wiring on
-a reference runner: run request (w-lint, main).
+1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`).
+**Wired (2026-11-20, C1):** `.kiln/ci.yaml` and `.kiln/nightly.yaml` run the lane as `provision-gate-linux` and
+`provision-gate-macos`, each taking a bare-metal machine whole (`exclusive: true`); GitHub's `provision-histogram` runs it
+on ubuntu-latest and macos-latest. The lane always includes the loaded form (`PROVISION_BENCH_LOAD=2`). Where the machine
+has a baseline, a regression or a failed bench gate fails the job; elsewhere it measures and keeps the histogram
+(`target/provision-histogram.tsv`, the job's artifact) and reports the gates. The Linux bare-metal machine (adacachy,
+32 cores) stood at load 90-104 when its baseline was tried, so it has none yet; it records at its first quiet exclusive
+run.
 
 **The loaded p99, measured (macOS arm64, Apple M4 Max 14 CPUs, this MacBook, host load 4-54 from other agents, release,
 9 shards).** Red on main: 1.62 ms against the bound 0.87 ms (quiet 616 µs, parked 683 -> 939 µs under the load). By the
@@ -12506,7 +12519,7 @@ or executable regression was performed by this docs change.
 | GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
 | GAP-A9-12 | Closed registry, distinct identities with type-enforced causation, and typed loss/absence markers built and proven by use single-node (`e18619a`); open: cross-node trace propagation and the fleet/archive emitters (§4.8/§4.10 integration). (Was: signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven.) | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
 | GAP-A9-13 | **Built single-node (2026-09-14, `docs/wip/clean-digest.md`):** verified current digest only (`Overlay::digest`, the `Digest` verb on the wire/CLI/MCP); invalidated before any mutation (`copy_up`, `base_forget`, listing refresh); bounded cache discovery (`Store.digests`, `digest_capacity`, typed counted `DigestCacheFull`); watcher hints backed by revalidation, overflow drops all. Owed: cooperative slicing of the hash, sealed-content digests, SDK exposure. (Was: clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content.) | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
-| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: the slot and unsubmitted mount writes are lost at a restart, a mount is not refreshed when its work's base moves, a work over a green on another shard mounts nothing, a green landed again into a directory holding its earlier landing conflicts on every changed file (part 3 lands its head without a copy, but the plan holds no witness of the earlier landing; incremental landing owed), the landing view's tree is loaded in one step (slicing owed), a work with declared changes is refused a mount, only the NFS and FUSE bridges lend the green to a mount's base, several spans a file (D-O17), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). A work's first edit holds what it wrote as pieces over the base, never the file (A-790, 2026-11-20: 8 one-byte edits of a 64 MiB file add 32 KiB, were 201 MB). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
+| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A save through a mount is refined into the edits it made (2026-11-20, A-774 part 5 with A-776). A mount's unsubmitted writes survive a restart (2026-11-20, A-774 part 4: the slot rebuilt from its image). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: a mount is not refreshed when its work's base moves, a work over a green on another shard mounts nothing, a green landed again into a directory holding its earlier landing conflicts on every changed file (part 3 lands its head without a copy, but the plan holds no witness of the earlier landing; incremental landing owed), the landing view's tree is loaded in one step (slicing owed), a work with declared changes is refused a mount, only the NFS and FUSE bridges lend the green to a mount's base, the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). A work's first edit holds what it wrote as pieces over the base, never the file (A-790, 2026-11-20: 8 one-byte edits of a 64 MiB file add 32 KiB, were 201 MB). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
 | GAP-A9-15 | Evidence surface built (2026-09-14, `docs/wip/conformance.md`): a typed record per transport × suite rendered as a doc-truth matrix, with `cargo xtask conformance` driving the real binary over a real mount and a CI `conformance` lane; on macOS NFS fsx and fsstress pass, the workloads differ by two declared NFS limits (AppleDouble sidecars, SQLite WAL) and pjdfstest ran unprivileged (3,348/3,331/2,007) with its failures categorized, none reviewed as expected; Linux runs as a LIMITED root-NFS adapter, Windows/virtio-fs/OCI and the pressure/failure suites are typed skips. Historical overstatement is closed by construction; the transport guarantees themselves remain open. (Was: native/guest POSIX, strict RAM residency and grant-only disk effects lack complete transport-specific evidence; historical stages overstate coverage.) | §4.6, Part 6 and EQUIVALENCE.md: explicit semantics/boundaries; report skipped lanes and limited adapters honestly. | AC-9.7/T-9.1 plus original conformance/workload gates; Phase 9, prerequisite gates run in their owning phase. |
 
 **Additional decisions/evidence owed.** Phase 4 must establish the supported VMM/device seam,

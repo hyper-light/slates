@@ -24,8 +24,8 @@ use std::sync::atomic::{Ordering, fence};
 
 use slates_mem::Encoded;
 
-use super::SyncRefusal;
 use super::cell::{CellRef, claim};
+use crate::error::RtError;
 
 /// Format: a place no sender holds.
 const FREE: u64 = 0;
@@ -45,9 +45,9 @@ pub(crate) struct Room {
 impl Room {
   /// Room for `waiters` senders waiting at once, its cells held by `ends` handles. Refused `BadConfig` for none, and
   /// `Capacity` past the cell table's bound (every cell claimed so far is given back).
-  pub(crate) fn new(waiters: usize, ends: u32) -> Result<Self, SyncRefusal> {
+  pub(crate) fn new(waiters: usize, ends: u32) -> Result<Self, RtError> {
     if waiters == 0 {
-      return Err(SyncRefusal::BadConfig {
+      return Err(RtError::BadConfig {
         what: "a channel with no room for a waiting sender",
       });
     }
@@ -55,7 +55,7 @@ impl Room {
     let mut places = Vec::new();
     places
       .try_reserve_exact(waiters)
-      .map_err(|_| SyncRefusal::BadConfig {
+      .map_err(|_| RtError::BadConfig {
         what: "a channel with more waiting places than an allocation holds",
       })?;
     for _ in 0..waiters {

@@ -74,8 +74,11 @@ the two cross-cutting sections keep their numbers.
 > `provision_bench` alone, every gated row (spinning and parked p50, p99, p999; max informational) held to its machine's
 > ceilings, which only tighten, every run's rows kept (`target/provision-histogram.tsv`); the bench itself fails past the
 > 50 µs floor and, run with `PROVISION_BENCH_LOAD=<n>`, past a loaded bound derived from the quiet run and the load (the
-> load may add to the spinning 1-client p99 at most what it adds to the parked p99). Wiring the lane into CI on a
-> reference machine is a run request (w-lint, main). **Open, in flight:** the loaded p99 misses its bound on main
+> load may add to the spinning 1-client p99 at most what it adds to the parked p99). The lane always runs the loaded
+> form (two spinners a logical CPU). **Wired (2026-11-20):** kiln's `provision-gate-linux` and `provision-gate-macos`
+> take a bare-metal machine whole (`exclusive`) on every push and nightly and fail on a regression or on the bench's
+> gates where the machine has a baseline; a machine without one, and GitHub's shared runners
+> (`provision-histogram`), measure and keep the histogram as the artifact, the gates reported. **Open, in flight:** the loaded p99 misses its bound on main
 > (macOS arm64: 1.62 ms against 0.87 ms; GAPS 8a-r9-gate), measured to macOS's zero-timeout `kevent` in the shard's busy
 > harvest.
 
@@ -11236,7 +11239,12 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
 > judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
 > a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
-> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> A changed file is declared as the whole-file replacement it is and refined at composition (D-O17, A-776), so one
+> save changing two lines is two edits (`one_save_changing_two_lines_does_not_cover_another_editors_line_between`).
+> A mount's unsubmitted writes survive a restart: recovery rebuilds a mounted work's slot from its
+> published image, its base reacquired through the green at the work's durable base
+> (`tests/mounted_work.rs` `a_save_through_a_mount_survives_a_daemon_restart`). Owed: a green landed again into a
+> directory holding an earlier landing plans every file again (identical ones are
 > skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
 
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
@@ -11809,8 +11817,8 @@ never the whole work. A verdict crosses from the copy that computed it to the ow
 `Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
 (content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
 back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
-unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, behind A-697's test hook until its last
-piece): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
+unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, in force since A-697 part f put the rule
+"replicated here" in its test hook's place): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
 carries both to the owner, which commits it by `Green::submit_computed` (`judge_computed`, then `commit_judged` at once)
 inside the submit's own step.
 
@@ -22972,11 +22980,12 @@ named below, BENCHMARKS, GAPS.
 
 Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
 2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
-`crates/server/src/forward_lane.rs`) is being built by A-697, with production routing unchanged until its last piece: a
-`CreateWork` forwarded from another node still places the work on the green's shard. Part a1 (2026-11-20): the green's
+`crates/server/src/forward_lane.rs`) is built by A-697 and in force since its part f (2026-11-20), which put the rule
+"replicated here" in the test hook's place: a node that replicates a green another node owns serves the green's works
+itself, and a `CreateWork` from a node that does not is forwarded to the green's owner, which places the work there. Part a1 (2026-11-20): the green's
 owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
 its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
-(2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
+(2026-11-20, then behind a test hook that part f deleted): a holder makes the work on its client's partition,
 asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
 (2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
 `verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
@@ -23003,16 +23012,17 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered there with no hop between shards; only what needs the green crosses to the owner. Its name is held at the
     partition the name hashes to, as every name is: by an alias of the work's id when that is another partition
     (A-236's reservation, asked before the green's admission, confirmed once the creation commits). A creation
-    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (being built;
-    in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
+    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (in force
+    since its part f, 2026-11-20: the rule "replicated here"): a node holding the green's replica makes the work itself, on
     its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
     replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
     node's replica holds the version it made; after a restart it comes back from its log over the node's replica; it
-    rebases over the replica, and a copy it declares is composed over the replica. Takeover follows in A-697's last
-    part. Until A-400 a work was placed on
+    rebases over the replica, and a copy it declares is composed over the replica. A node that does not replicate the
+    green forwards the creation to its owner. When the owner dies the green's successor takes the work's asks: the
+    node's forwards resolve the green's owner afresh, and a node that adopts the green serves its works as its own. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -55986,6 +55996,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's record v4, part B — rows by pack place: a landed object is where it lies in its push's pack (2026-11-20, w-git for UI goal 93; main's pack-homing ruling: content once, the store's bytes a push must not grow)
+- **Why.** A push's staging put every object new to the repository in the content store inflated (git/git's v1.5.0:
+  309 MiB for a 9.4 MiB pack), its row naming that copy. Main's ruling for record v4: the landed objects are places
+  in the one pack the push brought, not second copies.
+- **Change.**
+  - Staging's first step after the generations puts the push's pack in the content store as one content, a window a
+    unit (`Step::Packing`; `Push::set_stored_pack`).
+  - Each object's row names that pack and carries where its entry begins (`ObjectRow::offset`, the kind byte marked
+    `rows::IN_PACK`); the row holds the pack.
+  - The repository keeps each pack's length (`Repository`'s `packs`) and reads an indexed object through one read
+    (`Repository::read_stored`/`row_bytes`/`stored_of`): whole, or where it lies through `packed::read` (B1), its
+    chain from the objects read lately (held to the largest pack), a REF_DELTA's base followed through the index into
+    its own pack (`IndexBases`). A read is held to the longest object the packs hold (`largest`), not the store's lent
+    room: it allocates nothing in the store.
+  - Every reader goes through it: the index view a push's thin bases are read from, the pushed-objects view, the
+    walks, the fragments' encoder (an in-pack object read whole at its first window), the upload stream's loose and
+    large objects (`StoredAt` in place of a content; an in-pack object deflated from its bytes read whole), and the
+    hook view (its whole objects by `StoredAt`; its reads and seal handed the repository).
+  - A push's reads take its own pack and the store's packs by identity (`PushSource`), so a thin pack's REF_DELTA base
+    in a landed pack is read where it lies.
+  - Every push's objects are a pack's: the server's own commits are written as a pack of whole objects first
+    (`pack::of_whole_placed`) and admitted where they lie, so a record is always its push's pack and a replay makes the
+    store the live one made (the whole replay `replay_pack` places objects as the stepped one does).
+  - Gone, as no object is put inflated any more: `Push::put_placed`, the resolution-order putting (47dc24b72) and the
+    holds given back in turns after a landing (ccd07b58c): a landing gives back the push's one hold of its pack.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, 9.4 MiB of pack): the
+  content store after the push lands holds 14.1 MiB (309.0 MiB before: every object inflated), its peak 15.4 MiB
+  (310.3); the process's peak RSS 356.6 MiB (781.8); the store made again from the log in 1,468 turns, its content
+  at most 14.1 MiB. The longest step, 27.3 ms, is still the landing's entry apply (the record carrying the pack: part
+  A, the record v4 itself).
+- **Tests.** `slates-git` `store::tests::packed::a_landed_push_is_read_where_it_lies_in_its_stored_pack` (the captured
+  `create` push: every object read back from its stored pack; the store grew by 1,919 bytes for 11,076 bytes of
+  objects inflated, a 748-byte pack); `slates-git --lib` 582 passed; `slates-server --lib` 1,032 passed (one lease
+  deadline test failed once under the suite's load and passed three times alone).
+
 ### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
 - **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
   cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
@@ -57614,6 +57659,19 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `RtError::Capacity`, and `futures::race2`/`Either` (pinned on its own frame, no pin-projection crate). The engine's
 > machine facts are already `slates_machine::facts` by the same names (hyper-rt took them from slates). Tests:
 > retirement 2/2, race 1/1, sync 11/11.
+> Step 3 (2026-11-20): the crates vendored and ported. `vendor/mantle/` holds `mantle-engine`, `-chunk`, `-disk`,
+> `-crc`, `-codec` at mantle `87ab09e1`; `hyper-block`'s issuer is back, on `slates_rt`; every `hyper_rt::` path is
+> `slates_rt`'s or `slates_machine`'s (`vendor/mantle/README.md`, `vendor/hyper-raft/README.md`, "Local changes");
+> `ranges` stays upstream. No `hyper-rt` and no `unsafe impl Send`/`Sync` anywhere. Unit tests on slates' runtime:
+> engine 155/155, chunk 52/52, `hyper-block` 101/101 (issuer included), slates-rt sync 11/11 and retirement 3/3.
+> Step 4 (2026-11-20), the write seam: none of the vendored crates opens a file in its production code (the
+> engine, the chunk store and the log are handed `BlockFile`s), except `hyper-block`'s own openers and `mantle-disk`'s
+> calibration scratch. So the store's files are opened by `slates_land::store_root`: the granted directory walked as
+> a landing target is (no symlink, no `..`, owned, on none of the daemon's mounts), checked against its `StoreGrant`
+> (device and inode), and every file created or opened as one plain name relative to its handle (`openat`,
+> `O_NOFOLLOW`), a new name made durable with the directory; `hyper-block`'s `DeviceFile::adopt` takes such a file
+> (local change 3). Tests: `slates-land --test store_root` 3/3. A store file is one `DeviceFile` for now; segmented
+> files over the root (mantle's answer to APFS's first-write stalls) are a performance item (GAPS).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -57738,6 +57796,27 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (tw
 one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-789 — On macOS each content pool extent is an object of its own, made ahead of need and given back whole (2026-11-20, w-sizing; main's ruling of 15:20, "content as extents made on demand", piece 1; §4.2, A-98, A-110)
+Applied in the same change to: `crates/mem/src/shared.rs` (`extent_handoff`, `make_extent`), `crates/server/src/content_pool.rs`
+(`make_own_extents`, `map`, `give_back`), `crates/api/src/role/daemon.rs` (the extents released with the anchor's
+objects, A-778), the tests (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`,
+`a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name`, the killed anchor's extents), BENCHMARKS,
+GAPS.
+
+Status: built 2026-11-20, macOS. Linux keeps one memfd with holes punched and Windows needs a section per extent (g226's
+measurements, BENCHMARKS "Content give-back per platform").
+- Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
+  back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
+  volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).
+- The rule: an extent is named from the content object's name and its id. Its owner shard makes its slice's extents at
+  its start, and a release makes the extent again, so a claim only opens and maps one, never makes it on the
+  provisioning path. A release unmaps the extent and removes its name, which gives every page back, then makes it
+  again empty. A successor adopts held extents by name. A daemon whose anchor is gone removes every extent's name.
+  Counts are bounded: at most `POOL_EXTENTS_PER_PARTITION` (64) a partition, one name each.
+- After: the same burst's volume destroyed left the object at 0 MiB and the process at 123 MiB.
+- Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
+  still only leave the footprint.
 
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
@@ -58031,6 +58110,40 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
   12.3 s, held off its owner 24.5 s), the whole live move 49.5 s against 112 s before.
 - **Open.** The preparation is paced by the seal periods: the carry and the handoff took about 12 s each for under
   1 MB.
+
+### A-697 part f — A node that replicates a green serves its works; the test hook is gone, and the green's successor takes the works' asks after a takeover (2026-11-20, w-shared for UI goal 93; main's plan for A-697, its last piece)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), §4.16 A-658's route, GAPS
+(A-247's step two), `crates/server/src/work_home.rs`, `crates/server/src/fleet.rs`, `crates/server/src/verbs.rs`,
+`crates/server/src/daemon.rs`, `crates/server/tests/fleet.rs`.
+- **Change: the rule "replicated here" in the test hook's place, one path.** `Daemon::serve_works_on_holders` and
+  `WorkHome::on_holders` are deleted. A node serves a green's works itself when another node owns the green and this
+  node holds its replica (`work_home::green_elsewhere`). A `CreateWork` over such a green is made on its client's
+  partition and admitted by the owner over the fleet, as parts a to e built. One over a green the node does not
+  replicate is forwarded to the owner, as before A-697. Every holder step (admission, base reads, floors, verdict,
+  rebase, copies, settling) asks the same predicate.
+- **Where each shard learns it.** The control shard holds the replicas (`merge.replicas`) and reads them directly.
+  Every other shard reads `WorkHome::holding`: the greens this node replicates, each with its owner as the control
+  shard's routing names it. The control shard fans that list with the period's configuration fan
+  (`fleet::fan_configs_to_shards`, `Fanned::observe_holding`), version-gated by a generation. An unchanged list, the
+  usual period, is compared in place and copies nothing. When a replica the last fanned list lacks takes its first
+  version, the list is also fanned at once (`fleet::fan_holding_at_once`, from `work_home::replica_reached`). So a
+  creation is served on the holder from the replica's first version, not a period later. A shard whose channel refuses
+  the list gets it with the period's fan. `owned_elsewhere` reads the fanned owner when this shard's own routing holds
+  no copy of the green, so a takeover's new owner reaches the work's shard too.
+- **Takeover.** When the owner dies, a survivor takes the green over (§4.8). A holder's forwards (`AdmitWork`,
+  `SubmitComputed`, `MoveWorkFloor`) resolve the green's owner afresh (`verbs::resolve_and_forward`), so they reach the
+  successor. A holder that adopts the green itself holds no replica of it any more: its works are then served through
+  the green on this node, as any of its own greens' works are.
+- **Counters.** `fleet.holding_fan.sent`, `fleet.holding_fan.refused`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20).
+  - `slates-server --test fleet a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies`: three nodes
+    at `f = 1`. The survivor that does not take A's green over makes a work as the green's holder and edits it; A dies.
+    Expect: the holder's submit answered version 2, computed on its replica and taken by position at the successor
+    (both counters moved); the successor's green reads "hello world".
+  - `a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner` is now the two-node
+    `f = 1` end-to-end test on production routing, with `merge.verdict.taken_by_position` as its counter.
+  - Every holder test runs with no hook. Each waits until B replicates the green before B's creation, since B's
+    creations are A's until then.
 
 ### A-790 — A work's changed file is pieces over its base: a first edit costs what it wrote (2026-11-20, w-work-cow; main's dispatch after the Slates-vs-Sapling comparison; §4.16 "Role", failure matrix; D-5; MEMORY SIZING)
 Applied in the same change to: §4.16 (the work as a delta; its A-247 status), `crates/server/src/work_files.rs`,

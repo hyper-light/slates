@@ -1,8 +1,8 @@
 [package]
 name = "hyper-block"
 description = "Block I/O for the shared log: aligned direct I/O, the platform's full flush, buffers that meet the device's alignment, group commit's wait and a simulated device with power-loss semantics"
-# slates: the device issuer (`src/issuer.rs`) and its hyper-rt dependency are left out (vendor/hyper-raft/README.md,
-# "Local changes"): slates runs one executor (CLAUDE.md §2 item 2), and the changeset log (A-767) needs none of it.
+# slates: the device issuer runs on slates' runtime, not hyper-rt (vendor/hyper-raft/README.md, "Local changes", 1):
+# slates runs one executor (CLAUDE.md §2 item 2, D-9).
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
@@ -19,6 +19,8 @@ sim = ["dep:hyper-sim"]
 # A kept record's checksum (`record`), the log's CRC-32C.
 crc32c = "0.6"
 getrandom = "0.4"
+# The runtime the issuer runs on: slates' own, in hyper-rt's place (local change 1).
+slates-rt = { path = "../../../crates/rt" }
 # The simulated device's model (`sim`, test support only): hyper-sim's block device.
 hyper-sim = { path = "../hyper-sim", optional = true }
 thiserror = "2.0"
@@ -38,5 +40,12 @@ libc = "0.2.189"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Performance", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
 
+
+[dev-dependencies]
+# The issuer's unit tests run here (README, local change 1): the runtime under them changed.
+hyper-sim = { path = "../hyper-sim" }
+hyper-measure = { path = "../hyper-measure" }
+proptest = "1.11"
+tempfile = "3.20"
 
 [workspace]
