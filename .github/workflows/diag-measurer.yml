@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's A/B of the client's reply wait (84a, main's ruling of 2026-11-20): A d799eff4b (the library's spin, the bench
+# g222's A/B/C of the client's reply wait (84a): A d799eff4b (the library's former spin), B 89e37868f (main: park at once, A-799), C 8d4d33618 (spin while spins catch). Was: A d799eff4b (the library's spin, the bench
 # waiting as an agent does and gating a loaded p99 at 1 ms on Linux), B 7ffa0d8ac (the sync wait parks at once unless its
 # caller names a spin). edit_merge_bench loaded and quiet, provision_bench quiet (R9's uncontended spinning p99), every
 # platform, interleaved. Diagnostics only (never main).
@@ -11,7 +11,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "d799eff4b 7ffa0d8ac"
+  ARMS: "d799eff4b 89e37868f 8d4d33618"
   ROUNDS: "3"
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
             fi
             # Does the newer daemon run inside 256 MB? One short loaded accept under the cap decides; else CPUs only.
             if [ "$(cat "$W/constraint")" = systemd ] && timeout 300 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
-                 "$W/bin-7ffa0d8ac/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
+                 "$W/bin-8d4d33618/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
               echo "cap: AllowedCPUs=0-1 MemoryMax=256M" | tee "$W/capnote"
             else
               echo "cap: AllowedCPUs=0-1 only (the 256 MB probe failed: $(tail -2 "$W/logs/probe.log" | tr '\n' ' '))" | tee "$W/capnote"
