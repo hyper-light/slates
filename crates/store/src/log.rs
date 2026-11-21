@@ -266,6 +266,21 @@ pub struct ChangesetLog<F: BlockFile> {
   file: F,
   /// Where the committed records end: the next append's offset.
   end: u64,
+  /// The record being appended, if one is: its state lives here, not in a borrow, so a record appended a slice at a
+  /// time over many requests leaves the log readable between them (the owner's sliced landing).
+  open: Option<OpenRecord>,
+}
+
+/// A record being appended: its header, where it starts and where its next byte goes, its identity so far, the sections
+/// begun and the open one.
+#[derive(Debug)]
+struct OpenRecord {
+  header: Header,
+  start: u64,
+  at: u64,
+  identity: blake3::Hasher,
+  written: u16,
+  section: Option<OpenSection>,
 }
 
 impl<F: BlockFile> ChangesetLog<F> {
@@ -281,7 +296,11 @@ impl<F: BlockFile> ChangesetLog<F> {
       each(&file, &located);
       end = located.end();
     }
-    Ok(Self { file, end })
+    Ok(Self {
+      file,
+      end,
+      open: None,
+    })
   }
 
   /// Where the committed records end.
@@ -299,23 +318,137 @@ impl<F: BlockFile> ChangesetLog<F> {
     self.file
   }
 
-  /// Begins a record with `header` where the log ends.
+  /// Begins a record with `header` where the log ends ([`Appending`], which abandons the record when dropped uncommitted).
   pub fn begin(&mut self, header: Header) -> Result<Appending<'_, F>, LogError> {
+    self.open_record(header)?;
+    Ok(Appending { log: self })
+  }
+
+  /// Opens a record with `header` where the log ends, its header written. Refused while another record is open.
+  pub fn open_record(&mut self, header: Header) -> Result<(), LogError> {
+    if self.open.is_some() {
+      return Err(LogError::OutOfOrder("a record is already open"));
+    }
     let mut bytes = [0u8; HEADER_BYTES];
     encode_header(&header, &mut bytes);
     let start = self.end;
     self.file.write_all_at(&bytes, start)?;
     let mut identity = blake3::Hasher::new();
     identity.update(&bytes);
-    Ok(Appending {
-      log: self,
+    self.open = Some(OpenRecord {
       header,
       start,
       at: offset_after(start, HEADER_BYTES)?,
       identity,
       written: 0,
-      open: None,
+      section: None,
+    });
+    Ok(())
+  }
+
+  /// Whether a record is open.
+  pub fn is_open(&self) -> bool {
+    self.open.is_some()
+  }
+
+  /// Begins the open record's next section, `len` bytes of `kind`; its bytes follow through [`ChangesetLog::open_piece`].
+  pub fn open_section(&mut self, kind: SectionKind, len: u64) -> Result<(), LogError> {
+    self.close_section()?;
+    let record = self
+      .open
+      .as_mut()
+      .ok_or(LogError::OutOfOrder("a section with no record open"))?;
+    if record.written >= record.header.sections {
+      return Err(LogError::OutOfOrder("more sections than the header names"));
+    }
+    let head = record.at;
+    record.at = offset_after(head, SECTION_HEAD_BYTES)?;
+    record.written = record.written.saturating_add(1);
+    record.identity.update(&section_label(kind, len));
+    record.section = Some(OpenSection {
+      head,
+      kind,
+      len,
+      done: 0,
+      crc: 0,
+    });
+    Ok(())
+  }
+
+  /// Writes the next `bytes` of the open record's open section.
+  pub fn open_piece(&mut self, bytes: &[u8]) -> Result<(), LogError> {
+    let record = self
+      .open
+      .as_mut()
+      .ok_or(LogError::OutOfOrder("bytes with no record open"))?;
+    let Some(mut section) = record.section else {
+      return Err(LogError::OutOfOrder("bytes with no section begun"));
+    };
+    let count = u64::try_from(bytes.len()).map_err(|_| LogError::TooLarge)?;
+    let done = section.done.checked_add(count).ok_or(LogError::TooLarge)?;
+    if done > section.len {
+      return Err(LogError::OutOfOrder("a section's bytes past its length"));
+    }
+    self.file.write_all_at(bytes, record.at)?;
+    record.at = record.at.checked_add(count).ok_or(LogError::TooLarge)?;
+    record.identity.update(bytes);
+    section.crc = mantle_crc::crc32c_extend(section.crc, bytes);
+    section.done = done;
+    record.section = Some(section);
+    Ok(())
+  }
+
+  /// Writes the open section's head now that its bytes are whole and their CRC known.
+  fn close_section(&mut self) -> Result<(), LogError> {
+    let Some(record) = self.open.as_mut() else {
+      return Ok(());
+    };
+    let Some(section) = record.section.take() else {
+      return Ok(());
+    };
+    if section.done != section.len {
+      return Err(LogError::OutOfOrder(
+        "a section closed before its bytes were whole",
+      ));
+    }
+    let mut head = [0u8; SECTION_HEAD_BYTES];
+    encode_section_head(section.kind, section.len, section.crc, &mut head);
+    self.file.write_all_at(&head, section.head)?;
+    Ok(())
+  }
+
+  /// Commits the open record: the trailer written, the log flushed, and only then the log's end moved past it. Refused,
+  /// with nothing committed and the record let go, when a section is not whole or fewer sections were written than the
+  /// header names.
+  pub fn commit_open(&mut self) -> Result<Located, LogError> {
+    let closed = self.close_section();
+    let record = self
+      .open
+      .take()
+      .ok_or(LogError::OutOfOrder("a commit with no record open"))?;
+    closed?;
+    if record.written != record.header.sections {
+      return Err(LogError::OutOfOrder("fewer sections than the header names"));
+    }
+    let identity: [u8; IDENTITY] = *record.identity.finalize().as_bytes();
+    let past = offset_after(record.at, TRAILER_BYTES)?;
+    let len = past.checked_sub(record.start).ok_or(LogError::TooLarge)?;
+    let mut trailer = [0u8; TRAILER_BYTES];
+    encode_trailer(&identity, len, &mut trailer);
+    self.file.write_all_at(&trailer, record.at)?;
+    self.file.sync_data()?;
+    self.end = past;
+    Ok(Located {
+      offset: record.start,
+      header: record.header,
+      identity,
+      len,
     })
+  }
+
+  /// Lets the open record go uncommitted: the log's end stays where it was, and the next record overwrites its bytes.
+  pub fn abandon_open(&mut self) {
+    self.open = None;
   }
 
   /// The sections of the committed record `located`, in order.
@@ -344,20 +477,11 @@ impl<F: BlockFile> ChangesetLog<F> {
   }
 }
 
-/// A record being appended: its sections written in order, its commit the last step ([`Appending::commit`]). Dropped
-/// before its commit, it leaves the log's end where it was.
+/// A record being appended in one borrow of the log: its sections written in order, its commit the last step
+/// ([`Appending::commit`]). Dropped before its commit, it lets the record go and leaves the log's end where it was.
 #[derive(Debug)]
 pub struct Appending<'a, F: BlockFile> {
   log: &'a mut ChangesetLog<F>,
-  header: Header,
-  start: u64,
-  /// Where the next byte goes.
-  at: u64,
-  identity: blake3::Hasher,
-  /// Sections begun.
-  written: u16,
-  /// The open section: its head's offset, its kind and length, its bytes written so far, and their CRC so far.
-  open: Option<OpenSection>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -372,80 +496,23 @@ struct OpenSection {
 impl<F: BlockFile> Appending<'_, F> {
   /// Begins the next section, `len` bytes of `kind`; its bytes follow through [`Appending::piece`].
   pub fn section(&mut self, kind: SectionKind, len: u64) -> Result<(), LogError> {
-    self.close_section()?;
-    if self.written >= self.header.sections {
-      return Err(LogError::OutOfOrder("more sections than the header names"));
-    }
-    let head = self.at;
-    self.at = offset_after(head, SECTION_HEAD_BYTES)?;
-    self.written = self.written.saturating_add(1);
-    self.identity.update(&section_label(kind, len));
-    self.open = Some(OpenSection {
-      head,
-      kind,
-      len,
-      done: 0,
-      crc: 0,
-    });
-    Ok(())
+    self.log.open_section(kind, len)
   }
 
   /// Writes the next `bytes` of the open section.
   pub fn piece(&mut self, bytes: &[u8]) -> Result<(), LogError> {
-    let Some(mut open) = self.open else {
-      return Err(LogError::OutOfOrder("bytes with no section begun"));
-    };
-    let count = u64::try_from(bytes.len()).map_err(|_| LogError::TooLarge)?;
-    let done = open.done.checked_add(count).ok_or(LogError::TooLarge)?;
-    if done > open.len {
-      return Err(LogError::OutOfOrder("a section's bytes past its length"));
-    }
-    self.log.file.write_all_at(bytes, self.at)?;
-    self.at = self.at.checked_add(count).ok_or(LogError::TooLarge)?;
-    self.identity.update(bytes);
-    open.crc = mantle_crc::crc32c_extend(open.crc, bytes);
-    open.done = done;
-    self.open = Some(open);
-    Ok(())
+    self.log.open_piece(bytes)
   }
 
-  /// Writes the open section's head now that its bytes are whole and their CRC known.
-  fn close_section(&mut self) -> Result<(), LogError> {
-    let Some(open) = self.open.take() else {
-      return Ok(());
-    };
-    if open.done != open.len {
-      return Err(LogError::OutOfOrder(
-        "a section closed before its bytes were whole",
-      ));
-    }
-    let mut head = [0u8; SECTION_HEAD_BYTES];
-    encode_section_head(open.kind, open.len, open.crc, &mut head);
-    self.log.file.write_all_at(&head, open.head)?;
-    Ok(())
+  /// Commits the record ([`ChangesetLog::commit_open`]).
+  pub fn commit(self) -> Result<Located, LogError> {
+    self.log.commit_open()
   }
+}
 
-  /// Commits the record: the trailer written, the log flushed, and only then the log's end moved past it. Refused, with
-  /// nothing committed, when a section is not whole or fewer sections were written than the header names.
-  pub fn commit(mut self) -> Result<Located, LogError> {
-    self.close_section()?;
-    if self.written != self.header.sections {
-      return Err(LogError::OutOfOrder("fewer sections than the header names"));
-    }
-    let identity: [u8; IDENTITY] = *self.identity.finalize().as_bytes();
-    let past = offset_after(self.at, TRAILER_BYTES)?;
-    let len = past.checked_sub(self.start).ok_or(LogError::TooLarge)?;
-    let mut trailer = [0u8; TRAILER_BYTES];
-    encode_trailer(&identity, len, &mut trailer);
-    self.log.file.write_all_at(&trailer, self.at)?;
-    self.log.file.sync_data()?;
-    self.log.end = past;
-    Ok(Located {
-      offset: self.start,
-      header: self.header,
-      identity,
-      len,
-    })
+impl<F: BlockFile> Drop for Appending<'_, F> {
+  fn drop(&mut self) {
+    self.log.abandon_open();
   }
 }
 

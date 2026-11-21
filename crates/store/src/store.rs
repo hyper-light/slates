@@ -112,6 +112,11 @@ pub enum StoreError {
   BadRow,
   /// A section named a staged content that is not staged.
   NotStaged,
+  /// A sliced landing's step named a landing that is not open: committed, abandoned (its client let it go), or
+  /// another's.
+  NoLanding,
+  /// The owner's queue of landings waiting for an open sliced landing is full (the asker's `OwnerError::Busy`).
+  Held,
 }
 
 impl fmt::Display for StoreError {
@@ -124,6 +129,8 @@ impl fmt::Display for StoreError {
       Self::Sizing(what) => write!(f, "the store's sizing: {what}"),
       Self::BadRow => f.write_str("a store row that does not decode"),
       Self::NotStaged => f.write_str("a section named a content that is not staged"),
+      Self::Held => f.write_str("the store's owner holds as many landings as it may wait"),
+      Self::NoLanding => f.write_str("no such landing is open (committed, abandoned or another's)"),
     }
   }
 }
@@ -229,6 +236,34 @@ impl Store {
   /// rows applied ([`Store::applied`]).
   pub fn begin(&mut self, header: Header) -> Result<Appending<'_, DeviceFile>, StoreError> {
     Ok(self.log.begin(header)?)
+  }
+
+  /// Opens a landing whose steps come over many requests (the owner's sliced landing): the record's header written
+  /// where the log ends, nothing visible until [`Store::commit_landing`]. Refused while one is open.
+  pub fn open_landing(&mut self, header: Header) -> Result<(), StoreError> {
+    Ok(self.log.open_record(header)?)
+  }
+
+  /// Begins the open landing's next section, `len` bytes of `kind`.
+  pub fn landing_section(&mut self, kind: SectionKind, len: u64) -> Result<(), StoreError> {
+    Ok(self.log.open_section(kind, len)?)
+  }
+
+  /// Writes the next `bytes` of the open landing's section.
+  pub fn landing_part(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+    Ok(self.log.open_piece(bytes)?)
+  }
+
+  /// Commits the open landing (one flush) and applies its rows ([`Store::applied`]).
+  pub fn commit_landing(&mut self) -> Result<Located, StoreError> {
+    let located = self.log.commit_open()?;
+    self.applied(&located)?;
+    Ok(located)
+  }
+
+  /// Lets the open landing go: the log's end stays where it was, and the next record is written over its bytes.
+  pub fn abandon_landing(&mut self) {
+    self.log.abandon_open();
   }
 
   /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable. Its sections

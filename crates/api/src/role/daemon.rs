@@ -370,22 +370,68 @@ fn store_sizing(config: &DaemonConfig, disk: u64) -> slates_store::store::Sizing
 
 #[cfg(test)]
 mod store_sizing_tests {
-  /// A-767, w-hg's finding. Do: size the store for this machine's own daemon configuration. Expect: its memtable is one
-  /// trunk node's worth (fanout extents), whatever the machine's memory, far inside the engine's 4 GiB bound.
+  #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+
+  use slates_store::log::{Header, SectionKind, Tool};
+
+  /// A fresh directory beside the test binary, in the build output (R1: never `/tmp`).
+  fn store_directory(name: &str) -> std::path::PathBuf {
+    let binary = std::env::current_exe().unwrap();
+    let dir = binary
+      .parent()
+      .unwrap()
+      .join(format!("vcs-sizing-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.canonicalize().unwrap()
+  }
+
+  /// A-767, w-hg's finding (a 128 GiB Mac refused every landing, "a memtable past 4 GiB"; main's order of 2026-11-20).
+  /// Do: for an 8 GiB and a 128 GiB machine, the profile's memory injected where the product reads it, derive the
+  /// daemon's configuration, start its store as `--vcs-store` does, land a changeset through a shard's handle and stop
+  /// the store. Expect: the engine opens, the landing is answered and the stop is clean at both extremes, and both
+  /// machines size the store alike: it is sized by its work (one trunk node of extents), never by the machine.
   #[test]
-  fn the_store_is_sized_from_its_work_not_the_machine() {
-    let profile = super::measure(true).unwrap();
-    let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
-    let sizing = super::store_sizing(&config, 1 << 30);
-    assert_eq!(
-      sizing.memory as u64,
-      sizing.extent_bytes * sizing.fanout as u64
-    );
-    assert!(
-      sizing.memory < (4usize << 30),
-      "{} bytes of memtable",
-      sizing.memory
-    );
+  fn the_store_lands_on_a_small_and_a_large_machine_alike() {
+    let measured = super::measure(true).unwrap();
+    let mut memories = Vec::new();
+    for (name, total) in [("8g", 8u64 << 30), ("128g", 128u64 << 30)] {
+      let mut profile = measured.clone();
+      profile.facts.memory.total = total;
+      profile.facts.memory.available = total / 2;
+      profile.facts.memory.limit = None;
+      let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
+      let dir = store_directory(name);
+      let (owner, _views) = super::start_store(&dir, &config).unwrap();
+      let handle = owner.handle();
+      let runtime = slates_rt::runtime::LocalRuntime::new(&config.runtime).unwrap();
+      let landed = runtime
+        .block_on(async move {
+          handle
+            .land(
+              Header {
+                tool: Tool::Mercurial,
+                repository: 7,
+                sequence: 0,
+                judged_over: 0,
+                grant: 1,
+                work: 0,
+                time_ns: 1,
+                sections: 0,
+              },
+              vec![(SectionKind::Record, b"clone".to_vec())],
+            )
+            .await
+        })
+        .unwrap();
+      assert!(landed.is_ok(), "{name}: {landed:?}");
+      drop(runtime);
+      let stopped = owner.stop();
+      assert!(stopped.is_ok(), "{name}: {stopped:?}");
+      memories.push(super::store_sizing(&config, 1 << 30).memory);
+      let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(memories[0], memories[1], "the store is sized by its work");
   }
 }
 

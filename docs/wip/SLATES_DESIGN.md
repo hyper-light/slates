@@ -57882,9 +57882,24 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
 > `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
 > the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
-> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
-> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
-> (`examples/per_path_read.rs`, Mercurial's own history).
+> (red with the rows not written: no landed text). A changeset landed through `begin`/`applied` gets every row since
+> bc0677af9 (`applied` reads the committed record back, as a replay does). Owed: the release timing against the
+> per-file arm's 91 µs (`examples/per_path_read.rs`, Mercurial's own history).
+
+> **Status (2026-11-20, the store sized by its work at both extremes; the owner's sliced landing).** A 128 GiB Mac
+> refused every landing (w-hg: "a memtable past 4 GiB"): the store's memtable was the shard's reserve, which grows with
+> the machine. It is one trunk node of extents (fanout × the content plane's chunk), the engine's own unit of work;
+> the memtable holds rows, never a landing's bytes (those are in the log), so no machine input belongs in it and no
+> clamp is needed. Held by `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike` in
+> `slates-api` (8 GiB and 128 GiB profiles injected into the machine facts the daemon derives from, the store started
+> as `--vcs-store` starts it, a landing and a clean stop at each; red at 128 GiB, the landing `Gone`, under the
+> machine-sized formula). A device's flush rate belongs to the log's group commit (owed), not the memtable. The
+> owner's sliced landing: `StoreHandle::begin` opens a record whose state lives in the log (`ChangesetLog::open_record`,
+> `open_section`, `open_piece`, `commit_open`, `abandon_open`), so the owner serves reads between its parts;
+> `SlicedLanding::section`, `part` (at most one piece, the read's unit, so a landing in flight holds a piece a request)
+> and `commit`; other landings wait in the owner's queue, bounded by the request channel's capacity and refused `Busy`
+> past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
+> end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
