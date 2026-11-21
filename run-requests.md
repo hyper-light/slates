@@ -6910,3 +6910,15 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   from Client.prototype or the collided-work assertions fail.
 - Cross-platform compile of A-782's touched crates (server, client, api, mcp, sdk-node, sdk-python) on Linux and Windows:
   red = a cfg arm still matching `Submitted`/`Outcome` without `Identical`. Plus clippy on the same crates.
+
+## w-provision-gate, A-786 (landed 2c8f89de6, 2026-11-20): R9's provisioning gate into CI (for w-lint and main)
+- CI wiring (.github/workflows/ci.yml): a job on a reference runner the lane can own (nothing else scheduled beside it):
+  `cargo xtask ratchet --provision` (first time on that machine: `--record`), then `PROVISION_BENCH_LOAD=2 cargo run
+  --release -p slates-client --example provision_bench`; upload target/provision-histogram.tsv as an artifact every run.
+  Red = a `REGRESSION` row, an `ac-2.1 ... FAIL` line (floor or loaded bound). The loaded bound is RED on main until
+  A-786 part 2 lands (macOS 1.62 ms vs 0.87 ms) -- wire it as allowed-to-fail until then, or hold the loaded step.
+- clippy on slates-client (examples) and xtask for 2c8f89de6 (macOS, Linux, Windows); provision_bench builds on Windows
+  (`spin()`'s parent check is cfg(unix)).
+- Linux x86_64 and arm64 measurement: `PROVISION_BENCH_LOAD=2` provision_bench on a many-core Linux box (the 2026-10-20
+  x86 host if it exists): the `tail:` lines name daemon vs client part; Linux's epoll_wait(0) does not nap, so its
+  1.6 ms is another hop -- report the tail split per run.
