@@ -164,7 +164,6 @@ async fn logged_kinds(id: RepositoryId) -> Vec<&'static str> {
         Record::RevisionProperties { .. } => "properties",
         Record::Revision(_) => "revision",
         Record::Locks(_) => "locks",
-        Record::Deltified { .. } => "deltified",
       },
     );
   }

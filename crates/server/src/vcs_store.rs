@@ -447,6 +447,10 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
+  /// A Subversion revision whose record carries a text its rows name inline, not named stored: the form a log held
+  /// before C2 stage B part 2 (b) (2026-11-21, main's ruling of 09:20, retiring the records' RAM texts). A repository's
+  /// texts are its changesets' on the node's store, and records a daemon keeps hold none in RAM.
+  SvnTextsInline,
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
@@ -3258,6 +3262,9 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
       store.records = Some(records);
       Ok(())
     }
+    SvnRecord::Revision(revision) if svn_texts_inline(&revision) => {
+      Err(ReplayRefused::SvnTextsInline)
+    }
     record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
@@ -3268,6 +3275,21 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
         .map_err(ReplayRefused::SvnStep)
     }
   }
+}
+
+/// Whether `revision`'s record carries a text its rows name inline, not named stored ([`ReplayRefused::SvnTextsInline`]):
+/// the form logs held before C2 stage B part 2 (b). A text whose bytes a row also names as a property list is named
+/// stored beside them, so it is not one.
+fn svn_texts_inline(revision: &slates_svn::commit::revision::Revision) -> bool {
+  revision
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text)
+    .any(|text| {
+      revision.contents.contains_key(&text.identity)
+        && !revision.stored.contains_key(&text.identity)
+    })
 }
 
 /// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]). A
@@ -4023,6 +4045,9 @@ fn svn_record_turn(
       };
       let brought = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
       match SvnRecord::decode(&bytes) {
+        Ok(SvnRecord::Revision(revision)) if svn_texts_inline(&revision) => {
+          return Some(RecordTurn::Replayed(Err(ReplayRefused::SvnTextsInline)));
+        }
         Ok(SvnRecord::Revision(revision)) => (SvnPending::Begin(revision), brought),
         _ => return Some(RecordTurn::Replayed(replay_bytes(state, id, &bytes))),
       }
