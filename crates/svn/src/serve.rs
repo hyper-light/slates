@@ -1671,6 +1671,10 @@ impl Connection {
       reads::Progress::More => Phase::Streaming(established, stream),
       reads::Progress::Done => Phase::Commands(established),
       reads::Progress::Close => return Err(Refused::Aborted),
+      reads::Progress::Waiting(wanted) => {
+        self.phase = Phase::Streaming(established, stream);
+        return Ok(Turn::Waiting(wanted));
+      }
     };
     Ok(Turn::Wrote)
   }

@@ -849,6 +849,7 @@ impl DavFileRevs {
     };
     match self.stream.resume(&mut reads, budget) {
       Ok(Progress::More) => DavLogProgress::More,
+      Ok(Progress::Waiting(wanted)) => DavLogProgress::Waiting(wanted),
       Ok(Progress::Done | Progress::Close) => match &self.stream.writer {
         RevsWriter::Dav {
           refused: Some(failure),

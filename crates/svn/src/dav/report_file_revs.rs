@@ -54,6 +54,7 @@ impl FileRevsWalk {
         .resume(served.index, served.repository, served.rules, out, budget);
     match progress {
       DavLogProgress::More => ReportProgress::More,
+      DavLogProgress::Waiting(wanted) => ReportProgress::Waiting(wanted),
       DavLogProgress::Done => ReportProgress::Done,
       DavLogProgress::Refused { .. } if self.revisions.begun() => ReportProgress::Broken,
       DavLogProgress::Refused { code, message } => {
