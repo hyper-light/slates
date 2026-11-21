@@ -1,5 +1,9 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## NOW (main 05:16 PST): P2's engine half (git's unmaterialized greens)
+Interface sent: inbox/w-git-from-w-rewrite-ops-p2-interface.md (DeferredPush, Green::defer, materializing over
+`Building` and `PushObjects`, `green_ready`, `Applied::Deferred`). Stage C follows; w-svn told.
+
 ## NEXT, in order (main 04:36 PST, 2026-11-21)
 1. **Stage C, the green's side.** It waits for w-svn's answer on the split (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).
    If w-svn hasn't answered within its next turn, I build my half against the proposed split: `ImportBatch` on a lineage
