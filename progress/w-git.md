@@ -419,3 +419,14 @@
   * step: made_commit::commit(state, pending, |state| sealed.record (v5) -> check -> super::commit(store) -> mutate).
   * abandon before the step: drop the kept head (paths) so a retry builds again; release homed; sealed.abandon.
   Later sub-pieces: the kill test; removing record_of/v2 and after_submit/staged/owed; t_a614a wall-time bound.
+- 2026-11-21 ~13:30 PST: (1) P2's daemon-test regressions FIXED and LANDED alone (main's order): fa318e929. A git
+  green made through the door derives its map (paths::derive_once_made); t_a727 windows test asserts both halves
+  (records' windows back from the image; main's map back, same version and tree, after first read); A-727 a3b submits
+  its file; new t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart.
+  (2) C5 2b piece 3 part 1 LANDED: 8b23c6fdd, A-822. Recorded git submits take the made_commit hook (Tool::Git):
+  map over the held preview (offset: preview v0 = green head), commit sealed as a pack, homed + landed, v5 record in
+  the one step. Red t_c5b_p3 green; t_a664 parked test now a clone oracle; t_a614a wall-time bound folded in.
+  Focused: daemon::tests verbs merge_service vcs_store made_commit git_push repository green_ready vcs_* identities
+  544/544. Flake seen once: daemon::tests::the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it.
+  NEXT (piece 3 part 2): the kill test between landing and step; remove record_of/v2 with after_submit's owed path,
+  non-recorded submits, push_through; then the change step over the preview sliced. r61 (git/git push) is main's.
