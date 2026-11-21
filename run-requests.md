@@ -7011,3 +7011,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   (c990989f7^) and after, release, on the big Studio (`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n>
   SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture`).
   Red would be the after's peak RSS or placement time growing with size squared, or a watchdog end (exit 4).
+- w-shared, lane (main's item 4): CPU profile, sender and holder, of
+  `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
+  packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
