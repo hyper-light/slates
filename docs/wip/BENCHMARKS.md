@@ -15845,6 +15845,16 @@ arm64), loaded (load average 55-73 from other agents' builds); runs interleaved.
 | the cache plus w-svn's owned run kept across a window's pieces | 1.97, 2.27, 7.82, 1.99, 1.78 | 1.78 | 0.89 ms | 30,488 |
 
 Measured and rejected: the owned-run change (dead even with the cache, the same windows made); the cache stays.
+
+Through the daemon (release, this Mac at load ~35-45, base a703 at 2bf76bbbb-era with the owned-run drive, equal to the
+cache by the table above): `SLATES_SVN_REPLAY_DUMP=git-2000.dump SLATES_SVN_REPLAY_LAST=300 /usr/bin/time -l
+target/release/deps/slates_server-* measure_svnsync_replay_range_over_the_tunnel --ignored --nocapture` imports the
+dump into a test daemon a turn a call, then hands `svnserve -t` over the daemon's SSH site the recorded tunnel
+handshake and one `replay-range ( 1 300 0 true )`, as `svnsync synchronize` asks. One run: the replay of r1..r300
+2.22 s, 7.4 ms a revision (27,339,304 bytes, 300 `finish-replay`s), against the matrix's 540 ms a revision before the
+cache: the server's one-step turns are not the gap. The import 62.3 s (131-485 s before SimHost lent its node,
+fc6ebd03c). The process's peak, 5.68 GB, holds the dump twice for the simulated host and is no daemon's figure: the
+2,511 MiB peak against the 447 MiB dump is measured next on a release daemon (A-772, GAPS).
 Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
 0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
 one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
