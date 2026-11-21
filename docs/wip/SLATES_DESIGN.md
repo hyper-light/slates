@@ -58708,3 +58708,16 @@ Applied in the same change to: §4.16 "Composition at seal" (the deriver's shape
   no watchdog end; each of 128 to 320 MiB had ended exit 4 there before. Found, not fixed (GAPS): a holder's forward of
   the increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms), and the control shard's beat task ran 520 to
   1,381 ms late during it (near misses, the watchdog's beat holding).
+
+### §4.16 amended — A holder's forward is timed on both ends, and a late beat is counted (2026-11-21, w-shared for UI goal 93; main's ruling on the lane, step 1: measure first)
+Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD_BUILD`), `crates/server/src/verbs.rs`
+(`SUBMIT_OWNER_STEP`), `crates/server/src/daemon.rs` (`BEAT_LATE`; `log_late_beat` returns whether it logged),
+`crates/server/tests/fleet.rs` (the release bench prints them).
+- **Counters.** `merge.submit.forward_build` (the holder's control-shard step that builds its `SubmitComputed`: the
+  verdict computed, the increment encoded and held, the request encoded), `merge.submit.owner_step` (the owner's step
+  for it: decode, verdict by position, append), each with its nanoseconds; `daemon.beat.late` and `daemon.beat.late_ns`
+  (the control shard's beats the near-miss rule logs, and their gaps), so a step past the shard's budget is counted,
+  not only logged (CLAUDE.md §3 "Bounded work").
+- **First reading** (debug, this Mac, a 32 MiB holder submit): the build step alone took 909 ms of one control-shard
+  step. It is the beat's lateness and the reason a size-independent bound refused the submit before a byte was sent
+  (main's ruling, items 2 and 3; inbox/main-from-w-shared-lane-plan.md).

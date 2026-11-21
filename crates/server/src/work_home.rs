@@ -1601,6 +1601,12 @@ pub(crate) const SUBMIT_COMPOSE: (&str, &str) = ("merge.submit.compose", "merge.
 pub(crate) const SUBMIT_COMPUTE: (&str, &str) = ("merge.submit.compute", "merge.submit.compute_ns");
 /// See [`SUBMIT_COMPOSE`].
 pub(crate) const SUBMIT_FORWARD: (&str, &str) = ("merge.submit.forward", "merge.submit.forward_ns");
+/// See [`SUBMIT_COMPOSE`]: the control shard's step that builds the forward (the verdict computed, the increment encoded
+/// and held, the request encoded), one step today (main's ruling on the lane, 2026-11-20: measured before it is sliced).
+pub(crate) const SUBMIT_FORWARD_BUILD: (&str, &str) = (
+  "merge.submit.forward_build",
+  "merge.submit.forward_build_ns",
+);
 /// See [`SUBMIT_COMPOSE`].
 pub(crate) const SUBMIT_SETTLE: (&str, &str) = ("merge.submit.settle", "merge.submit.settle_ns");
 
@@ -1669,8 +1675,11 @@ fn verdict_over_fleet(
       here,
       control,
       move || async move {
+        let build_start = slates_machine::clock::monotonic_ns();
         let built =
           state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
+        let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
+        state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
         let forward_start = slates_machine::clock::monotonic_ns();
         let reply = match built {
           Some(Ok(request)) => crate::verbs::resolve_and_forward(

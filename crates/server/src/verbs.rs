@@ -5301,7 +5301,14 @@ fn dispatch_inner(
       increment,
       computed,
       carried,
-    } => submit_computed(state, (work, green), (&increment, computed), carried),
+    } => {
+      // The owner's whole step for a holder's submit (main's ruling on the lane, 2026-11-20: measured on both ends).
+      let start = slates_machine::clock::monotonic_ns();
+      let reply = submit_computed(state, (work, green), (&increment, computed), carried);
+      let step_ns = slates_machine::clock::monotonic_ns().saturating_sub(start);
+      crate::merge_service::count_phase(state, SUBMIT_OWNER_STEP, step_ns);
+      reply
+    }
     RequestBody::Edit {
       work,
       path,
@@ -11350,6 +11357,12 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
 /// Format: a verdict a holder computed on its replica taken by position and committed here (A-697 part c; A-658 part
 /// 3b), the non-vacuity count of [`judge_submission`]'s computed path.
 pub(crate) const TAKEN_BY_POSITION: &str = "merge.verdict.taken_by_position";
+
+/// Counter pair: a holder's `SubmitComputed` served on this owner, and its steps' time in all, nanoseconds (the decode,
+/// the verdict taken by position, the append), measured on both ends of the forward (main's ruling on the lane,
+/// 2026-11-20).
+pub(crate) const SUBMIT_OWNER_STEP: (&str, &str) =
+  ("merge.submit.owner_step", "merge.submit.owner_step_ns");
 
 /// `SubmitComputed` (A-697 part c; A-658 part 3b): the node holding a work over this green sends the work's increment and
 /// the verdict its replica computed, and the owner judges and commits it as a submit asked from a work's shard is
