@@ -332,3 +332,8 @@
   (d31502d48, base origin/main at merge). Every reader of a stored text reads one RAM does not hold through the store,
   each held by a store test red without its wait. New finding (GAPS only): the svn://, svnserve -t and DAV loops have no
   guard against a drive waiting again for the piece just fetched (the export and deltify jobs have one). Next: B2 (b).
+- 2026-11-21 ~04:00 PST: B2 (b) P1 (197b5f2d7: a commit brings back an evicted stored text for its green increment),
+  P2 (34259b8eb: the hook view brings one back before holding it; GAPS: a view pins what it shows), P3 (abd5e7b2e: the
+  content store lets go a commit's texts once landed, recovery reads none back, deltify job retired) on main, each with
+  a store test red first. svn_made was done by A-804 (90e2a7666, not mine). Next: P4 (imports land texts as Payload,
+  records keep none in RAM). Target trim of leftovers was declined at the prompt; disk 26 GB free.
