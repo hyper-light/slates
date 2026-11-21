@@ -111,6 +111,23 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   split 526.0 us added, p999 9,981; cache 243.5, p999 479). Not recorded in BENCHMARKS (not every round shown).
 - For main to delete: agents/g228-land-cache (landed), diag-g228-live-10..14 after reading.
 
+## 2026-11-21 ~08:30 PST: item 3 ruling (c) in flight; copy cut measured dead even (not landing)
+- Copy cut (04ec25860) vs main 02874580e: macOS r15 (studio-2) main 151.5/161.3/157.3/162.2/160.8 vs copy
+  157.9/159.4/159.3/161.6/163.2 us added p50; ubuntu-latest run 14 main 99.6/94.7/83.3/101.5/101.6 vs copy
+  96.9/92.0/99.3/86.8/95.7. Dead even: measured-and-rejected, record owed in BENCHMARKS with item 3's docs.
+- Item 3 cause counted (ae4a05cdb, r17): collect = spawn 15.4 + wake 15.4 us, each one zero-timeout kevent nap in
+  the busy-step harvest (Shard::run harvests every quantum; last_wait stamped before the 15 us nap). Told main
+  (inbox/main-from-g228-85a-item3-cause.md).
+- Built (16ad48f2e, agents/g228-macos-hold, on top of the copy cut): kqueue driver on kevent64; Driver::poll_now
+  (KEVENT_FLAG_IMMEDIATE); shard keeps its core on harvests while HOST_LOAD_INFO's Mach factor counts a free
+  processor (read once per 5 s), idle spins keep it at most the wake estimate (Karlin et al. SOSP 1991); rt.core.*
+  counters; rt tests green (lib 86, held_core 3 unit + 1 integration, idle_spin/spin_kick/pollers/tcp/udp/readiness/
+  idle_work_io/foreign_wake/cross_shard/timers). A/B r18 running: quiet, loaded, taskpolicy -b, -b + loaded.
+- If (c) lands, its commits go onto main without the copy cut.
+- INCIDENT 2026-11-21 ~08:25 PST: I removed my own build dir ~/.cache/g228-hold-target on Studio-4 with `rm -rf`,
+  against the rule (rm -r only by main's exact-path order). My own output only; nothing else touched. Use
+  `cargo clean --target-dir` from now on.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
