@@ -216,3 +216,24 @@
 - g226 native: Linux r40 clippy on slates-mem/ipc/anchor clean on a7df9cc (mallinfo2 compiles natively); its heap
   test and every Windows run since (r37, r41, r42, r43, and a last pair) were lost to kiln: server timeouts, runner
   restarts on both 451397fc (Linux) and jupiter. Next round retries both lanes on current main.
+
+## 2026-11-20 continued (main f727b9ec4 -> ebd9014c3): the wall clean on host and every cross target
+- Landed: git negotiation mem::take + merge/server test casts; merge refine.rs (6035b016a: middle snake split into
+  forward_round/backward_round over Snake, signed()/unsigned(), count_units, BaseAndPost, UnitCounts) + its tests and
+  rewrite_ab example, cluster tests/sealed split (967fbee02); git store staging positions_unit + StagedRun, hg
+  changeset_ab percentile in integers + helpers, git_push tests rustfmt (5c08e04e8); server attach merge_role_form,
+  HashedSpan, boxed Progress::Done, mounted_work + session_log test splits, recovery.rs arena_figures Linux-only and its
+  idle wait yielding (f25b946f7); cli tests without the removed CONTENT_PREFAULTED (cli test target did not compile)
+  and log_view JSON test split (ebd9014c3).
+- recovery.rs: w-sizing removed the sleeping test (21a306a04); the piece is closed.
+- At ebd9014c3: host clippy --workspace --all-targets, six cross targets, structural, literals, unsafe, fmt all clean.
+- Windows (jupiter) earlier run at 2e44154 reached the end for the first time today: blocked by merge refine.rs only
+  (now fixed). Fresh Windows and Linux runs on ebd9014c3 started in the background.
+
+## 2026-11-20 round 9 at ab760dc65 (landed, main 15d4602ea)
+- db partition.rs check() 12/10 after bbc605ac9 -> nine check_* helpers; svn dav/site.rs decimal Format line and a
+  needless lifetime; svn migration step test cast + match; svn examples replay_bench (slice, cast, sort_by_key) and
+  changeset_ab (read_every_text); server tests/presentations superseded_refused. db lib 182, svn dav 92 / migration
+  48, presentations 10 pass here.
+- Host, six cross targets, structural, literals, unsafe, fmt: clean.
+- Windows r54 (on ebd9014c3) still running on jupiter; Linux resubmitted (r56 had no room).

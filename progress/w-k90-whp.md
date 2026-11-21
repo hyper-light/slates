@@ -100,14 +100,28 @@ every profile name a run leaves behind here; no other admin steps or installs.
   device takes none of yet). Ask: three edits in volume ...05 with no host mount, harness at /mnt/c/..., change request
   exactly its changes, landing held then written on the person's approval; Bypass: LAND_WRITTEN at once (3 written).
   Log C:\Users\corph\w-k90-whp\drive-cc1ecb625.log.
-- Rerun at current main 63da2c592 (36 commits on, incl. w-k90-kvm's 22bb3fb9e in the microVM sandbox path): r27, log
-  C:\Users\corph\w-k90-whp\drive-<sha>.log. goals_done after it.
+- Rerun at current main 63da2c592 (36 commits on, incl. w-k90-kvm's 22bb3fb9e in the microVM sandbox path): r34
+  PASSED: 1 passed, 0 failed, 1863.63 s (the fixture's runner reconnected to its server 4 times before the first session
+  opened; then every step held). Log C:\Users\corph\w-k90-whp\drive-63da2c592.log.
+- GOAL MET: goals_done 01a1fa3695247602901e94e021bfa56e (plan 01a1fa36 step 6) with this evidence.
+- Open (not mine, reported): windows-latest clippy errors in workspace/container.rs, sandbox/container.rs,
+  workspace/slates.rs, slates_fleet.rs (others' code); kiln should re-vendor Slates past 721f4ff97 to fold 0003 away.
 
 ## AppContainer profiles left on jupiter by my runs
 - After r26: 164 profiles, identical to the baseline: none added, none removed (Shards removed its per-VM profiles).
+- After r34: 164 profiles, none new since the baseline. My runs left NO AppContainer profile on jupiter.
 - Baseline before r26 (HKCU ...\AppContainer\Mappings monikers, C:\Users\corph\w-k90-whp\appcontainers-before.txt):
   164 profiles, 2 of them Shards' and not mine: shards.pipes-s0.41940.0, shards.pipes-s0.48268.0.
 
+## 2026-11-20 15:55 PST: WHP piece DONE (main recorded it); cleanup done by me
+- Deleted: jupiter C:\Users\corph\w-k90-whp\target (9.9G) and \kiln (645M) (logs + AppContainer lists kept there, 60 KB);
+  adas-mac-studio-3 and adas-mac-studio.local-2: ~/.cache/w-k90-whp-clone, ~/.cache/w-k90-whp-target.noindex (11.6G each);
+  this MacBook: ~/kiln-work/w-k90-whp.
+
+## NEXT (main 15:52): goal 92's two open parts (ownerless since g268)
+1. A-555 parts 2 and 3: server parks a request on a pending S3 base, answers when the fetch lands (no EIO/fault);
+   then the wire's create + credential hand-off. Red first each; land on slates main, focused tests.
+2. "The Shards-owed items done with Shards' side": list from g268's progress + cited Shards plans; build/test; GAPS.
+
 ## For main to delete
-- jupiter: C:\Users\corph\w-k90-whp\target (my kiln build) and C:\Users\corph\w-k90-whp\kiln (my clone), once the
-  goal is marked; adas-mac-studio-3 and adas-mac-studio.local-2: ~/.cache/w-k90-whp-clone, ~/.cache/w-k90-whp-target.noindex.
+- (none)

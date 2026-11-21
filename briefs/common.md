@@ -217,3 +217,19 @@ slates' CLAUDE.md §8 (Ada, 2026-11-18, "binding on every agent and subagent, fo
 - **The one addition, from Ada 2026-11-20 ("make your agents do A|B testing and back their decisions with data"):** a
   design decision between competing shapes is settled by the agent's own A/B: release builds, interleaved, all N
   shown, built as a measured example where possible (w-hg's changeset_ab.rs).
+
+## CLOSE THE OPEN ITEMS (ADA 2026-11-20 ~16:05-16:15 PST; binding)
+Ada: "stop FUCKING doing that and ensure they close the existing fucking items"; "anything you have currently added
+up until now gets closed, but no more new"; "the large message I sent you (the Codex/ChatGPT analysis) also needs to
+be closed"; "as well as the changeset work and integration in full"; "prioritize implementation/completion first,
+then robustness, then performance". Main had let UI parts gain new open items as fast as old ones closed; only one UI
+part closed between 07:20 and 16:00.
+- **Your queue is fixed: what you have been given up to now, and nothing more** (briefs/close-list.md names each
+  agent's items). Everything on it gets closed; nothing is dropped and nothing is added.
+- **Order: completion first, then robustness, then performance.** Build what's missing before hardening it, and
+  harden it before speeding it up.
+- **A new finding** (a bug, a gap, a faster shape) goes to docs/wip/GAPS.md and your progress file. It isn't worked
+  and isn't added to your queue or any UI part, unless it blocks an item already on your list.
+- **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
+  measurement. Main marks the UI part met the same check.
+- Main adds no new open items to UI parts and gives no new pieces beyond the close list.

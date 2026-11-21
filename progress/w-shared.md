@@ -1,5 +1,10 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## LANDED 2026-11-20: sweep family 2 (stragglers woken by their reports) = 54b9d8b2b (main ab30bfb75). Reports to main now
+  go as inbox/main-from-w-shared-<topic>.md on this branch (main moved to the Studio; SendMessage no longer reaches it).
+  Family 3 (fuse helper exit via ExitWatch) on agents/w-shared-sweep-3 215556146, worktree ~/slates-work/w-shared-sweep-3;
+  its Linux test is kiln run r5 on adacachy. NEXT after it: exit 4 at 64 MiB; (1); (4) incl. reply polling; (2); f; A-658 3c.
+
 ## LANDED 2026-11-20: sweep family 1 (lent record sessions woken by their return) = c03a8953b (main 86e23c4ef; focused
   tests local on 8ebf8a1c6 per Ada: fleet 25/25, lib 84/84, fmt). Local target deleted. Rules now: Ada says focused
   tests run locally (no blocking on CI); main: build nothing here under 30 GiB free, delete target after each landing;
