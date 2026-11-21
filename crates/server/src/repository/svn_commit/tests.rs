@@ -1411,8 +1411,9 @@ fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestI
 /// commit, the answer). Do: submit a work to a Subversion repository's green as a client's recorded request; read its
 /// completion, the records' youngest revision and the green's durable head in the verb's own step; then wait for the
 /// revision. Expect: in the verb's step nothing is answered and nothing durable (the revision not landed); once it
-/// landed, the request answered, the green's durable head 1 and the register naming the creation and the revision.
-/// Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
+/// landed, the request answered, the green's durable head 1, the register naming the creation and the revision, and the
+/// made revision's text named stored by the records, none of it in RAM (its changeset carries it, C2 stage B part 2 (b)
+/// P4b). Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
 #[test]
 fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed() {
   stored(|| async move {
@@ -1450,6 +1451,18 @@ fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed(
         logged(state, svn).len(),
       )
     });
+    let alpha = identity(b"alpha\n");
+    let kept_as = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .map(|records| (records.stored_len(&alpha), records.text(&alpha).is_some()))
+    });
+    assert_eq!(
+      kept_as,
+      Some((Some(6), false)),
+      "the made text is not stored alone"
+    );
     assert_eq!(
       in_the_verb,
       (false, 0, 0),
@@ -1828,5 +1841,70 @@ fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once
       )
     });
     assert_eq!(retried, (1, true, 2), "the retry landed once");
+  });
+}
+
+/// C2 stage B part 2 (b), the records' RAM texts retired (main's ruling of 2026-11-21 09:20). Do: in three repositories
+/// commit revision 1 and set its properties (changeset 2); in the second land, as a hostile log, a deltified text's
+/// record (the retired kind) at changeset 2; in the third, revision 1's record with its texts inline (the form logs held
+/// before part 2 (b)) at changeset 1; rebuild each from the node's store. Expect: the first made again whole; the second
+/// refused `SvnRecord(Retired(Deltified))` and the third `SvnTextsInline`, each typed, never a panic or a skip.
+#[test]
+fn a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild() {
+  stored(|| async move {
+    let mut seen = Vec::new();
+    for (name, hostile) in [
+      ("whole", None),
+      ("deltified", Some(2u64)),
+      ("inline", Some(1u64)),
+    ] {
+      let (svn, _) = subversion(name).await;
+      assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+      let properties = Record::RevisionProperties {
+        revision: 1,
+        properties: BTreeMap::from([(b"svn:log".to_vec(), b"again".to_vec())]),
+      };
+      assert_eq!(
+        super::land_record((&owner(), svn), properties).await,
+        Some(Ok(()))
+      );
+      if let Some(sequence) = hostile {
+        let bytes = if sequence == 2 {
+          // The retired kind's bytes as a log written before held them: the header, kind 5, a text, no base, a delta.
+          let mut bytes = Record::Locks(Vec::new()).encode();
+          bytes.truncate(9);
+          bytes[8] = 5;
+          bytes.extend_from_slice(&[7u8; 32]);
+          bytes.push(0);
+          bytes.extend_from_slice(&0u64.to_le_bytes());
+          bytes
+        } else {
+          Record::Revision(first()).encode()
+        };
+        let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+        let landed = super::landing::land(
+          &disk,
+          (svn, sequence),
+          vec![(slates_store::log::SectionKind::Record, bytes)],
+        )
+        .await;
+        assert_eq!(landed, Ok(()));
+      }
+      rebuild(svn).await;
+      seen.push(on(|state| {
+        state
+          .vcs_stores
+          .unrecovered(svn)
+          .map(|refused| format!("{refused:?}"))
+      }));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        None,
+        Some("SvnRecord(Retired(Deltified))".to_owned()),
+        Some("SvnTextsInline".to_owned())
+      ]
+    );
   });
 }

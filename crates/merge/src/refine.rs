@@ -1787,6 +1787,28 @@ pub fn whole_replaced(doc: &OpsDoc) -> Vec<(String, String)> {
   found
 }
 
+/// `doc`'s whole-file replacements as `(base path, the base length its ops replace)` (A-817): a replacement whose base
+/// file is not that long is no replacement [`refine_rewrites`] refines (it keeps it as declared), so its base bytes are
+/// asked for nothing. What a work's shard holds against the base lengths it keeps before asking for bytes.
+pub fn whole_replaced_lengths(doc: &OpsDoc) -> Vec<(String, u64)> {
+  let mut found = Vec::new();
+  let mut start = 0;
+  while start < doc.ops.len() {
+    let path = doc.ops.get(start).map_or(0, |op| op.path);
+    let mut end = start;
+    while doc.ops.get(end).is_some_and(|op| op.path == path) {
+      end = end.saturating_add(1);
+    }
+    if let Some(shape) = whole_replacement(doc.ops.get(start..end).unwrap_or_default())
+      && let Some(base) = doc.paths.path(shape.from.unwrap_or(path))
+    {
+      found.push((base.to_owned(), shape.base_len));
+    }
+    start = end;
+  }
+  found
+}
+
 /// The base paths whose bytes [`refine_rewrites`] reads to refine `doc`'s whole replacements ([`whole_replaced`]): what
 /// a work's shard asks its green's owner for the base of, besides the files it does not hold (C1, A-247).
 pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
