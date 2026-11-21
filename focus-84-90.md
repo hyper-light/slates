@@ -1578,3 +1578,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - b9ce328cb (w-svn B2 (a): export reads stored texts through the store).
   - 24a8f7e5e (w-fed-move, A-803): the verdict's growth with history named as A-793's re-anchor: O(k) for a path's k-th change while a reader pins the floor. Judge 24 -> 71 us and values walked 7.9 -> 231 at 10^5 versions; not the 100k wall. Fix design to main first.
   A-804 is claimed by w-rewrite-ops (the deferred-submit hook). The MacBook disk is 59 GB.
+- 2026-11-21 02:28 PST LANDED:
+  - 90e2a7666 (w-rewrite-ops, A-804, the deferred-submit hook): a server-made svn commit is answered only after its changeset landed and its version and entry committed together.
+  - ee96cfa26 (w-svn: C2 B2 (a) COMPLETE; the deltify job reads through the store).
+  - c870c8f80 (w-perf: the hg stream clone's chunks as stored deltas, no whole text made, red first). hg's one-changeset pull went 4.2 s -> 0.303 s in round 1 (hg serve 0.230 s).
+  RULING (w-perf): advertise the stream capability per repository, only where the store keeps the logs. Stock hg clone --stream against an imported repo now aborts "operation forbidden by server" instead of falling back. Red with stock 7.2, then the full A/B, and name what's left of the pull.
+  NOTED: w-svn's B2 (b) plan. (b.1) a commit's stored texts let go once landed; recovery stops reading them back. (b.2) the records' kept texts land as Payload deltas with Texts rows and keep only a window index; disk stays delta-sized, ~35 MB for git-2000. Storing wholes was rejected at 12x the disk.
+  The MacBook disk is 51 GB.
