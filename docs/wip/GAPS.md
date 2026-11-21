@@ -347,6 +347,18 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-797 (2026-11-21, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: the green's
+> owner answers a batch of work asks within its step budget and hands the rest back (one batch had held its shard 1,055
+> ms in one poll; the watchdog killed the primary). Partial evidence, not proof: no `is spinning` and no kill in 3,110 s
+> of the next 100k run (six reports and a kill the run before); that run was stopped by main at 96 of 97 GB swap (it held
+> about 30 GB), so its latencies are confounded. Open, found by that run: (1) about 2,700 submits never answered: on
+> the client node 9,116,579 forwards resolved on the control shard and 9,113,196 delivered home, 3,383 lost between
+> (`deliver_owner_forward` -> `send_reply_home`); the run on `e4c2ad76` with A-794 finished, the runs on `8a18edcc` did
+> not, so a change in that range is suspect (`343b741e`, `ca496af8` touch the runtime's idle and pacing). (2) One work's
+> log reached 300,898,443 bytes and filled its partition's merge budget; the refusal's line now describes the largest
+> log's entries. (3) 10,141,852 asks of the green's owner for 100,000 clients. The 100k rung is main's to run
+> (run-requests.md, mem=40g).
+>
 > **A-794 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a forwarded
 > work's creation is made on the partition its name hashes to, not its green's (76,955 works had filled the primary's
 > one partition's merge budget: `TableAtCapacity` 71,776 to 0), and a forwarded verb parked at its work's gate answers
