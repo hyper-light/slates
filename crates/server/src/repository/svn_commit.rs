@@ -1266,7 +1266,7 @@ fn land(
 /// reads a version it kept (`restore`: a copy from an older revision is made from the head and set back from the
 /// records), and svn's reads are the records', so only a live reader's version (a work's base, a pinned attachment, a
 /// mount) is kept. Before, it folded only past its retention budget, so git-2000's import kept 440 MB of versions.
-fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
+pub(crate) fn fold_to_readers(state: &mut ShardState, green: DbVolumeId) {
   let floor = crate::merge_service::reachable_floor(state, green);
   let folded = state
     .greens
