@@ -7037,3 +7037,25 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
   Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
   held replies).
+
+## 2026-11-21T08:20Z w-fed-move main 086089ba (goal 86b C1 rung: A-792, A-793, A-794, A-797 by use)
+- Command (repository root, release; a load run, so main's under CLAUDE.md §8):
+  `SLATES_LOADTEST_TREE=<a Linux kernel checkout, v7.4-rc4 5f22fb204, 97,371 files>
+  SLATES_LOADTEST_BENCH=<target>/release/examples/load_bench SLATES_LOADTEST_CLIENTS=100000
+  SLATES_LOADTEST_ARGS="--rounds 1 --per-connection 32 --hot-files 42000 --reply-patience 3600"
+  cargo test --release --locked -p slates-cli --test load_scale -- --nocapture`, after
+  `cargo build --release --locked -p slates-client --example load_bench` and `-p slates-cli`.
+- Needs: mem=40g (measured about 30 GB: primary 13 GB, replicas 5.8 GB each, client daemon 1.8 GB, bench 3.3 GB) and
+  disk for the 2.1 GB tree; in kiln declare it in `needs` (`cpus=16,mem=40g` or more), never pin with `on`.
+  Runs 15 to 65 minutes.
+- Platform: macOS arm64 or Linux (the test reads `ps`; on Linux raise `ulimit -n`, per the test's module docs).
+- What to read: the `bound`, `oracle`, `refusal`, `node` and `rung` rows, and any `slates-server: ... (first
+  occurrence)` lines (the merge-budget and retention-cap diagnoses), `is spinning`, `killing it`.
+- Red: any `oracle_failures` above 0 (a wrong verdict); a watchdog kill (`killing it`, A-797's wall); `refusal` rows
+  (TableAtCapacity: A-794's wall; BudgetExceeded: open); `bench_exit -1` with `pending ... inflight Some((SubmitAccepted`
+  rows that stop moving (the open lost-reply wall: compare the client node's `fleet.forward.client.resolved` with
+  `delivered_home` in its `slates status --json`).
+- Known so far: on main 8a18edcc + A-797 (stopped at 96 of 97 GB swap) no kill in 3,110 s; about 2,700 submits never
+  answered; one 300 MB work log.
+- Who to send results to: w-fed-move
+
