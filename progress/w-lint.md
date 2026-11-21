@@ -257,3 +257,11 @@
   (362bd8c39) two content_pool.rs open_range sites, budget not raised -> w-sizing (inbox/w-sizing-from-w-lint-unsafe.md).
 - literals: 56 sites in slates-store, w-store's (inbox/w-store-from-w-lint.md); none elsewhere.
 - r58/r60 were collected by kiln's restart without results; relaunched on 833144bd7 as r1 (jupiter) and r2 (Linux).
+
+## 2026-11-20 round 12 at 283d646b7 (landed e51d9adeb, main e79614bdf)
+- merge head_under test (A-792) no longer a Result test that asserts; server work_files ChangedEntry alias + test
+  initializer; verbs assemble_post_state's size is post_state_size. Tests: head_under 1, work_files 3,
+  green_post_state 7.
+- Host, fmt, structural, six cross targets clean. Still with owners: slates-store's 56 literals (w-store),
+  slates-server's unsafe 8 > 6 (w-sizing, A-789).
+- Windows: jupiter is offline; r4 asks kiln for any Windows runner. Linux r60 still queued.
