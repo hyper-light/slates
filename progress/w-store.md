@@ -6,7 +6,8 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
-- C2 remainder = the land write seam: vendored prod code opens no files except hyper-block's DeviceFile::open /
+- C2 CLOSED cd1261e43 (land store_root + DeviceFile::adopt); close note inbox/main-from-w-store-close.md.
+- (was) C2 remainder = the land write seam: vendored prod code opens no files except hyper-block's DeviceFile::open /
   SegmentedFile create+add and mantle-disk calibrate's scratch -> seam: land opens the granted store root (dir handle),
   files created relative to it (openat), hyper-block patched to take an open file / a dir handle. Doing it as C3's
   first step with slates-store + R1 table (xtask HOST_PATH_ALLOWED/WRITE_ALLOWED + design table).
