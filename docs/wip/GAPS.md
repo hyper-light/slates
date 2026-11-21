@@ -235,6 +235,9 @@
 >   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
 >   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
 >   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
+>   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
+>   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
