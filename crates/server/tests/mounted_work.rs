@@ -371,3 +371,37 @@ fn a_save_through_a_mount_survives_a_daemon_restart() {
   drop(client);
   daemon.stop();
 }
+
+/// D-O17 through a mount (A-774 with A-776's refinement; main's order 3). Do: two works over one green; through its mount
+/// editor A saves f5 with lines 0 and 4 changed in one save, editor B saves f5 with line 2 changed; submit A then B.
+/// Expect: both accepted (A's save is the two edits it made, not one span over B's line), and the head holds all three
+/// changes.
+#[test]
+fn one_save_changing_two_lines_does_not_cover_another_editors_line_between() {
+  let (daemon, mut client, _) = start("spans");
+  let green = seeded_green(&mut client);
+  let (a, _) = client.create_work(green, "mounted-spans-a").unwrap();
+  let (b, _) = client.create_work(green, "mounted-spans-b").unwrap();
+  let a_bytes = with_line(
+    &with_line(&base_file(5), 0, "editor A's first line"),
+    4,
+    "editor A's last line",
+  );
+  let b_bytes = with_line(&base_file(5), 2, "editor B's middle line");
+  for (name, bytes) in [("mounted-spans-a", &a_bytes), ("mounted-spans-b", &b_bytes)] {
+    let (mut stream, root) = mounted(&daemon, name);
+    let mut xid = 10;
+    editor_save(&mut stream, &root, "f5", bytes, &mut xid);
+  }
+  for (work, who) in [(a, "A"), (b, "B")] {
+    let verdict = client.submit(work).unwrap();
+    assert!(
+      matches!(verdict, Submitted::Accepted(_)),
+      "editor {who}'s submit: {verdict:?}"
+    );
+  }
+  let expected = with_line(&a_bytes, 2, "editor B's middle line");
+  assert_eq!(client.read(green, "f5", ReadAt::Head).unwrap(), expected);
+  drop(client);
+  daemon.stop();
+}
