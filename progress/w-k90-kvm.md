@@ -76,3 +76,12 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
 - Landing worktree ~/kiln-work/w-k90-kvm-land removed.
 - for main to delete: kiln branch agents/w-k90-kvm-g90; adacachy ~/.cache/w-k90-kvm/{wt,wt3,clone}; here ~/kiln-work/w-k90-kvm,
   ~/.cache/w-k90-kvm-local-target.noindex.
+
+## 2026-11-20 ~17:05 PST: C1 (90d) and C2 (90f) CLOSED; inbox/main-from-w-k90-kvm-close.md written
+- At kiln main c0f576eb3 on adacachy KVM: r51 g266 PASSED (721 s), r42 g90 PASSED (daemon 2738760 -> 3689757). Steps 5 and 8 met.
+- FINDINGS (recorded, not worked, per the close order):
+  (1) an agent's act is refused at once while its runner's link is down (reach/node.rs on_local; deliberate per
+      reach/tests.rs). Under load, a link blip fails an agent's landing.
+  (2) a session start sent just before a link drop can be lost; the server then marks it crashed ("the runner doesn't
+      hold it"), and only a person's resume takes it up.
+  (3) under I/O pressure (adacachy, io some avg10 ~10%) a runner's sqlite stores took 48-96 s to open.
