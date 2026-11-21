@@ -662,6 +662,33 @@ fn a745_reading_a_scattered_answer_reads_a_window_a_unit_never_the_whole_set() {
   repository.release(&mut store).unwrap();
 }
 
+/// A-745 (found by use: `git fetch --deepen 100` of git v2.0.0 held a poll of the HTTP edge past a second of CPU, five
+/// times a fetch, 365 ms and 1.1 s, the watchdog killing the daemon once, each in a unit marking a part's wanted
+/// entries; module docs, **Slices**). Do: push one version of twelve windows' worth of files, encode it, and answer
+/// every other file one by one, its part read entry by entry; stream it a unit a turn. Expect: read back, exactly the
+/// files answered; no unit of marking read more than a window's worth of the part's entries in position order, where
+/// it had searched the whole order afresh for each of a window's worth of positions (about 11 reads each here).
+#[test]
+fn a745_marking_a_parts_wanted_entries_reads_a_window_a_unit() {
+  let format = ObjectFormat::Sha1;
+  let mut store = store();
+  let handles = WINDOW / size_of::<u64>();
+  let (repository, files) = files_in_one_version(format, &mut store, handles * 12);
+  let wanted: BTreeSet<ObjectId> = files.iter().step_by(2).map(|file| file.id).collect();
+  let answer = Answer::objects(&positions_of(&repository, &store, &wanted));
+  let (pack, counters) = streamed(&repository, &store, answer, 0);
+  assert_eq!(
+    once(&read_back(format, &pack, &Held::none()).unwrap()),
+    wanted
+  );
+  assert_eq!(counters.parts_by_entry, 1, "{counters:?}");
+  assert!(
+    counters.marks_read_most > 0 && counters.marks_read_most <= u64::try_from(handles).unwrap(),
+    "{counters:?}"
+  );
+  repository.release(&mut store).unwrap();
+}
+
 /// A ref whose history a client holds at version 0, then rewritten twice: version 1 a new root over a file `p`,
 /// version 2 that file edited (a reference delta against version 1's in its fragment), version 3 a new root again
 /// keeping version 2's file and adding `q`, so version 1's file is in neither the client's history nor the wanted one.
