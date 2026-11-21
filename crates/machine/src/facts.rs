@@ -620,44 +620,6 @@ mod platform {
     Some(pages.saturating_mul(page))
   }
 
-  /// Format: XNU's `host_load_info`, three load averages and three Mach factors, each a fixed-point count of threads
-  /// or processors scaled by [`LOAD_SCALE`] [B: XNU `osfmk/mach/host_info.h`].
-  #[repr(C)]
-  struct HostLoadInfo {
-    /// The load averages, unread: the Mach factor is the figure asked.
-    _avenrun: [libc::integer_t; 3],
-    mach_factor: [libc::integer_t; 3],
-  }
-
-  /// Format: the fixed-point scale of `host_load_info`'s figures [B: XNU `osfmk/mach/host_info.h`, `LOAD_SCALE`].
-  const LOAD_SCALE: i64 = 1000;
-
-  /// Format: `host_load_info`'s size in `integer_t`s, the count `host_statistics` takes [B: XNU `HOST_LOAD_INFO_COUNT`].
-  const HOST_LOAD_INFO_COUNT: libc::mach_msg_type_number_t = 6;
-
-  pub(super) fn free_processors() -> Option<u64> {
-    let mut info = HostLoadInfo {
-      _avenrun: [0; 3],
-      mach_factor: [0; 3],
-    };
-    let mut count = HOST_LOAD_INFO_COUNT;
-    // SAFETY: `info` is a writable host_load_info of `count` integers; the host port is the caller's own.
-    let rc = unsafe {
-      libc::host_statistics(
-        mach_host_self(),
-        libc::HOST_LOAD_INFO,
-        (&raw mut info).cast::<libc::integer_t>(),
-        &raw mut count,
-      )
-    };
-    if rc != libc::KERN_SUCCESS {
-      return None;
-    }
-    // The first Mach factor, the kernel's one-minute average of the processors no runnable thread wanted.
-    let factor = i64::from(info.mach_factor.first().copied().unwrap_or(0));
-    u64::try_from(factor.max(0).checked_div(LOAD_SCALE).unwrap_or(0)).ok()
-  }
-
   #[link(name = "IOKit", kind = "framework")]
   unsafe extern "C" {
     fn IOPSCopyPowerSourcesInfo() -> *const c_void;
@@ -780,25 +742,6 @@ mod platform {
 ///
 /// `None` where the question cannot be asked: off Linux, or when no mapping starts exactly at `base`. A cold
 /// path — `smaps` costs a walk of the whole address space — so ask once and keep the answer.
-/// The processors no runnable thread wanted, as the kernel last averaged them: on macOS the first Mach factor of
-/// `HOST_LOAD_INFO` (a one-minute average the scheduler recomputes every few seconds, so it trails a load that has
-/// just begun), `None` where it was refused. A cold-path question (`slates_rt`'s held core, A-218 and 85a item 3): it
-/// tells a busy shard whether keeping its core between steps takes one another thread wanted. macOS's per-CPU idle
-/// ticks cannot tell it (A-218: 0.0 idle cores with no extra load, 5.8 beside 36 spinners).
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn free_processors() -> Option<u64> {
-  platform::free_processors()
-}
-
-/// Elsewhere nothing asks: a zero-timeout poll gives up no core on Linux or Windows (A-218), so a shard keeps its core
-/// there whatever this says.
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn free_processors() -> Option<u64> {
-  None
-}
-
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn huge_backed_bytes(base: usize) -> Option<u64> {

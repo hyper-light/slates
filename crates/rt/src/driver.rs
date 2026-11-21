@@ -172,15 +172,6 @@ pub trait Driver {
   /// bound). Completions are appended to `out`. Returns `DriverLost` when the driver died.
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError>;
 
-  /// Gathers what is ready **without giving up the thread**: a harvest for a shard that may keep its core. Every driver
-  /// but kqueue answers a zero-timeout `wait` at once (epoll and IOCP in well under a microsecond, io_uring and the
-  /// simulation without a syscall at all), so this is that wait. macOS's zero-timeout `kevent` sleeps 14.6-15.5 µs with
-  /// an involuntary switch (A-218), so the kqueue driver answers it with `KEVENT_FLAG_IMMEDIATE` instead (180-186 ns).
-  /// Whether a harvest may keep its core is the shard's decision (`crate::held_core`), never the driver's.
-  fn poll_now(&mut self, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    self.wait(Some(0), out)
-  }
-
   /// Submits an operation that completes with `user_data` on a following `wait` (the seam's
   /// self-test; every real operation follows the same path).
   fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;

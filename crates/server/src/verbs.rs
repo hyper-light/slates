@@ -27432,19 +27432,18 @@ mod resize_admission_tests {
   }
 }
 
-/// This shard's driver harvests and idle spins by whether they kept the core (`slates_rt::held_core`, 85a item 3), as
-/// `rt.core.*` rows: each a non-vacuity count of its path, and `rt.core.kept_spin_ns` the CPU the kept spins cost.
-/// Rows at zero are left out, as every count of the report is.
+/// This shard's busy harvests deferred and its idle moments' user-space watches (`slates_rt::held_core`, 85a item 3), as
+/// `rt.core.*` rows: each a non-vacuity count of its path, and `rt.core.watch_ns` the CPU the watches cost. Rows at
+/// zero are left out, as every count of the report is.
 fn held_core_rows() -> Vec<RefusalCount> {
   let Some(counters) = slates_rt::registry::with_current(|ctx| ctx.counters()) else {
     return Vec::new();
   };
   [
-    ("rt.core.harvests_kept", counters.harvests_kept),
-    ("rt.core.harvests_slept", counters.harvests_slept),
-    ("rt.core.kept_spins_caught", counters.kept_spins_caught),
-    ("rt.core.kept_spins_ran_out", counters.kept_spins_ran_out),
-    ("rt.core.kept_spin_ns", counters.kept_spin_ns),
+    ("rt.core.harvests_deferred", counters.harvests_deferred),
+    ("rt.core.watches_caught", counters.watches_caught),
+    ("rt.core.watches_ran_out", counters.watches_ran_out),
+    ("rt.core.watch_ns", counters.watch_ns),
   ]
   .into_iter()
   .filter(|(_, count)| *count > 0)

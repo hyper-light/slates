@@ -1,11 +1,12 @@
-//! A shard keeps its core when it harvests its driver while a core is free, and an idle spin keeps it no longer than
-//! blocking costs (§4.3 "Loop"; A-218; 85a item 3, main's ruling (c), 2026-11-21; `slates_rt::held_core`).
+//! A busy shard asks its driver no more often than asking costs, and an idle moment watches the rings in user space no
+//! longer than blocking costs (§4.3 "Loop"; A-218; 85a item 3, main's ruling (c), 2026-11-21; `slates_rt::held_core`).
 //!
-//! On macOS a zero-timeout `kevent` sleeps about 15 µs with an involuntary switch (A-218), and a busy shard harvested its
-//! driver with one between steps, so a live write's exchange paid two such sleeps on its control shard (about 30 µs,
-//! g228). The kept path (`Driver::poll_now`, `KEVENT_FLAG_IMMEDIATE` there) is taken only while the kernel counts a free
-//! processor. This test drives a real shard through busy steps and an idle spin and holds the kept path to its counts:
-//! a non-vacuity check that the path runs, and that every harvest is counted on exactly one path.
+//! On macOS an empty zero-timeout `kevent` sleeps about 13 µs with an involuntary switch, and a busy shard asked its
+//! driver once a quantum (a few microseconds), so every busy step after the first slept: a live write's exchange paid
+//! two such sleeps on its control shard (about 30 µs, g228). This test drives a real shard through an idle window (where
+//! it learns what a harvest costs) and then through busy steps, and holds both rules to their counts on whatever host
+//! runs it: harvests deferred exactly when the measured harvest outlasts the quantum, and every idle moment's watch
+//! counted.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -18,14 +19,14 @@ use slates_rt::registry;
 use slates_rt::runtime::{NO_IDLE_FLOOR_NS, Runtime, RuntimeConfig, WakeTracking};
 use slates_rt::shard::{Counters, ShardId};
 
-/// Shape: the wake estimate the shard is seeded with, a kicked park's on Apple silicon (A-387's row): the quantum its
-/// busy steps harvest at and the bound its idle spin keeps the core within.
+/// Shape: the wake estimate the shard is seeded with, a kicked park's on Apple silicon (A-387's row): its quantum and
+/// the bound of its idle watch.
 const PRIOR_WAKE_NS: u64 = 5_000;
 /// Shape: the estimate's weighting, sixteen wakes.
 const SHIFT: u32 = 4;
-/// Shape: the idle window, many times the bound, so a spin outlives its kept part and sleeps the rest.
+/// Shape: the idle window, thousands of harvests long on any host, so the shard learns its harvest's cost in it.
 const WINDOW_NS: u64 = 20_000_000;
-/// Shape: the busy steps the test runs, each a yield of one task: thousands of quanta, so harvests are certain.
+/// Shape: the busy steps the test runs, each a yield of one task: thousands of quanta.
 const BUSY_STEPS: u32 = 20_000;
 /// Shape: how long a shard gets to answer a question (a step is microseconds).
 const ANSWER: Duration = Duration::from_secs(5);
@@ -73,18 +74,29 @@ fn wait(span: Duration) {
   }
 }
 
-/// 85a item 3 by use. Do: run a task that yields twenty thousand times (busy steps, each harvest a quantum apart), then
-/// note one client activity and wait out its idle window. Expect: harvests counted; and, while the kernel counts a free
-/// processor, harvests that kept the core (the kept path is live), idle spins that kept it and ended, by catching work or
-/// by spinning out the cost of blocking, and time spent keeping it. With no processor free the kept path must not run,
-/// so the test then holds that instead and says so.
+/// 85a item 3 by use. Do: note one client activity and wait out its idle window (the shard's idle moments watch, then
+/// spin, learning a harvest's cost), then run a task that yields twenty thousand times. Expect: idle moments' watches
+/// counted with time spent; and harvests deferred if and only if the harvest the shard measured outlasts its quantum
+/// (a macOS `kevent` that sleeps, not a Linux or Windows poll): the longer interval runs exactly where it should.
 #[test]
-fn a_shard_keeps_its_core_between_steps_while_a_core_is_free_and_a_spin_no_longer_than_blocking_costs()
+fn a_busy_shard_asks_its_driver_no_more_often_than_asking_costs_and_an_idle_one_watches_its_rings_first()
  {
-  let free = slates_machine::facts::free_processors();
   let rt = Runtime::start(&config()).unwrap();
   let shard = rt.shard_ids()[0];
   let before = counters_of(&rt, shard);
+  rt.spawn_on(shard, async {
+    registry::with_current(|ctx| ctx.note_activity());
+  })
+  .unwrap();
+  wait(Duration::from_nanos(WINDOW_NS).saturating_mul(2));
+  let idled = counters_of(&rt, shard);
+  let watches = (idled.watches_caught - before.watches_caught)
+    + (idled.watches_ran_out - before.watches_ran_out);
+  assert!(watches > 0, "no idle moment watched its rings: {idled:?}");
+  assert!(
+    idled.watch_ns > before.watch_ns,
+    "no time was counted watching: {idled:?}"
+  );
   let (done_tx, done_rx) = channel();
   rt.spawn_on(shard, async move {
     for _ in 0..BUSY_STEPS {
@@ -94,46 +106,21 @@ fn a_shard_keeps_its_core_between_steps_while_a_core_is_free_and_a_spin_no_longe
   })
   .unwrap();
   done_rx.recv_timeout(ANSWER).unwrap();
-  rt.spawn_on(shard, async {
-    registry::with_current(|ctx| ctx.note_activity());
-  })
-  .unwrap();
-  wait(Duration::from_nanos(WINDOW_NS).saturating_mul(2));
-  let after = counters_of(&rt, shard);
-  let kept = after.harvests_kept - before.harvests_kept;
-  let slept = after.harvests_slept - before.harvests_slept;
-  assert!(
-    kept + slept > 0,
-    "no harvest was counted on either path: {after:?}"
-  );
-  if free == Some(0) {
-    eprintln!(
-      "held_core: SKIPPED the kept path's checks: the kernel counts no free processor (free {free:?})"
-    );
-    assert_eq!(
-      kept, 0,
-      "the core was kept with no processor free: {after:?}"
-    );
-    rt.shutdown().unwrap();
-    return;
-  }
-  let spins_ended = (after.kept_spins_caught - before.kept_spins_caught)
-    + (after.kept_spins_ran_out - before.kept_spins_ran_out);
+  let busy = counters_of(&rt, shard);
+  let deferred = busy.harvests_deferred - idled.harvests_deferred;
+  let harvest_outlasts_quantum = idled.held_turn_ns > idled.wake_cost_ns;
   eprintln!(
-    "held_core: free {free:?}; harvests kept {kept}, slept {slept}; kept spins ended {spins_ended}, kept {} ns",
-    after.kept_spin_ns - before.kept_spin_ns
+    "held_core: harvest {} ns against a quantum of {} ns; deferred {deferred}; watches {watches}, {} ns",
+    idled.held_turn_ns,
+    idled.wake_cost_ns,
+    idled.watch_ns - before.watch_ns
   );
-  assert!(
-    kept > 0,
-    "a core was free and no harvest kept it: {after:?}"
-  );
-  assert!(
-    spins_ended > 0,
-    "the idle spin never kept its core: {after:?}"
-  );
-  assert!(
-    after.kept_spin_ns > before.kept_spin_ns,
-    "no time was counted keeping the core: {after:?}"
+  assert_eq!(
+    deferred > 0,
+    harvest_outlasts_quantum,
+    "busy harvests deferred {deferred} times with a harvest of {} ns against a quantum of {} ns: {busy:?}",
+    idled.held_turn_ns,
+    idled.wake_cost_ns
   );
   rt.shutdown().unwrap();
 }

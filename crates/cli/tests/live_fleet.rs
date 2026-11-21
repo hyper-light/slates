@@ -2088,8 +2088,8 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
-  // Each daemon's harvests and idle spins by whether they kept the core (`slates_rt::held_core`, 85a item 3), summed
-  // over its shards: the kept path's non-vacuity counts and the CPU its spins cost.
+  // Each daemon's busy harvests deferred and its idle moments' user-space watches (`slates_rt::held_core`, 85a item 3),
+  // summed over its shards: each path's non-vacuity count and the CPU the watches cost.
   for (index, instance) in fleet.instances.iter().enumerate() {
     eprintln!(
       "measure: daemon {index}'s core counters {:?}",
