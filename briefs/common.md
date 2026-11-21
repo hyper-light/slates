@@ -31,6 +31,10 @@ Ada: "Goal 93 is where we need to focus our efforts now. Complete the servers, e
   measurement as one GAPS line), write inbox/main-from-<you>-free.md, and main gives you a goal-93 piece. CI runs
   already going finish and are recorded; start no new non-93 runs.
 - Goal-93 owners keep their lists (close-list.md, "93 ..."), reordered C, then R, then P under this rule.
+- USE, CONCURRENCY AND CRASH TESTS (main 10:48, correcting its own 10:38 pieces; CLAUDE.md §8 binds): an agent WRITES
+  them as #[ignore]d tests that drive stock clients, runs one focused case to prove the test, lands it, and puts the
+  exact command, platform, dataset and red in run-requests.md. Main runs the rounds (interop, chaos, load, Linux and
+  Windows) and sends each red to its owner. No agent runs sweeps, matrices or other platforms' rounds.
 - A failure found by use goes to the server's owner as a red test (inbox/<owner>-from-<you>-<topic>.md). It is fixed
   by the owner, or by you if the owner says so in writing; never two agents in one file at once.
 
