@@ -1,5 +1,39 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (main, 2026-11-21, A-832): a daemon kept one file descriptor per base file it had ever read, and never closed
+> it.** kiln's daemon on adacachy reached 1,048,575 of its 1,048,576 descriptors over ~/Projects/kiln (731 worktrees)
+> and refused every open (`EMFILE`); this MacBook's held 4,574 (3,995 regular files of ~/Projects/slates). Now an
+> untouched base file's descriptor lives only while a handle holds the inode open (`BasePlane::transient`, `deferred`,
+> `release_unopened` in crates/vfs/src/base.rs; `Volume::unpin_open`): a verb with no open closes what it opened when
+> its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
+> proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
+> Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). Still open, owner w-provision-gate: a recovery over a
+> base of ~192k directories reopens them in one step and overruns the 1 s liveness window, so adacachy's restarted
+> daemon is killed every ~1 s and the anchor counts each restart as recovered. Witnessed descriptors are still bounded
+> only by the large-class copies a volume holds.
+
+> **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
+> Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
+> `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
+> agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
+> watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
+> The same test on origin/main alone: kiln r29.
+> **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+> fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
+> passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
+
+> **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
+> complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
+> the lane hears nothing back while the request crosses, resends it in place on silence (6 to 9 times) and gives up at
+> its bound after 7 to 10 s, and the submit is refused `Overloaded { shard: 0 }` with the owner never having run it.
+> Release, big Studio, load 11.5 to 24: main 6a6e352 0 of 12 at 320, 384, 448 and 512 MiB (kiln r21); interleaved A/B
+> 895b80994 (before A-825) against 545cf46c5 (A-825), 3 rounds: 256 MiB 3 of 3 both, 320 and 512 MiB 0 of 3 both
+> (r23). On a quiet Studio (load 2 to 3.6, r13) 320 MiB passed 9 of 10 and 512 MiB 0 of 10. Not an admission bound a
+> client could split against: the increment's size alone decides it. A-825 took a third off the owner's step at 256
+> MiB (667-681 ms to 437-476 ms) and the late beat from 1.2 s to 0.55 s or none. A-826 (lane 3b) names the increment
+> instead, the owner fetching it by identity on the content plane.
+
 > **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
 > `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
@@ -101,6 +135,14 @@
 >   first tick. arm64 with shard and client slices came close: p99 under 1 ms in 6 of 6 rounds and p999 in 5 of 6. On
 >   x86_64, p99 stays at 1.0-1.8 ms and the client slice costs the loaded p50 (conflict 99-172 against 49-90 µs).
 >   Preempting at a wake needs a privileged class (R10). Open: 84a Linux under this lane's oversubscription.
+> - **macOS, Mach's time-constraint policy (A-831, 2026-11-21, w-provision-gate; BENCHMARKS "84a on macOS"):** LANDED
+>   for a latency-tracking runtime's shards and a client's synchronous reply wait. On CI macos-latest (runs 44934544995
+>   and 44934809949, six rounds against main) the loaded accept p99 fell from 14.0-17.4 to 0.41-2.11 ms and the p999
+>   from 16.6-20.8 to 0.70-4.52 ms; conflict likewise. The busy path's kevent harvests of 1 ms or more fell from
+>   8.7-12.2% to 0.001-0.03%. The quiet medians and R9's uncontended p99 are unchanged. The load's own spinners got
+>   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
+>   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
+>   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -1840,6 +1882,16 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
+> `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
+> `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
+> over SSH, every step's status, state and printed bytes compared, over `bench/hg_correctness_fixture.sh`'s repository
+> or `SLATES_TEST_HG_SOURCES`. Its first focused run (the fixture, macOS arm64, debug, 67fa7f75a): 30 passed, 50
+> failed, all from one cause. **Open, w-hg's (inbox/w-hg-from-w-balance-push-spin.md):** a push of 64 MiB and 32 MiB
+> random binaries spins shard 8 past the watchdog (3,170 ms of CPU in one poll of `hg_push::take`, then
+> `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
+> unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
+>
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
@@ -2422,6 +2474,14 @@
 > Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
 > the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
 > (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
+> **A-830, the git server's memory held to the change (clients, 2026-11-21; Ada's MEMORY SIZING ruling):**
+> `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history` (`crates/cli/tests/
+> git_interop.rs`) holds the daemon's resident set at its peak and settled after a push and a clone to the warm-up's
+> end plus `2N + W` (N the pack's bytes, W the warm-up round's range). Its made history (2,000 files, 200 one-line
+> commits, N 258,770 bytes) passes on main 67fa7f75a (this Mac, debug: peak 68.2 MiB, bound 90.5 MiB), so w-interop
+> r2's 7,421 MiB against git/git v2.0.0 (base 26c98c76d) is not reproduced at that size; the same test over git/git's
+> cut (`SLATES_TEST_GIT_SOURCE`, `SLATES_TEST_GIT_CUT=v2.0.0`) is main's run (run-requests.md), its red the piece's
+> next step (attribution by `slates status --memory`, then the fix with w-git).
 > **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
@@ -2463,6 +2523,13 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **A-681 part C by use, against svnserve byte for byte (clients, 2026-11-21):**
+> `stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte` (`crates/cli/tests/svn_interop.rs`) runs one session
+> (commits, copies and moves in a working copy and by URL, a copy of an older revision, versioned and revision
+> properties set and deleted, an import, the log, list, cat, proplist, blame, diff and status) over HTTPv2 and against
+> stock svnserve over FSFS, comparing each command's output with timestamps left out. Not yet run (no svn on this Mac):
+> main's run on a Studio with svn 1.15 (run-requests.md). By reading, the edge serves no PROPPATCH on `!svn/rev/N`, so
+> `svn propset --revprop` over HTTP is expected red (w-svn's, if so).
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
@@ -2996,6 +3063,30 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **The push intake's file delta bases through the store (A-767 C1, 2026-11-21, w-hg; main's ruling (b2) over (b1)).
+> BUILT.**
+> - A file delta whose base is not the text kept last no longer reads the fork's whole text from the content store
+>   (`Intake::file_base`):
+>   - the push's cache of its own texts (`BaseCache`: each text kept before the last, at most the push's room, let go
+>     as each file group ends), counted `base_hits`;
+>   - else rebuilt from the push's own deltas, walked back through the revisions its group brought to a text in hand,
+>     each rebuilt text cached, counted `base_rebuilds` ((b1), the one source; the cache only saves the rebuild);
+>   - a revision landed before the push is read from the node's changeset store between steps (`Stepped::Store`; the
+>     intake answers `StoreWants`: its rows, then its text within the step's room), counted `base_store_reads`.
+> - Drivers: the push's sliced intake (`hg_push::take_sliced`, `hg_view::answer_store_wants`, counted
+>   `vcs_store.hg_intake_base_asks`) and the recovery's and rebuild's piece replays (`PieceStep::Store`,
+>   `hg_view::answer_wants_over` over the disk alone, since a recovery holds the state). A whole replay cannot wait,
+>   so it is refused typed (`record::Refused::StoreWanted`): no register-held push record remains since e6c3f10cd.
+>   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`.
+> - Held by `push::intake::tests::a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`
+>   (one file's four revisions, two deltas against a revision before the last: with the cache 2 hits and nothing
+>   rebuilt; with none every base rebuilt and the rows equal; a later push's base landed before, read from the store
+>   once). The tests keep no store: `Intake::answer_from_fork` stands in for it.
+> - OPEN (main's conditions): the A/B of (b1) alone (the cache bounded at zero) against (b2) on a merge-heavy push,
+>   landing (b1) alone if it is within noise. It is a performance piece, deferred under Ada's goal-93 order (complete,
+>   correct, then optimize; briefs/common.md 65ad57c). The red of zero whole-text bytes left in the store after a push
+>   comes with step 2. `push/tree.rs`, `push/made.rs`, `push/verify.rs` and `Indexed::file` still
+>   read whole file texts and block step 2 (main's order, 10:34).
 > **A Mercurial whole's place is its raw text, the store's contract (A-767 C1, 2026-11-21, w-hg; main's ruling). BUILT.**
 > - Found reading lookup's `.hgtags` through the store: `StoreHandle::text` refused `BadRow` for every Mercurial text.
 >   Both writers (the push intake's `KeptText.place`, the import's `Emitter::revision`) kept a revision against the null
@@ -4003,6 +4094,12 @@
 > `inject_memory_stall` in server roles), so the wedge is judged a wedge on any host; the A-336 tests keep driving a
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
+
+> **`t_a752`'s "more quanta than files" stated the machine's timing, not A-752's rule (2026-11-21; CLOSED by this change,
+> w-bugs; found by w-git: 1 failure in 2 runs at load 12.8, more since 2b2fc8d80's pacing).** A quantum is the shard's
+> live wake estimate, which load and few CPUs raise, so quanta over files is the machine's speed; the rule is a unit a
+> file at least. The pushes' turns now count their units (`push.build.units`) and the test asserts units >= files. Its
+> runs at 1-2 CPUs and loaded, main against the change, are main's (run-requests.md).
 
 > **Killed test daemons leave their macOS socket-route nodes behind, an unbounded set (2026-11-21; OPEN, w-bugs, after
 > its current three; found by main on the MacBook).** `$TMPDIR` (`/var/folders/.../T`) held 1,637 `slates-<hex>.sock`
@@ -5979,6 +6076,15 @@
 > blocks of about `√ops` pieces, new runs merged as made (`derive::PieceList`).
 > Found then, open: a holder's forward of its increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms; BENCHMARKS),
 > against the transport's 1.3 GB/s; and the control shard's beat task runs 520 to 1,381 ms late during it.
+> interval at a time before). A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch since 2026-11-20 (family three: polled
+> a heartbeat tick at a time before; a watch the kernel refuses refuses the mount, typed). Owed from that sweep: the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> bench run's exit 4 at 64 MiB under memory pressure.
+
+> **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
+> a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,
+> load about 70) at `waits >= 1` (handshake.rs:252): a helper that sends its descriptor at once can answer before the
+> owner's first poll, so the owner never waits. The test should hold the helper until the owner has polled once (a pipe
+> the helper reads before it sends), not assume a race's order. Predates family three's change.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
@@ -9367,7 +9473,10 @@
 > ruling (c) and the candidate measured and rejected, losing under contention (BENCHMARKS, same section): item 3
 > closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-829 (a busy shard asks its driver
 > no more often than an empty ask costs): macOS 137.0-141.2 against 164.5-167.7 µs added at the median, no contended
-> condition lost. Still open: 2.2x on Linux;
+> condition lost. A live write's build is split (capture, keys, seal, append, send) and the volume's sealing keys are
+> kept between publications (`seal_keys::BodyKeys`): keys 3.8 to 0.4 µs a write; the daemon's share on ubuntu-latest
+> about 51-58 µs at the median against a transport floor of 50-54 (BENCHMARKS, same section). Next: the seal itself,
+> about 12-13 µs. Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
 > spin primitive with g222's 84a arm C).
 

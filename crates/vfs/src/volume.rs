@@ -6667,6 +6667,10 @@ impl Volume {
       *global = global.saturating_sub(count);
       if *global == 0 {
         self.opens.remove(&no);
+        // The last handle closed: an untouched base file's descriptor goes (closed when the next overlay borrow ends).
+        if let Some(plane) = self.base.as_mut() {
+          plane.release_unopened(no);
+        }
       }
     }
   }

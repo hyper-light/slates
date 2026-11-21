@@ -5025,6 +5025,7 @@ async fn init_shard(
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
     placement_cache: std::cell::RefCell::default(),
+    body_keys: crate::seal_keys::BodyKeys::default(),
     state_logs: crate::state_log::StateLogs::default(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),

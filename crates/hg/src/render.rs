@@ -381,6 +381,11 @@ pub trait StoreWants {
   fn reads_tags(&self) -> bool {
     false
   }
+  /// Whether the asker is a push's intake reading a file delta's base (`crate::push::intake::Stepped::Store`): what the
+  /// daemon counts its asks by.
+  fn reads_bases(&self) -> bool {
+    false
+  }
 }
 
 impl StoreWants for Streaming {

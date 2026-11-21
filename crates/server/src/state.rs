@@ -918,6 +918,9 @@ pub struct ShardState {
   /// The placements of the objects this shard asks about, one computation a configuration
   /// ([`crate::placement_cache`]): read through [`ShardState::with_placement`].
   pub(crate) placement_cache: std::cell::RefCell<crate::placement_cache::PlacementCache>,
+  /// Each live volume's sealing keys, unwrapped once and kept while their records stand (`crate::seal_keys::BodyKeys`;
+  /// g228, 85a: five unwraps a publication before).
+  pub(crate) body_keys: crate::seal_keys::BodyKeys,
   /// The state logs' records of the repositories this shard owns that some candidate still lacks (A-636 part 2b): each
   /// a part of its log's register, shipped by the record plane in position order and let go once every candidate holds
   /// it. Bounded by the partition's merge budget (`crate::state_log::bound`); empty on a laptop.

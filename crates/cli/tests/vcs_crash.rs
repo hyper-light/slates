@@ -26,6 +26,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -578,6 +579,16 @@ impl Faults {
     ));
   }
 
+  /// Records each of `checks` found (its flag true) as a violation at point `point`, killed `delay` after the client
+  /// started.
+  fn add_each(&mut self, point: usize, delay: Duration, checks: Vec<(bool, String)>) {
+    for (found, what) in checks {
+      if found {
+        self.add(point, delay, what);
+      }
+    }
+  }
+
   /// Fails the test naming every violation, if any.
   fn assert_none(self) {
     assert!(
@@ -587,6 +598,11 @@ impl Faults {
       self.found.join("\n")
     );
   }
+}
+
+/// What a check refused, or nothing where it passed.
+fn failure_of(checked: &Result<(), String>) -> &str {
+  checked.as_ref().err().map_or("", String::as_str)
 }
 
 /// The delay of point `point` of `count` into an operation of span `span`: `point·span/(count+1)`.
@@ -678,7 +694,7 @@ fn a_git_push_killed_at_any_point_leaves_the_repository_before_or_after() {
   eprintln!(
     "REFERENCE push of {PAYLOAD_FILES} x {PAYLOAD_FILE_BYTES} B took {span:?}; {count} points"
   );
-  let mut violations = Vec::new();
+  let mut faults = Faults::new("push");
   for point in 1..=count {
     let name = format!("{REPOSITORY_PREFIX}-push-{point}");
     served.create(&name, "git");
@@ -728,51 +744,52 @@ fn a_git_push_killed_at_any_point_leaves_the_repository_before_or_after() {
           "OTHER"
         }),
     );
-    let mut fault = |what: String| {
-      eprintln!("VIOLATION push point {point}: {what}");
-      violations.push(format!("push point {point} (kill at {delay:?}): {what}"));
-    };
-    if !matches!(state, "before" | "after") {
-      fault(format!("the branch is neither before nor after: {head:?}"));
-    }
-    if let Err(fsck) = &fsck {
-      fault(format!(
-        "the repository failed fsck after the crash: {fsck}"
-      ));
-    }
-    if ended.code == Some(0) && state != "after" {
-      fault(format!(
-        "the client saw its push succeed, and the branch is {state}"
-      ));
-    }
-    if ended.code.is_none() {
-      fault(format!("the client hung past {PATIENCE:?}: {ended:?}"));
-    }
-    if retry.code != Some(0) {
-      fault(format!("the retried push failed: {retry:?}"));
-    }
-    if head_after_retry
+    let after_retry = head_after_retry
       .as_ref()
       .ok()
-      .and_then(|head| head.as_deref())
-      != Some(work.after.as_str())
-    {
-      fault(format!(
-        "after the retry the branch is not after: {head_after_retry:?}"
-      ));
-    }
-    if let Err(fsck) = &fsck_after_retry {
-      fault(format!(
-        "the repository failed fsck after the retry: {fsck}"
-      ));
-    }
+      .and_then(|head| head.as_deref());
+    faults.add_each(
+      point,
+      delay,
+      vec![
+        (
+          !matches!(state, "before" | "after"),
+          format!("the branch is neither before nor after: {head:?}"),
+        ),
+        (
+          fsck.is_err(),
+          format!(
+            "the repository failed fsck after the crash: {}",
+            failure_of(&fsck)
+          ),
+        ),
+        (
+          ended.code == Some(0) && state != "after",
+          format!("the client saw its push succeed, and the branch is {state}"),
+        ),
+        (
+          ended.code.is_none(),
+          format!("the client hung past {PATIENCE:?}: {ended:?}"),
+        ),
+        (
+          retry.code != Some(0),
+          format!("the retried push failed: {retry:?}"),
+        ),
+        (
+          after_retry != Some(work.after.as_str()),
+          format!("after the retry the branch is not after: {head_after_retry:?}"),
+        ),
+        (
+          fsck_after_retry.is_err(),
+          format!(
+            "the repository failed fsck after the retry: {}",
+            failure_of(&fsck_after_retry)
+          ),
+        ),
+      ],
+    );
   }
-  assert!(
-    violations.is_empty(),
-    "{} violations:\n{}",
-    violations.len(),
-    violations.join("\n")
-  );
+  faults.assert_none();
 }
 
 /// UI goal 93 correctness, crash consistency of a git clone (§4.17.2 "A fetch"). Do: an anchor as the push sweep
@@ -1077,51 +1094,46 @@ fn an_hg_push_killed_at_any_point_leaves_the_repository_before_or_after() {
       verified.as_ref().map_or("FAILED", |()| "ok"),
       retry.code,
     );
-    if !matches!(state, "before" | "after") {
-      faults.add(
-        point,
-        delay,
-        format!("default is neither before nor after: {head:?}"),
-      );
-    }
-    if let Err(why) = &verified {
-      faults.add(
-        point,
-        delay,
-        format!("the repository failed hg verify after the crash: {why}"),
-      );
-    }
-    if ended.code == Some(0) && state != "after" {
-      faults.add(
-        point,
-        delay,
-        format!("the client saw its push succeed, and default is {state}"),
-      );
-    }
-    if ended.code.is_none() {
-      faults.add(
-        point,
-        delay,
-        format!("the client hung past {PATIENCE:?}: {ended:?}"),
-      );
-    }
-    if !Hg::pushed(&retry) {
-      faults.add(point, delay, format!("the retried push failed: {retry:?}"));
-    }
-    if head_after_retry.as_deref().ok() != Some(work.after.as_str()) {
-      faults.add(
-        point,
-        delay,
-        format!("after the retry default is not after: {head_after_retry:?}"),
-      );
-    }
-    if let Err(why) = &verified_after_retry {
-      faults.add(
-        point,
-        delay,
-        format!("the repository failed hg verify after the retry: {why}"),
-      );
-    }
+    faults.add_each(
+      point,
+      delay,
+      vec![
+        (
+          !matches!(state, "before" | "after"),
+          format!("default is neither before nor after: {head:?}"),
+        ),
+        (
+          verified.is_err(),
+          format!(
+            "the repository failed hg verify after the crash: {}",
+            failure_of(&verified)
+          ),
+        ),
+        (
+          ended.code == Some(0) && state != "after",
+          format!("the client saw its push succeed, and default is {state}"),
+        ),
+        (
+          ended.code.is_none(),
+          format!("the client hung past {PATIENCE:?}: {ended:?}"),
+        ),
+        (
+          !Hg::pushed(&retry),
+          format!("the retried push failed: {retry:?}"),
+        ),
+        (
+          head_after_retry.as_deref().ok() != Some(work.after.as_str()),
+          format!("after the retry default is not after: {head_after_retry:?}"),
+        ),
+        (
+          verified_after_retry.is_err(),
+          format!(
+            "the repository failed hg verify after the retry: {}",
+            failure_of(&verified_after_retry)
+          ),
+        ),
+      ],
+    );
   }
   faults.assert_none();
 }
@@ -1483,57 +1495,48 @@ fn an_svn_commit_killed_at_any_point_leaves_the_repository_before_or_after() {
       verified.as_ref().map_or("FAILED", |()| "ok"),
       retry.code,
     );
-    if !matches!(youngest, Ok(SVN_BEFORE | SVN_AFTER)) {
-      faults.add(
-        point,
-        delay,
-        format!("the youngest revision is neither 1 nor 2: {youngest:?}"),
-      );
-    }
-    if let Err(why) = &verified {
-      faults.add(
-        point,
-        delay,
-        format!("the history failed svnadmin verify after the crash: {why}"),
-      );
-    }
-    if ended.code == Some(0) && youngest != Ok(SVN_AFTER) {
-      faults.add(
-        point,
-        delay,
-        format!("the client saw its commit succeed, and the youngest is {youngest:?}"),
-      );
-    }
-    if ended.code.is_none() {
-      faults.add(
-        point,
-        delay,
-        format!("the client hung past {PATIENCE:?}: {ended:?}"),
-      );
-    }
-    if retry.code != Some(0) {
-      faults.add(
-        point,
-        delay,
-        format!("the retried commit failed: {retry:?}"),
-      );
-    }
-    if youngest_after_retry != Ok(SVN_AFTER) || files != Some(PAYLOAD_FILES) {
-      faults.add(
-        point,
-        delay,
-        format!(
-          "after the retry the youngest is {youngest_after_retry:?} with {files:?} payload files"
+    faults.add_each(
+      point,
+      delay,
+      vec![
+        (
+          !matches!(youngest, Ok(SVN_BEFORE | SVN_AFTER)),
+          format!("the youngest revision is neither 1 nor 2: {youngest:?}"),
         ),
-      );
-    }
-    if let Err(why) = &verified_after_retry {
-      faults.add(
-        point,
-        delay,
-        format!("the history failed svnadmin verify after the retry: {why}"),
-      );
-    }
+        (
+          verified.is_err(),
+          format!(
+            "the history failed svnadmin verify after the crash: {}",
+            failure_of(&verified)
+          ),
+        ),
+        (
+          ended.code == Some(0) && youngest != Ok(SVN_AFTER),
+          format!("the client saw its commit succeed, and the youngest is {youngest:?}"),
+        ),
+        (
+          ended.code.is_none(),
+          format!("the client hung past {PATIENCE:?}: {ended:?}"),
+        ),
+        (
+          retry.code != Some(0),
+          format!("the retried commit failed: {retry:?}"),
+        ),
+        (
+          youngest_after_retry != Ok(SVN_AFTER) || files != Some(PAYLOAD_FILES),
+          format!(
+            "after the retry the youngest is {youngest_after_retry:?} with {files:?} payload files"
+          ),
+        ),
+        (
+          verified_after_retry.is_err(),
+          format!(
+            "the history failed svnadmin verify after the retry: {}",
+            failure_of(&verified_after_retry)
+          ),
+        ),
+      ],
+    );
   }
   faults.assert_none();
 }

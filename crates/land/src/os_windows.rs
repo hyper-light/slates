@@ -1583,15 +1583,16 @@ pub(crate) fn store_identity(dir: BorrowedHandle<'_>) -> Result<(u64, u64), Host
     return Err(last_refusal());
   }
   let id = info.FileId.Identifier;
+  // The 128-bit file id is two little-endian u64 halves, low then high.
   let low = u64::from_le_bytes(
-    id.get(..8)
+    id.get(..size_of::<u64>())
       .and_then(|b| b.try_into().ok())
-      .unwrap_or([0; 8]),
+      .unwrap_or([0; size_of::<u64>()]),
   );
   let high = u64::from_le_bytes(
-    id.get(8..)
+    id.get(size_of::<u64>()..)
       .and_then(|b| b.try_into().ok())
-      .unwrap_or([0; 8]),
+      .unwrap_or([0; size_of::<u64>()]),
   );
   Ok((info.VolumeSerialNumber, low ^ high))
 }

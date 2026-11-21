@@ -247,7 +247,11 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 97
+slates-machine = 101
+# 2026-11-21 (+4, A-831, macOS only; 97 -> 101): `time_constraint.rs`, Mach's THREAD_TIME_CONSTRAINT_POLICY, which no
+#   crate the workspace takes wraps: the `unsafe extern` block (mach_timebase_info, thread_policy_set/get), the
+#   `thread_policy_set` call in `set_current`, the `thread_policy_get` call in `holds`, and `mach_timebase_info` in
+#   `ticks`. Linux and Windows: none (`set_current` is `false`, `holds` `None`).
 # 2026-11-19 (+11, A-570; 86 -> 97): the host's memory-pressure reports (`memory_pressure.rs`), the kernel's own event
 #   in place of the reap loop's once-a-window sample. macOS (+7): libdispatch's memory-pressure source, which no crate
 #   the workspace takes wraps: the `unsafe extern` block, the global queue, the source's creation, the block that sets
