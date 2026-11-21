@@ -255,12 +255,13 @@ part closed between 07:20 and 16:00.
 - If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
   Tell main in your reply, so main closes the stale goal in your stack.
 
-## REACHING MAIN (2026-11-21)
-- Main is the kiln agent 01a14885fc1d72fba8b659837cc43b94, running as Claude session `slates-5b` on adas-macbook-pro-2.
-  `slates-74` and other `slates-*` sessions are NOT main (one is a separate job for Ada); don't send them your status.
+## REACHING MAIN (2026-11-21; main changed ~09:55 PST)
+- Main is now the kiln agent 01a1ff311fc972a8a0f720e354891538 ("Slates Agent", on adacachy). It took over from
+  01a14885fc1d72fba8b659837cc43b94 (`slates-5b` on adas-macbook-pro-2), which lost its goal stack and stopped answering.
+  Send nothing more to 01a14885 or `slates-5b`. Reach main with kiln `agents_send` (agent 01a1ff311fc972a8a0f720e354891538)
+  or the inbox below. `slates-74` and other `slates-*` sessions are NOT main (one is a separate job for Ada).
 - The route that always works: write `inbox/main-from-<you>-<topic>.md` on agents/fanout-state and push it. Main reads
   every new inbox file each check. kiln mail to main can sit "waiting" behind a stuck admission, so never rely on it alone.
-- On the MacBook, a cross-session message to `slates-5b` also reaches main at once.
 - Main reaches you the same three ways. When kiln mail from main is stuck, it arrives as a goal or a session message.
 - A-NUMBERS (2026-11-21): claim an A-number by adding its row to amendments.tsv and pushing that claim BEFORE writing the
   number in a commit, doc or test. If the push is refused, fetch, and if the number was taken meanwhile, take the next
