@@ -26,3 +26,18 @@
   `SLATES_TEST_CLI=1 SLATES_SVN_USE_DUMP=crates/svn/fixtures/dump/full.dump SLATES_SVN_USE_REVISIONS=2 SLATES_SVN_USE_VERBS=log cargo test -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture`
   at the branch's tip. If it's green, merge the branch, or tell me to try again once kiln answers.
 - **The Studio's scratch:** ~/.cache/w-reaper-clone, ~/.cache/w-reaper-target and ~/.cache/w-reaper-svnuse.log.
+
+## Later, 2026-11-21: the routes landed by someone else; my branch is dropped
+- **Superseded:** 013c0f0bf on main (SLATES_SVN_USE_ROUTE: svn, http, http-v1, ssh) does what my branch b8b78e729
+  did, plus an http-v1 leg. I've dropped my branch (agents/w-reaper-svnuse deleted) rather than merge over it.
+- **Check the http-v1 leg before trusting it:** it tells the client SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2. From memory,
+  not verified: ra_serf honours that only in builds compiled with SVN_DEBUG (options.c), and Homebrew's svn 1.15 on
+  the big Studio is a release build. If so, the leg silently speaks HTTPv2. The server counts v1 activities
+  (`vcs_http.svn_v1_activities`, A-766); one MKACTIVITY on that counter after the leg's commit proves it really ran v1.
+  A daemon can't withhold v2 except in the server's own unit tests (`V1_ONLY_PREFIX`, cfg(test)), so A-766 part 4's
+  server test is the v1 path that holds either way.
+- **What's mine on main:** the by-use test itself (007bbca86, 33dc5f546). The routes' focused proof stays owed
+  (013c0f0bf: main's call).
+- **Scratch:** my clone and target here are deleted. Still on the big Studio: ~/.cache/w-reaper-clone,
+  ~/.cache/w-reaper-target and ~/.cache/w-reaper-svnuse.log. My runner's kiln can't reach the Studio right now, so
+  those need main.
