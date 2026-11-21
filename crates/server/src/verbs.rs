@@ -8601,7 +8601,10 @@ fn create_work_here(
       base_version: base,
       journal: Vec::new(),
       files: crate::work_files::WorkFiles::default(),
-      revision: 0,
+      // A revision is seeded from the partition's log position, which only grows across restarts, and every change to
+      // the work records an entry before it moves the revision: so a merge check's stamp (A-796) never names this
+      // work after a restart once it changed, as a revision counted from 0 at every rebuild did.
+      revision: state.db.next_seq(),
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,
@@ -10939,7 +10942,12 @@ fn merge_answer(
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
   let Some(ask) = ask else {
-    return rebase_answer(engine, green_id, &inc, composes);
+    return rebase_answer(
+      engine,
+      green_id,
+      (&inc, std::collections::BTreeSet::new()),
+      composes,
+    );
   };
   if ask.head.is_some_and(|head| head != engine.head()) {
     return RebaseAnswer::Reply(refused(Refusal::StaleMergeView));
@@ -10971,7 +10979,12 @@ fn merge_answer(
   let Some(head) = ask.head else {
     let declaration = canonical_declaration(&inc.doc);
     let head = engine.head();
-    return match rebase_answer(engine, green_id, &inc, composes) {
+    return match rebase_answer(
+      engine,
+      green_id,
+      (&inc, std::collections::BTreeSet::new()),
+      composes,
+    ) {
       RebaseAnswer::Rebased { .. } => RebaseAnswer::Checked {
         head,
         declaration,
@@ -10987,7 +11000,12 @@ fn merge_answer(
       other => other,
     };
   };
-  match rebase_answer(engine, green_id, &inc, composes) {
+  match rebase_answer(
+    engine,
+    green_id,
+    (&inc, established_by(&ask.replacement)),
+    composes,
+  ) {
     RebaseAnswer::Rebased {
       version,
       changed,
@@ -11024,6 +11042,28 @@ fn merge_answer(
     },
     other => other,
   }
+}
+
+/// The paths a resolution's replacement brings into being at the head (A-796, AC-6.13): each it writes, makes, or renames
+/// onto, canonically keyed. The work's kept metadata on them is judged against what the replacement establishes.
+fn established_by(
+  replacement: &[slates_ipc::protocol::WorkChange],
+) -> std::collections::BTreeSet<String> {
+  use slates_ipc::protocol::WorkChange;
+  replacement
+    .iter()
+    .filter_map(|change| match change {
+      WorkChange::Edit { path, .. }
+      | WorkChange::Declare {
+        op: WorkOp::Mkdir { path } | WorkOp::Mknod { path, .. },
+      } => Some(path),
+      WorkChange::Declare {
+        op: WorkOp::Rename { to, .. },
+      } => Some(to),
+      WorkChange::Declare { .. } => None,
+    })
+    .map(|path| crate::merge_service::canonical_path(path).to_owned())
+    .collect()
 }
 
 /// A work's canonical declaration (A-796): its composed operations by index, the indices a resolution retires.
@@ -11121,11 +11161,14 @@ fn apply_replacement(
 fn rebase_answer(
   engine: &slates_merge::engine::Green,
   green_id: DbVolumeId,
-  inc: &slates_merge::engine::Increment,
+  (inc, established): (
+    &slates_merge::engine::Increment,
+    std::collections::BTreeSet<String>,
+  ),
   composes: bool,
 ) -> crate::work_home::RebaseAnswer {
   use crate::work_home::RebaseAnswer;
-  match engine.rebase(inc) {
+  match engine.rebase_establishing(inc, established) {
     slates_merge::engine::Rebased::Rebased {
       version,
       changed,
@@ -19444,7 +19487,9 @@ fn install_rebuilt_work(
       base_version,
       journal,
       files,
-      revision: 0,
+      // Seeded from the partition's log position, as a new work's is: past every revision the work had before the
+      // restart, so no merge check's stamp from then names it (A-796).
+      revision: state.db.next_seq(),
       charged,
       entries: std::collections::BTreeMap::new(),
       verdict: None,

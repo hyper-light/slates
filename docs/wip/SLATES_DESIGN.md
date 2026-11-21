@@ -11750,10 +11750,13 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > rebase restates it, one recorded step; refused `StaleMergeView` with nothing changed when the work moved (checked on
 > its shard) or the head did (checked on the green's half, before anything is mapped). Off the green's shard the ask
 > travels with the sealed work (A-247). No merge is inferred: every byte of a resolution is declared (D-27). Ported
-> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli); its `rebase_with`
-> refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
-> resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
-> (one history on one shard and on eight).
+> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli). Its `rebase_with` rule
+> (AC-6.13) holds too: the work's kept mode and attribute changes on a path the replacement writes, makes or renames
+> onto are judged as on a path the work establishes (`Green::rebase_establishing`), so a mode kept on a file the head
+> removed and the replacement writes anew rebases. A work's revision is seeded from its partition's log position at
+> creation and at rebuild, so a stamp from before a restart never names the work once it changed (the Codex agent's
+> conflict-mutants finding: revisions counted from 0 at every rebuild let one). Test:
+> `crates/server/tests/merge_check.rs` (one history on one shard and on eight; the restart; the kept mode).
 > The same three are MCP tools (`slates.merge.check`, `slates.merge.read_check`, `slates.merge.resolve`) and CLI verbs
 > (`slates check WORK`, `slates resolve JSON`, the resolution as the tool's JSON object), one JSON shape for both
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
@@ -58621,6 +58624,11 @@ work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `r
   stamp's revision and base and the green at its head; it retires canonical operations by index, rebases the rest
   onto that head, applies the agent's changes there, and restates the work (A-207's restatement, one recorded step).
   The windows reuse A-267's kept verdict; nothing pages them twice. None of A-255, A-257 or A-263-A-267 is changed.
+- **Metadata and restarts (2026-11-20, finishing the strand at main's routing).** `Green::rebase_establishing` takes
+  the paths a resolution's replacement brings into being; `Resolved::establishes` counts them, so kept metadata on them
+  is judged as on a path the work makes (red: a mode kept on a removed file written anew answered a conflict). A work's
+  revision starts at its partition's `next_seq()` when made or rebuilt (red: a stamp from before a restart named the
+  work after one more edit, `Ok(Rebased(0))`).
 - **Tests.** `crates/server/tests/merge_check.rs` on one shard and on eight (every work off its green's shard): a
   conflicting check names the head and base and changes neither the work's bytes nor the green; a clean check leaves
   the base where it was; the views read both sides; a resolution retiring the work's operations on the file and writing
