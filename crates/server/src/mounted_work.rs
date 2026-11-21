@@ -29,8 +29,8 @@
 //! **What is owed (GAPS, A-774).** A mount is not refreshed when its work's base moves past its pin: it shows the
 //! pinned version under its own changes, and a later submit of a file it changed declares its bytes against the work's,
 //! undoing another work's change to that file. A work holding declared changes when first mounted is refused. A
-//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS and FUSE bridges
-//! lend the tree; the others refuse a mounted work's base reads typed. A green on another shard than its work's mounts
+//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS, FUSE and WinFsp
+//! bridges lend the tree; virtio-fs and the file verbs refuse a mounted work's base reads typed. A green on another shard than its work's mounts
 //! nothing yet.
 
 use slates_db::catalog::{Role, VolumeId as DbVolumeId};
