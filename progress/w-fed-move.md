@@ -1,5 +1,10 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~04:00 PST: stale role test FIXED (564cc74a); A-808 LANDED 10a0318d (lengths from the kept entry)
+- Contention is the asks knob (17.5 -> 69.4 a client from 300 to 10 hot files). Edits' length re-asks fixed: 69.4 ->
+  48.5. Open: rebases' file asks (13.8 a client), asked main whether a rebase may drop ops identical to the head.
+- Report: inbox/main-from-w-fed-move-asks.md.
+
 ## 2026-11-21 ~03:15 PST: A-806 LANDED slates main 4c404823 (the 300 MB work log: a work's log is what it wrote)
 - Peak counter merge.work.log_peak_bytes; rebases answer parts over the head; restatements log parts.
 - 1k over asic_reg: 35,249,811 -> 1,957 bytes. Report: inbox/main-from-w-fed-move-worklog.md.

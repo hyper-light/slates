@@ -1621,3 +1621,29 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - NEXT for w-fed-move: owner asks per client grow ~6x with scale (17.5 at 1k, ~101 at 100k). Inject contention to find the kind that grows.
   - DISK: the MacBook back to 42 GB. The kiln-build container is still running at 47 min, 14.3 GB.
 - 2026-11-21 03:18 PST LANDED: 564cc74af (w-fed-move: the stale role test judges a green's landing as any volume's, so it expects the missing target refused, not Unsupported: A-774 part 3's rule; stale since f401f798c). w-fed-faults acknowledged an old message late; its list stays closed. w-git's r22 (the git/git push on the 8baa1cf16 diagnostic) is running. The MacBook disk is 55 GB.
+- 2026-11-21 03:23 PST
+  - LANDED: dbfac3e13 (w-rewrite-ops, A-807: Mercurial's made changesets take the deferred-submit hook). Piece 1, the dirty read during a held landing, isn't visible on main; asked whether it's inside A-807, and if not it comes before A-803.
+  - RUN: main queued w-work-mount's Linux FUSE C1 test as kiln r2 (needs linux,mem=16g,disk=30g; adacachy under strain, so queued): a fresh clone of main, then fuse_mount's a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save. A skip is not green. jupiter's r1 (the WinFsp test) hasn't reported yet.
+  - The MacBook disk is 53 GB.
+- 2026-11-21 03:28 PST LANDED: bf3606a54 (w-perf: hg serve streams only where the store keeps the logs, so stock hg clone --stream falls back instead of aborting; a null-base revision is streamed as its text). 89269ab1b (w-lint: the transport clippy fix, so the full lint round runs). w-work-mount waits on main's r1 (WinFsp, jupiter) and r2 (FUSE, Linux, queued). No agent waiting on main for a ruling. The MacBook disk is 53 GB.
+- 2026-11-21 03:33 PST
+  - LANDED: 8968640c0 (w-perf). The stream capability per repository is red/green with stock hg 7.2: the imported leg aborted "operation forbidden by server" before, and clones plainly with hg's warning after. A REAL BUG found and fixed in the same commit: a pushed repository's stream clone failed "integrity check failed on 00changelog:0", because a null-base revision carried its 12-byte push header. Test stand-ins had stored it without the header; they now model the real push.
+  - r3 (old tree, big Studio), all three rounds against stock hg:
+    - one-changeset pull: 0.181-0.216 vs 0.155-0.205 s (best 1.17x);
+    - clone -U: 17.2-17.7 vs 8.0-11.0 s (2.1x);
+    - first push: 113-128 vs 10.6-14.1 s (about 10x slower, the largest hg gap);
+    - the daemon ends at 5.9 GiB resident.
+  - NEXT for w-perf: the pull A/B with needs (no Studio-2 pin), then profile the push by phase and hand w-hg the named step, or fix it if it lies outside C1's files.
+- 2026-11-21 03:38 PST LANDED:
+  - b0405dcad (w-fed-move, goal 86b): an edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched. At 10 hot files, owner asks fell from 69.4 to 48.5 a client.
+  - 4e32bd101 (w-lint round 14 at 89269ab1b: db, vcs, store, merge, ipc and hg back under the wall; literals derived). Round 14's pieces went to w-provision-gate (a disallowed std::thread::sleep in its A-798 spin_kick test; nudged through kiln), w-git and w-hg.
+  - A-809 claimed by w-rewrite-ops (A-803's fix, the layered anchor). w-perf's pull A/B now runs off Studio-2; the push profile is next.
+- 2026-11-21 03:43 PST
+  - CONFIRMED: w-rewrite-ops' piece 1, the dirty read during a held landing, is on main as 31c0acd50 (A-805), before A-807; it is now on A-809 (A-803's layered anchor).
+  - LANDED: 5d555c7fa (w-lint round 14 part 2: repository creation's boxed refusal, the svn landing's payload, the store tests' scratch and splits).
+  - w-fed-move's asks table at 1,000 clients (hot files 300/100/30/10): asks per client 17.5 / 23.1 / 38.7 / 69.4 and rebases 2.3 / 3.9 / 9.7 / 22.2. Contention is the knob. A-808 fixed the length re-asks.
+  - RULING: a rebase drops a journal op whose result became identical to the head, as git rebase skips already-upstream commits (D-27's identical). Provenance stays: each is recorded identical, as in A-782. An oracle holds heads and per-op outcomes equal with and without the drop, apart from git's later-change case, stated in the design with an amendment entry. A/B expects ~13.8 fewer byte asks per client at 10 hot files.
+- 2026-11-21 03:48 PST
+  - LANDED: f25fa0438 (w-provision-gate: A-798's spin_kick holds its turn instead of sleeping, D-9). 7ff7b3316 (w-git layer 2 piece 2: a decision step reckons its stage's room from counts, 0.5 ms -> 30 us a step).
+  - RUN r1 (jupiter): the WinFsp test SKIPPED (SLATES_TEST_CLI and WINFSP_TEST_MOUNT unset), which isn't green. slates-server built with no slates warnings (only aws-lc's build-script notes), so 0cbef8441's import fix holds. WinFsp is installed on jupiter (winfsp-x64.dll present). Rerun as r3 with both variables set.
+  - RULING (w-git layer 2 decision wall: 1,027 refs, mostly old annotated tags, each walking its whole history, over 350 s): option (A), an amendment to A-614 under A-647's derived-data rule. A ref created at a commit that is no green's head records "the closure of H", derived on first read, so admission walks what's new once per push, as git does. (B') was rejected: new persistent derived index state for the same result. Conditions: an oracle (derived equals eager, before and after a restart), sliced and memoized derivation, recovery flat in history, and the 611 MB push landing as the green.
