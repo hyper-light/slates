@@ -1270,6 +1270,7 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
 /// MEMORY SIZING (w-sizing; found by use on the big Studio, 2026-11-20: four anchors killed with `SIGKILL` held 21 GB
 /// with no process alive). Do: start an anchor, read its issuer surface for the names of its segment and its content
 /// object, `SIGKILL` the anchor and wait for its daemon to leave. Expect both names gone (`shm_open` answers `ENOENT`),
+/// and every content pool extent's too (objects of their own on macOS since the extents piece),
 /// so the objects and every page written into them go back to the system with their last holder. Before, nothing
 /// removed them: macOS keeps a shared-memory object while its name exists, and only the creator, the killed anchor,
 /// removed the name. Any name the test finds left is removed at the end, so a red run leaks nothing.
@@ -1308,7 +1309,25 @@ fn a_killed_anchors_segment_and_content_go_with_its_daemon() {
     progress.check(&instance, "the daemon's process ended");
     pause();
   }
-  let left: Vec<&String> = names.iter().filter(|name| present(name)).collect();
+  // The content pool's extents, objects of their own on macOS, named from the content object's name and their id: every
+  // id a layout of up to 64 partitions can name.
+  let content = exports
+    .iter()
+    .find(|(name, _)| name == slates_anchor::segment::ENV_CONTENT)
+    .map(|(_, value)| slates_mem::Handoff::Name(value.clone()))
+    .expect("the content object's name");
+  let extents: Vec<String> = (0..64 * slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
+    .filter_map(|id| u16::try_from(id).ok())
+    .filter_map(|id| match slates_mem::extent_handoff(&content, id) {
+      Some(slates_mem::Handoff::Name(name)) => Some(name),
+      _ => None,
+    })
+    .collect();
+  let left: Vec<&String> = names
+    .iter()
+    .chain(extents.iter())
+    .filter(|name| present(name))
+    .collect();
   for name in &left {
     let _ = rustix::shm::unlink(name.as_str());
   }

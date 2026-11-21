@@ -488,13 +488,24 @@ impl Live {
   ) -> Result<Pending, GitRefused> {
     let mut push = Push::new(FORMAT);
     let mut writer = RecordWriter::default();
-    for brought in objects {
-      let arriving = incoming(brought, depth);
+    let arriving: Vec<Incoming<'_>> = objects
+      .iter()
+      .map(|brought| incoming(brought, depth))
+      .collect();
+    let (pack, offsets) = slates_git::pack::of_whole_placed(
+      FORMAT,
+      arriving
+        .iter()
+        .map(|incoming| (incoming.kind, incoming.content)),
+    )
+    .map_err(|_| GitRefused::Allocation)?;
+    push.extend_pack(&pack);
+    for (arriving, offset) in arriving.into_iter().zip(offsets) {
       admit_object(
         &mut self.content,
         &self.store,
         (&mut push, &mut writer),
-        (arriving, None),
+        (arriving, Some(offset)),
       )?;
     }
     Ok(Pending {
@@ -547,7 +558,7 @@ impl Live {
     let record = record_of(
       &self.content,
       &self.store,
-      (&pending.writer, deepest, &[]),
+      (&pending.writer, deepest, pending.push.pack()),
       moves,
     )?;
     commit_moves(
@@ -1321,52 +1332,6 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
 }
 
 /// A push begun on the shard with `objects` admitted at `depth`.
-/// A zlib stream of `data` in stored (uncompressed) blocks, as a pack entry's data may be (RFC 1950, RFC 1951 §3.2.4):
-/// what git's reader inflates, made with no compressor.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-  let mut out = vec![0x78, 0x01];
-  let mut blocks = data.chunks(usize::from(u16::MAX)).peekable();
-  if blocks.peek().is_none() {
-    out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-  }
-  while let Some(block) = blocks.next() {
-    out.push(u8::from(blocks.peek().is_none()));
-    let len = u16::try_from(block.len()).expect("a stored block's length");
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&(!len).to_le_bytes());
-    out.extend_from_slice(block);
-  }
-  let (mut a, mut b) = (1u32, 0u32);
-  for byte in data {
-    a = (a + u32::from(*byte)) % 65_521;
-    b = (b + a) % 65_521;
-  }
-  out.extend_from_slice(&((b << 16) | a).to_be_bytes());
-  out
-}
-
-/// A pack of `objects`, each whole, as a client sends them (A-723: the pack the record keeps).
-pub(crate) fn pack_of(objects: &[Brought]) -> Vec<u8> {
-  let mut out = Vec::new();
-  let count = u32::try_from(objects.len()).expect("a count");
-  let mut writer = slates_git::pack::Writer::new(FORMAT, count, &mut out);
-  let mut at = slates_git::entry::PACK_HEADER_LEN;
-  for (kind, _, bytes) in objects {
-    let mut head = Vec::new();
-    let header = slates_git::entry::Header {
-      representation: slates_git::entry::Representation::Whole(*kind),
-      size: u64::try_from(bytes.len()).expect("a size"),
-    };
-    slates_git::entry::write(header, at, &mut head).expect("a header");
-    let data = zlib_stored(bytes);
-    slates_git::out::Out::put(&mut writer, &head);
-    slates_git::out::Out::put(&mut writer, &data);
-    at += u64::try_from(head.len() + data.len()).expect("an offset");
-  }
-  writer.finish().expect("a trailer");
-  out
-}
-
 fn begun_at(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1374,8 +1339,6 @@ fn begun_at(
   depth: u64,
 ) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-  let pack = pack_of(objects);
-  push.keep_pack_to(u64::try_from(pack.len()).expect("a length"), &pack);
   let arriving: Vec<Incoming<'_>> = objects
     .iter()
     .map(|brought| incoming(brought, depth))
@@ -1757,7 +1720,7 @@ fn assert_an_abandoned_push_leaves_nothing(
   let mut abandoned = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
   let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
   abandoned.admit_all(state, &arriving).expect("admitted");
-  assert!(state.vcs_stores.charged() > 0);
+  assert!(!abandoned.quarantine().is_empty());
   abandoned.abandon(state);
   assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
   assert_eq!(state.vcs_stores.charged(), 0);
@@ -2293,11 +2256,16 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
     let identity = ContentId::of(&blob);
-    let root = state
+    // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
+    // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
+    let window = state
       .vcs_stores
       .content()
-      .map(|content| content.root_of(&identity))
+      .map(ContentStore::window)
       .unwrap();
+    let mut scratch = ContentStore::new(u64::try_from(4 * LARGE).unwrap(), window).unwrap();
+    let held = scratch.put_object(&blob).unwrap();
+    let root = scratch.root_of(&held);
     assert_ne!(root, identity, "the file is past one window");
     let written = records(state, repository)
       .into_iter()

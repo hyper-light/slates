@@ -80,7 +80,7 @@ use crate::entry;
 use crate::object_name::{CollisionAttack, ObjectFormat, ObjectId};
 use crate::{Admission, PastAdmission, refname, to_u64};
 
-use super::{Push, Repository, StoreRefused};
+use super::{Push, Repository, StoreRefused, StoredAt};
 
 mod environment;
 pub(in crate::store) mod seal;
@@ -453,7 +453,7 @@ impl HookView {
   /// a pack's seal knows from `seals`.
   pub fn read(
     &self,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     seals: &dyn Seals,
     path: &[u8],
     (from, len): (u64, u64),
@@ -477,7 +477,7 @@ impl HookView {
           },
           Seal::known,
         );
-        unit.fill(store, known, range, out)?;
+        unit.fill((store, repository), known, range, out)?;
       }
       _ => return Err(ReadRefused::NotAFile),
     }
@@ -511,11 +511,11 @@ impl HookView {
   pub fn seal_step(
     &self,
     sealing: &mut Sealing,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     quantum: Quantum<'_>,
   ) -> Result<bool, SealRefused> {
     let unit = self.unit(&sealing.pack()).ok_or(SealRefused::NoPack)?;
-    sealing.step_on(unit, store, quantum)
+    sealing.step_on(unit, (store, repository), quantum)
   }
 
   /// Ends `sealing` once its pass is done: the pack's seal, its index kept as content in `store`
@@ -666,7 +666,10 @@ fn hold(
     .iter()
     .flat_map(|unit| {
       let parts = unit.parts.iter().map(|part| part.content);
-      parts.chain(unit.wholes.iter().map(|whole| whole.content))
+      parts.chain(unit.wholes.iter().map(|whole| match whole.stored {
+        StoredAt::Whole(content) => content,
+        StoredAt::InPack(place) => place.pack,
+      }))
     })
     .collect();
   admission.charge_items::<ContentId>(contents.len())?;

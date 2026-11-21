@@ -1575,6 +1575,14 @@ pub struct Rewrites {
   pub longest_unit_work: u64,
 }
 
+/// Whether an op kind is a file's content (what a refinement replaces).
+fn is_content(kind: OpKind) -> bool {
+  matches!(
+    kind,
+    OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::Delete | OpKind::Truncate
+  )
+}
+
 /// Whether an op's `src` is an offset into the post-state (its bytes laid there), as the seal lays them.
 fn laid(op: &Op) -> bool {
   op.src != u64::MAX
@@ -1584,27 +1592,39 @@ fn laid(op: &Op) -> bool {
     )
 }
 
-/// The whole-file replacement a path's ops declare, if that is all they declare about its content and namespace:
-/// `(base length, the post-state offset its bytes were laid at, the writer's length)`.
-fn whole_replacement(ops: &[Op]) -> Option<(u64, u64, u64)> {
+/// A path's whole-file replacement, as [`whole_replacement`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Replacement {
+  /// The length of the base content its ops replace.
+  base_len: u64,
+  /// The post-state offset its bytes were laid at.
+  laid_at: u64,
+  /// The writer's length.
+  post_len: u64,
+  /// The path index of the base file its content ops are relative to, when a `Rename` moved one over this path
+  /// (A-547: the content a rename carries is relative to its source's base); none, its own base.
+  from: Option<u64>,
+}
+
+/// The whole-file replacement a path's ops declare, if that is all they declare about its content and namespace: its
+/// content replaced whole, and at most a `Rename` that moved a base file over it (close item C2), whose source's base is
+/// then what the content replaced.
+fn whole_replacement(ops: &[Op]) -> Option<Replacement> {
   let mut content = ops.iter().filter(|op| {
     matches!(
       op.kind,
       OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::Delete | OpKind::Truncate
     )
   });
-  let namespace = ops.iter().any(|op| {
+  let other_namespace = ops.iter().any(|op| {
     matches!(
       op.kind,
-      OpKind::Create
-        | OpKind::Unlink
-        | OpKind::Rename
-        | OpKind::Link
-        | OpKind::Symlink
-        | OpKind::Mknod
+      OpKind::Create | OpKind::Unlink | OpKind::Link | OpKind::Symlink | OpKind::Mknod
     )
   });
-  if namespace || ops.iter().any(|op| op.flags != 0) {
+  let mut renames = ops.iter().filter(|op| op.kind == OpKind::Rename);
+  let from = renames.next().map(|op| op.src);
+  if other_namespace || renames.next().is_some() || ops.iter().any(|op| op.flags != 0) {
     return None;
   }
   let first = content.next()?;
@@ -1612,9 +1632,9 @@ fn whole_replacement(ops: &[Op]) -> Option<(u64, u64, u64)> {
   if content.next().is_some() {
     return None;
   }
-  match (first.kind, second.map(|op| op.kind)) {
+  let (base_len, laid_at, post_len) = match (first.kind, second.map(|op| op.kind)) {
     (OpKind::Overwrite, None) if first.at == 0 && first.len > 0 => {
-      Some((first.len, first.src, first.len))
+      (first.len, first.src, first.len)
     }
     (OpKind::Insert, Some(OpKind::Delete)) | (OpKind::Delete, Some(OpKind::Insert)) => {
       let second = second?;
@@ -1623,38 +1643,47 @@ fn whole_replacement(ops: &[Op]) -> Option<(u64, u64, u64)> {
       } else {
         (second, first)
       };
-      (insert.at == 0 && delete.at == 0 && delete.len > 0 && insert.len > 0)
-        .then_some((delete.len, insert.src, insert.len))
+      if !(insert.at == 0 && delete.at == 0 && delete.len > 0 && insert.len > 0) {
+        return None;
+      }
+      (delete.len, insert.src, insert.len)
     }
-    _ => None,
-  }
+    _ => return None,
+  };
+  Some(Replacement {
+    base_len,
+    laid_at,
+    post_len,
+    from,
+  })
 }
 
-/// A path's two texts, base and post, as [`refine_rewrites`]' `files` lends them.
+/// A path's two texts, base and post, as [`refine_rewrites`]' `files` lends them: the base file's bytes (the path's own,
+/// or a rename's source's) and the writer's bytes at the path.
 pub type BaseAndPost<'f> = (Cow<'f, [u8]>, Cow<'f, [u8]>);
 
 /// Recovers every whole-file replacement in `doc` as the edit it was (this module's docs), rewriting `doc`'s ops and
 /// relaying the post-state `plan` compactly (the seal's layout: each laid run at the next offset, in the order the seal
-/// laid them). `files` answers a path's base bytes and the writer's bytes; a path it cannot answer, or whose bytes do
-/// not match the lengths the document declares, keeps its replacement. Paths with namespace ops or node-exclusive
+/// laid them). `files(base path, path)` answers the base bytes (the path's own, or, under a rename over it, its source's)
+/// and the writer's bytes at the path; a path it cannot answer, or whose bytes do not match the lengths the document
+/// declares, keeps its replacement. Paths with namespace ops or node-exclusive
 /// flags keep theirs (a Subversion commit judges a node whole, A-542). Runs to its end in one call: see
 /// [`refine_rewrites_paced`] for the sliced form.
 pub fn refine_rewrites<'f>(
   doc: &mut OpsDoc,
   plan: &mut PostStatePlan,
   refiner: &mut Refiner,
-  files: &mut dyn FnMut(&str) -> Option<BaseAndPost<'f>>,
+  files: &mut dyn FnMut(&str, &str) -> Option<BaseAndPost<'f>>,
 ) -> Rewrites {
   let ticks = crate::pace::Ticks;
   crate::pace::finish(refine_rewrites_paced(doc, plan, refiner, (files, &ticks)))
 }
 
-/// A whole replacement found: `[start, end)` of the document's ops, its path, and (base length, where it was laid,
-/// post length).
-type Replacement = (usize, usize, u64, (u64, u64, u64));
-
 /// The whole-file replacements of `doc` with their path's ops: `(path index, base length, laid at, post length)`.
-async fn replacements(doc: &OpsDoc, meter: &mut Meter<'_>) -> Vec<Replacement> {
+async fn replacements(
+  doc: &OpsDoc,
+  meter: &mut Meter<'_>,
+) -> Vec<(usize, usize, u64, Replacement)> {
   let mut found = Vec::new();
   let mut start = 0;
   while start < doc.ops.len() {
@@ -1672,9 +1701,9 @@ async fn replacements(doc: &OpsDoc, meter: &mut Meter<'_>) -> Vec<Replacement> {
   found
 }
 
-/// The paths `doc` replaces whole, the ones [`refine_rewrites`] refines when it has their bytes (A-776): what a work's
-/// shard asks its green's owner for the base of, besides the files it does not hold (C1, A-247). One walk of the
-/// document's ops, as its composition's own walks are.
+/// The base paths whose bytes [`refine_rewrites`] reads to refine `doc`'s whole replacements (A-776): each replaced
+/// path's own, or, under a rename over it, its source's (C2). What a work's shard asks its green's owner for the base of,
+/// besides the files it does not hold (C1, A-247). One walk of the document's ops, as its composition's own walks are.
 pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
   let mut found = Vec::new();
   let mut start = 0;
@@ -1684,8 +1713,8 @@ pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
     while doc.ops.get(end).is_some_and(|op| op.path == path) {
       end = end.saturating_add(1);
     }
-    if whole_replacement(doc.ops.get(start..end).unwrap_or_default()).is_some()
-      && let Some(name) = doc.paths.path(path)
+    if let Some(shape) = whole_replacement(doc.ops.get(start..end).unwrap_or_default())
+      && let Some(name) = doc.paths.path(shape.from.unwrap_or(path))
     {
       found.push(name.to_owned());
     }
@@ -1697,11 +1726,11 @@ pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
 /// An op and where its bytes sat in the old layout (`None` when not laid).
 type OpBefore = (Op, Option<u64>);
 
-/// A refined path's ops in place of its replacement's, `[start, end)` of the document's ops.
+/// A refined path's ops in place of its replacement's content ops, `[start, end)` of the document's ops.
 type RefinedRun = (usize, usize, Vec<OpBefore>);
 
-/// The lender of a path's base and post bytes, by name.
-pub type FileLender<'l, 'f> = &'l mut dyn FnMut(&str) -> Option<BaseAndPost<'f>>;
+/// The lender of the base bytes at a base path and the writer's bytes at a path: (base path, path).
+pub type FileLender<'l, 'f> = &'l mut dyn FnMut(&str, &str) -> Option<BaseAndPost<'f>>;
 
 /// [`refine_rewrites`] a unit at a time under `ticks` (module docs, "Sliced"): each replacement's refinement, the
 /// relaid post-state's sort and the document's canonical order are paced; the same document and plan whatever the
@@ -1717,15 +1746,14 @@ pub async fn refine_rewrites_paced<'f>(
   let found = replacements(doc, &mut meter).await;
   // Each refined path's ops, by its first op's index.
   let mut refined_at: Vec<RefinedRun> = Vec::new();
-  for (start, end, path, (base_len, laid_at, post_len)) in found {
-    let Some((base, post)) = lent_whole((doc, plan), files, path, (base_len, laid_at, post_len))
-    else {
+  for (start, end, path, shape) in found {
+    let Some((base, post)) = lent_whole((doc, plan), files, path, shape) else {
       continue;
     };
     let ops = refined_ops(
       refiner,
       (&base, &post),
-      (path, laid_at),
+      (path, shape.laid_at),
       (&mut done, &mut meter),
     )
     .await;
@@ -1743,19 +1771,20 @@ pub async fn refine_rewrites_paced<'f>(
   done
 }
 
-/// The base and post bytes of path `path` as `files` lends them, when they are the replacement's whole: its base
-/// `base_len` long, its post `post_len` long and laid from the start of the writer's file at `laid_at`. None otherwise:
-/// the replacement keeps its whole.
+/// The base bytes (the path's own, or a rename's source's) and the writer's bytes of path `path` as `files` lends them,
+/// when they are the replacement `shape`'s whole: the lengths it declares, laid from the start of the writer's file.
+/// None otherwise: the replacement keeps its whole.
 fn lent_whole<'f>(
   (doc, plan): (&OpsDoc, &PostStatePlan),
-  files: &mut dyn FnMut(&str) -> Option<BaseAndPost<'f>>,
+  files: &mut dyn FnMut(&str, &str) -> Option<BaseAndPost<'f>>,
   path: u64,
-  (base_len, laid_at, post_len): (u64, u64, u64),
+  shape: Replacement,
 ) -> Option<BaseAndPost<'f>> {
   let name = doc.paths.path(path)?;
-  let at_in_file = plan.get(&laid_at).copied()?;
-  let (base, post) = files(name)?;
-  (base.len() as u64 == base_len && post.len() as u64 == post_len && at_in_file == 0)
+  let base_name = doc.paths.path(shape.from.unwrap_or(path))?;
+  let at_in_file = plan.get(&shape.laid_at).copied()?;
+  let (base, post) = files(base_name, name)?;
+  (base.len() as u64 == shape.base_len && post.len() as u64 == shape.post_len && at_in_file == 0)
     .then_some((base, post))
 }
 
@@ -1804,19 +1833,16 @@ async fn refined_ops(
   with_old
 }
 
-/// `doc`'s ops, each with where its bytes sat in the old layout, the refined paths' ops in place of their replacements.
+/// `doc`'s ops, each with where its bytes sat in the old layout, the refined paths' ops in place of their replacements'
+/// content ops.
 async fn spliced(
   doc: &OpsDoc,
   refined_at: Vec<RefinedRun>,
   meter: &mut Meter<'_>,
 ) -> Vec<OpBefore> {
-  let replaced: usize = refined_at
-    .iter()
-    .map(|(start, end, _)| end.saturating_sub(*start))
-    .sum();
+  // At most every op kept and every refined op added: laid once at that bound.
   let added: usize = refined_at.iter().map(|(_, _, ops)| ops.len()).sum();
-  let mut out: Vec<OpBefore> =
-    Vec::with_capacity(doc.ops.len().saturating_sub(replaced).saturating_add(added));
+  let mut out: Vec<OpBefore> = Vec::with_capacity(doc.ops.len().saturating_add(added));
   let mut refined_at = refined_at.into_iter().peekable();
   let mut index = 0;
   while index < doc.ops.len() {
@@ -1828,6 +1854,7 @@ async fn spliced(
       if let Some((_, _, ops)) = refined_at.next() {
         out.extend(ops);
       }
+      others_kept(doc, (index, end), &mut out, meter).await;
       index = end;
       continue;
     }
@@ -1837,6 +1864,24 @@ async fn spliced(
     index = index.saturating_add(1);
   }
   out
+}
+
+/// A refined path's other ops, `[start, end)` of `doc`'s, kept as they were into `out`: its rename, its mode, its
+/// attributes. Only its content was refined.
+async fn others_kept(
+  doc: &OpsDoc,
+  (start, end): (usize, usize),
+  out: &mut Vec<OpBefore>,
+  meter: &mut Meter<'_>,
+) {
+  for index in start..end {
+    charge!(meter, 1);
+    if let Some(op) = doc.ops.get(index)
+      && !is_content(op.kind)
+    {
+      out.push((*op, laid(op).then_some(op.src)));
+    }
+  }
 }
 
 /// The laid ops of `out`, as (where its bytes sat, its index), in the old layout's order.

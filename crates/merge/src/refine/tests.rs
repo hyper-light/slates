@@ -202,7 +202,7 @@ fn rewrite(
   base_of.dirs.push("src".into());
   let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
   if refine {
-    let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |path| {
+    let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |_, path| {
       (path == PATH).then_some((Cow::Borrowed(base), Cow::Borrowed(post)))
     });
     assert_eq!(done.paths, 1, "the rewrite was recognised: {done:?}");
@@ -376,7 +376,7 @@ fn a_rewrite_whose_bytes_are_not_known_keeps_its_replacement() {
     &mut unknown,
     &mut unknown_plan,
     &mut Refiner::new(),
-    &mut |_| None,
+    &mut |_, _| None,
   );
   assert_eq!(
     (done.paths, &unknown.ops, &unknown_plan),
@@ -388,7 +388,7 @@ fn a_rewrite_whose_bytes_are_not_known_keeps_its_replacement() {
     &mut short,
     &mut short_plan,
     &mut Refiner::new(),
-    &mut |_| Some((Cow::Borrowed(base.as_bytes()), Cow::Borrowed(wrong))),
+    &mut |_, _| Some((Cow::Borrowed(base.as_bytes()), Cow::Borrowed(wrong))),
   );
   assert_eq!((done.paths, &short.ops), (0, &doc.ops));
   let _: BTreeMap<u64, u64> = short_plan;
@@ -490,14 +490,17 @@ fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
     |path: &str| (path == PATH).then(|| (Cow::Borrowed(&base[..]), Cow::Borrowed(&post[..])));
   // Unpaced: the reference.
   let (mut whole, mut whole_plan) = (doc.clone(), plan.clone());
-  let unpaced = refine_rewrites(&mut whole, &mut whole_plan, &mut Refiner::new(), &mut |p| {
-    lend(p)
-  });
+  let unpaced = refine_rewrites(
+    &mut whole,
+    &mut whole_plan,
+    &mut Refiner::new(),
+    &mut |_, p| lend(p),
+  );
   assert_eq!(unpaced.paths, 1);
   // Paced: a turn ends a few asks in.
   let (mut sliced, mut sliced_plan) = (doc.clone(), plan.clone());
   let mut refiner = Refiner::new();
-  let mut files = |p: &str| lend(p);
+  let mut files = |_: &str, p: &str| lend(p);
   let ticks = crate::pace::Ticks;
   let pace = crate::pace::Pace::new(counting_clock);
   let mut work = Box::pin(super::refine_rewrites_paced(
@@ -528,4 +531,154 @@ fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
   );
   assert_eq!(sliced.ops, whole.ops);
   assert_eq!(sliced_plan, whole_plan);
+}
+
+/// Close item C2 (A-776, A-547). Do: over a green holding `src/lib.rs` and `src/other.rs` (200 short functions), one
+/// agent declares an edit of `other.rs` near its end; another rewrites `other.rs` whole with a line near its top changed
+/// and renames it over `lib.rs`, as a tool that writes a file and moves it into place does. Submit the edit, then the
+/// rename. Expect: both accepted, `lib.rs` holding both edits and `other.rs` gone. The content a rename carries is
+/// relative to its source's base, so the rewrite is refined against `other.rs`'s base bytes, and the edit, mapped
+/// through the move, meets no overlap. Unrefined, the carried content replaced the source whole and the rename
+/// conflicted.
+#[test]
+fn a_rewrite_renamed_over_another_file_is_refined_against_its_source() {
+  let base = source();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let other = "src/other.rs";
+  let mut base_of = Base::of_files(vec![(PATH.into(), 12), (other.into(), base.len() as u64)]);
+  base_of.dirs.push("src".into());
+  // A green holding both files, with one agent's declared edit of other.rs ("a + 190" made "a - 190", one byte).
+  let fresh = || {
+    let mut green = Green::with_origin(Origin {
+      files: vec![
+        (PATH.into(), b"fn old() {}\n".to_vec()),
+        (other.into(), base.as_bytes().to_vec()),
+      ],
+      dirs: vec!["src".into()],
+      ..Origin::default()
+    });
+    let at = base.find("a + 190\n").unwrap() as u64 + 2;
+    let edit = vec![VolumeOp::Overwrite {
+      path: other.into(),
+      at,
+      len: 1,
+    }];
+    let (doc, plan) = compose_volume_planned(&base_of, &edit).unwrap();
+    let edited = base.replacen("a + 190\n", "a - 190\n", 1);
+    let post_state = laid(&doc.ops, &plan, edited.as_bytes());
+    let one = green.submit(&Increment {
+      id: [1; 32],
+      base: 0,
+      doc,
+      post_state,
+      evidence: Vec::new(),
+      named: Default::default(),
+    });
+    assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
+    green
+  };
+  let n = first.len() as u64;
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: other.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: other.into(),
+      at: 0,
+      len: n,
+    },
+    VolumeOp::Rename {
+      from: other.into(),
+      to: PATH.into(),
+    },
+  ];
+  let judge = |refine: bool, green: &mut Green| {
+    let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
+    if refine {
+      let done = refine_rewrites(
+        &mut doc,
+        &mut plan,
+        &mut Refiner::new(),
+        &mut |from, path| {
+          (from == other && path == PATH).then_some((
+            Cow::Borrowed(base.as_bytes()),
+            Cow::Borrowed(first.as_bytes()),
+          ))
+        },
+      );
+      assert_eq!(done.paths, 1, "{done:?}");
+    }
+    let post_state = laid(&doc.ops, &plan, first.as_bytes());
+    green.submit(&Increment {
+      id: [2 + u8::from(refine); 32],
+      base: 0,
+      doc,
+      post_state,
+      evidence: Vec::new(),
+      named: Default::default(),
+    })
+  };
+  let unrefined = judge(false, &mut fresh());
+  let mut green = fresh();
+  assert!(
+    matches!(unrefined, Outcome::Conflict { .. }),
+    "unrefined: {unrefined:?}"
+  );
+  let two = judge(true, &mut green);
+  assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
+  assert_eq!(
+    String::from_utf8(green.content(PATH).unwrap().to_vec()).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1)
+  );
+  assert!(green.content(other).is_none());
+}
+
+/// A-776's refinement replaces only a path's content: do, in one work, rewrite `src/lib.rs` whole with one line changed
+/// and make it executable (a tool that saves and chmods, a codemod over a script); refine and submit. Expect: accepted,
+/// the file's bytes the writer's and its mode 0755. Until 2026-11-20 the refined path's every op was replaced by its
+/// content ops, so the mode change was dropped and the file kept its old mode (found with close item C2, where the same
+/// loss dropped a rename).
+#[test]
+fn a_refined_rewrite_keeps_its_paths_other_operations() {
+  let base = source();
+  let post = base.replacen("a + 3\n", "a * 3\n", 1);
+  let mut green = green_of(base.as_bytes());
+  let mut base_of = Base::of_files(vec![(PATH.into(), base.len() as u64)]);
+  base_of.dirs.push("src".into());
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: PATH.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: PATH.into(),
+      at: 0,
+      len: post.len() as u64,
+    },
+    VolumeOp::SetMode {
+      path: PATH.into(),
+      mode: 0o755,
+    },
+  ];
+  let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
+  let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |_, _| {
+    Some((
+      Cow::Borrowed(base.as_bytes()),
+      Cow::Borrowed(post.as_bytes()),
+    ))
+  });
+  assert_eq!(done.paths, 1, "{done:?}");
+  let post_state = laid(&doc.ops, &plan, post.as_bytes());
+  let outcome = green.submit(&Increment {
+    id: [7; 32],
+    base: 0,
+    doc,
+    post_state,
+    evidence: Vec::new(),
+    named: Default::default(),
+  });
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert_eq!(green.content(PATH).unwrap(), post.as_bytes());
+  assert_eq!(green.mode(PATH), Some(0o755));
 }

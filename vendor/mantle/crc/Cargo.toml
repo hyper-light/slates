@@ -1,0 +1,15 @@
+[package]
+name = "mantle-crc"
+description = "mantle's CRC-32C and CRC-64/NVME (vendored at mantle 87ab09e1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/mantle"
+publish = false
+
+[dependencies]
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+
+# A root of its own: a vendored snapshot of mantle (vendor/mantle/SNAPSHOT), outside slates' workspace.
+[workspace]

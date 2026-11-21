@@ -57,7 +57,7 @@ fn a_pinned_extent_reads_the_bytes_it_was_pinned_at_after_the_head_replaced_them
   write_windows(&mut vol, &mut store, f, b'a');
   let mut pinned = Vec::new();
   let file = vol
-    .pin_extents(&mut store, f, &mut pinned)
+    .pin_extents(&mut store, f, &mut pinned, |_, _| true)
     .unwrap()
     .expect("a written file has chunked content");
   assert_eq!(file.extents, pinned.len());
@@ -102,7 +102,9 @@ fn a_pin_let_go_frees_nothing_the_head_holds() {
   write_windows(&mut vol, &mut store, f, b'a');
   let chunks = store.content.chunks();
   let mut pinned = Vec::new();
-  vol.pin_extents(&mut store, f, &mut pinned).unwrap();
+  vol
+    .pin_extents(&mut store, f, &mut pinned, |_, _| true)
+    .unwrap();
   store.content.unpin_extents(&pinned).unwrap();
   assert_eq!(store.content.pinned(), 0);
   assert_eq!(store.content.chunks(), chunks, "nothing was freed");

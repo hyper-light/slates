@@ -1316,6 +1316,20 @@ impl Reaper {
     Ok(leases)
   }
 
+  /// Joins every owner, after the workers and services that used its leases have ended (upstream's
+  /// `Runtime::shutdown`, which joined its retirement owners last): the first owner's failure is the answer, a group
+  /// whose native thread ended abnormally among them (`BadConfig`), and every owner is joined either way.
+  pub fn shutdown(mut self) -> Result<(), RtError> {
+    let mut first = Ok(());
+    for mut owner in std::mem::take(&mut self.owners) {
+      let joined = owner.join();
+      if first.is_ok() {
+        first = joined;
+      }
+    }
+    first
+  }
+
   /// Joins the owners that are done, then checks the new groups fit the bound and an owner's place is reserved.
   fn room(&mut self, capacities: &[usize]) -> Result<(), RtError> {
     if crate::registry::with_current(|_| ()).is_some() {

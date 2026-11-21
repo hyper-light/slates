@@ -480,6 +480,13 @@ impl Repository {
     revision: Revision,
     identity: &ContentIdentity,
   ) -> Option<ContentIdentity> {
+    let base = self.skip_target(path, revision)?;
+    (base != *identity && self.texts.contains_key(&base)).then_some(base)
+  }
+
+  /// The text of the skip-delta predecessor of the node at `path` in `revision`, wherever it is kept; none for a node
+  /// with no predecessor, or one with no text.
+  fn skip_target(&self, path: &str, revision: Revision) -> Option<ContentIdentity> {
     let node = self.index.node(path, revision).ok().flatten()?;
     let count = node.predecessor_count();
     let target = count & count.saturating_sub(1);
@@ -487,8 +494,7 @@ impl Repository {
     for _ in 0..count.saturating_sub(target) {
       at = self.index.node_revision(at.predecessor()?).ok()?;
     }
-    let base = at.text()?.identity;
-    (base != *identity && self.texts.contains_key(&base)).then_some(base)
+    Some(at.text()?.identity)
   }
 
   /// The properties a node's property list holds.
@@ -608,7 +614,188 @@ impl Repository {
       } => self.set_revision_properties(revision, properties),
       Record::Revision(revision) => self.commit(revision).map(drop),
       Record::Locks(entries) => self.apply_lock_entries(&entries),
+      Record::Deltified { text, base, delta } => self.keep_deltified(text, base, delta),
     }
+  }
+
+  /// The stored texts the deltify job may keep as deltas now (main's ruling on A-761; GAPS' A-727 (c)), oldest first:
+  /// each a text a commit stored in the content store whose path's node at the youngest revision holds another text (its
+  /// node moved past it), with the text it would be a delta against: its node's skip-delta predecessor's, when the
+  /// records keep that one (a delta or a list's bytes), none for a first version or a predecessor of the same text. A
+  /// text whose predecessor is itself still stored waits, so a chain is made oldest first; a later call names it. One
+  /// walk of the rows, each stored text named once, by the first row that names it.
+  pub fn deltify_candidates(&self) -> Vec<Deltifiable> {
+    let youngest = self.youngest();
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for revision in 1..=youngest {
+      let Ok(changes) = self.index.changes(revision) else {
+        continue;
+      };
+      for change in changes {
+        let Some(text) = change.text else { continue };
+        if !self.stored.contains_key(&text.identity) || !seen.insert(text.identity) {
+          continue;
+        }
+        if let Some(candidate) = self.deltifiable(&change.path, revision, text.identity) {
+          candidates.push(candidate);
+        }
+      }
+    }
+    candidates
+  }
+
+  /// The stored texts `revision` moved past ([`Repository::deltify_candidates`]'s rule, for one revision): each path it
+  /// changed whose node before it held a stored text another than the one it holds now. What a commit hands the
+  /// deltify job: the rows of one revision walked, not the history.
+  pub fn deltify_after(&self, revision: Revision) -> Vec<Deltifiable> {
+    let Some(before) = revision.checked_sub(1) else {
+      return Vec::new();
+    };
+    let Ok(changes) = self.index.changes(revision) else {
+      return Vec::new();
+    };
+    let mut candidates: Vec<Deltifiable> = Vec::new();
+    for change in changes {
+      let Some(prior) = self
+        .index
+        .node(&change.path, before)
+        .ok()
+        .flatten()
+        .and_then(|node| node.text())
+      else {
+        continue;
+      };
+      if !self.stored.contains_key(&prior.identity)
+        || candidates
+          .iter()
+          .any(|candidate| candidate.text == prior.identity)
+      {
+        continue;
+      }
+      if let Some(candidate) = self.deltifiable(&change.path, before, prior.identity) {
+        candidates.push(candidate);
+      }
+    }
+    candidates
+  }
+
+  /// The stored text `text`, held by the node at `path` in `revision`, as the deltify job would take it now: none while
+  /// the youngest revision's node at `path` still holds it, or while its skip-delta predecessor's text is itself still
+  /// stored (it waits, so a chain is made oldest first).
+  fn deltifiable(
+    &self,
+    path: &str,
+    revision: Revision,
+    text: ContentIdentity,
+  ) -> Option<Deltifiable> {
+    let len = self.stored.get(&text).copied()?;
+    let head = self
+      .index
+      .node(path, self.youngest())
+      .ok()
+      .flatten()
+      .and_then(|node| node.text())
+      .map(|head| head.identity);
+    if head == Some(text) {
+      return None;
+    }
+    let base = match self.skip_target(path, revision) {
+      Some(base) if base == text => None,
+      Some(base) if self.stored.contains_key(&base) => return None,
+      Some(base) => self.kept_len(&base).map(|base_len| (base, base_len)),
+      None => None,
+    };
+    Some(Deltifiable { text, len, base })
+  }
+
+  /// `len` bytes of the text the records keep under `identity` from `offset`, made window by window: the source view a
+  /// deltify job's window is made against. None for a text the records do not keep, or a range past it.
+  pub fn kept_range(&self, identity: &ContentIdentity, offset: u64, len: u64) -> Option<Vec<u8>> {
+    self.range_of(identity, offset, len, 0)
+  }
+
+  /// The length of a text the records keep (a delta or a list's bytes), none for one they do not.
+  fn kept_len(&self, identity: &ContentIdentity) -> Option<u64> {
+    match self.texts.get(identity) {
+      Some(kept) => Some(kept.len()),
+      None => self
+        .contents
+        .get(identity)
+        .and_then(|bytes| u64::try_from(bytes.len()).ok()),
+    }
+  }
+
+  /// The check of [`Record::Deltified`], which changes nothing: the bytes the records would hold more once `text` is
+  /// kept as `delta` against `base`, and the delta's windows. The text must be stored, its base one the records keep (or
+  /// none), the delta an svndiff making exactly the stored length, and the records within their room after it.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Corrupt`] for a text not stored, a base not kept, or a delta that is not an svndiff making the text's
+  /// length; [`StepRefusal::Room`] past the room.
+  pub fn check_deltified(
+    &self,
+    text: &ContentIdentity,
+    base: Option<&ContentIdentity>,
+    delta: &[u8],
+  ) -> Result<u64, StepRefusal> {
+    self
+      .checked_deltified(text, base, delta)
+      .map(|(growth, _)| growth)
+  }
+
+  /// [`Repository::check_deltified`], with the delta's windows.
+  fn checked_deltified(
+    &self,
+    text: &ContentIdentity,
+    base: Option<&ContentIdentity>,
+    delta: &[u8],
+  ) -> Result<CheckedDelta, StepRefusal> {
+    let len = self.stored.get(text).copied().ok_or(StepRefusal::Corrupt)?;
+    if base.is_some_and(|base| self.kept_len(base).is_none()) {
+      return Err(StepRefusal::Corrupt);
+    }
+    let windows = windows_of(delta).ok_or(StepRefusal::Corrupt)?;
+    let made = windows
+      .last()
+      .map_or(0, |(start, made, _)| start.saturating_add(*made));
+    if made != len {
+      return Err(StepRefusal::Corrupt);
+    }
+    let growth = u64::try_from(delta.len()).unwrap_or(u64::MAX);
+    let held = self.held.saturating_add(growth);
+    if held > self.room.bytes {
+      return Err(StepRefusal::Room {
+        needed: held,
+        room: self.room.bytes,
+      });
+    }
+    Ok((growth, windows))
+  }
+
+  /// A stored text kept as `delta` against `base` from now on, its stored length dropped ([`Record::Deltified`]), once
+  /// [`Repository::check_deltified`] takes it.
+  ///
+  /// # Errors
+  /// [`Repository::check_deltified`]'s.
+  fn keep_deltified(
+    &mut self,
+    text: ContentIdentity,
+    base: Option<ContentIdentity>,
+    delta: Vec<u8>,
+  ) -> Result<(), StepRefusal> {
+    let (growth, windows) = self.checked_deltified(&text, base.as_ref(), &delta)?;
+    self.stored.remove(&text);
+    self.texts.insert(
+      text,
+      KeptText {
+        base,
+        delta,
+        windows,
+      },
+    );
+    self.held = self.held.saturating_add(growth);
+    Ok(())
   }
 
   /// A transaction on the youngest revision, named as FSFS names it: the base, a `-`, and the repository's count of
@@ -905,8 +1092,98 @@ impl KeptText {
 /// Derived: a `u64`'s 64 halvings, and the first version.
 const MAX_CHAIN: usize = 65;
 
+/// A delta checked against its text: the text's length and the delta's windows (target offset, target length,
+/// offset into the delta).
+type CheckedDelta = (u64, Vec<(u64, u64, usize)>);
+
 /// An encoded delta and its windows: each window's (offset into the target, target length, offset into the delta).
 type EncodedDelta = (Vec<u8>, Vec<(u64, u64, usize)>);
+
+/// A stored text the deltify job may keep as a delta ([`Repository::deltify_candidates`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deltifiable {
+  /// The text's identity.
+  pub text: ContentIdentity,
+  /// Its length, as stored.
+  pub len: u64,
+  /// The text its delta is against and that text's length; none for a delta against nothing.
+  pub base: Option<(ContentIdentity, u64)>,
+}
+
+/// An svndiff of version 2 made a window at a time ([`DeltaWriter::window`]), as the deltify job makes a stored text's
+/// delta a bounded step a turn: each window from a piece of the target and the piece of the source beside it, its
+/// sections LZ4 blocks where that is shorter, as [`encode_delta`] writes the records' other deltas.
+#[derive(Debug)]
+pub struct DeltaWriter {
+  /// The encoder.
+  encoder: svndiff::Encoder,
+  /// The delta so far.
+  out: Vec<u8>,
+}
+
+impl Default for DeltaWriter {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl DeltaWriter {
+  /// A delta with its header written.
+  pub fn new() -> Self {
+    let encoder = svndiff::Encoder::new(svndiff::Version::Two);
+    let out = encoder.header().to_vec();
+    Self { encoder, out }
+  }
+
+  /// The most target bytes one window makes, and the most source bytes it views: Subversion's window
+  /// (`SVN_DELTA_WINDOW_SIZE`), as the records' other deltas are cut.
+  pub fn window_room() -> u64 {
+    svndiff::WINDOW_LIMIT
+  }
+
+  /// The window that makes `target` (at most [`DeltaWriter::window_room`] bytes) from `source`, the source's bytes
+  /// from `source_offset`: the windows the deltifier makes of the two pieces, their views moved to where `source` lies
+  /// in the whole source. None if the deltifier or the encoder refuses, which it never does within the room.
+  pub fn window(&mut self, source: &[u8], source_offset: u64, target: &[u8]) -> Option<()> {
+    let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
+    for mut window in svndiff::deltas(source, target, room).ok()? {
+      window.source_offset = window.source_offset.checked_add(source_offset)?;
+      self
+        .encoder
+        .window(&window, svndiff::Compression::Lz4, &mut self.out)
+        .ok()?;
+    }
+    Some(())
+  }
+
+  /// The delta's bytes.
+  pub fn finish(self) -> Vec<u8> {
+    self.out
+  }
+}
+
+/// Each window of `delta` (an svndiff): where its target bytes start in the text, how many it makes, and where its
+/// encoding starts in the delta; none for bytes that are not a whole svndiff.
+fn windows_of(delta: &[u8]) -> Option<Vec<(u64, u64, usize)>> {
+  let mut decoder = svndiff::Decoder::new();
+  let mut at = match decoder.decode(delta).ok()? {
+    svndiff::Decoded::Header { consumed, .. } => consumed,
+    _ => return None,
+  };
+  let mut windows = Vec::new();
+  let mut made = 0u64;
+  while at < delta.len() {
+    match decoder.decode(delta.get(at..)?).ok()? {
+      svndiff::Decoded::Window { window, consumed } => {
+        windows.push((made, window.target_len, at));
+        made = made.checked_add(window.target_len)?;
+        at = at.checked_add(consumed)?;
+      }
+      _ => return None,
+    }
+  }
+  Some(windows)
+}
 
 /// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
 /// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
