@@ -1413,6 +1413,17 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
 > debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
 > its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+>
+> **Status (2026-11-20, g228: the sweep on the shard's idle time, spaced by its length).** Armed as a task that advanced
+> a step a turn, a status request's sweep ran half a step quantum of `mincore` ahead of every turn's ready work for as
+> long as it lasted, seconds over tens of GiB of address space, on every shard the request reached. Live writes begun
+> after a status request paid it at every hop, and every daemon burned seconds of CPU (BENCHMARKS, "What live shipping
+> adds to a stable write, after A-396's holds"). The sweep is now the shard's idle work (`ShardContext::set_idle_work`,
+> `content_ranges::idle_slice`): it advances only when the shard has nothing ready and its idle spin has run out, and a
+> sweep is armed no sooner after the last completed than that one took, so sweeps take at most half a shard's time
+> however often status is asked and a report reads figures at most two sweeps old. Counted
+> `content_range.sweep.idle_slices` and `.spaced`; held by
+> `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
@@ -56515,7 +56526,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
   ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
   node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
-  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`.
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`. Part 2a (same day): every
+  file of the view is a referenced file (the small ones one made piece, made again when its bytes change), so the view's
+  volume keeps nothing in the shard's chunk store and a read of it can run while that store is lent to the content
+  store's windows (A-727 a2), the test holding the chunk store empty; and `slates_land::store_root::StoreRoot::mount_point`
+  makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
+  alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
+  `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
 - **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
   store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
   REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
@@ -57252,6 +57269,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
   stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
   build dropped and made again.
+- **Part 5 under a stream (2026-11-20, Goal 85b C3).** "Only if the head is still the one it was captured at" never held
+  while writes went on: the seeded nemesis (seeds 1256052866610850298, 5939796479076166087) dropped 1,055 of 1,055
+  images, and a candidate behind the tail stayed 608 and 743 entries behind through the fleet wait. An image is now made
+  at the head it was captured at while the retained tail still reaches past that head (`Shipper::mark_checkpoint` takes a
+  head behind the owner's on its chain that `retains_after` reaches past, never one behind the checkpoint): a holder
+  installed there catches up by the entries after it (A-428). Test: `slates-db` live
+  `a_whole_state_behind_the_head_is_the_checkpoint_while_the_tail_holds_what_follows` (red: refused, checkpoint none).
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 

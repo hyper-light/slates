@@ -34,7 +34,7 @@
 > resume; (3) a runner's sqlite stores took 48-96 s to open under that I/O pressure. The link itself drops when a
 > starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
 
-> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
+> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below; C1 and P2 CLOSED).** BUILT: the
 > gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
 > and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
@@ -8543,6 +8543,19 @@
 > lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
+> **Open (85a, g228, 2026-11-20): a live write adds under 50 µs at the median and under 1 ms at p999 under load.**
+> macOS (32-core Studio, release, contract command, BENCHMARKS "What live shipping adds to a stable write, after A-396's
+> holds"): on b402afc7c 168-205 µs added at load 16-31 (p999 393-708 µs), 543-823 µs at load 33-75. A-396's holds are
+> declined on macOS and change nothing there; holds forced on are measured and rejected (+50 µs). Main regressed 4x at
+> the median since a48bcdc52: a status request armed A-744's memory sweep as a task ahead of every turn's ready work
+> (`mincore` the heaviest frame in every daemon). Fixed here in part: the sweep runs on the shard's idle time, spaced by
+> its own length, and the runtime harvests its driver between idle slices (median 1,217-1,939 against 2,614-3,096 µs,
+> p999 2.2-3.7 against 4.9-9.7 ms at load 11-15). **Open, blocking 85a:** a plain status request still arms a sweep of
+> tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
+> burst and delays the next message up to half a step quantum per idle slice. Proposed (main's decision): arm the
+> background sweep only for a request that asks for the memory report, and read the content object whole from the
+> kernel's per-mapping figures rather than a page walk. Linux not measured: adacachy's runs froze at load 80-89.
+
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
@@ -10956,8 +10969,13 @@ spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards
 empties it on their path (queued p99 1.05-1.17 ms -> 22-23 µs), and on Linux the same band is the kernel tick. On
 provisioning the candidates' p999 sits in cross-shard hops to a shard that spins without sleeping, which macOS demotes
 and which then waits quanta for a core: 7-29 ms. QoS user-interactive does not move it (rejected; BENCHMARKS "Where the
-loaded p999 goes, per hop"). **Decision needed (main/Ada):** land the immediate poll for p99 3-5x better and R9's quiet
-floor (with the p999 4-5x worse and 4-6x the quiet CPU with holds), or keep main's nap.
+loaded p999 goes, per hop"). **Decided and CLOSED (P2, 2026-11-20 night):** main's option 3 (the
+immediate poll only where a shard keeps its core, holds declined where it can't) was A/B'd against main on four
+conditions. It failed all four: quiet CPU 5.7-10.0 against 1.6-1.7 cores, loaded p999 10.1-12.7 against 2.1-3.4 ms,
+loaded p99 better in two rounds of three, quiet p99 82 µs in one round. Option 2 failed the same way. Both are recorded
+as measured and rejected (BENCHMARKS "options 2 and 3 measured and rejected"), and **main's nap stays**. The loaded
+bound in the gate stays red on macOS: that is R9 unmet under load on this platform, recorded, with no daemon lever
+found.
 Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:

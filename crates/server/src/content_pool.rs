@@ -306,16 +306,19 @@ impl ContentPool {
     {
       // An extent of its own (macOS): made at its owner's start or at its last release; made here only if neither
       // could (the OS refused it then).
-      // SAFETY: no other mapping in any process reaches the extent's object while this region lives: this partition
-      // holds its owner word (claimed by compare-and-swap, or held from the previous daemon, which has exited), and the
-      // object is unmapped before its word is released (`release`). The anchor never maps it.
-      let object = match unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) } {
-        Ok(object) => object,
-        Err(_) => {
-          slates_mem::make_extent(&extent, len).map_err(ServerError::Memory)?;
-          // SAFETY: as above.
-          unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) }
-            .map_err(ServerError::Memory)?
+      // At most two attempts: the open, and once the extent is made, the open again.
+      let mut made = false;
+      let object = loop {
+        // SAFETY: no other mapping in any process reaches the extent's object while this region lives: this partition
+        // holds its owner word (claimed by compare-and-swap, or held from the previous daemon, which has exited), and
+        // the object is unmapped before its word is released (`release`). The anchor never maps it.
+        match unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) } {
+          Ok(object) => break object,
+          Err(refusal) if made => return Err(ServerError::Memory(refusal)),
+          Err(_) => {
+            slates_mem::make_extent(&extent, len).map_err(ServerError::Memory)?;
+            made = true;
+          }
         }
       };
       return Ok(Region::shared(object, self.page));
