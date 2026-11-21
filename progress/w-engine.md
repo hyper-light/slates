@@ -285,3 +285,9 @@ Red: a focused server test landing a large named text: no step past the quantum,
   main the durable-format question for the checkpoint's last ~43 ms step (record by identity in the content store, as
   A-760/A-825; rides format 6?). Running the A/B 585b89299 vs d4c7e1f42 (Z 50/20, 5 rounds,
   ~/.cache/w-engine-p3-runs/ab-final.txt).
+- 2026-11-21 later: key slices REVERTED ed4661d40 (fold in turns 47.6-52.6 s at 1,000 clients against 1-3 s, every
+  past-deadline turn at the 100 ms ceiling). Found main's own load_bench regression (not A-579's): SubmitAccepted server
+  p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091 (Z=50, macOS arm64, this Mac); window c1449f629..b3f674640 and
+  merges 946b60b2d, 99729edef; bisect stopped unfinished on main's 14:33 order (goal 93's reserve: start no runs).
+- LANDED 8da724578 (GAPS): A-579's last ~43 ms step and 13.4 ms key folds deferred past goal 93 with plans; (b)'s A/B
+  put in run-requests.md for main (blocked by the regression). Now in goal 93's reserve: no runs.

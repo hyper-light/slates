@@ -7429,3 +7429,16 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Platforms:** Linux (adacachy or fedora, ideally one under systemd's LimitNOFILE), Windows (jupiter).
 - **Green:** all pass; Windows' descriptor_limit line shows before = after = 16,777,216, nothing refused. **Red:** the
   Linux child refused (setrlimit past fs.nr_open) or not raised; send it to w-bugs.
+
+## w-engine (A-579 (b), landed 596500613): (b)'s A/B against main without A-579 at Z = 20 ms
+- **Command:** two release `load_bench` binaries (`cargo build --release --locked -p slates-client --example load_bench`):
+  A = main with A-579 reverted (before 5d3733d2c's fold in turns), B = main. Alternate A B / B A, 5 rounds each, Z = 20
+  and 50 ms: `load_bench --tree <linux-v7.4-rc1/fs> --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+  --reply-patience 60 --think-us 20000|50000`; read the `latency_server` rows (SubmitAccepted, ReadHead p50/p99/p999/max).
+  The script w-engine used: `~/.cache/w-engine-scratch/p3-ab.sh <rounds> <Z...>` (this Mac).
+- **Platform:** macOS arm64 (the Studio), quiesced.
+- **Precondition:** main's own regression fixed first: SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at
+  1a35ab091 (Z = 50 ms), in the vcs_store C5 2b piece 3 window c1449f629..b3f674640 or its merges (946b60b2d,
+  99729edef, 1a35ab091's second parent); bisect logs `~/.cache/w-engine-p3-runs/bis-*.log`.
+- **Green:** B's Z = 20 ms SubmitAccepted p99 at or under A's (main's before A-579 measured 2.48-4.47 ms), p999/max no
+  worse, Z = 50 ms every kind's p99 under 1 ms. **Red:** B's Z = 20 p99 above A's in most rounds; send it to w-engine.
