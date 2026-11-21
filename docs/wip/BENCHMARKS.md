@@ -15327,6 +15327,28 @@ over-allocation left. w-hg's account: the import keeps every file revision whole
 115,479 file revisions are 4,296.9 MiB as whole texts; a push of the same history committed 4,495.5 MiB). Ada's
 changeset ruling (changesets the stored unit, per-file deltas derived) replaces that; its A/B is the next section.
 
+### Where import D's 5.7 GB is: the content store's whole texts, 91 % (R2's attribution; main's order of 15:35; 2026-11-20)
+Build: release main 1b63ab896, the same Studio and hg-src (`.hg` 87,836 KiB), one import on a fresh anchor (kiln
+r26, script `~/.cache/w-perf/bench/hgmem.sh`, logs `~/.cache/w-perf/prof/hgmem-20261121T011519/`). The daemon's RSS
+sampled by `ps` each second, its import counters beside it; `footprint` and `vmmap -summary` taken before the import and
+after its landing only. Rejected as instruments, each tried: `MallocStackLogging` (every step slowed past the daemon's 1 s
+liveness window: the anchor killed and restarted it about a hundred times, peak 633 MB, 2,172 s) and `heap` (it
+suspended the daemon for 211 s: 7 restarts). Neither number is the import's.
+
+| Phase (s from the import's start) | RSS |
+|---|---|
+| 0 to 54: the changelog and manifests read | 93 MB -> 967 MB |
+| 54 to 111 | flat, 967 MB -> 1,068 MB |
+| 122 to 311: the file logs, every revision put whole | 1,267 MB -> 5,583 MB |
+| 311 to the landing: the record written, landed | flat, 5,583 MB -> 5,630 MB |
+
+After the landing, `footprint` 5,589 MB (peak 5,648 MB): **shared memory 5.1 GB dirty** (the content store's chunk arena
+in the anchor's content object, A-727), `MALLOC_SMALL` 193 MB, `VM_ALLOCATE` 154 MB, the rest (text, stacks, page
+tables) about 130 MB. So 91 % of the peak is what the import keeps in the content store: Mercurial's 115,479 file
+revisions as whole texts, 4,296.9 MiB by w-hg's count, plus the arena's chunks around them; the heap is 6 %. The cut is
+what the store keeps, not a transient: the changeset as the stored unit with per-file reads derived (Ada's ruling; main's
+ruling of 15:40 for R2), which waits on w-store's slates-store (A-767 piece 3) and hg onto it (w-hg's close item).
+
 ### The lend's swap, release (A-727 slice a2)
 `vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
