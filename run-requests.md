@@ -7014,3 +7014,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-shared, lane (main's item 4): CPU profile, sender and holder, of
   `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
   packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
+- w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
+  encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
+  Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
