@@ -456,3 +456,60 @@ fn two_clients_taking_turns_keep_folding_and_recover_whole() {
     assert_eq!(read.ok(), last[index], "{}'s last write", names[index]);
   }
 }
+
+/// Lane (A), condition 3 (A-714's retention; chain entry format 6): a version's increment is held in the owner shard's
+/// content store from its submit until its version folds into a checkpoint. Do: on a one-shard daemon whose green-chain
+/// cap (and so its history's) is 256 KiB, create a file at
+/// version 1, keep a second work at version 1 (so the chain cannot fold past it), land ten versions each overwriting the
+/// file with 8 KiB, read the shard's held content; then destroy the second work, land one more version (whose accept
+/// checkpoints the chain at the risen floor), and read it again. Expect: while the floor is held, at least the ten 8 KiB
+/// increments are held and charged; once the chain folds, at most the newest version's, above the checkpoint, is held,
+/// at a tenth of the charge or less.
+#[test]
+fn a_versions_increment_is_held_until_its_version_folds_into_a_checkpoint() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-chain-inputs-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    config(&profile, &instance),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "chain-inputs"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let (green, work) = green_with_one_file(&mut client);
+  let (holder, _) = client.create_work(green, "floor-holder").unwrap();
+  let mut len = 1u64;
+  for n in 2..=11 {
+    client.edit(work, "file", 0, len, &bytes_of(n)).unwrap();
+    len = EDIT_BYTES as u64;
+    assert!(
+      matches!(client.submit(work), Ok(Submitted::Accepted(version)) if version == n),
+      "version {n} accepted"
+    );
+  }
+  let held = daemon.fleet_replica_account().unwrap();
+  client.destroy(holder).unwrap();
+  client.edit(work, "file", 0, len, &bytes_of(12)).unwrap();
+  let last = client.submit(work);
+  let folded = daemon.fleet_replica_account().unwrap();
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(last, Ok(Submitted::Accepted(12))),
+    "the last version is accepted: {last:?}"
+  );
+  assert!(
+    held.manifests >= 10 && held.charged >= 10 * EDIT_BYTES as u64,
+    "the unfolded versions' increments are held and charged: {held:?}"
+  );
+  assert!(
+    folded.manifests <= 1 && folded.charged * 10 <= held.charged,
+    "the folded versions' increments are given back, at most the newest version's left above the checkpoint: {folded:?}, \
+     held before {held:?}"
+  );
+}

@@ -3101,15 +3101,19 @@ impl Daemon {
         identities.sort_unstable();
         identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
           |(index, bytes)| {
-            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-              (
-                u64::try_from(index)
-                  .unwrap_or(u64::MAX)
-                  .saturating_add(held)
-                  .saturating_add(1),
-                entry.increment.id,
-              )
-            })
+            let inputs = slates_merge::chain_entry::inputs(bytes).ok()?;
+            let increment = crate::merge_service::increment_of(s, volume, &inputs)?;
+            slates_merge::chain_entry::decode(bytes, &increment)
+              .ok()
+              .map(|entry| {
+                (
+                  u64::try_from(index)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(held)
+                    .saturating_add(1),
+                  entry.increment.id,
+                )
+              })
           },
         ));
         // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
@@ -8178,10 +8182,13 @@ mod tests {
   /// copy slices through `svn_commit::land_work`: its text put into the content store a slice a turn, then landed in
   /// the revision's changeset with its record, then the register's entry naming it; then stop the daemon without
   /// publishing anything more, as a crash right after the entry, and start a successor over the same segment and store.
-  /// Expect: the successor replays the revision with its stored text held, no replay refused, the text read back from
-  /// the node's store into the content store (`vcs_store.svn_text_fetched` 1, the shard's image never having kept it),
-  /// and read back whole. Before stage B the entry waited for the shard's image to keep the text (A-727 slice b's
-  /// barrier); without either, the replay is refused `SvnStored`.
+  /// Expect: the successor replays the revision with its stored text held, no replay refused, and the text read back
+  /// whole. Since chain entry format 6 (lane (A)) the shard publishes before the entry is appended, so the revision's
+  /// increment, held in the content store, is in the image the entry is recovered with; that publication carries the
+  /// text's window too, so the successor finds it in the image (`vcs_store.svn_text_fetched` 0). Before format 6 the
+  /// image never kept it and the text was read back from the node's store (`svn_text_fetched` 1). Before stage B the
+  /// entry waited for the shard's image to keep the text (A-727 slice b's barrier); without either, the replay is
+  /// refused `SvnStored`.
   #[test]
   fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
     use slates_anchor::AnchorSegment;
@@ -8304,7 +8311,7 @@ mod tests {
     drop(segment);
     let seen =
       seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
-    assert_eq!(seen, Some((true, (0, 1), true)));
+    assert_eq!(seen, Some((true, (0, 0), true)));
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a

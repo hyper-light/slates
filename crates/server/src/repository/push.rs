@@ -818,13 +818,21 @@ fn apply_planned(
   (entry, made): (RepositoryEntry, Vec<VolumeRecord>),
   held: &mut Held,
 ) -> Result<Appended, AppendRefused> {
-  let committed = commit(state, steps, verdicts)?;
-  let entry = recorded_entry(state, entry, steps, &committed);
+  let increments = hold_increments(state, steps, &verdicts)?;
+  let committed = match commit(state, steps, verdicts) {
+    Ok(committed) => committed,
+    Err(refused) => {
+      release_increments(state, steps, increments);
+      return Err(refused);
+    }
+  };
+  let entry = recorded_entry(state, entry, steps, &committed, &increments);
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })
     .collect();
   ops.push(Op::RepositoryAdvanced { entry });
+  crate::verbs::publish_held_increments(state).map_err(AppendRefused::Entry)?;
   record_all(state, ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
@@ -1008,7 +1016,7 @@ fn entry(
   }
   for (step, verdict) in steps.iter().zip(verdicts) {
     if let (Some((green, work)), Some(Verdict::Held(judged))) = (step.work(), verdict) {
-      let bound = slates_merge::chain_entry::entry_bound(work.encoded_len(), work);
+      let bound = slates_merge::chain_entry::entry_bound(work);
       entry.versions.push(GreenVersion {
         green,
         version: judged.at().saturating_add(1),
@@ -1119,18 +1127,62 @@ fn commit(
   Ok(committed)
 }
 
-/// The entry with each version's real chain entry: the increment, what its verdict resolved it to, and, where the
-/// version's record goes to holders, the head's identity for a replay to compare (as `verbs::record_accepted` records
-/// a submit's).
+/// Each held verdict's increment held in the content store, where its chain entry names it (chain entry format 6, as
+/// `verbs::submit` holds a submit's), before any verdict commits: refused typed at the shard's room with what it held
+/// given back. In the order of the steps, none for a step with no held verdict.
+fn hold_increments(
+  state: &mut ShardState,
+  steps: &[Step],
+  verdicts: &[Option<Verdict>],
+) -> Result<Vec<Option<crate::merge_service::HeldIncrement>>, AppendRefused> {
+  let mut increments = Vec::new();
+  for (step, verdict) in steps.iter().zip(verdicts) {
+    let held = match (step.work(), verdict) {
+      (Some((green, work)), Some(Verdict::Held(judged))) => {
+        let version = judged.at().saturating_add(1);
+        match crate::merge_service::hold_increment(state, green, version, &work.encode()) {
+          Ok(held) => Some(held),
+          Err(refusal) => {
+            release_increments(state, steps, increments);
+            return Err(AppendRefused::Entry(refusal));
+          }
+        }
+      }
+      _ => None,
+    };
+    increments.push(held);
+  }
+  Ok(increments)
+}
+
+/// Gives back what [`hold_increments`] stored, for a push that records nothing.
+fn release_increments(
+  state: &mut ShardState,
+  steps: &[Step],
+  increments: Vec<Option<crate::merge_service::HeldIncrement>>,
+) {
+  for (step, held) in steps.iter().zip(increments) {
+    if let (Some((green, _)), Some(held)) = (step.work(), held) {
+      crate::merge_service::release_refused_increment(state, green, held);
+    }
+  }
+}
+
+/// The entry with each version's real chain entry: the increment by where the content store holds it, what its verdict
+/// resolved it to, and, where the version's record goes to holders, the head's identity for a replay to compare (as
+/// `verbs::record_accepted` records a submit's).
 fn recorded_entry(
   state: &mut ShardState,
   mut entry: RepositoryEntry,
   steps: &[Step],
   committed: &Committed,
+  increments: &[Option<crate::merge_service::HeldIncrement>],
 ) -> RepositoryEntry {
   let mut versions = Vec::new();
-  for (step, made) in steps.iter().zip(committed) {
-    let (Some((green, work)), Some((version, applied, false))) = (step.work(), made) else {
+  for ((step, made), held) in steps.iter().zip(committed).zip(increments) {
+    let (Some((green, work)), Some((version, applied, false)), Some(held)) =
+      (step.work(), made, held)
+    else {
       continue;
     };
     let identity = crate::merge_service::record_goes_to_holders(state, green)
@@ -1141,8 +1193,7 @@ fn recorded_entry(
           .map(|mut engine| engine.head_identity())
       })
       .flatten();
-    let bytes =
-      slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
+    let bytes = slates_merge::chain_entry::encode(held.inputs, work, applied, None, identity, None);
     versions.push(GreenVersion {
       green,
       version: *version,
