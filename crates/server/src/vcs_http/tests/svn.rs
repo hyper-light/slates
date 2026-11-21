@@ -542,9 +542,22 @@ fn added_row(path: &str, kind: NodeKind, text: Option<&[u8]>) -> ChangedPath {
   }
 }
 
-/// Makes Subversion repository [`COMMITTED`] on a daemon's shard and commits its revision 1 through the owner's step
-/// (A-655 part 2b): `/trunk`, `/trunk/a.txt`, `/trunk/sub` and `/trunk/sub/b.txt`, by alice. Its id.
-fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
+/// Makes Subversion repository [`COMMITTED`] on a store-backed daemon's shard and lands its revision 1 through the
+/// owner's step (A-655 part 2b; C2), from a history running as a task there: `/trunk`, `/trunk/a.txt`, `/trunk/sub` and
+/// `/trunk/sub/b.txt`, by alice. Its id.
+async fn committed_repository() -> RepositoryId {
+  use crate::repository::svn_commit::tests::on;
+  let (id, revision) = on(made_repository);
+  let committed =
+    crate::repository::svn_commit::tests::commit((&daemon_owner(), id), revision, None).await;
+  assert!(committed.is_ok(), "{committed:?}");
+  id
+}
+
+/// [`committed_repository`]'s repository, made, and its revision 1.
+fn made_repository(
+  state: &mut crate::state::ShardState,
+) -> (RepositoryId, slates_svn::commit::revision::Revision) {
   let create = slates_ipc::protocol::RequestBody::CreateRepository {
     name: COMMITTED.to_owned(),
     tool: slates_ipc::protocol::VcsTool::Subversion,
@@ -586,10 +599,7 @@ fn committed_repository(state: &mut crate::state::ShardState) -> RepositoryId {
     stored: BTreeMap::new(),
     lock_entries: Vec::new(),
   };
-  let committed =
-    crate::repository::svn_commit::commit(state, (&daemon_owner(), id), revision, None);
-  assert!(committed.is_ok(), "{committed:?}");
-  id
+  (id, revision)
 }
 
 /// What the site reads of [`COMMITTED`] through the daemon's lender, from a task on its shard: whether the lender holds
@@ -658,8 +668,12 @@ fn read_through_the_lender(id: RepositoryId) -> (bool, bool, Vec<u8>, Vec<u8>, V
 /// alice with its message and its four added paths, then revision 0.
 #[test]
 fn the_daemons_lender_serves_a_repositorys_committed_records() {
-  let daemon = crate::daemon::audit_daemon();
-  let id = crate::daemon::observe_first(&daemon, committed_repository);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = crate::test_store::run_on_first(
+    &daemon,
+    committed_repository,
+    std::time::Duration::from_secs(60),
+  );
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {

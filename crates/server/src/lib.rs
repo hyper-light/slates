@@ -145,6 +145,8 @@ mod nfs_writeback;
 pub mod observe;
 mod owner_location;
 mod staging;
+#[cfg(test)]
+pub(crate) mod test_store;
 mod work_charge;
 pub mod work_files;
 mod work_log;

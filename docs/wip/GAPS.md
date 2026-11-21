@@ -2413,14 +2413,26 @@
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > **C2 / A-767 C6, svn onto the changeset store (2026-11-20, w-svn; w-store's wiring baa28bfab, d3accba0e,
-> 046628f88):** part 1 BUILT: a client's commit (`svn_commit::land_work`, svn:// and svn+ssh and DAV) lands its
-> revision into the node's store as one changeset, sequence the revision, judged over the one before, its Record
-> section the revision's record as the register holds it, answered once durable (`store_changeset`; counters
-> `repository.svn.revision_stored`/`_unstored`; refused `Unstored`). Held by
-> `a_subversion_commit_lands_as_a_changeset_in_the_store` (the real store: the log recovered from its files holds the
-> creation and revision 1, whose Record decodes to `/trunk` added). Owed: the replay from the store (asked w-store for
-> a section read through its owner, and which log recovery replays from), an import as one changeset, green-made
-> versions, the texts as the changeset's sections.
+> 046628f88; main's rulings of 20:30 and 21:05):** stage A BUILT, history: the store is the truth. Every record a
+> Subversion repository takes (its creation, a revision, a lock verb's entries, a revision's properties, the UUID, a
+> deltified text) is checked, landed whole on the node's store as one changeset (sequence: how many the register names,
+> creation 0), then committed by a register entry holding only a reference to it (`svn_commit::landing`) with the green's
+> version where it moves one; one landing a repository at a time (its landing turn, held from the check to the
+> register's commit, a waiting task woken, never polled). Recovery and rebuild read each changeset the register names
+> back from the store in sequence order and replay it through the live step (`vcs_store::svn_to_fetch`, `fetch_svn`,
+> `RevisionReplay`); a changeset landed past the register's last is dropped and its retry lands once. A daemon without
+> `--vcs-store` refuses a Subversion repository, typed (`Unsupported` naming `--vcs-store`); the tests run on
+> store-backed daemons through one helper (`crate::test_store`: a directory beside the test binary named with the
+> process id, removed by its guard). Held by `a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood` (the
+> arbiter: two revisions, a revision's properties and a deltified text recovered after a stop equal to the state before,
+> the register five references and no record's bytes) and
+> `a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once` (the crash between land and
+> commit). Owed: stage B, the texts as the changeset's sections read async through the owner (HeadTexts; R6); stage C,
+> an import as one sliced changeset (today a changeset a record); a submitted version's revision (`svn_made`) lands from
+> a task holding the turn the submit took, so a crash between the submit's commit and the revision's leaves the version
+> without its revision (main's call open, inbox main-from-w-svn-c2-made); a repository's creation lands its changeset
+> after the register records it (w-store's `land_creation`), so a crash between leaves a repository whose creation the
+> store lacks, refused at recovery typed (`Unlanded`).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`

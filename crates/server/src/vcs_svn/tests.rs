@@ -58,7 +58,7 @@ const OTHER: usize = 1;
 const OWNER: u32 = 1234;
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for the svn:// listener at `address`.
-fn daemon(address: SocketAddrV4) -> Daemon {
+fn daemon(address: SocketAddrV4) -> crate::test_store::StoredDaemon {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -68,8 +68,14 @@ fn daemon(address: SocketAddrV4) -> Daemon {
   );
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
   config.vcs_svn = Some(address);
-  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance })
-    .expect("the daemon starts");
+  // A Subversion repository's history lands on the node's changeset store (C2): the daemon holds one.
+  let daemon = crate::test_store::StoredDaemon::start(
+    "vcs-svn",
+    &profile,
+    config,
+    SegmentSource::Create { name: instance },
+  )
+  .expect("the daemon starts");
   daemon
     .bootstrap(true)
     .expect("the daemon creates its initial group");

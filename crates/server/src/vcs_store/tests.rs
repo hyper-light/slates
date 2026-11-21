@@ -1253,7 +1253,7 @@ pub(crate) fn repository(
 /// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard(|state| {
     let (git, _) = repository(state, "git", VcsTool::Git);
     let (hg, _) = repository(state, "hg", VcsTool::Mercurial);
     let (svn, _) = repository(state, "svn", VcsTool::Subversion);

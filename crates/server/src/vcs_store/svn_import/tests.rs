@@ -20,6 +20,7 @@ use super::{LoadFailed, Loaded, Turned, begin, turn};
 use crate::merge_service::ReplyRoute;
 use crate::repository::import::{ANSWERED, import_with, svn_refusal_of, svn_reply_of};
 use crate::repository::svn_commit::Uncommitted;
+use crate::repository::svn_commit::tests::{on, rebuild, stored};
 use crate::state::ShardState;
 use crate::verbs::{dispatch, to_db_volume};
 
@@ -96,19 +97,20 @@ pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
   (host, root)
 }
 
-/// Imports `dump` into repository `id` on the shard, a turn at a time, to its end: what the turns ended with, and how
-/// many there were.
-pub(crate) fn imported(
-  state: &mut ShardState,
-  id: RepositoryId,
-  dump: &[u8],
-) -> (Result<Loaded, LoadFailed>, u64) {
+/// Imports `dump` into repository `id` from a history running as a task on the shard, a turn at a time, each record
+/// handed over landed on the node's store before the next turn (C2, `super::land_owed`), to its end: what the turns
+/// ended with, and how many there were.
+pub(crate) async fn imported(id: RepositoryId, dump: &[u8]) -> (Result<Loaded, LoadFailed>, u64) {
+  use crate::repository::svn_commit::tests::on;
   let (host, root) = host_holding(dump);
-  if let Err(failed) = begin(state, (&owner(), id), (Box::new(host), root, DUMP)) {
+  if let Err(failed) = on(|state| begin(state, (&owner(), id), (Box::new(host), root, DUMP))) {
     return (Err(failed), 0);
   }
   for turns in 1..=TURN_LIMIT {
-    match turn(state, id) {
+    if let Some(Err(failed)) = super::land_owed(id).await {
+      return (Err(failed), turns);
+    }
+    match on(|state| turn(state, id)) {
       Some(Ok(Turned::More)) => {}
       Some(Ok(Turned::Done(loaded))) => return (Ok(loaded), turns),
       Some(Err(failed)) => return (Err(failed), turns),
@@ -136,19 +138,25 @@ fn history(state: &ShardState, id: RepositoryId) -> Option<(u64, Vec<u8>)> {
   Some((records.youngest(), exported(records, 0, records.youngest())))
 }
 
-/// The kinds of the records repository `id`'s register holds, in its order.
-fn logged_kinds(state: &ShardState, id: RepositoryId) -> Vec<&'static str> {
-  let kind = |bytes: &[u8]| match Record::decode(bytes) {
-    Ok(Record::Created { .. }) => "created",
-    Ok(Record::Uuid(_)) => "uuid",
-    Ok(Record::RevisionProperties { .. }) => "properties",
-    Ok(Record::Revision(_)) => "revision",
-    Ok(Record::Locks(_)) => "locks",
-    Ok(Record::Deltified { .. }) => "deltified",
-    Err(_) => "refused",
-  };
-  let repositories = state.db.partition().repositories();
-  repositories.objects(id).map(kind).collect()
+/// The kinds of the records repository `id`'s register names, in its order, each read back from the node's store (C2:
+/// the register holds a reference a changeset).
+async fn logged_kinds(id: RepositoryId) -> Vec<&'static str> {
+  use crate::repository::svn_commit::tests::{on, stored_record};
+  let named = on(|state| state.db.partition().repositories().object_count(id));
+  let mut kinds = Vec::new();
+  for sequence in 0..named {
+    kinds.push(
+      match stored_record(id, u64::try_from(sequence).unwrap()).await {
+        Record::Created { .. } => "created",
+        Record::Uuid(_) => "uuid",
+        Record::RevisionProperties { .. } => "properties",
+        Record::Revision(_) => "revision",
+        Record::Locks(_) => "locks",
+        Record::Deltified { .. } => "deltified",
+      },
+    );
+  }
+  kinds
 }
 
 /// Counter `name` on the shard.
@@ -163,16 +171,16 @@ fn count(state: &ShardState, name: &str) -> u64 {
 /// three revisions and one import done.
 #[test]
 fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    let (loaded, _) = imported(state, svn, PART1);
+  stored(|| async move {
+    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (loaded, _) = imported(svn, PART1).await;
     let revisions = loaded.map(|loaded| (loaded.revisions, loaded.youngest));
     assert_eq!(revisions, Ok((PART1_LAST, PART1_LAST)));
     assert!(
-      history(state, svn) == Some((PART1_LAST, PART1.to_vec())),
+      on(|state| history(state, svn)) == Some((PART1_LAST, PART1.to_vec())),
       "part1.dump again"
     );
-    let head = state.greens.get(&green).map(|engine| engine.head());
+    let head = on(|state| state.greens.get(&green).map(|engine| engine.head()));
     assert_eq!(head, Some(PART1_LAST));
     let wanted = [
       "created",
@@ -182,8 +190,8 @@ fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte
       "revision",
       "revision",
     ];
-    assert_eq!(logged_kinds(state, svn), wanted);
-    let counted = [count(state, super::REVISIONS), count(state, super::DONE)];
+    assert_eq!(logged_kinds(svn).await, wanted);
+    let counted = on(|state| [count(state, super::REVISIONS), count(state, super::DONE)]);
     assert_eq!(counted, [PART1_LAST, 1]);
   });
 }
@@ -194,16 +202,18 @@ fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte
 /// revision 0 as `svnadmin load` refuses a revision out of its sequence (`E160006`, on the wire), the history as it was.
 #[test]
 fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refused() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, _) = subversion(state, "svn");
-    let parts =
-      [PART1, PART2].map(|part| imported(state, svn, part).0.map(|loaded| loaded.youngest));
+  stored(|| async move {
+    let (svn, _) = on(|state| subversion(state, "svn"));
+    let mut parts = Vec::new();
+    for part in [PART1, PART2] {
+      parts.push(imported(svn, part).await.0.map(|loaded| loaded.youngest));
+    }
     assert_eq!(parts, [Ok(PART1_LAST), Ok(FULL_LAST)]);
     assert!(
-      history(state, svn) == Some((FULL_LAST, FULL.to_vec())),
+      on(|state| history(state, svn)) == Some((FULL_LAST, FULL.to_vec())),
       "full.dump"
     );
-    let (again, _) = imported(state, svn, PART1);
+    let (again, _) = imported(svn, PART1).await;
     let out_of_sequence = LoadFailed::Refused {
       refusal: MigrationRefusal::OutOfSequence {
         expected: FULL_LAST + 1,
@@ -220,7 +230,7 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
     };
     assert_eq!(wire, Refusal::ImportRefused { fault: wanted });
     assert!(
-      history(state, svn) == Some((FULL_LAST, FULL.to_vec())),
+      on(|state| history(state, svn)) == Some((FULL_LAST, FULL.to_vec())),
       "as it was"
     );
   });
@@ -232,43 +242,49 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
 /// back, its counter of refusals one.
 #[test]
 fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, _) = subversion(state, "svn");
+  stored(|| async move {
+    let (svn, _) = on(|state| subversion(state, "svn"));
     let cut = PART1.get(..PART1.len() - 3).expect("a shorter dump");
-    let (loaded, _) = imported(state, svn, cut);
+    let (loaded, _) = imported(svn, cut).await;
     let truncated = LoadFailed::Refused {
       refusal: MigrationRefusal::Stream(DumpError::Truncated),
       revision: Some(PART1_LAST),
     };
     assert_eq!(loaded, Err(truncated));
-    let youngest = state
-      .vcs_stores
-      .subversion_records(svn)
-      .map(Repository::youngest);
-    assert_eq!(youngest, Some(PART1_LAST - 1));
-    assert!(!state.vcs_stores.importing(svn));
-    assert_eq!(count(state, super::REFUSED), 1);
+    let seen = on(|state| {
+      (
+        state
+          .vcs_stores
+          .subversion_records(svn)
+          .map(Repository::youngest),
+        state.vcs_stores.importing(svn),
+        count(state, super::REFUSED),
+      )
+    });
+    assert_eq!(seen, (Some(PART1_LAST - 1), false, 1));
   });
 }
 
-/// A-652 part 3 (the imported records are durable). Do: import `part1.dump`, then make the store again from the
-/// partition's log. Expect: the records made again hold the same history, exported as `part1.dump` byte for byte, and
+/// A-652 part 3 (the imported records are durable). Do: import `part1.dump`, then make the store again from its
+/// changesets on the node's store (C2). Expect: the records made again hold the same history, exported as `part1.dump` byte for byte, and
 /// none refused; every record of the register replayed.
 #[test]
 fn t_a652_the_records_an_import_committed_are_made_again_from_the_log() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, _) = subversion(state, "svn");
-    assert!(imported(state, svn, PART1).0.is_ok());
-    let replayed = count(state, crate::vcs_store::REPLAYED);
-    crate::vcs_store::rebuild(state, svn);
-    crate::vcs_store::settle_rebuild(state, svn);
-    assert_eq!(state.vcs_stores.unrecovered(svn), None);
+  stored(|| async move {
+    let (svn, _) = on(|state| subversion(state, "svn"));
+    assert!(imported(svn, PART1).await.0.is_ok());
+    let replayed = on(|state| count(state, crate::vcs_store::REPLAYED));
+    rebuild(svn).await;
+    assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
     assert!(
-      history(state, svn) == Some((PART1_LAST, PART1.to_vec())),
+      on(|state| history(state, svn)) == Some((PART1_LAST, PART1.to_vec())),
       "made again"
     );
-    let logged = u64::try_from(logged_kinds(state, svn).len()).unwrap_or(u64::MAX);
-    assert_eq!(count(state, crate::vcs_store::REPLAYED), replayed + logged);
+    let logged = u64::try_from(logged_kinds(svn).await.len()).unwrap_or(u64::MAX);
+    assert_eq!(
+      on(|state| count(state, crate::vcs_store::REPLAYED)),
+      replayed + logged
+    );
   });
 }
 
@@ -289,7 +305,7 @@ fn routed(state: &mut ShardState, request: u64) {
 /// undeliverable, no client being there), and the repository's history `part1.dump`'s.
 #[test]
 fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let (id, _) = subversion(state, "svn");
     routed(state, 1);

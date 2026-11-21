@@ -3,15 +3,12 @@
 //! read back through the store"). The store's directory is a real one beside the test binary in the build output, never
 //! `/tmp` (R1).
 
-use std::path::PathBuf;
-
-use slates_db::catalog::Principal;
+use slates_db::catalog::{Principal, RepositoryId};
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
-use slates_land::store_root::{StoreGrant, StoreRoot};
 use slates_store::log::{ChangesetLog, SectionKind, Tool};
-use slates_store::owner::StoreOwner;
-use slates_store::store::{LOG_FILE, Sizing, Store};
+use slates_store::store::{LOG_FILE, Store};
 
+use crate::test_store::{SIZING, TestStore, root};
 use crate::{Daemon, SegmentSource};
 
 /// Shape: the daemon's shards.
@@ -24,49 +21,17 @@ fn owner() -> Principal {
   }
 }
 
-/// A fresh directory beside the test binary, in the build output.
-fn store_directory(name: &str) -> PathBuf {
-  let binary = std::env::current_exe().unwrap();
-  let dir = binary
-    .parent()
-    .unwrap()
-    .join(format!("vcs-store-{name}-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).unwrap();
-  dir.canonicalize().unwrap()
-}
-
-fn root(dir: &std::path::Path) -> StoreRoot {
-  let grant = StoreGrant {
-    repository: 0,
-    target: StoreRoot::identify(dir).unwrap(),
-    issued_ns: 0,
-  };
-  StoreRoot::open(dir, &grant).unwrap()
-}
-
-/// Shape: a test's store: 8 MiB of memory, 1 GiB of disk, 128 KiB extents, fanout 8.
-fn sizing() -> Sizing {
-  Sizing {
-    memory: 8 << 20,
-    disk: 1 << 30,
-    extent_bytes: 128 << 10,
-    fanout: 8,
-  }
-}
-
 /// A-767 item 7. Do: start a daemon holding a store, create a git repository through the verb, wait for its creation to
 /// land, stop the daemon and the store's owner, then open the store again from its files. Expect: the creation is one
 /// changeset of that repository, sequence 0, a git record naming the repository and its default branch, read back
 /// through the recovered store's rows and log.
 #[test]
 fn a_created_repository_is_landed_into_the_store_and_recovered() {
-  let dir = store_directory("create");
-  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let mut store = TestStore::start("create");
   let profile = crate::daemon::test_profile();
   let instance = format!("vcs-store-create-{}", std::process::id());
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
-  config.vcs_disk = Some(store_owner.handle());
+  config.vcs_disk = Some(store.handle());
   let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
   daemon.bootstrap(true).unwrap();
   let name = "stored".to_owned();
@@ -116,7 +81,8 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
     std::thread::sleep(std::time::Duration::from_millis(5));
   }
   daemon.stop();
-  store_owner.stop().unwrap();
+  store.stop_owner();
+  let dir = store.dir().to_path_buf();
 
   // Recovered: the log read whole names one changeset, and the store's rows find it by its repository.
   let log_file = hyper_block::file::DeviceFile::adopt(
@@ -142,8 +108,10 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   let record = String::from_utf8(record).unwrap();
   assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
   drop(log);
-  let mut store = Store::open(root(&dir), sizing()).unwrap();
-  let rows = store.changesets(creation.header.repository, 0, 10).unwrap();
+  let mut reopened = Store::open(root(&dir), SIZING).unwrap();
+  let rows = reopened
+    .changesets(creation.header.repository, 0, 10)
+    .unwrap();
   assert_eq!(rows.len(), 1);
   assert_eq!(rows[0].identity, creation.identity);
 }
@@ -156,12 +124,11 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
 /// revision's record as the register holds it: `/trunk` added. Before, a commit landed nothing into the store.
 #[test]
 fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
-  let dir = store_directory("svn-commit");
-  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let mut store = TestStore::start("svn-commit");
   let profile = crate::daemon::test_profile();
   let instance = format!("vcs-store-svn-{}", std::process::id());
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
-  config.vcs_disk = Some(store_owner.handle());
+  config.vcs_disk = Some(store.handle());
   let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
   daemon.bootstrap(true).unwrap();
   let name = "stored-svn".to_owned();
@@ -227,7 +194,8 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
     .recv_timeout(std::time::Duration::from_secs(60))
     .expect("the landing answered");
   daemon.stop();
-  store_owner.stop().unwrap();
+  store.stop_owner();
+  let dir = store.dir().to_path_buf();
   assert_eq!(landed, Some(Ok(1)));
 
   let log_file = hyper_block::file::DeviceFile::adopt(
@@ -273,4 +241,398 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
       .collect::<Vec<_>>(),
     vec!["/trunk"]
   );
+}
+
+/// A daemon of one shard over the anchor's `segment` (and its content object) holding `store`'s handle: what a node's
+/// restart starts again over the segment and store the dead daemon left.
+fn daemon_over(
+  instance: &str,
+  (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
+  store: &TestStore,
+) -> Daemon {
+  let profile = crate::daemon::test_profile();
+  let mut config = crate::DaemonConfig::derive(&profile, instance, Some(1));
+  config.vcs_disk = Some(store.handle());
+  let (handoff, len) = segment.handoff().unwrap();
+  let source = SegmentSource::Handoff {
+    handoff,
+    len,
+    content: segment.content_handoff().unwrap(),
+    rendezvous: rendezvous.adoption(),
+  };
+  Daemon::start(&profile, config, source).unwrap()
+}
+
+/// The anchor's segment and content object for `instance`, sized as the anchor sizes them, and its rendezvous.
+fn anchor_of(instance: &str) -> (slates_anchor::AnchorSegment, slates_ipc::HeldRendezvous) {
+  let profile = crate::daemon::test_profile();
+  let config = crate::DaemonConfig::derive(&profile, instance, Some(1));
+  let segment = slates_anchor::AnchorSegment::create(
+    &format!("{instance}-seg"),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(&format!("{instance}-con"), config.content_bytes())
+  .unwrap();
+  (segment, slates_ipc::HeldRendezvous::hold(instance).unwrap())
+}
+
+/// Creates Subversion repository `name` on `daemon`'s one shard and waits for its creation to land on the store.
+fn created_subversion(daemon: &Daemon, name: &str) -> RepositoryId {
+  let name = name.to_owned();
+  let repository = crate::daemon::observe_first(daemon, move |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: name.clone(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Revisions,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      matches!(created, ReplyBody::GreenCreated { .. }),
+      "{created:?}"
+    );
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&name)
+      .map(|record| record.id)
+      .unwrap()
+  });
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+  while crate::daemon::observe_first(daemon, |state| {
+    state
+      .refusals
+      .get(super::CREATION_LANDED)
+      .copied()
+      .unwrap_or(0)
+  }) == 0
+  {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the creation never landed"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+  }
+  repository
+}
+
+/// A client's work on revision `head` setting `/trunk/a.txt` to `bytes` (`action`: add or modify), `/trunk` added with
+/// it at revision 0, with its text held as a commit's sink holds it.
+fn file_work(
+  head: u64,
+  action: slates_svn::index::Action,
+  bytes: &[u8],
+) -> (
+  slates_svn::commit::drive::Work,
+  slates_svn::commit::drive::HeldTexts,
+) {
+  use slates_svn::commit::drive::TextSink;
+  use slates_svn::index::{Action, ChangedPath, NodeKind};
+  let text = slates_svn::commit::drive::text_of(bytes).unwrap();
+  let texts = slates_svn::commit::drive::HeldTexts::new();
+  let staged = texts.stage().unwrap();
+  texts.append(staged, bytes).unwrap();
+  texts.seal(staged, text.identity).unwrap();
+  let mut changes = Vec::new();
+  if head == 0 {
+    changes.push(ChangedPath {
+      path: "/trunk".to_owned(),
+      action: Action::Add,
+      kind: NodeKind::Directory,
+      copy_from: None,
+      text: None,
+      properties: None,
+      mergeinfo_modified: false,
+    });
+  }
+  changes.push(ChangedPath {
+    path: "/trunk/a.txt".to_owned(),
+    action,
+    kind: NodeKind::File,
+    copy_from: None,
+    text: Some(text),
+    properties: None,
+    mergeinfo_modified: false,
+  });
+  let work = slates_svn::commit::drive::Work {
+    head,
+    record: slates_svn::index::RevisionRecord {
+      transaction: format!("{head}-1"),
+      changes,
+    },
+    lock_entries: Vec::new(),
+    revision_properties: vec![(b"svn:log".to_vec(), format!("r{}", head + 1).into_bytes())],
+    texts: std::iter::once(text.identity).collect(),
+    property_lists: std::collections::BTreeMap::new(),
+    locks: slates_svn::lock::CommitLocks::default(),
+  };
+  (work, texts)
+}
+
+/// Lands `work` on `repository` through the client's commit landing (`svn_commit::land_work`), as a task on `daemon`'s
+/// shard: the revision it committed, or why not.
+fn landed_work(
+  daemon: &Daemon,
+  repository: RepositoryId,
+  head: u64,
+  (action, bytes): (slates_svn::index::Action, Vec<u8>),
+) -> Result<u64, super::svn_commit::Uncommitted> {
+  crate::test_store::run_on_first(
+    daemon,
+    move || async move {
+      let (work, texts) = file_work(head, action, &bytes);
+      super::svn_commit::land_work((&owner(), repository), work, &texts)
+        .await
+        .unwrap()
+        .map(|committed| committed.revision)
+    },
+    std::time::Duration::from_secs(60),
+  )
+}
+
+/// Everything recovery must make again of `repository`: its records whole as they print, their youngest revision, its
+/// green's head, and the sequence each of its register's records names (each a reference: the register holds no
+/// record's bytes), with what the recovery refused.
+fn svn_seen(
+  state: &crate::state::ShardState,
+  repository: RepositoryId,
+) -> (String, Option<u64>, Option<u64>, Vec<Option<u64>>) {
+  let records = state.vcs_stores.subversion_records(repository);
+  let green = super::svn_commit::green_of(state, repository).ok();
+  (
+    format!(
+      "{records:?} unrecovered {:?}",
+      state.vcs_stores.unrecovered(repository)
+    ),
+    records.map(slates_svn::migration::Repository::youngest),
+    green.and_then(|green| state.greens.get(&green).map(|engine| engine.head())),
+    state
+      .db
+      .partition()
+      .repositories()
+      .objects(repository)
+      .map(super::svn_commit::landing::sequence_of)
+      .collect(),
+  )
+}
+
+/// Waits until `daemon`'s deltify job has kept `count` superseded texts as deltas, each landed as a changeset and named
+/// by the register (`vcs_store::svn_deltify`): a revision changing a file hands the job its old text, and its landing
+/// runs as a task of its own.
+fn deltified(daemon: &Daemon, count: u64) {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+  while crate::daemon::observe_first(daemon, |state| {
+    state
+      .refusals
+      .get(crate::vcs_store::svn_deltify::DELTIFIED)
+      .copied()
+      .unwrap_or(0)
+  }) < count
+  {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the deltify job never landed"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+  }
+}
+
+/// The text `bytes` as a session reads it from the recovered repository (by its identity), and `/trunk/a.txt` as the
+/// green holds it.
+fn read_back(
+  daemon: &Daemon,
+  repository: RepositoryId,
+  bytes: &[u8],
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+  let identity = *blake3::hash(bytes).as_bytes();
+  crate::daemon::observe_first(daemon, move |state| {
+    // Read as a session reads it: through the green, then the content store, then the records (`svn_view::lend_in`).
+    let held = crate::vcs_store::svn_view::lend_in(state, repository, |lent| {
+      slates_svn::reads::Repository::text(lent.repository, &identity, 0)
+        .map(std::borrow::Cow::into_owned)
+    })
+    .flatten();
+    let green = super::svn_commit::green_of(state, repository).ok();
+    let file = green
+      .and_then(|green| state.greens.get(&green))
+      .and_then(|engine| engine.content("trunk/a.txt").map(<[u8]>::to_vec));
+    (held, file)
+  })
+}
+
+/// C2's arbiter (main's ruling of 2026-11-20 20:30, item 4: "the state before the kill must equal the state recovered
+/// from the store"). Do: on a daemon holding a store, create a Subversion repository, land revision 1 (`/trunk` and a
+/// file), a revision's properties set whole, and revision 2 changing the file, whose old text the deltify job keeps as
+/// a delta; stop the daemon (a stop publishes nothing, so what survives is what was made durable) and the store's
+/// owner; start both again over the same segment and store. Expect: the recovered repository equal to the one before
+/// the stop (records whole, youngest 2, the green at version 2), with nothing refused; its register five references
+/// naming sequences 0 to 4 (the creation, the two revisions, the properties and the deltified text), no record's bytes;
+/// the store's log holding those five changesets; and the file read back at revision 2.
+#[test]
+fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
+  let instance = format!("vcs-store-svn-arbiter-{}", std::process::id());
+  let mut store = TestStore::start("svn-arbiter");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "arbiter");
+  let first = b"alpha\n".to_vec();
+  let second = b"alpha beta\n".to_vec();
+  assert_eq!(
+    landed_work(
+      &daemon,
+      repository,
+      0,
+      (slates_svn::index::Action::Add, first)
+    ),
+    Ok(1)
+  );
+  let set = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut properties = std::collections::BTreeMap::new();
+      properties.insert(b"svn:log".to_vec(), b"the first, again".to_vec());
+      properties.insert(b"svn:author".to_vec(), b"alice".to_vec());
+      super::svn_commit::land_record(
+        (&owner(), repository),
+        slates_svn::commit::record::Record::RevisionProperties {
+          revision: 1,
+          properties,
+        },
+      )
+      .await
+      .unwrap()
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(set, Ok(()));
+  assert_eq!(
+    landed_work(
+      &daemon,
+      repository,
+      1,
+      (slates_svn::index::Action::Modify, second.clone())
+    ),
+    Ok(2)
+  );
+  deltified(&daemon, 1);
+  let before = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(before.1, Some(2));
+  assert_eq!(before.2, Some(2));
+  assert_eq!(before.3, vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
+  daemon.stop();
+  store.restart_owner();
+
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let after = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(after, before);
+  assert_eq!(
+    read_back(&daemon, repository, &second),
+    (Some(second.clone()), Some(second))
+  );
+  daemon.stop();
+  store.stop_owner();
+
+  let log_file = hyper_block::file::DeviceFile::adopt(
+    root(store.dir()).open_file(LOG_FILE).unwrap(),
+    &store.dir().join(LOG_FILE),
+    hyper_block::file::CachingRequest::Buffered,
+    hyper_block::buf::Alignment::BYTE,
+  )
+  .unwrap();
+  let mut found = Vec::new();
+  let _log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let sequences: Vec<u64> = found
+    .iter()
+    .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
+    .map(|located| located.header.sequence)
+    .collect();
+  assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
+}
+
+/// C2's crash between the store's landing and the register's commit (main's rulings of 2026-11-20 20:30 item 5 and
+/// 21:05 item 2: "a crash between the land and the commit recovers to the state before the land, and the retried commit
+/// lands once"). Do: on a daemon holding a store, create a Subversion repository and land revision 1; then land revision
+/// 2's changeset on the store at the next sequence, as a landing does, and stop the daemon before any register entry
+/// names it (the crash); start the daemon and the store again; then commit revision 2 again, as the unanswered client
+/// retries it. Expect: the recovered repository as it stood before the landing (youngest 1, its register naming
+/// sequences 0 and 1 alone); the retry answered revision 2, committed once (youngest 2, the register naming 0 to 2, and
+/// 3 the deltify job's keeping revision 1's text as a delta); and a second restart recovering that, revision 2's text
+/// the retry's.
+#[test]
+fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once() {
+  let instance = format!("vcs-store-svn-crash-{}", std::process::id());
+  let mut store = TestStore::start("svn-crash");
+  let anchor = anchor_of(&instance);
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  daemon.bootstrap(true).unwrap();
+  let repository = created_subversion(&daemon, "crash");
+  assert_eq!(
+    landed_work(
+      &daemon,
+      repository,
+      0,
+      (slates_svn::index::Action::Add, b"one\n".to_vec())
+    ),
+    Ok(1)
+  );
+  let before = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(before.3, vec![Some(0), Some(1)]);
+  // The landing's first half: revision 2's record landed on the store at the next sequence, durable, no entry naming it.
+  let disk = store.handle();
+  let dropped = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let (work, _texts) = file_work(1, slates_svn::index::Action::Modify, b"two, lost\n");
+      let revision = slates_svn::commit::revision::Revision::of_work(
+        work,
+        slates_svn::lock::AprTime(1_800_000_000_000_000),
+      )
+      .unwrap();
+      let record = slates_svn::commit::record::Record::revision_bytes(&revision);
+      super::svn_commit::landing::land(&disk, (repository, 2), vec![(SectionKind::Record, record)])
+        .await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(dropped, Ok(()));
+  daemon.stop();
+  store.restart_owner();
+
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let recovered = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(recovered, before);
+  assert_eq!(
+    landed_work(
+      &daemon,
+      repository,
+      1,
+      (slates_svn::index::Action::Modify, b"two\n".to_vec())
+    ),
+    Ok(2)
+  );
+  deltified(&daemon, 1);
+  let retried = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(retried.1, Some(2));
+  assert_eq!(retried.3, vec![Some(0), Some(1), Some(2), Some(3)]);
+  daemon.stop();
+  store.restart_owner();
+
+  let daemon = daemon_over(&instance, (&anchor.0, &anchor.1), &store);
+  let again = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
+  assert_eq!(again, retried);
+  let two = b"two\n".to_vec();
+  assert_eq!(
+    read_back(&daemon, repository, &two),
+    (Some(two.clone()), Some(two))
+  );
+  daemon.stop();
 }

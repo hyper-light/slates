@@ -80,13 +80,13 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
-fn daemon(identity: EdgeIdentity) -> Daemon {
+fn daemon(identity: EdgeIdentity) -> crate::test_store::StoredDaemon {
   daemon_named(Some(identity)).0
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
-fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+fn daemon_named(identity: Option<EdgeIdentity>) -> (crate::test_store::StoredDaemon, String) {
   daemon_configured(identity, |_| {})
 }
 
@@ -94,7 +94,7 @@ fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
 fn daemon_configured(
   identity: Option<EdgeIdentity>,
   configure: impl FnOnce(&mut crate::DaemonConfig),
-) -> (Daemon, String) {
+) -> (crate::test_store::StoredDaemon, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -108,7 +108,9 @@ fn daemon_configured(
     identity,
   });
   configure(&mut config);
-  let daemon = Daemon::start(
+  // A Subversion repository's history lands on the node's changeset store (C2): the daemon holds one.
+  let daemon = crate::test_store::StoredDaemon::start(
+    "vcs-http",
     &profile,
     config,
     SegmentSource::Create {

@@ -11,8 +11,9 @@
 //! `Repository::deltify_after` walks its rows alone), and a recovery hands it every one the records still keep stored
 //! ([`resume`]). For each, in order, oldest first: its delta is made a window a slice (the records' `DeltaWriter`, the
 //! window Subversion cuts, each target piece read from the content store beside its base's piece read from the records),
-//! then landed as one entry of the repository's logs (`Record::Deltified`, through the owner's step for a record that
-//! moves no version, `repository::svn_commit::record`), and only then is the store's hold on the whole text given back.
+//! then landed as one changeset on the node's store and committed by an entry of the register naming it
+//! (`Record::Deltified`, through the step for a record that moves no version, `repository::svn_commit::land_record`,
+//! C2), and only then is the store's hold on the whole text given back.
 //! A text whose skip-delta predecessor is itself still stored waits (the records name it again once its base is a
 //! delta), so a chain is made from its oldest text up.
 //!
@@ -61,9 +62,24 @@ struct Job {
 
 /// What one unit of a job did.
 enum Unit {
-  /// A window made, or a text landed or passed over: more may follow.
+  /// A window made, or a text passed over: more may follow.
   Went,
+  /// A text's windows are all made: its record lands next, as the job's owner, then its whole bytes are given back.
+  Land(Landing),
   /// The queue is empty: the job ends.
+  Ended,
+}
+
+/// A text's delta made whole, to land: its record, the stored text it deltifies, and the job's owner it lands as.
+type Landing = (Record, slates_svn::index::ContentIdentity, Principal);
+
+/// What a slice of a job left.
+pub(crate) enum Slice {
+  /// More units follow.
+  More,
+  /// A text's record lands before the next unit.
+  Land(Landing),
+  /// The job ended.
   Ended,
 }
 
@@ -133,29 +149,60 @@ fn hand(state: &mut ShardState, repository: RepositoryId, candidates: Vec<Deltif
   }
 }
 
-/// Drives `repository`'s job a slice at a time, yielding between slices, until it ends.
+/// Drives `repository`'s job a slice at a time, yielding between slices, until it ends; a text's record landed on the
+/// node's store and committed in the register (`svn_commit::land_record`, C2) before its whole bytes are given back.
 async fn drive(repository: RepositoryId) {
-  while crate::state::with_state_counted(|state| {
-    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
-    slice(state, repository, budget)
-  }) == Some(true)
-  {
-    slates_rt::futures::yield_now().await;
+  loop {
+    let sliced = crate::state::with_state_counted(|state| {
+      let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+      slice(state, repository, budget)
+    });
+    match sliced {
+      Some(Slice::More) => slates_rt::futures::yield_now().await,
+      Some(Slice::Land((record, text, owner))) => {
+        let landed = crate::repository::svn_commit::land_record((&owner, repository), record).await;
+        let _ = crate::state::with_state_counted(|state| landed_text(state, text, landed));
+      }
+      Some(Slice::Ended) | None => return,
+    }
   }
 }
 
-/// One slice of `repository`'s job: units until `budget_ns` is spent, at least one. Whether more follow.
-pub(crate) fn slice(state: &mut ShardState, repository: RepositoryId, budget_ns: u64) -> bool {
+/// What a text's landing did: its whole bytes given back once its record stands, counted either way.
+fn landed_text(
+  state: &mut ShardState,
+  text: slates_svn::index::ContentIdentity,
+  landed: Option<Result<(), crate::repository::svn_commit::Uncommitted>>,
+) {
+  match landed {
+    Some(Ok(())) => {
+      crate::repository::svn_commit::release_texts(state, None, &[text]);
+      state.count(DELTIFIED, 1);
+    }
+    refused => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: a stored Subversion text was not deltified: {refused:?}",
+        state.partition
+      );
+      state.count(REFUSED, 1);
+    }
+  }
+}
+
+/// One slice of `repository`'s job: units until `budget_ns` is spent, at least one, or until a text's record is due to
+/// land.
+pub(crate) fn slice(state: &mut ShardState, repository: RepositoryId, budget_ns: u64) -> Slice {
   let began = slates_rt::futures::now_ns();
   loop {
     match unit(state, repository) {
       Unit::Ended => {
         state.vcs_stores.svn_deltifies.0.remove(&repository);
-        return false;
+        return Slice::Ended;
       }
+      Unit::Land(landing) => return Slice::Land(landing),
       Unit::Went => {
         if slates_rt::futures::now_ns().saturating_sub(began) >= budget_ns {
-          return true;
+          return Slice::More;
         }
       }
     }
@@ -192,20 +239,7 @@ fn unit(state: &mut ShardState, repository: RepositoryId) -> Unit {
     base: candidate.base.map(|(base, _)| base),
     delta: writer.finish(),
   };
-  match crate::repository::svn_commit::record(state, (&owner, repository), record) {
-    Ok(()) => {
-      crate::repository::svn_commit::release_texts(state, None, &[candidate.text]);
-      state.count(DELTIFIED, 1);
-    }
-    Err(refused) => {
-      slates_machine::log_line!(
-        "slates-server: partition {}: a stored Subversion text was not deltified: {refused:?}",
-        state.partition
-      );
-      state.count(REFUSED, 1);
-    }
-  }
-  Unit::Went
+  Unit::Land((record, candidate.text, owner))
 }
 
 /// Makes the next window of `candidate`'s delta: at most a window of its text from `made`, read from the content store,
@@ -310,7 +344,7 @@ mod tests {
   /// before and after the rebuild, and the rebuild refusing nothing (its replay holds no text a later entry deltified).
   #[test]
   fn a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released() {
-    let daemon = crate::daemon::audit_daemon_of(1);
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
     let first: Vec<u8> = (0..250_000_u32).map(|at| (at % 251) as u8).collect();
     let mut second = first.clone();
     second[1_000] ^= 1;

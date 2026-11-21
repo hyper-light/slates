@@ -35,7 +35,7 @@
 //! itself, or once the edge's signal says the client has gone (`super::site::ClientGone`), which ends the tunnel as
 //! `svnserve` ends where its client leaves inside a command (E210002); Windows, with no hook driver, refuses a change at
 //! a configured point. The work the drive accepts lands through the owner's
-//! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::commit_work`, the one both ra_svn
+//! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::land_work`, the one both ra_svn
 //! transports call, A-698), and `close-edit` is answered with `commit-info` (the revision, its date and author) or with
 //! the step's refusal as its failure, after which the client's commands are dropped until its `abort-edit`.
 //!
@@ -161,7 +161,7 @@ pub(crate) trait SvnStores {
   /// Runs `step` over what repository `id`'s sessions are opened with; none when its store is not held here.
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T>;
   /// Lands `work`, which `principal`'s commit made on repository `id` and the connection accepted, through the owner's
-  /// commit step (`repository::svn_commit::commit_work` at the owner's instant, A-698): the revision it made, or why
+  /// commit step (`repository::svn_commit::land_work` at the owner's instant, A-698): the revision it made, or why
   /// not; none when its store is not held here.
   async fn commit(
     &mut self,
@@ -170,11 +170,17 @@ pub(crate) trait SvnStores {
     work: Work,
     texts: &dyn TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
-  /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step: a lock verb's
-  /// entries (`Record::Locks`, A-693 part 2) or a revision's properties whole (`Record::RevisionProperties`, A-702 part
-  /// 2); whether it landed; none when its store is not held here.
-  fn land_record(
+  /// A repository's landing turn (C2, `repository::svn_commit::landing::Turn`), held from a verb's judgment to its
+  /// record's landing.
+  type Turn;
+  /// Repository `id`'s landing turn, once no other landing holds it; none when its store is not held here.
+  async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn>;
+  /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step, holding its
+  /// landing `turn`: a lock verb's entries (`Record::Locks`, A-693 part 2) or a revision's properties whole
+  /// (`Record::RevisionProperties`, A-702 part 2); whether it landed; none when its store is not held here.
+  async fn land_record(
     &mut self,
+    turn: Self::Turn,
     id: RepositoryId,
     principal: &Principal,
     record: Record,
@@ -642,6 +648,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Some(verdicts) = pre_lock_hooks(site, &hooked, room, &call).await else {
       return self.client_left();
     };
+    // The landing turn, held from the judgment to the entries' landing (C2): no other landing moves the lock table
+    // between them.
+    let Some(turn) = self.stores.turn(id).await else {
+      return self.not_held();
+    };
     let undrawn = std::cell::Cell::new(false);
     let mut draw = || {
       let mut token = [0u8; slates_svn::lock::UUID_BYTES];
@@ -676,7 +687,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     } else {
       match self
         .stores
-        .land_record(id, &self.principal, Record::Locks(entries))
+        .land_record(turn, id, &self.principal, Record::Locks(entries))
+        .await
       {
         None => return self.not_held(),
         Some(landed) => landed.map_err(|refused| refused.failure()),
@@ -718,6 +730,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Some(verdict) = revision_property_hook(site, &hooked, room, pre, call).await else {
       return self.client_left();
     };
+    // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
+    let Some(turn) = self.stores.turn(id).await else {
+      return self.not_held();
+    };
     let judged = {
       let Self {
         connection,
@@ -736,7 +752,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Some(Ok(None)) => return,
       Some(Ok(Some(record))) => record,
     };
-    let landed = match self.stores.land_record(id, &self.principal, record) {
+    let landed = match self
+      .stores
+      .land_record(turn, id, &self.principal, record)
+      .await
+    {
       None => return self.not_held(),
       Some(landed) => landed.map_err(|refused| refused.failure()),
     };

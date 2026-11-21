@@ -563,8 +563,15 @@ impl SvnStores for Lends {
     )
   }
 
-  fn land_record(
+  type Turn = ();
+
+  async fn turn(&mut self, id: RepositoryId) -> Option<()> {
+    self.holds(id).then_some(())
+  }
+
+  async fn land_record(
     &mut self,
+    (): (),
     id: RepositoryId,
     _principal: &Principal,
     record: slates_svn::commit::record::Record,
@@ -720,6 +727,47 @@ fn drive<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
 fn tunnel<S: SshSite>(site: &mut S, asker: &Principal, runs: &[&[u8]]) -> Ended {
   match site.dispatch(asker, &Asked::Subversion, None) {
     Dispatched::Run(mut command) => drive(&mut command, runs),
+    Dispatched::Refuse(refused) => (
+      Answered {
+        err: refused.stderr,
+        status: Some(refused.exit_status),
+        ..Answered::default()
+      },
+      0,
+    ),
+  }
+}
+
+/// [`drive`] awaiting each step: a site whose landing waits on the node's changeset store (C2), as the daemon's does.
+async fn drive_awaited<C: Command>(command: &mut C, runs: &[&[u8]]) -> Ended {
+  let mut answered = Answered::default();
+  let mut consumed = 0;
+  let mut runs = runs.iter();
+  let mut next = Next::More;
+  for _ in 0..MOST_STEPS {
+    take(command, &mut answered);
+    match next {
+      Next::Exited(status) => {
+        answered.status = Some(status);
+        return (answered, consumed);
+      }
+      Next::Input => hand_over(command, runs.next()),
+      Next::More => {}
+    }
+    let stepped = command
+      .step(ClientGone::never())
+      .await
+      .expect("a tunnel ends as svnserve ends, never failed");
+    consumed += stepped.consumed;
+    next = stepped.next;
+  }
+  panic!("a tunnel that never exits: {answered:?}");
+}
+
+/// [`tunnel`] awaiting each step ([`drive_awaited`]).
+async fn tunnel_awaited<S: SshSite>(site: &mut S, asker: &Principal, runs: &[&[u8]]) -> Ended {
+  match site.dispatch(asker, &Asked::Subversion, None) {
+    Dispatched::Run(mut command) => drive_awaited(&mut command, runs).await,
     Dispatched::Refuse(refused) => (
       Answered {
         err: refused.stderr,
@@ -1100,7 +1148,7 @@ fn realm_of(bytes: &[u8]) -> Vec<u8> {
 /// Before this the daemon's site refused `svnserve -t` as not served.
 #[test]
 fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let created = crate::verbs::dispatch(
       state,
@@ -1130,7 +1178,7 @@ fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
       let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
-      let _ = sent.send(tunnel(&mut site, &principal(OWNER), &[MKDIR_CLIENT]));
+      let _ = sent.send(tunnel_awaited(&mut site, &principal(OWNER), &[MKDIR_CLIENT]).await);
     })
     .expect("the tunnel's task");
     slates_rt::futures::detach(task).expect("detached");
@@ -1371,7 +1419,7 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .and_then(|last| last.parse().ok())
     .unwrap_or(200);
   let dump = std::fs::read(&path).expect("the dump");
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let importing = std::time::Instant::now();
   // The import a turn a call, as the server runs it: one call of all of it spins the shard past its watchdog window.
   let id = crate::daemon::observe_first(&daemon, move |state| {

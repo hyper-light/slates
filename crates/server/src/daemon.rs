@@ -7978,7 +7978,11 @@ mod tests {
     use slates_svn::commit::drive::TextSink;
     let profile = test_profile();
     let instance = format!("svn-intake-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    // A Subversion repository's history lands on the node's changeset store (C2): the daemons hold one, which the
+    // successor opens again.
+    let mut store = crate::test_store::TestStore::start("svn-intake-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8045,6 +8049,10 @@ mod tests {
     assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
     // The crash: nothing more published.
     first.stop();
+    // Every handle let go first (the configuration's too), so the owner ends, then opens the store again.
+    config.vcs_disk = None;
+    store.restart_owner();
+    config.vcs_disk = Some(store.handle());
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;

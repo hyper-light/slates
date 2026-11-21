@@ -191,7 +191,7 @@ fn answered_by_message(
 /// anything of the work.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work_is_built() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard(|state| {
     [
       ("git", VcsTool::Git),
       ("hg", VcsTool::Mercurial),
@@ -224,7 +224,7 @@ fn answered_by_identity(
 /// the principal's own name.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard(|state| {
     let git = (mercurial_only("Ada"), git_only("Ada"));
     let mercurial = (git_only("Ada"), mercurial_only("Ada"));
     let svn = repository_work(state, "svn", VcsTool::Subversion);

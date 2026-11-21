@@ -378,6 +378,12 @@ pub(crate) fn create_repository(
   (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
+  // A Subversion repository's history is the node's changeset store (C2, A-767 item 1; main's ruling of 2026-11-20
+  // 21:05): a daemon started without the store's grant has nowhere to keep it, and keeps no second copy in the
+  // register.
+  if matches!(tool, VcsTool::Subversion) && state.vcs_disk.is_none() {
+    return refused(unstored_subversion());
+  }
   let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
     Some(Ok(id)) => Some(id),
     Some(Err(refusal)) => return refused(refusal),
@@ -393,8 +399,8 @@ pub(crate) fn create_repository(
     (repository, name, tool, format, default_branch),
     adopted,
   ) {
-    Ok(root) => {
-      install_root(state, repository, root, adopted.is_some());
+    Ok((root, svn_created)) => {
+      install_root(state, repository, root, (adopted.is_some(), &svn_created));
       let created = ReplyBody::GreenCreated {
         id: to_wire_volume(root),
       };
@@ -402,7 +408,7 @@ pub(crate) fn create_repository(
         state,
         repository,
         (name, tool, format, default_branch),
-        created,
+        (created, svn_created),
       )
     }
     Err(refusal) => refused(refusal),
@@ -417,6 +423,15 @@ pub(crate) const CREATION_UNLANDED: &str = "repository.create.unlanded";
 /// Counter: creations whose landing task could not be spawned (the shard's arena full).
 pub(crate) const CREATION_UNRUN: &str = "repository.create.unrun";
 
+/// The refusal of a Subversion repository on a daemon started without `--vcs-store` (C2; main's ruling of 2026-11-20
+/// 21:05): its history has no store to land on.
+pub(crate) fn unstored_subversion() -> Refusal {
+  Refusal::Unsupported {
+    feature: "a Subversion repository on a daemon started without --vcs-store DIR, the store its history lands on"
+      .to_owned(),
+  }
+}
+
 /// Lands a new repository's creation into the node's version-control store when the daemon has one (A-767 item 7, main's
 /// ruling of 2026-11-20): one changeset, sequence 0, whose record names the repository as the client asked for it, under
 /// the node's store grant. The repository's record is the partition's already; the request is answered once the
@@ -427,7 +442,7 @@ fn land_creation(
   state: &mut ShardState,
   repository: RepositoryId,
   (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
-  created: ReplyBody,
+  (created, svn_created): (ReplyBody, Vec<u8>),
 ) -> ReplyBody {
   let Some(disk) = state.vcs_disk.clone() else {
     return created;
@@ -447,15 +462,16 @@ fn land_creation(
     sections: 0,
   };
   let record = creation_record(name, tool, format, default_branch);
+  // A Subversion repository's creation record (its UUID and revision 0's date) is its history's first, read back by a
+  // recovery as the changeset's last `Record` section (`svn_commit::landing::changeset_record`).
+  let mut parts = vec![(slates_store::log::SectionKind::Record, record)];
+  if !svn_created.is_empty() {
+    parts.push((slates_store::log::SectionKind::Record, svn_created));
+  }
   let deferred = state.current_request.zip(state.reply_route);
   let reply = created.clone();
   let task = async move {
-    let landed = disk
-      .land(
-        header,
-        vec![(slates_store::log::SectionKind::Record, record)],
-      )
-      .await;
+    let landed = disk.land(header, parts).await;
     let answered = crate::state::with_state_counted(move |state| {
       state.count(
         if landed.is_ok() {
@@ -537,7 +553,8 @@ fn repository_id(
 }
 
 /// The records of a new repository: its record, its root (a new green unless one is adopted), the root's membership
-/// and the default branch's binding. The root's id.
+/// and the default branch's binding. The root's id, and a Subversion repository's creation record, which its store's
+/// changeset 0 holds and its register's entry names by reference (C2); empty for another tool.
 fn record_repository(
   state: &mut ShardState,
   principal: &Principal,
@@ -549,7 +566,7 @@ fn record_repository(
     &str,
   ),
   adopted: Option<DbVolumeId>,
-) -> Result<DbVolumeId, Refusal> {
+) -> Result<(DbVolumeId, Vec<u8>), Refusal> {
   // A Subversion repository's creation's record is made first, for the same reason (A-655 part 2b).
   let created = match tool {
     VcsTool::Subversion => svn_created(state, repository)?,
@@ -594,8 +611,8 @@ fn record_repository(
     }
     (None, None) => return Err(Refusal::NotFound),
   };
-  // The root joins and the default branch binds it in one entry of the new register (A-603), which holds a Subversion
-  // repository's creation's record too (A-655 part 2b).
+  // The root joins and the default branch binds it in one entry of the new register (A-603), which names a Subversion
+  // repository's creation's changeset, sequence 0, by reference (C2; A-655 part 2b).
   let mut entry = next_entry(state, repository)?;
   entry.joined.push(MemberRecord {
     repository,
@@ -606,14 +623,21 @@ fn record_repository(
     name: default_branch.to_owned(),
     green: root,
   });
-  entry.objects = created;
+  if !created.is_empty() {
+    entry.objects = crate::repository::svn_commit::landing::reference(0);
+  }
   record(state, &Op::RepositoryAdvanced { entry })?;
-  Ok(root)
+  Ok((root, created))
 }
 
 /// The root's engine in a new lineage, once its records stand: the adopted green's own engine, moved in as it stands,
 /// or a new empty one, whose version 0's merge record is enqueued as a new green's is.
-fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolumeId, adopted: bool) {
+fn install_root(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  root: DbVolumeId,
+  (adopted, svn_created): (bool, &[u8]),
+) {
   let engine = if adopted {
     state.greens.remove(&root).unwrap_or_default()
   } else {
@@ -628,8 +652,9 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
   if !adopted {
     crate::merge_service::enqueue_record(state, root, 0, [0u8; 32], 0, Vec::new(), (None, None));
   }
-  // The repository's tool store, beside its record, on its owner shard (A-662), made from the records its entries hold
-  // (a Subversion repository's creation's, A-655 part 2b), as a recovery makes it.
+  // The repository's tool store, beside its record, on its owner shard (A-662), made from the records its entries hold,
+  // as a recovery makes it; a Subversion repository's from its creation record in hand (A-655 part 2b), which lands on
+  // the store as this verb is answered (C2).
   if let Some(record) = state
     .db
     .partition()
@@ -637,7 +662,11 @@ fn install_root(state: &mut ShardState, repository: RepositoryId, root: DbVolume
     .repository(repository)
     .cloned()
   {
-    crate::vcs_store::make_from_log(state, &record);
+    if record.tool == slates_db::catalog::VcsTool::Subversion {
+      crate::vcs_store::make_created(state, &record, svn_created);
+    } else {
+      crate::vcs_store::make_from_log(state, &record);
+    }
   }
 }
 

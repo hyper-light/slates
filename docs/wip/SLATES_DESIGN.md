@@ -57911,6 +57911,20 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
 > files: one changeset, sequence 0, its record and its row read back).
 >
+> **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
+> store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
+> properties, UUID, deltified text) lands whole as one changeset, sequence the count the register names (creation 0),
+> and only then is committed at f+1 by a register entry holding a reference to it alone, with the green's version where
+> it moves one (`repository::svn_commit::landing`); one landing a repository at a time, from its check to its commit.
+> Recovery and rebuild read each named changeset back in sequence order and replay it through the live step; a changeset
+> landed past the register's last was never committed or answered, and is dropped, the client's retry landing it once.
+> A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
+> no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
+> `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
+> between land and commit). Owed: the texts as sections read through the owner (stage B), an import as one sliced
+> changeset (stage C), and the two landings that commit before their store lands (a submitted version's revision, a
+> creation; GAPS C2).
+>
 > **Status (2026-11-20, A-645's derived per-path read form on the store; w-perf, main's orders of 18:30 and 19:50; the
 > interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
 > every tool (`slates_store::texts`: per touched path its bytes, the tool's id, the full text's identity and length,
