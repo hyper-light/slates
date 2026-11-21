@@ -306,3 +306,9 @@
   int_plus_one. merge lib 253 pass. Host, fmt, structural, unsafe, six cross targets clean otherwise.
 - Still with owners: git receive tests wide_connectivity (w-git), hg push intake_tests intake (w-hg), store's 3
   literals (w-store). Windows requests waiting on main's word about jupiter (r12 lost to its restart).
+
+## 2026-11-21 round 16 at 30e89672f
+- server git_derive never_loop -> one match; merge history_layers_bench Stream alias (every target); git oracle
+  CommittedPush alias. server vcs_store:: 109 pass, examples and git lib tests build. Host, fmt, structural, unsafe, cross
+  clean otherwise. Still with owners: w-git (receive wide_connectivity, which also blocks git's lib tests), w-hg (intake
+  helper), w-store (3 literals). Windows requests held for main's word on jupiter.
