@@ -56,3 +56,19 @@ landing and its replay red first.
   "the store's engine: invalid argument: a memtable past 4 GiB", so `repository create` answers Overloaded before any
   push. Reported to w-store (inbox/w-store-from-w-hg-memtable-2026-11-20.md). It lands on main once that's fixed and
   the test passes.
+
+## C1 hg onto the changeset store: the push LANDED on origin/main 242f4a173 (~21:20); the import is the rest
+- **Commit:** 242f4a173 (branch agents/w-hg-c1 merged).
+  - A push to a daemon with `--vcs-store` lands as one changeset before its entry: Record (v6 head), Payload (the
+    changegroup, moved in), Texts (w-perf's encoder).
+  - The entry holds a v7 reference.
+  - A recovery or rebuild reads the payload back by `StoreHandle::piece` and replays it a unit a slice.
+- **Test, by use, red first:** `slates-cli --test hg_interop`
+  `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them`: stock hg 7.2 pushes two
+  changesets, `hg_push.landed` counted, the daemon is killed with SIGKILL, and a clone after the restart holds both.
+  With w-store's bc0677af9/71db6d157 the store accepts landings on this Mac.
+- **Suites (local macOS):** slates-hg lib 377/377; slates-server Mercurial tests 55/55; hg_interop 14/14 against stock
+  hg 7.2.
+- **Not yet: `repository import mercurial` onto the store.** The import still keeps whole texts, which is R2's
+  5.73 GB, w-perf's to measure. Taking it next as the rest of C1: one changeset an import through the sliced landing,
+  the revlogs' deltas as Payload, Texts per version, no whole texts kept. Then C1 closes whole.

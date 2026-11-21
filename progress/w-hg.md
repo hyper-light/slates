@@ -171,3 +171,5 @@
 - ~20:50 C1 on branch agents/w-hg-c1: 3ffb95c4b (land first, v7 reference in the entry, replay from the store by
   piece), a9620fbb1 (Texts section). By-use test blocked: the store refuses every landing on this Mac (memtable past
   4 GiB; reported to w-store). Lands on main when it passes.
+- ~21:20 LANDED 242f4a173: C1's push onto the changeset store (by-use test with stock hg 7.2 passes; suites green).
+  NEXT: the import onto the store (rest of C1; R2's peak).
