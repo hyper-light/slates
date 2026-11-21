@@ -281,6 +281,16 @@ impl<F: BlockFile> ChangesetLog<F> {
     Ok(sections)
   }
 
+  /// The header of the committed record at `offset` (a row's offset): read and its CRC checked.
+  pub fn header_at(&self, offset: u64) -> Result<Header, LogError> {
+    if offset_after(offset, HEADER_BYTES)? > self.end {
+      return Err(LogError::Corrupt("a header past the committed records"));
+    }
+    let mut head = [0u8; HEADER_BYTES];
+    self.file.read_exact_at(&mut head, offset)?;
+    decode_header(&head).ok_or(LogError::Corrupt("a header"))
+  }
+
   /// Reads `buf.len()` bytes of the log from `offset` (inside a committed record's section, by its [`Section`]).
   pub fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<(), LogError> {
     let past = offset_after(offset, buf.len())?;

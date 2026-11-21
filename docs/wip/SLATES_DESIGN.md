@@ -57679,6 +57679,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > later behind the same names) is the sections' content. Tests: `slates-store --lib log` 6/6 over the simulated file with
 > power-loss semantics: round trip, every crash mode, a record interrupted before its commit, a cut at every byte of
 > the last record, a flipped bit in a header, a payload or a trailer, out-of-order appends.
+>
+> **Status (2026-11-20, piece C3 step 2: the store).** `store.rs`: the granted directory's two files, the changeset
+> log (`changesets`) and mantle's engine (`rows`), both opened through `slates_land::store_root` and adopted as
+> buffered device files; a landing appends and commits the record (one flush), then applies its rows to the engine,
+> whose write-ahead log the changeset log is; the engine checkpoints at the log's end, and opening the store replays
+> the log from the checkpoint's offset. The `C` table (repository and sequence big-endian, so a repository's
+> changesets are one ordered range) names each record's offset, length, identity, tool and work. The engine's sizing:
+> page = the file's layout block, extents bounded by the grant's disk allowance, leaves by the shard's memory over a
+> row's bytes; extent pages (32, mantle's) and fanout (8, SplinterDB's) cited, learned owed (GAPS). Tests:
+> `slates-store --test store` 3/3 on real directories in the build output (rows by repository with a payload read
+> back; recovery from the log alone; a checkpoint and the log after it, every row once).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
