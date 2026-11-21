@@ -141,6 +141,9 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
   empty: the rows' fields are resident_bytes/reserved_bytes/modified_bytes/measured (parser fixed). Rerun r48 queued.
 - r46's build showed `content_pool::parts_of` dead on macOS (since 20bef898c): gated to Windows, LANDED 6008a67d5
   (merge f68722759); xwin check of slates-server clean of it.
+- R3 measured (r48): RSS 6,193 after the push = arenas 5,166 + segment 229 + content 2 + rest ~796. Idle heap check
+  (1/4/23 shards): RSS 35/40/87 MiB vs status heap 920/925/961 -> heap row counts allocated bytes. GAPS c7e7f3b4c; split
+  to w-hg/w-store; close note updated. R3 waits on w-hg (content holdings) and w-store (disk store).
 - Branches: agents/w-sizing-r2win already deleted at landing; agents/w-sizing-r2hold (red experiment) deleted; none left.
 
 ## Queue
