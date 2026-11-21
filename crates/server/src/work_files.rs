@@ -650,6 +650,10 @@ pub struct Base<'a> {
   pub fetched: Option<&'a FetchedBase>,
   /// The base version.
   pub version: u64,
+  /// The work's kept base entries at that version (A-247; `WorkState::entries`), each naming its path's length there:
+  /// where a length is read when neither the green nor this verb's fetch has it, so an edit after a rebase asks no one
+  /// for a length the rebase already gave (A-808). `None` where no work's entries apply.
+  pub entries: Option<&'a BTreeMap<String, slates_merge::increment::Base>>,
 }
 
 impl<'a> Base<'a> {
@@ -674,20 +678,36 @@ impl<'a> Base<'a> {
     if let Some(green) = self.green {
       return Ok(green.content_len_at(path, self.version).map(as_u64));
     }
-    let fetched = self
-      .fetched
-      .filter(|fetched| !fetched.gone)
-      .ok_or(BaseGone)?;
-    if let Some(len) = fetched.lengths.get(path) {
-      return Ok(*len);
+    let fetched = self.fetched.filter(|fetched| !fetched.gone);
+    if let Some(fetched) = fetched {
+      if let Some(len) = fetched.lengths.get(path) {
+        return Ok(*len);
+      }
+      if let Some(file) = fetched.files.get(path) {
+        return Ok(file.as_ref().map(|bytes| as_u64(bytes.len())));
+      }
+      if let Some(page) = fetched.page.as_ref().filter(|page| page.path == path) {
+        return Ok(page.answer.as_ref().map(|(_, total)| *total));
+      }
     }
-    if let Some(file) = fetched.files.get(path) {
-      return Ok(file.as_ref().map(|bytes| as_u64(bytes.len())));
+    // A fetch that says the green is gone is the answer: no base.
+    if self.fetched.is_some_and(|fetched| fetched.gone) {
+      return Err(BaseGone);
     }
-    match &fetched.page {
-      Some(page) if page.path == path => Ok(page.answer.as_ref().map(|(_, total)| *total)),
-      _ => Err(BaseGone),
-    }
+    self.entry_len(path).ok_or(BaseGone)
+  }
+
+  /// `path`'s length at the base from the work's kept entry of it (A-808): `Some(Some(len))` for a file there,
+  /// `Some(None)` for an entry that holds no file of that path, `None` when no entry of `path` is kept.
+  pub(crate) fn entry_len(self, path: &str) -> Option<Option<u64>> {
+    let entry = self.entries?.get(path)?;
+    Some(
+      entry
+        .files
+        .iter()
+        .find(|(file, _)| file == path)
+        .map(|(_, len)| *len),
+    )
   }
 
   /// The base's bytes of `path` in `[at, at + len)`, which a held file's piece names: copied out of that range alone,
@@ -1222,6 +1242,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     let at = u64::try_from(BIG / 2).unwrap();
@@ -1250,6 +1271,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     let mut last = Vec::new();
@@ -1279,6 +1301,7 @@ mod tests {
       green: Some(&green),
       fetched: None,
       version: 0,
+      entries: None,
     };
     let mut files = WorkFiles::default();
     files.splice(base, "old", (10, 0), b"INSERT").unwrap();
