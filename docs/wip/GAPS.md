@@ -24434,3 +24434,12 @@ in what lands. Branch tips as of 2026-11-10:
   `nfs-work-lease-holder-phased-v4` 4bf73859d.
 - **outside the goal's Green/Work scope (VFS reclaim / runtime), untouched.**
   `holder-reentrant-drop-green` 4cfd8cc72, `reclaim-delegation-copy-preparation` 6264a9d01, `reclaim-input-preparation` e569f721d, `reclaim-preparation-evidence` 8d830db09, `reclaim-prepared-result` b7e7aaf0b.
+
+> **A-579 (2026-11-21, w-engine; goal 89b):** a checkpoint's identity fold runs in paced turns on the owner, ending
+> within its doubling interval (landed for robustness: the whole fold took a 1,124 ms step on w-git's push). MEASURED
+> GAP: at Z = 20 ms (3,500 verdicts/s, the owner saturated) SubmitAccepted's server p99 is worse with it, 5.43-9.73 ms
+> against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
+> kind's p99 is under 1 ms in 5 of 5 rounds. OWED: (b) subtract a key's old entry at its first change (the fold then
+> hashes current bytes only, no history reads); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record
+> 24.4 of 49 MB) and single key folds of up to 13.4 ms.
+

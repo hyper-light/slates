@@ -11489,7 +11489,10 @@ checkpoint deltas by the same composition, which is exact, so every base back to
 maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
 checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
-holds (the record names the floor), so no replica keeps more history than its owner (A-385).
+holds (the record names the floor), so no replica keeps more history than its owner (A-385). A checkpoint reads the
+head's identity, whose backlog (every key changed since it was last read) is folded a paced step at a time on the owner
+and finished in turns by a task of its own, each turn's share the fold left spread over the turns before the next
+checkpoint is due (A-579): no step hashes the backlog whole.
 
 > **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
 > order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
@@ -59371,4 +59374,37 @@ Applied in the same change to:
   - a replay before the commit reaches the version before the batch, and after it the batch's last;
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
+
+### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
+
+- **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
+  landed): the slow submits of a run came in one or two clusters, each starting with one poll on the green's owner
+  shard, the cross-shard call running `verbs::owner_floor` → `merge_service::checkpoint_green`, 76-112 ms. Of a 100 ms
+  checkpoint the head's identity was 73.66 ms (A-202 folds the identity only when it is read, and nothing read it
+  between checkpoints, so the first read hashed every file changed since, at its old and new versions), the record 16.07,
+  the encoding 4.79, the build 4.17. Every request the owner serves waited behind it: p999 and max near 100 ms, and the
+  p99 tens of milliseconds whenever a stall caught 1% of a run's samples. w-git met the same fold, run whole for ~1,000
+  member greens at a chain's cap, as a 1,124 ms step the watchdog killed the daemon for.
+- **The rule.** `Green::fold_identity_step(keys)` brings a slice of the backlog to the head, each key moved from the
+  version its entry was taken at (`identity_folded`), so commits between steps leave every key exact; the read folds
+  the rest. `merge_service::checkpoint_green` folds in one paced step (`slates_pace::Step`); if the backlog outlasts it
+  (someone waited), a task on the owner finishes it in turns and then takes the checkpoint. A turn's budget
+  (`turn_budget_ns`) is the fold left (the backlog at its measured cost a key) times the measured gap between turns over
+  the time left before the next checkpoint is due (the doubling interval, the time the increments it folds took to come),
+  never under the quantum: under steady contention, yielding at every quantum gave the fold one key a trip round the
+  owner's ready queue and took 7.2-13.0 s.
+- **Counters:** `merge.checkpoint.in_turns`, `merge.checkpoint.identity_steps`, `merge.checkpoint.in_turns_longest_ns`.
+- **Tests.** The identity oracle with partial folds at random steps (`crates/merge/tests/identity.rs`; red with each key
+  moved from `identity_version`); `a_checkpoint_with_someone_waiting_folds_the_identity_in_turns` (red on the one-step
+  checkpoint); `a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline`.
+- **A/B** (BENCHMARKS, "A checkpoint's identity fold in paced turns"): at Z = 50 ms every kind's server p99 under 1 ms in
+  5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
+  equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
+  wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
+- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
+  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
+  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
+  `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
+  `repository` tests), §4.16, GAPS, BENCHMARKS.md.
 
