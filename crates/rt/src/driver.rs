@@ -475,12 +475,48 @@ mod tests {
         driver.kind().name(),
         after - before
       ),
-      None => eprintln!(
-        "SKIP (loud): {} — this OS counts no per-thread voluntary switches; delivery was checked",
-        driver.kind().name()
-      ),
+      // macOS counts no per-thread switches: the wait is judged by its time against the shortest sleep this OS gives
+      // a thread, measured here. A zero-timeout `kevent` slept 12–15 µs with an involuntary switch (A-218), and under
+      // load that switch lost the shard's core between two tasks of one request for up to a time slice (A-722).
+      None => {
+        let median = |mut times: Vec<u64>| {
+          times.sort_unstable();
+          times.get(times.len() / 2).copied().unwrap_or(0)
+        };
+        let harvest = median(
+          (0..IDLE_HARVESTS)
+            .map(|_| {
+              let started = driver.now_ns();
+              driver.wait(Some(0), &mut out).unwrap();
+              driver.now_ns() - started
+            })
+            .collect(),
+        );
+        let sleep = median(
+          (0..IDLE_HARVESTS)
+            .map(|_| {
+              let started = driver.now_ns();
+              std::thread::sleep(std::time::Duration::from_nanos(1));
+              driver.now_ns() - started
+            })
+            .collect(),
+        );
+        assert!(
+          harvest.saturating_mul(SLEEP_SHARE) < sleep,
+          "{}: a zero-timeout wait took {harvest} ns at the median, past 1/{SLEEP_SHARE} of the shortest sleep \
+           ({sleep} ns): it put the thread to sleep",
+          driver.kind().name()
+        );
+      }
     }
     drop(driver);
     drop(registration);
   }
+
+  /// Shape: how far under the OS's shortest sleep a harvest's median must sit to be a poll and not a sleep. A poll is
+  /// a system call's cost (`kevent64` with `KEVENT_FLAG_IMMEDIATE`: 180–186 ns, A-218's probe) and a sleep at least
+  /// the scheduler's switch out and back (5–15 µs on Apple silicon), so the two medians stand an order of magnitude
+  /// apart; a half keeps a loaded test thread's preemptions from failing a poll.
+  #[cfg(unix)]
+  const SLEEP_SHARE: u64 = 2;
 }
