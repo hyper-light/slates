@@ -705,7 +705,7 @@ fn the_daemons_lender_serves_a_repositorys_committed_records() {
 #[test]
 fn a_get_reads_a_text_ram_does_not_hold_through_the_store() {
   let bytes = crate::test_store::noise(200 << 10);
-  let (_store, daemon) =
+  let (_store, daemon, _) =
     crate::test_store::a_text_only_the_store_holds(&principal(OWNER), "stored", &bytes);
   let (status, reply) = crate::test_store::run_on_first(
     &daemon,

@@ -15865,6 +15865,43 @@ the same draws in one process.
 - Found on this history and fixed first (c5d746f8b): a text that comes back (A, B, A) made a chain loop when its row
   was replaced; a `T` row is now its first landing's.
 
+## Mercurial's one-changeset pull against `hg serve`: 4.2 s to 0.24 s (the index's runs merged, a pull made from what it sends) (goal 93 perf; main's order of 2026-11-21 00:22; 2026-11-21)
+
+**What changed.** A profile of a one-changeset pull of Mercurial's whole history (24.95 s at load 15 to 31, release main
+948711996) found two steps that scale with the history: every index lookup walked every run, since the learned merge
+had no caller (155 runs after the import, a lookup visiting 123 at p50, 11.8 µs; 2 runs, 0.6 µs after one merge;
+`crates/hg/examples/index_runs.rs`), and a pull whose client holds the history walked every manifest and file row for
+their links (7.2's `fastpathlinkrev`). Fixed in 94ff89fe5 (the merge made a table at a time and kept up on the owner
+shard, `vcs_store::index_upkeep`; the link walk only for a clone of every head) and f0ca841c7 (git's index on the same
+upkeep).
+
+**Command.** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=BIN SLATES_FILL=import crates/cli/bench/hg_scale.sh
+~/.cache/w-interop/bin/hg ~/.cache/w-perf/hg-src WORK 3 1800`, the harness starting slates with `--vcs-store` (7189ce280;
+release build of 7189ce280: 94ff89fe5 and that harness line), stock Mercurial 7.2, interleaved stock then slates each
+run, Mercurial's own repository (57,036 changesets, 307 tags). adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores),
+2026-11-21 02:00 to 02:43 PST, load 14 at the start, 5.6 to 7.8 at the end (shared). Studio-1, which main named for
+timing, was offline in kiln; the big Studio's slow link carries no part of a loopback run. Logs:
+`~/.cache/w-perf/prof/hg-ab-20261121T100112/` on the Studio. Every slates clone verified (`hg verify`) and its changesets
+and tags identical to the source.
+
+| Step (seconds) | `hg serve` runs 1 / 2 / 3 | best | slates runs 1 / 2 / 3 | best |
+|---|---|---|---|---|
+| one-changeset pull | 0.189 / 0.192 / 0.271 | 0.189 | 0.303 / 0.301 / 0.243 | **0.243** |
+| one-changeset push | 0.200 / 0.221 / 0.177 | 0.177 | 0.672 / 0.872 / 0.651 | 0.651 |
+| `clone -U` | 9.244 / 12.222 / 7.729 | 7.729 | 53.445 / 56.637 / 53.928 | 53.445 |
+| `clone -U --stream` (this build's stream: every text whole) | 0.495 / 0.570 / 0.840 | 0.495 | 335.3 / 352.2 / 337.6 | 335.3 |
+| filled (stock: push; slates: import) | 13.0 / 15.9 / 12.4 | 12.4 | 142.4 / 141.6 / 144.8 | 141.6 |
+
+What it says:
+- **The pull: 4.2 s (w-interop, 907c246ac) and 24.95 s (948711996, loaded) to 0.243 s best**, 1.3 times `hg serve`'s
+  0.189 s. Ten times faster than `hg serve` in wall time is not reachable for a one-changeset pull: stock hg's own client
+  (its Python start, discovery's round trips, writing the changeset) is most of `hg serve`'s 0.19 s, so the bar is the
+  server's own share, measured next by the daemon's time a request.
+- **The stream** in this build still sends every text whole (335 s, worse than the 46.8 s measured an hour before at
+  load 4; owed an explanation with the fixed stream's A/B). Its fix (c870c8f80: each revision its stored delta, read in
+  place) serves a repository whose revisions the store keeps, so its A/B fills slates by a push, next.
+- **`clone -U` is 6.9 times slower** (53 against 7.7 s; 24 against 16.4 s in w-interop's run): w-hg's clone item, sent.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
