@@ -10,3 +10,10 @@
    run the 64-512 MiB x 10 proof. Decide whether the proof should count the holder route alone meanwhile (it is 5/5).
 3. A-658 3c: blocked on A-767's "holders' changesets" (w-store, owed).
 Until 2 unblocks and 3 lands, I have no open piece: give me a goal-93 piece (C or R first) if you have one.
+
+## 15:21 PST: git large-update red confirmed (kiln r7, branch agents/w-shared-gitbuild 668ea8a1d, main 9ab8a0602 + test)
+`git_push::tests::t_goal93_a_large_files_update_is_built_a_slice_a_unit` (a 64 MiB file rewritten by one push):
+"the watchdog ends the daemon's process (exit 4): shard 0 is spinning, 4150 ms of CPU without a step against its 4095
+ms window, in task spawned at crates/server/src/git_push/tests.rs:2095" (the push's build). The fix (sliced Posting +
+PushObjects::blob_range, git's resuming its inflate a slice at a time) waits for w-hg's NotYet seam in
+slates_merge::push (not on main yet); red and fix land together per your ruling.
