@@ -618,6 +618,15 @@ impl Repositories {
       .fold(0, usize::saturating_add)
   }
 
+  /// How many entry objects `repository`'s register holds (A-662): a Subversion repository's changeset count, the
+  /// sequence its next changeset lands at (C2, A-767 item 1).
+  pub fn object_count(&self, repository: RepositoryId) -> usize {
+    self
+      .registers
+      .get(&repository)
+      .map_or(0, |register| register.objects.len())
+  }
+
   /// `repository`'s entry objects at `index` in the order its register received them (A-662): what a recovery replays a
   /// record at a time.
   pub fn object_record(&self, repository: RepositoryId, index: usize) -> Option<&[u8]> {

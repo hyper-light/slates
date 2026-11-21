@@ -101,6 +101,24 @@ fn repository_work(state: &mut ShardState, name: &str, tool: VcsTool) -> VolumeI
   edited_work(state, green, name)
 }
 
+/// The root greens of new repositories `tools` (each a name and a tool) on a store-backed daemon's one shard, each made
+/// through a client's request (A-767 item 7: a creation lands on the store before it is recorded, and a Subversion
+/// repository needs the store, C2): each name with its green.
+fn stored_greens<const N: usize>(
+  daemon: &crate::Daemon,
+  tools: [(&'static str, VcsTool); N],
+) -> [(&'static str, VolumeId); N] {
+  tools.map(|(name, tool)| {
+    let default_branch = match tool {
+      VcsTool::Subversion => "trunk",
+      VcsTool::Git | VcsTool::Mercurial => "main",
+    };
+    let asked = (name, tool, ObjectFormat::Sha1, default_branch);
+    let (_, green) = crate::test_store::create_on(daemon, 0, &owner(), asked);
+    (name, crate::verbs::to_wire_volume(green))
+  })
+}
+
 /// A work holding one edit over a plain green, no repository's.
 fn plain_work(state: &mut ShardState) -> VolumeId {
   let green = created(
@@ -176,9 +194,9 @@ fn accepted_version(reply: &ReplyBody) -> Option<u64> {
 /// message, then an empty one, then one: the two refusals, and the version the last accepted.
 fn answered_by_message(
   state: &mut ShardState,
-  (name, tool): (&str, VcsTool),
+  (name, green): (&str, VolumeId),
 ) -> (Option<Refusal>, Option<Refusal>, Option<u64>) {
-  let work = repository_work(state, name, tool);
+  let work = edited_work(state, green, name);
   let [none, empty, given] = [None, Some(""), Some("the change")]
     .map(|message| ask(state, submit(work, message, both("Ada"))));
   (refusal(none), refusal(empty), accepted_version(&given))
@@ -191,14 +209,19 @@ fn answered_by_message(
 /// anything of the work.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work_is_built() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let greens = stored_greens(
+    &daemon,
     [
       ("git", VcsTool::Git),
       ("hg", VcsTool::Mercurial),
       ("svn", VcsTool::Subversion),
-    ]
-    .map(|repository| answered_by_message(state, repository))
+    ],
+  );
+  let answered = crate::daemon::observe_first(&daemon, move |state| {
+    greens.map(|repository| answered_by_message(state, repository))
   });
+  daemon.stop();
   let refused = Some(Refusal::MessageRequired);
   let each = (refused.clone(), refused, Some(1));
   assert_eq!(answered, [each.clone(), each.clone(), each]);
@@ -208,10 +231,10 @@ fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work
 /// then with `then`'s: the first's refusal, and the version the second accepted.
 fn answered_by_identity(
   state: &mut ShardState,
-  (name, tool): (&str, VcsTool),
+  (name, green): (&str, VolumeId),
   (first, then): (ToolIdentities, ToolIdentities),
 ) -> (Option<Refusal>, Option<u64>) {
-  let work = repository_work(state, name, tool);
+  let work = edited_work(state, green, name);
   let [first, then] =
     [first, then].map(|identities| ask(state, submit(work, Some("the change"), identities)));
   (refusal(first), accepted_version(&then))
@@ -224,17 +247,27 @@ fn answered_by_identity(
 /// the principal's own name.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
-  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let [git_green, hg_green, svn_green] = stored_greens(
+    &daemon,
+    [
+      ("git", VcsTool::Git),
+      ("hg", VcsTool::Mercurial),
+      ("svn", VcsTool::Subversion),
+    ],
+  );
+  let answered = crate::daemon::observe_first(&daemon, move |state| {
     let git = (mercurial_only("Ada"), git_only("Ada"));
     let mercurial = (git_only("Ada"), mercurial_only("Ada"));
-    let svn = repository_work(state, "svn", VcsTool::Subversion);
+    let svn = edited_work(state, svn_green.1, "svn");
     let svn = submit(svn, Some("the change"), ToolIdentities::default());
     (
-      answered_by_identity(state, ("git", VcsTool::Git), git),
-      answered_by_identity(state, ("hg", VcsTool::Mercurial), mercurial),
+      answered_by_identity(state, git_green, git),
+      answered_by_identity(state, hg_green, mercurial),
       accepted_version(&ask(state, svn)),
     )
   });
+  daemon.stop();
   let required = |tool| Some(Refusal::IdentityRequired { tool });
   let expected = (
     (required(VcsTool::Git), Some(1)),

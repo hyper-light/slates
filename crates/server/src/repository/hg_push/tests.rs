@@ -609,8 +609,7 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
 /// payload the replay read back, in order.
 #[test]
 fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
-  let store = crate::test_store::TestStore::new("hg");
-  let daemon = crate::test_store::audit_daemon_stored(&store);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, made, before) = crate::daemon::observe_first(&daemon, |state| {
     let mut hg = Hg::new(state, "replayed");
     let made = rebuild(state, &mut hg, (&[1], 1));

@@ -137,8 +137,7 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
 /// their records, the push's from its changeset on the store.
 #[test]
 fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
-  let store = crate::test_store::TestStore::new("hg");
-  let daemon = crate::test_store::audit_daemon_stored(&store);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (repository, green, held) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "made");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };

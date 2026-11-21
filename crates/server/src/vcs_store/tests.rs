@@ -1252,10 +1252,18 @@ pub(crate) fn repository(
 /// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
-  crate::test_store::audit_on_stored_shard("vcs", |state| {
-    let (git, _) = repository(state, "git", VcsTool::Git);
-    let (hg, _) = repository(state, "hg", VcsTool::Mercurial);
-    let (svn, _) = repository(state, "svn", VcsTool::Subversion);
+  // Each made through a client's request on a store-backed daemon (A-767 item 7: a creation lands on the store before
+  // it is recorded, and a Subversion repository needs the store, C2).
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let [git, hg, svn] = [
+    ("git", VcsTool::Git),
+    ("hg", VcsTool::Mercurial),
+    ("svn", VcsTool::Subversion),
+  ]
+  .map(|(name, tool)| {
+    crate::test_store::create_on(&daemon, 0, &owner(), (name, tool, WireFormat::Sha1, "main")).0
+  });
+  crate::daemon::observe_first(&daemon, move |state| {
     assert_each_tool_has_its_arm(state, [git, hg, svn]);
     assert_bytes_that_are_no_record_are_refused(state, hg, svn);
     assert!(!super::replayed(state, hg, Err(ReplayRefused::Diverged)));
@@ -1271,6 +1279,7 @@ fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
     }
     assert_eq!(state.vcs_stores.charged(), 0);
   });
+  daemon.stop();
 }
 
 /// The stores of [`t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it`]: each its tool's arm, git's

@@ -1,5 +1,11 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **FIXED (A-798, 2026-11-20, w-provision-gate): a bench's client waited forever with every shard parked** (provision_bench;
+> w-engine's load_bench end-of-run read, blocking 84a, 86a, 89b's measurements). The idle spin's harvest took the kick of a
+> ring published just after the turn's look, and the spin then parked; each turn now harvests first, then looks. Red
+> deterministic in `crates/rt/tests/spin_kick.rs` (3 of 3 hung, shard parked), green 3 of 3
+> (`docs/bugs/2026-11-20-a-shards-idle-spin-took-a-clients-kick.md`).
+
 > **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
 > A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to
 > its shard taking it and to its reply: under two spinners a CPU the daemon's part is the queue, not the service
@@ -30,7 +36,10 @@
 >   Loaded accept p99 by the client's wait: the library default (its wake estimate) 1.7–5.1 ms, capped at 50 µs 1.9–2.1,
 >   yielding each spin turn 12–18 (rejected), parked at once **0.32–0.39 ms** (conflict 0.30–0.91); parking at once
 >   costs the quiet median 15–30 µs (runs 44871159397, 44873199369). Loaded p999 0.9–4.0 ms in every arm (the floor's
->   0.8–2.8). **Owed:** main's decision on the client's sync wait (§4.7's spin, R9's spinning provisioning form).
+>   0.8–2.8). Main ruled (2026-11-20): change the wait, A/B settled. **A/B (run 44876741078; BENCHMARKS, "The
+>   client's reply wait, A/B"):** parking at once takes Linux arm64's loaded accept p99 to 0.36–0.43 ms and leaves R9
+>   unharmed, but Linux x86_64 stays at 3.2 ms, macOS at 8 ms, and no platform's p999 is under 1 ms. **Owed:** what holds
+>   Linux x86_64's and macOS's loaded tails; whether to land B (simpler) or build C.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -157,14 +166,15 @@
 > `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them` (stock hg 7.2: two changesets
 > pushed and counted `hg_push.landed`, the daemon killed, a clone after the restart holding both).
 > **No store, no Mercurial (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1). CLOSED.** A
-> daemon without `--vcs-store` refuses `repository create --tool hg`, typed `Unsupported` naming `--vcs-store`
-> (`repository::no_store_for`; `crates/cli/tests/cli.rs` `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`).
-> The register-held v2 record path is gone (`unbundle_in`'s whole-history record, `record_sliced`); a push with no
-> store reference is refused `UNRECORDED`. The hg tests run on store-backed daemons through the one shared helper,
-> `crates/server/src/test_store.rs` (`TestStore`: a real store beside the test binary, removed when dropped;
-> `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`, `create`: a creation landed, then recorded, in
-> place), and `crates/cli/tests/hg_interop.rs`'s anchors
-> each hold a scratch store.
+> daemon without `--vcs-store` refuses `repository create --tool hg`, typed `Unsupported` naming `--vcs-store`, as it
+> refuses Subversion's (one `repository::no_store_for`;
+> `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag`). The register-held v2
+> record path is gone (`unbundle_in`'s whole-history record, `record_sliced`); a push with no store reference is
+> refused `UNRECORDED`. The hg tests run on store-backed daemons through the one shared helper with w-svn's,
+> `crates/server/src/test_store.rs`: its `TestStore`, `audit_daemon_stored` and routed `created`/`create_on`, and for a
+> test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
+> recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
+> `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
 > Owed:
 > - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
 >   reads;
@@ -1896,7 +1906,7 @@
 > **Built (A-649 part 4):** the server's adapter from §4.15's host seam to the import's (`slates-server`'s `hg_base`):
 > one name at a time under the repository's directory, an absent file `None`, the host's refusals carried through, a
 > name not UTF-8 refused by kind, a file read within its length when it was opened, a host's short answer read on and
-> an S3 base's pending fetch carried through (never read as the file's end), at most a directory and two files held
+> a later refusal carried through (never read as the file's end), at most a directory and two files held
 > whatever a path's depth, everything closed when the lend ends; proven on macOS arm64 (Mac Studio, 11 of 11) by two
 > stores imported through the simulated host equal to the same files read from memory, the guards each by a test; its
 > red run against a stub and each guard's mutation owed to main.
@@ -2456,14 +2466,28 @@
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
 > **C2 / A-767 C6, svn onto the changeset store (2026-11-20, w-svn; w-store's wiring baa28bfab, d3accba0e,
-> 046628f88):** part 1 BUILT: a client's commit (`svn_commit::land_work`, svn:// and svn+ssh and DAV) lands its
-> revision into the node's store as one changeset, sequence the revision, judged over the one before, its Record
-> section the revision's record as the register holds it, answered once durable (`store_changeset`; counters
-> `repository.svn.revision_stored`/`_unstored`; refused `Unstored`). Held by
-> `a_subversion_commit_lands_as_a_changeset_in_the_store` (the real store: the log recovered from its files holds the
-> creation and revision 1, whose Record decodes to `/trunk` added). Owed: the replay from the store (asked w-store for
-> a section read through its owner, and which log recovery replays from), an import as one changeset, green-made
-> versions, the texts as the changeset's sections.
+> 046628f88; main's rulings of 20:30 and 21:05):** stage A BUILT, history: the store is the truth. Every record a
+> Subversion repository takes (its creation, a revision, a lock verb's entries, a revision's properties, the UUID, a
+> deltified text) is checked, landed whole on the node's store as one changeset (sequence: how many the register names,
+> creation 0), then committed by a register entry holding only a reference to it (`svn_commit::landing`) with the green's
+> version where it moves one; one landing a repository at a time (its landing turn, held from the check to the
+> register's commit, a waiting task woken, never polled). Recovery and rebuild read each changeset the register names
+> back from the store in sequence order and replay it through the live step (`vcs_store::svn_to_fetch`, `fetch_svn`,
+> `RevisionReplay`); a changeset landed past the register's last is dropped and its retry lands once. A daemon without
+> `--vcs-store` refuses a Subversion repository, typed (`Unsupported` naming `--vcs-store`); the tests run on
+> store-backed daemons through one helper (`crate::test_store`: a directory beside the test binary named with the
+> process id, removed by its guard). Held by `a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood` (the
+> arbiter: two revisions, a revision's properties and a deltified text recovered after a stop equal to the state before,
+> the register five references and no record's bytes) and
+> `a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once` (the crash between land and
+> commit). Owed: stage B, the texts as the changeset's sections read async through the owner (HeadTexts; R6); stage C,
+> an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
+> today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
+> between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
+> landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
+> the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
+> `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
+> records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -3344,6 +3368,17 @@
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
 
+> **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
+> and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**
+> adacachy (Linux x86_64, 32 cores, load 31-55, shared with CI), release main 90e9b720c, `ci/interop/hg-matrix.sh` over
+> Mercurial's whole history (57,053 changesets): 22 of 24. The watchdog named `hg_push::unbundle` (1,091 ms of CPU
+> without a step), the HTTP edge's connection task (`vcs_http.rs:850`, `drive`, twice, each killed) and the restarted
+> daemon's start (`daemon.rs:1186`, `start_shard`, at its first poll, killed): spins 5, kills 4, restarts 4. clone-rev
+> failed `bad HTTP status line: ''` and ssh-push `stream ended unexpectedly`, each a client whose daemon was killed
+> under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
+> the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
+> no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
 > at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
@@ -3870,9 +3905,8 @@
 > - **Mantle**'s agent, asked on 2026-11-18 whether it waits on slates, has not answered; its kiln track (plan T10)
 >   puts kiln's bytes on Mantle through kiln's `Blobs`, and two of its steps reach slates, neither started: CP-T10.4 keeps slates snapshots on Mantle, which needs a snapshot's
 >   archive taken out through `slates-api` and a volume made from one (the archive exists inside the daemon, for the
->   fleet's copies and a takeover, with no verb for a host); CP-T10.5 lays a slates overlay over Mantle's objects until
->   Mantle's file system ships, which needs a base read from an object store rather than a host folder (§4.15 knows
->   only a host folder). Both wait on T10.1 to T10.3.
+>   fleet's copies and a takeover, with no verb for a host); CP-T10.5, a slates overlay over Mantle's objects read
+>   from an S3-compatible store, is declined (A-795, 2026-11-20). CP-T10.4 waits on T10.1 to T10.3.
 
 > **Open (g267, 2026-11-18): a volume moves between fleet nodes, and kiln's runners form the fleet.** Kiln moves an
 > agent between runners only without a volume (`harness/relocate.rs` refuses one), so the work owed is §4.10's
@@ -5282,8 +5316,14 @@
 > shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
 > inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
 > step each, so N shipments cost N times the inputs (64 MiB: at least 64 passes of 128 MB copied and 64 MB hashed);
-> the archive is now made once, chunks lent (`merge.inputs.manifest_made`). Whether it was exit 4's cause is open,
-> until the 64 to 320 MiB reruns on the Studio report the watchdog's line.
+> the archive is now made once, chunks lent (`merge.inputs.manifest_made`). It was not exit 4's cause.
+> The watchdog's line named it (2026-11-20, 128 to 320 MiB, this MacBook at load 42 to 60 and Studio-1 at load 3.7):
+> shard 1 spinning 1,009 to 1,201 ms of CPU in one poll of a session's first submit (`identities.rs:243`), and the
+> sample's top was `slates_merge::derive::split_at`: a path's composition walked a flat piece list from its front for
+> every declared op, so a file written a few KiB a write composed in time squared in its writes. Fixed the same day:
+> blocks of about `√ops` pieces, new runs merged as made (`derive::PieceList`).
+> Found then, open: a holder's forward of its increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms; BENCHMARKS),
+> against the transport's 1.3 GB/s; and the control shard's beat task runs 520 to 1,381 ms late during it.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
@@ -15591,81 +15631,11 @@ Owed:
 Shards streams on macOS have the same shape and are covered: their writes are logged since `1fa154230`; on Windows
 since A-402, which also makes the log option 2 names available to the WinFsp drive.
 
-### 2026-11-18: an overlay's base read from S3 objects (Mantle's CP-T10.5; designed and its pure core built, A-464; its network client built, A-471; its host, oracle and naming built, A-524; a request parked on its pending fetch, A-555; the volume over it owed)
+### 2026-11-20: Mantle's CP-T10.5 S3 ask declined (A-795)
 
-> - **Designed.** §4.15 "An S3 base": a directory listed lazily by a delimited `ListObjectsV2`, a file read by ranged
->   `GetObject` bound to its object by `If-Match` (or its version id), a replaced object a new file (A-151) whose drift
->   reaches every mapped copy (A-163), a deleted object a missing entry, every request SigV4-signed, credentials in RAM
->   only, no external runtime, every bound derived, laptop ≡ fleet. From S3's API reference and guides, fetched
->   2026-11-18.
-> - **Built (part 1, the pure core in `crates/base/src/s3`).** `sigv4` (held to the S3 signing page's four worked
->   examples), `list` (a `ListObjectsV2` page, its cap checked before parsing, every hostile shape refused by kind) and
->   `keys` (the tree and one directory's listing, every key that names no path refused by kind). Proven (Mac Studio,
->   debug, kiln r389): `cargo test --locked -p slates-base --lib -- s3`, 14 of 14 (the four golden vectors, twenty
->   hostile pages, a page cut anywhere and arbitrary bytes, every unnamable key); red once each (`$` unreserved, `<!`
->   passed over, `..` a name).
-> - **Built (part 2, A-471).** The network client in `crates/base/src/s3` (`client`, `http`, `tls`, `wait`):
->   `HeadObject`, ranged `GetObject` bound by `If-Match` or a version id, and `ListObjectsV2` pages, signed, over the
->   runtime's TCP and rustls over aws-lc-rs, every length capped before it is held, every wait learned from the path's
->   round trips within the caller's liveness window and ceiling, every answer typed. Proven (Mac Studio, debug, kiln
->   r447): `cargo test --locked -p slates-base --lib -- s3`, 30 of 30 (the client's seven against an in-process fake
->   store on loopback, over TLS and in the clear; the framing's five, twenty-three hostile answers among them; the
->   waits' three); red once each (a `412` untyped, `If-Match` not sent, no back-off, a length past its cap let
->   through); `cargo xwin check -p slates-base` (Windows x86_64) clean.
-> - **Built (part 3, A-524).** `S3Host` (`crates/base/src/s3/host.rs`), the host seam over the base's objects, sans-io:
->   a miss answers `HostError::Pending` (`VfsError::BasePending`, `Unpublished` on the wire) and names its fetch, one
->   however many calls miss on it; a directory is its delimited listing, serving one learned round trip and listed again
->   after it while it answers; a file bound to its object by `If-Match` and its version (a versioned bucket's replaced
->   object still reads its own version; elsewhere `412` or `404` makes the handle stale); chunks and listings cached
->   within the caller's budget. `SimS3` (`sim.rs`) is its oracle; `S3Base` (`name.rs`) the library's naming, exported by
->   `slates-api` (contract 43). Proven (Mac Studio, debug, 2026-11-19): `cargo test --locked -p slates-base --lib -- s3`
->   49 of 49 (the host's eight, the oracle over 256 generated histories on versioned and unversioned buckets, `SimS3`'s
->   two, the naming's four); the api's naming and contract tests 2 of 2; red first four ways (a landed range unkept, a
->   `412` taken for an unavailable store, a version unbound, a stale listing never listed again).
-> - **Built (A-555): a request waits for the fetch it met.** A pending answer names its fetch
->   (`HostError::Pending(FetchId)`, `VfsError::BasePending(FetchId)`): one name a directory's listing, one a run of
->   chunks, and `S3Host::landed` says which fetch a landing settled. The shard parks a request on the fetch it met
->   (`crates/server/src/base_wait.rs`, the fetch noted by a lens where the slot's host is lent), wakes it when that fetch
->   lands and no other, and serves it again; at most the shard's client credit of waits (past it the retry at once,
->   `base.wait.full`) and at most the failover delay a request (`base.wait.overdue`). An NFS call parks so, local or
->   forwarded (`nfs::serve_local_fetched`); a request that could not wait is answered the retry, FUSE `EAGAIN` and NFS
->   `NFS3ERR_JUKEBOX`, no longer `EIO` or a server fault. What a fetch landed is held while requests are parked on it
->   (`S3Host::hold_for_waiters`, `release_held`), and a landing the unheld cache cannot keep is counted
->   (`HostCounts::unkept`). A slot's base host is a `BaseHost` (a host directory or an S3 base). Proven: see A-555's
->   evidence.
-> - **Owed.**
->   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
->     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
->     to `base_wait::land` (`spawn_driver`). Started where a volume over an S3 base is made (A-791); its start at a
->     recovery waits on the credential's hold across a restart (below).
->   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
->     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
->     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
->   - A-555's remainder: WinFsp's answer (its catch-all) and the waits of the Shards streams, slates'
->     virtio-fs device and the typed channel's verbs (`Unpublished`, retryable); and the end-to-end run: an NFS read of
->     a volume over an S3 base through a daemon, its fetch answered by `SimS3`, once a volume over an S3 base can be
->     made. A volume destroyed (or its host replaced) while requests wait on its fetches leaves them to their deadline,
->     the failover delay, then the retry: its slot's removal should wake them.
->   - Part 2's remainder: the platform's trust roots (a source of roots to choose: compiled-in or the operating
->     system's store), name resolution (the caller resolves the endpoint today), the read-ahead from the measured
->     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
->     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
->   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
->     hand-off are built (A-791: `CreateOverS3`, the owner shard's `S3Host` and driver, `BaseRecord::S3` without the
->     credential); owed: the credential held by the anchor across a restart and the recovery over an S3 base that uses
->     it (until then such a volume recovers unavailable, `BaseUnavailable`), a clone of such an overlay (refused
->     `BaseUnavailable` now), the library's `VolumeSpec` over an S3 base, name resolution of the endpoint's host (an
->     IPv4 address alone today); the base plane's host calls audited for
->     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
->     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
->     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential
->     through `SimS3`.
->   - Closed (A-555): the fetches under way could shed each other's landed runs through a small cache before their
->     requests ran again; what a fetch landed is now held until the last request parked on it has run.
->   - The listing page and request caps assume a continuation token no longer than an encoded key (S3 states no
->     length): the client counts the longest a listing names (`Counts::longest_token`); the live run reads it.
->   - The cross-target lint of `slates-base` with its new `aws-lc-rs`, `rustls`, `slates-rt` and `slates-transport`
->     dependencies (Windows through `cargo xwin clippy`, the Linux targets): main's.
+> Mantle's CP-T10.5, a slates overlay laid over Mantle's objects through a base read from an S3-compatible store, is
+> declined: Ada never asked for an S3 base and said NFS, so the S3 base built for it (A-464, A-471, A-524, A-555,
+> A-791) is removed whole (A-795). An overlay's base is a host directory or a green's tree (A-774).
 
 ### 2026-11-18: a volume made from an archive through the library (Mantle's CP-T10.4 import half; built, A-453)
 
@@ -24051,7 +24021,7 @@ experiment/*, codex/*), none on origin: 1,387 commits not on main (cc29bfc4c), 6
 (VFS, DAX, FUSE, catalog, reclaim, runtime) are outside this goal and untouched. None duplicates A-255, A-257 or A-263-A-267
 in what lands. Branch tips as of 2026-11-10:
 
-- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** Not ported: the Codex `rebase_with` refinement (a kept operation conflicting only on a path the replacement re-establishes answers the windows instead), and its CLI and MCP review adapters (next).
+- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** Not ported: the Codex `rebase_with` refinement (a kept operation conflicting only on a path the replacement re-establishes answers the windows instead), which the agent meets by retiring those operations too. Its CLI and MCP surface landed with it: `slates check`/`slates resolve` and `slates.merge.check`/`read_check`/`resolve`, one JSON shape (`crates/mcp/tests/mcp.rs`).
   `work/slates-atomic-conflicts` 6420b7ee7, `work/slates-conflict-cli` 0d5ab5141, `work/slates-conflict-mutants` 65472f43a.
 - **superseded: A-257 (a green's chain records its verdict; recovery applies it), A-782 (one typed outcome).** Evidence: `green_checkpoint.rs` (0782fdb0c), `recovery.rs`.
   `work/slates-owned-merge-verdict` fd456c059, `work/slates-runtime-step-verdict` f5f26fe41, `work/slates-server-root-publication` 246b88842, `work/slates-verdict-counter-mutant` 246b88842, `work/slates-verdict-force-inline` f065ee4ad, `work/slates-verdict-inline-commit` 2bf699369, `work/slates-verdict-ordinary-path` 2bf699369.

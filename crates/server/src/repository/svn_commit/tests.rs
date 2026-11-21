@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ObjectFormat, Refusal, VcsTool};
 use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
@@ -15,10 +15,9 @@ use slates_svn::index::{
 };
 use slates_svn::lock::{AprTime, CommitLocks};
 
-use super::{Committed, PROPS, UNSUPPORTED, Uncommitted, commit, commit_work};
+use super::{Committed, PROPS, UNSUPPORTED, Uncommitted};
 use crate::repository::push::AppendRefused;
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the date every test revision carries.
 const DATE: &str = "2026-11-19T20:00:00.000000Z";
@@ -33,26 +32,14 @@ pub(crate) fn owner() -> Principal {
   }
 }
 
-/// Creates Subversion repository `name` on the shard: its id and its one green.
-pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
-    state,
-    1,
+/// Creates Subversion repository `name` from a history running as a task on the shard, through a client's request,
+/// once its creation landed on the node's store and was recorded (A-767 item 7): its id and its one green.
+pub(crate) async fn subversion(name: &str) -> (RepositoryId, DbVolumeId) {
+  crate::test_store::created(
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Subversion,
-      format: ObjectFormat::Revisions,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let record = repositories.repository_named(name).expect("the record");
-  (record.id, to_db_volume(id))
+    (name, VcsTool::Subversion, ObjectFormat::Revisions, "main"),
+  )
+  .await
 }
 
 /// `bytes`' content identity.
@@ -226,54 +213,139 @@ fn whole(
   )
 }
 
+/// Shape: how long a test's history may run on its shard before the test fails.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs `history` as a task on a fresh store-backed audit daemon's shard (C2: a Subversion record lands on the node's
+/// changeset store before the register names it, so a commit is awaited), the daemon and its store given back after.
+pub(crate) fn stored<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+) -> T {
+  stored_configured(history, |_| {})
+}
+
+/// [`stored`] on a daemon whose configuration `configure` changed first.
+fn stored_configured<T: Send + 'static, F: std::future::Future<Output = T> + 'static>(
+  history: impl FnOnce() -> F + Clone + Send + 'static,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> T {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(configure);
+  let out = crate::test_store::run_on_first(&daemon, history, PATIENCE);
+  daemon.stop();
+  out
+}
+
+/// The shard's state, borrowed for one step of a history.
+pub(crate) fn on<R>(step: impl FnOnce(&mut ShardState) -> R) -> R {
+  crate::state::with_state(step).expect("the shard's state")
+}
+
+/// `revision` landed on `svn` by `principal` through the step (`svn_commit::land_revision`): its answer.
+pub(crate) async fn commit(
+  (principal, svn): (&Principal, RepositoryId),
+  revision: Revision,
+  judged: Option<(&CommitLocks, AprTime)>,
+) -> Result<Committed, Uncommitted> {
+  super::land_revision((principal, svn), revision, judged)
+    .await
+    .expect("the shard's state")
+}
+
+/// `svn`'s store made again from its changesets on the node's store, its turns run to their end.
+pub(crate) async fn rebuild(svn: RepositoryId) {
+  on(|state| crate::vcs_store::rebuild(state, svn));
+  crate::vcs_store::rebuilt(svn).await;
+}
+
+/// `svn`'s changeset `sequence`'s record as the node's store holds it, once landed (a creation lands as a task).
+pub(crate) async fn stored_record(svn: RepositoryId, sequence: u64) -> Record {
+  let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  loop {
+    if let Ok(bytes) = super::landing::changeset_record(&disk, svn, sequence).await {
+      return Record::decode(&bytes).expect("a Subversion record");
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "changeset {sequence} never landed"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Waits until `svn`'s records reach revision `youngest` (a submitted version's revision lands as a task, C2).
+pub(crate) async fn youngest_reaches(svn: RepositoryId, youngest: u64) {
+  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  while on(|state| kept(state, svn).0) != youngest {
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "revision {youngest} never landed"
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
 /// A-655 part 2b (`CreateRepository` of a Subversion repository; `svnadmin create`'s UUID and revision 0's date). Do:
 /// create a Subversion repository. Expect: its records at revision 0, its UUID its id's sixteen bytes in RFC 4122's
-/// form, revision 0's `svn:date` the one its register's one record holds; the register's record its creation's; the
-/// green at version 0; the shard charged what the records hold.
+/// form, revision 0's `svn:date` the one its creation record holds; the register's one record a reference to changeset 0,
+/// whose record on the node's store is the creation's (C2); the green at version 0; the shard charged what the records
+/// hold.
 #[test]
 fn t_a655_a_subversion_repository_is_made_with_its_creation_record() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    let records = logged(state, svn);
-    let [created] = records.as_slice() else {
-      panic!("not one record: {records:?}")
-    };
-    let Ok(Record::Created { uuid, date }) = Record::decode(created) else {
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    let records = on(|state| logged(state, svn));
+    let sequences: Vec<_> = records
+      .iter()
+      .map(|bytes| super::landing::sequence_of(bytes))
+      .collect();
+    assert_eq!(
+      sequences,
+      vec![Some(0)],
+      "the register names the creation alone, by reference"
+    );
+    let created = stored_record(svn, 0).await;
+    let Record::Created { uuid, date } = created else {
       panic!("not a creation: {created:?}")
     };
-    let made = state.vcs_stores.subversion_records(svn).map(|records| {
-      let dated = records
-        .revision_properties(0)
-        .and_then(|properties| properties.get(b"svn:date".as_slice()))
-        .cloned();
-      (records.youngest(), records.uuid(), dated)
+    let made = on(|state| {
+      state.vcs_stores.subversion_records(svn).map(|records| {
+        let dated = records
+          .revision_properties(0)
+          .and_then(|properties| properties.get(b"svn:date".as_slice()))
+          .cloned();
+        (records.youngest(), records.uuid(), dated)
+      })
     });
     assert_eq!(made, Some((0, uuid, Some(date))));
     let digits: String = svn.bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     let printed = String::from_utf8(uuid.as_bytes().to_vec()).unwrap();
     assert_eq!(printed.replace('-', ""), digits);
-    let (_, held, charged) = kept(state, svn);
-    assert_eq!((green_head(state, green), charged), (Some(0), held));
+    let (_, held, charged) = on(|state| kept(state, svn));
+    assert_eq!(
+      (on(|state| green_head(state, green)), charged),
+      (Some(0), held)
+    );
   });
 }
 
 /// A-655 part 2b (§4.17.4 items 1 and 3.5). Do: commit revision 1 (a directory with a property list, a file, a
 /// directory holding a file) through the step. Expect: answered revision 1 with its date and author; the green at
 /// version 1 holding each file's bytes, the directories, and the directory's list named by its identity; the
-/// register's second record the revision whole; the records at revision 1 holding the texts; the shard charged what
-/// they hold.
+/// register's second record a reference to changeset 1, whose record on the node's store is the revision whole (C2);
+/// the records at revision 1 holding the texts; the shard charged what they hold.
 #[test]
 fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    let committed = commit(state, (&owner(), svn), first(), None);
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    let committed = commit((&owner(), svn), first(), None).await;
     assert_eq!(committed, answered(1));
     let seen = (
-      green_head(state, green),
-      green_file(state, green, "trunk/a.txt"),
-      green_file(state, green, "trunk/sub/b.txt"),
-      green_dir(state, green, "trunk/sub"),
-      green_props(state, green, "trunk"),
+      on(|state| green_head(state, green)),
+      on(|state| green_file(state, green, "trunk/a.txt")),
+      on(|state| green_file(state, green, "trunk/sub/b.txt")),
+      on(|state| green_dir(state, green, "trunk/sub")),
+      on(|state| green_props(state, green, "trunk")),
     );
     let expected = (
       Some(1),
@@ -283,19 +355,24 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
       Some(identity(&ignores()).to_vec()),
     );
     assert_eq!(seen, expected);
-    let records = logged(state, svn);
-    let second = records.get(1).map(|bytes| Record::decode(bytes));
-    assert_eq!(second, Some(Ok(Record::Revision(first()))));
-    let alpha = state
-      .vcs_stores
-      .subversion_records(svn)
-      .and_then(|records| {
-        records
-          .text(&identity(b"alpha\n"))
-          .map(std::borrow::Cow::into_owned)
-      });
+    let records = on(|state| logged(state, svn));
+    let second = records
+      .get(1)
+      .and_then(|bytes| super::landing::sequence_of(bytes));
+    assert_eq!(second, Some(1));
+    assert_eq!(stored_record(svn, 1).await, Record::Revision(first()));
+    let alpha = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| {
+          records
+            .text(&identity(b"alpha\n"))
+            .map(std::borrow::Cow::into_owned)
+        })
+    });
     assert_eq!(alpha, Some(b"alpha\n".to_vec()));
-    let (youngest, held, charged) = kept(state, svn);
+    let (youngest, held, charged) = on(|state| kept(state, svn));
     assert_eq!((youngest, charged), (1, held));
   });
 }
@@ -325,19 +402,16 @@ fn branched() -> Revision {
 /// the replaced file's new text and list; the green at version 4.
 #[test]
 fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    assert_eq!(
-      commit(state, (&owner(), svn), branched(), None),
-      answered(2)
-    );
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let after_copy = (
-      green_props(state, green, "branches/b"),
-      green_file(state, green, "branches/b/a.txt"),
-      green_dir(state, green, "branches/b/sub"),
-      green_file(state, green, "branches/b/sub/b.txt"),
-      green_file(state, green, "trunk/a.txt"),
+      on(|state| green_props(state, green, "branches/b")),
+      on(|state| green_file(state, green, "branches/b/a.txt")),
+      on(|state| green_dir(state, green, "branches/b/sub")),
+      on(|state| green_file(state, green, "branches/b/sub/b.txt")),
+      on(|state| green_file(state, green, "trunk/a.txt")),
     );
     let expected = (
       Some(identity(&ignores()).to_vec()),
@@ -352,11 +426,11 @@ fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
       vec![row("/trunk", Action::Delete, NodeKind::Directory)],
       &[],
     );
-    assert_eq!(commit(state, (&owner(), svn), deleted, None), answered(3));
+    assert_eq!(commit((&owner(), svn), deleted, None).await, answered(3));
     let gone = (
-      green_dir(state, green, "trunk"),
-      green_dir(state, green, "trunk/sub"),
-      green_file(state, green, "trunk/sub/b.txt"),
+      on(|state| green_dir(state, green, "trunk")),
+      on(|state| green_dir(state, green, "trunk/sub")),
+      on(|state| green_file(state, green, "trunk/sub/b.txt")),
     );
     assert_eq!(gone, (false, false, None));
     let native = list("svn:eol-style", "native");
@@ -365,11 +439,11 @@ fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
       ..file("/branches/b/a.txt", Action::Replace, b"gamma\n")
     };
     let replacing = revision(3, vec![replaced], &[b"gamma\n", &native]);
-    assert_eq!(commit(state, (&owner(), svn), replacing, None), answered(4));
+    assert_eq!(commit((&owner(), svn), replacing, None).await, answered(4));
     let after = (
-      green_head(state, green),
-      green_file(state, green, "branches/b/a.txt"),
-      green_props(state, green, "branches/b/a.txt"),
+      on(|state| green_head(state, green)),
+      on(|state| green_file(state, green, "branches/b/a.txt")),
+      on(|state| green_props(state, green, "branches/b/a.txt")),
     );
     let expected = (
       Some(4),
@@ -396,9 +470,9 @@ fn alices() -> CommitLocks {
 /// '/trunk/a.txt'" (`E160024`), the green, the records, the register and the charge as they were.
 #[test]
 fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let locks = alices();
     let judged = Some((&locks, AprTime(1)));
     let edit =
@@ -406,19 +480,19 @@ fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
     let one = edit("/trunk/a.txt", b"a 2\n");
     let two = edit("/trunk/sub/b.txt", b"b 2\n");
     let three = edit("/trunk/a.txt", b"a 3\n");
-    assert_eq!(commit(state, (&owner(), svn), one, judged), answered(2));
-    assert_eq!(commit(state, (&owner(), svn), two, judged), answered(3));
+    assert_eq!(commit((&owner(), svn), one, judged).await, answered(2));
+    assert_eq!(commit((&owner(), svn), two, judged).await, answered(3));
     let both = (
-      green_head(state, green),
-      green_file(state, green, "trunk/a.txt"),
-      green_file(state, green, "trunk/sub/b.txt"),
+      on(|state| green_head(state, green)),
+      on(|state| green_file(state, green, "trunk/a.txt")),
+      on(|state| green_file(state, green, "trunk/sub/b.txt")),
     );
     assert_eq!(
       both,
       (Some(3), Some(b"a 2\n".to_vec()), Some(b"b 2\n".to_vec()))
     );
-    let before = whole(state, (svn, green));
-    let refused = commit(state, (&owner(), svn), three, judged);
+    let before = on(|state| whole(state, (svn, green)));
+    let refused = commit((&owner(), svn), three, judged).await;
     let conflict = CommitRefusal::Conflict {
       path: "/trunk/a.txt".to_owned(),
       kind: ConflictKind::FileChanged,
@@ -430,7 +504,7 @@ fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
     let words = (step.subversion_code(), step.message());
     assert_eq!(words, (160_024, "Conflict at '/trunk/a.txt'".to_owned()));
     assert_eq!(refused, Err(Uncommitted::Step(step)));
-    assert_eq!(whole(state, (svn, green)), before);
+    assert_eq!(on(|state| whole(state, (svn, green))), before);
   });
 }
 
@@ -442,9 +516,9 @@ fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
 /// they were.
 #[test]
 fn t_a655_a_refused_revision_changes_nothing() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let mut unbrought = revision(1, vec![file("/trunk/c.txt", Action::Add, b"c\n")], &[]);
     unbrought.contents.clear();
     let stranger = Principal::Uid {
@@ -478,79 +552,78 @@ fn t_a655_a_refused_revision_changes_nothing() {
       ),
     ];
     for (principal, refused, why) in cases {
-      let before = whole(state, (svn, green));
-      assert_eq!(commit(state, (&principal, svn), refused, None), Err(why));
-      assert_eq!(whole(state, (svn, green)), before);
+      let before = on(|state| whole(state, (svn, green)));
+      assert_eq!(commit((&principal, svn), refused, None).await, Err(why));
+      assert_eq!(on(|state| whole(state, (svn, green))), before);
     }
     let edit = revision(
       1,
       vec![file("/trunk/a.txt", Action::Modify, b"a 2\n")],
       &[b"a 2\n"],
     );
-    assert_eq!(commit(state, (&owner(), svn), edit, None), answered(2));
+    assert_eq!(commit((&owner(), svn), edit, None).await, answered(2));
     let mut older = branched();
     older.head = 2;
-    let before = whole(state, (svn, green));
-    let counted = state.refusals.get(UNSUPPORTED).copied().unwrap_or(0);
+    let before = on(|state| whole(state, (svn, green)));
+    let counted = on(|state| state.refusals.get(UNSUPPORTED).copied().unwrap_or(0));
     let unsupported = Uncommitted::Unsupported {
       path: "/branches/b/sub".to_owned(),
     };
+    assert_eq!(commit((&owner(), svn), older, None).await, Err(unsupported));
+    assert_eq!(on(|state| whole(state, (svn, green))), before);
     assert_eq!(
-      commit(state, (&owner(), svn), older, None),
-      Err(unsupported)
+      on(|state| state.refusals.get(UNSUPPORTED).copied()),
+      Some(counted + 1)
     );
-    assert_eq!(whole(state, (svn, green)), before);
-    assert_eq!(state.refusals.get(UNSUPPORTED).copied(), Some(counted + 1));
   });
 }
 
 /// A-655 part 2b (`vcs_store`: a recovery's replay of the records through the step's check and apply). Do: commit
-/// revisions 1 to 3 (a branch made by copy, a deletion), then make the store again from the partition's log. Expect:
+/// revisions 1 to 3 (a branch made by copy, a deletion), then make the store again from the changesets the register names
+/// on the node's store (C2). Expect:
 /// the records made again equal the live ones whole, as they print; every record replayed, the creation's among them;
 /// none refused; the shard charged what they hold.
 #[test]
 fn t_a655_the_records_are_made_again_from_the_log() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    assert_eq!(
-      commit(state, (&owner(), svn), branched(), None),
-      answered(2)
-    );
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let deleted = revision(
       2,
       vec![row("/trunk", Action::Delete, NodeKind::Directory)],
       &[],
     );
-    assert_eq!(commit(state, (&owner(), svn), deleted, None), answered(3));
-    let live = whole(state, (svn, green));
-    let replayed = state
-      .refusals
-      .get(crate::vcs_store::REPLAYED)
-      .copied()
-      .unwrap_or(0);
-    crate::vcs_store::rebuild(state, svn);
-    crate::vcs_store::settle_rebuild(state, svn);
-    assert_eq!(state.vcs_stores.unrecovered(svn), None);
-    assert_eq!(whole(state, (svn, green)), live);
-    let count = u64::try_from(logged(state, svn).len()).unwrap();
+    assert_eq!(commit((&owner(), svn), deleted, None).await, answered(3));
+    let live = on(|state| whole(state, (svn, green)));
+    let replayed = on(|state| {
+      state
+        .refusals
+        .get(crate::vcs_store::REPLAYED)
+        .copied()
+        .unwrap_or(0)
+    });
+    rebuild(svn).await;
+    assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
+    assert_eq!(on(|state| whole(state, (svn, green))), live);
+    let count = u64::try_from(on(|state| logged(state, svn)).len()).unwrap();
     assert_eq!(
-      state.refusals.get(crate::vcs_store::REPLAYED).copied(),
+      on(|state| state.refusals.get(crate::vcs_store::REPLAYED).copied()),
       Some(replayed + count)
     );
-    let (_, held, charged) = kept(state, svn);
+    let (_, held, charged) = on(|state| kept(state, svn));
     assert_eq!((count, charged), (4, held));
   });
 }
 
-/// A-698 (`commit_work`: what both ra_svn transports call with the work their connection accepted). Do: land a client's
+/// A-698 (`land_work`: what both ra_svn transports call with the work their connection accepted). Do: land a client's
 /// accepted work adding `/trunk`, by alice, presenting no lock, at [`DATE`]'s instant. Expect: revision 1, dated by that
-/// instant and by alice, as `commit-info` carries them; the green at version 1 holding `/trunk`; the register's second
-/// record the revision the step made.
+/// instant and by alice, as `commit-info` carries them; the green at version 1 holding `/trunk`; changeset 1 on the
+/// node's store the revision the step made.
 #[test]
 fn t_a698_a_clients_accepted_work_lands_through_the_step() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
     let work = Work {
       head: 0,
       record: RevisionRecord {
@@ -569,21 +642,23 @@ fn t_a698_a_clients_accepted_work_lands_through_the_step() {
         ..CommitLocks::default()
       },
     };
-    let landed = commit_work(state, (&owner(), svn), work, DATE_INSTANT);
+    // The revision made of the work at the owner's instant and judged again with its locks then, as `land_work` makes
+    // it, at [`DATE`]'s instant.
+    let locks = work.locks.clone();
+    let of_work = Revision::of_work(work, DATE_INSTANT).unwrap();
+    let landed = commit((&owner(), svn), of_work, Some((&locks, DATE_INSTANT))).await;
     let made = revision(
       0,
       vec![row("/trunk", Action::Add, NodeKind::Directory)],
       &[],
     );
-    let records = logged(state, svn);
-    let second = records.get(1).map(|bytes| Record::decode(bytes));
     let seen = (
       landed,
-      green_head(state, green),
-      green_dir(state, green, "trunk"),
+      on(|state| green_head(state, green)),
+      on(|state| green_dir(state, green, "trunk")),
     );
     assert_eq!(seen, (answered(1), Some(1), true));
-    assert_eq!(second, Some(Ok(Record::Revision(made))));
+    assert_eq!(stored_record(svn, 1).await, Record::Revision(made));
   });
 }
 
@@ -600,22 +675,22 @@ const FOLD_WITHIN: u64 = 256;
 /// cap refused the next.
 #[test]
 fn subversion_revisions_fold_their_greens_chain_as_they_land() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let mut head = 1;
-    while state.db.partition().green_floor(green) == 0 && head < FOLD_WITHIN {
+    while on(|state| state.db.partition().green_floor(green)) == 0 && head < FOLD_WITHIN {
       let bytes = format!("alpha {head}\n").into_bytes();
       let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
       let next = revision(head, rows, &[&bytes]);
       assert_eq!(
-        commit(state, (&owner(), svn), next, None),
+        commit((&owner(), svn), next, None).await,
         answered(head + 1)
       );
       head += 1;
     }
     assert!(
-      state.db.partition().green_floor(green) > 0,
+      on(|state| state.db.partition().green_floor(green)) > 0,
       "no checkpoint after {head} revisions"
     );
   });
@@ -630,40 +705,38 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 /// Found by use (w-perf, 2026-11-19: `slates repository import` of git/git's newest 5,000 commits as a dump refused
 /// `TableAtCapacity { table: "green_chains" }` at revision 1,685). Do: on a shard whose partition's merge budget is
 /// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
-/// every revision lands, the register's objects hold more than the merge budget, and the shard's budget charges them:
-/// a repository's content is bounded by what its owner shard can hold (A-662, `vcs_store::settle_objects`), never by
-/// the merge budget the partition's chains share; and a revision whose entry the chains had no room for checkpointed
-/// its green first and was appended once (A-742's counter moved). Before the fix each revision's record was charged to the merge
-/// budget, so the repository's whole content had to fit in it.
+/// every revision lands, bringing more than the merge budget, while the register holds a reference a changeset alone,
+/// far below it, charged to the shard's budget (A-662, `vcs_store::settle_objects`): a repository's content is
+/// the node's changeset store's and its shard's (C2), never the merge budget the partition's chains share; and a
+/// revision whose entry the chains had no room for checkpointed its green first and was appended once (A-742's counter
+/// moved). Before A-662 each revision's record was charged to the merge budget, so the repository's whole content had
+/// to fit in it.
 #[test]
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
-  let landed = crate::daemon::audit_on_shard_configured(
-    |state| {
-      let (svn, _green) = subversion(state, "svn");
-      let mut answers = vec![commit(state, (&owner(), svn), first(), None)];
+  let landed = stored_configured(
+    || async move {
+      let (svn, _green) = subversion("svn").await;
+      let mut answers = vec![commit((&owner(), svn), first(), None).await];
       for head in 1..9u64 {
         let bytes = vec![u8::try_from(head).unwrap_or(0); QUARTER_TEXT];
         let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
-        answers.push(commit(
-          state,
-          (&owner(), svn),
-          revision(head, rows, &[&bytes]),
-          None,
-        ));
+        answers.push(commit((&owner(), svn), revision(head, rows, &[&bytes]), None).await);
       }
-      let held = state.db.partition().repositories().objects_bytes(svn);
-      let charged = state.vcs_stores.objects_charged(svn);
-      let checkpointed_first = state
-        .refusals
-        .get(super::CHAIN_ROOM_CHECKPOINTED)
-        .copied()
-        .unwrap_or(0);
-      (
-        answers,
-        held > SMALL_MERGE_BUDGET,
-        charged == u64::try_from(held).unwrap_or(0),
-        checkpointed_first > 0,
-      )
+      on(|state| {
+        let referenced = state.db.partition().repositories().objects_bytes(svn);
+        let charged = state.vcs_stores.objects_charged(svn);
+        let checkpointed_first = state
+          .refusals
+          .get(super::CHAIN_ROOM_CHECKPOINTED)
+          .copied()
+          .unwrap_or(0);
+        (
+          answers,
+          referenced < SMALL_MERGE_BUDGET,
+          charged == u64::try_from(referenced).unwrap_or(0),
+          checkpointed_first > 0,
+        )
+      })
     },
     |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
   );
@@ -679,19 +752,21 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
 /// the version before its record was refused, and kept it: the green moved past the records for good.
 #[test]
 fn a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands() {
-  let seen = crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    let first_landed = commit(state, (&owner(), svn), first(), None);
+  let seen = stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    let first_landed = commit((&owner(), svn), first(), None).await;
     let second = || {
       let rows = vec![file("/trunk/a.txt", Action::Modify, b"two\n")];
       revision(1, rows, &[b"two\n"])
     };
-    state
-      .db
-      .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend));
-    let refused = commit(state, (&owner(), svn), second(), None).is_err();
-    let head_after = green_head(state, green);
-    let again = commit(state, (&owner(), svn), second(), None);
+    on(|state| {
+      state
+        .db
+        .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend));
+    });
+    let refused = commit((&owner(), svn), second(), None).await.is_err();
+    let head_after = on(|state| green_head(state, green));
+    let again = commit((&owner(), svn), second(), None).await;
     (first_landed, refused, head_after, again)
   });
   assert_eq!(seen, (answered(1), true, Some(1), answered(2)));
@@ -713,15 +788,14 @@ impl slates_svn::lock::HeadView for IndexHead<'_> {
 
 /// A-693 part 2 (a lock verb's entries through the owner's step). Do: land revision 1; judge alice's lock of
 /// `/trunk/a.txt` against the records' table, as the ra_svn connection judges `lock-many`, and land its entries as a
-/// `Record::Locks`; then make the repository's store again from its log. Expect: the step lands the entries; the
-/// records hold alice's lock, the register holds the record as `locks`; the store made again from the log holds the
-/// same lock, so a lock is as durable as a revision.
+/// `Record::Locks`; then make the repository's store again from its changesets. Expect: the step lands the entries; the
+/// records hold alice's lock, the last changeset the register names is the `locks` record on the node's store; the
+/// store made again holds the same lock, so a lock is as durable as a revision.
 #[test]
 fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
-  let seen = crate::daemon::audit_on_shard(|state| {
-    let (svn, _green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    let records = state.vcs_stores.subversion_records(svn).unwrap();
+  let seen = stored(|| async move {
+    let (svn, _green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let request = slates_svn::lock::LockRequest {
       user: Some("alice".to_owned()),
       comment: Some(b"held".to_vec()),
@@ -731,17 +805,22 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
       )]),
       ..slates_svn::lock::LockRequest::default()
     };
-    let decision = records
-      .locks()
-      .lock(
-        &request,
-        &IndexHead(records.index()),
-        AprTime(1),
-        8,
-        &mut || [7; 16],
-      )
-      .unwrap();
-    let landed = super::record(state, (&owner(), svn), Record::Locks(decision.entries));
+    let decision = on(|state| {
+      let records = state.vcs_stores.subversion_records(svn).unwrap();
+      records
+        .locks()
+        .lock(
+          &request,
+          &IndexHead(records.index()),
+          AprTime(1),
+          8,
+          &mut || [7; 16],
+        )
+        .unwrap()
+    });
+    let landed = super::land_record((&owner(), svn), Record::Locks(decision.entries))
+      .await
+      .expect("the shard's state");
     let owner_of = |state: &ShardState| {
       state
         .vcs_stores
@@ -753,14 +832,16 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
             .map(|lock| lock.owner.clone())
         })
     };
-    let held = owner_of(state);
-    let kinds: Vec<bool> = logged(state, svn)
-      .iter()
-      .map(|bytes| matches!(Record::decode(bytes), Ok(Record::Locks(_))))
-      .collect();
-    crate::vcs_store::rebuild(state, svn);
-    crate::vcs_store::settle_rebuild(state, svn);
-    (landed, held, kinds.last().copied(), owner_of(state))
+    let held = on(|state| owner_of(state));
+    let named = on(|state| logged(state, svn)).len();
+    let last = stored_record(svn, u64::try_from(named).unwrap() - 1).await;
+    rebuild(svn).await;
+    (
+      landed,
+      held,
+      Some(matches!(last, Record::Locks(_))),
+      on(|state| owner_of(state)),
+    )
   });
   let alice = Some("alice".to_owned());
   assert_eq!(seen, (Ok(()), alice.clone(), Some(true), alice));
@@ -774,55 +855,55 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
 /// revision 2, the green at version 2 holding both files.
 #[test]
 fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "submitted");
+  stored(|| async move {
+    let (svn, green) = subversion("submitted").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
-    let version = crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made]);
+    let version =
+      on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made]));
     assert_eq!(version, 1);
-    assert_eq!(kept(state, svn).0, 1, "the submit made no revision");
-    let rows: Vec<(String, Action, NodeKind, bool)> = state
-      .vcs_stores
-      .subversion_records(svn)
-      .and_then(|records| records.index().changes(1).ok().map(<[ChangedPath]>::to_vec))
-      .unwrap_or_default()
-      .into_iter()
-      .map(|row| {
-        (
-          row.path,
-          row.action,
-          row.kind,
-          row.text == Some(real_text(b"alpha\n")),
-        )
-      })
-      .collect();
+    youngest_reaches(svn, 1).await;
+    let rows: Vec<(String, Action, NodeKind, bool)> = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| records.index().changes(1).ok().map(<[ChangedPath]>::to_vec))
+    })
+    .unwrap_or_default()
+    .into_iter()
+    .map(|row| {
+      (
+        row.path,
+        row.action,
+        row.kind,
+        row.text == Some(real_text(b"alpha\n")),
+      )
+    })
+    .collect();
     let made = vec![
       ("/trunk".to_owned(), Action::Add, NodeKind::Directory, false),
       ("/trunk/a.txt".to_owned(), Action::Add, NodeKind::File, true),
     ];
     assert_eq!(rows, made);
-    let author = state
-      .vcs_stores
-      .subversion_records(svn)
-      .and_then(|records| records.revision_properties(1))
-      .and_then(|properties| properties.get(b"svn:author".as_slice()).cloned());
+    let author = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .and_then(|records| records.revision_properties(1))
+        .and_then(|properties| properties.get(b"svn:author".as_slice()).cloned())
+    });
     assert_eq!(
       author,
       Some(b"a-u-thor".to_vec()),
       "the principal's own name"
     );
     let rows = vec![file("/trunk/b.txt", Action::Add, b"beta\n")];
-    let committed = commit(
-      state,
-      (&owner(), svn),
-      revision(1, rows, &[b"beta\n"]),
-      None,
-    );
+    let committed = commit((&owner(), svn), revision(1, rows, &[b"beta\n"]), None).await;
     assert_eq!(committed, answered(2));
     let seen = (
-      green_head(state, green),
-      green_file(state, green, "trunk/a.txt"),
-      green_file(state, green, "trunk/b.txt"),
+      on(|state| green_head(state, green)),
+      on(|state| green_file(state, green, "trunk/a.txt")),
+      on(|state| green_file(state, green, "trunk/b.txt")),
     );
     assert_eq!(
       seen,
@@ -842,25 +923,34 @@ fn real_text(bytes: &[u8]) -> Text {
 /// hold.
 #[test]
 fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "linked");
+  stored(|| async move {
+    let (svn, green) = subversion("linked").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let link = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Symlink {
       path: "/trunk/l".to_owned(),
       target: "a.txt".to_owned(),
     });
     let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
-    crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made, link]);
+    on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, vec![made, link]));
+    youngest_reaches(svn, 1).await;
     let special = b"K 11\nsvn:special\nV 1\n*\nEND\n";
-    let records = state
-      .vcs_stores
-      .subversion_records(svn)
-      .expect("the records");
-    let row = records
-      .index()
-      .changes(1)
-      .ok()
-      .and_then(|rows| rows.iter().find(|row| row.path == "/trunk/l").cloned());
+    let (row, kept_special) = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      let row = records
+        .index()
+        .changes(1)
+        .ok()
+        .and_then(|rows| rows.iter().find(|row| row.path == "/trunk/l").cloned());
+      (
+        row,
+        records
+          .text(&identity(special))
+          .map(std::borrow::Cow::into_owned),
+      )
+    });
     let seen = row.map(|row| (row.action, row.kind, row.text, row.properties));
     let expected = (
       Action::Add,
@@ -869,10 +959,7 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
       Some(held(special)),
     );
     assert_eq!(seen, Some(expected));
-    assert_eq!(
-      records.text(&identity(special)).as_deref(),
-      Some(&special[..])
-    );
+    assert_eq!(kept_special.as_deref(), Some(&special[..]));
   });
 }
 
@@ -883,8 +970,8 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
 /// `/branches/b/a.txt` at revision 2; the client's revision lands as revision 3.
 #[test]
 fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "copied");
+  stored(|| async move {
+    let (svn, green) = subversion("copied").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let first = vec![
       crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n"),
@@ -892,7 +979,8 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
         path: "/branches".to_owned(),
       }),
     ];
-    crate::vcs_store::paths::tests::version(state, ipc_green, 1, first);
+    on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 1, first));
+    youngest_reaches(svn, 1).await;
     let copy = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Copy {
       from: "/trunk".to_owned(),
       to: "/branches/b".to_owned(),
@@ -900,57 +988,56 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
       replace: false,
     });
     assert_eq!(
-      crate::vcs_store::paths::tests::version(state, ipc_green, 2, vec![copy]),
+      on(|state| crate::vcs_store::paths::tests::version(state, ipc_green, 2, vec![copy])),
       2
     );
-    let records = state
-      .vcs_stores
-      .subversion_records(svn)
-      .expect("the records");
-    let rows: Vec<(String, Action, NodeKind, Option<CopySource>)> = records
-      .index()
-      .changes(2)
-      .map(|rows| {
-        rows
-          .iter()
-          .map(|row| {
-            (
-              row.path.clone(),
-              row.action,
-              row.kind,
-              row.copy_from.clone(),
-            )
-          })
-          .collect()
-      })
-      .unwrap_or_default();
-    let copied = CopySource {
-      path: "/trunk".to_owned(),
-      revision: 1,
-    };
-    assert_eq!(
-      rows,
-      vec![(
-        "/branches/b".to_owned(),
-        Action::Add,
-        NodeKind::Directory,
-        Some(copied)
-      )]
-    );
-    let held = records
-      .index()
-      .node("/branches/b/a.txt", 2)
-      .ok()
-      .flatten()
-      .is_some();
+    youngest_reaches(svn, 2).await;
+    let held = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      let rows: Vec<(String, Action, NodeKind, Option<CopySource>)> = records
+        .index()
+        .changes(2)
+        .map(|rows| {
+          rows
+            .iter()
+            .map(|row| {
+              (
+                row.path.clone(),
+                row.action,
+                row.kind,
+                row.copy_from.clone(),
+              )
+            })
+            .collect()
+        })
+        .unwrap_or_default();
+      let copied = CopySource {
+        path: "/trunk".to_owned(),
+        revision: 1,
+      };
+      assert_eq!(
+        rows,
+        vec![(
+          "/branches/b".to_owned(),
+          Action::Add,
+          NodeKind::Directory,
+          Some(copied)
+        )]
+      );
+      let held = records
+        .index()
+        .node("/branches/b/a.txt", 2)
+        .ok()
+        .flatten()
+        .is_some();
+      held
+    });
     assert!(held, "the copy brings /trunk/a.txt");
     let rows = vec![file("/branches/b/c.txt", Action::Add, b"gamma\n")];
-    let committed = commit(
-      state,
-      (&owner(), svn),
-      revision(2, rows, &[b"gamma\n"]),
-      None,
-    );
+    let committed = commit((&owner(), svn), revision(2, rows, &[b"gamma\n"]), None).await;
     assert_eq!(committed, answered(3));
   });
 }
@@ -970,31 +1057,38 @@ fn read_held(
 
 /// A-749 rule 4 (§4.17.1 "A fetch's answer": fetches run over the index generation they began on), for Subversion's
 /// records. Do: commit revision 1; hold the records as a fetch's answer does when it begins; make the store again from
-/// the log (a rebuild: the store freed, made empty and lent to nothing until its records are replayed, a turn each);
+/// its changesets (a rebuild: the store freed, made empty and lent to nothing until its records are read back from the
+/// node's store and replayed, a turn each);
 /// read through the hold while it is lent to nothing and again once it is whole; give the hold back. Expect: the hold
 /// reads revision 1 and `/trunk/a.txt`'s text throughout; the records kept for it charged until it is given back, and
 /// then the shard charged for the store made again alone, as before the rebuild; a hold taken after reads the store made
 /// again. Red before the change: the hold read nothing once the store was freed.
 #[test]
 fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, _) = subversion(state, "held");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    let (_, _, charged) = kept(state, svn);
-    let retained = state.store.budget.retained();
-    let hold = crate::vcs_store::svn_view::hold_in(state, svn).expect("the records held");
-    crate::vcs_store::rebuild(state, svn);
-    let lent_to_nothing = state.vcs_stores.subversion_records(svn).is_none();
-    let during = read_held(state, &hold);
-    while crate::vcs_store::rebuild_turn_once(state, svn) {}
-    let made_again = kept(state, svn);
-    let both = state.store.budget.retained();
-    let after = read_held(state, &hold);
-    hold.give_back(state);
-    let given_back = state.store.budget.retained();
-    let again = crate::vcs_store::svn_view::hold_in(state, svn).expect("the store made again held");
-    let fresh = read_held(state, &again);
-    again.give_back(state);
+  stored(|| async move {
+    let (svn, _) = subversion("held").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    let (_, _, charged) = on(|state| kept(state, svn));
+    let retained = on(|state| state.store.budget.retained());
+    let hold =
+      on(|state| crate::vcs_store::svn_view::hold_in(state, svn)).expect("the records held");
+    let (lent_to_nothing, during) = on(|state| {
+      crate::vcs_store::rebuild(state, svn);
+      (
+        state.vcs_stores.subversion_records(svn).is_none(),
+        read_held(state, &hold),
+      )
+    });
+    crate::vcs_store::rebuilt(svn).await;
+    let made_again = on(|state| kept(state, svn));
+    let both = on(|state| state.store.budget.retained());
+    let after = on(|state| read_held(state, &hold));
+    on(|state| hold.give_back(state));
+    let given_back = on(|state| state.store.budget.retained());
+    let again = on(|state| crate::vcs_store::svn_view::hold_in(state, svn))
+      .expect("the store made again held");
+    let fresh = on(|state| read_held(state, &again));
+    on(|state| again.give_back(state));
     let alpha = Some((1, Some(b"alpha\n".to_vec())));
     assert_eq!(
       (lent_to_nothing, during, after, fresh),
@@ -1046,9 +1140,9 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
 /// text read from the green, borrowed, and an earlier text still read from the records.
 #[test]
 fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    let held = |state: &ShardState| {
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    let held_by_green = |state: &mut ShardState| {
       let engine = state.greens.get(&green).expect("the green");
       let texts: [&[u8]; 5] = [b"alpha\n", b"beta\n", b"alpha 2\n", b"gamma\n", b"never\n"];
       let each: Vec<bool> = texts
@@ -1057,28 +1151,37 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
         .collect();
       (engine.held_count(), each)
     };
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    assert_eq!(held(state), (2, vec![true, true, false, false, false]));
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     assert_eq!(
-      commit(state, (&owner(), svn), branched(), None),
-      answered(2)
+      on(|state| held_by_green(state)),
+      (2, vec![true, true, false, false, false])
     );
-    assert_eq!(held(state), (3, vec![true, true, true, false, false]));
+    assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
+    assert_eq!(
+      on(|state| held_by_green(state)),
+      (3, vec![true, true, true, false, false])
+    );
     let deleted = revision(
       2,
       vec![row("/trunk", Action::Delete, NodeKind::Directory)],
       &[],
     );
-    assert_eq!(commit(state, (&owner(), svn), deleted, None), answered(3));
-    assert_eq!(held(state), (1, vec![false, false, true, false, false]));
+    assert_eq!(commit((&owner(), svn), deleted, None).await, answered(3));
+    assert_eq!(
+      on(|state| held_by_green(state)),
+      (1, vec![false, false, true, false, false])
+    );
     let replacing = revision(
       3,
       vec![file("/branches/b/a.txt", Action::Replace, b"gamma\n")],
       &[b"gamma\n"],
     );
-    assert_eq!(commit(state, (&owner(), svn), replacing, None), answered(4));
-    assert_eq!(held(state), (1, vec![false, false, false, true, false]));
-    assert_read_through_the_green(state, (svn, green));
+    assert_eq!(commit((&owner(), svn), replacing, None).await, answered(4));
+    assert_eq!(
+      on(|state| held_by_green(state)),
+      (1, vec![false, false, false, true, false])
+    );
+    on(|state| assert_read_through_the_green(state, (svn, green)));
   });
 }
 
@@ -1088,42 +1191,42 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
 /// nothing more, since the green holds texts already.
 #[test]
 fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
-    assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    assert_eq!(
-      commit(state, (&owner(), svn), branched(), None),
-      answered(2)
-    );
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let texts: [&[u8]; 3] = [b"alpha\n", b"beta\n", b"alpha 2\n"];
-    let mut engine = state.greens.get_mut(&green).expect("the green");
-    // Every holder of every text let go, as a green a recovery made again holds none.
-    while engine.held_count() > 0 {
-      for bytes in texts {
-        let _ = engine.release_held(&identity(bytes));
+    let seen = on(|state| {
+      let mut engine = state.greens.get_mut(&green).expect("the green");
+      // Every holder of every text let go, as a green a recovery made again holds none.
+      while engine.held_count() > 0 {
+        for bytes in texts {
+          let _ = engine.release_held(&identity(bytes));
+        }
       }
-    }
-    drop(engine);
-    crate::vcs_store::svn_texts::rehold_head(state, svn, green);
-    crate::vcs_store::svn_texts::rehold_head(state, svn, green);
-    let engine = state.greens.get(&green).expect("the green");
-    let held: Vec<bool> = texts
-      .iter()
-      .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
-      .collect();
-    assert_eq!((engine.held_count(), held), (3, vec![true, true, true]));
+      drop(engine);
+      crate::vcs_store::svn_texts::rehold_head(state, svn, green);
+      crate::vcs_store::svn_texts::rehold_head(state, svn, green);
+      let engine = state.greens.get(&green).expect("the green");
+      let held: Vec<bool> = texts
+        .iter()
+        .map(|bytes| engine.held(&identity(bytes)) == Some(*bytes))
+        .collect();
+      (engine.held_count(), held)
+    });
+    assert_eq!(seen, (3, vec![true, true, true]));
   });
 }
 
 /// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step, so one
 /// large revision held its shard). Do: commit a revision adding `/trunk` and twelve files of 50 KiB distinct texts,
-/// then rebuild the repository from its log, its turns driven to the end. Expect: the same records and green; and the
+/// then rebuild the repository from its changesets on the node's store, its turns driven to the end. Expect: the same records and green; and the
 /// revision's replay taken over at least a turn a file (`vcs_store.svn_replay_turns`): each turn keeps its rows' texts
 /// until the shard's quantum runs, and a file's delta outlasts it. Before, the record was replayed whole in one turn.
 #[test]
 fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
-  crate::daemon::audit_on_shard(|state| {
-    let (svn, green) = subversion(state, "svn");
+  stored(|| async move {
+    let (svn, green) = subversion("svn").await;
     let texts: Vec<Vec<u8>> = (0..12u32)
       .map(|at| {
         (0..50 * 1024u32)
@@ -1137,10 +1240,10 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
     }
     let contents: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
     assert_eq!(
-      commit(state, (&owner(), svn), revision(0, rows, &contents), None),
+      commit((&owner(), svn), revision(0, rows, &contents), None).await,
       answered(1)
     );
-    let live = whole(state, (svn, green));
+    let live = on(|state| whole(state, (svn, green)));
     let turns = |state: &ShardState| {
       state
         .refusals
@@ -1148,12 +1251,11 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
         .copied()
         .unwrap_or(0)
     };
-    let before = turns(state);
-    crate::vcs_store::rebuild(state, svn);
-    crate::vcs_store::settle_rebuild(state, svn);
-    assert_eq!(state.vcs_stores.unrecovered(svn), None);
-    assert_eq!(whole(state, (svn, green)), live);
-    let taken = turns(state) - before;
+    let before = on(|state| turns(state));
+    rebuild(svn).await;
+    assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
+    assert_eq!(on(|state| whole(state, (svn, green))), live);
+    let taken = on(|state| turns(state)) - before;
     assert!(taken >= 12, "the revision replayed in {taken} turns");
   });
 }

@@ -16916,3 +16916,65 @@ read too (`push.build.turns`, both sides).
 384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
 and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
 (`do_freezer_trap`) and was stopped unbuilt.
+
+## A-697's release bench at 64 to 320 MiB: exit 4 found and fixed (2026-11-20, w-shared; main's close list)
+
+`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n> SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test
+fleet bench_a697 -- --ignored --nocapture --test-threads=1`, one run each.
+
+Before (main `90e9b72`, this MacBook at load 42 to 60; and main `6f29c8d`, Studio-1 at load 3.7, 128 MiB): exit 4 at
+128, 256 and 320 MiB (exit 101 at 64 MiB on the MacBook, with a 1,652 ms poll). The watchdog: shard 1 spinning 1,009 to
+1,201 ms of CPU in one poll of the session's first submit. `/usr/bin/sample`: 997 of the shard's busy samples at the top
+of the stack in `slates_merge::derive::split_at`, the deriver's walk of a flat piece list for every op.
+
+After (`ffb2a65`, the deriver's blocked piece list; Studio-1, load 2.9 to 4.2), every size passes:
+
+| MiB | kind | wall | compose | forward | judge | append | place | recompute |
+|---|---|---|---|---|---|---|---|---|
+| 64 | holder | 514 ms | 42.7 | 428.2 | 3.9 | 63.2 | 123.0 | 2.3 |
+| 64 | local | 330 ms | 36.4 | — | 3.9 | 63.7 | 165.3 | 4.0 |
+| 128 | holder | 1,025 ms | 87.6 | 848.9 | 8.9 | 126.2 | 242.0 | 4.7 |
+| 128 | local | 650 ms | 75.1 | — | 8.0 | 125.6 | 322.8 | 7.8 |
+| 256 | holder | 3,093 ms | 175.5 | 2,737.0 | 16.8 | 236.8 | 492.5 | 9.4 |
+| 256 | local | 1,319 ms | 148.1 | — | 16.1 | 256.7 | 657.1 | 16.2 |
+| 320 | holder | 3,497 ms | 237.6 | 3,046.5 | 21.5 | 296.8 | 593.3 | 11.2 |
+| 320 | local | 1,618 ms | 179.1 | — | 20.2 | 314.8 | 805.9 | 19.5 |
+
+(Phases in ms.) What remains: the holder's forward is most of its wall time, about 105 to 150 MB/s, against the
+transport's 1.3 GB/s on the bulk row; and the control shard's beat task ran 520 to 1,381 ms late during the larger
+forwards (near misses: the watchdog's own beat held).
+
+## The client's reply wait, A/B on every platform: parking at once wins Linux arm64's loaded p99, not x86_64's or macOS's (84a; g222; 2026-11-21)
+
+**What it is.** Main's ruling of 2026-11-20 on Linux's 1 ms band (the client's own reply spin holding the CPU its woken
+shard needs, GAPS 84a): A, the library's wait (spin for the wake estimate, then park; `d799eff4b`, which also makes
+`edit_merge_bench` wait as the library does and fails a loaded p99 over 1 ms on Linux), against B, the sync wait parking
+at once unless its caller names a spin (`7ffa0d8ac`). C (spin only while a core is free) was not built: B is the simpler
+arm and the A/B decides whether C is needed.
+
+**Command.** CI run 44876741078 (branch `diag-measurer-g222-18`), each arm built release from its `git archive`, rotated
+each round, 3 rounds: `edit_merge_bench --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict`
+(Linux inside A-224's `systemd-run` lane with its fsync writer; elsewhere the harness's spinners), then `--quiet-only
+--files 10 --files 1000 --form accept --form conflict` and `provision_bench` (R9's uncontended spinning p99). Each figure
+is the invocation's median of 3 runs. µs unless marked.
+
+| platform | arm | loaded accept p99 | loaded conflict p99 | loaded accept p999 | quiet accept p50 / p99 | R9 spinning p99 |
+|---|---|---|---|---|---|---|
+| Linux arm64 | A | 3,162 / 2,160 / 2,099 | 2,843 / 2,205 / 2,759 | 5,000 / 3,994 / 3,805 | 86–92 / 129–142 | 36.8 / 56.0 / 33.4 |
+| Linux arm64 | B | **360 / 414 / 426** | 1,815 / 713 / 747 | 1,030 / 1,015 / 4,039 | 100–101 / 139–149 | 32.6 / 33.0 / 37.7 |
+| Linux x86_64 | A | 5,639 / 5,869 / 5,243 | 6,199 / 6,116 / 5,900 | 6,199 / 7,363 / 6,141 | 93–100 / 133–162 | 46.0 / 35.3 / 47.8 |
+| Linux x86_64 | B | 3,225 / 3,276 / 3,209 | 4,001 / 5,944 / 5,462 | 5,886 / 5,421 / 5,923 | 109–121 / 168–176 | 31.6 / 34.5 / 37.7 |
+| macOS (CI, 3 CPUs) | A | 8,049 / 8,262 / 7,724 | 8,038 / 8,076 / 7,805 | 8,507 / 11,792 / 8,177 | 274–374 / 521–1,030 | 190 / 486 / 293 |
+| macOS (CI, 3 CPUs) | B | 8,077 / 8,021 / 8,025 | 8,294 / 8,936 / 8,080 | 10,088 / 8,248 / 8,673 | 229–338 / 551–644 | 350 / 267 / 170 |
+| Windows x86_64 | A | 223 / 318 / 202 | 296 / 289 / 179 | 42,922 / 37,813 / 40,732 | 116 / 187–191 | — |
+| Windows x86_64 | B | 246 / 234 / 269 | 192 / 195 / 180 | 32,408 / 39,245 / 33,171 | 133–134 / 201–218 | — |
+| Windows arm64 | A | 336 / 347 / 290 | 320 / 322 / 322 | 18,160 / 42,367 / 436 | 116–120 / 160–168 | — |
+| Windows arm64 | B | 174 / 172 / 171 | 123 / 125 / 128 | 30,195 / 247 / 19,937 | 120–123 / 172–176 | — |
+
+- B wins Linux arm64's loaded accept p99 (2.1–3.2 ms → 0.36–0.43 ms) and its gate passes 2 of 3 rounds (A 0 of 3); it
+  halves Windows arm64's p99 and leaves Windows x86_64's even. It does not bring Linux x86_64 (3.2 ms) or macOS (8 ms)
+  under 1 ms, and no arm's p999 is under 1 ms anywhere (Linux 1.0–7.4 ms, macOS 8–12 ms, Windows 0.2–59 ms).
+- B costs the quiet median 10–30 µs on Linux and Windows (not on macOS) and leaves R9's uncontended spinning p99 where
+  it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
+- So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
+  busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).

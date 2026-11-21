@@ -477,8 +477,7 @@ fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
 /// clock.
 #[test]
 fn t_a675_the_shards_task_runs_an_import_to_its_end() {
-  let store = crate::test_store::TestStore::new("hg");
-  let daemon = crate::test_store::audit_daemon_stored(&store);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
@@ -648,8 +647,7 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
 /// holding the rows the landing left, the replay counted.
 #[test]
 fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
-  let store = crate::test_store::TestStore::new("hg");
-  let daemon = crate::test_store::audit_daemon_stored(&store);
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));

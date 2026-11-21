@@ -1,6 +1,5 @@
 //! HTTPS for the edge (§4.17.2 "Transports" item 1: "TLS is rustls over aws-lc-rs"): rustls's server session driven
-//! sans-io beneath the HTTP framing, as the network export drives its own (`slates_server::nfs_tls`) and an S3 base its
-//! client (`slates_base::s3::tls`): the socket's bytes go in, plaintext comes out, and what the session must send is
+//! sans-io beneath the HTTP framing, as the network export drives its own (`slates_server::nfs_tls`): the socket's bytes go in, plaintext comes out, and what the session must send is
 //! taken out to be written.
 //!
 //! **The connection** ([`ServingIdentity::connection`]): the operator's certificate chain and key, the leaf first

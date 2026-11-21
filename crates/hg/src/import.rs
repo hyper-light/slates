@@ -208,7 +208,7 @@ const DECIMAL_RADIX: u32 = 10;
 pub enum FileRefused<R> {
   /// The file is longer than the room the import has left: refused before a byte of it was held.
   PastAdmission(PastAdmission),
-  /// The host's own refusal (§4.15's `HostError`: a fetch still pending on an S3 base, the host unavailable).
+  /// The host's own refusal (§4.15's `HostError`: the host unavailable, among others).
   Host(R),
 }
 

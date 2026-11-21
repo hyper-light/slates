@@ -290,8 +290,69 @@ fn assert_merge_loop(server: &mut McpServer) {
     "the conflict names the file: {conflict}"
   );
   assert_session_log_names_the_collision(server, &green, &work_a, &work_b);
+  assert_merge_check_resolves_over_mcp(server, &green, &work_b);
 
   assert_declare_namespace_ops(server, &green);
+}
+
+/// A-796 over MCP (`slates.merge.check`, `read_check`, `resolve`; the Codex agent's review surface): the collided work's
+/// check names the head and its windows and changes nothing; the green's view at the checked head reads "hello"; a
+/// resolution retiring the work's operations on `f` and writing " world" after the head's bytes rebases it onto that
+/// head, and its submit lands "hello world". A resolution naming a stale stamp is refused, typed.
+fn assert_merge_check_resolves_over_mcp(server: &mut McpServer, green: &str, work: &str) {
+  let check = call(server, "slates.merge.check", json!({ "work": work }));
+  assert_eq!(check["stamp"]["head"], 1, "{check}");
+  assert!(
+    !check["conflicts"].as_array().unwrap().is_empty(),
+    "{check}"
+  );
+  let stamp = check["stamp"].clone();
+  let green_view = call(
+    server,
+    "slates.merge.read_check",
+    json!({ "stamp": stamp, "view": "green", "path": "f" }),
+  );
+  assert_eq!(green_view["text"], "hello");
+  let work_view = call(
+    server,
+    "slates.merge.read_check",
+    json!({ "stamp": stamp, "view": "work", "path": "f" }),
+  );
+  assert_eq!(
+    work_view["text"], "world",
+    "a check changes nothing of the work"
+  );
+  let discard: Vec<Value> = check["declaration"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter(|op| op["path"] == "f")
+    .map(|op| op["index"].clone())
+    .collect();
+  let resolved = call(
+    server,
+    "slates.merge.resolve",
+    json!({
+      "stamp": stamp,
+      "discard": discard,
+      "replacement": [{ "kind": "edit", "path": "f", "at": 5, "delete_len": 0, "text": " world" }],
+    }),
+  );
+  assert_eq!(resolved, json!({ "rebased": true, "version": 1 }));
+  let refused = call_refused(
+    server,
+    "slates.merge.resolve",
+    json!({ "stamp": stamp, "discard": [], "replacement": [] }),
+  );
+  assert!(refused.contains("StaleMergeView"), "{refused}");
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work }));
+  assert_eq!(submitted["accepted"], true, "{submitted}");
+  let read = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "f" }),
+  );
+  assert_eq!(read["text"], "hello world");
 }
 
 /// A-773 over MCP (`slates.log`, the shape `slates log --json` prints): after the merge loop, the collided work is the

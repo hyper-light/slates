@@ -4870,7 +4870,6 @@ async fn init_shard(
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     nfs_call: None,
-    nfs_pending_base: None,
     held_nfs_replies: std::collections::BTreeMap::new(),
     held_nfs_replies_changed: false,
     recovered_nfs_replies: std::collections::BTreeMap::new(),
@@ -4982,7 +4981,6 @@ async fn init_shard(
     volume_ids_minted: 0,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
-    base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
@@ -7979,7 +7977,11 @@ mod tests {
     use slates_svn::commit::drive::TextSink;
     let profile = test_profile();
     let instance = format!("svn-intake-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    // A Subversion repository's history lands on the node's changeset store (C2): the daemons hold one, which the
+    // successor opens again.
+    let mut store = crate::test_store::TestStore::start("svn-intake-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8004,9 +8006,9 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let put = bytes.clone();
     first
-      .observe(shard, move |state| {
-        let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "barrier");
+      .observe(shard, move |_state| {
         let task = slates_rt::futures::spawn(async move {
+          let (repository, _) = crate::repository::svn_commit::tests::subversion("barrier").await;
           let texts = slates_svn::commit::drive::HeldTexts::new();
           let staged = texts.stage().unwrap();
           texts.append(staged, &put).unwrap();
@@ -8046,6 +8048,10 @@ mod tests {
     assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
     // The crash: nothing more published.
     first.stop();
+    // Every handle let go first (the configuration's too), so the owner ends, then opens the store again.
+    config.vcs_disk = None;
+    store.restart_owner();
+    config.vcs_disk = Some(store.handle());
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;
@@ -8205,7 +8211,7 @@ mod tests {
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a729-identities-{}", std::process::id());
-    let store = crate::test_store::TestStore::new("a729");
+    let store = crate::test_store::TestStore::start("a729");
     let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)

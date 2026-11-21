@@ -18,7 +18,7 @@
 //! **The tunnel's lender** ([`TunnelRecords`], `svnserve -t` over the daemon's SSH site, A-688): the same records lent
 //! as the tunnel's sources, opened with the UUID as the realm and `EXTERNAL` alone (the SSH key proved the principal,
 //! whose reach the tunnel judged before opening), the session writing where it reaches, and its accepted work landed
-//! through the owner's commit step (`repository::svn_commit::commit_work`, A-698).
+//! through the owner's commit step (`repository::svn_commit::land_work`, A-698).
 //!
 //! **Not lent.** A repository whose records this shard does not hold: one of another tool, one on another shard, or
 //! one whose creation's record has not been replayed. The site answers it `503`.
@@ -171,7 +171,7 @@ impl SvnStores for ServedRecords {
   ) -> Option<Result<Committed, svn_commit::Uncommitted>> {
     svn_commit::land_work((principal, id), work, texts).await
   }
-  fn lock_verb(
+  async fn lock_verb(
     &mut self,
     id: RepositoryId,
     principal: &Principal,
@@ -180,7 +180,10 @@ impl SvnStores for ServedRecords {
       &mut dyn FnMut() -> [u8; UUID_BYTES],
     ) -> (Vec<LockEntry>, HttpAnswer),
   ) -> Option<Result<HttpAnswer, svn_commit::Uncommitted>> {
-    crate::state::with_state(|state| {
+    // The landing turn, held from the judgment to the entries' landing (C2): no other landing moves the lock table
+    // between them.
+    let turn = svn_commit::landing::turn(id).await?;
+    let judged = crate::state::with_state(|state| {
       let undrawn = std::cell::Cell::new(false);
       let mut draw = || {
         let mut token = [0u8; UUID_BYTES];
@@ -189,24 +192,28 @@ impl SvnStores for ServedRecords {
         }
         token
       };
-      let (entries, answer) = lend_in(state, id, |lent| judge(lent, &mut draw))?;
+      let judged = lend_in(state, id, |lent| judge(lent, &mut draw))?;
       if undrawn.get() {
         crate::fleet::count_refusal(TOKEN_UNDRAWN);
         return Some(Err(svn_commit::Uncommitted::NotHeld));
       }
-      if entries.is_empty() {
-        return Some(Ok(answer));
-      }
-      Some(
-        svn_commit::record(
-          state,
-          (principal, id),
-          slates_svn::commit::record::Record::Locks(entries),
-        )
-        .map(|()| answer),
-      )
+      Some(Ok(judged))
     })
-    .flatten()
+    .flatten()?;
+    let (entries, answer) = match judged {
+      Ok(judged) => judged,
+      Err(refused) => return Some(Err(refused)),
+    };
+    if entries.is_empty() {
+      return Some(Ok(answer));
+    }
+    let landed = svn_commit::land_record_with(
+      turn,
+      (principal, id),
+      slates_svn::commit::record::Record::Locks(entries),
+    )
+    .await?;
+    Some(landed.map(|()| answer))
   }
 }
 
@@ -403,12 +410,19 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
     svn_commit::land_work((principal, id), work, texts).await
   }
 
-  fn land_record(
+  type Turn = svn_commit::landing::Turn;
+
+  async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn> {
+    svn_commit::landing::turn(id).await
+  }
+
+  async fn land_record(
     &mut self,
+    turn: Self::Turn,
     id: RepositoryId,
     principal: &Principal,
     record: slates_svn::commit::record::Record,
   ) -> Option<Result<(), svn_commit::Uncommitted>> {
-    crate::state::with_state(|state| svn_commit::record(state, (principal, id), record))
+    svn_commit::land_record_with(turn, (principal, id), record).await
   }
 }
