@@ -1805,3 +1805,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-hg is on piece 1 of the .hgtags work (a byte cap on Want::Texts; tags_text removed).
   - w-interop's r12 runs the full hg_interop suite and r8 proves the matrices on Linux.
   - MacBook 49 GB.
+- 2026-11-21 08:40 PST VERIFIED: the full hg_interop suite on main b9fed44e9 (w-hg's C1 1b) passes 16/16 with 0 skips against stock Mercurial 7.2 (w-interop's r12 on Studio-2, debug, 15.84 s; log ~/.cache/w-interop-hg/hg_interop-1121-0834.log there). That includes the one-changeset large-file pull sending its stored delta as stock does, and the changeset-store push-and-replay test.
