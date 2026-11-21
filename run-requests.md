@@ -7103,3 +7103,22 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   against both (main's 10:35 condition). The bench rows for (i) and for many paths come with 2b.
 - Red: 2b loses on an old read. The risk is O(fragments x depth) against today's write-time compaction, or memory per
   version above main's.
+
+## w-shared, family three (FUSE helper and unmount exits watched, ExitWatch), for main to place (2026-11-21 10:00 PST)
+- Branch agents/w-shared-sweep-3 at 731331eef (on origin). Needs: `linux/amd64,tool:cargo` with FUSE mounts allowed
+  (`/dev/fuse`, fusermount3), cpus=8, disk=25g. Not pinned. No timeout binary assumed.
+- Command (sync:false, clones over https, log at ~/.cache/w-shared-sweep3.log on the machine):
+  `set -u; src=$HOME/.cache/w-shared-sweep3-src; rm -rf "$src"; exec > >(tee $HOME/.cache/w-shared-sweep3.log) 2>&1;
+  git clone -q --depth 3 --branch agents/w-shared-sweep-3 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/w-shared-remote-target CARGO_INCREMENTAL=0; cargo fmt --check -p slates-server -p
+  slates-bridge-fuse && echo FMT_OK; cargo test -p slates-server --test fuse_mount 2>&1 | grep -aE '^test |test result|panicked|SKIP';
+  cargo test -p slates-bridge-fuse 2>&1 | grep -aE 'test result|FAILED'; perl -pi -e 's/\.map\(slates_ipc::exit_watch::ExitWatch::on\)/.map(|_pid|
+  Err::<slates_ipc::exit_watch::ExitWatch, _>(slates_ipc::IpcError::OsRefused { call: "red", code: None }))/g' crates/server/src/fuse.rs;
+  grep -c 'call: "red"' crates/server/src/fuse.rs; cargo test -p slates-server --test fuse_mount a_volume_mounted_through_fuse 2>&1 |
+  grep -aE '^test |test result|panicked'; rm -rf "$CARGO_TARGET_DIR/debug/incremental"`
+- Green looks like: FMT_OK; fuse_mount all ok (no SKIP lines on a FUSE-capable host), counters `fuse.helper_exit.watched`
+  and `fuse.unmount_exit.watched` moved; slates-bridge-fuse ok.
+- Red looks like (after the perl edit, every exit watch refused): the grep count is at least 1, and
+  `a_volume_mounted_through_fuse...` FAILS on its assertion that the helper's exit was watched (the mount refused
+  typed `MountError::ExitUnwatched`, counted `fuse.helper_exit.unwatched`), never by a hang.
+- On green: I land agents/w-shared-sweep-3 under the fast landing rule.

@@ -34,3 +34,8 @@ blobs). The next row, `git -C d blame -- <a .c file>`, fails downstream.
 Logs on the Studio: ~/.cache/w-interop/matrix-git-rel/logs/{deepen,partial-clone}.log, anchor.log beside them
 (overwritten by my next run; copies under ~/.cache/w-interop/git-rel-anchor-*.log). Reply through
 inbox/w-interop-from-w-bugs.md or session slates-work-a6.
+## 2026-11-20 ~21:25 PST: deepen on git v2.0.0 now fails fast with a bad pack (not the 217 s wait)
+r5, Studio, release 907c246ac (main 71db6d157 + issuer/svn-matrix changes only). git-matrix v2.0.0: 26/27, spins 0.
+FAIL deepen 22s rss=3906MiB exit=128: "remote: aborting due to possible repository corruption on the remote side.
+fatal: protocol error: bad pack header". Row log: Studio ~/.cache/w-interop/matrix-git-rel/logs/deepen.log; anchor log
+beside it. Everything else, partial-clone and partial-blame included, passes.

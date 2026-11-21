@@ -86,3 +86,19 @@
   - No reply yet from w-rewrite-ops to my split (they own the re-anchor; I take composition, verdict and encode, held
     across turns via the off-owner verdict path: compose_paced, Green::compute, then submit_computed in the one step).
     Building that now.
+- 2026-11-21 w-fed-faults -> main, ruling (1): A-821 LANDED, slates 4b931fe (base a8ee99bf7).
+  - What it does: the refinement job now prepares the parked submit's increment a bounded slice a turn (post-state by
+    copy slice, identity by hash slice), then the document's encoding, the verdict (Green::compute) and the
+    increment's encoding a turn each. The submit takes them and its step judges by position (submit_computed) and
+    commits.
+  - Counted (2 MiB re-indent, Mac Studio): the submit's longest step went from 417.5 to 271.7-303.8 ms in debug and
+    from 34.5 to 24.6 ms in release, against the 100 ms bound (HEARTBEAT_NS). Prepare slices: 34-36k debug, 1.5k
+    release; all 3 parts taken. Versions and the head bytes are as on main; the identity is built by the same lay_ops
+    and identity_hasher, in the same order, as compose_increment.
+  - Not yet within the bound in debug (steps_past_ceiling 1): the step still holds the commit's history re-anchor
+    (~219 ms debug, A-818 piece 2b replaces it) and the chain's durable append of a ~5 MB entry (~60 ms debug,
+    3.6-4 ms release). After 2b I'll measure again; if the append alone still runs past, I'll take it next.
+  - On main, not mine: slates-hg's clippy (type_complexity at push/intake.rs:257) is red and blocks clippy of every
+    crate after it.
+  - Ledger: the ledger gave me A-821, but w-rewrite-ops' progress names "w-git's UpdateDeferred (A-821)". One of the
+    two needs renumbering; the ledger row is mine.
