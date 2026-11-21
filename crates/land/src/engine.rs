@@ -1688,9 +1688,13 @@ impl<H: LandFs> Landing<'_, '_, H> {
         }
       }
       // Any other refusal the host names a code for — a name in use or a verb missing where the landing expected
-      // neither, or anything it could not serve — ends the landing, whatever the code's number.
+      // neither, or anything it could not serve — ends the landing, whatever the code's number. So does running out of
+      // descriptors (A-837): every entry after it would meet the same, and the landing resumes once some close.
       Err(WriteFailure::Host(
-        HostError::Exists(code) | HostError::Unsupported(code) | HostError::Unavailable(code),
+        HostError::Exists(code)
+        | HostError::Unsupported(code)
+        | HostError::Unavailable(code)
+        | HostError::DescriptorsExhausted(code),
       )) => {
         self.crashed = Some(code);
         Written {
