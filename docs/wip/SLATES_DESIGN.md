@@ -58282,6 +58282,17 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
     - This Mac, load 6 to 16: 69 to 79 µs at 2 MiB, 133 to 157 µs at 8 MiB. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
     200 ms at 12 MiB. Turns past the whole quantum: 2 to 4%, past 16 quanta 0.03%. The quantum here is a few µs, the
     shard's measured wake.
+  - **Fixed 2026-11-21 (main's red: `green_post_state` exit 4 in a debug build).** The shard's watchdog ended the
+    daemon on a 3.5 s poll of the job's task. The refinement's own turns were short (34,571 for the 2 MiB test); the
+    long poll was the job's end running the parked submit again, whose re-anchor of the path's history
+    (`history::reanchor`) was O(pieces × runs) twice over:
+    - `Value::remapped` scanned every kept run for each piece; it now uses a sorted index (`KeptIndex`), or the scan
+      when runs overlap, so the result is the scan's either way (property test `the_indexed_remap_is_the_scans`);
+    - `cut_superseded_blocks` scanned the union for each piece; it now binary-searches it.
+    Measured, debug, one path refined whole: 10,000 / 20,000 / 40,000 / 80,000 ops submitted in 0.40 / 1.43 / 5.64 /
+    22.5 s before, 11 / 23 / 44 / 90 ms after. `green_post_state` passes 8 of 8 in 5.2 s.
+  - **A verb outside a recorded request** (a bare dispatch, which no route could answer after the job) composes
+    unrefined and is answered now (645937436, w-fed-faults), as a remote edit-and-submit does.
   - **The remaining tail** follows the largest single buffer freed. Deferring those frees to an idle moment waits on
     A-783's yield-when-someone-waits primitive (GAPS D-O17).
   - **Not refined:** an edit-and-submit of a work off its green's shard. The job reads the writer's bytes from the work,
