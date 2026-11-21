@@ -300,8 +300,13 @@
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
 > edge, every tree entry of the whole pack, about 60.6 M for git/git), sized by the pack's history rather than by the
-> slice in flight (A-719). Owed: the checks a slice at a time over the pack held once, charging only the slice; red, the
-> 611 MB push refused today and landing within its room; an A/B against stock git (10.77 s).
+> slice in flight (A-719). Piece 1 BUILT (2026-11-21): the walk charges a state an object and no edge table. When no
+> object is incomplete of its own, every pushed tip is complete and the walk ends after its first pass. Otherwise it
+> carries the worst state back from each tip depth first, a frame an object, its stack charged as it grows. Red:
+> `receive::tests::the_connectivity_check_charges_its_objects_never_its_edges` (322 objects, 16,449 edges, 8 B an
+> object) asked 134,176 B with 2,254 left at df349a9fe; green. Owed: what else the answer holds for the whole pack
+> (the next wall the 611 MB push meets, measured); red, that push landing within its room; an A/B against stock git
+> (10.77 s).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no

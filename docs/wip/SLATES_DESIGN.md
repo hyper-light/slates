@@ -58965,6 +58965,21 @@ one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, not
 entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
 are to work a slice at a time over the pack held once (GAPS).
 
+**Layer 2, piece 1: the connectivity check charges its objects, never its edges** (`slates_git::receive::connect`).
+- The first pass reads each pushed object once and judges its own edges out of the pack.
+- When no object is incomplete of its own, no tip can reach one, so every pushed tip is complete and the walk ends
+  there. That covers every push of a complete history, git/git's included, and needs no second read and no table but
+  one state per object.
+- Otherwise the worst state is carried back from each pushed tip, depth first. Each object is read once more as it is
+  opened, and each child's state is folded into the exit frame of the object that opened it. The stack holds the open
+  path and the children it waits on, charged as it grows: bounded by the history's depth times its widest object,
+  never by its edges.
+- Red: 322 objects and 16,449 edges within 8 bytes an object asked 134,176 bytes with 2,254 left. Green.
+- A-719's turn test now asks two turns an object (fsck and the first pass), since a complete push has no propagation.
+
+Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
+`crates/git/src/receive/tests/session.rs`.
+
 Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
 `crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
 `crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
