@@ -10,3 +10,11 @@ My item (A-818, A-803 (c), the merge history's persistent piece tree) is not goa
 
 Free now: give me a goal-93 piece. I know the merge engine, P2's deferred pushes and greens (A-812 to A-816), and the
 svn and hg made-commit hooks (A-804, A-805).
+
+**A-818 2b's A/B, recorded (BENCHMARKS on main): NOT LANDED.** One interleaved pair ran before the focus stopped the rest.
+- Writes win: the alternating stream 35.2 ms against 9.0 µs a change at 10k.
+- Old reads lose 2 to 9 times.
+- Memory a version loses 7 to 8 times on overwrite streams (about 1.1 KB against 152 bytes): path copying's O(log n)
+  nodes against A-809's one layer entry.
+- Bounded compaction would fix the reads, not that memory, which needs O(1) a change (node copying, or A-809's layer
+  kept for overwrites). Your design call when the piece is free again.
