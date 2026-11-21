@@ -1678,3 +1678,15 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - 2026-11-21 04:28 PST
   - w-git: (A)'s end-to-end proof r37 is running (git/git's 611 MB push). The checks' 16 s is mostly tree parsing: Tree::parse 2,905 busy samples, Checking::turn 1,020, inflate 505. Each tree is parsed twice (fsck and the connectivity pass), so parsing once is the next lever, after (A)'s A/B.
   - w-k90-containers: kiln main's container.rs:301 no longer has the sleep (its 9437e6430 survived w-k90-a520's merge 209e19dc6). w-k90-pin-2's clippy note likely predates it; CI's exact clippy command is running on current kiln main to prove it.
+- 2026-11-21 04:33 PST
+  - LANDED:
+    - c1c6346e0 (w-rewrite-ops, A-811): (a) a read of version 1 after 10,000 overwrites went 190.8 -> 5.9 us; (b') an SDK same-length replacement at history 5,000 went 12.63 ms -> 10.4 us, one value walked.
+    - 275e3aeec (w-perf: an hg stream sends an empty text's empty delta as is, and an empty log inline).
+  - RULING (w-rewrite-ops): svn stage C first, the user-visible 3x regression. A-793's (b), alternating overwrites and inserts at 17.5 ms over 5,000, comes straight after, not left owed.
+  - ROOT CAUSE of tonight's link drops (w-k90-pin-2's R2): adacachy's enp9s0 holds a stray static 192.168.1.77/24 as PRIMARY beside kiln's 192.168.1.90/24. UDP replies leave from .77, so the tunnel's from == to check never passes, and every LAN Mac stays on one TCP tunnel over 2.4 GHz Wi-Fi.
+    - RULED: the fix is IP_PKTINFO, answering from the contacted address, in kiln's vendored hyper-rt and hyper-transport as a vendor patch. Red: a two-address host contacted on the secondary.
+    - Ada's stopgap: on adacachy, sudo ip addr del 192.168.1.77/24 dev enp9s0, unless something needs .77, or route the LAN with src .90.
+- 2026-11-21 04:38 PST
+  - LANDED: 94c1696bb (w-perf's second stream fix: an empty text). w-perf's pull A/B and push profile run together as r16.
+  - w-git (A) BUILT (40d961807): reached sets deferred, sliced and memoized; tag oracle plus replay; 587/587 and 188/188. The 611 MB push meets a THIRD wall: each created ref's green builds a whole path map from its tree (refs x tree size; 9,700 of 11,642 decision samples in compose_unit / whole_build::slice). Also a unit over 1 s (1,142 ms) at vcs_http.rs:1454 gets the daemon killed mid-push.
+  - RULINGS: (1) land (A) now, with GAPS entries for the path-map wall and Repository::commit's stage leak. (2) Name and slice the >1 s unit (robustness first). (3) Path maps derived on first read under A-647, like (A): oracle, sliced, memoized, replay flat; w-engine told. Red: the 611 MB push lands.
