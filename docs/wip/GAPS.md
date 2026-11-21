@@ -418,6 +418,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
+> every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
+> injections into the 1,000-client stand-in (bases behind, long history, works pinning the floor) the last grew: 10^4
+> idle works cut verdicts to 2,506/s and slowed every answer two to three times. After: 5,956/s, flat in the idle works.
+> Open: a long history doubles the verdict (41 to 90 µs over 10^5 versions); main's r48 confirms on the topology.
+>
 > **A-801 (2026-11-21, w-fed-move; goal 86b's throughput).** BUILT: owner asks counted and answers timed by kind; the
 > load harness prints the server nodes' merge counters. At 1,000 clients in-process: 17.5 asks a client (lengths 44%,
 > files 18%, verdicts 14%, rebases 13%), the owner's answering 185 ms in all: not the wall at that scale. Open: the
