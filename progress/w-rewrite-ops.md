@@ -1,5 +1,19 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~11:05 PST — main 09:40: A-803 (c) = A-818; piece 1 LANDED (015d1733c, main cf3389d3d)
+- `crates/merge/src/piece_tree.rs`: a persistent piece tree, with each version a join-based AVL tree of runs over an
+  arena with holder counts, and path copying. `rebuild` makes a change's version from the engine's `segments`, at
+  O(parts log n); a read is O(log n + runs). Oracles:
+  - against a serial model, with the AVL bound, read visits bounded, and release to zero;
+  - sharing counted;
+  - main's oracle, against today's re-anchored history, in `history::tests`.
+  Two mutations (path copying off, a cut offset) fail them. The BENCHMARKS entry for A-803 (b), rejected, rode along.
+- ASKED main (inbox/main-from-w-rewrite-ops-a818-anchor.md): what a run names in piece 2. (i) Immutable chunks keep a
+  path's whole earlier block, the goal 86b retention A-793 removed; (ii) byte identities through one index a path,
+  recommended. Going with (ii) unless main says otherwise.
+- NEXT: piece 2, the engine switch (re-anchor walk deleted, no mode switch), then the A/B at m = 10/100/1k/10k (write,
+  old read, memory a version, interleaved, all N), plus a row of many paths changed once each.
+
 ## ~10:10 PST — main 07:30: the held preview LANDED (A-816, main 4b73ba551); A-803 (b) shift layers measured and REJECTED
 - A-816 (A-815 was w-engine's withdrawn entry): `made_commit::hold_preview(state, &mut pending, judged)` keeps the held
   verdict's preview with the pending accept; `with_held_preview(state, &mut pending, |engine| ..)` lends it each turn

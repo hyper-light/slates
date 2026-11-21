@@ -100,3 +100,17 @@ push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run 
 - 2026-11-21 02:30 PST: kiln refused every run 08:07-10:30 UTC (10 retries, "did not answer in time"); GitHub back at ~09:00 UTC (state pushed). WinFsp test and the warning fix 0cbef8441 still wait on kiln; nothing else in my queue.
 
 - 2026-11-21 04:35 PST: C1 WinFsp GREEN (r4) after fix 87721dbeb (merge volume status reports its mounts; r3 red). Only the Linux FUSE run r2 remains for C1.
+
+## 2026-11-21 ~07:40 PST — main's 09:40 (11-20) piece: the version-control store's Windows lane
+- Branch agents/w-work-mount-vcswin: bee6ecc94 tests only (red branch agents/w-work-mount-vcswin-red), 5db34aab0 the
+  Windows StoreRoot (os_windows.rs store_* verbs: walk_target reuse, NtCreateFile relative to the root handle with
+  FILE_OPEN_REPARSE_POINT, FileIdInfo identity, FileFsFullSizeInformation, flush_dir after a create). Uncommitted:
+  unsafe-budget slates-land 33 -> 35, GAPS line.
+- macOS: crates/land/tests/store_root.rs 5/5 (new positioned I/O test), each_tool_creates_a_repository_into_the_store ok.
+- Cross clippy for Windows impossible here (zstd-sys needs a Windows C toolchain, via slates-vfs -> slates-archive):
+  clippy runs on jupiter instead.
+- jupiter via kiln from Studio-2 works again; GOTCHA: in `kiln run -- bash -lc '...'` an unquoted ~/ or $HOME/ path
+  right after an option (`mkdir -p ~/x`, `ls -la ~/x`) is dropped; cd "$HOME/Projects" then quoted relative names.
+  Logs: ~/Projects/wmlogs/*.log; clone ~/Projects/wm-vcs; target ~/Projects/w-work-mount-win-target.
+- Red run started 07:30 PST (wmlogs/red.log). Next: green run on agents/w-work-mount-vcswin + clippy -p slates-land
+  -p slates-store on jupiter; then land under the fast rule; tell w-interop to rerun its Windows matrix.
