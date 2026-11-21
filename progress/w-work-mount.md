@@ -96,3 +96,11 @@ WinFsp test pending: kiln server unresponsive since 08:07 UTC. Next: when kiln a
 w-work-mount-win-target, 11 GB warm): build (no warnings) + `cargo test -p slates-cli --test winfsp
 a_work_mounted_through_winfsp`; green -> merge origin/main into the fix, push HEAD:main, add to the close note; red ->
 red-first fix. Linux FUSE run also mine.
+
+## 2026-11-21 ~01:00 PST — C1 Windows runs, blocked on infrastructure
+Build GREEN on jupiter (e4cfbd38d, 31m47s), one unused-import warning -> fix 0cbef8441 on agents/w-work-mount-win.
+WinFsp test pending: kiln server unresponsive since 08:07 UTC; GitHub fetch "early EOF" from this Mac (SSH and HTTPS).
+Next when both answer: on jupiter (--on jupiter --no-sync; clone agents/w-work-mount-win with retries into
+~/Projects/w-work-mount-win; CARGO_TARGET_DIR ~/Projects/w-work-mount-win-target, 11 GB warm) build with no warnings,
+then `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`; green -> merge origin/main into the fix,
+push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run is mine too.

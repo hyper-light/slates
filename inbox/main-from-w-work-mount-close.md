@@ -43,3 +43,13 @@ All five items (C1 C2 R3 R4 P5) are closed on origin/main.
   between runs (~/Projects cleanup), a re-clone hit a GitHub disconnect, and the retry (detached, 06:05 UTC) is
   unconfirmed: since 08:07 UTC the kiln server answers no `kiln run` ("the kiln server did not answer in time").
   The kiln CLI prints no run id; the runner is f766f09294f2e17e3b8a631ffd4e6a4b (jupiter).
+
+## C1 Windows runs (2026-11-21, w-work-mount's own, on jupiter)
+- Windows build of crates/server/src/winfsp.rs: GREEN. `kiln run --on jupiter --no-sync` (the --needs windows sync of
+  the 585 MB tree timed out twice: "did not answer the sync in 60s"), in a clone of origin/main e4cfbd38d:
+  `cargo build --locked -p slates-server` exit 0 in 31 min 47 s; runner f766f09294f2e17e3b8a631ffd4e6a4b (the kiln CLI
+  prints no run id). One warning from C1: `use slates_vfs::host::HostFs` unused in winfsp.rs; fix 0cbef8441 on branch
+  agents/w-work-mount-win, landing once jupiter builds it clean.
+- `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`: NOT YET RUN. The clone on jupiter vanished
+  between runs, a re-clone hit a GitHub disconnect, the detached retry (06:05 UTC) is unconfirmed: from 08:07 UTC the
+  kiln server answers no `kiln run`, and from ~08:30 UTC GitHub fetches from this Mac fail ("early EOF", SSH and HTTPS).
