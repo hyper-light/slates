@@ -55,7 +55,7 @@ impl LockCredit {
   pub(crate) fn reserve(control: u16, bytes: u64, capacity: u64) -> Result<LockCredit, u64> {
     let word = entry(control).ok_or(0u64)?;
     word
-      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+      .try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
         held.checked_add(bytes).filter(|after| *after <= capacity)
       })
       .map(|_| LockCredit { control, bytes })
@@ -72,7 +72,7 @@ impl Drop for LockCredit {
   fn drop(&mut self) {
     if let Some(word) = entry(self.control) {
       let bytes = self.bytes;
-      let _ = word.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+      let _ = word.try_update(Ordering::AcqRel, Ordering::Acquire, |held| {
         Some(held.saturating_sub(bytes))
       });
     }

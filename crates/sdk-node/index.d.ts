@@ -70,6 +70,67 @@ export interface MergeOutcome {
   ok: boolean
   version: number | null
   conflicts: ConflictWindow[]
+  /** An accepted increment that changed nothing: every operation was already at the head (A-782). */
+  identical: boolean
+}
+
+/** How a work's last submission ended (A-773, A-782, A-785); the other fields are the state's own. */
+export interface LogMark {
+  state: 'open' | 'accepted' | 'identical' | 'collided' | 'awaiting_approval'
+  version?: number | null
+  verdict?: number | null
+  windows?: number | null
+  first?: ConflictWindow | null
+  identity?: string | null
+  paths?: number | null
+}
+
+/** A work in the session log: where it started, how far its green moved past it, its mark. */
+export interface LogWorkLine {
+  id: string
+  name: string
+  base: number
+  behind: number
+  mark: LogMark
+}
+
+/** A green in the session log: its head (null when unread) and its works. */
+export interface LogGreen {
+  id: string
+  head?: number | null
+  works: LogWorkLine[]
+}
+
+/** One decision that needs a person; the fields present are the kind's own. */
+export interface LogNeed {
+  kind: 'collided' | 'awaiting_approval' | 'awaiting_grant'
+  work?: string | null
+  name?: string | null
+  green?: string | null
+  path?: string | null
+  windows?: number | null
+  behind?: number | null
+  identity?: string | null
+  paths?: number | null
+  landing?: number | null
+  volume?: string | null
+  target?: string | null
+  manifest?: string | null
+}
+
+/** A landing presented and awaiting its grant. */
+export interface LogLandingLine {
+  landing: number
+  volume: string
+  target: string
+  manifest: string
+}
+
+/** The session log (A-773): `needsYou` first, then `greens` and `awaitingGrant`. */
+export interface SessionLogView {
+  needsYou: LogNeed[]
+  greens: LogGreen[]
+  awaitingGrant: LogLandingLine[]
 }
 
 /** A landing's result (§4.15) — the finished outcome, or a grant-required record for a human to authorize. */
@@ -92,6 +153,8 @@ export class Client {
   status(volume: string): VolumeStatus
   /** Every drifted entry of an overlay, past what a status carries (A-267). */
   drifted(volume: string): DriftedResult
+  /** The session log (A-773): what needs a person first, then each green's works. A read: it approves nothing. */
+  sessionLog(): SessionLogView
   list(): VolumeEntry[]
   resize(volume: string, sizeBytes: number, dynamic?: boolean): void
   destroy(volume: string): void

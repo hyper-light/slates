@@ -766,6 +766,9 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       } else {
         match outcome {
           Submitted::Accepted(version) => slates_machine::out_line!("accepted: {version}"),
+          Submitted::Identical(version) => {
+            slates_machine::out_line!("identical: {version} (already at the head; nothing changed)")
+          }
           Submitted::Conflict(windows) => print_windows(&windows),
           Submitted::ApprovalRequired { identity, paths } => {
             slates_machine::out_line!("approval required: {} ({paths} paths)", hex32(&identity))
@@ -794,7 +797,13 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
 /// with the new green `version`, or the `conflicts` windows to rebase against.
 fn submit_json(outcome: &Submitted) -> serde_json::Value {
   match outcome {
-    Submitted::Accepted(version) => serde_json::json!({ "accepted": true, "version": version }),
+    Submitted::Accepted(version) => {
+      serde_json::json!({ "accepted": true, "identical": false, "version": version })
+    }
+    // Accepted, changing nothing (A-782): every operation was already at the head.
+    Submitted::Identical(version) => {
+      serde_json::json!({ "accepted": true, "identical": true, "version": version })
+    }
     Submitted::Conflict(windows) => {
       serde_json::json!({ "accepted": false, "conflicts": slates_mcp::windows_json(windows) })
     }

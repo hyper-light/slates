@@ -192,7 +192,7 @@ fn verdict_as_expected(editor: usize, verdict: &Submitted) -> bool {
     }
     7 => {
       assert!(
-        matches!(verdict, Submitted::Accepted(_)),
+        matches!(verdict, Submitted::Identical(_)),
         "editor 7's identical save: {verdict:?}"
       );
       false
@@ -279,6 +279,129 @@ fn ten_editors_on_mounted_works_submit_and_a_grant_lands_the_green() {
     other => panic!("the granted landing of the green: {other:?}"),
   }
   landed_exactly(&target.path, &oracle);
+  drop(client);
+  daemon.stop();
+}
+
+/// What a restart test holds as its anchor, named for `tag`: the daemon's configuration, a segment with content, and the
+/// rendezvous each daemon in turn adopts (as `signed_work.rs` holds them).
+fn anchored(
+  tag: &str,
+) -> (
+  DaemonConfig,
+  slates_anchor::AnchorSegment,
+  slates_ipc::HeldRendezvous,
+) {
+  let name = format!("mounted-{tag}");
+  let profile = common::machine_profile();
+  let config = DaemonConfig::derive(
+    &profile,
+    &format!("{name}-{}", std::process::id()),
+    Some(TEST_SHARDS),
+  );
+  let segment = slates_anchor::AnchorSegment::create(
+    &common::fixture_object("slates-seg", &name),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &common::fixture_object("slates-con", &name),
+    config.content_bytes(),
+  )
+  .unwrap();
+  let rendezvous = slates_ipc::HeldRendezvous::hold(&config.instance).unwrap();
+  (config, segment, rendezvous)
+}
+
+/// A daemon over the segment and rendezvous the test holds as its anchor.
+fn start_over(
+  config: &DaemonConfig,
+  (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
+) -> Daemon {
+  let (handoff, len) = segment.handoff().unwrap();
+  let content = segment.content_handoff().unwrap();
+  let daemon = Daemon::start(
+    &common::machine_profile(),
+    config.clone(),
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+      rendezvous: rendezvous.adoption(),
+    },
+  )
+  .unwrap();
+  let _ = daemon.bootstrap(true);
+  daemon
+}
+
+/// A-774 (main's order 2: a mount's unsubmitted saves survive a restart as a volume's writes do, A-127). Do: mount a work
+/// over a seeded green, save one edit through the mount as an editor does, stop the daemon, start another over the same
+/// segment, and submit the work with no declaration and no remount. Expect: the submit is accepted and the green's head
+/// holds the save.
+#[test]
+fn a_save_through_a_mount_survives_a_daemon_restart() {
+  let (config, segment, rendezvous) = anchored("restart");
+  let daemon = start_over(&config, (&segment, &rendezvous));
+  let mut client = connect(&config.instance);
+  let green = seeded_green(&mut client);
+  let (work, _) = client.create_work(green, "mounted-restart").unwrap();
+  let saved = with_line(&base_file(3), 1, "saved before the restart");
+  {
+    let (mut stream, root) = mounted(&daemon, "mounted-restart");
+    let mut xid = 10;
+    editor_save(&mut stream, &root, "f3", &saved, &mut xid);
+  }
+  drop(client);
+  daemon.stop();
+
+  let daemon = start_over(&config, (&segment, &rendezvous));
+  let mut client = connect(&config.instance);
+  let verdict = client.submit(work).unwrap();
+  assert!(
+    matches!(verdict, Submitted::Accepted(_)),
+    "the restarted work's submit: {verdict:?}"
+  );
+  assert_eq!(
+    client.read(green, "f3", ReadAt::Head).unwrap(),
+    saved,
+    "the save made through the mount before the restart is in the green"
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// D-O17 through a mount (A-774 with A-776's refinement; main's order 3). Do: two works over one green; through its mount
+/// editor A saves f5 with lines 0 and 4 changed in one save, editor B saves f5 with line 2 changed; submit A then B.
+/// Expect: both accepted (A's save is the two edits it made, not one span over B's line), and the head holds all three
+/// changes.
+#[test]
+fn one_save_changing_two_lines_does_not_cover_another_editors_line_between() {
+  let (daemon, mut client, _) = start("spans");
+  let green = seeded_green(&mut client);
+  let (a, _) = client.create_work(green, "mounted-spans-a").unwrap();
+  let (b, _) = client.create_work(green, "mounted-spans-b").unwrap();
+  let a_bytes = with_line(
+    &with_line(&base_file(5), 0, "editor A's first line"),
+    4,
+    "editor A's last line",
+  );
+  let b_bytes = with_line(&base_file(5), 2, "editor B's middle line");
+  for (name, bytes) in [("mounted-spans-a", &a_bytes), ("mounted-spans-b", &b_bytes)] {
+    let (mut stream, root) = mounted(&daemon, name);
+    let mut xid = 10;
+    editor_save(&mut stream, &root, "f5", bytes, &mut xid);
+  }
+  for (work, who) in [(a, "A"), (b, "B")] {
+    let verdict = client.submit(work).unwrap();
+    assert!(
+      matches!(verdict, Submitted::Accepted(_)),
+      "editor {who}'s submit: {verdict:?}"
+    );
+  }
+  let expected = with_line(&a_bytes, 2, "editor B's middle line");
+  assert_eq!(client.read(green, "f5", ReadAt::Head).unwrap(), expected);
   drop(client);
   daemon.stop();
 }

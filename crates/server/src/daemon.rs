@@ -3223,17 +3223,6 @@ impl Daemon {
     })
   }
 
-  /// Test support (A-697, until its last piece puts the rule in its place; never reachable from the wire): with `on`,
-  /// every shard of this node serves the works of greens another node owns (`work_home::green_elsewhere`): a creation is
-  /// made on its client's partition and admitted by the green's owner over the fleet, and the work's base reads are
-  /// answered by this node's replica of the green. `Ok` once every shard has it, else the first typed refusal.
-  pub fn serve_works_on_holders(&self, on: bool) -> Result<(), ObserveError> {
-    for shard in &self.shards {
-      self.observe(Some(*shard), move |s| s.work_home.on_holders = on)?;
-    }
-    Ok(())
-  }
-
   /// Test support: loses the next verdict or admission the work's shard for `partition` is answered by its green's
   /// owner (A-247; never reachable from the wire), as a crash between the owner's step and the work's would.
   pub fn lose_next_owner_answer(&self, partition: u16) -> Result<(), ObserveError> {
@@ -3838,16 +3827,17 @@ impl Daemon {
     })
   }
 
-  /// Test support: leaves unanswered every live phase-one report and log fetch this node, as a holder, is asked by one of
-  /// `askers` (§4.10, A-240; counted `fleet.live.silenced_by_fault`), while it answers everything else: the holder of a
-  /// live log paused or cut off from its successor alone. Replaces any earlier set; an empty `askers` restores full
-  /// service. Installed on every shard; `Ok` once installed, else the first typed refusal.
-  pub fn inject_live_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+  /// Test support: leaves unanswered every live phase-one report and log fetch (§4.10, A-240) and every content request
+  /// (§4.10, §4.16: a green successor's fetch of the inputs it lacks) this node, as a holder, is asked by one of `askers`
+  /// (counted `fleet.holder.silenced_by_fault`), while it answers everything else: a holder paused or cut off from its
+  /// successor alone. Replaces any earlier set; an empty `askers` restores full service. Installed on every shard; `Ok`
+  /// once installed, else the first typed refusal.
+  pub fn inject_holder_silence(&self, askers: &[slates_db::HostId]) -> Result<(), ObserveError> {
     // On every shard: a holder's copy is answered on the shard that keeps it.
     for shard in self.shards.iter().copied() {
       let askers: std::collections::BTreeSet<slates_db::HostId> = askers.iter().copied().collect();
       self.observe(Some(shard), move |s| {
-        s.injected_live_silence = askers;
+        s.injected_holder_silence = askers;
       })?;
     }
     Ok(())
@@ -5043,7 +5033,7 @@ async fn init_shard(
     injected_content_ack_delay_ns: None,
     injected_forward_silence: None,
     injected_takeover_silence: std::collections::BTreeSet::new(),
-    injected_live_silence: std::collections::BTreeSet::new(),
+    injected_holder_silence: std::collections::BTreeSet::new(),
     injected_confirmation_withheld: false,
     injected_deaf_session: None,
     injected_discovery_hold: None,
@@ -5118,7 +5108,7 @@ async fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: crate::state::PendingMaterializations::default(),
-    given_up_volumes: std::collections::BTreeMap::new(),
+    given_up_taken_over: std::collections::BTreeMap::new(),
     making_taken_over: std::collections::BTreeMap::new(),
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),

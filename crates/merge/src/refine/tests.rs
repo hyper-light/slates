@@ -124,7 +124,7 @@ fn a_one_token_change_in_a_rewrite_is_one_token_range() {
   let mut refiner = Refiner::new();
   let (hunks, _) = refiner.refine(&base, &post);
   assert_eq!(hunks.len(), 1, "{hunks:?}");
-  let hunk = hunks[0];
+  let hunk = hunks.get(0).unwrap();
   assert_eq!(
     &base[ix(hunk.base_at)..ix(hunk.base_at + hunk.base_len)],
     b"compute"
@@ -202,7 +202,7 @@ fn rewrite(
   base_of.dirs.push("src".into());
   let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
   if refine {
-    let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |path| {
+    let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |_, path| {
       (path == PATH).then_some((Cow::Borrowed(base), Cow::Borrowed(post)))
     });
     assert_eq!(done.paths, 1, "the rewrite was recognised: {done:?}");
@@ -286,7 +286,10 @@ fn two_rewrites_of_different_lines_merge_as_their_edits_would() {
   let second = base.replacen("a + 190\n", "a - 190\n", 1);
   let both = first.replacen("a + 190\n", "a - 190\n", 1);
   let (one, two, _) = judge(&base, &first, &second, (false, false));
-  assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
+  assert!(
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+    "{one:?}"
+  );
   assert!(
     matches!(two, Outcome::Conflict { .. }),
     "unrefined: {two:?}"
@@ -299,8 +302,14 @@ fn two_rewrites_of_different_lines_merge_as_their_edits_would() {
 fn both_edits_held(base: &str, (first, second): (&str, &str), both: &str) {
   for rename in [false, true] {
     let (one, two, content) = judge(base, first, second, (rename, true));
-    assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
-    assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
+    assert!(
+      matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+      "{one:?}"
+    );
+    assert!(
+      matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+      "{two:?}"
+    );
     assert_eq!(content, both);
   }
 }
@@ -314,7 +323,8 @@ fn different_tokens_of_one_line_merge_and_one_token_conflicts() {
   let second = base.replacen("fn f7(a: u32)", "fn f7(a: u64)", 1);
   let (one, two, content) = judge(&base, &first, &second, (true, true));
   assert!(
-    matches!(one, Outcome::Accepted { .. }) && matches!(two, Outcome::Accepted { .. }),
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. })
+      && matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
     "{two:?}"
   );
   assert_eq!(content, base.replacen("fn f7(a: u32)", "fn g7(a: u64)", 1));
@@ -333,7 +343,8 @@ fn a_formatter_pass_beside_an_edit_merges() {
   let edited = base.replacen("a + 42\n", "a + 4200\n", 1);
   let (one, two, content) = judge(&base, &formatted, &edited, (false, true));
   assert!(
-    matches!(one, Outcome::Accepted { .. }) && matches!(two, Outcome::Accepted { .. }),
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. })
+      && matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
     "{two:?}"
   );
   assert_eq!(content, formatted.replacen("a + 42\n", "a + 4200\n", 1));
@@ -365,7 +376,7 @@ fn a_rewrite_whose_bytes_are_not_known_keeps_its_replacement() {
     &mut unknown,
     &mut unknown_plan,
     &mut Refiner::new(),
-    &mut |_| None,
+    &mut |_, _| None,
   );
   assert_eq!(
     (done.paths, &unknown.ops, &unknown_plan),
@@ -377,7 +388,7 @@ fn a_rewrite_whose_bytes_are_not_known_keeps_its_replacement() {
     &mut short,
     &mut short_plan,
     &mut Refiner::new(),
-    &mut |_| Some((Cow::Borrowed(base.as_bytes()), Cow::Borrowed(wrong))),
+    &mut |_, _| Some((Cow::Borrowed(base.as_bytes()), Cow::Borrowed(wrong))),
   );
   assert_eq!((done.paths, &short.ops), (0, &doc.ops));
   let _: BTreeMap<u64, u64> = short_plan;
@@ -414,4 +425,262 @@ fn a_reindent_of_every_line_is_anchored_and_touches_only_blanks() {
   );
   refiner.release();
   assert_eq!(refiner.scratch_bytes(), 0);
+}
+
+thread_local! {
+  /// The counting clock's reads: each read is one tick of time, so a turn's deadline is a count of asks.
+  static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+fn counting_clock() -> u64 {
+  NOW.with(|now| {
+    let at = now.get() + 1;
+    now.set(at);
+    at
+  })
+}
+
+/// A source-like file of `lines` lines, and the same file re-indented with one token changed in every hundredth line:
+/// a formatter's pass and a codemod's edits at once, the refinement's heaviest path (Myers runs out, then anchors).
+fn reformatted(lines: usize) -> (Vec<u8>, Vec<u8>) {
+  let base: String = (0..lines)
+    .map(|n| format!("  let value_{n} = compute({n}, other_{});\n", n % 97))
+    .collect();
+  let post: String = base
+    .split_inclusive('\n')
+    .enumerate()
+    .map(|(n, line)| {
+      let line = format!("  {line}");
+      if n % 100 == 0 {
+        line.replacen("compute", "measure", 1)
+      } else {
+        line
+      }
+    })
+    .collect();
+  (base.into_bytes(), post.into_bytes())
+}
+
+/// A-787 (§4.3's step budget; CLAUDE.md §3 "Bounded work everywhere"). Do: refine a 3 MiB whole-file replacement (every
+/// line re-indented, every hundredth line's call renamed) driven by a pace whose turns end after a few asks, a turn at a
+/// time. Expect: it spans many turns, no unit does more than a unit's work (three times `WORK_PER_TICK` at most: the
+/// last charge before an ask is at most a unit's work itself), and the document and plan equal the unpaced
+/// refinement's. Unsliced, the whole refinement was one unit.
+#[test]
+fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
+  let (base, post) = reformatted(72_000);
+  assert!(base.len() > 3 << 20, "{}", base.len());
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: PATH.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: PATH.into(),
+      at: 0,
+      len: post.len() as u64,
+    },
+  ];
+  let (doc, plan) = compose_volume_planned(
+    &Base::of_files(vec![(PATH.into(), base.len() as u64)]),
+    &journal,
+  )
+  .unwrap();
+  let lend =
+    |path: &str| (path == PATH).then(|| (Cow::Borrowed(&base[..]), Cow::Borrowed(&post[..])));
+  // Unpaced: the reference.
+  let (mut whole, mut whole_plan) = (doc.clone(), plan.clone());
+  let unpaced = refine_rewrites(
+    &mut whole,
+    &mut whole_plan,
+    &mut Refiner::new(),
+    &mut |_, p| lend(p),
+  );
+  assert_eq!(unpaced.paths, 1);
+  // Paced: a turn ends a few asks in.
+  let (mut sliced, mut sliced_plan) = (doc.clone(), plan.clone());
+  let mut refiner = Refiner::new();
+  let mut files = |_: &str, p: &str| lend(p);
+  let ticks = crate::pace::Ticks;
+  let pace = crate::pace::Pace::new(counting_clock);
+  let mut work = Box::pin(super::refine_rewrites_paced(
+    &mut sliced,
+    &mut sliced_plan,
+    &mut refiner,
+    (&mut files, &ticks),
+  ));
+  let mut turns = 0u64;
+  let done = loop {
+    turns += 1;
+    pace.turn(counting_clock() + 8);
+    if let core::task::Poll::Ready(done) = pace.drive(work.as_mut()) {
+      break done;
+    }
+  };
+  drop(work);
+  assert!(turns > 100, "turns {turns}");
+  assert!(
+    done.longest_unit_work <= 3 * super::WORK_PER_TICK,
+    "{done:?}"
+  );
+  // And absolutely, whatever the constant: no unit does a 64th of the file's work (unsliced, one unit did it all).
+  assert!(done.longest_unit_work < base.len() as u64 / 64, "{done:?}");
+  assert_eq!(
+    (done.paths, done.refined_bytes),
+    (unpaced.paths, unpaced.refined_bytes)
+  );
+  assert_eq!(sliced.ops, whole.ops);
+  assert_eq!(sliced_plan, whole_plan);
+}
+
+/// Close item C2 (A-776, A-547). Do: over a green holding `src/lib.rs` and `src/other.rs` (200 short functions), one
+/// agent declares an edit of `other.rs` near its end; another rewrites `other.rs` whole with a line near its top changed
+/// and renames it over `lib.rs`, as a tool that writes a file and moves it into place does. Submit the edit, then the
+/// rename. Expect: both accepted, `lib.rs` holding both edits and `other.rs` gone. The content a rename carries is
+/// relative to its source's base, so the rewrite is refined against `other.rs`'s base bytes, and the edit, mapped
+/// through the move, meets no overlap. Unrefined, the carried content replaced the source whole and the rename
+/// conflicted.
+#[test]
+fn a_rewrite_renamed_over_another_file_is_refined_against_its_source() {
+  let base = source();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let other = "src/other.rs";
+  let mut base_of = Base::of_files(vec![(PATH.into(), 12), (other.into(), base.len() as u64)]);
+  base_of.dirs.push("src".into());
+  // A green holding both files, with one agent's declared edit of other.rs ("a + 190" made "a - 190", one byte).
+  let fresh = || {
+    let mut green = Green::with_origin(Origin {
+      files: vec![
+        (PATH.into(), b"fn old() {}\n".to_vec()),
+        (other.into(), base.as_bytes().to_vec()),
+      ],
+      dirs: vec!["src".into()],
+      ..Origin::default()
+    });
+    let at = base.find("a + 190\n").unwrap() as u64 + 2;
+    let edit = vec![VolumeOp::Overwrite {
+      path: other.into(),
+      at,
+      len: 1,
+    }];
+    let (doc, plan) = compose_volume_planned(&base_of, &edit).unwrap();
+    let edited = base.replacen("a + 190\n", "a - 190\n", 1);
+    let post_state = laid(&doc.ops, &plan, edited.as_bytes());
+    let one = green.submit(&Increment {
+      id: [1; 32],
+      base: 0,
+      doc,
+      post_state,
+      evidence: Vec::new(),
+      named: Default::default(),
+    });
+    assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
+    green
+  };
+  let n = first.len() as u64;
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: other.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: other.into(),
+      at: 0,
+      len: n,
+    },
+    VolumeOp::Rename {
+      from: other.into(),
+      to: PATH.into(),
+    },
+  ];
+  let judge = |refine: bool, green: &mut Green| {
+    let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
+    if refine {
+      let done = refine_rewrites(
+        &mut doc,
+        &mut plan,
+        &mut Refiner::new(),
+        &mut |from, path| {
+          (from == other && path == PATH).then(|| {
+            (
+              Cow::Borrowed(base.as_bytes()),
+              Cow::Borrowed(first.as_bytes()),
+            )
+          })
+        },
+      );
+      assert_eq!(done.paths, 1, "{done:?}");
+    }
+    let post_state = laid(&doc.ops, &plan, first.as_bytes());
+    green.submit(&Increment {
+      id: [2 + u8::from(refine); 32],
+      base: 0,
+      doc,
+      post_state,
+      evidence: Vec::new(),
+      named: Default::default(),
+    })
+  };
+  let unrefined = judge(false, &mut fresh());
+  let mut green = fresh();
+  assert!(
+    matches!(unrefined, Outcome::Conflict { .. }),
+    "unrefined: {unrefined:?}"
+  );
+  let two = judge(true, &mut green);
+  assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
+  assert_eq!(
+    String::from_utf8(green.content(PATH).unwrap().to_vec()).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1)
+  );
+  assert!(green.content(other).is_none());
+}
+
+/// A-776's refinement replaces only a path's content: do, in one work, rewrite `src/lib.rs` whole with one line changed
+/// and make it executable (a tool that saves and chmods, a codemod over a script); refine and submit. Expect: accepted,
+/// the file's bytes the writer's and its mode 0755. Until 2026-11-20 the refined path's every op was replaced by its
+/// content ops, so the mode change was dropped and the file kept its old mode (found with close item C2, where the same
+/// loss dropped a rename).
+#[test]
+fn a_refined_rewrite_keeps_its_paths_other_operations() {
+  let base = source();
+  let post = base.replacen("a + 3\n", "a * 3\n", 1);
+  let mut green = green_of(base.as_bytes());
+  let mut base_of = Base::of_files(vec![(PATH.into(), base.len() as u64)]);
+  base_of.dirs.push("src".into());
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: PATH.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: PATH.into(),
+      at: 0,
+      len: post.len() as u64,
+    },
+    VolumeOp::SetMode {
+      path: PATH.into(),
+      mode: 0o755,
+    },
+  ];
+  let (mut doc, mut plan) = compose_volume_planned(&base_of, &journal).unwrap();
+  let done = refine_rewrites(&mut doc, &mut plan, &mut Refiner::new(), &mut |_, _| {
+    Some((
+      Cow::Borrowed(base.as_bytes()),
+      Cow::Borrowed(post.as_bytes()),
+    ))
+  });
+  assert_eq!(done.paths, 1, "{done:?}");
+  let post_state = laid(&doc.ops, &plan, post.as_bytes());
+  let outcome = green.submit(&Increment {
+    id: [7; 32],
+    base: 0,
+    doc,
+    post_state,
+    evidence: Vec::new(),
+    named: Default::default(),
+  });
+  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert_eq!(green.content(PATH).unwrap(), post.as_bytes());
+  assert_eq!(green.mode(PATH), Some(0o755));
 }

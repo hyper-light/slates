@@ -773,6 +773,14 @@ pub enum Op {
     /// The credential's id.
     id: [u8; 32],
   },
+  /// A landing awaiting its grant was superseded by a newer presentation of the same volume into the same target
+  /// (A-779): it leaves `AwaitingGrant` for `Superseded`, naming the newer. Appended.
+  LandingSuperseded {
+    /// The older landing.
+    id: u64,
+    /// The newer presentation.
+    by: u64,
+  },
 }
 
 impl Op {
@@ -882,6 +890,7 @@ impl Op {
       Op::CredentialEnrolled { .. } => "credential_enrolled",
       Op::CredentialRevoked { .. } => "credential_revoked",
       Op::CredentialTombstoned { .. } => "credential_tombstoned",
+      Op::LandingSuperseded { .. } => "landing_superseded",
       Op::RepositoryRebuilt { .. } => "repository_rebuilt",
     }
   }

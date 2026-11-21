@@ -262,7 +262,10 @@ fn assert_merge_loop(server: &mut McpServer) {
   );
 
   let submitted = call(server, "slates.merge.submit", json!({ "work": work_a }));
-  assert_eq!(submitted, json!({ "accepted": true, "version": 1 }));
+  assert_eq!(
+    submitted,
+    json!({ "accepted": true, "identical": false, "version": 1 })
+  );
   assert_eq!(
     call(server, "slates.merge.versions", json!({ "green": green }))["head"],
     1
@@ -286,8 +289,47 @@ fn assert_merge_loop(server: &mut McpServer) {
       .any(|w| w["path"] == "f"),
     "the conflict names the file: {conflict}"
   );
+  assert_session_log_names_the_collision(server, &green, &work_a, &work_b);
 
   assert_declare_namespace_ops(server, &green);
+}
+
+/// A-773 over MCP (`slates.log`, the shape `slates log --json` prints): after the merge loop, the collided work is the
+/// one decision that needs a person, and the green's head and both works are shown. The tool approves nothing (R10).
+fn assert_session_log_names_the_collision(
+  server: &mut McpServer,
+  green: &str,
+  accepted: &str,
+  collided: &str,
+) {
+  let log = call(server, "slates.log", json!({}));
+  let needs = log["needs_you"].as_array().unwrap();
+  assert_eq!(
+    needs.len(),
+    1,
+    "exactly the collision needs a person: {log}"
+  );
+  assert_eq!(needs[0]["kind"], "collided");
+  assert_eq!(needs[0]["work"], collided);
+  assert_eq!(needs[0]["path"], "f");
+  assert_eq!(needs[0]["behind"], 1);
+  let shown = log["greens"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .find(|g| g["id"] == green)
+    .unwrap_or_else(|| panic!("the green is shown: {log}"));
+  assert_eq!(shown["head"], 1);
+  let mark = |work: &str| {
+    shown["works"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .find(|w| w["id"] == work)
+      .map(|w| w["mark"]["state"].clone())
+  };
+  assert_eq!(mark(accepted), Some(json!("accepted")));
+  assert_eq!(mark(collided), Some(json!("collided")));
 }
 
 /// Namespace operations over MCP (`slates.merge.declare`): a work builds a directory tree with a

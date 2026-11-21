@@ -138,7 +138,12 @@ fn main() {
       let converge = time(
         shape,
         |_, n| replace(0, middle(size), &[b'B'; SLOT], n),
-        |outcome| matches!(outcome, Outcome::Accepted { .. }),
+        |outcome| {
+          matches!(
+            outcome,
+            Outcome::Accepted { .. } | Outcome::Identical { .. }
+          )
+        },
       );
       // Disjoint and at the head the green has when it is judged: a quarter in, each one's base the version before it.
       let accept = time(
@@ -151,7 +156,12 @@ fn main() {
             n,
           )
         },
-        |outcome| matches!(outcome, Outcome::Accepted { .. }),
+        |outcome| {
+          matches!(
+            outcome,
+            Outcome::Accepted { .. } | Outcome::Identical { .. }
+          )
+        },
       );
       println!(
         "verdict\tpaths\t{paths}\tfile_bytes\t{size}\tconflict_ns\t{conflict}\tconverge_ns\t{converge}\taccept_ns\t{accept}"

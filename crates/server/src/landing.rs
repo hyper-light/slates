@@ -679,15 +679,30 @@ pub(crate) fn capture_of(
 /// A landing's beginning: against its capture for a captured clone ([`capture_of`]), else from the volume's own
 /// diverged entries.
 fn landing_beginning(
-  vol: &slates_vfs::volume::Volume,
+  slot: &crate::state::VolumeSlot,
   target: &slates_land::engine::LandingTarget,
   request: &LandingRequest,
   against: Option<slates_vfs::captured::CaptureBase>,
 ) -> Result<slates_land::engine::Beginning, slates_land::engine::LandingRefusal> {
+  let vol = &slot.volume;
   match against {
     Some(base) => slates_land::engine::Beginning::against_capture(vol, target, request, base),
+    // A green's landing view lands its whole tree, read from the green (A-774 part 3).
+    None if over_tree(slot) => slates_land::engine::Beginning::materializing(vol, target, request),
     None => slates_land::engine::Beginning::new(vol, target, request),
   }
+}
+
+/// Whether `slot`'s volume is an overlay whose base is a tree the shard holds (a green's landing view, A-774 part 3):
+/// its base is never the landing's target, so it lands as a scratch volume does, its files read through the tree.
+fn over_tree(slot: &crate::state::VolumeSlot) -> bool {
+  matches!(slot.host, Some(BaseHost::Tree(_)))
+}
+
+/// Whether `slot`'s volume is an overlay whose base is the directory it lands into (§4.15 step 9): its host is lent to
+/// the landing's writer.
+fn base_is_target(slot: &crate::state::VolumeSlot) -> bool {
+  slot.volume.is_overlay() && !over_tree(slot)
 }
 
 /// A presentation (§4.15 steps 1–3; AUD-29-07): the landing planned and its entries checked against the target without
@@ -714,6 +729,8 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     return refused(Refusal::NotFound);
   };
   let (source, implicit) = match prepared.source {
+    // A green's landing view has no writer: its head is the state it lands, read where it lies (A-774 part 3).
+    Source::Head if over_tree(slot) => (Source::Head, None),
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
       Err(e) => {
@@ -723,7 +740,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     },
     named => (named, None),
   };
-  let was_overlay = slot.volume.is_overlay();
+  let was_overlay = base_is_target(slot);
   // One host per volume: an overlay's base names its directories by the handles of the host its slot holds, so the
   // writer is built inside that host, with the target walked again under the same containment, and the host goes back
   // to the slot between units.
@@ -762,7 +779,7 @@ fn defer_presentation(state: &mut ShardState, prepared: Prepared) -> ReplyBody {
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
+  let beginning = match landing_beginning(slot, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
@@ -1722,6 +1739,8 @@ fn begin_granted(
   // An unnamed landing lands the head as it is now: a snapshot of it, which the writers that go on
   // between slices do not move.
   let (source, implicit) = match prepared.source {
+    // A green's landing view has no writer: its head is the state it lands, read where it lies (A-774 part 3).
+    Source::Head if over_tree(slot) => (Source::Head, None),
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
       Err(e) => {
@@ -1734,7 +1753,7 @@ fn begin_granted(
     },
     named => (named, None),
   };
-  let was_overlay = slot.volume.is_overlay();
+  let was_overlay = base_is_target(slot);
   let (os, land_target) = if was_overlay {
     let Some(host) = take_disk_host(slot) else {
       drop_implicit(slot, &mut state.store, implicit, &mut state.refusals);
@@ -1774,7 +1793,7 @@ fn begin_granted(
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
   };
-  let beginning = match landing_beginning(&slot.volume, &land_target, &request, against) {
+  let beginning = match landing_beginning(slot, &land_target, &request, against) {
     Ok(beginning) => beginning,
     Err(refusal) => {
       give_host_back(slot, HostSlot::Owned(os), was_overlay, land_target.dir);
@@ -2007,14 +2026,26 @@ fn step_beginning(
     },
     Writer::Out => return Some(Err(LandingRefusal::HostAway)),
   };
-  let stepped = beginning.unit(
+  // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
+  let lent_green =
+    crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
+  let tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut lens = None;
+  let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
+    (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),
+    _ => None,
+  };
+  let stepped = beginning.unit_over(
     &mut os,
+    base,
     &mut slot.volume,
     &mut state.store,
-    &mut state.landing.grants,
-    &mut state.landing.audit,
+    (&mut state.landing.grants, &mut state.landing.audit),
   );
-  *writer = if slot.volume.is_overlay() {
+  drop(lens);
+  *writer = if base_is_target(slot) {
     let (host, away) = os.lend();
     slot.host = Some(BaseHost::Disk(host));
     Writer::Lent(away)
@@ -2132,13 +2163,25 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
     return Stepped::Ended(Box::new(Err(LandingRefusal::HostAway)));
   }
   let began = state.clock.monotonic_ns();
-  let stepped = granted.run.step(
+  // A green's landing view reads its files from the green, lent beside the writer (A-774 part 3).
+  let lent_green =
+    crate::mounted_work::view_source(&state.greens, &state.merge.green_views, slot.id);
+  let tree = lent_green
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let mut lens = None;
+  let base: Option<&mut dyn slates_vfs::host::HostFs> = match (slot.host.as_mut(), tree.as_ref()) {
+    (Some(BaseHost::Tree(host)), Some(tree)) => Some(lens.insert(host.lend(tree))),
+    _ => None,
+  };
+  let stepped = granted.run.step_over(
     &mut slot.volume,
     &mut state.store,
-    &mut state.landing.audit,
-    &mut granted.spans,
+    (&mut state.landing.audit, &mut granted.spans),
     budget_ns,
+    base,
   );
+  drop(lens);
   if granted.was_overlay {
     lend_back(slot, granted);
   }
@@ -2227,7 +2270,7 @@ fn complete_finish(
   drain_land_spans(state, spans);
   let mut rebased = false;
   if let Ok(slot) = state.volumes.get_mut(granted.handle) {
-    if slot.volume.is_overlay() {
+    if base_is_target(slot) {
       rebased = !granted.was_overlay;
       if let Some(os) = granted.run.take_host() {
         let mut host = os.into_host();
@@ -2468,6 +2511,7 @@ fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), s
         state: ended,
         written,
         conflicts: attempt.conflicts,
+        superseded_by: None,
       },
     }
   };
@@ -2691,12 +2735,29 @@ struct Presenter<'a> {
   signature: Option<&'a [u8]>,
 }
 
-/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
-/// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
+/// The landings awaiting a grant that a new presentation of `volume` into `target` supersedes (A-779): every one of
+/// that volume and target the partition's waiting index holds, unless a landing of the volume is running now. Read
+/// from the index's range for the volume, so it costs that volume's waiting landings.
+fn superseded_by_presentation(state: &ShardState, volume: DbVolumeId, target: &str) -> Vec<u64> {
+  if state.landing.running.contains_key(&volume) {
+    return Vec::new();
+  }
+  state
+    .db
+    .partition()
+    .awaiting_grant_from(std::ops::Bound::Included((volume, 0)))
+    .take_while(|landing| landing.volume == volume)
+    .filter(|landing| landing.target == target)
+    .map(|landing| landing.id)
+    .collect()
+}
+
+/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: one that replaces a
+/// presentation, its client's own (AUD-29-07) or any client's it supersedes (A-779), never does.
 fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
   let replaces = state.landing.awaiting.values().any(|awaiting| {
     awaiting.client == client && awaiting.volume == volume && awaiting.target == target
-  });
+  }) || !superseded_by_presentation(state, volume, target).is_empty();
   !replaces && state.landing.awaiting.len() >= state.config.landings_awaiting_per_shard
 }
 
@@ -2770,10 +2831,17 @@ fn present(
       refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest },
     });
   }
-  // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
-  // longer grantable (AUD-29-07): re-planning costs no room.
-  state.landing.awaiting.retain(|_, awaiting| {
-    !(awaiting.client == client && awaiting.volume == ids.volume && awaiting.target == ids.target)
+  // A presentation of the same volume into the same target, by any client, supersedes every earlier one still
+  // awaiting its grant (A-779, main's ruling 2026-11-20; AUD-29-07 replaced only the same client's): their ids are no
+  // longer grantable, and re-planning costs no room. A landing of the volume running now is left to finish.
+  let superseded = superseded_by_presentation(state, ids.volume, ids.target);
+  // A granted landing's presentation kept for its resume (an aborted run's) is no presentation awaiting a grant, so it
+  // stays; the same client's own re-presentation replaces it as before (AUD-29-07).
+  state.landing.awaiting.retain(|id, awaiting| {
+    !(superseded.contains(id)
+      || (awaiting.client == client
+        && awaiting.volume == ids.volume
+        && awaiting.target == ids.target))
   });
   state.landing.awaiting.insert(
     landing_id,
@@ -2801,6 +2869,7 @@ fn present(
     state: DbLandingState::AwaitingGrant,
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   let planned = DbAuditRecord {
     seq: 0,
@@ -2819,6 +2888,15 @@ fn present(
     .and_then(|_| write_audit(state, vec![planned], now))
   {
     return refused(crate::error::refusal_of_db(&e));
+  }
+  for older in superseded {
+    let op = Op::LandingSuperseded {
+      id: older,
+      by: landing_id,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+      return refused(crate::error::refusal_of_db(&e));
+    }
   }
   // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
   // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
@@ -2920,6 +2998,7 @@ fn finish(
     state: db_state,
     written: u32::try_from(report.written).unwrap_or(u32::MAX),
     conflicts: u32::try_from(report.conflicts).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   // A landing under a fresh id is recorded; one under its presentation's id moves that presentation's
   // record out of `AwaitingGrant` (AUD-29-07), its grant named by the audit records that follow.
@@ -3279,6 +3358,16 @@ pub fn grant_verb(
     return crate::verbs::forbidden("grant");
   }
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
+    // A presentation a newer one superseded is refused by kind, naming the newer (A-779): an older state never lands
+    // over a newer one.
+    if let Some(newer) = state
+      .db
+      .partition()
+      .landing(landing_id)
+      .and_then(|landing| landing.superseded_by)
+    {
+      return crate::verbs::refused(Refusal::LandingSuperseded { newer });
+    }
     return crate::verbs::refused(Refusal::NotFound);
   };
   if !proven_by_launcher(
@@ -4257,6 +4346,7 @@ fn wire_landing_stage(state: DbLandingState) -> slates_ipc::protocol::LandingSta
     DbLandingState::Partial => Stage::Partial,
     DbLandingState::Refused => Stage::Refused,
     DbLandingState::Aborted => Stage::Aborted,
+    DbLandingState::Superseded => Stage::Superseded,
   }
 }
 
@@ -4272,6 +4362,7 @@ fn landing_state_name(state: DbLandingState) -> String {
     DbLandingState::Partial => "partial",
     DbLandingState::Refused => "refused",
     DbLandingState::Aborted => "aborted",
+    DbLandingState::Superseded => "superseded",
   }
   .to_owned()
 }

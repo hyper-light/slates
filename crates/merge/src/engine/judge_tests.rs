@@ -154,7 +154,7 @@ fn seen(green: &mut Green) -> Seen {
 fn landed(green: &mut Green, edits: &[Edit], id: u64) -> u64 {
   let inc = work(green, green.head(), edits, id);
   match green.submit(&inc) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("not accepted: {other:?}"),
   }
 }
@@ -189,7 +189,7 @@ fn assert_a_held_verdict_commits_as_a_submit_would(green: &mut Green, mut submit
   assert_eq!(answered.1.as_deref(), Some(held.applied()));
   let committed = green
     .commit_judged(held)
-    .map(|(version, applied)| (Outcome::Accepted { version }, Some(applied)));
+    .map(|(version, applied)| (committed_as(green, version), Some(applied)));
   assert_eq!(committed, Ok(answered));
   assert_eq!(seen(green), seen(&mut submitted));
 }
@@ -243,7 +243,7 @@ fn assert_conflicts_and_retries_are_answered(green: &mut Green) {
 /// Submits `inc`, accepted: the version made.
 fn landed_increment(green: &mut Green, inc: &Increment) -> u64 {
   match green.submit(inc) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("not accepted: {other:?}"),
   }
 }
@@ -290,6 +290,16 @@ struct Census {
   conflicts: u64,
 }
 
+/// The outcome a submit answers for a verdict committed as `version`: `Identical` where the version changed nothing
+/// (A-782), else `Accepted`.
+fn committed_as(green: &Green, version: u64) -> Outcome {
+  if green.changed_nothing_at(version) == Some(true) {
+    Outcome::Identical { version }
+  } else {
+    Outcome::Accepted { version }
+  }
+}
+
 /// `inc` judged on `green` and, when accepted, committed: answered as a submit answers, counted.
 fn judged_and_committed(
   green: &mut Green,
@@ -302,7 +312,7 @@ fn judged_and_committed(
       let (version, applied) = green
         .commit_judged(held)
         .map_err(|moved| TestCaseError::fail(format!("{moved:?}")))?;
-      (Outcome::Accepted { version }, Some(applied))
+      (committed_as(green, version), Some(applied))
     }
     Judgment::AcceptedBefore { version } => {
       census.accepted_before += 1;

@@ -306,7 +306,7 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
     }
   } else if !parent.anchor_alive() {
     slates_machine::log_line!("slates daemon: the anchor is gone; leaving");
-    release_the_anchors_objects();
+    release_the_anchors_objects(daemon.shards().len());
   } else {
     slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
@@ -318,7 +318,12 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
 /// on macOS an object outlives every holder while its name exists, so a `SIGKILL`ed anchor left both in the kernel with
 /// every page the daemon had written (21 GB of the big Studio after four killed anchors, 2026-11-20). Done before the
 /// stop, so a daemon killed while it stops has already let them go; its own mappings keep the bytes until it exits.
-fn release_the_anchors_objects() {
+///
+/// The content pool's extents are objects of their own where the platform gives one back whole (macOS,
+/// `slates_mem::extent_handoff`), named from the content object's name and the extent's id: every id the layout can
+/// name, `partitions × POOL_EXTENTS_PER_PARTITION`, is released with it (a bounded count; a name never made is no
+/// refusal).
+fn release_the_anchors_objects(partitions: usize) {
   for variable in [
     slates_anchor::segment::ENV_HANDOFF,
     slates_anchor::segment::ENV_CONTENT,
@@ -330,6 +335,18 @@ fn release_the_anchors_objects() {
       Ok(descriptor) => slates_mem::Handoff::Descriptor(descriptor),
       Err(_) => slates_mem::Handoff::Name(value),
     };
+    if variable == slates_anchor::segment::ENV_CONTENT {
+      let ids = partitions.saturating_mul(slates_anchor::layout::POOL_EXTENTS_PER_PARTITION);
+      for id in (0..ids).filter_map(|id| u16::try_from(id).ok()) {
+        if let Some(extent) = slates_mem::extent_handoff(&handoff, id)
+          && let Err(refusal) = slates_mem::unlink_handoff(&extent)
+        {
+          slates_machine::log_line!(
+            "slates daemon: the anchor's content extent {id} was not released: {refusal}"
+          );
+        }
+      }
+    }
     if let Err(refusal) = slates_mem::unlink_handoff(&handoff) {
       slates_machine::log_line!(
         "slates daemon: the anchor's {variable} was not released: {refusal}"

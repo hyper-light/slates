@@ -188,7 +188,7 @@ impl ChunkArena {
   pub fn new(granule: usize) -> Self {
     // Checked, never wrapped: 2^64 arenas cannot be made in practice, but a spent space refuses by type.
     let identity = ARENAS
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
         taken.checked_add(1)
       })
       .ok()

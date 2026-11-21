@@ -2271,8 +2271,8 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   if !(is_forwardable_read(body) || is_forwardable_write(body)) {
     return None;
   }
-  // A work over a green another node owns is made here, on the client's own partition, and admitted by the green's
-  // owner (A-697 part a; with `WorkHome::on_holders` on, until its last piece).
+  // A work over a green another node owns and this node replicates is made here, on the client's own partition, and
+  // admitted by the green's owner (A-697 part a; the rule "replicated here", part f).
   if let RequestBody::CreateWork { green, .. } = body
     && crate::work_home::green_elsewhere(state, to_db_volume(*green))
   {
@@ -4985,6 +4985,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ImportRefused { .. } => "import_refused",
     Refusal::CopyRefused { .. } => "copy_refused",
     Refusal::CredentialUnreplicated { .. } => "credential_unreplicated",
+    Refusal::LandingSuperseded { .. } => "landing_superseded",
   }
 }
 
@@ -6615,7 +6616,7 @@ pub(crate) fn find(
 /// budget is the formula's product measured at the moment of need: the mutation rate times a reader's lag times the
 /// record size. Until 2026-10-23 every volume reserved a fixed 10‰ of its quota here, whatever it needed. Shared by
 /// creation and recovery: a rebuilt journal starts empty, at the floor.
-fn journal_floor_bytes(state: &ShardState) -> usize {
+pub(crate) fn journal_floor_bytes(state: &ShardState) -> usize {
   derived!(
     usize::try_from(state.config.geometry.page)
       .unwrap_or(1)
@@ -6879,6 +6880,35 @@ pub(crate) fn admit(
   require_locked: bool,
   base: Option<&str>,
 ) -> Result<Admitted, Box<ReplyBody>> {
+  let base = match base {
+    None => AdmitBase::Scratch,
+    Some(path) => AdmitBase::Path(path),
+  };
+  admit_over(state, principal, (size, names, require_locked), base)
+}
+
+/// What an admitted volume is made over: nothing (a scratch volume), a host directory, or a tree the shard holds, lent
+/// per request (a mounted work's green version, A-774; `slates_vfs::host::tree`), named by its identity.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmitBase<'a> {
+  /// A scratch volume.
+  Scratch,
+  /// An overlay over the host directory at this path.
+  Path(&'a str),
+  /// An overlay over a tree the shard holds, of this identity.
+  Tree {
+    /// The tree's identity: its fingerprints' device.
+    identity: u64,
+  },
+}
+
+/// [`admit`] over any [`AdmitBase`].
+pub(crate) fn admit_over(
+  state: &mut ShardState,
+  principal: &Principal,
+  (size, names, require_locked): (SizeClass, NamePolicy, bool),
+  base: AdmitBase<'_>,
+) -> Result<Admitted, Box<ReplyBody>> {
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
@@ -6970,8 +7000,32 @@ pub(crate) fn admit(
     }
   };
   let config = volume_config(state, names, quota);
-  let (mut volume, host) = match base {
-    None => match Volume::create(&mut state.store, config) {
+  let (mut volume, mut host) = match base {
+    AdmitBase::Tree { .. } => {
+      let probe = slates_vfs::host::tree::TreeHost::new(0, (0, 0));
+      let made = Volume::create_overlay(
+        &mut state.store,
+        config,
+        BaseConfig {
+          root: probe.root(),
+          facts: probe.tree_facts(),
+          large_class_bytes: state.config.large_class_bytes,
+        },
+      );
+      match made {
+        Ok(v) => (v, None),
+        Err(e) => {
+          return Err(Box::new(give_back(
+            state,
+            reservation,
+            version_credit,
+            metadata_credit,
+            refusal_of_vfs(&e),
+          )));
+        }
+      }
+    }
+    AdmitBase::Scratch => match Volume::create(&mut state.store, config) {
       Ok(v) => (v, None),
       Err(e) => {
         return Err(Box::new(give_back(
@@ -6983,7 +7037,7 @@ pub(crate) fn admit(
         )));
       }
     },
-    Some(path) => match open_base(state, path, config) {
+    AdmitBase::Path(path) => match open_base(state, path, config) {
       Ok(pair) => pair,
       Err(reply) => {
         return Err(Box::new(give_back(
@@ -7008,6 +7062,12 @@ pub(crate) fn admit(
       version_credit,
       metadata_credit,
       refusal_of_vfs(&e),
+    )));
+  }
+  // A tree's entries show the volume's own owner, so its user may write what it mounts (A-774).
+  if let AdmitBase::Tree { identity } = base {
+    host = Some(BaseHost::Tree(Box::new(
+      slates_vfs::host::tree::TreeHost::new(identity, tree_owner(principal)),
     )));
   }
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
@@ -8476,6 +8536,7 @@ fn create_work_here(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9195,8 +9256,8 @@ pub(crate) fn compose_increment(
     &mut doc,
     &mut plan,
     &mut slates_merge::refine::Refiner::new(),
-    &mut |path| {
-      let before = files_base.file(path).ok().flatten()?;
+    &mut |base_path, path| {
+      let before = files_base.file(base_path).ok().flatten()?;
       let after = files.get(files_base, path).ok().flatten()?;
       Some((before, after))
     },
@@ -9264,12 +9325,14 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::Submitted {
         version: None,
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::Submitted {
@@ -9277,6 +9340,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         conflicts,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::SubmittedSigned {
@@ -9285,6 +9349,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::SubmittedSigned {
         version: None,
@@ -9292,6 +9357,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::SubmittedSigned {
@@ -9300,6 +9366,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::Rebased {
@@ -9684,6 +9751,7 @@ fn conflicted_reply(
       verification: signed.verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   } else {
     ReplyBody::Submitted {
@@ -9691,6 +9759,7 @@ fn conflicted_reply(
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   }
 }
@@ -9708,6 +9777,40 @@ pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
     } => Some(*version),
     _ => None,
   }
+}
+
+/// Notes on the work a submission an ask policy held for approval (A-785, the session log's mark), at the work's
+/// revision now; any other answer leaves the mark as it is, to stand or go stale with the revision.
+fn note_held(state: &mut ShardState, work_id: DbVolumeId, reply: &ReplyBody) {
+  let ReplyBody::MergeApprovalRequired {
+    identity, paths, ..
+  } = reply
+  else {
+    return;
+  };
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.held = Some(crate::state::HeldMerge {
+      identity: *identity,
+      paths: *paths,
+      revision: work.revision,
+    });
+  }
+}
+
+/// Whether a submit's reply says its accepted increment changed nothing (A-782).
+fn accepted_identical(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Submitted {
+      version: Some(_),
+      identical: true,
+      ..
+    } | ReplyBody::SubmittedSigned {
+      version: Some(_),
+      identical: true,
+      ..
+    }
+  )
 }
 
 /// What a submit brings its verdict from its write policy (A-285): its work's own merge mode, read on the work's shard
@@ -9870,6 +9973,7 @@ fn settle_submit(
   reply: ReplyBody,
 ) -> ReplyBody {
   let Some(version) = accepted_version(&reply) else {
+    note_held(state, work_id, &reply);
     return kept_conflict(state, work_id, reply);
   };
   // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
@@ -9890,9 +9994,11 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
-  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on, and whether
+  // it changed nothing (A-782).
+  let identical = accepted_identical(&reply);
   if let Some(work) = state.works.get_mut(&work_id) {
-    work.accepted = Some(version);
+    work.accepted = Some((version, identical));
   }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
@@ -10096,6 +10202,7 @@ fn judge_submission(
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }
+      | slates_merge::engine::Outcome::Identical { .. }
   ));
   let verdict = match state.current_span {
     Some(cause) => state
@@ -10110,7 +10217,10 @@ fn judge_submission(
   };
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
-    slates_merge::engine::Outcome::Accepted { version } => {
+    // An identical increment commits its (empty) version as an accept does, so retries and the chain's replay answer
+    // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
+    slates_merge::engine::Outcome::Accepted { version }
+    | slates_merge::engine::Outcome::Identical { version } => {
       // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
       // (`vcs_store::svn_made`).
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
@@ -10146,6 +10256,16 @@ fn judge_submission(
         inc.evidence,
         (completion, Some(sealed.work)),
       );
+      // A verdict a holder computed came with its increment, which that holder holds as the version's inputs (A-697 (1)):
+      // its shipment carries none of them back. The work's id names that holder's member.
+      if sealed.computed.is_some() {
+        crate::merge_service::inputs_held_by(
+          state,
+          green_id,
+          version,
+          ObjectId(sealed.work.bytes).creator(),
+        );
+      }
       // True the retention charge up to what the commit retained (the secured surplus credited). A settle after an
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
       // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
@@ -10647,7 +10767,7 @@ fn admit_work(
 }
 
 /// The engine a work's base reads are answered from (A-247): the green's own, on its owner shard; or, for a work on a
-/// holder node (A-697 part a, with `WorkHome::on_holders` on), this node's replica of the green, on the control shard
+/// holder node (A-697 part a; `work_home::green_elsewhere`), this node's replica of the green, on the control shard
 /// that holds it, which `work_home::answer_on_owner` has checked holds the work's base version.
 enum BaseEngine<'a> {
   Owned(crate::greens::GreenRef<'a>),
@@ -10670,7 +10790,7 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
   if let Some(engine) = state.greens.get(&green) {
     return Some(BaseEngine::Owned(engine));
   }
-  if !state.work_home.on_holders {
+  if !crate::work_home::green_elsewhere(state, green) {
     return None;
   }
   state
@@ -14597,7 +14717,7 @@ pub(crate) fn adopt_taken_over_green(
     );
     return Ok(());
   }
-  record_taken_over_completions(state, &completions);
+  record_taken_over_completions(state, id, &completions);
   let object = ObjectId(id.bytes);
   let placed = state.merge.placed.entry(object).or_insert(head);
   *placed = (*placed).max(head);
@@ -14730,6 +14850,7 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 /// typed and runs nothing (the work is gone with its owner). Counted.
 fn record_taken_over_completions(
   state: &mut ShardState,
+  green: DbVolumeId,
   completions: &[(u64, crate::merge_service::SubmitCompletion)],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
@@ -14758,6 +14879,7 @@ fn record_taken_over_completions(
           conflicts: Vec::new(),
           conflicts_elided: 0,
           verdict: 0,
+          identical: crate::merge_service::identical_at(state, green, version),
         },
         work,
       );
@@ -15910,7 +16032,7 @@ pub fn longest_recordable_base() -> usize {
 
 /// `reason` as a recovery cause records it: whole, as every reason the daemon builds is, or cut at a character boundary
 /// to [`RECOVERY_REASON_BYTES`].
-fn recorded_reason(mut reason: String) -> String {
+pub(crate) fn recorded_reason(mut reason: String) -> String {
   let mut keep = reason.len().min(RECOVERY_REASON_BYTES);
   while !reason.is_char_boundary(keep) {
     keep = keep.saturating_sub(1);
@@ -17480,26 +17602,53 @@ async fn rebuild_record(
     Role::Work { green, .. } => {
       rebuild_work(state, record, green);
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+      // A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127).
+      if let Some(pin) = crate::mounted_work::recovered_pin(state, record.id)
+        && images.contains_key(&record.id.bytes)
+      {
+        match rebuild_volume(
+          state,
+          record,
+          images.get(&record.id.bytes),
+          claims,
+          Some(pin),
+        ) {
+          Ok(prefix) => {
+            *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+            state.merge.mounted.insert(record.id, pin);
+          }
+          Err(cause) => {
+            slates_machine::log_line!(
+              "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
+              state.partition,
+              record.name
+            );
+            state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
+          }
+        }
+      }
     }
-    Role::Plain => match rebuild_volume(state, record, images.get(&record.id.bytes), claims) {
-      Ok(prefix) => {
-        rebuilt.volumes = rebuilt.volumes.saturating_add(1);
-        *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
-        rebuilt.snapshots_trimmed = rebuilt
-          .snapshots_trimmed
-          .saturating_add(trim_unrecorded_snapshots(state, record.id));
+    Role::Plain => {
+      match rebuild_volume(state, record, images.get(&record.id.bytes), claims, None) {
+        Ok(prefix) => {
+          rebuilt.volumes = rebuilt.volumes.saturating_add(1);
+          *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+          rebuilt.snapshots_trimmed = rebuilt
+            .snapshots_trimmed
+            .saturating_add(trim_unrecorded_snapshots(state, record.id));
+        }
+        Err(cause) => {
+          rebuilt.skipped = rebuilt.skipped.saturating_add(1);
+          slates_machine::log_line!(
+            "slates-server: partition {}: volume {} not rebuilt: {cause:?}",
+            state.partition,
+            record.name
+          );
+          state.unrecovered.insert(record.id, cause);
+          return false;
+        }
       }
-      Err(cause) => {
-        rebuilt.skipped = rebuilt.skipped.saturating_add(1);
-        slates_machine::log_line!(
-          "slates-server: partition {}: volume {} not rebuilt: {cause:?}",
-          state.partition,
-          record.name
-        );
-        state.unrecovered.insert(record.id, cause);
-        return false;
-      }
-    },
+    }
   }
   true
 }
@@ -18627,6 +18776,7 @@ fn install_rebuilt_work(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
 }
@@ -19796,8 +19946,13 @@ fn rebuild_volume(
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
+  tree: Option<crate::mounted_work::MountPin>,
 ) -> Result<u16, RecoveryCause> {
-  let size = wire_size(record.policy.size);
+  // A mounted work's slot has no quota of its own (`crate::mounted_work`), whatever its record's size says.
+  let size = match tree {
+    Some(_) => crate::mounted_work::MOUNT_SIZE,
+    None => wire_size(record.policy.size),
+  };
   let reservation = match size {
     SizeClass::Bounded { limit } => Some(
       state
@@ -19837,7 +19992,7 @@ fn rebuild_volume(
       )));
     }
   };
-  let built = build_recovered_volume(state, record, image, claims, size);
+  let built = build_recovered_volume(state, record, image, claims, (size, tree));
   let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
     Err(cause) => {
@@ -19947,8 +20102,11 @@ fn build_recovered_volume(
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
-  size: SizeClass,
+  (size, tree): (SizeClass, Option<crate::mounted_work::MountPin>),
 ) -> Result<(Volume, Option<BaseHost>, u16), RecoveryCause> {
+  if let Some(pin) = tree {
+    return crate::mounted_work::rebuild_mounted(state, record, image, claims, (size, pin));
+  }
   let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
@@ -20500,6 +20658,15 @@ fn stamp_root_owner(
   };
   let root = volume.root_inode(store)?;
   volume.chown(store, root, *uid, creator_gid())
+}
+
+/// The owner a tree base's entries show for a volume provisioned by `principal` (A-774): its root's owner, as
+/// [`stamp_root_owner`] stamps it, so a mount and its recovery fingerprint the tree alike.
+pub(crate) fn tree_owner(principal: &Principal) -> (u32, u32) {
+  match principal {
+    Principal::Uid { uid, .. } => (*uid, creator_gid()),
+    _ => (0, 0),
+  }
 }
 
 /// The group a provisioned volume's root takes: this process's effective gid. The rendezvous admits
@@ -24059,11 +24226,11 @@ mod tests {
         .unwrap()
         .clone();
       state.content = None;
-      let scratch = super::build_recovered_volume(state, &record, None, None, size).err();
+      let scratch = super::build_recovered_volume(state, &record, None, None, (size, None)).err();
       record.base = super::BaseRecord::Path {
         path: ".".to_owned(),
       };
-      let overlay = super::build_recovered_volume(state, &record, None, None, size).err();
+      let overlay = super::build_recovered_volume(state, &record, None, None, (size, None)).err();
       (scratch, overlay)
     });
     assert_eq!(scratch, Some(slates_ipc::protocol::RecoveryCause::NoImage));
@@ -24114,7 +24281,8 @@ mod tests {
       let before = (state.store.inodes.len(), state.store.dirs.len());
       let small = super::SizeClass::Bounded { limit: 64 };
       let refusal =
-        super::build_recovered_volume(state, &record, Some(&image), Some(&claims), small).err();
+        super::build_recovered_volume(state, &record, Some(&image), Some(&claims), (small, None))
+          .err();
       let after = (state.store.inodes.len(), state.store.dirs.len());
       (refusal, before, after)
     });

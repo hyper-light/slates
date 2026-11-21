@@ -9,8 +9,9 @@
 //! where its entry begins ([`Push::admit_placed`]), never inflated beside it: git/git's v1.5.0 pack is 9.4 MiB, its
 //! objects 304.6 MiB inflated. An object is read from the pack where it lies ([`Push::bytes`], `store::packed::read`),
 //! a chain resolved from the objects read lately ([`super::packed::Recent`], held to the pack's length). A push's
-//! staging puts each object new to the repository in the content store as its row is written
-//! ([`Push::put_placed`]): what lands is held there; the in-flight push held its pack alone.
+//! staging puts the pack in the content store as one content, a window a unit ([`Push::set_stored_pack`]), and each
+//! object's row names where it lies there (A-722's record v4, rows by pack place): what lands is the pack, never its
+//! objects inflated.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -111,6 +112,9 @@ pub(crate) struct Staged {
   pub(crate) positions: BTreeMap<ObjectId, u64>,
   /// The repository's next position when the fork was made, which the positions follow.
   pub(crate) base: u64,
+  /// The runs of positions given each type, `[start, end)` (A-639: by type, then id): what a position's type is read
+  /// from once the push lands, with no row read (`Repository::kind_at`). One run a type the push brought.
+  pub(crate) kinds: Vec<(u64, u64, Kind)>,
 }
 
 /// Where a held object's bytes are.
@@ -147,8 +151,6 @@ struct Placed {
   len: u64,
   /// Its content identity.
   identity: ContentId,
-  /// Its root in the content store once put there ([`Push::put_placed`]), held by the push until its row holds it.
-  stored: Option<ContentId>,
 }
 
 /// A push's objects (module docs).
@@ -168,16 +170,12 @@ pub struct Push {
   pack: Vec<u8>,
   /// The objects of `pack`, by name. One entry an object: what names it to where it lies.
   placed: BTreeMap<ObjectId, Placed>,
-  /// The pack's objects whose rows landed, their holds still to give back a unit at a time ([`Push::give_back_turn`]):
-  /// none unless the push gives back in turns.
-  set_aside: BTreeMap<ObjectId, Placed>,
-  /// Whether the pack's holds are given back in turns after the landing ([`Push::give_back_in_turns`]).
-  in_turns: bool,
-  /// The objects of `pack` in the order they were admitted: the order the pack's reader resolved them, each delta after
-  /// its base. Kept so staging reads each object just after its base, which the objects read lately then hold, rather
-  /// than its whole chain again in its name's order (git/git's v1.5.0: chains 12.6 deep on average); one name an
-  /// object.
-  order: Vec<ObjectId>,
+  /// The pack put in the content store as one content by the push's staging, a window a unit (A-722's record v4: rows
+  /// name their objects by where they lie in it, never a second copy inflated): its identity and length, held by the
+  /// push until its rows hold it.
+  stored_pack: Option<(ContentId, u64)>,
+  /// The longest object of its own pack: what a read of its objects, and once it lands its repository's, is held to.
+  largest: u64,
   /// The buffers an object is read from the pack with, and the objects read lately (`packed::Scratch`): reused read
   /// after read; what it keeps lately is held to the pack's length. In a cell because a read is a look, not a change.
   reading: RefCell<Scratch>,
@@ -195,9 +193,8 @@ impl Push {
       staged: None,
       pack: Vec::new(),
       placed: BTreeMap::new(),
-      order: Vec::new(),
-      set_aside: BTreeMap::new(),
-      in_turns: false,
+      stored_pack: None,
+      largest: 0,
       reading: RefCell::new(Scratch::default()),
     }
   }
@@ -280,6 +277,7 @@ impl Push {
     if incoming.kind == Kind::Commit {
       self.read_commit(id, incoming.content, store.room())?;
     }
+    self.largest = self.largest.max(len);
     self.placed.insert(
       id,
       Placed {
@@ -287,10 +285,8 @@ impl Push {
         offset,
         len,
         identity,
-        stored: None,
       },
     );
-    self.order.push(id);
     self.sealed = false;
     self.deepest = self.deepest.max(incoming.depth);
     Ok((id, Admitted::New))
@@ -362,34 +358,15 @@ impl Push {
     };
     let mut out = Vec::new();
     let mut reading = self.reading.borrow_mut();
+    let source = PushSource { push: self, store };
     packed::read(
-      self,
+      &source,
       (self.own(offset), self.format),
       &bases,
-      (&mut *reading, store.room()),
+      (&mut *reading, self.largest.max(store.room())),
       &mut out,
     )?;
     Ok(out)
-  }
-
-  /// Puts `bytes`, the object of the push's pack held under `id` as [`Push::bytes`] read it, in the content store, held
-  /// by the push until its row holds it (module docs: a push's staging, a unit an object): its root. An object the
-  /// push holds in the store already answers its root, nothing put.
-  pub(crate) fn put_placed(
-    &mut self,
-    store: &mut ContentStore,
-    id: &ObjectId,
-    bytes: &[u8],
-  ) -> Result<Option<ContentId>, ContentRefused> {
-    let Some(placed) = self.placed.get_mut(id) else {
-      return Ok(None);
-    };
-    if let Some(stored) = placed.stored {
-      return Ok(Some(stored));
-    }
-    let root = store.put_object(bytes)?;
-    placed.stored = Some(root);
-    Ok(Some(root))
   }
 
   /// Admits every object `entries` hands in, in order; how many were new to the push.
@@ -538,97 +515,64 @@ impl Push {
     }
   }
 
-  /// The `at`th object of the push's pack in the order it was admitted (the order its reader resolved it), none past the
-  /// last.
-  pub(crate) fn placed_in_order(&self, at: usize) -> Option<ObjectId> {
-    self.order.get(at).copied()
+  /// Whether the push holds an object of its own pack.
+  pub(crate) fn has_placed(&self) -> bool {
+    !self.placed.is_empty()
   }
 
-  /// The content-store root of an object held under `id`: where it is stored, or where its pack's entry was put there
-  /// ([`Push::put_placed`]); none for an entry not put.
-  pub(crate) fn stored(&self, id: &ObjectId) -> Option<ContentId> {
+  /// Where the object held under `id` is in the content store: its own content, for one held whole; where its entry
+  /// lies in the push's pack once the staging has put the pack there ([`Push::set_stored_pack`]); none before.
+  pub(crate) fn stored(&self, id: &ObjectId) -> Option<StoredAt> {
     match self.placed.get(id) {
-      Some(placed) => placed.stored,
+      Some(placed) => {
+        let (pack, len) = self.stored_pack?;
+        Some(StoredAt::InPack(InPack {
+          pack,
+          len,
+          offset: placed.offset,
+        }))
+      }
       None => self
         .quarantine
         .object(id.as_bytes())
-        .map(|(_, content, _)| content),
+        .map(|(_, content, _)| StoredAt::Whole(content)),
     }
   }
 
-  /// Gives back the push's holds once its objects' rows hold them, leaving the push empty. A push that gives back in
-  /// turns ([`Push::give_back_in_turns`]) sets its pack's holds aside instead, for [`Push::give_back_turn`].
+  /// The longest object of the push's own pack.
+  pub(crate) fn largest(&self) -> u64 {
+    self.largest
+  }
+
+  /// The pack as the staging put it in the content store, held by the push: its identity and length.
+  pub(crate) fn stored_pack(&self) -> Option<(ContentId, u64)> {
+    self.stored_pack
+  }
+
+  /// Keeps `identity`, the push's pack the staging put in the content store `len` bytes long, holding it (the put's
+  /// hold) until the push's rows hold it.
+  pub(crate) fn set_stored_pack(&mut self, identity: ContentId, len: u64) {
+    self.stored_pack = Some((identity, len));
+  }
+
+  /// Gives back the push's holds once its objects' rows hold them, leaving the push empty: the stored pack's one hold,
+  /// whatever its objects' count, and each object held whole.
   pub(crate) fn release_holds(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
     self.commits.clear();
-    let placed = if self.in_turns {
-      self.put_aside();
-      Ok(())
-    } else {
-      self.release_placed(store)
-    };
+    let placed = self.release_placed(store);
     self.quarantine.abandon(store).and(placed)
   }
 
-  /// Gives back the pack's holds a unit at a time once its objects land ([`Push::give_back_turn`]) rather than in the
-  /// landing's step: what its owner asks that turns them (a live push's answer, A-722's landing step).
-  pub fn give_back_in_turns(&mut self) {
-    self.in_turns = true;
-  }
-
-  /// One turn of giving back the holds set aside at the landing: a unit at least, then units until `quantum` is spent.
-  /// Whether none is left.
-  pub fn give_back_turn(
-    &mut self,
-    store: &mut ContentStore,
-    quantum: super::hook_view::Quantum<'_>,
-  ) -> Result<bool, ContentRefused> {
-    let deadline = quantum.clock.now_ns().saturating_add(quantum.ns);
-    loop {
-      let Some((_, placed)) = self.set_aside.pop_first() else {
-        return Ok(true);
-      };
-      if let Some(root) = placed.stored {
-        store.release(&root)?;
-      }
-      if quantum.clock.now_ns() >= deadline {
-        return Ok(self.set_aside.is_empty());
-      }
-    }
-  }
-
-  /// The pack's objects set aside, their holds to give back in turns; the pack and its reading let go.
-  fn put_aside(&mut self) {
-    let placed = core::mem::take(&mut self.placed);
-    if self.set_aside.is_empty() {
-      self.set_aside = placed;
-    } else {
-      self.set_aside.extend(placed);
-    }
-    self.let_go();
-  }
-
-  /// Gives back the holds of the pack's entries put in the content store, those set aside included, and the pack,
-  /// leaving no object of it held.
+  /// Gives back the stored pack's hold and lets go of the pack, its objects, their order and its reading.
   fn release_placed(&mut self, store: &mut ContentStore) -> Result<(), ContentRefused> {
-    let mut first = Ok(());
-    let set_aside = core::mem::take(&mut self.set_aside);
-    for placed in core::mem::take(&mut self.placed)
-      .into_values()
-      .chain(set_aside.into_values())
-    {
-      if let Some(root) = placed.stored {
-        first = first.and(store.release(&root).map(drop));
-      }
-    }
-    self.let_go();
-    first
-  }
-
-  /// Lets go of the pack, its order and its reading.
-  fn let_go(&mut self) {
+    let given = match self.stored_pack.take() {
+      Some((identity, _)) => store.release(&identity).map(drop),
+      None => Ok(()),
+    };
+    self.placed = BTreeMap::new();
     self.pack = Vec::new();
-    self.order = Vec::new();
     *self.reading.get_mut() = Scratch::default();
+    given
   }
 
   /// The rows staged, if the push was staged.
@@ -680,6 +624,16 @@ impl Placed {
   }
 }
 
+/// Where an object is in the content store (A-722's record v4): its own content, held whole; or where its entry lies in
+/// a pack held as one content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredAt {
+  /// Its own content: its root.
+  Whole(ContentId),
+  /// An entry of a pack.
+  InPack(InPack),
+}
+
 /// The push's own pack, as its objects are read from it: a piece is the rest of the pack from `offset`.
 impl PackSource for Push {
   fn piece(&self, _pack: &ContentId, _len: u64, offset: u64) -> Option<Cow<'_, [u8]>> {
@@ -689,6 +643,22 @@ impl PackSource for Push {
       .get(offset..)
       .filter(|rest| !rest.is_empty())
       .map(Cow::Borrowed)
+  }
+}
+
+/// Where a push's objects are read from: its own pack, and the packs the repository holds in the content store, which
+/// a thin pack's REF_DELTA base may lie in (A-722's record v4), each by its identity.
+struct PushSource<'a> {
+  push: &'a Push,
+  store: &'a ContentStore,
+}
+
+impl PackSource for PushSource<'_> {
+  fn piece(&self, pack: &ContentId, len: u64, offset: u64) -> Option<Cow<'_, [u8]>> {
+    if *pack == OWN_PACK {
+      return self.push.piece(pack, len, offset);
+    }
+    self.store.piece(pack, len, offset)
   }
 }
 

@@ -89,7 +89,7 @@ fn the_restatement_is_the_submits(
       Rebased::Rebased {
         version, changed, ..
       },
-      Outcome::Accepted { .. },
+      Outcome::Accepted { .. } | Outcome::Identical { .. },
     ) => {
       prop_assert_eq!(version, head);
       restated_is(&before, &changed, &head_files(&accepting))
