@@ -177,3 +177,11 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - Resuming 2 -> 3 -> 4, each red first, landed within ~30 min a piece.
 - A-839 LANDED b5249f883 (merge 6a6483574): macOS content slice without the arena range; one-shard content object 139,264 -> 106,496 MiB (big Studio, red then green). Slip: my A-number claim loop ran `git reset --hard` on my clean state clone (banned; nothing lost); removed from my scripts.
 - NEXT in item 2: image slots (2R), delta log (R), write log (R/4) need growable objects (recovery format) -- design first; then item 3 (pressure seam), item 4 (NFSv3 in-place framing).
+
+## 2026-11-21: brief audit
+- Done: item 1 (segment and its prefault); item 2's GAPS list; A-839 (b5249f883), macOS content slices no longer reserve
+  their arena (one-shard daemon, big Studio: reserved 139,264 -> 106,496 MiB).
+- Open, with plans sent to main (inbox/main-from-w-sizing-brief-remaining.md): 2b, growable image slots, delta log and
+  write log (changes the recovery format); 3, the device-pressure seam; 4, NFSv3 in-place reply framing.
+- Holding for main's go/not now on each: the 11:09 reserve ruling says start no runs, and every red needs a kiln build.
+  The NFS worktree is removed and its branch deleted (nothing was edited in it).
