@@ -7152,3 +7152,20 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   - `stock_hg_pulls_by_a_tag_over_ssh`.
 - **Red:** a tag lookup refused "a .hgtags text not read from the changeset store"; a stream, clone or pull of a pushed
   repository failing `hg verify` (the whole-place change); `vcs_store.hg_lookup_store_asks` unmoved.
+
+## w-sessionlog (2026-11-21 ~11:20 PST), goal 93 git correctness by use -- crates/cli/tests/git_correctness.rs (868bc1fde)
+- Platform: macOS arm64 and Linux x86_64 (a Studio and a Linux runner), RELEASE build of origin/main, git >= 2.50,
+  OpenSSH (SSH rows), git-lfs if present (the LFS row skips loudly without it).
+- Tag kinds (seconds):
+  cargo test --locked --release -p slates-cli --test git_correctness -- --ignored --nocapture every_kind_of_tag
+  Red today (main 4b6df30dc..21f10f3e4): rows push-every-kind-*, refs-*, clone-* FAIL `ref names no tree`. Green once
+  w-git takes tag-of-blob / tag-of-tag (inbox/w-git-from-w-sessionlog-tag-kinds.md).
+- Dataset rounds, one per dataset (each prints PASS/FAIL rows and fails naming every red row):
+  SLATES_TEST_GIT_DATASET=<bare repo> SLATES_TEST_GIT_STEP_SECONDS=3600 \
+    cargo test --locked --release -p slates-cli --test git_correctness -- --ignored --nocapture stock_git_verbs
+  Datasets: (1) git/git whole: `git clone --bare https://github.com/git/git.git` (r16 used f7de81456940, 1,027 refs);
+  (2) the Linux tree, shallow cut: `git clone --bare --depth 50000 https://github.com/torvalds/linux.git` (its shallow
+  and partial rows are the ones main's piece names); a full Linux mirror only on a box with >100 GB free.
+  Red looks like: any FAIL row; r16 predicts on git/git `push-whole` (junio-gpg-pub, v1.0rc1-6 rejected),
+  `ls-remote`, and `clone`/`clone-ssh`/`partial` ("possible repository corruption on the remote side"). Each red row
+  -> w-git as its own inbox file with the row's text.
