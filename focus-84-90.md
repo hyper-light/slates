@@ -1591,3 +1591,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-fed-move stays on the 100k walls. While r48 waits it takes the 300 MB work log, unbounded growth: a counter-named mechanism, red, fix.
   2c32af2b5 was already in w-fed-move's profiled build; the growth survives it.
 - 2026-11-21 02:38 PST LANDED: 2659cfe39 (w-perf: git's repository index is kept up as Mercurial's is, merged a table at a time once built whole, its lends reporting lookups; red: no merge without its arm). The compaction ruling now covers git as well as hg. No agent waiting on main. r48 still queued (no start notice). The MacBook disk is 46 GB.
+- 2026-11-21 02:43 PST
+  - LANDED:
+    - 772395004 (BENCHMARKS: hg's one-changeset pull 4.2 s -> 0.243 s best, hg serve 0.189 s, every run shown; still 1.29x stock).
+    - 5ddb0e3c3 (w-svn B2 (b) P1: a commit brings back a stored text the content store let go).
+  - RUN: w-work-mount's C1 WinFsp test can't reach jupiter from Studio-2 (10 kiln refusals), so main runs it from the MacBook as kiln r1 on jupiter: a fresh clone of agents/w-work-mount-win (0cbef8441), slates-server's build warnings counted, then a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save. The result goes to w-work-mount.
