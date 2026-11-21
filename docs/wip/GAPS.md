@@ -67,8 +67,10 @@
 > (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
 > depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
 > adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
-> pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + the pressure hold) keeping
-> the burst's free extents, whose free pages macOS only marks reusable. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
+> fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
+> ea004b541). The anchor's content object held 0-2 MiB throughout, so the extents go back; what stays is the process's
+> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -253,6 +255,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-793 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a change
+> re-anchors its path's content history on the new block (`history::reanchor`), so the history keeps what a change
+> overwrote, not the earlier file; A-728 part 2's splice and seal are replaced. At 100,000 clients: `BudgetExceeded`
+> 94,877 to 0, accepted 5,123 to 29,795, verdicts 13 to 131 a second, oracle clean. Open (goal 86b's next bound): the
+> 70,205 clients that met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases): the
+> client node's merge budget (`green_chain_bytes`, 373 MB a partition, which work logs share) filled; a first-occurrence
+> log line (`Partition::merge_budget_held`) names what holds it at the next run. Still open from A-792: every p99 is
+> seconds to minutes (the cycle's 677 s), CreateWork p50 25 s.
 >
 > **A-792 (2026-11-20, w-fed-move; goal 86b, found by use: the many-client rung on one primary and two replicas over
 > the Linux kernel).** FIXED: a green listed at its head reads the directory's subtree (`Green::head_under`, one descent
