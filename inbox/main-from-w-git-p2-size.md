@@ -32,3 +32,15 @@ Several pieces; the engine half is the larger, and the git half can go alongside
 ## Order
 I start the git half now against the interface above, the `TreeSource` and the deferred create, behind the engine's
 `is_materialized`. It lands once the engine half does, red to green on git/git's push. No P1.
+
+## r52 meanwhile: git/git's branches only, on main ca444739c (Studio-2, release, 07:10 PST)
+- Push of the 8 branches (the whole 611 MB history): landed in 72.5 s, code 0, no watchdog kill.
+- Mirror clone right after: 465.1 s, code 0, 8 refs, `fsck --connectivity-only` clean.
+- The clone's time: `vcs_store.git_derive.turns` 3,024,021 for 8 versions derived (my derivation runs about a unit a
+  turn, each turn paying a lend, a settle and a yield), and `git_encode.turns` 992,574 with `units_past_budget`
+  844,380 (A-718's encoder).
+
+Proposal while w-rewrite-ops answers on the engine half: pace my derivation by A-783's `slates_pace` (run units to the
+step ceiling when nobody waits on the shard, yield at the quantum when someone does), as the push build does. Red: the
+turns a derivation of a long history takes, counted, and the clone's time. Encoding's units past budget are A-718's; I'd
+name them in GAPS for their owner unless you want them with this.
