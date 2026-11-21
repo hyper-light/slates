@@ -402,9 +402,15 @@ pub(crate) fn create_repository(
 const NEEDS_A_STORE: &str = "a Mercurial repository's history is kept on the node's changeset store: start the daemon \
                              with --vcs-store DIR";
 
+/// Format: the refusal's words for a git repository a daemon without a changeset store cannot keep (C5; the same
+/// ruling: one rule for all three tools).
+const GIT_NEEDS_A_STORE: &str = "a git repository's history is kept on the node's changeset store: start the daemon \
+                                 with --vcs-store DIR";
+
 /// A repository a daemon without a changeset store refuses (main's ruling of 2026-11-20, decision 1): a Mercurial or a
 /// Subversion repository's history is the node's store (C1, C2), and a register-held copy for a daemon without one
-/// would be a second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`; git's as its C item lands.
+/// would be a second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`, for all three tools (git's
+/// since C5: its pushes land on the store, A-767).
 fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
   if state.vcs_disk.is_some() {
     return None;
@@ -414,7 +420,9 @@ fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
     VcsTool::Mercurial => Some(Refusal::Unsupported {
       feature: NEEDS_A_STORE.to_owned(),
     }),
-    VcsTool::Git => None,
+    VcsTool::Git => Some(Refusal::Unsupported {
+      feature: GIT_NEEDS_A_STORE.to_owned(),
+    }),
   }
 }
 
@@ -2523,10 +2531,10 @@ mod tests {
     }
   }
 
-  /// C1, C2 (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1). Do: on a daemon started without
-  /// a changeset store, create a Mercurial, a Subversion and a git repository. Expect Mercurial's and Subversion's
-  /// refused `Unsupported`, each naming `--vcs-store`, and no repository recorded for either; git's created. Red before:
-  /// the daemon made a Mercurial repository whose history it kept in its register.
+  /// C1, C2, C5 (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1: one rule for all three tools).
+  /// Do: on a daemon started without a changeset store, create a Mercurial, a Subversion and a git repository. Expect
+  /// each refused `Unsupported`, naming `--vcs-store`, and no repository recorded for any. Red before: the daemon made a
+  /// Mercurial repository whose history it kept in its register, and (before C5's part 2) a git one.
   #[test]
   fn a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag() {
     let (hg, svn, git, recorded) = crate::daemon::audit_on_shard(|state| {
@@ -2543,7 +2551,7 @@ mod tests {
           },
         )
       });
-      let recorded = ["Mercurial", "Subversion"].map(|name| {
+      let recorded = ["Mercurial", "Subversion", "Git"].map(|name| {
         state
           .db
           .partition()
@@ -2554,14 +2562,13 @@ mod tests {
       let [hg, svn, git] = made;
       (hg, svn, git, recorded)
     });
-    for reply in [hg, svn] {
+    for reply in [hg, svn, git] {
       let Refusal::Unsupported { feature } = refusal(reply) else {
         panic!("refused by kind");
       };
       assert!(feature.contains("--vcs-store"), "{feature}");
     }
-    assert!(matches!(git, ReplyBody::GreenCreated { .. }), "{git:?}");
-    assert_eq!(recorded, [false, false]);
+    assert_eq!(recorded, [false, false, false]);
   }
 
   /// A-644 (§4.17.2 "Protected branches", configured through A-622's policy). Do: set a git repository's policy with
