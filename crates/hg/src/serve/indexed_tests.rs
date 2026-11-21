@@ -104,7 +104,6 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
-    stored_logs: true,
   }
 }
 
@@ -321,7 +320,9 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -450,7 +451,6 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
-    stored_logs: true,
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -761,7 +761,6 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
-    stored_logs: true,
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -1018,7 +1017,6 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
-    stored_logs: true,
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1089,10 +1087,9 @@ fn streamed(answer: &[u8]) -> Streamed {
   (status, sent)
 }
 
-/// A changeset store as a stream asks it, over an imported index: every revision kept whole, as a push's changegroup
-/// holds a delta against the null base (7.2's `mdiff.trivialdiffheader`: one hunk replacing nothing at 0, then the
-/// text), its place that hunk under its text's own identity, so the stream's bytes are the whole rendering's
-/// (`render::revlogs`).
+/// A changeset store as a stream asks it, over an imported index: every revision kept whole, its place its raw text
+/// under its text's own identity (the store's contract for a whole, A-767 C1), so the stream's bytes are the whole
+/// rendering's (`render::revlogs`).
 struct WholeTexts<'s> {
   index: &'s crate::index::HgIndex,
   store: &'s slates_vcs::ContentStore,
@@ -1113,7 +1110,7 @@ impl crate::render::StoredSource for WholeTexts<'_> {
   fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
     places
       .iter()
-      .map(|place| trivial_hunk(self.texts.get(&place.payload)?))
+      .map(|place| self.texts.get(&place.payload).cloned())
       .collect()
   }
 }
@@ -1137,7 +1134,7 @@ impl WholeTexts<'_> {
       let mut text = Vec::new();
       crate::import::record::write_text(&mut text, self.store, &kept);
       let identity = *blake3::hash(&text).as_bytes();
-      let len = u64::try_from(trivial_hunk(&text)?.len()).ok()?;
+      let len = u64::try_from(text.len()).ok()?;
       self.texts.insert(identity, text);
       rows.push(Some(crate::render::StoredRevision {
         text: identity,
@@ -1151,21 +1148,6 @@ impl WholeTexts<'_> {
     }
     Some(rows)
   }
-}
-
-/// `text` as a changegroup holds a delta against the null base: one hunk replacing bytes 0 to 0 with it (7.2's
-/// `mdiff.trivialdiffheader`, three big-endian words), then the text; an empty text as no hunk at all, an empty delta
-/// (read from 7.2's `hg debugbundle --all` of a commit adding an empty file: its delta's length 0).
-fn trivial_hunk(text: &[u8]) -> Option<Vec<u8>> {
-  if text.is_empty() {
-    return Some(Vec::new());
-  }
-  let mut hunk = Vec::with_capacity(text.len().saturating_add(12));
-  for field in [0, 0, u32::try_from(text.len()).ok()?] {
-    hunk.extend_from_slice(&field.to_be_bytes());
-  }
-  hunk.extend_from_slice(text);
-  Some(hunk)
 }
 
 /// The whole-text store of `index`.
@@ -1260,7 +1242,9 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1268,7 +1252,7 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
     let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
     let by_links = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
     let named =
-      super::super::getbundle::named_changegroup(&view, &outgoing, Version::V03, &mut room())
+      super::super::getbundle::named_changegroup_whole(&view, &outgoing, Version::V03, &mut room())
         .unwrap();
     assert_eq!(carried(&by_links), carried(&named), "{name}");
     assert!(!carried(&by_links).is_empty(), "{name}");
@@ -1360,7 +1344,9 @@ fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
   let mut deltas = 0usize;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1413,7 +1399,7 @@ impl crate::render::StoredSource for Deltas<'_> {
           .edits
           .get(&place.payload)
           .cloned()
-          .or_else(|| trivial_hunk(self.whole.texts.get(&place.payload)?))
+          .or_else(|| self.whole.texts.get(&place.payload).cloned())
       })
       .collect()
   }
@@ -1669,3 +1655,100 @@ fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
 
 /// Shape: a step's room small enough that a batch holds one log's rows or one chunk, large enough for an entry.
 const SMALL_ROOM: u64 = 1 << 8;
+
+/// A-767 C1 (main's ruling (A) of 2026-11-21: lookup's `.hgtags` through the changeset store). Do: over `hidden-tag`
+/// (`make-state-fixtures.sh`: a visible head whose `.hgtags` tags the root `seen`, and a pruned, hidden head whose
+/// `.hgtags` alone tags `hidden-only`), read the heads' `.hgtags` from the store and look up both names. Expect one want
+/// of rows naming only the visible head's `.hgtags` revision, then one of texts; `seen` the root, as stock 7.2's `hg log
+/// -r seen` resolved it; `hidden-only` unknown, its hidden head's `.hgtags` never read.
+#[test]
+fn a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_round() {
+  use super::super::lookup::{TagsRead, lookup};
+  use crate::render::Want;
+  let (imported, store) = imported("hidden-tag");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
+  let mut tags = TagsRead::begin(&view, &mut room()).unwrap();
+  let mut asks = Vec::new();
+  while let Some(want) = tags.wants().cloned() {
+    tags.give(view.stored_now(&want).unwrap());
+    asks.push(want);
+  }
+  assert_eq!(asks.len(), 2, "one want of rows, one of texts: {asks:?}");
+  match &asks[0] {
+    Want::Rows { logs } => {
+      assert_eq!(logs.len(), 1);
+      assert_eq!(logs[0].0, b".hgtags");
+      assert_eq!(logs[0].1.len(), 1, "the visible head's .hgtags alone");
+    }
+    other => panic!("rows first, not {other:?}"),
+  }
+  let answer = |key: &str| {
+    let mut out = Vec::new();
+    lookup(&view, Some(&tags), key.as_bytes(), &mut room(), &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+  };
+  assert_eq!(
+    answer("seen"),
+    "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n"
+  );
+  assert_eq!(answer("hidden-only"), "0 unknown revision 'hidden-only'\n");
+}
+
+/// A-767 C1 (main's ruling (A)). Do: over `states`, whose heads hold no `.hgtags`, begin reading the tags over a view
+/// that answers the store only between steps, and look up a name nothing has, in a whole answer too. Expect nothing
+/// asked of the store and the name unknown in 7.2's words.
+#[test]
+fn a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup() {
+  use super::super::lookup::{TagsRead, lookup};
+  let (imported, store) = imported("states");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let tags = TagsRead::begin(&view, &mut room()).unwrap();
+  assert_eq!(tags.wants(), None);
+  let mut out = Vec::new();
+  lookup(&view, Some(&tags), b"nothing", &mut room(), &mut out).unwrap();
+  assert_eq!(out, b"0 unknown revision 'nothing'\n");
+  let whole = TagsRead::now(&view, &mut room()).unwrap();
+  assert_eq!(whole.wants(), None);
+}
+
+/// A-767 C1 (main's ruling (A): one round of wants for all the names a batch looks up). Do: over `hidden-tag`, answer
+/// a `batch` of two lookups that reach the tags, its view answering the store only between steps, its wants answered by
+/// the caller. Expect the batch to wait on the store once, two asks in all (rows, texts) for both lookups, and its
+/// answer `seen`'s node then `nope` unknown.
+#[test]
+fn a_batch_of_lookups_reads_the_tags_once() {
+  use super::super::session::{Batch, BatchStep, Transport};
+  use crate::render::StoreWants;
+  let (imported, store) = imported("hidden-tag");
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let answering = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
+  let mut batch = Batch::begin(b"lookup key=seen;lookup key=nope", &mut room()).unwrap();
+  let mut waits = 0;
+  let mut asks = 0;
+  let answer = loop {
+    match batch.step(&view, Transport::Ssh, &mut room()).unwrap() {
+      BatchStep::Store => {
+        waits += 1;
+        while let Some(want) = batch.wants().cloned() {
+          asks += 1;
+          match answering.stored_now(&want).unwrap() {
+            super::super::getbundle::Given::Rows(rows) => batch.give_rows(rows),
+            super::super::getbundle::Given::Texts(texts) => batch.give_texts(texts),
+            other => panic!("a .hgtags read is given rows or texts, not {other:?}"),
+          }
+        }
+      }
+      BatchStep::Answered(answer) => break answer,
+      BatchStep::Push(_) => panic!("no pushkey call"),
+    }
+  };
+  assert_eq!((waits, asks), (1, 2));
+  assert_eq!(
+    String::from_utf8(answer).unwrap(),
+    "1 c3daaa7ea5f5d20902f12c53611fefce7e15cefa\n;0 unknown revision 'nope'\n"
+  );
+}

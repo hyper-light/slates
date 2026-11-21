@@ -84,11 +84,8 @@ pub trait Repository {
 
   /// The node of the `.hgtags` file revision revision `rev`'s manifest names (7.2's `_readtagcache` reads one at each
   /// head, `crate::tags`); none where its manifest names no `.hgtags`. What it reads is charged to `admission` first.
+  /// Its text is read from the node's changeset store (`lookup::TagsRead`).
   fn tags_file(&self, rev: Rev, admission: &mut Admission) -> Result<Option<Node>, Refusal>;
-
-  /// The bytes of `.hgtags` file revision `node`, its metadata block left out (7.2's `filectx.data()`), charged to
-  /// `admission` before they are read.
-  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal>;
 }
 
 /// Why a request was refused.
@@ -184,6 +181,7 @@ pub(crate) fn node_of(repo: &impl Repository, rev: Rev) -> Result<Node, Refusal>
 }
 
 /// A set of the served view's revisions, a bit each, its words charged before they are made.
+#[derive(Debug)]
 pub(crate) struct RevSet {
   /// The bits, `u64::BITS` revisions a word.
   words: Vec<u64>,

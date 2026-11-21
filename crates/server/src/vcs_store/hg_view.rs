@@ -107,6 +107,14 @@ impl HgStores for ServedViews {
     crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
 
+  async fn answer_wants(
+    &mut self,
+    (_, id, _): (&Generation, RepositoryId, u64),
+    wants: &mut dyn slates_hg::render::StoreWants,
+  ) -> bool {
+    answer_store_wants(wants, id).await
+  }
+
   fn fetch_turn(&self, id: RepositoryId) -> Option<(u64, u64)> {
     crate::state::with_state(|state| {
       (
@@ -117,26 +125,7 @@ impl HgStores for ServedViews {
   }
 }
 
-/// A fetch's paced turn (A-745 rule 2 under A-783, the one primitive every paced path uses): its steps run while the
-/// turn's quantum has room for the next one's estimated cost, and at the quantum's end it asks once whether anyone else
-/// waits on the shard: if someone does it yields there; if no one does it takes another quantum, up to the shard's
-/// ceiling (the watchdog's look). The quantum is a few microseconds (2.2 us on an M4 Max), and a stream's step is one
-/// index entry or one chunk, so a turn that yielded at its first quantum took one step: hg-src's stream was about
-/// 460,000 turns of 64 bytes or a chunk each, each with its view made and its bytes written (r23 on bbcf0f72f: 15.8 s
-/// against stock's 0.44-0.50 s, the serving shard idle two thirds of it). A step's unit is one answer step; its cost
-/// is measured across the exchange's turns (`costs`).
-pub(crate) fn paced_turn(quantum_ns: u64, began: u64) -> slates_pace::Step {
-  let env = slates_pace::Env {
-    clock: slates_rt::futures::now_ns,
-    waiting: slates_rt::futures::others_waiting,
-    quantum_ns,
-    ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum_ns),
-    target_ppm: crate::git_push::target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum_ns),
-  };
-  slates_pace::Step::begin(env, began)
-}
-
-/// Counter: the turns a fetch's streamed answer took over either edge (A-783's paced turn, [`paced_turn`]): a turn
+/// Counter: the turns a fetch's streamed answer took over either edge (A-783's paced turn, [`super::paced_turn`]): a turn
 /// yielding at its first quantum took one step, so a stream of hg-src was about 460,000 of them. Format: a counter name
 /// in the status report.
 pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
@@ -144,6 +133,16 @@ pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 /// Counter: the asks a fetch's streamed answer made of the node's changeset store ([`answer_store_wants`]), each a
 /// batch of rows or of chunks. Format: a counter name in the status report.
 pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
+/// Counter: the file revisions a pull sent whole against the null base, each a text the store made from its chain since
+/// its stored base was neither on the client nor sent earlier in the answer (A-767 C1 step 1b, main's ruling of
+/// 2026-11-21 08:45; `slates_hg::serve::getbundle::Pull`). Format: a counter name in the status report.
+pub(crate) const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
+
+/// Counter: the asks a `lookup` or a `batch` made of the node's changeset store for the heads' `.hgtags` (A-767 C1,
+/// main's ruling (A) of 2026-11-21; `slates_hg::serve::lookup::TagsRead`), each a want of rows or of texts. Format: a
+/// counter name in the status report.
+pub(crate) const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
 
 /// Counter: the nanoseconds a fetch's streamed answer waited on the changeset store's answers, summed over its asks
 /// ([`STORE_ASKS`]). Format: a counter name in the status report.
@@ -153,12 +152,6 @@ pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
 pub(crate) fn turn_taken() {
   let _ = crate::state::with_state(|state| state.count(STREAM_TURNS, 1));
 }
-
-/// The unit kinds a fetch's paced turn measures ([`paced_turn`]): one, an answer's step.
-pub(crate) type TurnCosts = slates_pace::Costs<1>;
-
-/// The one unit kind of a fetch's paced turn: an answer's step.
-pub(crate) const ANSWER_STEP: usize = 0;
 
 /// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store
 /// keeps it), over the shard's handle, as a task: a log's rows by node (`StoreHandle::texts_by_tool`, the `I` rows) and
@@ -231,14 +224,73 @@ pub(crate) async fn answer_store_wants(
         wants.give_chunks(chunks);
       }
       (Want::Chunks { .. }, None) => return false,
+      (Want::Texts { texts, most }, Some(disk)) => {
+        match texts_made(&disk, repository, &texts, most).await {
+          None => return false,
+          Some(MadeTexts::Past) => wants.texts_past(),
+          Some(MadeTexts::Made(made)) => {
+            if !wants.reads_tags() {
+              let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+              let _ = crate::state::with_state(|state| state.count(PULL_WHOLE_TEXTS, whole));
+            }
+            wants.give_texts(made);
+          }
+        }
+      }
+      (Want::Texts { .. }, None) => return false,
     }
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let tags = wants.reads_tags();
     let _ = crate::state::with_state(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
+      if tags {
+        state.count(LOOKUP_STORE_ASKS, 1);
+      }
     });
   }
   true
+}
+
+/// The full texts of a [`texts_made`] read: each made, or past the bytes they could hold together.
+#[derive(Debug)]
+pub(crate) enum MadeTexts {
+  /// Each text, in the order asked.
+  Made(Vec<Vec<u8>>),
+  /// The texts held more than the bytes allowed: none read past them.
+  Past,
+}
+
+/// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains and read
+/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1: a pull's revision sent whole,
+/// a lookup's `.hgtags`), together at most `most` bytes: past them the reading stops, so a hostile or huge text is
+/// never held whole ([`MadeTexts::Past`]). None where the store keeps no such text.
+pub(crate) async fn texts_made(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  texts: &[[u8; 32]],
+  most: u64,
+) -> Option<MadeTexts> {
+  let mut made = Vec::new();
+  made.try_reserve_exact(texts.len()).ok()?;
+  let mut total = 0_u64;
+  for identity in texts {
+    let mut text = Vec::new();
+    loop {
+      let at = u64::try_from(text.len()).ok()?;
+      let piece = disk.text(repository, *identity, at).await.ok()??;
+      if piece.is_empty() {
+        break;
+      }
+      total = total.saturating_add(u64::try_from(piece.len()).ok()?);
+      if total > most {
+        return Some(MadeTexts::Past);
+      }
+      text.extend_from_slice(&piece);
+    }
+    made.push(text);
+  }
+  Some(MadeTexts::Made(made))
 }
 
 /// [`held`], for the tests.
@@ -260,8 +312,6 @@ pub(crate) struct Generation {
   roots: Vec<PhaseHead>,
   /// The register's bookmarks as they stood.
   bookmarks: BookmarkHeads,
-  /// Whether the changeset store kept every revision as it stood (`HgStore::unstored`).
-  stored_logs: bool,
 }
 
 impl Generation {
@@ -305,21 +355,15 @@ pub(crate) fn hold_in(
     return None;
   }
   let (roots, bookmarks) = register_of(state, id, room).ok()?;
-  let (index, stored_logs) = super::within_budget(state, 0, |stores| {
+  let index = super::within_budget(state, 0, |stores| {
     let (content, store) = stores.mercurial(id)?;
-    let stored_logs = !store.unstored;
-    store
-      .index
-      .fork(content)
-      .ok()
-      .map(|index| (index, stored_logs))
+    store.index.fork(content).ok()
   })?;
   Some(Generation {
     id,
     index: Some(index),
     roots,
     bookmarks,
-    stored_logs,
   })
 }
 
@@ -338,7 +382,6 @@ pub(crate) fn lend_held_in<R>(
       roots: &generation.roots,
       bookmarks: &generation.bookmarks,
       publishing: PUBLISHING,
-      stored_logs: generation.stored_logs,
     };
     let view = Indexed::new(index, content, read, room).ok()?;
     Some(step(&view, room))
@@ -358,7 +401,7 @@ fn held(state: &ShardState, id: RepositoryId) -> bool {
 
 /// Runs `step` over repository `id`'s view, made within `room` from what `state` holds now; none when it is not lent
 /// (module docs), an unmade view counted.
-fn lend_in<R>(
+pub(crate) fn lend_in<R>(
   state: &mut ShardState,
   id: RepositoryId,
   room: &mut Admission,
@@ -392,8 +435,18 @@ pub(crate) fn resolved_in(
   name: &[u8],
   room: &mut Admission,
 ) -> Option<Result<Option<Node>, slates_hg::serve::Refusal>> {
+  let tags = match super::hg_tags::owed(state, id, name, room)? {
+    Ok(super::hg_tags::Owed::Ready(tags)) => tags,
+    // The verb's door reads the tags first (`super::hg_tags`); a dispatch that passed no door cannot wait for them.
+    Ok(super::hg_tags::Owed::Read(_)) => {
+      return Some(Err(slates_hg::serve::Refusal::Store {
+        what: "a .hgtags text not read from the changeset store",
+      }));
+    }
+    Err(refusal) => return Some(Err(refusal)),
+  };
   lend_in(state, id, room, |view, room| {
-    slates_hg::serve::lookup::resolve_name(view, name, room)
+    slates_hg::serve::lookup::resolve_name(view, tags.as_ref(), name, room)
   })
 }
 
@@ -412,7 +465,6 @@ pub(crate) fn with_view<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
-    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
@@ -434,7 +486,6 @@ pub(crate) fn with_view_over<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
-    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);

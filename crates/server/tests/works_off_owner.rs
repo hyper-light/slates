@@ -274,8 +274,11 @@ fn submit_when_room(client: &mut Client, work: VolumeId) -> Submitted {
   }
 }
 
-/// Advances the green from `writer` until its chain refuses, a held floor having kept it from folding; the version the
-/// refused submit would have been, its edit still in the work.
+/// Advances the green from `writer` until it is refused, a held floor having kept it from folding; the version the
+/// refused submit would have been, its edit still in the work. Since chain entry format 6 (A-825) an entry names its
+/// increment in the content store, so the green's history retention, held by the same floor and bounded by the same
+/// derived cap, refuses first (`BudgetExceeded`); before it the chain's own cap did (`TableAtCapacity`). Either is the
+/// held floor's typed refusal.
 fn fill_the_chain(client: &mut Client, writer: VolumeId, delete: u64) -> u64 {
   for next in 2..=VERSIONS {
     client
@@ -286,6 +289,7 @@ fn fill_the_chain(client: &mut Client, writer: VolumeId, delete: u64) -> u64 {
       Err(ClientError::Refused(Refusal::TableAtCapacity { table })) if table == "green_chains" => {
         return next;
       }
+      Err(ClientError::Refused(Refusal::BudgetExceeded { .. })) => return next,
       other => panic!("submit {next}: {other:?}"),
     }
   }
@@ -1638,5 +1642,55 @@ fn an_edit_after_a_rebase_reads_its_files_length_from_the_kept_entry() {
     ),
     (0, true),
     "the edit after the rebase read its length from the kept entry"
+  );
+}
+
+/// Format: the counter of file asks of the green's owner (A-801).
+const ASKED_FILES: &str = "merge.work.asked_owner.files";
+
+/// A-817 (goal 86b's owner asks: at 10 hot files a work's rebases and submits asked files 17 a client, every one for a
+/// path its composition took as replaced whole, `merge.work.base_missing.replaced_whole`). Do: on an eight-shard daemon,
+/// a work on a shard other than its green's overwrites the first 64 bytes of a 1,024-byte file and submits. Expect: the
+/// submit asks the owner for no file's bytes and is accepted, the file reading back with the write. An overwrite at
+/// offset 0 shorter than the file is no whole-file replacement (the refinement keeps a replacement whose base length
+/// differs from the file's), yet its base bytes were asked to refine it.
+#[test]
+fn an_overwrite_at_the_start_of_a_longer_file_asks_no_base_bytes() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "head-overwrite");
+  let mut client = connect(&instance);
+  let green = client.create_green("head-overwrite-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "head-overwrite-seed").unwrap();
+  client.edit(seed, "f", 0, 0, &[b'.'; FILE_BYTES]).unwrap();
+  assert!(submitted(&mut client, seed).starts_with("accepted"));
+  let green_shard = slates_server::verbs::owner_of(green);
+  let (mut worker, work) = (0..64)
+    .map(|n| {
+      let mut other = connect(&instance);
+      let made = other
+        .create_work(green, &format!("head-overwrite-work-{n}"))
+        .unwrap()
+        .0;
+      (other, made)
+    })
+    .find(|(_, made)| slates_server::verbs::owner_of(*made) != green_shard)
+    .expect("a work off its green's shard");
+  let head = vec![b'h'; 64];
+  worker.edit(work, "f", 0, 64, &head).unwrap();
+  let before = daemon.refusals_on_every_shard().unwrap();
+  let answer = submitted(&mut worker, work);
+  let after = daemon.refusals_on_every_shard().unwrap();
+  let read = client.read(green, "f", ReadAt::Head).unwrap();
+  drop(worker);
+  drop(client);
+  daemon.stop();
+  let count = |counts: &std::collections::BTreeMap<&'static str, u64>, name: &str| {
+    counts.get(name).copied().unwrap_or(0)
+  };
+  assert!(answer.starts_with("accepted"), "{answer}");
+  assert_eq!((&read[..64], read.len()), (head.as_slice(), FILE_BYTES));
+  assert_eq!(
+    count(&after, ASKED_FILES) - count(&before, ASKED_FILES),
+    0,
+    "the submit asked the owner for no file's bytes"
   );
 }

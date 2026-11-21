@@ -725,10 +725,12 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 /// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
 /// every revision lands, bringing more than the merge budget, while the register holds a reference a changeset alone,
 /// far below it, charged to the shard's budget (A-662, `vcs_store::settle_objects`): a repository's content is
-/// the node's changeset store's and its shard's (C2), never the merge budget the partition's chains share; and a
-/// revision whose entry the chains had no room for checkpointed its green first and was appended once (A-742's counter
-/// moved). Before A-662 each revision's record was charged to the merge budget, so the repository's whole content had
-/// to fit in it.
+/// the node's changeset store's and its shard's (C2), never the merge budget the partition's chains share; and the
+/// chains never ran short of room, so no revision checkpointed its green first (A-742's counter unmoved): since chain
+/// entry format 6 (lane (A)) an entry names its revision's increment, which the owner shard's content store holds and
+/// its room charges, so the chains hold a few hundred bytes a revision. Before A-662 each revision's record was charged
+/// to the merge budget, so the repository's whole content had to fit in it; before format 6 the entry carried the
+/// increment and the chains filled within a few revisions.
 #[test]
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
   let landed = stored_configured(
@@ -759,7 +761,7 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
     |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
   );
   let expected: Vec<_> = (1..10).map(answered).collect();
-  assert_eq!(landed, (expected, true, true, true));
+  assert_eq!(landed, (expected, true, true, false));
 }
 
 /// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,
@@ -1841,5 +1843,418 @@ fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once
       )
     });
     assert_eq!(retried, (1, true, 2), "the retry landed once");
+  });
+}
+
+/// C2 stage B part 2 (b), the records' RAM texts retired (main's ruling of 2026-11-21 09:20). Do: in three repositories
+/// commit revision 1 and set its properties (changeset 2); in the second land, as a hostile log, a deltified text's
+/// record (the retired kind) at changeset 2; in the third, revision 1's record with its texts inline (the form logs held
+/// before part 2 (b)) at changeset 1; rebuild each from the node's store. Expect: the first made again whole; the second
+/// refused `SvnRecord(Retired(Deltified))` and the third `SvnTextsInline`, each typed, never a panic or a skip.
+#[test]
+fn a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild() {
+  stored(|| async move {
+    let mut seen = Vec::new();
+    for (name, hostile) in [
+      ("whole", None),
+      ("deltified", Some(2u64)),
+      ("inline", Some(1u64)),
+    ] {
+      let (svn, _) = subversion(name).await;
+      assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+      let properties = Record::RevisionProperties {
+        revision: 1,
+        properties: BTreeMap::from([(b"svn:log".to_vec(), b"again".to_vec())]),
+      };
+      assert_eq!(
+        super::land_record((&owner(), svn), properties).await,
+        Some(Ok(()))
+      );
+      if let Some(sequence) = hostile {
+        let bytes = if sequence == 2 {
+          // The retired kind's bytes as a log written before held them: the header, kind 5, a text, no base, a delta.
+          let mut bytes = Record::Locks(Vec::new()).encode();
+          bytes.truncate(9);
+          bytes[8] = 5;
+          bytes.extend_from_slice(&[7u8; 32]);
+          bytes.push(0);
+          bytes.extend_from_slice(&0u64.to_le_bytes());
+          bytes
+        } else {
+          Record::Revision(first()).encode()
+        };
+        let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+        let landed = super::landing::land(
+          &disk,
+          (svn, sequence),
+          vec![(slates_store::log::SectionKind::Record, bytes)],
+        )
+        .await;
+        assert_eq!(landed, Ok(()));
+      }
+      rebuild(svn).await;
+      seen.push(on(|state| {
+        state
+          .vcs_stores
+          .unrecovered(svn)
+          .map(|refused| format!("{refused:?}"))
+      }));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        None,
+        Some("SvnRecord(Retired(Deltified))".to_owned()),
+        Some("SvnTextsInline".to_owned())
+      ]
+    );
+  });
+}
+
+/// P7's finding (1), its robustness side (a green folds its history under a tight budget, `Green::fold_history_to_budget`;
+/// FSFS copies from any committed revision). Do: commit revision 1 (`/trunk/a.txt` `alpha\n`, `/trunk/sub/b.txt`),
+/// revision 2 changing `a.txt` to `alpha 2\n`; fold the green's history below its head, as the budget's fold does under
+/// pressure; then commit revision 3 copying `/trunk` at revision 1 to `/branches/b`. Expect revision 3, and the green's
+/// `branches/b/a.txt` revision 1's text (`alpha\n`), `branches/b/sub/b.txt` beside it and `trunk/a.txt` still revision 2's.
+/// Before, the copy was refused once the green's history below its head was folded: its source's version was gone.
+#[test]
+fn a_copy_from_an_older_revision_commits_after_the_green_folded_its_history() {
+  stored(|| async move {
+    let (svn, green) = subversion("folded").await;
+    assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+    let changed = revision(
+      1,
+      vec![file("/trunk/a.txt", Action::Modify, b"alpha 2\n")],
+      &[b"alpha 2\n"],
+    );
+    assert_eq!(commit((&owner(), svn), changed, None).await, answered(2));
+    on(|state| {
+      let mut engine = state.greens.get_mut(&green).expect("the green");
+      let head = engine.head();
+      engine.fold_history_before(head);
+    });
+    let copied = ChangedPath {
+      copy_from: Some(CopySource {
+        path: "/trunk".to_owned(),
+        revision: 1,
+      }),
+      ..row("/branches/b", Action::Add, NodeKind::Directory)
+    };
+    let branched = revision(
+      2,
+      vec![row("/branches", Action::Add, NodeKind::Directory), copied],
+      &[],
+    );
+    let committed = commit((&owner(), svn), branched, None).await;
+    let seen = (
+      on(|state| green_file(state, green, "branches/b/a.txt")),
+      on(|state| green_file(state, green, "branches/b/sub/b.txt")),
+      on(|state| green_file(state, green, "trunk/a.txt")),
+    );
+    assert_eq!(committed, answered(3));
+    assert_eq!(
+      seen,
+      (
+        Some(b"alpha\n".to_vec()),
+        Some(b"beta\n".to_vec()),
+        Some(b"alpha 2\n".to_vec())
+      )
+    );
+  });
+}
+
+/// A node of [`copies_oracle`]'s model: a directory, or a file's text, and its property list's bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelNode {
+  /// Whether it is a directory.
+  directory: bool,
+  /// A file's text.
+  text: Vec<u8>,
+  /// Its property list in FSFS's form, none for none.
+  props: Option<Vec<u8>>,
+}
+
+/// A tree of the model, by green path.
+type ModelTree = BTreeMap<String, ModelNode>;
+
+/// The paths of `tree` at and beneath `path`.
+fn subtree(tree: &ModelTree, path: &str) -> Vec<String> {
+  tree
+    .keys()
+    .filter(|found| *found == path || found.starts_with(&format!("{path}/")))
+    .cloned()
+    .collect()
+}
+
+/// A green's tree as a test reads it: each path's directory flag, its bytes, and its property list.
+type GreenTree = BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)>;
+
+/// The green `green`'s tree as the model writes one: every node, its text and its property list's identity.
+fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
+  let engine = state.greens.get(&green).expect("the green");
+  engine
+    .beneath("")
+    .into_iter()
+    .map(|(path, directory)| {
+      let text = engine
+        .content(&path)
+        .map(<[u8]>::to_vec)
+        .unwrap_or_default();
+      let props = engine.xattr(&path, PROPS).map(<[u8]>::to_vec);
+      (
+        path,
+        (directory, if directory { Vec::new() } else { text }, props),
+      )
+    })
+    .collect()
+}
+
+/// `tree` as [`green_tree`] reads a green: a property list by its identity.
+fn as_green(tree: &ModelTree) -> GreenTree {
+  tree
+    .iter()
+    .map(|(path, node)| {
+      let props = node.props.as_deref().map(|bytes| identity(bytes).to_vec());
+      (path.clone(), (node.directory, node.text.clone(), props))
+    })
+    .collect()
+}
+
+/// P7's finding (1), main's oracle of 2026-11-21 (10:55, condition 1): copies from older revisions made from the head
+/// and set back. Do: for each of 24 seeds, commit 14 generated revisions to a Subversion repository (an addition of a
+/// file or a directory, a text changed, a property list set, a deletion, a copy of any node from any revision before,
+/// copies of copies among them, and a copy changed beneath in the revision that makes it); a model applies each to its
+/// own tree. Expect every revision committed; after each, the green folded to its head (no version kept, so no copy can
+/// read one) and its tree (every node, each file's text, each property list's identity) the model's: a copy from
+/// revision R holds what its source held at R. Copies from older revisions walk their sources
+/// (`repository.svn_commit.restore_slices` counted).
+#[test]
+fn copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then() {
+  stored(|| async move {
+    for seed in 1..=24u64 {
+      let (svn, green) = subversion(&format!("oracle-{seed}")).await;
+      let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+      let mut next = move |bound: usize| -> usize {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        usize::try_from(state % u64::try_from(bound.max(1)).unwrap()).unwrap()
+      };
+      let mut history: Vec<ModelTree> = vec![ModelTree::new()];
+      let mut named = 0usize;
+      for head in 0..14u64 {
+        let mut tree = history.last().cloned().unwrap();
+        let directories: Vec<String> = std::iter::once(String::new())
+          .chain(
+            tree
+              .iter()
+              .filter(|(_, node)| node.directory)
+              .map(|(path, _)| path.clone()),
+          )
+          .collect();
+        let files: Vec<String> = tree
+          .iter()
+          .filter(|(_, node)| !node.directory)
+          .map(|(path, _)| path.clone())
+          .collect();
+        let under = |parent: &str, name: &str| {
+          if parent.is_empty() {
+            name.to_owned()
+          } else {
+            format!("{parent}/{name}")
+          }
+        };
+        named += 1;
+        let name = format!("n{named}");
+        let bytes = format!("text {} of {seed}\n", next(4)).into_bytes();
+        let (rows, contents): (Vec<ChangedPath>, Vec<Vec<u8>>) = match next(8) {
+          0 | 1 => {
+            let path = under(&directories[next(directories.len())], &name);
+            tree.insert(
+              path.clone(),
+              ModelNode {
+                directory: false,
+                text: bytes.clone(),
+                props: None,
+              },
+            );
+            (
+              vec![file(&format!("/{path}"), Action::Add, &bytes)],
+              vec![bytes],
+            )
+          }
+          2 => {
+            let path = under(&directories[next(directories.len())], &name);
+            tree.insert(
+              path.clone(),
+              ModelNode {
+                directory: true,
+                text: Vec::new(),
+                props: None,
+              },
+            );
+            (
+              vec![row(&format!("/{path}"), Action::Add, NodeKind::Directory)],
+              Vec::new(),
+            )
+          }
+          3 if !files.is_empty() => {
+            let path = files[next(files.len())].clone();
+            let bytes = format!("changed {named} of {seed}\n").into_bytes();
+            tree.get_mut(&path).unwrap().text = bytes.clone();
+            (
+              vec![file(&format!("/{path}"), Action::Modify, &bytes)],
+              vec![bytes],
+            )
+          }
+          4 if !tree.is_empty() => {
+            let path = tree.keys().nth(next(tree.len())).unwrap().clone();
+            let listed = list("p", &format!("v{}", next(3)));
+            let node = tree.get_mut(&path).unwrap();
+            node.props = Some(listed.clone());
+            let kind = if node.directory {
+              NodeKind::Directory
+            } else {
+              NodeKind::File
+            };
+            let changed = ChangedPath {
+              properties: Some(held(&listed)),
+              ..row(&format!("/{path}"), Action::Modify, kind)
+            };
+            (vec![changed], vec![listed])
+          }
+          5 if !tree.is_empty() => {
+            let path = tree.keys().nth(next(tree.len())).unwrap().clone();
+            let kind = if tree[&path].directory {
+              NodeKind::Directory
+            } else {
+              NodeKind::File
+            };
+            for gone in subtree(&tree, &path) {
+              tree.remove(&gone);
+            }
+            (
+              vec![row(&format!("/{path}"), Action::Delete, kind)],
+              Vec::new(),
+            )
+          }
+          _ => {
+            // A copy of a node of any revision before this one, from the oldest to the head.
+            let from = 1 + next(usize::try_from(head).unwrap().max(1));
+            let from = u64::try_from(from).unwrap().min(head);
+            let then = &history[usize::try_from(from).unwrap()];
+            if then.is_empty() || from == 0 {
+              let path = under(&directories[next(directories.len())], &name);
+              tree.insert(
+                path.clone(),
+                ModelNode {
+                  directory: true,
+                  text: Vec::new(),
+                  props: None,
+                },
+              );
+              (
+                vec![row(&format!("/{path}"), Action::Add, NodeKind::Directory)],
+                Vec::new(),
+              )
+            } else {
+              let source = then.keys().nth(next(then.len())).unwrap().clone();
+              let parents: Vec<&String> = directories
+                .iter()
+                .filter(|parent| **parent != source && !parent.starts_with(&format!("{source}/")))
+                .collect();
+              let dest = under(parents[next(parents.len())], &name);
+              let kind = if then[&source].directory {
+                NodeKind::Directory
+              } else {
+                NodeKind::File
+              };
+              for found in subtree(then, &source) {
+                let moved = format!("{dest}{}", found.get(source.len()..).unwrap());
+                tree.insert(moved, then[&found].clone());
+              }
+              let copied = ChangedPath {
+                copy_from: Some(CopySource {
+                  path: format!("/{source}"),
+                  revision: from,
+                }),
+                ..row(&format!("/{dest}"), Action::Add, kind)
+              };
+              let mut rows = vec![copied];
+              let mut contents = Vec::new();
+              // Now and then, a file the copy brought changed in the same revision.
+              let inside: Vec<String> = subtree(&tree, &dest)
+                .into_iter()
+                .filter(|found| *found != dest && !tree[found].directory)
+                .collect();
+              if !inside.is_empty() && next(2) == 0 {
+                let path = inside[next(inside.len())].clone();
+                let bytes = format!("changed in the copy {named} of {seed}\n").into_bytes();
+                tree.get_mut(&path).unwrap().text = bytes.clone();
+                rows.push(file(&format!("/{path}"), Action::Modify, &bytes));
+                contents.push(bytes);
+              }
+              (rows, contents)
+            }
+          }
+        };
+        let rows = if rows.is_empty() {
+          let path = under(&directories[next(directories.len())], &name);
+          tree.insert(
+            path.clone(),
+            ModelNode {
+              directory: true,
+              text: Vec::new(),
+              props: None,
+            },
+          );
+          vec![row(&format!("/{path}"), Action::Add, NodeKind::Directory)]
+        } else {
+          rows
+        };
+        let brought: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+        let committed = commit(
+          (&owner(), svn),
+          revision(head, rows.clone(), &brought),
+          None,
+        )
+        .await;
+        assert_eq!(
+          committed.map(|answer| answer.revision),
+          Ok(head + 1),
+          "seed {seed} revision {}: {rows:?}",
+          head + 1
+        );
+        // The green keeps no version below its head: no reader names one, and no copy reads one.
+        let folded = on(|state| {
+          let engine = state.greens.get(&green).expect("the green");
+          (engine.folded_below(), engine.head())
+        });
+        assert_eq!(
+          folded,
+          (head + 1, head + 1),
+          "seed {seed}: the green kept a version"
+        );
+        let seen = on(|state| green_tree(state, green));
+        assert!(
+          seen == as_green(&tree),
+          "seed {seed} revision {}: {rows:?}\ngreen {seen:?}\nmodel {:?}",
+          head + 1,
+          as_green(&tree)
+        );
+        history.push(tree);
+      }
+    }
+    let slices = on(|state| {
+      state
+        .refusals
+        .get(super::restore::SLICES)
+        .copied()
+        .unwrap_or(0)
+    });
+    assert!(
+      slices > 0,
+      "no copy from an older revision walked its source"
+    );
   });
 }

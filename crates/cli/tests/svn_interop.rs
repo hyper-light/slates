@@ -760,6 +760,74 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_protocol() {
   round_trip(&svn, &format!("svn://127.0.0.1:{port}/{REPOSITORY}"));
 }
 
+/// P7's finding (1), main's interop case of 2026-11-21 (10:55, condition 1): a copy from an older revision, made by the
+/// server from the head and set back from the records, as stock `svn` 1.15 sees it. Do: start an anchor with its
+/// `svn://` listener; as stock `svn`, commit a directory `d` holding [`FILE`] (`one`) as revision 1; change the file to
+/// `two` (revision 2); add `d/later` (revision 3); then copy `d` at revision 1 to `e` (revision 4). Expect: the copy
+/// committed as revision 4; `e` listing [`FILE`] alone, its text `one`; `d`'s text still `two`; and revision 4's log
+/// naming `/e` added from `/d:1`, as `svnserve` names a copy. Skips loudly without stock Subversion 1.15.
+#[test]
+fn stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol() {
+  if !stock_svn() {
+    eprintln!(
+      "skipping stock svn's copy from an older revision: no stock Subversion 1.15 here (svn on the PATH)"
+    );
+    return;
+  }
+  let instance = format!("svn-old-copy-{}", std::process::id());
+  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let port = svn_listener_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "stock svn's copy from an older revision") else {
+    return;
+  };
+  create_repository(&instance);
+  let (id, token) = minted_token(&instance, &issuer);
+  let scratch = Scratch::new("svn-old-copy");
+  let svn = Svn::new(&scratch, "copy", credentials(id, token));
+  let url = format!("svn://127.0.0.1:{port}/{REPOSITORY}");
+  let copy = svn.copy("work");
+  svn.ok(&svn.scratch, &["checkout", &url, &copy]);
+  svn.ok(&copy, &["mkdir", "d"]);
+  let within = format!("{copy}/d");
+  put(&within, "one\n");
+  svn.ok(&within, &["add", FILE]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "d"]),
+    "Committed revision 1.",
+  );
+  put(&within, "two\n");
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "two"]),
+    "Committed revision 2.",
+  );
+  svn.ok(&within, &["mkdir", "later"]);
+  expect_line(
+    &svn.ok(&copy, &["commit", "--message", "later"]),
+    "Committed revision 3.",
+  );
+  let copied = svn.ok(
+    &svn.scratch,
+    &[
+      "copy",
+      "--revision",
+      "1",
+      &format!("{url}/d"),
+      &format!("{url}/e"),
+      "--message",
+      "from 1",
+    ],
+  );
+  expect_line(&copied, "Committed revision 4.");
+  let listed = svn.ok(&svn.scratch, &["list", &format!("{url}/e")]);
+  assert_eq!(listed, format!("{FILE}\n"), "e's listing");
+  let text = svn.ok(&svn.scratch, &["cat", &format!("{url}/e/{FILE}")]);
+  assert_eq!(text, "one\n", "e's text");
+  let head = svn.ok(&svn.scratch, &["cat", &format!("{url}/d/{FILE}")]);
+  assert_eq!(head, "two\n", "d's text");
+  let logged = svn.ok(&svn.scratch, &["log", "--verbose", "--revision", "4", &url]);
+  expect_line(&logged, "   A /e (from /d:1)");
+}
+
 /// §4.17.4 item 14 over `http://` (item 5's HTTP: the WebDAV site on the shared HTTP edge, a repository under the
 /// URL's first segment, as `SVNParentPath` serves one). Do: start an anchor with its HTTP edge on loopback
 /// (`--vcs-http 127.0.0.1:0`); make the repository and a token; run the round trip as stock `svn` 1.15 at
@@ -1347,8 +1415,11 @@ fn a_large_commit_measured() {
 /// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
 /// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
 /// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
+/// With `SLATES_SVN_IMPORT_HOLD` naming a path, the daemon is held after the import for main's heap attribution (P7's
+/// finding (2)): its pid written to the path, and the daemon kept until the path is deleted, at most [`PATIENCE`].
 #[test]
 #[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+#[allow(clippy::disallowed_methods)] // test code: the hold's pid file, at the path the measurer names
 fn an_import_measured() {
   let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
     eprintln!("skipping the import's measurement: SLATES_SVN_IMPORT_DUMP names no dump");
@@ -1404,6 +1475,28 @@ fn an_import_measured() {
     out.join().unwrap().trim(),
     err.join().unwrap().trim()
   );
+  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
+    let pid = daemon_pid(&instance).expect("the daemon's pid");
+    std::fs::write(&hold, format!("{pid}\n")).unwrap();
+    println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
+    let held = Instant::now();
+    while std::path::Path::new(&hold).exists() && held.elapsed() < PATIENCE {
+      pause();
+    }
+    let _ = std::fs::remove_file(&hold);
+  }
+}
+
+/// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
+fn daemon_pid(instance: &str) -> Option<u32> {
+  let listed = Command::new("ps")
+    .args(["-A", "-o", "pid=,command="])
+    .output()
+    .ok()?;
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(instance) && !line.contains(" anchor"))
+    .find_map(|line| line.split_whitespace().next()?.parse().ok())
 }
 
 /// P7 of Ada's close list (A-772: svnsync over the matrix took 524 s over HTTP and 1,068 s over svn://; a measurement,

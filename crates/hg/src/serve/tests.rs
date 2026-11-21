@@ -132,15 +132,6 @@ impl Repository for History {
   fn tags_file(&self, rev: Rev, _admission: &mut Admission) -> Result<Option<Node>, Refusal> {
     Ok(self.hgtags.get(&rev).map(|(node, _)| *node))
   }
-  fn tags_text(&self, node: &Node, admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
-    let (_, text) = self
-      .hgtags
-      .values()
-      .find(|(held, _)| held == node)
-      .ok_or(Refusal::Store { what: "tags" })?;
-    admission.charge(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-    Ok(text.clone())
-  }
 }
 
 /// A node no two revisions of a history share: splitmix64 of the revision's seed, so node order is not revision order.

@@ -175,11 +175,18 @@ pub struct EncodingCounters {
   /// Units that alone took longer than their turn's quantum (A-718: a unit past the step budget, the signal of a unit
   /// to split).
   pub units_past_quantum: u64,
+  /// [`EncodingCounters::units_past_quantum`] by the stage the unit was in: the walk, the gather, the encoding, the
+  /// keeping (as [`EncodingCounters::longest_unit_ns`]), so a unit to split is named by its stage.
+  /// Shape: one a stage, four.
+  pub units_past_quantum_by_stage: [u64; 4],
   /// The longest unit of each stage, in the owner's nanoseconds: the walk, the gather, the encoding, the keeping.
   /// Shape: one a stage, four.
   pub longest_unit_ns: [u64; 4],
   /// The most bytes one unit read, put into the store, or was given to search or deflate (A-718: a window at most).
   pub most_bytes_a_unit: u64,
+  /// The most bytes one search or deflate step of an object's entry was given (A-718, main's ruling of 2026-11-21
+  /// 07:30: a unit sized from its measured cost within the step budget).
+  pub most_put_bytes: u64,
   /// The most rows one unit read into the order (A-718: one).
   pub most_rows_a_unit: u64,
 }
@@ -274,7 +281,7 @@ impl Encoding {
     loop {
       let unit_start = clock.now_ns();
       let stage = self.stage_index();
-      let progress = match self.unit(repository, store, exchange) {
+      let progress = match self.unit(repository, store, (exchange, quantum_ns)) {
         Ok(progress) => progress,
         Err(refused) => {
           self.stage = Stage::Refused(refused);
@@ -285,6 +292,9 @@ impl Encoding {
       self.spent_ns = self.spent_ns.saturating_add(unit_ns);
       if unit_ns > quantum_ns {
         self.counters.units_past_quantum = self.counters.units_past_quantum.saturating_add(1);
+        if let Some(past) = self.counters.units_past_quantum_by_stage.get_mut(stage) {
+          *past = past.saturating_add(1);
+        }
       }
       if let Some(longest) = self.counters.longest_unit_ns.get_mut(stage) {
         *longest = (*longest).max(unit_ns);
@@ -330,12 +340,12 @@ impl Encoding {
     }
   }
 
-  /// One unit of work: the stage's next step.
+  /// One unit of work: the stage's next step, within `quantum_ns` where its work is sized by its measured cost.
   fn unit(
     &mut self,
     repository: &mut Repository,
     store: &mut ContentStore,
-    exchange: Exchange,
+    (exchange, quantum_ns): (Exchange, u64),
   ) -> Result<Progress, StoreRefused> {
     let stage = core::mem::replace(&mut self.stage, Stage::Done);
     self.stage = match stage {
@@ -345,7 +355,12 @@ impl Encoding {
         blobs,
         part,
         current,
-      } => self.encode(repository, store, exchange, (blobs, *part, current))?,
+      } => self.encode(
+        repository,
+        store,
+        (exchange, quantum_ns),
+        (blobs, *part, current),
+      )?,
       keeping @ Stage::Keep { .. } => self.keep(repository, store, keeping)?,
       Stage::Done => return Ok(Progress::Done),
       Stage::Refused(refused) => return Err(refused),
@@ -441,7 +456,7 @@ impl Encoding {
     &mut self,
     repository: &mut Repository,
     store: &ContentStore,
-    exchange: Exchange,
+    (exchange, quantum_ns): (Exchange, u64),
     (blobs, mut part, current): (bool, Part, Option<Box<Current>>),
   ) -> Result<Stage, StoreRefused> {
     let Some(mut current) = current else {
@@ -487,11 +502,15 @@ impl Encoding {
       }
       Current::Put(ref mut putting) => {
         let mut learning = repository.learning(exchange);
+        let bytes = putting.unit_bytes(&exchange.rates, quantum_ns, window);
+        if !putting.sampling() {
+          self.counters.most_put_bytes = self.counters.most_put_bytes.max(to_u64(bytes));
+        }
         let put = part
           .encoder
-          .step(putting, &mut learning, window)
+          .step(putting, &mut learning, bytes)
           .map_err(StoreRefused::Encoding)?;
-        self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(window));
+        self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(bytes));
         match put {
           Put::More(bytes) => {
             part.bytes.extend_from_slice(&bytes);

@@ -264,11 +264,35 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       body: &[],
     };
     let room = || Admission::new(ROOM);
-    let whole = lend_in(state, hg, &mut room(), |view, left| {
-      hg_http::answer(view, &request, 0, &mut Plain, left)
-    })
-    .expect("the whole answer");
-    assert_eq!(whole.refused, None);
+    let disk = state.vcs_disk.clone().expect("the store");
+    let repository = u128::from_be_bytes(hg.bytes);
+    // The whole answer as the edges make it: a step at a time, each want of the changeset store answered between steps
+    // (A-767 C1: a clone's file revisions as the store keeps them).
+    let whole = {
+      let begun = lend_in(state, hg, &mut room(), |view, left| {
+        hg_http::begin(view, &request, 0, &mut Plain, left)
+      })
+      .expect("the answer begun");
+      let Begun::Streamed(mut streamed) = begun else {
+        panic!("a clone's answer is streamed");
+      };
+      let mut body = Vec::new();
+      loop {
+        assert!(crate::test_store::answer_wants_blocking(
+          &disk,
+          repository,
+          &mut *streamed
+        ));
+        let more = lend_in(state, hg, &mut room(), |view, left| {
+          streamed.step(view, left, &mut body)
+        })
+        .expect("a step")
+        .expect("a slice");
+        if !more {
+          break body;
+        }
+      }
+    };
     let begun = lend_in(state, hg, &mut room(), |view, left| {
       hg_http::begin(view, &request, 0, &mut Plain, left)
     })
@@ -279,6 +303,11 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
     let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
     let mut body = Vec::new();
     let mut turn = |state: &mut ShardState, body: &mut Vec<u8>| {
+      assert!(crate::test_store::answer_wants_blocking(
+        &disk,
+        repository,
+        &mut *streamed
+      ));
       super::lend_held_in(state, &generation, &mut room(), |view, left| {
         streamed.step(view, left, body)
       })
@@ -296,7 +325,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       rebuilding, None,
       "the repository's view was lent mid-rebuild"
     );
-    assert_eq!(body, whole.body);
+    assert_eq!(body, whole);
   });
 }
 
@@ -305,7 +334,9 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
 /// second adding `.hgtags` with `v1` at the first changeset and `mid` at the second; then branch from `default`, from
 /// `tip`, from `v1`, from `mid` and from `nope`. Expect `default` and `tip` the line's head (the third changeset), as
 /// Mercurial resolves a branch's name to its tip-most head; `v1` the first changeset, made from `mark`, the bookmark that
-/// heads it; `mid` refused `Unsupported`, since no line or bookmark heads it; and `nope` `NotFound`.
+/// heads it; `mid` refused `Unsupported`, since no line or bookmark heads it; and `nope` `NotFound`. Since A-767 C1
+/// (main's ruling (A)) a name that reaches the tags has the heads' `.hgtags` read from the changeset store at the verb's
+/// door first: none read before the head names a `.hgtags`, then one read each for `default` and `v1`.
 #[test]
 fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   use slates_ipc::protocol::Refusal;
@@ -326,10 +357,10 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ("second", "b", b"b\n", Some(0), "default"),
       ("Added tags", ".hgtags", tags, Some(1), "default"),
     ]);
+    let reads = core::cell::Cell::new(0);
     let branch = |state: &mut ShardState, name: &str, from: &str| {
-      dispatch(
+      let (reply, read) = crate::vcs_store::hg_tags::dispatch_blocking(
         state,
-        1,
         &owner(),
         RequestBody::CreateBranch {
           repository: "hg".to_owned(),
@@ -337,11 +368,14 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
           from: from.to_owned(),
           version: None,
         },
-      )
+      );
+      reads.set(reads.get() + u32::from(read));
+      reply
     };
     pushed(state, hg, &made, &[0]);
     let mark = branch(state, "mark", "default");
     assert!(matches!(mark, ReplyBody::GreenCreated { .. }), "{mark:?}");
+    assert_eq!(reads.get(), 0, "no head named a .hgtags revision yet");
     pushed(state, hg, &made, &[1, 2]);
     let replies: Vec<ReplyBody> = [
       ("from-default", "default"),
@@ -379,6 +413,8 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ),
       "{marks:?}"
     );
+    // `default` and `v1` reach the tags, read from the changeset store before each runs (A-767 C1); `tip` never.
+    assert_eq!(reads.get(), 2, "the tags read for `default` and `v1`");
     let mid = branch(state, "from-mid", "mid");
     assert!(
       matches!(
@@ -439,4 +475,336 @@ fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs(
       ((true, true), (true, true))
     );
   });
+}
+
+/// A want of whole texts made by the store ([`slates_hg::render::Want::Texts`]) and what it was given.
+struct AskedTexts {
+  /// The want, until answered.
+  want: Option<slates_hg::render::Want>,
+  /// The texts given, or `None` where the store found them past the want's room.
+  given: Option<Option<Vec<Vec<u8>>>>,
+}
+
+impl slates_hg::render::StoreWants for AskedTexts {
+  fn wants(&self) -> Option<&slates_hg::render::Want> {
+    self.want.as_ref()
+  }
+
+  fn give_rows(&mut self, _rows: Vec<Vec<Option<slates_hg::render::StoredRevision>>>) {
+    self.want = None;
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    self.want = None;
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    self.want = None;
+    self.given = Some(Some(texts));
+  }
+
+  fn texts_past(&mut self) {
+    self.want = None;
+    self.given = Some(None);
+  }
+}
+
+/// A-767 C1 (the store makes a Mercurial text whole: a pull's revision sent whole, a lookup's `.hgtags`). Do: push two
+/// changesets to a Mercurial repository, each adding a file, and ask the node's store for both files' texts whole
+/// (`hg_view::texts_made`, `StoreHandle::text`), then again within one byte less than they hold. Expect each text as it
+/// was pushed, then the read refused past its room: a whole a push keeps is its raw text, as the store makes it.
+#[test]
+fn the_store_makes_a_pushed_mercurial_text_whole() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let hg = created(state, "hg", VcsTool::Mercurial);
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b, a longer text\n", Some(0), "default"),
+    ]);
+    pushed(state, hg, &made, &[0, 1]);
+    let texts: Vec<[u8; 32]> = [&b"a\n"[..], b"b, a longer text\n"]
+      .iter()
+      .map(|text| *blake3::hash(text).as_bytes())
+      .collect();
+    let disk = state.vcs_disk.clone().expect("a store");
+    let ask = |most: u64| {
+      let mut asked = AskedTexts {
+        want: Some(slates_hg::render::Want::Texts {
+          texts: texts.clone(),
+          most,
+        }),
+        given: None,
+      };
+      assert!(crate::test_store::answer_wants_blocking(
+        &disk,
+        u128::from_be_bytes(hg.bytes),
+        &mut asked
+      ));
+      asked.given.expect("an answer")
+    };
+    assert_eq!(
+      ask(u64::MAX),
+      Some(vec![b"a\n".to_vec(), b"b, a longer text\n".to_vec()])
+    );
+    let held = u64::try_from(b"a\n".len() + b"b, a longer text\n".len()).unwrap();
+    assert_eq!(ask(held - 1), None, "refused past its room");
+  });
+}
+
+/// Every revision of repository `id`'s served view: its log's path as the store's rows name it, its node and its text,
+/// changesets first, then the manifest log's, then each file log's, in order.
+fn every_revision(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Vec<(Vec<u8>, slates_hg::Node, Vec<u8>)> {
+  use slates_hg::push::intake::{CHANGELOG_PATH, MANIFEST_PATH};
+  lend_in(state, id, &mut Admission::new(ROOM), |view, room| {
+    let mut revisions = Vec::new();
+    for rev in 0..view.count() {
+      let node = view.node(rev).unwrap();
+      let text = view
+        .changeset_text(rev, room)
+        .unwrap()
+        .unwrap()
+        .into_owned();
+      revisions.push((CHANGELOG_PATH.to_vec(), node, text));
+    }
+    let mut position = 0;
+    while let Some(linked) = view.manifest_linked(position) {
+      let logged = view.manifest(&linked.node, room).unwrap().unwrap();
+      revisions.push((
+        MANIFEST_PATH.to_vec(),
+        linked.node,
+        logged.text.into_owned(),
+      ));
+      position += 1;
+    }
+    let mut at = (Vec::new(), 0);
+    while let Some((path, position, linked)) = view.file_linked_from((&at.0, at.1)) {
+      let logged = view.file(&path, &linked.node, room).unwrap().unwrap();
+      revisions.push((path.clone(), linked.node, logged.text.into_owned()));
+      at = (path, position + 1);
+    }
+    revisions
+  })
+  .expect("the view lent")
+}
+
+/// What the node's store keeps of `revisions` in repository `id`: how many it keeps as an edit against a base, and each
+/// text made whole from its chain (`StoreHandle::texts_by_tool`, then `hg_view::texts_made`).
+fn kept_by_the_store(
+  state: &mut ShardState,
+  id: RepositoryId,
+  revisions: &[(Vec<u8>, slates_hg::Node, Vec<u8>)],
+) -> (usize, Vec<Vec<u8>>) {
+  struct Rows {
+    want: Option<slates_hg::render::Want>,
+    rows: Vec<Vec<Option<slates_hg::render::StoredRevision>>>,
+  }
+  impl slates_hg::render::StoreWants for Rows {
+    fn wants(&self) -> Option<&slates_hg::render::Want> {
+      self.want.as_ref()
+    }
+    fn give_rows(&mut self, rows: Vec<Vec<Option<slates_hg::render::StoredRevision>>>) {
+      self.want = None;
+      self.rows = rows;
+    }
+    fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+      self.want = None;
+    }
+  }
+  let disk = state.vcs_disk.clone().expect("a store");
+  let repository = u128::from_be_bytes(id.bytes);
+  let logs = revisions
+    .iter()
+    .map(|(path, node, _)| (path.clone(), vec![*node]))
+    .collect();
+  let mut rows = Rows {
+    want: Some(slates_hg::render::Want::Rows { logs }),
+    rows: Vec::new(),
+  };
+  assert!(crate::test_store::answer_wants_blocking(
+    &disk, repository, &mut rows
+  ));
+  let rows: Vec<slates_hg::render::StoredRevision> = rows
+    .rows
+    .into_iter()
+    .map(|log| {
+      log
+        .into_iter()
+        .next()
+        .flatten()
+        .expect("a row for every revision")
+    })
+    .collect();
+  let edits = rows.iter().filter(|row| row.base.is_some()).count();
+  let mut asked = AskedTexts {
+    want: Some(slates_hg::render::Want::Texts {
+      texts: rows.iter().map(|row| row.text).collect(),
+      most: ROOM,
+    }),
+    given: None,
+  };
+  assert!(crate::test_store::answer_wants_blocking(
+    &disk, repository, &mut asked
+  ));
+  (
+    edits,
+    asked.given.expect("an answer").expect("within the room"),
+  )
+}
+
+/// The changegroup a clone of repository `id` sends over the HTTP edge, its file revisions as the store keeps them
+/// (A-767 C1 step 1a), as a push's part.
+fn cloned_changegroup(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> slates_hg::push::ChangegroupPart {
+  use slates_hg::serve::http::{self as hg_http, Begun, Compression, Compressor, Media};
+  struct Plain;
+  impl Compressor for Plain {
+    fn choose(&mut self, _: Media, _: &[slates_hg::compression::Engine], _: u64) -> Compression {
+      Compression {
+        engine: slates_hg::compression::Engine::Uncompressed,
+        level: 0,
+      }
+    }
+  }
+  let heads: Vec<String> = lend_in(state, id, &mut Admission::new(ROOM), |view, room| {
+    slates_hg::serve::discovery::head_revs(view, room)
+      .unwrap()
+      .into_iter()
+      .map(|rev| crate::verbs::hex_of(&view.node(rev).unwrap()))
+      .collect()
+  })
+  .expect("the view lent");
+  let arguments = format!(
+    "bundlecaps=HG20%2Cbundle2%3DHG20%250Achangegroup%253D02%252C03&cg=1&common={}&heads={}",
+    "0".repeat(40),
+    heads.join("+")
+  );
+  let headers: [(&[u8], &[u8]); 2] = [
+    (b"X-HgArg-1", arguments.as_bytes()),
+    (b"X-HgProto-1", b"0.1 0.2 comp=none"),
+  ];
+  let request = slates_hg::http::Request {
+    query: b"cmd=getbundle",
+    headers: &headers,
+    body: &[],
+  };
+  let disk = state.vcs_disk.clone().expect("the store");
+  let repository = u128::from_be_bytes(id.bytes);
+  let begun = lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
+    hg_http::begin(view, &request, 0, &mut Plain, left)
+  })
+  .expect("the answer begun");
+  let Begun::Streamed(mut streamed) = begun else {
+    panic!("a clone's answer is streamed");
+  };
+  let mut body = Vec::new();
+  loop {
+    assert!(crate::test_store::answer_wants_blocking(
+      &disk,
+      repository,
+      &mut *streamed
+    ));
+    let more = lend_in(state, id, &mut Admission::new(ROOM), |view, left| {
+      streamed.step(view, left, &mut body)
+    })
+    .expect("a step")
+    .expect("a slice");
+    if !more {
+      break;
+    }
+  }
+  // The `0.2` media's header first: the compression engine's name, its length a byte before it.
+  let engine = usize::from(body[0]);
+  let stream = &body[1 + engine..];
+  let mut room = Admission::new(ROOM);
+  let bundle = slates_hg::bundle2::Bundle2::decode(stream, &mut room).expect("a bundle2 stream");
+  let (index, part) = bundle
+    .top_level()
+    .find(|(_, part)| part.is(b"changegroup"))
+    .expect("a changegroup part");
+  let version =
+    slates_hg::changegroup::Version::from_part_param(part.param(b"version")).expect("a version");
+  slates_hg::push::ChangegroupPart {
+    version,
+    changesets: None,
+    target_phase: None,
+    tree_manifests: false,
+    payload: bundle.payload_bytes(index, &mut room).expect("its payload"),
+  }
+}
+
+/// A-767 C1 (main's ruling of 2026-11-21: a Mercurial whole's place is its raw text, the store's contract; the
+/// two-encodings oracle). Do: for each of 7.2's five store formats (dotencode, hybrid, pre-share-safe, revlog v2,
+/// file index), import the history into one repository (the import's writer); clone it through the store and push the
+/// clone's changegroup into another (the push intake's writer); ask the node's store for every revision of each
+/// whole (`StoreHandle::text`). Expect every text the store makes equal the text the view derives, revision for
+/// revision, under both writers, and edits among what each writer kept, so both a whole and a delta are made.
+#[test]
+fn every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format() {
+  use crate::hg_base::tests::{DOT, FILE_INDEX, HYBRID, LEGACY, V2};
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let formats = [
+      ("dot", DOT),
+      ("hybrid", HYBRID),
+      ("legacy", LEGACY),
+      ("v2", V2),
+      ("fileindex", FILE_INDEX),
+    ];
+    for (name, files) in formats {
+      let imported_id = created(state, &format!("{name}-imported"), VcsTool::Mercurial);
+      let (host, directory) = laid_out(files.iter().copied());
+      assert_eq!(
+        begin(state, imported_id, (Box::new(host), directory)),
+        Ok(())
+      );
+      imported(state, imported_id);
+      let revisions = every_revision(state, imported_id);
+      let texts: Vec<Vec<u8>> = revisions.iter().map(|(_, _, text)| text.clone()).collect();
+      let (imported_edits, made) = kept_by_the_store(state, imported_id, &revisions);
+      assert_eq!(made, texts, "{name}: the import's texts made whole");
+      let changegroup = cloned_changegroup(state, imported_id);
+      let pushed_id = created(state, &format!("{name}-pushed"), VcsTool::Mercurial);
+      push_part(state, pushed_id, changegroup);
+      assert_eq!(
+        every_revision(state, pushed_id),
+        revisions,
+        "{name}: the push holds the import's history"
+      );
+      let (pushed_edits, made) = kept_by_the_store(state, pushed_id, &revisions);
+      assert_eq!(made, texts, "{name}: the push's texts made whole");
+      assert!(
+        imported_edits > 0 && pushed_edits > 0,
+        "{name}: edits kept, {imported_edits} imported and {pushed_edits} pushed"
+      );
+    }
+  });
+}
+
+/// Lands `changegroup` on repository `id` as a push of its owner lands it.
+fn push_part(
+  state: &mut ShardState,
+  id: RepositoryId,
+  changegroup: slates_hg::push::ChangegroupPart,
+) {
+  use slates_hg::push::{Asks, Taken, Unbundle};
+  let unbundle = Unbundle {
+    parts: vec![Taken {
+      id: 0,
+      mandatory: true,
+      asks: Asks::Changegroup(changegroup),
+    }],
+  };
+  let mut room = Admission::new(u64::MAX);
+  let terms = (false, [7; 32], u64::MAX);
+  let prepared = crate::repository::hg_push::prepare_served(state, id, &unbundle, terms, &mut room)
+    .expect("the push prepared");
+  let landed = crate::repository::hg_push::land_stored(state, (&owner(), id), prepared);
+  assert!(
+    landed.answer.is_ok() && landed.released.is_ok(),
+    "{landed:?}"
+  );
 }

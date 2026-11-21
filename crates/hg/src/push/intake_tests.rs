@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::{Intake, Intaken, Refused, Stepped};
+use super::{Intake, Intaken, KeptText, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
@@ -64,17 +64,31 @@ fn intake(
   loop {
     steps += 1;
     match intake.step(&part.payload, store, admission) {
-      Ok(Stepped::More) => {}
-      Ok(Stepped::Done) => break,
-      Ok(Stepped::Wanted(range)) => panic!("a whole changegroup wanted {range:?}"),
+      Ok(stepped) if more(&stepped) => {}
+      Ok(_) => break,
       Err(refused) => {
         intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
       }
     }
   }
-  let (fork, intaken) = intake.finish().ok().unwrap();
+  let (fork, intaken) = finished(intake);
   Ok((fork, intaken, steps))
+}
+
+/// Whether a whole changegroup's intake steps again: more to take, or done. It never wants a range of a payload it holds
+/// whole.
+fn more(stepped: &Stepped) -> bool {
+  match stepped {
+    Stepped::More => true,
+    Stepped::Done => false,
+    Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+  }
+}
+
+/// A done intake's fork and what it brought.
+fn finished(intake: Intake) -> (HgIndex, Intaken) {
+  intake.finish().ok().unwrap()
 }
 
 /// An index's rows, each key with its body.
@@ -435,7 +449,8 @@ fn deltas_by_node<'d>(
 /// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
 /// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
 /// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
-/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
+/// the place in the payload holding exactly its delta, or for a whole its raw text past the hunk it arrived in (the
+/// store's contract, A-767 C1); the changelog and manifest log under their NUL-led paths.
 #[test]
 fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
   let part = stock();
@@ -456,15 +471,19 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
     let (base, data) = deltas[&kept.node];
     let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
     assert_eq!(kept.base, base_identity, "{:?}", kept.node);
-    assert_eq!(
-      &part.payload
-        [usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap()],
-      data
-    );
+    // A whole is kept as its raw text (the store's contract, A-767 C1); an edit as its delta.
+    let whole = (base == crate::NULL_NODE).then_some(&text[..]);
+    kept_bytes_are(&part.payload, kept, whole.unwrap_or(data));
   }
   for index in [fork, index] {
     index.release(&mut store).unwrap();
   }
+}
+
+/// The payload's bytes at `kept`'s place are `expected`.
+fn kept_bytes_are(payload: &[u8], kept: &KeptText, expected: &[u8]) {
+  let at = usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap();
+  assert_eq!(&payload[at], expected, "{:?}", kept.node);
 }
 
 /// The sectioned record `sectioned` refused by `Replay::begin` (its payload is not in it), and by kind cut short or with
@@ -552,6 +571,7 @@ fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
       payload: *blake3::hash(&part.payload).as_bytes(),
       len: u64::try_from(part.payload.len()).unwrap(),
       sequence: 5,
+      made: None,
     }
   );
   assert_eq!(
@@ -714,4 +734,84 @@ fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
   for index in [by_pieces, fork, index] {
     index.release(&mut store).unwrap();
   }
+}
+
+/// The revisions of `decoded` whose delta's base is neither the null node nor the revision before it in its group: the
+/// bases an intake does not hold as the text it kept last, so must read back from the fork.
+fn bases_not_kept_last(decoded: &crate::changegroup::Changegroup<'_>) -> u64 {
+  let mut groups = vec![
+    decoded.group(&decoded.changelog),
+    decoded.group(&decoded.manifests),
+  ];
+  groups.extend(
+    decoded
+      .files
+      .iter()
+      .map(|group| decoded.group(&group.revisions)),
+  );
+  groups
+    .iter()
+    .map(|group| {
+      let mut previous = crate::NULL_NODE;
+      group
+        .iter()
+        .filter(|revision| {
+          let far = revision.base != crate::NULL_NODE && revision.base != previous;
+          previous = revision.node;
+          far
+        })
+        .count() as u64
+    })
+    .sum()
+}
+
+/// Main's ruling of 2026-11-21 05:12 (c), red first (w-perf's profile of hg-src's first push, base 94c1696bb: 57% of the
+/// shard's time in checking each new manifest's files, which rebuilt the manifest's text and its first parent's from
+/// their chains, two whole texts a manifest, the push's memory 5.8 GiB at its end). Do: take stock 7.2's bundle through
+/// the intake. Expect a whole text rebuilt from the fork's chains only for a delta whose base is not the text kept just
+/// before it in its group; none to check a new manifest's files, which reads the lines its delta wrote (14 rebuilt
+/// before, two a manifest).
+#[test]
+fn a_pushs_intake_rebuilds_a_text_only_for_a_base_it_does_not_hold() {
+  let part = stock();
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let mut index = HgIndex::new();
+  let mut store = store();
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  assert!(!intaken.changesets.is_empty(), "{intaken:?}");
+  assert_eq!(
+    intaken.rebuilt,
+    bases_not_kept_last(&decoded),
+    "texts rebuilt from the fork's chains"
+  );
+  fork.release(&mut store).unwrap();
+}
+
+/// Main's ruling of 2026-11-21 05:12 (a), the refusal side (hostile input): a new manifest's files are checked from
+/// the lines its delta wrote, so a manifest naming a file revision nobody holds is still refused. Do: take stock 7.2's
+/// bundle through the intake with every file group left out, its manifests naming file revisions neither the
+/// repository nor the push holds. Expect it refused `MissingFile`.
+#[test]
+fn a_manifest_naming_a_file_revision_nobody_holds_is_refused() {
+  let part = stock();
+  let mut decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  decoded.files.clear();
+  let mut payload = Vec::new();
+  decoded.encode(&mut payload).unwrap();
+  let fileless = ChangegroupPart {
+    payload,
+    ..part.clone()
+  };
+  let mut index = HgIndex::new();
+  let mut store = store();
+  let refused = intake(&fileless, &mut index, &mut store, &mut room()).err();
+  assert!(
+    matches!(
+      refused,
+      Some(Refused::Unverified(Unverified::MissingFile { .. }))
+    ),
+    "{refused:?}"
+  );
 }
