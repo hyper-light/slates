@@ -32,6 +32,7 @@ use slates_db::catalog::{
 use slates_ipc::protocol::{DUMP_FILE, NamePolicy, Refusal, ReplyBody, SizeClass};
 use slates_svn::dump::Format;
 use slates_svn::migration::{Exporter, Exporting, MigrationRefusal};
+use slates_svn::reads::Wanted;
 use slates_vfs::clock::Clock;
 use slates_vfs::ids::InodeNo;
 use slates_wire::request::RequestId;
@@ -183,14 +184,20 @@ pub(crate) struct ExportJob {
   file: InodeNo,
   /// The volume's id: its name's alias's, or minted when it is admitted.
   volume: Option<DbVolumeId>,
+  /// The stored text's piece the walk waits for (C2 stage B part 2): fetched through the node's store between slices.
+  waiting: Option<Wanted>,
+  /// The piece fetched for the walk, held until the slice after the fetch has read it, then let go.
+  fetched: Option<Wanted>,
 }
 
 impl Drop for ExportJob {
   fn drop(&mut self) {
-    if self.admitted.is_some() && crate::state::with_state(|s| self.release(s)).is_none() {
+    let holds = self.admitted.is_some() || self.fetched.is_some();
+    if holds && crate::state::with_state(|s| self.release(s)).is_none() {
       // A task that ended early with the state unreachable (a shutdown): nothing can be given back, and the process's
       // end returns it.
       self.admitted = None;
+      self.fetched = None;
     }
   }
 }
@@ -222,6 +229,8 @@ impl ExportJob {
       admitted: None,
       file: InodeNo(0),
       volume,
+      waiting: None,
+      fetched: None,
     }
   }
 
@@ -237,6 +246,7 @@ impl ExportJob {
       exporter: walk,
       hasher,
       length,
+      waiting,
       ..
     } = self;
     let walk = walk.as_mut().ok_or_else(unreachable)?;
@@ -252,10 +262,21 @@ impl ExportJob {
           scratch.clear();
           Ok(None)
         }
+        Exporting::Waiting(wanted) => {
+          *waiting = Some(wanted);
+          Ok(Some(()))
+        }
         Exporting::Done => Ok(Some(())),
       }
-    })?;
-    if done.is_none() {
+    });
+    // Let go whatever the slice came to: a refused one read the piece as far as it went.
+    let read = self.let_go_fetched(state);
+    let done = done?;
+    // A walk waiting again for the piece fetched for it would wait for good.
+    if read.is_some() && self.waiting == read {
+      return Err(Refusal::ContentUnavailable);
+    }
+    if done.is_none() || self.waiting.is_some() {
       return Ok(false);
     }
     self.measured = Some((self.length, *self.hasher.finalize().as_bytes()));
@@ -309,6 +330,7 @@ impl ExportJob {
       written,
       walked,
       admitted,
+      waiting,
       ..
     } = self;
     let (Some(walk), Some(admitted)) = (walk.as_mut(), admitted.as_mut()) else {
@@ -343,17 +365,48 @@ impl ExportJob {
           *length = length.saturating_add(u64::try_from(stage.len()).unwrap_or(u64::MAX));
           Ok(None)
         }
+        Exporting::Waiting(wanted) => {
+          *waiting = Some(wanted);
+          Ok(Some(()))
+        }
         Exporting::Done => {
           *walked = true;
           Ok(Some(()))
         }
       }
-    })?;
-    if done.is_none() {
+    });
+    // Let go whatever the slice came to: a refused one read the piece as far as it went.
+    let read = self.let_go_fetched(state);
+    let done = done?;
+    // A walk waiting again for the piece fetched for it would wait for good.
+    if read.is_some() && self.waiting == read {
+      return Err(Refusal::ContentUnavailable);
+    }
+    if done.is_none() || self.waiting.is_some() {
       return Ok(false);
     }
     self.same_as_measured(state)?;
     Ok(true)
+  }
+
+  /// Lets go the piece fetched for the walk, which the slice just run read (C2 stage B part 2): that piece, if any.
+  fn let_go_fetched(&mut self, state: &mut ShardState) -> Option<Wanted> {
+    let fetched = self.fetched.take()?;
+    crate::vcs_store::svn_texts::let_go(state, fetched);
+    Some(fetched)
+  }
+
+  /// Fetches the stored text's piece the walk waits for through the node's store (C2 stage B part 2), held for the next
+  /// slice; a piece the store cannot give refuses the export, since the walk would wait for it again.
+  async fn fetch_waited(&mut self) -> Result<(), Refusal> {
+    let Some(wanted) = self.waiting.take() else {
+      return Ok(());
+    };
+    if !crate::vcs_store::svn_texts::fetch_piece(self.repository, wanted).await {
+      return Err(Refusal::ContentUnavailable);
+    }
+    self.fetched = Some(wanted);
+    Ok(())
   }
 
   /// Refuses a second walk that made other bytes than the first measured, counted (module doc).
@@ -436,8 +489,9 @@ impl ExportJob {
     })
   }
 
-  /// Gives back what the export holds: the volume, discarded with its credits.
+  /// Gives back what the export holds: the piece fetched for its walk, and the volume, discarded with its credits.
   pub(crate) fn release(&mut self, state: &mut ShardState) {
+    let _ = self.let_go_fetched(state);
     if let Some(admitted) = self.admitted.take() {
       crate::verbs::discard_admitted(state, admitted);
     }
@@ -481,10 +535,12 @@ async fn run_export(mut job: ExportJob, alias: Option<NameAlias>) {
 /// it, each slice a step of the shard and a yield between them.
 async fn export_steps(job: &mut ExportJob) -> Result<(), Refusal> {
   while !with(|s| job.measure_step(s))? {
+    job.fetch_waited().await?;
     slates_rt::futures::yield_now().await;
   }
   with(|s| job.prepare(s))?;
   while !with(|s| job.write_step(s))? {
+    job.fetch_waited().await?;
     slates_rt::futures::yield_now().await;
   }
   Ok(())
