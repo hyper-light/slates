@@ -37,6 +37,7 @@ pub(crate) struct TestStore {
 
 impl TestStore {
   /// A fresh store named `name`, its owner started.
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   pub(crate) fn start(name: &str) -> TestStore {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,6 +95,7 @@ impl Drop for TestStore {
     {
       let _ = owner.stop();
     }
+    #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
     let _ = std::fs::remove_dir_all(&self.dir);
   }
 }
@@ -278,7 +280,8 @@ pub(crate) async fn created(
     !matches!(reply, slates_ipc::protocol::ReplyBody::Refused { .. }),
     "{reply:?}"
   );
-  let deadline = slates_rt::futures::now_ns().saturating_add(CREATION_PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(CREATION_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   loop {
     if let Some(Some(made)) = crate::state::with_state(|state| recorded(state, (asked.0, asked.3)))
     {
