@@ -1,5 +1,10 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~09:20 PST — svn stage C, the green's side, LANDED (A-814, main a0cdaf94f)
+- `ImportBatch` (a scratch member, staged works, one entry). w-svn has the seam and its side's list.
+- GAPS: A-813's f > 0 limit recorded with main's §4.16 ruling.
+- NOW: A-803 (b), offset-shift layers (red: values walked per insert). Then the one-value drift.
+
 ## ~08:45 PST — main 05:51: A-812's robustness gaps FIXED (A-813, main 8f4011a2e)
 - Holders take an owed version (the replica owes the same push). Retention is secured before the commit. Tail signatures
   are kept.
