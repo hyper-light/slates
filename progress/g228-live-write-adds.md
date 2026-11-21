@@ -107,6 +107,8 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   162.6-171.3; p999 290-484 us). Transport bench on the same runner = the exchange's round trip (my "30 us daemon" was
   wrong). Copy cut (04ec25860) A/B running: diag-g228-live-14, kiln r15. Item 3: ruling asked
   (inbox/main-from-g228-85a-item3.md); g222's arm C rejected, g222 closed.
+- The pre-restart r3 (d1323898, 32 cores) did finish, but kiln collected its output; only round 5 survives (load 28:
+  split 526.0 us added, p999 9,981; cache 243.5, p999 479). Not recorded in BENCHMARKS (not every round shown).
 - For main to delete: agents/g228-land-cache (landed), diag-g228-live-10..14 after reading.
 
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
