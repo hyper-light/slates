@@ -6935,3 +6935,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-sizing, A-789 (362bd8c39), 2026-11-20: provisioning A/B on a QUIET macOS machine (r26 ran at load 44-79). Release
   `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), interleaved, 3 rounds,
   all N. Red: B's 1-client spinning p99 above A's beyond the rounds' spread.
+- w-shared, A-697 part f (a9e789e54, main 56f33c6f6): the whole `slates-server --test fleet` suite on macOS and Linux,
+  plus loadtest-scale's three-node rungs. Production routing now serves a green's works on every node that replicates
+  it, so any test whose client on B created a work over A's green and expected the work on A may change. Red: a test
+  asserting a work id names the green's owner while its client was on another node.

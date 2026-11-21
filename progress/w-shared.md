@@ -313,3 +313,9 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   reached 9209 (the 1.1 KB-datagram hypothesis is refuted); 64 MiB stops: window ~6800, pacer ~600, budget ~7340, credit 0,
   goodput 34-60 MB/s; 4 MiB 18-476 MB/s. The congestion window bounds the lane on loopback: look at loss and cwnd
   collapse next, on a quiet machine.
+
+## LANDED 2026-11-20 ~18:05 PST: A-697 part f = a9e789e54 (main 56f33c6f6): the hook deleted, the rule "replicated here",
+  the holding list fanned, and the takeover test. A-697 complete. Close report appended. NEXT (completion): A-658 3c, with
+  its scope question to main (inbox/main-from-w-shared-a658-3c-scope.md; building reading (A) unless told otherwise).
+  Then robustness: family three (kiln r6 queued), exit 4 (kiln r9 queued). Then performance: lane (congestion window),
+  A/B.

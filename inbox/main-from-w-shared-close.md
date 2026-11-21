@@ -20,3 +20,19 @@ Still open, in close-list order:
 - Performance: the lane's ~200 MB/s, then the content-plane-versus-lane A/B.
 
 The sleep-and-look item closes when family three lands.
+
+## Closed 2026-11-20 ~18:05 PST: A-697 part f (takeover + routing flip; the hook deleted in the same change)
+Commit a9e789e54 on origin/main (landed as 56f33c6f6). `Daemon::serve_works_on_holders` / `WorkHome::on_holders` are
+gone. The rule "replicated here" (`work_home::green_elsewhere`) is in force: the control shard reads `merge.replicas`,
+and every other shard reads the fanned `WorkHome::holding`. The list is fanned per period and at once on a replica's
+first version.
+Tests (macOS arm64, local; on the merged tree):
+- `cargo test -p slates-server --test fleet a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies`
+  (new, 3 nodes at f = 1; the survivor that doesn't take over submits after A dies; answered v2; counters
+  `merge.work.computed_on_holder` and `merge.verdict.taken_by_position` at the successor moved).
+- The two-node e2e on production routing:
+  `a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner`.
+- Filters: fleet `a_holder` + `a_works_route_ends` 26 of 26; lib `work_home` + `fleet::tests` 23 of 23 (new
+  `a_replica_taken_reaches_the_other_shards_with_its_owner_once`); fmt clean.
+- Red, with the rule off: both holder tests failed ("the work's id names B", "the work was made on the holder").
+A-697 is complete with this (parts a1-f). Please mark it met.
