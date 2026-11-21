@@ -1518,3 +1518,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - clean-aggressive.sh freed 2 GB (stale kiln reach copies, an old bench target). Every big target was written in the last 2 h.
     - w-svn (33 GB target) was interrupted with an urgent trim. w-hg, w-git, w-perf and w-shared are told to keep one profile and send cold builds to the Studios.
     - Not ours, left alone: ~/.cache/kiln-move-stuck-target (24 GB, idle since 21:04; the script skips it, no fingerprint dir), kiln-send-route-target (27 GB) and kiln-opt-target (18 GB), all kiln sessions'. Ada's call.
+- 2026-11-21 01:23 PST DISK: the MacBook back to 34Gi free. w-svn deleted 22.6 GB (release and incremental) and w-git trimmed to 3.5 GB. w-shared's target grew to 19 GB for the release lane A/B main asked for. w-svn was redirected off a stage C worktree to B2 (main's 01:02 ruling supersedes 00:36). w-interop's Windows build for R3 failed its downloads on jupiter; it retries.
