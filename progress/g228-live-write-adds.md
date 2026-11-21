@@ -123,6 +123,12 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   processor (read once per 5 s), idle spins keep it at most the wake estimate (Karlin et al. SOSP 1991); rt.core.*
   counters; rt tests green (lib 86, held_core 3 unit + 1 integration, idle_spin/spin_kick/pollers/tcp/udp/readiness/
   idle_work_io/foreign_wake/cross_shard/timers). A/B r18 running: quiet, loaded, taskpolicy -b, -b + loaded.
+- 08:07 main: why kevent64? Probe (~/.cache/g228-probe): rustix FIONREAD 145 ns, recv peek 264, poll(0) 8.3-9.0 us,
+  kevent(0) empty 12.3-13.1 us, kevent(0) with an event ready 206 ns. kevent64 and free_processors dropped (r18
+  stopped). Rebuilt rustix-only (cf981488d): busy harvest no more often than its measured empty cost (held_turn), stamped
+  after; idle moment watches rings/pollers in user space for at most the wake estimate (only when tracked; capped at the
+  next timer), then today's spin and park. No driver/FFI/unsafe change. rt green (idle_spin caught a bound bug, fixed).
+  A/B r19: base ae4a05cdb vs hold cf981488d, quiet / loaded / taskpolicy -b / -b + loaded, 5 rounds each.
 - If (c) lands, its commits go onto main without the copy cut.
 - INCIDENT 2026-11-21 ~08:25 PST: I removed my own build dir ~/.cache/g228-hold-target on Studio-4 with `rm -rf`,
   against the rule (rm -r only by main's exact-path order). My own output only; nothing else touched. Use
