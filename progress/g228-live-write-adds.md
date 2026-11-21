@@ -156,6 +156,9 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   wrap (hyper-seal); blake3 neon on aarch64; hash a raw chunk once (seal.md §4 ruling).
 - Worktrees removed to free Studio-4 (~1.4 GB). Diag branches 10-19 and diag-results for main to delete.
 
+## 2026-11-21 12:42 PST: goal 93 reserve (main 01a1ff2e). The hg push spin stays with w-hg (its file); nothing written or
+run on it. No runs until main hands over the next red.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
