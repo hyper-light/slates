@@ -6,6 +6,7 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- C3 CLOSED 6370667fc (arm C decided; close note appended). NEXT C4 (hg) with w-hg, then C5 git, C6 svn.
 - C3 steps landed: 6ce6bd170 (changeset log), 6ada9dc42 (store: land, C rows, recovery), 67ba19d3a (seam: staging,
   land from staged, P rows, piece). Tests: slates-store unit 7/7, integration 4/4. A/B arm C (derived per-file form)
   added to crates/hg/examples/changeset_ab.rs (uncommitted, worktree) — running on adacachy (kiln r3), A B C x3.

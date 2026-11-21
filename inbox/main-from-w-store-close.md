@@ -20,3 +20,29 @@
   crates/rt and crates/land; the vendored crates' unit suites on Linux/Windows
   (`TMPDIR=<own dir> cargo test --manifest-path vendor/mantle/engine/Cargo.toml --lib`, same for chunk, hyper-block).
 - GAPS (performance, not blocking): segmented store files over the granted root.
+
+## C3 CLOSED (2026-11-20): slates-store — the seam, landing, and the content-form A/B with the derived per-path arm
+- Commits on origin/main (each confirmed with merge-base):
+  - 6ce6bd170 the changeset log (crates/store/src/log.rs): CRC'd header, sections (kind, len, CRC-32C), trailer (BLAKE3
+    identity, commit magic, len, CRC); appended in pieces, committed by trailer + one sync_data before the end moves;
+    recovered to the first record that does not verify. On hyper-block directly (hyper-log's groups keep a truncated
+    suffix; the history is never truncated) — recorded in A-767.
+  - 6ada9dc42 the store: granted dir (land store_root) holding `changesets` + mantle's engine `rows`; landing = commit
+    then C rows; engine checkpoints at the log's end; open replays the log from the checkpoint.
+  - 67ba19d3a the seam: Staging (in flight by BLAKE3, moved not copied, bounded, Full past budget), Store::land from
+    bytes or staged contents, P rows (payload identity -> place in the log, rebuilt on replay), Store::piece
+    (borrowed in flight, read from the log once landed), Store::changesets/sections.
+  - 6370667fc the A/B's arm C (crates/hg/examples/changeset_ab.rs): changesets + derived per-file form. Over hg's
+    history at zstd 1, N=3, Adas-Mac-Studio-2: old read p50 73-74 µs, clone file section 0.06 s (bar: 91 µs, 0.27 s;
+    A 77-79 µs / 0.19 s; B 814-833 µs / 2.02 s); derivation 2.2 s once, +25.7 MiB. Decided in A-767: changeset log =
+    truth, derived per-file form serves reads. BENCHMARKS has every round.
+- Tests: slates-store unit 7/7 (log over hyper-block's power-loss SimFile: round trip, every crash mode, interrupted
+  record, cut at every byte, bit flips, out-of-order; staging), integration 4/4 on real dirs (rows by repository,
+  recovery without/with checkpoint, a 300,001-byte pack read the same staged/landed/recovered), land store_root 3/3.
+- Not met as asked: adacachy could not clone hg's history (mercurial-scm.org "incomplete response" x3), so the A/B rows
+  are this Mac's (load 2-3.5). A Linux row needs the dataset carried there another way.
+- Agreement on the stored form: w-hg agreed (named-base edits, Texts section — both in the format), w-git agreed
+  (v4 payload by identity, normalization behind the same names); w-svn has not replied.
+- Next: C4-C6 — the store into the server (StoreGrant at repository creation, the store on the owner shard), each
+  tool's intake landing through Store::land, replay from Store::changesets, an RSS red test per tool; the derived
+  per-file form built in the store with hg (C4).
