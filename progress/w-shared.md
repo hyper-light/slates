@@ -334,3 +334,7 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   drops read as loss, and the window collapses (64 MiB stops: window ~6800). Test it with netstat -s -p udp deltas
   around the bulk row, then size the buffer from the work (the path's bandwidth-delay product, up to
   kern.ipc.maxsockbuf), on a quiet machine.
+
+## 2026-11-20 ~18:55 PST: main's ruling on A-658 3c: (A) not built; (B) stays on my list, sequenced after w-store's
+  A-767 server wiring lands. GAPS line landed (main 548e99440). NOW: robustness, family three (kiln r6) and exit 4
+  (kiln r9). Then 3c (B) once the store wiring is on main, then the lane and the A/B.
