@@ -1424,6 +1424,19 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > however often status is asked and a report reads figures at most two sweeps old. Counted
 > `content_range.sweep.idle_slices` and `.spaced`; held by
 > `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
+>
+> **Status (2026-11-20, main's ruling on g228's finding: residency only when asked, and no page walk for an object
+> whole).** A plain `DaemonStatus` does no residency work: the request carries `memory`, and only one that asks
+> (`slates status --memory`, `Client::daemon_memory_status`) advances the A-744 sweep, arms it on idle time and reads
+> the anchor's objects whole; a plain status reports the last figures read. The segment and the content object whole
+> come from the kernel's per-mapping figures (`slates_mem::resident::of_mapping`): macOS `mach_vm_region`'s top
+> information, each VM object's resident pages counted once (no written bytes reported there), Linux `/proc/self/smaps`
+> (`Rss` and the dirty pages); Windows, which has no per-mapping form, keeps the bounded walk only the asking request
+> pays. Measured on a Mac Studio (32 GiB shared mapping, 2 GiB written): 0.11 ms against `mincore`'s 30.0-31.7 ms,
+> agreeing to the page (BENCHMARKS). Counted `content_range.sweep.armed` and `.steps`; held by
+> `a_burst_of_plain_statuses_arms_no_residency_sweep_and_a_memory_status_does` (`crates/server/tests/daemon.rs`; red
+> with every status doing the work: 50 plain statuses armed one sweep a shard and took 398 and 177 steps) and
+> `resident::tests::a_mapping_read_whole_agrees_with_its_page_walk`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
@@ -1718,9 +1731,23 @@ cluster.
 > stand-in for the client's shard tells the waiting shards after every message it takes, as a drain does
 > (`slates_rt::registry::Registration::tell_room`), and nothing else moves the carrier.
 
+**Yield at the quantum when someone waits** (A-783, amending the rule that a cooperative step yields at its quantum).
+A paced step (`slates_pace::Step`, the one primitive every paced path uses: a push's build, git's and Mercurial's
+answers, Subversion's landings) runs units while its quantum has room for the next unit's estimated cost; at the
+quantum's end it asks once whether anyone else waits on its shard (`slates_rt::futures::others_waiting`: an inbound
+ring, a ready poller, the driver's completions harvested without blocking, a due timer, a ready task, or a task of the
+step's batch not yet polled, which the step took out of the ready queue with the asker). If someone does
+it yields there; if no one does it takes another quantum, up to the shard's ceiling (the watchdog's look,
+`HEARTBEAT_NS`: a step that ends within a look leaves every look a step to see). One ask a quantum, never one a unit
+(D-7, D-8), and never sooner than an ask costs. Each unit kind's cost is its own measured estimate: the running mean
+until the count reaches `ceil(CV^2 / e^2)` (CV the spread over the mean, `e` the target error, the scheduler's measured
+jitter over the quantum), then an exponentially weighted mean over that window (R3). A poll that asked and found no
+one is judged against the allowance its last ask gave, never counted a long step for it.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
-the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
+the CPU, or past the allowance its last ask for waiters gave, A-783, or waiting inside a call past it): Degraded,
+counted (`long_steps`, `blocked_steps`), the
 offending operation is chunked by design (destroys, large clones) so this is a bug signal. A poll the
 host held off the CPU past the quantum: counted apart (`preempted_steps`), never the task's; one the
 platform cannot attribute (macOS off the CPU, Windows everywhere): counted unattributed.
@@ -57515,8 +57542,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
   `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
   in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
-- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
-  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
+- **Part 3, the files made before the commit** (2026-11-20, closing A-760, main's close order C1). `Green::make_step`
+  makes a held verdict's files a copy slice a step (a file is its pieces of base and post-state, `segments`, copied
+  in order into its bytes reserved once), so the commit copies none: a splice of five bytes into a large file costs
+  its turns, never the commit's one step. Every file but those a run makes whole is made first, and each whole run's
+  buffer is moved into its file last; a green that moved since the verdict refuses the step `HeadMoved`, as the commit
+  does. Counted: `files_made_in_steps`. Test: a 1 MiB file spliced from one run beside a file made whole of another,
+  made a 64 KiB slice a step: no step past its slice, the spliced file copied once over the steps, the commit making
+  none, the whole run's buffer the created file.
+- **A bug in part 2, fixed with it.** The commit moved a whole run's buffer into its file before it made the others,
+  and a moved buffer shortens the post-state's one address space: every later run's bytes moved down by its length, so
+  a file spliced from a later run was made of the wrong bytes, silently
+  (`a_run_moved_into_its_file_leaves_later_runs_where_they_were`: `bytes` where `secon` belonged). Now the whole runs
+  are found first, every other file made with every buffer in place, the buffers moved last.
+- **Owed, named, not A-760's.** w-svn's landing driving the turns (`svn.land.*`, with `make_step` between its judge and
+  its commit); items 3-7 (w-engine's queue) then name the plane's object from the green's block, so the text is held
+  once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
@@ -57902,9 +57943,24 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
 > `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
 > the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
-> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
-> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
-> (`examples/per_path_read.rs`, Mercurial's own history).
+> (red with the rows not written: no landed text). A changeset landed through `begin`/`applied` gets every row since
+> bc0677af9 (`applied` reads the committed record back, as a replay does). Owed: the release timing against the
+> per-file arm's 91 µs (`examples/per_path_read.rs`, Mercurial's own history).
+
+> **Status (2026-11-20, the store sized by its work at both extremes; the owner's sliced landing).** A 128 GiB Mac
+> refused every landing (w-hg: "a memtable past 4 GiB"): the store's memtable was the shard's reserve, which grows with
+> the machine. It is one trunk node of extents (fanout × the content plane's chunk), the engine's own unit of work;
+> the memtable holds rows, never a landing's bytes (those are in the log), so no machine input belongs in it and no
+> clamp is needed. Held by `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike` in
+> `slates-api` (8 GiB and 128 GiB profiles injected into the machine facts the daemon derives from, the store started
+> as `--vcs-store` starts it, a landing and a clean stop at each; red at 128 GiB, the landing `Gone`, under the
+> machine-sized formula). A device's flush rate belongs to the log's group commit (owed), not the memtable. The
+> owner's sliced landing: `StoreHandle::begin` opens a record whose state lives in the log (`ChangesetLog::open_record`,
+> `open_section`, `open_piece`, `commit_open`, `abandon_open`), so the owner serves reads between its parts;
+> `SlicedLanding::section`, `part` (at most one piece, the read's unit, so a landing in flight holds a piece a request)
+> and `commit`; other landings wait in the owner's queue, bounded by the request channel's capacity and refused `Busy`
+> past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
+> end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58488,6 +58544,49 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   748 s to 944 s (every client reached a verdict); oracle failures 0 in both. The next bound: the 70,205 clients that
   met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases), the client node's merge
   budget; a first-occurrence log line now names what holds it (`Partition::merge_budget_held`).
+
+### A-783 — Paced work yields at the quantum when someone waits (2026-11-20, w-engine; main's pacing call of 15:35, "(1) + (2) + (3), one primitive"; amends §4.3's yield-at-the-quantum; D-7, D-8, R3)
+
+- **The gap** (w-git's measure): a 9,000-object git answer ran in 8,498 steps (release) and 29,177 (debug); each yield
+  costs a scheduler turn under load, so its wall time was the step count times the host's turn (about 10 s at load 60
+  for milliseconds of CPU). The quantum is the shard's wake estimate (§4.3), a few microseconds, and the answer already
+  ran units until it was spent: units cost about a quantum, so steps were about units.
+- **The rule** (§4.3 "Yield at the quantum when someone waits"): a step asks at each quantum's end whether anyone else
+  waits on its shard and yields only if someone does; else it takes another quantum, up to the ceiling (the watchdog's
+  look). An ask is one probe a quantum, never one a unit, and no sooner than an ask costs (its own measured estimate),
+  so asking takes at most half a step whatever the quantum. A unit kind's estimate stops a step before a unit that would
+  end past its quantum while someone waits.
+- **The batch** (found by the A/B, 2026-11-20): a shard's step takes up to a batch of ready tasks out of its queue and
+  polls them in turn, so while the first runs a paced turn the rest are in neither the queue nor the control channel. A
+  ref advertisement's connection, moved to its repository's shard just as a build turn began there, was admitted in the
+  same step and taken into the same batch: the turn asked 4,263 times over 80 ms and found no one, and the newcomer was
+  first polled 94 ms after its move was sent (the daemon's log, a scratch diagnostic build). The probe counts the
+  batch's tasks not yet polled (`batch_left`, a plain cell the step sets before each poll). Red first:
+  `a_task_ready_in_the_same_batch_is_seen_waiting` unseen for its whole 2 s bound before, seen after.
+- **Where.** `slates-pace` (no runtime: its clock and probe given, so the engine, git, Mercurial and Subversion use it):
+  `Env`, `Step`, `UnitCost`, `Costs`, `Report`. `slates_rt`: `ShardContext::others_waiting` (counted:
+  `waiting_asked`, `waiting_found`), `step_ceiling_ns` (set by the daemon at each shard's start to `HEARTBEAT_NS`; a
+  runtime nobody configures keeps a quantum, as before), and the long-step count judged against the last ask's
+  allowance. `slates_merge::pace::Pace` runs on it (unit kinds walk, base, compose, post, hash); the push build's
+  turns pass the shard's probe and ceiling (`push.build.more_quanta`, `push.build.yielded`).
+- **Tests.** `slates-pace`: under a mixed workload (3 ns and 40 ns units, a 100 ns quantum) no step runs past its
+  quantum while someone waits once the estimates are learned, where the fixed slicing's do; while no one waits the
+  steps number the work over the ceiling, a tenth of the fixed slicing's or fewer, one ask a quantum; the estimate's
+  window follows the spread (CV 0.8 at e 0.1: 64 samples). `slates-rt` `tests/pacing.rs`: the probe sees a ready task
+  and nothing alone; a connection arriving at a listener on a busy shard, a spawn sent to it, and a task ready in the
+  same batch are each seen; a poll that asked and found no one counts no long step, one that did not ask counts one. Server
+  `t_a752` (debug, 1,500 files): the update's build in 10 turns over 41,497 quanta (was about 163,000 turns), past
+  budget 0, no turn past its ceiling by more than a unit.
+- **A/B** (main's condition (d), release, interleaved, every round shown, idle and at load = cores; BENCHMARKS.md
+  "Paced work yields only when someone waits"): the first pass found the batch above (B's newcomers waited out whole
+  turns, about 100 ms). With it fixed, the push build's turns fell 3 to 20 times in six idle rounds of seven (A about
+  371,000 a round of 8 pushes), the wall best 7.864 s against 6.011 s and median 9.204 against 7.195 s, the newcomers'
+  p99 median 2.51 against 2.53 ms and max median 13.12 against 13.62 ms, provisioning's p99 median 176.4 against 183.0
+  µs. Owed: one round gained nothing, every turn yielding at its first ask (GAPS).
+- **Applied in the same change to** `crates/pace` (new), `crates/rt` (`shard`: the probe, the batch, the ceiling, the
+  polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
+  (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
+  `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
 
 ### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
 - **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing

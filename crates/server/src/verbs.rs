@@ -3161,10 +3161,10 @@ pub(crate) fn status_on_channel(
     ));
   }
   slot.status_pages.clear(&mut state.store.metadata);
-  if matches!(body, RequestBody::DaemonStatus) {
+  if let RequestBody::DaemonStatus { memory } = body {
     // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
     slot.status_pages.begin(request, &mut state.store.metadata);
-    return Some(scatter_status(state, client.index(), request));
+    return Some(scatter_status(state, client.index(), request, *memory));
   }
   None
 }
@@ -3894,14 +3894,14 @@ fn gather_session_log(
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
 /// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
 /// listing's part does.
-fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
+fn scatter_status(state: &mut ShardState, client_index: u32, request: u64, memory: bool) -> Served {
   let others: Vec<u16> = state
     .shards
     .iter()
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = shard_report(state);
+  let mine = shard_report(state, memory);
   if others.is_empty() {
     return Served::Reply(daemon_report(state, vec![mine]));
   }
@@ -3912,7 +3912,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
   for shard in others {
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(shard_report);
+        let part = crate::state::with_state(|state| shard_report(state, memory));
         crate::xshard::send_reply_home(origin, move || {
           gather_status(request, shard, part);
         });
@@ -4256,10 +4256,11 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
   }
 }
 
-/// This shard's part of the status: its counters and its health signals (§4.14 catalog).
-pub fn shard_report(state: &mut ShardState) -> ShardReport {
-  // Advanced first, mutably: the sweep of the shard's slice of the anchor content object (A-744).
-  let content_ranges = crate::content_ranges::report(state);
+/// This shard's part of the status: its counters and its health signals (§4.14 catalog). `memory`: the request asked for
+/// the memory report, whose residency work only such a request pays ([`crate::content_ranges::report`]).
+pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
+  // First, mutably: the residency the memory report reads, when asked (A-744; main's ruling on g228's finding).
+  let content_ranges = crate::content_ranges::report(state, memory);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -5599,8 +5600,8 @@ fn dispatch_inner(
       from,
     } => conflicts(state, principal, work, verdict, from),
     RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
-    RequestBody::DaemonStatus => {
-      let mine = shard_report(state);
+    RequestBody::DaemonStatus { memory } => {
+      let mine = shard_report(state, memory);
       daemon_report(state, vec![mine])
     }
     RequestBody::DaemonStatusNext { .. } => refused(Refusal::NotFound),
@@ -25155,7 +25156,7 @@ mod tests {
       let sent = [
         super::scatter_list(state, seat, asked(1), scatter_asker(), None),
         super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
-        super::scatter_status(state, seat, asked(3)),
+        super::scatter_status(state, seat, asked(3), false),
       ];
       let all_sent = sent
         .iter()
