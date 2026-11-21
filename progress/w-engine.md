@@ -281,3 +281,7 @@ Red: a focused server test landing a large named text: no step past the quantum,
   A-579 (b) + the mid-fold sum_at fix landed 596500613 (fast rule: fmt check, focused tests by name, local target;
   merged with main 1a35ab091 fetched through the MacBook, this Mac's DNS can't reach github.com). NEXT (05:00 order):
   slice the checkpoint's ~43 ms last step and the 13.4 ms single-key folds; (b)'s A/B owed.
+- 2026-11-21 ~15:30: A-579 key slices landed d4c7e1f42 (fold_identity_slice; the paced unit a BLAKE3 slice). Asked
+  main the durable-format question for the checkpoint's last ~43 ms step (record by identity in the content store, as
+  A-760/A-825; rides format 6?). Running the A/B 585b89299 vs d4c7e1f42 (Z 50/20, 5 rounds,
+  ~/.cache/w-engine-p3-runs/ab-final.txt).
