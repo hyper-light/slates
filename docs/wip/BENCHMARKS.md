@@ -15829,6 +15829,42 @@ What it says:
 - Logs: `~/.cache/w-perf/ab/a722p3-20261120T232946/` on the Studio (`push-<arm>-<round>.log`,
   `scale-<arm>-<round>.log`).
 
+## The derived per-path read form on the changeset store: an old file revision in 85 µs at p50, read from its own chain alone (A-645 on A-767; main's order of 2026-11-20 18:30; UI goal 93; 2026-11-20)
+
+**What it is.** The changeset store's read side for a file's old versions (`slates_store::texts`, fa5fd0023 and
+c5d746f8b): each changeset's `Texts` section names every version it kept (identity, length, base, place in its
+payload); landing derives `T` rows (a text by identity to how it is made) and `H` rows (a path's history), and
+`Store::text_at` makes a version by walking its `T` rows to a whole and applying each edit read from its own changeset,
+so no changeset outside the chain is read. Main's bar: "an old file revision read without rebuilding any changeset it
+isn't in, within the per-file arm's 91 µs" (w-hg's arm A at zstd 1, p50; the section "Mercurial's history held as
+changesets or as per-file deltas" above).
+
+**Command.** `cargo run --locked --release -p slates-store --example per_path_read -- ~/.cache/w-perf/hg-src DIR 2000`
+at c5d746f8b (kiln r32), adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB), 2026-11-20 20:13 to 20:31 PST, load
+11 to 14 (shared). Mercurial's own repository (4,242 paths, 114,696 file revisions, 94.0 MiB of revlog chunks) landed as
+54,728 changesets, one a changelog revision with the file revisions it introduced, each Mercurial's own chunk (a whole
+or its `mpatch` hunks against its recorded base; no diff made). Then 2,000 file revisions drawn as `changeset_ab` draws
+them (xorshift, seed 0x2026_1120), each read whole on a cold text cache, checked against its BLAKE3, three rounds over
+the same draws in one process.
+
+| Round | Old read µs p50 / p99 / max | Changesets opened p50 / p99 | Reads outside their chain |
+|---|---|---|---|
+| 1 (the log not yet in the page cache) | 234 / 20,334 / 90,598 | 41 / 851 | 0 |
+| 2 | 87 / 4,048 / 11,519 | 41 / 851 | 0 |
+| 3 | 85 / 4,067 / 9,083 | 41 / 851 | 0 |
+
+- **Within the bar once the log is cached** (85 and 87 µs against 91 µs), and the p99 beside arm A's (3,716 µs at zstd 1,
+  3,807 raw). Every read opened its own chain's changesets alone. The first round pays the log's first read from the
+  device (20 ms at p99).
+- **The chains are Mercurial's own**, up to 851 edits: a read applies each edit over the text before it. Shorter chains
+  (the store's own wholes at the chain bound) are the stored form's, w-hg's C1.
+- **Landing**: 978.7 s, 17.9 ms a changeset, one full flush (`F_FULLFSYNC`) each, as the store commits today; landings
+  sharing a flush are w-store's (A-767 item 2). The log 128.0 MiB (the chunks plus each changeset's `Texts` section and
+  framing), the rows file 132 KiB before a checkpoint. Peak RSS 1.06 GB is the example's (every chunk and identity held
+  to land and check), not the store's.
+- Found on this history and fixed first (c5d746f8b): a text that comes back (A, B, A) made a chain loop when its row
+  was replaced; a `T` row is now its first landing's.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
