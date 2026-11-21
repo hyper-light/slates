@@ -183,6 +183,8 @@ pub enum Given {
   Chunks(Vec<Vec<u8>>),
   /// Each full text asked, in order.
   Texts(Vec<Vec<u8>>),
+  /// The full texts asked hold more than the want's `most` bytes: none read past it.
+  TextsPast,
 }
 
 /// A manifest revision as the store keeps it, a delta ([`Store::manifest_delta`]): its base's position in the log, its
@@ -968,7 +970,7 @@ impl Walk {
         }
       }
       // A clone walked by its links sends every base before its delta: it asks no whole text.
-      Given::Texts(_) => files.unkept = true,
+      Given::Texts(_) | Given::TextsPast => files.unkept = true,
     }
   }
 
@@ -1144,14 +1146,17 @@ impl Walk {
       changegroup::put_name(&found, out).map_err(|_| unencodable("a path"))?;
       self.files.sent.clear();
     }
-    let base = match row.base {
-      None => NULL_NODE,
-      Some(base) => *self.files.sent.get(&base).ok_or(Refusal::Store {
-        what: "a file revision whose stored base this answer did not send",
-      })?,
-    };
     let link = node_of(store, link)?;
-    self.put_delta((node, parents, link, flags), (base, &chunk), room, out)?;
+    match row.base {
+      // A stored whole is its raw text (the store's contract, A-767 C1), sent as the one hunk 7.2 sends a whole in.
+      None => self.put((node, parents, link, flags), &chunk, room, out)?,
+      Some(base) => {
+        let base = *self.files.sent.get(&base).ok_or(Refusal::Store {
+          what: "a file revision whose stored base this answer did not send",
+        })?;
+        self.put_delta((node, parents, link, flags), (base, &chunk), room, out)?;
+      }
+    }
     self.files.sent.insert(row.text, node);
     self.files.stored = self.files.stored.saturating_add(1);
     Ok(Some(next(Some(found.clone()))))
@@ -1289,6 +1294,10 @@ pub(crate) struct Pull {
   ended: bool,
   /// Whether the store gave fewer rows or bytes than were asked: refused at the next step.
   short: bool,
+  /// The room a whole text was asked within, where the store found the text past it: refused at the next step.
+  past: Option<u64>,
+  /// The room the last whole text was asked within.
+  texts_most: Option<u64>,
 }
 
 /// A pull's file revision read ahead: where it is in the plan, how it is sent once decided, and its bytes once given.
@@ -1337,6 +1346,8 @@ impl Pull {
       whole: 0,
       ended: false,
       short: false,
+      past: None,
+      texts_most: None,
     }
   }
 
@@ -1355,6 +1366,10 @@ impl Pull {
             }
           }
         }
+      }
+      Given::TextsPast => {
+        self.data_asked.clear();
+        self.past = self.texts_most;
       }
       Given::Chunks(data) | Given::Texts(data) => {
         let asked = core::mem::take(&mut self.data_asked);
@@ -1376,6 +1391,12 @@ impl Pull {
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<bool, Refusal> {
+    if let Some(left) = self.past {
+      return Err(Refusal::PastAdmission(crate::PastAdmission {
+        asked: left.saturating_add(1),
+        left,
+      }));
+    }
     if self.short {
       return Err(Refusal::Store {
         what: "a file revision the changeset store gave short",
@@ -1438,11 +1459,15 @@ impl Pull {
       changegroup::put_name(&path, out).map_err(|_| unencodable("a path"))?;
       self.open = true;
     }
-    room.charge(to_u64(data.len()))?;
-    let (base, whole) = match send {
+    // A stored whole is its raw text (the store's contract, A-767 C1), and a text made whole is one: each sent as the
+    // one hunk 7.2 sends a whole in.
+    let (base, made_whole) = match send {
       Sending::Stored { base, .. } => (base, false),
       Sending::Whole { .. } => (NULL_NODE, true),
     };
+    let whole = base == NULL_NODE;
+    let hunk = if whole { delta::HUNK_HEADER_LEN } else { 0 };
+    room.charge(to_u64(data.len().saturating_add(hunk)))?;
     let revision = Revision {
       node: planned.node,
       p1: planned.entry.parents[0],
@@ -1465,7 +1490,7 @@ impl Pull {
       changegroup::put_revision(&revision, version, out)
     };
     written.map_err(|_| unencodable("a revision"))?;
-    if whole {
+    if made_whole {
       self.whole = self.whole.saturating_add(1);
     } else {
       self.stored = self.stored.saturating_add(1);
@@ -1625,7 +1650,8 @@ impl Pull {
     }
     if !texts.is_empty() {
       self.data_asked = asked;
-      self.want = Some(crate::render::Want::Texts { texts });
+      self.texts_most = Some(room);
+      self.want = Some(crate::render::Want::Texts { texts, most: room });
     }
   }
 }

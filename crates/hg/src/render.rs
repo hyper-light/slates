@@ -58,15 +58,6 @@ const NODE_PADDING: [u8; 12] = [0; 12];
 const FLAGS_BITS: u32 = 16;
 /// Format: the chunk header of a text stored as it is (`revlog.compress`'s `u`).
 const UNCOMPRESSED: u8 = b'u';
-/// Format: the hunk a changegroup puts before a text it deltas against the null base (7.2's `mdiff.trivialdiffheader`:
-/// start 0, end 0 and the text's length, three big-endian 32-bit words). The store keeps such a revision as it came,
-/// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
-/// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
-/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`).
-/// An empty text comes with no hunk at all, an empty delta (7.2's `hg debugbundle --all`: an empty file's delta is of
-/// length 0), which is sent as it is: refused, it left hg-src's stream empty (`mercurial/__init__.py`'s first revision).
-/// Format: three big-endian 32-bit words.
-const TRIVIAL_HUNK_BYTES: u64 = 12;
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
 
@@ -351,10 +342,14 @@ pub enum Want {
     places: Vec<StoredPlace>,
   },
   /// These full texts, each by its identity, made by the store from its chain (A-767 C1 step 1b: a pull's file revision
-  /// whose stored base the client may lack, sent whole against the null base).
+  /// whose stored base the client may lack, sent whole against the null base; a lookup's `.hgtags` at the served heads).
+  /// The texts together hold at most `most` bytes: the store reads them a piece at a time and stops past it, answering
+  /// [`StoreWants::texts_past`], so a hostile or huge text is never read whole.
   Texts {
     /// Each text's identity.
     texts: Vec<[u8; 32]>,
+    /// The most bytes the texts together may hold: the asking step's room.
+    most: u64,
   },
 }
 
@@ -378,6 +373,14 @@ pub trait StoreWants {
   fn give_chunks(&mut self, chunks: Vec<Vec<u8>>);
   /// The texts a [`Want::Texts`] asked for, in order; an answer that never asks for texts (a stream's) takes none.
   fn give_texts(&mut self, _texts: Vec<Vec<u8>>) {}
+  /// The texts a [`Want::Texts`] asked for hold more than its `most` bytes: the store stopped reading them there, and
+  /// the asker refuses its answer as past its room. An answer that never asks for texts (a stream's) is told none.
+  fn texts_past(&mut self) {}
+  /// Whether the asker is reading `.hgtags` for a name's lookup (`crate::serve::lookup::TagsRead`): what the daemon
+  /// counts its asks by.
+  fn reads_tags(&self) -> bool {
+    false
+  }
 }
 
 impl StoreWants for Streaming {
@@ -734,9 +737,8 @@ impl Streaming {
         (found.node, found.flags, found.len)
       }
     };
-    // A revision against the null base is sent as its text alone: its place must be the trivial hunk and the text.
-    let whole_text =
-      row.place.len == 0 && text == 0 || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES);
+    // A revision against the null base is sent as its text alone, which its place holds (a whole kept raw, A-767 C1).
+    let whole_text = row.place.len == text;
     let chunk = sent_len(row)
       .filter(|_| based || whole_text)
       .ok_or_else(unreadable)?;
@@ -814,16 +816,9 @@ impl Streaming {
       self.wanted_chunks = tags;
       return Ok(Stage::Data(log, rev));
     }
-    let row = stored
-      .revisions
-      .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
-      .ok_or_else(unreadable)?;
+    // A whole's chunk is its raw text and an edit's its delta (A-767 C1): either is sent as it lies.
     let (_, _, chunk) = self.chunks.pop_front().ok_or_else(unreadable)?;
-    let sent = if row.base.is_some() {
-      chunk.as_slice()
-    } else {
-      text_after_trivial_hunk(&chunk).ok_or_else(unreadable)?
-    };
+    let sent = chunk.as_slice();
     admission.charge(chunk_len(to_u64(sent.len())))?;
     if !sent.is_empty() {
       out.push(UNCOMPRESSED);
@@ -886,34 +881,10 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
   }
 }
 
-/// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a delta against
-/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]; an empty delta, an empty text's, as it
-/// is); none for a place too short to hold that hunk.
+/// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a whole its text's,
+/// which its place holds (A-767 C1).
 fn sent_len(row: &StoredRevision) -> Option<u64> {
-  let sent = if row.base.is_some() || row.place.len == 0 {
-    row.place.len
-  } else {
-    row.place.len.checked_sub(TRIVIAL_HUNK_BYTES)?
-  };
-  Some(chunk_len(sent))
-}
-
-/// The text a delta against the null base carries ([`TRIVIAL_HUNK_BYTES`]): what follows its one hunk, which must
-/// replace bytes 0 to 0 with exactly the rest; an empty delta, an empty text's, as it is; none for anything else.
-fn text_after_trivial_hunk(delta: &[u8]) -> Option<&[u8]> {
-  if delta.is_empty() {
-    return Some(delta);
-  }
-  let header = usize::try_from(TRIVIAL_HUNK_BYTES).ok()?;
-  let (hunk, text) = (delta.get(..header)?, delta.get(header..)?);
-  let words: Vec<u32> = hunk
-    .as_chunks::<{ size_of::<u32>() }>()
-    .0
-    .iter()
-    .map(|word| u32::from_be_bytes(*word))
-    .collect();
-  let length = u32::try_from(text.len()).ok()?;
-  (words == [0, 0, length]).then_some(text)
+  Some(chunk_len(row.place.len))
 }
 
 /// A chunk's length in its data file: its stored bytes and the `u` that marks a chunk stored as it is (7.2's reader

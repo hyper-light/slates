@@ -41,6 +41,7 @@
 
 use super::getbundle::{Answering, Asked, Store, getbundle};
 use super::keys;
+use super::lookup::TagsRead;
 use super::{Refusal, discovery, lookup, pull, stream};
 use crate::bundle2::{Bundle2, Event, Param, Part};
 use crate::decimal::Decimal;
@@ -278,6 +279,8 @@ pub enum Producing {
   Bundle(Box<Answering>),
   /// A `stream_out`'s revlogs.
   Revlogs(Box<crate::render::Streaming>),
+  /// A `lookup` reading the heads' `.hgtags` first.
+  Lookup(Box<Looking>),
 }
 
 impl Producing {
@@ -291,6 +294,7 @@ impl Producing {
   ) -> Result<bool, Refusal> {
     match self {
       Producing::Bundle(answering) => answering.step(store, room, out),
+      Producing::Lookup(looking) => looking.step(store, room, out),
       Producing::Revlogs(streaming) => {
         let (index, content) = store.revlogs().ok_or(Refusal::Store { what: "a revlog" })?;
         streaming
@@ -306,6 +310,7 @@ impl crate::render::StoreWants for Producing {
     match self {
       Producing::Revlogs(streaming) => streaming.wants(),
       Producing::Bundle(answering) => answering.wants(),
+      Producing::Lookup(looking) => looking.tags.wants(),
     }
   }
 
@@ -313,6 +318,7 @@ impl crate::render::StoreWants for Producing {
     match self {
       Producing::Revlogs(streaming) => streaming.give_rows(rows),
       Producing::Bundle(answering) => answering.give(super::getbundle::Given::Rows(rows)),
+      Producing::Lookup(looking) => looking.tags.give_rows(rows),
     }
   }
 
@@ -320,14 +326,48 @@ impl crate::render::StoreWants for Producing {
     match self {
       Producing::Revlogs(streaming) => streaming.give_chunks(chunks),
       Producing::Bundle(answering) => answering.give(super::getbundle::Given::Chunks(chunks)),
+      Producing::Lookup(looking) => looking.tags.give(super::getbundle::Given::Chunks(chunks)),
     }
   }
 
   fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
-    if let Producing::Bundle(answering) = self {
-      answering.give(super::getbundle::Given::Texts(texts));
+    match self {
+      Producing::Revlogs(_) => {}
+      Producing::Bundle(answering) => answering.give(super::getbundle::Given::Texts(texts)),
+      Producing::Lookup(looking) => looking.tags.give_texts(texts),
     }
   }
+
+  fn texts_past(&mut self) {
+    match self {
+      Producing::Revlogs(_) => {}
+      Producing::Bundle(answering) => answering.give(super::getbundle::Given::TextsPast),
+      Producing::Lookup(looking) => looking.tags.texts_past(),
+    }
+  }
+
+  fn reads_tags(&self) -> bool {
+    matches!(self, Producing::Lookup(_))
+  }
+}
+
+/// A `lookup` of `key` over `transport` whose name reaches the tags: its answer begun reading the heads' `.hgtags`
+/// within `admission` (module docs of [`lookup`]); none where the name resolves before them, which is answered whole.
+pub(crate) fn lookup_begun(
+  store: &impl Store,
+  key: &[u8],
+  transport: Transport,
+  admission: &mut Admission,
+) -> Result<Option<Producing>, Refusal> {
+  if !lookup::needs_tags(store, key) {
+    return Ok(None);
+  }
+  let tags = TagsRead::begin(store, admission)?;
+  Ok(Some(Producing::Lookup(Box::new(Looking {
+    key: key.to_vec(),
+    transport,
+    tags,
+  }))))
 }
 
 /// Serves the request at the front of `input` as [`serve`] does, but a `getbundle` whose answer begins, or a
@@ -385,6 +425,27 @@ pub fn begin_serving(
   if command == b"stream_out" && store.revlogs().is_some() {
     *answering = Some(Producing::Revlogs(Box::default()));
     return Read::Done(Step::Answered { refused: None }, consumed);
+  }
+  if command == b"lookup"
+    && let Some(key) = arguments.get(spec, b"key")
+  {
+    match lookup_begun(store, key, Transport::Ssh, admission) {
+      Ok(Some(looking)) => {
+        *answering = Some(looking);
+        return Read::Done(Step::Answered { refused: None }, consumed);
+      }
+      Ok(None) => {}
+      Err(refusal) => {
+        let refused = Refused::Serve(refusal);
+        ssh::respond_error(&message(&refused), stdout, stderr);
+        return Read::Done(
+          Step::Answered {
+            refused: Some(refused),
+          },
+          consumed,
+        );
+      }
+    }
   }
   let refused = answer(store, command, spec, &arguments, admission, stdout, stderr);
   Read::Done(Step::Answered { refused }, consumed)
@@ -523,7 +584,9 @@ pub(crate) fn dispatch(
     batch_answer(store, transport, cmds, admission, &mut value)
   } else {
     let named = |name: &[u8]| arguments.get(spec, name);
-    string_answer(store, transport, command, named, admission, &mut value)
+    string_answer(
+      store, transport, command, named, &mut None, admission, &mut value,
+    )
   };
   match answered {
     Ok(()) => (Answer::Bytes(value), None),
@@ -537,6 +600,7 @@ fn string_answer<'a>(
   transport: Transport,
   command: &[u8],
   argument: impl Fn(&[u8]) -> Option<&'a [u8]>,
+  tags: &mut Option<TagsRead>,
   admission: &mut Admission,
   out: &mut Vec<u8>,
 ) -> Result<(), Refused> {
@@ -548,7 +612,13 @@ fn string_answer<'a>(
     b"branches" => discovery::branches(store, need(b"nodes")?, admission, out)?,
     b"branchmap" => discovery::branchmap(store, admission, out)?,
     b"listkeys" => pull::listkeys(store, need(b"namespace")?, admission, out)?,
-    b"lookup" => lookup::lookup(store, need(b"key")?, admission, out)?,
+    b"lookup" => {
+      let key = need(b"key")?;
+      if lookup::needs_tags(store, key) && tags.is_none() {
+        *tags = Some(TagsRead::now(store, admission)?);
+      }
+      lookup::lookup(store, tags.as_ref(), key, admission, out)?;
+    }
     b"capabilities" => advertised((transport, store.streams()), admission, out)?,
     b"hello" => {
       let mut line = Vec::new();
@@ -625,6 +695,10 @@ fn batch_answer(
       Ok(())
     }
     BatchStep::Push(_) => Err(Refused::NotServed),
+    // A whole answer cannot wait between steps for the store's `.hgtags` ([`lookup::TagsRead::now`]'s refusal).
+    BatchStep::Store => Err(Refused::Serve(Refusal::Store {
+      what: "a .hgtags text read from the changeset store between steps",
+    })),
   }
 }
 
@@ -650,6 +724,8 @@ pub struct Batch {
   next: usize,
   /// The answers so far, in order, unescaped.
   results: Vec<Vec<u8>>,
+  /// The heads' `.hgtags`, read once for every `lookup` call that reaches the tags ([`lookup::TagsRead`]).
+  tags: Option<TagsRead>,
 }
 
 /// What a [`Batch`]'s step came to.
@@ -660,6 +736,9 @@ pub enum BatchStep {
   Push(Vec<u8>),
   /// Every call answered: the batch's answer, each answer escaped, joined by `;`.
   Answered(Vec<u8>),
+  /// A `lookup` call needs the heads' `.hgtags` read from the changeset store first: the caller answers the batch's
+  /// [`crate::render::StoreWants`] and steps it again.
+  Store,
 }
 
 impl Batch {
@@ -686,6 +765,7 @@ impl Batch {
       results: Vec::with_capacity(calls.len()),
       calls,
       next: 0,
+      tags: None,
     })
   }
 
@@ -718,11 +798,19 @@ impl Batch {
           }
         }
       } else {
+        if call.command == b"lookup"
+          && let Some(key) = argument(b"key")
+          && lookup::needs_tags(store, key)
+          && !tags_read(&mut self.tags, store, admission)?
+        {
+          return Ok(BatchStep::Store);
+        }
         string_answer(
           store,
           transport,
           &call.command,
           argument,
+          &mut self.tags,
           admission,
           &mut result,
         )?;
@@ -751,6 +839,100 @@ impl Batch {
     self.results.push(answer);
     self.next = self.next.saturating_add(1);
     Ok(())
+  }
+}
+
+/// Whether a batch's heads' `.hgtags` are read (module docs of [`lookup`]): begun once within `admission`'s room, then
+/// answered at once where `store` can ([`Store::stored_now`]); false where the store must be asked between steps.
+fn tags_read(
+  tags: &mut Option<TagsRead>,
+  store: &impl Store,
+  admission: &mut Admission,
+) -> Result<bool, Refused> {
+  let tags = match tags {
+    Some(tags) => tags,
+    None => tags.insert(TagsRead::begin(store, admission)?),
+  };
+  while let Some(want) = tags.wants().cloned() {
+    let Some(given) = store.stored_now(&want) else {
+      return Ok(false);
+    };
+    tags.give(given);
+  }
+  Ok(true)
+}
+
+impl crate::render::StoreWants for Batch {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.tags.as_ref().and_then(TagsRead::wants)
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    if let Some(tags) = &mut self.tags {
+      tags.give_rows(rows);
+    }
+  }
+
+  fn give_chunks(&mut self, _chunks: Vec<Vec<u8>>) {
+    if let Some(tags) = &mut self.tags {
+      tags.give(super::getbundle::Given::Chunks(Vec::new()));
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    if let Some(tags) = &mut self.tags {
+      tags.give_texts(texts);
+    }
+  }
+
+  fn texts_past(&mut self) {
+    if let Some(tags) = &mut self.tags {
+      tags.texts_past();
+    }
+  }
+
+  fn reads_tags(&self) -> bool {
+    true
+  }
+}
+
+/// A `lookup` whose name reaches the tags (A-767 C1, main's ruling (A)): the heads' `.hgtags` read from the changeset
+/// store first ([`TagsRead`]), between steps where the store answers only then, then the answer written whole, framed
+/// for its transport.
+#[derive(Debug)]
+pub struct Looking {
+  /// The name looked up.
+  key: Vec<u8>,
+  /// The transport it is answered over: over SSH its string is framed `<length>\n<value>`.
+  transport: Transport,
+  /// The heads' `.hgtags`.
+  tags: TagsRead,
+}
+
+impl Looking {
+  /// Writes the answer to `out` once the tags are read: whether more follow (true while the store is still asked).
+  fn step(
+    &mut self,
+    store: &impl Store,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    while let Some(want) = self.tags.wants().cloned() {
+      let Some(given) = store.stored_now(&want) else {
+        return Ok(true);
+      };
+      self.tags.give(given);
+    }
+    let mut value = Vec::new();
+    lookup::lookup(store, Some(&self.tags), &self.key, room, &mut value)?;
+    match self.transport {
+      Transport::Ssh => {
+        room.charge(ssh::respond_len(&value))?;
+        ssh::respond(&value, out);
+      }
+      Transport::Http { .. } => out.append(&mut value),
+    }
+    Ok(false)
   }
 }
 

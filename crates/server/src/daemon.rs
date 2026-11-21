@@ -4985,6 +4985,7 @@ async fn init_shard(
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
     materializations: crate::green_ready::Materializations::default(),
+    hg_tags: crate::vcs_store::hg_tags::HgTags::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,

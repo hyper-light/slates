@@ -215,6 +215,15 @@ pub enum Unverified {
     /// The base.
     base: Node,
   },
+  /// A revision against the null base whose delta is not the one hunk inserting its whole text that every 7.2 writer
+  /// sends (`mdiff.trivialdiffheader`; an empty delta for an empty text): its text does not lie whole in the push's
+  /// bytes, where the store keeps a whole (A-767 C1).
+  NotWhole {
+    /// The log.
+    log: LogOf,
+    /// The revision.
+    node: Node,
+  },
   /// A delta that does not apply to its base.
   Delta {
     /// The log.

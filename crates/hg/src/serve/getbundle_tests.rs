@@ -112,14 +112,6 @@ impl Repository for Served {
   ) -> Result<Option<Node>, crate::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut crate::Admission,
-  ) -> Result<Vec<u8>, crate::serve::Refusal> {
-    Err(crate::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Served {
@@ -135,7 +127,7 @@ impl Served {
 
 impl Store for Served {
   /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
-  /// plain BLAKE3 of its text, its place named by that identity, its chunk the full-text hunk; none where its text is
+  /// plain BLAKE3 of its text, its place named by that identity, its chunk its raw text (a whole) or its delta; none where its text is
   /// lost.
   fn stored_now(&self, want: &crate::render::Want) -> Option<super::Given> {
     use crate::render::{StoredPlace, StoredRevision, Want};
@@ -158,7 +150,10 @@ impl Store for Served {
                 place: StoredPlace {
                   payload: identity,
                   offset: u64::from(before.is_some()),
-                  len: u64::try_from(delta::HUNK_HEADER_LEN + kept.text.len()).unwrap(),
+                  len: u64::try_from(
+                    kept.text.len() + before.map_or(0, |_| delta::HUNK_HEADER_LEN),
+                  )
+                  .unwrap(),
                 },
               })
             });
@@ -179,20 +174,26 @@ impl Store for Served {
           let mut chunk = Vec::new();
           match self.before(log, kept).filter(|_| place.offset == 1) {
             Some(before) => delta::encode_lines(&before.text, &kept.text, &mut chunk).ok()?,
-            None => delta::encode_full_text(&kept.text, &mut chunk).ok()?,
+            // A stored whole is its raw text (the store's contract, A-767 C1).
+            None => chunk.extend_from_slice(&kept.text),
           }
           chunks.push(chunk);
         }
         Some(super::Given::Chunks(chunks))
       }
-      Want::Texts { texts } => {
+      Want::Texts { texts, most } => {
         let mut made = Vec::new();
+        let mut total = 0_u64;
         for identity in texts {
           let kept = self
             .files
             .values()
             .flat_map(|log| log.values())
             .find(|kept| blake3::hash(&kept.text).as_bytes() == identity)?;
+          total = total.saturating_add(u64::try_from(kept.text.len()).unwrap());
+          if total > *most {
+            return Some(super::Given::TextsPast);
+          }
           made.push(kept.text.clone());
         }
         Some(super::Given::Texts(made))

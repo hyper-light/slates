@@ -111,6 +111,7 @@ pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
 pub(crate) mod hg_made;
+pub(crate) mod hg_tags;
 pub(crate) mod hg_view;
 pub(crate) mod homes;
 pub(crate) mod index_upkeep;

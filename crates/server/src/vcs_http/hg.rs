@@ -182,6 +182,7 @@ pub(crate) trait HgStores {
         Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
         Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
         Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
+        Some(slates_hg::serve::getbundle::Given::TextsPast) => wants.texts_past(),
         None => return false,
       }
     }
@@ -801,6 +802,18 @@ async fn answered_batch<S: HgStores>(
       None => return Ok(None),
       Some(Ok(BatchStep::Push(bundle))) => bundle,
       Some(Ok(BatchStep::Answered(answer))) => return Ok(Some(hg_http::batched(Ok(answer)))),
+      Some(Ok(BatchStep::Store)) => {
+        // A lookup call reaches the tags: the heads' `.hgtags` read from the node's changeset store, once for the
+        // batch (A-767 C1, main's ruling (A)), under a generation held for the asks, then the batch stepped again.
+        let room = admission.left();
+        let Some(held) = stores.hold(id, &mut Admission::new(room)) else {
+          return Ok(None);
+        };
+        if !stores.answer_wants((&held, id, room), &mut batch).await {
+          return Ok(None);
+        }
+        continue;
+      }
       Some(Err(refused)) => return Ok(Some(hg_http::batched(Err(refused)))),
     };
     if !posted {
