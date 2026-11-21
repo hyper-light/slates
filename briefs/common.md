@@ -81,8 +81,11 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
   - adas-mac-studio-2.local and adas-mac-studio-3.local push to GitHub over SSH. Use
     `git remote set-url --push origin git@github.com:hyper-light/<repo>.git`.
   - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
-    credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
-    there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
+    credential). Since 2026-11-20 ~18:00, kiln refuses runs on adas-mac-studio-2.local (draining), so land from the
+    32-core Studio through adas-mac-studio-3.local, with a bundle over stdin and no sync (main 20:55):
+    `git fetch origin && git merge origin/main`, rerun your focused tests, then
+    `git bundle create - origin/main..HEAD | ~/.local/bin/kiln run --on adas-mac-studio-3.local --no-sync -i --timeout 300 -- 'set -e; d=$HOME/.cache/<you>-push; [ -d "$d" ] || git clone -q --filter=blob:none --no-checkout git@github.com:hyper-light/slates.git "$d"; cd "$d"; cat > .git/in.bundle; git fetch -q origin main; git fetch -q .git/in.bundle HEAD:refs/<you>/tip; git push origin refs/<you>/tip:refs/heads/main; git update-ref -d refs/<you>/tip; rm -f .git/in.bundle'`.
+    A push refused because main moved: merge again, retest, resend. Then check `git merge-base --is-ancestor`.
 
 ## NAMING A BRANCH WITHOUT CHECKOUT (main 2026-11-20 ~01:20 PST: two agents ran `git checkout -b` tonight)
 `git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
