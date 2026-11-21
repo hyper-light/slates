@@ -193,7 +193,10 @@
 > turn yielded at its first quantum (2.2 us on an M4 Max), so a turn took one step, an index entry or a chunk, about
 > 460,000 turns for hg-src. BUILT: the hg edges' turns are paced as A-783 says every paced path is (`hg_view::paced_turn`
 > over `slates_pace::Step`: to the quantum while someone waits, on to the shard's ceiling while no one does), counted
-> (`vcs_store.hg_stream_turns`); hg's first 2987 changesets stream in 16 turns where they took 24,956. OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
+> (`vcs_store.hg_stream_turns`); hg's first 2987 changesets stream in 16 turns where they took 24,956. r25 on
+> 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
+> store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
+> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
 > against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
 > the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
 > stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own

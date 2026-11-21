@@ -452,11 +452,7 @@ fn serve(
         let _ = answer.try_send(found);
       }
       Request::Places { places, answer } => {
-        let read: Result<Vec<_>, StoreError> = places
-          .iter()
-          .map(|place| store.place_bytes(&staging, place))
-          .collect();
-        let _ = answer.try_send(read);
+        let _ = answer.try_send(store.places_bytes(&staging, &places));
       }
       Request::Read {
         offset,
