@@ -71,3 +71,15 @@ w-work-cow fixes "first edit copies whole file" at chunk grain in the content la
 2. Kernel variant with real editor processes (gated, run-request filed).
 3. Restart: unsubmitted mount writes lost at restart (slot not recorded); mount refresh when the work's base moves.
 4. D-O17 several spans a file: swap `changed_span` for w-rewrite-ops' minimiser at its one call site.
+
+## 2026-11-20 18:40 — main's 15:20 order done
+1. Lazy base: part 2 f6660f0ab (mounts: release 547 MB -> 0.75 MB for 8, 9.4-12.9 ms -> 0.5-0.8 ms), part 3 f401f798c
+   (green landing: presenting 69 MB -> 1.6 MB, release A/B in BENCHMARKS).
+2. Restart: part 4 9d73a77c6 (recovery rebuilds a mounted work's slot from its image over its green).
+3. D-O17: part 5 1b0f5679c (declare whole-file replacement; A-776 refine at composition).
+4. Kernel real-editor variant: run-requests.md.
+Remaining GAPS (A-774 row): mount not refreshed when its work's base moves; a work with declared changes refused a
+mount; only NFS/FUSE lend the tree (WinFsp, virtio-fs, fs verbs refuse typed); green on another shard mounts nothing;
+re-landing a green into a target holding an earlier landing conflicts on changed files (needs witnesses); the views'
+tree loads in one step (slice owed).
+Lessons: never build two worktrees into one target dir (poisoned release artifacts); `git commit --no-gpg-sign`.
