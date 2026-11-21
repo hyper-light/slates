@@ -1,0 +1,45 @@
+name: diag-measurer
+
+# g222's red/green of the Linux timed wait (84a): the sub-millisecond wait test at the test-only commit (red) and with
+# the timerfd deadline (green), and slates-rt's whole suite at green. A diagnostics lane run only from
+# `diag-measurer-*` branches (never main).
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  RED: "1b054a15d"
+  GREEN: "445082604"
+
+jobs:
+  red-green:
+    name: red/green (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: red, green, and slates-rt at green
+        shell: bash
+        run: |
+          uname -a; nproc
+          W="$RUNNER_TEMP/rg"; mkdir -p "$W"; export CARGO_TARGET_DIR="$W/target"
+          for arm in $RED $GREEN; do
+            mkdir -p "$W/src-$arm"; git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$arm"
+            echo "== $arm: the sub-millisecond wait test, 3 times"
+            for n in 1 2 3; do
+              ( cd "$W/src-$arm" && cargo test -q --locked -p slates-rt --lib a_sub_millisecond_timed_wait 2>&1 ) | grep -E 'test result|took at least|panicked|^error' | head -4
+            done
+          done
+          echo "== $GREEN: slates-rt whole"
+          ( cd "$W/src-$GREEN" && cargo test -q --locked -p slates-rt 2>&1 ) | grep -E 'test result|FAILED|panicked|^error' | head -40
