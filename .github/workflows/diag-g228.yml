@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "two:63d19f184 one:72af2d1ed"
+      ARMS: "split:d80175d3f"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -54,7 +54,7 @@ jobs:
                   if n: out.append(f"{h} {ns/n/1000:.1f}")
               for k in ["hold.declined","hold.answer","hold.exchange","hold.dispatches","hold.entries","hop.reply_timed"]:
                   if k in d: out.append(f"{k}={d[k]}")
-              out += [f"{k.split('.')[-1]}={v}" for k,v in d.items() if "woken_by" in k]
+              out += [f"{k.split('.')[-1]}={v}" for k,v in d.items() if "woken_by" in k or "reply_pending" in k]
               print(f"  {who}: "+", ".join(out))
           PY
           for r in $(seq 1 "$ROUNDS"); do
