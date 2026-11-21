@@ -347,6 +347,17 @@
 > Passes on its first run (local macOS, 49 s with the HTTP round trip). Reading (b), the forced push judged as a work
 > and made over the moved head (the lock-free rebase, beyond stock), waits on main's ruling
 > (inbox/main-from-w-hg-2026-11-20-item6-question.md).
+> **A clone sends a manifest kept as a delta as that delta (2026-11-20, w-hg; Ada's no-allocation rule, goal 93's
+> clone; found in the code).** A clone sent every revision as its whole text against the null base. For hg's own
+> history that's about 57,000 manifests of up to 179 KB, each rebuilt from its chain on the server and diffed again
+> by the client. FIXED for manifests: `getbundle::Store::manifest_delta` lends a manifest's stored delta in place
+> (`Indexed`, A-729's rows), and the walk sends it against its base where that base went just before it in the same
+> answer (every one after the first in a clone). Otherwise it sends the whole text, as before. Red first:
+> `serve::indexed::tests::a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta` ("every manifest was sent whole"
+> before; each text rebuilt from its base and checked against its node after). Every stock hg 7.2 interop test passes
+> through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
+> go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
+> 283 s, measured again, release.
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
