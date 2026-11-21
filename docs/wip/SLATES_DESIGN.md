@@ -57880,6 +57880,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
 > replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
+> **Status (2026-11-21, C1 step 3: an import lands as a run of segment changesets; main's ruling of 01:16).** The
+> import's changegroup is cut into segments of one trunk node of the store's memtable. Each lands as one changeset as it
+> is cut, its `Record` the index rows of its revisions by identity (record v8: groups continuing the logs, markers in
+> the last), its `Payload` its slice of the changegroup, and its `Texts` each revision's text, delta parent and place.
+> The register's import entry names the run (record v9: first and last sequence). A restart reads each segment's
+> record back and appends its rows by identity: its cost is the rows', with no payload read and no text rebuilt,
+> whatever the history's texts (main's red, held at a warm restart). The rows a segment's record stores equal the rows
+> the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
+> An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
+> sequence plus one (decision 2).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with

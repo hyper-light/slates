@@ -645,19 +645,19 @@ const STREAM_TURNS_AT_MOST: u64 = 6;
 /// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
 const STREAMING_LINE: &str = "streaming all changes";
 
-/// Goal 93 perf (main's ruling of 2026-11-21 02:31). A stream clone sends each revision as the changeset store keeps
-/// it, and the store keeps no revision of an imported history until w-hg's C1 step 3 lands imports as changesets, so
-/// such a repository must list no stream capability: stock 7.2 then clones plainly with its own warning, where it had
-/// aborted ("operation forbidden by server"). Do: over the HTTP edge, import a two-changeset history (an empty file
-/// among its files) into one
-/// repository (`slates repository import`) and push the same history into another; `hg clone --stream` each. Expect the
-/// imported one's clone to succeed with 7.2's warning and no stream, and the pushed one's to stream as before, each
-/// clone holding the source's changesets and passing `hg verify` without a warning (the empty file's log streamed
-/// split left its `.d` out of the client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking
-/// at most [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+/// Goal 93 perf (main's ruling of 2026-11-21 02:31) and A-767 C1 step 3. A stream clone sends each revision as the
+/// changeset store keeps it, and since C1 step 3 an import lands on the store as segment changesets, each revision its
+/// revlog's own delta, as a push's does; so an imported repository streams as a pushed one does (before, it listed no
+/// stream capability and stock 7.2 cloned it plainly with its warning). Do: over the HTTP edge, import a two-changeset
+/// history (an empty file among its files) into one repository (`slates repository import`) and push the same history
+/// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
+/// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
+/// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
+/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
 #[test]
 #[allow(clippy::disallowed_methods)]
-fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly() {
+fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
   let Some(hg) = stock_hg() else {
     eprintln!(
       "skipping stock hg's stream clone of an imported repository: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
@@ -734,7 +734,7 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_
   let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
   assert_eq!(
     (imported, pushed),
-    ((true, false, true, Ok(())), (false, true, true, Ok(()))),
+    ((false, true, true, Ok(())), (false, true, true, Ok(()))),
     "(warned, streamed, whole, verified clean) for the imported repository's clone, then the pushed one's"
   );
   assert!(

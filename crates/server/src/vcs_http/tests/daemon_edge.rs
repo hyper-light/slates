@@ -1131,7 +1131,10 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       "the import did not end: {ended:?}"
     );
     // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported(state, id),
+      Ok(())
+    );
   });
 }
 
