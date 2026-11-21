@@ -57666,6 +57666,19 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `O_NOFOLLOW`), a new name made durable with the directory; `hyper-block`'s `DeviceFile::adopt` takes such a file
 > (local change 3). Tests: `slates-land --test store_root` 3/3. A store file is one `DeviceFile` for now; segmented
 > files over the root (mantle's answer to APFS's first-write stalls) are a performance item (GAPS).
+>
+> **Status (2026-11-20, piece C3 step 1: the changeset log).** `crates/store` (`slates-store`), `log.rs`: item 2's
+> record (a 64-byte header with its CRC-32C; sections, each a head of kind, length and CRC-32C; a 48-byte trailer
+> holding the identity, BLAKE3 of the header and each section's kind, length and bytes, the commit magic, the length
+> and a CRC-32C), appended a section and a piece at a time, committed by the trailer and one `sync_data` before the
+> log's end moves, recovered from a trusted offset to the first record that does not verify. It is built on
+> `hyper-block`'s file directly, not on `hyper-log`: hyper-log is a Raft log whose groups retain a bounded suffix
+> (`group_entries`, `group_bytes`) truncated once applied, and the changeset log is the repository's whole history,
+> never truncated (hyper-log stays vendored for the fleet's replication). The agreed format (w-hg: an edit's named
+> base and a `Texts` section of each touched path's full-text identity; w-git: v4's payload homed by identity, normalized
+> later behind the same names) is the sections' content. Tests: `slates-store --lib log` 6/6 over the simulated file with
+> power-loss semantics: round trip, every crash mode, a record interrupted before its commit, a cut at every byte of
+> the last record, a flipped bit in a header, a payload or a trailer, out-of-order appends.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
