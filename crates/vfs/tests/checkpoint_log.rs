@@ -576,6 +576,28 @@ fn check_dead_ranges(
   }
 }
 
+/// Checks the written ranges (A-744's split, main's ruling on w-sizing's option (a), 2026-11-21: a residency sweep reads
+/// only what can hold pages) against what was written: every byte of either memory written since its last give-back
+/// lies inside them, so a sweep over them misses no page that can be resident.
+fn check_written_ranges(journal: &Journal, checkpoints: &Recorded, log: &Recorded) {
+  let [committed, stale, logged] = journal.written_ranges(checkpoints.bytes.len(), log.bytes.len());
+  let inside = |at: usize, ranges: &[(usize, usize)]| {
+    ranges
+      .iter()
+      .any(|(offset, len)| *offset <= at && at < offset + len)
+  };
+  if let Some(at) = (0..checkpoints.bytes.len())
+    .find(|at| checkpoints.written[*at] && !inside(*at, &[committed, stale]))
+  {
+    panic!(
+      "checkpoint byte {at} was written but lies outside the written ranges {committed:?}, {stale:?}"
+    );
+  }
+  if let Some(at) = (0..log.bytes.len()).find(|at| log.written[*at] && !inside(*at, &[logged])) {
+    panic!("log byte {at} was written but lies outside the written range {logged:?}");
+  }
+}
+
 proptest::proptest! {
   #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig {
     cases: slates_test_seeds::cases(48),
@@ -585,7 +607,8 @@ proptest::proptest! {
   /// A-117, A-226 and A-270, the oracle: do run a generated history of checkpoints, appended deltas, held pieces put and
   /// removed, give-backs and restarts over memories that record each byte written; expect after every step that the
   /// dead ranges name every written byte no restart reads, lie inside what no restart reads and end at the last such
-  /// write, and that a restart recovers the volume's full image and the model's held pieces whatever was given back.
+  /// write, that every byte written since its last give-back lies inside the journal's written ranges (A-744's split),
+  /// and that a restart recovers the volume's full image and the model's held pieces whatever was given back.
   #[test]
   fn a_give_back_names_every_dead_written_byte_and_stops_at_the_last(
     steps in proptest::collection::vec(
@@ -683,6 +706,7 @@ proptest::proptest! {
         }
       }
       check_dead_ranges(&journal, &checkpoints, &log, tail, &unknown);
+      check_written_ranges(&journal, &checkpoints, &log);
       let (image, _) = Journal::recover(&checkpoints, &log).unwrap();
       proptest::prop_assert!(
         image.unwrap() == full_with(&vol, &store, &held),

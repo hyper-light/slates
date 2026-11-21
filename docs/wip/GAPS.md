@@ -91,7 +91,18 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
+> shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
+> arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
+> written ranges of the write log, image slots and delta log, the rings), the memory report's kinds first: measured on
+> the second look, 75-89 ms, 256 of 256 MiB (`a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas`).
+> Steps are timed by a nanosecond step clock: on the shard's microsecond clock steps ran up to 15.5 ms against a ~1.6 us
+> budget unseen. **Open:** a fresh daemon's write log and journal cannot know their memories unwritten until their first
+> give-back, so the split (A-744's per-range rows) walks ~28 GiB a shard whole, 13.9 s on a debug audit daemon; the
+> anchor could tell its first daemon the content object is new. Also open: the runtime's look for work between two idle
+> slices (~17 us against ~1.6 us of sweep in each) sets the honest sweep's rate, about 280 K pages a second. Windows'
+> run is with w-lint (run-requests, 2026-11-21T01:10Z). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**

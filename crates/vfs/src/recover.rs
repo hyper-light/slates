@@ -1279,6 +1279,12 @@ fn streamed_crc<S: ImageRead + ?Sized>(slots: &S, at: usize, len: usize) -> Resu
 const SLOT_GEN_WIDTH: usize = size_of::<u64>();
 
 /// The two slots of image memory `total` bytes long: the first half and the rest.
+/// The two slots of image memory `total` bytes long, each as `(offset, len)` ([`slots_of`]).
+pub(crate) fn slots_of_memory(total: usize) -> ((usize, usize), (usize, usize)) {
+  let (first, second) = slots_of(total);
+  ((first.offset, first.len), (second.offset, second.len))
+}
+
 fn slots_of(total: usize) -> (Slot, Slot) {
   let half = total / 2;
   (
@@ -1313,6 +1319,13 @@ impl CommittedSlot {
     let (first, second) = slots_of(total);
     let stale = if self.second { first } else { second };
     (stale.offset, stale.len)
+  }
+
+  /// This slot of image memory `total` bytes long, as `(offset, len)`.
+  pub fn slot(self, total: usize) -> (usize, usize) {
+    let (first, second) = slots_of(total);
+    let slot = if self.second { second } else { first };
+    (slot.offset, slot.len)
   }
 
   /// The same committed slot, with the generation the publisher's last publication reached (a delta logged after
