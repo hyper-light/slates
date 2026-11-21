@@ -1499,6 +1499,50 @@ impl Repository for Grown {
 }
 
 impl Store for Grown {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
+  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the full-text hunk.
+  fn stored_now(
+    &self,
+    want: &slates_hg::render::Want,
+  ) -> Option<slates_hg::serve::getbundle::Given> {
+    use slates_hg::render::{StoredPlace, StoredRevision, Want};
+    use slates_hg::serve::getbundle::Given;
+    let identity = *blake3::hash(&self.bytes).as_bytes();
+    let len = u64::try_from(slates_hg::delta::HUNK_HEADER_LEN + self.bytes.len()).ok()?;
+    Some(match want {
+      Want::Rows { logs } => Given::Rows(
+        logs
+          .iter()
+          .map(|(path, nodes)| {
+            nodes
+              .iter()
+              .map(|node| {
+                self
+                  .files
+                  .iter()
+                  .any(|(held, file)| held == path && file == node)
+                  .then_some(StoredRevision {
+                    text: identity,
+                    base: None,
+                    place: StoredPlace {
+                      payload: identity,
+                      offset: 0,
+                      len,
+                    },
+                  })
+              })
+              .collect()
+          })
+          .collect(),
+      ),
+      Want::Chunks { places } => {
+        let mut chunk = Vec::new();
+        slates_hg::delta::encode_full_text(&self.bytes, &mut chunk).ok()?;
+        Given::Chunks(places.iter().map(|_| chunk.clone()).collect())
+      }
+    })
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,

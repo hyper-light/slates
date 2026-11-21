@@ -107,6 +107,14 @@ impl HgStores for ServedViews {
     crate::state::with_state(|state| crate::vcs_share::room(state, id).bytes)
   }
 
+  async fn answer_wants(
+    &mut self,
+    (_, id, _): (&Generation, RepositoryId, u64),
+    wants: &mut dyn slates_hg::render::StoreWants,
+  ) -> bool {
+    answer_store_wants(wants, id).await
+  }
+
   fn fetch_turn(&self, id: RepositoryId) -> Option<(u64, u64)> {
     crate::state::with_state(|state| {
       (

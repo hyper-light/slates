@@ -637,6 +637,11 @@ fn counter(instance: &str, name: &str) -> u64 {
 /// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
 const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 
+/// Format: the daemon's counter of the asks a fetch's answer made of the changeset store, each a batch of rows or of
+/// chunks (`crate::vcs_store::hg_view::STORE_ASKS` in `slates-server`): a stream's, and since A-767 C1 step 1a a plain
+/// clone's file section's.
+const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
 /// Shape: the most turns the pushed repository's stream clone may take: its store asks end a turn each (a pass's rows,
 /// the chunks) and the last turn ends the answer. A turn that yielded at its first quantum took one entry or one
 /// chunk, so this repository's stream was a turn a step before A-783's pacing reached the edge.
@@ -653,8 +658,10 @@ const STREAMING_LINE: &str = "streaming all changes";
 /// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
 /// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
 /// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
-/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly
-/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Then a plain
+/// `hg clone` of the pushed one (A-767 C1 step 1a): expect it to hold the source's changesets and verify, its file
+/// revisions read from the changeset store ([`STORE_ASKS`] counted). Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or
+/// an issuer surface.
 #[test]
 #[allow(clippy::disallowed_methods)]
 fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
@@ -740,6 +747,29 @@ fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
   assert!(
     (1..=STREAM_TURNS_AT_MOST).contains(&turns),
     "the pushed repository's stream took {turns} turns"
+  );
+  // A-767 C1 step 1a (main's ruling of 2026-11-21 08:45): a plain clone's file revisions come from the changeset store
+  // as it keeps them, asked between turns, never a whole text from the content store.
+  let asks_before = counter(&instance, STORE_ASKS);
+  let plain = format!("{}/pushed-plain", scratch.path);
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(
+      &["clone", "-U", &format!("{prefix}pushed"), &plain],
+      &config,
+    ),
+  );
+  let asks = counter(&instance, STORE_ASKS).saturating_sub(asks_before);
+  let (verified, out, err) = hg_in(&hg, &plain, &["verify"]);
+  assert_eq!(
+    (verified, hg_nodes(&hg, &plain) == hg_nodes(&hg, &source)),
+    (0, true),
+    "the plain clone holds the source's changesets and verifies: {out}{err}"
+  );
+  assert!(
+    asks > 0,
+    "the plain clone asked the changeset store {asks} times"
   );
 }
 

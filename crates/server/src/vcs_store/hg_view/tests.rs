@@ -264,11 +264,35 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       body: &[],
     };
     let room = || Admission::new(ROOM);
-    let whole = lend_in(state, hg, &mut room(), |view, left| {
-      hg_http::answer(view, &request, 0, &mut Plain, left)
-    })
-    .expect("the whole answer");
-    assert_eq!(whole.refused, None);
+    let disk = state.vcs_disk.clone().expect("the store");
+    let repository = u128::from_be_bytes(hg.bytes);
+    // The whole answer as the edges make it: a step at a time, each want of the changeset store answered between steps
+    // (A-767 C1: a clone's file revisions as the store keeps them).
+    let whole = {
+      let begun = lend_in(state, hg, &mut room(), |view, left| {
+        hg_http::begin(view, &request, 0, &mut Plain, left)
+      })
+      .expect("the answer begun");
+      let Begun::Streamed(mut streamed) = begun else {
+        panic!("a clone's answer is streamed");
+      };
+      let mut body = Vec::new();
+      loop {
+        assert!(crate::test_store::answer_wants_blocking(
+          &disk,
+          repository,
+          &mut *streamed
+        ));
+        let more = lend_in(state, hg, &mut room(), |view, left| {
+          streamed.step(view, left, &mut body)
+        })
+        .expect("a step")
+        .expect("a slice");
+        if !more {
+          break body;
+        }
+      }
+    };
     let begun = lend_in(state, hg, &mut room(), |view, left| {
       hg_http::begin(view, &request, 0, &mut Plain, left)
     })
@@ -279,6 +303,11 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
     let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
     let mut body = Vec::new();
     let mut turn = |state: &mut ShardState, body: &mut Vec<u8>| {
+      assert!(crate::test_store::answer_wants_blocking(
+        &disk,
+        repository,
+        &mut *streamed
+      ));
       super::lend_held_in(state, &generation, &mut room(), |view, left| {
         streamed.step(view, left, body)
       })
@@ -296,7 +325,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       rebuilding, None,
       "the repository's view was lent mid-rebuild"
     );
-    assert_eq!(body, whole.body);
+    assert_eq!(body, whole);
   });
 }
 

@@ -552,3 +552,87 @@ pub(crate) fn noise(len: usize) -> Vec<u8> {
     })
     .collect()
 }
+
+/// Answers what a streamed answer asks of the changeset store (`slates_hg::render::StoreWants`), each want asked of
+/// `disk` for `repository` and waited for on a thread of its own ([`land_blocking`]'s way), for a test's synchronous
+/// history on a shard: what `vcs_store::hg_view::answer_store_wants` answers between a daemon's turns. Whether every
+/// want was answered.
+pub(crate) fn answer_wants_blocking(
+  disk: &StoreHandle,
+  repository: u128,
+  wants: &mut dyn slates_hg::render::StoreWants,
+) -> bool {
+  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  while let Some(want) = wants.wants().cloned() {
+    let disk = disk.clone();
+    let given = std::thread::scope(|scope| {
+      scope
+        .spawn(move || {
+          waiting_runtime()
+            .block_on(async move {
+              match want {
+                Want::Rows { logs } => {
+                  let asked = logs
+                    .into_iter()
+                    .map(|(log, nodes)| (log, nodes.iter().map(|node| node.to_vec()).collect()))
+                    .collect();
+                  disk
+                    .texts_by_tool(repository, asked)
+                    .await
+                    .ok()
+                    .map(|found| {
+                      slates_hg::serve::getbundle::Given::Rows(
+                        found
+                          .into_iter()
+                          .map(|log| {
+                            log
+                              .into_iter()
+                              .map(|row| {
+                                row.map(|(text, row)| StoredRevision {
+                                  text,
+                                  base: row.base,
+                                  place: StoredPlace {
+                                    payload: row.place.payload,
+                                    offset: row.place.offset,
+                                    len: row.place.len,
+                                  },
+                                })
+                              })
+                              .collect()
+                          })
+                          .collect(),
+                      )
+                    })
+                }
+                Want::Chunks { places } => {
+                  let asked = places
+                    .iter()
+                    .map(|place| slates_store::texts::Place {
+                      payload: place.payload,
+                      offset: place.offset,
+                      len: place.len,
+                    })
+                    .collect();
+                  disk
+                    .places(asked)
+                    .await
+                    .ok()
+                    .map(slates_hg::serve::getbundle::Given::Chunks)
+                }
+              }
+            })
+            .ok()
+            .flatten()
+        })
+        .join()
+        .ok()
+        .flatten()
+    });
+    match given {
+      Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
+      Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
+      None => return false,
+    }
+  }
+  true
+}
