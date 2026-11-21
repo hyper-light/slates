@@ -36,8 +36,8 @@
 //! (`repository::svn_commit::tests`, the kill between the landing and the commit).
 //!
 //! **Not covered** (GAPS): a submit dispatched outside a recorded request (no answer waits on it) keeps the made task
-//! after its step; a Mercurial repository's made changeset (`vcs_store::hg_made`, A-807) takes the hook but lands
-//! nothing on the store before its step (its record is the register's entry), and a client's hg push takes no turn;
+//! after its step; a client's hg push takes no turn (a Mercurial made changeset lands on the store before its step
+//! since A-767 C1, `vcs_store::hg_made`);
 //! git's adopts this hook (w-git). The verdict's mapped files are made twice, once in the preview and once at the step (owed,
 //! performance).
 
@@ -236,11 +236,9 @@ pub(crate) fn defer(
       pending,
       (copies, judged),
     ),
-    // Its changeset is made at the one step, from the green the verdict was applied to there: nothing lands before it,
-    // so the held verdict is dropped here (its chain entry's form applies it, `verbs::apply_accepted`).
+    // Its changeset is made from a preview of the held verdict and landed on the store before the one step (A-767 C1).
     Tool::Mercurial => {
-      drop(judged);
-      crate::vcs_store::hg_made::make_deferred(state, held.turn, pending, copies);
+      crate::vcs_store::hg_made::make_deferred(state, held.turn, pending, (copies, judged));
     }
   }
   crate::lease_wait::parked_reply()

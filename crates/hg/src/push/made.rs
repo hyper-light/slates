@@ -9,8 +9,8 @@
 //! removed, its first parent the parent's manifest; the changeset, naming the manifest, the user, the time in whole
 //! seconds at UTC, the branch where it is not `default`, the paths touched in their order, and the message. Each node is
 //! 7.2's (SHA-1 of the parents and the text). A file whose text is its parent revision's makes no revision (7.2's
-//! `filelog.cmp`): with the parent's flag too it is not listed, with another only its flag changes. What the version brought is a [`Verified`], which the server keeps and records as a push's (`commit::fork_with`,
-//! `import::record::write_made`).
+//! `filelog.cmp`): with the parent's flag too it is not listed, with another only its flag changes. What the version brought is a [`Verified`], which the server lands on the changeset store as a push's changeset,
+//! through its changegroup ([`changegroup`]) and the push's intake (A-767 C1).
 //!
 //! **Not made** ([`Unmade`]): a parent the index does not hold, a field 7.2 would not write as it is, a version that
 //! changed no tracked file.

@@ -260,8 +260,6 @@ pub(crate) struct Generation {
   roots: Vec<PhaseHead>,
   /// The register's bookmarks as they stood.
   bookmarks: BookmarkHeads,
-  /// Whether the changeset store kept every revision as it stood (`HgStore::unstored`).
-  stored_logs: bool,
 }
 
 impl Generation {
@@ -305,21 +303,15 @@ pub(crate) fn hold_in(
     return None;
   }
   let (roots, bookmarks) = register_of(state, id, room).ok()?;
-  let (index, stored_logs) = super::within_budget(state, 0, |stores| {
+  let index = super::within_budget(state, 0, |stores| {
     let (content, store) = stores.mercurial(id)?;
-    let stored_logs = !store.unstored;
-    store
-      .index
-      .fork(content)
-      .ok()
-      .map(|index| (index, stored_logs))
+    store.index.fork(content).ok()
   })?;
   Some(Generation {
     id,
     index: Some(index),
     roots,
     bookmarks,
-    stored_logs,
   })
 }
 
@@ -338,7 +330,6 @@ pub(crate) fn lend_held_in<R>(
       roots: &generation.roots,
       bookmarks: &generation.bookmarks,
       publishing: PUBLISHING,
-      stored_logs: generation.stored_logs,
     };
     let view = Indexed::new(index, content, read, room).ok()?;
     Some(step(&view, room))
@@ -412,7 +403,6 @@ pub(crate) fn with_view<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
-    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
@@ -434,7 +424,6 @@ pub(crate) fn with_view_over<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
-    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);
