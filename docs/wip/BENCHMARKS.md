@@ -17335,6 +17335,12 @@ the control shard where it was, and under load spun long. Its bound is the wake 
 with the very queueing that means no core is free (A-218's finding again). Item 3 closes as (a) by main's ruling: the
 macOS collect stays a recorded cost.
 
+**The lesson.** A spin bound learned from the measured wake time grows exactly when cores are scarce, so it defeats
+itself under contention: the ring watch's bound was the wake estimate, and under load the estimate rose with the
+scheduler's queueing until one daemon spent 1.70 s of a round watching. "No core, no spin" did not hold, because the
+wake estimate rose before any free-core reading could fall. A spin's bound must come from something that shrinks under
+contention, or the spin must be absent; the busy interval, which spins nothing, is measured on its own next.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
