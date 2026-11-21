@@ -59750,7 +59750,10 @@ Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the c
   and 1,496 release, all three parts taken; the job's longest turn 22 ms debug (the verdict), 3 ms release.
 - **Tests** (macOS arm64, local). Red first: `merge.submit.steps_past_ceiling` 1 at 417.5 ms (debug). Green on this
   piece's assertions: the prepare sliced and its three parts taken, both submits accepted at versions 2 and 3, the head
-  the re-indented file with the edit, as on main. `green_post_state` 8 of 8; `slates-server --lib` 1,099 of 1,100
+  the re-indented file with the edit, as on main. The oracle (a debug build): the job also composes the increment whole by
+  `verbs::compose_increment`, main's function, in a turn of its own, and compares it whole with the sliced one
+  (`merge.refine.prepared_checked` 1, `merge.refine.prepared_mismatch` 0): the same identity, document, post-state and
+  evidence. The verdict taken by position equals the head's own judgment (A-658's property, `slates-merge`'s tests). `green_post_state` 8 of 8; `slates-server --lib` 1,099 of 1,100
   (`content_ranges`' sweep test failing under load, passing alone, as before).
 - **Owed.** The step's bound: the commit's re-anchor goes with A-818's engine switch (piece 2b), and the chain's durable
   append of a ~5 MB entry stays in the step. `merge.submit.steps_past_ceiling` reads 0 in release now and is the

@@ -9559,6 +9559,37 @@ pub(crate) fn compose_increment(
   })
 }
 
+/// The increment [`compose_increment`] composes whole for `work`'s journal over `refined`, its refinement's document and
+/// plan, at `base_version` on the green `green` holds here: the oracle a refinement job's sliced build is held to in a
+/// debug build (A-821). `None` where the work, the green or the composition is not there.
+pub(crate) fn composed_whole(
+  state: &ShardState,
+  (work, green, base_version): (DbVolumeId, DbVolumeId, u64),
+  refined: (
+    slates_merge::ops_doc::OpsDoc,
+    slates_merge::increment::PostStatePlan,
+  ),
+  evidence: Vec<[u8; 32]>,
+) -> Option<slates_merge::engine::Increment> {
+  let w = state.works.get(&work)?;
+  let engine = state.greens.get(&green)?;
+  let base = engine.base_for(base_version, &w.journal);
+  let files_base = crate::work_files::Base {
+    green: Some(&*engine),
+    fetched: None,
+    version: base_version,
+    entries: None,
+  };
+  compose_increment(
+    (work, base_version),
+    (&base, Some(refined)),
+    (&w.files, files_base),
+    &w.journal,
+    evidence,
+  )
+  .ok()
+}
+
 /// The increment identity's hasher with the work and its base taken in ([`compose_increment`]'s comment): the encoded
 /// document and then the post-state follow, whole or a slice at a time (A-787 part 3), to the same identity.
 pub(crate) fn identity_hasher(work_id: DbVolumeId, base_version: u64) -> blake3::Hasher {
