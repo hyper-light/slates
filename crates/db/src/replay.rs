@@ -18,7 +18,7 @@ use crate::catalog::StateLogRecord;
 use crate::error::DbError;
 use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
-use crate::record::{LogEntry, LogRing, ReplayCursor, Replayed};
+use crate::record::{LogEntry, LogRing, ReplayCursor};
 
 /// The recovery budget: `slates_machine::budgets::RECOVERY_BUDGET_NS` (RAMCloud's target of about a second for a crashed
 /// node, ratified as the default, GAPS §5), held there so the daemon and the workspace's tools derive from one source.
@@ -446,57 +446,29 @@ impl Recovering {
   }
 }
 
-/// A partition derived from the segment's durable state: the newest valid snapshot, then the
-/// records after it, replayed in order — what [`recover`] builds at boot, and what a rolled-back
-/// publication restores ([`Db::commit`]).
-struct DerivedPartition {
-  partition: Partition,
-  /// The snapshot slot and sequence the derivation started from, if any.
-  snapshot: Option<(u8, u64)>,
-  /// That snapshot's encoded size (zero with none).
-  snapshot_bytes: u64,
-  /// The first sequence replayed from the log.
-  from_seq: u64,
-  replayed: Replayed,
-  /// The records replayed.
-  records: u64,
-}
-
 /// Derives partition `index` from the segment: the newest valid snapshot (or an empty partition),
-/// then every record at or after it applied in order. Pure with respect to the segment (nothing is
-/// written; a torn tail is reported in `replayed`, not cut — the caller decides).
+/// then every record at or after it applied in order: what [`recover`] builds at boot, and what a rolled-back
+/// publication restores ([`Db::commit`]). Pure with respect to the segment (nothing is written; a torn tail is not
+/// cut).
 fn derive_partition(
   segment: &AnchorSegment,
   index: u16,
   log: &LogRing,
   caps: PartitionCaps,
   now_ns: u64,
-) -> Result<DerivedPartition, DbError> {
-  let (mut partition, snapshot, snapshot_bytes, from_seq) = match newest_snapshot(segment, index)? {
-    Some((slot, snapshot, size)) => {
-      let seq = snapshot.seq;
-      (
-        Partition::from_snapshot(&snapshot, caps, now_ns)?,
-        Some((slot, seq)),
-        size,
-        seq.saturating_add(1),
-      )
-    }
-    None => (Partition::new(caps, now_ns), None, 0, 0),
+) -> Result<Partition, DbError> {
+  let (mut partition, from_seq) = match newest_snapshot(segment, index)? {
+    Some((_, snapshot, _)) => (
+      Partition::from_snapshot(&snapshot, caps, now_ns)?,
+      snapshot.seq.saturating_add(1),
+    ),
+    None => (Partition::new(caps, now_ns), 0),
   };
   // A record at a time: decoded, applied and dropped before the next is read, the work each commit timed (A-420).
-  let replayed = log.replay(segment, from_seq, |entry| {
+  log.replay(segment, from_seq, |entry| {
     entry.ops().iter().try_for_each(|op| partition.apply(op))
   })?;
-  let records = replayed.records;
-  Ok(DerivedPartition {
-    partition,
-    snapshot,
-    snapshot_bytes,
-    from_seq,
-    replayed,
-    records,
-  })
+  Ok(partition)
 }
 
 /// Runs `step`, adding its wall time to `work_ns`.
@@ -816,7 +788,7 @@ impl Db {
       self.last_now_ns,
     ) {
       Ok(derived) => {
-        self.partition = derived.partition;
+        self.partition = derived;
         DbError::Unpublished {
           seq,
           cause: Box::new(cause),

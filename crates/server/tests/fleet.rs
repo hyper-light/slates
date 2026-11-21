@@ -16610,15 +16610,21 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     holders.iter().any(|served| *served > 0),
     "a holder's serves were timed: {holders:?}"
   );
+  assert!(
+    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
+    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
+  );
+  build_steps_within_the_build(&hops, &build_steps);
+}
+
+/// Every build step (timed, ns) in `build_steps` timed as often as each other, and their nanoseconds no more than the
+/// build's, the first of `hops`.
+fn build_steps_within_the_build(hops: &[(u64, u64)], build_steps: &[(u64, u64)]) {
   let build_ns = hops.first().map_or(0, |(_, ns)| *ns);
   let steps_timed = build_steps.first().map_or(0, |(timed, _)| *timed);
   assert!(
     steps_timed > 0 && build_steps.iter().all(|(timed, _)| *timed == steps_timed),
     "every build step was timed, as often as each other: {build_steps:?}"
-  );
-  assert!(
-    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
-    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
   );
   let steps_ns: u64 = build_steps.iter().map(|(_, ns)| ns).sum();
   assert!(

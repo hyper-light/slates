@@ -1,11 +1,35 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (main, 2026-11-21, A-832): a daemon kept one file descriptor per base file it had ever read, and never closed
+> it.** kiln's daemon on adacachy reached 1,048,575 of its 1,048,576 descriptors over ~/Projects/kiln (731 worktrees)
+> and refused every open (`EMFILE`); this MacBook's held 4,574 (3,995 regular files of ~/Projects/slates). Now an
+> untouched base file's descriptor lives only while a handle holds the inode open (`BasePlane::transient`, `deferred`,
+> `release_unopened` in crates/vfs/src/base.rs; `Volume::unpin_open`): a verb with no open closes what it opened when
+> its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
+> proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
+> Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`).
+> **Closed (main, 2026-11-21, A-833): a recovery reopened every base directory the image recorded, in one step.** kiln's
+> daemon on adacachy recorded about 192,000, overran the 1 s liveness window and was killed a second into every restart.
+> Now a recovery reopens the root alone; each other directory is reacquired at its first use (`Overlay::reacquire`:
+> its source path without following links, held to the record by `same_object`, else `BaseUnavailable` with its
+> untouched entries), and an unreacquired one's record goes into the next image unchanged, with no `fstat`. Red on main:
+> 201 host handles after recovering 200 listed directories; green: 1
+> (`a_recovery_reopens_only_the_root_and_reacquires_each_directory_at_its_first_use`).
+> **Still open (main):** (1) a directory listed in this daemon's life keeps its listing and its open directory until the
+> directory leaves the volume: bounded by the directories used, not by a derived budget; the listings need an idle
+> close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
+> recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
+> (4) `image()` still `fstat`s every reacquired directory at each publication.
+
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
 > `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
 > agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
-> The same test on origin/main alone: kiln r29.
+> **Main's, not family three's:** the same 2 fail on origin/main 3b664fb alone (kiln r29, adacachy): the zero-budget
+> round's slices are `[1, 1, ...]` (41) where the test expects the root and one file first, `[2, 1, ...]` (40)
+> (`takeover_round.rs:259`, `:294`). Owner to be assigned by main.
 > **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
 > fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
 > passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
@@ -79,6 +103,12 @@
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
 >   exists (R10), and A-224's short slice was rejected. Owed: the Linux bound's question to main.
+> - **Windows** (w-k90-win, A-828): a timed wait ends at its deadline now -- the IOCP driver's wait went through
+>   `GetQueuedCompletionStatusEx`'s whole milliseconds (a 200 µs wait's shortest 1.5-2.5 ms); a high-resolution waitable
+>   timer's wait completion packet now wakes the port (red then green on jupiter, windows-latest, windows-11-arm). It
+>   leaves the loaded p999 where it was (24-34 ms on windows-latest, accept and conflict; 15-34 ms conflict on
+>   windows-11-arm, whose accept p999 32 ms -> 0.75-0.89 ms): the 31.6 ms quantum a woken thread waits behind spinners
+>   (A-361), not the wait's timer. In flight: per-wake stamps for its mechanism.
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -433,6 +463,10 @@
 > the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
 > held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
+> R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
+> fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
+> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
@@ -1865,6 +1899,16 @@
 > its hidden refs are owed there); the daemon starting the SSH edge (A-684); other platforms' runs (main's); the
 > exchange moved by the live memory-pressure and load signals, as the codec policy's. The live stock `git clone` over
 > the daemon's edge is built since (stock git's interop tests, next).
+> **The hg correctness lane (2026-11-21, w-balance, UI goal 93 correctness by use):** `crates/cli/tests/hg_interop.rs`
+> `stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh` (ignored; main runs it) drives
+> `crates/cli/bench/hg_correctness.sh`: stock hg 7.2 against stock `hg serve` (the oracle), slates over HTTP and slates
+> over SSH, every step's status, state and printed bytes compared, over `bench/hg_correctness_fixture.sh`'s repository
+> or `SLATES_TEST_HG_SOURCES`. Its first focused run (the fixture, macOS arm64, debug, 67fa7f75a): 30 passed, 50
+> failed, all from one cause. **Open, w-hg's (inbox/w-hg-from-w-balance-push-spin.md):** a push of 64 MiB and 32 MiB
+> random binaries spins shard 8 past the watchdog (3,170 ms of CPU in one poll of `hg_push::take`, then
+> `hg_push::unbundle`); the anchor kills the daemon, and stock hg reads `bad HTTP status line: ''` (SSH: `stream ended
+> unexpectedly`). One 64 MiB file, or 16 MiB changed in place, passes.
+>
 > **Stock baselines at scale (A-699, 2026-11-20, w-perf, UI goal 93):** `crates/cli/bench/{git,hg,svn}_scale.sh` time
 > stock git, hg and svn against their stock servers over git/git, Mercurial's repository and git/git's newest 5,000
 > commits as svn (`git_to_svn_dump.py`); numbers in BENCHMARKS.md. Owed: slates' side of each (git's whole push waits on
@@ -2447,6 +2491,14 @@
 > Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
 > the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
 > (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
+> **A-830, the git server's memory held to the change (clients, 2026-11-21; Ada's MEMORY SIZING ruling):**
+> `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history` (`crates/cli/tests/
+> git_interop.rs`) holds the daemon's resident set at its peak and settled after a push and a clone to the warm-up's
+> end plus `2N + W` (N the pack's bytes, W the warm-up round's range). Its made history (2,000 files, 200 one-line
+> commits, N 258,770 bytes) passes on main 67fa7f75a (this Mac, debug: peak 68.2 MiB, bound 90.5 MiB), so w-interop
+> r2's 7,421 MiB against git/git v2.0.0 (base 26c98c76d) is not reproduced at that size; the same test over git/git's
+> cut (`SLATES_TEST_GIT_SOURCE`, `SLATES_TEST_GIT_CUT=v2.0.0`) is main's run (run-requests.md), its red the piece's
+> next step (attribution by `slates status --memory`, then the fix with w-git).
 > **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
@@ -2488,6 +2540,13 @@
 > after which the edge judges a client gone) is released at the table's next use, counted
 > (`vcs_store.dav_commits_released`). Before the edge has learned that bound none is released early; the table stays
 > bounded by one a repository and principal.
+> **A-681 part C by use, against svnserve byte for byte (clients, 2026-11-21):**
+> `stock_svn_over_httpv2_answers_as_stock_svnserve_byte_for_byte` (`crates/cli/tests/svn_interop.rs`) runs one session
+> (commits, copies and moves in a working copy and by URL, a copy of an older revision, versioned and revision
+> properties set and deleted, an import, the log, list, cat, proplist, blame, diff and status) over HTTPv2 and against
+> stock svnserve over FSFS, comparing each command's output with timestamps left out. Not yet run (no svn on this Mac):
+> main's run on a Studio with svn 1.15 (run-requests.md). By reading, the edge serves no PROPPATCH on `!svn/rev/N`, so
+> `svn propset --revprop` over HTTP is expected red (w-svn's, if so).
 > **svn replay by stock clients (w-interop, 2026-11-20; A-703):** `svn-matrix.sh` gains `svnrdump dump` and
 > `svnsync initialize/synchronize` over svn://, each compared with the dump stock svnserve 1.15.0 made of the same history
 > (`crates/svn/fixtures/replay`, `EXPECT_RDUMP`, `EXPECT_SYNC`): over the reads fixtures' repository both are
