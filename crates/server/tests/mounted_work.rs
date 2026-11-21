@@ -282,3 +282,92 @@ fn ten_editors_on_mounted_works_submit_and_a_grant_lands_the_green() {
   drop(client);
   daemon.stop();
 }
+
+/// What a restart test holds as its anchor, named for `tag`: the daemon's configuration, a segment with content, and the
+/// rendezvous each daemon in turn adopts (as `signed_work.rs` holds them).
+fn anchored(
+  tag: &str,
+) -> (
+  DaemonConfig,
+  slates_anchor::AnchorSegment,
+  slates_ipc::HeldRendezvous,
+) {
+  let name = format!("mounted-{tag}");
+  let profile = common::machine_profile();
+  let config = DaemonConfig::derive(
+    &profile,
+    &format!("{name}-{}", std::process::id()),
+    Some(TEST_SHARDS),
+  );
+  let segment = slates_anchor::AnchorSegment::create(
+    &common::fixture_object("slates-seg", &name),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &common::fixture_object("slates-con", &name),
+    config.content_bytes(),
+  )
+  .unwrap();
+  let rendezvous = slates_ipc::HeldRendezvous::hold(&config.instance).unwrap();
+  (config, segment, rendezvous)
+}
+
+/// A daemon over the segment and rendezvous the test holds as its anchor.
+fn start_over(
+  config: &DaemonConfig,
+  (segment, rendezvous): (&slates_anchor::AnchorSegment, &slates_ipc::HeldRendezvous),
+) -> Daemon {
+  let (handoff, len) = segment.handoff().unwrap();
+  let content = segment.content_handoff().unwrap();
+  let daemon = Daemon::start(
+    &common::machine_profile(),
+    config.clone(),
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+      rendezvous: rendezvous.adoption(),
+    },
+  )
+  .unwrap();
+  let _ = daemon.bootstrap(true);
+  daemon
+}
+
+/// A-774 (main's order 2: a mount's unsubmitted saves survive a restart as a volume's writes do, A-127). Do: mount a work
+/// over a seeded green, save one edit through the mount as an editor does, stop the daemon, start another over the same
+/// segment, and submit the work with no declaration and no remount. Expect: the submit is accepted and the green's head
+/// holds the save.
+#[test]
+fn a_save_through_a_mount_survives_a_daemon_restart() {
+  let (config, segment, rendezvous) = anchored("restart");
+  let daemon = start_over(&config, (&segment, &rendezvous));
+  let mut client = connect(&config.instance);
+  let green = seeded_green(&mut client);
+  let (work, _) = client.create_work(green, "mounted-restart").unwrap();
+  let saved = with_line(&base_file(3), 1, "saved before the restart");
+  {
+    let (mut stream, root) = mounted(&daemon, "mounted-restart");
+    let mut xid = 10;
+    editor_save(&mut stream, &root, "f3", &saved, &mut xid);
+  }
+  drop(client);
+  daemon.stop();
+
+  let daemon = start_over(&config, (&segment, &rendezvous));
+  let mut client = connect(&config.instance);
+  let verdict = client.submit(work).unwrap();
+  assert!(
+    matches!(verdict, Submitted::Accepted(_)),
+    "the restarted work's submit: {verdict:?}"
+  );
+  assert_eq!(
+    client.read(green, "f3", ReadAt::Head).unwrap(),
+    saved,
+    "the save made through the mount before the restart is in the green"
+  );
+  drop(client);
+  daemon.stop();
+}
