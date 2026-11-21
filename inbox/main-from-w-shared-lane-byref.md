@@ -123,3 +123,12 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
   Queued: no macOS runner with room answered yet.
 - kiln r2: the 3a release bench on origin/main, 64/128/256/320/512 MiB x 10, log ~/.cache/w-shared-bench.log there.
 - I land piece 1 when r1 is green (fast landing rule, on the merged tree), one line to w-git, w-hg, w-svn first.
+
+## 07:29 PST (by `date`; your "10:45" note): neither run had started; both restarted
+- r1 and r2 never left the queue (no runner with 80 GB free for r1; r2 sat behind others), so the Studio's outage did
+  not touch them. Stopped both. Piece 1 re-merged with origin/main (24 commits; only the design doc conflicted, both
+  entries kept, A-815 still free): ddf708e56 on agents/w-shared-byref.
+- r5: the merged tree's focused suites, no baseline this time (disk 60g so a cold build never lands on this MacBook,
+  which kiln placed r3/r4 on at disk 40g; I stopped those before they started). r6: the 3a release bench, same needs.
+  Both tentatively placed on runner b24c5c95, which lost r18 and r19 earlier ("did not answer in 15s").
+- Land piece 1 the moment r5 is green, one line each to w-git, w-hg, w-svn first.
