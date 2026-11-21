@@ -25,3 +25,14 @@ goes with (A). With (B) alone, a retry after a real stall still re-sends.
 Unless you say otherwise, I'm starting (B): first reading the db's write path (`Partition::mutate` / the segment
 publish) to see where a staged entry fits, red test the 32 MiB holder submit at 10 of 10, and each slice under the
 step quantum (`merge.submit.owner_step` and `daemon.beat.late` the proof).
+
+## Addendum ~04:05 PST, after reading the write path: (B) is a db change too, so I'm waiting for your ruling
+`judge_submission` -> `record_accepted` encodes the chain entry (the increment's bytes whole) into the verb's transaction,
+and `run_recorded`'s commit writes and checksums that one log record (`slates_db::record::checksum` shows in the
+profile). Slicing it (B) means a transaction whose large record is written over several turns before its commit
+point, with a torn record never replayed: a change to `crates/db`'s log and its crash safety, not only to the server.
+It also overlaps A-767 (w-store's changeset log, the store history is moving to). So both shapes reach past my lane:
+(A) changes the chain entry's format and leans on the content store's durability; (B) changes the db log's write path.
+I'd rather you or Ada choose, or route it to w-store, than build either on my own reading. Until then: the lane's 3a is
+landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's one long step is the measured blocker
+(GAPS has it). Family three waits on kiln r14 (adacachy is not answering).
