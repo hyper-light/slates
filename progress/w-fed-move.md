@@ -1,5 +1,11 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~02:30 PST: A-802 LANDED slates main fd0dd8eb (injections; the destroy's O(volumes) scan)
+- Harness injections: --idle-works M, --preload V, --lagged-submit; the owner's per-kind counters printed after each
+  phase. Results: (a) flat; (b) verdict about 2x at 10^5; (c) 10^4 idle works cut 6,513 to 2,506 verdicts/s, which
+  was a destroy collecting every volume record (erase_volume_keys) -> per-tenant count. A/B: 2,506 -> 5,956/s.
+- Next: (b) the verdict's growth with history (41 -> 90 us over 10^5 versions).
+
 ## 2026-11-21 ~01:40 PST: A-801 LANDED slates main 2d079c44 (throughput: name the mechanism first)
 - Owner asks counted by kind and answers timed by kind on the owner; the harness prints the server nodes' merge
   counters (`server_counter` rows; load_scale passes its servers).
