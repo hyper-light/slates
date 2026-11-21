@@ -103,12 +103,12 @@
 >   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
 >   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
 >   exists (R10), and A-224's short slice was rejected. Owed: the Linux bound's question to main.
-> - **Windows** (w-k90-win, A-828): a timed wait ends at its deadline now -- the IOCP driver's wait went through
->   `GetQueuedCompletionStatusEx`'s whole milliseconds (a 200 µs wait's shortest 1.5-2.5 ms); a high-resolution waitable
->   timer's wait completion packet now wakes the port (red then green on jupiter, windows-latest, windows-11-arm). It
->   leaves the loaded p999 where it was (24-34 ms on windows-latest, accept and conflict; 15-34 ms conflict on
->   windows-11-arm, whose accept p999 32 ms -> 0.75-0.89 ms): the 31.6 ms quantum a woken thread waits behind spinners
->   (A-361), not the wait's timer. In flight: per-wake stamps for its mechanism.
+> - **Windows: met** (w-k90-win, A-828 and A-834). A-828: a timed wait ends at its deadline (the IOCP wait went through
+>   `GetQueuedCompletionStatusEx`'s whole milliseconds; a high-resolution waitable timer's wait completion packet now
+>   wakes the port). A-834: a shard stays one level above normal while it runs, where A-361 put it back before it ran
+>   and a runnable shard lost a 31.6 ms quantum to normal-priority load (stamps: 12-22 requests a round queued over
+>   10 ms, 16-22 over 10 ms mid-service). Loaded p999 18-85 ms -> 304-699 µs, p99 174-319 µs, quiet unchanged, on
+>   windows-latest and windows-11-arm, 3 interleaved rounds each (diag run 44948887874; BENCHMARKS).
 > - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
 >   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
 >   thread waiting for a CPU.
@@ -695,10 +695,11 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
-> - A-818 (A-803 (c)) pieces 1 and 2a: a persistent piece tree a version (`crate::piece_tree`) and the index of where
->   each byte identity's bytes are now (`crate::byte_places`), both pure; the engine switch (2b) and the A/B (2c) are
->   left. Measured gap to watch: an old read through the index is O(fragments × depth), where today's re-anchor
->   compacts a fragmented value at write time.
+> - A-818 (A-803 (c)) pieces 1 and 2a landed (`crate::piece_tree`, `crate::byte_places`). Piece 2b, the engine switch
+>   with the re-anchor deleted, is on the branch `agents/w-rewrite-ops-a818-2b` (c4278fd3c) and NOT landed: its A/B
+>   (BENCHMARKS, 2026-11-21) wins writes (35.2 ms against 9.0 µs a change at 10k, alternating) but loses old reads 2 to
+>   9 times and memory a version 7 to 8 times on overwrite streams (path copying's O(log n) nodes against A-809's one
+>   layer). Paused by goal 93's focus; reopening needs O(1) space a change, not only a bounded compaction.
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
 >   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-824).
@@ -3080,6 +3081,20 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **Three more readers of whole file texts gone: made changesets, the presence check, the served view's `file` (A-767
+> C1, 2026-11-21, w-hg; main's order of 10:34). BUILT.**
+> - `push/made.rs`: whether a version's file keeps its parent's node (7.2's `filelog.cmp`) is told by the two texts'
+>   names, the metadata block's and the bytes' identities (`verify::FileNames`, `Held::file_names`), the parent's
+>   read from its index row unread (`IndexHeld::file_names`); no file text read.
+> - `push/verify.rs`: a new manifest's files are present by their rows (`file_names`), no text read. The whole
+>   `verify` has no production caller (the sliced intake replaced it); it stays as the intake's test oracle, its
+>   delta bases read from the content store there alone.
+> - `serve`: `getbundle::Store::file` is gone, and with it `Indexed::file`. `file_entry` (the row, no text) is the
+>   served view's one file read; a fetch's bytes come from the changeset store (C1 step 1).
+> - Held by the made tests (a version that changes nothing makes none; a same-text file keeps its node), the serve
+>   suites, and `texts_longer_than_a_window_are_copied_within_the_room` (file rows read with no text lent).
+> - Left before step 2: `push/tree.rs` (A-618's builder reads file bytes synchronously; main's ruling asked,
+>   inbox/main-from-w-hg-tree-through-store.md).
 > **The push intake's file delta bases through the store (A-767 C1, 2026-11-21, w-hg; main's ruling (b2) over (b1)).
 > BUILT.**
 > - A file delta whose base is not the text kept last no longer reads the fork's whole text from the content store
