@@ -16012,6 +16012,7 @@ next piece; the immediate poll lands with it, not before.
   coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
   next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
   the candidates), measured on a quiet host before anything is changed.
+## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
 
 
 ## A partial clone back under its time before A-722 part 3: no row read for a type or an unread size (main's order 1; w-perf's A/B; 2026-11-20)
@@ -16029,6 +16030,17 @@ next piece; the immediate poll lands with it, not before.
   type (its landing's runs) and none for a size `blob:none` does not use, so the partial clone is under its time before
   part 3. The scale script's own interleaved rounds on the shared machine were too noisy to compare by wall time (a
   full clone of either arm took 6.4 to 28 s), so the daemon's CPU is the comparison.
+`crates/server/tests/green_landing_cow.rs` (measured as `mounted_work_cow.rs presenting` before its move to a binary of its own), release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
+side, all shown. A 64 MiB green of 1,024 files of 64 KiB; its landing presented into a fresh directory, then granted and
+landed. Before: main 7f8eb5cbb (the landing view a scratch volume holding a copy of the head, a2415c930). After: the
+view an overlay over the green's head, planned whole and read through the tree host beside the writer.
+
+| side | presenting adds (MB) | the granted landing adds (MB) |
+|---|---|---|
+| before | 69.34, 69.35, 69.29, 69.21, 69.26 | 1.57, 1.77, 1.61, 1.70, 1.62 |
+| after | 1.74, 1.67, 1.82, 1.61, 1.51 | 1.08, 1.06, 1.05, 1.00, 2.80 |
+
+Bound the test holds: 16.8 MB (a fixed 8 MiB and 8 MiB of windows and entries).
 
 ## A rewrite's refinement sliced under its owner's turns: longest step 10-99 µs up to 4 MiB, per save 1.15-1.5x (A-787; 2026-11-20)
 
@@ -16062,4 +16074,3 @@ Rejected, measured:
 - A hash table for the anchors: its rehash is one step that grows with the file.
 
 Kept: A-787.
-
