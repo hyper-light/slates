@@ -127,7 +127,9 @@
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
 > (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
-> reads the record back and puts every row, as replay does). Owed: the release timing on Mercurial's history against the per-file arm's 91 µs.
+> reads the record back and puts every row, as replay does). Measured 33465d641 (BENCHMARKS "The derived per-path read
+> form"): an old revision of Mercurial's history p50 85-87 µs once the log is in the page cache (bar 91 µs), 234 µs on the
+> log's first read; every read from its own chain alone.
 >
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
