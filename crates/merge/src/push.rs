@@ -347,7 +347,7 @@ pub struct Built {
 
 /// Builds `push`'s work against `green`, reading its objects from `objects`, within `room` bytes (module docs): the
 /// increment to submit, and what the walk read; or the refusal. [`Building`] run to its end in one call.
-pub fn build<O: PushObjects>(
+pub fn build<O: PushObjects + ?Sized>(
   push: &Push<'_>,
   green: &Green,
   objects: &O,
@@ -664,7 +664,7 @@ impl Building {
 
   /// One turn over `green` and `objects`: units while the pace grants them. The work or the refusal once the build is
   /// done; none while units remain, for the next turn.
-  pub fn advance<O: PushObjects>(
+  pub fn advance<O: PushObjects + ?Sized>(
     &mut self,
     green: &Green,
     objects: &O,
@@ -697,7 +697,7 @@ impl Building {
   }
 
   /// One unit: the work once done.
-  fn unit<O: PushObjects>(
+  fn unit<O: PushObjects + ?Sized>(
     &mut self,
     green: &Green,
     objects: &O,
@@ -825,7 +825,7 @@ impl Building {
   }
 
   /// A unit of the walk; once it is done, the head's operation and the naming begun.
-  fn walked<O: PushObjects>(&self, walk: Walk, objects: &O) -> Result<Stage, PushRefused> {
+  fn walked<O: PushObjects + ?Sized>(&self, walk: Walk, objects: &O) -> Result<Stage, PushRefused> {
     let mut walker = Walker { objects, walk };
     if walker.unit()? {
       return Ok(Stage::Walk(walker.walk));
@@ -986,14 +986,14 @@ impl Walk {
 }
 
 /// A walk lent the objects for a turn.
-struct Walker<'o, O> {
+struct Walker<'o, O: ?Sized> {
   /// The objects.
   objects: &'o O,
   /// The walk.
   walk: Walk,
 }
 
-impl<O> core::ops::Deref for Walker<'_, O> {
+impl<O: ?Sized> core::ops::Deref for Walker<'_, O> {
   type Target = Walk;
 
   fn deref(&self) -> &Walk {
@@ -1001,13 +1001,13 @@ impl<O> core::ops::Deref for Walker<'_, O> {
   }
 }
 
-impl<O> core::ops::DerefMut for Walker<'_, O> {
+impl<O: ?Sized> core::ops::DerefMut for Walker<'_, O> {
   fn deref_mut(&mut self) -> &mut Walk {
     &mut self.walk
   }
 }
 
-impl<O: PushObjects> Walker<'_, O> {
+impl<O: PushObjects + ?Sized> Walker<'_, O> {
   /// One unit of the walk: an entry of the trees being compared, or the next step. Whether units remain.
   fn unit(&mut self) -> Result<bool, PushRefused> {
     if let Some(mut comparing) = self.walk.comparing.take() {
@@ -1334,7 +1334,7 @@ impl Posting {
 
   /// One unit: the length found an operation a unit, the post-state zeroed a copy slice a unit, then each operation's run
   /// laid. The document, the post-state and the reads once laid. Its length was charged as the walk made the runs.
-  fn unit<O: PushObjects>(
+  fn unit<O: PushObjects + ?Sized>(
     &mut self,
     objects: &O,
     head: Option<&[u8]>,
@@ -1413,7 +1413,7 @@ impl Posting {
 }
 
 /// The bytes of the blob the walk gave the file at `path`.
-fn file_bytes<'o, O: PushObjects>(
+fn file_bytes<'o, O: PushObjects + ?Sized>(
   walk: &mut Walk,
   objects: &'o O,
   path: &str,

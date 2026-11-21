@@ -485,6 +485,20 @@
 > `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
 > A-774 part 3), reported to main.
 >
+> **A-812, P2's engine half (2026-11-21, w-rewrite-ops; main's order of 05:16, w-git's request). BUILT, engine and
+> server; git's half (w-git) owed.** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
+> and is made when first reached, through one door (`crate::green_ready`). The made green is the eager create's by
+> construction, and requests park until it is made. The full description and tests are in the design entry A-812.
+> Owed:
+> - (a) `vcs_store::with_owed_push_objects` answers none for every tool until w-git registers git's view. Until then an
+>   owing green's readers get `ContentUnavailable`.
+> - (b) A deferred version's merge record is not sent to holders at f > 0.
+> - (c) A signature verdict on a version replayed into an owing green's tail is not kept.
+> - (d) A materialized green's retention is settled after its build, not secured before.
+> - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
+>   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
+>   for a missed path.
+>
 > **A-810 (2026-11-21, w-rewrite-ops; main's order of 04:02). FIXED.** `crates/merge/tests/checkpoint.rs`'s restore test
 > failed about one run in five on main: `changed_between(0, 1)` named `["e/f"]` and its model `["a", "e/f"]`.
 > - It was not the restore. The index's model (A-264's oracle) asked whether a link's target was ever a special node,

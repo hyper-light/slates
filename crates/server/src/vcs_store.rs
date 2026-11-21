@@ -4204,3 +4204,17 @@ pub(crate) fn make_whole(state: &mut ShardState, record: &RepositoryRecord) {
   // A commit a submit owed and no made commit settled is made by its build's end (A-664's live whole builds, part 2).
   paths::whole_build::resume_owed(state, record.id);
 }
+
+/// Hands `read` the objects a green's owed push reads (P2, `crate::green_ready`): the store of the tool `repository` is
+/// in, as a push's work is built from it, handed over rather than returned so a view borrowing the shard's state
+/// outlives nothing. Git's view lands with w-git's half of P2 (`PushedObjects` over an empty push, which reads the
+/// repository's committed objects); until then none, and a green that owes a push answers its readers
+/// `ContentUnavailable`. Whether there were any.
+pub(crate) fn with_owed_push_objects(
+  state: &crate::state::ShardState,
+  repository: Option<RepositoryId>,
+  read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
+) -> bool {
+  let _ = (state, repository, read);
+  false
+}
