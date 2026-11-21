@@ -40,3 +40,24 @@ Base: origin/main f656820d3. Worktree ~/slates-work/w-shared-lane-live (agents/w
 Release, interleaved A/B (before = main at the start of this series, after = each step's tree), 64/128/256/320/512 MiB,
 all N shown, on a loaded machine (this MacBook at its usual load 40-60, and Studio-1 as the quiet control); 320 and 512
 MiB must pass 10 of 10. BENCHMARKS gets the tables.
+
+## Update ~03:00 PST (machine clock): step 1 landed; 3a written but not landable alone; item 2 is the prerequisite
+- **Landed: step 1 (measurement)**, 47b87f28d (main 948711996). Counters: merge.submit.forward_build,
+  merge.submit.owner_step, daemon.beat.late (+ _ns). The bench prints them.
+- **Written, on agents/w-shared-lane-live, not landed:** the holder awaits its forward to its end
+  (`xshard::task_to_its_end`) instead of a failover-delay deadline; the connection reports send streams whose bytes
+  were acknowledged, and the endpoint counts them as the exchange's progress, so the lane's "never given up while its
+  own bytes move" holds for uploads. Tests: slates-transport 149 of 149 with a new unit test and its red;
+  slates-server lib 28 of 28; fleet a_holder/a_forwarded 30 of 30 apart from the new test.
+- **Why it can't land alone (measured, debug, this Mac at load ~40):** the red test (32 MiB holder submit, B's bound
+  injected short) passes 1 of 2 to 3 of 4. The rest fail later, measured: the owner's step for that submit runs
+  4.2 to 6.9 s as one step of its control shard (decode, verdict, append with the log record's checksum, all on the
+  whole increment). While that shard is stuck it reads none of its sessions, so the holder sees no acknowledgements,
+  and its lane rightly gives the forward up as silent (fleet.forward.given_up_silent 8 to 12), resends it, then gives
+  up at the bound: Overloaded. The holder's build step is 0.6 to 1.9 s the same way.
+- **So the order inside your list:** item 2 (bounded work) is the prerequisite for item 3's liveness, not only for
+  the beat. The owner's step is dominated by work on the whole increment: its decode, the chain entry that holds all
+  its bytes, and that record's checksum. That is where 3b (content stored once by identity, the chain entry naming it
+  rather than holding a copy, the by-reference item GAPS already owes) and the slicing meet. I'm starting there: (i)
+  the owner's step measured by part (decode, judge, append, record checksum) to pick what to slice first; (ii) the
+  sliced or by-reference form of the biggest part; landing 3a with it once the red test passes 10 of 10.

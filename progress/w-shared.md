@@ -384,3 +384,10 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## 2026-11-21 ~01:20 PST: family three's Linux run is kiln r14 (queued: adacachy, the one Linux runner, at load 60-93;
   r4 stopped: its 30 min test timeout covered a starved compile). r14 builds first, then times the tests; green then red.
   Waiting on: r14; main's answers on the lane (in-place forward refusals at 320 MiB, next step proposed).
+
+## 2026-11-21 ~03:00 PST: LANE (main's ruling 23:50): step 1 landed 47b87f28d (main 948711996). 3a on branch
+  agents/w-shared-lane-live (worktree ~/slates-work/w-shared-lane-live): task_to_its_end + acked request bytes as
+  progress; red test a_holders_submit_still_crossing_is_not_refused_by_a_size_independent_bound flaky because the
+  OWNER's step is 4-7 s in one control-shard step (debug, 32 MiB) -> lane gives up silent. NEXT: measure the owner's
+  step by part (decode / judge / append / record checksum), slice or by-reference the biggest; land 3a with it.
+  Family three: kiln r14 (queued, adacachy). Plan + update: inbox/main-from-w-shared-lane-plan.md.
