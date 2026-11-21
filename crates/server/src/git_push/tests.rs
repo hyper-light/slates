@@ -1641,9 +1641,8 @@ fn t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing() {
       .expect("create");
     let task = slates_rt::futures::spawn(async move {
       let outcome = short_homing_drive(repository, &request).await;
-      let records = crate::state::with_state(|state| {
-        crate::vcs_store::tests::records(state, repository).len()
-      });
+      let records =
+        crate::state::with_state(|state| crate::vcs_store::tests::records(state, repository).len());
       let _ = sent.send((outcome, records));
     })
     .expect("the push's task");

@@ -253,7 +253,7 @@ fn t_a767_c5_a_version_5_record_names_its_names_its_pack_and_its_changeset() {
   );
   let pack = slates_vcs::ContentId::of(b"PACK-bytes");
   let bytes =
-    RecordWriter::finish_packed((3, &moves), (identity, count), (pack, 10), 7).expect("written");
+    RecordWriter::finish_packed((3, &moves), Some((identity, count)), Some((pack, 10)), 7).expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
   expected.extend_from_slice(&5u32.to_le_bytes());
