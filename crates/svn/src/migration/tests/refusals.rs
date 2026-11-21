@@ -7,7 +7,7 @@ use super::support::{
 };
 use crate::dump::{CopyFrom, DeltaBase, Digest, DumpError, Format, NodeAction, NodeHeader, Uuid};
 use crate::index::{IndexRefusal, NodeKind};
-use crate::migration::{Exporter, Importer, MigrationRefusal, Properties, Repository, Room};
+use crate::migration::{Exporter, Importer, MigrationRefusal, Properties, Room, Standalone};
 use crate::svndiff::{Instruction, SvndiffError, Window};
 
 /// The text the first revision gives `f`.
@@ -47,7 +47,7 @@ fn second_revision(nodes: &[Node]) -> Vec<u8> {
 }
 
 /// The refusal importing `dump` into a created repository meets, with the repository it leaves.
-fn refusal(dump: &[u8]) -> (MigrationRefusal, Repository) {
+fn refusal(dump: &[u8]) -> (MigrationRefusal, Standalone) {
   let mut repository = created();
   let refusal = import_whole(&mut repository, dump).expect_err("a refusal");
   (refusal, repository)
@@ -377,7 +377,7 @@ fn a_refused_import_keeps_the_revisions_before_it_and_answers_again_the_same() {
   assert_eq!(refusal, MigrationRefusal::Stream(DumpError::Truncated));
   assert_eq!(refusal.subversion_code(), 200_003);
   assert_eq!(repository.youngest(), 1);
-  let again = importer.import(&mut repository, &whole, true).unwrap_err();
+  let again = repository.import(&mut importer, &whole, true).unwrap_err();
   assert_eq!(again, refusal);
   let mut fresh = created();
   import(&mut fresh, &whole, 1).unwrap();
