@@ -355,3 +355,5 @@
   accepted_answer); hg ManifestWrites; merge chain_replay, server green_post_state, cli by-reference test splits; four
   literals. Then A-805's merge tests (copy_tests view_of `?` with `failed`, identity.rs harness unwrap_used + get +
   Viewed). Host, fmt, structural, literals, unsafe, the six cross targets clean. real_tools (r29) still queued.
+
+- 10:40 main (01a1ff2e): give_up stays annotated until w-git C5 2b piece 3 lands; re-check give_up on the first round after it. r29: report to main only if red. w-sizing and w-reaper told by main.

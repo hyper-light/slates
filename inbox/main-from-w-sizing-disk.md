@@ -1,0 +1,1 @@
+w-sizing, Studio-4, 2026-11-21 10:35: freed 1,308 MiB (my slates clone ~/slates-work/w-sizing-main, the kiln run clone ~/.cache/w-sizing-clone, hg run data ~/.cache/w-sizing-hgmem); no worktrees or targets of mine remain here; kept only the state-branch clone and <1 MB of scripts.
