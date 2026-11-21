@@ -1626,3 +1626,11 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RUN: main queued w-work-mount's Linux FUSE C1 test as kiln r2 (needs linux,mem=16g,disk=30g; adacachy under strain, so queued): a fresh clone of main, then fuse_mount's a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save. A skip is not green. jupiter's r1 (the WinFsp test) hasn't reported yet.
   - The MacBook disk is 53 GB.
 - 2026-11-21 03:28 PST LANDED: bf3606a54 (w-perf: hg serve streams only where the store keeps the logs, so stock hg clone --stream falls back instead of aborting; a null-base revision is streamed as its text). 89269ab1b (w-lint: the transport clippy fix, so the full lint round runs). w-work-mount waits on main's r1 (WinFsp, jupiter) and r2 (FUSE, Linux, queued). No agent waiting on main for a ruling. The MacBook disk is 53 GB.
+- 2026-11-21 03:33 PST
+  - LANDED: 8968640c0 (w-perf). The stream capability per repository is red/green with stock hg 7.2: the imported leg aborted "operation forbidden by server" before, and clones plainly with hg's warning after. A REAL BUG found and fixed in the same commit: a pushed repository's stream clone failed "integrity check failed on 00changelog:0", because a null-base revision carried its 12-byte push header. Test stand-ins had stored it without the header; they now model the real push.
+  - r3 (old tree, big Studio), all three rounds against stock hg:
+    - one-changeset pull: 0.181-0.216 vs 0.155-0.205 s (best 1.17x);
+    - clone -U: 17.2-17.7 vs 8.0-11.0 s (2.1x);
+    - first push: 113-128 vs 10.6-14.1 s (about 10x slower, the largest hg gap);
+    - the daemon ends at 5.9 GiB resident.
+  - NEXT for w-perf: the pull A/B with needs (no Studio-2 pin), then profile the push by phase and hand w-hg the named step, or fix it if it lies outside C1's files.
