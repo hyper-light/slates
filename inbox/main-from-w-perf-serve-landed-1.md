@@ -41,3 +41,19 @@ One slip to report: I pushed my scratch branch `agents/w-perf-serve` with `-f` o
 fast-forwarded anyway and overwrote nothing. Not repeated.
 
 Next: what's left of the pull after the A/B (the per-turn view rebuild), then the stream's chunks as stored deltas.
+
+## Second landing: the stream clone's chunks as stored deltas (c870c8f80)
+- `render::Streaming` asks the store between steps for a log's rows (by node, the `I` rows: each version as it
+  landed, its own base and place) and for its chunks in batches (read in place). Each entry's base is the revision of
+  the log that first holds its base's text; each chunk is the stored edit or whole with the `u` mark, which 7.2's reader
+  strips whatever follows. No text is made whole while streaming (the walk calls no text reader; the old
+  whole-text path is gone from `stream_out`). The HTTP and SSH edges answer the wants through `StoreHandle`
+  (`hg_view::answer_store_wants`, one helper over `render::StoreWants`); a turn ends when a step asks.
+- A log the store doesn't keep (an imported repository's, until w-hg's C1 step 3) serves no stream: `1\n`. Stock
+  `hg clone --stream` takes that as "operation forbidden by server" and aborts; a plain clone is unaffected.
+- Red: `a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes` (a store of deltas: chunk bytes ≤
+  the deltas' plus a mark a chunk, fewer bytes than the whole-text stream, every revision read back by the revlog reader
+  and held to its node). The byte-for-byte tests stay green with a store of wholes.
+- Early A/B number (round 1 of 3, build 7189ce280, the walk fix and the merge, slates filled by import): the
+  one-changeset pull **0.303 s** (4.2 s before), stock's beside it in the full table when the run ends. The stream's A/B
+  needs a repository filled by a push (rows), on c870c8f80: next.
