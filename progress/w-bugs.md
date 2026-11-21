@@ -276,3 +276,11 @@
   all marking. Big Studio, 5 rounds: main 1 spin (longest poll 1,107 ms), this 0 (longest 947 ms). Time unchanged:
   stock 5.40 s, main 25.88 s, this 25.09 s. P1 stays open: a near-second unit remains (diag 10, kiln r5). My typed tree
   entries dropped: main's 7b66e7225 did the same (kinds from the landing's type runs).
+- 2026-11-21 main's two hg-row spins (after P1), read from adacachy's anchor log (r-linuxc-2239, release 90e9b720c):
+  - start_shard (daemon.rs:1186): a restarted daemon's start logged "the most CPU in one [slice] 962,859 µs, ending at
+    unit 1". Unit 1 is `slates_db::replay::recover`, the whole catalog replay, one unit, though held only to a recovery
+    budget of about a second, the liveness window itself. Plan: replay in steps (begin/step/finish) with the start's
+    slicer between; a counter of records a unit; red first.
+  - HTTP edge (vcs_http.rs:850) under hg: spins at the connection task's polls 1 and 7, one right after a restart. Each
+    hg request makes a view (`Indexed::new`) and answers a whole command in one poll. Diag build timing both per command
+    runs on adacachy under its load (kiln r16).
