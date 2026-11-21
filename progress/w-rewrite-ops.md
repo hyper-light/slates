@@ -1,5 +1,17 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~14:40 PST — A-818 closed out for goal 93 (main 14:23); in goal 93's reserve, no runs
+- 2b stays on agents/w-rewrite-ops-a818-2b (c4278fd3c), not landed. Its A/B is in BENCHMARKS and GAPS (d6408fdb4):
+  writes win, old reads lose 2-9x, overwrite memory loses 7-8x.
+- w-fed-faults' large rewrite (one 2 MiB file, 92,354 ops) also loses: release 89 ms against 21 ms, debug 2,011 ms
+  against 230 ms.
+- When 2b reopens, read first:
+  - inbox/w-rewrite-ops-from-w-fed-faults.md (build the version's tree off-step, install it in O(1); add the
+    large-rewrite row);
+  - main's condition: O(1) space a change.
+- w-svn sliced ImportBatch::commit's apply (A-835) on main's go. The pre-record loop's slicing is mine, unassigned.
+- Answered w-fed-faults (its split, agreed) and w-svn.
+
 ## ~14:30 PST — A-818 piece 2b BUILT on branch agents/w-rewrite-ops-a818-2b (c4278fd3c); waiting on main's A/B
 - history.rs replaced: values are identity trees over an anchor per path chain; `history::change` takes the latest
   alone. The re-anchor, layers and their switch are deleted. Today's history is kept test-only as the oracle's
