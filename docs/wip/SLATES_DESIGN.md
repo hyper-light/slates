@@ -58671,3 +58671,32 @@ Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound),
     equals the shipments.
 - **Owed.** An RSS-bound measurement of a 64 to 320 MiB version's placement before and after (main's run-requests),
   and the watchdog's own report from the Studio reruns, to say whether this was exit 4's cause.
+
+### A-794 — A forwarded work's creation is made on the partition its name hashes to, and a forwarded verb parked at its work's gate answers its exchange when it resumes (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; §4.8 "Lookup", §4.16 "Role", A-247, A-400, A-697, AUD-11)
+- **Why.** A work over a green another node owns is made on its client's own partition when that node holds the
+  green's replica (A-697); otherwise its creation is forwarded to the owner, where `serve_forward` ran it on the green's
+  own shard (`forwarded_to` of the verb's volume, the green). At 100,000 clients the client node held no replica for
+  most of the run, so 76,955 works were made on the primary's one partition, whose merge budget (373 MB, the green's
+  chain's too) filled with their logs: 60,349 edits, 3,883 rebases and 7,544 accepted submits refused `TableAtCapacity`
+  (A-793's first-occurrence line: 76,955 work logs, 341 MB, beside the chain's 32 MB). And a forwarded verb that parked
+  at a work's gate (A-247) had no way back to its exchange, which awaited only a deferred acceptance (AUD-11) and
+  answered `Overloaded` otherwise, so the origin's resend under the id met the completion.
+- **Change.** `crates/server/src/verbs.rs` `serve_forward`: a forwarded `CreateWork` runs on the shard its name hashes
+  to, as a create is placed; whether the green is made yet is still asked of the green's shard first
+  (`forwarded_before_made`, so a forward racing the green's creation answers retryable, nothing recorded);
+  `forwarded_write` takes the volume to check as an option. `crates/server/src/work_home.rs`: `attach_forwarded` keeps
+  a forward's waiter beside its parked verb, and the resume answers it from the verb's completion, or attaches it to
+  the verb's next wait (parked again, or its acceptance deferred to a fleet commit), else `Overloaded`
+  (`answer_forwarded`); `await_deferred_completion` attaches there when merge holds no acceptance for it. Counted:
+  `merge.work.forwarded_attached`, `merge.work.forwarded_answered`.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --test fleet
+  a_forwarded_work_creation_is_made_on_the_partition_its_name_hashes_to` (three nodes, each its own region, two shards
+  each; works made through a node that does not replicate the green): `spread-work-1` was made on the green's partition
+  1, its name's is 0; after, every work on its name's partition, each edited through the forwarding node, the
+  forwards answered at resume (`merge.work.forwarded_answered` > 0). The fleet tests on works and forwards (42),
+  `--lib work_home`, `--test merge_load` pass.
+- **By use** (release, `load_scale`, 100,000 clients, one round, the kernel v7.4-rc4; base `e4c2ad76`): `TableAtCapacity`
+  71,776 to 0, CreateWork p50 18.3 s to 10.0 s (p99 269 s to 20.1 s), rebases 13,468 to 91,076, accepted 28,224 to
+  31,223, verdicts 125 to 153 a second, oracle failures 0. The next bound: 64,072 accepted submits, 4,169 edits and 536
+  rebases refused `BudgetExceeded`; a first-occurrence line now logs what the green's retention holds when its cap
+  refuses a reservation with room left.

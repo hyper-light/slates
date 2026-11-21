@@ -306,6 +306,13 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-794 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a forwarded
+> work's creation is made on the partition its name hashes to, not its green's (76,955 works had filled the primary's
+> one partition's merge budget: `TableAtCapacity` 71,776 to 0), and a forwarded verb parked at its work's gate answers
+> its exchange when it resumes (before, `Overloaded` and the origin's resend). CreateWork p50 18.3 s to 10.0 s. Open
+> (goal 86b's next bound): 64,072 accepted submits, 4,169 edits and 536 rebases refused `BudgetExceeded`; a
+> first-occurrence line logs the green's retention at its cap at the next run.
+>
 > **A-793 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a change
 > re-anchors its path's content history on the new block (`history::reanchor`), so the history keeps what a change
 > overwrote, not the earlier file; A-728 part 2's splice and seal are replaced. At 100,000 clients: `BudgetExceeded`
@@ -8622,8 +8629,11 @@
 > tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
 > burst and delays the next message up to half a step quantum per idle slice. Ruled by main (2026-11-20) and built:
 > only a status that asks for the memory report arms the sweep, and the anchor's objects whole come from the kernel's
-> per-mapping figures (§4.14 status "residency only when asked"). Linux not measured: adacachy's runs froze at load
-> 80-89.
+> per-mapping figures (§4.14 status "residency only when asked"): 172-205 µs added against main's 1,353-2,220 µs.
+> **Still open:** on 218256bab the median is 184.5-437.0 µs (3.7-8.7x the goal) and p999 under 1 ms in 3 of 5 rounds at
+> load 6-10 on the 32-core Studio; the round's exchange (about 100 µs, the transport and two control shards' wakes, macOS
+> holds declined by A-387) and the held reply's wake (65-116 µs) remain. Linux not measured: adacachy's runs froze in
+> their cgroup at load 68-89.
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
