@@ -147,3 +147,130 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   assert_eq!(rows.len(), 1);
   assert_eq!(rows[0].identity, creation.identity);
 }
+
+/// A-767 C6 (svn onto the changeset store; main's order of 2026-11-20 19:50: "a push's landing as a changeset append,
+/// and its replay", red first on the real store). Do: start a daemon holding a store, create a Subversion repository,
+/// land a client's accepted work adding `/trunk` through the commit's landing (`svn_commit::land_work`), wait for its
+/// changeset, stop the daemon and the store's owner, and read the log back from its files. Expect: the repository's two
+/// changesets, its creation (sequence 0) and revision 1 (sequence 1, judged over 0), whose Record section is the
+/// revision's record as the register holds it: `/trunk` added. Before, a commit landed nothing into the store.
+#[test]
+fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
+  let dir = store_directory("svn-commit");
+  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-svn-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store_owner.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let name = "stored-svn".to_owned();
+  let partition = usize::from(crate::verbs::owner_of_name(&name, usize::from(SHARDS)));
+  let created_name = name.clone();
+  let repository = crate::daemon::observe_at(&daemon, partition, move |state| {
+    let created = crate::verbs::dispatch(
+      state,
+      1,
+      &owner(),
+      RequestBody::CreateRepository {
+        name: created_name.clone(),
+        tool: VcsTool::Subversion,
+        format: ObjectFormat::Revisions,
+        default_branch: "trunk".to_owned(),
+        green: None,
+      },
+    );
+    assert!(
+      matches!(created, ReplyBody::GreenCreated { .. }),
+      "{created:?}"
+    );
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&created_name)
+      .map(|record| record.id)
+      .unwrap()
+  });
+  let (sent, landed) = std::sync::mpsc::sync_channel(1);
+  crate::daemon::observe_at(&daemon, partition, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let work = slates_svn::commit::drive::Work {
+        head: 0,
+        record: slates_svn::index::RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![slates_svn::index::ChangedPath {
+            path: "/trunk".to_owned(),
+            action: slates_svn::index::Action::Add,
+            kind: slates_svn::index::NodeKind::Directory,
+            copy_from: None,
+            text: None,
+            properties: None,
+            mergeinfo_modified: false,
+          }],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"the trunk".to_vec())],
+        texts: std::collections::BTreeSet::new(),
+        property_lists: std::collections::BTreeMap::new(),
+        locks: slates_svn::lock::CommitLocks::default(),
+      };
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let landed =
+        crate::repository::svn_commit::land_work((&owner(), repository), work, &texts).await;
+      let _ = sent.send(landed.map(|landed| landed.map(|committed| committed.revision)));
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  let landed = landed
+    .recv_timeout(std::time::Duration::from_secs(60))
+    .expect("the landing answered");
+  daemon.stop();
+  store_owner.stop().unwrap();
+  assert_eq!(landed, Some(Ok(1)));
+
+  let log_file = hyper_block::file::DeviceFile::adopt(
+    root(&dir).open_file(LOG_FILE).unwrap(),
+    &dir.join(LOG_FILE),
+    hyper_block::file::CachingRequest::Buffered,
+    hyper_block::buf::Alignment::BYTE,
+  )
+  .unwrap();
+  let mut found = Vec::new();
+  let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+  let ours: Vec<_> = found
+    .iter()
+    .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
+    .copied()
+    .collect();
+  assert_eq!(
+    ours
+      .iter()
+      .map(|located| (
+        located.header.tool,
+        located.header.sequence,
+        located.header.judged_over
+      ))
+      .collect::<Vec<_>>(),
+    vec![(Tool::Subversion, 0, 0), (Tool::Subversion, 1, 0)]
+  );
+  let sections = log.sections(&ours[1]).unwrap();
+  assert_eq!(sections.len(), 1);
+  assert_eq!(sections[0].kind, SectionKind::Record);
+  let mut record = vec![0u8; usize::try_from(sections[0].len).unwrap()];
+  log.read_at(&mut record, sections[0].offset).unwrap();
+  let decoded = slates_svn::commit::record::Record::decode(&record).unwrap();
+  let slates_svn::commit::record::Record::Revision(revision) = decoded else {
+    panic!("not a revision: {decoded:?}")
+  };
+  assert_eq!(
+    revision
+      .record
+      .changes
+      .iter()
+      .map(|change| change.path.as_str())
+      .collect::<Vec<_>>(),
+    vec!["/trunk"]
+  );
+}

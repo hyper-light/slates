@@ -69,6 +69,76 @@ impl Drop for FleetProcess {
   }
 }
 
+/// CPU time a daemon process has used, in nanoseconds: the whole process, and on Linux its control shard's thread
+/// (`slates-shard-0`, the shard that holds the fleet's sessions and a candidate's live logs). Read from `/proc` on
+/// Linux, in clock ticks converted by the kernel's own tick rate; from `ps` on macOS, whose `time` column is
+/// centiseconds and whose threads carry no names, so the control shard is not told apart there. `None` where neither
+/// can be read.
+#[allow(clippy::disallowed_methods)]
+fn cpu_ns(process: &FleetProcess) -> (Option<u64>, Option<u64>) {
+  let pid = process.child.id();
+  if cfg!(target_os = "linux") {
+    let tick_ns = 1_000_000_000_u64 / rustix::param::clock_ticks_per_second();
+    // utime and stime are the 14th and 15th fields; the command name (the 2nd) may hold spaces, so count from its ')'.
+    let ticks = |stat: &str| {
+      let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+      let user: u64 = fields.get(11)?.parse().ok()?;
+      let system: u64 = fields.get(12)?.parse().ok()?;
+      Some((user + system) * tick_ns)
+    };
+    let whole = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+      .ok()
+      .and_then(|stat| ticks(&stat));
+    let control = std::fs::read_dir(format!("/proc/{pid}/task"))
+      .ok()
+      .and_then(|tasks| {
+        tasks.flatten().find_map(|task| {
+          let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+          if comm.trim() != "slates-shard-0" {
+            return None;
+          }
+          ticks(&std::fs::read_to_string(task.path().join("stat")).ok()?)
+        })
+      });
+    return (whole, control);
+  }
+  // `[[H:]M]M:SS.cc`.
+  let whole = Command::new("ps")
+    .args(["-o", "time=", "-p", &pid.to_string()])
+    .output()
+    .ok()
+    .and_then(|out| {
+      let text = String::from_utf8(out.stdout).ok()?;
+      let (clock, centis) = text.trim().rsplit_once('.')?;
+      let seconds = clock.split(':').try_fold(0_u64, |sum, part| {
+        Some(sum * 60 + part.parse::<u64>().ok()?)
+      })?;
+      Some(seconds * 1_000_000_000 + centis.parse::<u64>().ok()? * 10_000_000)
+    });
+  (whole, None)
+}
+
+/// [`cpu_ns`] of every daemon of `fleet`, in node order.
+fn fleet_cpu_ns(fleet: &Fleet) -> Vec<(Option<u64>, Option<u64>)> {
+  fleet.daemons.iter().map(cpu_ns).collect()
+}
+
+/// Milliseconds each daemon used between two [`fleet_cpu_ns`] readings, (process, control shard); `None` where unread.
+#[allow(clippy::cast_precision_loss)]
+fn cpu_used_ms(
+  before: &[(Option<u64>, Option<u64>)],
+  after: &[(Option<u64>, Option<u64>)],
+) -> Vec<(Option<f64>, Option<f64>)> {
+  let used = |was: Option<u64>, now: Option<u64>| Some(now?.saturating_sub(was?) as f64 / 1e6);
+  before
+    .iter()
+    .zip(after)
+    .map(|((whole, control), (whole_after, control_after))| {
+      (used(*whole, *whole_after), used(*control, *control_after))
+    })
+    .collect()
+}
+
 struct ScratchDir {
   path: String,
 }
@@ -1935,6 +2005,11 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   const PER_ROUND: usize = 400;
   /// Shape: each write's bytes, a page.
   const WRITE_BYTES: usize = 4096;
+  /// Shape: the wait after the stream before the idle reading: far past any shard's idle window (the wake estimate
+  /// times the idle ratio, a few milliseconds at most), so the reading sees the daemons as they idle.
+  const SETTLE: Duration = Duration::from_millis(500);
+  /// Shape: the quiet stretch the idle CPU is read over: ten heartbeats of the daemons' own periodic work.
+  const QUIET: Duration = Duration::from_secs(1);
   if std::env::var_os("SLATES_TEST_CLI").is_none()
     || std::env::var_os("SLATES_TEST_MEASURE").is_none()
   {
@@ -1944,7 +2019,8 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     return;
   }
   let fleet = start_fleet("live-measure");
-  let owner = &fleet.instances[(fleet.bootstrap + 1) % fleet.instances.len()];
+  let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
+  let owner = &fleet.instances[owner_index];
   let (mut plain, plain_file, _) = stable_session(owner, "plain", false);
   let (mut live, live_file, live_id) = stable_session(owner, "live", true);
   let data = vec![0x5a_u8; WRITE_BYTES];
@@ -1957,6 +2033,7 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     nfs::write(&mut live, &live_file, &data, xid);
   }
   let (mut plain_times, mut live_times) = (Vec::new(), Vec::new());
+  let streamed_from = fleet_cpu_ns(&fleet);
   for _ in 0..ROUNDS {
     for (stream, file, times) in [
       (&mut plain, &plain_file, &mut plain_times),
@@ -1970,6 +2047,16 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
       }
     }
   }
+  let streamed_to = fleet_cpu_ns(&fleet);
+  std::thread::sleep(SETTLE);
+  let quiet_from = fleet_cpu_ns(&fleet);
+  std::thread::sleep(QUIET);
+  let quiet_to = fleet_cpu_ns(&fleet);
+  let (streamed, settling, quiet) = (
+    cpu_used_ms(&streamed_from, &streamed_to),
+    cpu_used_ms(&streamed_to, &quiet_from),
+    cpu_used_ms(&quiet_from, &quiet_to),
+  );
   let caught = live_line(owner, "shipping", &live_id);
   let late = counter(owner, "fleet.live.durable_late");
   let lent = (
@@ -1981,6 +2068,16 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
+  // Each candidate's own: its serve of an entry, the publication that keeps it included (`fleet.live.hop.holder`), is
+  // the part of the owner's exchange that no owner counter splits out.
+  for (index, instance) in fleet.instances.iter().enumerate() {
+    if index != owner_index {
+      eprintln!(
+        "measure: candidate {index}'s live counters {:?}",
+        live_counters(instance)
+      );
+    }
+  }
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);
@@ -1991,14 +2088,17 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     "measure: {} writes each of {WRITE_BYTES} B FILE_SYNC, {ROUNDS} interleaved rounds; load {}\n  plain p50 {p50:.1} \
      p99 {p99:.1} p999 {p999:.1} max {max:.1} us\n  live  p50 {l50:.1} p99 {l99:.1} p999 {l999:.1} max {lmax:.1} us\n  \
      added at p50 {:.1} us; live log at the end {caught:?}; late {late}; (no_session, unanswered, link_lost) {lent:?}; \
-     live writes over 50 ms {}",
+     live writes over 50 ms {}\n  cpu ms (process, control shard) in node order, owner {owner_index}: stream {streamed:?}; \
+     the {} ms after it {settling:?}; the {} ms after that {quiet:?}",
     plain_times.len(),
     load.trim(),
     l50 - p50,
     live_times
       .iter()
       .filter(|time| **time > Duration::from_millis(50))
-      .count()
+      .count(),
+    SETTLE.as_millis(),
+    QUIET.as_millis()
   );
   assert_eq!(late, 0, "no stable write waited out its bound");
 }

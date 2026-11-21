@@ -121,8 +121,6 @@ pub(crate) mod referenced;
 pub(crate) mod svn_deltify;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
-// Owed caller: A-645 (a), the view mounted under the store's standing grant for a hook's REPOS-PATH.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod svn_presenter;
 pub(crate) mod svn_texts;
 pub(crate) mod svn_view;

@@ -855,7 +855,9 @@ fn allowing_hook(path: &str) {
 }
 
 /// The svn:// leg of a revision-property test: the anchor, the scratch, the client and the URL, revision 1 committed;
-/// none (the test skipped loudly) without stock Subversion 1.15 or where the platform names no issuer surface.
+/// none (the test skipped loudly) without stock Subversion 1.15 or where the platform names no issuer surface. The
+/// anchor is given a store directory in the scratch (`--vcs-store`, A-767's standing grant), where the daemon mounts a
+/// repository's FSFS view for its hooks (A-645 (a)): [`STORE`].
 fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
   if !stock_svn() {
     eprintln!(
@@ -863,12 +865,17 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
     );
     return None;
   }
-  let (anchor, lines, issuer) = start_anchor(instance, &["--vcs-svn", "127.0.0.1:0"]);
+  let scratch = Scratch::new("svn-revprop");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (anchor, lines, issuer) = start_anchor(
+    instance,
+    &["--vcs-svn", "127.0.0.1:0", "--vcs-store", &store],
+  );
   let port = svn_listener_port(&lines);
   let issuer = issuer_or_skip(issuer, "the revision property tests")?;
   create_repository(instance);
   let (id, token) = minted_token(instance, &issuer);
-  let scratch = Scratch::new("svn-revprop");
   let svn = Svn::new(&scratch, "revprop", credentials(id, token));
   let url = format!("svn://127.0.0.1:{port}/{REPOSITORY}");
   let first = svn.copy("first");
@@ -882,21 +889,56 @@ fn revprop_leg(instance: &str) -> Option<(Anchor, Scratch, Svn, String)> {
   Some((anchor, scratch, svn, url))
 }
 
-/// A-622 and A-702 part 2 (`slates repository policy`; `hooks.c` `svn_repos__hooks_pre_revprop_change`). Do: over the
-/// svn:// listener, with revision 1 committed as stock `svn` 1.15, configure a pre-revprop-change hook that allows
+/// Format: the store directory a revision-property test's anchor is given, in its scratch (`--vcs-store`).
+const STORE: &str = "store";
+
+/// Writes a hook program at `path` that reads `REPOS-PATH`, its first argument, with stock `svnlook youngest` by the
+/// absolute path `svnlook` (a Subversion hook starts with an empty environment, so no `PATH`), writes what it read to
+/// `out`, and allows what it is asked where the read succeeded.
+#[cfg(unix)]
+#[allow(clippy::disallowed_methods)]
+fn reading_hook(path: &str, svnlook: &str, out: &str) {
+  use std::os::unix::fs::PermissionsExt;
+  std::fs::write(
+    path,
+    format!("#!/bin/sh\n\"{svnlook}\" youngest \"$1\" > \"{out}\" || exit 1\nexit 0\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Stock `svnlook`'s absolute path, found on this process's `PATH`; none where it is not.
+fn svnlook_path() -> Option<String> {
+  let path = std::env::var_os("PATH")?;
+  std::env::split_paths(&path)
+    .map(|directory| directory.join("svnlook"))
+    .find(|candidate| candidate.is_file())
+    .map(|found| found.to_string_lossy().into_owned())
+}
+
+/// A-622, A-702 part 2 and A-645 (a) (`slates repository policy`; `hooks.c` `svn_repos__hooks_pre_revprop_change`;
+/// `REPOS-PATH`). Do: over the svn:// listener of an anchor given a store directory, with revision 1 committed as stock
+/// `svn` 1.15, configure a pre-revprop-change hook that reads its `REPOS-PATH` with stock `svnlook youngest`
 /// (`slates repository policy project --hook pre-revprop-change=PROGRAM`, the owner's verb), change revision 1's
-/// `svn:log` with stock `svn propset --revprop`, and read it. Expect the verb's answer naming the hook at policy version
-/// 1, the change taken, and the value read back.
+/// `svn:log` with stock `svn propset --revprop`, and read it; then unmount the view. Expect the verb's answer naming the
+/// hook at policy version 1, the change taken, the value read back, and the hook's `svnlook` reading revision 1 as the
+/// youngest: `REPOS-PATH` is the repository's FSFS view, mounted in the store directory. Red on main before A-645 (a):
+/// the hook was refused (E200007, "its root mount is not yet published") and the change with it.
 // Unix alone: hooks run where the hook driver does.
 #[cfg(unix)]
 #[test]
 fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
   let instance = format!("svn-revprop-{}", std::process::id());
+  let Some(svnlook) = svnlook_path() else {
+    eprintln!("skipping the revision property hook test: no stock svnlook here");
+    return;
+  };
   let Some((_anchor, scratch, svn, url)) = revprop_leg(&instance) else {
     return;
   };
   let hook = format!("{}/allow-revprop-change", scratch.path);
-  allowing_hook(&hook);
+  let read = format!("{}/youngest-read", scratch.path);
+  reading_hook(&hook, &svnlook, &read);
   let given = format!("pre-revprop-change={hook}");
   let (code, out, err) = slates(
     &instance,
@@ -906,18 +948,23 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
     &svn.scratch,
     &["propset", "--revprop", "-r1", "svn:log", "changed", &url],
   );
-  let read = svn.ok(
+  let value = svn.ok(
     &svn.scratch,
     &["propget", "--revprop", "-r1", "svn:log", &url],
   );
+  let youngest = std::fs::read_to_string(&read).unwrap_or_default();
+  let view = format!("{}/{STORE}/{REPOSITORY}.svn", scratch.path);
+  let unmounted = slates(&instance, &["unmount", &view]);
   assert_eq!(
     (
       (code, out.contains("version: 1"), out.contains(&given)),
       changed.0,
-      read.trim(),
+      value.trim(),
+      youngest.trim(),
+      unmounted.0,
     ),
-    ((0, true, true), 0, "changed"),
-    "policy: {out}{err}; changed: {changed:?}"
+    ((0, true, true), 0, "changed", "1", 0),
+    "policy: {out}{err}; changed: {changed:?}; unmount: {unmounted:?}"
   );
 }
 
