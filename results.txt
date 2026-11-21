@@ -1,0 +1,105 @@
+runner 4 cores, 15 GiB, load 1.08 0.28 0.10 1/269 2305
+arm between = cd8ed9ca9
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 6m 34s
+[1m[92m  Executable[0m tests/live_fleet.rs (../t-between/release/deps/live_fleet-1db8d50c5882a503)
+between /home/runner/work/slates/arm-between/../t-between/release/deps/live_fleet-1db8d50c5882a503
+== round 1 arm between measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.34 2.24 1.25
+exit 0
+  live  p50 159.8 p99 452.3 p999 1599.5 max 2979.2 us
+  added at p50 128.7 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(320.0), Some(310.0)), (Some(760.0), Some(360.0)), (Some(310.0), Some(300.0))]; plain statuses asked during the stream 0
+  the owner: build 66.6, to_control 12.5, lane 0.9, exchange 74.6, to_owner 3.8, round 158.4, reply 56.9, reply_wake 0.5, reply_poll 55.0, reply_tail 1.3, reply_fold_rest 1.9, hold.declined=21, hold.answer=2053, hold.exchange=3448, hold.dispatches=2042, long_steps=8, polls=4937, steps=2079, waited=1, waits=13, not_durable=3, placement=2, reply_poll=2051, reply_poll_ns=112841352, fold=2051
+  candidate 0: holder 17.5, hold.entries=1703
+  candidate 2: holder 13.2, hold.entries=1449
+slates-server: g228 reply woke 2163 ns after its fold, polled 100453215 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 866, column: 14 })), 5198 ns
+slates-server: g228 reply woke 1412 ns after its fold, polled 7832 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1051 ns
+slates-server: g228 reply woke 771 ns after its fold, polled 6720 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 160 ns
+slates-server: g228 reply woke 591 ns after its fold, polled 6700 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 80 ns
+slates-server: g228 reply woke 551 ns after its fold, polled 6189 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 71 ns
+slates-server: g228 reply woke 641 ns after its fold, polled 6209 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 81 ns
+slates-server: g228 reply woke 601 ns after its fold, polled 6179 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 571 ns after its fold, polled 6319 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 611 ns after its fold, polled 5839 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 571 ns after its fold, polled 5929 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 60 ns
+slates-server: g228 reply woke 611 ns after its fold, polled 6480 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 100 ns
+slates-server: g228 reply woke 601 ns after its fold, polled 6049 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 50 ns
+== round 2 arm between measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.34 2.24 1.25
+exit 0
+  live  p50 149.9 p99 375.4 p999 685.2 max 1765.1 us
+  added at p50 118.0 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(270.0), Some(270.0)), (Some(730.0), Some(360.0)), (Some(330.0), Some(330.0))]; plain statuses asked during the stream 0
+  the owner: build 48.0, to_control 10.4, lane 1.1, exchange 64.6, to_owner 4.2, round 128.2, reply 56.9, reply_wake 0.5, reply_poll 54.9, reply_tail 1.5, reply_fold_rest 1.9, hold.declined=21, hold.answer=2051, hold.exchange=3846, hold.dispatches=2103, long_steps=7, polls=4563, steps=2079, waited=1, waits=13, not_durable=2, placement=2, reply_poll=2051, reply_poll_ns=112510923, fold=2051
+  candidate 0: holder 11.3, hold.declined=165, hold.entries=1579
+  candidate 2: holder 12.6, hold.entries=1867
+slates-server: g228 reply woke 2423 ns after its fold, polled 100445302 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 866, column: 14 })), 4887 ns
+slates-server: g228 reply woke 1312 ns after its fold, polled 8172 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1262 ns
+slates-server: g228 reply woke 1141 ns after its fold, polled 8994 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1542 ns
+slates-server: g228 reply woke 701 ns after its fold, polled 6089 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 901 ns
+slates-server: g228 reply woke 591 ns after its fold, polled 6620 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1081 ns
+slates-server: g228 reply woke 591 ns after its fold, polled 5779 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 752 ns
+slates-server: g228 reply woke 541 ns after its fold, polled 5849 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 751 ns
+slates-server: g228 reply woke 521 ns after its fold, polled 5928 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 751 ns
+slates-server: g228 reply woke 501 ns after its fold, polled 5428 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 711 ns
+slates-server: g228 reply woke 521 ns after its fold, polled 5698 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 811 ns
+slates-server: g228 reply woke 591 ns after its fold, polled 5859 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 731 ns
+slates-server: g228 reply woke 561 ns after its fold, polled 6049 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 50 ns
+== round 3 arm between measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.63 2.28 1.27
+exit 0
+  live  p50 162.8 p99 386.9 p999 1665.9 max 3130.2 us
+  added at p50 128.0 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(320.0), Some(310.0)), (Some(760.0), Some(370.0)), (Some(310.0), Some(300.0))]; plain statuses asked during the stream 0
+  the owner: build 56.6, to_control 12.4, lane 0.9, exchange 72.8, to_owner 3.7, round 146.4, reply 56.8, reply_wake 0.5, reply_poll 55.0, reply_tail 1.3, reply_fold_rest 1.8, hold.declined=144, hold.answer=2052, hold.exchange=3390, hold.dispatches=2062, long_steps=4, polls=5755, steps=2079, waited=1, waits=13, not_durable=2, placement=2, reply_poll=2051, reply_poll_ns=112802833, fold=2051
+  candidate 0: holder 13.9, hold.declined=15, hold.entries=1569
+  candidate 2: holder 12.7, hold.entries=1438
+slates-server: g228 reply woke 2564 ns after its fold, polled 100563411 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 866, column: 14 })), 7632 ns
+slates-server: g228 reply woke 1151 ns after its fold, polled 5779 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 831 ns
+slates-server: g228 reply woke 861 ns after its fold, polled 5248 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 141 ns
+slates-server: g228 reply woke 761 ns after its fold, polled 4788 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 30 ns
+slates-server: g228 reply woke 480 ns after its fold, polled 4828 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 60 ns
+slates-server: g228 reply woke 391 ns after its fold, polled 4687 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 40 ns
+slates-server: g228 reply woke 371 ns after its fold, polled 4386 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 40 ns
+slates-server: g228 reply woke 410 ns after its fold, polled 4878 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 371 ns after its fold, polled 4496 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 50 ns
+slates-server: g228 reply woke 381 ns after its fold, polled 4296 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 40 ns
+slates-server: g228 reply woke 380 ns after its fold, polled 4327 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 50 ns
+slates-server: g228 reply woke 380 ns after its fold, polled 4467 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+== round 4 arm between measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.63 2.28 1.27
+exit 0
+  live  p50 140.6 p99 341.3 p999 1129.9 max 2320.6 us
+  added at p50 106.7 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(270.0), Some(260.0)), (Some(320.0), Some(320.0)), (Some(700.0), Some(310.0))]; plain statuses asked during the stream 0
+  the owner: build 63.3, to_control 9.7, lane 0.9, exchange 63.2, to_owner 3.5, round 140.6, reply 56.9, reply_wake 0.5, reply_poll 54.8, reply_tail 1.5, reply_fold_rest 1.9, hold.declined=22, hold.answer=2051, hold.exchange=4005, hold.dispatches=1967, long_steps=12, polls=4241, steps=2075, waited=1, waits=11, not_durable=1, placement=2, reply_poll=2051, reply_poll_ns=112488331, fold=2051
+  candidate 0: holder 13.0, hold.declined=9, hold.entries=1859
+  candidate 1: holder 14.8, hold.declined=11, hold.entries=1920
+slates-server: g228 reply woke 2924 ns after its fold, polled 100479142 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 866, column: 14 })), 10576 ns
+slates-server: g228 reply woke 1232 ns after its fold, polled 8092 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1101 ns
+slates-server: g228 reply woke 1071 ns after its fold, polled 7452 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1111 ns
+slates-server: g228 reply woke 741 ns after its fold, polled 8423 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1052 ns
+slates-server: g228 reply woke 631 ns after its fold, polled 7101 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 1071 ns
+slates-server: g228 reply woke 681 ns after its fold, polled 6340 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 901 ns
+slates-server: g228 reply woke 621 ns after its fold, polled 6299 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 811 ns
+slates-server: g228 reply woke 521 ns after its fold, polled 5809 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 801 ns
+slates-server: g228 reply woke 501 ns after its fold, polled 5748 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 741 ns
+slates-server: g228 reply woke 521 ns after its fold, polled 5779 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 751 ns
+slates-server: g228 reply woke 551 ns after its fold, polled 6299 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 911 ns
+slates-server: g228 reply woke 501 ns after its fold, polled 6299 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 132, column: 14 })), 781 ns
+== round 5 arm between measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.63 2.28 1.27
+exit 0
+  live  p50 149.8 p99 393.2 p999 1488.4 max 3738.3 us
+  added at p50 115.8 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(720.0), Some(350.0)), (Some(350.0), Some(340.0)), (Some(240.0), Some(240.0))]; plain statuses asked during the stream 0
+  the owner: build 51.6, to_control 10.3, lane 1.0, exchange 65.6, to_owner 3.8, round 132.4, reply 57.0, reply_wake 0.5, reply_poll 55.1, reply_tail 1.5, reply_fold_rest 1.9, hold.declined=10, hold.answer=2051, hold.exchange=3334, hold.dispatches=2200, long_steps=6, polls=5185, steps=2074, waited=1, waits=11, not_durable=3, placement=2, reply_poll=2051, reply_poll_ns=112965051, fold=2051
+  candidate 1: holder 13.7, hold.entries=1473
+  candidate 2: holder 12.5, hold.declined=3, hold.entries=1428
+slates-server: g228 reply woke 3345 ns after its fold, polled 100486632 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 866, column: 14 })), 7421 ns
+slates-server: g228 reply woke 1171 ns after its fold, polled 8543 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 141 ns
+slates-server: g228 reply woke 981 ns after its fold, polled 6360 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 551 ns after its fold, polled 6269 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 81 ns
+slates-server: g228 reply woke 451 ns after its fold, polled 5919 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 60 ns
+slates-server: g228 reply woke 481 ns after its fold, polled 5788 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 501 ns after its fold, polled 6369 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 60 ns
+slates-server: g228 reply woke 521 ns after its fold, polled 6069 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 480 ns after its fold, polled 6380 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 490 ns after its fold, polled 5979 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 70 ns
+slates-server: g228 reply woke 481 ns after its fold, polled 6059 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 80 ns
+slates-server: g228 reply woke 501 ns after its fold, polled 5769 ns after the wake; the poll before it: Some(Site(Location { file: "crates/server/src/xshard.rs", line: 1128, column: 16 })), 80 ns
