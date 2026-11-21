@@ -20,6 +20,12 @@
   Worktree ~/slates-work/w-provision-gate-land (branch agents/w-provision-gate). Scratch clone ~/slates-work/w-provision-gate
   has DIAG-free tree + local wip merge (do not push it). Arms/logs ~/.cache/w-provision-gate-arms.
 
+- 2026-11-20 ~17:10 (close list: C1 then P2): C1 wiring LANDED 2157188b4 (kiln ci+nightly exclusive bare-metal
+  provision-gate-linux/-macos; GHA provision-histogram; xtask lane informational w/o baseline, always loaded form).
+  By use: local lane exit 0, 28 rows kept. Baseline: adacachy (Linux, 451397…) at load 90-104 -> not recorded (r2
+  stopped); kiln r3 (`macos exclusive`, `--record`) queued — when it ends, commit its ratchets.toml diff to main, then
+  write inbox/main-from-w-provision-gate-close.md for C1. Worktree ~/slates-work/w-provision-gate-ci.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
