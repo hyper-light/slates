@@ -111,6 +111,19 @@
 - g226: status residency fix choice (a) filed with main (inbox/main-from-g226-close.md); g226 frozen by the close order.
 - Worktree ~/slates-work/w-sizing-a789 (landed; removable). Scripts ~/.cache/w-sizing-logs (hgmem.sh, hgmem-cmd.txt).
 
+## R2 Windows (main 18:40: Windows is inside R2; build it; Windows runs to run-requests, w-lint runs them, jupiter off)
+Plan: a section per pool extent, closed when wholly free; the anchor holds each extent's handle across a daemon restart.
+- anchor/src/handles.rs: new hold kind WHAT_CONTENT_EXTENT = 4 (1 handle, record = extent id), admits(), its own bound
+  class in HoldBounds (partitions x POOL_EXTENTS_PER_PARTITION; condition (c)).
+- server/src/anchor_hold_windows.rs: hold_extent/release_extent (as hold_section/release_section); adopt() collects
+  HandedExtent {id, section, record} for the successor (condition (d)).
+- server/src/content_pool.rs (cfg windows): own slice's extent sections made ahead of need on a background task at
+  shard start and held with the anchor (condition (a): claim only maps from a ready handle); release: drop region,
+  close own handle, release the anchor's hold (section closes -> commit returned, g226), make again in background.
+- Red first, across processes: a cli/server test (Windows) that an extent's section survives a daemon SIGKILL (anchor
+  holds it) and that a released extent's commit goes back. Builds/tests -> run-requests.md (w-lint, jupiter offline).
+- Then R3 with w-hg + w-store.
+
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =
    write log R/4 + images 2R + delta log R + arena R (R = reserve_per_shard = memory/shards/3) ~ 1.42 x memory, plus
