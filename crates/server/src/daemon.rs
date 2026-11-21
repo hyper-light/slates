@@ -6745,7 +6745,11 @@ async fn heartbeat_loop(segment: AnchorSegment, control_life: std::sync::mpsc::S
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
     let counters = registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
     if let Some((beat, before)) = last {
-      log_late_beat(now.saturating_sub(beat), &before, &counters);
+      let gap = now.saturating_sub(beat);
+      if log_late_beat(gap, &before, &counters) {
+        // Counted as well as logged (main's ruling on the lane, 2026-11-20): a late beat is a step past its budget.
+        state::with_state(|s| crate::merge_service::count_phase(s, BEAT_LATE, gap));
+      }
     }
     last = Some((now, counters));
     let (requested, lapse_bound_ns) = match segment.supervision() {
@@ -6801,9 +6805,9 @@ fn log_late_beat(
   gap: u64,
   before: &slates_rt::shard::Counters,
   after: &slates_rt::shard::Counters,
-) {
+) -> bool {
   if !beat_is_late(gap, after.scheduler_overrun_ns) {
-    return;
+    return false;
   }
   let delta =
     |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
@@ -6829,7 +6833,12 @@ fn log_late_beat(
     after.longest_step_ns / NS_PER_MS,
     after.scheduler_overrun_ns / NS_PER_MS
   );
+  true
 }
+
+/// Counter pair: the control shard's beats that came late ([`log_late_beat`]), and their gaps in all, nanoseconds: what
+/// a step past the shard's budget costs the beat, a counted bug signal (CLAUDE.md §3 "Bounded work").
+pub(crate) const BEAT_LATE: (&str, &str) = ("daemon.beat.late", "daemon.beat.late_ns");
 
 /// Shape: a beat that late — this share of the shard's window or more after the last — is logged as a near
 /// miss ([`log_late_beat`]): half the window, so the stalls that stop short of a kill are seen too. A scatter's part

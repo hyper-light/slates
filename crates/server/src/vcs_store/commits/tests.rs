@@ -474,10 +474,11 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
 }
 
 /// A-664's live whole builds (a submit parked behind one). Do: push a commit of three files to a git repository's root
-/// green, its map left to its build; submit a work editing `README` while the build is under way; drive the build to
-/// its end. Expect: the submit parked, the green still at the pushed version; once the build ends the submit runs
-/// again, the green at its version and its commit made over the map the build kept, its tree another than the
-/// pushed one.
+/// green, its map left to its build; submit a work appending to `README` (an append, so the edit is no whole-file
+/// rewrite, which would park the resumed submit again behind its refinement, A-787 part 2) while the build is under
+/// way; drive the build to its end. Expect: the submit parked, the green still at the pushed version; once the build
+/// ends the submit runs again, the green at its version and its commit made over the map the build kept, its tree
+/// another than the pushed one.
 #[test]
 fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
   let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
@@ -502,8 +503,8 @@ fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
       slates_ipc::protocol::RequestBody::Edit {
         work,
         path: "/README".to_owned(),
-        at: 0,
-        delete_len: 4,
+        at: 4,
+        delete_len: 0,
         bytes: b"two\n".to_vec(),
       },
     );

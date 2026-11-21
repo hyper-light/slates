@@ -1,5 +1,24 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
+> (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
+> commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
+
+> **Open (w-fed-faults, 2026-11-21): A-787 part 2's refinement job spins a shard past the watchdog in a debug build.**
+> `cargo test -p slates-server --test green_post_state` on macOS arm64 ends exit 4: "shard N is spinning, 3,513 ms of
+> CPU without a step against its 3,488 ms window, in task spawned at crates/server/src/refining.rs:166", after
+> `a_rebased_work_submits_as_it_would_have` passes. Same on origin/main 8cb10f986 (not caused by 6459374). The job's
+> turns do not count as the shard's steps, or a turn runs past its slice at debug speed.
+
+> **Open (w-fed-faults, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` fail on macOS arm64**
+> (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
+> larger than one ring region), on origin/main 8cb10f986 alike. Not looked into.
+
+> **Open (w-fed-faults, 2026-11-21): A-796's wire variants are appended but not published.** `CheckMerge`,
+> `ReadMergeCheck`, `ResolveMerge`, `MergeChecked`, `StaleMergeView` and the `MergeView` enum: `cargo test -p
+> slates-ipc --test wire_order` fails on main until A-796's owner publishes them (`-- --ignored
+> publish_appended_variants`, and `MergeView` added to the guard's schemas).
+
 > **FIXED (A-798, 2026-11-20, w-provision-gate): a bench's client waited forever with every shard parked** (provision_bench;
 > w-engine's load_bench end-of-run read, blocking 84a, 86a, 89b's measurements). The idle spin's harvest took the kick of a
 > ring published just after the turn's look, and the spin then parked; each turn now harvests first, then looks. Red
@@ -39,7 +58,7 @@
 >   0.8–2.8). Main ruled (2026-11-20): change the wait, A/B settled. **A/B (run 44876741078; BENCHMARKS, "The
 >   client's reply wait, A/B"):** parking at once takes Linux arm64's loaded accept p99 to 0.36–0.43 ms and leaves R9
 >   unharmed, but Linux x86_64 stays at 3.2 ms, macOS at 8 ms, and no platform's p999 is under 1 ms. **Owed:** what holds
->   Linux x86_64's and macOS's loaded tails; whether to land B (simpler) or build C.
+>   Linux x86_64's and macOS's loaded tails. **B landed (A-799, 2026-11-21).** C (spin only while a core is free) next.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >

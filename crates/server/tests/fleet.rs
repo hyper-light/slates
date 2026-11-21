@@ -22602,9 +22602,20 @@ const BENCH_EDIT_BYTES: usize = 3800;
 
 /// The phase counters the A-697 bench reads (`merge_service::SUBMIT_JUDGE` and its siblings, `work_home::SUBMIT_COMPOSE`
 /// and its): each pair's count and its sum.
-const BENCH_PHASES: [(&str, &str, &str); 9] = [
+const BENCH_PHASES: [(&str, &str, &str); 12] = [
   ("compose", "merge.submit.compose", "merge.submit.compose_ns"),
   ("compute", "merge.submit.compute", "merge.submit.compute_ns"),
+  (
+    "build",
+    "merge.submit.forward_build",
+    "merge.submit.forward_build_ns",
+  ),
+  (
+    "owner_step",
+    "merge.submit.owner_step",
+    "merge.submit.owner_step_ns",
+  ),
+  ("beat_late", "daemon.beat.late", "daemon.beat.late_ns"),
   ("forward", "merge.submit.forward", "merge.submit.forward_ns"),
   ("judge", "merge.submit.judge", "merge.submit.judge_ns"),
   ("append", "merge.submit.append", "merge.submit.append_ns"),
