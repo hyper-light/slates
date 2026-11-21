@@ -39,8 +39,8 @@ None of what lands duplicates A-255, A-257 or A-263-A-267.
 Landed for the goal: d8416294c (GAPS record of all 94 branches), 6823fde6f/68ce3d585 (A-796 check + resolution),
 c1e76d0a7/d2ad10da4 (MCP slates.merge.check/read_check/resolve, CLI slates check/resolve). Pushed as merges onto main
 through studio-3, never as agents/codex-* branches (nothing of the Codex trees was pushed: the port is new commits on
-main). Not ported, recorded in GAPS: the Codex rebase_with refinement (a kept op conflicting only on a path the
-replacement re-establishes answers the windows instead). A-255, A-257, A-263-A-267 untouched (A-267's kept verdict reused).
+main). The Codex rebase_with refinement (a kept op conflicting only on a path the replacement re-establishes) was
+first held back, then ported: see "Codex strand finished" below and "rebase_with settled" at the end. A-255, A-257, A-263-A-267 untouched (A-267's kept verdict reused).
 
 ### Codex strand finished (main's 22:54 routing: CLI/MCP adapters, rebase_with, conflict-mutants' tests) + the wire red
 - Wire red (A-796's tags unpublished, slates-ipc --test wire_order): FIXED db80da5e8 (CheckMerge 98, ReadMergeCheck 99,
@@ -56,3 +56,10 @@ replacement re-establishes answers the windows instead). A-255, A-257, A-263-A-2
 - Note: 544020bd2 is studio-3's merge of 4930bf14b over a main that had moved again (an auto-merged verbs.rs change I did
   not re-test after). Focused on my tree after merging e14493d62: merge_check 3/3, works_off_owner 16/16.
 - Not mine: vcs_store::paths::tests::t_a664_* (submit refused Overloaded) fails at d8416294c, before A-796 (w-fed-faults' red).
+
+### rebase_with settled (main's goal 88, 2026-11-21)
+- Ported, not open: 4930bf14b (main 544020bd2), Green::rebase_establishing; GAPS:24412 records it LANDED; no GAPS line
+  is left open for it. The "not ported" sentence above was written before the port, and is now corrected.
+- The test that would fail without it: merge_check a_kept_mode_on_a_file_the_resolution_writes_anew_is_not_a_conflict.
+  With the rule mutated out (resolution_establishes forced empty) it fails: left Conflict([MergeWindow { path: "f",
+  at: 0, len: 0, class: 5 }]), right Rebased(2). With main's rule it passes (merge_check run recorded in progress).
