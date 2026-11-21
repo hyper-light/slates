@@ -58812,3 +58812,34 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD
   take the kick of a control message published just before it looked, so the message stayed unseen while the shard
   parked, which matches the runs (every daemon idle, the replies never run; `343b741e`, in the range the stalls began).
   The rerun shows it gone if handed equals run.
+
+### §4.16 amended — A holder's forward is held to its own progress, not to a wall deadline; a request's acknowledged bytes are its progress (2026-11-21, w-shared for UI goal 93; main's ruling on the lane, item 3a)
+Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_fleet`), `crates/server/src/xshard.rs`
+(`task_to_its_end`), `crates/transport/src/connection.rs` (`send_progressed`, `take_send_progressed`),
+`crates/transport/src/endpoint.rs` (`take_progressed`), `crates/server/tests/fleet.rs`, GAPS (the sweep's lane line).
+- **What was there.** A holder's submit waited for its forward under the node's failover delay, a wall deadline of
+  about 3 s that does not grow with the increment and that also ran while the control shard built the request. At the
+  deadline the submit was answered `Overloaded` while the forward still ran, and its retry sent the whole increment
+  again into the same bound: A-697's release bench refused a 320 MiB holder submit in 1 of 2 runs. The forward lane's
+  own stall rule never gives up a forward whose own bytes move, but counted only its reply's bytes, so a forward still
+  sending a large request looked silent until its reply began.
+- **Change.** The holder awaits its forward's task to its end (`xshard::task_to_its_end`). The task bounds itself: its
+  lane gives the forward up, typed as before, once none of its own bytes have moved for a stall budget, and the
+  replica's wait keeps its own bound. The connection now records the send streams some of whose bytes were acknowledged
+  (`take_send_progressed`), and the endpoint reports their exchanges as progressed. So a forward whose request is
+  still being acknowledged counts as moving, and one whose peer stops acknowledging still stalls.
+- **Tests** (macOS arm64, local, debug, load about 25). `slates-server --test fleet a_holders_submit_still_crossing_is_
+  not_refused_by_a_size_independent_bound`: an 8 MiB holder submit with B's failover delay injected at 300 ms (its
+  forward took 1.8 to 6.7 s) is answered version 2, 6 of 6 runs. Red with the fixed deadline put back: refused
+  `Overloaded`, 2 of 2. `slates-transport --lib a_request_still_going_out_progresses_as_its_bytes_are_acknowledged`:
+  red with the acknowledgement left unrecorded. slates-transport 149 of 149 and every integration test; slates-server
+  lib forward_lane, work_home, xshard 28 of 28; fleet `a_holder` and `a_forwarded` 30 of 30.
+- **Measured, not fixed here:** at 32 MiB the same test passes only 1 of 2 to 3 of 4. The owner's step for that
+  submit runs 2.3 to 6.9 s as one step of its control shard: append 1.2 s, and about 1.1 s more around it (the
+  transaction's commit and the publish, writing and checksumming the record that holds the whole increment); decode
+  0, judge 5 ms. While that shard is stuck it reads none of its sessions, so the holder's lane rightly gives the
+  forward up as silent and resends it. Main's item 2 (bounded work) is therefore the next step's prerequisite.
+- **Owed (main's items 2 and 3b, inbox/main-from-w-shared-lane-plan.md):** the owner's step above and the holder's
+  build step (0.2 to 1.9 s) are each one control-shard step, so the beat is late; and a retry after a real stall
+  still re-sends the content. Next: the content placed ahead and stored once by identity, the record naming it rather
+  than holding it, so the owner's durable step is small.
