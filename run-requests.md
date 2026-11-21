@@ -7028,3 +7028,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
 - clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
 - Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.
+- w-fed-faults for w-lint, A-795 (6f29c8d, the S3 base removed): the Linux-only code it changed was never compiled.
+  crates/server/src/fuse.rs (the kept-request path removed; the turn lends the host straight to the bridge; the A-509
+  test's FuseMount without `kept`/`kept_waker`) and crates/bridge-fuse/src/channel.rs (`dispatch_kept`,
+  `allocation_running` and `Dispatched::request` removed). The Mac Studio has both Linux Rust targets but no Linux C
+  cross-compiler or sysroot (zstd-sys, blake3 and aws-lc-sys stop), and adacachy refused every start. On Linux x86_64
+  (and aarch64): `cargo clippy --locked -p slates-server -p slates-bridge-fuse --lib --tests`, then
+  `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
+  Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
+  held replies).
