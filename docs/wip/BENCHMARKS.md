@@ -16266,3 +16266,22 @@ the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 
 | 256 MiB | B | 4 | 2,856 B | 65,536 B | 234.458 µs | 436.792 µs |
 | 256 MiB | A | 5 | 268,445,792 B | 32,768 B | 13.308385 ms | 23.680417 ms |
 | 256 MiB | B | 5 | 2,832 B | 98,304 B | 347.718 µs | 755.375 µs |
+
+## The forward lane's bulk throughput: the instrument (2026-11-20, w-shared; A-697 item 4, main's sweep)
+
+`replication_bench`'s bulk row sends one request of N MiB on a warm session. The holder takes the request whole and
+answers nothing, so the row times one direction. For each sample it prints the goodput, the session's path MTU and
+congestion window, and why its sending stopped (`Endpoint::send_stops`: the packet budget, the window, the pacer,
+the credit, nothing to send). The command, release, best of the five timed samples after one warm-up:
+
+    cargo build --release -p slates-cluster --example replication_bench
+    REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200
+
+No numbers are recorded yet. The first run (macOS arm64, this MacBook, load average 74, base 5d29b9572) was too
+loaded to count. It showed two things to measure on a quiet machine:
+- The path MTU reached 9,209 bytes, at macOS's `net.inet.udp.maxdgram` of 9,216. So the lane is not bound by
+  small datagrams.
+- At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
+  lane on loopback.
+The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
+datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
