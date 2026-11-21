@@ -159,8 +159,8 @@ const REFS: &str = "refs/";
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
 /// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
-/// this daemon has published no root mount to show the hook its view beneath (A-645 P3, main's ruling 1).
-pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"root mount not yet published";
+/// this daemon holds no standing grant to show the hook its view under (A-645 (a): `--vcs-store`).
+pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"no standing grant to show a hook its view";
 
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
 /// shard's budget, or an object the store refused).
@@ -591,7 +591,7 @@ impl<P> ReceivePack<P> {
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
-      let answering = self.declined(&mut Declining::hook(hook, state.root_mount.is_some()), out)?;
+      let answering = self.declined(&mut Declining::hook(hook, state.hook_views.shows()), out)?;
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
@@ -1445,7 +1445,7 @@ impl Declining {
   fn hook(hook: &HookConfig, root_published: bool) -> Declining {
     if !root_published {
       let why = format!(
-        "the repository's {} hook cannot run here: this daemon's root mount is not yet published",
+        "the repository's {} hook cannot run here: this daemon holds no standing grant to show it its view (--vcs-store)",
         hook.name
       );
       return Declining {
@@ -1569,6 +1569,23 @@ pub(crate) struct PushTurns {
   pub(crate) longest_unit_ns: u64,
   /// The longest opening of a turn, nanoseconds: what it did before its first unit (the admission's turn, the views).
   pub(crate) longest_opening_ns: u64,
+  /// The quanta turns took past their first because no one waited (A-783): the non-vacuity count of the extension.
+  pub(crate) more_quanta: u64,
+  /// The turns that yielded to someone waiting at a quantum's end (A-783).
+  pub(crate) yielded: u64,
+}
+
+/// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
+/// own measured jitter over the quantum, at least one part, at most the whole.
+pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
+  u64::try_from(
+    u128::from(jitter_ns)
+      .saturating_mul(1_000_000)
+      .checked_div(u128::from(quantum_ns.max(1)))
+      .unwrap_or(0),
+  )
+  .unwrap_or(u64::MAX)
+  .clamp(1, 1_000_000)
 }
 
 impl PushTurns {
@@ -1587,9 +1604,24 @@ impl PushTurns {
     }
   }
 
+  /// What a turn's step did (A-783): the quanta it took past its first, and whether it yielded to someone waiting.
+  fn stepped(&mut self, report: Option<slates_pace::Report>) {
+    let Some(report) = report else {
+      return;
+    };
+    self.more_quanta = self
+      .more_quanta
+      .saturating_add(report.quanta.saturating_sub(1));
+    if report.stop == Some(slates_pace::Stop::Waiting) {
+      self.yielded = self.yielded.saturating_add(1);
+    }
+  }
+
   /// Its status rows.
-  pub(crate) fn rows(&self) -> [(&'static str, u64); 5] {
+  pub(crate) fn rows(&self) -> [(&'static str, u64); 7] {
     [
+      ("push.build.more_quanta", self.more_quanta),
+      ("push.build.yielded", self.yielded),
       ("push.build.turns", self.turns),
       ("push.build.past_budget", self.past_budget),
       ("push.build.longest_ns", self.longest_ns),
@@ -1772,8 +1804,16 @@ impl ServerJudge<'_> {
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
-    let budget = quantum / 2;
-    let deadline = began.saturating_add(budget);
+    // A-783: the turn yields at its quantum when someone waits on the shard, and goes on to the shard's ceiling (the
+    // watchdog's look) when no one does; a unit's estimate aims at the scheduler's own measured jitter over the
+    // quantum, its target relative error.
+    let env = slates_pace::Env {
+      clock: slates_rt::futures::now_ns,
+      waiting: slates_rt::futures::others_waiting,
+      quantum_ns: quantum,
+      ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
+      target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
+    };
     // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
     let slices = slates_merge::pace::Slices {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
@@ -1797,7 +1837,7 @@ impl ServerJudge<'_> {
         command,
         pushed,
         preparing,
-        (slates_rt::futures::now_ns, began, deadline),
+        (began, env),
         slices,
       );
       Ok(built)
@@ -1807,17 +1847,22 @@ impl ServerJudge<'_> {
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
     // three and the units before its deadline, measured on one clock.
-    let (unit, opening, asked_at) = preparing.as_ref().map_or((0, 0, began), |prepared| {
-      (
-        prepared.longest_unit_ns(),
-        prepared.opening_ns(),
-        prepared.asked_at_ns(),
-      )
-    });
+    let (unit, opening, asked_at, step) =
+      preparing.as_ref().map_or((0, 0, began, None), |prepared| {
+        (
+          prepared.longest_unit_ns(),
+          prepared.opening_ns(),
+          prepared.asked_at_ns(),
+          prepared.step_report(),
+        )
+      });
     let tail = ended.saturating_sub(asked_at.max(began));
+    // Its budget: what its step was allowed (to the end of its last quantum, or its ceiling).
+    let budget = step.map_or(quantum, |report| report.allowed_ns.max(quantum));
     state
       .push_turns
       .counted(ended.saturating_sub(began), (budget, (opening, unit, tail)));
+    state.push_turns.stepped(step);
     built
   }
 

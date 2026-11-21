@@ -93,6 +93,9 @@ pub struct Counters {
   pub unattributed_steps: u64,
   /// The longest poll by the wall clock, in nanoseconds (how long the shard was held, whoever held it).
   pub longest_step_ns: u64,
+  /// Polls by length, a power of two a bucket: bucket k counts polls of at least 2^(k-1) and under 2^k ns, the last
+  /// every longer one (A-783: what a paced step's extension costs the shard, read by `crates/cli/bench/pacing_ab.py`).
+  pub poll_log2: [u64; 32],
   /// Kicked parks whose kick-to-running latency fed the online wake estimate (a non-vacuity count).
   pub wake_samples: u64,
   /// Kick stamps that predated their park's announcement (a sender that saw an earlier park), dropped.
@@ -155,6 +158,10 @@ pub struct Counters {
   pub refused_at_shutdown: u64,
   /// Idle spins that ended with work arriving.
   pub spin_hits: u64,
+  /// Paced steps' asks whether anyone waited (A-783, [`ShardContext::others_waiting`]): one a quantum, never a unit.
+  pub waiting_asked: u64,
+  /// The asks that found someone waiting, so the step yielded.
+  pub waiting_found: u64,
   /// Pollers woken because their ring had something (client command rings).
   pub poller_wakes: u64,
   /// Idle spins that ran out and parked.
@@ -365,6 +372,14 @@ pub struct ShardContext {
   idle_ceiling_ns: u64,
   /// The configured step budget and idle spin, the quantum and the spin when not tracking.
   fixed_quantum_ns: u64,
+  /// The most a paced step runs while no one waits ([`ShardContext::step_ceiling_ns`], A-783): none set, a quantum.
+  step_ceiling_ns: Cell<Option<u64>>,
+  /// How far the poll under way may run, on the shard clock, since a paced step last asked and found no one waiting
+  /// (A-783): the long-step count judges a poll against this, not the bare quantum.
+  poll_allowed_until_ns: Cell<u64>,
+  /// The tasks of the step's batch still to be polled after the one under way (A-783): taken out of the ready queue
+  /// with it, so neither the queue nor the control channel shows them, yet each waits on this poll.
+  batch_left: Cell<usize>,
   fixed_spin_ns: u64,
   /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
   /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
@@ -565,6 +580,9 @@ impl ShardContext {
           tracking.idle_ceiling_ns
         }),
       fixed_quantum_ns: config.step_budget_ns,
+      step_ceiling_ns: Cell::new(None),
+      poll_allowed_until_ns: Cell::new(0),
+      batch_left: Cell::new(0),
       fixed_spin_ns: config.spin_ns,
       real_time: driver.kind() != DriverKind::Simulation,
       attribution: Cell::new(Tracker::default()),
@@ -694,6 +712,60 @@ impl ShardContext {
     }
     self.idle_holds.set(self.idle_holds.get().saturating_add(1));
     true
+  }
+
+  /// The most a paced step runs while no one waits on this shard (A-783, `slates_pace`): what its owner set
+  /// ([`ShardContext::set_step_ceiling_ns`], the daemon's derived share of the watchdog's look), else one quantum, so a
+  /// runtime nobody configures paces as it always did.
+  pub fn step_ceiling_ns(&self) -> u64 {
+    self
+      .step_ceiling_ns
+      .get()
+      .unwrap_or_else(|| self.quantum_ns())
+      .max(self.quantum_ns())
+  }
+
+  /// Sets [`ShardContext::step_ceiling_ns`].
+  pub fn set_step_ceiling_ns(&self, ceiling_ns: u64) {
+    self.step_ceiling_ns.set(Some(ceiling_ns));
+  }
+
+  /// Whether anyone else waits on this shard now (A-783; asked once a paced step's quantum, never once a unit): an
+  /// inbound ring's word, a ready poller (woken, since asking may consume its signal, as the idle spin does), the
+  /// driver's pending or harvested completions (a non-blocking poll, as a busy run's harvest), a due timer, a ready
+  /// task, or a task of the step's batch not yet polled. Counted ([`ShardCounters::waiting_asked`], [`ShardCounters::waiting_found`]).
+  pub fn others_waiting(&self) -> bool {
+    let now = self.now_ns();
+    let mut waiting = self.has_inbound();
+    let inner = self
+      .with_inner(|inner| {
+        let pending = inner.driver.has_pending();
+        let pollers = self.wake_ready_pollers(inner);
+        let due = inner
+          .timers
+          .next_deadline_ns()
+          .is_some_and(|deadline| deadline <= now);
+        pending || pollers || due
+      })
+      .unwrap_or(false);
+    waiting = waiting || inner;
+    waiting = self.harvest_io() || waiting;
+    // The rest of this step's batch waits too: taken from the queue with the task asking, it is in no queue now.
+    waiting = waiting || !self.local.is_empty() || self.batch_left.get() > 0;
+    if !waiting {
+      // No one waits: the step may go on another quantum from here, or as long as this ask took if longer (the step
+      // asks no sooner than an ask costs), and the poll is judged against that.
+      let asked = self.now_ns();
+      let room = self.quantum_ns().max(asked.saturating_sub(now));
+      self.poll_allowed_until_ns.set(asked.saturating_add(room));
+    }
+    self.with_inner(|inner| {
+      inner.counters.waiting_asked = inner.counters.waiting_asked.saturating_add(1);
+      if waiting {
+        inner.counters.waiting_found = inner.counters.waiting_found.saturating_add(1);
+      }
+    });
+    waiting
   }
 
   /// Whether any inbound ring holds a word (a check without a syscall).
@@ -1336,6 +1408,11 @@ impl ShardContext {
       // Idle: one slice of the registered idle work, then the loop looks for work again; it parks once the idle
       // work has none left (§4.2, "the shard schedules a pre-fault task on its idle time").
       if self.idle_slice() {
+        // The driver is harvested between idle slices, as the idle spin harvests it each turn: a step queues only what
+        // is already woken, and only a park, the spin or a busy stretch's quantum ask the driver, so without this a
+        // socket's readiness waited for the idle work to run out (the daemon's memory sweep on idle time held live
+        // writes 50-120 ms, g228; `tests/idle_work_io.rs`).
+        let _ = self.harvest_io();
         continue;
       }
       self.park(outcome.next_deadline_ns);
@@ -1544,6 +1621,9 @@ impl ShardContext {
     };
     for (polled, slot) in ready.iter().enumerate() {
       did_work = true;
+      self
+        .batch_left
+        .set(ready.len().saturating_sub(polled.saturating_add(1)));
       self.poll_slot(*slot);
       // A task this poll ran began to hold the shard alone: the rest of the batch waits for it, in its order.
       if alone.is_none() && self.held_alone() {
@@ -1553,6 +1633,7 @@ impl ShardContext {
         break;
       }
     }
+    self.batch_left.set(0);
     self.local.finish_drain(ready);
     let (exit, next_deadline_ns) = self
       .with_inner(|inner| {
@@ -1696,8 +1777,13 @@ impl ShardContext {
   /// simulated shard's clock is not the thread's, and nothing preempts a simulation, so its long polls
   /// are the task's.
   fn attribute_poll(&self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
-    let quantum = self.quantum_ns();
-    if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+    // A paced step that found no one waiting may run on to its last allowance (A-783): the poll is judged against the
+    // later of the quantum from its start and that allowance.
+    let allowed_until = poll_started_ns
+      .saturating_add(self.quantum_ns())
+      .max(self.poll_allowed_until_ns.get());
+    let quantum = allowed_until.saturating_sub(poll_started_ns);
+    if ended_ns <= allowed_until {
       return None;
     }
     if !self.real_time {
@@ -2183,6 +2269,12 @@ fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Opt
     count_long_poll(&mut inner.counters, attributed);
   }
   inner.counters.longest_step_ns = inner.counters.longest_step_ns.max(elapsed);
+  let bucket = usize::try_from(u64::BITS.saturating_sub(elapsed.leading_zeros()))
+    .unwrap_or(usize::MAX)
+    .min(inner.counters.poll_log2.len().saturating_sub(1));
+  if let Some(count) = inner.counters.poll_log2.get_mut(bucket) {
+    *count = count.saturating_add(1);
+  }
   let Some(handle) = handle_at(&inner.arena, slot) else {
     return Some(future);
   };

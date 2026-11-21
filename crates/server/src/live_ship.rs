@@ -2515,6 +2515,18 @@ struct Capture {
   read_rate: (u64, u64),
 }
 
+impl Capture {
+  /// The bytes the body it makes will hold, about: its record and every span's run (a run within its file's size is no
+  /// longer).
+  fn body_bytes(&self) -> usize {
+    let runs: u64 = self.spans.iter().map(|span| span.len).sum();
+    self
+      .record
+      .len()
+      .saturating_add(usize::try_from(runs).unwrap_or(usize::MAX))
+  }
+}
+
 /// A file of a [`Capture`]: its number, its size when pinned, and its open extent's offset and copied bytes.
 struct CapturedFile {
   inode: u64,
@@ -3496,11 +3508,15 @@ fn queue_behind_build(
   let Some(build) = live.building.as_mut() else {
     return;
   };
-  // The build's size whether it is sealing (its plain body) or hashing (its sealed payload, A-757 part 2).
-  let building_bytes = build
-    .hashing
-    .as_ref()
-    .map_or(build.body.len(), |(payload, _)| payload.len());
+  // The build's size whether it is capturing (the body its record and runs will make, A-768), sealing (its plain body) or
+  // hashing (its sealed payload, A-757 part 2). A capture counted for nothing until 2026-11-20: a successor's log, its
+  // bounds still unset, refused its second delta behind its first whole capture, owed a whole state, and its writes
+  // waited behind whole build after whole build (the seeded nemesis, Goal 85b).
+  let building_bytes = match (&build.capture, &build.hashing) {
+    (Some(capture), _) => capture.body_bytes(),
+    (None, Some((payload, _))) => payload.len(),
+    (None, None) => build.body.len(),
+  };
   let credit = credit.max(building_bytes);
   if !whole && build.queued_bytes > 0 && build.queued_bytes.saturating_add(body.len()) > credit {
     refuse(state, id, "fleet.live.refused.no_credit");
@@ -3704,11 +3720,15 @@ async fn image_build_task(id: slates_db::catalog::VolumeId) {
 /// One turn of `id`'s [`ImageBuild`]: its next pieces sealed until the seal turns' share of the quantum has passed, each
 /// sized to what is left of it ([`piece_bytes`], a page at least); once every piece is sealed, the image made at its head
 /// ([`install_image`]). Dropped, the image still owed, when the volume was superseded, owes a whole record, its keys are
-/// refused, or its head moved since the capture (counted `fleet.live.image_stale`).
+/// refused, or the retained tail no longer reaches past the head it was captured at (counted `fleet.live.image_stale`):
+/// until 2026-11-20 any head moved since the capture dropped it, so under a stream of writes no image was ever made.
 fn advance_image_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
   let current = state.live.shipping.get(&id.bytes).and_then(|live| {
     let build = live.image_build.as_ref()?;
-    Some(live.fenced.is_none() && !live.owes_whole && live.shipper.head() == Some(build.head))
+    // The capture serves while the tail still reaches past it: a holder installed there takes the entries after it.
+    let usable =
+      live.shipper.head() == Some(build.head) || live.shipper.retains_after(build.head.position);
+    Some(live.fenced.is_none() && !live.owes_whole && usable)
   });
   match current {
     None => return Advance::Done,
@@ -3857,7 +3877,8 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
 }
 
 /// Makes `image` (sealed under `anchors`' keys, `None` in the clear) the volume's install image at the shipper's head, or
-/// at `at` when it was captured there ([`advance_image_build`]), which the head must still be.
+/// at `at` when it was captured there ([`advance_image_build`]), which must be the head or a head the retained tail still
+/// reaches past.
 fn install_image(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -3868,13 +3889,14 @@ fn install_image(
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
-  let Some(head) = live.shipper.head() else {
+  let Some(head) = at.or_else(|| live.shipper.head()) else {
     return;
   };
-  if at.is_some_and(|at| at != head) {
+  // At the head, or behind it while the tail reaches past it (`Shipper::mark_checkpoint`): else not made.
+  live.shipper.mark_checkpoint(head);
+  if live.shipper.checkpoint() != Some(head) {
     return;
   }
-  live.shipper.mark_checkpoint(head);
   live.shipper.set_bounds(Bounds::of_whole(image.len()));
   // The image is the whole state now, held here; the shipper keeps no entry for it.
   live.shipper.keep(None);
@@ -9762,6 +9784,61 @@ mod tests {
     assert!(delta_turns >= 1, "the delta took turns of its own");
     assert_eq!(refused, 0, "nothing was refused");
     assert_eq!(pins, 0, "no pin outlived the capture");
+  }
+
+  /// Goal 85b C3 (the seeded nemesis, seeds 1256052866610850298, 10263252121351842258, 8389754676365715562 and
+  /// 17757241901296347647): the publications queued behind a whole capture in turns are held to the credit the capture's
+  /// body will take, as they are behind a sealing build. Do: on a live volume with no whole entry yet (the bounds a
+  /// successor's log starts with), write two 512 KiB files and publish at a quantum of zero (its whole state, captured
+  /// in turns), then write a page into the first file and publish, three times. Expect: the three deltas queued behind the capture, none refused
+  /// for credit. Before, a capture counted for nothing, the second delta was refused, the volume owed a whole state, and every write after a
+  /// takeover waited behind whole build after whole build past the fleet wait (`fleet.live.held_back.whole`).
+  #[test]
+  fn the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "capture-credit")?;
+      write_captured(state, id, "first", b"85b: the first file")?;
+      write_captured(state, id, "second", b"85b: the second file")?;
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, id, &holders);
+      // Its first publication, the whole state it owes, captured in turns at a quantum of zero.
+      state.seal_walk_quantum_ns = Some(0);
+      let _ = crate::verbs::publish_shard(state);
+      let capturing = state
+        .live
+        .shipping
+        .get(&id.bytes)
+        .and_then(|live| live.building.as_ref())
+        .is_some_and(|build| build.capture.is_some());
+      if !capturing {
+        return None;
+      }
+      for (at, fill) in [(0u64, 1u8), (65_536, 2), (131_072, 3)] {
+        let handle = *state.by_id.get(&id)?;
+        let ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).ok()?;
+        let root = slot.volume.root_inode(store).ok()?;
+        let file = slot.volume.lookup_no(store, root, "first").ok()?.inode;
+        slot.volume.write(store, file, at, &[fill; 4096]).ok()?;
+        let _ = crate::verbs::publish_shard(state);
+      }
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      Some((
+        counted(LIVE_QUEUED),
+        counted("fleet.live.refused.no_credit"),
+      ))
+    });
+    let (queued, refused) = measured.expect("the scene was made");
+    println!("behind a whole capture: {queued} queued, {refused} refused for credit");
+    assert_eq!(
+      refused, 0,
+      "no delta behind the capture was refused for credit"
+    );
+    assert_eq!(queued, 3, "every delta queued behind the capture");
   }
 
   /// A-768: a whole capture read in turns reads the head it began on. Do: write two 512 KiB files to a live volume, take the

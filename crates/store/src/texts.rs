@@ -420,7 +420,22 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
 ) -> Result<(), StoreError> {
   let entries = decode(bytes).map_err(|_| StoreError::BadRow)?;
   let mut value = Vec::with_capacity(TEXT_VALUE_BYTES);
+  let mut held = Vec::with_capacity(TEXT_VALUE_BYTES);
   for entry in entries {
+    rows.put(
+      &history_key(
+        header.repository,
+        blake3::hash(&entry.path).as_bytes(),
+        header.sequence,
+      ),
+      &entry.text,
+    )?;
+    // A text's row is the first changeset's that kept it, never replaced: a text that comes back (a file reverted, a
+    // copy, a version with its base's bytes) is made as it first was, so every base names an older row and no chain
+    // loops (A, then B against A, then A against B would otherwise make A and B each other's base).
+    if rows.get(&text_key(header.repository, &entry.text), &mut held)? {
+      continue;
+    }
     value.clear();
     value.extend_from_slice(&header.sequence.to_le_bytes());
     value.extend_from_slice(&entry.len.to_le_bytes());
@@ -438,14 +453,6 @@ pub(crate) fn put_rows<F: hyper_block::block::BlockFile>(
     value.extend_from_slice(&entry.place.offset.to_le_bytes());
     value.extend_from_slice(&entry.place.len.to_le_bytes());
     rows.put(&text_key(header.repository, &entry.text), &value)?;
-    rows.put(
-      &history_key(
-        header.repository,
-        blake3::hash(&entry.path).as_bytes(),
-        header.sequence,
-      ),
-      &entry.text,
-    )?;
   }
   Ok(())
 }

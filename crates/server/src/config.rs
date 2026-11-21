@@ -499,6 +499,11 @@ pub struct DaemonConfig {
   /// The version-control store's owner, when the operator gave the daemon a store directory (`--vcs-store DIR`, A-767):
   /// the handle each shard clones to land changesets and read them back. None keeps every repository in RAM as before.
   pub vcs_disk: Option<slates_store::owner::StoreHandle>,
+  /// The store's granted directory, opened for the views slates presents in it (A-645 (a): a Subversion repository's
+  /// FSFS view, mounted read-only there for its hooks' `REPOS-PATH`), when the operator gave the daemon a store
+  /// directory: the same standing grant (A-767). Process-lifetime, one per daemon start. None: no hook is shown its
+  /// repository, and a configured hook is refused, typed.
+  pub vcs_view_root: Option<&'static slates_land::store_root::StoreRoot>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -1258,6 +1263,7 @@ impl DaemonConfig {
       vcs_ssh: None,
       vcs_svn: None,
       vcs_disk: None,
+      vcs_view_root: None,
       derivations,
     }
     .with_control_shard_noted()

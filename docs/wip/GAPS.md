@@ -34,7 +34,7 @@
 > resume; (3) a runner's sqlite stores took 48-96 s to open under that I/O pressure. The link itself drops when a
 > starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
 
-> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
+> **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below; C1 and P2 CLOSED).** BUILT: the
 > gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
 > and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
@@ -70,7 +70,11 @@
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
 > fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
 > ea004b541). The anchor's content object held 0-2 MiB throughout, so the extents go back; what stays is the process's
-> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **R3 measured (w-sizing, kiln r48, big Studio, release 39aa0995d):** after hg's history push (84 MB store) the
+> daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
+> STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
+> heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -126,9 +130,30 @@
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
-> (SLATES_DESIGN A-767's status). Owed: rows for a changeset landed through `begin`/`applied` (w-store's path writes
-> neither `P` nor `T`/`H`); the release timing on Mercurial's history against the per-file arm's 91 µs.
+> (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
+> reads the record back and puts every row, as replay does). Measured 33465d641 (BENCHMARKS "The derived per-path read
+> form"): an old revision of Mercurial's history p50 85-87 µs once the log is in the page cache (bar 91 µs), 234 µs on the
+> log's first read; every read from its own chain alone.
 >
+> **C1 / A-767 C4, hg onto the changeset store (2026-11-20, w-hg; w-store's wiring baa28bfab, d3accba0e, 046628f88,
+> bc0677af9; w-perf's Texts encoder fa5fd0023). BUILT.** A push to a daemon holding a store (`--vcs-store`) lands as one
+> changeset before the register's entry: Record the push's head (record v6), Payload the changegroup as it arrived,
+> moved into the store's request and never copied, Texts each kept revision's text identity, base and place
+> (`push::intake::KeptText`). The entry then holds a reference (record v7: the payload's identity and length and the
+> changeset's sequence), never the changegroup. A crash between the two leaves an unnamed changeset that replay skips.
+> A recovery or a rebuild meeting a reference reads the payload back by `StoreHandle::piece` and replays it through
+> the push's intake, a unit a slice (`ReplayRefused::Unlanded` where it cannot). The library side is `slates_hg::landed`
+> (the `ChangesetLog` seam, tested over a double), `record::write_push_record`, `Replay::begin_sectioned`,
+> `write_push_reference` and `reference_of`.
+> Red first by use: `crates/cli/tests/hg_interop.rs`
+> `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them` (stock hg 7.2: two changesets
+> pushed and counted `hg_push.landed`, the daemon killed, a clone after the restart holding both). Without a store, a
+> push records as before (A-729 part 2's v2 record).
+> Owed:
+> - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
+>   reads;
+> - an import as changesets (R2's 5.73 GB peak, w-perf);
+> - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
 > standing grant; rows (`R N C V O D G`) in Mantle's `ShardDb`; everything else derived. Owed: the log format agreed
@@ -140,7 +165,32 @@
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
 > `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6).
+> refuses `Unsupported` there); each tool's landing onto it (C4-C6); the
+> engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
+> start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
+> `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
+> red 128 GiB `Gone` under the machine-sized formula, green both). The owner's sliced landing BUILT (2026-11-20):
+> `StoreHandle::begin`, then `SlicedLanding::section`/`part` (one piece a part)/`commit`, visible only at its commit,
+> other landings held in the owner's bounded queue meanwhile, a dropped one abandoned with nothing visible
+> (`tests/owner.rs` `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing`). Owed: the log's group commit
+> (concurrent landings sharing one flush, its window from the device's measured flush time), which is where a device
+> rate belongs; the memtable holds rows, never a landing's bytes, so its size is the engine's unit of work.
+> C5's store side BUILT (2026-11-20, main's split): `crates/server/src/vcs_store/store_packs.rs`, git's `PackSource`
+> over the store's owner (an awaited `fill` of a range into a bounded least-recently-used set of store pieces, the
+> synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6). Owed (w-git): the
+> push landed as a changeset before its entry, recovery of named sequences, the replay through the adapter, and the
+> pack named by the plain BLAKE3 of its `Payload`.
+> The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
+> checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
+> (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
+> standing-grant kind yet), and its revocation.
+> A creation's one landing order CLOSED (2026-11-20, main's order after w-svn's finding): `repository create` recorded
+> the repository in the register before it landed changeset 0, so a kill between them left a repository its store
+> could not recover. Now `land_then_record` judges the record, reserves its ids (`ShardState::family_reserved_through`),
+> lands changeset 0, and only then records the repository, its root and its completion in one transaction and answers.
+> Held by `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once` (red
+> before: the repository left behind). A create with no reply route (forwarded from another node) on a node keeping a
+> store is refused `Unsupported`: owed with the store's fleet half (A-767 item 5).
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -578,8 +628,16 @@
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
 > `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
 > no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
-> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
-> block naming the plane's object, no copy).
+> step. Part 3 BUILT (2026-11-20, C1): `Green::make_step` makes a held verdict's files a copy slice a step, so the
+> commit copies none; part 2's bug fixed with it (a whole run moved before the other files were made shifted every later
+> run's bytes: a file spliced from one was made of the wrong bytes). A-760 is whole. Not A-760's: the svn landing's
+> turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
+> no copy; w-engine's queue).
+>
+> **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
+> failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
+> the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
+> reach it.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -1203,7 +1261,12 @@
 > prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. P3's
 > referenced file BUILT (2026-11-20, main's ruling 2): `slates_vfs::referenced`, a read-only file of content-store
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
-> released, `EROFS` to every change; the server's seam over `ContentStore`. Owed: P3 (the presenter under
+> released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
+> REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
+> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
+> repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on
@@ -2372,6 +2435,15 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **C2 / A-767 C6, svn onto the changeset store (2026-11-20, w-svn; w-store's wiring baa28bfab, d3accba0e,
+> 046628f88):** part 1 BUILT: a client's commit (`svn_commit::land_work`, svn:// and svn+ssh and DAV) lands its
+> revision into the node's store as one changeset, sequence the revision, judged over the one before, its Record
+> section the revision's record as the register holds it, answered once durable (`store_changeset`; counters
+> `repository.svn.revision_stored`/`_unstored`; refused `Unstored`). Held by
+> `a_subversion_commit_lands_as_a_changeset_in_the_store` (the real store: the log recovered from its files holds the
+> creation and revision 1, whose Record decodes to `/trunk` added). Owed: the replay from the store (asked w-store for
+> a section read through its owner, and which log recovery replays from), an import as one changeset, green-made
+> versions, the texts as the changeset's sections.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -8541,6 +8613,20 @@
 > lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
+> **Open (85a, g228, 2026-11-20): a live write adds under 50 µs at the median and under 1 ms at p999 under load.**
+> macOS (32-core Studio, release, contract command, BENCHMARKS "What live shipping adds to a stable write, after A-396's
+> holds"): on b402afc7c 168-205 µs added at load 16-31 (p999 393-708 µs), 543-823 µs at load 33-75. A-396's holds are
+> declined on macOS and change nothing there; holds forced on are measured and rejected (+50 µs). Main regressed 4x at
+> the median since a48bcdc52: a status request armed A-744's memory sweep as a task ahead of every turn's ready work
+> (`mincore` the heaviest frame in every daemon). Fixed here in part: the sweep runs on the shard's idle time, spaced by
+> its own length, and the runtime harvests its driver between idle slices (median 1,217-1,939 against 2,614-3,096 µs,
+> p999 2.2-3.7 against 4.9-9.7 ms at load 11-15). **Open, blocking 85a:** a plain status request still arms a sweep of
+> tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
+> burst and delays the next message up to half a step quantum per idle slice. Ruled by main (2026-11-20) and built:
+> only a status that asks for the memory report arms the sweep, and the anchor's objects whole come from the kernel's
+> per-mapping figures (§4.14 status "residency only when asked"). Linux not measured: adacachy's runs froze at load
+> 80-89.
+
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
@@ -10954,8 +11040,13 @@ spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards
 empties it on their path (queued p99 1.05-1.17 ms -> 22-23 µs), and on Linux the same band is the kernel tick. On
 provisioning the candidates' p999 sits in cross-shard hops to a shard that spins without sleeping, which macOS demotes
 and which then waits quanta for a core: 7-29 ms. QoS user-interactive does not move it (rejected; BENCHMARKS "Where the
-loaded p999 goes, per hop"). **Decision needed (main/Ada):** land the immediate poll for p99 3-5x better and R9's quiet
-floor (with the p999 4-5x worse and 4-6x the quiet CPU with holds), or keep main's nap.
+loaded p999 goes, per hop"). **Decided and CLOSED (P2, 2026-11-20 night):** main's option 3 (the
+immediate poll only where a shard keeps its core, holds declined where it can't) was A/B'd against main on four
+conditions. It failed all four: quiet CPU 5.7-10.0 against 1.6-1.7 cores, loaded p999 10.1-12.7 against 2.1-3.4 ms,
+loaded p99 better in two rounds of three, quiet p99 82 µs in one round. Option 2 failed the same way. Both are recorded
+as measured and rejected (BENCHMARKS "options 2 and 3 measured and rejected"), and **main's nap stays**. The loaded
+bound in the gate stays red on macOS: that is R9 unmet under load on this platform, recorded, with no daemon lever
+found.
 Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
@@ -15517,7 +15608,8 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 > - **Owed.**
 >   - A-555's second piece built (the fetch driver, `slates_base::s3::driver`): a volume's owner shard runs its host's
 >     fetches one at a time, woken by the host when one is wanted and ended when the host is dropped, each answer handed
->     to `base_wait::land` (`spawn_driver`). Its start where an S3 volume is made or recovered is the create's.
+>     to `base_wait::land` (`spawn_driver`). Started where a volume over an S3 base is made (A-791); its start at a
+>     recovery waits on the credential's hold across a restart (below).
 >   - A-555's third piece written (Linux-only, not compiled by its author, filed for main's build): a FUSE request that
 >     met a pending fetch is kept off the device by its mount, waits on a task of the shard for that fetch, and is
 >     dispatched again before the device is read (`crate::fuse`'s `keep`, `slates_bridge_fuse::channel::dispatch_kept`).
@@ -15531,8 +15623,11 @@ since A-402, which also makes the log option 2 names available to the WinFsp dri
 >     bandwidth-delay product, and a live run against a real S3-compatible store, which also reads
 >     `Counts::longest_token` against the caps' assumption that no continuation token is longer than an encoded key.
 >   - The volume over an S3 base (A-524's status in §4.15): the wire's create naming a base and the credential's
->     hand-off, held in RAM by the owner shard and by the anchor across a restart; the shard's driver running the host's
->     fetches on the client and handing each answer to `base_wait::land` (A-555); the base plane's host calls audited for
+>     hand-off are built (A-791: `CreateOverS3`, the owner shard's `S3Host` and driver, `BaseRecord::S3` without the
+>     credential); owed: the credential held by the anchor across a restart and the recovery over an S3 base that uses
+>     it (until then such a volume recovers unavailable, `BaseUnavailable`), a clone of such an overlay (refused
+>     `BaseUnavailable` now), the library's `VolumeSpec` over an S3 base, name resolution of the endpoint's host (an
+>     IPv4 address alone today); the base plane's host calls audited for
 >     a pending answer (some take a host refusal for an absence: `fingerprint_at_path`'s `open_file(..).ok()?`); recovery
 >     over an S3 base (a pending reacquisition marks its directory unavailable, errno 0); a landing of an overlay over an
 >     S3 base into a host directory (its base's own landing is refused `BaseUnavailable`); and the N=1 differential
@@ -23880,14 +23975,31 @@ runs on the box at load average 74 to 93, and never alone.
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
 
-### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — open (w-forming's finding, not worked: Ada's close order)
+> **A-783 (2026-11-20, w-engine; main's pacing call):** paced work yields at the quantum only when someone waits
+> (`slates-pace`, `slates_rt::futures::others_waiting`, ceiling = the watchdog's look); the push build runs on it. The
+> A/B (BENCHMARKS "Paced work yields only when someone waits"): the build's turns 3 to 20 times fewer in six rounds of
+> seven, wall best 7.864 against 6.011 s, newcomers and provisioning held; it found the probe blind to the rest of a
+> step's batch, fixed in the same change. OWED: (1) git's answer and admission paths (w-git), Mercurial's (w-hg) and
+> Subversion's landings (w-svn) move onto the primitive; (2) in one round of seven every build turn yielded at its first
+> ask (369,778 of 369,786): find which task is ready at nearly every quantum on a push's shard, and whether it waits or
+> only yields for its own sake; (3) the A/B again on a quiet machine (this one ran beside other agents' work, load 5 to
+> 45).
+
+### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — fixed (w-forming, the same day)
 `cargo test -p slates-server --test fleet a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`
 failed on main's own code twice of two on Adas-Mac-Studio-4 at load ~39 (base 621cb6ce6 + w-forming's delta capture
 reverse-applied): 4 of the 8 writes made while the whole entry sealed were answered, the rest refused
 `DurabilityPending` after ~4.5 s; 6 whole builds where a quiet run makes 2, `fleet.live.refused.no_credit` 1,
 `fleet.live.build_waited` 16-20. An earlier run of the same code on the same machine passed (8 of 8, 2 builds). The
 shape: under the injected zero seal quantum, a delta queued behind the build is refused for credit, the volume then
-owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. Not chased.
+owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. **Cause (w-forming's own,
+A-768):** while a whole capture read in turns, `queue_behind_build` held the deltas behind it to the larger of the
+shipper's credit and the build's body, and a capture's body is empty until its last turn, so a log whose bounds were
+not yet set (a successor's, or any before its first whole entry) refused its second delta. The seeded nemesis met it
+after every takeover (Goal 85b C3: 5 of 5 replays stalled at `live_chaos.rs:2465`, `fleet.live.held_back.whole`).
+**Fixed:** a capture counts the body it will make (`Capture::body_bytes`); red-checked by
+`live_ship::tests::the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes` (2 queued, 1 refused
+before; 3 queued, none refused after); this fleet test passes again (fleet `a_live_` 11/11).
 
 ### 2026-11-20: a destroyed burst's extents not given back on Adas-Mac-Studio-2 — open (w-lint's finding, not worked: Ada's close order)
 `cargo test -p slates-server --test recovery a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` (A-789,

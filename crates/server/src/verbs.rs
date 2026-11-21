@@ -191,7 +191,9 @@ pub(crate) fn fresh_family_id_at(
   family: Option<u16>,
   offset: u64,
 ) -> Option<DbVolumeId> {
-  let number = state.db.family_number_at(offset)?;
+  // Past every number a creation in flight reserved (`ShardState::family_reserved_through`, A-767 item 7).
+  let base = u64::from(state.db.family_number_at(0)?).max(state.family_reserved_through);
+  let number = u32::try_from(base.checked_add(offset)?).ok()?;
   // Derived: a new family's tag is its number modulo the tags a family id holds, MAX_FAMILY_TAG + 1.
   let tags = u32::from(slates_db::register::MAX_FAMILY_TAG).checked_add(1)?;
   let tag = match family {
@@ -2783,7 +2785,9 @@ pub(crate) fn route_gated(
     ));
   }
   let owner = match &body {
-    RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    RequestBody::Create { name, .. } | RequestBody::CreateOverS3 { name, .. } => {
+      Some(owner_of_name(name, state.shards.len()))
+    }
     // A repository and every green of its lineage live on the partition its name hashes to (§4.17.1, A-575).
     RequestBody::CreateRepository { name, .. } => Some(owner_of_name(name, state.shards.len())),
     RequestBody::CreateBranch { repository, .. }
@@ -3189,10 +3193,10 @@ pub(crate) fn status_on_channel(
     ));
   }
   slot.status_pages.clear(&mut state.store.metadata);
-  if matches!(body, RequestBody::DaemonStatus) {
+  if let RequestBody::DaemonStatus { memory } = body {
     // No deadline yet: the capture's counts from the capture, once its scatter has made it (A-525, [`send_reply`]).
     slot.status_pages.begin(request, &mut state.store.metadata);
-    return Some(scatter_status(state, client.index(), request));
+    return Some(scatter_status(state, client.index(), request, *memory));
   }
   None
 }
@@ -3922,14 +3926,14 @@ fn gather_session_log(
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
 /// the origin assembles the daemon's view (§4.14 `slates.status`). An unserved report refuses the status, as a
 /// listing's part does.
-fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
+fn scatter_status(state: &mut ShardState, client_index: u32, request: u64, memory: bool) -> Served {
   let others: Vec<u16> = state
     .shards
     .iter()
     .copied()
     .filter(|s| *s != state.shard)
     .collect();
-  let mine = shard_report(state);
+  let mine = shard_report(state, memory);
   if others.is_empty() {
     return Served::Reply(daemon_report(state, vec![mine]));
   }
@@ -3940,7 +3944,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
   for shard in others {
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let part = crate::state::with_state(shard_report);
+        let part = crate::state::with_state(|state| shard_report(state, memory));
         crate::xshard::send_reply_home(origin, move || {
           gather_status(request, shard, part);
         });
@@ -4284,10 +4288,11 @@ fn gather_status(request: u64, shard: u16, part: Option<ShardReport>) {
   }
 }
 
-/// This shard's part of the status: its counters and its health signals (§4.14 catalog).
-pub fn shard_report(state: &mut ShardState) -> ShardReport {
-  // Advanced first, mutably: the sweep of the shard's slice of the anchor content object (A-744).
-  let content_ranges = crate::content_ranges::report(state);
+/// This shard's part of the status: its counters and its health signals (§4.14 catalog). `memory`: the request asked for
+/// the memory report, whose residency work only such a request pays ([`crate::content_ranges::report`]).
+pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
+  // First, mutably: the residency the memory report reads, when asked (A-744; main's ruling on g228's finding).
+  let content_ranges = crate::content_ranges::report(state, memory);
   let now = state.clock.monotonic_ns();
   let since_boot = now.saturating_sub(state.booted_ns);
   let ring_depth: u64 = state
@@ -5029,6 +5034,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
   matches!(
     body,
     RequestBody::Create { .. }
+      | RequestBody::CreateOverS3 { .. }
       | RequestBody::CreateGreen { .. }
       | RequestBody::CreateRepository { .. }
       | RequestBody::CreateBranch { .. }
@@ -5252,6 +5258,23 @@ fn dispatch_inner(
       names,
       require_locked,
       base.as_deref(),
+    ),
+    RequestBody::CreateOverS3 {
+      name,
+      size,
+      names,
+      require_locked,
+      base,
+      credential,
+    } => create_over_s3(
+      state,
+      principal,
+      &name,
+      size,
+      names,
+      require_locked,
+      &base,
+      credential,
     ),
     RequestBody::Snapshot { volume } => snapshot(state, principal, volume),
     RequestBody::Move { volume, to } => crate::moves::move_verb(state, principal, volume, to),
@@ -5609,8 +5632,8 @@ fn dispatch_inner(
       from,
     } => conflicts(state, principal, work, verdict, from),
     RequestBody::List { after } => list_page(vec![list_part(state, principal, after)]),
-    RequestBody::DaemonStatus => {
-      let mine = shard_report(state);
+    RequestBody::DaemonStatus { memory } => {
+      let mine = shard_report(state, memory);
       daemon_report(state, vec![mine])
     }
     RequestBody::DaemonStatusNext { .. } => refused(Refusal::NotFound),
@@ -6789,7 +6812,7 @@ pub(crate) fn db_size(size: SizeClass) -> DbSizeClass {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn create(
+pub(crate) fn create(
   state: &mut ShardState,
   principal: &Principal,
   name: &str,
@@ -6880,6 +6903,201 @@ fn create(
   )
 }
 
+/// The S3 base a `CreateOverS3` names (A-555), checked as the library checks it (`S3Base::new`): refused `BadRequest`
+/// naming what was wrong.
+fn s3_base_of(
+  spec: &slates_ipc::protocol::S3BaseSpec,
+) -> Result<slates_base::s3::name::S3Base, Refusal> {
+  let style = if spec.path_style {
+    slates_base::s3::client::Style::Path
+  } else {
+    slates_base::s3::client::Style::VirtualHosted
+  };
+  slates_base::s3::name::S3Base::new(
+    &spec.endpoint,
+    &spec.region,
+    &spec.bucket,
+    &spec.prefix,
+    style,
+  )
+  .map_err(|refused| Refusal::BadRequest {
+    reason: format!("an S3 base refused: {refused:?}"),
+  })
+}
+
+/// The store client of `base`, signed with `credential` (A-555): its endpoint at the address its host names, verified
+/// against `authorities` over HTTPS. The daemon resolves no names (GAPS A-464: name resolution is owed), so a host that
+/// is not an IPv4 address is refused `BaseUnavailable` naming the base, as is plain HTTP off loopback, HTTPS with no
+/// authority, and an authority the TLS configuration refuses. Its requests are dated by the host's wall clock, may be
+/// as late as this daemon's liveness window, and never take longer in all than the shard's failover delay, the longest
+/// a request parked on a fetch waits; its retry pauses are jittered from the volume's id.
+fn s3_client_of(
+  state: &ShardState,
+  base: &slates_base::s3::name::S3Base,
+  (authorities, credential): (&[Vec<u8>], slates_ipc::protocol::S3Credential),
+  seed: u64,
+) -> Result<slates_base::s3::client::Client, Refusal> {
+  use slates_base::s3::client::{Client, Limits, host_wall_ns};
+  let unreachable = || Refusal::BaseUnavailable {
+    path: base.to_string(),
+    errno: 0,
+  };
+  let addr: slates_rt::tcp::Ipv4Addr = base.host().parse().map_err(|_| unreachable())?;
+  if base.scheme() == slates_base::s3::name::Scheme::Https && authorities.is_empty() {
+    return Err(unreachable());
+  }
+  let authorities = authorities
+    .iter()
+    .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+    .collect();
+  let endpoint = base.endpoint(
+    slates_rt::tcp::SocketAddrV4::new(addr, base.port()),
+    authorities,
+  );
+  let credentials = slates_base::s3::sigv4::Credentials::new(
+    &credential.access_key_id,
+    &credential.secret_access_key,
+    credential.session_token.as_deref(),
+  );
+  let limits = Limits {
+    liveness_ns: crate::daemon::LIVENESS_BUDGET_NS,
+    ceiling_ns: state.failover_ns,
+  };
+  Client::new(endpoint, credentials, limits, host_wall_ns, seed).map_err(|_| unreachable())
+}
+
+/// `CreateOverS3` (A-555): makes an overlay over the objects of an S3 base as [`create`] makes one over a host
+/// directory, its slot's host the base's, and starts the base's fetch driver on this shard, the volume's owner, with
+/// the store client the credential signs for. The driver is started before the volume is published, so a shard whose
+/// task arena is full refuses the create `Overloaded` having made nothing; it first looks for its host once this verb
+/// has run, and ends at once if the publish was refused. The credential is never recorded (R1): the catalog keeps the
+/// base alone.
+#[allow(clippy::too_many_arguments)]
+fn create_over_s3(
+  state: &mut ShardState,
+  principal: &Principal,
+  name: &str,
+  size: SizeClass,
+  names: NamePolicy,
+  require_locked: bool,
+  spec: &slates_ipc::protocol::S3BaseSpec,
+  credential: slates_ipc::protocol::S3Credential,
+) -> ReplyBody {
+  if state.db.partition().volume_by_name(name).is_some() {
+    let existing = state
+      .db
+      .partition()
+      .volume_by_name(name)
+      .map(|v| to_wire_volume(v.id))
+      .unwrap_or_default();
+    return refused(Refusal::AlreadyExists { existing });
+  }
+  let base = match s3_base_of(spec) {
+    Ok(base) => base,
+    Err(refusal) => return refused(refusal),
+  };
+  if base.to_string().len() > longest_recordable_base() {
+    return refused(crate::error::base_unavailable(
+      base.to_string(),
+      Some(PATH_TOO_LONG),
+    ));
+  }
+  let Admitted {
+    volume,
+    host,
+    credits,
+  } = match admit_over(
+    state,
+    principal,
+    (size, names, require_locked),
+    AdmitBase::S3(&base),
+  ) {
+    Ok(admitted) => admitted,
+    Err(reply) => return *reply,
+  };
+  let Credits {
+    reservation,
+    version: version_credit,
+    metadata: metadata_credit,
+    lock: lock_credit,
+  } = credits;
+  let discard = |state: &mut ShardState, volume: Volume| {
+    let hold = volume.version_hold();
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
+    release_version_hold(&mut state.store, hold);
+  };
+  let Some(id) = fresh_volume_id(state) else {
+    discard(state, volume);
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      ids_exhausted(),
+    );
+  };
+  // Derived: the jitter's seed is the volume's own id, so two volumes' retries never pause in step.
+  let seed = id
+    .bytes
+    .first_chunk::<8>()
+    .map_or(0, |word| u64::from_le_bytes(*word));
+  let started =
+    s3_client_of(state, &base, (&spec.authorities, credential), seed).and_then(|client| {
+      crate::base_wait::spawn_driver(id, client)
+        .map_err(|_| Refusal::Overloaded { shard: state.shard })
+    });
+  if let Err(refusal) = started {
+    discard(state, volume);
+    return give_back(state, reservation, version_credit, metadata_credit, refusal);
+  }
+  let record = VolumeRecord {
+    id,
+    name: name.to_owned(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: db_size(size),
+      names: match names {
+        NamePolicy::Exact => DbNamePolicy::Exact,
+        NamePolicy::Fold => DbNamePolicy::Fold,
+      },
+      require_locked,
+      role: Role::Plain,
+      live_shipped: false,
+      live_holders: None,
+      write: None,
+      write_version: 0,
+      signers: Vec::new(),
+    },
+    base: BaseRecord::S3 {
+      endpoint: spec.endpoint.clone(),
+      region: spec.region.clone(),
+      bucket: spec.bucket.clone(),
+      prefix: spec.prefix.clone(),
+      path_style: spec.path_style,
+    },
+    head: DbSnapshotId::default(),
+    epoch: 0,
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: principal.clone(),
+    access: Vec::new(),
+    created_ns: state.clock.monotonic_ns(),
+    catalog_version: 0,
+    taken_over: None,
+  };
+  publish_created_volume(
+    state,
+    id,
+    volume,
+    host,
+    (reservation, version_credit, metadata_credit, lock_credit),
+    record,
+  )
+}
+
 /// What a volume holds against the shard's ledgers from its admission to its teardown (§4.2): a bounded volume's byte
 /// reservation, its inode allowance against the version slab, its records against the metadata ledger, and a strict
 /// volume's locked entitlement.
@@ -6930,6 +7148,8 @@ pub(crate) enum AdmitBase<'a> {
     /// The tree's identity: its fingerprints' device.
     identity: u64,
   },
+  /// An overlay over the objects of an S3 base, read through the shard's fetches (§4.15, A-791).
+  S3(&'a slates_base::s3::name::S3Base),
 }
 
 /// [`admit`] over any [`AdmitBase`].
@@ -7068,6 +7288,18 @@ pub(crate) fn admit_over(
       }
     },
     AdmitBase::Path(path) => match open_base(state, path, config) {
+      Ok(pair) => pair,
+      Err(reply) => {
+        return Err(Box::new(give_back(
+          state,
+          reservation,
+          version_credit,
+          metadata_credit,
+          reply_refusal(*reply),
+        )));
+      }
+    },
+    AdmitBase::S3(base) => match open_s3_base(state, base, config, size) {
       Ok(pair) => pair,
       Err(reply) => {
         return Err(Box::new(give_back(
@@ -7603,8 +7835,22 @@ fn clone_base_host(
   origin: Handle<VolumeSlot>,
   record: &VolumeRecord,
 ) -> Result<Option<BaseHost>, Refusal> {
-  let BaseRecord::Path { path } = &record.base else {
-    return Ok(None);
+  let path = match &record.base {
+    BaseRecord::Path { path } => path,
+    // An S3 base's host is one fetch state and its credential, which a clone cannot duplicate yet (A-555): refused,
+    // never a clone with no base under it.
+    BaseRecord::S3 {
+      endpoint,
+      bucket,
+      prefix,
+      ..
+    } => {
+      return Err(Refusal::BaseUnavailable {
+        path: format!("s3://{bucket}/{prefix} at {endpoint}"),
+        errno: 0,
+      });
+    }
+    BaseRecord::Scratch | BaseRecord::Image { .. } => return Ok(None),
   };
   let slot = state.volumes.get(origin).map_err(|_| Refusal::NotFound)?;
   // A base the catalog records by its path is a host directory, read through a directory host.
@@ -7618,6 +7864,74 @@ fn clone_base_host(
     .try_clone_dirs()
     .map(|host| Some(BaseHost::Disk(host)))
     .map_err(|error| base_open_refusal(path, error))
+}
+
+/// Makes the host of the S3 base `base` (A-555) and creates the overlay over its root, a volume of `size`. The host is
+/// built empty: nothing is fetched until a request asks, and the root's facts need no fetch. Its cache is the volume's
+/// own byte bound, no more than the shard could admit now; a cache that cannot hold one chunk is refused
+/// `BudgetExceeded`, since no read of the base could ever be answered.
+fn open_s3_base(
+  state: &mut ShardState,
+  base: &slates_base::s3::name::S3Base,
+  config: VolumeConfig,
+  size: SizeClass,
+) -> Result<(Volume, Option<BaseHost>), Box<ReplyBody>> {
+  use slates_base::s3::host::{HostConfig, HostRefused, S3Host};
+  let admittable = state.store.admittable();
+  let bound = match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  };
+  let host_config = HostConfig {
+    chunk_bytes: u64::try_from(state.store.content.chunk_bytes()).unwrap_or(u64::MAX),
+    // Derived: the volume's byte bound, within what the shard could admit now: what fetched ranges and listings may
+    // take of the shard is no more than the volume itself may.
+    cache_bytes: bound.min(admittable),
+    owner: s3_owner(),
+    wall_ns: slates_base::s3::client::host_wall_ns,
+  };
+  let mut host = S3Host::new(base, host_config).map_err(|refusal| {
+    Box::new(refused(match refusal {
+      HostRefused::CacheBelowChunk => Refusal::BudgetExceeded {
+        available: admittable,
+      },
+      HostRefused::ZeroChunk => Refusal::BaseUnavailable {
+        path: base.to_string(),
+        errno: 0,
+      },
+    }))
+  })?;
+  let root = host.root();
+  let facts = host.facts(root).map_err(|e| {
+    Box::new(refused(crate::error::base_unavailable(
+      base.to_string(),
+      e.code(),
+    )))
+  })?;
+  let volume = Volume::create_overlay(
+    &mut state.store,
+    config,
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: state.config.large_class_bytes,
+    },
+  )
+  .map_err(|e| Box::new(refused(refusal_of_vfs(&e))))?;
+  Ok((volume, Some(BaseHost::S3(Box::new(host)))))
+}
+
+/// The owner an S3 base's entries report (`st_uid`, `st_gid`): this daemon's own user and group, the one user the
+/// rendezvous admits ([`creator_gid`]).
+#[cfg(unix)]
+fn s3_owner() -> (u32, u32) {
+  (rustix::process::geteuid().as_raw(), creator_gid())
+}
+
+/// Windows: ownership is a security descriptor; the WinFsp bridge reports no POSIX ids.
+#[cfg(not(unix))]
+fn s3_owner() -> (u32, u32) {
+  (0, creator_gid())
 }
 
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
@@ -16280,6 +16594,7 @@ pub(crate) fn recorded_reason(mut reason: String) -> String {
 fn new_volume_name(body: &RequestBody) -> Option<&str> {
   match body {
     RequestBody::Create { name, .. }
+    | RequestBody::CreateOverS3 { name, .. }
     | RequestBody::CreateGreen { name, .. }
     | RequestBody::CreateWork { name, .. }
     | RequestBody::Clone { name, .. }
@@ -20363,6 +20678,21 @@ fn build_recovered_volume(
   let mut opened = match &record.base {
     // An image volume holds its content itself, as a scratch one does; its base names only the snapshot it pins.
     BaseRecord::Scratch | BaseRecord::Image { .. } => None,
+    // An S3 base's credential is held in RAM alone and never recorded (R1), so a recovery has none to fetch with until
+    // the credential is handed again: the volume is held unavailable, naming its base (A-555; GAPS A-464).
+    BaseRecord::S3 {
+      endpoint,
+      bucket,
+      prefix,
+      ..
+    } => {
+      return Err(RecoveryCause::BaseUnavailable {
+        path: format!("s3://{bucket}/{prefix} at {endpoint}"),
+        reason: recorded_reason(
+          "an S3 base's credential is held in RAM alone and has not been handed again since the restart".to_owned(),
+        ),
+      });
+    }
     BaseRecord::Path { path } => {
       Some(OsHost::open_root(std::path::Path::new(path)).map_err(|error| base_cause(path, error))?)
     }
@@ -24895,7 +25225,7 @@ mod tests {
       let sent = [
         super::scatter_list(state, seat, asked(1), scatter_asker(), None),
         super::scatter_grants(state, seat, asked(2), scatter_asker(), None),
-        super::scatter_status(state, seat, asked(3)),
+        super::scatter_status(state, seat, asked(3), false),
       ];
       let all_sent = sent
         .iter()

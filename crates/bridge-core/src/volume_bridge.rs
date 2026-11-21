@@ -95,6 +95,10 @@ pub struct VolumeBridge<'v> {
   /// How the transport shows its guest the volume's owners ([`crate::OwnerView`]): the identity unless the Shards route's
   /// serve task says otherwise ([`VolumeBridge::viewing_owners`]; A-281).
   owners: crate::OwnerView,
+  /// Where a referenced file's content pieces are read (A-645 P3 ruling 2, `slates_vfs::referenced`): the shard's
+  /// content store, lent for the request by a server that serves such a volume ([`VolumeBridge::reading_referenced`]);
+  /// none, and a referenced file's content is refused `ReferenceUnresolved` (`EIO`), never read as zeros.
+  referenced: Option<&'v dyn slates_vfs::referenced::ReferencedContent>,
   /// Which attribute namespaces the transport reaches ([`crate::AttributeNamespaces`]): a host's mount's unless a guest
   /// kernel's route says otherwise ([`VolumeBridge::serving_a_guest`]; A-290).
   namespaces: crate::AttributeNamespaces,
@@ -326,6 +330,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      referenced: None,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
       write_log: None,
@@ -352,6 +357,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      referenced: None,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
       write_log: None,
@@ -384,6 +390,7 @@ impl<'v> VolumeBridge<'v> {
       lost: None,
       dax: crate::DaxOffer::Withheld,
       owners: crate::OwnerView::IDENTITY,
+      referenced: None,
       namespaces: crate::AttributeNamespaces::Host,
       setxattr_ext: false,
       write_log: None,
@@ -412,6 +419,18 @@ impl<'v> VolumeBridge<'v> {
   #[must_use]
   pub fn offering_dax(mut self, dax: crate::DaxOffer) -> VolumeBridge<'v> {
     self.dax = dax;
+    self
+  }
+
+  /// This bridge, reading a referenced file's content pieces through `content` (A-645 P3 ruling 2): a server's view
+  /// volume (a Subversion repository's FSFS view, A-645 (a)) is served with the shard's content store lent for the
+  /// request.
+  #[must_use]
+  pub fn reading_referenced(
+    mut self,
+    content: &'v dyn slates_vfs::referenced::ReferencedContent,
+  ) -> VolumeBridge<'v> {
+    self.referenced = Some(content);
     self
   }
 
@@ -1034,7 +1053,12 @@ impl Bridge for VolumeBridge<'_> {
         .volume
         .with_host(host)
         .read(self.store, inode, offset, tail),
-      None => self.volume.read(self.store, inode, offset, tail),
+      None => match self.referenced {
+        Some(content) => self
+          .volume
+          .read_referenced(self.store, inode, offset, tail, content),
+        None => self.volume.read(self.store, inode, offset, tail),
+      },
     };
     match read {
       Ok(read) => {

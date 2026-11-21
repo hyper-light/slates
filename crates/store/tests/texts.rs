@@ -190,3 +190,77 @@ fn an_old_file_revision_is_read_from_its_own_chain_alone() {
   check(&mut store);
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A text that comes back (A, then B, then A again, as a file reverted is): its `T` row is the first changeset's that
+/// kept it and is never replaced, so no chain loops. Do: land A whole, B as an edit of A, A again as an edit of B; read
+/// each on a cold cache. Expect: each version's bytes, A read from its first changeset alone, and the path's history
+/// naming all three.
+#[test]
+fn a_text_that_comes_back_keeps_its_first_row_and_no_chain_loops() {
+  let dir = scratch("revert");
+  let mut store = open(&dir);
+  let staging = Staging::new(0);
+  let a: Vec<u8> = b"the first text".to_vec();
+  let b: Vec<u8> = b"the other text".to_vec();
+  let (id_a, id_b) = (*blake3::hash(&a).as_bytes(), *blake3::hash(&b).as_bytes());
+  let edit_to_b = hunk(4, 9, b"other");
+  let edit_to_a = hunk(4, 9, b"first");
+  for (sequence, (payload, text, base)) in (1u64..).zip([
+    (a.clone(), id_a, None),
+    (edit_to_b, id_b, Some(id_a)),
+    (edit_to_a, id_a, Some(id_b)),
+  ]) {
+    let entry = TextEntry {
+      path: b"f".to_vec(),
+      tool_id: Vec::new(),
+      text,
+      len: 14,
+      base,
+      place: Place {
+        payload: *blake3::hash(&payload).as_bytes(),
+        offset: 0,
+        len: payload.len() as u64,
+      },
+    };
+    let section = texts::encode(&[entry]);
+    store
+      .land(
+        Header {
+          tool: Tool::Git,
+          repository: 1,
+          sequence,
+          judged_over: sequence - 1,
+          grant: 1,
+          work: sequence,
+          time_ns: sequence,
+          sections: 0,
+        },
+        &[
+          (SectionKind::Payload, Contents::Bytes(&payload)),
+          (SectionKind::Texts, Contents::Bytes(&section)),
+        ],
+        &staging,
+      )
+      .unwrap();
+  }
+  for (identity, text, chain) in [
+    (id_a, &a, BTreeSet::from([1])),
+    (id_b, &b, BTreeSet::from([1, 2])),
+  ] {
+    let mut cache = TextCache::new(0);
+    let read = store
+      .text_at(&staging, 1, &identity, 0, &mut cache)
+      .unwrap()
+      .map(<[u8]>::to_vec);
+    assert_eq!(read.as_ref(), Some(text));
+    assert_eq!(cache.changesets, chain);
+  }
+  let history: Vec<u64> = store
+    .path_texts(1, b"f", 0, 10)
+    .unwrap()
+    .into_iter()
+    .map(|(sequence, _)| sequence)
+    .collect();
+  assert_eq!(history, [1, 2, 3]);
+  let _ = std::fs::remove_dir_all(&dir);
+}

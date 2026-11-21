@@ -45,6 +45,23 @@ pub fn step_budget_ns() -> Option<u64> {
   registry::with_current(|ctx| ctx.quantum_ns())
 }
 
+/// Whether anyone else waits on the current shard now (A-783, [`crate::shard::ShardContext::others_waiting`]): what a
+/// paced step asks once a quantum. False off a shard thread (no one shares it).
+pub fn others_waiting() -> bool {
+  registry::with_current(|ctx| ctx.others_waiting()).unwrap_or(false)
+}
+
+/// The most a paced step runs on the current shard while no one waits (A-783,
+/// [`crate::shard::ShardContext::step_ceiling_ns`]). `None` off a shard thread.
+pub fn step_ceiling_ns() -> Option<u64> {
+  registry::with_current(|ctx| ctx.step_ceiling_ns())
+}
+
+/// Sets the current shard's paced-step ceiling ([`step_ceiling_ns`]); nothing off a shard thread.
+pub fn set_step_ceiling_ns(ceiling_ns: u64) {
+  let _ = registry::with_current(|ctx| ctx.set_step_ceiling_ns(ceiling_ns));
+}
+
 /// The current shard's idle window in nanoseconds (`ShardContext::idle_window_ns`): what the daemon's serve
 /// loop keeps polling for after its last work. `None` off a shard thread.
 pub fn idle_window_ns() -> Option<u64> {

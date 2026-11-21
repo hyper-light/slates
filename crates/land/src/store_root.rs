@@ -84,6 +84,8 @@ pub struct StoreRoot {
   dir: OwnedFd,
   path: PathBuf,
   target: TargetIdentity,
+  /// The standing grant it was opened under, recorded by the store at its open (A-767's `G` row, R10).
+  grant: StoreGrant,
 }
 
 /// Windows has no store directory yet: every call refuses [`StoreRootRefusal::Unsupported`] (its handle-relative
@@ -103,6 +105,11 @@ impl StoreRoot {
   /// The directory's identity.
   pub fn target(&self) -> &TargetIdentity {
     &self.target
+  }
+
+  /// The standing grant the directory was opened under.
+  pub fn grant(&self) -> &StoreGrant {
+    &self.grant
   }
 
   /// The path a store file is named under in messages.
@@ -129,6 +136,11 @@ impl StoreRoot {
   pub fn exists(&self, _name: &str) -> Result<bool, StoreRootRefusal> {
     Err(StoreRootRefusal::Unsupported)
   }
+
+  /// Refused: no store directory on this platform yet.
+  pub fn mount_point(&self, _name: &str) -> Result<PathBuf, StoreRootRefusal> {
+    Err(StoreRootRefusal::Unsupported)
+  }
 }
 
 #[cfg(unix)]
@@ -145,7 +157,13 @@ impl StoreRoot {
       dir,
       path: path.to_path_buf(),
       target,
+      grant: grant.clone(),
     })
+  }
+
+  /// The standing grant the directory was opened under.
+  pub fn grant(&self) -> &StoreGrant {
+    &self.grant
   }
 
   /// The identity a standing grant for the directory at `path` binds (for the grant's issue, which the human
@@ -203,6 +221,45 @@ impl StoreRoot {
         code: errno.raw_os_error(),
       }),
     }
+  }
+
+  /// The directory `name` in the granted directory, a mount point for a view slates presents there (A-645 (a): a
+  /// Subversion repository's FSFS view, mounted read-only for its hooks' `REPOS-PATH`): made empty, for this process's
+  /// user alone, and its name made durable, where missing; kept where it is already a directory, not a symlink. The
+  /// path it lies at.
+  ///
+  /// # Errors
+  /// [`StoreRootRefusal::BadName`] for a name that is not one plain name; [`StoreRootRefusal::Io`] when the name holds
+  /// something else (a file, a symlink: `ENOTDIR`) or the OS refuses the make.
+  #[allow(clippy::disallowed_methods)] // a mount point under the store's standing grant (R1, A-767; A-645 (a)).
+  pub fn mount_point(&self, name: &str) -> Result<PathBuf, StoreRootRefusal> {
+    plain(name)?;
+    match rustix::fs::mkdirat(&self.dir, name, Mode::RWXU) {
+      Ok(()) => rustix::fs::fsync(&self.dir).map_err(|errno| StoreRootRefusal::Io {
+        op: "flush the store's directory after a mount point's make",
+        code: errno.raw_os_error(),
+      })?,
+      Err(rustix::io::Errno::EXIST) => {
+        let stat = rustix::fs::statat(&self.dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+          .map_err(|errno| StoreRootRefusal::Io {
+            op: "look up a mount point",
+            code: errno.raw_os_error(),
+          })?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
+          return Err(StoreRootRefusal::Io {
+            op: "use a mount point that is not a directory",
+            code: rustix::io::Errno::NOTDIR.raw_os_error(),
+          });
+        }
+      }
+      Err(errno) => {
+        return Err(StoreRootRefusal::Io {
+          op: "make a mount point",
+          code: errno.raw_os_error(),
+        });
+      }
+    }
+    Ok(self.path_of(name))
   }
 
   fn open_at(&self, name: &str, extra: OFlags) -> Result<File, StoreRootRefusal> {

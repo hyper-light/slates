@@ -10,6 +10,7 @@ use super::*;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_svn::dump::{Admission, Uuid};
+use slates_svn::migration::Repository as SvnRecords;
 use slates_svn::migration::{Importer, Importing, Room, WithTexts};
 use slates_vfs::NameEquivalence;
 use slates_vfs::clock::StepClock;
@@ -153,7 +154,7 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   let mut presented = Presented::new();
   let mut holds = ViewHolds {
     store: None,
-    records: &records,
+    stored: &BTreeSet::new(),
   };
   let mut calls = 0;
   while presented
@@ -202,6 +203,11 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
     format!("{youngest}\n").into_bytes()
   );
   assert!(volume.referenced_counts().bytes_read >= read);
+  assert_eq!(
+    (store.content.chunks(), store.content.allocated_bytes()),
+    (0, 0),
+    "the view keeps nothing in the shard's chunk store"
+  );
 }
 
 /// A-645 (a), the revprop rows. Do: present the golden repository's view; change revision 1's `svn:log` in the records,
@@ -225,7 +231,7 @@ fn a_revision_property_change_rewrites_that_revisions_properties_file() {
     };
     let mut holds = ViewHolds {
       store: None,
-      records: &records,
+      stored: &BTreeSet::new(),
     };
     while presented
       .advance(

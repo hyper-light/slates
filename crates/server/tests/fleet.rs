@@ -3630,7 +3630,7 @@ fn council_reports_over_the_wire(daemons: &[Daemon]) -> Vec<slates_ipc::protocol
     .iter()
     .map(|daemon| {
       let mut client = Client::connect(daemon.instance());
-      match client.call(&RequestBody::DaemonStatus) {
+      match client.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
         other => panic!("status answers on every node: {other:?}"),
       }
@@ -7411,7 +7411,8 @@ fn share_with_node(
 /// `fleet` (A-237): as an operator who means to reach a volume from several nodes shares it with each. The owner's own
 /// node is told apart by the anchor its status reports.
 fn share_with_fleet(owner: &mut Client, volume: VolumeId, fleet: &[Daemon]) {
-  let ReplyBody::DaemonStatus { report } = owner.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } = owner.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the owner's node reported its status");
   };
   for node in fleet
@@ -9496,8 +9497,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   // the member dead (`route_dropped.owner_ineligible.dead`) though its own detector condemned no one (2026-10-08).
   let detectors: Vec<String> = daemons
     .iter()
-    .map(
-      |daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+    .map(|daemon| {
+      match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => format!(
           "{:?} (foreign: {}): {:?}",
           daemon.member_identity().ok(),
@@ -9505,8 +9506,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
           report.fleet.detector
         ),
         other => format!("status unavailable: {other:?}"),
-      },
-    )
+      }
+    })
     .collect();
   let routing = format!("{routing}; every node's detector {detectors:?}");
   trace_routing_views(&daemons, ObjectId(id.bytes));
@@ -10200,7 +10201,7 @@ fn the_harness_reads_a_paged_status_whole_across_an_acknowledgement() {
       ReplyBody::Listed { .. }
     ));
   }
-  let reply = client.call(&RequestBody::DaemonStatus);
+  let reply = client.call(&RequestBody::DaemonStatus { memory: false });
   daemon.stop();
   assert!(
     matches!(reply, ReplyBody::DaemonStatus { .. }),
@@ -10722,14 +10723,15 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // A's own detector, and what A holds about B: an A that never asked a relay (2026-10-10: requested 0, while B
   // refused about as many probes as A sent lease renewals) either never probed B or held B already condemned, and
   // these say which.
-  let detector_a = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => (
-      report.fleet.detector,
-      report.fleet.detector_pool,
-      report.fleet.detector_relays,
-    ),
-    _ => Default::default(),
-  };
+  let detector_a =
+    match Client::connect(a.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => (
+        report.fleet.detector,
+        report.fleet.detector_pool,
+        report.fleet.detector_relays,
+      ),
+      _ => Default::default(),
+    };
   let b_on_a = a.fleet_member_state(host_b);
 
   // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
@@ -10751,21 +10753,23 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // A's own detector at the end of the hold, and what A's fleet holds about B: a hold lost with every relay request
   // answered (2026-10-10: 17 asked, 17 credited, B gone after 12 periods, C's detector condemning nothing) says here
   // whether A's detector condemned B, on what evidence, or whether B left A's fleet by another path.
-  let detector_a_held = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => (
-      report.fleet.detector,
-      report.fleet.detector_pool,
-      report.fleet.detector_relays,
-    ),
-    _ => Default::default(),
-  };
+  let detector_a_held =
+    match Client::connect(a.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => (
+        report.fleet.detector,
+        report.fleet.detector_pool,
+        report.fleet.detector_relays,
+      ),
+      _ => Default::default(),
+    };
   let b_on_a_held = a.fleet_member_state(host_b);
   // C's detector as its status reports it: whether C condemned B by its own probes, and how that compares with the
   // theory's allowance (a count far above it is a detector misjudging a live peer; one within it is the load).
-  let detector_c = match Client::connect(c.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => report.fleet.detector,
-    _ => Vec::new(),
-  };
+  let detector_c =
+    match Client::connect(c.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => report.fleet.detector,
+      _ => Vec::new(),
+    };
   let counts_a = a.fleet_plane_counts().unwrap_or_default();
   let acked_on_a = counts_a.indirect_acked;
   let requested_by_a = counts_a.relays_asked;
@@ -11105,7 +11109,7 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     daemon_b.fleet_meshed()
   });
   let mut client = Client::connect(&instance_a);
-  let report = match client.call(&RequestBody::DaemonStatus) {
+  let report = match client.call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => report,
     other => panic!("status answers: {other:?}"),
   };
@@ -11155,7 +11159,7 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let sessions_of = |daemon: &Daemon| {
     let mut client = Client::connect(daemon.instance());
-    match client.call(&RequestBody::DaemonStatus) {
+    match client.call(&RequestBody::DaemonStatus { memory: false }) {
       ReplyBody::DaemonStatus { report } => report.fleet.sessions,
       _ => Vec::new(),
     }
@@ -11184,11 +11188,12 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
   let last: Vec<_> = daemons.iter().map(sessions_of).collect();
   // The sessions peers dialed to each node, as its serve loops saw them: the connections whose sender is this node
   // when a peer's forwards and reads come back.
-  let served_of =
-    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
-      ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
-      _ => Vec::new(),
-    };
+  let served_of = |daemon: &Daemon| match Client::connect(daemon.instance())
+    .call(&RequestBody::DaemonStatus { memory: false })
+  {
+    ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
+    _ => Vec::new(),
+  };
   let served = poll_until(&observed, formation_deadline(), || {
     Ok(daemons.iter().all(|daemon| {
       served_of(daemon)
@@ -11254,13 +11259,14 @@ fn assert_detectors_measured(measured: bool, detectors: &[DetectorReading]) {
 /// polled for as the sessions are: one read right after formation found it unmeasured on a loaded Mac (2026-10-10,
 /// "the node's lateness is measured: 0"; 6 of 6 green when repeated).
 fn measured_detectors(daemons: &[Daemon], observed: &[&Daemon]) -> (bool, Vec<DetectorReading>) {
-  let detector_of =
-    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
-      ReplyBody::DaemonStatus { report } => {
-        Some((report.fleet.detector, report.fleet.detector_granularity_ns))
-      }
-      _ => None,
-    };
+  let detector_of = |daemon: &Daemon| match Client::connect(daemon.instance())
+    .call(&RequestBody::DaemonStatus { memory: false })
+  {
+    ReplyBody::DaemonStatus { report } => {
+      Some((report.fleet.detector, report.fleet.detector_granularity_ns))
+    }
+    _ => None,
+  };
   let measured = poll_until(observed, formation_deadline(), || {
     Ok(
       daemons
@@ -11355,14 +11361,14 @@ impl Client {
   }
 
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       // Acknowledged once before the first page, as `slates_client` does, and never between pages: any request but the
       // next page cancels the channel's capture (`status_on_channel`), so an acknowledgement that fell due mid-report
       // left the report refused (main's Windows arm64 lane, run 42528348387: `share_with_fleet` got `Refused` after
       // `DaemonStatus`, `Acknowledge`, `DaemonStatusNext`).
       self.acknowledge_if_due();
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect::<IpcError>(capacity, |request| {
+      return slates_ipc::status::collect::<IpcError>(capacity, *memory, |request| {
         self.sequence += 1;
         Ok(self.send_at(self.sequence, request))
       })
@@ -12080,7 +12086,7 @@ fn a_successors_failover_estimate_learns_the_takeover_it_completed() {
 /// The failover estimate the daemon `client` is connected to reports in its status (A-363), or `None` when it did not
 /// answer one.
 fn failover_through(client: &mut Client) -> Option<slates_ipc::protocol::FailoverReport> {
-  match client.call(&RequestBody::DaemonStatus) {
+  match client.call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => Some(report.fleet.failover),
     _ => None,
   }
@@ -12698,7 +12704,7 @@ fn f2_live_body(file: usize) -> Vec<u8> {
 /// The head of `volume`'s live log `daemon` holds as a candidate (its status's holding line), `None` while it shows none.
 fn held_live_head(daemon: &Daemon, volume: VolumeId) -> Option<u64> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return None;
   };
@@ -13227,7 +13233,9 @@ fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
 /// `volume`'s entries in flight on its owner as the owner's status reports its live log (the head's position past the
 /// durable one), or `None` while the status shows no log for it.
 fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -13256,7 +13264,9 @@ fn owned_live_line(
   client: &mut Client,
   volume: VolumeId,
 ) -> Option<(Option<u64>, Option<u64>, bool)> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -14395,7 +14405,9 @@ const CONTINUITY_FILES: usize = 6;
 /// The epoch and position of the head of `volume`'s live log on `client`'s node, as the owner it ships from (its own
 /// log, not a candidate's copy).
 fn owned_live_head(client: &mut Client, volume: VolumeId) -> Option<(u64, u64)> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -15837,7 +15849,7 @@ fn retakeable_volume(
 /// Every live line `daemon`'s status shows for `volume`: the log it ships, if any, and its copy as a candidate, if any.
 fn live_lines(daemon: &Daemon, volume: VolumeId) -> Vec<LiveReport> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return Vec::new();
   };
@@ -16097,7 +16109,7 @@ const INSTALLS_WALKED: &str = "fleet.config.installs_walked";
 /// not answer.
 fn held_record_count(daemon: &Daemon) -> Option<u64> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return None;
   };
@@ -17024,7 +17036,7 @@ fn heal_the_probe_plane(daemons: &[Daemon]) {
 
 /// This node's host epoch, from its status, through a client of `daemon`.
 fn host_epoch_of(daemon: &Daemon) -> Option<u64> {
-  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => Some(report.fleet.host_epoch),
     _ => None,
   }
@@ -19682,7 +19694,9 @@ struct RestartedSuccessor {
 /// `instance`'s own copy of `volume`'s log as a candidate, as its status reports it (`holding`).
 fn held_copy(instance: &str, volume: VolumeId) -> Option<LiveReport> {
   let mut client = Client::connect(instance);
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -21069,7 +21083,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     usize::from(TWO_SHARDS),
   )));
   let listed = client.call(&RequestBody::List { after: None });
-  let status = client.call(&RequestBody::DaemonStatus);
+  let status = client.call(&RequestBody::DaemonStatus { memory: false });
   daemon_a.stop();
   daemon_b.stop();
 
@@ -24031,7 +24045,7 @@ fn a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_s
       let seated = daemon.council_voters()?.is_some_and(|voters| {
         voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
       });
-      let kept = match status.call(&RequestBody::DaemonStatus) {
+      let kept = match status.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
         _ => usize::MAX,
       };
@@ -24326,7 +24340,7 @@ fn a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_su
       let seated = daemon.council_voters()?.is_some_and(|voters| {
         voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
       });
-      let kept = match status.call(&RequestBody::DaemonStatus) {
+      let kept = match status.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
         _ => usize::MAX,
       };
@@ -29664,7 +29678,9 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
 
 /// The sum over `client`'s daemon's shards of the counter `kind` (`slates status`'s per-shard counts).
 fn shard_count(client: &mut Client, kind: &str) -> u64 {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the daemon reported its status");
   };
   report
@@ -29931,7 +29947,9 @@ fn a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing() {
 /// macOS, as the one test that asks it is.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
-  let Ok(ReplyBody::DaemonStatus { report }) = client.call(&RequestBody::DaemonStatus) else {
+  let Ok(ReplyBody::DaemonStatus { report }) =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the daemon reported its status");
   };
   report

@@ -658,6 +658,13 @@ impl SparseObject {
     crate::resident::of_range(self.inner.base().wrapping_add(offset), len, self.page)
   }
 
+  /// What of the whole map is in RAM, from the kernel's per-mapping figures rather than a page walk
+  /// ([`crate::resident::of_mapping`]; main's ruling on g228's finding): the anchor's content object and segment whole,
+  /// tens of GiB of address space, for the cost of reading their mappings.
+  pub fn mapped_residency(&self) -> Result<crate::resident::Residency, MemError> {
+    crate::resident::of_mapping(self.inner.base(), self.len, self.page)
+  }
+
   /// Copies the `into.len()` bytes at `offset` out (committed first); refused past the end or touching a
   /// declared word.
   pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {

@@ -238,6 +238,8 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     .as_deref()
     .map(|dir| start_store(std::path::Path::new(dir), &config))
     .transpose()?;
+  config.vcs_view_root = store.as_ref().map(|(_, views)| *views);
+  let store = store.map(|(owner, _)| owner);
   config.vcs_disk = store.as_ref().map(slates_store::owner::StoreOwner::handle);
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
@@ -306,7 +308,13 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
 fn start_store(
   dir: &std::path::Path,
   config: &DaemonConfig,
-) -> Result<slates_store::owner::StoreOwner, Failure> {
+) -> Result<
+  (
+    slates_store::owner::StoreOwner,
+    &'static slates_land::store_root::StoreRoot,
+  ),
+  Failure,
+> {
   use slates_land::store_root::{StoreGrant, StoreRoot};
   let target = StoreRoot::identify(dir).map_err(|e| failed("vcs store directory", e))?;
   let grant = StoreGrant {
@@ -321,6 +329,11 @@ fn start_store(
     grant.target.inode
   );
   let root = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  // The same grant opened once more for the views slates presents in the directory (A-645 (a): a Subversion
+  // repository's FSFS view, mounted read-only there for its hooks), held for the process's life: one handle per daemon
+  // start, which a restart opens again.
+  let views = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  let views: &'static StoreRoot = Box::leak(Box::new(views));
   let disk = root
     .free_bytes()
     .map_err(|e| failed("vcs store free space", e))?;
@@ -329,24 +342,96 @@ fn start_store(
   let waiting = config
     .clients_per_shard
     .saturating_mul(usize::from(config.runtime.shards).max(1));
-  slates_store::owner::StoreOwner::start(root, sizing, waiting).map_err(|e| failed("vcs store", e))
+  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+    .map_err(|e| failed("vcs store", e))?;
+  Ok((owner, views))
 }
 
-/// The store's sizing from this daemon's derivations (A-767; Ada's memory-sizing ruling: from the work, never the
-/// machine): its engine's memory the shard's reserve, its disk what the store's file system has free, its extent the
-/// content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its fanout SplinterDB's.
+/// The store's sizing from the work, never the machine (A-767; Ada's memory-sizing ruling). Its engine's memtable is one
+/// trunk node's worth, `fanout` extents: what one flush turns into one bundle; the engine learns it upward from the rows
+/// it holds (owed, GAPS), so a 128 GiB machine and a laptop start the same. Its disk is what the store's file system
+/// has free, its extent the content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its
+/// fanout SplinterDB's. Until 2026-11-20 the memtable was the shard's reserve, sized from the machine, which on a 128 GiB
+/// Mac passed the engine's 4 GiB bound and refused every landing (w-hg, by use).
 fn store_sizing(config: &DaemonConfig, disk: u64) -> slates_store::store::Sizing {
   let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
     8,
     "SplinterDB's target fanout, as mantle runs its engine until its E-step measures F on this hardware",
     ["engine-structure.md §4"]
   );
+  let extent_bytes = slates_vfs::content::chunk_bytes(config.page).get();
   slates_store::store::Sizing {
-    memory: usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX),
+    memory: extent_bytes.saturating_mul(fanout.get()),
     disk,
-    extent_bytes: u64::try_from(slates_vfs::content::chunk_bytes(config.page).get())
-      .unwrap_or(u64::MAX),
+    extent_bytes: u64::try_from(extent_bytes).unwrap_or(u64::MAX),
     fanout: fanout.get(),
+  }
+}
+
+#[cfg(test)]
+mod store_sizing_tests {
+  #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+
+  use slates_store::log::{Header, SectionKind, Tool};
+
+  /// A fresh directory beside the test binary, in the build output (R1: never `/tmp`).
+  fn store_directory(name: &str) -> std::path::PathBuf {
+    let binary = std::env::current_exe().unwrap();
+    let dir = binary
+      .parent()
+      .unwrap()
+      .join(format!("vcs-sizing-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.canonicalize().unwrap()
+  }
+
+  /// A-767, w-hg's finding (a 128 GiB Mac refused every landing, "a memtable past 4 GiB"; main's order of 2026-11-20).
+  /// Do: for an 8 GiB and a 128 GiB machine, the profile's memory injected where the product reads it, derive the
+  /// daemon's configuration, start its store as `--vcs-store` does, land a changeset through a shard's handle and stop
+  /// the store. Expect: the engine opens, the landing is answered and the stop is clean at both extremes, and both
+  /// machines size the store alike: it is sized by its work (one trunk node of extents), never by the machine.
+  #[test]
+  fn the_store_lands_on_a_small_and_a_large_machine_alike() {
+    let measured = super::measure(true).unwrap();
+    let mut memories = Vec::new();
+    for (name, total) in [("8g", 8u64 << 30), ("128g", 128u64 << 30)] {
+      let mut profile = measured.clone();
+      profile.facts.memory.total = total;
+      profile.facts.memory.available = total / 2;
+      profile.facts.memory.limit = None;
+      let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
+      let dir = store_directory(name);
+      let (owner, _views) = super::start_store(&dir, &config).unwrap();
+      let handle = owner.handle();
+      let runtime = slates_rt::runtime::LocalRuntime::new(&config.runtime).unwrap();
+      let landed = runtime
+        .block_on(async move {
+          handle
+            .land(
+              Header {
+                tool: Tool::Mercurial,
+                repository: 7,
+                sequence: 0,
+                judged_over: 0,
+                grant: 1,
+                work: 0,
+                time_ns: 1,
+                sections: 0,
+              },
+              vec![(SectionKind::Record, b"clone".to_vec())],
+            )
+            .await
+        })
+        .unwrap();
+      assert!(landed.is_ok(), "{name}: {landed:?}");
+      drop(runtime);
+      let stopped = owner.stop();
+      assert!(stopped.is_ok(), "{name}: {stopped:?}");
+      memories.push(super::store_sizing(&config, 1 << 30).memory);
+      let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(memories[0], memories[1], "the store is sized by its work");
   }
 }
 

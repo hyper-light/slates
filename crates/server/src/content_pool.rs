@@ -136,7 +136,9 @@ pub(crate) fn hold_toward(
 /// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range: its length cut on `unit` into
 /// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. At most one part per bit
 /// of `len / unit`.
-/// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]).
+/// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]): what a Windows extent's length is read
+/// from (`crate::content_extents::extent_len`, A-789).
+#[cfg(windows)]
 pub(crate) fn parts_of(config: &DaemonConfig) -> Vec<(usize, usize)> {
   arena_parts(config.shard_content_layout().arena.1, config.pool_unit())
 }
@@ -306,16 +308,19 @@ impl ContentPool {
     {
       // An extent of its own (macOS): made at its owner's start or at its last release; made here only if neither
       // could (the OS refused it then).
-      // SAFETY: no other mapping in any process reaches the extent's object while this region lives: this partition
-      // holds its owner word (claimed by compare-and-swap, or held from the previous daemon, which has exited), and the
-      // object is unmapped before its word is released (`release`). The anchor never maps it.
-      let object = match unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) } {
-        Ok(object) => object,
-        Err(_) => {
-          slates_mem::make_extent(&extent, len).map_err(ServerError::Memory)?;
-          // SAFETY: as above.
-          unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) }
-            .map_err(ServerError::Memory)?
+      // At most two attempts: the open, and once the extent is made, the open again.
+      let mut made = false;
+      let object = loop {
+        // SAFETY: no other mapping in any process reaches the extent's object while this region lives: this partition
+        // holds its owner word (claimed by compare-and-swap, or held from the previous daemon, which has exited), and
+        // the object is unmapped before its word is released (`release`). The anchor never maps it.
+        match unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) } {
+          Ok(object) => break object,
+          Err(refusal) if made => return Err(ServerError::Memory(refusal)),
+          Err(_) => {
+            slates_mem::make_extent(&extent, len).map_err(ServerError::Memory)?;
+            made = true;
+          }
         }
       };
       return Ok(Region::shared(object, self.page));

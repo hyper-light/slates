@@ -46,6 +46,14 @@ pub const ROWS_FILE: &str = "rows";
 const CHANGESETS: u8 = b'C';
 /// Format: the content table's tag: a payload section's identity to its place in the log.
 const CONTENTS: u8 = b'P';
+/// Format: the tag of a standing grant's row (A-767's `G`: the grant the store's directory was opened under, R10).
+const GRANTS: u8 = b'G';
+/// Format: a grant row's key: the tag and the grant's id.
+const GRANT_KEY_BYTES: usize = AFTER_TAG + U64;
+/// Format: a grant row's value: when it was first issued, the directory's device and inode.
+const GRANT_VALUE_BYTES: usize = U64 + U64 + U64;
+/// Format: the BLAKE3 key-derivation context of a standing grant's id, from its directory's device and inode.
+const GRANT_ID_CONTEXT: &str = "slates 2026-11-20 store standing grant id";
 /// Format: a `u64` field's width.
 const U64: usize = size_of::<u64>();
 /// Format: a repository id's width (`u128`, A-515).
@@ -112,6 +120,11 @@ pub enum StoreError {
   BadRow,
   /// A section named a staged content that is not staged.
   NotStaged,
+  /// A sliced landing's step named a landing that is not open: committed, abandoned (its client let it go), or
+  /// another's.
+  NoLanding,
+  /// The owner's queue of landings waiting for an open sliced landing is full (the asker's `OwnerError::Busy`).
+  Held,
 }
 
 impl fmt::Display for StoreError {
@@ -124,6 +137,8 @@ impl fmt::Display for StoreError {
       Self::Sizing(what) => write!(f, "the store's sizing: {what}"),
       Self::BadRow => f.write_str("a store row that does not decode"),
       Self::NotStaged => f.write_str("a section named a content that is not staged"),
+      Self::Held => f.write_str("the store's owner holds as many landings as it may wait"),
+      Self::NoLanding => f.write_str("no such landing is open (committed, abandoned or another's)"),
     }
   }
 }
@@ -188,11 +203,28 @@ pub struct Store {
   rows: ShardDb<DeviceFile>,
   /// Reused for every row's value.
   value: Vec<u8>,
+  /// The standing grant its directory is written under, as first recorded.
+  grant: GrantRow,
+}
+
+/// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
+/// header names as its `grant`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrantRow {
+  /// The grant's id: its directory's device and inode, hashed.
+  pub id: u64,
+  /// When it was first issued (monotonic ns of the issuing process): kept as first recorded.
+  pub issued_ns: u64,
+  /// The directory's device.
+  pub device: u64,
+  /// The directory's inode.
+  pub inode: u64,
 }
 
 impl Store {
-  /// Opens the store in the granted directory `root`, creating its files on first use, and recovers: the engine at its
-  /// checkpoint, then the log's records past it applied again.
+  /// Opens the store in the granted directory `root`, creating its files on first use, and recovers: the engine at its checkpoint, the log replayed from there, and the standing grant
+  /// `root` was opened under recorded durably as its `G` row the first time (checkpointed before the store serves), or
+  /// found as first recorded every time after.
   pub fn open(root: StoreRoot, sizing: Sizing) -> Result<Self, StoreError> {
     let log_file = adopt(&root, LOG_FILE)?;
     let rows_existed = root.exists(ROWS_FILE)?;
@@ -208,36 +240,69 @@ impl Store {
     let mut buffer = Vec::new();
     let log = ChangesetLog::recover(log_file, applied, |file, located| {
       if replayed.is_ok() {
-        replayed = put_changeset(&mut rows, located, &mut value).and_then(|()| {
-          for section in sections_in(file, located)? {
-            if section.kind == SectionKind::Payload {
-              let identity = identity_of_range(file, section.offset, section.len, &mut buffer)?;
-              put_content(&mut rows, &identity, section.offset, section.len)?;
-            }
-            if section.kind == SectionKind::Texts {
-              buffer.clear();
-              buffer.resize(
-                usize::try_from(section.len)
-                  .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
-                0,
-              );
-              file
-                .read_exact_at(&mut buffer, section.offset)
-                .map_err(LogError::from)?;
-              crate::texts::put_rows(&mut rows, &located.header, &buffer)?;
-            }
-          }
-          Ok(())
-        });
+        replayed = put_rows_from_log(&mut rows, file, located, (&mut value, &mut buffer));
       }
     })?;
     replayed?;
-    Ok(Self {
+    let mut store = Self {
       root,
       log,
       rows,
       value,
-    })
+      grant: GrantRow {
+        id: 0,
+        issued_ns: 0,
+        device: 0,
+        inode: 0,
+      },
+    };
+    store.grant = store.record_grant()?;
+    Ok(store)
+  }
+
+  /// The standing grant the store's directory is written under, as first recorded (its `G` row).
+  pub fn grant(&self) -> &GrantRow {
+    &self.grant
+  }
+
+  /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the engine so it is
+  /// durable before anything lands.
+  fn record_grant(&mut self) -> Result<GrantRow, StoreError> {
+    let grant = self.root.grant();
+    let id = grant_id(grant.target.device, grant.target.inode);
+    let mut key = [0u8; GRANT_KEY_BYTES];
+    put(&mut key, 0, &[GRANTS]);
+    put(&mut key, AFTER_TAG, &id.to_be_bytes());
+    if self.rows.get(&key, &mut self.value)? {
+      let word = |at: usize| -> Result<u64, StoreError> {
+        let bytes = self
+          .value
+          .get(at..at.saturating_add(U64))
+          .ok_or(StoreError::BadRow)?;
+        Ok(u64::from_le_bytes(
+          bytes.try_into().map_err(|_| StoreError::BadRow)?,
+        ))
+      };
+      return Ok(GrantRow {
+        id,
+        issued_ns: word(0)?,
+        device: word(U64)?,
+        inode: word(U64 + U64)?,
+      });
+    }
+    let row = GrantRow {
+      id,
+      issued_ns: grant.issued_ns,
+      device: grant.target.device,
+      inode: grant.target.inode,
+    };
+    let mut value = [0u8; GRANT_VALUE_BYTES];
+    put(&mut value, 0, &row.issued_ns.to_le_bytes());
+    put(&mut value, U64, &row.device.to_le_bytes());
+    put(&mut value, U64 + U64, &row.inode.to_le_bytes());
+    self.rows.put(&key, &value)?;
+    self.checkpoint()?;
+    Ok(row)
   }
 
   /// The granted directory.
@@ -251,9 +316,45 @@ impl Store {
     Ok(self.log.begin(header)?)
   }
 
-  /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable.
+  /// Opens a landing whose steps come over many requests (the owner's sliced landing): the record's header written
+  /// where the log ends, nothing visible until [`Store::commit_landing`]. Refused while one is open.
+  pub fn open_landing(&mut self, header: Header) -> Result<(), StoreError> {
+    Ok(self.log.open_record(header)?)
+  }
+
+  /// Begins the open landing's next section, `len` bytes of `kind`.
+  pub fn landing_section(&mut self, kind: SectionKind, len: u64) -> Result<(), StoreError> {
+    Ok(self.log.open_section(kind, len)?)
+  }
+
+  /// Writes the next `bytes` of the open landing's section.
+  pub fn landing_part(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+    Ok(self.log.open_piece(bytes)?)
+  }
+
+  /// Commits the open landing (one flush) and applies its rows ([`Store::applied`]).
+  pub fn commit_landing(&mut self) -> Result<Located, StoreError> {
+    let located = self.log.commit_open()?;
+    self.applied(&located)?;
+    Ok(located)
+  }
+
+  /// Lets the open landing go: the log's end stays where it was, and the next record is written over its bytes.
+  pub fn abandon_landing(&mut self) {
+    self.log.abandon_open();
+  }
+
+  /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable. Its sections
+  /// are read back from the log, as a recovery's replay reads them, so a changeset landed a slice at a time gets every row
+  /// `land` puts (`C`, `P` for each payload, `T`/`H` from its `Texts`; w-perf's finding).
   pub fn applied(&mut self, located: &Located) -> Result<(), StoreError> {
-    put_changeset(&mut self.rows, located, &mut self.value)
+    let mut buffer = Vec::new();
+    put_rows_from_log(
+      &mut self.rows,
+      self.log.file(),
+      located,
+      (&mut self.value, &mut buffer),
+    )
   }
 
   /// Lands a changeset whose sections are `sections`, each bytes the caller holds or a content staged in `staging`
@@ -490,6 +591,19 @@ fn engine_sizing(
   ))
 }
 
+/// A standing grant's id (its `G` row's key, and what each landing's header names as its `grant`): its directory's
+/// device and inode, hashed (so a directory replaced at the same path is another
+/// grant's).
+pub fn grant_id(device: u64, inode: u64) -> u64 {
+  let mut hasher = blake3::Hasher::new_derive_key(GRANT_ID_CONTEXT);
+  hasher.update(&device.to_le_bytes());
+  hasher.update(&inode.to_le_bytes());
+  let hash = hasher.finalize();
+  let mut id = [0u8; U64];
+  id.copy_from_slice(hash.as_bytes().get(..U64).unwrap_or(&[0u8; U64]));
+  u64::from_le_bytes(id)
+}
+
 /// The changeset row's key.
 fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   let mut key = [0u8; KEY_BYTES];
@@ -497,6 +611,37 @@ fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   put(&mut key, AFTER_TAG, &repository.to_be_bytes());
   put(&mut key, K_SEQUENCE, &sequence.to_be_bytes());
   key
+}
+
+/// Puts every row of the committed record `located`, its sections read back from `file`: the `C` row, a `P` row for each
+/// payload (its identity hashed from the log), the `T`/`H` rows of its `Texts`. One function for a recovery's replay and
+/// for [`Store::applied`], so a record is indexed the same whichever way it landed.
+fn put_rows_from_log<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  located: &Located,
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  put_changeset(rows, located, value)?;
+  for section in sections_in(file, located)? {
+    if section.kind == SectionKind::Payload {
+      let identity = identity_of_range(file, section.offset, section.len, buffer)?;
+      put_content(rows, &identity, section.offset, section.len)?;
+    }
+    if section.kind == SectionKind::Texts {
+      buffer.clear();
+      buffer.resize(
+        usize::try_from(section.len)
+          .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+        0,
+      );
+      file
+        .read_exact_at(buffer, section.offset)
+        .map_err(LogError::from)?;
+      crate::texts::put_rows(rows, &located.header, buffer)?;
+    }
+  }
+  Ok(())
 }
 
 /// Puts the changeset row of the committed record `located`.

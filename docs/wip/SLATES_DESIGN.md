@@ -1413,6 +1413,30 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > turn), and `heap` (the system allocator's own statistics and the large path's mappings, `slates_mem::heap`). A fresh
 > debug daemon on the Mac Studio read every kind within 8 status calls (2.5 s), its longest advance 0.67 ms, none past
 > its budget. It replaces suspending the daemon with `vmmap` or `heap`, which past the anchor's window kills it (A-232).
+>
+> **Status (2026-11-20, g228: the sweep on the shard's idle time, spaced by its length).** Armed as a task that advanced
+> a step a turn, a status request's sweep ran half a step quantum of `mincore` ahead of every turn's ready work for as
+> long as it lasted, seconds over tens of GiB of address space, on every shard the request reached. Live writes begun
+> after a status request paid it at every hop, and every daemon burned seconds of CPU (BENCHMARKS, "What live shipping
+> adds to a stable write, after A-396's holds"). The sweep is now the shard's idle work (`ShardContext::set_idle_work`,
+> `content_ranges::idle_slice`): it advances only when the shard has nothing ready and its idle spin has run out, and a
+> sweep is armed no sooner after the last completed than that one took, so sweeps take at most half a shard's time
+> however often status is asked and a report reads figures at most two sweeps old. Counted
+> `content_range.sweep.idle_slices` and `.spaced`; held by
+> `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
+>
+> **Status (2026-11-20, main's ruling on g228's finding: residency only when asked, and no page walk for an object
+> whole).** A plain `DaemonStatus` does no residency work: the request carries `memory`, and only one that asks
+> (`slates status --memory`, `Client::daemon_memory_status`) advances the A-744 sweep, arms it on idle time and reads
+> the anchor's objects whole; a plain status reports the last figures read. The segment and the content object whole
+> come from the kernel's per-mapping figures (`slates_mem::resident::of_mapping`): macOS `mach_vm_region`'s top
+> information, each VM object's resident pages counted once (no written bytes reported there), Linux `/proc/self/smaps`
+> (`Rss` and the dirty pages); Windows, which has no per-mapping form, keeps the bounded walk only the asking request
+> pays. Measured on a Mac Studio (32 GiB shared mapping, 2 GiB written): 0.11 ms against `mincore`'s 30.0-31.7 ms,
+> agreeing to the page (BENCHMARKS). Counted `content_range.sweep.armed` and `.steps`; held by
+> `a_burst_of_plain_statuses_arms_no_residency_sweep_and_a_memory_status_does` (`crates/server/tests/daemon.rs`; red
+> with every status doing the work: 50 plain statuses armed one sweep a shard and took 398 and 177 steps) and
+> `resident::tests::a_mapping_read_whole_agrees_with_its_page_walk`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
@@ -1707,9 +1731,23 @@ cluster.
 > stand-in for the client's shard tells the waiting shards after every message it takes, as a drain does
 > (`slates_rt::registry::Registration::tell_room`), and nothing else moves the carrier.
 
+**Yield at the quantum when someone waits** (A-783, amending the rule that a cooperative step yields at its quantum).
+A paced step (`slates_pace::Step`, the one primitive every paced path uses: a push's build, git's and Mercurial's
+answers, Subversion's landings) runs units while its quantum has room for the next unit's estimated cost; at the
+quantum's end it asks once whether anyone else waits on its shard (`slates_rt::futures::others_waiting`: an inbound
+ring, a ready poller, the driver's completions harvested without blocking, a due timer, a ready task, or a task of the
+step's batch not yet polled, which the step took out of the ready queue with the asker). If someone does
+it yields there; if no one does it takes another quantum, up to the shard's ceiling (the watchdog's look,
+`HEARTBEAT_NS`: a step that ends within a look leaves every look a step to see). One ask a quantum, never one a unit
+(D-7, D-8), and never sooner than an ask costs. Each unit kind's cost is its own measured estimate: the running mean
+until the count reaches `ceil(CV^2 / e^2)` (CV the spread over the mean, `e` the target error, the scheduler's measured
+jitter over the quantum), then an exponentially weighted mean over that window (R3). A poll that asked and found no
+one is judged against the allowance its last ask gave, never counted a long step for it.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
-the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
+the CPU, or past the allowance its last ask for waiters gave, A-783, or waiting inside a call past it): Degraded,
+counted (`long_steps`, `blocked_steps`), the
 offending operation is chunked by design (destroys, large clones) so this is a bug signal. A poll the
 host held off the CPU past the quantum: counted apart (`preempted_steps`), never the task's; one the
 platform cannot attribute (macOS off the CPU, Windows everywhere): counted unattributed.
@@ -10569,6 +10607,26 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > its own `unique`. A request still pending past its deadline, or past the bound, is answered the retry, as are those
 > whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
 > mount over a socket pair on an audit shard and expects a kept request answered before the device's.
+
+> **Status (2026-11-20, A-791: a volume over an S3 base made through the wire).** Built: `CreateOverS3` (appended to
+> the wire's requests) names the base (`S3BaseSpec`: the endpoint, region, bucket, prefix, addressing and the
+> authorities for TLS) and hands the credential its fetches are signed with (`S3Credential`, whose `Debug` names the
+> access key alone); the client's `create_over_s3` sends it. The volume's owner shard makes the overlay over an
+> `S3Host` of the base (`verbs::open_s3_base`: the root's facts need no fetch; the host's cache is the volume's byte
+> bound within what the shard could admit, refused `BudgetExceeded` below one chunk), puts the host in the slot
+> (`BaseHost::S3`), and starts the base's fetch driver over the store client (`verbs::s3_client_of`, `base_wait::
+> spawn_driver`) before the volume is published, so a full task arena refuses the create `Overloaded` with nothing
+> made. The client's requests may be as late as the daemon's liveness window and never take longer in all than the
+> shard's failover delay, the longest a parked request waits. The catalog records the base alone
+> (`BaseRecord::S3`, appended); the credential is held in RAM by the owner shard and never written (R1). A recovery
+> over an S3 base holds the volume unavailable (`BaseUnavailable`, naming the base) until the credential is handed
+> again, and a clone of such an overlay is refused `BaseUnavailable`: the host's fetch state and its credential are
+> not duplicated. An image of the volume records each listed directory by its identity (`HostFs::identify_dir`: the
+> device, number and birth a recovery holds it to), which an S3 base answers with no fetch; it recorded the whole
+> fingerprint, whose listing had not landed, so every create over an S3 base was skipped by the shard's publication
+> (`EAGAIN`) and answered `ContentUnavailable`. A host directory's identity is its fingerprint, as before. Owed: the anchor's hold of the credential across a daemon restart and the recovery that uses it;
+> name resolution (a host that is not an IPv4 address is refused `BaseUnavailable`) and the platform's trust roots
+> (the caller hands the authorities); the library's `VolumeSpec` over an S3 base.
 
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
@@ -56515,11 +56573,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
   ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
   node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
-  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`.
-- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
-  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
-  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
-  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`. Part 2a (same day): every
+  file of the view is a referenced file (the small ones one made piece, made again when its bytes change), so the view's
+  volume keeps nothing in the shard's chunk store and a read of it can run while that store is lent to the content
+  store's windows (A-727 a2), the test holding the chunk store empty; and `slates_land::store_root::StoreRoot::mount_point`
+  makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
+  alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
+  `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
+- **Part 3, its fifth piece (2026-11-20, A-645 (a) parts 2b and 2c, main's ruling of 20:00): a hook is handed its
+  repository's view, mounted under the store's standing grant.** Where the daemon is given a store directory
+  (`--vcs-store`, A-767's standing grant), the daemon role opens it once more for views (`DaemonConfig::vcs_view_root`),
+  and every shard's `ShardState::hook_views` is `HookViews::Granted`. A configured Subversion hook's `REPOS-PATH` is
+  then `svn_presenter::repos_for_hook`, run on the repository's owner shard (`xshard::task_in_shard_time`):
+  - the view volume made once, a scratch volume owned by the repository's owner, named `.svn-view.<repository>.<n>`
+    with `n` the first number whose name routes to the owner shard (`verbs::owner_of_name`), so the view's reads run where
+    the records are;
+  - laid out a revision a turn (`present_slice`, inside `vcs_store::lent_state`, so a text the content store keeps is
+    held), then each revision's properties file refreshed a revision a turn (`refresh_slice`), since a revision property
+    change may have changed them;
+  - mounted read-only, once, at `<store>/<repository>.svn` (`StoreRoot::mount_point`) by the daemon's own `slates
+    --instance I mount <view volume> <point> --read-only`, run as a helper of the shard (`hook_driver::run_helper`, its
+    exit awaited through `ExitWatch`, bounded by the failover delay, killed with its group past it), so each platform
+    mounts it as any client's mount does (§4.6: Linux FUSE through `fusermount3`, macOS NFS `mount(2)`).
+  The bridges read a view volume's texts through `VolumeBridge::reading_referenced` (bridge-core, new): the daemon's NFS
+  export (`nfs::with_export`) and FUSE turn (`fuse::turn_with`) serve a view volume's request inside `lent_state`, the
+  view's `ViewTexts` lent to the bridge. A daemon with no store directory refuses a configured hook typed
+  (`svn_presenter::UNGRANTED_WORDS`, `SVN_ERR_UNSUPPORTED_FEATURE`; git's push `no standing grant to show a hook its
+  view`); the unpublished root mount and `ShardState::root_mount` are gone, and `Daemon::record_root_mount` is the
+  in-process hook tests' stand-in (`HookViews::Given`). Held by `slates-server --lib` vcs_svn, git_push, vcs_ssh's svn,
+  vcs_http's svn and daemon edge, svn_hooks, hook_driver and the presenter (67 of 67, macOS arm64), and owed to a host
+  with stock Subversion 1.15 and room to build: `svn_interop::a_repository_policys_hook_lets_stock_svn_change_a_revision_property`
+  (the anchor given `--vcs-store`, the hook running `svnlook youngest $REPOS`; red on main before: E200007). Windows:
+  the store directory is `Unsupported` there and no hook runs, so a configured hook stays refused typed.
+- **Owed.** The by-use run above (in run-requests.md); a per-change signal for revision properties instead of the
+  refresh of every revision's file at each hook (GAPS); the view's mount ended with the repository; P4; and the
+  presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -57252,6 +57340,13 @@ Applied in the same change to: part e's entry (its "Owed" closed), GAPS (A-247's
   `a_candidate_behind_the_tail_of_a_large_volume_is_installed_from_an_image_sealed_in_turns` (a 3 MiB file, a candidate
   stopped while it is overwritten, then resumed), red before (the image made in one turn), 65 turns after with one stale
   build dropped and made again.
+- **Part 5 under a stream (2026-11-20, Goal 85b C3).** "Only if the head is still the one it was captured at" never held
+  while writes went on: the seeded nemesis (seeds 1256052866610850298, 5939796479076166087) dropped 1,055 of 1,055
+  images, and a candidate behind the tail stayed 608 and 743 entries behind through the fleet wait. An image is now made
+  at the head it was captured at while the retained tail still reaches past that head (`Shipper::mark_checkpoint` takes a
+  head behind the owner's on its chain that `retains_after` reaches past, never one behind the checkpoint): a holder
+  installed there catches up by the entries after it (A-428). Test: `slates-db` live
+  `a_whole_state_behind_the_head_is_the_checkpoint_while_the_tail_holds_what_follows` (red: refused, checkpoint none).
 - **Applied in the same change to** GAPS (the one-turn walks entry), amendments.tsv. g226's branches touch neither
   `db::live` nor `live_ship` (checked 2026-11-20), so no order was needed.
 
@@ -57447,8 +57542,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
   `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
   in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
-- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
-  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
+- **Part 3, the files made before the commit** (2026-11-20, closing A-760, main's close order C1). `Green::make_step`
+  makes a held verdict's files a copy slice a step (a file is its pieces of base and post-state, `segments`, copied
+  in order into its bytes reserved once), so the commit copies none: a splice of five bytes into a large file costs
+  its turns, never the commit's one step. Every file but those a run makes whole is made first, and each whole run's
+  buffer is moved into its file last; a green that moved since the verdict refuses the step `HeadMoved`, as the commit
+  does. Counted: `files_made_in_steps`. Test: a 1 MiB file spliced from one run beside a file made whole of another,
+  made a 64 KiB slice a step: no step past its slice, the spliced file copied once over the steps, the commit making
+  none, the whole run's buffer the created file.
+- **A bug in part 2, fixed with it.** The commit moved a whole run's buffer into its file before it made the others,
+  and a moved buffer shortens the post-state's one address space: every later run's bytes moved down by its length, so
+  a file spliced from a later run was made of the wrong bytes, silently
+  (`a_run_moved_into_its_file_leaves_later_runs_where_they_were`: `bytes` where `secon` belonged). Now the whole runs
+  are found first, every other file made with every buffer in place, the buffers moved last.
+- **Owed, named, not A-760's.** w-svn's landing driving the turns (`svn.land.*`, with `make_step` between its judge and
+  its commit); items 3-7 (w-engine's queue) then name the plane's object from the green's block, so the text is held
+  once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
@@ -57834,9 +57943,49 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
 > `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
 > the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
-> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
-> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
-> (`examples/per_path_read.rs`, Mercurial's own history).
+> (red with the rows not written: no landed text). A changeset landed through `begin`/`applied` gets every row since
+> bc0677af9 (`applied` reads the committed record back, as a replay does). Owed: the release timing against the
+> per-file arm's 91 µs (`examples/per_path_read.rs`, Mercurial's own history).
+
+> **Status (2026-11-20, the store sized by its work at both extremes; the owner's sliced landing).** A 128 GiB Mac
+> refused every landing (w-hg: "a memtable past 4 GiB"): the store's memtable was the shard's reserve, which grows with
+> the machine. It is one trunk node of extents (fanout × the content plane's chunk), the engine's own unit of work;
+> the memtable holds rows, never a landing's bytes (those are in the log), so no machine input belongs in it and no
+> clamp is needed. Held by `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike` in
+> `slates-api` (8 GiB and 128 GiB profiles injected into the machine facts the daemon derives from, the store started
+> as `--vcs-store` starts it, a landing and a clean stop at each; red at 128 GiB, the landing `Gone`, under the
+> machine-sized formula). A device's flush rate belongs to the log's group commit (owed), not the memtable. The
+> owner's sliced landing: `StoreHandle::begin` opens a record whose state lives in the log (`ChangesetLog::open_record`,
+> `open_section`, `open_piece`, `commit_open`, `abandon_open`), so the owner serves reads between its parts;
+> `SlicedLanding::section`, `part` (at most one piece, the read's unit, so a landing in flight holds a piece a request)
+> and `commit`; other landings wait in the owner's queue, bounded by the request channel's capacity and refused `Busy`
+> past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
+> end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
+
+> **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
+> (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
+> `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
+> into a set bounded by the caller's derived `most`, least recently used let go first, a range past the bound refused
+> `PastBound`, an unknown pack `Missing`; `piece` lends from the set alone and answers `None` on a miss, the caller's
+> cue to await a fill and step again. One way to the bytes (R6). The pack is named by plain BLAKE3 of its `Payload`
+> section, the store's `P` key. Held by `a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time`
+> (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
+> fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
+
+> **Status (2026-11-20, the standing grant's `G` row).** `StoreRoot` keeps the grant it was opened under;
+> `Store::open` finds its `G` row (keyed by `grant_id`: the directory's device and inode, hashed) or puts it and
+> checkpoints the engine before anything lands, so the grant is recorded once and kept as first issued;
+> `StoreHandle::grant` is the id each landing's header names (the creation's since this change). Held by
+> `a_stores_standing_grant_is_recorded_once_and_found_after_a_crash` (`tests/store.rs`) and the creation test's
+> provenance check (`repository/store_tests.rs`). Owed: the audit position (a standing-grant audit kind) and revocation.
+
+> **Status (2026-11-20, a creation in the one landing order).** `CreateRepository` on a node keeping a store now lands
+> first and records second, as every landing does: the repository's record judged (the guard alone), its ids and its
+> root's reserved past the partition's family counter (`ShardState::family_reserved_through`, never lowered, so an id
+> whose creation never recorded is a gap), changeset 0 landed, then in one transaction the repository, its root and
+> its completion recorded, then the answer (deferred, AUD-11). A kill between the two leaves a changeset no repository
+> names, which recovery passes over, and the client's retry creates the repository afresh. Without a store the record
+> is made at once, as before; with one, a request with no reply route is refused `Unsupported` (the fleet half, owed).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58420,6 +58569,78 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   748 s to 944 s (every client reached a verdict); oracle failures 0 in both. The next bound: the 70,205 clients that
   met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases), the client node's merge
   budget; a first-occurrence log line now names what holds it (`Partition::merge_budget_held`).
+
+### A-783 — Paced work yields at the quantum when someone waits (2026-11-20, w-engine; main's pacing call of 15:35, "(1) + (2) + (3), one primitive"; amends §4.3's yield-at-the-quantum; D-7, D-8, R3)
+
+- **The gap** (w-git's measure): a 9,000-object git answer ran in 8,498 steps (release) and 29,177 (debug); each yield
+  costs a scheduler turn under load, so its wall time was the step count times the host's turn (about 10 s at load 60
+  for milliseconds of CPU). The quantum is the shard's wake estimate (§4.3), a few microseconds, and the answer already
+  ran units until it was spent: units cost about a quantum, so steps were about units.
+- **The rule** (§4.3 "Yield at the quantum when someone waits"): a step asks at each quantum's end whether anyone else
+  waits on its shard and yields only if someone does; else it takes another quantum, up to the ceiling (the watchdog's
+  look). An ask is one probe a quantum, never one a unit, and no sooner than an ask costs (its own measured estimate),
+  so asking takes at most half a step whatever the quantum. A unit kind's estimate stops a step before a unit that would
+  end past its quantum while someone waits.
+- **The batch** (found by the A/B, 2026-11-20): a shard's step takes up to a batch of ready tasks out of its queue and
+  polls them in turn, so while the first runs a paced turn the rest are in neither the queue nor the control channel. A
+  ref advertisement's connection, moved to its repository's shard just as a build turn began there, was admitted in the
+  same step and taken into the same batch: the turn asked 4,263 times over 80 ms and found no one, and the newcomer was
+  first polled 94 ms after its move was sent (the daemon's log, a scratch diagnostic build). The probe counts the
+  batch's tasks not yet polled (`batch_left`, a plain cell the step sets before each poll). Red first:
+  `a_task_ready_in_the_same_batch_is_seen_waiting` unseen for its whole 2 s bound before, seen after.
+- **Where.** `slates-pace` (no runtime: its clock and probe given, so the engine, git, Mercurial and Subversion use it):
+  `Env`, `Step`, `UnitCost`, `Costs`, `Report`. `slates_rt`: `ShardContext::others_waiting` (counted:
+  `waiting_asked`, `waiting_found`), `step_ceiling_ns` (set by the daemon at each shard's start to `HEARTBEAT_NS`; a
+  runtime nobody configures keeps a quantum, as before), and the long-step count judged against the last ask's
+  allowance. `slates_merge::pace::Pace` runs on it (unit kinds walk, base, compose, post, hash); the push build's
+  turns pass the shard's probe and ceiling (`push.build.more_quanta`, `push.build.yielded`).
+- **Tests.** `slates-pace`: under a mixed workload (3 ns and 40 ns units, a 100 ns quantum) no step runs past its
+  quantum while someone waits once the estimates are learned, where the fixed slicing's do; while no one waits the
+  steps number the work over the ceiling, a tenth of the fixed slicing's or fewer, one ask a quantum; the estimate's
+  window follows the spread (CV 0.8 at e 0.1: 64 samples). `slates-rt` `tests/pacing.rs`: the probe sees a ready task
+  and nothing alone; a connection arriving at a listener on a busy shard, a spawn sent to it, and a task ready in the
+  same batch are each seen; a poll that asked and found no one counts no long step, one that did not ask counts one. Server
+  `t_a752` (debug, 1,500 files): the update's build in 10 turns over 41,497 quanta (was about 163,000 turns), past
+  budget 0, no turn past its ceiling by more than a unit.
+- **A/B** (main's condition (d), release, interleaved, every round shown, idle and at load = cores; BENCHMARKS.md
+  "Paced work yields only when someone waits"): the first pass found the batch above (B's newcomers waited out whole
+  turns, about 100 ms). With it fixed, the push build's turns fell 3 to 20 times in six idle rounds of seven (A about
+  371,000 a round of 8 pushes), the wall best 7.864 s against 6.011 s and median 9.204 against 7.195 s, the newcomers'
+  p99 median 2.51 against 2.53 ms and max median 13.12 against 13.62 ms, provisioning's p99 median 176.4 against 183.0
+  µs. Owed: one round gained nothing, every turn yielding at its first ask (GAPS).
+- **Applied in the same change to** `crates/pace` (new), `crates/rt` (`shard`: the probe, the batch, the ceiling, the
+  polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
+  (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
+  `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+
+### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
+- **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing
+  made a volume over an S3 base: no request named one, `spawn_driver` had no caller, and `BaseHost::S3` was built only
+  by tests.
+- **The change.** `RequestBody::CreateOverS3` (appended, tag 97) names the base (`S3BaseSpec`) and hands its credential
+  (`S3Credential`, its `Debug` naming the access key alone); the client's `create_over_s3` sends it. The owner shard
+  makes the overlay over an `S3Host` (`verbs::open_s3_base`; its cache the volume's byte bound within the shard's
+  admittable room, refused `BudgetExceeded` below one chunk), starts the fetch driver with the store client before the
+  volume is published (`verbs::s3_client_of`: the endpoint's host an IPv4 address, plain HTTP to loopback alone, HTTPS
+  with the caller's authorities; requests as late as the liveness window and no longer in all than the failover
+  delay), and records `BaseRecord::S3` (appended, tag 3) without the credential (R1). A recovery holds such a volume
+  unavailable until the credential is handed again; a clone of it is refused `BaseUnavailable`.
+- **Found by its test, fixed in the same change.** The shard's publication imaged each listed base directory with its
+  whole fingerprint, which over S3 needs the directory's listing, so the new volume was skipped (`EAGAIN`) and the
+  create answered `ContentUnavailable`. A recovery holds a directory to its identity alone (`same_object`), so the
+  image now records that (`HostFs::identify_dir`, defaulting to `fingerprint_dir`; an S3 base's needs no fetch).
+- **Applied in the same change to:** §4.15's status (a block after A-555's third piece), GAPS (A-464's owed list:
+  the create and the hand-off built; the anchor's hold, recovery, clone, the library's spec and name resolution owed),
+  `crates/ipc` (the request and its types, tag published), `crates/db` (`BaseRecord::S3`, tag published),
+  `crates/client` (`create_over_s3`), `crates/vfs` (`identify_dir`, the base image), `crates/base` (`S3Host` and
+  `BaseHost` answer it), `crates/server` (the create, the routing, recovery's and the clone's arms, `Lens`).
+- **Evidence (macOS arm64, adas-macbook-pro-2 through kiln run r52, 2026-11-20).** `cargo test --locked -p
+  slates-server --test s3_base`: red with the driver not started (the read still `Unpublished` at its 30 s bound,
+  32.93 s), green 2 of 2 in 5.04 s (`a_volume_made_over_an_s3_base_reads_its_objects_from_the_store` over a loopback
+  store answering `ListObjectsV2` and ranged `GetObject`; `a_credential_s_debug_text_never_names_its_secret`); before
+  the identity fix the create was refused `ContentUnavailable`. `-p slates-base --lib -- s3::host` 16 of 16 (the new
+  `a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s`); `-p slates-ipc --test wire_order` and `-p
+  slates-db --test wire_order` 2 of 2 each; rustfmt's layout applied.
 
 ### A-794 — A forwarded work's creation is made on the partition its name hashes to, and a forwarded verb parked at its work's gate answers its exchange when it resumes (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; §4.8 "Lookup", §4.16 "Role", A-247, A-400, A-697, AUD-11)
 - **Why.** A work over a green another node owns is made on its client's own partition when that node holds the

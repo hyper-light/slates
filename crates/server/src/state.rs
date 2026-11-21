@@ -786,6 +786,11 @@ pub struct ShardState {
   /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
   /// handle to its owner thread, through which a repository's landings reach the changeset log.
   pub vcs_disk: Option<slates_store::owner::StoreHandle>,
+  /// The partition's family numbers handed out but not yet recorded (`verbs::fresh_family_id_at` mints from past them):
+  /// a repository's creation reserves its ids when its verb runs and records them once its landing is durable (A-767
+  /// item 7's one landing order), so no id minted meanwhile is its. Never lowered while the process runs, so a number
+  /// whose creation never recorded is a gap, never handed out twice; a restart starts it at the recorded counter.
+  pub(crate) family_reserved_through: u64,
   /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
   /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
@@ -795,11 +800,15 @@ pub struct ShardState {
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
-  /// The root mount this daemon published (§4.6, D-1; A-645 P3): the point the host shows every volume beneath, which a
-  /// hook is handed its repository's view beneath. The daemon's own record of the mount it made, written on every shard
-  /// when it publishes the mount, never a configured value that could drift from the mount (main's ruling of
-  /// 2026-11-20). None until then, and a configured hook is refused, typed, while it is none.
-  pub(crate) root_mount: Option<std::path::PathBuf>,
+  /// Where a hook is shown its repository (A-645 (a), `crate::vcs_store::svn_presenter::HookViews`): the store's
+  /// granted directory, where the repository's view is mounted for it, or none, when a configured hook is refused, typed.
+  pub(crate) hook_views: crate::vcs_store::svn_presenter::HookViews,
+  /// The Subversion repositories whose FSFS view this shard presents for their hooks (A-645 (a)), by repository: its
+  /// volume, its layout so far and where it is mounted. Bounded by the repositories this shard owns.
+  pub(crate) svn_views: std::collections::BTreeMap<
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::svn_presenter::ViewSlot,
+  >,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
