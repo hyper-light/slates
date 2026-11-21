@@ -6983,8 +6983,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
      make_section/from_section, crates/server/src/content_extents_windows.rs, anchor_hold_windows.rs hold_extent/
      release_extent + adopt, content_pool.rs cfg(windows) arms, cli tests); `cargo xtask unsafe` (mem 86, server 9).
   2. `cargo test --locked -p slates-anchor --lib handles:: held_windows::` and `--test handles_windows`.
-  3. `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- a_freed_content_extent_gives_its_commit_back_on_windows
-     a_content_extent_outlives_a_killed_daemon_on_windows --nocapture --test-threads=1`.
+  3. `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test content_extents_windows -- --nocapture --test-threads=1`
+     (moved 2026-11-21 from cli.rs, which is #![cfg(unix)], acff9a6e8; before that they compiled to nothing on Windows).
      Red would look like: commit after the destroy within N/4 of with-burst (extents kept their commit), or the read after
      TerminateProcess differing / refused (an extent's section not held across the restart).
   4. RED-FIRST CHECK: run 3 also at the commit before this piece (origin/main before it) -- the commit test must fail
