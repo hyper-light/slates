@@ -1756,3 +1756,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - RULINGS: w-rewrite-ops' A-818 leaves name stable byte identities, option (ii): (i) would keep a whole earlier block per touched path, which goal 86b measured as BudgetExceeded at 100k. The location index is bounded and charged, the A/B includes the many-paths-once row against (i), and the oracle runs against today's reanchor. made_commit.rs::give_up's dead-code warning goes to w-lint (annotate it with its caller to come, or delete it).
 - RUN: main's r50 (P7's re-measure for w-svn on the MacBook, where the 437 MiB git-2000 dump is; current main, release; it cleans up after itself).
 - Disks: MacBook 50, Studio-2 120, Studio-4 41, big Studio 719 GB.
+- 2026-11-21 07:28 PST LANDED: 21ed9cd8d (w-lint round 19 at 481d7abef: debug prints out of the hg replay, the replay's open split, svn examples take Base). Working:
+  - w-fed-faults has its red, the resumed submit's longest step 417.5 ms in debug.
+  - w-rewrite-ops is landing A-818 piece 1 (the pure piece tree).
+  - w-work-mount's store Windows lane is pushed and in its jupiter run.
+  - r50 (P7's re-measure) is building on the MacBook; r26 (100k) is still queued.
+  - w-interop and w-shared were told to check runs placed on the big Studio during its 09:40-10:20 outage.
+  - Disks: MacBook 49, Studio-2 123, Studio-4 41, big Studio 714 GB.
