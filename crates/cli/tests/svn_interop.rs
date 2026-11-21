@@ -1415,8 +1415,11 @@ fn a_large_commit_measured() {
 /// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
 /// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
 /// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
+/// With `SLATES_SVN_IMPORT_HOLD` naming a path, the daemon is held after the import for main's heap attribution (P7's
+/// finding (2)): its pid written to the path, and the daemon kept until the path is deleted, at most [`PATIENCE`].
 #[test]
 #[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+#[allow(clippy::disallowed_methods)] // test code: the hold's pid file, at the path the measurer names
 fn an_import_measured() {
   let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
     eprintln!("skipping the import's measurement: SLATES_SVN_IMPORT_DUMP names no dump");
@@ -1472,6 +1475,28 @@ fn an_import_measured() {
     out.join().unwrap().trim(),
     err.join().unwrap().trim()
   );
+  if let Ok(hold) = std::env::var("SLATES_SVN_IMPORT_HOLD") {
+    let pid = daemon_pid(&instance).expect("the daemon's pid");
+    std::fs::write(&hold, format!("{pid}\n")).unwrap();
+    println!("an_import_measured: held, daemon pid {pid} in {hold}; delete it to end");
+    let held = Instant::now();
+    while std::path::Path::new(&hold).exists() && held.elapsed() < PATIENCE {
+      pause();
+    }
+    let _ = std::fs::remove_file(&hold);
+  }
+}
+
+/// The pid of instance `instance`'s daemon (not its anchor), as `ps` lists it.
+fn daemon_pid(instance: &str) -> Option<u32> {
+  let listed = Command::new("ps")
+    .args(["-A", "-o", "pid=,command="])
+    .output()
+    .ok()?;
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .filter(|line| line.contains(instance) && !line.contains(" anchor"))
+    .find_map(|line| line.split_whitespace().next()?.parse().ok())
 }
 
 /// P7 of Ada's close list (A-772: svnsync over the matrix took 524 s over HTTP and 1,068 s over svn://; a measurement,
