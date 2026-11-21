@@ -7312,6 +7312,22 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Red:** a step fails naming the command (`svn [...]`), or an assert_eq naming the label (left HTTPv2, right svnserve).
   Expected by reading: `revprop set log` refused (no PROPPATCH on !svn/rev/N). Send to w-svn, copy w-interop.
 
+- w-balance (2026-11-21, goal 93 correctness by use, Mercurial; landed 97d8131bc): the hg correctness lane.
+  Command (release, from the repository root):
+    SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg" \
+    SLATES_TEST_HG_SOURCES="<hg's own history: hg clone -U https://www.mercurial-scm.org/repo/hg>" \
+    cargo test --release -p slates-cli --test hg_interop stock_hg_gets_what_stock_hg_serve_gives_on_every_verb_over_http_and_ssh -- --ignored --nocapture
+  and once more with SLATES_TEST_HG_SOURCES unset (the test makes bench/hg_correctness_fixture.sh's repository:
+  named branches, one closed; merges, one hand-resolved; tags moved and removed; bookmarks; draft and secret; binaries
+  of 1, 16 and 64 MiB). Optional SLATES_TEST_HG_BOUND=<s> bounds each step (default 1800).
+  Platforms: Linux x86_64 (adacachy), then Linux arm64; macOS is w-k90-microvm's. Needs bash, perl, python3, ssh-keygen,
+  ssh-keyscan; skips loudly without them or without stock hg 7.2.
+  Green: "== N passed, 0 failed" and the test passes. Red: each "FAIL <server> <step>: ..." line names the server
+  (http or ssh), the step, its status against stock hg serve's, and the state or bytes that differ; a status 142 is a
+  step killed at the bound (an HTTP edge spin; vcs_http.rs:850 is w-bugs'). Each red goes to w-hg.
+  Known red today (debug, macOS, the fixture): the whole push dies at shard 8 spinning in hg_push::take/unbundle
+  (inbox/w-hg-from-w-balance-push-spin.md), and 50 FAILs follow from it.
+
 ## loadtest-scale → main: goal 93, git under concurrent pushes (correctness; main's rounds)
 - **Command:** `SLATES_GIT_CONCURRENCY=2,10,50 cargo test --release --locked -p slates-cli --test git_interop -- --ignored concurrent_pushes --nocapture --test-threads 1`
   on release current main (≥ the commit carrying 8ff29de8a), macOS and Linux; Windows too if Git for Windows is on the PATH.

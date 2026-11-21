@@ -124,3 +124,14 @@
 
 ## 2026-11-21: follow-up GREEN -- run 44887857088 job 136804151233 (a0d114abb): slates_e2e 25/25, workspace:: 100/100.
 - Close note appended; w-k90-pin-2 told by inbox/w-k90-pin-2-from-w-k90-win.md (agents_send timed out). Queue empty.
+
+## 2026-11-21 ~12:30 PST: 84a Windows (main's inbox/84a-from-main-loaded-tails-2026-11-21.md), A-828
+- Slates clone ~/slates-work/w-k90-win-84a (https shallow, push ssh). Landing worktree ~/slates-work/w-k90-win-84a-land,
+  commit 4b7f653ef (on slates main 97d8131bc): IOCP timed wait via high-res waitable timer + NtAssociateWaitCompletionPacket.
+- Red then green (separate targets): jupiter red 62f7464cd shortest 1.53 ms, fix 2b23bd562 green (0.03 s); CI diag run
+  44941791157: windows-latest red 1.87 ms / fix green, windows-11-arm fix green (red passed by early tick -> median added).
+- Loaded tails (runs 44934773181, 44941791157, 3 rounds): p99 <1 ms both arms; p999 unmoved 24-34 ms (windows-latest,
+  arm conflicts) = 31.6 ms quantum (A-361). arm accept p999 32 ms -> <0.9 ms 3/3. 84a NOT met on Windows.
+- Landing check: diag branch diag-measurer-w-k90-win-84a-3 (tests + slates-rt clippy, both runners); kiln/jupiter down.
+- Next: land 4b7f653ef; then per-wake stamps (g222's diag-g222-hops-base stamp module) on Windows for the p999 mechanism.
+- jupiter disk: was 0.7 GB free at 11:30; I deleted my kiln target (23 GB) -> 27 GB. Others fill it too.
