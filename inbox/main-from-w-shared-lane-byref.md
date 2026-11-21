@@ -173,3 +173,18 @@ identity) and the slicing, re-measured at these five sizes x 10.
   origin), worktrees removed; my local target was already deleted.
 - Next, per your ruling: 3b (content ahead: the holder's SubmitComputed names its increment, the owner fetches what it
   lacks by identity from the holder, stored once), then slicing what remains, then the bench at 64-512 MiB x 10.
+
+## 10:12 PST: r21 overturns my 512 MiB read. The owner never runs; the holder's forward goes silent and gives up
+- r21: main 6a6e352 (A-825 in), big Studio at load 11.5-13, release, 320/384/448/512 MiB x 3: 0 of 12 passed, all
+  `Overloaded { shard: 0 }`. 320 MiB passed 9/10 on 0287458 (r13, Studio-3, load 2-3.6, before A-825).
+- In every failure no owner step counted (no merge.submit.owner_step), so the owner never ran the verb. The holder's
+  forward: fleet.forward.given_up_silent 6-9, resent_in_place 6-9, silence_awaited_receiver 6-9, given_up_at_bound 1,
+  merge.submit.forward_ns 7.05 s (320) to 10.1 s (512); the holder's own steps were small (compose 0.29-0.47 s,
+  forward_build 0.24-0.38 s, compute 11 us). So it is not call_owner's 1 s CPU wait (my guess from the code was wrong):
+  the whole 320-512 MiB SubmitComputed is resent in place while the lane hears nothing back, until the bound.
+- Cause not yet known: the load (12 vs 3), A-825 (the owner's step gained a hold copy and a publish), or another
+  commit between 0287458 and 6a6e352. kiln r23 now: interleaved A/B on one machine, main just before A-825
+  (895b80994) against A-825's landing (545cf46c5), 256/320/512 MiB x 3 each. If A-825 regressed it, I fix that first.
+- Either way the GAPS line: a holder-route submit of 320 MiB and above does not complete: its request crosses the
+  forward lane whole and the lane gives up on silence. That is 3b's job (the request names the increment; the owner
+  fetches chunks by identity on the content plane), so 3b may come before the owner-step slicing. I'll confirm with r23.
