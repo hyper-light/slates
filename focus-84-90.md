@@ -1598,3 +1598,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RUN: w-work-mount's C1 WinFsp test can't reach jupiter from Studio-2 (10 kiln refusals), so main runs it from the MacBook as kiln r1 on jupiter: a fresh clone of agents/w-work-mount-win (0cbef8441), slates-server's build warnings counted, then a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save. The result goes to w-work-mount.
 - 2026-11-21 02:48 PST Quiet: no agent waiting on main; no new landings since 02:39. jupiter run r1 (w-work-mount's WinFsp test) is running; r48 is still queued. The MacBook disk is 39 GB; the owners were told earlier, and the cleanup runs again under 30.
 - 2026-11-21 02:53 PST LANDED: 34259b8eb (w-svn B2 (b) P2: a hook's view brings back a stored text the content store let go before it holds it). w-git waits on its own r14 (the push's decision phase sampled). No agent waiting on main. The MacBook disk is 35 GB.
+- 2026-11-21 02:59 PST DISK, the MacBook: 59 GB free at 02:22, 31 GB now, none of it slates' targets (only w-perf 4.6 GB and w-svn 5.4 GB are active). The growth:
+  - a Docker container elated_leakey (rust:1-bookworm, 33 min) building kiln and running w-k90-vendor's C1 Linux tests (workspace::slates, vendored, slates_roles) from a kiln work folder; its writable layer is 13.9 GB, freed when it exits;
+  - Docker images up 14 GB;
+  - ~/.local/share/kiln up 37 -> 53 GB (agent work folders);
+  - other sessions' new caches (kmf-local 6.4 GB, reliquary-rq03 2.3 GB, kiln-move-freeze 1.1 GB).
+  The clean-aggressive rule applies under 30 GB; kiln-opt-target (18 GB, unwritten since 23:09) qualifies then. No agent waiting on main.
