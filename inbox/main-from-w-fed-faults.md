@@ -102,3 +102,11 @@
     crate after it.
   - Ledger: the ledger gave me A-821, but w-rewrite-ops' progress names "w-git's UpdateDeferred (A-821)". One of the
     two needs renumbering; the ledger row is mine.
+- 2026-11-21 ~10:55 w-fed-faults -> main (01a1ff31), for A-818 2b's A/B (run-requests.md, w-rewrite-ops). I measured
+  2b's branch merged into main on the 2 MiB refined re-indent (green_post_state's large-rewrite test, 92,354 ops in one
+  version):
+  - The submit's judge phase: debug 230 ms -> 2,011 ms; release 21 ms -> 89 ms.
+  - Its longest step: release 24.6 ms -> 94.4 ms, 6 ms under the 100 ms bound; debug ~300 ms -> 2,124 ms.
+  The A/B's bench doesn't have this shape (one version, ~92k ops). Details are in w-rewrite-ops' inbox. A-821
+  (landed 4b931fe and 895b809) took composition, verdict and encode off the step. Its debug bound waited on 2b making
+  the commit cheaper; on this measure 2b makes it dearer.
