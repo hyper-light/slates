@@ -17271,6 +17271,30 @@ Per hop, p50 (bucket bounds), both arms: build 18.4-22.5, exchange 98.3-106.5 of
 every hold on macOS: `hold.declined` about 7,700 a run); with the round trip's own two parked wakes, that is the macOS
 excess over Linux.
 
+**Measured and rejected: a live entry's request taken whole by its stream** (agents/g228-exchange-split 04ec25860,
+not landed; 85a item 2, g228, 2026-11-21). A live entry was copied four times a holder on its way to the wire: its
+encode, the exchange's `to_vec`, `Endpoint::begin`'s `to_vec` and `Connection::open_exchange`'s `to_vec`. The cut moved
+the bytes whole to the stream (`begin_owned`, `request_owned`, `request_within` by value, `exchange` by value): one copy
+a holder, and one fewer for the record commit, prepare and content dispatch. Focused tests green. Each arm built from
+its commit, the contract command, release, five rounds interleaved, order alternating; added p50; live p50 / p999 (µs):
+
+| round | macOS: main 02874580e | macOS: copy cut | ubuntu-latest: main | ubuntu-latest: copy cut |
+|---|---|---|---|---|
+| 1 | 151.5; 177.5 / 330.1 | 157.9; 183.9 / 255.7 | 99.6; 121.9 / 2,322.9 | 96.9; 116.2 / 2,615.6 |
+| 2 | 161.3; 187.1 / 359.6 | 159.4; 185.1 / 311.5 | 94.7; 113.7 / 2,656.0 | 92.0; 118.1 / 1,146.8 |
+| 3 | 157.3; 183.0 / 355.2 | 159.3; 184.0 / 322.4 | 83.3; 114.3 / 1,401.7 | 99.3; 125.5 / 810.0 |
+| 4 | 162.2; 187.1 / 434.3 | 161.6; 186.6 / 334.1 | 101.5; 118.7 / 672.2 | 86.8; 118.0 / 2,288.1 |
+| 5 | 160.8; 186.7 / 306.9 | 163.2; 189.0 / 398.3 | 101.6; 123.4 / 2,236.9 | 95.7; 117.4 / 2,810.6 |
+
+macOS: adas-mac-studio-2.local, 14 cores, load 3.6-4.0, kiln r15 (15:50-15:55 UTC). ubuntu-latest: 4 cores, load
+1.8-2.3, diag-g228-live-14 (run 44920886522); the bare transport's 4 KiB live ship 42.2-54.0 µs at p50 on the same
+runner. The exchange's collect stayed 30.7-32.8 µs at the median on macOS in both arms.
+
+**Reading.** Dead even. The macOS medians interleave (the cut ahead in 2 of 5 rounds); on ubuntu-latest the cut is
+ahead in 4 of 5 rounds by 2.7-14.7 µs and behind in one by 16.0, inside the runner's own spread (main alone 83.3-101.6).
+A few 2 KiB copies cost well under a microsecond each, below what a live write's median can show, so the cut stays off
+main under the rule that a dead-even A/B does not land. The entry's build (about 20-27 µs) is not its copies.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
