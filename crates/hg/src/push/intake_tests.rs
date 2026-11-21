@@ -133,8 +133,9 @@ fn check_brought(intaken: &Intaken, verified: &Verified, steps: u64) {
 }
 
 /// A-720 (the working set). Do: find the least admission the whole verification takes stock 7.2's bundle within, and the
-/// least the intake does. Expect the intake's less: what it holds across steps is a node or two a revision, and each
-/// step's texts are let go when it ends, where verification holds every arrived text at once.
+/// least the intake does. Expect the intake's less, apart from the `Texts` section it writes for the landing (A-767 C4,
+/// the changeset's own section, O(revisions) as the record is): what it holds across steps is a node or two a
+/// revision, and each step's texts are let go when it ends, where verification holds every arrived text at once.
 #[test]
 fn the_intake_holds_less_than_verification_whole() {
   let part = stock();
@@ -151,6 +152,13 @@ fn the_intake_holds_less_than_verification_whole() {
     high
   };
   let verifying = least(&|room| verify(&part, &Nothing, &mut Admission::new(room)).is_ok());
+  let texts = {
+    let mut store = store();
+    let mut index = HgIndex::new();
+    let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+    fork.release(&mut store).unwrap();
+    intaken.texts_charged()
+  };
   let taking = least(&|room| {
     let mut store = store();
     let mut index = HgIndex::new();
@@ -161,7 +169,8 @@ fn the_intake_holds_less_than_verification_whole() {
       }
       Err(_) => false,
     }
-  });
+  })
+  .saturating_sub(texts);
   assert!(
     taking < verifying,
     "the intake took {taking}, verification {verifying}"
@@ -375,4 +384,151 @@ fn the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it() {
   for index in [fork, index] {
     index.release(&mut store).unwrap();
   }
+}
+
+/// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
+/// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
+/// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
+/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
+#[test]
+fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
+  use std::collections::BTreeMap;
+  let part = stock();
+  let verified = verify(&part, &Nothing, &mut room()).unwrap();
+  let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+  let mut paths: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+  for arrived in &verified.changesets {
+    texts.insert(arrived.node, arrived.text.clone());
+    paths.insert(arrived.node, super::CHANGELOG_PATH.to_vec());
+  }
+  for arrived in &verified.manifests {
+    texts.insert(arrived.node, arrived.text.clone());
+    paths.insert(arrived.node, super::MANIFEST_PATH.to_vec());
+  }
+  for (path, revisions) in &verified.files {
+    for arrived in revisions {
+      texts.insert(arrived.node, arrived.text.clone());
+      paths.insert(arrived.node, path.clone());
+    }
+  }
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let mut deltas: BTreeMap<Node, (Node, &[u8])> = BTreeMap::new();
+  for range in [&decoded.changelog, &decoded.manifests] {
+    for revision in decoded.group(range) {
+      deltas.insert(revision.node, (revision.base, revision.data));
+    }
+  }
+  for group in &decoded.files {
+    for revision in decoded.group(&group.revisions) {
+      deltas.insert(revision.node, (revision.base, revision.data));
+    }
+  }
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  assert_eq!(u64::try_from(intaken.texts.len()).unwrap(), intaken.kept);
+  for kept in &intaken.texts {
+    let text = &texts[&kept.node];
+    assert_eq!(kept.identity, *blake3::hash(text).as_bytes());
+    assert_eq!(kept.len, u64::try_from(text.len()).unwrap());
+    assert_eq!(kept.path, paths[&kept.node]);
+    let (base, data) = deltas[&kept.node];
+    let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
+    assert_eq!(kept.base, base_identity, "{:?}", kept.node);
+    assert_eq!(&part.payload[kept.place.clone()], data);
+  }
+  for index in [fork, index] {
+    index.release(&mut store).unwrap();
+  }
+}
+
+/// A-767 C4 (a push landed on the changeset log: its `Record` section and its `Payload` section, the changegroup held
+/// once). Do: take stock 7.2's bundle through the intake; write its sectioned record (`record::write_push_record`) and
+/// replay it with the changegroup as its payload (`Replay::begin_sectioned`, a step at a time); replay the A-729 v2
+/// record of the same push too. Expect the sectioned record a few dozen bytes, never the changegroup; both replays the
+/// intake's fork row for row; the sectioned record refused by `Replay::begin` (its payload is not in it), and refused by
+/// kind cut short or with a byte after it, nothing held after.
+#[test]
+fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
+  use crate::import::record::{self, Replay};
+  let part = stock();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (mut fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let revisions = intaken.kept + intaken.passed_over;
+  let sectioned = record::write_push_record(1 << 20, part.version);
+  assert!(sectioned.len() < 64, "{} bytes", sectioned.len());
+  let mut by_sections = HgIndex::new();
+  let mut replay =
+    Replay::begin_sectioned(&sectioned, &part.payload, &mut by_sections, &mut store).unwrap();
+  while replay.step(&part.payload, &mut store).unwrap() {}
+  replay.finish(&mut by_sections, &mut store).unwrap();
+  let whole = record::write_changegroup(1 << 20, (part.version, &part.payload), revisions).unwrap();
+  let mut by_whole = HgIndex::new();
+  record::replay(&whole, &mut by_whole, &mut store).unwrap();
+  let expected = rows(&mut fork, &store);
+  assert_eq!(rows(&mut by_sections, &store), expected);
+  assert_eq!(rows(&mut by_whole, &store), expected);
+  let held = store.len();
+  let mut empty = HgIndex::new();
+  assert!(matches!(
+    Replay::begin(&sectioned, &mut empty, &mut store),
+    Err(record::Refused::Version { version: 6 })
+  ));
+  for cut in 0..sectioned.len() {
+    assert!(
+      Replay::begin_sectioned(&sectioned[..cut], &part.payload, &mut empty, &mut store).is_err(),
+      "cut at {cut}"
+    );
+  }
+  let mut trailing = sectioned.clone();
+  trailing.push(0);
+  assert!(matches!(
+    Replay::begin_sectioned(&trailing, &part.payload, &mut empty, &mut store),
+    Err(record::Refused::Trailing)
+  ));
+  assert_eq!(store.len(), held, "a refused replay held something");
+  for index in [by_sections, by_whole, fork, index, empty] {
+    index.release(&mut store).unwrap();
+  }
+}
+
+/// A-767 C4 (the register's reference to a push's changeset). Do: write the reference of stock 7.2's push as changeset
+/// 5, read it back, and hand it to `Replay::begin`. Expect it read back as written (the room, the changegroup's
+/// version, its payload named by the BLAKE3 of the changegroup's bytes and their length, the sequence), its record the
+/// sectioned head; a cut or a byte after it not read as a reference; and `Replay::begin` refusing it by version, its
+/// payload being the log's.
+#[test]
+fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
+  use crate::import::record::{self, Reference, Replay};
+  let part = stock();
+  let bytes = record::write_push_reference(1 << 20, (part.version, &part.payload), 5);
+  let read = record::reference_of(&bytes).unwrap();
+  assert_eq!(
+    read,
+    Reference {
+      room: 1 << 20,
+      version: part.version,
+      payload: *blake3::hash(&part.payload).as_bytes(),
+      len: u64::try_from(part.payload.len()).unwrap(),
+      sequence: 5,
+    }
+  );
+  assert_eq!(
+    read.record(),
+    record::write_push_record(1 << 20, part.version)
+  );
+  for cut in 0..bytes.len() {
+    assert_eq!(record::reference_of(&bytes[..cut]), None, "cut at {cut}");
+  }
+  let mut trailing = bytes.clone();
+  trailing.push(0);
+  assert_eq!(record::reference_of(&trailing), None);
+  let mut store = store();
+  let mut index = HgIndex::new();
+  assert!(matches!(
+    Replay::begin(&bytes, &mut index, &mut store),
+    Err(record::Refused::Version { version: 7 })
+  ));
 }

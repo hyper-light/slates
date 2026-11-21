@@ -1684,9 +1684,9 @@ impl Client {
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect(capacity, |request| self.call_plain(request));
+      return slates_ipc::status::collect(capacity, *memory, |request| self.call_plain(request));
     }
     self.call_plain(body)
   }
@@ -5004,9 +5004,22 @@ impl Client {
     }
   }
 
-  /// The daemon's status (§4.14 `slates.status`).
+  /// The daemon's status (§4.14 `slates.status`): its counters and health signals, with no residency work asked of
+  /// it; the memory report's figures are the last a memory request read ([`Client::daemon_memory_status`]).
   pub fn daemon_status(&mut self) -> Result<DaemonReport, ClientError> {
-    match self.call(&RequestBody::DaemonStatus)? {
+    self.daemon_status_asking(false)
+  }
+
+  /// [`Client::daemon_status`] with the memory report read now: the anchor's objects whole from the kernel's per-mapping
+  /// figures, and each shard's ranges swept on its idle time (A-744; main's ruling on g228's finding). Only such a
+  /// request costs the daemon residency work.
+  pub fn daemon_memory_status(&mut self) -> Result<DaemonReport, ClientError> {
+    self.daemon_status_asking(true)
+  }
+
+  /// The daemon's status, the memory report's residency asked for or not.
+  fn daemon_status_asking(&mut self, memory: bool) -> Result<DaemonReport, ClientError> {
+    match self.call(&RequestBody::DaemonStatus { memory })? {
       ReplyBody::DaemonStatus { report } => Ok(*report),
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",

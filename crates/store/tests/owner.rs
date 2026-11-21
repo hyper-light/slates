@@ -278,3 +278,130 @@ fn a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart() {
   owner.stop().unwrap();
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The sliced landing (A-767; promised to w-svn for an import as one changeset). Do: open a sliced landing and, while
+/// it is open, land another changeset whole from a second task and list the changesets; send the first's record and its
+/// 200,000-byte payload one piece a part, and commit. Then open a third, write part of it and let it go; land a fourth
+/// whole. Then open a fifth and send a part past one piece. Restart the owner. Expect: nothing listed while the first is
+/// open and the whole landing unanswered until the commit, then landed after it; the payload read back by identity; the
+/// dropped third never listed and the fourth landed; the oversized part refused and its landing gone; the same list
+/// after the restart.
+#[test]
+fn a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing() {
+  use slates_rt::futures::{join, spawn, yield_now};
+  use slates_store::owner::OwnerError;
+  use slates_store::store::{PIECE_BYTES, StoreError};
+  let dir = scratch("sliced");
+  let payload: Vec<u8> = (0..200_000u32).map(|at| (at % 239) as u8).collect();
+  let identity = *blake3::hash(&payload).as_bytes();
+  let len = payload.len() as u64;
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let runtime = runtime();
+  let to_land = payload.clone();
+  let listed = runtime
+    .block_on(async move {
+      let mut first = handle
+        .begin(Header {
+          sections: 2,
+          ..header(1)
+        })
+        .await
+        .unwrap();
+      let (sent, mut whole) = slates_rt::sync::channel(1).unwrap();
+      let other = handle.clone();
+      let task = spawn(async move {
+        let landed = other
+          .land(header(2), vec![(SectionKind::Record, b"whole".to_vec())])
+          .await;
+        let _ = sent.try_send(landed);
+      })
+      .unwrap();
+      yield_now().await;
+      assert!(
+        handle.changesets(11, 0, 10).await.unwrap().is_empty(),
+        "nothing is visible while a landing is open"
+      );
+      assert!(
+        whole.try_recv().unwrap().is_none(),
+        "a whole landing waits for the open one"
+      );
+      first.section(SectionKind::Record, 5).await.unwrap();
+      first.part(b"heads".to_vec()).await.unwrap();
+      first.section(SectionKind::Payload, len).await.unwrap();
+      for part in to_land.chunks(PIECE_BYTES) {
+        first.part(part.to_vec()).await.unwrap();
+      }
+      let first = first.commit().await.unwrap();
+      join(task).await.unwrap();
+      let second = whole.recv().await.unwrap().unwrap();
+      assert!(second.offset > first.offset, "the held landing lands after");
+      let mut read = Vec::new();
+      while (read.len() as u64) < len {
+        read.extend(
+          handle
+            .piece(identity, len, read.len() as u64)
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+      }
+      assert_eq!(read, to_land, "the payload by identity");
+
+      let mut dropped = handle
+        .begin(Header {
+          sections: 1,
+          ..header(3)
+        })
+        .await
+        .unwrap();
+      dropped.section(SectionKind::Record, 100).await.unwrap();
+      dropped.part(vec![3; 50]).await.unwrap();
+      drop(dropped);
+      handle
+        .land(header(4), vec![(SectionKind::Record, b"after".to_vec())])
+        .await
+        .unwrap();
+
+      let mut oversized = handle
+        .begin(Header {
+          sections: 1,
+          ..header(5)
+        })
+        .await
+        .unwrap();
+      let past = PIECE_BYTES + 1;
+      oversized
+        .section(SectionKind::Payload, past as u64)
+        .await
+        .unwrap();
+      assert!(matches!(
+        oversized.part(vec![5; past]).await,
+        Err(OwnerError::Store(StoreError::Sizing(_)))
+      ));
+      assert!(matches!(
+        oversized.commit().await,
+        Err(OwnerError::Store(StoreError::NoLanding))
+      ));
+      handle.changesets(11, 0, 10).await.unwrap()
+    })
+    .unwrap();
+  let sequences = |rows: &[slates_store::store::Changeset]| {
+    rows.iter().map(|row| row.sequence).collect::<Vec<_>>()
+  };
+  assert_eq!(sequences(&listed), [1, 2, 4]);
+  owner.stop().unwrap();
+
+  let owner = start(&dir);
+  let handle = owner.handle();
+  let again = runtime
+    .block_on(async move {
+      let listed = handle.changesets(11, 0, 10).await.unwrap();
+      let head = handle.piece(identity, len, 0).await.unwrap().unwrap();
+      (listed, head)
+    })
+    .unwrap();
+  assert_eq!(sequences(&again.0), [1, 2, 4]);
+  assert_eq!(again.1, payload[..again.1.len()]);
+  owner.stop().unwrap();
+}

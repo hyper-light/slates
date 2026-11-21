@@ -379,6 +379,10 @@ pub(crate) struct HgStore {
   pub(crate) generation: u64,
   /// Its derived values.
   pub(crate) derivations: Derivations,
+  /// The sequence of the changeset this repository landed last on the node's changeset log (A-767 C4): 0 its creation's
+  /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
+  /// register's references at recovery.
+  pub(crate) landed: u64,
 }
 
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
@@ -431,6 +435,9 @@ pub(crate) enum ReplayRefused {
   /// A version-3 git record's names (A-724 piece 8c) not read: the store holds no content of their identity whole (not
   /// yet fetched from their region homes), or its rows are refused.
   Names(record_names::NamesRefused),
+  /// A Mercurial record naming a changeset on the changeset log (record v7, A-767 C4) the node cannot read back: no log
+  /// held, its owner busy or gone, or its payload not whole at its identity and length.
+  Unlanded,
 }
 
 /// The repository's objects as the bases a replayed pack's reference deltas may name (A-723), read through the index view
@@ -605,6 +612,25 @@ impl VcsStores {
     match self.entries.get_mut(&id)? {
       RepositoryStore::Mercurial(store) => Some((content, store)),
       _ => None,
+    }
+  }
+
+  /// The sequence repository `id`'s next changeset lands at on the changeset log (A-767 C4), taken now so two pushes
+  /// landing side by side never share one; none where the repository has no Mercurial store here.
+  pub(crate) fn next_changeset(&mut self, id: RepositoryId) -> Option<u64> {
+    match self.entries.get_mut(&id)? {
+      RepositoryStore::Mercurial(store) => {
+        store.landed = store.landed.checked_add(1)?;
+        Some(store.landed)
+      }
+      _ => None,
+    }
+  }
+
+  /// Notes that repository `id` landed changeset `sequence` (a recovery reading the register's references).
+  pub(crate) fn landed_changeset(&mut self, id: RepositoryId, sequence: u64) {
+    if let Some(RepositoryStore::Mercurial(store)) = self.entries.get_mut(&id) {
+      store.landed = store.landed.max(sequence);
     }
   }
 
@@ -2444,7 +2470,13 @@ fn hg_record_step(
   lend(store, vcs_stores, lent);
   let stepped = {
     let lent = Lent::new(&mut *store, vcs_stores);
-    hg_step_in(lent.stores, id, bytes, replay, deadline_ns)
+    hg_step_in(
+      lent.stores,
+      id,
+      HgSource::Record(bytes),
+      replay,
+      deadline_ns,
+    )
   };
   let whole = settle_in(store, vcs_stores);
   if !whole {
@@ -2454,23 +2486,160 @@ fn hg_record_step(
   Some(stepped)
 }
 
+/// [`hg_record_step`] for a changeset on the changeset log (A-767 C4): its `record` and its `payload` read back, the
+/// room the payload takes lent at its first step.
+fn hg_sectioned_step(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (record, payload): (&[u8], &[u8]),
+  replay: Option<slates_hg::import::record::Replay>,
+  ns: u64,
+) -> Result<HgStep, ReplayRefused> {
+  let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
+  let lent = if replay.is_none() {
+    u64::try_from(payload.len()).unwrap_or(u64::MAX)
+  } else {
+    0
+  };
+  let ShardState {
+    store, vcs_stores, ..
+  } = &mut *state;
+  lend(store, vcs_stores, lent);
+  let stepped = {
+    let lent = Lent::new(&mut *store, vcs_stores);
+    hg_step_in(
+      lent.stores,
+      id,
+      HgSource::Sectioned { record, payload },
+      replay,
+      deadline_ns,
+    )
+  };
+  if !settle_in(store, vcs_stores) {
+    state.count(CHARGE_SHORT, 1);
+  }
+  state.count(HG_REPLAY_TURNS, 1);
+  stepped
+}
+
+/// Changeset `reference`'s payload read back from the node's changeset log (A-767 C4), a piece at a time by its
+/// identity and length; none where the node holds no log or the payload is not whole there. The payload is gathered
+/// whole: the intake reads a changegroup as one slice, the same bytes the live push held while it arrived, so the
+/// replay holds no more than the push did (a piece-reading intake is owed with the derived per-path form).
+async fn payload_of(
+  disk: &slates_store::owner::StoreHandle,
+  reference: &slates_hg::import::record::Reference,
+) -> Option<Vec<u8>> {
+  let len = usize::try_from(reference.len).ok()?;
+  let mut payload = Vec::new();
+  payload.try_reserve_exact(len).ok()?;
+  while payload.len() < len {
+    let at = u64::try_from(payload.len()).ok()?;
+    let piece = disk
+      .piece(reference.payload, reference.len, at)
+      .await
+      .ok()??;
+    if piece.is_empty() {
+      return None;
+    }
+    payload.extend_from_slice(&piece);
+  }
+  (payload.len() == len).then_some(payload)
+}
+
+/// Repository `id`'s record at `index` where it names a changeset on the changeset log (record v7, A-767 C4).
+fn hg_reference(
+  state: &ShardState,
+  id: RepositoryId,
+  index: usize,
+) -> Option<slates_hg::import::record::Reference> {
+  let bytes = state
+    .db
+    .partition()
+    .repositories()
+    .object_record(id, index)?;
+  slates_hg::import::record::reference_of(bytes)
+}
+
+/// Replays changeset `reference` from the node's changeset log into repository `id`'s store, a unit of `slices` a step
+/// (A-767 C4; A-732's slicing): its payload read back, then taken again through the live push's intake.
+async fn replay_hg_referenced(
+  state: &mut ShardState,
+  id: RepositoryId,
+  reference: slates_hg::import::record::Reference,
+  slices: &mut crate::recovery_slices::RecoverySlices,
+) -> Result<(), ReplayRefused> {
+  let disk = state.vcs_disk.clone().ok_or(ReplayRefused::Unlanded)?;
+  let payload = payload_of(&disk, &reference)
+    .await
+    .ok_or(ReplayRefused::Unlanded)?;
+  state.vcs_stores.landed_changeset(id, reference.sequence);
+  let record = reference.record();
+  let mut replay = None;
+  loop {
+    match hg_sectioned_step(
+      state,
+      id,
+      (&record, &payload),
+      replay.take(),
+      slices.budget_ns(),
+    )? {
+      HgStep::Begun(begun) | HgStep::Stepped(Some(begun)) => {
+        replay = Some(begun);
+        slices.unit_done().await;
+      }
+      HgStep::Stepped(None) => return Ok(()),
+    }
+  }
+}
+
+/// What a Mercurial replay reads: a register record whole, or a changeset on the changeset log (A-767 C4), its record
+/// and its payload read back.
+#[derive(Clone, Copy)]
+enum HgSource<'a> {
+  /// A record the register holds whole.
+  Record(&'a [u8]),
+  /// A changeset's `Record` section and its `Payload`, each step handed the payload.
+  Sectioned {
+    /// Its record (record v6).
+    record: &'a [u8],
+    /// Its changegroup.
+    payload: &'a [u8],
+  },
+}
+
 /// [`hg_record_step`] over the stores.
 fn hg_step_in(
   stores: &mut VcsStores,
   id: RepositoryId,
-  bytes: &[u8],
+  source: HgSource<'_>,
   replay: Option<slates_hg::import::record::Replay>,
   deadline_ns: u64,
 ) -> Result<HgStep, ReplayRefused> {
+  let bytes = match source {
+    HgSource::Record(bytes) => bytes,
+    HgSource::Sectioned { payload, .. } => payload,
+  };
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
     return Err(unheld);
   };
   let Some(mut replay) = replay else {
-    return slates_hg::import::record::Replay::begin(bytes, &mut store.index, content)
-      .map(HgStep::Begun)
-      .map_err(ReplayRefused::Mercurial);
+    let begun = match source {
+      HgSource::Record(bytes) => {
+        slates_hg::import::record::Replay::begin(bytes, &mut store.index, content)
+      }
+      HgSource::Sectioned { record, payload } => {
+        slates_hg::import::record::Replay::begin_sectioned(
+          record,
+          payload,
+          &mut store.index,
+          content,
+        )
+      }
+    };
+    return begun.map(HgStep::Begun).map_err(ReplayRefused::Mercurial);
   };
   let mut stepped = replay.step(bytes, content);
   while matches!(stepped, Ok(true)) && slates_rt::futures::now_ns() < deadline_ns {
@@ -2848,7 +3017,10 @@ async fn recover_repository(
     // A Mercurial record is replayed a revision a unit (A-732): whole in one unit, a large repository's held its
     // shard past the watchdog's window at every restart.
     let outcome = if record.tool == VcsTool::Mercurial {
-      replay_hg_sliced(state, record.id, index, slices).await
+      match hg_reference(state, record.id, index) {
+        Some(reference) => Some(replay_hg_referenced(state, record.id, reference, slices).await),
+        None => replay_hg_sliced(state, record.id, index, slices).await,
+      }
     } else {
       // A git record carrying a pack is replayed a turn's units a unit of the recovery (A-722 part 4).
       let ns = state.config.step_quantum_ns();
@@ -3379,14 +3551,48 @@ pub(crate) fn release_aside(state: &mut ShardState, aside: Option<slates_hg::ind
 async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex>) {
   let mut index = 0usize;
   let mut replay = None;
+  // A record naming a changeset on the changeset log (A-767 C4): its record and payload, read back once at its first
+  // step and held until it is replayed.
+  let mut sectioned: Option<(Vec<u8>, Vec<u8>)> = None;
   loop {
+    if replay.is_none() && sectioned.is_none() {
+      let found = crate::state::with_state(|state| {
+        hg_reference(state, id, index).map(|reference| (reference, state.vcs_disk.clone()))
+      })
+      .flatten();
+      if let Some((reference, disk)) = found {
+        let payload = match disk {
+          Some(disk) => payload_of(&disk, &reference).await,
+          None => None,
+        };
+        let Some(payload) = payload else {
+          crate::state::with_state(|state| {
+            let _ = replayed(state, id, Err(ReplayRefused::Unlanded));
+          })
+          .unwrap_or_default();
+          break;
+        };
+        crate::state::with_state(|state| state.vcs_stores.landed_changeset(id, reference.sequence));
+        sectioned = Some((reference.record(), payload));
+      }
+    }
     let stepped = crate::state::with_state(|state| {
       let ns = state.config.step_quantum_ns();
-      hg_record_step(state, id, index, replay.take(), ns)
+      match &sectioned {
+        Some((record, payload)) => Some(hg_sectioned_step(
+          state,
+          id,
+          (record, payload),
+          replay.take(),
+          ns,
+        )),
+        None => hg_record_step(state, id, index, replay.take(), ns),
+      }
     });
     match stepped.flatten() {
       Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
       Some(Ok(HgStep::Stepped(None))) => {
+        sectioned = None;
         let next = crate::state::with_state(|state| replayed(state, id, Ok(()))).unwrap_or(false);
         if !next {
           break;

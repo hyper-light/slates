@@ -247,6 +247,11 @@ impl Preparing {
     self.building.pace().longest_unit_ns()
   }
 
+  /// What its last turn's step did (A-783): the quanta it took and how it stopped.
+  pub fn step_report(&self) -> Option<slates_pace::Report> {
+    self.building.pace().step_report()
+  }
+
   /// Its last turn's opening, nanoseconds on its owner's clock: what the turn did before its first unit.
   pub fn opening_ns(&self) -> u64 {
     self.building.pace().opening_ns()
@@ -328,15 +333,16 @@ where
 
   /// One turn of `command`'s work, built against the green and base its verdict will read (A-752): whether it is
   /// ready, so this step judges it (a delete, a command whose verdict refuses before any work, or a work built); not
-  /// ready, the turn, begun at `began`, ended at `deadline` on `clock` (the owner's, nanoseconds) and `preparing` keeps
-  /// the build for the next, each unit moving at most the owner's derived `slices`. What the turn did before its first
+  /// ready, the turn, begun at `began` and paced by `env` (A-783: yielding at its quantum when someone waits, to its
+  /// ceiling when no one does), ended and `preparing` keeps the build for the next, each unit moving at most the owner's
+  /// derived `slices`. What the turn did before its first
   /// unit is its opening ([`Preparing::opening_ns`]). A build for another command or push is begun again.
   pub fn prepare(
     &self,
     command: &Command,
     pushed: &Pushed<'_>,
     preparing: &mut Option<Preparing>,
-    (clock, began, deadline): (fn() -> u64, u64, u64),
+    (began, env): (u64, slates_pace::Env),
     slices: Slices,
   ) -> bool {
     if command.is_delete() {
@@ -368,7 +374,7 @@ where
         };
         *preparing = Some(Preparing {
           command: (command.name.clone(), command.new),
-          building: Building::new(&push, self.room, Pace::new(clock)),
+          building: Building::new(&push, self.room, Pace::new(env.clock)),
           done: None,
           parent,
         });
@@ -377,7 +383,7 @@ where
         return true;
       };
       let pace = prepared.building.pace();
-      pace.turn_from(began, (deadline, slices));
+      pace.turn_from(began, (env, slices));
       prepared.done = prepared.building.advance(green, self.objects);
       prepared.done.is_some()
     };
