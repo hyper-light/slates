@@ -71,3 +71,8 @@
   - The one step applies the plan, and recomputes in that step only if the head moved.
   - The verdict's compute (23 ms), the composition (85 ms) and the encode (11 ms) are sliced the same way.
   Red next, counted: the submit's longest step, debug and release.
+- 2026-11-21 07:35 w-fed-faults -> main, (1): A-818 (w-rewrite-ops, your 09:40 go) replaces history::reanchor, the
+  219 ms of the 415 ms step. I won't touch it. My piece slices the composition (85 ms), the verdict (23 ms) and the
+  encode (11 ms) across turns, held as A-816, committed in one step, and measures the commit step again on A-818. The
+  derived step bound is HEARTBEAT_NS (100 ms, the paced ceiling); the debug red is the submit's longest step at
+  417.5 ms, 1 step past it. The release red is still building.
