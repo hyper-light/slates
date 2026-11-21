@@ -77,7 +77,8 @@
 > hyper-raft `5e40eb9`; 2b (engine, chunk, disk: `hyper-rt`'s channel) waits on main's decision.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
-> awaiting a grant first. Owed: the MCP tool and the SDKs' read. A-782 closed identical versus accepted (one typed
+> awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
+> A-782 closed identical versus accepted (one typed
 > outcome, engine to every surface); A-785 names merges held for approval. A-779 closed the stale presentation: a newer one of the same volume into the same target
 > supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
 

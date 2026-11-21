@@ -11123,7 +11123,10 @@ numbers conflict, and the same node made twice converges.
 > submission ended (open, accepted as a version, or collided where), and the landings awaiting a grant (§4.15), the
 > collided works and those landings named first. A read (`RequestBody::SessionLog`), a scatter over the shards like
 > `grants`, each shard reading its works and its partition's waiting-landing index, never the landing history; it
-> shows a pending grant and never makes one (R10). Owed: the MCP tool and the SDKs' read.
+> shows a pending grant and never makes one (R10). A-788: the same view over MCP (`slates.log`, read-only, the JSON
+> `slates log --json` prints, one definition: `slates_mcp::session_log_json`) and in the SDKs' sync clients (Python
+> `session_log()`, Node `sessionLog()`, the same keys in each one's case). Owed: the async SDK forms (the async clients
+> carry single requests; the log is a paged walk, as `drifted` is, sync alone too).
 
 > **Status (2026-11-20, A-785: held merges in the session log).** A submission an ask policy holds for approval
 > (A-285) needs the human as a collision and a waiting landing do: the work remembers the held increment's identity and
@@ -57840,3 +57843,18 @@ Evidence: `cargo test --locked -p slates-server --test session_log a_merge_held_
 red with the note disabled (the log named nothing), green with it; `--test session_log` 4 passed; `-p slates-cli --bin
 slates log_view` 3; `-p slates-client --lib session_log` 1; `-p slates-ipc --test wire_order` 2 (macOS arm64, this
 Mac, local).
+
+### A-788 — The session log over MCP and in the SDKs (2026-11-20, w-sessionlog; main's order 15:20 PST, item 4; A-773, §4.12, R10)
+`slates.log` is an MCP tool answering the JSON `slates log --json` prints, from one definition moved into `slates-mcp`
+(`session_log_json`), which the CLI now calls. The Python and Node SDKs link the client alone, so each builds the same
+keys from the typed log (`session_log.rs` in each): Python `Client.session_log()` a dict, Node `Client.sessionLog()` a
+typed object (`index.d.ts`). No tool or verb approves or grants (R10); the tool list's no-grant check holds. The async
+clients carry single requests; the log is a paged walk and stays sync, as `drifted` is.
+Found by use in this change: A-782's `identical` key broke `crates/mcp/tests/mcp.rs`'s exact comparison of a submit's
+JSON; fixed here.
+Applied in the same change to: §4.16 (A-773's status line), GAPS, `crates/mcp` (the tool, `session_log_json`, its test),
+`crates/cli` (`log_view` calls it), `crates/sdk-python` (`session_log`, its test), `crates/sdk-node` (`sessionLog`,
+`index.d.ts`, its test).
+Evidence: `cargo test --locked -p slates-mcp --test mcp` red with the tool's dispatch removed, green with it; `-p
+slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 3; workspace `cargo check --tests --examples` clean (macOS
+arm64, this Mac, local). The SDK tests need a built wheel and addon with a daemon: run requested from main.
