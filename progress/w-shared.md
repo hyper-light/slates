@@ -319,3 +319,18 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   its scope question to main (inbox/main-from-w-shared-a658-3c-scope.md; building reading (A) unless told otherwise).
   Then robustness: family three (kiln r6 queued), exit 4 (kiln r9 queued). Then performance: lane (congestion window),
   A/B.
+
+## 2026-11-20 ~18:45 PST: leads recorded (no code yet; order is completion -> robustness -> performance)
+- A-658 3c: reading (A) moves no work out of git's decision step (judge and append share one step), so it would land
+  code with no effect. Asked main to choose: record it as blocked on the repository store's replication to holders,
+  or build (B). inbox/main-from-w-shared-a658-3c-scope.md. Worktree ~/slates-work/w-shared-a658-3c is clean
+  (no changes).
+- Exit 4 / record plane: cut_shipments rebuilds the version's inputs bytes (inputs_of) and the whole inputs archive
+  (chunk + BLAKE3) on every shipment pass, and each pass carries one archive slice, so the cost is size squared, all on
+  the owner shard. Suspect for exit 4 at 64 MiB; kiln r9 (macOS, 64/128/256/320 MiB) will name the spinning shard.
+- Lane (perf): UDP sockets keep the OS default SO_RCVBUF. macOS net.inet.udp.recvspace = 786,896 B (~85 datagrams at
+  the 9,209 B path MTU; net.inet.udp.maxdgram 9216); this Mac shows 11,411,409 datagrams "dropped due to full socket
+  buffers" since boot (all processes). Hypothesis: a congestion window up to 560 KB overruns the receive buffer, the
+  drops read as loss, and the window collapses (64 MiB stops: window ~6800). Test it with netstat -s -p udp deltas
+  around the bulk row, then size the buffer from the work (the path's bandwidth-delay product, up to
+  kern.ipc.maxsockbuf), on a quiet machine.
