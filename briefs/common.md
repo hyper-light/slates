@@ -236,3 +236,13 @@ part closed between 07:20 and 16:00.
 - **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
   measurement. Main marks the UI part met the same check.
 - Main adds no new open items to UI parts and gives no new pieces beyond the close list.
+
+## SHARED MACHINES' MEMORY (main 2026-11-21 ~00:05 PST)
+- On 2026-11-20 at 23:58 the big Studio (96 GiB of RAM) had 96 GB of its 97 GB swap in use and 180-250 MB free.
+  w-fed-move's 100,000-client load run held about 30 GB, and a release build of kiln's crate (w-k90-containers) held
+  23 GB. Every other agent's tests on that machine stalled; w-git's C5 run sat 70 minutes at 0% CPU. Main stopped both.
+- A run that takes more than about 8 GB declares it in kiln's `needs` (`mem=16g`; a release build of kiln `mem=32g`;
+  a 100,000-client load run `mem=40g`) and never pins a machine with `on`, so the balancer places it where it fits.
+- Load runs are main's (§8 above): put them in run-requests.md with the command and the memory measured.
+- Give every test run a `timeout_s` sized from its last measured run, so a stall ends and reports instead of holding
+  a machine for an hour.
