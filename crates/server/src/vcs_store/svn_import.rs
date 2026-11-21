@@ -4,10 +4,11 @@
 //! **What it does.** A Subversion repository `CreateRepository` made holds revision 0 and its creation's record. An
 //! import gives it the history a stock `svnadmin dump` wrote (format 2 or 3): the dump's file is read from the host as a
 //! base is, read-only (§4.15), and `slates-svn`'s import (`Importer`, A-628) reads it as `svnadmin load` does, handing
-//! over each record it makes. Each revision is committed through the owner's commit step a client's commit takes
-//! (`repository::svn_commit::commit`: the green's next version and the revision's record one entry of the repository's
-//! logs, then applied); the UUID and revision 0's properties through the step for a record that moves no version
-//! (`svn_commit::record`). So every imported revision is durable as it lands and a recovery reaches it, and a refusal
+//! over each record it makes. Each revision is landed as a client's commit lands one (`repository::svn_commit::
+//! land_revision`: checked, landed whole on the node's changeset store, then the green's next version and a reference
+//! to the changeset one entry of the register, then applied; C2); the UUID and revision 0's properties through the
+//! landing for a record that moves no version (`svn_commit::land_record`). A record handed over ends its turn and lands
+//! before the import reads on ([`land_owed`]). So every imported revision is durable as it lands and a recovery reaches it, and a refusal
 //! keeps the revisions before it, as `svnadmin load` keeps them. The history keeps the stream's revision numbers: a dump
 //! continues the repository's history (revision 0 into one that holds no revision but 0, else the revision after its
 //! youngest), so a dump made in parts loads part after part.
@@ -85,6 +86,8 @@ pub(crate) struct Importing {
   revisions: u64,
   /// The turns taken.
   turns: u64,
+  /// The record the import handed over last, owed its landing before the import reads on ([`land_owed`]).
+  owed: Option<Record>,
 }
 
 impl std::fmt::Debug for Importing {
@@ -154,6 +157,8 @@ pub(crate) enum Turned {
 enum Unit {
   /// Not at the stream's end.
   More,
+  /// A record handed over, owed its landing ([`land_owed`]).
+  Owed,
   /// At the stream's end, every record committed.
   Done,
 }
@@ -189,6 +194,7 @@ pub(crate) fn begin(
     charged: 0,
     revisions: 0,
     turns: 0,
+    owed: None,
   };
   state.vcs_stores.svn_imports.insert(id, importing);
   state.count(STARTED, 1);
@@ -212,6 +218,11 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
+  // A record owed its landing first: the import reads on only from the records it made.
+  if importing.owed.is_some() {
+    state.vcs_stores.svn_imports.insert(id, importing);
+    return Some(Ok(Turned::More));
+  }
   importing.turns = importing.turns.saturating_add(1);
   state.count(TURNS, 1);
   let began = slates_rt::futures::now_ns();
@@ -219,7 +230,10 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
   let outcome = loop {
     match unit(state, id, &mut importing) {
       Ok(Unit::More) if slates_rt::futures::now_ns().saturating_sub(began) < spend => {}
-      Ok(Unit::More) => break charge_holding(state, &mut importing).map(|()| Turned::More),
+      // A record handed over ends the turn: it lands before the import reads on ([`land_owed`]).
+      Ok(Unit::More | Unit::Owed) => {
+        break charge_holding(state, &mut importing).map(|()| Turned::More);
+      }
       Ok(Unit::Done) => break done(state, id, &importing).map(Turned::Done),
       Err(failed) => break Err(failed),
     }
@@ -272,8 +286,8 @@ fn unit(
     Ok(Imported::Commit { consumed, record }) => {
       importing.consume(consumed);
       importing.needed = 0;
-      commit_one(state, id, importing, *record)?;
-      Ok(Unit::More)
+      importing.owed = Some(*record);
+      Ok(Unit::Owed)
     }
     Ok(Imported::Done) => Ok(Unit::Done),
     Err(refusal) => Err(refused(state, refusal, importing.importer.loading())),
@@ -330,37 +344,61 @@ impl Importing {
   }
 }
 
-/// Commits `record`, which the import handed over, through the owner's step (the module doc): a revision as a client's
-/// commit is, counted; the UUID or a revision's properties as a record that moves no version.
-fn commit_one(
-  state: &mut ShardState,
-  id: RepositoryId,
-  importing: &mut Importing,
-  record: Record,
-) -> Result<(), LoadFailed> {
-  let principal = importing.principal.clone();
+/// Lands the record repository `id`'s import handed over last, if one is owed (the module doc): a revision as a
+/// client's commit lands one (`svn_commit::land_revision`: checked, landed on the node's store, then the green's next
+/// version), counted; the UUID or a revision's properties as a record that moves no version
+/// (`svn_commit::land_record`). Refused, the import ends as a refused turn ends it. None where no import of `id` is
+/// under way or the shard's state is gone.
+pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  let owed = crate::state::with_state(|state| {
+    let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
+    Some((importing.owed.take(), importing.principal.clone()))
+  })??;
+  let (record, principal) = match owed {
+    (Some(record), principal) => (record, principal),
+    (None, _) => return Some(Ok(())),
+  };
   let failed = |refusal: Uncommitted, revision: u64| match refusal {
     Uncommitted::Budget { available } => LoadFailed::Budget { available },
     refusal => LoadFailed::Uncommitted { refusal, revision },
   };
-  match record {
+  let landed = match record {
     Record::Revision(revision) => {
       let number = revision.head.saturating_add(1);
-      svn_commit::commit(state, (&principal, id), revision, None)
-        .map_err(|refusal| failed(refusal, number))?;
-      importing.revisions = importing.revisions.saturating_add(1);
-      state.count(REVISIONS, 1);
+      svn_commit::land_revision((&principal, id), revision, None)
+        .await?
+        .map(|_| true)
+        .map_err(|refusal| failed(refusal, number))
     }
     other => {
       let revision = match &other {
         Record::RevisionProperties { revision, .. } => *revision,
         _ => 0,
       };
-      svn_commit::record(state, (&principal, id), other)
-        .map_err(|refusal| failed(refusal, revision))?;
+      svn_commit::land_record((&principal, id), other)
+        .await?
+        .map(|()| false)
+        .map_err(|refusal| failed(refusal, revision))
     }
-  }
-  Ok(())
+  };
+  crate::state::with_state(|state| match landed {
+    Ok(revision) => {
+      if revision {
+        if let Some(importing) = state.vcs_stores.svn_imports.get_mut(&id) {
+          importing.revisions = importing.revisions.saturating_add(1);
+        }
+        state.count(REVISIONS, 1);
+      }
+      Ok(())
+    }
+    Err(failed) => {
+      if let Some(importing) = state.vcs_stores.svn_imports.remove(&id) {
+        end(state, importing);
+        state.count(REFUSED, 1);
+      }
+      Err(failed)
+    }
+  })
 }
 
 /// The import's refusal of the stream, at `revision`: past the records' room it is the shard's budget that could not
@@ -430,6 +468,9 @@ pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
 pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> {
   loop {
     slates_rt::futures::yield_now().await;
+    if let Err(failed) = land_owed(id).await? {
+      return Some(Err(failed));
+    }
     let turned = crate::state::with_state(|state| turn(state, id))??;
     match turned {
       Ok(Turned::More) => {}

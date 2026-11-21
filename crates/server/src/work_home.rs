@@ -142,6 +142,20 @@ pub(crate) struct SealedWork {
   /// The verdict of `composed` a holder computed on its replica, in its wire form (A-658 part 3a), when the work lives
   /// on a node that holds a replica of a green another node owns (A-697 part c): the owner takes it by position.
   pub(crate) computed: Option<Vec<u8>>,
+  /// A merge check's or resolution's ask (A-796), when the rebase is one: what the green's half does beyond a rebase.
+  pub(crate) merge: Option<MergeAsk>,
+}
+
+/// What a merge check or a resolution asks of the green's half beyond a rebase (A-796).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MergeAsk {
+  /// The head a resolution's check judged: the green's half refuses `StaleMergeView` when its head is another. `None`
+  /// for a check, which judges the head as it is.
+  pub(crate) head: Option<u64>,
+  /// The canonical operations to retire, strictly increasing.
+  pub(crate) discard: Vec<u64>,
+  /// The agent's changes, applied at the head after the kept operations.
+  pub(crate) replacement: Vec<slates_ipc::protocol::WorkChange>,
 }
 
 /// What a clean rebase leaves a work, or the answer when it was not clean.
@@ -160,6 +174,16 @@ pub(crate) enum RebaseAnswer {
   },
   /// A conflict or a refusal: the reply, with the work unchanged.
   Reply(ReplyBody),
+  /// A merge check's answer (A-796): the head it judged, the canonical declaration, and the conflicting reply when a
+  /// submit now would conflict (`None` when it would be accepted). Nothing moves.
+  Checked {
+    /// The green's head the check judged.
+    head: u64,
+    /// The work's canonical declaration, by index.
+    declaration: Vec<slates_ipc::protocol::MergeOp>,
+    /// The conflict, as a rebase answers one.
+    conflict: Option<ReplyBody>,
+  },
 }
 
 /// The owner's answer to a work's creation: the work's id, minted before the ask, and its base.
@@ -398,7 +422,12 @@ fn may_ask(state: &ShardState, principal: &Principal, body: &RequestBody) -> boo
     RequestBody::Submit { .. }
     | RequestBody::SubmitSigned { .. }
     | RequestBody::SubmitHeld { .. }
-    | RequestBody::Rebase { .. } => require_work(state, principal, volume, false, "ask").is_ok(),
+    | RequestBody::Rebase { .. }
+    | RequestBody::CheckMerge { .. }
+    | RequestBody::ReadMergeCheck { .. } => {
+      require_work(state, principal, volume, false, "ask").is_ok()
+    }
+    RequestBody::ResolveMerge { .. } => require_work(state, principal, volume, true, "ask").is_ok(),
     // An approval reaches the verdict only once it verifies (A-285): the owner trusts what it is sent, so a consumer's
     // or a forged approval runs here, where `verbs::submit_approved` refuses it, and nothing reaches the green.
     RequestBody::SubmitApproved {
@@ -471,6 +500,37 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
         seal(state, work),
         (evidence, approval, signature, authorship),
       ))
+    }
+    RequestBody::CheckMerge { .. } => merge_need(state, work, MergeAsk::default()),
+    RequestBody::ResolveMerge {
+      stamp,
+      discard,
+      replacement,
+    } => {
+      // A stale stamp asks nothing: the verb refuses it on this shard.
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      merge_need(
+        state,
+        work,
+        MergeAsk {
+          head: Some(stamp.head),
+          discard: discard.clone(),
+          replacement: replacement.clone(),
+        },
+      )
+    }
+    RequestBody::ReadMergeCheck {
+      stamp,
+      path,
+      offset,
+      max,
+    } => {
+      if !crate::verbs::stamp_holds(state, work, stamp) {
+        return None;
+      }
+      page_if_unheld(w, fetched, path, *offset, (*max).min(page_room()))
     }
     RequestBody::Rebase { .. } => {
       if home.rebased.is_some() {
@@ -579,6 +639,25 @@ fn verdict_need(
     evidence: evidence.to_vec(),
     sealed: Box::new(composed(state, sealed, evidence.to_vec())),
     policy: crate::verbs::SubmitPolicy::of_work(state, work, (approval, signature, authorship)),
+  })
+}
+
+/// What a merge check or a resolution needs of the green's owner (A-796): a rebase's base and refinement first, then the
+/// rebase itself carrying `ask`.
+fn merge_need(state: &ShardState, work: DbVolumeId, ask: MergeAsk) -> Option<Need> {
+  if state.work_home.rebased.is_some() {
+    return None;
+  }
+  let mut sealed = seal(state, work);
+  if let Some(need) = base_missing(state, &sealed) {
+    return Some(need);
+  }
+  if let Some(owed) = refine_owed(state, &sealed) {
+    return Some(Need::Refine(Box::new(owed)));
+  }
+  sealed.merge = Some(ask);
+  Some(Need::Rebase {
+    sealed: Box::new(composed(state, sealed, Vec::new())),
   })
 }
 
@@ -778,6 +857,7 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
     composed: None,
     computed: None,
+    merge: None,
   }
 }
 
@@ -2773,6 +2853,7 @@ mod tests {
       files: super::WorkFiles::default(),
       composed: None,
       computed: None,
+      merge: None,
     }
   }
 
@@ -2781,6 +2862,7 @@ mod tests {
     match answer {
       super::RebaseAnswer::Rebased { journal, .. } => format!("rebased to {journal:?}"),
       super::RebaseAnswer::Reply(reply) => format!("answered {reply:?}"),
+      super::RebaseAnswer::Checked { head, .. } => format!("checked at {head}"),
     }
   }
 

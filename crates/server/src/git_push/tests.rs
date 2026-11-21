@@ -229,9 +229,8 @@ pub(crate) fn owner() -> Principal {
 
 /// Makes git repository `name`, SHA-1, its default branch `main`, on the shard: its id.
 pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),

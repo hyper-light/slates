@@ -943,7 +943,7 @@ fn blobs() -> Vec<Vec<u8>> {
 }
 
 /// A step, generated as plain tuples and a weighted selector, so the strategy needs no `Arc`-backed `prop_oneof!`
-/// (R2; `crates/base/src/s3/host.rs` is the pattern). The selector's ranges keep the weights the steps had: admit 4,
+/// (R2). The selector's ranges keep the weights the steps had: admit 4,
 /// commit 2, abandon 1, insert 3, get 2, seal 2, compact 2, due 1, fork 1, release 1, recreate 1.
 fn step() -> impl Strategy<Value = Step> {
   (

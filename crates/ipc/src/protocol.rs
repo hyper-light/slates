@@ -1403,71 +1403,45 @@ pub enum RequestBody {
     /// The last line of the previous page, or `None` for the first page.
     after: Option<LogCursor>,
   },
-  /// Create a volume laid over the objects of an S3 base (§4.15 "An S3 base"; A-555): an overlay as `Create` with a
-  /// host directory makes one, its base read from the store `base` names, signed with `credential`. The credential is
-  /// held in RAM by the volume's owner shard and never written anywhere (R1); the catalog records the base alone.
-  /// Answered `Created`, or refused as `Create` is, and `BaseUnavailable` naming the base's endpoint for a base the
-  /// daemon cannot reach (an endpoint name it would have to resolve, a host no plain loopback address, no authority
-  /// for TLS). Appended.
-  CreateOverS3 {
-    /// The name.
-    name: String,
-    /// The size class.
-    size: SizeClass,
-    /// The name policy.
-    names: NamePolicy,
-    /// Whether unlocked memory refuses.
-    require_locked: bool,
-    /// The base: its store, bucket and prefix.
-    base: S3BaseSpec,
-    /// What the store's requests are signed with.
-    credential: S3Credential,
+  /// Removed (2026-11-20, Ada: the S3 base was never asked for). Tag 97 was `CreateOverS3`, a volume laid over an S3
+  /// base's objects; the tag stays reserved, never reused, and a peer that sends it is refused `Unsupported` by kind.
+  RemovedCreateOverS3,
+  /// Checks a work's pending declarations against its green's head and publishes nothing (§4.16; the Codex agent's
+  /// early-conflict check, A-796): the verdict a submit would get now, the head and base it judged and the work's
+  /// revision, with the canonical declaration (the composed operations, by index) and the conflict windows, each as
+  /// far as one reply holds. The work's base, journal, files and charge and the green are unchanged; the windows are
+  /// kept with the work for `Conflicts` (A-267), as a conflicting rebase keeps them. Answered `MergeChecked`. A read.
+  /// Appended.
+  CheckMerge {
+    /// The work volume.
+    work: VolumeId,
   },
-}
-
-/// An S3 base as the wire names it (A-555; the library's `S3Base`, which checks every part and is what a caller makes
-/// one from): the store's endpoint (`https://host[:port]`, or `http://` to a loopback address alone), the bucket's
-/// region, the bucket, the prefix its keys lie under (empty or ending in `/`), whether requests name the bucket in the
-/// path, and the authorities the store's certificate is verified against (DER), none for plain HTTP.
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
-pub struct S3BaseSpec {
-  /// The endpoint, `https://host[:port]` or `http://host[:port]`.
-  pub endpoint: String,
-  /// The bucket's region, the signature's scope.
-  pub region: String,
-  /// The bucket.
-  pub bucket: String,
-  /// The prefix: empty, or ending in `/`.
-  pub prefix: String,
-  /// Path-style addressing (`/bucket/key`), as an S3-compatible store on one host serves it; virtual-hosted otherwise.
-  pub path_style: bool,
-  /// The certificate authorities the store's certificate is verified against, each DER; empty for plain HTTP.
-  pub authorities: Vec<Vec<u8>>,
-}
-
-/// A credential for an S3 store (A-555): an access key and its secret, with a session token for a temporary one. Its
-/// `Debug` names the key alone: the secret and the token never reach a log.
-#[derive(Wire, Clone, PartialEq, Eq)]
-pub struct S3Credential {
-  /// The access key id.
-  pub access_key_id: String,
-  /// The secret access key.
-  pub secret_access_key: String,
-  /// The session token of a temporary credential.
-  pub session_token: Option<String>,
-}
-
-impl std::fmt::Debug for S3Credential {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("S3Credential")
-      .field("access_key_id", &self.access_key_id)
-      .field("secret_access_key", &"<withheld>")
-      .field(
-        "session_token",
-        &self.session_token.as_ref().map(|_| "<withheld>"),
-      )
-      .finish()
-  }
+  /// Reads a byte range of the work as a `CheckMerge` saw it (A-796): refused `StaleMergeView` once the work changed (its
+  /// revision moved, its base or its green is not the stamp's). The green's view is the green at the stamp's head, read
+  /// with `ReadRange` at that version, which no later publication changes. Answered as `ReadRange` is. A read. Appended.
+  ReadMergeCheck {
+    /// The check's stamp.
+    stamp: MergeStamp,
+    /// The file.
+    path: String,
+    /// The first byte.
+    offset: u64,
+    /// The most bytes wanted.
+    max: u64,
+  },
+  /// Resolves a conflict an agent checked (A-796): retires the canonical operations `discard` names, rebases the rest
+  /// onto the stamp's head, applies `replacement` there in head coordinates, and restates the work at the head, as one
+  /// recorded step. Refused `StaleMergeView`, with nothing changed, when the green's head is not the stamp's or the work
+  /// changed since the check; answered `Rebased` with the windows, nothing changed, when what is kept still conflicts.
+  /// No merge is inferred: every byte of a resolution is the agent's declaration (D-27). Appended.
+  ResolveMerge {
+    /// The check's stamp.
+    stamp: MergeStamp,
+    /// Indices into the check's canonical declaration to retire, strictly increasing.
+    discard: Vec<u64>,
+    /// The agent's own changes, in the head's coordinates, applied after the kept operations.
+    replacement: Vec<WorkChange>,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2498,6 +2472,15 @@ impl RequestBody {
       | RequestBody::Status { volume }
       | RequestBody::Drifted { volume, .. }
       | RequestBody::Conflicts { work: volume, .. }
+      | RequestBody::CheckMerge { work: volume }
+      | RequestBody::ReadMergeCheck {
+        stamp: MergeStamp { work: volume, .. },
+        ..
+      }
+      | RequestBody::ResolveMerge {
+        stamp: MergeStamp { work: volume, .. },
+        ..
+      }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -2545,7 +2528,7 @@ impl RequestBody {
       // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
       RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
       RequestBody::Create { .. }
-      | RequestBody::CreateOverS3 { .. }
+      | RequestBody::RemovedCreateOverS3
       | RequestBody::Advance { .. }
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
@@ -2598,7 +2581,6 @@ impl RequestBody {
     matches!(
       self,
       RequestBody::Create { .. }
-        | RequestBody::CreateOverS3 { .. }
         | RequestBody::CreateGreen { .. }
         | RequestBody::CreateRepository { .. }
         | RequestBody::CreateBranch { .. }
@@ -2615,6 +2597,7 @@ impl RequestBody {
         | RequestBody::Submit { .. }
         | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
+        | RequestBody::ResolveMerge { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
         | RequestBody::Destroy { .. }
@@ -2648,6 +2631,8 @@ impl RequestBody {
       RequestBody::Status { .. }
         | RequestBody::Drifted { .. }
         | RequestBody::Conflicts { .. }
+        | RequestBody::CheckMerge { .. }
+        | RequestBody::ReadMergeCheck { .. }
         | RequestBody::Versions { .. }
         | RequestBody::MergeRecord { .. }
         | RequestBody::ChangedSince { .. }
@@ -3033,6 +3018,67 @@ pub struct MergeWindow {
   pub len: u64,
   /// The conflict class, as its `MergeConflictClass` discriminant.
   pub class: u8,
+}
+
+/// Everything a merge check judged (A-796): the work, its green, the base and head the verdict mapped between, and the
+/// work's revision, which every change to the work moves. A read or a resolution naming it is refused `StaleMergeView`
+/// once any of them no longer holds.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeStamp {
+  /// The work.
+  pub work: VolumeId,
+  /// Its green.
+  pub green: VolumeId,
+  /// The work's base the check mapped from.
+  pub base: u64,
+  /// The green's head the check judged against.
+  pub head: u64,
+  /// The work's revision when it was checked.
+  pub revision: u64,
+}
+
+/// A byte view a merge check names (A-796): what a client reads it through.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeView {
+  /// The work as it stood when checked (`ReadMergeCheck`, refused once the work changed).
+  Work,
+  /// The green at the check's head (`ReadRange` at that version).
+  Green,
+}
+
+/// One change of a resolution (A-796), with the ordinary edit's and declaration's meaning, in the head's coordinates.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum WorkChange {
+  /// A splice of a file, as `Edit`.
+  Edit {
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// The bytes removed there.
+    delete_len: u64,
+    /// The bytes inserted there.
+    bytes: Vec<u8>,
+  },
+  /// A namespace or metadata declaration, as `Declare`.
+  Declare {
+    /// The declaration.
+    op: WorkOp,
+  },
+}
+
+/// One operation of a work's canonical declaration (A-796): what its journal composes to against its base, by the
+/// index a resolution's `discard` names it with.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct MergeOp {
+  /// The path the operation acts on.
+  pub path: String,
+  /// The operation's kind, as the ops document's `OpKind` discriminant.
+  pub kind: u8,
+  /// Its offset (or its kind's first operand).
+  pub at: u64,
+  /// Its length (or its kind's second operand).
+  pub len: u64,
 }
 
 /// A namespace or metadata operation a work volume declares (§4.16), the counterpart to the content
@@ -4749,6 +4795,9 @@ pub enum Refusal {
     /// The newer presentation.
     newer: u64,
   },
+  /// A merge check's view no longer holds (A-796): the green's head moved past the stamp's, or the work changed since it
+  /// was checked. Nothing was read or changed; check again. Appended.
+  StaleMergeView,
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
@@ -4818,8 +4867,9 @@ pub enum ImportFault {
     /// The bytes an import may hold at once.
     room: u64,
   },
-  /// A file is still being fetched from the base's store (an S3 base): ask again once it has landed.
-  Pending,
+  /// Removed (2026-11-20, Ada: the S3 base was never asked for): a file still being fetched from an S3 base. The tag
+  /// stays reserved, never reused; no daemon of this build sends it.
+  RemovedPending,
   /// The import was given back before its end: its repository was freed.
   Abandoned,
   /// A Subversion dump the import refused as `svnadmin load` refuses the same stream (A-652 part 3): Subversion's error
@@ -5828,6 +5878,22 @@ pub enum ReplyBody {
     lines: Vec<LogLine>,
     /// The cursor that continues the walk (this page's last line), or `None` when this page ends it.
     next: Option<LogCursor>,
+  },
+  /// A merge check (`CheckMerge`, A-796): what it judged, the conflict windows as far as one reply holds (the rest kept
+  /// under `verdict` for `Conflicts`, A-267), and the canonical declaration as far as the reply holds. Appended.
+  MergeChecked {
+    /// What the check judged.
+    stamp: MergeStamp,
+    /// The conflict windows; none when a submit now would be accepted.
+    conflicts: Vec<MergeWindow>,
+    /// Windows past what this reply holds, read with `Conflicts`.
+    conflicts_elided: u32,
+    /// The kept verdict the windows are of; 0 when there are none.
+    verdict: u64,
+    /// The canonical declaration, by index.
+    declaration: Vec<MergeOp>,
+    /// Operations of the declaration past what this reply holds.
+    declaration_elided: u32,
   },
 }
 

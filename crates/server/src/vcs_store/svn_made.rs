@@ -17,9 +17,12 @@
 //! revision properties: `svn:log`, the submit's message, `svn:date`, the owner's instant, and `svn:author`, the
 //! principal's own name its session carries (`crate::identities`), as the svn+ssh edge names a commit's author.
 //!
-//! **Recorded as an import's is** (`svn_commit::land_made`): checked by the records, its record appended in the submit's
-//! own transaction in an entry of the register holding it alone, after the version's own record, so the version and its
-//! revision are one durable atom, and a recovery replays it with every other record, in log order.
+//! **Landed as an import's is** (`svn_commit::land_made`; C2 of Ada's close list): the submit takes the repository's
+//! landing turn in its own step where it is free, and a task holding it makes the revision, checks it, lands it on the
+//! node's changeset store and commits it by an entry of the register naming it alone (the version moved the green
+//! already), so no client's commit lands between the version and its revision. Owed (GAPS, C2): a crash between the
+//! submit's commit and the revision's leaves the version without its revision; main's call on making it again at
+//! recovery is open.
 //!
 //! **Not made, and counted** ([`UNMADE`]), the version standing: a version not the one after the youngest revision, a
 //! copy in the change (A-586: the index names a copy at its destination alone), a special file or a symbolic link
@@ -51,6 +54,7 @@ use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
+use crate::repository::svn_commit::landing::{self, Turn};
 use crate::repository::svn_commit::{PROPS, Uncommitted, land_made};
 use crate::state::ShardState;
 
@@ -86,6 +90,8 @@ enum Unmade {
   Digest,
   /// The step refused it.
   Step(Uncommitted),
+  /// Its landing's task could not be spawned (the shard's arena full).
+  Unrun,
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the step's refusal and dead-code analysis
@@ -99,11 +105,15 @@ impl std::fmt::Debug for Unmade {
       Unmade::Unreadable => formatter.write_str("Unreadable"),
       Unmade::Digest => formatter.write_str("Digest"),
       Unmade::Step(refused) => formatter.debug_tuple("Step").field(refused).finish(),
+      Unmade::Unrun => formatter.write_str("Unrun"),
     }
   }
 }
 
-/// Makes the revision of `green`'s `version`, where `green` is a Subversion repository's (module docs); counted.
+/// Makes the revision of `green`'s `version`, where `green` is a Subversion repository's (module docs; C2): the
+/// repository's landing turn taken in the submit's own step where it is free, so no client's commit lands between the
+/// version and its revision, then the revision made, landed on the node's store and committed by a task holding it
+/// ([`made_landing`]); counted.
 pub(crate) fn make(
   state: &mut ShardState,
   green: DbVolumeId,
@@ -111,49 +121,99 @@ pub(crate) fn make(
   authorship: &Authorship,
   copies: &[MadeCopy],
 ) {
-  match made(state, green, version, (authorship, copies)) {
-    Ok(true) => state.count(MADE, 1),
-    Ok(false) => {}
-    Err(why) => {
-      slates_machine::log_line!(
-        "slates-server: partition {}: no revision was made of a submitted version: {why:?}",
-        state.partition
-      );
-      state.count(UNMADE, 1);
-    }
+  let Some(repository) = subversion_repository_of(state, green) else {
+    return;
+  };
+  let turn = Turn::take_now(state, repository);
+  let task = made_landing(
+    (repository, green, version),
+    (authorship.clone(), copies.to_vec()),
+    turn,
+  );
+  if slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    unmade(state, &Unmade::Unrun);
   }
 }
 
-/// [`make`]'s steps: whether a revision was made.
-fn made(
+/// Counts and logs a version of which no revision was made.
+fn unmade(state: &mut ShardState, why: &Unmade) {
+  slates_machine::log_line!(
+    "slates-server: partition {}: no revision was made of a submitted version: {why:?}",
+    state.partition
+  );
+  state.count(UNMADE, 1);
+}
+
+/// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the revision made of
+/// `green`'s `version` and landed (`svn_commit::land_made`); counted.
+async fn made_landing(
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  (authorship, copies): (Authorship, Vec<MadeCopy>),
+  turn: Option<Turn>,
+) {
+  let turn = match turn {
+    Some(turn) => turn,
+    None => match landing::turn(repository).await {
+      Some(turn) => turn,
+      None => return,
+    },
+  };
+  let Some(made) = crate::state::with_state(|state| {
+    revision_made(state, (repository, green), version, (&authorship, &copies))
+  }) else {
+    return;
+  };
+  let revision = match made {
+    Ok(Some(revision)) => revision,
+    Ok(None) => {
+      let _ = crate::state::with_state(|state| turn.give_back(state));
+      return;
+    }
+    Err(why) => {
+      let _ = crate::state::with_state(|state| {
+        unmade(state, &why);
+        turn.give_back(state);
+      });
+      return;
+    }
+  };
+  let landed = land_made(turn, repository, move |_| Ok(revision)).await;
+  let _ = crate::state::with_state(|state| match landed {
+    Some(Ok(_)) => state.count(MADE, 1),
+    Some(Err(refused)) => unmade(state, &Unmade::Step(refused)),
+    None => {}
+  });
+}
+
+/// The revision of `green`'s `version`, made after the records' youngest; none where it is made already.
+fn revision_made(
   state: &mut ShardState,
-  green: DbVolumeId,
+  (repository, green): (RepositoryId, DbVolumeId),
   version: u64,
   (authorship, copies): (&Authorship, &[MadeCopy]),
-) -> Result<bool, Unmade> {
-  let Some(repository) = subversion_repository_of(state, green) else {
-    return Ok(false);
-  };
+) -> Result<Option<Revision>, Unmade> {
   let youngest = state
     .vcs_stores
     .subversion_records(repository)
     .map_or(u64::MAX, SvnRecords::youngest);
   // A revision a client's commit landed moved the green itself: made already.
   if youngest >= version {
-    return Ok(false);
+    return Ok(None);
   }
   if youngest.checked_add(1) != Some(version) {
     return Err(Unmade::NotNext);
   }
   let now = AprTime(state.clock.wall_ns().div_euclid(NANOS_PER_MICRO));
-  let revision = revision_of(
+  revision_of(
     state,
     (repository, green),
     (youngest, version),
     (authorship, now, copies),
-  )?;
-  land_made(state, repository, revision).map_err(Unmade::Step)?;
-  Ok(true)
+  )
+  .map(Some)
 }
 
 /// The Subversion repository `green` is the green of: a member of a repository whose tool is Subversion's.

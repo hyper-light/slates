@@ -787,10 +787,55 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         }
       }
     }
+    Verb::CheckMerge { work } => {
+      let checked = client.check_merge(*work)?;
+      if json {
+        slates_machine::out_line!("{}", slates_mcp::merge_check_json(&checked));
+      } else {
+        slates_machine::out_line!(
+          "checked: head {} base {} revision {}",
+          checked.stamp.head,
+          checked.stamp.base,
+          checked.stamp.revision
+        );
+        for (index, op) in checked.declaration.iter().enumerate() {
+          slates_machine::out_line!(
+            "op {index}: {} kind {} at {} len {}",
+            op.path,
+            op.kind,
+            op.at,
+            op.len
+          );
+        }
+        print_windows(&checked.conflicts);
+      }
+    }
+    Verb::ResolveMerge { resolution } => {
+      let args: serde_json::Value =
+        serde_json::from_str(resolution).map_err(|error| bad_resolution(error.to_string()))?;
+      let (stamp, discard, replacement) =
+        slates_mcp::resolve_args(&args).map_err(bad_resolution)?;
+      let outcome = client.resolve_merge(stamp, &discard, replacement)?;
+      if json {
+        slates_machine::out_line!("{}", rebase_json(&outcome));
+      } else {
+        match outcome {
+          Rebased::Rebased(version) => slates_machine::out_line!("resolved: {version}"),
+          Rebased::Conflict(windows) => print_windows(&windows),
+        }
+      }
+    }
     // Only the merge verbs above reach here.
     _ => {}
   }
   Ok(())
+}
+
+/// A resolution's JSON the CLI could not read (A-796), refused as the daemon refuses a malformed request.
+fn bad_resolution(message: String) -> ClientError {
+  ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest {
+    reason: format!("invalid resolution: {message}"),
+  })
 }
 
 /// A submit outcome as JSON (the MCP schema — `slates_mcp::windows_json` for the conflicts): `accepted`
@@ -1642,6 +1687,8 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
+    | Verb::CheckMerge { .. }
+    | Verb::ResolveMerge { .. }
     | Verb::Advance { .. }
     | Verb::Read { .. } => serve_merge(client, verb, json)?,
     Verb::Write {

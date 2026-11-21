@@ -14247,10 +14247,12 @@ fn port_on(lines: &[String], prefix: &str) -> Option<u16> {
 
 /// Starts an anchor whose daemon serves the version-control HTTP edge on loopback, on a port the system picks
 /// (`--vcs-http 127.0.0.1:0`), and waits for it as [`start_anchor_with_issuer_surface`] does, its consensus group
-/// bootstrapped: the anchor, the issuer surface's exports where this platform prints them ([`PRINTS_ISSUER_SURFACE`]),
-/// and the edge's port, which the daemon names before it says it serves.
+/// bootstrapped, its daemon's changeset store in `store` (`--vcs-store`): the anchor, the issuer surface's exports where
+/// this platform prints them ([`PRINTS_ISSUER_SURFACE`]), and the edge's port, which the daemon names before it says it
+/// serves.
 fn start_anchor_with_vcs_http(
   instance: &str,
+  store: &ScratchDir,
 ) -> (AnchorProcess, Option<Vec<(String, String)>>, u16) {
   use std::io::{BufRead, Write};
   let mut child = slates()
@@ -14263,6 +14265,8 @@ fn start_anchor_with_vcs_http(
       SHARDS,
       "--vcs-http",
       "127.0.0.1:0",
+      "--vcs-store",
+      &store.path,
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
@@ -14312,7 +14316,12 @@ fn start_anchor_with_vcs_http(
 #[test]
 fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
   let instance = format!("cli-repository-{}", std::process::id());
-  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance);
+  // A Subversion repository's history lands on the daemon's changeset store (C2): the anchor is given a directory for
+  // it, removed after the anchor (declared first, so dropped last).
+  let store = ScratchDir {
+    path: build_output_dir("vcs-store"),
+  };
+  let (anchor, issuer, port) = start_anchor_with_vcs_http(&instance, &store);
   let name = "made-by-the-cli";
   let (code, out, err) = run(&instance, &["repository", "create", name, "--tool", "git"]);
   assert_eq!(code, 0, "the create answers: {err}");

@@ -4870,7 +4870,6 @@ async fn init_shard(
     nfs_v4_instance: None,
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     nfs_call: None,
-    nfs_pending_base: None,
     held_nfs_replies: std::collections::BTreeMap::new(),
     held_nfs_replies_changed: false,
     recovered_nfs_replies: std::collections::BTreeMap::new(),
@@ -4982,7 +4981,6 @@ async fn init_shard(
     volume_ids_minted: 0,
     acceptance_deferred: false,
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
-    base_waits: crate::base_wait::BaseWaits::default(),
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
@@ -8150,20 +8148,26 @@ mod tests {
     );
   }
 
-  /// §4.17.1 "A push's intake" part 2 (main's ruling (B), A-727 slice b's barrier). Do: on a daemon over a retained
-  /// anchor segment, land a Subversion work whose text spans several copy slices through `svn_commit::land_work`: its
-  /// text put into the content store a slice a turn, its revision appended naming the text by identity only once the
-  /// text is durable; then stop the daemon without publishing anything more, as a crash right after the entry, and
-  /// start a successor over the same segment. Expect: the successor replays the revision with its stored text held, no
-  /// replay refused, and the text read back whole from the store. Without the barrier (the entry appended right after
-  /// the puts) the text is in no image and the replay is refused `SvnStored`.
+  /// §4.17.1 "A push's intake" part 2 (main's ruling (B)); C2 stage B (the store carries a commit's texts). Do: on a
+  /// daemon over a retained anchor segment holding a changeset store, land a Subversion work whose text spans several
+  /// copy slices through `svn_commit::land_work`: its text put into the content store a slice a turn, then landed in
+  /// the revision's changeset with its record, then the register's entry naming it; then stop the daemon without
+  /// publishing anything more, as a crash right after the entry, and start a successor over the same segment and store.
+  /// Expect: the successor replays the revision with its stored text held, no replay refused, the text read back from
+  /// the node's store into the content store (`vcs_store.svn_text_fetched` 1, the shard's image never having kept it),
+  /// and read back whole. Before stage B the entry waited for the shard's image to keep the text (A-727 slice b's
+  /// barrier); without either, the replay is refused `SvnStored`.
   #[test]
   fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
     use slates_anchor::AnchorSegment;
     use slates_svn::commit::drive::TextSink;
     let profile = test_profile();
     let instance = format!("svn-intake-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    // A Subversion repository's history lands on the node's changeset store (C2): the daemons hold one, which the
+    // successor opens again.
+    let mut store = crate::test_store::TestStore::start("svn-intake-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8188,9 +8192,9 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     let put = bytes.clone();
     first
-      .observe(shard, move |state| {
-        let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "barrier");
+      .observe(shard, move |_state| {
         let task = slates_rt::futures::spawn(async move {
+          let (repository, _) = crate::repository::svn_commit::tests::subversion("barrier").await;
           let texts = slates_svn::commit::drive::HeldTexts::new();
           let staged = texts.stage().unwrap();
           texts.append(staged, &put).unwrap();
@@ -8230,17 +8234,21 @@ mod tests {
     assert_eq!(landed.map(|landed| landed.is_ok()), Some(true));
     // The crash: nothing more published.
     first.stop();
+    // Every handle let go first (the configuration's too), so the owner ends, then opens the store again.
+    config.vcs_disk = None;
+    store.restart_owner();
+    config.vcs_disk = Some(store.handle());
     let second = super::Daemon::start(&profile, config, source()).unwrap();
     let shard = second.shards.first().copied();
     let identity = text.identity;
     let read = || {
       second
         .observe(shard, move |state| {
-          let refused = state
-            .refusals
-            .get(crate::vcs_store::REPLAY_REFUSED)
-            .copied()
-            .unwrap_or(0);
+          let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+          let refused = (
+            counted(crate::vcs_store::REPLAY_REFUSED),
+            counted(crate::vcs_store::SVN_TEXT_FETCHED),
+          );
           let recovered = state.vcs_stores.unrecovered(repository).is_none()
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
@@ -8262,7 +8270,7 @@ mod tests {
     while std::time::Instant::now() < deadline
       && !seen
         .as_ref()
-        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1 > 0)
+        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1.0 > 0)
     {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
@@ -8271,7 +8279,7 @@ mod tests {
     drop(segment);
     let seen =
       seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
-    assert_eq!(seen, Some((true, 0, true)));
+    assert_eq!(seen, Some((true, (0, 1), true)));
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
@@ -8389,7 +8397,9 @@ mod tests {
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a729-identities-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a729");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())

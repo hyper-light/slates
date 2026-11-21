@@ -15,7 +15,10 @@ use crate::repository::hg_push::tests::{Made, changegroup};
 use crate::repository::hg_push::{land_in, line_name, take_whole};
 use crate::state::ShardState;
 use crate::vcs_store::paths::tests::{create, version};
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
+
+/// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
+const TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn owner() -> Principal {
   Principal::Uid {
@@ -26,9 +29,8 @@ fn owner() -> Principal {
 
 /// A Mercurial repository `name`, its first line `default`'s: its id and the line's green.
 fn mercurial(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -126,14 +128,17 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
   changeset.node
 }
 
-/// A-731. Do: make a Mercurial repository; submit a work making `a.txt` to its line's green; push a client's changeset
-/// on top of the made one; submit another work changing `a.txt`; then make the repository's store again from its log as
-/// a recovery does. Expect: the first submit made a changeset over the null node, the line's head; the push's changeset
-/// the head after it, its parent the made one; the second submit's changeset over the push's, the head; and after the
-/// rebuild, the same head and every changeset held: the made node put back from the record.
+/// A-731, A-767 C4. Do: on a running daemon holding a changeset store, make a Mercurial repository; submit a work
+/// making `a.txt` to its line's green; push a client's changeset on top of the made one (landed on the store); submit
+/// another work changing `a.txt`; then make the repository's store again from its log as a recovery does (the sliced
+/// `vcs_store::rebuild`), and read it once the task ends. Expect: the first submit made a changeset over the null node,
+/// the line's head; the push's changeset the head after it, its parent the made one; the second submit's changeset over
+/// the push's, the head; and after the rebuild, the same head and every changeset held: the made nodes put back from
+/// their records, the push's from its changeset on the store.
 #[test]
 fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
-  crate::daemon::audit_on_shard(|state| {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, green, held) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "made");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     assert_eq!(
@@ -156,29 +161,28 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
     let second = head_of(state, green).expect("the second submit made a changeset");
     assert_eq!(parent_of(state, repository, &second), Some(pushed));
     assert_eq!(state.refusals.get(MADE).copied(), Some(2));
-    assert_rebuilt_from_the_log(state, (repository, green), [first, pushed, second]);
+    crate::vcs_store::rebuild(state, repository);
+    (repository, green, [first, pushed, second])
   });
-}
-
-/// `repository`'s store made again from its log: `green`'s head still the last changeset of `held`, the made node
-/// put back from the record, and every changeset of `held` held.
-fn assert_rebuilt_from_the_log(
-  state: &mut ShardState,
-  (repository, green): (RepositoryId, DbVolumeId),
-  held: [Node; 3],
-) {
-  crate::vcs_store::rebuild_whole(state, repository);
-  assert_eq!(
-    head_of(state, green),
-    Some(held[2]),
-    "the made node from the record"
-  );
-  for node in held {
-    assert!(
-      parent_of(state, repository, &node).is_some(),
-      "{node:?} not held after the rebuild"
-    );
-  }
+  let began = std::time::Instant::now();
+  let rebuilding = loop {
+    let rebuilding = crate::daemon::observe_first(&daemon, move |state| {
+      state.vcs_stores.rebuilding(repository)
+    });
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let (head, parents) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      head_of(state, green),
+      held.map(|node| parent_of(state, repository, &node).is_some()),
+    )
+  });
+  daemon.stop();
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert_eq!(head, Some(held[2]), "the made node from the record");
+  assert_eq!(parents, [true; 3], "every changeset held after the rebuild");
 }
 
 /// A-731 with A-626 part 4 (a copy made through a work). Do: make a Mercurial repository; submit `a.txt`; then submit a
@@ -189,7 +193,7 @@ fn assert_rebuilt_from_the_log(
 fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
   use crate::vcs_store::paths::tests::Op;
   use slates_ipc::protocol::WorkOp;
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let (repository, green) = mercurial(state, "copied");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     version(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
