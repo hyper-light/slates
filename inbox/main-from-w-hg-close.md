@@ -186,3 +186,26 @@ landing and its replay red first.
 - **Next:**
   - C1 step 1 (file texts read through the store, the served view first), then step 2. Then R2 to w-perf.
   - After C1, the push's memory (your 05:12 ruling).
+
+## C1: made changesets on the changeset store: LANDED on origin/main ac25475c1 (~10:10, 2026-11-21; base 8d7dec8df)
+- **Your ruling (09:00), one hook and one path:** a made changeset is a changegroup the server builds, taken through
+  the push's own intake and landed as a push's changeset: a made record (the green's key and version beside the
+  push's head), Payload and Texts, named by a made reference in the register. A replay puts the made node back.
+  - Recorded submits go through the shared deferred-submit hook. The changeset is made from a preview of the held
+    verdict and landed by a task, then the version and the entry are committed in one step. A bare dispatch lands it
+    from a task holding the turn.
+  - Edge cases: a store refusal gives the accept up; a fork a client's push made stale leaves the version alone,
+    counted.
+- **Removed, with no fallback:**
+  - the v3 made record (`write_made`, `DELTA_VERSION`, its `formed` reader);
+  - `hg_made::recorded`;
+  - `HgStore::unstored`, and `State::stored_logs` with it (w-perf's flag): every history is on the store and every
+    repository streams.
+- **Tests, local macOS:**
+  - the made changegroup through the intake equals `fork_with`, row for row (stock 7.2's three changesets);
+  - a made record's replay puts the made node back;
+  - `t_a731`: two made changesets named by reference on the store, and the rebuild puts the made head back;
+  - slates-hg 390/390; the hg server subset 89/89 after the final merge;
+  - the widened server set 369 passed, 1 failed (a git daemon_edge fetch that passes alone twice at load 16);
+  - hg_interop 15/15 against stock 7.2, the CLI's bookmarks submitting through the hook.
+- **Next:** C1 step 1a, the clone walk's file section through the store (StoreWants), then 1b (the pull).
