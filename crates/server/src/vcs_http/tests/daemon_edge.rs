@@ -2286,3 +2286,124 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
     "{answer}"
   );
 }
+
+/// A-766 part 2 (DeltaV v1, ra_serf 1.14's `open_root` without HTTPv2; `mod_dav_svn` 1.14.x `activity.c`, `version.c`,
+/// `mod_dav.c`). Do: on a daemon's HTTP edge, commit a file as a client without HTTPv2 does: MKACTIVITY of an activity;
+/// CHECKOUT of the VCC into it (`apply-to-version`); PROPPATCH of the working baseline the CHECKOUT named, setting
+/// `svn:log`; CHECKOUT of the root's version resource; PUT of `f.txt` under the working root that CHECKOUT named; MERGE
+/// of the activity; DELETE of the activity. Expect: `201` "Activity ... has been created."; `201` naming
+/// `!svn/wbl/ID/0`; `207`; `201` naming `!svn/wrk/ID/`; `201`; `200` naming revision 1; `204`; and revision 1 carrying
+/// the log message and the file. Before, the site refused every one of them.
+#[cfg(unix)]
+#[test]
+fn a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  let edge = (port, &certificate);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let activity = "4c1d2b8a-0f6e-4b52-9c7a-3d2e1f0a9b8c";
+  let made = dav(
+    edge,
+    ("MKACTIVITY", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let checkout_body = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:checkout xmlns:D=\"DAV:\"><D:activity-set><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:activity-set><D:apply-to-version/></D:checkout>"
+  );
+  let xml = ["Content-Type: text/xml"];
+  let baseline = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/vcc/default")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_baseline = field(&baseline.1, "Location").unwrap_or_default();
+  let logged = dav(
+    edge,
+    ("PROPPATCH", &working_baseline),
+    &xml,
+    b"<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+      xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\"><D:set><D:prop><S:log>a v1 commit</S:log></D:prop>\
+      </D:set></D:propertyupdate>",
+  );
+  let root = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/ver/0/")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_root = field(&root.1, "Location").unwrap_or_default();
+  let put = dav(
+    edge,
+    ("PUT", &format!("{}f.txt", working_root)),
+    &["Content-Type: application/vnd.svn-svndiff"],
+    &fulltext_delta(b"hello\n"),
+  );
+  let merge = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:merge xmlns:D=\"DAV:\"><D:source><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:source><D:no-auto-merge/><D:no-checkout/><D:prop><D:checked-in/><D:version-name/>\
+     </D:prop></D:merge>"
+  );
+  let merged = dav(edge, ("MERGE", &format!("/{name}")), &xml, merge.as_bytes());
+  let deleted = dav(
+    edge,
+    ("DELETE", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let landed_name = name.clone();
+  let landed = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let id = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&landed_name)?
+      .id;
+    let records = state.vcs_stores.subversion_records(id)?;
+    let log = records
+      .revision_properties(1)?
+      .iter()
+      .find(|(name, _)| name.as_slice() == b"svn:log")
+      .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+    let file = records.index().node("/f.txt", 1).ok().flatten().is_some();
+    Some((records.youngest(), log, file))
+  });
+  daemon.stop();
+  assert_eq!(
+    (
+      (made.0, made.2.contains("has been created.")),
+      (
+        baseline.0,
+        working_baseline.ends_with(&format!("/!svn/wbl/{activity}/0"))
+      ),
+      logged.0,
+      (
+        root.0,
+        working_root.ends_with(&format!("/!svn/wrk/{activity}/"))
+      ),
+      put.0,
+      (
+        merged.0,
+        merged.2.contains("<D:version-name>1</D:version-name>")
+      ),
+      deleted.0,
+      landed,
+    ),
+    (
+      (201, true),
+      (201, true),
+      207,
+      (201, true),
+      201,
+      (200, true),
+      204,
+      Some((1, Some(String::from("a v1 commit")), true)),
+    ),
+    "MKACTIVITY {made:?}\nCHECKOUT {baseline:?}\nPROPPATCH {logged:?}\nCHECKOUT {root:?}\nPUT {put:?}\nMERGE {merged:?}"
+  );
+}
