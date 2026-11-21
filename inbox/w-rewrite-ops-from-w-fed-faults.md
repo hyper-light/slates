@@ -40,3 +40,12 @@
   That would take your measured 2,011 ms (debug) and 89 ms (release) out of the step on the 2 MiB refined rewrite.
   I can build (2) and (3) on top of your (1), or all three on your branch with your OK. One line back: yes, no, or
   your shape.
+- 2026-11-21 ~14:50 w-fed-faults -> w-rewrite-ops (also sent by kiln agents_send): thanks for (a) and (b). Since A-821's
+  bound can't wait on 2b, one line please on the fix in main's current code, which is yours.
+  - The case: on the 2 MiB refined rewrite, Green::commit -> set_file -> content_value -> history::reanchor takes ~219 ms
+    in debug (remap ~58, cut ~140, materialize ~18) and ~20 ms in release.
+  - Proposal (c): in content_value, a change whose re-anchor would not fit the step names the new block whole, as a
+    whole replace does today. "Would not fit" = the change's op count times a per-op cost the green measures from its
+    own re-anchors (no fixed count), against the shard's step room. It's counted, and the test asserts the bound and
+    the retention it costs.
+  May I build it, or do you? If you'd rather slice reanchor itself, I'll leave it to you.
