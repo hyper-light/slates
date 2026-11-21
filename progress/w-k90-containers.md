@@ -212,3 +212,20 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    Jupiter is still waiting on the kiln re-vendor of Slates ae8319811 (export_engine).
 ## For main to delete (add): this Studio ~/.cache/w-k90-containers-ship-1795208540; MacBook ~/.cache/w-k90-containers-e2e-2f589ba,
    ~/.cache/w-k90-containers-dockercfg.
+## 2026-11-20 ~22:30: CLOSED (main's order after Ada's ~21:00 correction; the container part was rewritten and marked met by main)
+- Stopped by run id: r74 (MacBook, the rerun of r71) and r70 (jupiter, still building).
+- LANDED kiln 9437e6430 (fast-forward from b928a782a; is-ancestor confirmed): workspace/container.rs:301 rt::sleep -> rt::sleep_until(deadline), with no allow;
+  plus container_ab_tests.rs:253 (indexing_slicing) and tests/slates_fleet_live_move.rs:695 (.last() on a DoubleEndedIterator, redundant
+  closure), which also kept `cargo clippy -p kiln --all-targets --locked -- -D warnings` red. Red, then green under that exact command (big Studio,
+  macOS aarch64); 65 container unit tests pass. Told w-k90-pin-2.
+- Results on record: r49 (2f589baa6), r56 (cc80a38f8: Ask all 4 steps PROVEN, end included), r71 (f500759d2: drift passed). No adacachy pass (per w-k90-a520).
+- New findings (GAPS): the bind-vs-export A/B (r61) needs fresh folders per round and an exec tmpfs, and its take-down hangs on Docker Desktop's VM
+  holding the mount; fixes are only on agents/w-k90-a520-unlanded (fedd354ba), unverified. kiln's tree isn't `cargo fmt` clean under rustc 1.100
+  (1146 files reformat).
+## DELETED by exact path: big Studio: every ~/.cache/w-k90-containers-* (targets 128G+25G+18G, ship folders, logs), ~/kiln-work/w-k90-containers-kiln,
+   worktree ~/kiln-work/w-k90-containers-a520. MacBook-Pro-2: ~/.cache/w-k90-containers-{ab-cc80,dockercfg,e2e,e2e-2f589ba,e2e-cc80,e2e-f500,
+   live-r70.log,target}, ~/.cache/wkc-clippy.bundle, ~/.cache/kiln-container-ab, ~/kiln-work/w-k90-containers-{a520,kiln}. jupiter:
+   ~/.cache/w-k90-containers-{target,target.del-main,win-e2e.log,wincheck.log,win-leg2.log}, ~/kiln-work/w-k90-containers-win.
+## For main to delete (I couldn't reach these): b24c (did not answer): ~/.cache/w-k90-containers-statepush, ~/.cache/wkc-state.bundle,
+   ~/.cache/wkc-clippy.bundle (if there). adacachy (no room): any ~/.cache/w-k90-containers-*. This Studio: this state clone
+   ~/fanout-state-w-k90-containers (in use until this push). MacBook images pulled for the A/B: rust:1.99.1-bookworm, node:24-bookworm.

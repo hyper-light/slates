@@ -344,3 +344,19 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   (MountError::ExitUnwatched; unmount counted refused), with no tick fallback (banned second path). bridge-fuse suites
   green locally except a pre-existing flaky handshake count (1 of 4 on a loaded Mac; GAPS line added). Linux green+red =
   kiln r11. Exit 4 = kiln r9 (queued).
+
+## 2026-11-20 ~21:35 PST: kiln runs held, both still queued (not started)
+- r11: family three, Linux green + red (agents/w-shared-sweep-3 731331eef); needs linux/amd64, tool:cargo, cpus=8,
+  mem=16g, disk=40g. kiln: "queued; not linux 8 runners, machine under strain 1 (adacachy 451397fc...), no cargo 1".
+- r9: exit 4 reproduction (64/128/256/320 MiB holder submits, release); needs macos/arm64, cpus=8, mem=32g,
+  disk=60g. kiln: "queued; link down 3, haven't answered 3, not macos 3, under strain 1 (the big Studio d1323898...)".
+NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and their whole archive on every shipment
+  pass (size squared, one owner step each); building the fix with an RSS-bound test.
+
+## LANDED 2026-11-20 ~22:50 PST: record plane, inputs archived once = 8f04c9130 (main c990989f7). Exit 4 open until kiln r9
+  (queued) reports. Family three: kiln r11 started on adacachy (green running). Next: land sweep-3 on r11 green; read r9.
+
+## LANDED 2026-11-20 ~23:55 PST: lane step one = b72aff1fc (frames encoded in place, packets sealed in one reused
+  buffer; Studio-1 profile before/after in BENCHMARKS: memmove 604->491, median 1,066.5->1,103 MB/s). Lane is ~1.1 GB/s
+  quiet. NEXT: step two (frames by reference into the send stream until acked; receiver copies). Family three: kiln r15
+  (Linux, queued, r11 lost to a runner restart). Exit 4: kiln r9 (queued).

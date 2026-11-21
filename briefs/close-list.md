@@ -63,16 +63,19 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
     the pacing primitive is its lever)
 90a vendoring, every platform's build and CI, the library API  w-k90-vendor (incl. the export_engine re-vendor),
     w-k90-pin-2 (lanes green; R: the cec37f60 kiln link closing every 1-5 min)
-90b OCI/Docker engine ........................................ w-k90-containers; w-k90-a520 the session-end fix (r49)
-90c Kubernetes on KIND ....................................... w-k90-close
+90b slates volumes attach to OCI containers: MET 21:05 (Ada ~21:00: kiln runs agents in slates microVMs and Hex;
+    the part only checks the attach). w-k90-containers: the clippy fix at kiln container.rs:301 for 90a, then done
+90c slates volumes attach to Kubernetes pods: MET 21:05 (kiln's Kubernetes engine rework is its own task).
+    w-k90-close: the W10 docs paragraph, stop its cycles and cluster, done
 90d microVM on KVM (HVF and WHP done) ........................ w-k90-kvm, w-k90-microvm (then R: kiln's take_down,
     first-mount wait and collapsed notices, already given)
 90e slates_e2e bare_metal on Windows ......................... w-k90-win
 90f SlatesVolumes' resync end on KVM ......................... w-k90-kvm, w-k90-microvm
-90g A-520 piece 5 ............................................ w-k90-a520
+90g A-520 piece 5: REMOVED 21:05 (kiln container-engine wiring, not this goal). w-k90-a520: stop r81, done
 91  the multi-runner test with injected faults ............... w-fed-faults
-92a the Shards-owed items with Shards' side .................. w-k90-whp
-92b A-555 parts 2-3 .......................................... w-k90-whp
+92a Shards' side works inside kiln, each project vendored once (Ada 21:33): six items validated or made to work
+    in kiln's vendored tree ........ w-k90-kvm (w-k90-whp offline)
+92b DELETED 21:29 (Ada: "I didn't specify s3. I said nfs." then "delete it"): w-fed-faults removes the S3 base
 93 shared  w-shared (three sleep-and-look waits, exit 4 at 64 MiB, inputs held at B, the lane's ~200 MB/s, the
     content-plane-vs-lane A/B, A-697 f, A-658 3c); w-perf (deltify job, svn storage A/B vs FSFS, c3); w-engine (A-760
     whole, A-752's literals); w-balance (send v3-at-f+1 evidence: e73283fd6, 08fba4007)
@@ -86,4 +89,6 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
     w-hg (P: clone-b); w-svn (P: svnsync)
 93 perf an order of magnitude faster than competing servers, measured and recorded: w-interop, after its items (each
     server's client operations against git daemon/http-backend, hg serve, svnserve/mod_dav_svn; release, best of N)
+88  the Codex agent's Green/Work and atomic-conflict work (no owner until 20:55) .... w-work-cow: inventory the
+    Codex branches on adacachy read-only, land what main lacks red-first, record the rest in GAPS as superseded
 Keeper: w-lint (the wall, run-requests). g226: the give-back probes for w-sizing.

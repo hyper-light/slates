@@ -285,3 +285,16 @@
 - CLOSED: C1 3e63bee8d, R3 74beb5600, R4 25035f50c, R5 (507d722b3/2cf1b1d35 + b1206d96c). C2 waits on w-store's
   server wiring answer. NEXT: P6 svn:// update 5.6 vs 2.7 s, P7 svnsync (A-772 daemon peak; uncommitted RSS
   checkpoints in w-svn-next vcs_ssh/tests/svn.rs), P8 500 MB commit.
+- C2 (main 20:30 ruling: the store is the truth; replacement, no second path; register keeps green head only; crash
+  test between store land and register commit; recovery test is the arbiter). w-store has on main: sections/read/text
+  (ba760f0ef), sliced landing begin/section/part/commit (71db6d157). Part 1 LANDED 00ff3b25c (land_work lands
+  changeset seq=revision -- seq rule changes in stage A to changeset count). Staging sent (inbox main-from-w-svn-c2-plan):
+  A history (all records as changesets, register head only, recovery from store, arbiter + crash tests; texts stay in
+  content store), B texts async via owner (svn drives yield), C import as one sliced changeset. Asked main the
+  no-store decision (inbox main-from-w-svn-c2-no-store). Worktree ~/slates-work/w-svn-c2 (agents/w-svn-c2), target
+  ~/.cache/w-svn-c2-target. Register write sites: svn_commit land_record (locks/revprops; callers vcs_svn.rs:1219,1278),
+  land (revision + green head entry, svn_commit.rs:623), append_made (svn_made, in a submit tx), svn_created
+  (repository.rs:555). Recovery: vcs_store record_turn/recover_repository over register indices.
+- P6: measurement test (w-svn-next, uncommitted vcs_ssh/tests/svn.rs: RSS checkpoints + update/checkout) got
+  "not whole" 524-byte answers for update; release run printing the answer in progress (bq3pv7luh). git-200.dump made
+  (~/.cache/w-svn-gitgit) for faster runs; debug builds die to the watchdog in import.

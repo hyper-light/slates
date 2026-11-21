@@ -31,3 +31,35 @@
   section per extent needs the anchor to hold each extent's handle across a daemon restart (a new anchor<->daemon
   handle hand-off) and Windows builds/tests, which are main's. QUESTION: is Windows inside R2 (then I build it and
   put the Windows runs in run-requests), or a separate item?
+
+## R2 Windows arm -- LANDED 2026-11-20 (main's ruling 18:40; fast landing 19:25)
+- Commit on origin/main: 20bef898c (merge b30a0ab6d). Each content pool extent a section of its own on Windows, held by
+  the anchor across a restart (new hold kind WHAT_CONTENT_EXTENT, bound class HoldBounds::extents = partitions x 64),
+  made before any claim, closed when wholly free (commit back, g226's measurement).
+- Mac focused tests on the landing commit (big Studio): anchor handles:: 18/18 (incl. new class test), mem shared:: 6/6,
+  server content_pool config:: 11/11, api 3/3, fmt clean. Windows cross-check `cargo xwin clippy --target
+  x86_64-pc-windows-msvc -- -D warnings`: clean in this piece's files; main's own 5 remain (winfsp.rs unused HostFs
+  import; work_files.rs type_complexity + field assignment; verbs.rs assemble_post_state complexity; vcs_svn/tests.rs
+  unused HOOK_PATIENCE_NS), which stop the cli crate's Windows check.
+- Windows by-use (red at the base, green here, across processes): run-requests.md, for w-lint on jupiter.
+- OPEN in R2 (found 19:45, in GAPS): the macOS give-back of a destroyed volume's burst depends on the machine --
+  passed quiet (1,648 -> 123 MiB), kept 1,366 MiB on adas-macbook-pro-2 later and 335 MiB on the big Studio at 5,433
+  free pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + pressure hold) keeping
+  the free extents. Next for me, before R3.
+
+## R2 -- CLOSED on every platform (2026-11-20 ~20:10)
+- macOS A-789 362bd8c39, Windows 20bef898c, Linux unchanged (g226's measurement), leak A-778 779840fba, reserve A-777.
+- The variance found at 19:45 is not R2's: with the test's pressure readings injected (none / a fall of two bursts)
+  the anchor's content object held 0-2 MiB after the destroyed burst, so the extents go back; the RAM that stayed (591
+  / 340 MiB on the big Studio) is the process's own heap and buffers. Recorded in GAPS (c131361d3); worked under R3.
+- Owed: the Windows by-use run in run-requests (w-lint, jupiter).
+
+## R3 -- peak RSS 145x the repository (with w-hg + w-store): my part done; measured split, closes on w-hg/w-store
+- Mine landed: A-777 21a306a04 (reserve that held the whole burst, 4,931 MiB), A-778 779840fba (killed anchors'
+  objects), A-789 362bd8c39 + 20bef898c (extents given back on macOS and Windows), unsafe budget d15a7fc45,
+  parts_of gate 6008a67d5.
+- Measured (kiln r48, big Studio, release 39aa0995d), hg's history 84 MB pushed: RSS 90 -> 6,193 MiB, same after 20 s
+  idle; arenas (stored content) 5,166 MiB, segment 229, content object 2, rest ~796 (idle baseline ~90). The ratio
+  (~74x the store) is now the stored content in RAM: w-hg's holdings / w-store's disk store. GAPS c7e7f3b4c.
+- Asked w-hg and w-store (inbox/w-hg-from-w-sizing-r3.md) for the number their pieces bring the arenas' 5.2 GB to.
+- Found (GAPS, not worked under the close rule): status's heap row counts allocated bytes (~900 MB idle, untouched).

@@ -42,6 +42,46 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   all declined). Hold code unchanged in the range; live_ship.rs +2,072 lines (A-768 capture turns, A-763, the holder's
   task 2d4bb1285, ...). Running (kiln r36): main56 vs noholds56 vs old (b402afc7c) to split holds from the rest.
 
+## LANDED 2026-11-20 ~20:40 PST: origin/main 5e3bc853a (branch agents/g228-live-write-adds-sweep)
+- 97fc6ed5a, 8a5aac20f: the live-shipping measurement reads each daemon's CPU (stream, 500 ms after, 1 s after; Linux the
+  control shard's thread) and prints each candidate's live counters.
+- 68b597dd8: A-744's sweep a status request arms runs on the shard's idle time (set_idle_work), spaced by its own length
+  (content_range.sweep.idle_slices, .spaced); test content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_
+  idle_time_and_is_spaced_by_its_length. (The sweep's design status line rode in 343b741e8 by `git add -A`; the branch
+  was pushed, so it was not amended.)
+- 343b741e8: rt harvests its driver between idle slices; tests/idle_work_io.rs red before (accept never served in 5 s),
+  green after; idle_work.rs still green.
+- cdb0e80ab: BENCHMARKS (all rounds), GAPS 85a line.
+- Focused tests on the merged tree (macOS arm64, this Mac, local, own target): content_ranges 2/2, rt idle_work_io 1/1,
+  idle_work 1/1; fmt clean.
+- A/B (Studio, load 11-15): added 1,217-1,939 vs main 2,614-3,096 us; p999 2.2-3.7 vs 4.9-9.7 ms; 0 writes > 50 ms.
+
+## LANDED 2026-11-20 ~21:55 PST: origin/main 218256bab (main's ruling on the status-armed sweep, yes to both)
+- 7ac3900ee: DaemonStatus { memory } (wire change, no compat path; frames' schema hash refuses a mismatched build);
+  `slates status --memory`, Client::daemon_memory_status; a plain status does no residency work (red: 50 plain statuses
+  armed one sweep a shard, 398 and 177 steps; green: 0 and 0); the segment and content object whole from per-mapping
+  kernel figures (resident::of_mapping: macOS mach_vm_region top info 0.11 ms vs mincore 30-32 ms on a 32 GiB mapping
+  with 2 GiB written; Linux /proc/self/smaps; Windows the bounded walk only the asking request pays); slates-mem unsafe
+  budget 86 -> 87; the live-shipping measurement's status-burst sibling.
+- 8f1c22d70: BENCHMARKS. A/B (Studio, load 9-11): added 172-205 vs main 1,353-2,220 us; p999 342-445 us vs 2.7-7.1 ms;
+  under a status burst 178-293 vs 1,099-2,815 us; idle daemons 10-30 ms CPU a second vs about a core.
+- Focused tests on the merged tree: server --test daemon a_burst_of_plain_statuses 1/1; content_ranges 2/2; mem
+  resident 3/3; ipc --test status 3/3; cli args 41/41; fmt clean.
+- Run requests for main: the Linux smaps arm (resident::tests::a_mapping_read_whole_agrees_with_its_page_walk on
+  Linux), the Windows build of resident.rs's fallback arm, xtask unsafe (slates-mem 87), clippy.
+
+## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
+shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).
+Proposed: arm the background sweep only for a request asking for the memory report (a DaemonStatus field: wire change),
+and read the content object whole from per-mapping kernel figures (macOS vm_region extended info, Linux smaps) rather
+than a page walk. Rejected on record: holds forced on macOS (+50 us); reply-first fold (hop.reply 88 vs 92 us).
+
+## For main to delete (mine, landed or rejected)
+- remote branches agents/g228-live-write-adds-holds-ab (rejected fold 2fbc20496 + landed test commits),
+  agents/g228-live-write-adds-sweep (landed); local branch agents/g228-live-write-adds-idle-window (never pushed).
+- this Mac: ~/.cache/g228-local-target, ~/.cache/g228; worktree ~/slates-work/g228-land after this piece.
+- Studio d1323898: ~/.cache/g228-clone (kept for the next 85a run), ~/.cache/g228-*.sh, ~/.cache/g228-*-out.log.
+
 ## Incidents (recorded honestly)
 - 2026-11-20 ~09:57-10:40 PST: two A/B runs started without `cwd` ran in the runners' home folders; the script's
   `rsync -a ./` copied adacachy's home (73 GB) into ~/.cache/g228-ab-noholds-src before it was stopped; removed by exact

@@ -126,3 +126,60 @@ shard parks at once) off and on, interleaved 3 rounds, ring split every request:
   1 ms tick. That is the kernel's: no unprivileged raise exists on Linux (R10), and A-224's short slice was rejected.
 - So on Linux I find no daemon lever for the 1 ms; the loaded p99/p999 bound there is the scheduler's, on this lane
   (2 CPUs, 4 spinners and a writer at the shard's own weight). I'm putting it to main as 84a's Linux question.
+
+## 2026-11-20 20:55 PST — finding 7: Linux's 1 ms is a woken shard's CPU wait (it spun), not a timer; your holds matter
+
+Main's lead was epoll's millisecond timeout. It was real: rustix (no `linux_5_11`) rounds a sub-millisecond
+`epoll_wait` timeout up to 1 ms, so every short timed park lasted a millisecond. Red, then green with a timerfd
+deadline (branch `agents/g222-loaded-p99-p999-epoll-ns`, 445082604; `driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`:
+red 3/3 on ubuntu-latest and ubuntu-24.04-arm, shortest 200 µs wait 1,018–1,059 µs; green 3/3, slates-rt whole green;
+CI runs 44860111648). **But it is not the band**: with it, queued p99 stays 1,009.5–1,010.8 µs (A/B, run 44860060964).
+
+Floor (main's ask), the lane's own: a ping-pong of two threads through park/unpark inside the same scope (4 spinners and
+the fsync writer): p50 2.8–4.3 µs, **p99 4.7–5.1 µs**, p999 0.8–2.7 ms, no 1 ms band. So the lane allows <1 ms p99.
+
+Park stamps, every park on that run (~100,000 a run, both arms): 13,000–14,600 a run waited 0.95–1.10 ms, and ~11,000
+of those were **ended by a kick** (or by a deadline under 100 µs). So the shard was made runnable on time and did not
+get a CPU for a millisecond. The ping-pong threads sleep between hand-offs and are preferred when woken; a shard spins
+(its idle window and A-326's holds) and is not, so it waits for the spinner's slice to end at the 1 ms tick (EEVDF).
+My earlier "park at once" zeroed only the window; the holds still spun. Running now (diag-measurer-g222-10): no window
+**and** no hold (`G222_NO_SPIN`, `G222_NO_HOLD`) against main's, one binary, the floor each round. If the band empties,
+Linux's fix is the hold rule (yours, A-387) telling an oversubscribed machine not to spin — we should land it together.
+
+## 2026-11-20 21:35 PST — finding 8: Linux's band is none of: the epoll ms (fixed, on main), idle spin, holds, a 100 µs slice, pinning
+
+All on CI ubuntu-24.04-arm, A-224's lane (the bench reports 4 cores and starts 8 spinners and 3 shards: the user
+scope's `AllowedCPUs` is not enforced there, so the lane is 4 CPUs at two spinners each), one binary per run with the
+timerfd fix, env-switched, interleaved 3 rounds; "1 ms parks" = parks that waited 0.95–1.10 ms of ~100,000 a run.
+
+| run | arm | queued p99 µs | queued p999 µs | 1 ms parks a run |
+|---|---|---|---|---|
+| 44861831509 | main / no spin + no hold | 1,010–1,011 / 1,008 | 1,040–1,233 / 1,026–1,215 | 12,700–13,800 / 14,900–16,200 |
+| 44863105516 | main / slice 100 µs / slice + no spin | 1,010–1,011 / 1,005–1,009 / 1,001–1,003 | 1,026–1,197 / 1,019–1,026 / 1,008–1,024 | 13,000–15,000 / 12,100–12,900 / 14,000–16,200 |
+| 44865071559 | main / unpinned | 1,010–1,011 / 1,012–1,014 | 1,024–1,191 / 2,996–3,000 | 13,600–14,700 / 4,100–6,000 |
+
+- Unpinned shards cut the 1 ms parks threefold but make the queued p999 and the submit p99 worse (accept 5.2–11.0 ms).
+- The lane's own floor (ping-pong beside the bench, every run): p99 4.6–5.1 µs, p999 0.8–2.8 ms. So on this lane the
+  daemon's p99 can be < 1 ms by the floor, and the p999 floor is above 1 ms (0.8–2.8 ms).
+- Open: what holds a woken shard thread for one tick when a woken ping-pong thread runs at once. Next I'd stamp the
+  scheduler's own view (`/proc/self/task/*/schedstat` wait time per shard thread) around a band request.
+
+## 2026-11-20 22:30 PST — finding 9: Linux's 1 ms band is the client's own reply spin holding the CPU its shard needs
+
+Per-park stamps of the kick and the wake (CI run 44867818237): in the ~1 ms parks, the kick lands anywhere from 0 to
+1 ms after the wait began and the wake takes the rest, so the shard runs ~1 ms after it parked whatever the kick's time:
+it runs when the CPU it needs is given up. The bench client spins for its reply up to `SPIN_NS` = 1 ms. One binary,
+the client's spin switched (CI ubuntu-24.04-arm, A-224's lane, 3 interleaved rounds):
+
+| client spin | queued (landing → taken) mode | queued p99 µs | accept p99 ms (median run) | conflict p99 ms |
+|---|---|---|---|---|
+| 1 ms (the harness's) | 1.0 ms (2,400–3,000 a run) | 1,010–1,012 | 4.0–8.0 | 4.0–6.0 |
+| 200 µs | 0.2 ms (25,700–27,500 a run) | 222–990 | 2.3–4.0 | 2.0–4.0 |
+| library default (its wake estimate) | 0.1 ms (5,500–7,900) and 1.0 ms (300–940) | 999–1,002 | 4.0–4.1 | 2.2–2.7 |
+| 0 (park at once) | none | 17–22 | **0.32–0.33** | **0.32–0.69** |
+
+(runs 44868692669 and 44869944205). With the client parked at once, Linux's loaded p99 is under 1 ms; p999 3.0–4.0 ms
+(the lane's floor p999 0.8–2.8 ms). The library's own default spin starves the shard too. Testing now: the spin
+yielding its CPU each turn (`std::thread::yield_now`), with the default and the harness's spin. Your provisioning
+client: if its sync waits spin first (SDK default), it pays the same; your harness parks, which is why your client part
+was small and your daemon part (the shard waiting for the CPU) large.

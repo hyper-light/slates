@@ -61,5 +61,15 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
   changed-since-base, not bytes) -> test reordered: land through grant first, then drift (5767f795898). Cycle 11 running.
 - docs/agentic.md W10 status paragraph drafted in ~/.cache/k90-close/wt (uncommitted), to land with the passing run.
 
+## 2026-11-20 ~21:30 PST: DONE (main's correction: the K8s part = slates volumes attach to pods; cycle 10 proved it)
+- Stopped my units, deleted minikube profile k90-close (shared ~/.kube/config still on `kiln`).
+- LANDED kiln main b928a782a96 (docs 2c1224efdca: W10 volume-check status, engine rework a separate task; plus
+  k8s_agent_live's later test-only commits, cfg(unix), compile-checked on Mac). Branch agents/w-k90-close deleted.
+- Mac scratch deleted (worktree, targets). adacachy ~/.cache/w-k90-close + my 3 docker images: deletion pending kiln
+  reconnect (see below).
+
 ## For main to delete
-- adacachy ~/.cache/w-k90-close/kiln2 (partial SSH clone, 84K) and ~/.cache/w-k90-close/wt (broken half-checkout; `git -C ~/.cache/w-k90-close/kiln3 worktree remove` needs --force)
+(kiln said "not connected to the kiln server" for every run from this session at ~21:40 PST, so these stay:)
+- adacachy: /home/adalundhe/.cache/w-k90-close (my clone kiln3 + worktrees wt/wt2 + target + images + logs; ~50+ GB)
+- adacachy docker images: k90-close-agent:live, k90-close-kicbase:tls, k90-close-kicbase:base
+- adacachy: the `tls` kernel module stays loaded (harmless; `sudo modprobe -r tls` if wanted)

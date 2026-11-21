@@ -45,3 +45,15 @@ fmt clean.
 The lane item (~200 MB/s) stays open, under performance in the close order. The lead: the congestion window bounds the
 lane on loopback (64 MiB: about 6,800 window stops), and the suspect is the UDP receive buffer left at the OS default
 (~85 datagrams; this Mac has dropped 11.4 M datagrams on full socket buffers since boot).
+
+## Landed 2026-11-20 ~22:50 PST, toward exit 4 (the item stays open until r9 reports): a version's inputs archived once
+Commit 8f04c9130 on origin/main (landed as c990989f7). Before, every shipment pass of a later version copied its
+increment out of the chain and rebuilt and rehashed its whole inputs archive in one owner step: a 64 MiB version took
+at least 64 passes of about 128 MB copied and 64 MB hashed. Now the manifest is made once and the chunks are lent from
+the chain (`merge.inputs.manifest_made`).
+Tests (macOS arm64, local; on the merged tree):
+- new lib oracle `a_shipment_cut_from_lent_bytes_is_the_whole_archives_byte_for_byte`;
+- new cluster oracle `a_lent_raw_chunks_request_is_the_held_chunks_byte_for_byte`;
+- new fleet `a_version_crossing_in_several_shipments_is_archived_once` (red: made 3 over 3 shipments);
+- merge_service + merge_origin 32 of 32.
+Exit 4 closes when kiln r9's 64-320 MiB reruns show no watchdog end (or name another cause, which I'll fix next).

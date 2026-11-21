@@ -170,3 +170,4 @@ Started 2026-11-19 ~21:40 PST. Reads: brief, common.md, relaunch notes, g088v, g
 - 2026-11-20 16:40 (Ada's CLOSE order): R2 closed, inbox/main-from-w-k90-microvm-close.md. C1 was already closed by
   w-k90-kvm (r51 g266 and r42 g90 on KVM, ran my 522ba54b3). My close-list is empty. Local target long gone (deleted
   before main's 15:45/16:31 notes; Studio-2's current writer isn't mine).
+- 2026-11-20 21:45: landed w-k90-whp A-791 (2da4c55e5) on slates main cc29bfc4c for main; inbox notes written.
