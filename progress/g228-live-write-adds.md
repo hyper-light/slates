@@ -102,6 +102,13 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Disk: Studio-4 was at 26 GiB free; my ~/.cache/g228-local-target (18.8 GiB, debug only) removed with `cargo clean`.
   Builds go to kiln runners with disk=50g since.
 
+## LANDED 2026-11-21 ~07:45 PST: origin/main 02874580e (agents/g228-land-cache): exchange split + placement cache
+- A/B: ubuntu-latest 10/10 rounds (107.5-141.7 vs 120.9-162.8 us added p50); macOS studio-2 5/5 (156.9-163.4 vs
+  162.6-171.3; p999 290-484 us). Transport bench on the same runner = the exchange's round trip (my "30 us daemon" was
+  wrong). Copy cut (04ec25860) A/B running: diag-g228-live-14, kiln r15. Item 3: ruling asked
+  (inbox/main-from-g228-85a-item3.md); g222's arm C rejected, g222 closed.
+- For main to delete: agents/g228-land-cache (landed), diag-g228-live-10..14 after reading.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
