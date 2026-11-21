@@ -6944,3 +6944,15 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - clippy + xtask over crates/server/src/{mounted_work,verbs}.rs (rebuild_volume's tree pin, rebuild_mounted, tree_owner).
 - Suites touched: `cargo test -p slates-server --test recovery --test daemon` (recovery now rebuilds a mounted work's slot); `--lib recover` passed 25/25 here. Red: a recovery refusal or a work NotRecovered.
 - Main's order 4, owed to main: real editors on kernel mounts of works. macOS (root): `slates attach <work>` then `mount_nfs` the capability path; ten works over one green; per mount run `vim -es -c '3s/.*/editor N/' -c wq f3` (temp+rename save), `sed -i ''`, and `python3 -c` write-then-os.replace; then `slates submit` each, grant via the CLI, land; red = any verdict other than the in-process test's (tests/mounted_work.rs) or landed bytes != oracle. Linux the same with `mount -t nfs -o vers=3` and FUSE (`slates mount --fuse`). Gate it as `mounted_work_kernel` on SLATES_TEST_MOUNTED_WORK_KERNEL=1 when main schedules it.
+
+## 2026-11-20, w-work-mount C1/R4 (77fcae73a, 60a71db8a; main 56e44c7f8)
+- Linux (FUSE): `cargo test --locked -p slates-server --test fuse_mount a_work_mounted_through_fuse` on a host with
+  fusermount3 and /dev/fuse. Red: a read of `f` refused (the tree host not lent) or the submit not Accepted with TWO in
+  the green's head.
+- Windows: build `cargo test --locked -p slates-server --no-run` (winfsp.rs's tree lend, cfg(windows), never compiled on
+  macOS), then `cargo test --locked -p slates-cli --test winfsp a_work_mounted_through_winfsp` with WinFsp live. Red: a
+  compile error in crates/server/src/winfsp.rs, a refused read through the drive, or the save missing from the head.
+- Suites (main's): `cargo test -p slates-server` integration targets nfs_mount, snapshot_landing, presentations,
+  recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
+- Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
+  (25 GB); deleted whole by exact path; since then only focused --test targets, CARGO_PROFILE_TEST_DEBUG=0 (3.2 GB).
