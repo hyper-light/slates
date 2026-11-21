@@ -27,3 +27,7 @@
 main's 15:20 order done: A-779, A-782, A-785, A-788 all on origin/main. Stopped; waiting for main's next piece.
 Owed (not started): async SDK forms of the log; whether a write of the head's own bytes with nothing intervening should
 answer Identical (main's call); an Abandoned landing state for presentations whose client went away (main's call).
+
+## Close list (Ada 16:05-16:15; main 16:20): C1 = A-782, C2 = A-785, C3 = A-788, all on origin/main.
+inbox/main-from-w-sessionlog-close.md written. Findings recorded, not worked: async SDK log forms (GAPS A-773 entry).
+Disk: deleted ~/.cache/w-sessionlog-target.noindex/debug/incremental (12 GB), 2026-11-20 16:30.
