@@ -370,3 +370,11 @@
   Reds (w-rewrite-ops' list): answered only after both (the durable head 0 in the verb's step); a kill between the land
   and the commit recovers to before, and the retry lands once. Open question: the version's trees from a preview need
   vcs_store::paths' map/trees of the preview's post-state (A-664).
+  Piece 3 design refinement (08:30): paths::stepped(&engine, ...) takes an engine ref, so the version's map/trees can
+  be stepped from the preview (state.greens.with_preview(&preview, |engine| stepped(...)) as svn_made::revision_held
+  does). It KEEPS the map as the green's git head at the version before the version is durable: acceptable as git's
+  derived data, but an abandoned made commit must drop that kept head (restore the one before). A green needing a whole
+  build (needs_whole) gets it sliced in the made task before the landing (A-664's whole_build machinery), never in the
+  submit's step. Then commits::made's objects from Head::trees -> GitPush sealed -> task: carry Home, carry Land ->
+  made_commit::commit(tool = guard + store commit + append v5 entry). The owed path (staged/make_owed) folds into
+  this; record_of/v2 removed after.
