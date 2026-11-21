@@ -17047,6 +17047,64 @@ is the invocation's median of 3 runs. µs unless marked.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 
+## 84a on macOS: Mach's time-constraint policy for the shards and the client's reply wait (A-831; w-provision-gate; 2026-11-21)
+
+**What, and why.** g222's hop split put macOS's loaded tail on two things:
+- the forward to the owner shard and back, the taken-to-written hop;
+- the busy path's zero-timeout kevent, which took at least 1 ms in 9-12% of its loaded calls.
+
+A woken time-share thread behind busy neighbours runs only when their quanta end. A thread under Mach's
+`THREAD_TIME_CONSTRAINT_POLICY` is in the real-time band, needs no privilege, and runs ahead of them. The kernel refuses a
+computation below its minimum real-time quantum (50 µs on Apple silicon; `slates_machine::time_constraint`'s test), so
+the policy's terms are aperiodic, with computation = constraint = the thread's measured window doubled until the kernel
+takes it.
+
+**The runs.** CI macos-latest (3 CPUs, 2 shards), `edit_merge_bench` with two spinners a CPU, then the quiet forms and
+`provision_bench`. Three interleaved rounds per run; each cell is a round's median of three runs, every round shown.
+- Run 44934544995 (branch `diag-measurer-w-provision-gate-tc`). B = main a9a2393b8 plus a line printing the load's
+  throughput; TC = plus the client's synchronous reply wait under the policy; TB = plus the shard threads.
+- Run 44934809949 (`diag-measurer-w-provision-gate-tck`). The same arms, also counting the busy path's zero-timeout
+  harvests that took 1 ms or more.
+
+Take 1, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s |
+|---|---|---|---|---|---|
+| B | 16.76 · 16.02 · 14.31 | 20.40 · 17.45 · 17.31 | 16.39 · 15.88 · 14.43 | 19.59 · 18.94 · 18.19 | 225 · 221 · 242 |
+| TC | 1.32 · 1.47 · 0.68 | 4.69 · 5.05 · 1.12 | 1.06 · 3.55 · 1.08 | 4.94 · 17.07 · 3.07 | 161 · 141 · 158 |
+| TB | 0.69 · 0.87 · 0.41 | 0.95 · 2.16 · 0.77 | 0.67 · 0.75 · 0.55 | 1.69 · 1.70 · 1.06 | 121 · 133 · 129 |
+
+Take 2, loaded:
+
+| arm | accept p99 ms | accept p999 ms | conflict p99 ms | conflict p999 ms | load, M spinner turns/s | busy harvests ≥ 1 ms |
+|---|---|---|---|---|---|---|
+| B | 15.72 · 14.00 · 17.42 | 16.60 · 16.59 · 20.76 | 15.92 · 14.70 · 15.63 | 20.23 · 18.93 · 17.68 | 221 · 224 · 213 | 16,293 of 172,191 · 14,172 of 162,157 · 21,273 of 174,757 |
+| TC | 2.25 · 1.06 · 5.33 | 4.38 · 2.72 · 29.92 | 2.47 · 2.66 · 4.39 | 15.17 · 6.94 · 28.44 | 147 · 153 · 140 | 184 of 139,685 · 137 of 159,691 · 472 of 134,252 |
+| TB | 0.89 · 0.42 · 2.11 | 3.01 · 0.70 · 4.52 | 0.65 · 0.70 · 1.85 | 0.80 · 1.32 · 4.56 | 137 · 114 · 98 | 5 of 200,410 · 2 of 184,609 · 62 of 198,370 |
+
+**Quiet (every round, both runs, accept_f10 p50 µs).** The medians are unchanged.
+- Take 1: B 451 · 506 · 549; TC 831 · 516 · 642; TB 438 · 377 · 435.
+- Take 2: B 454 · 522 · 470; TC 422 · 438 · 409; TB 479 · 468 · 478.
+
+**R9's uncontended spinning p99** (`provision_bench`) is unchanged, and misses 50 µs on this 3-CPU runner in every arm,
+main included:
+- B 335 · 344 · 326 and 333 · 196 · 303 µs;
+- TC 309 · 344 · 319 and 198 · 193 · 566;
+- TB 305 · 338 · 294 and 310 · 201 · 180.
+
+No refusal and no demotion was logged by any arm.
+
+**Verdict:**
+- **TB wins every round against main** on the loaded p99 and p999 of both forms, about 15-20 times on p99, with the
+  quiet medians and R9's p99 even. It lands as A-831: a latency-tracking runtime's shards (the daemon's) and a client's
+  synchronous reply wait run under the policy on macOS. Red first: `crates/rt/tests/time_constraint.rs`, a tracking
+  runtime's shard not under the policy on main, under it after.
+- **TC (the client alone) is measured and rejected:** p999 up to 29.9 ms, conflict p99 up to 4.4 ms.
+- **The cost:** the load's own spinners got 98-137 against 213-242 million turns a second. The daemon finishes its
+  work about ten times sooner, and while it works it runs ahead of them.
+- **84a's bar is still open on macOS.** The loaded p99 is under 1 ms in 11 of 12 round medians (worst 2.11 ms), the
+  p999 in 4 of 12 (0.70-4.56 ms).
+
 ## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
 
 **The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
