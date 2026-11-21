@@ -50,3 +50,44 @@
 - Left in GAPS: one row's text is still deltified whole within its step.
 - C2 status: waiting on w-store's answer about how the server opens a repository's Store (inbox
   w-store-from-w-svn-stored-form-2026-11-20.md). Next: P6 svn:// update 5.6 s vs 2.7 s.
+
+## C2 svn onto the changeset store -- IN PROGRESS
+- Part 1 LANDED 00ff3b25c. A client's svn commit (land_work: svn://, svn+ssh, DAV) lands its revision as one
+  changeset through the shard's StoreHandle: sequence = revision, judged over the one before, Record section = the
+  revision's record. The client is answered once it is durable.
+- Test: a_subversion_commit_lands_as_a_changeset_in_the_store. Red first on the real store: the log recovered from its
+  files holds the creation and revision 1.
+- Replay from the store waits on w-store for a section read through the owner, and on your ruling with w-store on
+  whether recovery replays from the store or the register (inbox w-store-from-w-svn-replay-2026-11-20.md).
+- Next while waiting: green-made versions' changesets. Then an import as one changeset (its sequence rule asked).
+
+## P6 CLOSED (2026-11-21 ~01:20): svn:// update 5.6 s vs 2.7 s
+- Commit on origin/main: e69375553 (in 40c3f8d1e): `measure_svnsync_replay_range_over_the_tunnel` now also times an
+  update across `SLATES_SVN_UPDATE` (FROM:TO) and a checkout, as stock svn asks them, through the daemon's tunnel site.
+- Measurement (BENCHMARKS "Subversion on the changeset store", release, MacBook Pro 2, load 20-30, git-2000):
+  update r1000..r1500 0.14 s (2.3 MB, the edit whole), checkout r1500 0.46 s (24.6 MB). w-bugs' run 13 (base
+  2d3f218cb, before w-perf's per-reader WindowCache b51f908f2) was 5.6 s for a stock client's whole update, its longest
+  step a window unit; the server's drive is now 0.14 s of that. Re-running w-bugs' diag harness end to end on main is
+  yours if you want the stock-client wall.
+- My earlier "not whole" 524 bytes was my script's: the client's closing success sent during the drive (E210004, as
+  svnserve answers it).
+
+## P8 CLOSED (2026-11-21 ~00:50 PST): the 500 MB commit, re-measured
+- Commit on origin/main: 002a7944f (BENCHMARKS "A 500 MB Subversion commit, re-measured on the changeset store").
+- Measurement: big Studio, stock svn 1.15, main 73cd23c (C2 stage A + B1), `a_large_commit_measured` release. kiln r9
+  (load 5-9): svn:// Committed revision 1 in 11.2 s, DAV in 13.9 s; daemon peak 4,067 MiB (8x the text; 12x before);
+  longest shard step 1.91 s. kiln r8 (load 8-14): DAV's daemon restarted within that step, E160007.
+- Left, outside svn and recorded in GAPS/BENCHMARKS: the green's apply of the landing in one step (w-engine's 1b),
+  and the text carried twice in the register's log (chain entry and checkpoint, 524 MB each; P7's finding).
+
+## P7 (2026-11-21 ~01:20 PST): svnsync and the daemon peak, measured; what is left is outside svn or recorded
+- svnsync over svn://, stock 1.15 on the big Studio, git-2000: 270.7 s, 135 ms a revision, mirror at r2000 (main
+  1bfe51f88; BENCHMARKS 9d792682f) against w-interop's 1,068 s. The server's replay is 2.4-2.8 ms of each revision.
+- svnsync over HTTP: `svnsync init` was refused (HTTPv2 revision resource unserved): FIXED red-first, 2dafcad02. `sync`
+  cannot run: the DAV site serves no `replay-report` (a new finding: GAPS and progress only, per Ada's order). If you
+  want it built, assign it.
+- Daemon peak against the dump: real daemon 1,570 MiB for a 437 MiB dump (8508a8d52); half is the segment, where the
+  green's chain entries carry each revision's file bytes; folding an svn green's history was measured and rejected
+  (copies from older revisions read those versions, c9f79f925). The chain carrying texts is the register's/merge
+  engine's (yours to assign).
+Close P7 if this is the measurement you wanted; otherwise say which part to take further.

@@ -6954,10 +6954,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-mount C1/R4 (77fcae73a, 60a71db8a; main 56e44c7f8)
 - Linux (FUSE): `cargo test --locked -p slates-server --test fuse_mount a_work_mounted_through_fuse` on a host with
   fusermount3 and /dev/fuse. Red: a read of `f` refused (the tree host not lent) or the submit not Accepted with TWO in
-  the green's head.
-- Windows: build `cargo test --locked -p slates-server --no-run` (winfsp.rs's tree lend, cfg(windows), never compiled on
-  macOS), then `cargo test --locked -p slates-cli --test winfsp a_work_mounted_through_winfsp` with WinFsp live. Red: a
-  compile error in crates/server/src/winfsp.rs, a refused read through the drive, or the save missing from the head.
+  the green's head. (Mine to run, as the Windows ones are: main 2026-11-21.)
 - Suites (main's): `cargo test -p slates-server` integration targets nfs_mount, snapshot_landing, presentations,
   recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
 - Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
@@ -6996,3 +6993,132 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   `REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200`, with `netstat -s -p udp | grep
   "full socket"` read before and after. What it would show: if the window stops come with a rise in full-socket-buffer
   drops, the receive buffer is the lane's bound.
+
+## 2026-11-20, w-reaper: A-645 (a), svn's revprop rows by use (lands as the commit after b7cfb02fc; see the A-738 design entry, "fifth piece")
+- macOS with stock Subversion 1.15 and room to build (Studio-1 has svn 1.15.0 but 693 MB free):
+  `SLATES_TEST_CLI=1 cargo test -p slates-cli --test svn_interop -- a_repository_policys_hook_lets_stock_svn_change_a_revision_property a_revision_property_change_without_a_hook --nocapture`.
+  Then w-interop's matrix revprop-svn and revprop-ssh rows (an anchor given `--vcs-store DIR`).
+- Linux the same: the view mounts through FUSE (`fusermount3`), and `crates/server/src/fuse.rs`'s turn change is
+  compiled only there. Clippy for Linux, please (`fuse.rs` `turn_with`'s `lent_if` closure).
+- Red would look like: E200007 with `UNGRANTED_WORDS` (no --vcs-store given), or "could not show this repository's hook
+  its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
+  `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
+- 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.
+- w-shared, record plane (8f04c9130): RSS and time of one 64, 128, 256 and 320 MiB holder submit's placement, before
+  (c990989f7^) and after, release, on the big Studio (`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n>
+  SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture`).
+  Red would be the after's peak RSS or placement time growing with size squared, or a watchdog end (exit 4).
+- w-shared, lane (main's item 4): CPU profile, sender and holder, of
+  `REPLICATION_BENCH_BULK_MIB=64 target/release/examples/replication_bench 20` on a quiet Mac. 45-75 µs per 9.2 KB
+  packet measured at load 22; the UDP receive buffer was ruled out (no drops). Asked for: the top frames per side.
+- w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
+  encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
+  Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
+- w-shared, transport step two (35c740150): stream data in flight as spans of the sender's bytes (loss recovery, probes
+  and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
+  Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
+  after a loss.
+- w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
+  suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
+  taken partial, or a stalled exchange (its progress now counted on delivery).
+
+## 2026-11-20, w-work-cow: A-796 merge check and resolution (main d2ad10da4; commits 6823fde6f, c1e76d0a7)
+- clippy + xtask over crates/server/src/verbs.rs (merge_answer, apply_replacement, check_merge, resolve_merge, volume_op_of), work_home.rs (MergeAsk, Checked), ipc protocol, client, mcp lib, cli args/verbs.
+- Linux/Windows: `cargo test --locked -p slates-server --test merge_check`, `-p slates-mcp --test mcp the_mcp_surface_serves_the_tools`; red = the histories differ between 1 and 8 shards, or a stale stamp is not refused.
+- w-fed-faults for w-lint, A-795 (6f29c8d, the S3 base removed): the Linux-only code it changed was never compiled.
+  crates/server/src/fuse.rs (the kept-request path removed; the turn lends the host straight to the bridge; the A-509
+  test's FuseMount without `kept`/`kept_waker`) and crates/bridge-fuse/src/channel.rs (`dispatch_kept`,
+  `allocation_running` and `Dispatched::request` removed). The Mac Studio has both Linux Rust targets but no Linux C
+  cross-compiler or sysroot (zstd-sys, blake3 and aws-lc-sys stop), and adacachy refused every start. On Linux x86_64
+  (and aarch64): `cargo clippy --locked -p slates-server -p slates-bridge-fuse --lib --tests`, then
+  `cargo test --locked -p slates-bridge-fuse --lib` and `cargo test --locked -p slates-server --lib -- fuse:: nfs::`.
+  Red would be a compile error or an unused item in fuse.rs or channel.rs, or a FUSE test failing (A-509's EIO test,
+  held replies).
+
+## 2026-11-21T08:20Z w-fed-move main 086089ba (goal 86b C1 rung: A-792, A-793, A-794, A-797 by use)
+- Command (repository root, release; a load run, so main's under CLAUDE.md §8):
+  `SLATES_LOADTEST_TREE=<a Linux kernel checkout, v7.4-rc4 5f22fb204, 97,371 files>
+  SLATES_LOADTEST_BENCH=<target>/release/examples/load_bench SLATES_LOADTEST_CLIENTS=100000
+  SLATES_LOADTEST_ARGS="--rounds 1 --per-connection 32 --hot-files 42000 --reply-patience 3600"
+  cargo test --release --locked -p slates-cli --test load_scale -- --nocapture`, after
+  `cargo build --release --locked -p slates-client --example load_bench` and `-p slates-cli`.
+- Needs: mem=40g (measured about 30 GB: primary 13 GB, replicas 5.8 GB each, client daemon 1.8 GB, bench 3.3 GB) and
+  disk for the 2.1 GB tree; in kiln declare it in `needs` (`cpus=16,mem=40g` or more), never pin with `on`.
+  Runs 15 to 65 minutes.
+- Platform: macOS arm64 or Linux (the test reads `ps`; on Linux raise `ulimit -n`, per the test's module docs).
+- What to read: the `bound`, `oracle`, `refusal`, `node` and `rung` rows, and any `slates-server: ... (first
+  occurrence)` lines (the merge-budget and retention-cap diagnoses), `is spinning`, `killing it`.
+- Red: any `oracle_failures` above 0 (a wrong verdict); a watchdog kill (`killing it`, A-797's wall); `refusal` rows
+  (TableAtCapacity: A-794's wall; BudgetExceeded: open); `bench_exit -1` with `pending ... inflight Some((SubmitAccepted`
+  rows that stop moving (the open lost-reply wall: compare the client node's `fleet.forward.client.resolved` with
+  `delivered_home` in its `slates status --json`).
+- Known so far: on main 8a18edcc + A-797 (stopped at 96 of 97 GB swap) no kill in 3,110 s; about 2,700 submits never
+  answered; one 300 MB work log.
+- Who to send results to: w-fed-move
+
+
+## w-shared 01:40 PST 2026-11-21 (kiln ids; all sync:false over https)
+- r16 (big Studio, running): agents/w-shared-byref-ci 4a16c53d4: merge, cluster, server lib, 8 server suites, cli kill test, and a baseline of 5 lib tests at 544020bd2.
+- r20 (queued, macos mem=16g disk=40g): the kill test's red at 544020bd2 with only the test applied (r18, r19 lost: runner b24c5c95 did not answer).
+- r21 (queued, same needs): 3a release bench on origin/main, 64/128/256/320/512 MiB x 10 (r15's placement went away before it started).
+- r22 (queued, linux): family three green + red (r14 lost: adacachy restarted mid-build).
+- Local target ~/.cache/w-shared-local-target.noindex deleted at 01:38 (main's 01:23 note); exit-4 scratch deleted too. No local builds from here.
+
+## 2026-11-21 ~07:45, w-lint round 18 (main f52934d65): the wall's open reds and their owners
+- Host clippy: crates/hg/src/push/intake_tests.rs:56 `intake` returns Result and panics/unwraps inside
+  (panic_in_result_fn) -- owner w-hg (inbox/w-hg-from-w-lint.md).
+- `cargo xtask literals`: crates/store/src/texts.rs:243/248 (`4`, `4`, `8`: the hunk words' widths) -- owner w-store
+  (inbox/w-store-from-w-lint.md).
+- Fmt, structural, unsafe, the six cross targets: clean.
+- Windows (held requests): A-789's checks + red-first at 20bef898c^ (w-sizing), then w-realtools' real_tools over
+  WinFsp. r13 never started (jupiter's runner restarted while it was starting; the third such of mine) -- waiting on
+  main's answer in inbox/main-from-w-lint-jupiter.md.
+- ~09:00 update (main 37c7a1691, w-lint round 19 at 21ed9cd8d): open host reds and owners: hg push/intake_tests.rs's
+  intake (w-hg); server made_commit.rs's give_up, unused with an unsanctioned dead_code allow (w-git, A-815); store
+  texts.rs's three literals (w-store). Windows (jupiter, short runs per main's 07:50): workspace clippy at a693c49e4
+  ran (its host reds fixed in 21ed9cd8d; svn_presenter's Windows dead code is w-reaper's); `cargo xtask unsafe` was
+  refused "no room here now" twice; the rest of A-789's checks and w-realtools' real_tools follow when it has room.
+- ~09:20 (w-lint, Windows, ~/w-lint-win at 37c7a1691): `cargo xtask unsafe` cannot build on jupiter: aws-lc-sys's
+  builder panics "NASM command not found" (a tool missing there, not a red; the host count is clean). The anchor lib
+  tests (`handles:: held_windows::`, --test-threads 1) were refused "no room here now" twice; reported per main's 07:50
+  rule. Still owed on Windows: anchor lib + handles_windows, the two content-extent CLI tests and their red-first at
+  20bef898c^ (w-sizing, A-789), then w-realtools' real_tools over WinFsp.
+- 2026-11-21 08:20 (w-lint, main 13ded84f0+): the wall's last two reds closed by w-lint per main's word: store texts.rs
+  literals (w-store's) and hg intake_tests's intake helper (w-hg's, lint-only). Host clippy, fmt, structural, literals,
+  unsafe, the six cross targets: clean.
+- 2026-11-21 (w-lint, Windows, ~/w-lint-win at 02874580e): A-789's anchor checks green on jupiter: `--lib handles::
+  held_windows::` 26/26 (r23), `--test handles_windows` 9 passed, 10 ignored by the test (r24). The two content-extent
+  CLI tests (`a_freed_content_extent_gives_its_commit_back_on_windows`, `a_content_extent_outlives_a_killed_daemon_on_windows`)
+  were refused "no room here now" twice (r25, r26): reported per main's rule. Still owed: those two, their red-first at
+  20bef898c^ (w-sizing), and w-realtools' real_tools over WinFsp.
+- 2026-11-21 ~09:00 (w-lint): A-789's Windows CLI tests are `#[cfg(windows)]` in crates/cli/tests/cli.rs, which is
+  `#![cfg(unix)]`: on jupiter the `cli` target ran 0 tests (r27). Their run and red-first cannot be met as written --
+  owner w-sizing (inbox/w-sizing-from-w-lint.md). The red-first run (r28) stopped as moot. w-realtools' real_tools over
+  WinFsp (r29) queued by platform.
+
+## 2026-11-21 ~12:30 PST, w-rewrite-ops: A-818 (A-803 (c)) A/B, for after piece 2b lands (main's 09:40 and 10:35 conditions)
+- Command: `cargo run --release -p slates-merge --example history_layers_bench` on main before and after 2b,
+  interleaved rounds, all N shown. Rows: write per change, old-version read and memory per version at m = 10/100/1k/10k;
+  plus many paths changed once each (memory per version). Option (i), runs naming chunks on the generic leaf, is measured
+  against both (main's 10:35 condition). The bench rows for (i) and for many paths come with 2b.
+- Red: 2b loses on an old read. The risk is O(fragments x depth) against today's write-time compaction, or memory per
+  version above main's.
+
+## w-shared, family three (FUSE helper and unmount exits watched, ExitWatch), for main to place (2026-11-21 10:00 PST)
+- Branch agents/w-shared-sweep-3 at 731331eef (on origin). Needs: `linux/amd64,tool:cargo` with FUSE mounts allowed
+  (`/dev/fuse`, fusermount3), cpus=8, disk=25g. Not pinned. No timeout binary assumed.
+- Command (sync:false, clones over https, log at ~/.cache/w-shared-sweep3.log on the machine):
+  `set -u; src=$HOME/.cache/w-shared-sweep3-src; rm -rf "$src"; exec > >(tee $HOME/.cache/w-shared-sweep3.log) 2>&1;
+  git clone -q --depth 3 --branch agents/w-shared-sweep-3 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/w-shared-remote-target CARGO_INCREMENTAL=0; cargo fmt --check -p slates-server -p
+  slates-bridge-fuse && echo FMT_OK; cargo test -p slates-server --test fuse_mount 2>&1 | grep -aE '^test |test result|panicked|SKIP';
+  cargo test -p slates-bridge-fuse 2>&1 | grep -aE 'test result|FAILED'; perl -pi -e 's/\.map\(slates_ipc::exit_watch::ExitWatch::on\)/.map(|_pid|
+  Err::<slates_ipc::exit_watch::ExitWatch, _>(slates_ipc::IpcError::OsRefused { call: "red", code: None }))/g' crates/server/src/fuse.rs;
+  grep -c 'call: "red"' crates/server/src/fuse.rs; cargo test -p slates-server --test fuse_mount a_volume_mounted_through_fuse 2>&1 |
+  grep -aE '^test |test result|panicked'; rm -rf "$CARGO_TARGET_DIR/debug/incremental"`
+- Green looks like: FMT_OK; fuse_mount all ok (no SKIP lines on a FUSE-capable host), counters `fuse.helper_exit.watched`
+  and `fuse.unmount_exit.watched` moved; slates-bridge-fuse ok.
+- Red looks like (after the perl edit, every exit watch refused): the grep count is at least 1, and
+  `a_volume_mounted_through_fuse...` FAILS on its assertion that the helper's exit was watched (the mount refused
+  typed `MountError::ExitUnwatched`, counted `fuse.helper_exit.unwatched`), never by a hang.
+- On green: I land agents/w-shared-sweep-3 under the fast landing rule.

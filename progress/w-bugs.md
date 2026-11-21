@@ -270,3 +270,38 @@
     1 s of CPU at about its 100,000th poll, base and candidate alike (5 of 5 rounds each; 3 on the quiet run); the
     watchdog killed the candidate's daemon in round 5 (client: curl 18, bad pack header). Being located with a scratch
     diag build on the big Studio (kiln r3); builds moved off Studio-4 by main's order, caches deleted.
+- 2026-11-21 P1 spin fixed, landed f660401d4 (merged fb1077161): a part's wanted entries marked by a galloping cursor,
+  a window of the order read a unit (red: 1,536 reads a unit, window 128); the answer's plan read a window of its own
+  units a turn (red: 512 runs a unit). Found by a scratch build timing each unit: ~5 units a deepen of 365 ms and 1.1 s,
+  all marking. Big Studio, 5 rounds: main 1 spin (longest poll 1,107 ms), this 0 (longest 947 ms). Time unchanged:
+  stock 5.40 s, main 25.88 s, this 25.09 s. P1 stays open: a near-second unit remains (diag 10, kiln r5). My typed tree
+  entries dropped: main's 7b66e7225 did the same (kinds from the landing's type runs).
+- 2026-11-21 main's two hg-row spins (after P1), read from adacachy's anchor log (r-linuxc-2239, release 90e9b720c):
+  - start_shard (daemon.rs:1186): a restarted daemon's start logged "the most CPU in one [slice] 962,859 µs, ending at
+    unit 1". Unit 1 is `slates_db::replay::recover`, the whole catalog replay, one unit, though held only to a recovery
+    budget of about a second, the liveness window itself. Plan: replay in steps (begin/step/finish) with the start's
+    slicer between; a counter of records a unit; red first.
+  - HTTP edge (vcs_http.rs:850) under hg: spins at the connection task's polls 1 and 7, one right after a restart. Each
+    hg request makes a view (`Indexed::new`) and answers a whole command in one poll. Diag build timing both per command
+    runs on adacachy under its load (kiln r16).
+- 2026-11-21 01:40 queued from main (after the current three: P1's last unit, start_shard, the HTTP edge spin under hg):
+  killed test daemons leave macOS socket-route nodes (`slates-<hex>.sock`, crates/ipc/src/route.rs) in TMPDIR, an
+  unbounded set (1,637 on the MacBook). Recorded in GAPS, 5ee55fde3. Red owed: SIGKILL a test daemon, assert its node
+  gone once the harness ends; shapes: the harness removes its node at its end, or the route sweeps dead instances'
+  nodes at bind (bounded, owner-only).
+- 2026-11-21 07:10 main: r16/r17 lost when kiln's server dropped; restarted unpinned: P1 r1, start_shard r2, hg r3.
+  4th item (found by use): t_a752's "more quanta than files" fails under load. It states the implementation's timing,
+  not A-752's rule: a quantum is the shard's live wake estimate (`step_budget_ns`), which load and few CPUs raise, so
+  quanta over files is the machine's speed. The rule is a unit a file at least; the pace report counts units. Change:
+  PushTurns counts units (status `push.build.units`), the test asserts units >= files. Red/green at 1 CPU, 2 CPUs and a
+  loaded host, main against the branch: kiln r4 (Linux).
+- 2026-11-21 queued 5th (main, found by use; after the current four): daemon::tests::the_pairs_canonical_dialer_keeps_a_
+  peer_that_dialed_it_and_only_it failed once in a 4-thread run on the MacBook (w-git landing fa318e929; not w-git's
+  change, not yet rerun alone). Read: one audit_on_shard closure over shard state, no waits; suspects to test, a clock
+  read inside direct_contact_reason / keeps_direct_contact_with (a window a slow closure crosses), or the role rule over
+  per-boot host ids leaving no member outside the neighbourhood. Plan: reproduce at 1-2 CPUs (taskpolicy), loaded, and
+  in the parallel suite; capture the failing assertion; red first; if the pairing logic, GAPS with the failing order.
+  - 5th, read ahead while runs queue: `direct_contact` is a rule over shard state, no clock read, so timing is the
+    weaker suspect. Stronger: the test's members are `local ^ (n << 16)` from a per-boot random host id, and its first
+    assertion needs one of them outside the role rule at scatter 3, which placement over those ids may not give. To
+    count: run it a few hundred times alone and in the parallel suite, capture which assertion fails.

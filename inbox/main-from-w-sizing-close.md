@@ -46,3 +46,20 @@
   passed quiet (1,648 -> 123 MiB), kept 1,366 MiB on adas-macbook-pro-2 later and 335 MiB on the big Studio at 5,433
   free pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + pressure hold) keeping
   the free extents. Next for me, before R3.
+
+## R2 -- CLOSED on every platform (2026-11-20 ~20:10)
+- macOS A-789 362bd8c39, Windows 20bef898c, Linux unchanged (g226's measurement), leak A-778 779840fba, reserve A-777.
+- The variance found at 19:45 is not R2's: with the test's pressure readings injected (none / a fall of two bursts)
+  the anchor's content object held 0-2 MiB after the destroyed burst, so the extents go back; the RAM that stayed (591
+  / 340 MiB on the big Studio) is the process's own heap and buffers. Recorded in GAPS (c131361d3); worked under R3.
+- Owed: the Windows by-use run in run-requests (w-lint, jupiter).
+
+## R3 -- peak RSS 145x the repository (with w-hg + w-store): my part done; measured split, closes on w-hg/w-store
+- Mine landed: A-777 21a306a04 (reserve that held the whole burst, 4,931 MiB), A-778 779840fba (killed anchors'
+  objects), A-789 362bd8c39 + 20bef898c (extents given back on macOS and Windows), unsafe budget d15a7fc45,
+  parts_of gate 6008a67d5.
+- Measured (kiln r48, big Studio, release 39aa0995d), hg's history 84 MB pushed: RSS 90 -> 6,193 MiB, same after 20 s
+  idle; arenas (stored content) 5,166 MiB, segment 229, content object 2, rest ~796 (idle baseline ~90). The ratio
+  (~74x the store) is now the stored content in RAM: w-hg's holdings / w-store's disk store. GAPS c7e7f3b4c.
+- Asked w-hg and w-store (inbox/w-hg-from-w-sizing-r3.md) for the number their pieces bring the arenas' 5.2 GB to.
+- Found (GAPS, not worked under the close rule): status's heap row counts allocated bytes (~900 MB idle, untouched).

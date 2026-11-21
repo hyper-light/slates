@@ -285,3 +285,75 @@
 - CLOSED: C1 3e63bee8d, R3 74beb5600, R4 25035f50c, R5 (507d722b3/2cf1b1d35 + b1206d96c). C2 waits on w-store's
   server wiring answer. NEXT: P6 svn:// update 5.6 vs 2.7 s, P7 svnsync (A-772 daemon peak; uncommitted RSS
   checkpoints in w-svn-next vcs_ssh/tests/svn.rs), P8 500 MB commit.
+- C2 (main 20:30 ruling: the store is the truth; replacement, no second path; register keeps green head only; crash
+  test between store land and register commit; recovery test is the arbiter). w-store has on main: sections/read/text
+  (ba760f0ef), sliced landing begin/section/part/commit (71db6d157). Part 1 LANDED 00ff3b25c (land_work lands
+  changeset seq=revision -- seq rule changes in stage A to changeset count). Staging sent (inbox main-from-w-svn-c2-plan):
+  A history (all records as changesets, register head only, recovery from store, arbiter + crash tests; texts stay in
+  content store), B texts async via owner (svn drives yield), C import as one sliced changeset. Asked main the
+  no-store decision (inbox main-from-w-svn-c2-no-store). Worktree ~/slates-work/w-svn-c2 (agents/w-svn-c2), target
+  ~/.cache/w-svn-c2-target. Register write sites: svn_commit land_record (locks/revprops; callers vcs_svn.rs:1219,1278),
+  land (revision + green head entry, svn_commit.rs:623), append_made (svn_made, in a submit tx), svn_created
+  (repository.rs:555). Recovery: vcs_store record_turn/recover_repository over register indices.
+- P6: measurement test (w-svn-next, uncommitted vcs_ssh/tests/svn.rs: RSS checkpoints + update/checkout) got
+  "not whole" 524-byte answers for update; release run printing the answer in progress (bq3pv7luh). git-200.dump made
+  (~/.cache/w-svn-gitgit) for faster runs; debug builds die to the watchdog in import.
+- C2 stage A built in ~/slates-work/w-svn-c2 (uncommitted at 22:40, testing): every svn record store-first
+  (svn_commit::landing: gate/turn, sequence = register object count, reference-only register entries), recovery and
+  rebuild read changesets back from the store (vcs_store svn_to_fetch/fetch_svn), svn creation refused without
+  --vcs-store, crate::test_store shared helper (TestStore guard, StoredDaemon, run_on_first), svn_commit/import/export
+  tests async on stored daemons, arbiter + crash tests in repository::store_tests. slates-server svn+store_tests
+  96/96, identities+vcs_store 37/37, barrier/deltify/svn_texts 3/3, cli --test cli a_repository_the_cli_creates 1/1.
+  svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
+- P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
+  status returned too soon" (the script's report). Fix the script after C2.
+- C2 stage A LANDED 72576cb1f (0703e62d2 + 65f69e1da). Tests: server 136/136 affected; cli svn_interop 4/4,
+  svn_http_reports 9/9, cli create 1/1. Main's ruling on svn_made (inbox w-svn-from-main-c2-made): submit acceptance
+  deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
+- C2 stage B part 1 LANDED 40c3f8d1e (e69375553): texts in the changeset, recovery fetch, barrier gone for svn. P6/P7
+  measured (BENCHMARKS). Next: B part 2 (texts read through the owner). Stock legs kiln r2 on mac-studio.local-2; P8 next.
+- 2026-11-21 ~00:50: P6 CLOSED (close note), P8 CLOSED (002a7944f), P7: real-daemon peak measured (8508a8d52: 1,570
+  MiB for a 437 MiB dump, half the segment: green chain carries texts), green-fold rejected (c9f79f925), svnsync
+  measurement landed (1bfe51f88) and running on the big Studio (kiln r10). Stock legs pass on the Studio (r8).
+  Open: C2 B2 (main to decide, inbox stage-b2-value), svn_made (w-work-cow's view), C. B2a wait-path patch kept at
+  ~/.cache/w-svn-b2a-wait.patch.
+- 2026-11-21 ~01:20 PST state: CLOSED C1 R3 R4 R5 P6 P8. P7 measured (svn:// svnsync 270.7 s vs 1,068; real daemon peak
+  1,570 MiB / 437 MiB dump, half the green's chain in the segment; HTTP svnsync init fixed 2dafcad02, replay-report
+  absent -> GAPS), awaiting main's close. C2: stage A (72576cb1f) and B part 1 (40c3f8d1e) on main; B part 2 and C sent
+  to main with sizing (inbox stage-b2-value, stage-c-analysis), awaiting the call; svn_made waits for w-work-cow's
+  post-verdict view (main's routing), w-git builds git's made commits on the same hook. Worktree ~/slates-work/w-svn-c2
+  at main 9d792682f, clean. Patches kept: ~/.cache/w-svn-b2a-wait.patch (B2 wait path), ~/.cache/w-svn-fold-attempt.patch
+  (rejected fold).
+- 2026-11-21 ~02:10 PST: B2 (a) on main: drives (35786a9dd/b934f9e5b), ra_svn get-file (9061acd6c), DAV GET
+  (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
+  window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
+  and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.
+- 2026-11-21 ~02:45 PST: B2 (a) COMPLETE on main: get-file-revs (560ebad9f), export (99ff3b8cb), deltify job
+  (d31502d48, base origin/main at merge). Every reader of a stored text reads one RAM does not hold through the store,
+  each held by a store test red without its wait. New finding (GAPS only): the svn://, svnserve -t and DAV loops have no
+  guard against a drive waiting again for the piece just fetched (the export and deltify jobs have one). Next: B2 (b).
+- 2026-11-21 ~04:00 PST: B2 (b) P1 (197b5f2d7: a commit brings back an evicted stored text for its green increment),
+  P2 (34259b8eb: the hook view brings one back before holding it; GAPS: a view pins what it shows), P3 (abd5e7b2e: the
+  content store lets go a commit's texts once landed, recovery reads none back, deltify job retired) on main, each with
+  a store test red first. svn_made was done by A-804 (90e2a7666, not mine). Next: P4 (imports land texts as Payload,
+  records keep none in RAM). Target trim of leftovers was declined at the prompt; disk 26 GB free.
+- 2026-11-21 ~10:00 PST: B2 (b) P4a 8d7dec8df, P4b f50841803 on main (every new svn text on the store, none in RAM);
+  A-818 72a1bbb24 (main's 09:20 "RETIRE"): Record::Deltified and the deltify APIs gone, a pre-P4a log refused typed
+  (Retired::Deltified at decode, SvnTextsInline at replay). KeptText stays for records standing alone (told main; a
+  fixture move if main wants it gone). C2 stage B complete. Next: P7's findings, re-measured on this tree first.
+- 2026-11-21 ~08:30 PST (date clock): A-819 renumber 6652f7717; P7 re-measured by main (r50: peak 1,630 MiB, heap
+  not down). Finding (1) BUILT as A-820 be9a33e34 (copies from older revisions made from the head and set back from the
+  records; svn greens fold to readers' floor); A-side measurement test 3bf21428b (landed 8940003ed). Owed, main's
+  runs: the A/B (measure_copies_from_older_revisions) and the stock svn leg (the big Studio d1323898 offline in kiln).
+  Next after P7: KeptText fixtures onto a test-side text source (main's 10:35 item 3).
+- 2026-11-21 ~08:30 (date clock): hold hook 30d2e4100 (SLATES_SVN_IMPORT_HOLD) for main's attribution of (2).
+  KeptText move STOPPED by main (after P7). NOW: P7 (3) = C2 stage C's records side over A-814 (ImportBatch).
+  Plan: (1) a batch changeset = Payload+Texts of all its texts + one Record section per revision (landing::land_changeset
+  takes Vec<record>; changeset_records reads all Record sections); (2) replay applies every Record section of a
+  changeset in order (svn_fetched holds a queue); (3) svn_import stages each revision: take_texts -> content store
+  (Storing accumulated), restore::plan, records.check + apply in RAM, Building against batch.with_engine (needs a
+  Greens-taking variant; tree_beneath must use records.youngest not engine.head), batch.stage; flush at a derived bound,
+  before a non-revision record, at the import's end: land one changeset then ImportBatch::commit(EntryParts{objects:
+  reference(seq)}); refusal: batch.abandon + vcs_store::rebuild + release storing; (4) svn readers refused while
+  importing (as hg_view.rs:346). Tests: imports export byte for byte, register names few changesets, recovery equal,
+  crash before commit leaves nothing.

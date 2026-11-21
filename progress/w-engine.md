@@ -204,3 +204,76 @@ Red: a focused server test landing a large named text: no step past the quantum,
   deterministically (names log Some(5), expected Some(2)) since 455fe41fb "wip: push records ride the names log"
   (A-724 piece 8c); a probe with my engine change reverted fails the same.
 - NEXT (main starts it): the pacing item (steps fill the quantum, per-unit-kind EWMA).
+## 2026-11-20 ~16:00-18:10 -- A-783 (pacing) and the close order (C1, C2, P3)
+- A-783 COMMITTED ca496af8a (+ merge 640d1ea87, base cd1261e43), NOT YET LANDED: studio-2 (the push route) draining
+  since ~17:55; kiln "did not answer" once, then "no runner suits". A/B in BENCHMARKS "Paced work yields only when
+  someone waits": pass 1 found the probe blind to the rest of a step's batch (newcomers waited ~100 ms; red test
+  a_task_ready_in_the_same_batch_is_seen_waiting, fixed); pass 3 idle 7 rounds: build turns 3-20x fewer in 6/7, wall
+  best 7.864 -> 6.011 s, newcomer p99 median 2.51 vs 2.53 ms, provision p99 median 176 vs 183 us. Owed in GAPS: the
+  round where every turn yielded at its first ask; a quiet-machine rerun.
+- Interface notes written (inbox/w-git|w-hg|w-svn-from-w-engine-pace-interface-2026-11-20.md) and
+  inbox/main-from-w-engine-a783-2026-11-20.md (also: provision_bench's 8-client form hangs on main, both sides; a .pyc
+  committed on main in 8f286457c). Not pushed yet (state push goes through studio-2 too).
+- C2 A-752 literals: CLOSED (4b6d5c24b on origin/main; verified today). Close note in inbox/main-from-w-engine-close.md.
+- C1 A-760: COMMITTED b1460a5e1, NOT YET LANDED: Green::make_step (files made a slice a step before the commit) and
+  part 2's bug (a moved whole run shifted later runs: wrong bytes, silently; red first). merge lib 246, named 25,
+  server named_objects 1. Close note to add once landed.
+- Finding (GAPS): checkpoint proptest failed once in 10 runs, case not kept; names no runs.
+- NEXT: land both when studio-2 is back (TIP after b1460a5e1); write C1 to the close note; then P3 (89b: A-579 the
+  server's own p99 under load, 9-75 ms at 1,000 clients; the pacing primitive is the lever).
+- Worktree to delete once A-783 lands: /Users/adalundhe/slates-work/w-engine-ab-a; target dirs ~/.cache/w-engine-ab-a,
+  ~/.cache/w-engine-ab-b.
+- 20:xx LANDED both through studio-3 (main's route): origin/main 4a9259ff5 contains ca496af8a (A-783) and b1460a5e1
+  (C1). First push refused (main moved); merged c7e7f3b4c (docs) and pushed. Focused tests at base 4f57efa69: server
+  content_ranges 2/2, git_push 23/23; earlier at 33465d641: pace+rt all, merge lib 248, git receive 49, named_objects 1.
+  content_ranges' sweep test failed on main's own 33465d641 too (grouped, 2 of 2); main's next change fixed it.
+- C1 and C2 CLOSED (inbox/main-from-w-engine-close.md). NEXT: P3 89b (A-579), pacing as the lever.
+## P3, goal 89b (A-579), 2026-11-20 21:15-22:20 -- MECHANISM FOUND (counters), cut next
+- A/B (release load_bench, recorded command, Z 50/20 ms, 3 rounds, alternating; A = cc29bfc4c with A-783 reverted,
+  B = cc29bfc4c; load 12-79; runs in ~/.cache/w-engine-p3-runs/ab.txt): dead even, as expected (A-783 paces only the
+  git push build). SubmitAccepted server p99 Z=50: A 31.90/3.35/1.21, B 2.88/1.88/5.68 ms; every run on both sides
+  p999 57-141 ms, max 81-176 ms.
+- Diagnostic build (scratch worktree ~/slates-work/w-engine-p3-diag, never landed): long polls by task label, host-clock
+  gaps and steps per shard, owner batches, owner_floor and checkpoint parts timed, the bench's --events with its epoch.
+  Result: the slow submits come in 1-2 clusters a run (63+109 of 172 slow >50 ms), each starting with ONE poll on the
+  green's owner shard (19): the cross-shard call running verbs::owner_floor -> merge_service::checkpoint_green, 76-112
+  ms. Split (diag6): build 4.17, head_identity 73.66, encode 4.79, record 16.07 ms; 36,256,116 bytes, floor 806,
+  first checkpoint (held 0). Owner batches (A-388) are not it: one >=10 ms batch in a run, 1 verdict of 22 ms.
+- Why head_identity costs 74 ms: A-202 folds the identity only when read; nothing reads it between checkpoints, so the
+  first read pays every changed file's entry at the last read and at the head (hash + history reconstruction).
+- Cut planned: a paced identity fold on the owner (per-key folded-at versions so partial folds stay exact; oracle =
+  head_identity_from_scratch), then the 16 ms record. Then the A/B (release, interleaved, best of N, load recorded).
+- Finding (GAPS, main's): the bench's end-of-run read hung twice (Client::round_trip waits forever, every shard parked:
+  diag2 at 21:35 and diag5), the same hang as provision_bench's.
+- 22:15-23:20 CUT 1 built, committed LOCALLY 507110661 (not pushed; main's review): Green::fold_identity_step (exact
+  partial folds, per-key folded-at versions; identity oracle with partial folds, red-checked) + the checkpoint's
+  identity fold paced on the owner, finished in turns (merge.checkpoint.in_turns / identity_steps /
+  in_turns_longest_ns); server test a_checkpoint_with_someone_waiting_folds_the_identity_in_turns (red on the old
+  one-step checkpoint). A/B 5 rounds (A 585b89299, B + cut; ~/.cache/w-engine-p3-runs/ab-cut.txt): SubmitAccepted p999
+  Z=50 82.1/70.6/76.1/97.7/59.6 -> 3.3/4.5/7.3/12.0/23.9 ms, Z=20 124.5/142.8/109.2/102.9/118.8 -> 19.7/39.3/30.3/21.7/
+  28.1; max Z=20 133-162 -> 43-63. OPEN: (1) the fold in turns takes 7.2-13.0 s under contention (one key a queue
+  cycle), so the checkpoint lands late (a chain at its cap would force Doubling::Now's one-step fold); a fixed 0.5 ms
+  slice (scratch C) took 0.62 s but raised p99 (24 ms once): a design question for main (background progress under
+  "yield when someone waits"); (2) SubmitAccepted p50 at Z=20 B 2.68-3.13 vs A 2.00-2.35 in pass 1, 1.04-1.66 vs
+  0.90-1.17 in pass 2: not resolved, the host at load 17-28; not forced identity folds (counted 0). (3) Left after the
+  cut (B diag): the checkpoint's last step 42.6 ms (build 5.7, encode 9.5, record 24.4 of 49 MB); single key folds up
+  to 13.4 ms.
+- Server lib: 5 repository/paths tests fail on main 585b89299 itself (Overloaded at write), with or without the cut.
+- 2026-11-21 01:30-02:40: part 1b committed LOCALLY 310288b17 (not landed): the fold's turn budget = the fold left
+  (backlog x measured cost a key) spread over the turns before its doubling deadline (turn_budget_ns, unit test); svn
+  chain-fold test now lands each revision in its own look (a checkpoint in turns runs between, as in the daemon).
+  A/B 5 rounds, load 14-17 (~/.cache/w-engine-p3-runs/ab-deadline.txt): Z=50 every kind's server p99 < 1 ms in 5/5
+  (A <= 2/5), SubmitAccepted p999 64.7-89.5 -> 1.4-9.2; Z=20 fold 0.9-1.6 s, p50 restored, p99 WORSE (SubmitAccepted
+  2.48-4.47 -> 5.43-9.73, ReadHead 1.04-1.94 -> 3.09-4.38), p999/max better. The owner is saturated at Z=20: the fold's
+  74 ms costs wherever it lands. Profile (A, sample): fold_identity 109 samples: BLAKE3 over the changed files' bytes
+  (old and new) most, content_ref_at (history reconstruction) 30. Options to cut the work, for main: (a) land 1b;
+  (b) subtract a key's old entry when a commit first dirties it (no format change; commits pay ~one file hash a key an
+  interval); (c) an entry's lanes from a stored 32-byte digest (identity format change: golden vectors, records).
+## 2026-11-21 ~06:00-08:00
+- LANDED A-579 part 1 (5d3733d2c via the MacBook route, main's 05:00 order): the checkpoint identity fold in paced turns
+  with the deadline-sized share; docs (design A-579, §4.16, BENCHMARKS two passes, GAPS measured Z=20 p99 gap); test
+  on a store-backed daemon. w-git and main told.
+- w-svn's post-view ask: already A-805 (w-rewrite-ops, Lineage::preview). My view_after (A-815) withdrawn, not landed;
+  its oracle (copy + identity histories, red-checked) offered to main as a patch.
+- NEXT: (b) subtract a key's old entry at first change; slice the checkpoint's last step (~43 ms) and big single keys;
+  A/B.

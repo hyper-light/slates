@@ -103,3 +103,24 @@
 - r2 (jupiter, main 4af73427b+): SLATES_E2E=1 slates_e2e bare_metal, then Windows clippy. Watching. Also GitHub ci.yml
   run on 4af73427b's descendants: `windows (Slates tests)` job.
 - For main to delete: ~/fanout-state-w-k90-win (half clone), ~/kiln-work/w-k90-win-kiln (broken blobless clone).
+
+## 2026-11-20 ~20:20 PST: C1 CLOSED (inbox/main-from-w-k90-win-close.md)
+- jupiter r3 at main eb7194f00: slates_e2e bare_metal 2/2 passed (93 s), WinFsp 2.1.25156, Python 3.15.2.
+- GitHub run 44851246181 job 136703754349 (4f5e58c1b): slates_e2e 25/25 incl. both bare_metal drives.
+- mod bare_metal is cfg(any(unix, windows)).
+- Follow-up in flight: workspace::tests w2/w7 '/'-joined expectations fail on Windows (98/100) -> fb3460e9e, jupiter r4.
+
+## 2026-11-20 ~21:45 PST: C1 met in kiln (goals_done 01a1fa369a1c76f99a79a44a1fcf1f98); follow-up state
+- Finding (not C1): kiln workspace::tests w2_/w7_ hard-code Unix paths, fail on Windows (CI job 136703754349 98/100).
+  Fix on branch agents/w-k90-win-wst2 9ebc11e5d (host-spelled paths). jupiter r5 (first version): w2 passes on Windows,
+  w7 failed because '/Users/..' isn't absolute on Windows (rehomed correctly skips it) -> 9ebc11e5d gives w7 drive-letter
+  paths there. Its jupiter run (r7) was lost to the kiln server dropping; not yet green on Windows, not landed.
+  Next: re-run `cargo test -p kiln --lib -- workspace::tests::` on jupiter at wst2, then land as its own commit.
+
+## 2026-11-20 ~21:45 PST: w2/w7 test follow-up LANDED f16212799 (main 492af26f9)
+- macOS arm64 Studio-2 local: workspace::tests:: 11/11. Windows run lost to kiln server; GitHub run 44872271307
+  (492af26f9) pending -> watching its `windows (Slates tests)` job; send w-k90-pin-2 (01a1facadebb) the green run id.
+- Re-created ~/.cache/w-k90-win-local-target.noindex for this test (Studio-2 117 GB free).
+
+## 2026-11-21: follow-up GREEN -- run 44887857088 job 136804151233 (a0d114abb): slates_e2e 25/25, workspace:: 100/100.
+- Close note appended; w-k90-pin-2 told by inbox/w-k90-pin-2-from-w-k90-win.md (agents_send timed out). Queue empty.

@@ -298,3 +298,147 @@
   chunked body (daemon_edge.rs:571 -> chunked_body), not the fetch. Suspects: Receive::answer_until awaits that skip the
   keepalive deadline: turns::take, home_in_region (names + pack), names_committed_within. Diag r140
   (~/.cache/w-git-diag/r2_patch.py, never for main) times each.
+- 2026-11-21 00:45 C5 part 1 LANDED origin/main 0e7120bdd (record v5 + changeset landing + store recovery; red test
+  t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store; r13 green 211 passed, 6 A-664
+  failures that also fail on main). Close note in inbox/main-from-w-git-close.md. Next: C5 part 2 (store-less git
+  creation refused + git leg of w-hg's test; v2 and sequence 0 removed; git tests onto test_store; StorePacks replay),
+  then R2 (edge tests under load: push answer_until awaits skip the keepalive deadline; r139 repro 19/24).
+  Studio-4: my old target, clone and worktree deleted (58 GiB free there after).
+- 2026-11-21 01:05 C5 part 2a LANDED cf6b3c98a: git refused without --vcs-store; 76 tests onto test_store; edge suite
+  StoredDaemon; v3_takeover/git_interop anchors with --vcs-store. Next: C5 part 2b (v2 + seq 0 removed, homing/landing
+  mandatory, StorePacks replay), then R2 (keepalive across answer_until's awaits: carry homing/landing,
+  names_committed_within; the edge tests fail under load; landing's flush makes it longer).
+- 2026-11-21 01:00 R2 CLOSED 970950081 (first keepalive after the body was 2 intervals = 10 s; r28 red 18/18 -> r29
+  green 18/18 at load 29-33). Next: C5 part 2b piece 1 (pushes v5 only; carried shortfalls refuse; names race
+  refuses; moves-only v5; the v4 test switch removed; v2 left for made commits and sync test drivers' untaken asks),
+  then 2b-2 (sync drivers async), then made commits onto w-svn's deferred-submit hook.
+- 2026-11-21 01:10 C5 2b piece 1 LANDED 3ce898533 (pushes v5 only; shortfalls Unlanded; switch gone). Next: piece 2,
+  the tests' synchronous push drivers (answered/pushed/pushed_from_the_fixtures and the in-test loops, ~30 sites)
+  made async on stored daemons, and an untaken homing ask refusing; piece 3 waits for w-svn's deferred-submit hook.
+- 2026-11-21 C5 2b piece 2 LANDED f5a14f6a8 (untaken asks refuse Unlanded; carry helpers; region holds apart in
+  replay). Piece 3 (made commits onto the deferred-submit hook, record_of/v2 removed) waits for the hook on main.
+- 2026-11-21 01:31 PRIORITY, the push cut-off (w-interop: git/git whole-history push over HTTP cut at ~60 s, curl 18).
+  Diagnosed by a DIAG build (Studio-2 ~/.cache/w-git-relwt, patches ~/.cache/w-git-diag/{cut,phase_cut}_patch.py,
+  binary slates-phasediag, repro push_repro.sh into ~/.cache/w-git-diag/pushrepro). The cause: an answer step refused
+  PastAdmission after the 200 head, so the edge aborted. Phase: the checks (`unbegun/checking`) asked 485,230,824 B
+  with 300,809,433 left; it is the connectivity walk's whole-pack edge table (slates_git receive::connect begin_edges).
+- 02:20 Layer 1 LANDED 379087733 (merge df349a9fe): refusals after the body go out as band 3 words / unpack+ng
+  report, the reply ends clean, counted; git_push::words shared with SSH. Red 2/2 at 94ff89fe5, green 2/2; focused
+  51/51 + git 49/49 on the merged tree. main and w-interop told (inbox *-push-cut*).
+- NEXT (main 01:56): layer 2 before C5 2b piece 3. The checks a slice at a time over the pack held once, charging
+  only the slice (no whole edge table); red = the 611 MB push refused today, then landing within its room; A/B vs
+  stock git (release, interleaved, all N). Merge w-shared format 6 piece 1 when it lands.
+- 02:40 Layer 2 piece 1 LANDED b295ea7b3 (merge b7d2ae37e): connectivity check charges per object, no edge table
+  (red asked 134,176 B / 2,254 left). The 611 MB push no longer refused; it lands its changeset.
+- 04:10 Layer 2 piece 2 LANDED 8baa1cf16 (merge 339f7e73d): stage_room from counts; restage_turn skips when nothing
+  due (decision step 0.5 ms -> ~30 us). Focused on merged tree: git store 115, receive 50, server 53.
+- Measured (Studio-2, git/git push): checks 16.0 s, seal 3.7 s, homing+landing 1.3 s, decision >350 s unfinished.
+  The decision wall: a create walks its whole history for its green's reached set (A-614), refs x history. Options
+  (A) lazy reached sets, (B') generation order + peeled-commit head map; asked main (inbox
+  main-from-w-git-layer2-decision.md), holding. Next on my side meanwhile: the checks' 16 s.
+- Diag kit on Studio-2: ~/.cache/w-git-diag/{cut,phase_cut,timeline2}_patch.py, push_repro.sh, slates-l2diag.
+  Removed there: w-git-wt, w-git-wt2 (worktrees), w-git-target.noindex (8 GB).
+- 05:10 A-614 amended, (A), LANDED (40d961807 + docs 36883edbd, merge 30e89672f): creates, rewrites and fast-forwards
+  over sets never walked are admitted with no walk; sets derived on first read (store::Deriving, sliced, memoized, base
+  by search back); policy by git's two-colour walk; server derives before fetch and encode (vcs_store::git_derive);
+  replay walks nothing. git 587/587, server git set 188/188 on the merged tree.
+- NEXT (main 04:42): (2) the >1 s unit in the push decision (watchdog kills the daemon: shard 10 spinning 1,142 ms,
+  vcs_http.rs:1454): name it with a unit-length counter, red, slice it. r42 times each part of a decision step.
+  (3) path maps per created ref derived on first read (A-664/A-752), oracle + sliced/memoized + replay flat; red =
+  git/git push lands; then the A/B vs stock git. w-engine told (inbox/w-engine-from-w-git-path-maps.md).
+- 06:20 A-238 amended LANDED 4f6242707: a push makes the chains room before its append, a green a turn (red: 73
+  append checkpoints -> 0). The >1 s unit was repository::push::admit folding ~1,000 member greens in one append
+  (r44's stack samples). Each fold whole until w-engine lands 507110661. NEXT: path maps derived on first read.
+- 07:10 r52 (branches only on ca444739c): push 72.5 s ok, mirror clone 465 s ok (fsck clean); derive turns 3.0 M,
+  encode units past budget 844 k.
+- 07:55 derivation pacing LANDED 2b2fc8d80 (A-783 pace; red 2,404 turns -> <= 8). Finding: t_a752 flakes under load
+  on main too (1/2 at load 12.8).
+- 06:30 wide_connectivity clippy fix LANDED ca444739c (w-lint told).
+- P2 (main 05:12): created refs' greens unmaterialized, paths derived on first read. Engine half: w-rewrite-ops
+  (interface agreed: PushObjects as source, DeferredPush, green_ready, Applied::Deferred). My git half waits for it.
+- NEXT while blocked on the engine half: C5 2b piece 3 (made commits onto the deferred-submit hook, A-804 landed
+  5a21c11dc; record_of/v2 removed in the same series), per w-rewrite-ops' made-hook note.
+- 08:15 C5 2b piece 3 STARTED (main 07:05: go now). Plan, from reading made_commit.rs (A-804) and svn_made.rs:
+  1. made_commit::Tool::Git; made_repository_of recognises a git repository's green (shares svn's landing Turn type).
+  2. vcs_store::commits gains make_deferred(state, (repository, turn), pending, judged): the version's trees built from
+     a preview of the held verdict (Greens::preview/with_preview, as svn_made::revision_held), the commit's objects into
+     a GitPush, sealed; a task carries Home (names, pack) then Land (changeset at the next sequence), then
+     made_commit::commit(state, pending, |state| guard entry; store commit of the sealed push; append the register
+     entry with a v5 record naming the sequence). Store refused -> made_commit::abandon.
+  3. Remove the in-step path (commits::make from verbs::judge_submission, record appended in the submit's transaction)
+     and git_push's record_of / v2 writer (and v2 replay) in the same series.
+  Reds (w-rewrite-ops' list): answered only after both (the durable head 0 in the verb's step); a kill between the land
+  and the commit recovers to before, and the retry lands once. Open question: the version's trees from a preview need
+  vcs_store::paths' map/trees of the preview's post-state (A-664).
+  Piece 3 design refinement (08:30): paths::stepped(&engine, ...) takes an engine ref, so the version's map/trees can
+  be stepped from the preview (state.greens.with_preview(&preview, |engine| stepped(...)) as svn_made::revision_held
+  does). It KEEPS the map as the green's git head at the version before the version is durable: acceptable as git's
+  derived data, but an abandoned made commit must drop that kept head (restore the one before). A green needing a whole
+  build (needs_whole) gets it sliced in the made task before the landing (A-664's whole_build machinery), never in the
+  submit's step. Then commits::made's objects from Head::trees -> GitPush sealed -> task: carry Home, carry Land ->
+  made_commit::commit(tool = guard + store commit + append v5 entry). The owed path (staged/make_owed) folds into
+  this; record_of/v2 removed after.
+- 08:50 piece 3 RED committed locally (w-git-c5b, not pushed): vcs_store::commits::tests::t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed: in the verb's step (true, 1, 0) answered+durable. Next: Tool::Git in made_commit, commits::make_deferred from a preview (paths::stepped over with_preview), the landing task, then the kill test, then removing record_of/v2.
+- 09:45 main ruling (b): piece 3 after P2's engine half. Piece 3's red kept on agents/w-git-piece3-red (cf289fb7d);
+  old worktree w-git-c5b removed (its only unpushed commits were the red and its revert). New worktree
+  ~/slates-work/w-git-p2 from main f52934d65.
+- P2 engine half LANDED by w-rewrite-ops (A-812, 7e110566d): BranchChange::CreateDeferred, DeferredPush, green_ready,
+  with_owed_push_objects hook. My git half in w-git-p2 (uncommitted, not compiling yet):
+  * works.rs: Entry::Create { name, from, push: DeferredPush } (push_of of the eager create); prepare builds nothing
+    for creates.
+  * vcs_store::with_owed_push_objects: git arm (PushedObjects over an empty Push).
+  * git_push::created: CreateDeferred; the unborn default -> BranchChange::UpdateDeferred { green, push } (ASKED of
+    w-rewrite-ops, inbox/w-rewrite-ops-from-w-git-update-deferred.md; not on main yet).
+  Left: git crate works tests (Entry::Create increment), server tests reading created greens' files directly (route via
+  the door / lend), the oracle (derived map = eager build, branches and tags, before/after replay), red = git/git push.
+- 2026-11-21 ~11:40 PST: P2's git half LANDED, A-821 (main b2fbe6bf3; docs renumbered 955d6d645, w-svn took A-820).
+  BranchChange::UpdateDeferred built by me on CreateDeferred's pattern (main 08:10). The materialization's turn reads
+  inside vcs_store::with_room (red: build refused Malformed, pack read Unread{at:166}: windows live in the lent chunk
+  store). A push reaches greens only through the door (ShardGreens notes the owing green; build turn / delete wait,
+  bounded: a refused build declines the command). A create passes over an owing non-default holder (t_a719: 40 creates
+  at one commit waited on each other's makes). Tests: t_p2 unborn default (red on main 14,273 quanta -> <=1 turn,
+  made once), t_p2 branch+tag oracle (one owed push byte for byte across a replay before/after make; made = eager files).
+  Focused 298/298 single-threaded (server git_push repository::push green_ready vcs_store vcs_ssh vcs_http), git receive
+  50/50. Load-sensitive (not this change): t_a752 `quanta > FLAT_FILES` (3 of 4 alone pass, routed before); t_a614a
+  (mine, 2b2fc8d80) 15 turns vs 8 under the parallel suite, 3/3 alone pass — owed: bound its turns by wall time/ceiling.
+  Line to w-rewrite-ops: inbox/w-rewrite-ops-from-w-git-p2-git-half-landed.md.
+  NEXT: red = git/git's 611 MB push lands (Studio, push_clone_repro.sh), then A/B vs stock git 10.77 s (main's runs);
+  then C5 2b piece 3 on A-816 (red on agents/w-git-piece3-red). MacBook target trimmed 5.7 -> 5.4 GB; removed
+  ~/.cache/w-git-wt, w-git-clone, w-git-diag (clean, nothing unpushed).
+- 2026-11-21 ~12:00 PST: main 08:20: r61 (git/git push red, release) queued by main; A/B after. Fold t_a614a's
+  wall-time bound into piece 3's series. PIECE 3 STARTED in ~/slates-work/w-git-p2 (from main 30d2e4100; red test
+  applied from cf289fb7d, uncommitted). Design:
+  * made_commit: Tool::Git (made_repository_of via vcs_store::paths::git_repository_of); defer -> commits::make_deferred.
+  * make_deferred: hold_preview(judged); spawn task holding the turn.
+  * task turn 1 (map): paths::stepped(&preview_engine, (store, vcs_stores), ...) through a new made_commit lend giving
+    the preview engine + &mut store/vcs_stores (disjoint fields). Change step if the head before has a map; whole over
+    the preview for a root's first version; else whole_build::start(head version) sliced first, poll, then the change.
+  * then commit_objects -> GitPush::admit_all (already a pack of whole objects) -> seal -> sealed.admit(moves).
+  * homing in the task: names_now/put_names + keep_for_region, pack_to_home/hold_for_record + keep_for_region,
+    landing_of + disk.land(...).await, sealed.landed_as(seq).
+  * step: made_commit::commit(state, pending, |state| sealed.record (v5) -> check -> super::commit(store) -> mutate).
+  * abandon before the step: drop the kept head (paths) so a retry builds again; release homed; sealed.abandon.
+  Later sub-pieces: the kill test; removing record_of/v2 and after_submit/staged/owed; t_a614a wall-time bound.
+- 2026-11-21 ~13:30 PST: (1) P2's daemon-test regressions FIXED and LANDED alone (main's order): fa318e929. A git
+  green made through the door derives its map (paths::derive_once_made); t_a727 windows test asserts both halves
+  (records' windows back from the image; main's map back, same version and tree, after first read); A-727 a3b submits
+  its file; new t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart.
+  (2) C5 2b piece 3 part 1 LANDED: 8b23c6fdd, A-822. Recorded git submits take the made_commit hook (Tool::Git):
+  map over the held preview (offset: preview v0 = green head), commit sealed as a pack, homed + landed, v5 record in
+  the one step. Red t_c5b_p3 green; t_a664 parked test now a clone oracle; t_a614a wall-time bound folded in.
+  Focused: daemon::tests verbs merge_service vcs_store made_commit git_push repository green_ready vcs_* identities
+  544/544. Flake seen once: daemon::tests::the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it.
+  NEXT (piece 3 part 2): the kill test between landing and step; remove record_of/v2 with after_submit's owed path,
+  non-recorded submits, push_through; then the change step over the preview sliced. r61 (git/git push) is main's.
+- ~14:30 PST: part 2a (kill test) LANDED 946b60b2d (note: pushed after a merge that touched commits.rs before
+  rerunning; reran after: 276/276 on that main). Part 2b/2c WIP on agents/w-git-p2-part2 (not compiling yet):
+  * commits.rs: make/make_owed enqueue MadeJob on VcsStores.made_after (bounded by client seats; landing turn
+    take_now at enqueue else awaited by driver); drive_made_after -> made_after: sealed_of -> home_and_land (shared
+    sync steps first_ask/next_ask, async via git_push::carry, blocking via git_push::tests::carried_blocking) ->
+    recorded_after (own txn, v5). Test drain: commits::made_after_now (called in paths::tests::version_saying).
+  * vcs_store.rs: SealedPush::record v2 arm -> Err(Unlanded); record_of removed; record.rs finish/finish_as/
+    whole_pack removed. vcs_store tests: appended/push_unsettled land via home_and_land_blocking.
+  * LEFT: vcs_store/tests.rs Live oracle (commit_part uses record_of -> must write v5: names_to_content + pack by
+    identity + finish_packed), hostile-record tests (move to v5 bytes), assert_a_head_nobody_sent (finish -> v5);
+    then reader drops v1/v2 (record.rs decode; Record.objects/pack fields; replay_objects inline branch; git_replay
+    pack_at; stepped()); then compile, focused tests, docs (A-822 + GAPS), land. Then the sliced change step.

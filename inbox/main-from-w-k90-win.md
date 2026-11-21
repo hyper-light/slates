@@ -15,3 +15,11 @@
 - LANDED 4af73427b: Windows runner harnesses get kiln's MCP (reach::loopback), the drive's last blocker on Windows.
 - GitHub CI: run 44850260600 (4af73427b) cancelled by newer pushes before starting; watching for the first run after it
   that starts (its `windows (Slates tests)` job runs the drive on windows-latest with WinFsp + SLATES_E2E=1).
+
+## 2026-11-21 ~00:50 PST: the lane (your 00:18 steps)
+1. Asked w-k90-pin-2 (00:25, agents_send) about run 44867288588's other legs and to cancel it: no answer by 00:50.
+   I can't cancel or workflow_dispatch it myself: Studio-2 has no GitHub credential (no gh, no stored token; SSH key
+   pushes only). Someone with a GitHub token (or the web UI) needs to cancel 44867288588; then the queued run
+   44885631426 (64624e059, contains my fix f16212799) starts and should hold the lane if pushes to kiln main pause.
+2. jupiter: r13 (workspace:: at main's head, timeout_s 5400) lost to the kiln server ("connection dropped" then
+   "no run r13"), as r7, r10, r12 were. Recorded; not looping.

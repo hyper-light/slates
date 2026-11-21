@@ -1,5 +1,110 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~12:30 PST — A-818 piece 2a LANDED (bb6a738df, main 945c9ad42); main's 10:35 ruling: option (ii)
+- `crates/merge/src/byte_places.rs`: byte identities given once; a treap of the latest order (rank = offset in the
+  newest block); removed ranges stored once and retired when the floor passes their change; bytes charged and bounded.
+  Main's oracle `history::tests::every_identity_version_reads_as_the_reanchored_history` passes, and mutations fail it.
+- RISK (GAPS): an old read is O(fragments x depth), while today's re-anchor compacts at write time. Main's A/B decides
+  it; the run is queued in run-requests.md (per CLAUDE.md §8, not timed here).
+- w-git's places for UpdateDeferred (A-821) read: nothing breaks the pattern. Theirs to note and mine to fix: a green
+  replayed without origin shares meets ContentOnMissing when its owed push is built (A-812 (a), the restart test).
+  Queued after A-818 unless main orders otherwise.
+- Ops notes: kiln restarted mid-turn. This Mac's LAN address is now 192.168.1.82 (was .88). Main is the kiln agent
+  "Slates" (01a14885...), reached with kiln agents_send; slates-74 is a different session.
+- NEXT: 2b, the engine switch (re-anchor walk deleted, no mode switch).
+
+## ~11:05 PST — main 09:40: A-803 (c) = A-818; piece 1 LANDED (015d1733c, main cf3389d3d)
+- `crates/merge/src/piece_tree.rs`: a persistent piece tree, with each version a join-based AVL tree of runs over an
+  arena with holder counts, and path copying. `rebuild` makes a change's version from the engine's `segments`, at
+  O(parts log n); a read is O(log n + runs). Oracles:
+  - against a serial model, with the AVL bound, read visits bounded, and release to zero;
+  - sharing counted;
+  - main's oracle, against today's re-anchored history, in `history::tests`.
+  Two mutations (path copying off, a cut offset) fail them. The BENCHMARKS entry for A-803 (b), rejected, rode along.
+- ASKED main (inbox/main-from-w-rewrite-ops-a818-anchor.md): what a run names in piece 2. (i) Immutable chunks keep a
+  path's whole earlier block, the goal 86b retention A-793 removed; (ii) byte identities through one index a path,
+  recommended. Going with (ii) unless main says otherwise.
+- NEXT: piece 2, the engine switch (re-anchor walk deleted, no mode switch), then the A/B at m = 10/100/1k/10k (write,
+  old read, memory a version, interleaved, all N), plus a row of many paths changed once each.
+
+## ~10:10 PST — main 07:30: the held preview LANDED (A-816, main 4b73ba551); A-803 (b) shift layers measured and REJECTED
+- A-816 (A-815 was w-engine's withdrawn entry): `made_commit::hold_preview(state, &mut pending, judged)` keeps the held
+  verdict's preview with the pending accept; `with_held_preview(state, &mut pending, |engine| ..)` lends it each turn
+  for a sliced map build; retired in `made_commit::commit` (the one step) or `give_up`; counted
+  `vcs.made.preview_held_across_turns`. Test: `a_held_verdicts_preview_lives_across_turns_until_its_one_step`. Main's
+  red (first version past a copy answered (false, 0, 0) through a sliced build) is w-git's t_c5b_p3, green with their
+  piece 3. Shape agreed in inbox/w-git-from-w-rewrite-ops-preview.md.
+- A-803 (b), offset-shift layers: built, oracle green, REJECTED on measurement (patch kept at
+  scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch). Reads of version 1 after m alternating changes carry
+  through every shift: 2.9 us / 0.17 / 4.3 / 58 ms at m = 10 / 100 / 1k / 10k (main 0.33 / 1.4 / 4.4 us at 10 / 100 /
+  1k). Bounding the shifts (file length: 11.2 ms at 10k; s^2: 0.54 ms) gives the write win back (s^2: changes
+  0.39 / 3.3 / 14.1 ms, main 0.53 / 3.6 / 17.5). Load 79 while measured. Proposed to main: a persistent piece tree a
+  version (O(log) insert and old read); waiting for the go.
+- NEXT: the go on the piece tree, else the one-value drift (2.6 to 9-10 us over history).
+
+## ~09:20 PST — svn stage C, the green's side, LANDED (A-814, main a0cdaf94f)
+- `ImportBatch` (a scratch member, staged works, one entry). w-svn has the seam and its side's list.
+- GAPS: A-813's f > 0 limit recorded with main's §4.16 ruling.
+- NOW: A-803 (b), offset-shift layers (red: values walked per insert). Then the one-value drift.
+
+## ~08:45 PST — main 05:51: A-812's robustness gaps FIXED (A-813, main 8f4011a2e)
+- Holders take an owed version (the replica owes the same push). Retention is secured before the commit. Tail signatures
+  are kept.
+- Open: a version after an owed one at f > 0 waits for a holder's replica to be made (needs the git store on holders).
+  Asked of main and w-git.
+- Next: svn stage C, my half, against the proposed split.
+
+## ~08:00 PST — P2's engine half LANDED (A-812, main 7e110566d)
+- An owing green is made when first reached, through one door, and equals the eager create by construction.
+- w-git told (inbox/w-git-from-w-rewrite-ops-p2-landed.md); main told (inbox/main-from-w-rewrite-ops-p2.md).
+- Owed: GAPS A-812 (a) to (e).
+
+## NEXT, in order (main 04:36 PST, 2026-11-21)
+1. **Stage C, the green's side.** It waits for w-svn's answer on the split (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).
+   If w-svn hasn't answered within its next turn, I build my half against the proposed split: `ImportBatch` on a lineage
+   preview, one `apply_recorded` commit, and push taking N updates of one green.
+2. **A-809 leftover (b).** Layers that carry an offset shift, composing with overwrite layers, so an insert or delete
+   walks no earlier value. The oracle must cover them. Red: values walked per insert (2,551 at history 5,000 today).
+3. **The drift.** A one-value change still goes 2.6 to 9–10 µs over history 100 to 5,000 (A-811's bench). Chase it after
+   (b).
+
+## 2026-11-21 ~04:35 PST — main 04:11: leftovers measured, A-811 LANDED (main 55288d05b); stage C split proposed
+- (a) read through layers: 191 to 5.9 µs at m = 10^4. (b') SDK replace: 12.6 ms to 10.4 µs at history 5,000.
+- (b) insert re-anchor: measured open (17.5 ms at history 5,000); its design asked of main.
+- Stage C: split proposed to w-svn (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md); waiting for the answer.
+
+## 2026-11-21 ~04:30 PST — main 04:02: the checkpoint failure FIXED (A-810, main d9bc5f00c)
+- The index's model asked specialness timelessly; the index was right; it was not the restore. Seeded red, named test,
+  0 failures in 25 runs. Bug record in docs/bugs.
+- A-803 (a) and (b) are not measured gaps (GAPS corrected, fd031603d); stopped there per main's condition.
+- Note: inbox/main-from-w-rewrite-ops-a810.md.
+
+## 2026-11-21 ~04:00 PST — main 02:37: all three pieces LANDED
+- Piece 1: A-805, 31c0acd50.
+- Piece 2: A-807, dbfac3e13.
+- Piece 3: A-809, main 5eeb3c481 (piece 2f35ad7d8). At 10^5 versions, judge 65.4 to 22.5 µs and values 228 to 1.6 a
+  verdict.
+- w-fed-move told: inbox/w-fed-move-from-w-rewrite-ops-a809.md. main told: inbox/main-from-w-rewrite-ops-a809.md, with
+  the checkpoint seed that fails on main.
+- Left: GAPS A-803 (a) and (b); GAPS C2 (b), (c) owed with w-hg, and (d).
+
+## 2026-11-21 — main 02:37: pieces 1 and 2 LANDED, piece 3 (A-803) in progress
+
+- Piece 1 (A-805): the verdict is held, never shown before the one commit. Landed as 6f4303bef.
+- Piece 2 (A-807): Mercurial's made changesets take the hook. Landed as c6f71e8e4.
+- Piece 3 (A-803): the re-anchor's per-path anchor indirection. Next; w-fed-move told.
+
+## 2026-11-21 — LANDED: the deferred-submit hook (A-804; piece 109348900, main 5a21c11dc)
+
+- Main's 01:52 piece. `crate::made_commit`: the turn is taken before the verdict (or the submit parks). The made task
+  lands the changeset, then commits the version, the register entry, the settle and the completion in one step, and
+  then answers. A kill between the land and the commit recovers to before, and the retry lands once.
+- Three tests in `repository/svn_commit/tests.rs`, red before and green now. Notes: inbox/w-svn-, w-git- and
+  main-from-w-rewrite-ops-made-hook.md.
+- Left (GAPS C2, A-804 owed): the pure verdict committed by position, the bare dispatch, hg_made, and git's adoption
+  (w-git).
+- The BENCHMARKS before/after table (ca9e40a7b) landed with it.
+
 ## 2026-11-20 ~19:10 PST — close list (Ada's CLOSE THE OPEN ITEMS order): C1, C2, R3 all CLOSED
 
 - C1 CLOSED: b8c16aad7 (main d4a5f9f43). A work off its green's shard fetches the base of files it replaced whole.

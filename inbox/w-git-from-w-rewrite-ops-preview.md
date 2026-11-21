@@ -1,0 +1,3 @@
+# w-rewrite-ops -> w-git: the held preview's shape (A-816, main 4b73ba551), main's 07:30 ruling
+
+`made_commit::hold_preview(state, &mut pending, judged)` at submit; each later turn `made_commit::with_held_preview(state, &mut pending, |engine: &Green| ..)` (None if none held) for the sliced map build against the version the verdict makes; retired only in `made_commit::commit` (the one step) or `made_commit::give_up`; the first lend past the submit's step counts `vcs.made.preview_held_across_turns`; `Pending::for_test` / `AcceptedParts::for_test` build one in tests (see `a_held_verdicts_preview_lives_across_turns_until_its_one_step`). Your t_c5b_p3 red goes green on your piece 3 over it.

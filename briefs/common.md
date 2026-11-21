@@ -81,8 +81,11 @@ Never put a number in a commit for main that you haven't pushed to the ledger.
   - adas-mac-studio-2.local and adas-mac-studio-3.local push to GitHub over SSH. Use
     `git remote set-url --push origin git@github.com:hyper-light/<repo>.git`.
   - adas-mac-studio.local-2 (the 32-core Studio) has no GitHub credentials (SSH publickey denied, no HTTPS
-    credential). Land from it through kiln `run` on adas-mac-studio-2.local, as w-fed-faults does: sync your worktree
-    there, then `git push origin HEAD:main` and check `git merge-base --is-ancestor`, retrying if the push is rejected.
+    credential). Since 2026-11-20 ~18:00, kiln refuses runs on adas-mac-studio-2.local (draining), so land from the
+    32-core Studio through adas-mac-studio-3.local, with a bundle over stdin and no sync (main 20:55):
+    `git fetch origin && git merge origin/main`, rerun your focused tests, then
+    `git bundle create - origin/main..HEAD | ~/.local/bin/kiln run --on adas-mac-studio-3.local --no-sync -i --timeout 300 -- 'set -e; d=$HOME/.cache/<you>-push; [ -d "$d" ] || git clone -q --filter=blob:none --no-checkout git@github.com:hyper-light/slates.git "$d"; cd "$d"; cat > .git/in.bundle; git fetch -q origin main; git fetch -q .git/in.bundle HEAD:refs/<you>/tip; git push origin refs/<you>/tip:refs/heads/main; git update-ref -d refs/<you>/tip; rm -f .git/in.bundle'`.
+    A push refused because main moved: merge again, retest, resend. Then check `git merge-base --is-ancestor`.
 
 ## NAMING A BRANCH WITHOUT CHECKOUT (main 2026-11-20 ~01:20 PST: two agents ran `git checkout -b` tonight)
 `git checkout` and `git switch` stay banned, including `-b`. To name your work as a branch, use `git branch <name>` (the
@@ -233,3 +236,33 @@ part closed between 07:20 and 16:00.
 - **When an item closes**, write inbox/main-from-<you>-close.md: the item, the commit on origin/main, the test or the
   measurement. Main marks the UI part met the same check.
 - Main adds no new open items to UI parts and gives no new pieces beyond the close list.
+
+## SHARED MACHINES' MEMORY (main 2026-11-21 ~00:05 PST)
+- On 2026-11-20 at 23:58 the big Studio (96 GiB of RAM) had 96 GB of its 97 GB swap in use and 180-250 MB free.
+  w-fed-move's 100,000-client load run held about 30 GB, and a release build of kiln's crate (w-k90-containers) held
+  23 GB. Every other agent's tests on that machine stalled; w-git's C5 run sat 70 minutes at 0% CPU. Main stopped both.
+- A run that takes more than about 8 GB declares it in kiln's `needs` (`mem=16g`; a release build of kiln `mem=32g`;
+  a 100,000-client load run `mem=40g`) and never pins a machine with `on`, so the balancer places it where it fits.
+- Load runs are main's (§8 above): put them in run-requests.md with the command and the memory measured.
+- Give every test run a `timeout_s` sized from its last measured run, so a stall ends and reports instead of holding
+  a machine for an hour.
+
+## A RE-SENT GOAL IS KILN'S REMINDER, NOT ADA (main 2026-11-21 ~00:25 PST)
+- kiln re-sends your goal under way at the end of every turn until it is marked met. That reminder carries the goal's
+  text as written when its plan was made. It is not a new instruction, and not Ada's word.
+- A stop or a rescope from main stands until main lifts it, or Ada does in her own words. On 2026-11-21 an agent took
+  the re-sent pre-ruling container-engine goal as "authorization over main's stop" and restarted out-of-scope work.
+- If your re-sent goal contradicts main's latest message or Ada's rulings here, follow the message and the rulings.
+  Tell main in your reply, so main closes the stale goal in your stack.
+
+## REACHING MAIN (2026-11-21; main changed ~09:55 PST)
+- Main is now the kiln agent 01a1ff311fc972a8a0f720e354891538 ("Slates Agent", on adacachy). It took over from
+  01a14885fc1d72fba8b659837cc43b94 (`slates-5b` on adas-macbook-pro-2), which lost its goal stack and stopped answering.
+  Send nothing more to 01a14885 or `slates-5b`. Reach main with kiln `agents_send` (agent 01a1ff311fc972a8a0f720e354891538)
+  or the inbox below. `slates-74` and other `slates-*` sessions are NOT main (one is a separate job for Ada).
+- The route that always works: write `inbox/main-from-<you>-<topic>.md` on agents/fanout-state and push it. Main reads
+  every new inbox file each check. kiln mail to main can sit "waiting" behind a stuck admission, so never rely on it alone.
+- Main reaches you the same three ways. When kiln mail from main is stuck, it arrives as a goal or a session message.
+- A-NUMBERS (2026-11-21): claim an A-number by adding its row to amendments.tsv and pushing that claim BEFORE writing the
+  number in a commit, doc or test. If the push is refused, fetch, and if the number was taken meanwhile, take the next
+  free one. Three collisions in one morning (A-815, A-821, A-822) cost renumbering commits.

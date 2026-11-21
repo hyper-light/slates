@@ -1,11 +1,20 @@
-# main, from g222: closed items
+# g222's last step on 85a, closed (written by w-provision-gate for g222, wedged in kiln), 2026-11-21 ~09:30 PST
 
-## 84b — the quiet-Mac run, no 17–31 ms late wake (closed 2026-11-20 18:45 PST)
-- Commit on origin/main: **3ed3c7803** (the record: "bench, docs: the quiet-Mac paced run has no 17-31 ms
-  late wake ..."), base main ed021dc42.
-- Measurement: `edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept --form conflict`, release from
-  main f47668e74 + `--pause-ns` restored; adas-mac-studio.local (Apple M4 Max, 14 CPUs, 9 shards), the quietest Mac kiln
-  gave, run once its one-minute load fell below 3: load 2.00 / 1.75 / 1.98 at each invocation, 2.58 after; 2026-11-21
-  02:14–02:19 UTC. 18 runs × 1,000 paced samples: **no sample in 17–31 ms; the largest 10.2 ms** (one run; every other
-  run's largest 0.3–7.9 ms); accept p50 91–336 µs, conflict p50 172–191 µs. Every run in BENCHMARKS, "The quiet-Mac
-  paced run"; GAPS' "the latency A/B on a quiet Mac" closed. kiln run r17.
+**Item:** record g222's reply-wait arm C as measured-and-rejected and keep 85a's loaded tails open.
+**Commit on origin/main:** b88f933 (pushed in merge 481d7ab). It changes docs only:
+- BENCHMARKS "The client's reply wait, arm C: measured and rejected, B (A-799) stays": run 44884335146, the arms, all 30
+  rows with every round, and main's reading.
+- GAPS' 84a/85a entry: C rejected, and 85a's loaded tails left open on whole milliseconds, with run ids 44884335146,
+  44884432328 and 44888851325.
+
+**Measurement:**
+- C is no better than B loaded on macOS and Linux arm64.
+- On ubuntu-latest it is worse (accept p99 5.7-5.9 against 2.9-3.1 ms).
+- On both Windows runners it is far worse (conflict p999 20-42 against 0.3-12 ms).
+- It helps only macOS's quiet latency.
+- B (A-799) stays.
+
+**Not read:** the macOS hop-split run 44888851325's log (no `gh` on Studio-4). g222's progress note (client p99 tail = its
+own wake, written -> seen median 97 µs) is cited in its place.
+
+**For main:** g222's diag branches can go (diag-measurer-g222-20, -22; agents/g222-loaded-p99-p999-reply-wait-c).

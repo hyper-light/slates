@@ -256,3 +256,128 @@ Also: re-run git matrix for A-719 part 1 (81c36bd99) and hg matrix when w-hg's p
 - Main is now session slates-9a (kiln restarted sessions). r119 git v2.0.0 (base 85d66d9cb, has 6737b04a7 + 67dd4ef40):
   24/27, 0 spins/kills/restarts; FAIL deepen (needs more room), partial-clone (promisor), partial-blame. RSS lost with the
   kiln restart. Reported. r2 running on Studio: hg full + git v2.0.0 release, RSS sampled, log to ~/.cache/w-interop/r-*.txt.
+- r2 (release, base 26c98c76d): hg 24/24 RSS 12,141 MiB wall 1,093 s (clone-b 357 s regression -> w-hg); git v2.0.0 24/27
+  RSS 7,421 MiB, 0 spins/kills/restarts; deepen + partial-clone -> w-bugs (inbox 5efbb7566). Ratios ~145x (hg 84 MiB
+  store; git 51.3 MiB). Main now slates-9a.
+- LANDED per-row RSS in git/hg/svn matrices (rss= per row, run peak after summary). Next: hg rerun after w-hg's fix.
+- (2026-11-20 afternoon) svn r10 (base 9d4c5e5db): 30/32 x4 (reads + git-2000, svn + http routes); revprop rows wait for
+  A-645 (a) root mount (w-reaper). svnsync 1,068 s svn:// / 524 s http; peak 2,511 MiB vs 437 MiB dump -> w-svn.
+- Windows (jupiter, debug, 9d4c5e5): hg 1.0 cut 24/24 (wrapper now python -P); git v1.0.0 27/27 after LANDED 210302b1b
+  (git-matrix default branch = cut's branch). One exit-143 restart each run -> g226; lost port -> w-reaper.
+- Linux (adacachy, release, f95edf68e): git v1.0.0 27/27; issuer claim EINTR intermittent (issuer_route::claim recvmsg,
+  code 4) -> w-reaper. r26 running: hg-src stepwise clone, then git v2.0.0 + hg full.
+- hg quiet/loaded pair (r31, Studio, 9d4c5e5db): quiet clone-b 40 s / loaded (32 burners, load ~55) 84 s; small rows 5-6x;
+  loaded RSS drops to <300 MiB between clones. Sent to w-hg. Main session slates-9a vanished; waiting for the new main.
+- LANDED 2e7756638 (main b86f0a4a2): ipc issuer_route claim/answer retry EINTR within patience (uninterrupted()); Linux
+  test slates-ipc issuer_route 3/3 on adacachy. Linux r34 (f95edf68e) was refused EINTR twice at load ~80. r36: Linux
+  release build of 2e7756638, then hg full + git v2.0.0 runs.
+- (2026-11-20 night, restarted by main) Queue fixed by close-list C: (C) HTTP v2 rows, Linux counts; (R) r110 rerun;
+  (P) 93 perf vs stock servers. Branch agents/w-interop-wake 907c246ac (over main 71db6d157):
+  - 2b25dc78c anchor's await_observation polls the issuer route's listener (IssuerRoute::readiness): with the EINTR fix
+    in, Linux claims then timed out ETIMEDOUT (code 110) at load ~65, as the anchor answered only once a turn and a
+    running daemon's turn is up to the observation budget = the claim's patience. Blocks the Linux counts. Linux
+    slates-ipc issuer_route 4/4 (new a_waiting_claim_makes_its_route_readable); macOS release build clean.
+  - 907c246ac svn-matrix.sh: anchor --vcs-store $WORK/store, trap unmounts project.svn (A-645 (a), w-reaper).
+  - Running: r2 (Studio) release build + svn matrix reads.dump both routes; r3 (adacachy) Linux release build + ipc test.
+- r4 (Studio, release 907c246ac): svn matrix reads.dump 30/32 both routes; revprop rows now
+  "could not show this repository's hook its repository: Volume(NoSpace)": svn_presenter slot_for makes the view volume
+  Dynamic { max: 0 } (a 0-byte ceiling). w-reaper's code -> inbox/w-reaper-from-w-interop.md. HTTP v2 rows wait on it.
+- r5 (Studio): r110's rerun on 907c246ac: git v2.0.0 then hg full, release. r3 (adacachy): Linux build of the wake fix.
+- CLOSED R r110 rerun (r5, Studio release 907c246ac): git v2.0.0 26/27 spins 0 (deepen "bad pack header" -> w-bugs),
+  hg 24/24 spins 0. Close note in inbox/main-from-w-interop-close.md.
+- r3 on adacachy lost to a runner restart after ipc 4/4; r1 (adacachy): cargo test -p slates-api --lib role::anchor,
+  compiles the Linux anchor arm; land agents/w-interop-wake on green.
+- P started (C items wait on w-reaper's view-size fix and the wake landing): r3 (Studio) git_scale.sh stock+slates,
+  3 runs, release 907c246ac, git/git bare. Then hg_scale.sh, svn_scale.sh; git-http-backend and mod_dav_svn still owed.
+- LANDED 2b25dc78c (issuer wake: await_observation polls IssuerRoute::readiness) + 907c246ac (svn-matrix --vcs-store
+  and view unmount) via main 90e9b720c. Tests: Linux slates-ipc issuer_route 4/4, slates-api role::anchor 15/15 (1
+  ignored), macOS release build clean. r4 (adacachy): Linux release build of main for the Linux counts.
+- r4: Linux release build of main 90e9b720c, 270 s. adacachy has no svn/svnadmin/svnrdump/svnsync: Linux svn counts need
+  an install (Ada's go; asked through main). r5 (adacachy): hg full + git v2.0.0 on it.
+- CLOSED C Linux counts (r5, adacachy, release main 90e9b720c): git v2.0.0 26/27 (deepen, w-bugs), hg 22/24 (spins 5,
+  kills 4 -> GAPS 3760530f5, w-hg), git v1.0.0 27/27 earlier; svn not countable (no svn on adacachy; Ada's go).
+  Left: C HTTP v2 rows (waits on w-reaper's view volume max 0); P perf vs stock (git_scale on the Studio when it has
+  memory; it answered nothing at 6 GB free).
+- P r7 (Studio, release 907c246ac, git_scale.sh stock+slates x3, free mem 55 MiB at start): stock git daemon best
+  push 13.5 s, clone 12.7, clone-again 12.5, inc-push 0.17, inc-fetch 0.18, shallow 1.01, partial 7.29. slates: push
+  and incremental push failed all 3 runs (curl 18 at 64-86 s), so its clone/fetch rows (0.04-0.06 s) read an empty
+  repository: no slates numbers yet. BENCHMARKS already records this blocker (git/git whole push, w-git). Also my
+  git-git.git has refs beyond branches+tags (stock objects check DIFFER 436,736): rebuild the dataset as a plain bare
+  clone before recording. r2: slates leg alone with KEEP_LOGS to name the cause for w-git.
+- r2 (slates leg alone, KEEP_LOGS): whole push dies 70.6 s, no spin/kill/refusal in the anchor log -> w-git
+  (inbox/w-git-from-w-interop.md); git perf waits on it. Running: hg_scale + svn_scale (git-2000.dump), stock+slates x3.
+- P svn (r4, Studio, release 907c246ac, git-2000.dump, load 37 -> 100: NOT a recordable floor), best of 3, svnserve vs
+  slates: load/import 129.7 vs 21.5 s (6.0x); checkout 8.81 vs 10.15 (slates 1.15x slower); log 0.204 vs 0.096
+  (2.1x); commit 2.50 vs 2.39; update 0.880 vs 0.845; update-1000 2.86 vs 4.03 (slates 1.4x slower). Far from an
+  order of magnitude; checkout and update-1000 slower. Re-measure quieter before recording.
+- hg r4: every step exit 127 (my HG passed as a string with spaces; harness runs it as one program). Rerun via a
+  wrapper ~/.cache/w-interop/bin/hg (r5).
+- Main's order: land w-reaper's ef3247236 (view sized to its content) myself. Merged onto main as f09d464ec
+  (agents/w-interop-a645; 3 conflicts resolved keeping both sides). r6 (big Studio): presenter lib, store tests,
+  svn_interop revprop x2 + view mount test. Then push, rerun svn matrix (HTTP v2 rows). r5 (hg perf) also on the Studio.
+- LANDED w-reaper's ef3247236 via f09d464ec, main a51023f57 (big Studio svn 1.15: presenter 2/2, store 3/3,
+  svn_interop revprop x2 + view mount 3/3). w-reaper told. r7 (big Studio): waits for r5 (hg perf), then release build
+  of main + svn matrix reads.dump and git-2000.dump over svn and http routes -> HTTP v2 rows.
+- P hg (r5, Studio, release 907c246ac, load 60-98; NOT a floor): hg serve vs slates best of 3: push 22.6 vs 136.4
+  (6x slower, a spin+kill in hg_push::unbundle), clone 16.4 vs 24.0, inc-push 0.26 vs 0.30, inc-pull 0.23 vs 4.22
+  (18x slower), stream 0.89 vs 48.1 (54x slower). -> w-hg inbox. 93 perf status: svn near parity (6x on load, 2x log,
+  slower checkout/update-1000), hg slower on 4 of 5, git blocked (push cut at ~70 s, w-git). Order of magnitude not met.
+- r7 (Studio, release main a51023f57): svn matrix reads.dump 32/32 svn AND http routes (revprop rows green, spins 0,
+  mounts 0). git-2000.dump svn route 30/32: revprop-svn/ssh "could not show this repository's hook its repository: its
+  owner shard did not answer in time" (presenting a 2,000-revision view on demand at the hook misses the deadline);
+  http route result pending.
+- Main 00:22: w-perf takes hg serve side (pull 18x, stream 54x); w-hg keeps push. My next: svn checkout and
+  update-1000 by phase -> inbox/w-svn-from-w-interop-perf.md. r8 (Studio, load 5.7): ~/.cache/w-interop/svn-phase.sh
+  (info / ls -R / export / checkout; diff --summarize / update-1000; client CPU, server CPU, sample of the daemon),
+  svnserve --threads vs slates, 3 runs, git-2000.dump.
+- CLOSED C HTTP v2 rows (r7): http route all HTTP rows green on reads + git-2000; reads 32/32 both routes. Red left:
+  revprop-svn/ssh on git-2000 (repos_for_hook's 1 s LIVENESS_BUDGET_NS bound on the first view) -> w-reaper + main.
+  My C items done (svn on Windows/Linux wait on Ada's go). R done. P: r8 svn phase split running; git waits on w-git.
+- Main 00:30: the revprop rows' hook-view bound is mine (w-reaper told, inbox/w-reaper-from-w-interop-hook-view.md).
+  Branch agents/w-interop-hookview: ac5f6c48f red test (svn_interop a_hooks_first_view_of_a_long_history_..., 2,000
+  revisions imported, start-commit hook reads $1/db/current via DAV POST), bdf99f92d fix (repos_for_hook drives
+  view_turn turns on the owner, each a step quantum, answering Laying/Refreshing/Shown; refused only when a turn is not
+  answered in the owner's liveness window or moves nothing). r9 (big Studio): red at ac5f, green + hook/view tests at
+  bdf9, presenter lib. r8 (phase split) died: AUTH=() unbound under set -u on bash 3.2 -> fix and rerun after r9.
+- r9: NOT red: the one-file 2,000-revision test passed on the test-only commit (22.8 s); fix commit 4/4 + presenter 2/2.
+  e14493d62 widens the test's tree to git/git's 4,872 files (each revision's file carries trunk's listing). r10: red with
+  main's presenter swapped in, then green at the fix + hook/view tests.
+- LANDED hook-view fix: bdf99f92d + tests ac5f6c48f/e14493d62, main e14493d62. Red (main's presenter + 4,872-file
+  2,000-revision test): hook unrun, POST 404; green 4/4 (+ revprop x2, view mount) and presenter 2/2, big Studio debug.
+  w-reaper told. r11 (big Studio): release build of main, svn matrix git-2000 both routes (revprop rows), then the fixed
+  svn phase split (AUTH expansion fixed) for w-svn.
+- CLOSED revprop rows on git-2000 (r11, release main e14493d62): svn matrix 32/32 both routes, spins 0. Close note added.
+- Phase split stock side (r11, load ~4, svnserve --threads, best of 3): info 0.046 s; ls -R 0.056; export 0.948
+  (client 0.85, server 0.54); checkout 3.540 (client 2.60, server 0.53); diff --summarize 0.141 (server 0.13);
+  update-1000 1.887 (client 1.16, server 0.42). slates side failed: repository create needs --vcs-store on main ->
+  script fixed; svn_scale.sh has the same break -> w-perf inbox. r13: slates side only (SKIP_STOCK=1).
+- svn phase split done (r13, load ~5): checkout slates 3.422 vs svnserve 3.540 (srv CPU 0.35 vs 0.53); update-1000
+  1.996 vs 1.887 (srv 0.18 vs 0.42; the gap is off-CPU wait 0.73 vs 0.31 s); diff-summarize 0.122 vs 0.141; client
+  CPU is the floor. -> inbox/w-svn-from-w-interop-perf.md. Left on P: git waits on w-git's push fix; hg on w-perf/w-hg;
+  then all three on the quietest Studio -> BENCHMARKS.
+- git receive keepalive fixes on main (0af1f2486, ec0a98155). r14 (big Studio): release build of main, clean bare
+  dataset git-clean.git (branches+tags only), git_scale.sh stock+slates x3 with logs kept.
+  CORRECTION: r14 NOT STARTED: kiln "not connected to the kiln server" (~01:30). Run it when kiln is back.
+- Main 01:12: run w-git's R3 Windows restart-spin check (git v2.0.0 matrix on jupiter, current main >= 970950081;
+  red = restarted daemon spinning in start_shard or "stop watch could not be installed" loop; green = 0 spins, kills,
+  restarts); bounded; rerun once if lost; result -> w-git. (inbox note file absent; main's message is the brief.)
+  r15 (jupiter): debug build of main (+ v2.0.0 tag in git-src); then the matrix run.
+- r18 (big Studio): the git comparison rerun (release main with ec0a98155, git-clean.git, git_scale stock+slates x3, KEEP_LOGS). Started after kiln came back.
+- r18: stock git daemon clean at load ~3-7 (push 10.77, clone 10.51, partial 6.17 best); slates failed "repository not found" (git_scale.sh lacks --vcs-store) -> w-perf. r19: slates side only with a scratch-patched copy (--vcs-store).
+- r17 (jupiter): both fetches failed (slates main: curl 56 schannel; git-src has no remote), build skipped. r21: retry with http.sslBackend=openssl x3, v2.0.0 by URL from github git/git, stop unless at/after 970950081, then debug build.
+- r19: slates git push still cut at 56.6-63.1 s (curl 18) on main 3ce898533 with the keepalive fixes; no server line; RSS 1.9 GiB after. -> w-git. git perf still waits.
+- 07:05 main (via session slates-5b): push cutoff looks fixed (65005a07d, 7f411f580). r21 lost in its build; r2 (jupiter) is the one rerun. r3 (big Studio): git comparison on current main, both servers, x3.
+- r2 (jupiter): debug build of main 5b929b8d2 (has 970950081), 1,239 s. r4: git v2.0.0 matrix on it (counts spins/kills/restarts, stop-watch lines, start_shard spins) -> w-git.
+- r4 (jupiter): git-matrix.sh stopped at repository create (needs --vcs-store now for git). Fix 24086b09c on agents/w-interop-store (git + hg matrices get $WORK/store). r5 (jupiter): v2.0.0 matrix with that script on the 5b929b8d2 debug binary = the w-git R3 check and the test of 24086b09c.
+- r5 (jupiter): Windows daemon refuses --vcs-store ("not supported on this platform yet"), anchor crash-loops 40x; without it repository create is refused -> Windows cannot serve git on main. R3 check BLOCKED -> w-git + main.
+- r6 (big Studio, waits for r3): git v1.0.0 cut + hg full with the --vcs-store matrix scripts (24086b09c) on the release binary -> land 24086b09c on green.
+- 09:43 main: Windows store lane -> w-work-mount (will tell me; then rerun Windows git/hg/svn). Land 24086b09c on green. Big Studio (adas-mac-studio.local-2) OFFLINE ~09:45: r3 (git comparison) and r6 stuck there. r8 (adacachy): release main + git v1.0.0 + hg full with the --vcs-store matrix scripts = the test for 24086b09c.
+- r3 alive (not stalled): stock push 13.6 / clone 12.2; slates push 1,713 s, 4 tags "failed to update ref", clone 8+ min. Interim sent to w-git. r6 queued behind it; r8 (adacachy) testing 24086b09c.
+- LANDED 24086b09c (matrices --vcs-store), main 21405836e, on main's fast-rule order. Proof runs: r8 adacachy (running), r6 big Studio (when back).
+- r3/r6 lost (big Studio runner restart). Not rerun: r6 = r8 on adacachy; r3 waits for w-git tag-refusal fix (push 1,713 s, 4 tags refused). Told main.
+- main: full hg_interop on current main (b9fed44e9, w-hg C1 1b) -> inbox/w-hg-from-w-interop-1b.md. r12: unpinned needs macos,disk=30g, SLATES_TEST_HG=uvx hg 7.2, log ~/.cache/w-interop-hg/hg_interop-*.log on the machine, timeout 5400.
+- r12 (Studio-2): hg_interop on main b9fed44e9 16/16, 0 skips -> inbox/w-hg-from-w-interop-1b.md. Target 2.8 GB at ~/.cache/w-interop-hg/target on Studio-2.
+- r8: git 27/27 with --vcs-store; hg 19 rows then known loaded-Linux spin (vcs_http.rs:850, 2 kills), scope SIGKILLed outside at 69 min. 24086b09c proven. Sent to main + w-hg.
+- main: vcs_http.rs:850 spin is w-bugs' item -> inbox/w-bugs-from-w-interop-http-spin.md (scope kill: not cap, not kiln timeout, no oomd line; coincides with kiln disk headroom events). r14 queued: git A/B unpinned (macos, disk=60g) on main 43080ff29+ with P2 git half.
+- r14 (Studio-2, main 1602f0aef, build 218 s): git/git dataset clone failed (curl 92 HTTP/2 CANCEL). r16: same run, dataset clone over HTTP/1.1 with 3 attempts.
+- r16 (Studio-2, release a8ee99bf7, load 3-5): stock push 9.6/clone 9.4/shallow 0.90/partial 5.26; slates push 50 s refuses tags naming non-commit/non-tree (junio-gpg-pub, v1.0rc1-6), all whole clones fail "repository corruption"; inc-push even, shallow 4.2x slower. -> w-git + main.

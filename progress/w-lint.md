@@ -269,3 +269,83 @@
 ## 2026-11-20 19:15: refine.rs table back (9f77462e4), main's order
 - Whole refinement back at pre-round-10 cost; sliced ~1.05x left (GAPS D-O17 (f) updated). Plus refine CHUNK cast,
   refine test split, server refining.rs literals. Close note appended to inbox/main-from-w-lint-close.md.
+- Windows after jupiter's return (19:37): r4 (queued by needs while it was away) started, then timed out at 90 min
+  with no output at all (not even the clone's line: a hung clone or no output streamed). Resubmitted by needs with the
+  warm CARGO_TARGET_DIR and a 600 s clone cap: r5 and r6 both refused "no room here now" on jupiter. Not resubmitting
+  again until the next round. Linux r60 still queued.
+
+## 2026-11-20 round 13 at e4cfbd38d (landed 7a9ace19f, 785e0a94f, 55038e039, part 3)
+- main's five Windows reds: two fixed (winfsp HostFs, vcs_svn HOOK_PATIENCE_NS cfg(unix)), three already in e51d9adeb;
+  `cargo xwin clippy` works on this Mac and ran the server and cli Windows check.
+- Host: hg, mem, merge, rt (Rc -> mpsc), db, land, server (push boxed verdict, hg_push, content_ranges, verbs
+  forward_placement, scratch-dir allows, svn_presenter), store tests and example, cli dead helper. slates-pace: no-panic
+  attribute (+4 checked divisions), budget 0; literals derived/named.
+- Correction to 785e0a94f's message: the rt pacing failure happened once, on my version only, under load; both versions
+  then passed 3 of 3. content_ranges failed once at load 7, then passed 2 of 2 on both versions.
+- To g228 (inbox/g228-from-w-lint.md): live_fleet's two time-waits, resident.rs's /proc read (structural), mem unsafe
+  88 > 87. Still with w-store: 3 store literals; w-sizing: server unsafe (now ok? see next round).
+- Windows run requests (main 20:05: w-sizing R2 at 20bef898c with its red-first at 20bef898c^, w-work-mount's WinFsp
+  mounted-work test, w-realtools' real_tools over WinFsp): one combined run by needs "windows". r7 and r8 both ended
+  "the kiln server did not answer in time" before any output came back; whether r8 runs on jupiter is unknown.
+
+## 2026-11-21 round 14 (89269ab1b .. c8b77f817): through the network outage
+- The Mac lost GitHub for hours (fetches died mid-pack, then no answer); the transport fix (encode_packet) waited and
+  landed as 89269ab1b once it came back. kiln's server also dropped; r10 (A-789 Windows checks, red-first, real_tools)
+  ran 5h21m with no output past its clippy stage and ended when jupiter's runner restarted: no results. Not resubmitted
+  yet (main's 21:58 rule: once only, after checking).
+- Landed: 4e32bd101 (db, vcs, store, merge, ipc, hg, svn literal), 5d555c7fa (server repository, svn landing,
+  test_store), 6995ff750 (server recovery, ssh hg, git receive, verbs, tests), c22f468e3 (cli merge verbs, load_bench,
+  merge_check, fleet). Tests run for each (listed in the commits).
+- Sent: w-provision-gate (rt spin_kick time-wait; since fixed upstream), w-git (receive tests wide_connectivity),
+  w-hg (push intake_tests intake): both still red on the host. w-store: 3 store literals.
+- Windows run requests: r12 (the once-only resubmission, by needs "windows", each step capped) never started: jupiter's
+  runner restarted while it was "starting". Not resubmitted again; main to say when jupiter is steady.
+
+## 2026-11-21 round 15 at c8b77f817 (landed 7db3bdba6)
+- merge history.rs overlay (554482004, A-803; 11/10, every target) -> unchanged_outside; history_block_tests
+  int_plus_one. merge lib 253 pass. Host, fmt, structural, unsafe, six cross targets clean otherwise.
+- Still with owners: git receive tests wide_connectivity (w-git), hg push intake_tests intake (w-hg), store's 3
+  literals (w-store). Windows requests waiting on main's word about jupiter (r12 lost to its restart).
+
+## 2026-11-21 round 16 at 30e89672f
+- server git_derive never_loop -> one match; merge history_layers_bench Stream alias (every target); git oracle
+  CommittedPush alias. server vcs_store:: 109 pass, examples and git lib tests build. Host, fmt, structural, unsafe, cross
+  clean otherwise. Still with owners: w-git (receive wide_connectivity, which also blocks git's lib tests), w-hg (intake
+  helper), w-store (3 literals). Windows requests held for main's word on jupiter.
+
+## 2026-11-21 round 17 at 7e110566d
+- merge push.rs (efe6d2763: deferred push records) on every target: decode split (DeferredReader::head), widths by
+  size_of; push tests GreenReads alias + owed_history split; server push test split, green_ready Copy clone. merge lib
+  258, server repository::push 7 pass. w-git's helper fixed upstream. Still with owners: w-hg (intake helper), w-store
+  (3 literals). Windows requests held for main's word on jupiter.
+
+## 2026-11-21 round 18 at 5b929b8d2 (landed b37c38d14, main f52934d65)
+- server import_batch dead accessor removed; push tests GreenRead alias, replica_owing_the_record, staged_batch.
+  repository::push 11 pass (the commit message says 9: wrong, it was 11), import_batch 2. Owners named in
+  run-requests.md. r13 lost to a jupiter restart before it started (third time): asked main in
+  inbox/main-from-w-lint-jupiter.md before resubmitting.
+
+## 2026-11-21 rounds 18-19 and Windows (main 37c7a1691, landed 21ed9cd8d)
+- Main 07:50: jupiter's restarts are R2 (the runner's link through the HTTP tunnel), not my runs; short runs, one check
+  each, logs on jupiter, the shared target dir kept. Deleted ~/w-lint-src-1795240804 there (42 GB free after), cloned
+  ~/w-lint-win at a693c49e4, ran Windows clippy: its reds were host reds of new landings (fixed in 21ed9cd8d) plus
+  svn_presenter (w-reaper). `xtask unsafe` refused "no room here now" twice; the rest waits for room.
+- Round 19 at 481d7abef: debug eprintlns removed from the hg replay; replay_sliced -> open_record; t_a729 split; svn
+  examples handle Importing::Base; hg SEGMENT_VERSION Format; svn_commit PieceOf alias. give_up -> w-git.
+
+## 2026-11-21 ~10:50 round on 37c7a1691 (main's 10:35 word)
+- made_commit.rs give_up annotated as having no caller yet, naming w-git's C5 2b piece 3 (1cfbe14d9, main f917e1ce4);
+  one-line note to w-rewrite-ops (inbox/w-rewrite-ops-from-w-lint.md). Host clean but for w-hg's intake helper;
+  literals clean but for w-store's three; fmt, structural, unsafe, the six cross targets clean.
+
+## 2026-11-21 08:20 (main's word): the wall green
+- 13ded84f0 (main d612e3963): store texts.rs hunk widths derived (w-store's), hg intake helper split lint-only (w-hg's,
+  told in its inbox). Host clippy and literals clean on the merged tree. Windows anchor tests (r23) running on jupiter.
+- Windows A-789: anchor lib 26/26 (r23), handles_windows 9 + 10 ignored (r24) green; CLI extent tests refused for room
+  twice (r25, r26), reported in run-requests.md. Stale r10/r13 stopped (not on jupiter).
+
+## 2026-11-21 round at 8b23c6fdd (landed 689b710b8, e62705815; main 3538c014e)
+- hg getbundle (AskedRows, checked divisions, Copy StoredPlace), git works test drop, merge SplitMix64 Format line;
+  then the server reds hg's had hidden: svn restore push_children, commits Before::Landed boxed, svn_commit tests
+  GreenTree + get(). Tests: hg getbundle 20, git works 9, merge byte_places 2, server svn_commit 30, commits 12.
+  Host, fmt, literals, structural, unsafe, the six cross targets clean. real_tools (r29) still queued for jupiter.

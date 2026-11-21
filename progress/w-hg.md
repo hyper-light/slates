@@ -168,3 +168,131 @@
     w-store's wiring lands; the Texts section once w-perf's encoder lands.
 - R2: r43 placed itself on this MacBook (load 116) and was stopped (no measurement here). r42 is still queued on
   adacachy.
+- ~20:50 C1 on branch agents/w-hg-c1: 3ffb95c4b (land first, v7 reference in the entry, replay from the store by
+  piece), a9620fbb1 (Texts section). By-use test blocked: the store refuses every landing on this Mac (memtable past
+  4 GiB; reported to w-store). Lands on main when it passes.
+- ~21:20 LANDED 242f4a173: C1's push onto the changeset store (by-use test with stock hg 7.2 passes; suites green).
+  NEXT: the import onto the store (rest of C1; R2's peak).
+- ~21:45 main's ruling (inbox/w-svn-from-main-c2-rulings.md, decision 1) applies to C1: no repository without
+  --vcs-store (a typed refusal naming it), no register-held history path for hg, and tests on store-backed daemons
+  through ONE shared helper (repository::store_tests' directory, made shared with a removal guard). Not small for hg:
+  every hg server test runs on a store-less shard through the sync push path (unbundle_in). Plan: the very next
+  commit after C1 lands. Recovery rule already matches decision 2 (next sequence = named + 1; unnamed changesets
+  dropped).
+- C1 remaining order:
+  1. file texts read through the store (T rows) instead of the content store;
+  2. the intake keeps no whole text with a store;
+  3. the import as changesets (R2).
+  Then the no-store path dropped.
+- 2026-11-21 ~00:20 LANDED 8cb10f986: C1 step 0, the no-store commit. One `repository::no_store_for` refuses hg and svn
+  without --vcs-store. The v2 path is gone. hg tests are on store-backed daemons through the one shared helper
+  (w-svn's test_store.rs plus mine: audit_on_stored_shard, land_blocking, create → repository::create_blocking).
+  Close note written, with the siblings: 10 failures already on main 68ce3d585 (whole_build's park bound) and the
+  load-bound git_push t_a752.
+- ~00:30 asked main (inbox/main-from-w-hg-c1-order.md) to order C1 as 3, then 1, then 2: step 1 alone can't serve an
+  imported repo, whose texts aren't on the store until 3.
+- ~00:45 step 3 design sent to main and w-store (inbox/main-from-w-hg-c1-import-design.md): the import lands as a run
+  of bounded changesets whose payloads, concatenated, are one cg3 changegroup; the register's one import entry names
+  the run; replay goes through the push intake reading pieces.
+- NOW: the piece-reading intake (needed by both 1 and 3).
+  - slates_hg: a `Source` (bytes by range, or Wanted{range}) and a forward `Window`.
+  - The changegroup framing decoded in steps from a cursor over a Source.
+  - Intake::step reads its delta through a Source; a step asks for its bytes before changing any state.
+  - Server replay (vcs_store replay_hg_referenced / replay_sliced, payload_of): a window filled by
+    `StoreHandle::piece` on Wanted. No whole payload is held.
+  - Red test: a replay's peak bytes against the payload's length.
+- 2026-11-21 ~00:55 LANDED d571ffbca: the piece-reading replay (framing over a Source, intake Wanted, Replay piece
+  mode, server fill_window; red test 789,956 B payload in 14 fills, window at most 193,859 B), and the daemon_edge hg
+  tests green via w-git's C5 part 2a. Close note written. Waiting on main's ruling for C1's order (3, 1, 2) and the
+  import's shape; next by default: step 3, the import as a run of changesets.
+- 2026-11-21 LANDED 6a0600ff1 (segment records v8, run reference v9, main's oracle on all five 7.2 formats) and
+  a693c49e4 (C1 step 3 server half: the import lands as a run of segment changesets; recovery and rebuild read the
+  segment records, 0 payload reads; imports stream). main confirmed. The push memory work went to w-perf whole;
+  t_a752 is w-bugs'.
+- C1 step 1 (main approved 08:45, inbox/main-from-w-hg-c1-step1-design.md, with the pull condition): getbundle's file
+  revisions come from the changeset store through w-perf's render::StoreWants (Want::Rows via texts_by_tool,
+  Want::Chunks via places), answered by hg_view::answer_store_wants between turns (vcs_http/hg.rs:653,
+  vcs_ssh/hg.rs:184).
+  - A stored delta is sent as it stands when its base is known by node (a revision sent earlier in this answer, or p1
+    or p2 whose link is served). Ask rows for (path, [node, p1, p2]).
+  - Otherwise send a whole text, made by the store (`StoreHandle::text`), against null: a new Want variant beside
+    w-perf's; tell w-perf.
+  - Counters: whole texts made; revisions sent whole.
+  - main wants a measurement of a one-changeset pull touching a large file, slates' bytes against stock's.
+  - Plan:
+    - 1a: the by-links walk (clone): Walk::file in serve/getbundle.rs, plus Producing::Bundle's StoreWants in
+      serve/session.rs.
+    - 1b: the pull path (named_changegroup, built whole and synchronous today) rebuilt as a stepwise walk with wants.
+    - Then lookup's .hgtags, the intake's base text, made changesets.
+    - Then step 2, after w-perf's intake change lands.
+- 09:00 main approved: made changesets onto the store FIRST, then 1a (the clone walk), then 1b (the pull).
+  Conditions:
+  - ONE HOOK: made_commit (A-804/A-805, Lineage::preview), the one svn_made uses. Ask w-rewrite-ops if it lacks
+    anything.
+  - ONE PATH: the server-built changegroup lands through the push's changeset path (Record v6, Payload, Texts, v7
+    reference). In the same series, remove the v3 made record (record::write_made, the DELTA_VERSION reader/writer, the
+    `formed` code), hg_made::recorded, and HgStore::unstored, with no fallback.
+  - Red: a repository with a made changeset is refused by the store rule today. Green: it clones and pulls through
+    the store, stock 7.2 verifies clean, and a restart replays it.
+  PLAN:
+  - M1 (slates-hg):
+    - record: `write_made_record(room, version, (green, ver))`, a SECTIONED head with Source::Made. head() lets
+      SECTIONED/REFERENCE take Push|Made.
+    - begin_sectioned keeps the made (green, ver); Retaken finish sets Replayed.made = (green, ver, the first new
+      changeset's node).
+    - Reference gains `made: Option<(u64, u64)>` (write_made_reference; reference_of; record() picks the made record).
+    - `push::made` encodes a Verified as a cg3 changegroup (put_revision_whole per revision; groups changelog,
+      manifests, empty tree list, files).
+  - M2 (server):
+    - made_commit::defer passes `judged` to hg_made::make_deferred.
+    - hg_made builds the Verified from a preview (svn_made::revision_held's pattern; changeset_of takes the engine), and
+      the bare make() spawns a task as svn_made::make does.
+    - The task: encode the cg, take it through the push intake into a fork (hg_push's begin_intake/take path),
+      hg_push::changeset_of with the made record, `disk.land` awaited, then made_commit::commit with landed_on_disk,
+      the register entry (v7 made reference), the fork placed, and the made map set.
+    - The recovery/rebuild replay of v7 already goes through the pieces; replayed_hg sets `made`.
+    - Tests poll for the made changeset (async now).
+- ~10:10 LANDED ac25475c1: made changesets on the store (one hook, one path). The v3 made record, `unstored` and
+  `stored_logs` are removed. Close note written; main and w-perf told.
+- NEXT: C1 step 1a, the clone walk (by_links) in serve/getbundle.rs Walk::file through StoreWants.
+  - Walk fields: want, wanted logs, the ahead deque (path, position, node, link, row, chunk), and a sent map
+    (identity -> node) for the open group.
+  - A new `Store::file_entry(path, node) -> ([Node;2], flags)`, read from the index, no text.
+  - A stored delta is sent as it stands (put_delta against the sent node, or NULL for a stored whole).
+  - Producing::Bundle forwards wants to Answering, then the Walk.
+  - The edges already answer wants between turns (vcs_http/hg.rs:653, vcs_ssh/hg.rs:184).
+  - Whole callers (getbundle::changegroup, session::serve whole, the tests) need a want-answerer: render's StoredSource
+    / answer_want style.
+  - Red: a full clone makes no whole text and reads chunks = file revisions; stock 7.2's clone verifies clean.
+  - Then 1b (the pull path, named_changegroup) with main's condition: the base on the client or sent earlier, from the
+    common set; count whole sends; measure a one-changeset pull touching a big file against stock.
+- ~11:20 LANDED 5d2940ff9: C1 step 1a.
+  - The by-links walk (serve/getbundle.rs Walk::file) reads file revisions through StoreWants (Files: ask_rows /
+    ask_chunks / give) and sends stored deltas as they stand.
+  - Store::file_entry and Store::stored_now (test stand-ins; the daemon's Indexed answers nothing at once, and its
+    test seam is `answering_from_its_texts`, cfg(test)).
+  - HgStores::answer_wants: ServedViews overrides it to hg_view::answer_store_wants, and the default answers from the
+    lent view's stored_now.
+  - test_store::answer_wants_blocking.
+  - hg_interop's stream test does a plain clone that asks the store.
+  - Target trimmed for main (27 GB free).
+- NEXT 1b, the pull path:
+  - named_changegroup (getbundle.rs ~910: common_ancestors, changelog_entries, named_revisions, encode_changegroup) is
+    built whole at begin from content-store texts.
+  - Plan: keep the planning (which revisions, by path, node, parents, link) but send each file revision from stored
+    rows and chunks, stepwise.
+  - Ask rows for (path, [node, p1, p2]). The base is sendable if the stored base identity is a revision sent earlier in
+    the group, or p1/p2 when the parent's link is held (on the client) or sent.
+  - Otherwise send a whole text: a new Want::Texts variant answered by StoreHandle::text pieces (render.rs Want and
+    answer_store_wants are w-perf's: tell them), counted WHOLE_SENT.
+  - Measure a one-changeset pull of a large file, slates' bytes against stock (main asked).
+- LANDED 1b b9fed44e9 (base 5d2940ff9): the pull's file section is serve::getbundle::Pull, read a step at a time from
+  the changeset store (rows, then stored edits, then Want::Texts one at a time). A stored delta goes where its base is
+  earlier in its group or a parent the common set holds; otherwise the whole text against null, counted
+  (Walk::whole_sent, vcs_store.hg_pull_whole_texts). Measured: a one-changeset pull of a 2 MB file is 554 bytes, the
+  same as stock 7.2, none whole. Main confirmed; w-lint runs clippy and w-interop the full hg_interop.
+- WAITING:
+  - main's ruling on lookup's .hgtags: A, wants at each of the four entry points including the --from verb as a task
+    (my lean); B, all .hgtags texts kept in RAM; C, .hgtags exempt from step 2;
+  - w-perf's answer on intake.rs ownership for the intake's base text (inbox/w-perf-from-w-hg-intake-base.md).
+- Target trimmed by exact paths (4 stale rlibs and .o files, 6.9 to 6.2 GB).

@@ -70,3 +70,107 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Clippy red on Windows/Linux (all clippy legs): crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` is a
   disallowed method (A-520 piece 5, w-k90-containers'). For main / lint keeper.
 - Poller bebez30pl stopped at its 2 h limit.
+
+## ~21:45 PST (05:45Z)
+- GREEN Linux x86-64: GitHub run 44851246181 (kiln 4f5e58c1b, contains e763e394f + the 08f1a434 pin), job 136703754443
+  `ubuntu-latest (Slates build and tests)`: every step success. macOS arm64 green again there (136703754428).
+- ubuntu-24.04-arm 136703754445: build ran 90 min (oomd off, swap, -j2), exit 101, no detail; its (clippy, build) leg
+  lost the runner (143). LANDED kiln f500759d2 (base f500759d2): slates Report covers the build step.
+- windows-11-arm 136703754464: build OK, lib Slates tests OK (51 min), `--test vendored --test slates_roles` exit 101
+  again (slates_roles is #![cfg(unix)] -> the `vendored` test or the test build fails on Windows arm64). Report step
+  (eb7194f00) not in that run; next run 44867288588 (af73099bd) carries it.
+- windows-slates (w-k90-win) on 4f5e58c1b: slates_e2e GREEN; lib: 2 tests with hard-coded Unix paths (mod.rs:747/764)
+  -> told w-k90-win (agents_send + inbox).
+- clippy container.rs:301 -> w-k90-containers says it's w-k90-a520's, forwarded.
+- r145 (jupiter repro) still queued: jupiter not answering. kiln's own lanes for 08f1a434 still wedged.
+
+## ~00:30 PST 11-21 (08:30Z)
+- Run 44867288588 (af73099bd): ubuntu-latest GREEN again (136745995680). ubuntu-24.04-arm build failed at kiln's final
+  link ("linking with `cc` failed: exit status: 1", reason cut by the 4 KiB cap). LANDED kiln 482bd01f8 (base 482bd01f8):
+  Linux arm64 links with the toolchain's gcc-ld/ld.lld when present; Report shortens >300-char lines.
+- windows-11-arm 136745995679: build + lib Slates tests green; `vendored` 2 of 11 red: a_vendored_crate_taken_from_git
+  ("the planted source isn't in the lock") and an_unrelated_crates_io_crate ("quiver isn't in the lock as kiln's"):
+  CRLF Cargo.lock on Windows checkouts vs "\n" patterns. Fix in worktree: kiln_lock() normalizes \r\n. Testing:
+  kiln run r2 (d13238) `cargo test -p kiln --test vendored`, own target ~/.cache/w-k90-pin-2-target.noindex.
+- Note: my code_run sleep loop spun 2000 calls when machines.run failed fast during kiln's restart (now shell waits).
+
+## ~01:15 PST 11-21 (09:15Z)
+- LANDED kiln 60c0b27c5 (merge-base confirmed, base 60c0b27c5): tests/vendored.rs kiln_lock() normalizes \r\n.
+  Local (this Mac, own target): `cargo test --locked -p kiln --test vendored` 11/11 with LF lock and with a CRLF lock.
+- kiln restarted twice on this Mac; runs r2 (d13238 went silent), r4 lost. Local shell used instead.
+- State per platform (GitHub ci.yml `slates` job): macOS arm64 GREEN (44841298533/136653837819), Linux x86-64 GREEN
+  (44851246181/136703754443; again 44867288588/136745995680). Linux arm64: lld link fix 482bd01f8 awaiting a run.
+  Windows arm64: CRLF fix 60c0b27c5 awaiting a run. Windows x86-64: w-k90-win (2 Unix-path tests in workspace::tests).
+
+## ~03:10 PST 11-21 (11:10Z)
+- Run 44887857088 (kiln a0d114abb: contains 08f1a434's pin, 482bd01f8 lld, 60c0b27c5 CRLF, w-k90-win's f16212799):
+  GREEN Windows x86-64 `windows (Slates tests)` 136804151233 (w-k90-win's job); GREEN Linux arm64 `ubuntu-24.04-arm
+  (Slates build and tests)` 136804151244 (lld link; build 37 min). ubuntu-latest lost its hosted runner (infra; Linux
+  x86-64 already green twice). windows-11-arm in lib tests; macos-latest still building.
+
+## ~04:25 PST 11-21: DONE
+- GREEN Windows arm64: run 44887857088 job 136804151286 (a0d114abb; vendored 11/11 with the CRLF fix).
+- Goal 01a1facaf183 marked met (goals_done) with: macOS arm64 44851246181/136703754428, Linux x86-64
+  44851246181/136703754443 (4f5e58c1b); Linux arm64 136804151244, Windows x86-64 136804151233, Windows arm64
+  136804151286 (44887857088, a0d114abb). Pin 8ce3d61523e1 in all. No CLI call. Reported to main (inbox).
+- For main to cancel (needs a person): kiln ci runs 01a1fa8f0de173e39b8af52219ffb700, 01a1fa8fe4097372b94f7337ff2b7fd3,
+  01a1fa8ff6d771bc90e709b705554f79, 01a1fa9006fe76bcbc4891519afba25e (wedged), and r145 (jupiter repro, unneeded now).
+- For main to delete: ~/kiln-work/w-k90-pin-2-kiln (scratch clone), ~/.cache/w-k90-pin-2-target.noindex,
+  ~/kiln-work/w-k90-pin-2-logs.
+
+## ~05:00 PST 11-21: C1 CLOSED (inbox/main-from-w-k90-pin-2-close.md). R2 (runner link closing) root cause found
+- adacachy enp9s0: 192.168.1.77/24 primary (static, not NetworkManager's: DHCP-only profile) + 192.168.1.90/24
+  secondary (DHCP). kiln quic_advertise 192.168.1.90:7071, bound 0.0.0.0:7071; LAN route src .77.
+- kiln's version probe from Studio-4 to .90:7071: answered 5/5 FROM .77 (scripts ~/kiln-work/w-k90-pin-2-scripts/vnprobe.py).
+- => direct QUIC answers come from the wrong address -> runners fall to the HTTP tunnel and its 5-min UDP check
+  (tunnel.rs udp_answers: from == to) never passes -> all LAN Macs stay tunnelled; Macs reach adacachy on 2.4 GHz Wi-Fi
+  (Studio-4 en1 ch9 -69 dBm, Ethernet unplugged; cec37f60 .84 logs "Host is down" every few min): each blip kills the
+  tunnel's TCP -> QUIC ends ~30-90 s later -> "agent disconnected reason=closed". 192.168.1.93's tunnel: opened every
+  ~16.3 min, its QUIC gone within ~1 min, tunnel closed idle 600 s later (f3f618's cycle).
+- Ruled out: load (server's 7071 socket 0 drops since start; 0.7% host-wide UDP drops are other sockets), ARP table
+  (109/1024), upgrades (1 of ~20 drops). Tunnel is Class::Background in overload.rs (noted, not the cause here).
+- Operational fix = a person on adacachy (drop .77 or route src .90). kiln fix = IP_PKTINFO in vendored hyper-rt +
+  hyper-transport (passes local_ip None at endpoint.rs:1037): asked main whether that's R2's fix.
+- Reported: inbox/main-from-w-k90-pin-2.md (~04:50).
+
+## ~06:30 PST 11-21: R2 fix (main approved IP_PKTINFO, 04:36)
+- Worktree ~/kiln-work/w-k90-pin-2-r2 (base origin/main a0d114abb), local commit (unpushed, to amend).
+- kiln-rt (kiln's own hyper-rt; vendor/hyper-raft/crates/hyper-rt stays upstream's, nothing kiln builds uses it):
+  linux.rs enable_local_addresses (IP_PKTINFO + IPV6_RECVPKTINFO), Received::to from cmsgs, write_controls (UDP_SEGMENT
+  + IP_PKTINFO/IPV6_PKTINFO src), CONTROL_WORDS 15; macos.rs same + sendmsg send_from; batched.rs Arrival::to,
+  send_segments_from. ORIGIN.md row.
+- vendor hyper-raft: hyper-transport Endpoint::handle_datagram_to (local_ip in place of None at endpoint.rs:1037);
+  hyper-rt-transport driver passes arrival.to and sends from transmit.src_ip. Recorded by hand as
+  vendor/patches/hyper-raft/0006-* (vendor.py needs Python 3.11; this Mac has 3.9) + UPSTREAM.md row.
+- Windows: only runs client endpoints (src_ip None) -> portable send, unchanged.
+- Test: crates/kiln/src/tunnel.rs r2_a_server_on_a_host_with_two_addresses_answers_from_the_one_it_was_reached_at
+  (server endpoint bound 0.0.0.0; udp_answers at 127.0.0.1 [Linux+macOS] and 127.0.0.2 [Linux]).
+- macOS: cargo check -p kiln --lib --tests OK (local). Runs queued: r17 Linux RED (fix reversed) then GREEN;
+  r18 macOS test. vendor.py check hyper-raft to run where Python >= 3.11.
+- R2 BEFORE (kiln machines.list topo, 2026-11-21T14:59:53Z): drops / rtt / spread ms:
+  Studio-4 2768 135/214/369; Studio-3 cec37f 485/225/21; Studio-2 b24c 166/692/3934; Studio d13238 109/113/437;
+  MBP-2 e30189 167/13/39; jupiter 55/8/86; adacachy 9/0/0. Second sample later -> drops/hour before the fix.
+- r17 stopped (its red half diffed the working tree, empty after the local commit); r19 = red/green on Linux by
+  HEAD~1..HEAD, + kiln-rt udp tests + vendor.py check hyper-raft.
+- R2 BEFORE, better measure: kiln's topo.drops did NOT count Studio-4's 15:34:40Z drop (135 at 14:59 and 15:50), so the
+  measure is the runners' own "disconnected from server" lines per hour (UTC, 2026-11-21):
+  Studio-4 (.83): 05h 4, 06h 1, 07h 1, 08h 2, 09h 4, 10h 2, 15h 1 (none 11-14h).
+  Studio-3 cec37f (.84): 00h 24, 01h 8, 02h 2, 04h 2, 05h 5, 06h 3, 07h 1, 08h 3, 09h 4, 10h 3, 11h 3, 15h 1.
+  cec37f has been tunnelled since 2026-11-16T04:54Z ("UDP 192.168.1.90:7071 unreachable"). Probe at 15:50Z: still from .77.
+  AFTER = same counts once the fix is deployed (server + runners), plus each runner's "connected directly" line.
+- ~08:45 PST: macOS green (this Mac, local, own target): crates/kiln-rt/tests/udp_local_address.rs
+  an_arrival_tells_its_local_address_and_an_answer_from_it_arrives 1/1 x4 (sendmsg+IP_PKTINFO answer arrives);
+  udp_batched 18/18 x13 (10/10 clean); hyper-rt --lib udp:: 13/13; cargo check -p kiln --lib --tests OK.
+  CAUTION learned: two worktrees on one CARGO_TARGET_DIR mixed kiln-rt artifacts (a test compiled against origin's
+  lib) -> base worktree removed; never share a target across worktrees.
+- Linux runs waiting on adacachy (load ~40/32, "machine under strain"; fedora offline): r19 = kiln e2e RED/GREEN
+  (32g), r21 = kiln-rt tests + vendor.py check (6g). r18 = kiln e2e on macOS (queued for this Mac).
+- Local commit (unpushed) in ~/kiln-work/w-k90-pin-2-r2: 10 files (+685/-74).
+- ~11:00 PST 11-21: Linux kiln-rt green in a container on Studio-4 (rust:1.99.1-bookworm, aarch64): udp_local_address 2/2
+  (reached_at_a_second_address: kernel answers 127.0.0.2 from 127.0.0.1 = the fault; from 127.0.0.2 with the fix),
+  udp_batched 23/23, --lib udp:: 13/13, clippy -D warnings clean (Linux and macOS).
+- Waiting for the kiln e2e (tunnel.rs r2 test, never run yet): r19 (Linux RED/GREEN, adacachy strained for hours),
+  r23 (macOS, queued; fleet: several runners "link down"/not answering). r18 stopped, r22 lost (d13238 silent).
+- Studio-4 disk: my target deleted whole 09:20; r23 deletes its target after the run.
+- NEXT: on r19 or r23 green -> amend commit message with results, merge origin/main, push HEAD:main, is-ancestor;
+  then measure runners' drops after deploy (deploy is a person's).

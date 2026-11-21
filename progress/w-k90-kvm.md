@@ -85,3 +85,34 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   (2) a session start sent just before a link drop can be lost; the server then marks it crashed ("the runner doesn't
       hold it"), and only a person's resume takes it up.
   (3) under I/O pressure (adacachy, io some avg10 ~10%) a runner's sqlite stores took 48-96 s to open.
+
+## 2026-11-20 ~21:30 PST onward: goal 92, the six Shards-owed items (main's ask; "vendor once": judged in kiln's tree)
+- 1 HOLDS: vendor/patches/shards/0002 == Shards D288 b9006561 (numstat, docs aside); KVM r42/r28, HVF 81174ac49.
+- 3 HOLDS: slates_e2e microvm::g266 + ::g90 on KVM (r51, r42 at c0f576eb3) and HVF (81174ac49).
+- 4 HOLDS: one Slates in kiln (vendor/slates); vendored Shards has no Slates dep; SLATES_REV only in Shards' .github.
+- 6 BUILT, red/green on macOS HVF (this Studio): commit 3ba7efe6c (merge 2666498ea on main 865d8bed5), vendor patch
+  0003 "a restored microVM is given its served shares' streams". Red: restore refused --slates-fs-fd; green 1/1.
+  Windows: vm-process cross-checks clean; shards crate's Windows (cli served_pipes) unchecked here (aws-lc C), owed on jupiter.
+  LANDING: push via adacachy run r3 (synced from ~/kiln-work/w-k90-kvm branch w-k90-kvm-item6). Two earlier tries failed
+  (kiln server timeouts; one pasted bundle corrupt).
+- 5 IN FLIGHT: PM M620 scratch branch agents/w-k90-kvm-m620 (e1b6b45bd tests only = red, c60ed4c9b + fix = green);
+  jupiter run r2 (openssl-backend shallow clone; schannel kept dropping). Then land as vendor patch 0004.
+- 6 LANDED (2666498ea). 2 LANDED kiln 110f4115f (vendor patch 0004, fs/acl.rs + server.rs): red unit 3 failed / VM
+  "mode reads 600 after its ACL, not 640"; green fs 122, boot a_direct_boots_share_enforces_its_guests_posix_acls 1/1 (HVF).
+- 5: GitHub clones on jupiter kept failing (curl 92 HTTP/2 reset), so I sent the commits as a bundle (carry repo m620.bundle) into jupiter
+  ~/.cache/w-k90-kvm/kiln.git; worktrees red/green there; run r9. Landing tree ~/kiln-work/w-k90-kvm-m620land (diff applied, win cross-check clean).
+- Slips: r61's retry loop ran `rm -rf` on its own partial clone dir (green.part) on jupiter; my git grep/diff on main's
+  ~/.local/state/shards-audit.git likely lazily fetched objects into it (told main).
+- for main to delete (this Studio): ~/.cache/w-k90-kvm-shards-stray-target{,-2} (test artifacts moved out of vendor/shards),
+  ~/.cache/w-k90-kvm-shards-stray-target-3, ~/kiln-work/w-k90-kvm-acl (worktree, landed), ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; jupiter ~/.cache/w-k90-kvm/{kiln.git,green.try1}.
+
+## 2026-11-21 ~02:10 PST: GOAL 92 DONE (close table in inbox/main-from-w-k90-kvm-close.md)
+- 5 LANDED kiln 64624e059 (vendor patch 0005, PM M620). Jupiter WHP fs::window::guest at --test-threads 1: red 4 passed 2 failed,
+  green 6 passed; landed tree devices::virtio::fs 116 passed. At --test-threads 4 two WHP tests collide on host resources (finding).
+- 6 Windows: `cargo check -p shards --bins` on jupiter rc 0 (AWS_LC_SYS_PREBUILT_NASM=1 from env; no NASM/CMake there, nothing installed).
+  The shards bin test target can't compile in kiln's vendored tree (missing testdata/scripts/docs files; finding).
+- Slip: one jupiter command carried a stray `rm -f /dev/null 2>/dev/null` (typo; no effect seen). Noted.
+- for main to delete: this Studio ~/kiln-work/{w-k90-kvm-acl,w-k90-kvm-m620,w-k90-kvm-m620land} (worktrees, landed; git worktree remove),
+  ~/kiln-work/{w-k90-kvm-m620tree,w-k90-kvm-carry,w-k90-kvm-shards.git}, ~/.cache/w-k90-kvm-shards-stray-target{,-2,-3},
+  ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; kiln branch agents/w-k90-kvm-m620;
+  jupiter ~/.cache/w-k90-kvm (kiln.git, m620/, target/, green.try3, logs).
