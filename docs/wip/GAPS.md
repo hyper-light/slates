@@ -2912,8 +2912,13 @@
 >   stored base a sibling's: sent whole, counted 1), and `a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history`
 >   (a step a unit sent).
 >   The daemon counts each whole text a pull is given, `vcs_store.hg_pull_whole_texts`.
-> - OPEN: the bytes of a one-changeset pull of a large file against stock's (main's condition), measured below when
->   recorded. Then the other synchronous readers (lookup's
+> - Measured (main's condition; MacBook arm64, debug build, stock hg 7.2, 2026-11-21): a one-changeset pull changing
+>   one line of a 40,000-line (about 2 MB) file sent a changegroup of 554 bytes from slates and 554 from stock 7.2
+>   pulling the same changeset from its source; none sent whole. Not materially more, so no A/B arm of a delta made
+>   against p1. Held by hg_interop `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does` (within
+>   twice stock's, `vcs_store.hg_pull_whole_texts` unmoved, verify clean), and the two stock round trips over HTTP and
+>   SSH pass.
+> - Left: the other synchronous readers (lookup's
 >   `.hgtags`, the push intake's base text), then step 2.
 > **C1, made changesets on the changeset store (2026-11-21, w-hg; main's ruling of 09:00: one hook, one path).
 > CLOSED.**
