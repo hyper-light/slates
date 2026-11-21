@@ -29,6 +29,13 @@
 //! once that step's bytes have gone to the channel, so the output held is a packet at most. The input held is at most the
 //! channel's window, which the session refuses to exceed; what a request consumed is given back to it.
 //!
+//! **git's keepalive** (A-722's on the fetch, as the HTTP edge's `vcs_http::git::upload`). An answer's step may write
+//! nothing: its pack's objects still being chosen after the `packfile` section's head is written, or its source framing
+//! nothing new. Once the answer has been silent for the keepalive interval (git's own five seconds,
+//! `crate::config::GIT_KEEPALIVE_NS`, unless the site is given another), the step writes git's keepalive where the answer
+//! may carry one (`Answer::write_keepalive`: inside a banded pack's section, as git's `create_pack_file` writes `0005\1`
+//! while `pack-objects` is silent). Between requests the session waits on its client, and writes nothing.
+//!
 //! **The store.** A repository whose store the lender does not hold is not served (the site's not-served words). A
 //! store that goes away mid-session ends it in the same words. A-662 holds each repository's store on its owner shard,
 //! and the daemon's lender lends it from that map (`crate::vcs_store::upload::ShardStores`, A-682): each request's step
@@ -107,16 +114,21 @@ pub(crate) struct UploadCommand<L: StoreLender> {
   room: u64,
   /// What follows it.
   after: After,
+  /// How long an answer may write nothing before git's keepalive is written (the module doc).
+  keepalive_ns: u64,
+  /// When the session last wrote.
+  last_written_ns: u64,
 }
 
 impl<L: StoreLender> UploadCommand<L> {
   /// A session of `reader` over the store of `repository` that `lender` lends, at protocol `version`, each request
-  /// admitted `room`, the edge's request room, or what its stores' shard could admit when it began where that is less.
+  /// admitted `room`, the edge's request room, or what its stores' shard could admit when it began where that is less;
+  /// git's keepalive written after `keepalive_ns` of a silent answer.
   pub(crate) fn new(
     lender: L,
     (repository, reader): (RepositoryId, Principal),
     version: Version,
-    room: u64,
+    (room, keepalive_ns): (u64, u64),
   ) -> Self {
     Self {
       lender,
@@ -132,6 +144,8 @@ impl<L: StoreLender> UploadCommand<L> {
       admission: Admission::new(0),
       room,
       after: After::Next,
+      keepalive_ns,
+      last_written_ns: slates_rt::futures::now_ns(),
     }
   }
 
@@ -186,11 +200,14 @@ impl<L: StoreLender> UploadCommand<L> {
       admission,
       out,
       after,
+      keepalive_ns,
+      last_written_ns,
       ..
     } = self;
     let Some(made) = answer.as_mut() else {
       return Ok(Next::More);
     };
+    let before = out.len();
     let step = |served: &Served<'_>, packs: &mut L::Packs| {
       let mut spent = packs.turn();
       made.write_within(served, packs, admission, out, MAX_LEN, &mut spent)
@@ -200,6 +217,12 @@ impl<L: StoreLender> UploadCommand<L> {
       None => lender.lend_objects(*repository, step),
     }
     .ok_or_else(unheld)?;
+    let now = slates_rt::futures::now_ns();
+    if out.len() > before {
+      *last_written_ns = now;
+    } else if now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out) {
+      *last_written_ns = now;
+    }
     if written == Written::More {
       return Ok(Next::More);
     }

@@ -21,6 +21,14 @@
 > close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
+> **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):
+> part 1 landed:** the daemon raises its soft `RLIMIT_NOFILE` at start to min(hard, the platform's cap: Linux
+> `fs.nr_open`, macOS `kern.maxfilesperproc`), never lowering it, Windows none; the boot profile's `descriptor_limit`
+> line names before, hard, cap and after (`a837_the_soft_descriptor_limit_is_raised_...`, a re-invoked child raised from
+> 64). **Part 2 landed:** the learned ceiling (`slates_machine::descriptors`): the count held at the first `EMFILE`,
+> `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
+> `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
+> **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
@@ -460,8 +468,9 @@
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
 > fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
-> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
-> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence, and the SSH edge's upload after
+> git's own interval (red/green `a_long_fetchs_answer_over_ssh_…`). Owed: a fetch's wait before its sections (the
+> A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused

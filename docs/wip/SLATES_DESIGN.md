@@ -2305,7 +2305,8 @@ threshold; racy window = the base filesystem's timestamp granularity (from a cit
 table keyed by the type `statfs` reports) plus the measured clock resolution; watcher coalescing
 window = measured p50 inter-arrival of event bursts; descriptor budget for large-class copy-ups =
 `RLIMIT_NOFILE` (or the Windows handle budget) minus the daemon's measured steady-state use,
-divided by the measured number of concurrently open large-class files.
+divided by the measured number of concurrently open large-class files; the daemon first raises its soft
+`RLIMIT_NOFILE` to min(hard limit, the platform's cap) at its start (A-837).
 
 **Worked example.** `cargo build` in a clone creates 190k files under `target/`: each create
 touches its directory (mostly current-epoch nodes, mutated in place after the first touch), the
@@ -55925,9 +55926,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
   (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
   keepalive, the pack whole after it).
-- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
-  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
-  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+- **The SSH edge** (2026-11-21, same day): `vcs_ssh::git`'s upload session writes it the same way, after git's own
+  interval (`GIT_KEEPALIVE_NS`; `ToolServices::with_git_keepalive` gives a site another). Red on main 1a35ab091:
+  `vcs_ssh::tests::receive::a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`,
+  the section's second packet the pack's first; green after.
+- **Owed.** A fetch's wait before its sections (the A-718 encode and A-614's derivations in `body_end`, the SSH
+  session's encode before its advertisement) has no packet git allows there under side-band-64k alone (a band-2
+  progress packet needs `sideband-all`), so it stays silent.
 
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
