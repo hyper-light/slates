@@ -254,6 +254,15 @@ const MESSAGE_TOO_LARGE: i32 = libc::EMSGSIZE;
 #[cfg(windows)]
 const MESSAGE_TOO_LARGE: i32 = windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;
 
+impl From<crate::sync::SyncRefusal> for RtError {
+  fn from(refusal: crate::sync::SyncRefusal) -> Self {
+    match refusal {
+      crate::sync::SyncRefusal::Capacity { what, bound } => Self::Capacity { what, bound },
+      crate::sync::SyncRefusal::BadConfig { what } => Self::BadConfig { what },
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::{ReceiveRefusal, RtError};
@@ -317,14 +326,5 @@ mod tests {
       RtError::ShardGone { shard: 0 }.receive_refusal(),
       ReceiveRefusal::SocketGone
     );
-  }
-}
-
-impl From<crate::sync::SyncRefusal> for RtError {
-  fn from(refusal: crate::sync::SyncRefusal) -> Self {
-    match refusal {
-      crate::sync::SyncRefusal::Capacity { what, bound } => Self::Capacity { what, bound },
-      crate::sync::SyncRefusal::BadConfig { what } => Self::BadConfig { what },
-    }
   }
 }

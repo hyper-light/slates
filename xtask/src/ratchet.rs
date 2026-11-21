@@ -415,6 +415,7 @@ mod tests {
     append_rows(&path, "2026-11-20", "abcd", 1, &rows(2)).unwrap();
     append_rows(&path, "2026-11-20", "abcd", 2, &rows(7)).unwrap();
     let kept = std::fs::read_to_string(&path).unwrap();
+    #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
     std::fs::remove_file(&path).unwrap();
     assert_eq!(
       kept.lines().collect::<Vec<_>>(),

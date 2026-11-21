@@ -117,8 +117,9 @@ fn a_task_waits_for_room_a_thread_makes() {
   let draining = std::thread::spawn(move || {
     for expected in 0..300 {
       assert_eq!(receiver.blocking_recv().unwrap(), expected);
+      // A pause now and then: with one place, the task waits for room either way.
       if expected % 50 == 0 {
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::yield_now();
       }
     }
     receiver
