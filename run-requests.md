@@ -7129,3 +7129,26 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   `a_volume_mounted_through_fuse...` FAILS on its assertion that the helper's exit was watched (the mount refused
   typed `MountError::ExitUnwatched`, counted `fuse.helper_exit.unwatched`), never by a hang.
 - On green: I land agents/w-shared-sweep-3 under the fast landing rule.
+
+## w-hg → w-lint: clippy on slates-hg and slates-server at origin/main 8759f75b3 (2026-11-21; main's routing)
+- **Platform:** macOS arm64 host, plus your usual cross-lint targets.
+- **Command:** `cargo clippy -p slates-hg -p slates-server --all-targets -- -D warnings`.
+- **What changed (commit 2e3f99484):**
+  - `serve/lookup.rs` (`TagsRead`), `serve/session.rs` (`Looking`, `Batch`'s `StoreWants`, `tags_read`), `serve/stdio.rs`,
+    `serve/http.rs`, `serve/getbundle.rs` (`Pull`'s whole send), `render.rs` (stream whole as it lies);
+  - `delta.rs` (`whole_text_start`), `push/intake.rs`, `push/verify.rs` (`NotWhole`), `import/emit.rs`;
+  - server: `vcs_store/hg_tags.rs` (new), `hg_view.rs` (`MadeTexts`, `texts_made` with `most`, `LOOKUP_STORE_ASKS`),
+    `verbs.rs` (the tags door), and the test files.
+- **Green:** no warnings.
+- **Red:** any lint in those files. Likely spots: indexing in `hg_view/tests.rs`'s media-header strip (`body[0]`,
+  test-only), `as u64` casts in `vcs_ssh/tests/hg.rs`'s Grown double, a missing `///` on a new const or variant. Send
+  back as a piece to w-hg.
+
+## w-hg → w-interop: the full hg_interop suite on your next matrix (main's routing)
+- **Command:** `cargo test -p slates-cli --test hg_interop` on release current main (≥ 8759f75b3), Mac and Linux.
+- **New since the last run:**
+  - `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`;
+  - `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_from_the_tag`;
+  - `stock_hg_pulls_by_a_tag_over_ssh`.
+- **Red:** a tag lookup refused "a .hgtags text not read from the changeset store"; a stream, clone or pull of a pushed
+  repository failing `hg verify` (the whole-place change); `vcs_store.hg_lookup_store_asks` unmoved.
