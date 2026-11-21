@@ -645,6 +645,12 @@ impl<S: HgStores> Exchange for HgExchange<S> {
         Ok(false)
       }
       Some(Made::Streamed(mut streamed)) => {
+        // What the answer's next step asks of the node's changeset store, answered before its turn (a stream's rows and
+        // chunks, read where the store keeps them).
+        if !crate::vcs_store::hg_view::answer_store_wants(&mut *streamed, self.repository.id).await
+        {
+          return Err(Failed(Status::SERVICE_UNAVAILABLE));
+        }
         let more = self.turn(&mut streamed, out)?;
         if more {
           self.answered = Some(Made::Streamed(streamed));
@@ -677,6 +683,10 @@ impl<S: HgStores> HgExchange<S> {
         let mut taken = false;
         loop {
           match streamed.step(store, room, out) {
+            // A step that asks the changeset store ends the turn: the store answers before the next one.
+            Ok(true) if slates_hg::render::StoreWants::wants(&*streamed).is_some() => {
+              break Ok(true);
+            }
             Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {
               taken = true
             }

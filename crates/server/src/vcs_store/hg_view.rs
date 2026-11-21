@@ -117,6 +117,63 @@ impl HgStores for ServedViews {
   }
 }
 
+/// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store
+/// keeps it), over the shard's handle, as a task: a log's rows by node (`StoreHandle::texts_by_tool`, the `I` rows) and
+/// a batch of chunks (`StoreHandle::places`, read in place). A daemon holding no store keeps no revision, so a rows'
+/// want is answered none and the stream is not served (`1\n`). Whether every want was answered; false where the store
+/// refused or was gone, which ends the answer.
+pub(crate) async fn answer_store_wants(
+  wants: &mut dyn slates_hg::render::StoreWants,
+  id: RepositoryId,
+) -> bool {
+  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  let repository = u128::from_be_bytes(id.bytes);
+  while let Some(want) = wants.wants().cloned() {
+    let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
+    match (want, disk) {
+      (Want::Rows { log, nodes }, Some(disk)) => {
+        let asked = nodes.iter().map(|node| node.to_vec()).collect();
+        let Ok(found) = disk.texts_by_tool(repository, log, asked).await else {
+          return false;
+        };
+        wants.give_rows(
+          found
+            .into_iter()
+            .map(|row| {
+              row.map(|(text, row)| StoredRevision {
+                text,
+                base: row.base,
+                place: StoredPlace {
+                  payload: row.place.payload,
+                  offset: row.place.offset,
+                  len: row.place.len,
+                },
+              })
+            })
+            .collect(),
+        );
+      }
+      (Want::Rows { nodes, .. }, None) => wants.give_rows(vec![None; nodes.len()]),
+      (Want::Chunks { places }, Some(disk)) => {
+        let asked = places
+          .iter()
+          .map(|place| slates_store::texts::Place {
+            payload: place.payload,
+            offset: place.offset,
+            len: place.len,
+          })
+          .collect();
+        let Ok(chunks) = disk.places(asked).await else {
+          return false;
+        };
+        wants.give_chunks(chunks);
+      }
+      (Want::Chunks { .. }, None) => return false,
+    }
+  }
+  true
+}
+
 /// [`held`], for the tests.
 #[cfg(test)]
 pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
