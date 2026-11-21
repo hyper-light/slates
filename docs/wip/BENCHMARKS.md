@@ -17035,6 +17035,13 @@ is the invocation's median of 3 runs. µs unless marked.
   could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
   the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
   reader's buffer) held once (Ada's MEMORY SIZING rule).
+- **Measured and rejected (2026-11-21): folding a Subversion green's history to its readers at each landing.** Sixteen
+  revisions rewriting a 16 KiB file left 246,150 bytes of green history, and the fold
+  (`merge_service::settle_green_retention_leaving` with room for all of it, after each landing) took it under one
+  text; but a copy from an older revision is the green's `Copy` of that version (A-586), so the import of
+  `part2.dump` refused `CopyRefused { case: VersionFolded }` at revision 12 (`svn_export` tests). The green's retained
+  versions are what serve such copies. Freeing them needs a copy's source tree built from the records when the green
+  has folded past it; until then the retention stays.
 
 ## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
 
