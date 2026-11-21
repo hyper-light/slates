@@ -162,7 +162,8 @@
 > The register-held v2 record path is gone (`unbundle_in`'s whole-history record, `record_sliced`); a push with no
 > store reference is refused `UNRECORDED`. The hg tests run on store-backed daemons through the one shared helper,
 > `crates/server/src/test_store.rs` (`TestStore`: a real store beside the test binary, removed when dropped;
-> `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`), and `crates/cli/tests/hg_interop.rs`'s anchors
+> `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`, `create`: a creation landed, then recorded, in
+> place), and `crates/cli/tests/hg_interop.rs`'s anchors
 > each hold a scratch store.
 > Owed:
 > - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived

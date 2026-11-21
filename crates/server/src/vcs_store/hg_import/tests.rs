@@ -59,9 +59,8 @@ fn owner() -> Principal {
 
 /// Creates repository `name` of `tool` on the shard: its id.
 pub(crate) fn created(state: &mut ShardState, name: &str, tool: VcsTool) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),

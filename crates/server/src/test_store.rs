@@ -141,3 +141,33 @@ pub(crate) fn audit_daemon_stored(store: &TestStore) -> crate::Daemon {
     config.vcs_disk = Some(handle);
   })
 }
+
+/// A `CreateRepository` request served on a test's shard as a client's creation is served on a node keeping a store,
+/// answered once its changeset 0 is landed and it is recorded (`repository::create_blocking`, A-767 item 7): a test on a
+/// store-backed daemon creates its repositories here, since the verb's own creation waits for its landing in a task the
+/// test's shard cannot run while the test holds it. On a node with no store, and for any other request, the verb as a
+/// client's dispatch serves it.
+pub(crate) fn create(
+  state: &mut crate::state::ShardState,
+  principal: &slates_db::catalog::Principal,
+  request: slates_ipc::protocol::RequestBody,
+) -> slates_ipc::protocol::ReplyBody {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return crate::verbs::dispatch(state, 1, principal, request);
+  };
+  match request {
+    slates_ipc::protocol::RequestBody::CreateRepository {
+      name,
+      tool,
+      format,
+      default_branch,
+      green,
+    } => crate::repository::create_blocking(
+      state,
+      (disk, principal),
+      (&name, tool, format, &default_branch),
+      green,
+    ),
+    other => crate::verbs::dispatch(state, 1, principal, other),
+  }
+}

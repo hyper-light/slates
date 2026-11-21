@@ -15,7 +15,7 @@ use crate::repository::hg_push::tests::{Made, changegroup};
 use crate::repository::hg_push::{land_in, line_name, take_whole};
 use crate::state::ShardState;
 use crate::vcs_store::paths::tests::{create, version};
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
 
 /// Shape: how long a test waits for a shard's task (a rebuild) to end before it fails, as the import tests wait.
 const TASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -29,9 +29,8 @@ fn owner() -> Principal {
 
 /// A Mercurial repository `name`, its first line `default`'s: its id and the line's green.
 fn mercurial(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),

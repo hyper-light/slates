@@ -373,9 +373,8 @@ struct Hg {
 impl Hg {
   /// A new Mercurial repository `name`, its first line `default`'s, empty.
   fn new(state: &mut ShardState, name: &str) -> Hg {
-    let reply = dispatch(
+    let reply = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.to_owned(),

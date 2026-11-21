@@ -58015,7 +58015,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (record v7) alone, and a landing with none is refused `UNRECORDED`. Tests run on store-backed daemons through one
 > shared helper, `crates/server/src/test_store.rs` (`TestStore`, a real store beside the test binary removed when
 > dropped; `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`, which waits for the owner's answer on a
-> thread of its own since a shard's thread cannot wait on a wake its runtime would deliver). Recovery applies only the
+> thread of its own since a shard's thread cannot wait on a wake its runtime would deliver; `create`, a creation in the
+> one landing order, changeset 0 landed and the repository recorded before it returns: `repository::create_blocking`
+> over `creation_changeset` and `recorded_after_landing`, the two halves `land_then_record` runs). Recovery applies only the
 > sequences the register names (decision 2), as C4's replay already did. Held by `crates/cli/tests/cli.rs`
 > `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge` (the refusal through the CLI) and every hg test
 > on the helper. Git's and Subversion's creates follow as their C items land.

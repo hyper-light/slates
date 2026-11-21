@@ -23,7 +23,7 @@ use super::{
 };
 use crate::repository::push::{Appended, BranchAppended, BranchChange, EntryParts, StoreMove};
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
+use crate::verbs::to_db_volume;
 
 /// Shape: the window the store-level tests' content store holds content in, as A-614's view tests hold theirs: past the
 /// longest row the store writes here with its table's frame (`slates_vcs::index` refuses one past it), and short, so a
@@ -1224,9 +1224,8 @@ pub(crate) fn repository(
   name: &str,
   tool: VcsTool,
 ) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),

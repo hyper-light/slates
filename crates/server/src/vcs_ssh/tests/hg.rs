@@ -1042,9 +1042,8 @@ fn owner() -> Principal {
 /// Makes Mercurial repository `name` on `state`'s shard holding what 7.2's server held before `ssh-push`: `base` and
 /// `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record.
 fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1234,9 +1233,8 @@ fn one_file_history(
   name: &str,
   bytes: &'static [u8],
 ) -> (RepositoryRecord, Node) {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),

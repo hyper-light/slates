@@ -394,7 +394,7 @@ pub(crate) fn create_repository(
   asked: (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
-  if let Some(refusal) = no_store_for(state, tool) {
+  if let Some(refusal) = no_store_for(state, asked.1) {
     return refused(refusal);
   }
   let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
@@ -498,6 +498,73 @@ fn land_then_record(
           .to_owned(),
     });
   };
+  let (header, record) = match creation_changeset(
+    state,
+    (&disk, principal),
+    (name, tool, format, default_branch),
+    (repository, minted),
+  ) {
+    Ok(changeset) => changeset,
+    Err(reply) => return reply,
+  };
+  let principal = principal.clone();
+  let asked = (name.to_owned(), default_branch.to_owned());
+  let task = async move {
+    let landed = disk
+      .land(
+        header,
+        vec![(slates_store::log::SectionKind::Record, record)],
+      )
+      .await;
+    #[cfg(test)]
+    if KILL_BETWEEN_LANDING_AND_RECORD.with(std::cell::Cell::get) {
+      crate::state::with_state(|state| state.count(CREATION_KILLED, 1));
+      return;
+    }
+    let answered = crate::state::with_state_counted(move |state| {
+      state.count(
+        if landed.is_ok() {
+          CREATION_LANDED
+        } else {
+          CREATION_UNLANDED
+        },
+        1,
+      );
+      let reply = recorded_after_landing(
+        state,
+        &principal,
+        (&asked.0, tool, format, &asked.1),
+        (adopted, (repository, minted)),
+        (landed.is_ok(), Some(request)),
+      );
+      (reply, state.shard)
+    });
+    if let Some((reply, here)) = answered {
+      crate::told::deliver_to(route, reply, here);
+    }
+  };
+  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
+    Ok(()) => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      ReplyBody::Acknowledged
+    }
+    Err(_) => {
+      state.count(CREATION_UNRUN, 1);
+      refused(Refusal::Overloaded { shard: state.shard })
+    }
+  }
+}
+
+/// A new repository's creation changeset (A-767 item 7): its record judged (a name already taken lands nothing, its
+/// refusal the answer), its ids reserved (`ShardState::family_reserved_through`), and the changeset's header (sequence
+/// 0, the store's standing grant) and `Record` section ([`creation_record`]).
+fn creation_changeset(
+  state: &mut ShardState,
+  (disk, principal): (&slates_store::owner::StoreHandle, &Principal),
+  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+  (repository, minted): (RepositoryId, Option<DbVolumeId>),
+) -> Result<(slates_store::log::Header, Vec<u8>), ReplyBody> {
   let judged = admits(
     state,
     &Op::RepositoryCreated {
@@ -514,7 +581,7 @@ fn land_then_record(
     },
   );
   if let Err(refusal) = judged {
-    return refused(refusal);
+    return Err(refused(refusal));
   }
   // The repository's number and its root's, so nothing minted while the landing runs takes either.
   let reserved = minted.unwrap_or(DbVolumeId {
@@ -541,65 +608,67 @@ fn land_then_record(
     sections: 0,
   };
   let record = creation_record(name, tool, format, default_branch);
-  let principal = principal.clone();
-  let asked = (name.to_owned(), default_branch.to_owned());
-  let task = async move {
-    let landed = disk
-      .land(
-        header,
-        vec![(slates_store::log::SectionKind::Record, record)],
-      )
-      .await;
-    #[cfg(test)]
-    if KILL_BETWEEN_LANDING_AND_RECORD.with(std::cell::Cell::get) {
-      crate::state::with_state(|state| state.count(CREATION_KILLED, 1));
-      return;
-    }
-    let answered = crate::state::with_state_counted(move |state| {
-      state.count(
-        if landed.is_ok() {
-          CREATION_LANDED
-        } else {
-          CREATION_UNLANDED
-        },
-        1,
-      );
-      let (origin, id) = request;
-      state.db.begin();
-      let reply = match landed {
-        Ok(_) => record_created(
-          state,
-          &principal,
-          (&asked.0, tool, format, &asked.1),
-          (adopted, (repository, minted)),
-        ),
-        Err(_) => refused(Refusal::Overloaded { shard: state.shard }),
-      };
-      let reply = crate::verbs::record_completion(state, origin, id, reply);
-      let reply = match state.db.commit(&mut state.segment) {
-        Ok(_) => reply,
-        Err(error) => {
-          crate::verbs::reconcile_unpublished_effects(state);
-          refused(refusal_of_db(&error))
-        }
-      };
-      (reply, state.shard)
-    });
-    if let Some((reply, here)) = answered {
-      crate::told::deliver_to(route, reply, here);
-    }
+  Ok((header, record))
+}
+
+/// A landed creation recorded (A-767 item 7, the second step): in one transaction the repository, its root and, for a
+/// client's `request`, its completion; a creation the store refused answered `Overloaded`, nothing recorded of it.
+fn recorded_after_landing(
+  state: &mut ShardState,
+  principal: &Principal,
+  asked: (&str, VcsTool, ObjectFormat, &str),
+  ids: (Option<DbVolumeId>, (RepositoryId, Option<DbVolumeId>)),
+  (landed, request): (bool, Option<(u64, slates_wire::request::RequestId)>),
+) -> ReplyBody {
+  state.db.begin();
+  let reply = if landed {
+    record_created(state, principal, asked, ids)
+  } else {
+    refused(Refusal::Overloaded { shard: state.shard })
   };
-  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
-    Ok(()) => {
-      state.reply_route = None;
-      state.acceptance_deferred = true;
-      ReplyBody::Acknowledged
-    }
-    Err(_) => {
-      state.count(CREATION_UNRUN, 1);
-      refused(Refusal::Overloaded { shard: state.shard })
+  let reply = match request {
+    Some((origin, id)) => crate::verbs::record_completion(state, origin, id, reply),
+    None => reply,
+  };
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => reply,
+    Err(error) => {
+      crate::verbs::reconcile_unpublished_effects(state);
+      refused(refusal_of_db(&error))
     }
   }
+}
+
+/// [`create_repository`] for a test on a shard of a node keeping a store (main's ruling of 2026-11-20: tests on
+/// store-backed daemons; A-767 item 7's one landing order): the creation's changeset landed and waited for on a thread
+/// of its own (`crate::test_store::land_blocking`), then recorded, so the repository stands when this returns, as a
+/// client's creation stands when it is answered.
+#[cfg(test)]
+pub(crate) fn create_blocking(
+  state: &mut ShardState,
+  (disk, principal): (slates_store::owner::StoreHandle, &Principal),
+  asked: (&str, VcsTool, ObjectFormat, &str),
+  green: Option<VolumeId>,
+) -> ReplyBody {
+  let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
+    Some(Ok(id)) => Some(id),
+    Some(Err(refusal)) => return refused(refusal),
+    None => None,
+  };
+  let ids = match creation_ids(state, adopted) {
+    Ok(ids) => ids,
+    Err(refusal) => return refused(refusal),
+  };
+  let (header, record) = match creation_changeset(state, (&disk, principal), asked, ids) {
+    Ok(changeset) => changeset,
+    Err(reply) => return reply,
+  };
+  let landed = crate::test_store::land_blocking(
+    disk,
+    header,
+    vec![(slates_store::log::SectionKind::Record, record)],
+  );
+  recorded_after_landing(state, principal, asked, (adopted, ids), (landed, None))
 }
 
 /// Format: a repository's creation record in its store (A-767): one line each of a marker, the name, the default
@@ -1439,7 +1508,7 @@ mod tests {
   }
 
   fn create(state: &mut ShardState, name: &str, default: &str) -> ReplyBody {
-    ask(
+    crate::test_store::create(
       state,
       &owner(),
       RequestBody::CreateRepository {
@@ -2409,7 +2478,8 @@ mod tests {
   #[test]
   fn protections_and_trusted_signers_are_a_git_repositorys_policy() {
     use slates_ipc::protocol::{PolicyNames, PolicyRight};
-    crate::daemon::audit_on_shard(|state| {
+    // A Mercurial repository among them: a node keeping a store (main's ruling of 2026-11-20).
+    crate::test_store::audit_on_stored_shard("vcs", |state| {
       green_of(create(state, "linux", "main"));
       let rules = vec![
         denying(
@@ -2455,7 +2525,7 @@ mod tests {
   /// refused `BadRequest` and the rule by the database's guard, naming it.
   fn assert_mercurial_refuses_signers_and_protections(state: &mut ShardState) {
     use slates_ipc::protocol::{DatabaseRefusal, PolicyNames, PolicyRight};
-    let created = ask(
+    let created = crate::test_store::create(
       state,
       &owner(),
       RequestBody::CreateRepository {

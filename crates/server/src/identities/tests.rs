@@ -51,7 +51,7 @@ fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
 
 /// The green `made` creates.
 fn created(state: &mut ShardState, made: RequestBody) -> VolumeId {
-  let ReplyBody::GreenCreated { id } = ask(state, made) else {
+  let ReplyBody::GreenCreated { id } = crate::test_store::create(state, &owner(), made) else {
     panic!("a green");
   };
   id
