@@ -49,7 +49,6 @@
 use slates_db::catalog::{
   MemberOrigin, Principal, RepositoryId, StateChange, VolumeId as DbVolumeId,
 };
-use slates_hg::import::record::{self, WriteRefused};
 use slates_hg::import::{Clock, Import, ImportRefused, Imported, Progress, Turn};
 use slates_hg::index::HgIndex;
 use slates_hg::phases::PhaseHead;
@@ -92,6 +91,16 @@ pub(crate) struct Importing {
   /// What the import's room holds of the shard's budget: charged as retention when it started, given back once it is
   /// done, refused or abandoned.
   reserved: u64,
+  /// The segments of its changegroup cut and not yet landed on the changeset store (A-767 C1 step 3), oldest first: a
+  /// turn's, landed before the next turn ([`segment_changeset`], [`segment_landed`]).
+  segments: std::collections::VecDeque<slates_hg::import::emit::Segment>,
+  /// The run of segment changesets landed so far: the first's sequence and the last's.
+  run: Option<(u64, u64)>,
+  /// The last changeset the register named when the import began: what the repository's next sequence is counted from
+  /// again where the import is given back (main's ruling, decision 2: never roll forward).
+  named: u64,
+  /// The import's name, derived as its segments land from their payloads' identities ([`NAME_CONTEXT`]).
+  name: blake3::Hasher,
 }
 
 /// Where an import stands.
@@ -106,28 +115,13 @@ enum Stage {
     /// The directory.
     directory: HostDir,
   },
-  /// Its record being written a revision a turn (A-732: written whole at the landing, a large repository's held its
-  /// shard past the watchdog's window): what it imported, the room the landing runs within, the writer, and what its
-  /// end answers.
-  Writing {
-    /// What it imported.
-    imported: Box<Imported>,
-    /// The room the landing runs within.
-    room: u64,
-    /// The record's writer.
-    writer: Box<record::Writer>,
-    /// What its end answers, its turns counted on.
-    finished: Box<Finished>,
-  },
-  /// Done: its index and state, waiting to land ([`land`]), the room it ran within, which its record carries, and its
-  /// record, written.
+  /// Done: its index and state, waiting to land ([`land`]) once its last segments land, and the room it ran within,
+  /// which its segments' records and its run's reference carry.
   Done {
     /// What it imported.
     imported: Box<Imported>,
     /// The room it ran within.
     room: u64,
-    /// Its record.
-    record: Vec<u8>,
   },
 }
 
@@ -138,13 +132,12 @@ impl std::fmt::Debug for Importing {
       Stage::Running { import, .. } => shown
         .field("turns", &import.turns())
         .field("units", &import.units()),
-      Stage::Writing { finished, .. } => shown
-        .field("writing", &true)
-        .field("turns", &finished.turns),
       Stage::Done { room, .. } => shown.field("done", &true).field("room", room),
     };
     shown
       .field("reserved", &self.reserved)
+      .field("segments", &self.segments.len())
+      .field("run", &self.run)
       .finish_non_exhaustive()
   }
 }
@@ -260,12 +253,17 @@ pub(crate) fn begin(
 ) -> Result<(), ImportFailed> {
   takes_import(&mut state.vcs_stores, id)?;
   let room = room_of(state);
+  let named = state
+    .vcs_stores
+    .landed_of(id)
+    .ok_or(ImportFailed::NoStore)?;
   let started = Import::start(
     &mut HgBase::new(&mut *host, directory),
     Admission::new(room),
   );
   match started {
     Ok(import) => {
+      let import = import.emitting(segment_bytes(state));
       let holding = import.holding();
       reserve(state, holding)?;
       let importing = Importing {
@@ -275,6 +273,10 @@ pub(crate) fn begin(
           directory,
         },
         reserved: holding,
+        segments: std::collections::VecDeque::new(),
+        run: None,
+        named,
+        name: blake3::Hasher::new_derive_key(NAME_CONTEXT),
       };
       state.vcs_stores.imports.insert(id, importing);
       state.count(STARTED, 1);
@@ -327,16 +329,6 @@ pub(crate) fn turn(
   id: RepositoryId,
   (clock, quantum_ns): (&mut dyn Clock, u64),
 ) -> Option<Result<Turned, ImportFailed>> {
-  if matches!(
-    state.vcs_stores.imports.get(&id),
-    Some(Importing {
-      stage: Stage::Writing { .. },
-      ..
-    })
-  ) {
-    state.count(TURNS, 1);
-    return Some(write_turn(state, id, (clock, quantum_ns)));
-  }
   let advanced = advance(state, id, Turn { clock, quantum_ns })?;
   state.count(TURNS, 1);
   Some(match advanced {
@@ -348,6 +340,143 @@ pub(crate) fn turn(
       Err(ImportFailed::Refused(refused))
     }
   })
+}
+
+/// Derived: a segment of an import's changegroup, the least bytes one is cut at (A-767 C1 step 3): one trunk node of
+/// the changeset store's memtable, what one of its flushes turns into one bundle (`store_sizing` in `slates-api`'s
+/// daemon: the content plane's chunk, the unit of copy-on-write, times SplinterDB's fanout). An import holds one segment
+/// at a time, and lands as many changesets as its changegroup has segments.
+fn segment_bytes(state: &ShardState) -> usize {
+  let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
+    8,
+    "SplinterDB's target fanout, as the daemon's store_sizing sizes the store's memtable",
+    ["engine-structure.md §4"]
+  );
+  slates_vfs::content::chunk_bytes(state.config.page)
+    .get()
+    .saturating_mul(fanout.get())
+}
+
+/// Counter: a segment of an import's changegroup landed on the changeset store as a changeset (A-767 C1 step 3).
+/// Format: a counter name in the status report.
+pub(crate) const SEGMENTS_LANDED: &str = "vcs_store.hg_import.segments_landed";
+/// Counter: a segment the store refused to land, its import given back. Format: a counter name.
+pub(crate) const SEGMENTS_UNLANDED: &str = "vcs_store.hg_import.segments_unlanded";
+
+/// A segment changeset to land: the store, its header, its sections, and its payload's identity.
+pub(crate) type SegmentLanding = (
+  slates_store::owner::StoreHandle,
+  slates_store::log::Header,
+  Vec<slates_store::owner::Part>,
+  [u8; 32],
+);
+
+/// The next segment of repository `id`'s import to land on the changeset store as a changeset (A-767 C1 step 3): its
+/// sequence the repository's next, its sections its `Record` (the index rows of its revisions, by identity), its
+/// `Payload` (its slice of the import's changegroup, moved in, never copied) and its `Texts` (each revision's text,
+/// its delta parent's and the delta's place); none when no segment waits, or no store is held.
+pub(crate) fn segment_changeset(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Option<SegmentLanding> {
+  let disk = state.vcs_disk.clone()?;
+  let segment = state
+    .vcs_stores
+    .imports
+    .get_mut(&id)?
+    .segments
+    .pop_front()?;
+  let sequence = state.vcs_stores.next_changeset(id)?;
+  let payload_identity = *blake3::hash(&segment.payload).as_bytes();
+  let texts: Vec<slates_store::texts::TextEntry> = segment
+    .texts
+    .iter()
+    .map(|kept| slates_store::texts::TextEntry {
+      path: kept.path.clone(),
+      tool_id: kept.node.to_vec(),
+      text: kept.identity,
+      len: kept.len,
+      base: kept.base,
+      place: slates_store::texts::Place {
+        payload: payload_identity,
+        offset: kept.place.start,
+        len: kept.place.end.saturating_sub(kept.place.start),
+      },
+    })
+    .collect();
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Mercurial,
+    repository: u128::from_be_bytes(id.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    // The store's standing grant (its `G` row, R10): the landing's provenance.
+    grant: disk.grant(),
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let parts = vec![
+    (slates_store::log::SectionKind::Record, segment.record),
+    (slates_store::log::SectionKind::Payload, segment.payload),
+    (
+      slates_store::log::SectionKind::Texts,
+      slates_store::texts::encode(&texts),
+    ),
+  ];
+  Some((disk, header, parts, payload_identity))
+}
+
+/// Repository `id`'s segment changeset `sequence` landed (`landed`) or refused (A-767 C1 step 3): landed, the run grows
+/// and the import's name takes the payload's identity; refused, the import is given back, the repository's next
+/// sequence counted again from the last the register names, and the store's refusal answered.
+pub(crate) fn segment_landed(
+  state: &mut ShardState,
+  id: RepositoryId,
+  (sequence, payload_identity): (u64, [u8; 32]),
+  landed: bool,
+) -> Result<(), ImportFailed> {
+  if !landed {
+    state.count(SEGMENTS_UNLANDED, 1);
+    abandon(state, id);
+    return Err(ImportFailed::Landing(Refusal::Overloaded {
+      shard: state.shard,
+    }));
+  }
+  let importing = state
+    .vcs_stores
+    .imports
+    .get_mut(&id)
+    .ok_or(ImportFailed::NoStore)?;
+  importing.run = Some(match importing.run {
+    Some((first, _)) => (first, sequence),
+    None => (sequence, sequence),
+  });
+  importing.name.update(&payload_identity);
+  state.count(SEGMENTS_LANDED, 1);
+  Ok(())
+}
+
+/// [`land`] for a test that holds the shard's state: the segments its import cut landed first
+/// ([`land_segments_blocking`]), as [`run`] lands them between turns.
+#[cfg(test)]
+pub(crate) fn land_imported(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
+  land_segments_blocking(state, id)?;
+  land(state, id)
+}
+
+/// Every segment repository `id`'s import has cut, landed on the changeset store, waiting on a thread of its own for
+/// each (`crate::test_store::land_blocking`): [`run`]'s landing for a test that holds the shard's state.
+#[cfg(test)]
+pub(crate) fn land_segments_blocking(
+  state: &mut ShardState,
+  id: RepositoryId,
+) -> Result<(), ImportFailed> {
+  while let Some((disk, header, parts, identity)) = segment_changeset(state, id) {
+    let sequence = header.sequence;
+    let landed = crate::test_store::land_blocking(disk, header, parts);
+    segment_landed(state, id, (sequence, identity), landed)?;
+  }
+  Ok(())
 }
 
 /// One turn of repository `id`'s import over the map, lent every byte the shard could admit now, then the arena grown
@@ -387,6 +516,16 @@ fn advance(
     }
     _ => None,
   };
+  if let Some(Importing {
+    stage: Stage::Running { import, .. },
+    segments,
+    ..
+  }) = stores.imports.get_mut(&id)
+  {
+    while let Some(segment) = import.take_segment() {
+      segments.push_back(segment);
+    }
+  }
   drop(lent);
   grown_and_settled(state);
   true_up_holding(state, id);
@@ -400,6 +539,7 @@ fn true_up_holding(state: &mut ShardState, id: RepositoryId) {
   let Some(Importing {
     stage: Stage::Running { import, .. },
     reserved,
+    ..
   }) = state.vcs_stores.imports.get(&id)
   else {
     return;
@@ -442,16 +582,33 @@ fn grown_and_settled(state: &mut ShardState) {
 /// Repository `id`'s import done (the module doc): its room given back and its host closed, and what it imported kept in
 /// the map, waiting to land; what it found answered.
 fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFailed> {
-  let (import, reserved) = match state.vcs_stores.imports.remove(&id) {
-    Some(Importing {
-      stage: Stage::Running { import, .. },
-      reserved,
-    }) => (*import, reserved),
-    Some(done) => {
-      state.vcs_stores.imports.insert(id, done);
+  let Some(importing) = state.vcs_stores.imports.remove(&id) else {
+    return Err(ImportFailed::NoStore);
+  };
+  let Importing {
+    stage,
+    reserved,
+    segments,
+    run,
+    named,
+    name,
+  } = importing;
+  let import = match stage {
+    Stage::Running { import, .. } => *import,
+    done => {
+      state.vcs_stores.imports.insert(
+        id,
+        Importing {
+          stage: done,
+          reserved,
+          segments,
+          run,
+          named,
+          name,
+        },
+      );
       return Err(ImportFailed::Busy);
     }
-    None => return Err(ImportFailed::NoStore),
   };
   state.store.budget.credit_retention(reserved);
   let turns = import.turns();
@@ -459,123 +616,24 @@ fn finish(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFail
     .into_imported()
     .ok_or(ImportFailed::Refused(ImportRefused::Ended))?;
   let finished = Finished::of(&imported, turns);
-  // The landing's room, which bounds its record and its bookmarks' works: what the shard could admit now (A-720 part 3),
-  // the import's own holding given back above.
+  // The room its segments' records carry and its run's reference names: what it ran within.
   let room = room_of(state);
-  let content = state
-    .vcs_stores
-    .content
-    .as_ref()
-    .ok_or(ImportFailed::NoStore)?;
-  let writer = match record::Writer::begin(&imported.index, content, room) {
-    Ok(writer) => writer,
-    Err(refused) => {
-      give_back(state, imported.index);
-      return Err(ImportFailed::Landing(write_refusal(state, &refused)));
-    }
-  };
-  let writing = Importing {
-    stage: Stage::Writing {
-      imported: Box::new(imported),
-      room,
-      writer: Box::new(writer),
-      finished: Box::new(finished),
+  state.vcs_stores.imports.insert(
+    id,
+    Importing {
+      stage: Stage::Done {
+        imported: Box::new(imported),
+        room,
+      },
+      reserved: 0,
+      segments,
+      run,
+      named,
+      name,
     },
-    reserved: 0,
-  };
-  state.vcs_stores.imports.insert(id, writing);
-  Ok(Turned::More)
-}
-
-/// One turn of repository `id`'s record being written (A-732): parts written until the record is whole or `quantum_ns`
-/// is spent on `clock`, at least one; whole, the import is done, waiting to land. Refused, everything it held is given
-/// back.
-fn write_turn(
-  state: &mut ShardState,
-  id: RepositoryId,
-  (clock, quantum_ns): (&mut dyn Clock, u64),
-) -> Result<Turned, ImportFailed> {
-  let start = clock.now_ns();
-  let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
-  let stores = &mut *lent.stores;
-  let written = match (stores.content.as_ref(), stores.imports.get_mut(&id)) {
-    (
-      Some(content),
-      Some(Importing {
-        stage:
-          Stage::Writing {
-            imported,
-            writer,
-            finished,
-            ..
-          },
-        ..
-      }),
-    ) => {
-      finished.turns = finished.turns.saturating_add(1);
-      loop {
-        match writer.step(&imported.index, content) {
-          Ok(true) if clock.now_ns().saturating_sub(start) < quantum_ns => {}
-          other => break other,
-        }
-      }
-    }
-    _ => return Err(ImportFailed::NoStore),
-  };
-  drop(lent);
-  match written {
-    Ok(true) => Ok(Turned::More),
-    Ok(false) => written_whole(state, id),
-    Err(refused) => {
-      let refusal = write_refusal(state, &refused);
-      end(state, id);
-      state.count(REFUSED, 1);
-      Err(ImportFailed::Landing(refusal))
-    }
-  }
-}
-
-/// Repository `id`'s record written whole: the import done, waiting to land with its record; what it found answered.
-fn written_whole(state: &mut ShardState, id: RepositoryId) -> Result<Turned, ImportFailed> {
-  let Some(Importing {
-    stage: Stage::Writing {
-      imported,
-      room,
-      writer,
-      finished,
-    },
-    ..
-  }) = state.vcs_stores.imports.remove(&id)
-  else {
-    return Err(ImportFailed::NoStore);
-  };
-  let Some(record) = writer.finish() else {
-    give_back(state, imported.index);
-    return Err(ImportFailed::Landing(Refusal::ContentUnavailable));
-  };
-  let done = Importing {
-    stage: Stage::Done {
-      imported,
-      room,
-      record,
-    },
-    reserved: 0,
-  };
-  state.vcs_stores.imports.insert(id, done);
+  );
   state.count(DONE, 1);
-  Ok(Turned::Done(finished))
-}
-
-/// The register's refusal for a record that could not be written.
-fn write_refusal(state: &ShardState, refused: &WriteRefused) -> Refusal {
-  match refused {
-    WriteRefused::Allocation => Refusal::BudgetExceeded {
-      available: state.store.admittable(),
-    },
-    WriteRefused::Unreadable { .. } | WriteRefused::UnreadableMarker { .. } => {
-      Refusal::ContentUnavailable
-    }
-  }
+  Ok(Turned::Done(Box::new(finished)))
 }
 
 /// Puts `index` in repository `id`'s Mercurial store's place, giving back the empty index it replaces: whether every
@@ -595,8 +653,7 @@ fn place(
     return Err(Box::new((ImportFailed::NotEmpty, index)));
   }
   let empty = core::mem::replace(&mut store.index, index);
-  // An imported history is held outside the changeset store until imports land as changesets (C1 step 3).
-  store.unstored = true;
+  // An imported history is on the changeset store, a segment changeset at a time (A-767 C1 step 3), so it is stored.
   let released = empty.release(content).is_ok();
   stores.index_changed(id);
   Ok(released)
@@ -640,21 +697,33 @@ pub(crate) fn place_imported(
 /// Ends repository `id`'s refused import: the import gave its index back as it refused; its room is given back and its
 /// host closed.
 fn end(state: &mut ShardState, id: RepositoryId) {
-  if let Some(Importing { reserved, .. }) = state.vcs_stores.imports.remove(&id) {
+  if let Some(Importing {
+    reserved, named, ..
+  }) = state.vcs_stores.imports.remove(&id)
+  {
     state.store.budget.credit_retention(reserved);
+    state.vcs_stores.set_landed(id, named);
   }
 }
 
 /// Gives back repository `id`'s import, under way or waiting to land, if there is one (the module doc's cancellation):
 /// its index's holds and its room, its host closed. What freeing the repository does first (the map's `free`).
 pub(crate) fn abandon(state: &mut ShardState, id: RepositoryId) {
-  let Some(Importing { stage, reserved }) = state.vcs_stores.imports.remove(&id) else {
+  let Some(Importing {
+    stage,
+    reserved,
+    named,
+    ..
+  }) = state.vcs_stores.imports.remove(&id)
+  else {
     return;
   };
   state.store.budget.credit_retention(reserved);
+  // Its segments landed unnamed: the next landing takes the last the register names, plus one (decision 2).
+  state.vcs_stores.set_landed(id, named);
   let whole = match (state.vcs_stores.content.as_mut(), stage) {
     (Some(content), Stage::Running { import, .. }) => (*import).abandon(content).is_ok(),
-    (Some(content), Stage::Done { imported, .. } | Stage::Writing { imported, .. }) => {
+    (Some(content), Stage::Done { imported, .. }) => {
       let Imported { index, .. } = *imported;
       index.release(content).is_ok()
     }
@@ -684,23 +753,26 @@ fn give_back(state: &mut ShardState, index: HgIndex) {
 /// the entry's apply. Refused, nothing is recorded, and the index and everything it held are given back. `Busy` while
 /// the import is still under way, `NoStore` when none is held for `id`.
 pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), ImportFailed> {
-  let (mut imported, room, record) = match state.vcs_stores.imports.remove(&id) {
+  let (mut imported, room, (run, named, name)) = match state.vcs_stores.imports.remove(&id) {
     Some(Importing {
-      stage: Stage::Done {
-        imported,
-        room,
-        record,
-      },
+      stage: Stage::Done { imported, room },
+      segments,
+      run: Some(run),
+      named,
+      name,
       ..
-    }) => (imported, room, record),
+    }) if segments.is_empty() => (imported, room, (run, named, name)),
     Some(running) => {
       state.vcs_stores.imports.insert(id, running);
       return Err(ImportFailed::Busy);
     }
     None => return Err(ImportFailed::NoStore),
   };
+  // The register names the run (A-767 C1 step 3): its segments' records and payloads are the changeset store's.
+  let record = slates_hg::import::record::write_run_reference(room, run);
+  let name = *name.finalize().as_bytes();
   let entry = super::lent_state(state, |state| {
-    landing_entry(state, id, (&*imported, room), record)
+    landing_entry(state, id, (&*imported, room), (record, name))
   });
   let mut index = Some(core::mem::take(&mut imported.index));
   let appended = entry.and_then(|(owner, changes, parts, record)| {
@@ -722,6 +794,8 @@ pub(crate) fn land(state: &mut ShardState, id: RepositoryId) -> Result<(), Impor
       Ok(())
     }
     Err(refusal) => {
+      // The run landed unnamed: the next landing takes the last the register names, plus one (decision 2).
+      state.vcs_stores.set_landed(id, named);
       state.count(LANDING_REFUSED, 1);
       Err(ImportFailed::Landing(refusal))
     }
@@ -737,7 +811,7 @@ fn landing_entry(
   state: &ShardState,
   id: RepositoryId,
   (imported, room): (&Imported, u64),
-  record: Vec<u8>,
+  (record, name): (Vec<u8>, [u8; 32]),
 ) -> Result<Landing, Refusal> {
   let content = state
     .vcs_stores
@@ -755,7 +829,6 @@ fn landing_entry(
     .map(|member| member.green)
     .ok_or(Refusal::NotFound)?;
   let held = IndexHeld::new(&imported.index, content);
-  let name = import_name(&record);
   let changes = bookmark_greens(state, (root, &imported.bookmarks), (&held, name, room))?;
   // The record rides as the import's stored objects (`push_imported`), never as the parts' own.
   let parts = EntryParts {
@@ -767,16 +840,9 @@ fn landing_entry(
   Ok((owner, changes, parts, record))
 }
 
-/// Format: the BLAKE3 context an import's name is derived from its record in: every work of its entry begins its
-/// identity with it (A-618's push name).
-const NAME_CONTEXT: &str = "slates 2026-11-19 a Mercurial import's name";
-
-/// The import's name: BLAKE3 under [`NAME_CONTEXT`] over its record, so two imports of other histories never share one.
-fn import_name(record: &[u8]) -> [u8; 32] {
-  let mut hasher = blake3::Hasher::new_derive_key(NAME_CONTEXT);
-  hasher.update(record);
-  *hasher.finalize().as_bytes()
-}
+/// Format: the BLAKE3 context an import's name is derived in, over its segments' payloads' identities in order, so two
+/// imports of other histories never share one: every work of its entry begins its identity with it (A-618's push name).
+const NAME_CONTEXT: &str = "slates 2026-11-21 a Mercurial import's name, over its segments";
 
 /// Each phase root as the phases log adds it (§4.17.3 decision 3): its phase's number and its node, in the import's
 /// order (by phase, then node).
@@ -888,6 +954,25 @@ fn landing_refusal(refused: AppendRefused) -> Refusal {
 /// Runs repository `id`'s import to its end on its owner shard, a turn at a time (the module doc): a yield, then one turn
 /// within the shard's quantum on its clock, so the shard serves its inbox and pulse between turns. What the import found
 /// once done, why it ended otherwise, or `None` when no import of `id` is under way or the shard's state is gone.
+/// Lands every segment repository `id`'s import has cut and not yet landed, oldest first, each awaited on the changeset
+/// store; none when the shard's state is gone.
+async fn land_segments(id: RepositoryId) -> Option<Result<(), ImportFailed>> {
+  loop {
+    let Some((disk, header, parts, identity)) =
+      crate::state::with_state(|state| segment_changeset(state, id))?
+    else {
+      return Some(Ok(()));
+    };
+    let sequence = header.sequence;
+    let landed = disk.land(header, parts).await.is_ok();
+    let counted =
+      crate::state::with_state(|state| segment_landed(state, id, (sequence, identity), landed))?;
+    if let Err(failed) = counted {
+      return Some(Err(failed));
+    }
+  }
+}
+
 pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, ImportFailed>> {
   loop {
     slates_rt::futures::yield_now().await;
@@ -895,6 +980,12 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Box<Finished>, Import
       let quantum_ns = quantum_of(state);
       turn(state, id, (&mut ShardClock, quantum_ns))
     })??;
+    if turned.is_ok() {
+      // The segments the turn cut land on the changeset store before the next turn (A-767 C1 step 3), each awaited.
+      if let Err(failed) = land_segments(id).await? {
+        return Some(Err(failed));
+      }
+    }
     match turned {
       Ok(Turned::More) => {}
       Ok(Turned::Done(finished)) => {

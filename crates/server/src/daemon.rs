@@ -8440,6 +8440,55 @@ mod tests {
     );
   }
 
+  /// `read` until what it reads is `done`, or until the wait the successor is given to replay passes: the last read.
+  fn read_until<T>(read: impl Fn() -> Option<T>, done: impl Fn(&T) -> bool) -> Option<T> {
+    let mut seen = read();
+    // Derived: 600 looks 50 ms apart, the wait the successor is given to replay the record.
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+      if seen.as_ref().is_some_and(&done) {
+        break;
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+      seen = read();
+    }
+    seen
+  }
+
+  /// The `states` repository imported into a Mercurial repository a unit a turn and landed, as segment changesets
+  /// whose records hold its rows by identity (A-767 C1 step 3), the register naming the import's run: the repository
+  /// and its index's rows.
+  fn a729_imported_and_landed(
+    state: &mut crate::state::ShardState,
+  ) -> (
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::hg_import::tests::Rows,
+  ) {
+    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
+    let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
+    let laid = directory(crate::hg_base::tests::STATES.iter().copied());
+    assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
+    assert!(to_its_end(state, id).1.is_ok(), "imported");
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported(state, id),
+      Ok(())
+    );
+    let segments = state
+      .refusals
+      .get(crate::vcs_store::hg_import::SEGMENTS_LANDED)
+      .copied()
+      .unwrap_or(0);
+    assert!(segments >= 1, "the import landed as segment changesets");
+    let records = state.db.partition().repositories();
+    let named = (0..)
+      .map_while(|index| records.object_record(id, index))
+      .filter_map(slates_hg::import::record::run_of)
+      .count();
+    assert_eq!(named, 1, "the register names the import's run");
+    (id, rows_of(state, id))
+  }
+
   /// A-729 part 2 (an import's record names its contents by identity; main's ruling: since A-727 a3 the content survives
   /// a restart in the shard image, recovered before the records). Do: on a daemon over a retained anchor segment, import
   /// the `states` repository into a Mercurial repository a unit a turn and land it; publish every shard; stop; start a
@@ -8448,7 +8497,8 @@ mod tests {
   /// unheld once the records were replayed.
   #[test]
   fn t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity() {
-    use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
+    use crate::vcs_store::hg_import::tests::rows_of;
+    // The import lands as segment changesets whose records hold its rows by identity (A-767 C1 step 3).
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a729-identities-{}", std::process::id());
@@ -8472,16 +8522,7 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    let (id, before) = first
-      .observe(shard, |state| {
-        let id = created(state, "hg", slates_ipc::protocol::VcsTool::Mercurial);
-        let laid = directory(crate::hg_base::tests::STATES.iter().copied());
-        assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
-        assert!(to_its_end(state, id).1.is_ok(), "imported");
-        assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
-        (id, rows_of(state, id))
-      })
-      .unwrap();
+    let (id, before) = first.observe(shard, a729_imported_and_landed).unwrap();
     first.publish_every_shard().unwrap();
     first.stop();
     let second = super::Daemon::start(&profile, config, source()).unwrap();
@@ -8500,23 +8541,25 @@ mod tests {
             count(crate::vcs_store::WINDOWS_RESTORED),
             count(crate::vcs_store::WINDOWS_UNRESTORED),
             count(crate::vcs_store::WINDOWS_UNHELD),
+            [
+              count(crate::vcs_store::HG_REPLAY_SEGMENTS),
+              count(crate::vcs_store::HG_REPLAY_RECORD_BYTES),
+              count(crate::vcs_store::HG_REPLAY_TURNS),
+              count(crate::vcs_store::HG_REPLAY_WANTS),
+            ],
           )
         })
         .ok()
     };
-    let mut seen = read();
-    // Derived: 600 looks 50 ms apart, the wait the successor is given to replay the record.
-    let deadline =
-      std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
-    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-      if seen.as_ref().is_some_and(|seen| seen.0 == before) {
-        break;
-      }
-      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
-      seen = read();
-    }
-    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    let seen = read_until(read, |seen| seen.0 == before);
+    let (after, restored, unrestored, unheld, [segments, record_bytes, turns, wants]) =
+      seen.expect("the successor answered");
     second.stop();
+    println!(
+      "A-767 C1 step 3 restart: {} rows from {segments} segment records ({record_bytes} bytes) in {turns} replay \
+       turns, {wants} payload reads",
+      before.len()
+    );
     assert!(!before.is_empty(), "the import kept rows");
     assert_eq!(
       after, before,
@@ -8524,7 +8567,26 @@ mod tests {
     );
     assert!(restored > 0, "no window was restored");
     assert_eq!((unrestored, unheld), (0, 0));
+    // Main's red (ruling of 2026-11-21 01:16): a restart reads the index's rows, never a text nor a payload, so its cost
+    // is the rows', whatever the texts: no payload read, no text rebuilt (the intake never runs), and the records'
+    // bytes within one identity row's worth a row.
+    assert!(
+      segments >= 1,
+      "the run's segments were replayed from the store"
+    );
+    assert_eq!(wants, 0, "a payload was read at the restart");
+    assert!(turns >= 1);
+    let rows = u64::try_from(before.len()).unwrap();
+    assert!(
+      record_bytes <= rows.saturating_mul(IDENTITY_ROW_MOST),
+      "{record_bytes} record bytes for {rows} rows"
+    );
   }
+
+  /// Shape: the most bytes one revision takes in an identity record, a file revision's (node, parents, link, flags,
+  /// length, delta fields, content identity, block marker and identity): the per-row bound a restart's reading is held
+  /// to, a path's group head amortized over its revisions.
+  const IDENTITY_ROW_MOST: u64 = 256;
 
   /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's
   /// change is in flight its records go to both cohorts and its lease needs confirmations in both, so it keeps

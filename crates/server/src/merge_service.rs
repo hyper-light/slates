@@ -141,6 +141,15 @@ pub struct MergeShardState {
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
+  /// The greens whose checkpoint is being taken in turns ([`checkpoint_green`], A-579): one task each, which folds the
+  /// identity's backlog a paced step at a time and takes the checkpoint at its end.
+  pub(crate) checkpointing: BTreeSet<DbVolumeId>,
+  /// What an identity key's fold costs on this shard, learned across checkpoints (`slates_pace::Costs`, A-579).
+  pub(crate) identity_costs: slates_pace::Costs<1>,
+  /// When each green's last checkpoint was taken here, or when it first asked for one (A-579): the start of the
+  /// interval its next checkpoint's identity fold is paced to finish within. One entry a green this shard holds,
+  /// pruned of greens gone whenever one is added.
+  pub(crate) checkpoint_since: BTreeMap<DbVolumeId, u64>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -221,8 +230,147 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
-  checkpoint_green_when(state, green, Doubling::Wait);
+  if state.merge.checkpointing.contains(&green) {
+    return;
+  }
+  if !state.merge.checkpoint_since.contains_key(&green) {
+    let now = slates_rt::futures::now_ns();
+    let greens = &state.greens;
+    state
+      .merge
+      .checkpoint_since
+      .retain(|held, _| greens.get(held).is_some());
+    state.merge.checkpoint_since.insert(green, now);
+  }
+  if fold_inputs(state, green).is_none_or(FoldInputs::waits) {
+    return;
+  }
+  // The identity's backlog first, in a paced step (A-579): a checkpoint reads the head's identity, and a green whose
+  // identity was last read thousands of versions ago hashed every file changed since in this one step (73.7 ms of a
+  // 100 ms checkpoint at 1,000 clients on the Mac Studio, 2026-11-20; every request the owner serves waited behind it).
+  // When the step's quantum ends with someone waiting, the rest is folded in turns by a task of its own.
+  let quantum = state.config.step_quantum_ns();
+  if identity_folded_in_a_step(state, green, quantum) {
+    taken_now(state, green);
+    return;
+  }
+  match slates_rt::futures::spawn(checkpoint_in_turns(green)) {
+    Ok(task) => {
+      state.merge.checkpointing.insert(green);
+      state.count(CHECKPOINT_IN_TURNS, 1);
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No room for the task: taken here as before, whole.
+    Err(_) => taken_now(state, green),
+  }
 }
+
+/// Takes `green`'s checkpoint now, by the doubling rule, and starts the interval its next one is paced within.
+fn taken_now(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_when(state, green, Doubling::Wait);
+  let now = slates_rt::futures::now_ns();
+  state.merge.checkpoint_since.insert(green, now);
+}
+
+/// One turn's share of a checkpoint's identity fold (A-579), nanoseconds: what is left of it at its measured cost a key
+/// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
+/// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
+/// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
+/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling).
+fn turn_budget_ns(
+  left_ns: u64,
+  (gap_ns, quantum_ns): (u64, u64),
+  (began_ns, interval_ns, now_ns): (u64, u64, u64),
+) -> u64 {
+  let deadline = began_ns.saturating_add(interval_ns);
+  let remaining = deadline.saturating_sub(now_ns);
+  if remaining <= gap_ns {
+    return left_ns.max(quantum_ns);
+  }
+  let share = u128::from(left_ns)
+    .saturating_mul(u128::from(gap_ns))
+    .checked_div(u128::from(remaining))
+    .unwrap_or(u128::from(left_ns));
+  u64::try_from(share).unwrap_or(u64::MAX).max(quantum_ns)
+}
+
+/// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
+/// folded. A green gone is folded (its checkpoint then finds nothing to take).
+fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
+  let mut env = crate::git_push::shard_pace_env(state);
+  // The step asks whether anyone waits at the end of its budget, not of the bare quantum ([`turn_budget_ns`]).
+  env.quantum_ns = budget_ns.max(env.quantum_ns);
+  let mut costs = state.merge.identity_costs;
+  let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
+    let mut step = slates_pace::Step::begin(env, (env.clock)());
+    let mut done = engine.identity_backlog() == 0;
+    while !done && step.more(IDENTITY_KEY, &mut costs) {
+      done = engine.fold_identity_step(1);
+    }
+    step.close((env.clock)(), &mut costs);
+    done
+  });
+  state.merge.identity_costs = costs;
+  state.count(CHECKPOINT_IDENTITY_STEPS, 1);
+  folded
+}
+
+/// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
+const IDENTITY_KEY: usize = 0;
+
+/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
+/// then the checkpoint itself, its doubling rule judged again then. Ends when the green or the shard state is gone.
+async fn checkpoint_in_turns(green: DbVolumeId) {
+  let began = slates_rt::futures::now_ns();
+  let mut last_turn = began;
+  loop {
+    let folded = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      let quantum = state.config.step_quantum_ns();
+      let interval = state
+        .merge
+        .checkpoint_since
+        .get(&green)
+        .map_or(0, |since| began.saturating_sub(*since));
+      let per_key = state.merge.identity_costs.units[IDENTITY_KEY].estimate_ns();
+      let backlog = state
+        .greens
+        .get(&green)
+        .map_or(0, |engine| engine.identity_backlog());
+      let left = per_key.saturating_mul(u64::try_from(backlog).unwrap_or(u64::MAX));
+      let budget = turn_budget_ns(
+        left,
+        (now.saturating_sub(last_turn), quantum),
+        (began, interval, now),
+      );
+      last_turn = now;
+      if identity_folded_in_a_step(state, green, budget) {
+        state.merge.checkpointing.remove(&green);
+        taken_now(state, green);
+        let span = slates_rt::futures::now_ns().saturating_sub(began);
+        let longest = state
+          .refusals
+          .entry(CHECKPOINT_IN_TURNS_LONGEST_NS)
+          .or_insert(0);
+        *longest = (*longest).max(span);
+        return true;
+      }
+      false
+    });
+    if folded.unwrap_or(true) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: checkpoints whose identity backlog outlasted one paced step and were finished by a task in turns (A-579),
+/// the non-vacuity count of [`checkpoint_in_turns`].
+pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
+/// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
+pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+/// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
+pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 
 /// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4559,6 +4707,35 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
+  /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
+  /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
+  /// way), all of it once the deadline has passed, and never less than the quantum.
+  #[test]
+  fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
+    const MS: u64 = 1_000_000;
+    const QUANTUM: u64 = 5_000;
+    let left = 80 * MS;
+    let gap = MS / 2;
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      40_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 500 * MS)),
+      80_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
+      left
+    );
+    assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), left);
+    assert_eq!(
+      turn_budget_ns(1_000, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      QUANTUM
+    );
+  }
 
   /// AC-6.8 / A-26, A-294: seed a green from a frozen namespace of FIFO and socket names and device nodes without
   /// reading a stream or opening a device; expect every kind, owner and device number in the green, each alias a link.

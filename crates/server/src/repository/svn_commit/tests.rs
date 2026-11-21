@@ -334,8 +334,9 @@ fn t_a655_a_subversion_repository_is_made_with_its_creation_record() {
 /// A-655 part 2b (§4.17.4 items 1 and 3.5). Do: commit revision 1 (a directory with a property list, a file, a
 /// directory holding a file) through the step. Expect: answered revision 1 with its date and author; the green at
 /// version 1 holding each file's bytes, the directories, and the directory's list named by its identity; the
-/// register's second record a reference to changeset 1, whose record on the node's store is the revision whole (C2);
-/// the records at revision 1 holding the texts; the shard charged what they hold.
+/// register's second record a reference to changeset 1, whose record on the node's store is the revision with its texts
+/// named by identity and length (C2; the texts are its changeset's payload, stage B part 2 (b)); the records at revision
+/// 1 naming the texts stored, none of their bytes in RAM; the shard charged what they hold.
 #[test]
 fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
   stored(|| async move {
@@ -362,21 +363,36 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
       .get(1)
       .and_then(|bytes| super::landing::sequence_of(bytes));
     assert_eq!(second, Some(1));
-    assert_eq!(stored_record(svn, 1).await, Record::Revision(first()));
+    assert_eq!(
+      stored_record(svn, 1).await,
+      Record::Revision(texts_stored(first()))
+    );
     let alpha = on(|state| {
-      state
-        .vcs_stores
-        .subversion_records(svn)
-        .and_then(|records| {
-          records
-            .text(&identity(b"alpha\n"))
-            .map(std::borrow::Cow::into_owned)
-        })
+      state.vcs_stores.subversion_records(svn).map(|records| {
+        let alpha = identity(b"alpha\n");
+        (records.stored_len(&alpha), records.text(&alpha).is_some())
+      })
     });
-    assert_eq!(alpha, Some(b"alpha\n".to_vec()));
+    assert_eq!(alpha, Some((Some(6), false)));
     let (youngest, held, charged) = on(|state| kept(state, svn));
     assert_eq!((youngest, charged), (1, held));
   });
+}
+
+/// `revision` as its landing records it (C2 stage B part 2 (b)): each text its rows name moved out of its contents and
+/// named among its stored texts by its length.
+fn texts_stored(mut revision: Revision) -> Revision {
+  for text in revision
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text)
+  {
+    if revision.contents.remove(&text.identity).is_some() {
+      revision.stored.insert(text.identity, text.size);
+    }
+  }
+  revision
 }
 
 /// Revision 2: `/branches/b` copied from `/trunk` at revision 1 (the head), its `a.txt` changed and its `sub` deleted.
@@ -1129,10 +1145,13 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
     texts.text(&identity(b"gamma\n")),
     Some(std::borrow::Cow::Borrowed(b"gamma\n"))
   ));
+  // An earlier text is its changeset's on the node's store: the records name it, RAM holds none of it (C2 stage B
+  // part 2 (b)), and a reader reads it through the store.
+  let alpha = identity(b"alpha\n");
   assert_eq!(
-    texts.text(&identity(b"alpha\n")).as_deref(),
-    Some(&b"alpha\n"[..]),
-    "an earlier text is read from the records"
+    (texts.text(&alpha).is_none(), texts.fetchable(&alpha, 0)),
+    (true, false),
+    "a view without the store's pieces reads nothing of an earlier text"
   );
 }
 
@@ -1141,7 +1160,7 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
 /// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
 /// source after each. Expect: after 1 the green holds both texts; after 2 those of `trunk` and the branch's changed
 /// `a.txt`, each once though two rows reach it; after 3 the branch's alone; after 4 only the replacing text; each held
-/// text read from the green, borrowed, and an earlier text still read from the records.
+/// text read from the green, borrowed, and an earlier text nowhere in RAM (its changeset's on the node's store).
 #[test]
 fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
   stored(|| async move {
@@ -1223,12 +1242,13 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
 }
 
 /// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step, so one
-/// large revision held its shard). Do: commit a revision adding `/trunk` and twelve files of 50 KiB distinct texts,
-/// then rebuild the repository from its changesets on the node's store, its turns driven to the end. Expect: the same records and green; and the
-/// revision's replay taken over at least a turn a file (`vcs_store.svn_replay_turns`): each turn keeps its rows' texts
-/// until the shard's quantum runs, and a file's delta outlasts it. Before, the record was replayed whole in one turn.
+/// large revision held its shard), under C2 stage B part 2 (b). Do: commit a revision adding `/trunk` and twelve files of
+/// 50 KiB distinct texts, then rebuild the repository from its changesets on the node's store, its turns driven to the
+/// end. Expect: the same records and green; the twelve texts named stored by the records, none kept in RAM, so the
+/// replay makes no text and takes at least one turn (`vcs_store.svn_replay_turns`). Before part 2 (b) the replay
+/// deltified each text, a turn a file at least.
 #[test]
-fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
+fn a_revisions_texts_replay_as_stored_keeping_nothing_in_ram() {
   stored(|| async move {
     let (svn, green) = subversion("svn").await;
     let texts: Vec<Vec<u8>> = (0..12u32)
@@ -1260,7 +1280,21 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
     assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
     assert_eq!(on(|state| whole(state, (svn, green))), live);
     let taken = on(|state| turns(state)) - before;
-    assert!(taken >= 12, "the revision replayed in {taken} turns");
+    assert!(taken >= 1, "the revision replayed in {taken} turns");
+    let stored = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      texts
+        .iter()
+        .filter(|bytes| {
+          let named = identity(bytes);
+          records.stored_len(&named).is_some() && records.text(&named).is_none()
+        })
+        .count()
+    });
+    assert_eq!(stored, 12, "a text kept in RAM");
   });
 }
 
@@ -1379,8 +1413,9 @@ fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestI
 /// commit, the answer). Do: submit a work to a Subversion repository's green as a client's recorded request; read its
 /// completion, the records' youngest revision and the green's durable head in the verb's own step; then wait for the
 /// revision. Expect: in the verb's step nothing is answered and nothing durable (the revision not landed); once it
-/// landed, the request answered, the green's durable head 1 and the register naming the creation and the revision.
-/// Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
+/// landed, the request answered, the green's durable head 1, the register naming the creation and the revision, and the
+/// made revision's text named stored by the records, none of it in RAM (its changeset carries it, C2 stage B part 2 (b)
+/// P4b). Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
 #[test]
 fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed() {
   stored(|| async move {
@@ -1418,6 +1453,18 @@ fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed(
         logged(state, svn).len(),
       )
     });
+    let alpha = identity(b"alpha\n");
+    let kept_as = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .map(|records| (records.stored_len(&alpha), records.text(&alpha).is_some()))
+    });
+    assert_eq!(
+      kept_as,
+      Some((Some(6), false)),
+      "the made text is not stored alone"
+    );
     assert_eq!(
       in_the_verb,
       (false, 0, 0),
@@ -1796,5 +1843,70 @@ fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once
       )
     });
     assert_eq!(retried, (1, true, 2), "the retry landed once");
+  });
+}
+
+/// C2 stage B part 2 (b), the records' RAM texts retired (main's ruling of 2026-11-21 09:20). Do: in three repositories
+/// commit revision 1 and set its properties (changeset 2); in the second land, as a hostile log, a deltified text's
+/// record (the retired kind) at changeset 2; in the third, revision 1's record with its texts inline (the form logs held
+/// before part 2 (b)) at changeset 1; rebuild each from the node's store. Expect: the first made again whole; the second
+/// refused `SvnRecord(Retired(Deltified))` and the third `SvnTextsInline`, each typed, never a panic or a skip.
+#[test]
+fn a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild() {
+  stored(|| async move {
+    let mut seen = Vec::new();
+    for (name, hostile) in [
+      ("whole", None),
+      ("deltified", Some(2u64)),
+      ("inline", Some(1u64)),
+    ] {
+      let (svn, _) = subversion(name).await;
+      assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+      let properties = Record::RevisionProperties {
+        revision: 1,
+        properties: BTreeMap::from([(b"svn:log".to_vec(), b"again".to_vec())]),
+      };
+      assert_eq!(
+        super::land_record((&owner(), svn), properties).await,
+        Some(Ok(()))
+      );
+      if let Some(sequence) = hostile {
+        let bytes = if sequence == 2 {
+          // The retired kind's bytes as a log written before held them: the header, kind 5, a text, no base, a delta.
+          let mut bytes = Record::Locks(Vec::new()).encode();
+          bytes.truncate(9);
+          bytes[8] = 5;
+          bytes.extend_from_slice(&[7u8; 32]);
+          bytes.push(0);
+          bytes.extend_from_slice(&0u64.to_le_bytes());
+          bytes
+        } else {
+          Record::Revision(first()).encode()
+        };
+        let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+        let landed = super::landing::land(
+          &disk,
+          (svn, sequence),
+          vec![(slates_store::log::SectionKind::Record, bytes)],
+        )
+        .await;
+        assert_eq!(landed, Ok(()));
+      }
+      rebuild(svn).await;
+      seen.push(on(|state| {
+        state
+          .vcs_stores
+          .unrecovered(svn)
+          .map(|refused| format!("{refused:?}"))
+      }));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        None,
+        Some("SvnRecord(Retired(Deltified))".to_owned()),
+        Some("SvnTextsInline".to_owned())
+      ]
+    );
   });
 }

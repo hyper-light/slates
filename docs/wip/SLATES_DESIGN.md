@@ -11489,7 +11489,10 @@ checkpoint deltas by the same composition, which is exact, so every base back to
 maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
 checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
-holds (the record names the floor), so no replica keeps more history than its owner (A-385).
+holds (the record names the floor), so no replica keeps more history than its owner (A-385). A checkpoint reads the
+head's identity, whose backlog (every key changed since it was last read) is folded a paced step at a time on the owner
+and finished in turns by a task of its own, each turn's share the fold left spread over the turns before the next
+checkpoint is due (A-579): no step hashes the backlog whole.
 
 > **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
 > order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
@@ -12300,7 +12303,9 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
 > part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
 > the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
-> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
+> deltify job is retired, and its record kind with it (A-818: a log holding one is refused typed). An import's
+> revision lands its texts the same way since P4a (its changeset's Payload and Texts rows, its record naming them
+> stored), and an import's delta whose base is only on the store asks its caller for the base (`Importing::Base`).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
@@ -57768,13 +57773,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
-> properties, UUID, deltified text) lands whole as one changeset, sequence the count the register names (creation 0),
+> properties, UUID) lands whole as one changeset, sequence the count the register names (creation 0),
 > and only then is committed at f+1 by a register entry holding a reference to it alone, with the green's version where
 > it moves one (`repository::svn_commit::landing`); one landing a repository at a time, from its check to its commit.
 > Recovery and rebuild read each named changeset back in sequence order and replay it through the live step; a changeset
 > landed past the register's last was never committed or answered, and is dropped, the client's retry landing it once.
 > A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
-> no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
+> no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). A revision's texts are named
+> stored, their bytes the changeset's Payload with Texts rows (C2 stage B part 2 (b)); the deltify record kind is
+> retired and a revision carrying its texts inline is refused at replay (A-818). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
 > between land and commit). Stage B part 1: a client's commit lands its texts in its changeset (`Payload`, `Texts`,
 > `Record`), and a recovery reads a stored text the shard's image lacks back from the store. Owed: the texts read
@@ -57879,6 +57886,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
 > (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
 > replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
+
+> **Status (2026-11-21, C1 step 3: an import lands as a run of segment changesets; main's ruling of 01:16).** The
+> import's changegroup is cut into segments of one trunk node of the store's memtable. Each lands as one changeset as it
+> is cut, its `Record` the index rows of its revisions by identity (record v8: groups continuing the logs, markers in
+> the last), its `Payload` its slice of the changegroup, and its `Texts` each revision's text, delta parent and place.
+> The register's import entry names the run (record v9: first and last sequence). A restart reads each segment's
+> record back and appends its rows by identity: its cost is the rows', with no payload read and no text rebuilt,
+> whatever the history's texts (main's red, held at a warm restart). The rows a segment's record stores equal the rows
+> the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
+> An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
+> sequence plus one (decision 2).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -59369,6 +59387,118 @@ Applied in the same change to:
   - a replay before the commit reaches the version before the batch, and after it the batch's last;
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
+
+### A-816 — A held verdict's preview lives across turns until its one step (2026-11-21, w-rewrite-ops; main 07:30 PST, P2's interface, for w-git's C5 2b piece 3; A-804, A-805, A-664)
+Applied in the same change to:
+- `crates/server/src/made_commit.rs`: `HeldPreview`, `hold_preview`, `with_held_preview`, `give_up`,
+  `PREVIEW_HELD_ACROSS_TURNS`, and the retire in `commit`.
+- `crates/server/src/greens.rs`: `lineage_len`, a test's view.
+- `crates/server/src/verbs.rs`: `AcceptedParts::for_test`.
+
+- **Why.** A git made commit takes its trees from A-664's path map, stepped from the version's engine. A green whose map
+  is built whole (a first version, one past a copy) builds it a slice a turn on a task. Under the deferred-submit hook
+  the verdict is held, never applied, until the one step (A-805), and its preview was retired in the submit's step.
+- **What.** The preview is engine state kept with the pending accept:
+  - `hold_preview` makes it from the held verdict (`Greens::preview`).
+  - `with_held_preview` lends it on any later turn, so a sliced build steps against the version the verdict makes while
+    the green shows nothing of it.
+  - It is retired in the one step (`commit`, whatever the step does), or by `give_up` when the accept is abandoned. A
+    pending accept dropped otherwise gives its member back as it drops.
+  - The first lend after the submit's step counts `vcs.made.preview_held_across_turns`, the non-vacuity counter.
+- **Evidence.** `a_held_verdicts_preview_lives_across_turns_until_its_one_step`. In a later step of the shard the
+  preview reads as version 2 while the green shows version 1 and its lineage holds one member more, counted once.
+  Committed in a third step, the green is at version 2 and the preview is retired.
+  Main's red for the made commit itself (a first version past a copy answered (false, 0, 0) through a sliced build) is
+  w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
+  piece 3 over this interface.
+
+### A-818 — Subversion's RAM texts retired: the deltify record and inline texts refused at replay (2026-11-21, w-svn; main 09:20 PST; C2 stage B part 2 (b), A-761, A-767 C2)
+Applied in the same change to:
+- `crates/svn/src/commit/record.rs`: `Record::Deltified` removed; its kind byte (5) refused `RecordRefused::Retired(Retired::Deltified)`.
+- `crates/svn/src/migration/records.rs`: the deltify APIs removed (`supersede`, `deltify_candidates`, `deltify_after`,
+  `kept_range`, `check_deltified`, `Deltifiable`, `DeltaWriter`).
+- `crates/server/src/vcs_store.rs`: `ReplayRefused::SvnTextsInline`, checked by both revision replays.
+- `crates/server/src/repository/svn_commit.rs`: the deltified record's check and charge removed.
+- `docs/wip/GAPS.md`: C2's entry, the line left for main's call closed.
+
+- **Why.** Since C2 stage B part 2 (b) every new Subversion text is its changeset's on the node's store (P3 to P4b), so
+  the deltify record and texts carried inline in a revision's record served only logs written before. Keeping them to
+  replay such logs is the second path CLAUDE.md §2 item 7 bans, and the tree chose the same twice (w-git's C5 2b
+  removed version-2 records; w-hg's step 0 removed the register-held record path). slates has no deployed state for a
+  migration to protect.
+- **What.** A log's deltify record is refused typed at decode (`Retired::Deltified`); a revision record naming a text
+  inline and not stored is refused typed at replay (`SvnTextsInline`). The repository is left unrecovered with that
+  refusal, never a panic or a skip. The records' delta form (`KeptText`) stays for records standing alone (tests,
+  fixtures, an import before its caller lands it); a daemon's records reach it no more.
+- **Evidence.** `a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild` (three repositories
+  rebuilt from the node's store: whole, a hostile deltify record at changeset 2, revision 1's texts inline at changeset
+  1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
+  (slates-svn).
+
+### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
+
+- **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
+  landed): the slow submits of a run came in one or two clusters, each starting with one poll on the green's owner
+  shard, the cross-shard call running `verbs::owner_floor` → `merge_service::checkpoint_green`, 76-112 ms. Of a 100 ms
+  checkpoint the head's identity was 73.66 ms (A-202 folds the identity only when it is read, and nothing read it
+  between checkpoints, so the first read hashed every file changed since, at its old and new versions), the record 16.07,
+  the encoding 4.79, the build 4.17. Every request the owner serves waited behind it: p999 and max near 100 ms, and the
+  p99 tens of milliseconds whenever a stall caught 1% of a run's samples. w-git met the same fold, run whole for ~1,000
+  member greens at a chain's cap, as a 1,124 ms step the watchdog killed the daemon for.
+- **The rule.** `Green::fold_identity_step(keys)` brings a slice of the backlog to the head, each key moved from the
+  version its entry was taken at (`identity_folded`), so commits between steps leave every key exact; the read folds
+  the rest. `merge_service::checkpoint_green` folds in one paced step (`slates_pace::Step`); if the backlog outlasts it
+  (someone waited), a task on the owner finishes it in turns and then takes the checkpoint. A turn's budget
+  (`turn_budget_ns`) is the fold left (the backlog at its measured cost a key) times the measured gap between turns over
+  the time left before the next checkpoint is due (the doubling interval, the time the increments it folds took to come),
+  never under the quantum: under steady contention, yielding at every quantum gave the fold one key a trip round the
+  owner's ready queue and took 7.2-13.0 s.
+- **Counters:** `merge.checkpoint.in_turns`, `merge.checkpoint.identity_steps`, `merge.checkpoint.in_turns_longest_ns`.
+- **Tests.** The identity oracle with partial folds at random steps (`crates/merge/tests/identity.rs`; red with each key
+  moved from `identity_version`); `a_checkpoint_with_someone_waiting_folds_the_identity_in_turns` (red on the one-step
+  checkpoint); `a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline`.
+- **A/B** (BENCHMARKS, "A checkpoint's identity fold in paced turns"): at Z = 50 ms every kind's server p99 under 1 ms in
+  5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
+  equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
+  wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
+- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
+  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
+  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
+  `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
+  `repository` tests), §4.16, GAPS, BENCHMARKS.md.
+
+### A-817 — A work asks for a file's base bytes only for a whole-file replacement whose declared base length is the file's; the identical-op drop measured and rejected (2026-11-21, w-fed-move, goal 86b; main's rulings 03:16 and 03:46 PST; A-787, A-808, D-27)
+- **How it was found.** After A-808, rebases and submits still asked the green's owner for files: 17.2 a client at 10
+  hot files in the 1,000-client stand-in (release, in-process, `kernel/`, one round). Main ruled that a rebase drop the
+  journal operations its change made identical to the head (git's skip of an already-applied commit), on two
+  conditions, and expected about 13.8 fewer asks a client. Counted why `base_missing` wanted each path
+  (`merge.work.base_missing.<unentried|unheld|replaced_whole>`): every one was replaced whole (76.3 paths a client at 10
+  hot files), none for a missing entry or an unheld file. `refine::whole_replacement` takes a lone overwrite at offset 0
+  as a whole-file replacement whatever the file's length, and the load harness's first slot is at offset 0, so every
+  work that wrote it asked its green's owner for the file's bytes at each rebase and submit, to refine a replacement
+  the refinement then keeps as declared (it refines only one whose base length is the file's).
+- **Change.** `crates/merge/src/refine.rs`: `whole_replaced_lengths` (each replacement's base path and the base length
+  its operations replace). `crates/server/src/work_home.rs` `base_missing`: a replaced path is asked for only when the
+  work's kept entry names that length for it, or names none. Nothing the refinement does changes: the bytes it no longer
+  gets are those it never used.
+- **Tests** (macOS arm64, Mac Studio, local). Red first, `slates-server --test works_off_owner
+  an_overwrite_at_the_start_of_a_longer_file_asks_no_base_bytes` (a 64-byte overwrite at offset 0 of a 1,024-byte file,
+  submitted from a work off its green's shard: one file asked before, none after; accepted, reading back). The
+  `works_off_owner` suite (18), `-p slates-merge --lib` (259) and its test targets, `green_post_state`, `mounted_work`,
+  `mounted_work_cow`, `merge_load`, `work_cow`, `work_edit_cow`, `verdict_pages`, `session_log` and the lib's work and
+  refine tests pass.
+- **A/B by use** (same stand-in): file asks 3.0, 4.5, 8.2, 17.2 a client at 300, 100, 30, 10 hot files to none; asks a
+  client 14.1, 17.6, 27.5, 49.2 to 11.1, 12.9, 19.1, 30.0 (69.4 before A-808 at 10 hot files); oracle failures 0 in
+  every run. What remains grows only with the rebases themselves (18.4 a client at 10 hot files, one ask a rebase).
+- **Measured and rejected: the identical-operation drop.** Built to main's ruling (`increment::drop_identical` after the
+  engine's rebase, its oracle on generated histories: outcomes and heads equal with and without the drop but for git's
+  case; a deterministic case: a work whose overwrite another wrote first). By use it fired 0.00, 0.00, 0.01 and 0.03
+  times a client at 300, 100, 30 and 10 hot files and left the rebases' file asks where they were (14.2 a client at 10
+  hot files): the engine's restatement already leaves out an operation whose effect became the head's, so the journal
+  reaching the drop holds nothing to drop, and the deterministic case passed only vacuously (an empty journal). Not
+  landed (CLAUDE.md §5: a dead-even A/B does not land); the patch is kept outside the tree
+  (`~/slates-work/w-fed-move-a817-rejected-drop.patch`, w-fed-move's machine) and its rule is not in the rebase section.
 ### A-815 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
 - **Why.** The lane's liveness (A-697's holder route at 32 MiB and above): the owner's one durable step copied the
   increment into its chain entry and the entry into the partition's log, 2.3 to 6.9 s of one shard's step in a debug

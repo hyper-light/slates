@@ -62,7 +62,7 @@ const UNCOMPRESSED: u8 = b'u';
 /// start 0, end 0 and the text's length, three big-endian 32-bit words). The store keeps such a revision as it came,
 /// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
 /// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
-/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`).
+/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`).
 /// An empty text comes with no hunk at all, an empty delta (7.2's `hg debugbundle --all`: an empty file's delta is of
 /// length 0), which is sent as it is: refused, it left hg-src's stream empty (`mercurial/__init__.py`'s first revision).
 /// Format: three big-endian 32-bit words.

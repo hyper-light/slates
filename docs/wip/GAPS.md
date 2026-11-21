@@ -67,7 +67,14 @@
 >   0.8–2.8). Main ruled (2026-11-20): change the wait, A/B settled. **A/B (run 44876741078; BENCHMARKS, "The
 >   client's reply wait, A/B"):** parking at once takes Linux arm64's loaded accept p99 to 0.36–0.43 ms and leaves R9
 >   unharmed, but Linux x86_64 stays at 3.2 ms, macOS at 8 ms, and no platform's p999 is under 1 ms. **Owed:** what holds
->   Linux x86_64's and macOS's loaded tails. **B landed (A-799, 2026-11-21).** C (spin only while a core is free) next.
+>   Linux x86_64's and macOS's loaded tails. **B landed (A-799, 2026-11-21).**
+>   **C (spin only while the spins catch) measured and rejected (2026-11-21, run 44884335146; BENCHMARKS "arm C"):**
+>   no better than B loaded on macOS and Linux arm64, worse on ubuntu-latest (accept p99 5.7-5.9 against 2.9-3.1 ms),
+>   far worse on both Windows runners (conflict p999 20-42 against 0.3-12 ms); it helps only macOS's quiet latency. B
+>   stays. **Open (85a):** the loaded tails sit on whole milliseconds (3,998 / 4,000 / 4,996 / 5,998 µs): the scheduler's
+>   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
+>   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325): the client's p99
+>   tail is its own wake (written -> seen, median 97 µs).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -188,7 +195,7 @@
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
 > whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
 > stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
-> `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
+> `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`; the unit test's store had
 > kept such a revision bare). An empty text comes with no hunk (an empty delta), sent as it is, and a log whose every
 > chunk is empty is sent inline, as 7.2 keeps it: at hg-src's scale the first refused the stream (an empty body, "unexpected
 > response from remote server: empty string", `mercurial/__init__.py`) and the second left two warnings in `hg verify`
@@ -253,14 +260,32 @@
 > in 14 fills, the window at most 193,859 bytes (one 128 KiB delta, a 64 KiB piece and a header). Counters
 > `vcs_store.hg_replay_wants` and `vcs_store.hg_replay_window_most`.
 > Owed:
-> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main, inbox/main-from-w-hg-c1-import-design.md).
->   BUILT, its first part: `slates_hg::import::emit` writes an import's history as the changegroup (03) a push of it
->   would bring, each revision's chunk its revlog's own delta against its delta parent (`Outline::delta_parent`, 7.2's
->   `deltaparent`), cut into segments of at least a bound only between chunks, each naming its texts as a push's
->   `Texts` section does (`Import::emitting`, `take_segment`). Held by
->   `import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`: for each of the five stores 7.2
->   wrote, the segments concatenated and taken through the push's intake give the import's index row for row. Owed:
->   the server landing each segment as a changeset and the import's entry naming the run, and the replay of a run;
+> **C1 step 3, the import as changesets (main's ruling of 2026-11-21 01:16: segment records hold the index rows by
+> identity). CLOSED.**
+> - `slates_hg::import::emit` writes the import's history as the changegroup (03) a push of it would bring, each
+>   revision its revlog's own delta against its delta parent, cut into segments of at least one trunk node of the
+>   store's memtable (`hg_import::segment_bytes`).
+> - Each segment lands on the changeset store as one changeset as it is cut, between the import's turns: `Record` (its
+>   revisions' index rows by identity, record v8), `Payload` and `Texts` (`hg_import::segment_changeset`,
+>   `segment_landed`).
+> - The import's register entry names the run, first and last sequence (record v9, `write_run_reference`). A
+>   recovery or rebuild reads each segment's `Record` back from the store and appends its rows by identity
+>   (`vcs_store::replay_hg_run`, `rebuild_hg_run`), reading no payload and rebuilding no text.
+> - An import given back sets the repository's next sequence back to the last the register names (decision 2).
+> - An imported repository is stored (`HgStore::unstored` false), so it streams as a pushed one does.
+> - Held by:
+>   - main's oracle (`import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`): for each of the
+>     five stores 7.2 wrote, the segments' records replayed equal the rows the push's intake derives from the same
+>     changegroup, and the import's;
+>   - `daemon::tests::t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity`: segments landed,
+>     the register naming the run, and a successor's restart reading 32 rows from 1 segment record (2,259 bytes), 0
+>     payload reads, the record bytes within 256 a row;
+>   - `crates/cli/tests/hg_interop.rs` `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`: stock
+>     7.2 streams the imported repository and verifies it clean.
+> - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
+>   holds the run's recovery.
+> Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
+> whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -491,6 +516,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
+> replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
+> submit): file asks 17.2 to 0 a client at 10 hot files, asks a client 49.2 to 30.0. The identical-op drop main ruled was
+> built and measured and rejected (fired 0.03 a client; the engine already omits such operations). What remains is one
+> ask a rebase.
+>
 > **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
 > asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
 > keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
@@ -531,6 +562,9 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
+> - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
+>   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3.
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.
@@ -2808,8 +2842,22 @@
 > store-held texts into RAM deltas, is retired; held by
 > `a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store` (red without it: the content store
 > kept the text) and the crash test `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (the text
-> read back whole through the store, nothing in RAM). Owed: P4 imports land texts as Payload with Texts rows and the
-> records keep none in RAM (`KeptText`, `Record::Deltified` retired). Stage C,
+> read back whole through the store, nothing in RAM). P4a BUILT: a revision that brings its texts (an import's,
+> `svn_commit::land_revision`) lands them as its changeset's Payload with Texts rows, put through the content store as
+> a client's commit's are and let go after, and its record names them stored, so the records keep none of an import's
+> texts in RAM; an import's delta whose base is only on the store asks for it (`Importing::Base`,
+> `Importer::supply_base`), answered from RAM where the green or the content store holds it, else brought whole
+> through the store between turns (`svn_import::supply_owed_base`). Held by
+> `an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere` (slates-svn) and
+> `t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte` (every imported text stored, none in
+> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. P4b BUILT:
+> a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
+> shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
+> (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
+> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-818, main 09:20): the deltify record
+> and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
+> (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
+> standing alone, which a daemon's no longer reach. Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
@@ -2876,9 +2924,9 @@
 > (`Repository::replay_revision`, `replay_step`) checks and applies its rows at its first step and keeps its rows' texts
 > a step each, kept between turns (`vcs_store::svn_replays`) until the shard's quantum runs, one row at least
 > (`vcs_store.svn_replay_turns`). Held by `a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does` (the
-> same records as a whole commit) and `a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild` (twelve 50 KiB files,
-> at least twelve turns, the same records and green). Left: one row's text is still deltified whole in its step (a
-> row at a time, not a window), and a record's decode is whole. Closed.
+> same records as a whole commit) and, since C2 stage B part 2 (b) P4a, `a_revisions_texts_replay_as_stored_keeping_nothing_in_ram`
+> (twelve 50 KiB files named stored, none made in RAM, the same records and green). Left: a record's decode is whole.
+> Closed.
 > **R3, the svn hook tests' flake (2026-11-20, w-svn; Ada's close list):** `vcs_svn::tests` waited ten liveness windows
 > for an answer that runs hooks, and its reader returns part-way at a timeout; on a loaded Mac a hook's first run
 > outlasted that (1 in 3, w-perf; 22 s against 2.3 s), read as a wrong answer. The wait is now a hang's bound
@@ -24433,3 +24481,12 @@ in what lands. Branch tips as of 2026-11-10:
   `nfs-work-lease-holder-phased-v4` 4bf73859d.
 - **outside the goal's Green/Work scope (VFS reclaim / runtime), untouched.**
   `holder-reentrant-drop-green` 4cfd8cc72, `reclaim-delegation-copy-preparation` 6264a9d01, `reclaim-input-preparation` e569f721d, `reclaim-preparation-evidence` 8d830db09, `reclaim-prepared-result` b7e7aaf0b.
+
+> **A-579 (2026-11-21, w-engine; goal 89b):** a checkpoint's identity fold runs in paced turns on the owner, ending
+> within its doubling interval (landed for robustness: the whole fold took a 1,124 ms step on w-git's push). MEASURED
+> GAP: at Z = 20 ms (3,500 verdicts/s, the owner saturated) SubmitAccepted's server p99 is worse with it, 5.43-9.73 ms
+> against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
+> kind's p99 is under 1 ms in 5 of 5 rounds. OWED: (b) subtract a key's old entry at its first change (the fold then
+> hashes current bytes only, no history reads); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record
+> 24.4 of 49 MB) and single key folds of up to 13.4 ms.
+

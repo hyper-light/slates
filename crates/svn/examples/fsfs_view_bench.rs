@@ -81,6 +81,8 @@ fn imported(dump: &[u8]) -> Repository {
     match importer.import(&mut repository, rest, true).unwrap() {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
+      // A dump imported whole into fresh records names every base in it: none is asked for.
+      Importing::Base { .. } => panic!("a whole dump's import asked for a base"),
       Importing::Commit { consumed, record } => {
         rest = rest.get(consumed..).unwrap_or_default();
         repository.commit_record(*record).unwrap();

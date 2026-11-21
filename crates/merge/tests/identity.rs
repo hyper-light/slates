@@ -20,7 +20,8 @@ proptest! {
   /// A-202: do apply generated increments (files, directories, modes, symlinks, hard links, attributes, renames and
   /// removals; some conflict and change nothing) to a green over a generated origin, after one create that always
   /// commits, reading the identity at some steps and folding the history below the head at others; expect the
-  /// running identity to equal the from-scratch one at every read.
+  /// running identity to equal the from-scratch one at every read. A-579: and bringing a few keys up alone at others
+  /// (`fold_identity_step`), the rest left for the read.
   #[test]
   fn the_running_identity_equals_a_recount_after_every_step(
     origin in proptest::collection::vec(raw(), 0..24),
@@ -44,6 +45,11 @@ proptest! {
       if step.3 % 4 == 0 {
         let floor = green.head();
         green.fold_history_before(floor);
+      }
+      // A-579: part of the backlog brought up alone at some steps (one to three keys), so keys folded at different
+      // versions are changed again, folded again and read beside keys never folded alone.
+      if step.3 % 3 == 1 {
+        green.fold_identity_step(1 + usize::from(step.4 % 3));
       }
       if step.4 % 3 == 0 {
         prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after step {} {:?}", index, step);
