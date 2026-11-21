@@ -346,3 +346,14 @@
   records; svn greens fold to readers' floor); A-side measurement test 3bf21428b (landed 8940003ed). Owed, main's
   runs: the A/B (measure_copies_from_older_revisions) and the stock svn leg (the big Studio d1323898 offline in kiln).
   Next after P7: KeptText fixtures onto a test-side text source (main's 10:35 item 3).
+- 2026-11-21 ~08:30 (date clock): hold hook 30d2e4100 (SLATES_SVN_IMPORT_HOLD) for main's attribution of (2).
+  KeptText move STOPPED by main (after P7). NOW: P7 (3) = C2 stage C's records side over A-814 (ImportBatch).
+  Plan: (1) a batch changeset = Payload+Texts of all its texts + one Record section per revision (landing::land_changeset
+  takes Vec<record>; changeset_records reads all Record sections); (2) replay applies every Record section of a
+  changeset in order (svn_fetched holds a queue); (3) svn_import stages each revision: take_texts -> content store
+  (Storing accumulated), restore::plan, records.check + apply in RAM, Building against batch.with_engine (needs a
+  Greens-taking variant; tree_beneath must use records.youngest not engine.head), batch.stage; flush at a derived bound,
+  before a non-revision record, at the import's end: land one changeset then ImportBatch::commit(EntryParts{objects:
+  reference(seq)}); refusal: batch.abandon + vcs_store::rebuild + release storing; (4) svn readers refused while
+  importing (as hg_view.rs:346). Tests: imports export byte for byte, register names few changesets, recovery equal,
+  crash before commit leaves nothing.
