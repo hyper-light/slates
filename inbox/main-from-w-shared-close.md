@@ -90,3 +90,9 @@ see inbox/main-from-w-shared-lane.md.
   worktree deleted.
 - Before/after for 320 and 512 MiB: kiln r32, interleaved release A/B 65133486d (before) vs main (after) at
   64/128/256/320/512 MiB x 10 rounds. Then the owner-step slicing with a derived bound (performance, last).
+
+## 12:40 PST: takeover_round's 2 Linux failures are main's (kiln r29, origin/main 3b664fb alone, adacachy)
+`slates-bridge-fuse --test takeover_round`: a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once
+(takeover_round.rs:259: the zero-budget round's slices [1, 1, ...] where it expects [2, 1, ...]) and
+a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted (:294: 41 slices, expects 40). The same on
+family three's branch, so not family three's. GAPS updated on main. Needs an owner; not on my list.
