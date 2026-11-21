@@ -1,0 +1,40 @@
+   Compiling slates-bridge-virtiofs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-virtiofs)
+   Compiling slates-hg v0.1.0 (/home/runner/work/slates/slates/crates/hg)
+   Compiling slates-land v0.1.0 (/home/runner/work/slates/slates/crates/land)
+   Compiling slates-http-edge v0.1.0 (/home/runner/work/slates/slates/crates/http-edge)
+   Compiling slates-client v0.1.0 (/home/runner/work/slates/slates/crates/client)
+   Compiling slates-ssh v0.1.0 (/home/runner/work/slates/slates/crates/ssh)
+   Compiling slates-svn v0.1.0 (/home/runner/work/slates/slates/crates/svn)
+   Compiling slates-bridge-nfs v0.1.0 (/home/runner/work/slates/slates/crates/bridge-nfs)
+   Compiling slates-bridge-oci v0.1.0 (/home/runner/work/slates/slates/crates/bridge-oci)
+   Compiling slates-server v0.1.0 (/home/runner/work/slates/slates/crates/server)
+   Compiling yasna v0.5.2
+   Compiling rcgen v0.13.2
+   Compiling slates-mcp v0.1.0 (/home/runner/work/slates/slates/crates/mcp)
+   Compiling slates-guest-probe v0.1.0 (/home/runner/work/slates/slates/crates/guest-probe)
+   Compiling slates-api v0.1.0 (/home/runner/work/slates/slates/crates/api)
+   Compiling slates-cli v0.1.0 (/home/runner/work/slates/slates/crates/cli)
+warning: unused import: `process_wait::await_exit_of`
+  --> crates/cli/tests/vm/mod.rs:14:16
+   |
+14 | pub(crate) use process_wait::await_exit_of;
+   |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `InstanceWait`, `Judged`, and `Verdict`
+  --> crates/cli/tests/vm/mod.rs:16:31
+   |
+16 | pub(crate) use process_wait::{InstanceWait, Judged, Verdict};
+   |                               ^^^^^^^^^^^^  ^^^^^^  ^^^^^^^
+
+error[E0425]: cannot find value `held` in this scope
+    --> crates/cli/tests/cli.rs:7020:17
+     |
+7020 |       wait_for(&held.instance, || attachments_of(&self.instance, &self.id)
+     |                 ^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `slates-cli` (test "cli") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+warning: `slates-cli` (test "guest_vhost") generated 2 warnings (run `cargo fix --test "guest_vhost" -p slates-cli` to apply 2 suggestions)

@@ -1,0 +1,70 @@
+host runnervmnfvap Linux aarch64, 4 CPUs, Fri Nov 20 23:20:20 UTC 2026, A d33d2a48e (main + flow), B 837c3be2d (pair reverted), backlog 20000, N 4
+== build a exit 101
+== build b exit 101
+== run 1 leg a exit 0 load 1.64, 3.22, 2.42
+   1a LD-CU backlog 20000 volumes 568facb89fbd6b9b0000000000000067 568facb89fbd6b9b000000000000007d by shard {"0": ["568facb89fbd6b9b0000000000000067", "568facb89fbd6b9b000000000000007d"], "1": ["568facb89fbd6b9b0001000000000033"]}
+   1a LD-CU prefill 30000 writes, 0 refused
+   1a LD-CU quiet v2 n 6085 p50 375 us p99 788 us max 197369 us
+   1a LD-CU ahead 20000 writes, 189773318 change bytes, in 17.293578279s with the holder stopped
+   1a LD-CU before resume: owner v1 head Some(50053)
+   1a LD-CU caught Some(2.731946472s) wall 2.732612491s; holder took 0 install(s) and held 21246 message(s) meanwhile
+   1a LD-CU busy v2 n 1242 refused 0 p50 1401 us p99 13882 us max 150209 us
+   1a LD-CU cpu owner total 442 ticks over 2.73 s; by thread [(250, "slates-shard-0:11675"), (192, "slates-shard-1:11676"), (0, "slates:11665"), (0, "slates-watchdog:11677"), (0, "slates-log:11674")]
+   1a LD-CU per MiB 15.1 ms (180.98 MiB behind)
+   1a LD-CU-S 2056 owner Some(50062) holder Some(46709)
+   1a LD-CU-S 2563 owner Some(50062) holder Some(50053)
+== run 2 leg b exit 124 load 2.14, 3.01, 2.42
+   2b LD-CU backlog 20000 volumes fe45353ae9da6aea000000000000003b fe45353ae9da6aea0000000000000051 by shard {"0": ["fe45353ae9da6aea000000000000003b", "fe45353ae9da6aea0000000000000051"], "1": ["fe45353ae9da6aea000100000000001d"]}
+   2b LD-CU prefill 30000 writes, 0 refused
+   2b LD-CU quiet v2 n 4734 p50 398 us p99 2817 us max 95080 us
+   2b cleaned 3 leftover process(es)
+== run 3 leg b exit 124 load 2.07, 2.21, 2.26
+   3b LD-CU backlog 20000 volumes ab8128405659d9390000000000000063 ab8128405659d9390000000000000079 by shard {"0": ["ab8128405659d9390000000000000063", "ab8128405659d9390000000000000079"], "1": ["ab8128405659d9390001000000000031"]}
+   3b cleaned 3 leftover process(es)
+== run 4 leg a exit 0 load 1.93, 2.10, 2.16
+   4a LD-CU backlog 20000 volumes b69fdcad2fc27c5e000000000000003f b69fdcad2fc27c5e0000000000000055 by shard {"0": ["b69fdcad2fc27c5e000000000000003f", "b69fdcad2fc27c5e0000000000000055"], "1": ["b69fdcad2fc27c5e000100000000001f"]}
+   4a LD-CU prefill 30000 writes, 0 refused
+   4a LD-CU quiet v2 n 6159 p50 408 us p99 992 us max 100701 us
+   4a LD-CU ahead 20000 writes, 189701766 change bytes, in 19.986241001s with the holder stopped
+   4a LD-CU before resume: owner v1 head Some(50059)
+   4a LD-CU caught Some(3.859655698s) wall 3.860602522s; holder took 1 install(s) and held 20030 message(s) meanwhile
+   4a LD-CU busy v2 n 1549 refused 0 p50 1220 us p99 18893 us max 191168 us
+   4a LD-CU cpu owner total 577 ticks over 3.86 s; by thread [(342, "slates-shard-0:12789"), (235, "slates-shard-1:12790"), (0, "slates:12779"), (0, "slates-watchdog:12792"), (0, "slates-log:12788")]
+   4a LD-CU per MiB 21.3 ms (180.91 MiB behind)
+   4a LD-CU-S 3249 owner Some(50070) holder Some(48155)
+   4a LD-CU-S 3774 owner Some(50070) holder Some(50062)
+== run 5 leg a exit 0 load 2.26, 2.19, 2.19
+   5a LD-CU backlog 20000 volumes 7ea60fbf288da7f00000000000000039 7ea60fbf288da7f0000000000000004f by shard {"0": ["7ea60fbf288da7f00000000000000039", "7ea60fbf288da7f0000000000000004f"], "1": ["7ea60fbf288da7f0000100000000001c"]}
+   5a LD-CU prefill 30000 writes, 0 refused
+   5a LD-CU quiet v2 n 3595 p50 671 us p99 2515 us max 99331 us
+   5a LD-CU ahead 20000 writes, 186944583 change bytes, in 17.797844876s with the holder stopped
+   5a LD-CU before resume: owner v1 head Some(50052)
+   5a LD-CU caught Some(4.1942166s) wall 4.197820449s; holder took 0 install(s) and held 20969 message(s) meanwhile
+   5a LD-CU busy v2 n 2319 refused 0 p50 977 us p99 10573 us max 140701 us
+   5a LD-CU cpu owner total 586 ticks over 4.20 s; by thread [(360, "slates-shard-0:13129"), (226, "slates-shard-1:13130"), (0, "slates:13119"), (0, "slates-watchdog:13131"), (0, "slates-log:13128")]
+   5a LD-CU per MiB 23.5 ms (178.28 MiB behind)
+   5a LD-CU-S 3554 owner Some(50059) holder Some(47806)
+   5a LD-CU-S 4081 owner Some(50059) holder Some(50052)
+== run 6 leg b exit 124 load 2.75, 2.32, 2.23
+   6b LD-CU backlog 20000 volumes 628f2be5dea036f8000000000000005d 628f2be5dea036f80000000000000073 by shard {"0": ["628f2be5dea036f8000000000000005d", "628f2be5dea036f80000000000000073"], "1": ["628f2be5dea036f8000100000000002e"]}
+   6b LD-CU prefill 30000 writes, 0 refused
+   6b LD-CU quiet v2 n 2540 p50 568 us p99 9895 us max 138823 us
+   6b cleaned 3 leftover process(es)
+== run 7 leg b exit 124 load 2.00, 2.12, 2.16
+   7b LD-CU backlog 20000 volumes 2c59ca2cbbf765c50000000000000059 2c59ca2cbbf765c5000000000000006f by shard {"0": ["2c59ca2cbbf765c50000000000000059", "2c59ca2cbbf765c5000000000000006f"], "1": ["2c59ca2cbbf765c5000100000000002c"]}
+   7b LD-CU prefill 30000 writes, 0 refused
+   7b LD-CU quiet v2 n 3548 p50 658 us p99 2931 us max 62464 us
+   7b cleaned 3 leftover process(es)
+== run 8 leg a exit 0 load 1.93, 2.11, 2.14
+   8a LD-CU backlog 20000 volumes 8e89dfab6a4235b8000000000000003d 8e89dfab6a4235b80000000000000053 by shard {"0": ["8e89dfab6a4235b8000000000000003d", "8e89dfab6a4235b80000000000000053"], "1": ["8e89dfab6a4235b8000100000000001e"]}
+   8a LD-CU prefill 30000 writes, 0 refused
+   8a LD-CU quiet v2 n 3963 p50 647 us p99 1781 us max 181531 us
+   8a LD-CU ahead 20000 writes, 191098984 change bytes, in 18.172298648s with the holder stopped
+   8a LD-CU before resume: owner v1 head Some(50049)
+   8a LD-CU caught Some(8.953265614s) wall 8.989938992s; holder took 0 install(s) and held 20965 message(s) meanwhile
+   8a LD-CU busy v2 n 2274 refused 0 p50 618 us p99 50906 us max 259200 us
+   8a LD-CU cpu owner total 1247 ticks over 8.99 s; by thread [(761, "slates-shard-0:14103"), (486, "slates-shard-1:14104"), (0, "slates:14092"), (0, "slates-watchdog:14106"), (0, "slates-log:14102")]
+   8a LD-CU per MiB 49.1 ms (182.25 MiB behind)
+   8a LD-CU-S 8075 owner Some(50062) holder Some(50049)
+   8a LD-CU-S 8607 owner Some(50062) holder Some(50050)
+== done Sat Nov 21 00:59:18 UTC 2026
