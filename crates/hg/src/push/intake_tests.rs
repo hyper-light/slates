@@ -449,7 +449,8 @@ fn deltas_by_node<'d>(
 /// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
 /// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
 /// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
-/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
+/// the place in the payload holding exactly its delta, or for a whole its raw text past the hunk it arrived in (the
+/// store's contract, A-767 C1); the changelog and manifest log under their NUL-led paths.
 #[test]
 fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
   let part = stock();
@@ -470,11 +471,14 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
     let (base, data) = deltas[&kept.node];
     let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
     assert_eq!(kept.base, base_identity, "{:?}", kept.node);
-    assert_eq!(
-      &part.payload
-        [usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap()],
-      data
-    );
+    // A whole is kept as its raw text (the store's contract, A-767 C1); an edit as its delta.
+    let kept_bytes = &part.payload
+      [usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap()];
+    if base == crate::NULL_NODE {
+      assert_eq!(kept_bytes, &text[..], "{:?}", kept.node);
+    } else {
+      assert_eq!(kept_bytes, data);
+    }
   }
   for index in [fork, index] {
     index.release(&mut store).unwrap();

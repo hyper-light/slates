@@ -57803,7 +57803,10 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
 > every tool (`slates_store::texts`: per touched path its bytes, the tool's id, the full text's identity and length,
 > its edit's base, and the edit's or whole's place in the payload; Mercurial's changelog and manifest as the paths
-> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks. Landing (and a recovery's
+> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks; a whole's place is its raw
+> text, never a hunk around it (A-767 C1, main's ruling of 2026-11-21: both Mercurial writers had kept a whole as the
+> trivial full-text hunk and its text, so `text` refused `BadRow` for every Mercurial text; a store written before is
+> not read past that refusal, re-imported or re-pushed instead). Landing (and a recovery's
 > replay) derives two tables from it: `T` (a repository's text by identity: its changeset, length, base, place) and
 > `H` (a path by BLAKE3 and a sequence: the text kept). `Store::text_at` makes an old version by walking its `T` rows
 > to a whole and applying each edit read from its own changeset's payload, so no changeset outside the chain is read;

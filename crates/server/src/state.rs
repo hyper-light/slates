@@ -895,6 +895,9 @@ pub struct ShardState {
   pub(crate) made_commits: crate::made_commit::MadeCommits,
   /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
   pub(crate) materializations: crate::green_ready::Materializations,
+  /// The shard's reads of Mercurial repositories' `.hgtags` for an owner's verb, and the requests parked on them
+  /// (A-767 C1, `crate::vcs_store::hg_tags`).
+  pub(crate) hg_tags: crate::vcs_store::hg_tags::HgTags,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

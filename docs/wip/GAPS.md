@@ -2952,6 +2952,39 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **A Mercurial whole's place is its raw text, the store's contract (A-767 C1, 2026-11-21, w-hg; main's ruling). BUILT.**
+> - Found reading lookup's `.hgtags` through the store: `StoreHandle::text` refused `BadRow` for every Mercurial text.
+>   Both writers (the push intake's `KeptText.place`, the import's `Emitter::revision`) kept a revision against the null
+>   base as the trivial full-text hunk and its text, while the store's `make` takes a whole as raw bytes of its length.
+>   The stream hid it by stripping the hunk (`text_after_trivial_hunk`), the clone and the pull by sending the hunk as
+>   a delta against null.
+> - Now one rule: a whole's place is its raw text (the payload's bytes unchanged, the place past the hunk; an empty
+>   text an empty place). The stream sends a whole as it lies (`text_after_trivial_hunk` removed); the clone walk and
+>   the pull write a stored whole as the one hunk 7.2 sends (`put_revision_whole`). A delta against null that is not
+>   that one hunk is refused typed (`Unverified::NotWhole`); every 7.2 writer sends it.
+> - Old stores: no shim. A whole kept before is still refused `BadRow` (typed) by `text` until the repository is
+>   re-imported or re-pushed.
+> - Held by `hg_view::tests::the_store_makes_a_pushed_mercurial_text_whole` (red before: no text made; and a read past
+>   its room refused), the two-encodings oracle `every_text_both_writers_keep_is_made_whole_by_the_store_in_every_format`
+>   (dotencode, hybrid, pre-share-safe, revlog v2, file index: every revision imported, then cloned through the store
+>   and pushed into a second repository, each text the store makes equal the view's, edits counted under both writers),
+>   and the stream, clone and pull oracles unchanged.
+> **Lookup's `.hgtags` through the changeset store (A-767 C1, 2026-11-21, w-hg; main's ruling (A)). BUILT.**
+> - A name that reaches the tags (`serve::lookup::needs_tags`) has the served heads' `.hgtags` read first
+>   (`lookup::TagsRead`): the rows of every head's `.hgtags` revision in one want, then their texts in one, bounded by
+>   the asking step's room (`Want::Texts`'s `most`: the store stops reading past it and the lookup is refused past its
+>   admission). `Repository::tags_text` is gone.
+> - Over the edges: a plain `lookup` is a `Producing::Lookup` answer (over HTTP `application/mercurial-0.1`,
+>   uncompressed, as 7.2 sends a string); a `batch` reads the tags once for all its lookups (`BatchStep::Store`,
+>   answered by the SSH session's stream turns and the HTTP edge's batch driver). Counted `vcs_store.hg_lookup_store_asks`.
+> - The owner's `CreateBranch --from <tag>` (A-575) parks at a door in `verbs::run_recorded` while a task reads the tags
+>   (`vcs_store::hg_tags`), then runs again over the read; a read whose heads changed meanwhile is made again.
+> - Held by `a_tag_only_a_hidden_head_carries_is_unknown_and_the_tags_are_read_in_one_round` (the new `hidden-tag`
+>   fixture, made by stock 7.2: one rows want naming the visible head's `.hgtags` alone), `a_batch_of_lookups_reads_the_tags_once`,
+>   `a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup`, `a_hgtags_past_the_room_is_refused_past_its_admission`,
+>   and `a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch` (red at first: `default` and `v1`
+>   refused with no door; now one read each). OPEN: stock 7.2's `pull -r <tag>` over SSH and HTTP and a batched
+>   `pull -r a -r b` by use (hg_interop), and the `--from` verb by use, run by main or w-interop.
 > **C1 step 1b, a pull's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45 with its
 > condition on pulls). BUILT.**
 > - A pull (any fetch the links do not walk) still makes its changelog and manifests whole when it begins
@@ -3931,7 +3964,11 @@
 > daemon and asserts its node is gone once the harness ends.
 
 > **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
-> and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**
+> and a restarted daemon's own start spun into a fifth (2026-11-20; found by w-interop's Linux counts).** The
+> `hg_push::unbundle` spin: not reproduced on 481d7abef (w-interop's r8, load ~40, after e6c3f10cd removed the
+> register-held record path the spinning build 90e9b720c still ran); the chain rebuild it most likely came from was
+> removed in c5248394f (w-perf's `files_present`). The next Linux matrix on current main confirms or reopens it. The
+> HTTP edge's and `start_shard`'s spins are w-bugs'.
 > adacachy (Linux x86_64, 32 cores, load 31-55, shared with CI), release main 90e9b720c, `ci/interop/hg-matrix.sh` over
 > Mercurial's whole history (57,053 changesets): 22 of 24. The watchdog named `hg_push::unbundle` (1,091 ms of CPU
 > without a step), the HTTP edge's connection task (`vcs_http.rs:850`, `drive`, twice, each killed) and the restarted
