@@ -11478,6 +11478,21 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > the verdict whatever the ops (`Green::superseded_bytes`). A file's first small edit now charges the earlier file
 > whole, as it is kept; before, it was counted as the current value's and went uncharged.
 
+> **Status (2026-11-20, A-793: the history is anchored on the newest block; replaces A-728 part 2's splice and seal).**
+> A change re-anchors its path's content history on the file's new block (`crates/merge/src/history.rs`, `reanchor`):
+> the runs the change kept, found by walking its ops over the value it supersedes and checked against the new block byte
+> for byte, are moved to the new block in every value the path's history holds; a block only this history holds is cut
+> to what the change overwrote or removed (one owned chunk) and let go; a value whose pieces outweigh it is stored whole.
+> The latest value is the new block, named whole. So a 64-byte overwrite of a 16 KiB file retains 64 bytes and a few
+> pieces, where A-728 part 2 kept the earlier file whole for as long as a reader held the floor. A whole replace keeps
+> nothing of the value it supersedes, so its block stays as that version's bytes; a block another holder keeps is never
+> cut. `Green::history_reservation` reserves, per changed path, the superseded value's list and block and two pieces a
+> gap of its ops for every value the path's history holds: an upper bound the settle trues up (A-16), no longer equal to
+> the growth. Counted: `Green::history_reanchored` (changes, blocks let go, bytes copied). Found by use: at 100,000
+> clients over the Linux kernel (goal 86b) every accepted version retained about 73 KB for 256 bytes written, and the
+> green's cap (373 MB, one shard's table share) refused 94,877 of 100,000 submits `BudgetExceeded` after 5,123 accepts.
+> After: 29,795 accepted and none refused at retention; the next bound is the client node's merge budget (GAPS, A-793).
+
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
 > which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
@@ -56489,8 +56504,28 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   API did not exist. macOS arm64, merged main 051bf8f4: `slates-vfs --test referenced` 6 of 6, `--lib`, `--test recover`,
   `--test image`, `--test special` 167 of 167; `slates-server --lib vcs_store::referenced` 2 of 2; `slates-api --lib
   volume_core` 3 of 3.
-- **Owed.** P3's presenter (the view a hook runs in, under the root mount, made of referenced files), P4, the root mount's
-  publication (A-645 (a)), and the presenter's call of `hold_owed_references` after a recovery.
+- **Part 3, its fourth piece (2026-11-20, A-645 (a) part 1, main's ruling of 20:00): the view as a volume.**
+  `vcs_store::svn_presenter::Presented` lays a repository's view into a volume of its own, a budget of node-revisions a
+  call: the directories and fixed files, each revision's properties file, and each revision file as a referenced file
+  (`fsfs::RevisionFile::pieces`: its made bytes kept in the volume, each text a piece by identity and length). `db/current`
+  is rewritten after the files it names exist. A revision property change rewrites that revision's file
+  (`revision_properties_changed`). A text is read through `ViewTexts`, the repository's own text source (the green's held
+  head text, else the content store's window, else the records' delta window), and held through `ViewHolds` where the
+  content store keeps it. Every text is `PLAIN`: `WithTexts` answers no stored delta (`fsfs::TextDeltas`), since the
+  records' svndiffs are no content a piece can name and per-file deltas become derived forms of the changeset log (Ada's
+  ruling of ~13:35). Held by `the_presented_volume_holds_the_fsfs_view_byte_for_byte` (the golden repository laid out a
+  node-revision a call; every revision file, properties file and fixed file the bytes `fsfs` makes, each revision file
+  refused `EROFS`) and `a_revision_property_change_rewrites_that_revisions_properties_file`. Part 2a (same day): every
+  file of the view is a referenced file (the small ones one made piece, made again when its bytes change), so the view's
+  volume keeps nothing in the shard's chunk store and a read of it can run while that store is lent to the content
+  store's windows (A-727 a2), the test holding the chunk store empty; and `slates_land::store_root::StoreRoot::mount_point`
+  makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
+  alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
+  `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
+- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
+  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
+  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
+  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)
@@ -58362,3 +58397,32 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   in the base's offsets); `work_charge`'s oracle (the charge equals a recount and the view a plain map after every
   generated edit, unlink and rename, with distinct base and written bytes); `tests/work_edit_cow.rs` (red above; green:
   +32,768 B, 0.15 ms mean); `tests/works_off_owner.rs` (one history on one shard and on eight, reply for reply).
+
+### A-793 — A change re-anchors its path's content history on the new block: what it overwrote is kept, not the earlier file (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel on one primary and two replicas; §4.16 "The history", "Splice", "delta retention before folding"; replaces A-728 part 2's splice and seal; A-16, AUD-16, A-728 part 4)
+- **Why.** A-728 part 2 anchored a path's history on its earliest block: the first change named the earlier block
+  whole and every later value shared runs of it, so each file a change touched kept a whole earlier copy while any
+  reader held the floor. With 100,000 works open at old bases nothing folds: about 73 KB of retention for each accepted
+  version (four 64-byte slots written), and the green's cap (373 MB, `green_chain_bytes`, one shard's table share)
+  refused 94,877 of the 100,000 submits `BudgetExceeded` after 5,123 accepts (release, `load_scale`, one round,
+  `--hot-files 42000 --per-connection 32`, the Studio, Slates `60586cdd`).
+- **Change.** `crates/merge/src/history.rs`: `reanchor` (the kept runs and where they lie in the new block, checked
+  byte for byte; every value's pieces in them moved there; a block only this history holds cut to what the change
+  removed and let go; a value whose pieces outweigh it stored whole), `Value::supersede`; `Value::spliced`, the cutting
+  `Value::seal` and `kept_when_superseded` removed. `crates/merge/src/engine.rs`: `content_value` re-anchors, the
+  running totals moved by the lists' change, `Green::history_reanchored` counted; `superseded_bytes` bounds a change by
+  the superseded block and list and two pieces a gap of its ops for every value of the path.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-merge --test engine
+  small_edits_to_many_files_retain_what_they_wrote_not_the_files` (32 files of 16 KiB, each overwritten in a 64-byte
+  slot twice, no fold): 529,384 bytes retained before, under the 13,312-byte bound after; every version reads back. The
+  history oracle ported to `reanchor` (`every_version_is_apply_and_shares_what_it_kept`, `applied_equals_is_the_bytes_compared`;
+  owned bytes bounded by what the changes removed, no leak, blocks bounded), `small_overwrites_of_a_large_file_cost_what_they_wrote`
+  (1 MiB, 64 edits: the current block and 4,096 owned bytes, one live block), `a_whole_replace_keeps_the_block_it_replaced`,
+  `a_reanchor_leaves_a_block_another_holder_keeps`; A-728's block tests and AUD-16's charge tests restated
+  (`special.rs`: the reservation covers the growth; `crates/server/tests/daemon.rs`: six 4-byte edits of a 2 KiB file
+  retain 1,152 bytes, under one copy). `cargo test -p slates-merge --tests` all pass; `slates-server --test
+  green_retention`, `--test daemon` (the two retention tests), `--lib merge` pass.
+- **By use** (release, `crates/cli/tests/load_scale.rs`, 100,000 clients, the kernel v7.4-rc4, same arguments): accepted
+  5,123 to 29,795, `BudgetExceeded` 94,877 to 0, verdicts 13 to 131 a second, CreateWork p50 84.5 s to 25.1 s, wall
+  748 s to 944 s (every client reached a verdict); oracle failures 0 in both. The next bound: the 70,205 clients that
+  met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases), the client node's merge
+  budget; a first-occurrence log line now names what holds it (`Partition::merge_budget_held`).

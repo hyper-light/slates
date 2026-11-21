@@ -4594,9 +4594,10 @@ const RETENTION_EDITS: u64 = 6;
 /// lagging work still names the old version the copies are kept for it (the fold floor is its base),
 /// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
 /// head, folds every copy away and credits the charge — so only the rejected-result cache remains
-/// charged. Non-vacuous: the history grew with the edits before the fold (the earlier file once, which the lagging work
-/// keeps, and what the edits wrote: under two copies for all of them, A-728 part 4's honest charge) and is zero after
-/// it, and every observation has `charged == history + rejected`.
+/// charged. Non-vacuous: the history grew with the edits before the fold (what the edits overwrote, which the lagging
+/// work's version still reads, and the pieces its versions name of the current file: well under one copy of the file,
+/// A-793; A-728 part 2 kept the earlier file whole) and is zero after it, and every observation has
+/// `charged == history + rejected`.
 #[test]
 fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
   let (daemon, instance) = daemon("merge-retention");
@@ -4613,13 +4614,17 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
     submit_accepted(&mut client, writer, 2 + edit);
   }
   let retained = daemon.merge_retention(g).unwrap();
-  // The honest charge (A-728 part 4, main's ruling): the lagging work keeps the file as it was before the edits, once,
-  // which the history holds (its earlier block); the edits add what they wrote. Never a copy per edit (W2).
+  // The honest charge (A-728 part 4, main's ruling) of what the history holds (A-793): the bytes each edit overwrote,
+  // which the lagging work's version reads, and the pieces every version names of the current file's block, two more
+  // for each edit at most; never the earlier file whole (A-728 part 2), nor a copy per edit (W2).
   let file = RETENTION_FILE_BYTES as u64;
+  let pieces = (RETENTION_EDITS + 1) * (2 * RETENTION_EDITS + 1) * 3 * size_of::<usize>() as u64;
   assert!(
-    retained.history >= file && retained.history < 2 * file,
-    "the small edits retained the earlier file once for the lagging work and what they wrote, under two copies of \
-     the file for all of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
+    retained.history > 0
+      && retained.history <= RETENTION_EDITS * 4 + pieces
+      && retained.history < file,
+    "the small edits retained what they overwrote and their versions' pieces, under one copy of the file ({file} \
+     bytes; a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
     RETENTION_EDITS * file
   );
   assert_balanced(&retained, 0);
