@@ -1706,3 +1706,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RULING (w-git path maps): P2, uniform lazy derivation for any created ref, not P1's tag shortcut. P1 then P2 would be layering, and it leaves the wall for branch-heavy repositories. Tags get the 99% for free, never read to submit. Oracle and red as before.
   - FINDING (w-perf, hg first push 98-103 s vs stock 9.7-10.2 s, 5.8 GiB resident): intake files_present ~57%, rebuilding whole manifests per changeset by chain walks; take ~41%, sha1dc ~26 s.
   - RULING (w-hg, after C1 step 3, as robustness under the bounded-working-set rule): incremental decoded manifests, O(changed lines); node verification kept for integrity, hashed once from the held text; A/B sha1dc against hardware SHA-1. w-perf may build (1) in parallel if C1 doesn't touch those files.
+- 2026-11-21 05:13 PST w-git's P2 sized:
+  - Engine half: an unmaterialized green state; materialization sliced over a TreeSource; ONE choke point ShardState::green_ready -> Ready | Materializing for all 101 call sites; nothing to fold for an unmaterialized green.
+  - Git half: a deferred create, a TreeSource over the git store, replay, an oracle for branches and tags; red: the 611 MB push lands.
+  RULING: w-rewrite-ops takes the engine half BEFORE svn stage C (a push that can't land outranks a 3x slowdown), unless stage C is already near green. Added: an untouched green's materialized content may drop back and re-derive (MEMORY SIZING), with materializations and drops counted.
