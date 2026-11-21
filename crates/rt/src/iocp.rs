@@ -1,5 +1,13 @@
 //! The I/O completion port driver (Windows): `PostQueuedCompletionStatus` for kicks and no-ops,
-//! `GetQueuedCompletionStatusEx` with a timeout for the wait [B: Microsoft Learn].
+//! `GetQueuedCompletionStatusEx` for the wait [B: Microsoft Learn].
+//!
+//! **A timed wait ends at its deadline, not the next millisecond (84a).** `GetQueuedCompletionStatusEx` takes whole
+//! milliseconds, so a wait for 200 µs lasted a millisecond or more (a 10 ms wait, a 15.6 ms tick). A timed wait instead
+//! arms a high-resolution waitable timer (`CreateWaitableTimerExW`, `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) whose wait
+//! completion packet (`NtAssociateWaitCompletionPacket`) posts to the port when it fires, and waits on the port untimed,
+//! as the epoll driver's timerfd does; Go's runtime does the same since 1.23 (`runtime/netpoll_windows.go`). Where the
+//! calls are missing (before Windows 8) or a packet can't be re-armed this time, the wait falls back to whole
+//! milliseconds ([`Deadline`]). No privilege is asked.
 //!
 //! **A blocked wait sits one level above normal (A-361).** Windows raises a thread's priority a level when an event, a
 //! semaphore or an address it waits on wakes it, and none when it is dequeued from an I/O completion port, which is how a
@@ -16,16 +24,21 @@
 //! loaded, against a parked wake of 6–15 µs. No privilege is asked: a thread may set its own level within its process's
 //! class (R10).
 
+use std::ffi::c_void;
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::Foundation::{
+  CloseHandle, FARPROC, GENERIC_ALL, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::System::IO::{
   CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Threading::{
-  GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
-  THREAD_PRIORITY_NORMAL,
+  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThread,
+  GetThreadPriority, SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_ABOVE_NORMAL,
+  THREAD_PRIORITY_NORMAL, TIMER_ALL_ACCESS,
 };
 
 use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
@@ -41,6 +54,9 @@ const NOP_KEY: usize = usize::MAX - 1;
 /// Format: the completion key the AFD readiness device is associated under. Its completions carry a
 /// poll block in the overlapped pointer (its head is the block), not a user word in the key.
 const AFD_KEY: usize = usize::MAX - 2;
+
+/// Format: the completion key the deadline timer's wait completion packet posts under ([`Deadline`]).
+const DEADLINE_KEY: usize = usize::MAX - 4;
 
 /// Shape: entries drained per wait (see the kqueue driver for the reasoning).
 const EVENTS_PER_WAIT: usize = 64;
@@ -82,6 +98,9 @@ pub struct IocpDriver {
   /// The pipe ends this driver serves (A-179): their completions come back under `PIPE_KEY`, and their readiness is a
   /// finished operation rather than an AFD poll.
   pipes: Pipes,
+  /// The timed wait's deadline (84a, the module doc); none where Windows lacks the calls, so waits take whole
+  /// milliseconds there.
+  deadline: Option<Deadline>,
 }
 
 impl std::fmt::Debug for IocpDriver {
@@ -124,6 +143,7 @@ impl IocpDriver {
       entries,
       afd: None,
       pipes: Pipes::default(),
+      deadline: Deadline::new(),
     })
   }
 
@@ -163,16 +183,25 @@ impl IocpDriver {
 }
 
 impl IocpDriver {
-  /// One `GetQueuedCompletionStatusEx` for at most `remaining_ns` (none: without bound), rounded up to whole
-  /// milliseconds: how many entries it filled, or `None` when it timed out.
+  /// One `GetQueuedCompletionStatusEx` for at most `remaining_ns` (none: without bound): through the deadline timer
+  /// where it is armed, so the port's own wait is untimed, else rounded up to whole milliseconds. How many entries it
+  /// filled (the deadline's packet among them, [`DEADLINE_KEY`]), or `None` when it timed out.
   fn dequeue(&mut self, remaining_ns: Option<u64>) -> Result<Option<usize>, RtError> {
     /// Format: nanoseconds per millisecond.
     const NANOS_PER_MILLI: u64 = 1_000_000;
     /// Format: INFINITE.
     const INFINITE: u32 = u32::MAX;
-    let timeout_ms = remaining_ns.map_or(INFINITE, |ns| {
-      u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
-    });
+    let whole_ms =
+      |ns: u64| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1);
+    let timeout_ms = match remaining_ns {
+      None => INFINITE,
+      Some(0) => 0,
+      Some(ns) => match self.deadline.as_ref().map(|d| d.arm(self.port, ns)) {
+        Some(Armed::Armed) => INFINITE,
+        Some(Armed::Fired) => 0,
+        Some(Armed::Busy) | None => whole_ms(ns),
+      },
+    };
     let mut count: u32 = 0;
     let capacity = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
     // SAFETY: the entry buffer holds `capacity` records and `count` is writable.
@@ -198,6 +227,160 @@ impl IocpDriver {
       };
     }
     Ok(Some(usize::try_from(count).unwrap_or(0)))
+  }
+}
+
+impl IocpDriver {
+  /// Whether the first `count` entries are the deadline's packet alone: a wait that timed out, not one with work.
+  fn deadline_alone(&self, count: usize) -> bool {
+    self
+      .entries
+      .iter()
+      .take(count)
+      .all(|entry| entry.lpCompletionKey == DEADLINE_KEY)
+  }
+}
+
+/// `NtCreateWaitCompletionPacket`: a wait completion packet, which posts to a port when its target is signaled.
+type CreatePacket = unsafe extern "system" fn(*mut HANDLE, u32, *const c_void) -> i32;
+/// `NtAssociateWaitCompletionPacket`: the packet bound to a port and a target, its key and status as the completion's.
+type AssociatePacket = unsafe extern "system" fn(
+  HANDLE,
+  HANDLE,
+  HANDLE,
+  *const c_void,
+  *const c_void,
+  i32,
+  usize,
+  *mut u8,
+) -> i32;
+/// `NtCancelWaitCompletionPacket`: the packet's binding cancelled, and with `TRUE` a packet already posted taken back.
+type CancelPacket = unsafe extern "system" fn(HANDLE, u8) -> i32;
+
+/// Format: `STATUS_SUCCESS`.
+const STATUS_SUCCESS: i32 = 0;
+/// Format: `STATUS_PENDING`: a cancel that can't take effect yet (the target was being signaled).
+const STATUS_PENDING: i32 = 0x0000_0103;
+/// Format: `STATUS_CANCELLED`: a cancel of a binding whose target had already fired (nothing left to cancel).
+const STATUS_CANCELLED: i32 = 0xC000_0120_u32.cast_signed();
+
+/// The timed wait's deadline (84a, the module doc): a high-resolution waitable timer and a wait completion packet bound
+/// to the port whenever a timed wait arms it, so the port's wait ends at the deadline's nanoseconds.
+struct Deadline {
+  timer: HANDLE,
+  packet: HANDLE,
+  associate: AssociatePacket,
+  cancel: CancelPacket,
+}
+
+/// What arming the deadline did.
+enum Armed {
+  /// The timer runs and its packet posts to the port when it fires: wait untimed.
+  Armed,
+  /// The timer had fired by the time its packet was bound, so no packet comes: harvest without waiting.
+  Fired,
+  /// The packet couldn't be re-armed this time (its last binding was firing as it was cancelled): wait in whole
+  /// milliseconds.
+  Busy,
+}
+
+impl Deadline {
+  /// The timer and its packet, or none where this Windows lacks either (the packet calls are Windows 8's).
+  fn new() -> Option<Deadline> {
+    let module_name: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    // SAFETY: `module_name` is NUL-terminated and outlives the calls; ntdll is mapped into every Windows process for its
+    // life; each name passed is NUL-terminated, and each function's signature is the one its type above states
+    // (Windows 8+, as Go's runtime declares them in os_windows.go).
+    let (create, associate, cancel) = unsafe {
+      let module = GetModuleHandleW(module_name.as_ptr());
+      if module.is_null() {
+        return None;
+      }
+      let find = |name: &core::ffi::CStr| GetProcAddress(module, name.as_ptr().cast());
+      (
+        std::mem::transmute::<FARPROC, Option<CreatePacket>>(find(c"NtCreateWaitCompletionPacket"))?,
+        std::mem::transmute::<FARPROC, Option<AssociatePacket>>(find(c"NtAssociateWaitCompletionPacket"))?,
+        std::mem::transmute::<FARPROC, Option<CancelPacket>>(find(c"NtCancelWaitCompletionPacket"))?,
+      )
+    };
+    // SAFETY: an unnamed timer with default security; the result is checked.
+    let timer = unsafe {
+      CreateWaitableTimerExW(
+        std::ptr::null(),
+        std::ptr::null(),
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+        TIMER_ALL_ACCESS,
+      )
+    };
+    if timer.is_null() {
+      return None;
+    }
+    let mut packet: HANDLE = std::ptr::null_mut();
+    // SAFETY: `packet` is this frame's own for the call to write; no object attributes.
+    if unsafe { create(&raw mut packet, GENERIC_ALL, std::ptr::null()) } != STATUS_SUCCESS
+      || packet.is_null()
+    {
+      // SAFETY: the timer was created above and is owned here alone.
+      unsafe { CloseHandle(timer) };
+      return None;
+    }
+    Some(Deadline {
+      timer,
+      packet,
+      associate,
+      cancel,
+    })
+  }
+
+  /// Arms the timer for `ns` from now, its packet bound to `port` under [`DEADLINE_KEY`]. A binding a past wait left
+  /// (one a completion ended before its timer fired) is cancelled first, a packet it posted taken back with it.
+  fn arm(&self, port: HANDLE, ns: u64) -> Armed {
+    /// Format: nanoseconds per 100 ns tick, a waitable timer's unit.
+    const NANOS_PER_TICK: u64 = 100;
+    // SAFETY: the packet is this deadline's own and open.
+    match unsafe { (self.cancel)(self.packet, 1) } {
+      STATUS_SUCCESS | STATUS_CANCELLED => {}
+      _ => return Armed::Busy,
+    }
+    // A relative due time is negative; rounded up, so the timer never fires before the deadline.
+    let due = i64::try_from(ns.div_ceil(NANOS_PER_TICK))
+      .map_or(i64::MIN, i64::wrapping_neg)
+      .min(-1);
+    // SAFETY: the timer is this deadline's own and open; `due` outlives the call; no completion routine.
+    if unsafe { SetWaitableTimer(self.timer, &raw const due, 0, None, std::ptr::null(), 0) } == 0 {
+      return Armed::Busy;
+    }
+    let mut fired: u8 = 0;
+    // SAFETY: the packet, the port and the timer are open; the key is a tag the wait reads back, never dereferenced;
+    // `fired` is this frame's own.
+    let bound = unsafe {
+      (self.associate)(
+        self.packet,
+        port,
+        self.timer,
+        std::ptr::without_provenance(DEADLINE_KEY),
+        std::ptr::null(),
+        STATUS_SUCCESS,
+        0,
+        &raw mut fired,
+      )
+    };
+    match (bound, fired) {
+      (STATUS_SUCCESS, 0) => Armed::Armed,
+      (STATUS_SUCCESS, _) => Armed::Fired,
+      _ => Armed::Busy,
+    }
+  }
+}
+
+impl Drop for Deadline {
+  fn drop(&mut self) {
+    // SAFETY: both handles are this deadline's own, closed once here, the packet's binding cancelled first.
+    unsafe {
+      let _ = (self.cancel)(self.packet, 1);
+      CloseHandle(self.packet);
+      CloseHandle(self.timer);
+    }
   }
 }
 
@@ -281,15 +464,17 @@ impl Driver for IocpDriver {
     let count = loop {
       let remaining = deadline.map(|due| due.saturating_sub(self.now_ns()));
       match self.dequeue(remaining)? {
-        Some(count) => break count,
-        None if deadline.is_some_and(|due| self.now_ns() < due) => {}
-        None => return Ok(()),
+        Some(count) if !self.deadline_alone(count) => break count,
+        // The deadline's packet alone (or a timeout): the wait is over once the deadline has passed. Before it (a
+        // timer that fired early, or a packet a past wait left behind), and on an untimed wait, it waits again.
+        _ if deadline.is_some_and(|due| self.now_ns() >= due) => return Ok(()),
+        _ => {}
       }
     };
     drop(raised);
     for entry in self.entries.iter().take(count) {
       match entry.lpCompletionKey {
-        KICK_KEY => {}
+        KICK_KEY | DEADLINE_KEY => {}
         NOP_KEY => out.push(Completion {
           user_data: u64::try_from(entry.lpOverlapped.addr()).unwrap_or(0),
           result: 0,
