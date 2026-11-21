@@ -96,7 +96,7 @@ fn landed_changesets_are_read_back_by_repository() {
     .iter()
     .find(|section| section.kind == SectionKind::Payload)
     .unwrap();
-  let mut read = vec![0u8; payload.len as usize];
+  let mut read = vec![0u8; usize::try_from(payload.len).unwrap()];
   store.log().read_at(&mut read, payload.offset).unwrap();
   assert_eq!(read, b"second");
 }
