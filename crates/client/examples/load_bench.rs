@@ -2557,13 +2557,76 @@ fn print_owner_counters(setup: &mut Client, label: &str) {
   }
 }
 
-fn main() {
-  let tree = arg("--tree").unwrap_or_default();
-  let levels: Vec<usize> = arg("--clients")
+/// The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
+/// client node's report does not show. `--report-instances` names them (the load_scale test passes its servers).
+fn report_server_counters() {
+  for instance in arg("--report-instances")
+    .unwrap_or_default()
+    .split(',')
+    .filter(|name| !name.is_empty())
+  {
+    match connect(instance).and_then(|mut client| client.daemon_status()) {
+      Ok(report) => {
+        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
+            let total = moved.entry(refusal.kind.as_str()).or_default();
+            *total = total.saturating_add(refusal.count);
+          }
+        }
+        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+          println!("server_counter\t{instance}\t{name}\t{count}");
+        }
+      }
+      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
+    }
+  }
+}
+
+/// `--clients n[,n…]`: the client counts to drive, ten by default.
+fn levels_arg() -> Vec<usize> {
+  arg("--clients")
     .unwrap_or_else(|| "10".to_owned())
     .split(',')
     .map(|n| n.parse().expect("--clients n[,n…]"))
-    .collect();
+    .collect()
+}
+
+/// The count `name` gives, or `default` without it.
+fn count_arg(name: &str, default: usize) -> usize {
+  arg(name).map_or(default, |n| n.parse().expect(name))
+}
+
+/// The daemon the bench drives: none when `external` (daemons running under their own anchors), else one started
+/// in-process under `instance` and bootstrapped.
+fn started_daemon(profile: &MachineProfile, instance: &str, external: bool) -> Option<Daemon> {
+  let cpus = profile.facts.cpus_at_once();
+  if external {
+    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
+    return None;
+  }
+  let config = DaemonConfig::derive(profile, instance, None);
+  println!(
+    "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
+    config.runtime.shards, config.clients_per_shard
+  );
+  let daemon = Daemon::start(
+    profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  Some(daemon)
+}
+
+fn main() {
+  let tree = arg("--tree").unwrap_or_default();
+  let levels = levels_arg();
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -2571,39 +2634,16 @@ fn main() {
   })
   .expect("the machine profile measures");
   let cpus = profile.facts.cpus_at_once();
-  let workers: usize =
-    arg("--workers").map_or((cpus / 4).max(1), |w| w.parse().expect("--workers n"));
-  let rounds: usize = arg("--rounds").map_or(ROUNDS, |r| r.parse().expect("--rounds n"));
-  let hot_files: usize =
-    arg("--hot-files").map_or(HOT_FILES, |h| h.parse().expect("--hot-files n"));
+  let workers = count_arg("--workers", (cpus / 4).max(1));
+  let rounds = count_arg("--rounds", ROUNDS);
+  let hot_files = count_arg("--hot-files", HOT_FILES);
   // `--instance <name>[,<name>…]` drives daemons already running under their own anchors (`slates --instance <name> anchor`), so a
   // chaos script can kill the daemon process mid-run and the anchor restart it; without it the daemon is in-process.
   let external = arg("--instance");
   let instance = external
     .clone()
     .unwrap_or_else(|| format!("load-bench-{}", std::process::id()));
-  let daemon = if external.is_some() {
-    println!("daemon\texternal\t{instance}\tcpus\t{cpus}");
-    None
-  } else {
-    let config = DaemonConfig::derive(&profile, &instance, None);
-    println!(
-      "daemon\tshards\t{}\tclients_per_shard\t{}\tcpus\t{cpus}",
-      config.runtime.shards, config.clients_per_shard
-    );
-    let daemon = Daemon::start(
-      &profile,
-      config,
-      SegmentSource::Create {
-        name: format!("slates-seg-{instance}"),
-      },
-    )
-    .unwrap();
-    daemon
-      .bootstrap(true)
-      .expect("the fixture explicitly creates its local consensus group");
-    Some(daemon)
-  };
+  let daemon = started_daemon(&profile, &instance, external.is_some());
   let mut setup = connect(first_instance(&instance)).unwrap();
   // `--green <32 hex>` drives a green that already exists, on this node or another node of its fleet (the client
   // node forwards every verb to the green's owner, A-201's filesystem server); without it the harness seeds its own
@@ -2645,29 +2685,7 @@ fn main() {
     let _ = setup.destroy(work);
   }
   report_losses(&mut setup);
-  // The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
-  // client node's report above does not show. `--report-instances` names them (the load_scale test passes its servers).
-  for instance in arg("--report-instances")
-    .unwrap_or_default()
-    .split(',')
-    .filter(|name| !name.is_empty())
-  {
-    match connect(instance).and_then(|mut client| client.daemon_status()) {
-      Ok(report) => {
-        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
-        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
-          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
-            let total = moved.entry(refusal.kind.as_str()).or_default();
-            *total = total.saturating_add(refusal.count);
-          }
-        }
-        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
-          println!("server_counter\t{instance}\t{name}\t{count}");
-        }
-      }
-      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
-    }
-  }
+  report_server_counters();
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();

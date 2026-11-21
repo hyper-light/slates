@@ -141,10 +141,7 @@ async fn answered(push: &mut crate::git_push::ReceivePack) -> bool {
       Some(Some(ok)) => return ok,
       Some(None) => {
         slates_rt::futures::yield_now().await;
-        if crate::git_push::tests::carry_awaited(push)
-          .await
-          .is_err()
-        {
+        if crate::git_push::tests::carry_awaited(push).await.is_err() {
           return false;
         }
       }
