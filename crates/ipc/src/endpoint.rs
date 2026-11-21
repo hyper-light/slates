@@ -91,6 +91,23 @@ pub enum Waited {
   Departed,
 }
 
+/// Format: the scale a spin's catch is recorded on (a catch is this, a miss zero), so the estimate's mean is the catch
+/// rate in parts per million (84a's C).
+const SPIN_CATCH_SCALE: u64 = 1_000_000;
+
+/// The adaptive spin's rule (84a's C), from the catch rate in parts per million and the reply time spins caught,
+/// the waits parked by choice since the last spin and the estimates' shift: twice that reply time while spins catch at
+/// least half their replies or a probe is due (after `2^shift` parked waits), else none.
+fn adaptive_spin((catch_ppm, spun_reply_ns): (u64, u64), parked_by_choice: u64, shift: u32) -> u64 {
+  let probe_due = parked_by_choice >= 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+  let catching = catch_ppm.saturating_mul(2) >= SPIN_CATCH_SCALE;
+  if catching || probe_due {
+    spun_reply_ns.saturating_mul(2)
+  } else {
+    0
+  }
+}
+
 /// The client's end.
 pub struct ClientEnd {
   region: ClientRegion,
@@ -123,6 +140,19 @@ pub struct ClientEnd {
   wake: WakeEstimate,
   /// Parks whose wake fed the estimate (a non-vacuity count).
   wake_samples: u64,
+  /// The reply time of the waits a spin caught (84a's C): the spin's budget, twice it (the 2-competitive factor),
+  /// seeded with the daemon's published window.
+  spun_reply: WakeEstimate,
+  /// How often a spin caught its reply, in parts per million (84a's C): a spin catches its reply while a core is free
+  /// for the shard it woke, and misses when its own spin holds the CPU that shard needs.
+  spin_catches: WakeEstimate,
+  /// Waits that parked at once because spins were missing, since the last spin: a spin probes again once as many have
+  /// passed as the estimates weight (`2^spin_shift`).
+  parked_by_choice: u64,
+  /// The estimates' weighting, the daemon's published shift (derived from its boot probe's spread).
+  spin_shift: u32,
+  /// The waits a spin caught and missed, and those that parked at once by choice (non-vacuity counts).
+  spin_counts: (u64, u64, u64),
   /// Parks a reply ended, by the reply stamp slot each named, whose stamp could not be judged when the client read it
   /// (a waker's confirmation not yet landed): settled at a later park's arming, and given up when the slot is armed
   /// again (`region::REPLY_STAMP_SLOTS`).
@@ -182,6 +212,11 @@ impl ClientEnd {
   pub fn new(region: ClientRegion) -> ClientEnd {
     let wake = WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift());
     ClientEnd {
+      spun_reply: WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift()),
+      spin_catches: WakeEstimate::new(SPIN_CATCH_SCALE, region.spin_shift()),
+      parked_by_choice: 0,
+      spin_shift: region.spin_shift(),
+      spin_counts: (0, 0, 0),
       wake,
       wake_samples: 0,
       unsettled: [None; REPLY_STAMP_SLOTS],
@@ -720,21 +755,68 @@ impl ClientEnd {
     waited
   }
 
+  /// The adaptive spin (84a's C): twice the reply time spins have caught while they catch at least half their replies,
+  /// none while they miss, and one probe spin after as many waits parked by choice as the estimates weight.
+  fn adaptive_spin_ns(&self) -> u64 {
+    adaptive_spin(
+      (self.spin_catches.mean_ns(), self.spun_reply.mean_ns()),
+      self.parked_by_choice,
+      self.spin_shift,
+    )
+  }
+
+  /// A spin ended: it caught its reply after `caught` nanoseconds, or missed (`None`).
+  fn judge_spin(&mut self, caught: Option<u64>) {
+    self.parked_by_choice = 0;
+    match caught {
+      Some(took) => {
+        self.spun_reply.record(took);
+        self.spin_catches.record(SPIN_CATCH_SCALE);
+        self.spin_counts.0 = self.spin_counts.0.saturating_add(1);
+      }
+      None => {
+        self.spin_catches.record(0);
+        self.spin_counts.1 = self.spin_counts.1.saturating_add(1);
+      }
+    }
+  }
+
+  /// The waits whose spin caught its reply, missed it, and that parked at once by choice (84a's C).
+  pub fn spin_counts(&self) -> (u64, u64, u64) {
+    self.spin_counts
+  }
+
   /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
   fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
     let started = Instant::now();
-    // A caller that names a spin gets it; by default the wait parks at once (A-799): a client spinning for its reply holds
-    // the CPU the shard it just woke needs whenever the cores are all busy, so the shard ran only when the spin ended
-    // (the loaded edit-and-merge p99 followed the spin: 1.7-5.1 ms on the wake estimate's spin, 0.32-0.39 ms parked).
-    let spin_ns = self.spin_override_ns.unwrap_or(0);
+    // A caller that names a spin gets it; otherwise the spin is the adaptive one (84a's C): spin while spins catch their
+    // replies, for twice the reply time they caught, and park at once while they miss, a spin's miss being the sign that
+    // no core is free for the shard it woke (A-799: a spin then held that shard's CPU, and the shard ran when it ended).
+    let adaptive = self.spin_override_ns.is_none();
+    let spin_ns = self
+      .spin_override_ns
+      .unwrap_or_else(|| self.adaptive_spin_ns());
+    let mut judged = !adaptive || spin_ns == 0;
+    if adaptive && spin_ns == 0 {
+      self.parked_by_choice = self.parked_by_choice.saturating_add(1);
+      self.spin_counts.2 = self.spin_counts.2.saturating_add(1);
+    }
     loop {
       if let Some(reply) = self.try_take()? {
+        if !judged {
+          let took = elapsed_ns(started);
+          self.judge_spin(Some(took).filter(|took| *took < spin_ns));
+        }
         return Ok(Waited::Reply(reply));
       }
       let elapsed = elapsed_ns(started);
       if elapsed < spin_ns {
         std::hint::spin_loop();
         continue;
+      }
+      if !judged {
+        judged = true;
+        self.judge_spin(None);
       }
       let look_timeout_ns = match self.before_park(ends, elapsed)? {
         Before::Park(timeout_ns) => timeout_ns,
@@ -1409,6 +1491,36 @@ impl DaemonEnd {
 
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod adaptive {
+  use super::{SPIN_CATCH_SCALE, adaptive_spin};
+
+  /// 84a's C (the client's adaptive spin). Do: ask the rule with spins catching every reply, half, a third and none,
+  /// and with spins missing but as many waits parked by choice as the estimates weight. Expect: twice the caught reply
+  /// time while at least half are caught, none below that, and one probe spin once `2^shift` waits have parked.
+  #[test]
+  fn a_client_spins_while_its_spins_catch_and_parks_while_they_miss() {
+    let reply_ns = 40_000;
+    let shift = 3;
+    assert_eq!(
+      adaptive_spin((SPIN_CATCH_SCALE, reply_ns), 0, shift),
+      2 * reply_ns
+    );
+    assert_eq!(
+      adaptive_spin((SPIN_CATCH_SCALE / 2, reply_ns), 0, shift),
+      2 * reply_ns
+    );
+    assert_eq!(adaptive_spin((SPIN_CATCH_SCALE / 3, reply_ns), 0, shift), 0);
+    assert_eq!(adaptive_spin((0, reply_ns), 0, shift), 0);
+    assert_eq!(adaptive_spin((0, reply_ns), (1 << shift) - 1, shift), 0);
+    assert_eq!(
+      adaptive_spin((0, reply_ns), 1 << shift, shift),
+      2 * reply_ns,
+      "the probe"
+    );
+  }
 }
 
 #[cfg(test)]
