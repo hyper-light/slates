@@ -10360,7 +10360,11 @@ const REANCHOR_VALUES_WALKED: &str = "merge.reanchor.values_walked";
 /// Secures `secured` bytes of `green_id`'s retention for the merge: folds what the retention budget allows first, leaving
 /// that room (never a live reader's version), then secures it, the first refusal reported. The bytes available where
 /// it cannot.
-fn secure_retention(state: &mut ShardState, green_id: DbVolumeId, secured: u64) -> Result<(), u64> {
+pub(crate) fn secure_retention(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  secured: u64,
+) -> Result<(), u64> {
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
   crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
@@ -19577,12 +19581,14 @@ fn replay_chain_entry(
             accepted: green.head(),
           });
         }
+        // The owed version's identity is its base's, as its owner's record carried it to holders.
+        let identity = green.head_identity();
         replayed.push(crate::merge_service::ReplayedVersion {
           version,
           increment: name,
           base,
           evidence: Vec::new(),
-          identity: [0; 32],
+          identity,
           completion: None,
         });
         *next = next.saturating_add(1);

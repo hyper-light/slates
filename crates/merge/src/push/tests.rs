@@ -1808,3 +1808,52 @@ fn a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized() {
   );
   assert_eq!(reads_of(&mut twin), reads_of(&mut eager));
 }
+
+/// P2's tail signatures (main's order of 05:51: a lost signature is a lost audit fact). Do: on a green that owes its
+/// first push, apply the second push's chain entry into the tail as a replay does, record that version's signature
+/// verdict as the replay records it, then materialize. Expect: the verdict is taken while owed (its version is one the
+/// green stands for) and answered for that version once made, as the eager green answers it.
+#[test]
+fn a_signature_recorded_on_a_version_in_the_owed_tail_is_kept() {
+  let mut store = Store::default();
+  let mut eager = Green::new();
+  let (head1, head2) = (head(1), head(2));
+  let tree1 = put(&mut store, &files_of(&[("a", file(b"one\n"))]));
+  let push1 = push(0, None, tree1, &head1);
+  let built1 = build(&push1, &eager, &store, u64::MAX).unwrap();
+  assert_eq!(
+    eager.submit(&built1.increment),
+    Outcome::Accepted { version: 1 }
+  );
+  let tree2 = put(&mut store, &files_of(&[("a", file(b"two\n"))]));
+  let built2 = build(
+    &push(1, Some(tree1), tree2, &head2),
+    &eager,
+    &store,
+    u64::MAX,
+  )
+  .unwrap();
+  let (outcome, applied) = eager.submit_resolved(&built2.increment);
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  let verdict = crate::chain_entry::Signature {
+    kind: 1,
+    detail: 0,
+    fingerprint: [7; 32],
+  };
+  assert!(eager.record_signature(2, verdict));
+  let mut twin = Green::new();
+  assert_eq!(twin.defer(DeferredPush::of(&push1, u64::MAX)), Some(1));
+  assert_eq!(twin.apply_recorded(&built2.increment, &applied.unwrap()), 2);
+  assert!(
+    twin.record_signature(2, verdict),
+    "the verdict of a version the owing green stands for is taken"
+  );
+  let made = build(&twin.deferred().unwrap().push(), &twin, &store, u64::MAX).unwrap();
+  assert_eq!(twin.materialize(&made.increment), Ok(2));
+  assert_eq!(
+    twin.signature(2),
+    eager.signature(2),
+    "kept through the materialization"
+  );
+  assert_eq!(twin.signature(2), Some(verdict));
+}

@@ -498,9 +498,19 @@
 > Owed:
 > - (a) `vcs_store::with_owed_push_objects` answers none for every tool until w-git registers git's view. Until then an
 >   owing green's readers get `ContentUnavailable`.
-> - (b) A deferred version's merge record is not sent to holders at f > 0.
-> - (c) A signature verdict on a version replayed into an owing green's tail is not kept.
-> - (d) A materialized green's retention is settled after its build, not secured before.
+> - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
+>   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
+>   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
+>   OPEN, A-813's limit: a version committed after an owed one, at f > 0, meets a holder replica that still owes. The
+>   replica cannot judge it, so the record is refused (`merge.replica.owes`, counted) and waits for placement until a
+>   holder's replica is made. Before A-813 the owed version itself never placed. The fix: a holder makes its replica
+>   through the same door over its tool's objects, which needs the repository's store on holders (w-git, w-store).
+>   Owed besides: the end-to-end f = 1 fleet kill test through a git push, once w-git's create defers.
+> - (c) FIXED by A-813. A signature verdict on a version in an owing green's tail is kept and recorded once the green is
+>   made (`a_signature_recorded_on_a_version_in_the_owed_tail_is_kept`).
+> - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
+>   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
+>   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.

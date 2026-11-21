@@ -1305,6 +1305,25 @@ fn after(state: &mut ShardState, steps: &[Step], committed: &Committed, held: &m
         (None, None),
       );
     }
+    // A deferred create's version 1 goes to holders as any version does (P2, R8): its push's record is its inputs, which
+    // a holder defers its replica by, so a takeover adopts a green that owes the same push.
+    if let Step::Create {
+      record,
+      deferred: Some(push),
+      ..
+    } = step
+    {
+      let owed = push.push();
+      crate::merge_service::enqueue_record(
+        state,
+        record.id,
+        push.version(),
+        owed.name,
+        owed.base_version,
+        Vec::new(),
+        (None, None),
+      );
+    }
   }
   settle_secured(state, held);
 }

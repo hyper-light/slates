@@ -971,6 +971,9 @@ pub struct Green {
   /// The versions recorded after the owed one, met while it is owed (a replay of a chain that went on once the green was
   /// materialized, then restarted): each applied, in order, once [`Green::materialize`] has committed the owed one.
   owed_tail: Vec<(Increment, Vec<crate::chain_entry::Applied>)>,
+  /// The signature verdicts recorded for versions this green stands for while it owes a push (the owed one and its
+  /// tail's, a replay's provenance, A-321): recorded once [`Green::materialize`] has applied them.
+  owed_signatures: BTreeMap<u64, crate::chain_entry::Signature>,
   /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
   /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
   identity: crate::identity::SetHash,
@@ -5495,6 +5498,18 @@ impl Green {
     Some(version)
   }
 
+  /// The version this green has reached: its head, or while it owes a push the owed version and every version recorded
+  /// after it ([`Green::defer`], the owed tail). What a holder's replica and a takeover count it at (P2): the version a
+  /// green that owes stands for, not its base.
+  pub fn reached(&self) -> u64 {
+    match &self.owed {
+      Some(owed) => owed
+        .version()
+        .saturating_add(u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX)),
+      None => self.head(),
+    }
+  }
+
   /// Whether this green holds its content: false while it owes a push ([`Green::defer`]).
   pub fn is_materialized(&self) -> bool {
     self.owed.is_none()
@@ -5535,6 +5550,10 @@ impl Green {
     let mut head = committed;
     for (inc, applied) in std::mem::take(&mut self.owed_tail) {
       head = self.apply_recorded(&inc, &applied);
+    }
+    // The verdicts recorded while it owed, on the versions now applied.
+    for (version, signature) in std::mem::take(&mut self.owed_signatures) {
+      self.record_signature(version, signature);
     }
     Ok(head)
   }
@@ -6090,6 +6109,11 @@ impl Green {
     version: u64,
     signature: crate::chain_entry::Signature,
   ) -> bool {
+    // A version a green that owes a push stands for (P2): kept until it is made, never lost (an audit fact).
+    if self.owed.is_some() && version > self.head() && version <= self.reached() {
+      self.owed_signatures.insert(version, signature);
+      return true;
+    }
     if version == 0 || version > self.head() {
       return false;
     }

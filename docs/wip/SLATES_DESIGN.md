@@ -59311,3 +59311,34 @@ Applied in the same change to:
   - the signature verdict of a version replayed into an owing green's tail;
   - the materialized content's retention charge before the build (it is settled after).
 
+### A-813 — An owed version goes to holders, its materialization is secured before it commits, and its tail keeps its signatures (2026-11-21, w-rewrite-ops; main 05:51 PST: A-812's robustness gaps; R8, A-321, A-16)
+Applied in the same change to:
+- `crates/merge/src/engine.rs`: `Green::reached`, and the owed signatures.
+- `crates/server/src/merge_service.rs`: `apply_inputs`, `REPLICA_OWES`, an owed version's inputs and identity.
+- `crates/server/src/merge_origin.rs` and `crates/server/src/green_adopt.rs`: replica versions by `reached`.
+- `crates/server/src/repository/push.rs`: an owed version's record enqueued.
+- `crates/server/src/green_ready.rs`: retention secured before the commit.
+- `crates/server/src/verbs.rs`: a replayed owed version's identity is its base's.
+- GAPS (A-812).
+
+What changed:
+- **Holders at f > 0 (R8: one code path).** An owed version's merge record is enqueued as any version's.
+  - Its inputs are the push's record, and its identity is the owing green's, its base's.
+  - A holder applies inputs through one function, `apply_inputs`, used by both the record's recomputation and the ledger
+    rebuild. A push's record makes the replica owe the same push.
+  - Replica versions are counted by `Green::reached`: the owed version and its tail, or the head when nothing is owed.
+    So a takeover adopts at the version the replica stands for, and the successor's door makes the green.
+  - An increment after an owed version meets a replica that still owes and is refused `merge.replica.owes` (GAPS A-812
+    (b), open).
+- **Retention.** Once the build is done and before `materialize` commits, the work's history and change index are
+  secured through the submit's own `secure_retention`. Past the room, the parked requests are answered
+  `BudgetExceeded`, typed with the bytes available; the green keeps owing (`merge.green.materialize_over_room`).
+- **Tail signatures (A-321).** A verdict recorded for a version an owing green stands for (up to `reached`) is kept, and
+  recorded once materialization applies the version.
+- **Evidence.**
+  - `a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`: the shipped inputs are the push's
+    record; the replica owes version 1 at the record's identity; a later increment is refused while it owes; made, the
+    adopted replica reads as the eager green.
+  - `a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`.
+  - `a_signature_recorded_on_a_version_in_the_owed_tail_is_kept` (red: the verdict was refused while owing).
+

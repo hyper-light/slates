@@ -22,8 +22,9 @@
 //! **Bounds.** The parked requests of the shard are bounded by its client seats, as a whole build's are; a request past
 //! that is refused `Overloaded`. A materialization's turn runs under half the shard's step quantum.
 //!
-//! **Owed** (GAPS, P2): dropping a materialized green nobody has touched back to owing (main's memory-sizing rule); a
-//! deferred version's merge record to holders at `f > 0`.
+//! **Retention.** A build's work is secured against the green's retention room before it commits, as a submit's
+//! admission secures one: past it the green keeps owing, counted [`MATERIALIZE_OVER_ROOM`], its requests answered
+//! `BudgetExceeded`. Settled after.
 
 use std::collections::BTreeMap;
 
@@ -38,6 +39,10 @@ use crate::verbs::ParkedSubmit;
 pub(crate) const MATERIALIZED: &str = "merge.green.materialized";
 /// Counter: a materialization whose build or commit was refused, the green left owing. Format: a counter name.
 pub(crate) const MATERIALIZE_REFUSED: &str = "merge.green.materialize_refused";
+/// Counter: a materialization refused at the green's retention room before it committed (its history and change index
+/// secured as a submit's admission secures them), the green left owing and its requests answered `BudgetExceeded`.
+/// Format: a counter name.
+pub(crate) const MATERIALIZE_OVER_ROOM: &str = "merge.green.materialize_over_room";
 /// Counter: a request parked on a green's materialization. Format: a counter name.
 pub(crate) const PARKED: &str = "merge.green.materialize_parked";
 /// Counter: a request refused `Overloaded` at the parked bound, or with no route to park on. Format: a counter name.
@@ -207,7 +212,7 @@ fn start(state: &mut ShardState, green: DbVolumeId) {
     .is_ok();
   if !started {
     state.materializations.building.remove(&green);
-    refuse_parked(state, green);
+    refuse_parked(state, green, Refusal::ContentUnavailable);
   }
 }
 
@@ -260,6 +265,19 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
       false
     }
     Some(Ok(built)) => {
+      // Secured before it commits, as a submit's admission secures a work's history and change index
+      // (`verbs::judge_submission`): a materialization past the green's room is refused, typed, never committed over it.
+      let reserved = state.greens.lend(&green).map_or(0, |engine| {
+        engine
+          .history_reservation(&built.increment)
+          .saturating_add(engine.changes_reservation(&built.increment))
+      });
+      let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
+      if let Err(available) = crate::verbs::secure_retention(state, green, secured) {
+        state.count(MATERIALIZE_OVER_ROOM, 1);
+        refuse_parked(state, green, Refusal::BudgetExceeded { available });
+        return true;
+      }
       let made = state
         .greens
         .lend_mut(&green)
@@ -280,7 +298,7 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
           "slates-server: partition {}: a green's owed push did not commit: {made:?}",
           state.partition
         );
-        refuse_parked(state, green);
+        refuse_parked(state, green, Refusal::ContentUnavailable);
       }
       true
     }
@@ -289,15 +307,15 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
         "slates-server: partition {}: a green's owed push was refused building: {refused:?}",
         state.partition
       );
-      refuse_parked(state, green);
+      refuse_parked(state, green, Refusal::ContentUnavailable);
       true
     }
   }
 }
 
-/// Answers every request parked on `green` `ContentUnavailable`, unrecorded, its materialization refused: the green
-/// still owes, and a retry starts it again.
-fn refuse_parked(state: &mut ShardState, green: DbVolumeId) {
+/// Answers every request parked on `green` `refusal`, unrecorded, its materialization refused: the green still owes,
+/// and a retry starts it again.
+fn refuse_parked(state: &mut ShardState, green: DbVolumeId, refusal: Refusal) {
   state.count(MATERIALIZE_REFUSED, 1);
   let parked = state
     .materializations
@@ -305,7 +323,7 @@ fn refuse_parked(state: &mut ShardState, green: DbVolumeId) {
     .remove(&green)
     .unwrap_or_default();
   for submit in parked {
-    crate::verbs::answer_refused(state, submit, Refusal::ContentUnavailable);
+    crate::verbs::answer_refused(state, submit, refusal.clone());
   }
 }
 
