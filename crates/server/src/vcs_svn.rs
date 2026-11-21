@@ -197,13 +197,6 @@ const HOOK_DIRECTORY: &str = "/";
 /// hook driver on Windows yet), or whose repository left the shard, as the `svn+ssh://` tunnel refuses it.
 const HOOK_NOT_RUN_WORDS: &str = "This server does not run this repository's hooks yet";
 
-/// Format: why a configured hook is refused before this daemon has published its root mount (A-645 P3, main's ruling
-/// 1): a hook is shown its repository beneath the root mount, and there is none yet to show it under. Answered with
-/// [`UNSUPPORTED_FEATURE`], as the other hooks this server cannot run are.
-#[cfg(unix)]
-pub(crate) const ROOT_UNPUBLISHED_WORDS: &str =
-  "This server cannot run this repository's hooks: its root mount is not yet published";
-
 /// Counter: a CRAM-MD5 response naming no key a token's record holds: answered as `svnserve` answers a user it has
 /// no password for.
 const UNKEYED: &str = "vcs_svn.unkeyed";
@@ -1519,46 +1512,50 @@ pub(crate) struct HookAnswer {
   pub(crate) token: Option<vcs_hooks::SvnLockToken>,
 }
 
-/// What a conversation's hooks need of its repository: its id and its name. REPOS, the directory a hook is given, is the
-/// repository's name beneath the root mount this daemon published (A-645 P3, `ShardState::root_mount`), decided when the
-/// hook runs; before the daemon has published one, a configured hook is refused ([`ROOT_UNPUBLISHED_WORDS`]).
+/// What a conversation's hooks need of its repository: its id and its name, and where this shard shows a hook its
+/// repository (`ShardState::hook_views`, A-645 (a)), read when the route that runs the hook began. REPOS is decided when
+/// the hook runs ([`crate::vcs_store::svn_presenter::repos_for_hook`]); where no view can be shown, a configured hook is
+/// refused, typed.
 pub(crate) struct Hooked {
   /// The repository's id, which its hooks' learned times are kept under (unix alone, where hooks run).
   #[cfg(unix)]
   id: RepositoryId,
-  /// Its name, which its record is found by on its owner shard, and its REPOS beneath the root mount.
+  /// Its name, which its record is found by on its owner shard, and its view is named for.
   name: String,
-  /// The root mount this daemon published, as the route that runs the hook read it (`ShardState::root_mount`, or the
-  /// tunnel's stores): none before one is published (unix alone, where hooks run).
+  /// Where its hooks are shown it (unix alone, where hooks run).
   #[cfg(unix)]
-  root: Option<std::path::PathBuf>,
+  views: crate::vcs_store::svn_presenter::HookViews,
 }
 
 impl Hooked {
-  /// What the hooks of the repository `id`, named `name`, need of it, the daemon's root mount being `root`.
-  pub(crate) fn new(id: RepositoryId, name: &str, root: Option<std::path::PathBuf>) -> Self {
+  /// What the hooks of the repository `id`, named `name`, need of it, shown it as `views` says.
+  pub(crate) fn new(
+    id: RepositoryId,
+    name: &str,
+    views: crate::vcs_store::svn_presenter::HookViews,
+  ) -> Self {
     #[cfg(not(unix))]
-    let _ = (id, root);
+    let _ = (id, views);
     Self {
       #[cfg(unix)]
       id,
       name: name.to_owned(),
       #[cfg(unix)]
-      root,
+      views,
     }
   }
 
-  /// The root mount this shard's daemon published (`ShardState::root_mount`), what the routes that run on a shard's
-  /// state hand [`Hooked::new`]; none outside a shard or before one is published.
-  pub(crate) fn published_root() -> Option<std::path::PathBuf> {
-    crate::state::with_state(|state| state.root_mount.clone()).flatten()
+  /// Where this shard shows a hook its repository (`ShardState::hook_views`), what the routes that run on a shard's
+  /// state hand [`Hooked::new`]; none outside a shard.
+  pub(crate) fn shard_views() -> crate::vcs_store::svn_presenter::HookViews {
+    crate::state::with_state(|state| state.hook_views.clone()).unwrap_or_default()
   }
 }
 
 impl Opened {
   /// What this repository's hooks need of it.
   fn hooked(&self) -> Hooked {
-    Hooked::new(self.id, &self.name, Hooked::published_root())
+    Hooked::new(self.id, &self.name, Hooked::shard_views())
   }
 }
 
@@ -1642,20 +1639,27 @@ async fn run_svn_hook(
     configured(policy, point).and_then(|hook| state.hook_times.bound_ns(repository.id, hook))
   })
   .flatten();
-  let root = repository.root.as_ref();
-  // A hook is shown its repository beneath the root mount this daemon published (A-645 P3, main's ruling 1); before
-  // there is one, a configured hook is refused, typed, and never started. A point with no hook answers as before.
-  let repos = match root {
-    Some(root) => root.join(&repository.name).to_string_lossy().into_owned(),
-    None if configured(policy, point).is_some() => {
-      let words = ROOT_UNPUBLISHED_WORDS.to_owned();
-      return HookAnswer {
-        verdict: Some(Err(vec![(UNSUPPORTED_FEATURE, words.clone())])),
-        post_commit_error: (point == HookPoint::SvnPostCommit).then_some(words),
-        token: None,
-      };
+  // A hook is shown its repository as the view slates presents and mounts under its store's grant (A-645 (a)); where
+  // none can be shown, a configured hook is refused, typed, and never started. A point with no hook answers as before.
+  let repos = if configured(policy, point).is_some() {
+    match crate::vcs_store::svn_presenter::repos_for_hook(
+      &repository.views,
+      repository.id,
+      &repository.name,
+    )
+    .await
+    {
+      Ok(repos) => repos,
+      Err(words) => {
+        return HookAnswer {
+          verdict: Some(Err(vec![(UNSUPPORTED_FEATURE, words.clone())])),
+          post_commit_error: (point == HookPoint::SvnPostCommit).then_some(words),
+          token: None,
+        };
+      }
     }
-    None => String::new(),
+  } else {
+    String::new()
   };
   let env = vcs_hooks::SvnHooksEnv::of(policy);
   let input = input(&env, &repos);

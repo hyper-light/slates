@@ -2407,3 +2407,113 @@ fn a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it() {
     "MKACTIVITY {made:?}\nCHECKOUT {baseline:?}\nPROPPATCH {logged:?}\nCHECKOUT {root:?}\nPUT {put:?}\nMERGE {merged:?}"
   );
 }
+
+/// Stock `svn` run with `arguments` in `directory`, as alice with the owner's token over Basic, its configuration in
+/// `config`: whether it succeeded, and what it printed.
+#[cfg(unix)]
+fn stock_svn(
+  config: &std::path::Path,
+  directory: &std::path::Path,
+  arguments: &[&str],
+) -> (bool, String) {
+  let config_dir = config.to_string_lossy().into_owned();
+  let output = std::process::Command::new("svn")
+    .current_dir(directory)
+    .args([
+      "--non-interactive",
+      "--no-auth-cache",
+      "--config-dir",
+      &config_dir,
+      "--config-option",
+      "servers:global:http-timeout=60",
+      "--username",
+      "alice",
+      "--password",
+      OWNER_TOKEN,
+    ])
+    .args(arguments)
+    .stdin(std::process::Stdio::null())
+    .output()
+    .expect("stock svn runs");
+  (
+    output.status.success(),
+    format!(
+      "{}{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    ),
+  )
+}
+
+/// A-766 part 4 (DeltaV v1 by use): stock svn 1.7 and later speak v1 to a server whose OPTIONS has no HTTPv2 headers
+/// (ra_serf `options.c`: HTTPv2 only where `SVN-Me-Resource` is sent), as to `mod_dav_svn` with
+/// `SVNAdvertiseV2Protocol Off`. Do: start a daemon whose edge serves loopback cleartext; create a Subversion
+/// repository named with [`crate::vcs_http::svn::V1_ONLY_PREFIX`], whose OPTIONS withholds those headers in tests; run stock svn's
+/// `mkdir` of `/trunk`, `checkout` of it, `add` and `commit` of a file, and `log`. Expect: each succeeds, the log lists
+/// both commits' messages, and the edge made at least two DeltaV v1 activities (MKACTIVITY): the commits went over v1,
+/// not HTTPv2. Skips loudly without stock svn.
+#[cfg(unix)]
+#[test]
+fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
+  let present = std::process::Command::new("svn")
+    .args(["--version", "--quiet"])
+    .output()
+    .is_ok_and(|output| output.status.success());
+  if !present {
+    eprintln!(
+      "SKIPPED stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge: no `svn` on this host"
+    );
+    return;
+  }
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = (0u32..)
+    .map(|serial| format!("{}{serial}", crate::vcs_http::svn::V1_ONLY_PREFIX))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there");
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let scratch = crate::git_hooks::tests::ScratchDir::new();
+  let config = scratch.path.join("config");
+  let url = format!("http://127.0.0.1:{port}/{name}");
+  let at = scratch.path.clone();
+  let mkdir = stock_svn(
+    &config,
+    &at,
+    &["mkdir", "-m", "the trunk over v1", &format!("{url}/trunk")],
+  );
+  let checkout = stock_svn(&config, &at, &["checkout", &format!("{url}/trunk"), "wc"]);
+  let wc = scratch.path.join("wc");
+  #[allow(clippy::disallowed_methods)]
+  // test code: a file in its own working copy, in its scratch directory
+  let written = std::fs::write(wc.join("a.txt"), b"hello over v1\n").is_ok();
+  let add = stock_svn(&config, &wc, &["add", "a.txt"]);
+  let commit = stock_svn(&config, &wc, &["commit", "-m", "a file over v1"]);
+  let log = stock_svn(&config, &at, &["log", &url]);
+  let activities = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .refusals
+      .get(crate::vcs_http::svn::V1_ACTIVITIES)
+      .copied()
+      .unwrap_or(0)
+  });
+  daemon.stop();
+  for (step, (ran, output)) in [
+    ("mkdir", &mkdir),
+    ("checkout", &checkout),
+    ("add", &add),
+    ("commit", &commit),
+    ("log", &log),
+  ] {
+    eprintln!("svn {step} (success {ran}):\n{output}");
+  }
+  assert_eq!(
+    (
+      (mkdir.0, checkout.0, written, add.0, commit.0, log.0),
+      log.1.contains("the trunk over v1") && log.1.contains("a file over v1"),
+      activities >= 2,
+    ),
+    ((true, true, true, true, true, true), true, true),
+    "the edge made {activities} v1 activities"
+  );
+}

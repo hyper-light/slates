@@ -145,6 +145,9 @@ pub(crate) struct Started {
   pub(crate) daemon: Daemon,
   /// Its watch on its anchor.
   parent: ParentWatch,
+  /// The version-control store's owner, when the operator gave a store directory (A-767): stopped after the daemon,
+  /// so its last landings are in and its checkpoint is written.
+  store: Option<slates_store::owner::StoreOwner>,
 }
 
 /// Starts the daemon over the anchor's segment from the environment (or its own, run alone) and marks it serving.
@@ -229,6 +232,15 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   // The svn:// listener, when the operator asked for one (`--vcs-svn`; §4.17.4 piece 7, A-656 part 2): cleartext as
   // ra_svn is, on a loopback address alone for a daemon that is no fleet node, which the flag's reading held it to.
   config.vcs_svn = options.vcs_svn;
+  // The version-control store (A-767), when the operator named its directory: the naming is the grant.
+  let store = options
+    .vcs_store
+    .as_deref()
+    .map(|dir| start_store(std::path::Path::new(dir), &config))
+    .transpose()?;
+  config.vcs_view_root = store.as_ref().map(|(_, views)| *views);
+  let store = store.map(|(owner, _)| owner);
+  config.vcs_disk = store.as_ref().map(slates_store::owner::StoreOwner::handle);
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
   }
@@ -284,13 +296,83 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
       " alone"
     }
   );
-  Ok(Started { daemon, parent })
+  Ok(Started {
+    daemon,
+    parent,
+    store,
+  })
+}
+
+/// Opens the node's version-control store in `dir` under the standing grant the operator gave by naming it (`--vcs-store
+/// DIR`; A-767 item 7, R10's CLI surface), sized from this daemon's own derivations, and starts its owner thread.
+fn start_store(
+  dir: &std::path::Path,
+  config: &DaemonConfig,
+) -> Result<
+  (
+    slates_store::owner::StoreOwner,
+    &'static slates_land::store_root::StoreRoot,
+  ),
+  Failure,
+> {
+  use slates_land::store_root::{StoreGrant, StoreRoot};
+  let target = StoreRoot::identify(dir).map_err(|e| failed("vcs store directory", e))?;
+  let grant = StoreGrant {
+    repository: 0,
+    target,
+    issued_ns: slates_vfs::clock::Clock::monotonic_ns(&mut slates_vfs::clock::HostClock::new()),
+  };
+  slates_machine::log_line!(
+    "slates daemon: the version-control store at {} granted by the operator's --vcs-store (device {}, inode {})",
+    dir.display(),
+    grant.target.device,
+    grant.target.inode
+  );
+  let root = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  // The same grant opened once more for the views slates presents in the directory (A-645 (a): a Subversion
+  // repository's FSFS view, mounted read-only there for its hooks), held for the process's life: one handle per daemon
+  // start, which a restart opens again.
+  let views = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  let views: &'static StoreRoot = Box::leak(Box::new(views));
+  let disk = root
+    .free_bytes()
+    .map_err(|e| failed("vcs store free space", e))?;
+  let sizing = store_sizing(config, disk);
+  // A request a client seat may have waiting at once: every shard's seats.
+  let waiting = config
+    .clients_per_shard
+    .saturating_mul(usize::from(config.runtime.shards).max(1));
+  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+    .map_err(|e| failed("vcs store", e))?;
+  Ok((owner, views))
+}
+
+/// The store's sizing from this daemon's derivations (A-767; Ada's memory-sizing ruling: from the work, never the
+/// machine): its engine's memory the shard's reserve, its disk what the store's file system has free, its extent the
+/// content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its fanout SplinterDB's.
+fn store_sizing(config: &DaemonConfig, disk: u64) -> slates_store::store::Sizing {
+  let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
+    8,
+    "SplinterDB's target fanout, as mantle runs its engine until its E-step measures F on this hardware",
+    ["engine-structure.md §4"]
+  );
+  slates_store::store::Sizing {
+    memory: usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX),
+    disk,
+    extent_bytes: u64::try_from(slates_vfs::content::chunk_bytes(config.page).get())
+      .unwrap_or(u64::MAX),
+    fanout: fanout.get(),
+  }
 }
 
 /// Serves a [`start`]ed daemon until a stop is requested, the anchor is gone or the control shard's watch ends, then
 /// stops it.
 pub(crate) fn serve(started: Started) -> Result<(), Failure> {
-  let Started { daemon, parent } = started;
+  let Started {
+    daemon,
+    parent,
+    store,
+  } = started;
   // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
   // stop request and these two at its own cadence and wakes this thread once one holds.
   let watch = parent;
@@ -311,6 +393,9 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
     slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
+  if let Some(owner) = store {
+    owner.stop().map_err(|e| failed("vcs store stop", e))?;
+  }
   Ok(())
 }
 

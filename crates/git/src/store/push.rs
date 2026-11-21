@@ -545,7 +545,7 @@ impl Push {
   }
 
   /// The pack as the staging put it in the content store, held by the push: its identity and length.
-  pub(crate) fn stored_pack(&self) -> Option<(ContentId, u64)> {
+  pub fn stored_pack(&self) -> Option<(ContentId, u64)> {
     self.stored_pack
   }
 

@@ -979,15 +979,30 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   // has waited for it longest. Not while an allocation runs, whose slices go first.
   let kept = next_kept(mount, kind);
   let kept_until = kept.as_ref().map(|kept| kept.until_ns);
-  let (dispatched, met) = {
+  // A view volume's texts are read through the content store, its chunks lent for the turn (A-645 (a)).
+  let view = crate::vcs_store::svn_presenter::view_of(&s.svn_views, mount.volume);
+  let view_green =
+    view.and_then(|repository| crate::repository::svn_commit::green_of(s, repository).ok());
+  let lent_turn = crate::vcs_store::svn_presenter::lent_if(s, view.is_some(), |s| {
+    // A mounted work whose base moved shows its new base (A-774 R4).
+    crate::mounted_work::refresh(s, mount.volume);
     let ShardState {
       store,
       volumes,
       attachments,
       greens,
       merge,
+      vcs_stores,
       ..
     } = &mut *s;
+    let view_source =
+      crate::vcs_store::svn_presenter::view_source(vcs_stores, greens, view, view_green);
+    let view_texts = view_source
+      .as_ref()
+      .map(crate::vcs_store::svn_presenter::ViewSource::texts);
+    let view_seam = view_texts
+      .as_ref()
+      .map(crate::vcs_store::svn_presenter::ViewTexts);
     // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
     let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
     let green_tree = lent_green
@@ -995,7 +1010,7 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
       .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
     let mut tree_lens = None;
     let Ok(slot) = volumes.get_mut(handle) else {
-      return Turned::Ended;
+      return None;
     };
     // The slot's base host is lent through a lens that notes the fetch a request met pending (A-555): such a request is
     // kept, not answered, until that fetch lands ([`keep`]).
@@ -1015,6 +1030,9 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
         lens.as_mut().map(|lens| lens as &mut dyn HostFs),
       )
       .with_lost_writes(&mut mount.lost);
+      if let Some(seam) = view_seam.as_ref() {
+        bridge = bridge.reading_referenced(seam);
+      }
       let mut scoped = None;
       let served = crate::verbs::scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
       match (kind, kept) {
@@ -1053,10 +1071,13 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
         }
       }
     };
-    (
+    Some((
       dispatched,
       lens.as_ref().and_then(crate::base_wait::Lens::met),
-    )
+    ))
+  });
+  let Some((dispatched, met)) = lent_turn else {
+    return Turned::Ended;
   };
   hand_over_session(s, attachment, mount);
   // Whether this turn delivered the owed round: a change turn always does; a request turn only when it dispatched a

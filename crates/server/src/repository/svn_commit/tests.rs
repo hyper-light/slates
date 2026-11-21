@@ -1114,3 +1114,46 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
     assert_eq!((engine.held_count(), held), (3, vec![true, true, true]));
   });
 }
+
+/// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step, so one
+/// large revision held its shard). Do: commit a revision adding `/trunk` and twelve files of 50 KiB distinct texts,
+/// then rebuild the repository from its log, its turns driven to the end. Expect: the same records and green; and the
+/// revision's replay taken over at least a turn a file (`vcs_store.svn_replay_turns`): each turn keeps its rows' texts
+/// until the shard's quantum runs, and a file's delta outlasts it. Before, the record was replayed whole in one turn.
+#[test]
+fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
+  crate::daemon::audit_on_shard(|state| {
+    let (svn, green) = subversion(state, "svn");
+    let texts: Vec<Vec<u8>> = (0..12u32)
+      .map(|at| {
+        (0..50 * 1024u32)
+          .map(|byte| ((byte * 31 + at * 7) % 251) as u8)
+          .collect()
+      })
+      .collect();
+    let mut rows = vec![row("/trunk", Action::Add, NodeKind::Directory)];
+    for (at, bytes) in texts.iter().enumerate() {
+      rows.push(file(&format!("/trunk/f{at:02}.bin"), Action::Add, bytes));
+    }
+    let contents: Vec<&[u8]> = texts.iter().map(Vec::as_slice).collect();
+    assert_eq!(
+      commit(state, (&owner(), svn), revision(0, rows, &contents), None),
+      answered(1)
+    );
+    let live = whole(state, (svn, green));
+    let turns = |state: &ShardState| {
+      state
+        .refusals
+        .get(crate::vcs_store::SVN_REPLAY_TURNS)
+        .copied()
+        .unwrap_or(0)
+    };
+    let before = turns(state);
+    crate::vcs_store::rebuild(state, svn);
+    crate::vcs_store::settle_rebuild(state, svn);
+    assert_eq!(state.vcs_stores.unrecovered(svn), None);
+    assert_eq!(whole(state, (svn, green)), live);
+    let taken = turns(state) - before;
+    assert!(taken >= 12, "the revision replayed in {taken} turns");
+  });
+}

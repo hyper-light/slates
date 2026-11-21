@@ -538,6 +538,52 @@ impl Drop for Hook {
   }
 }
 
+/// Runs `program` with `args` as a helper of this shard (A-645 (a): the daemon's own `slates mount` of a view), its
+/// standard streams the null device, in a process group of its own, and awaits its exit through the shard's driver
+/// (`ExitWatch`) for at most `bound_ns`: whether it exited successfully. A helper still running at the bound is killed
+/// with its group and reaped. Refused in words where it could not be started or waited for.
+pub(crate) async fn run_helper(
+  program: &Path,
+  args: &[&str],
+  bound_ns: u64,
+) -> Result<bool, String> {
+  let mut child = Command::new(program)
+    .args(args)
+    .process_group(0)
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|error| format!("could not be started: {error}"))?;
+  let exit = ExitWatch::on(child.id()).ok();
+  let waited = futures::within(bound_ns, async {
+    loop {
+      match child.try_wait() {
+        Ok(Some(status)) => return Some(status.success()),
+        Ok(None) => {}
+        Err(_) => return None,
+      }
+      let ready = exit
+        .as_ref()
+        .and_then(|exit| exit.readiness().map(|fd| fd.as_raw_fd()));
+      match ready {
+        Some(fd) if slates_rt::readiness::readable(fd).await.is_ok() => {}
+        _ => return child.wait().ok().map(|status| status.success()),
+      }
+    }
+  })
+  .await;
+  match waited {
+    Ok(Some(Some(success))) => Ok(success),
+    Ok(Some(None)) => Err("could not be waited for".to_owned()),
+    Ok(None) | Err(_) => {
+      kill_group_of(&child);
+      let _ = child.wait();
+      Err("ran past its bound and was killed".to_owned())
+    }
+  }
+}
+
 /// Counts `counter` on this shard, when there is one.
 fn count(counter: &'static str) {
   let _ = crate::state::with_state_counted(|state| state.count(counter, 1));

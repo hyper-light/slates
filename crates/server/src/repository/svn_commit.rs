@@ -141,6 +141,9 @@ pub(crate) enum Uncommitted {
   /// The commit's texts were not answered durable in the shard's image (A-727 slice b's barrier): nothing applied,
   /// the texts given back.
   NotDurable(crate::vcs_store::BarrierRefused),
+  /// The node's version-control store refused the revision's changeset (A-767 C6): the revision stands in the
+  /// repository's register, and the store holds none for it.
+  Unstored,
 }
 
 /// Format: `SVN_ERR_FS_GENERAL`, the filesystem category's start (160,000): the error a refusal of the step's own that
@@ -196,6 +199,10 @@ impl Uncommitted {
       Uncommitted::NotDurable(refused) => (
         SVN_ERR_FS_GENERAL,
         format!("The commit's texts were not made durable: {refused:?}"),
+      ),
+      Uncommitted::Unstored => (
+        SVN_ERR_FS_GENERAL,
+        "The repository's store did not take the commit".to_owned(),
       ),
     };
     Answered::Refused { code, message }
@@ -259,7 +266,7 @@ pub(crate) async fn land_work(
       return Some(Err(Uncommitted::NotDurable(refused)));
     }
   }
-  crate::state::with_state(|state| {
+  let landed = crate::state::with_state(|state| {
     let twice = held_twice(state, repository, &storing);
     let now = AprTime::from_wall_ns(slates_vfs::clock::Clock::wall_ns(&mut state.clock));
     let landed = commit_work(state, (principal, repository), work, now);
@@ -267,8 +274,85 @@ pub(crate) async fn land_work(
       Ok(_) => release_texts(state, None, &twice),
       Err(_) => release_stored(state, storing),
     }
-    landed
-  })
+    // The revision's record as the register holds it, read in the turn that appended it (A-767 C6).
+    let stored = landed
+      .as_ref()
+      .ok()
+      .and_then(|committed| changeset_of(state, repository, committed.revision));
+    (landed, stored)
+  })?;
+  match landed {
+    (Ok(committed), Some(changeset)) => Some(store_changeset(changeset).await.map(|()| committed)),
+    (landed, _) => Some(landed),
+  }
+}
+
+/// Counter: Subversion revisions landed into the node's version-control store (A-767 C6).
+pub(crate) const REVISION_STORED: &str = "repository.svn.revision_stored";
+/// Counter: Subversion revisions the store refused (its owner busy or gone, or its write failed): the revision stands in
+/// the repository's register, and its store holds no changeset for it.
+pub(crate) const REVISION_UNSTORED: &str = "repository.svn.revision_unstored";
+
+/// A revision's changeset as the node's version-control store takes it (A-767 C6; w-store's changeset log): the store's
+/// handle, the header (the repository's 128-bit id, the revision as the sequence, judged over the one before), and the
+/// revision's record as the register holds it, its Record section; none where the daemon holds no store or the register
+/// no record.
+fn changeset_of(
+  state: &ShardState,
+  repository: RepositoryId,
+  revision: u64,
+) -> Option<(
+  slates_store::owner::StoreHandle,
+  slates_store::log::Header,
+  Vec<u8>,
+)> {
+  let disk = state.vcs_disk.clone()?;
+  let record = state
+    .db
+    .partition()
+    .repositories()
+    .objects(repository)
+    .last()?
+    .to_vec();
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Subversion,
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence: revision,
+    judged_over: revision.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  Some((disk, header, record))
+}
+
+/// Lands a revision's changeset ([`changeset_of`]) into the node's store, answered once it is durable (one flush of the
+/// store's log on its owner thread); refused `Unstored` where the store refused it. Each counted.
+async fn store_changeset(
+  (disk, header, record): (
+    slates_store::owner::StoreHandle,
+    slates_store::log::Header,
+    Vec<u8>,
+  ),
+) -> Result<(), Uncommitted> {
+  let landed = disk
+    .land(
+      header,
+      vec![(slates_store::log::SectionKind::Record, record)],
+    )
+    .await;
+  let _ = crate::state::with_state(|state| {
+    state.count(
+      if landed.is_ok() {
+        REVISION_STORED
+      } else {
+        REVISION_UNSTORED
+      },
+      1,
+    );
+  });
+  landed.map(drop).map_err(|_| Uncommitted::Unstored)
 }
 
 /// The refusal of records that do not hold together.

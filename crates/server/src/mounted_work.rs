@@ -26,11 +26,14 @@
 //! durable base ([`recovered_pin`]): a save made before a restart is there to submit after it. A tree's identity is its
 //! green's alone, so a slot rebuilt at another version shows drift only where an entry's bytes differ.
 //!
-//! **What is owed (GAPS, A-774).** A mount is not refreshed when its work's base moves past its pin: it shows the
-//! pinned version under its own changes, and a later submit of a file it changed declares its bytes against the work's,
-//! undoing another work's change to that file. A work holding declared changes when first mounted is refused. A
-//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS and FUSE bridges
-//! lend the tree; the others refuse a mounted work's base reads typed. A green on another shard than its work's mounts
+//! **A moving base (R4).** A mount follows its work's base ([`refresh`]): once an accepted submit or a rebase moves it,
+//! the mount re-pins and its tree host moves to the new version, so the base plane lists each directory it next touches
+//! again and untouched entries show the new base.
+//!
+//! **What is owed (GAPS, A-774).** A file the mount changed stays its own after a refresh, so a later save of it is
+//! declared against the work's new bytes, which undoes another work's change made to that file meanwhile. A work holding declared changes when first mounted is refused. A
+//! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS, FUSE and WinFsp
+//! bridges lend the tree; virtio-fs and the file verbs refuse a mounted work's base reads typed. A green on another shard than its work's mounts
 //! nothing yet.
 
 use slates_db::catalog::{Role, VolumeId as DbVolumeId};
@@ -64,9 +67,11 @@ pub(crate) type MountedPins = std::collections::BTreeMap<DbVolumeId, MountPin>;
 /// The tree identity of `pin`: its fingerprints' device, the green's alone, so a mount rebuilt at another version of the
 /// same green (a restart re-pins at the work's durable base) finds drift only where an entry's bytes differ there.
 fn identity(pin: MountPin) -> u64 {
-  let mut word = [0u8; 8];
+  // Format: a `u64`'s little-endian bytes: the green's id folded into eight.
+  let mut word = [0u8; size_of::<u64>()];
+  let width = word.len();
   for (at, byte) in pin.green.bytes.iter().enumerate() {
-    if let Some(slot) = word.get_mut(at % 8) {
+    if let Some(slot) = word.get_mut(at.checked_rem(width).unwrap_or(0)) {
       *slot ^= *byte;
     }
   }
@@ -148,6 +153,7 @@ pub(crate) fn rebuild_mounted(
 /// when `id` is no work of this shard's or its slot could not be made (counted). A plain volume's slot answers `true`.
 pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   if state.by_id.contains_key(&id) {
+    refresh(state, id);
     return true;
   }
   let Some(record) = state.db.partition().volume(id).cloned() else {
@@ -161,7 +167,7 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   };
   // A work with declared changes of its own would show its green's version without them (owed: write them into the
   // overlay); one whose green is elsewhere has no green here to read.
-  if work.files.changed_entries().next().is_some() || state.greens.get(&work.green).is_none() {
+  if !work.files.is_empty() || state.greens.get(&work.green).is_none() {
     state.count(MOUNT_SLOT_REFUSED, 1);
     return false;
   }
@@ -185,12 +191,47 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
     host,
     credits,
   } = admitted;
+  let mut host = host;
+  if let Some(slates_base::BaseHost::Tree(tree)) = host.as_mut() {
+    tree.move_to(pin.version);
+  }
   if install(state, (id, record.name), volume, host, credits).is_err() {
     state.count(MOUNT_SLOT_REFUSED, 1);
     return false;
   }
   state.merge.mounted.insert(id, pin);
   true
+}
+
+/// Re-pins mounted work `id`'s base at its work's base once that has moved (A-774 R4: an accepted submit or a rebase
+/// moves it): the tree host moves to the new version, so the base plane lists each directory it next touches again and
+/// every untouched entry shows the work's new base. What the mount changed stays its own. Nothing for a work whose base
+/// has not moved, or for any other slot.
+pub(crate) fn refresh(state: &mut ShardState, id: DbVolumeId) {
+  let Some(pin) = state.merge.mounted.get(&id).copied() else {
+    return;
+  };
+  let Some(base) = state.works.get(&id).map(|work| work.base_version) else {
+    return;
+  };
+  if base == pin.version {
+    return;
+  }
+  let Some(&handle) = state.by_id.get(&id) else {
+    return;
+  };
+  if let Ok(slot) = state.volumes.get_mut(handle)
+    && let Some(slates_base::BaseHost::Tree(host)) = slot.host.as_mut()
+  {
+    host.move_to(base);
+    state.merge.mounted.insert(
+      id,
+      MountPin {
+        green: pin.green,
+        version: base,
+      },
+    );
+  }
 }
 
 /// Format: the status counter of a work's mount slot that could not be made (no budget, no room in the registry, a

@@ -76,6 +76,13 @@ const LIVE_PAYLOADS: [usize; 3] = [64, 4096, 65_536];
 const LIVE_CAP: usize = 1 << 17;
 /// Format: the request kind of the bare round trip, distinct from [`RECORD_STREAM`].
 const ECHO_KIND: u64 = 2;
+/// Format: the bulk row's kind: the holder takes the request whole and answers nothing, so the row times one direction.
+const BULK_KIND: u64 = 3;
+/// Shape: the bulk row's request sizes, in MiB (A-697's release bench: a holder's 4 MiB and 64 MiB forwards), or as
+/// `REPLICATION_BENCH_BULK_MIB` lists them; and how many of each are timed after one warm-up.
+const BULK_MIB: [usize; 2] = [4, 64];
+/// Shape: timed bulk requests per size.
+const BULK_SAMPLES: usize = 5;
 /// Format: nanoseconds per microsecond.
 const NS_PER_US: f64 = 1_000.0;
 /// Format: the owner and its two candidate holders.
@@ -187,6 +194,8 @@ async fn hold(mut endpoint: Endpoint, host: HostId, stop: &'static AtomicBool, s
               .unwrap_or_default(),
             Err(_) => Vec::new(),
           }
+        } else if kind == BULK_KIND {
+          Vec::new()
         } else {
           request
         }
@@ -284,6 +293,46 @@ fn main() {
       }
     }
     rows.push(("round-trip".to_owned(), timed));
+
+    // The bulk row (A-697's lane throughput, main's item 4): one request of the size on the warm session, taken whole by
+    // the holder, which answers nothing. Goodput is the size over the request's time; the session's own counts say why
+    // its sending stopped (the window, the pacer, the credit, the packet budget) and what datagram the path carried.
+    let sizes: Vec<usize> = std::env::var("REPLICATION_BENCH_BULK_MIB")
+      .ok()
+      .map(|list| list.split(',').filter_map(|mib| mib.trim().parse().ok()).collect())
+      .unwrap_or_else(|| BULK_MIB.to_vec());
+    for mib in sizes {
+      let payload = vec![0x5au8; mib << 20];
+      let mut walls = Vec::new();
+      for at in 0..=BULK_SAMPLES {
+        let stops_before = sessions[0].1.send_stops();
+        let started = slates_rt::futures::now_ns();
+        let reply = sessions[0]
+          .1
+          .request(BULK_KIND, Priority::Bulk, &payload)
+          .await
+          .unwrap();
+        let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
+        assert!(reply.is_empty(), "the bulk answer is empty");
+        let stops = sessions[0].1.send_stops();
+        if at > 0 {
+          walls.push(elapsed);
+          println!(
+            "bulk mib={mib} run={at} wall_ms={:.1} goodput_mb_s={:.0} path_mtu={:?} cwnd={} stops: budget={} window={} pacer={} credit={} empty={}",
+            elapsed as f64 / 1e6,
+            (mib << 20) as f64 / (elapsed as f64 / 1e9) / 1e6,
+            sessions[0].1.path_mtu(),
+            sessions[0].1.congestion_window(),
+            stops.budget - stops_before.budget,
+            stops.window - stops_before.window,
+            stops.pacer - stops_before.pacer,
+            stops.credit - stops_before.credit,
+            stops.empty - stops_before.empty,
+          );
+        }
+      }
+      rows.push((format!("bulk {mib} MiB"), walls));
+    }
 
     let mut owner_acceptor = Acceptor::new(OWNER, authority());
     let placement = Placement::of(&[OWNER, HOLDERS[0], HOLDERS[1]]);

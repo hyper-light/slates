@@ -604,6 +604,7 @@ const ORIGINAL_PUBLISHING: u64 = 1;
 /// Native ownership encoding: the whole resource was published before this state.
 const ORIGINAL_OWNED: u64 = 2;
 /// Native ownership encoding: unused or refused admission can never reopen.
+/// Format: the encoding's fourth state, after open, publishing and owned.
 const ORIGINAL_CLOSED: u64 = 3;
 
 struct OriginalAdmission(CellRef);
@@ -925,6 +926,7 @@ impl Owner {
     // Each group can have one worker Adopt-or-Retire, one original publication
     // notification, and one original retirement command outstanding; Stop owns its
     // independent final slot. All retries consume a refusal before publishing again.
+    // Derived: the three commands a group can have outstanding, named above.
     let command_capacity = groups
       .checked_mul(3)
       .and_then(|n| n.checked_add(1))
