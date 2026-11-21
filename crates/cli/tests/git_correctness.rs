@@ -762,6 +762,26 @@ impl CgiRequest {
   }
 }
 
+/// Reads a chunked body from `reader` to its last chunk: the chunks' bytes in order.
+fn read_chunked(reader: &mut impl BufRead) -> Option<Vec<u8>> {
+  let mut body = Vec::new();
+  loop {
+    let mut size = String::new();
+    reader.read_line(&mut size).ok()?;
+    let size = usize::from_str_radix(size.trim().split(';').next()?, 16).ok()?;
+    if size == 0 {
+      let mut end = String::new();
+      reader.read_line(&mut end).ok()?;
+      return Some(body);
+    }
+    let mut chunk = vec![0; size];
+    reader.read_exact(&mut chunk).ok()?;
+    body.extend_from_slice(&chunk);
+    let mut end = [0; 2];
+    reader.read_exact(&mut end).ok()?;
+  }
+}
+
 /// Reads one HTTP/1.1 request from `reader`: its line, its headers, and its body by `Content-Length` or chunked.
 fn read_request(reader: &mut impl BufRead) -> Option<CgiRequest> {
   let mut line = String::new();
@@ -795,21 +815,7 @@ fn read_request(reader: &mut impl BufRead) -> Option<CgiRequest> {
     .header("Transfer-Encoding")
     .is_some_and(|value| value.eq_ignore_ascii_case("chunked"));
   if chunked {
-    loop {
-      let mut size = String::new();
-      reader.read_line(&mut size).ok()?;
-      let size = usize::from_str_radix(size.trim().split(';').next()?, 16).ok()?;
-      if size == 0 {
-        let mut end = String::new();
-        reader.read_line(&mut end).ok()?;
-        break;
-      }
-      let mut chunk = vec![0; size];
-      reader.read_exact(&mut chunk).ok()?;
-      request.body.extend_from_slice(&chunk);
-      let mut end = [0; 2];
-      reader.read_exact(&mut end).ok()?;
-    }
+    request.body = read_chunked(reader)?;
   } else if let Some(length) = request.header("Content-Length") {
     let mut body = vec![0; length.parse().ok()?];
     reader.read_exact(&mut body).ok()?;

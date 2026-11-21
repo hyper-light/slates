@@ -884,7 +884,7 @@ pub(crate) fn fetch_of(want: ObjectId) -> Vec<u8> {
 
 /// Shape: the commits of [`a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report`]'s push: enough
 /// that its answer takes many turns.
-const KEPT_ALIVE_HISTORY: usize = 300;
+pub(crate) const KEPT_ALIVE_HISTORY: usize = 300;
 
 /// A-722's keepalive (the load-only edge tests: a long push's answer wrote nothing until its report, and the client's
 /// read gave up on the silence at a load of 56 to 67; git's receive-pack writes `0005\1` every `receive.keepAlive`
@@ -928,7 +928,7 @@ fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
 /// (an empty band-1 packet), and the section's pack whole after the keepalives, every object pushed.
 /// Shape: how much of each of a fetch's first packets [`a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`]
 /// compares and shows: past a section's name and a keepalive, short of a pack's whole packet.
-const OPENING_SHOWN: usize = 16;
+pub(crate) const OPENING_SHOWN: usize = 16;
 
 #[test]
 fn a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen() {

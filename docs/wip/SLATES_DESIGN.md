@@ -55944,9 +55944,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
   (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
   keepalive, the pack whole after it).
-- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
-  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
-  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+- **The SSH edge** (2026-11-21, same day): `vcs_ssh::git`'s upload session writes it the same way, after git's own
+  interval (`GIT_KEEPALIVE_NS`; `ToolServices::with_git_keepalive` gives a site another). Red on main 1a35ab091:
+  `vcs_ssh::tests::receive::a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`,
+  the section's second packet the pack's first; green after.
+- **Owed.** A fetch's wait before its sections (the A-718 encode and A-614's derivations in `body_end`, the SSH
+  session's encode before its advertisement) has no packet git allows there under side-band-64k alone (a band-2
+  progress packet needs `sideband-all`), so it stays silent.
 
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
@@ -58340,6 +58344,11 @@ wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe
   (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
   as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
   to main's run requests.
+- **Status (2026-11-21).** The acceptance flows by use are `crates/cli/tests/real_tools.rs`. A `#pragma once` compile
+  under clang, gcc and `cc` is held across a snapshot and a SIGKILL takeover; after each event, and under injected
+  memory pressure, `make -q`, `cargo build` and `git status` find nothing moved, and every tracked file's number and
+  times are unchanged. Green on macOS NFS (APFS). The test builds for Linux FUSE and Windows WinFsp, whose runs are
+  main's (run-requests.md).
 
 ### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
 The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
@@ -59685,8 +59694,13 @@ Applied in the same change to:
   a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
   mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
   first). Each key now moves from `identity_since`, its own folded-at version.
-- **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
-  step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms sliced; w-git's member loop in turns on
+- **Slicing inside a key: landed (d4c7e1f42) and reverted the same day.** A paced unit of one BLAKE3 slice within the
+  quantum (a few KB), with a partly hashed file begun again at each change to it, took the fold in turns from about 1-3 s
+  to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
+  share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
+  keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record),
+  its durable form a question for main; single keys of up to 13.4 ms sliced (above); w-git's member loop in turns on
   `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
@@ -60116,3 +60130,33 @@ Applied in the same change to:
 - **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
   is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
   release of the batch's texts) are one step each, scaled by the batch's paths.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today, now a chunk a
+  call).
+- **Status (2026-11-21, w-shared): the owner's step halved.** The owner no longer encodes and hashes again an increment
+  it holds by identity (`SealedWork::held`, `merge_service::increment_already_held`, its hold given back on a refused
+  verdict), and the fetched increment reaches the owner shard a chunk a call (`verbs::move_increment`). Release A/B,
+  Mac Studio, load 2-4, 5 rounds (kiln r2, 1a35ab0 vs 0deb19a): owner step 256 MiB 256-267 to 136-144 ms, 320 MiB
+  327-353 to 168-203 ms, 512 MiB 502-594 to 270-299 ms; the late beat 0.52-0.85 s in every 320 and 512 MiB run before,
+  none after; wall 512 MiB 1.98-2.06 to 1.46-1.57 s.
+
+### A-836 — A ref may name any object: a tag chain peeled to its end, a ref naming a blob holding no files (2026-11-21, w-git; main's order from w-interop's A/B of record r16; §4.17.1 item 6, §4.17.2; A-654)
+Applied in the same change to:
+- `crates/git/src/object_name.rs`: `empty_tree`.
+- `crates/git/src/receive/works.rs`: `tree_of` peels a chain of tags to its end; a blob gives the empty tree; `NO_TREE`
+  retired.
+- `crates/git/src/store/views.rs`: `PushedObjects::locate` answers the empty tree (`At::EmptyTree`) where nothing holds it.
+- `crates/server/src/git_push.rs`: `ShardGreens::tree_of` peels the same way.
+- GAPS (§4.17).
+
+- **Why.** git/git's push was refused for every ref whose target is neither a commit nor a tree (`junio-gpg-pub`, a
+  blob, and `v1.0rc1` to `v1.0rc6`), so clones of it were short of them; git lets a ref name any object, and stock
+  `git daemon` takes them.
+- **What.** A ref's tree is found as git peels the ref: a chain of annotated tags followed to its end (each a distinct
+  object named by its content, so the chain ends), then a commit's tree or a tree itself. A ref naming a blob (or a tag
+  of one) holds no files: its green's tree is git's empty tree, which git holds as present in every repository whether
+  or not an object stores it (`object-file.c`), and the push's views answer it so. Serving was already git's:
+  `ls-refs` peels through every tag (`upload::refs::peeled`), and a fetch's wants may name any object.
+- **Evidence.** `t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised`: one push of a bare ref to a blob,
+  an annotated tag of it and a tag of a tag of the commit, every command `ok` and each advertised at its object; `ls-refs`
+  with `peel` naming the signed blob's tag peeled to the blob and the tag of a tag peeled to the commit, none for the bare
+  blob; a fetch of the three holding them, the inner tag and the commit. Red before: each refused `ref names no tree`.

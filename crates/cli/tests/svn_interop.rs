@@ -29,6 +29,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -2464,6 +2465,64 @@ fn use_writes_logged(leg: &UseLeg, scratch: &str, writes: &[&str]) -> String {
   format!("{said}\n{unstamped}")
 }
 
+/// Slates' leg of the correctness by use on `route` (svn, http, http-v1 or ssh), its daemon `instance` with its issuer
+/// surface and its printed `lines`; None (said) where route ssh has no ssh-keygen here.
+fn use_slates_leg(
+  route: &str,
+  scratch: &Scratch,
+  (instance, issuer): (&str, &[(String, String)]),
+  lines: &[String],
+) -> Option<UseLeg> {
+  Some(match route {
+    "svn" => {
+      let (id, token) = minted_token(instance, issuer);
+      UseLeg {
+        name: "slates over svn://",
+        svn: Svn::new(scratch, "slates", credentials(id, token)),
+        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(lines)),
+      }
+    }
+    "http" | "http-v1" => {
+      let (_, token) = minted_token(instance, issuer);
+      let mut svn = Svn::new(scratch, "slates", credentials(USER.to_owned(), token));
+      if route == "http-v1" {
+        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
+      }
+      UseLeg {
+        name: if route == "http" {
+          "slates over HTTPv2"
+        } else {
+          "slates over HTTPv1"
+        },
+        svn,
+        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(lines)),
+      }
+    }
+    _ => {
+      let Some((key, public)) = ssh_key(scratch) else {
+        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
+        return None;
+      };
+      let (code, out, err) = slates_as_issuer(instance, issuer, &["credential", "key", &public]);
+      assert_eq!(code, 0, "credential key: {out}{err}");
+      let port = port_after(lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+      let tunnel = format!(
+        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
+      );
+      UseLeg {
+        name: "slates over svn+ssh",
+        svn: Svn::new(
+          scratch,
+          "slates",
+          vec!["--config-option".to_owned(), tunnel],
+        ),
+        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
+      }
+    }
+  })
+}
+
 /// Goal 93's Subversion correctness by use (main's lane of 2026-11-21; ignored: main runs its rounds, CLAUDE.md §8).
 /// Do: load the dump `SLATES_SVN_USE_DUMP` names into a stock FSFS repository (`svnadmin load`) served by stock
 /// `svnserve -t`, cut to its first `SLATES_SVN_USE_REVISIONS` revisions where that is set (`svnadmin dump -r`), and
@@ -2538,53 +2597,8 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     &["repository", "policy", REPOSITORY, "--hook", &given],
   );
   assert_eq!(policy.0, 0, "policy: {policy:?}");
-  let slates_leg = match route.as_str() {
-    "svn" => {
-      let (id, token) = minted_token(&instance, &issuer);
-      UseLeg {
-        name: "slates over svn://",
-        svn: Svn::new(&scratch, "slates", credentials(id, token)),
-        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
-      }
-    }
-    "http" | "http-v1" => {
-      let (_, token) = minted_token(&instance, &issuer);
-      let mut svn = Svn::new(&scratch, "slates", credentials(USER.to_owned(), token));
-      if route == "http-v1" {
-        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
-      }
-      UseLeg {
-        name: if route == "http" {
-          "slates over HTTPv2"
-        } else {
-          "slates over HTTPv1"
-        },
-        svn,
-        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
-      }
-    }
-    _ => {
-      let Some((key, public)) = ssh_key(&scratch) else {
-        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
-        return;
-      };
-      let (code, out, err) = slates_as_issuer(&instance, &issuer, &["credential", "key", &public]);
-      assert_eq!(code, 0, "credential key: {out}{err}");
-      let port = port_after(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
-      let tunnel = format!(
-        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
-         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
-      );
-      UseLeg {
-        name: "slates over svn+ssh",
-        svn: Svn::new(
-          &scratch,
-          "slates",
-          vec!["--config-option".to_owned(), tunnel],
-        ),
-        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
-      }
-    }
+  let Some(slates_leg) = use_slates_leg(&route, &scratch, (&instance, &issuer), &lines) else {
+    return;
   };
   let legs = [&control, &slates_leg];
   let youngest: u64 = control

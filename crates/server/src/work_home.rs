@@ -142,6 +142,9 @@ pub(crate) struct SealedWork {
   /// The verdict of `composed` a holder computed on its replica, in its wire form (A-658 part 3a), when the work lives
   /// on a node that holds a replica of a green another node owns (A-697 part c): the owner takes it by position.
   pub(crate) computed: Option<Vec<u8>>,
+  /// Where this shard's content store already holds `composed`'s encoding, when it does (lane (A) 3b: a holder's
+  /// submit, fetched by identity before the verb): the judgment then neither encodes nor hashes it again.
+  pub(crate) held: Option<slates_merge::chain_entry::Inputs>,
   /// A merge check's or resolution's ask (A-796), when the rebase is one: what the green's half does beyond a rebase.
   pub(crate) merge: Option<MergeAsk>,
   /// Whether the work's shard composes the work's increments itself ([`composed`]: a work off its green's shard), so a
@@ -915,6 +918,7 @@ fn seal(state: &ShardState, work: DbVolumeId) -> SealedWork {
     files: w.map(|w| w.files.clone()).unwrap_or_default(),
     composed: None,
     computed: None,
+    held: None,
     merge: None,
     composes_here: false,
   }
@@ -3131,6 +3135,7 @@ mod tests {
       files: super::WorkFiles::default(),
       composed: None,
       computed: None,
+      held: None,
       merge: None,
       composes_here: false,
     }

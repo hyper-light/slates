@@ -25,8 +25,8 @@
 //! - a delete retires the green, its old value the green's head, or the ref moved.
 //!
 //! A ref's tree is its commit's, or the tree it names; a tag (a green too, §4.17.1 item 6) may name
-//! an annotated tag, whose tree is that of the commit or the tree it names. A tag of a tag, or a
-//! ref naming a blob, is refused typed (owed: git peels any chain of tags).
+//! an annotated tag, followed as git peels it to the end of a chain of tags. A ref may name any
+//! object (A-836): one naming a blob, or a tag of one, holds no files, its tree git's empty tree.
 //!
 //! **The append moves the ref** ([`Appends`], A-642; g261's per-green append implements it once it
 //! lands, with the store's commit of the push's objects, A-614's `Repository::commit`, beside it):
@@ -79,10 +79,6 @@ pub const PAST_ROOM: &[u8] = b"push past its room";
 /// Slates' words: the reason a work naming bytes at a path the walk gave none is given (A-618's
 /// `Unplaced`).
 pub const UNPLACED: &[u8] = b"path without bytes";
-
-/// Slates' words: the reason a ref naming neither a commit nor a tree, nor an annotated tag of
-/// one, is given (a blob, or a tag of a tag).
-pub const NO_TREE: &[u8] = b"ref names no tree";
 
 /// A green as one push reads it.
 #[derive(Clone, Copy, Debug)]
@@ -594,8 +590,10 @@ where
     })
   }
 
-  /// The tree the object `head` names: a commit's, or that of the commit or tree an annotated tag
-  /// names.
+  /// The tree the object `head` names, as git peels a ref (A-836: a ref may name any object): a commit's; a tree itself;
+  /// the end of a chain of annotated tags followed to its end (a tag of a tag: git/git's `v1.0rc1` to `v1.0rc6`); and
+  /// for a blob (git/git's `junio-gpg-pub`), the empty tree, so a ref naming no tree holds no files. The chain's tags are
+  /// distinct objects the push or the repository holds, each named by its content, so it ends.
   fn tree_of(
     &self,
     head: &ObjectId,
@@ -603,28 +601,22 @@ where
     name: &[u8],
   ) -> Result<ObjectId, Declined> {
     let format = head.format();
-    let (kind, content) = self.object(head, pushed).ok_or_else(|| missing(name))?;
     let mut scratch = Admission::new(u64::MAX);
-    let (kind, target) = match kind {
-      Kind::Tag => {
-        let tag = Tag::parse(&content, &mut scratch).map_err(|_| missing(name))?;
-        let target = tag.object(format).ok_or_else(|| missing(name))?;
-        (tag.kind(), target)
-      }
-      kind => (Some(kind), *head),
-    };
+    let mut target = *head;
+    let (mut kind, mut content) = self.object(head, pushed).ok_or_else(|| missing(name))?;
+    while kind == Kind::Tag {
+      let tag = Tag::parse(&content, &mut scratch).map_err(|_| missing(name))?;
+      target = tag.object(format).ok_or_else(|| missing(name))?;
+      (kind, content) = self.object(&target, pushed).ok_or_else(|| missing(name))?;
+    }
     match kind {
-      Some(Kind::Commit) => {
-        let (_, content) = self.object(&target, pushed).ok_or_else(|| missing(name))?;
+      Kind::Commit => {
         let commit = Commit::parse(&content, &mut scratch).map_err(|_| missing(name))?;
         commit.tree(format).ok_or_else(|| missing(name))
       }
-      Some(Kind::Tree) => Ok(target),
-      _ => Err(declined(
-        NO_TREE,
-        name,
-        b"names neither a commit nor a tree",
-      )),
+      Kind::Tree => Ok(target),
+      // A blob, or (never, the chain followed) a tag: no tree, so no files.
+      Kind::Blob | Kind::Tag => crate::object_name::empty_tree(format).ok_or_else(|| missing(name)),
     }
   }
 

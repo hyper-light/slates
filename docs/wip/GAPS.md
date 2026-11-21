@@ -185,6 +185,10 @@
 > The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
 > and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
 > memory pressure from a host actually short of memory (the test injects it).
+> Open (found by use 2026-11-21, routed to g224): on Mac Studios (Studio-2 twice, Studio-4) a fresh slates NFS mount's
+> first `opendir` never returns. The client sends GETATTR, LOOKUP, ACCESS and FSSTAT (345 in 30 min) and never
+> READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
+> test now fails in 305 s naming the stall instead of hanging.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -238,6 +242,15 @@
 > - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
 >   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
 >   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the image slots, delta log and write log as growable
+>   objects (w-sizing).** Today, per shard, two image slots take 2R, the delta log R and the write log R/4 of the content
+>   object's address space: on the big Studio (96 GB, 23 shards, R = 1,425 MiB) that is 3.25R = 4,631 MiB a shard and
+>   106,496 MiB for a one-shard daemon, every byte reserved before anything is stored. macOS cannot resize an object it
+>   has sized once (EINVAL), so the ranges cannot grow in place. Plan: each slot and log becomes an object of its own,
+>   named per generation (as A-789's extents are), sized from the image it holds and grown by doubling when a
+>   publication outgrows it; the write log from the writes measured between barriers. This changes the recovery
+>   format (A-68), so it needs a design amendment first. Red first: after a restart a one-shard daemon's content
+>   object reserves less than one image slot's range, and recovery reads back an image grown past its first size.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
@@ -254,11 +267,26 @@
 > - Device reads: `slates_machine::facts::resident_now` is RSS on macOS, which counts given-back shared pages (above);
 >   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
 >   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the device-pressure seam that sizes consult
+>   (w-sizing).** Today the sampler (A-570) only sets the admission hold. A shard gives free extents back only at its next
+>   idle pass (`release_idle`), and no sizing site reads the device's pressure. Plan: one seam with the same code on a laptop and in a fleet. A pressure report makes every shard
+>   give back what it can at once (the free extents `release_idle` returns, the idle purge). Each sizing site reads the
+>   seam's ceiling before it grows. Past the hold, admission refuses with a typed error before the machine swaps. Red
+>   first: an injected pressure fall frees a deleted volume's extents with no idle pass, and a growth past the ceiling
+>   is refused with the typed error.
 > - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
 >   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:58): NFSv3 replies framed in place (w-sizing).** Today
+>   each v3 request copies its arguments into a Vec and encodes its results into a second one. Then
+>   `bridge-nfs::rpc::reply_record` (from `reply_for` in `crates/server/src/nfs.rs`) allocates a third Vec and copies the
+>   results into it behind the record head. The held reply and `nfs_replay::record` keep further copies. NFSv4 already
+>   encodes after reserved head room and frames in place (`XdrWriter::continuing`, `finish_success_record`). Plan: v3
+>   procedures write after the same head room and `reply_for` frames in place. The held reply and the replay record
+>   keep that one framed buffer, and the arguments are read where they arrive. Red first: a count of allocations per
+>   READ, then per READDIR.
 > - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
 >   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
 >   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
@@ -459,6 +487,9 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
+> naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
+> taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -468,8 +499,9 @@
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
 > fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
-> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
-> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence, and the SSH edge's upload after
+> git's own interval (red/green `a_long_fetchs_answer_over_ssh_…`). Owed: a fetch's wait before its sections (the
+> A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
@@ -24880,7 +24912,8 @@ in what lands. Branch tips as of 2026-11-10:
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB) and single key folds of up to 13.4 ms.
+> of 49 MB) and single key folds of up to 13.4 ms (slicing inside a key landed and was reverted the same day: a fold of
+> 47.6-52.6 s, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
