@@ -128,23 +128,46 @@ fn push_on(state: &mut ShardState, repository: RepositoryId, parent: Node) -> No
   changeset.node
 }
 
-/// A-731, A-767 C4. Do: on a running daemon holding a changeset store, make a Mercurial repository; submit a work
-/// making `a.txt` to its line's green; push a client's changeset on top of the made one (landed on the store); submit
-/// another work changing `a.txt`; then make the repository's store again from its log as a recovery does (the sliced
-/// `vcs_store::rebuild`), and read it once the task ends. Expect: the first submit made a changeset over the null node,
-/// the line's head; the push's changeset the head after it, its parent the made one; the second submit's changeset over
-/// the push's, the head; and after the rebuild, the same head and every changeset held: the made nodes put back from
-/// their records, the push's from its changeset on the store.
+/// Waits until `daemon`'s first shard has made `count` changesets of submitted versions: a made changeset lands on the
+/// changeset store from a task after its submit's step (A-767 C1).
+fn made_reaches(daemon: &crate::Daemon, count: u64) {
+  let began = std::time::Instant::now();
+  loop {
+    let made = crate::daemon::observe_first(daemon, |state| {
+      state.refusals.get(MADE).copied().unwrap_or(0)
+    });
+    if made >= count {
+      return;
+    }
+    assert!(
+      began.elapsed() < TASK_WAIT,
+      "{made} of {count} changesets made after {TASK_WAIT:?}"
+    );
+  }
+}
+
+/// A-731, A-767 C1 and C4. Do: on a running daemon holding a changeset store, make a Mercurial repository; submit a
+/// work making `a.txt` to its line's green and wait for its changeset (made, landed on the store and recorded by a
+/// task); push a client's changeset on top of the made one; submit another work changing `a.txt` and wait for its
+/// changeset; then make the repository's store again from its log as a recovery does (the sliced `vcs_store::rebuild`),
+/// and read it once the task ends. Expect: the first submit made a changeset over the null node, the line's head; the
+/// push's changeset the head after it, its parent the made one; the second submit's changeset over the push's, the
+/// head; every changeset on the store (the made ones as the push's are, A-767 C1); and after the rebuild, the same
+/// head and every changeset held: the made nodes put back from their changesets' records.
 #[test]
 fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (repository, green, held) = crate::daemon::observe_first(&daemon, |state| {
+  let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "made");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     assert_eq!(
       version(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]),
       1
     );
+    (repository, green)
+  });
+  made_reaches(&daemon, 1);
+  let (first, pushed) = crate::daemon::observe_first(&daemon, move |state| {
     let first = head_of(state, green).expect("the submit made a changeset");
     assert_eq!(parent_of(state, repository, &first), Some(NULL_NODE));
     let pushed = push_on(state, repository, first);
@@ -154,15 +177,29 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
       "the push on top is the head"
     );
     assert_eq!(parent_of(state, repository, &pushed), Some(first));
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     assert_eq!(
       version(state, ipc_green, 2, vec![create("a.txt", b"beta\n")]),
       3
     );
+    (first, pushed)
+  });
+  made_reaches(&daemon, 2);
+  let held = crate::daemon::observe_first(&daemon, move |state| {
     let second = head_of(state, green).expect("the second submit made a changeset");
     assert_eq!(parent_of(state, repository, &second), Some(pushed));
-    assert_eq!(state.refusals.get(MADE).copied(), Some(2));
+    let references = state.db.partition().repositories();
+    let stored = (0..)
+      .map_while(|index| references.object_record(repository, index))
+      .filter_map(slates_hg::import::record::reference_of)
+      .filter(|reference| reference.made.is_some())
+      .count();
+    assert_eq!(
+      stored, 2,
+      "both made changesets on the store, named by reference"
+    );
     crate::vcs_store::rebuild(state, repository);
-    (repository, green, [first, pushed, second])
+    [first, pushed, second]
   });
   let began = std::time::Instant::now();
   let rebuilding = loop {
@@ -185,18 +222,25 @@ fn t_a731_a_submitted_version_is_the_changeset_the_server_makes() {
   assert_eq!(parents, [true; 3], "every changeset held after the rebuild");
 }
 
-/// A-731 with A-626 part 4 (a copy made through a work). Do: make a Mercurial repository; submit `a.txt`; then submit a
-/// work declaring a copy of `/a.txt` to `/b.txt`, with no other change. Expect the second changeset to list `b.txt`,
-/// its file revision's block naming `a.txt` and `a.txt`'s node in the first changeset's manifest (`copy`, `copyrev`),
-/// its first parent null and its bytes `a.txt`'s, as stock 7.2 commits `hg cp a.txt b.txt`.
+/// A-731 with A-626 part 4 (a copy made through a work). Do: on a running daemon holding a changeset store, make a
+/// Mercurial repository; submit `a.txt` and wait for its changeset; then submit a work declaring a copy of `/a.txt` to
+/// `/b.txt`, with no other change, and wait for its changeset. Expect the second changeset to list `b.txt`, its file
+/// revision's block naming `a.txt` and `a.txt`'s node in the first changeset's manifest (`copy`, `copyrev`), its first
+/// parent null and its bytes `a.txt`'s, as stock 7.2 commits `hg cp a.txt b.txt`.
 #[test]
 fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
   use crate::vcs_store::paths::tests::Op;
   use slates_ipc::protocol::WorkOp;
-  crate::test_store::audit_on_stored_shard("hg", |state| {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (repository, green) = crate::daemon::observe_first(&daemon, |state| {
     let (repository, green) = mercurial(state, "copied");
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     version(state, ipc_green, 1, vec![create("a.txt", b"alpha\n")]);
+    (repository, green)
+  });
+  made_reaches(&daemon, 1);
+  crate::daemon::observe_first(&daemon, move |state| {
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let copy = Op::Declare(WorkOp::Copy {
       from: "/a.txt".to_owned(),
       to: "/b.txt".to_owned(),
@@ -204,8 +248,11 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
       replace: false,
     });
     assert_eq!(version(state, ipc_green, 2, vec![copy]), 2);
+  });
+  made_reaches(&daemon, 2);
+  let (source, row, text) = crate::daemon::observe_first(&daemon, move |state| {
     // Read as every step reads the store: its windows lent from the shard's chunk store (A-727 a2).
-    let (source, row, text) = crate::vcs_store::lent_state(state, |state| {
+    crate::vcs_store::lent_state(state, |state| {
       let (content, store) = state
         .vcs_stores
         .mercurial_ref(repository)
@@ -222,18 +269,19 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
         .revision_text(content, Log::File(b"b.txt"), 0)
         .expect("its text");
       (source, row, text)
-    });
-    let mut expected = b"\x01\ncopy: a.txt\ncopyrev: ".to_vec();
-    expected.extend_from_slice(crate::verbs::hex_of(&source).as_bytes());
-    expected.extend_from_slice(b"\n\x01\nalpha\n");
-    assert_eq!(
-      (String::from_utf8_lossy(&text).into_owned(), row.p1),
-      (
-        String::from_utf8_lossy(&expected).into_owned(),
-        slates_hg::index::NONE
-      )
-    );
+    })
   });
+  daemon.stop();
+  let mut expected = b"\x01\ncopy: a.txt\ncopyrev: ".to_vec();
+  expected.extend_from_slice(crate::verbs::hex_of(&source).as_bytes());
+  expected.extend_from_slice(b"\n\x01\nalpha\n");
+  assert_eq!(
+    (String::from_utf8_lossy(&text).into_owned(), row.p1),
+    (
+      String::from_utf8_lossy(&expected).into_owned(),
+      slates_hg::index::NONE
+    )
+  );
 }
 
 /// A work over `green` writing `bytes` at `path`, made by bare dispatches: its id.

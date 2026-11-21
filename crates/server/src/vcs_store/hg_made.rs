@@ -11,20 +11,24 @@
 //! version ([`head_of`] at the version before), each path the green changed between the two versions
 //! (`Green::changed_between`) its bytes and flag at the head (a symbolic link's target with `l`, an executable `x`), or
 //! removed; its user the principal's Mercurial identity, its message the submit's, its time the owner's instant read
-//! once, its branch its parent's (a root takes its line's). The changeset, its manifest and its file revisions are kept
-//! in a fork of the index (`commit::fork_with`) and recorded as a push's are, in the one Mercurial record kind with the
-//! green's key and the version beside them (`import::record::write_made`, `Source::Made`), in an entry of the register
-//! holding it alone (A-662), appended in the transaction of the version's record, after it: judged by the register's
-//! guard first, the fork kept only once the entry is appended, given back otherwise. A recorded submit takes the
-//! deferred-submit hook (A-807, `crate::made_commit`, [`make_deferred`]): the repository's landing turn before its
-//! verdict, the verdict held, and the version with its changeset committed in one step by a task, then the answer. A
-//! bare dispatch ([`make`]) still makes it in the submit's step. Owed (GAPS C2): the record landed on the node's store
-//! before the entry, as a push's is, and a push ordered by the same turn.
+//! once, its branch its parent's (a root takes its line's).
 //!
+//! **On the changeset store** (A-767 C1; main's ruling of 2026-11-21 09:00, one path). The server builds the made
+//! revisions' changegroup (`slates_hg::push::made::changegroup`), takes it through the push's own intake into a fork
+//! (`hg_push::take_whole`), and lands it as a push's changeset is landed: `Record` (a made record, the green's key and
+//! the version beside the push's head, `import::record::write_made_record`), `Payload`, `Texts`, then the register's
+//! entry naming it by reference (`write_made_reference`). A recorded submit takes the deferred-submit hook (A-807,
+//! `crate::made_commit`, [`make_deferred`]): the repository's landing turn before its verdict, the changeset made from a
+//! preview of the held verdict, landed on the store by a task, then the version and the entry committed in one step,
+//! then the answer; a store that refused it gives the accept up. A bare dispatch ([`make`]) takes the turn in its step
+//! and a task lands and records the changeset after it, in its own transaction. A client's push landed between a made
+//! changeset's making and its commit leaves its fork stale: the version stands alone, counted.
+
 //! **Its head** ([`head_of`]): a line's or a bookmark's changeset is the one the server made of its green's head version
 //! where it made one (the store's `made` map, green by green, the newest only), else the one its head names
 //! (`HEAD_ATTRIBUTE`, which a push sets): a push on top of a made changeset is the newer version and wins as the head.
-//! A recovery replays the record and puts the made node back in the map from the record alone (`super::replay_hg`).
+//! A recovery replays the changeset from the store and puts the made node back in the map from its record
+//! (`super::replay_hg_referenced`).
 //!
 //! **Not made, and counted** ([`UNMADE`]), the version standing: no Mercurial identity or message, a version that is not
 //! the green's head, a change the changeset cannot hold, the index's, the store's or the register's refusal.
@@ -37,7 +41,6 @@ use slates_db::op::Op;
 use slates_hg::Node;
 use slates_hg::index::HgIndex;
 use slates_hg::manifest::Flag;
-use slates_hg::push::commit::{Unindexed, fork_with};
 use slates_hg::push::held::IndexHeld;
 use slates_hg::push::made::{Authored, Change, Unmade as MadeRefused, made as made_of};
 use slates_hg::push::verify::Verified;
@@ -73,12 +76,14 @@ enum Unmade {
   NotHead,
   /// The changeset could not be made of the change.
   Made(MadeRefused),
-  /// The index refused the revisions.
-  Index(Unindexed),
   /// The record could not be written.
   Record,
   /// The register refused the entry.
   Entry(Refusal),
+  /// The changeset store refused the changeset, or the task could not run.
+  Unlanded,
+  /// A client's push landed after the changeset was made: its fork is stale.
+  Stale,
 }
 
 /// Written out rather than derived, as a derived `Debug` is all that reads the refusals and dead-code analysis ignores
@@ -89,14 +94,18 @@ impl std::fmt::Debug for Unmade {
       Unmade::Authorship => formatter.write_str("Authorship"),
       Unmade::NotHead => formatter.write_str("NotHead"),
       Unmade::Made(refused) => formatter.debug_tuple("Made").field(refused).finish(),
-      Unmade::Index(refused) => formatter.debug_tuple("Index").field(refused).finish(),
       Unmade::Record => formatter.write_str("Record"),
       Unmade::Entry(refused) => formatter.debug_tuple("Entry").field(refused).finish(),
+      Unmade::Unlanded => formatter.write_str("Unlanded"),
+      Unmade::Stale => formatter.write_str("Stale"),
     }
   }
 }
 
-/// Makes the changeset of `green`'s `version`, where `green` is a Mercurial repository's (module docs); counted.
+/// Makes the changeset of `green`'s `version`, where `green` is a Mercurial repository's (module docs; A-767 C1): the
+/// repository's landing turn taken in the submit's own step where it is free, then the changeset made of the green as
+/// the version left it, landed on the node's changeset store and recorded by a task holding the turn
+/// ([`made_landing`]); counted.
 pub(crate) fn make(
   state: &mut ShardState,
   green: DbVolumeId,
@@ -104,67 +113,422 @@ pub(crate) fn make(
   authorship: &Authorship,
   copies: &[MadeCopy],
 ) {
-  match made(state, green, version, authorship, copies) {
-    Ok(true) => state.count(MADE, 1),
-    Ok(false) => {}
-    Err(why) => {
-      slates_machine::log_line!(
-        "slates-server: partition {}: no changeset was made of a submitted version: {why:?}",
-        state.partition
-      );
-      state.count(UNMADE, 1);
-    }
+  let Some(repository) = mercurial_repository_of(state, green) else {
+    return;
+  };
+  let turn = crate::repository::svn_commit::landing::Turn::take_now(state, repository);
+  let task = made_landing(
+    (repository, green, version),
+    (authorship.clone(), copies.to_vec()),
+    turn,
+  );
+  if slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    unmade(state, &Unmade::Unlanded);
   }
 }
 
-/// Makes the changeset of the version `pending` holds, of a Mercurial repository's green, through the deferred-submit
-/// hook (A-806, `crate::made_commit`): a task holding the repository's landing turn, which the submit took before its
-/// verdict, applies the held verdict and commits the version and its changeset in one step, then answers.
+/// Counts and logs a version of which no changeset was made.
+fn unmade(state: &mut ShardState, why: &Unmade) {
+  slates_machine::log_line!(
+    "slates-server: partition {}: no changeset was made of a submitted version: {why:?}",
+    state.partition
+  );
+  state.count(UNMADE, 1);
+}
+
+/// [`make`]'s task: the landing turn (`turn`, or awaited where the submit could not take it), then the changeset made
+/// of `green`'s `version`, landed and recorded in its own transaction; counted.
+async fn made_landing(
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  (authorship, copies): (Authorship, Vec<MadeCopy>),
+  turn: Option<crate::repository::svn_commit::landing::Turn>,
+) {
+  let turn = match turn {
+    Some(turn) => turn,
+    None => match crate::repository::svn_commit::landing::turn(repository).await {
+      Some(turn) => turn,
+      None => return,
+    },
+  };
+  let made = crate::state::with_state(|state| {
+    super::lent_state(state, |state| {
+      made_applied(state, green, version, (&authorship, &copies))
+    })
+  });
+  let Some(made) = made else {
+    return;
+  };
+  let made = match made {
+    Ok(Some(made)) => made,
+    other => {
+      let _ = crate::state::with_state(move |state| {
+        if let Err(why) = &other {
+          unmade(state, why);
+        }
+        turn.give_back(state);
+      });
+      return;
+    }
+  };
+  let landed = landed(made).await;
+  let _ = crate::state::with_state(move |state| {
+    match landed {
+      Some(Ok((made, prepared))) => {
+        state.db.begin();
+        let committed = commit_made(state, &made, prepared);
+        let committed = match (committed, state.db.commit(&mut state.segment)) {
+          (Ok(()), Ok(_)) => Ok(()),
+          (Err(why), _) => Err(why),
+          (Ok(()), Err(error)) => {
+            crate::verbs::reconcile_unpublished_effects(state);
+            Err(Unmade::Entry(refusal_of_db(&error)))
+          }
+        };
+        match committed {
+          Ok(()) => state.count(MADE, 1),
+          Err(why) => unmade(state, &why),
+        }
+      }
+      Some(Err(why)) => unmade(state, &why),
+      None => {}
+    }
+    turn.give_back(state);
+  });
+}
+
+/// Makes the changeset of the version `pending` holds, of a Mercurial repository's green, from its verdict `judged`,
+/// held and not applied (A-805, `crate::made_commit`; A-767 C1): made from a preview of the verdict in this step, so the
+/// green shows nothing of it; then a task holding the repository's landing turn, which the submit took before its
+/// verdict, lands it on the node's changeset store and commits the version with it in one step, then answers.
 pub(crate) fn make_deferred(
   state: &mut ShardState,
   turn: crate::repository::svn_commit::landing::Turn,
   pending: crate::made_commit::Pending,
-  copies: Vec<MadeCopy>,
+  (copies, judged): (Vec<MadeCopy>, slates_merge::engine::Judged),
 ) {
-  let (green, _) = pending.version();
+  let (green, version) = pending.version();
+  let made = super::lent_state(state, |state| {
+    made_held(
+      state,
+      (green, version),
+      (pending.authorship(), &copies),
+      judged,
+    )
+  });
   let request = pending.request();
-  let task = made_step(turn, pending, copies);
+  let task = made_commit_landing(turn, pending, made);
   if slates_rt::futures::spawn(task)
     .and_then(slates_rt::futures::detach)
     .is_err()
   {
     // The task could not start (the shard's arena full): nothing of the accept is applied or durable.
-    state.count(UNMADE, 1);
+    unmade(state, &Unmade::Unlanded);
     crate::made_commit::abandon(state, (request, green));
   }
 }
 
-/// [`make_deferred`]'s task: the one step, the changeset made of the version once the verdict is applied (as [`make`]
-/// makes it), in that step's transaction; counted.
-async fn made_step(
+/// [`make_deferred`]'s task: the changeset `made` landed on the store, then committed with the version
+/// (`made_commit::commit`); a changeset not made, or one the commit refused, leaves the version standing alone, and a
+/// store that refused it gives the accept up (`made_commit::abandon`).
+async fn made_commit_landing(
   turn: crate::repository::svn_commit::landing::Turn,
   pending: crate::made_commit::Pending,
-  copies: Vec<MadeCopy>,
+  made: Result<Option<Made>, Unmade>,
 ) {
+  let (green, _) = pending.version();
+  let made = match made {
+    Ok(Some(made)) => made,
+    other => {
+      let _ = crate::state::with_state(move |state| {
+        if let Err(why) = &other {
+          unmade(state, why);
+        }
+        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+        turn.give_back(state);
+      });
+      return;
+    }
+  };
+  let landed = landed(made).await;
   let _ = crate::state::with_state(move |state| {
-    let (green, version) = pending.version();
-    let authorship = pending.authorship().clone();
-    let committed = crate::made_commit::commit(state, pending, |state| {
-      made(state, green, version, &authorship, &copies)
-    });
-    match committed {
-      Some(Ok(true)) => state.count(MADE, 1),
-      Some(Err(why)) => {
-        slates_machine::log_line!(
-          "slates-server: partition {}: no changeset was made of a submitted version: {why:?}",
-          state.partition
-        );
-        state.count(UNMADE, 1);
+    match landed {
+      Some(Ok((made, prepared))) => {
+        match crate::made_commit::commit(state, pending, |state| {
+          commit_made(state, &made, prepared)
+        }) {
+          Some(Ok(())) => state.count(MADE, 1),
+          Some(Err(why)) => unmade(state, &why),
+          None => {}
+        }
       }
-      Some(Ok(false)) | None => {}
+      // The store refused the changeset: nothing of the accept is applied or durable.
+      Some(Err(Unmade::Unlanded)) => crate::made_commit::abandon(state, (pending.request(), green)),
+      Some(Err(why)) => {
+        unmade(state, &why);
+        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+      }
+      None => {}
     }
     turn.give_back(state);
   });
+}
+
+/// What a made changeset carries to its landing (module docs): its repository, its green and version, and the revisions
+/// the server made.
+struct Made {
+  /// The repository.
+  repository: RepositoryId,
+  /// The green it was made of.
+  green: DbVolumeId,
+  /// The version it was made of.
+  version: u64,
+  /// Its revisions.
+  verified: Verified,
+}
+
+/// What a made changeset is built from, read from the shard before the green is read: the repository, the version and
+/// the one before, the parent, the user, message and time, the branch, and the room.
+struct Inputs {
+  /// The repository.
+  repository: RepositoryId,
+  /// The version before and the version.
+  versions: (u64, u64),
+  /// The parent changeset.
+  parent: Node,
+  /// The user, the message and the time in whole seconds.
+  authored: (String, String, u64),
+  /// The branch.
+  branch: Vec<u8>,
+  /// The room it is made within.
+  room: u64,
+}
+
+/// [`Inputs`] of `green`'s `version`; none where `green` is no Mercurial repository's.
+fn inputs(
+  state: &mut ShardState,
+  (green, version): (DbVolumeId, u64),
+  authorship: &Authorship,
+) -> Result<Option<Inputs>, Unmade> {
+  let Some(repository) = mercurial_repository_of(state, green) else {
+    return Ok(None);
+  };
+  // A store being made again from its records is lent to nothing (A-732): no changeset is made over half its history.
+  if state.vcs_stores.rebuilding(repository) {
+    return Err(Unmade::NotHead);
+  }
+  let user = authorship
+    .identities
+    .mercurial
+    .clone()
+    .ok_or(Unmade::Authorship)?;
+  let message = authorship.message.clone().ok_or(Unmade::Authorship)?;
+  // The changeset's time is the owner's instant, read once; its text carries it, so a replay reads no clock.
+  let seconds = u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0);
+  let before = version.checked_sub(1).ok_or(Unmade::NotHead)?;
+  let parent = made_at(state, green, before)
+    .or_else(|| named_head(state, green))
+    .unwrap_or(slates_hg::NULL_NODE);
+  let room = crate::vcs_share::room(state, repository).bytes;
+  let (content, store) = state
+    .vcs_stores
+    .mercurial_ref(repository)
+    .ok_or(Unmade::NotHead)?;
+  let branch = branch_of(state, (repository, green), (&store.index, content), parent);
+  Ok(Some(Inputs {
+    repository,
+    versions: (before, version),
+    parent,
+    authored: (user, message, seconds),
+    branch,
+    room,
+  }))
+}
+
+/// The changeset of `green`'s `version` made of the green as the version left it (a bare dispatch's, [`make`]).
+fn made_applied(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+  (authorship, copies): (&Authorship, &[MadeCopy]),
+) -> Result<Option<Made>, Unmade> {
+  let Some(inputs) = inputs(state, (green, version), authorship)? else {
+    return Ok(None);
+  };
+  let engine = state.greens.get(&green).ok_or(Unmade::NotHead)?;
+  let (content, store) = state
+    .vcs_stores
+    .mercurial_ref(inputs.repository)
+    .ok_or(Unmade::NotHead)?;
+  let verified = verified_of(&engine, (&store.index, content), &inputs, copies)?;
+  Ok(verified.map(|verified| Made {
+    repository: inputs.repository,
+    green,
+    version,
+    verified,
+  }))
+}
+
+/// The changeset of `green`'s `version` made from the verdict `judged`, held and not applied: read from a preview of it
+/// (`Greens::preview`), retired in this step.
+fn made_held(
+  state: &mut ShardState,
+  (green, version): (DbVolumeId, u64),
+  (authorship, copies): (&Authorship, &[MadeCopy]),
+  judged: slates_merge::engine::Judged,
+) -> Result<Option<Made>, Unmade> {
+  let Some(inputs) = inputs(state, (green, version), authorship)? else {
+    return Ok(None);
+  };
+  let ShardState {
+    greens, vcs_stores, ..
+  } = &mut *state;
+  let preview = greens
+    .preview(&green, judged)
+    .map_err(|_| Unmade::NotHead)?;
+  let verified = greens
+    .with_preview(&preview, |engine| {
+      let (content, store) = vcs_stores
+        .mercurial_ref(inputs.repository)
+        .ok_or(Unmade::NotHead)?;
+      verified_of(engine, (&store.index, content), &inputs, copies)
+    })
+    .unwrap_or(Err(Unmade::NotHead));
+  greens.retire_preview(preview);
+  Ok(verified?.map(|verified| Made {
+    repository: inputs.repository,
+    green,
+    version,
+    verified,
+  }))
+}
+
+/// A made changeset ready to land: its fork (the push's intake's, its changegroup taken into the index as it stood)
+/// and its changeset with the register's reference to it.
+type Prepared = (
+  crate::repository::hg_push::Forked,
+  crate::repository::hg_push::Changeset,
+);
+
+/// `made`'s changegroup (`slates_hg::push::made::changegroup`) taken through the push's own intake into a fork, its
+/// changeset made with its made record and reference (`hg_push::changeset_landing`), then landed on the node's
+/// changeset store and awaited (A-767 C1: a made changeset lands as a push's does). The fork is given back where the
+/// store refused it. None where the shard's state is gone.
+async fn landed(
+  made: Made,
+) -> Option<Result<(Made, (crate::repository::hg_push::Forked, Vec<u8>)), Unmade>> {
+  let prepared = crate::state::with_state(|state| prepared(state, &made))?;
+  let (forked, (disk, header, parts, reference)) = match prepared {
+    Ok(prepared) => prepared,
+    Err(why) => return Some(Err(why)),
+  };
+  if disk.land(header, parts).await.is_ok() {
+    return Some(Ok((made, (forked, reference))));
+  }
+  crate::state::with_state(|state| give_back_fork(state, forked.fork))?;
+  Some(Err(Unmade::Unlanded))
+}
+
+/// [`landed`]'s first half: the changegroup taken into a fork and the changeset made, its sequence taken now.
+fn prepared(state: &mut ShardState, made: &Made) -> Result<Prepared, Unmade> {
+  let room = crate::vcs_share::room(state, made.repository).bytes;
+  let changegroup =
+    slates_hg::push::made::changegroup(&made.verified, &mut slates_hg::Admission::new(room))
+      .map_err(|_| Unmade::Record)?;
+  let taken = crate::repository::hg_push::take_whole(
+    state,
+    made.repository,
+    (slates_hg::push::made::CHANGEGROUP_VERSION, changegroup),
+    &mut slates_hg::Admission::new(room),
+  );
+  let mut forked = match taken {
+    Some(Ok(forked)) => forked,
+    Some(Err(_)) => return Err(Unmade::Record),
+    None => return Err(Unmade::NotHead),
+  };
+  let made_key = (green_key(made.green), made.version);
+  match crate::repository::hg_push::changeset_landing(
+    state,
+    made.repository,
+    &mut forked,
+    Some(made_key),
+  ) {
+    Some(changeset) => Ok((forked, changeset)),
+    None => {
+      give_back_fork(state, forked.fork);
+      Err(Unmade::NotHead)
+    }
+  }
+}
+
+/// Records a landed made changeset in the caller's transaction (module docs): the register's entry naming its changeset
+/// by reference, judged then appended, then its fork put in the index's place and the made node noted; the fork given
+/// back where the entry is refused or a client's push made it stale meanwhile.
+fn commit_made(
+  state: &mut ShardState,
+  made: &Made,
+  (forked, reference): (crate::repository::hg_push::Forked, Vec<u8>),
+) -> Result<(), Unmade> {
+  let node = made
+    .verified
+    .changesets
+    .first()
+    .map(|changeset| changeset.node)
+    .ok_or(Unmade::Record)?;
+  if state.vcs_stores.generation_of(made.repository) != Some(forked.generation) {
+    give_back_fork(state, forked.fork);
+    return Err(Unmade::Stale);
+  }
+  let entry = Op::RepositoryAdvanced {
+    entry: RepositoryEntry {
+      repository: made.repository,
+      objects: reference,
+      ..RepositoryEntry::default()
+    },
+  };
+  let now = state.clock.monotonic_ns();
+  let appended = state
+    .db
+    .partition()
+    .check(&entry, now)
+    .and_then(|()| state.db.mutate(&mut state.segment, &entry, now).map(drop));
+  if let Err(error) = appended {
+    give_back_fork(state, forked.fork);
+    return Err(Unmade::Entry(refusal_of_db(&error)));
+  }
+  let (repository, green, version) = (made.repository, made.green, made.version);
+  let fork = forked.fork;
+  let released = super::within_budget(state, 0, |stores| {
+    let replaced = match stores.mercurial(repository) {
+      Some((content, store)) => {
+        store.made.insert(green_key(green), (version, node));
+        core::mem::replace(&mut store.index, fork).release(content)
+      }
+      None => stores
+        .content_mut()
+        .map_or(Ok(()), |content| fork.release(content)),
+    };
+    stores.index_changed(repository);
+    replaced
+  });
+  if released.is_err() {
+    state.count(super::RELEASE_REFUSED, 1);
+  }
+  Ok(())
+}
+
+/// Gives a made changeset's fork back, counted where a hold did not go back.
+fn give_back_fork(state: &mut ShardState, fork: HgIndex) {
+  let released = super::within_budget(state, 0, |stores| {
+    stores
+      .content_mut()
+      .map_or(Ok(()), |content| fork.release(content))
+  });
+  if released.is_err() {
+    state.count(super::RELEASE_REFUSED, 1);
+  }
 }
 
 /// The changeset that is `green`'s head (module docs): the one the server made of its head version, else the one its
@@ -199,52 +563,6 @@ fn named_head(state: &ShardState, green: DbVolumeId) -> Option<Node> {
   })
 }
 
-/// [`make`]'s steps: whether a changeset was made.
-fn made(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  authorship: &Authorship,
-  copies: &[MadeCopy],
-) -> Result<bool, Unmade> {
-  let Some(repository) = mercurial_repository_of(state, green) else {
-    return Ok(false);
-  };
-  // A store being made again from its records is lent to nothing (A-732): no changeset is made over half its history.
-  if state.vcs_stores.rebuilding(repository) {
-    return Err(Unmade::NotHead);
-  }
-  let user = authorship
-    .identities
-    .mercurial
-    .as_deref()
-    .ok_or(Unmade::Authorship)?;
-  let message = authorship.message.as_deref().ok_or(Unmade::Authorship)?;
-  // The changeset's time is the owner's instant, read once; its text carries it, so a replay reads no clock.
-  let seconds = u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0);
-  let before = version.checked_sub(1).ok_or(Unmade::NotHead)?;
-  let parent = made_at(state, green, before)
-    .or_else(|| named_head(state, green))
-    .unwrap_or(slates_hg::NULL_NODE);
-  let room = crate::vcs_share::room(state, repository).bytes;
-  let verified = super::lent_state(state, |state| {
-    changeset_of(
-      state,
-      room,
-      (repository, green),
-      (before, version),
-      parent,
-      (user, message, seconds),
-      copies,
-    )
-  })?;
-  let Some(verified) = verified else {
-    return Ok(false);
-  };
-  recorded(state, (repository, green, version), &verified)?;
-  Ok(true)
-}
-
 /// The Mercurial repository `green` is the green of.
 pub(crate) fn mercurial_repository_of(
   state: &ShardState,
@@ -256,43 +574,36 @@ pub(crate) fn mercurial_repository_of(
   matches!(record.tool, VcsTool::Mercurial).then_some(repository)
 }
 
-/// The revisions the server makes of `green`'s change from `before` to `version` over `parent` (module docs); none
-/// where the change touches no tracked file.
-fn changeset_of(
-  state: &ShardState,
-  room: u64,
-  (repository, green): (RepositoryId, DbVolumeId),
-  (before, version): (u64, u64),
-  parent: Node,
-  (user, message, seconds): (&str, &str, u64),
+/// The revisions the server makes of `engine`'s change from the version before to the version over the parent
+/// (module docs; `inputs`), read against `index`; none where the change touches no tracked file.
+fn verified_of(
+  engine: &Green,
+  (index, content): (&HgIndex, &slates_vcs::ContentStore),
+  inputs: &Inputs,
   copies: &[MadeCopy],
 ) -> Result<Option<Verified>, Unmade> {
-  let engine = state.greens.get(&green).ok_or(Unmade::NotHead)?;
+  let (before, version) = inputs.versions;
   if engine.head() != version {
     return Err(Unmade::NotHead);
   }
-  let (content, store) = state
-    .vcs_stores
-    .mercurial_ref(repository)
-    .ok_or(Unmade::NotHead)?;
   let paths = engine.changed_between(before, version);
   let sources: Vec<Option<String>> = paths.iter().map(|path| copied_from(path, copies)).collect();
   let changes: Vec<Change<'_>> = paths
     .iter()
     .zip(&sources)
-    .map(|(path, source)| change_of(&engine, path, source.as_deref()))
+    .map(|(path, source)| change_of(engine, path, source.as_deref()))
     .collect();
-  let branch = branch_of(state, (repository, green), (&store.index, content), parent);
+  let (user, message, seconds) = &inputs.authored;
   let authored = Authored {
     user: user.as_bytes(),
-    seconds,
-    branch: &branch,
+    seconds: *seconds,
+    branch: &inputs.branch,
     message: message.as_bytes(),
   };
-  let mut room = slates_hg::Admission::new(room);
+  let mut room = slates_hg::Admission::new(inputs.room);
   match made_of(
-    &IndexHeld::new(&store.index, content),
-    parent,
+    &IndexHeld::new(index, content),
+    inputs.parent,
     &changes,
     &authored,
     &mut room,
@@ -367,100 +678,6 @@ fn branch_of(
         .and_then(|(name, _)| line_of(name).map(|(branch, _)| branch))
     })
     .unwrap_or_else(|| DEFAULT_BRANCH.to_vec())
-}
-
-/// Records the made revisions (module docs): the entry judged by the register's guard, the revisions kept in a fork,
-/// the entry appended, then the fork put in the index's place and the made node noted; the fork given back where the
-/// append is refused.
-fn recorded(
-  state: &mut ShardState,
-  (repository, green, version): (RepositoryId, DbVolumeId, u64),
-  verified: &Verified,
-) -> Result<(), Unmade> {
-  let node = verified
-    .changesets
-    .first()
-    .map(|changeset| changeset.node)
-    .ok_or(Unmade::Record)?;
-  let room = crate::vcs_share::room(state, repository).bytes;
-  // The made manifest's record is its delta against its first parent's text (A-729 part 2), read from the index.
-  let parent = verified
-    .manifests
-    .first()
-    .map(|manifest| manifest.p1)
-    .filter(|p1| *p1 != slates_hg::NULL_NODE)
-    .and_then(|p1| {
-      let (content, store) = state.vcs_stores.mercurial_ref(repository)?;
-      slates_hg::push::verify::Held::manifest_text(
-        &slates_hg::push::held::IndexHeld::new(&store.index, content),
-        &p1,
-      )
-      .map(std::borrow::Cow::into_owned)
-    });
-  let objects = slates_hg::import::record::write_made(
-    verified,
-    (green_key(green), version),
-    parent.as_deref(),
-    room,
-  )
-  .map_err(|_| Unmade::Record)?;
-  let entry = Op::RepositoryAdvanced {
-    entry: RepositoryEntry {
-      repository,
-      objects,
-      ..RepositoryEntry::default()
-    },
-  };
-  let now = state.clock.monotonic_ns();
-  state
-    .db
-    .partition()
-    .check(&entry, now)
-    .map_err(|error| Unmade::Entry(refusal_of_db(&error)))?;
-  let forked = super::within_budget(state, room, |stores| {
-    let (content, store) = stores.mercurial(repository)?;
-    Some(fork_with(
-      &mut store.index,
-      content,
-      verified,
-      &mut slates_hg::Admission::new(room),
-    ))
-  });
-  let fork = match forked {
-    Some(Ok(fork)) => fork,
-    Some(Err(refused)) => return Err(Unmade::Index(refused)),
-    None => return Err(Unmade::NotHead),
-  };
-  if let Err(error) = state.db.mutate(&mut state.segment, &entry, now) {
-    let released = super::within_budget(state, 0, |stores| {
-      stores
-        .content_mut()
-        .map_or(Ok(()), |content| fork.release(content))
-    });
-    if released.is_err() {
-      state.count(super::RELEASE_REFUSED, 1);
-    }
-    return Err(Unmade::Entry(refusal_of_db(&error)));
-  }
-  let released = super::within_budget(state, 0, |stores| {
-    let replaced = match stores.mercurial(repository) {
-      Some((content, store)) => {
-        store.made.insert(green_key(green), (version, node));
-        // A made changeset's revisions are held outside the changeset store.
-        store.unstored = true;
-        core::mem::replace(&mut store.index, fork).release(content)
-      }
-      None => stores
-        .content_mut()
-        .map_or(Ok(()), |content| fork.release(content)),
-    };
-    stores.index_changed(repository);
-    replaced
-  });
-  if released.is_err() {
-    state.count(super::RELEASE_REFUSED, 1);
-  }
-  Ok(())
 }
 
 #[cfg(test)]

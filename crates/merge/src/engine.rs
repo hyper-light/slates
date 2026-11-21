@@ -439,7 +439,7 @@ struct FileMaking {
 
 /// A piece of a file being made: a range of its base, or of the work's post-state.
 #[derive(Clone, Copy)]
-enum Segment {
+pub(crate) enum Segment {
   /// `len` bytes of the base from `start`.
   Base { start: u64, len: u64 },
   /// `len` bytes of the post-state from `src`.
@@ -1549,7 +1549,7 @@ fn applied_len(base_len: u64, ops: &[Op]) -> u64 {
 
 /// The pieces [`apply`] makes a base of `base_len` bytes into under `ops`, in order, without copying a byte (A-760,
 /// [`Green::make_step`]): ranges of the base and of the post-state.
-fn segments(base_len: u64, ops: &[Op]) -> Vec<Segment> {
+pub(crate) fn segments(base_len: u64, ops: &[Op]) -> Vec<Segment> {
   let mut pieces = Vec::new();
   let mut pos = 0u64;
   for op in ops {

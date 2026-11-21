@@ -122,14 +122,18 @@ impl PlacedHead {
   /// from itself alone was in flight, kept that one-host cohort, which can never give `f + 1`, so the head read as
   /// unplaced for good after the change settled and every live write on it waited (`placed: false` 40 s in, with both
   /// candidates acknowledging; `a_live_volume_made_on_the_bootstrap_node_at_once_ships_to_its_candidates`).
+  ///
+  /// The configuration's placement of `object` is the shard's cached one (`ShardState::with_placement`), computed once a
+  /// configuration: computed anew, it was most of a live write's allocations on its owner (85a, g228).
   pub(crate) fn placed_under(
     &self,
-    configuration: &slates_db::register::Configuration,
+    state: &crate::state::ShardState,
     object: slates_db::register::ObjectId,
   ) -> bool {
-    configuration
-      .place(object)
-      .placed_with(&self.placement.acked, configuration.quorum)
+    let quorum = state.fleet.configuration().quorum;
+    state.with_placement(object, |placement| {
+      placement.placed_with(&self.placement.acked, quorum)
+    })
   }
 }
 

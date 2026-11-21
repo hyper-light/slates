@@ -76,10 +76,6 @@ pub struct State<'a> {
   pub bookmarks: &'a [(Vec<u8>, Node)],
   /// Whether the repository publishes (7.2's `phases.publish`).
   pub publishing: bool,
-  /// Whether the changeset store keeps every revision of the repository's logs, so a stream clone can send each as the
-  /// store keeps it (goal 93 perf; `crate::render::Streaming`): not for a history imported or made outside it, until
-  /// those land as changesets (w-hg's C1 step 3). Without it no stream is advertised, and a client clones plainly.
-  pub stored_logs: bool,
 }
 
 /// Why a changeset the changelog holds is not served: one of the two filters 7.2's `served` joins.
@@ -174,6 +170,10 @@ pub struct Indexed<'a> {
   census: Census,
   /// How the texts were lent.
   lends: Cell<Lends>,
+  /// The tests' changeset store answered at once from the index's own texts ([`Indexed::answering_from_its_texts`]),
+  /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
+  #[cfg(test)]
+  from_texts: Option<core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>>,
 }
 
 impl<'a> Indexed<'a> {
@@ -214,7 +214,74 @@ impl<'a> Indexed<'a> {
       markers,
       census,
       lends,
+      #[cfg(test)]
+      from_texts: None,
     })
+  }
+
+  /// The view, its changeset store answered at once from the index's own texts, each file revision as a stored whole
+  /// (the tests' stand-in for the node's changeset store, which the daemon asks between steps).
+  #[cfg(test)]
+  pub(crate) fn answering_from_its_texts(mut self) -> Self {
+    self.from_texts = Some(core::cell::RefCell::new(std::collections::BTreeMap::new()));
+    self
+  }
+
+  /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
+  #[cfg(test)]
+  fn given_from_texts(
+    &self,
+    texts: &core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>,
+    want: &crate::render::Want,
+  ) -> Option<super::getbundle::Given> {
+    use crate::render::{StoredPlace, StoredRevision, Want};
+    match want {
+      Want::Rows { logs } => {
+        let mut rows = Vec::new();
+        for (path, nodes) in logs {
+          let mut log = Vec::new();
+          for node in nodes {
+            let mut room = Admission::new(u64::MAX);
+            let logged = self.logged(Log::File(path), node, &mut room).ok()?;
+            log.push(logged.map(|logged| {
+              let text = logged.text.into_owned();
+              let identity = *blake3::hash(&text).as_bytes();
+              let len = to_u64(crate::delta::HUNK_HEADER_LEN.saturating_add(text.len()));
+              texts.borrow_mut().insert(identity, text);
+              StoredRevision {
+                text: identity,
+                base: None,
+                place: StoredPlace {
+                  payload: identity,
+                  offset: 0,
+                  len,
+                },
+              }
+            }));
+          }
+          rows.push(log);
+        }
+        Some(super::getbundle::Given::Rows(rows))
+      }
+      Want::Chunks { places } => {
+        let held = texts.borrow();
+        let mut chunks = Vec::new();
+        for place in places {
+          let mut chunk = Vec::new();
+          crate::delta::encode_full_text(held.get(&place.payload)?, &mut chunk).ok()?;
+          chunks.push(chunk);
+        }
+        Some(super::getbundle::Given::Chunks(chunks))
+      }
+      Want::Texts { texts: asked } => {
+        let held = texts.borrow();
+        let mut made = Vec::new();
+        for identity in asked {
+          made.push(held.get(identity)?.clone());
+        }
+        Some(super::getbundle::Given::Texts(made))
+      }
+    }
   }
 
   /// Why the changeset `node` is not served; `None` for one it serves, or one the changelog does not hold.
@@ -447,6 +514,31 @@ impl Store for Indexed<'_> {
     self.logged(Log::File(path), node, room)
   }
 
+  fn stored_now(&self, want: &crate::render::Want) -> Option<super::getbundle::Given> {
+    #[cfg(test)]
+    if let Some(texts) = &self.from_texts {
+      return self.given_from_texts(texts, want);
+    }
+    let _ = want;
+    None
+  }
+
+  /// A file revision as its log's row holds it, no text read (A-767 C1).
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::getbundle::FileEntry> {
+    let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self
+      .index
+      .revision(self.store, log, rev)
+      .filter(|row| row.node == *node)?;
+    Some(super::getbundle::FileEntry {
+      position: u64::from(rev),
+      parents: [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      link: self.index.changeset(self.store, row.link)?.node,
+      flags: row.flags,
+    })
+  }
+
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
     self.markers.iter().flat_map(|payload| {
       obsmarkers::decode(payload)
@@ -514,14 +606,13 @@ impl Store for Indexed<'_> {
   /// A stream is served unless a secret root the changelog holds makes a changeset secret (7.2's
   /// `allowservergeneration` over `phases.hassecret`); hidden changesets are streamed, as 7.2 streams them.
   fn streams(&self) -> bool {
-    self.state.stored_logs
-      && !self.state.roots.iter().any(|root| {
-        root.phase == Phase::Secret
-          && self
-            .index
-            .rev(self.store, Log::Changelog, &root.node)
-            .is_some()
-      })
+    !self.state.roots.iter().any(|root| {
+      root.phase == Phase::Secret
+        && self
+          .index
+          .rev(self.store, Log::Changelog, &root.node)
+          .is_some()
+    })
   }
 
   fn revlogs(&self) -> Option<(&HgIndex, &ContentStore)> {
