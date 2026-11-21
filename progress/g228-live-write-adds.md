@@ -150,6 +150,12 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   test holds every step timed and the sum within the build (green, kiln, debug). Diag run 15 (ubuntu-latest, release,
   5 rounds, transport bench beside each round) pending: report = daemon share + transport floor + base commit.
 
+## 2026-11-21 ~12:10 PST: landed 65133486d (build split + kept sealing keys); free for goal 93 (inbox/main-from-g228-free.md)
+- Seal probe, one 4.6 KB live piece: Apple silicon 9.65 us (2 BLAKE3 5.3, content_keyed 3.0); ubuntu-latest EPYC
+  11.78 us (content_keyed 6.09 = 2 derive_child x 2.71, 2 BLAKE3 4.1). Leads: derive the file id without the discarded
+  wrap (hyper-seal); blake3 neon on aarch64; hash a raw chunk once (seal.md §4 ruling).
+- Worktrees removed to free Studio-4 (~1.4 GB). Diag branches 10-19 and diag-results for main to delete.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
