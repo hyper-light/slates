@@ -1065,40 +1065,50 @@ fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
 /// slower than that release did.
 const MANY_REVISIONS: u64 = 2_000;
 
-/// Shape: the lines of the one file each revision of [`many_revisions_dump`] changes a line of.
-const MANY_REVISIONS_LINES: usize = 64;
+/// Shape: the files of the one directory every revision of [`many_revisions_dump`] changes a file of: as many as
+/// git/git's tree holds at f7de81456940 (4,872), the dump the matrix met the refusal with. Every revision's file in an
+/// FSFS view carries the listing of each directory on a changed path, so each revision costs the view as much as this
+/// listing; a history of one file lays 2,000 revisions out inside a liveness budget even in a debug build (this test
+/// with one file passed on main a51023f57, 22.8 s).
+const MANY_REVISIONS_FILES: u64 = 4_872;
 
-/// A dump of `revisions` revisions, each changing one line of one file, `file`, under `trunk/` (`slates_svn`'s
-/// `fsfs_view_bench` dump, put under a trunk): the history a hook's first view must lay out a revision at a time.
+/// A dump of `revisions` revisions under `trunk/`: the first adds [`MANY_REVISIONS_FILES`] files, each later one
+/// changes one of them: the history a hook's first view must lay out a revision at a time.
 fn many_revisions_dump(revisions: u64) -> Vec<u8> {
   let props = |log: &str| format!("K 7\nsvn:log\nV {}\n{log}\nPROPS-END\n", log.len());
-  let mut text: Vec<String> = (0..MANY_REVISIONS_LINES)
-    .map(|n| format!("{n:063}"))
-    .collect();
+  let file = |path: String, action: &str, body: &str| {
+    format!(
+      "Node-path: {path}\nNode-kind: file\nNode-action: {action}\nText-content-length: {0}\nContent-length: {0}\n\n\
+       {body}\n\n",
+      body.len()
+    )
+  };
   let mut out = String::from(
     "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-0000000064a6\n\nRevision-number: 0\n\
      Prop-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n",
   );
   for revision in 1..=revisions {
-    let at = usize::try_from(revision).unwrap() % MANY_REVISIONS_LINES;
-    if let Some(line) = text.get_mut(at) {
-      *line = format!("r{revision:062}");
-    }
-    let body: String = text.iter().map(|line| format!("{line}\n")).collect();
     let log = props(&format!("r{revision}"));
     out.push_str(&format!(
       "Revision-number: {revision}\nProp-content-length: {0}\nContent-length: {0}\n\n{log}\n",
       log.len()
     ));
     if revision == 1 {
-      out.push_str("Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n");
+      out.push_str(
+        "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\n\
+         PROPS-END\n\n",
+      );
+      for at in 0..MANY_REVISIONS_FILES {
+        out.push_str(&file(format!("trunk/f{at:05}"), "add", &format!("{at}\n")));
+      }
+    } else {
+      let at = revision % MANY_REVISIONS_FILES;
+      out.push_str(&file(
+        format!("trunk/f{at:05}"),
+        "change",
+        &format!("{at} r{revision}\n"),
+      ));
     }
-    let action = if revision == 1 { "add" } else { "change" };
-    out.push_str(&format!(
-      "Node-path: trunk/file\nNode-kind: file\nNode-action: {action}\nText-content-length: {0}\n\
-       Content-length: {0}\n\n{body}\n\n",
-      body.len()
-    ));
   }
   out.into_bytes()
 }
