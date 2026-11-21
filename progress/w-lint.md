@@ -423,3 +423,4 @@
   wall was clean.
 - VCS lane: Linux r36 dropped (adacachy didn't answer in 15 s), so I resubmitted it once as r38 (shallow clone).
   Windows r37 is queued for jupiter.
+- Disk: 33 GB free after the round (other workers' builds), so I deleted my own debug target (19 GB, literal path): 51 GB free.
