@@ -938,15 +938,18 @@ fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step(
 /// three objects each: enough that a few units a turn is hundreds of turns.
 const PACED_HISTORY: usize = 600;
 
-/// Shape: the most turns that line's one derivation may take while nobody else waits on the shard: a turn to begin it,
-/// one or two to derive it within the step's ceiling, one to find nothing due.
+/// Shape: the turns that line's one derivation takes besides those its work fills while nobody else waits on the shard:
+/// a turn to begin it, one to end the turn its work ends in, one to find nothing due, with room for a scheduler's
+/// spurious wake or two.
 const PACED_TURNS: u64 = 8;
 
 /// A-614 amended, paced (main's report of 2026-11-21, r52: a clone of git/git's branches took 465 s, its derivation of 8
 /// versions 3,024,021 turns, each paying the shard's lend, its settle and a yield). Do: push a line of [`PACED_HISTORY`]
 /// commits as one create, then turn the repository's derivation until it is idle, nobody else waiting on the shard.
-/// Expect: the one version derived, in at most [`PACED_TURNS`] turns: a derivation runs while nobody waits to the step's
-/// ceiling (A-783), never a few units a turn. Red before the change: hundreds of turns.
+/// Expect: the one version derived, in at most [`PACED_TURNS`] turns besides one per step's ceiling of the derivation's
+/// wall time: a derivation runs while nobody waits to the step's ceiling (A-783), never a few units a turn, so its turns
+/// follow its time, whatever the machine's load (a loaded host's ceiling-long turns do less each; main's ruling of
+/// 2026-11-21 08:20, the rule stated rather than the machine's speed). Red before the change: hundreds of turns.
 #[test]
 fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects() {
   use crate::vcs_store::git_derive::{DERIVED, TURNS, derive_for_read};
@@ -971,6 +974,10 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   // The derivation runs as a fetch's does, a task of the shard; this thread waits on a channel, not on the shard, so
   // nobody else waits there.
   let (done, finished) = std::sync::mpsc::channel();
+  let ceiling_ns = crate::daemon::observe_first(&daemon, |state| {
+    slates_rt::futures::step_ceiling_ns().unwrap_or_else(|| state.config.step_quantum_ns())
+  });
+  let began = std::time::Instant::now();
   crate::daemon::observe_first(&daemon, move |_| {
     let task = slates_rt::futures::spawn(async move {
       derive_for_read(repository).await;
@@ -980,13 +987,18 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
     slates_rt::futures::detach(task).unwrap();
   });
   finished.recv().unwrap();
+  let took_ns = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
   let after = crate::daemon::observe_first(&daemon, move |state| {
     (count(state, TURNS), count(state, DERIVED))
   });
   daemon.stop();
   let (turns, derived) = (after.0 - before.0, after.1 - before.1);
   assert_eq!(derived, 1);
-  assert!(turns <= PACED_TURNS, "{turns} turns");
+  let filled = took_ns.div_ceil(ceiling_ns.max(1));
+  assert!(
+    turns <= PACED_TURNS + filled,
+    "{turns} turns over {took_ns} ns at a {ceiling_ns} ns ceiling"
+  );
 }
 
 /// Shape: the files of [`t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`]'s first

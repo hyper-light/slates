@@ -8070,8 +8070,10 @@ mod tests {
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained
-  /// anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any node's window); read
-  /// the file's object by its identity, the BLAKE3 of its bytes; publish; stop; start a successor and read it again.
+  /// anchor segment and content object, write `main`'s one file, 1 MiB (past any node's window), in a work and submit it,
+  /// so the version's map holds the file's object (a pushed create owes its push since P2, A-821, and holds nothing until
+  /// first read; a submitted version's map is made with it and made again by the replay); read the file's object by its
+  /// identity, the BLAKE3 of its bytes; publish; stop; start a successor and read it again.
   /// Expect: the object whole by its identity on both; the successor taking back every list and name of the content
   /// store from the shard image (none refused), so the records' replay stores no list again.
   #[test]
@@ -8097,7 +8099,6 @@ mod tests {
         rendezvous: rendezvous.adoption(),
       }
     };
-    let (request, _) = crate::git_push::tests::large_create(LARGE);
     let blob: Vec<u8> = (0..LARGE)
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
@@ -8112,11 +8113,33 @@ mod tests {
     };
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
+    let written = blob.clone();
     let before = first
       .observe(first.shards.first().copied(), move |state| {
-        let repository = crate::git_push::tests::git_repository(state, "large");
-        let received = crate::git_push::tests::pushed(state, repository, &request);
-        let _ = received;
+        use crate::vcs_store::paths::tests::{ask, git_repository};
+        use slates_ipc::protocol::{ReplyBody, RequestBody};
+        let (_, green) = git_repository(state, "large");
+        let made = ask(
+          state,
+          RequestBody::CreateWork {
+            green,
+            name: "work-large".to_owned(),
+          },
+        );
+        let ReplyBody::WorkCreated { id: work, .. } = made else {
+          return None;
+        };
+        ask(
+          state,
+          RequestBody::Edit {
+            work,
+            path: "/large".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: written,
+          },
+        );
+        ask(state, crate::identities::authored(work, "large"));
         crate::vcs_store::paths::whole_build::settle(state);
         read(state)
       })
@@ -8171,6 +8194,105 @@ mod tests {
       (unrestored, lists),
       (0, Some(0)),
       "none refused, no list stored again"
+    );
+  }
+
+  /// P2 with A-727 a3b (main's ruling of 2026-11-21: the pushed path's survival, derived on first read, A-821). Do: on a
+  /// daemon over a retained anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any
+  /// node's window), and read the file's object by its identity; read `main` through the door and read the object
+  /// again; publish; stop; start a successor, read the object, then read `main` through the door and read it again.
+  /// Expect: on each daemon the object absent until `main` is first read (the green owes its push, its paths derived on
+  /// first read) and whole by its identity once it is.
+  #[test]
+  fn t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart() {
+    use slates_anchor::AnchorSegment;
+    const LARGE: usize = 1 << 20;
+    let profile = test_profile();
+    let instance = format!("p2-pushed-{}", std::process::id());
+    let store = crate::test_store::TestStore::start("p2-pushed");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let (request, _) = crate::git_push::tests::large_create(LARGE);
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = slates_vcs::ContentId::of(&blob);
+    let len = u64::try_from(LARGE).unwrap();
+    let read = move |state: &mut crate::state::ShardState| {
+      let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
+      lent
+        .stores
+        .content()
+        .and_then(|content| content.object_bytes(&identity, len))
+    };
+    // `main` reached through the door, made and its map derived: the object then, or none while it is being made.
+    let first_read = move |state: &mut crate::state::ShardState| {
+      let repositories = state.db.partition().repositories();
+      let repository = repositories.repository_named("large")?.id;
+      let green = repositories.branch(repository, "main")?;
+      if crate::green_ready::green_ready(state, green)
+        == crate::green_ready::GreenReady::Materializing
+      {
+        return None;
+      }
+      crate::vcs_store::paths::whole_build::settle(state);
+      read(state)
+    };
+    // Derived: 600 looks 50 ms apart, the wait a daemon is given to make the green and read the object back.
+    let patience = std::time::Duration::from_millis(50).saturating_mul(600);
+    let until_read = |daemon: &super::Daemon| {
+      let shard = daemon.shards.first().copied();
+      let deadline = std::time::Instant::now() + patience;
+      loop {
+        let seen = daemon.observe(shard, first_read).ok().flatten();
+        match deadline.checked_duration_since(std::time::Instant::now()) {
+          Some(left) if seen.is_none() => {
+            std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+          }
+          _ => return seen,
+        }
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let unread = first
+      .observe(first.shards.first().copied(), move |state| {
+        let repository = crate::git_push::tests::git_repository(state, "large");
+        let received = crate::git_push::tests::pushed(state, repository, &request);
+        let _ = received;
+        read(state)
+      })
+      .unwrap();
+    let before = until_read(&first);
+    first.publish_every_shard().unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let after = until_read(&second);
+    second.stop();
+    assert_eq!(unread, None, "nothing derived before main is first read");
+    assert_eq!(
+      before.as_deref(),
+      Some(blob.as_slice()),
+      "the object once read, before"
+    );
+    assert_eq!(
+      after.as_deref(),
+      Some(blob.as_slice()),
+      "the object once read, after a restart"
     );
   }
 
@@ -8331,14 +8453,39 @@ mod tests {
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
-  /// git repository and push the fixtures' `create` and `update` into it; publish every shard; stop; start a successor
-  /// over the same segment. Expect: every window the first daemon kept (by identity, with its holders and its bytes)
-  /// kept by the successor, taken back from the shard image (every one restored, none refused, none left unheld once
-  /// the records were replayed), so the replay's puts were answered by the windows kept, none stored again.
+  /// git repository and push the fixtures' `create` and `update` into it; note `main`'s map of paths (its version and
+  /// tree), then let go of the greens' derived maps; publish every shard; stop; start a successor over the same segment;
+  /// once its windows are back, read `main` through the door. Expect, P2's rule both halves (A-821: a created green owes
+  /// its push again on replay, and its paths are derived on first read): every window the records hold (by identity,
+  /// with its holders and its bytes) kept by the successor, taken back from the shard image (every one restored, none
+  /// refused, none left unheld once the records were replayed), so the replay's puts were answered by the windows kept,
+  /// none stored again; and after the first read `main`'s map back, of the same version and tree as the first daemon's.
   #[test]
   fn t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image() {
     use slates_anchor::AnchorSegment;
     type Windows = Vec<(slates_vcs::ContentId, u64, Vec<u8>)>;
+    /// `main`'s green in the repository named `kept`, and its map of paths: the version and the root tree's id.
+    fn main_map(
+      state: &crate::state::ShardState,
+    ) -> Option<(
+      slates_db::catalog::VolumeId,
+      Option<(u64, slates_git::object_name::ObjectId)>,
+    )> {
+      let repositories = state.db.partition().repositories();
+      let repository = repositories.repository_named("kept")?.id;
+      let green = repositories.branch(repository, "main")?;
+      let (content, git) = state.vcs_stores.git_ref(repository)?;
+      let map = git
+        .heads
+        .get(&crate::vcs_store::green_key(green))
+        .and_then(|head| {
+          Some((
+            head.version,
+            git.trees.as_ref()?.id(content, head.trees).ok()?,
+          ))
+        });
+      Some((green, map))
+    }
     fn windows(state: &mut crate::state::ShardState) -> Windows {
       let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
       let Some(content) = lent.stores.content() else {
@@ -8380,11 +8527,16 @@ mod tests {
     let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
     first.bootstrap(true).unwrap();
     let shard = first.shards.first().copied();
-    first
+    let map_before = first
       .observe(shard, |state| {
         let repository = crate::git_push::tests::git_repository(state, "kept");
         crate::git_push::tests::pushed_from_the_fixtures(state, repository, &["create", "update"]);
         crate::vcs_store::paths::whole_build::settle(state);
+        let map = main_map(state).and_then(|(_, map)| map);
+        // The greens' maps are derived data: a successor replays a created green owing its push again, and derives its
+        // paths on first read (P2, A-821), so the windows compared are those the repository's records hold.
+        crate::vcs_store::paths::forget_maps_for_test(state, repository);
+        map
       })
       .unwrap();
     first.publish_every_shard().unwrap();
@@ -8425,7 +8577,36 @@ mod tests {
       seen = read();
     }
     let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    // The first read: `main` reached through the door, made, and its map derived in the whole build's slices.
+    let first_read = || {
+      second
+        .observe(shard, |state| {
+          let (green, _) = main_map(state)?;
+          if crate::green_ready::green_ready(state, green)
+            == crate::green_ready::GreenReady::Materializing
+          {
+            return None;
+          }
+          crate::vcs_store::paths::whole_build::settle(state);
+          main_map(state).and_then(|(_, map)| map)
+        })
+        .ok()
+        .flatten()
+    };
+    let mut map_after = first_read();
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+      if map_after.is_some() {
+        break;
+      }
+      std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
+      map_after = first_read();
+    }
     second.stop();
+    assert!(map_before.is_some(), "the first daemon derived main's map");
+    assert_eq!(
+      map_after, map_before,
+      "main's map derived again on its first read: its version and tree"
+    );
     assert!(!before.is_empty(), "the pushes kept windows");
     assert_eq!(
       after, before,

@@ -328,8 +328,12 @@
 > changeset landed for real from a thread of its own), their async ones through the edge's own `carry`. The one
 > register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody homed,
 > which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing order, and
-> a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Owed (w-git): piece 3,
-> made commits onto the deferred-submit hook, and `record_of` removed with them; the replay reading the pack a piece at
+> a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Piece 3 part 1 BUILT
+> (A-822, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
+> the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
+> (`t_c5b_p3_…`; counter `vcs_commits.made_landed`). Owed (w-git): the kill test between the landing and the step;
+> `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
+> `after_submit`'s owed commit, `push_through`); the change step over the preview in one turn; the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
@@ -559,9 +563,13 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
+> - A-818 (A-803 (c)) pieces 1 and 2a: a persistent piece tree a version (`crate::piece_tree`) and the index of where
+>   each byte identity's bytes are now (`crate::byte_places`), both pure; the engine switch (2b) and the A/B (2c) are
+>   left. Measured gap to watch: an old read through the index is O(fragments × depth), where today's re-anchor
+>   compacts a fragmented value at write time.
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
->   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3.
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-822).
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.
@@ -9221,7 +9229,8 @@
 > parts, and its daemon-side share (borrow, collect, settle) is about 7 µs of 61 on Linux, the session's round trip the
 > rest; a shard's placements are cached (`crate::placement_cache`), 107.5-114.0 against 120.9-134.7 µs added at the
 > median on ubuntu-latest (5 of 5 rounds, twice). The exchange's round trip equals the bare transport's on the same
-> runner (at most 65.5 against 60.6-83.0 µs at p50), so the daemon hides nothing there. Still open: 2.2x on Linux;
+> runner (at most 65.5 against 60.6-83.0 µs at p50), so the daemon hides nothing there. A live entry's request taken whole (one copy a holder for four) is measured dead even and rejected (BENCHMARKS, same
+> section). Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
 > spin primitive with g222's 84a arm C).
 
