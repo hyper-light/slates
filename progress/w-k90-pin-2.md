@@ -174,3 +174,28 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - Studio-4 disk: my target deleted whole 09:20; r23 deletes its target after the run.
 - NEXT: on r19 or r23 green -> amend commit message with results, merge origin/main, push HEAD:main, is-ancestor;
   then measure runners' drops after deploy (deploy is a person's).
+
+## ~13:30 PST 11-21: R2 Linux + macOS pieces LANDED
+- kiln main ae1c43321 (fix 62912688c; base origin/main 8491937cf; merge-base --is-ancestor confirmed): kiln-rt
+  Arrival::to + Batched::send_segments_from (Linux IP_PKTINFO/IPV6_PKTINFO via recvmmsg/sendmmsg beside UDP_SEGMENT;
+  macOS recvmsg/sendmsg), vendored hyper-raft change 0006 (hyper-transport handle_datagram_to; driver passes
+  arrival.to, sends from transmit.src_ip), kiln-rt test udp_local_address.
+- RED/GREEN (Linux, no privilege): reached_at_a_second_address_it_answers_from_that_address -- server on 0.0.0.0 reached
+  at 127.0.0.2: the kernel's own answer came from 127.0.0.1 (red: today's behaviour), the answer from the arrival's
+  address from 127.0.0.2 (green). udp_batched 23/23, clippy clean. macOS: 1/1, udp_batched 18/18 x10, clippy clean,
+  kiln lib+tests check clean. vendor/hyper-raft = e0613f52 + 0001-0006 byte for byte (replayed by hand; Studio-4's
+  Docker wedged, containers stuck "Created").
+- NOT landed: the kiln end-to-end test (tunnel.rs r2_..., udp_answers through kiln's server endpoint) never ran
+  (adacachy strained for hours, macOS runs lost to restarts): kept at ~/kiln-work/w-k90-pin-2-logs/r2-e2e-test.patch
+  for a follow-up once a runner has room.
+- WINDOWS piece, written up (not built): kiln's server may run on Windows (README: "On macOS and Windows the server
+  keeps its own ways"), so the endpoint can serve there. kiln-rt's Windows path is portable (recv_from/send_to), so a
+  Windows-hosted server on a host with two addresses would answer from its route source. Needs: IP_PKTINFO (and
+  IPV6_PKTINFO) set on the socket; WSARecvMsg (pointer via WSAIoctl SIO_GET_EXTENSION_FUNCTION_POINTER,
+  WSAID_WSARECVMSG) reading IN_PKTINFO.ipi_addr into Arrival::to; WSASendMsg with an IN_PKTINFO control message
+  (ipi_addr = source) in send_message for Windows; test as udp_local_address with 127.0.0.2 (Windows loopback takes
+  127/8). Today's fleet server is Linux (adacachy) and no Windows-hosted server exists, so it waits until one does.
+- R2 closes on measurement once a server carrying ae1c43321 (or Ada's .77 change) is live: before-rates recorded above
+  (runners' own logs); after = same counts + each runner's "connected directly". Deploy isn't mine.
+- Removed: worktrees w-k90-pin-2-r2, -land2, -hr-replay, -base; ~/.cache/w-k90-pin-2-target.noindex.
+  For main to delete: ~/kiln-work/w-k90-pin-2-kiln, ~/kiln-work/w-k90-pin-2-hyper-raft (7 MB, shallow), ~/kiln-work/w-k90-pin-2-logs, ~/kiln-work/w-k90-pin-2-scripts.
