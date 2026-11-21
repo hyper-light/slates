@@ -632,6 +632,23 @@ impl VcsStores {
     format!("{youngest}-{}", self.dav_named)
   }
 
+  /// The name of the HTTP commit the principal keyed `principal` holds in repository `id` that is DeltaV v1's
+  /// `activity` (A-766 part 2); none where it holds none by that activity.
+  pub(crate) fn dav_commit_of_activity(
+    &self,
+    id: RepositoryId,
+    principal: &[u8],
+    activity: &str,
+  ) -> Option<String> {
+    self
+      .dav_commits
+      .iter()
+      .find(|((repository, _), held)| {
+        *repository == id && held.principal == principal && held.commit.activity() == Some(activity)
+      })
+      .map(|((_, name), _)| name.clone())
+  }
+
   /// Keeps `commit`, named `name`, for repository `id` and the principal keyed `principal`, dropping any other the
   /// same principal left open in it (the field's bound).
   pub(crate) fn begin_dav_commit(

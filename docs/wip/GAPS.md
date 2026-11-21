@@ -492,8 +492,11 @@
 > charged; a pair of trees read whole and the parts' record in one unit. Each other unit is a window's work at most
 > (w-k90-vendor, 2026-11-20: the 56 MB git/git v2.0.0 push's encoding had spun the shard 3.5 s in one object's unit).
 > The level and the window are chosen from the bytes saved and the machine's rates measured once a process
-> (`learn::Rates`), not timed per object: one input, one output. OWED: the release A/B on git/git; a deployment's rates
-> shared by its nodes.
+> (`learn::Rates`), not timed per object: one input, one output; its release A/B even on CPU (BENCHMARKS.md). FOUND
+> (2026-11-20, w-k90-vendor, not in a queue): a first version's fragments are 34 times git's pack of the same objects
+> (git/git v2.0.0: 1.92 GB against 55.9 MB; a first version names no bases and the learned window starts at one
+> candidate), so a clone of an imported repository sends that much; and `Repository::kept_fragments` counts a part
+> past a window as its root list's bytes, not its own, so A-724's relief under-counts large fragments.
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
@@ -2281,10 +2284,17 @@
 > headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
 > youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
 > collection `!svn/bc/REV/`, `version-name`, its revision's properties as dead properties), `!svn/ver/REV/PATH` (the
-> node in REV, no `checked-in`). Owed: part 2 the commit verbs (MKACTIVITY, CHECKOUT, the working baseline's PROPPATCH,
-> `wrk`, MERGE and DELETE of the activity) over DavCommit, part 3 the server site, part 4 by-use; the PROPFIND
-> writer's per-property strings rewritten into the connection's buffer (MEMORY SIZING; its subjects now lend their
-> properties).
+> node in REV, no `checked-in`). Part 2 BUILT (with part 3, the server site): MKACTIVITY begins a transaction with
+> the author alone and runs start-commit, as `dav_svn__create_txn` does, naming it the activity; CHECKOUT of the VCC (or
+> the youngest baseline) answers the working baseline `!svn/wbl/ID/REV`, of `!svn/ver/REV/PATH` the working resource
+> `!svn/wrk/ID/PATH`, its revision kept as the base later requests are judged against (`DavCommit::check_out`); the
+> working baseline's PROPPATCH sets the revision properties (`DavCommit::proppatch_revision_properties`); PUT, MKCOL,
+> DELETE, COPY and PROPPATCH on working resources run as on `!svn/txr/`; MERGE of the activity commits; DELETE of it
+> aborts or answers `204`; `201`s as `mod_dav`'s `dav_created` writes them (`dav::response::created`). Held by
+> `a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it` (the daemon's edge, ra_serf 1.14's requests) and
+> `dav::activity` tests. Departures, each stated: a MERGE answers HTTPv2's short form (no per-path `D:response`s a
+> working copy's wc-props take), `Location` is the path alone, a CHECKOUT's out-of-date check is the drive's at the
+> next request. Owed: part 4 by-use (stock svn 1.15 against an OPTIONS with no v2 headers, on a host with svn).
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
