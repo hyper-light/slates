@@ -31,3 +31,12 @@ family three running; r9 exit 4 queued).
   gone from the profile. BENCHMARKS has the table. Tests: slates-transport lib 148 of 148 plus every integration test.
 - **Next (step two):** frames held by reference into the send stream's bytes until acknowledged (no copy into a
   frame), then the receiver's copies (frame decode, reassembly). Then the profile again.
+
+## ~00:40 PST: step two landed (35c740150, main 585b89299)
+Stream data in flight is now a span of the sender's bytes, encoded from there, never copied into a frame (also in the
+retransmission queue, probe copies and MTU splits). Studio-1, load 3.1-3.3: memmove 433 (491 after step one, 604
+before), goodput 927 / 1,092 / 1,206 MB/s, level with step one. BENCHMARKS has the third row. Tests: slates-transport
+lib 148 of 148 plus every integration test.
+What the profile names now: sendto (811) and recvfrom (382), one syscall a datagram; AES-GCM (247 / 233); the
+receiver's copies (frame decode, reassembly) inside memmove. Next in the lane item: the receiver's copies (MEMORY
+SIZING), then batching datagrams per syscall if the profile still puts sendto first.

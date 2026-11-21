@@ -7017,3 +7017,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - w-shared, transport send path (b72aff1fc): every packet's encoding and sealing changed (one reused buffer, frames
   encoded in place). The fleet suites (`slates-server --test fleet`, `slates-cluster --test live`) and the Linux and
   Windows lanes. Red would be a decrypt failure, a malformed frame refusal, or a session that stalls.
+- w-shared, transport step two (35c740150): stream data in flight as spans of the sender's bytes (loss recovery, probes
+  and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
+  Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
+  after a loss.
