@@ -740,13 +740,15 @@ async fn laid_post_state(
         version: key.0,
         entries: None,
       };
+      // A range the green's bytes cannot fill gives the job up, so the composition runs unrefined.
       crate::verbs::lay_ops(
         &mut post,
         (doc, plan),
         (&w.files, base),
         &w.journal,
         next..end,
-      );
+      )
+      .ok()?;
       Some(end)
     })
     .await?;

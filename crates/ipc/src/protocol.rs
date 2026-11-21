@@ -1446,6 +1446,23 @@ pub enum RequestBody {
     /// The agent's own changes, in the head's coordinates, applied after the kept operations.
     replacement: Vec<WorkChange>,
   },
+  /// Resolves a conflict in one ask (A-840): the agent names the windows it gives up, and the green's half takes the
+  /// work's writes out of exactly those windows, rebases the rest onto the head as it is and applies `replacement`
+  /// there, as one recorded step, restating the work at the head as `ResolveMerge` does. An overwrite keeps its bytes
+  /// outside every window; an insertion, deletion, extension or truncation that meets a window goes whole, since it
+  /// shifts or ends the file; a zero-length window, a namespace conflict's anchor, gives up every operation on its
+  /// path. Nothing is judged at an older head, so there is no check to go stale. What is kept and still conflicts at the
+  /// head answers `Rebased` with those windows only, nothing changed: a resolution sent after it names them and the
+  /// windows given up before. No merge is inferred: every window given up and every byte written is the agent's
+  /// declaration (D-27). Appended.
+  ResolveConflict {
+    /// The work volume.
+    work: VolumeId,
+    /// The windows the agent gives up, in base coordinates, as a conflict named them.
+    over: Vec<MergeWindow>,
+    /// The agent's own changes, in the head's coordinates, applied after the kept operations.
+    replacement: Vec<WorkChange>,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2491,6 +2508,7 @@ impl RequestBody {
         stamp: MergeStamp { work: volume, .. },
         ..
       }
+      | RequestBody::ResolveConflict { work: volume, .. }
       | RequestBody::ReadBase { volume, .. }
       | RequestBody::Digest { volume, .. }
       | RequestBody::Rewitness { volume, .. }
@@ -2608,6 +2626,7 @@ impl RequestBody {
         | RequestBody::SubmitApproved { .. }
         | RequestBody::Rebase { .. }
         | RequestBody::ResolveMerge { .. }
+        | RequestBody::ResolveConflict { .. }
         | RequestBody::Clone { .. }
         | RequestBody::Resize { .. }
         | RequestBody::Destroy { .. }

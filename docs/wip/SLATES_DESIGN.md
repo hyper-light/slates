@@ -11782,6 +11782,24 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
 > (`assert_merge_check_resolves_over_mcp`).
 
+> **Status (2026-11-21, A-840: a conflict resolved in one ask).** `ResolveConflict { work, over, replacement }` gives
+> up the windows a conflict named and resolves at the head as it is: the green's half takes the work's writes out of
+> exactly those windows (an overwrite keeps its bytes outside them; an insertion, deletion, extension or truncation that
+> meets one goes whole; a zero-length window gives up every operation on its path), rebases the rest onto the head,
+> applies the agent's replacement there and restates the work, one recorded step, as `ResolveMerge` does. There is no
+> check and no stamp: nothing is judged at an older head, so nothing can be stale. What is kept and still conflicts
+> answers only its own windows, nothing changed, so the next resolution names those and the ones given up before. Every
+> window given up and every byte written is the agent's declaration (D-27). It is the client's corrective path in the
+> load harness: at 10 hot files in the 1,000-client stand-in, rebase-kind owner asks fell from 20.5-20.9 to 10.4-10.9 a
+> client and all owner asks from 32.7-33.2 to 26.3-27.0 (BENCHMARKS, 2026-11-21). A work's shard that cannot lay its
+> own increment's bytes (a rebased file held as parts over the head, A-806, names a run of the work's own write as the
+> head's, which a work off the green's shard does not hold) hands the owner its journal and files rather than laying
+> zeros, and the owner's answer still carries the work's base entries. Tests: `crates/server/tests/merge_check.rs`
+> (the one-ask history on one shard and on eight; a later write meets the resolved work in every file; a kept slot
+> beside a given-up one; a generated oracle of 24 histories under rival writes, every accepted version holding its
+> work's slots and the green ending as the replay) and `crates/server/tests/works_off_owner.rs`
+> (`a_resolution_the_owner_composed_leaves_the_work_its_entries`).
+
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
 > does the deriver composing the work's next submit. A hard link names the node at its target when it is made
@@ -58149,6 +58167,31 @@ Status: built 2026-11-21, macOS.
   extents are ranges of one memfd, holes punched), and so does Windows, whose extents are ranges of the object when no
   anchor holds their sections.
 
+### A-840 — A conflict resolved in one ask (2026-11-21, w-fed-move; goal 86b's owner asks; main's 10:37 ruling, take-head as one verb; §4.16 "Rebase, the only corrective path", D-27, A-796)
+Applied in the same change to: §4.16 (its status), `crates/ipc/src/protocol.rs` (`ResolveConflict`),
+`crates/server/src/verbs.rs` (`resolve_conflict`, `give_up_windows`, `merge_answer`, `lay_ops`/`lay_op`/
+`assemble_post_state` refusing `BaseGone`, `compose_increment`), `crates/server/src/work_home.rs` (`MergeAsk::over`,
+`SealedWork::composes_here`), `crates/server/src/refining.rs` (a sliced build that meets it gives up),
+`crates/client/src/client.rs` (`resolve_conflict`), `crates/client/examples/load_bench.rs` (the resolution, with
+`--resolve rebase` kept for the comparison), GAPS, BENCHMARKS, `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`.
+- **Why.** After A-817 the work's owner asks were 30.0 a client at 10 hot files, 20.1 of them rebases: 77% of rebases
+  conflicted again. Two cuts that kept a gap between the conflict and the resolution were even (the head's window bytes
+  in the reply; BENCHMARKS): in a closed loop some 50 to 120 verdicts land in either gap. A-796's check and resolution
+  closed the gap (16,035 to 584 repeat conflicts) but cost two asks; the check's stamp is what made the second.
+- **Rule.** The agent names the windows it gives up, never operation indices, so it needs no check: the green's half
+  takes the work's writes out of exactly those windows and resolves at the head as it is. The windows a conflict names
+  are the work's operations' ranges, so a window may span adjacent writes of the work; the agent writes again what it
+  keeps inside one.
+- **Found on the way, by the generated oracle.** A rebased file is held as parts over the head (A-806), a run equal to
+  the head's named as the head's; a work off the green's shard does not hold the head's bytes, so composing its next
+  increment met `BaseGone` and `lay_op` laid zeros into the post-state, which the green took as the work's bytes. A
+  composition now refuses it, the work's shard hands the owner its journal and files, and the owner's answer carries the
+  base entries anyway (`SealedWork::composes_here`; without them every later submit asked the files, 3.9 a client).
+- **Measured.** BENCHMARKS 2026-11-21, three pairs at each of 300/100/30/10 hot files, oracle clean in all 24 runs:
+  rebase-kind asks a client 2.1-2.2/3.7/8.9-9.5/20.5-20.9 to 1.8-1.9/2.6-2.7/5.4-5.7/10.4-10.9; all owner asks
+  11.2-11.3/13.2-13.3/19.5-20.1/32.7-33.2 to 10.9-11.0/12.3-12.5/17.2-17.6/26.3-27.0. Verdict asks rose (5.5-5.7 to
+  9.2-9.5 at 10 hot files): a resolved work submits at once, into the same contention. That is now the largest kind.
+
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
 (`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
@@ -58301,6 +58344,11 @@ wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe
   (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
   as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
   to main's run requests.
+- **Status (2026-11-21).** The acceptance flows by use are `crates/cli/tests/real_tools.rs`. A `#pragma once` compile
+  under clang, gcc and `cc` is held across a snapshot and a SIGKILL takeover; after each event, and under injected
+  memory pressure, `make -q`, `cargo build` and `git status` find nothing moved, and every tracked file's number and
+  times are unchanged. Green on macOS NFS (APFS). The test builds for Linux FUSE and Windows WinFsp, whose runs are
+  main's (run-requests.md).
 
 ### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
 The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
@@ -59877,8 +59925,17 @@ Applied in the same change to:
   - The store's oracle (`vcs_store::tests`, `Live`) writes and replays version 5 only, a recovery fetching each record's
     names and pack as a region fetch does; the hostile-input test runs over version-5 bytes; the A-664 commit tests make
     their commits through the queue.
-- **Owed** (GAPS, C5 part 2b): the change step over the preview in one turn (bounded by the submit's admission), next
-  in this series.
+- **The map a slice a turn** (2026-11-21, main's order: the change step over the preview is bounded work, part of this
+  series). A made commit's map is put from the held preview a slice a turn within the shard's step quantum
+  (`whole_build::PreviewChange`, owned by the made commit's task, which lends the preview each turn): the change's paths
+  over the map before, as a push's change build puts them from the green, then the change applied and kept; a root's
+  first version's whole put the same way, with no map before. The one-call step over the preview (`step_over_preview`)
+  and the numbering offset `stepped` and `plan` took for it are gone; only `over_preview_step` reads the preview's change
+  index in its own numbering. A build given up gives its holds back. Counted `vcs_commits.made_map_turns`;
+  `t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`: with no budget a turn (one path a turn, whatever
+  the machine's load), a root's first version of 8 files and then a change of all 8 each took at least 8 turns, and a
+  stock clone reads the second version's files.
+- **Owed:** none of this series.
 
 ### A-821 — A refined submit's increment, verdict and encoding are prepared by its refinement job a bounded slice a turn, and its step judges by position (2026-11-21, w-fed-faults; main's ruling of 09:25 on the refining.rs:166 kill; §4.3 step budget, §4.16, A-787 part 2, A-697, A-816)
 Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the commit's step); `crates/server/src/refining.rs`
