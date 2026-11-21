@@ -117,6 +117,41 @@ impl HgStores for ServedViews {
   }
 }
 
+/// A fetch's paced turn (A-745 rule 2 under A-783, the one primitive every paced path uses): its steps run while the
+/// turn's quantum has room for the next one's estimated cost, and at the quantum's end it asks once whether anyone else
+/// waits on the shard: if someone does it yields there; if no one does it takes another quantum, up to the shard's
+/// ceiling (the watchdog's look). The quantum is a few microseconds (2.2 us on an M4 Max), and a stream's step is one
+/// index entry or one chunk, so a turn that yielded at its first quantum took one step: hg-src's stream was about
+/// 460,000 turns of 64 bytes or a chunk each, each with its view made and its bytes written (r23 on bbcf0f72f: 15.8 s
+/// against stock's 0.44-0.50 s, the serving shard idle two thirds of it). A step's unit is one answer step; its cost
+/// is measured across the exchange's turns (`costs`).
+pub(crate) fn paced_turn(quantum_ns: u64, began: u64) -> slates_pace::Step {
+  let env = slates_pace::Env {
+    clock: slates_rt::futures::now_ns,
+    waiting: slates_rt::futures::others_waiting,
+    quantum_ns,
+    ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum_ns),
+    target_ppm: crate::git_push::target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum_ns),
+  };
+  slates_pace::Step::begin(env, began)
+}
+
+/// Counter: the turns a fetch's streamed answer took over either edge (A-783's paced turn, [`paced_turn`]): a turn
+/// yielding at its first quantum took one step, so a stream of hg-src was about 460,000 of them. Format: a counter name
+/// in the status report.
+pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+
+/// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it; nothing off a shard.
+pub(crate) fn turn_taken() {
+  let _ = crate::state::with_state(|state| state.count(STREAM_TURNS, 1));
+}
+
+/// The unit kinds a fetch's paced turn measures ([`paced_turn`]): one, an answer's step.
+pub(crate) type TurnCosts = slates_pace::Costs<1>;
+
+/// The one unit kind of a fetch's paced turn: an answer's step.
+pub(crate) const ANSWER_STEP: usize = 0;
+
 /// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store
 /// keeps it), over the shard's handle, as a task: a log's rows by node (`StoreHandle::texts_by_tool`, the `I` rows) and
 /// a batch of chunks (`StoreHandle::places`, read in place). A daemon holding no store keeps no revision, so a rows'
