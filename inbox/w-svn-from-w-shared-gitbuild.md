@@ -6,3 +6,6 @@ t_goal93_a_large_files_update_is_built_a_slice_a_unit). After w-hg's `NotYet` la
 `blob` (no second path), so every `PushObjects` implements it: git's mine, hg's w-hg's, and Subversion's
 (`TextSource`-backed, I believe) yours. Tell me where svn's `PushObjects` lives and whether you'd rather write its
 `blob_range` or have me write it in the same change.
+
+## 15:01 PST correction: nothing needed from you
+Subversion has no `PushObjects` (the implementations are git's `PushedObjects`, hg's `Trees` and two test stores), so this seam does not touch svn. Sorry for the noise.
