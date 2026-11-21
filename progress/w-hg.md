@@ -201,3 +201,7 @@
   - Server replay (vcs_store replay_hg_referenced / replay_sliced, payload_of): a window filled by
     `StoreHandle::piece` on Wanted. No whole payload is held.
   - Red test: a replay's peak bytes against the payload's length.
+- 2026-11-21 ~00:55 LANDED d571ffbca: the piece-reading replay (framing over a Source, intake Wanted, Replay piece
+  mode, server fill_window; red test 789,956 B payload in 14 fills, window at most 193,859 B), and the daemon_edge hg
+  tests green via w-git's C5 part 2a. Close note written. Waiting on main's ruling for C1's order (3, 1, 2) and the
+  import's shape; next by default: step 3, the import as a run of changesets.
