@@ -1699,3 +1699,10 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RULING CHANGED for w-engine: land the fold in turns now, for robustness, since the watchdog kills the daemon mid-push. The Z=20 p99 regression goes to GAPS as a measured gap, fixed straight after with (b). w-git builds layer 1 meanwhile.
 - 2026-11-21 04:58 PST Quiet: no new landings since 04:50. w-engine's kiln mail is still stuck (an 893-byte admitted message, depth 1, since ~23:00; harness restarted 03:14). The ruling to land the fold in turns is also in its inbox file. No other agent waiting on main. The MacBook disk is 54 GB.
 - 2026-11-21 05:03 PST w-perf: the hg stream clone works now but is ~37x slower than stock (r17). The push profile r18 is running: the push's first ~34 s has the slates daemon idle with flat memory, so the client side or the connection is suspect; check it against stock first. The stream's 37x is queued right after the push finding: phase-split, red, A/B with bytes on the wire. No landings since 04:50; w-engine's mail is still stuck.
+- 2026-11-21 05:08 PST
+  - LANDED:
+    - 7f411f580 (w-git layer 1, A-238 amended 4f6242707): a push makes the chains room before its append, a green a turn; red: 73 checkpoints inside appends, then none.
+    - ca444739c (w-git's connectivity test under the lint wall).
+  - RULING (w-git path maps): P2, uniform lazy derivation for any created ref, not P1's tag shortcut. P1 then P2 would be layering, and it leaves the wall for branch-heavy repositories. Tags get the 99% for free, never read to submit. Oracle and red as before.
+  - FINDING (w-perf, hg first push 98-103 s vs stock 9.7-10.2 s, 5.8 GiB resident): intake files_present ~57%, rebuilding whole manifests per changeset by chain walks; take ~41%, sha1dc ~26 s.
+  - RULING (w-hg, after C1 step 3, as robustness under the bounded-working-set rule): incremental decoded manifests, O(changed lines); node verification kept for integrity, hashed once from the held text; A/B sha1dc against hardware SHA-1. w-perf may build (1) in parallel if C1 doesn't touch those files.
