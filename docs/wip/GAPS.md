@@ -215,6 +215,15 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-793 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a change
+> re-anchors its path's content history on the new block (`history::reanchor`), so the history keeps what a change
+> overwrote, not the earlier file; A-728 part 2's splice and seal are replaced. At 100,000 clients: `BudgetExceeded`
+> 94,877 to 0, accepted 5,123 to 29,795, verdicts 13 to 131 a second, oracle clean. Open (goal 86b's next bound): the
+> 70,205 clients that met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases): the
+> client node's merge budget (`green_chain_bytes`, 373 MB a partition, which work logs share) filled; a first-occurrence
+> log line (`Partition::merge_budget_held`) names what holds it at the next run. Still open from A-792: every p99 is
+> seconds to minutes (the cycle's 677 s), CreateWork p50 25 s.
+>
 > **A-792 (2026-11-20, w-fed-move; goal 86b, found by use: the many-client rung on one primary and two replicas over
 > the Linux kernel).** FIXED: a green listed at its head reads the directory's subtree (`Green::head_under`, one descent
 > of each dimension's map), not the whole green's base, which every page of a listing copied (every path of 97,371). At

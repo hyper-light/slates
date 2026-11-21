@@ -11478,6 +11478,21 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > the verdict whatever the ops (`Green::superseded_bytes`). A file's first small edit now charges the earlier file
 > whole, as it is kept; before, it was counted as the current value's and went uncharged.
 
+> **Status (2026-11-20, A-793: the history is anchored on the newest block; replaces A-728 part 2's splice and seal).**
+> A change re-anchors its path's content history on the file's new block (`crates/merge/src/history.rs`, `reanchor`):
+> the runs the change kept, found by walking its ops over the value it supersedes and checked against the new block byte
+> for byte, are moved to the new block in every value the path's history holds; a block only this history holds is cut
+> to what the change overwrote or removed (one owned chunk) and let go; a value whose pieces outweigh it is stored whole.
+> The latest value is the new block, named whole. So a 64-byte overwrite of a 16 KiB file retains 64 bytes and a few
+> pieces, where A-728 part 2 kept the earlier file whole for as long as a reader held the floor. A whole replace keeps
+> nothing of the value it supersedes, so its block stays as that version's bytes; a block another holder keeps is never
+> cut. `Green::history_reservation` reserves, per changed path, the superseded value's list and block and two pieces a
+> gap of its ops for every value the path's history holds: an upper bound the settle trues up (A-16), no longer equal to
+> the growth. Counted: `Green::history_reanchored` (changes, blocks let go, bytes copied). Found by use: at 100,000
+> clients over the Linux kernel (goal 86b) every accepted version retained about 73 KB for 256 bytes written, and the
+> green's cap (373 MB, one shard's table share) refused 94,877 of 100,000 submits `BudgetExceeded` after 5,123 accepts.
+> After: 29,795 accepted and none refused at retention; the next bound is the client node's merge budget (GAPS, A-793).
+
 > **Status (2026-11-08, A-257: a chain entry records what its verdict resolved, and recovery applies it).** A
 > checkpoint at the floor can pass the base of an entry left above it, and recovery re-judged each entry at its base,
 > which a restored green no longer holds: the entry was refused and the green fenced, every acknowledged version
@@ -58188,3 +58203,32 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
   `crates/cli/tests/load_scale.rs`, one primary, two replicas, one client node, the kernel v7.4-rc4, one round, 10,000
   clients, `--hot-files 8000 --per-connection 32`): wall 201 s to 75 s, the primary's CPU 175 s to 53 s, verdicts 192
   to 228 a second, edits p50 1.04 s to 0.60 s, the cycle's p99 43.9 s to 23.6 s; oracle failures 0 in both.
+
+### A-793 — A change re-anchors its path's content history on the new block: what it overwrote is kept, not the earlier file (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel on one primary and two replicas; §4.16 "The history", "Splice", "delta retention before folding"; replaces A-728 part 2's splice and seal; A-16, AUD-16, A-728 part 4)
+- **Why.** A-728 part 2 anchored a path's history on its earliest block: the first change named the earlier block
+  whole and every later value shared runs of it, so each file a change touched kept a whole earlier copy while any
+  reader held the floor. With 100,000 works open at old bases nothing folds: about 73 KB of retention for each accepted
+  version (four 64-byte slots written), and the green's cap (373 MB, `green_chain_bytes`, one shard's table share)
+  refused 94,877 of the 100,000 submits `BudgetExceeded` after 5,123 accepts (release, `load_scale`, one round,
+  `--hot-files 42000 --per-connection 32`, the Studio, Slates `60586cdd`).
+- **Change.** `crates/merge/src/history.rs`: `reanchor` (the kept runs and where they lie in the new block, checked
+  byte for byte; every value's pieces in them moved there; a block only this history holds cut to what the change
+  removed and let go; a value whose pieces outweigh it stored whole), `Value::supersede`; `Value::spliced`, the cutting
+  `Value::seal` and `kept_when_superseded` removed. `crates/merge/src/engine.rs`: `content_value` re-anchors, the
+  running totals moved by the lists' change, `Green::history_reanchored` counted; `superseded_bytes` bounds a change by
+  the superseded block and list and two pieces a gap of its ops for every value of the path.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-merge --test engine
+  small_edits_to_many_files_retain_what_they_wrote_not_the_files` (32 files of 16 KiB, each overwritten in a 64-byte
+  slot twice, no fold): 529,384 bytes retained before, under the 13,312-byte bound after; every version reads back. The
+  history oracle ported to `reanchor` (`every_version_is_apply_and_shares_what_it_kept`, `applied_equals_is_the_bytes_compared`;
+  owned bytes bounded by what the changes removed, no leak, blocks bounded), `small_overwrites_of_a_large_file_cost_what_they_wrote`
+  (1 MiB, 64 edits: the current block and 4,096 owned bytes, one live block), `a_whole_replace_keeps_the_block_it_replaced`,
+  `a_reanchor_leaves_a_block_another_holder_keeps`; A-728's block tests and AUD-16's charge tests restated
+  (`special.rs`: the reservation covers the growth; `crates/server/tests/daemon.rs`: six 4-byte edits of a 2 KiB file
+  retain 1,152 bytes, under one copy). `cargo test -p slates-merge --tests` all pass; `slates-server --test
+  green_retention`, `--test daemon` (the two retention tests), `--lib merge` pass.
+- **By use** (release, `crates/cli/tests/load_scale.rs`, 100,000 clients, the kernel v7.4-rc4, same arguments): accepted
+  5,123 to 29,795, `BudgetExceeded` 94,877 to 0, verdicts 13 to 131 a second, CreateWork p50 84.5 s to 25.1 s, wall
+  748 s to 944 s (every client reached a verdict); oracle failures 0 in both. The next bound: the 70,205 clients that
+  met a conflict were refused `TableAtCapacity` resolving it (63,145 edits, 7,060 rebases), the client node's merge
+  budget; a first-occurrence log line now names what holds it (`Partition::merge_budget_held`).
