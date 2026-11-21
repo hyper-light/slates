@@ -214,6 +214,18 @@ impl Store {
               let identity = identity_of_range(file, section.offset, section.len, &mut buffer)?;
               put_content(&mut rows, &identity, section.offset, section.len)?;
             }
+            if section.kind == SectionKind::Texts {
+              buffer.clear();
+              buffer.resize(
+                usize::try_from(section.len)
+                  .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+                0,
+              );
+              file
+                .read_exact_at(&mut buffer, section.offset)
+                .map_err(LogError::from)?;
+              crate::texts::put_rows(&mut rows, &located.header, &buffer)?;
+            }
           }
           Ok(())
         });
@@ -278,6 +290,15 @@ impl Store {
       record.commit()?
     };
     put_changeset(&mut self.rows, &located, &mut self.value)?;
+    for (kind, contents) in sections {
+      if *kind == SectionKind::Texts {
+        let bytes = match contents {
+          Contents::Bytes(bytes) => *bytes,
+          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
+        };
+        crate::texts::put_rows(&mut self.rows, &located.header, bytes)?;
+      }
+    }
     let mut payload = payloads.iter();
     for section in self.log.sections(&located)? {
       if section.kind == SectionKind::Payload
@@ -327,6 +348,26 @@ impl Store {
       at.checked_add(offset).ok_or(StoreError::BadRow)?,
     )?;
     Ok(Some(Cow::Owned(bytes)))
+  }
+
+  /// Where the landed content `identity` lies in the log: its offset and length; none where no `P` row names it.
+  pub(crate) fn content_place(
+    &mut self,
+    identity: &Identity,
+  ) -> Result<Option<(u64, u64)>, StoreError> {
+    let mut key = [0u8; CONTENT_KEY_BYTES];
+    content_key(identity, &mut key);
+    if !self.rows.get(&key, &mut self.value)? {
+      return Ok(None);
+    }
+    decode_content(&self.value)
+      .map(Some)
+      .ok_or(StoreError::BadRow)
+  }
+
+  /// The engine's rows, for the derived tables beside the store's own (`crate::texts`).
+  pub(crate) fn rows_mut(&mut self) -> &mut ShardDb<DeviceFile> {
+    &mut self.rows
   }
 
   /// The changeset log, for reading committed records' sections.

@@ -57806,6 +57806,22 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > repository's landings on the device share one flush (item 2). Red test: `repository::store_tests` 1/1 (a git
 > repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
 > files: one changeset, sequence 0, its record and its row read back).
+>
+> **Status (2026-11-20, A-645's derived per-path read form on the store; w-perf, main's orders of 18:30 and 19:50; the
+> interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
+> every tool (`slates_store::texts`: per touched path its bytes, the tool's id, the full text's identity and length,
+> its edit's base, and the edit's or whole's place in the payload; Mercurial's changelog and manifest as the paths
+> `\0changelog` and `\0manifest`), and the edit is one form, Mercurial's `mpatch` hunks. Landing (and a recovery's
+> replay) derives two tables from it: `T` (a repository's text by identity: its changeset, length, base, place) and
+> `H` (a path by BLAKE3 and a sequence: the text kept). `Store::text_at` makes an old version by walking its `T` rows
+> to a whole and applying each edit read from its own changeset's payload, so no changeset outside the chain is read;
+> `path_texts` lists a path's history; the owner answers `text`, `text_row` and `path_texts` for shards, holding the
+> texts it made in a cache whose bound is learned (the longest chain it had to make). Held by
+> `an_old_file_revision_is_read_from_its_own_chain_alone` (39 changesets over three paths; the changesets read equal
+> the version's chain; again after a reopen) and `a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart`
+> (red with the rows not written: no landed text). Owed: a changeset landed through `begin`/`applied` writes neither
+> `P` nor `T`/`H` rows (only `Store::land` does); the release timing against the per-file arm's 91 µs
+> (`examples/per_path_read.rs`, Mercurial's own history).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
