@@ -125,3 +125,8 @@ The holder route completed 5/5 at every size both ways. The bench's whole-run pa
 fails only on the LOCAL 512 MiB submit's one step (1.05-1.09 s of CPU, shard 0): w-work-cow's slicing.
 Remaining for the lane's proof (320/512 10/10): w-work-cow's local-submit slicing, then the 64-512 MiB x 10 proof
 run; datagram batching after, measured. Post-landing check: kiln r3.
+
+## 14:56 PST CLOSED: the lane's ~200 MB/s (close-list "93 shared"), per main 14:56
+A holder's increment crosses on the content plane (A-826) at about 800 MB/s (512 MiB: forward incl. the owner's fetch
+0.58-0.67 s, kiln r2, Mac Studio). Datagram batching dropped (main: not needed). The 10x10 proof is main's round:
+the holder route's entry is in run-requests.md; the local route's follows w-work-cow's slicing.

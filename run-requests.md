@@ -7441,3 +7441,18 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Windows, second failure: r33 (the one resubmit of r31) ended with "f766f09294f2... no longer has this run (its runner
   restarted)". jupiter has no vcs-windows.log, and ~/w-lint-win is still at 02874580e, so the run died before its
   fetch finished. No test ran. Owner: jupiter's runner link (the R2 tunnel), not a slates test. Next try is next round.
+
+## w-shared, the lane's proof, holder route (main's round, §8; main 2026-11-21 14:56): 320 and 512 MiB x 10, release
+- Tree: origin/main at or after 2f3147b50. Needs: macos, disk=20g (release target measured 758 MB), a Studio (it is
+  a benchmark; not this MacBook). Command (sync:false, log on the machine):
+  `src=$HOME/.cache/lane-proof-src; rm -rf "$src"; git clone -q --depth 2 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/lane-proof-target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=8;
+  cargo test --release -p slates-server --test fleet bench_a697 --no-run;
+  for run in $(seq 1 10); do for mib in 320 512; do r=$(SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=$mib SLATES_A697_BENCH_RUNS=1
+  cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture --test-threads=1 2>&1);
+  echo "run=$run mib=$mib $(echo "$r" | grep -a 'kind=holder' | grep -oE 'wall_ms=[0-9.]+|owner_step=[0-9.]+ms|beat_late=[0-9.]+ms/[0-9]+|forward=[0-9.]+ms' | tr '\n' ' ')
+  $(echo "$r" | grep -aoE 'shard [0-9]+ is spinning, [0-9]+ ms of CPU' | head -1)"; done; done`
+- Pass for the holder route: a `kind=holder` line every run at both sizes (the holder submit accepted) with
+  beat_late 0. The same run's local submit (the bench's second half) still exits 4 at 512 MiB until w-work-cow's
+  slicing lands: that is the local route's proof, a separate entry after it lands, not this one.
+- Last measured (kiln r2, Mac Studio-3, load 2-4, 5 rounds): holder 5/5 at 320 and 512, beat_late none.
