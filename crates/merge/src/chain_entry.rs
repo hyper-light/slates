@@ -47,6 +47,7 @@ const MAGIC: u32 = u32::from_le_bytes(*b"GCHN");
 /// its inputs identity and length in place of its bytes (module docs). A version 5 entry is refused `BadVersion`, never
 /// read by a second path: a segment is read only by the build that wrote it, its anchor restarting the daemon from its
 /// own image (§2.7; A-621's precedent).
+/// Format: version 6, as above.
 const VERSION: u32 = 6;
 /// Format: a head identity and the entry's digest, each a BLAKE3 hash.
 const HASH_BYTES: usize = 32;

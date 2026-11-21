@@ -7226,34 +7226,25 @@ impl HeldMount {
 fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
   let instance = format!("cli-byref-{}", std::process::id());
   let _anchor = start_anchor(&instance);
-  let (code, out, err) = run(&instance, &["green", "byref"]);
-  assert_eq!(code, 0, "{err}");
-  let green = value_of(&out, "id");
-  let (code, _, err) = run(&instance, &["work", &green, "byrefheld"]);
-  assert_eq!(code, 0, "the work that keeps version 0 reachable: {err}");
-  let (code, out, err) = run(&instance, &["work", &green, "byref1"]);
-  assert_eq!(code, 0, "{err}");
-  let work = value_of(&out, "id");
+  let (green, work) = byref_green_and_work(&instance);
   let body = "by-reference-".repeat(64 * 1024 / 13);
   let (code, _, err) = run(&instance, &["edit", &work, "/f.txt", "0", "0", &body]);
   assert_eq!(code, 0, "{err}");
   let (code, out, err) = run(&instance, &["submit", &work, "--json"]);
   assert_eq!(code, 0, "{err}");
   assert!(out.contains("\"accepted\":true"), "accepted: {out}");
-  let (code, status, err) = run(&instance, &["status", "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(
-    status.contains("\"merge.inputs.held_by_owner\""),
-    "the submit held its increment in the owner's content store: {status}"
+  status_shows(
+    &instance,
+    "merge.inputs.held_by_owner",
+    "the submit held its increment in the owner's content store",
   );
   let killed = kill_the_daemon(&instance);
   let restarted = await_daemon(&instance, Some(killed), &[]);
   assert_ne!(restarted, killed, "a new daemon serves");
-  let (code, status, err) = run(&instance, &["status", "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(
-    status.contains("\"merge.chain.inputs_resolved\""),
-    "the recovery read version 1's increment from the content store: {status}"
+  status_shows(
+    &instance,
+    "merge.chain.inputs_resolved",
+    "the recovery read version 1's increment from the content store",
   );
   let (code, read, err) = run(&instance, &["read", &green, "/f.txt"]);
   assert_eq!(code, 0, "{err}");
@@ -7261,6 +7252,30 @@ fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
     read == body,
     "the head reads the version's file after the kill ({} bytes read)",
     read.len()
+  );
+}
+
+/// A green, a work kept at its version 0 so its chain cannot fold, and the work to land on it: the green and that work.
+#[cfg(unix)]
+fn byref_green_and_work(instance: &str) -> (String, String) {
+  let (code, out, err) = run(instance, &["green", "byref"]);
+  assert_eq!(code, 0, "{err}");
+  let green = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["work", &green, "byrefheld"]);
+  assert_eq!(code, 0, "the work that keeps version 0 reachable: {err}");
+  let (code, out, err) = run(instance, &["work", &green, "byref1"]);
+  assert_eq!(code, 0, "{err}");
+  (green, value_of(&out, "id"))
+}
+
+/// The instance's status names `counter`, as `what` says it should.
+#[cfg(unix)]
+fn status_shows(instance: &str, counter: &str, what: &str) {
+  let (code, status, err) = run(instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    status.contains(&format!("\"{counter}\"")),
+    "{what}: {status}"
   );
 }
 

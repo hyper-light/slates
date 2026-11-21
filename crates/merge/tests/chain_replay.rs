@@ -816,6 +816,24 @@ fn completion_of(version: u64) -> chain_entry::Completion {
   }
 }
 
+/// The entry `bytes` refused cut at every length and with any one byte flipped.
+fn every_cut_and_flip_refused(bytes: &[u8], increment_bytes: &[u8]) {
+  for len in 0..bytes.len() {
+    assert!(
+      chain_entry::decode(&bytes[..len], increment_bytes).is_err(),
+      "truncated at {len}"
+    );
+  }
+  for at in 0..bytes.len() {
+    let mut flipped = bytes.to_vec();
+    flipped[at] ^= 0x40;
+    assert!(
+      chain_entry::decode(&flipped, increment_bytes).is_err(),
+      "a byte flipped at {at}"
+    );
+  }
+}
+
 /// Hostile bytes are refused typed: every truncation, a flipped byte, a foreign magic and a bare increment.
 #[test]
 fn a_hostile_chain_entry_is_refused_typed() {
@@ -839,20 +857,7 @@ fn a_hostile_chain_entry_is_refused_typed() {
     Ok((Some(completion_of(2)), signature_for(2))),
     "the entry decodes, its completion key, submitting work and signature verdict with it"
   );
-  for len in 0..bytes.len() {
-    assert!(
-      chain_entry::decode(&bytes[..len], &increment_bytes).is_err(),
-      "truncated at {len}"
-    );
-  }
-  for at in 0..bytes.len() {
-    let mut flipped = bytes.clone();
-    flipped[at] ^= 0x40;
-    assert!(
-      chain_entry::decode(&flipped, &increment_bytes).is_err(),
-      "a byte flipped at {at}"
-    );
-  }
+  every_cut_and_flip_refused(&bytes, &increment_bytes);
   assert_eq!(
     chain_entry::decode(&increment_bytes, &increment_bytes),
     Err(DocDecodeError::BadMagic),
