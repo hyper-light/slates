@@ -493,3 +493,42 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
     index.release(&mut store).unwrap();
   }
 }
+
+/// A-767 C4 (the register's reference to a push's changeset). Do: write the reference of stock 7.2's push as changeset
+/// 5, read it back, and hand it to `Replay::begin`. Expect it read back as written (the room, the changegroup's
+/// version, its payload named by the BLAKE3 of the changegroup's bytes and their length, the sequence), its record the
+/// sectioned head; a cut or a byte after it not read as a reference; and `Replay::begin` refusing it by version, its
+/// payload being the log's.
+#[test]
+fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
+  use crate::import::record::{self, Reference, Replay};
+  let part = stock();
+  let bytes = record::write_push_reference(1 << 20, (part.version, &part.payload), 5);
+  let read = record::reference_of(&bytes).unwrap();
+  assert_eq!(
+    read,
+    Reference {
+      room: 1 << 20,
+      version: part.version,
+      payload: *blake3::hash(&part.payload).as_bytes(),
+      len: u64::try_from(part.payload.len()).unwrap(),
+      sequence: 5,
+    }
+  );
+  assert_eq!(
+    read.record(),
+    record::write_push_record(1 << 20, part.version)
+  );
+  for cut in 0..bytes.len() {
+    assert_eq!(record::reference_of(&bytes[..cut]), None, "cut at {cut}");
+  }
+  let mut trailing = bytes.clone();
+  trailing.push(0);
+  assert_eq!(record::reference_of(&trailing), None);
+  let mut store = store();
+  let mut index = HgIndex::new();
+  assert!(matches!(
+    Replay::begin(&bytes, &mut index, &mut store),
+    Err(record::Refused::Version { version: 7 })
+  ));
+}
