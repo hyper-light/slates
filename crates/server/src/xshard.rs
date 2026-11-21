@@ -1517,7 +1517,7 @@ mod tests {
       "the hand-off past the bound was refused to its sender: {past:?}"
     );
     let (refused, held) = crate::daemon::observe_first(&daemon, |state| {
-      let report = crate::verbs::shard_report(state);
+      let report = crate::verbs::shard_report(state, false);
       let refused: u64 = report
         .refusals
         .iter()

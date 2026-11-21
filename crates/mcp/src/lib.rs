@@ -854,7 +854,7 @@ impl McpServer {
   }
 
   fn status(&mut self) -> Result<Value, McpError> {
-    let (report, telemetry) = gather_daemon_status(&mut self.client).map_err(refusal)?;
+    let (report, telemetry) = gather_daemon_status(&mut self.client, false).map_err(refusal)?;
     Ok(daemon_json(&report, &telemetry))
   }
 
@@ -2081,8 +2081,13 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// `remaining` and the next status reads it.
 pub fn gather_daemon_status(
   client: &mut Client,
+  memory: bool,
 ) -> Result<(DaemonReport, Vec<TelemetryReport>), ClientError> {
-  let report = client.daemon_status()?;
+  let report = if memory {
+    client.daemon_memory_status()?
+  } else {
+    client.daemon_status()?
+  };
   let mut telemetry = Vec::with_capacity(report.shards.len());
   for shard in &report.shards {
     telemetry.push(client.telemetry(shard.partition)?);

@@ -70,7 +70,11 @@
 > pages, at A-789's own commit too. Not the pressure hold: with the test's own pressure readings injected (none, and a
 > fall of two bursts) both kept RAM, 591 and 340 MiB after the destroy (big Studio, branch agents/w-sizing-r2hold,
 > ea004b541). The anchor's content object held 0-2 MiB throughout, so the extents go back; what stays is the process's
-> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> own resident memory (heap and buffers of the write path), worked under R3 with w-hg and w-store. > **R3 measured (w-sizing, kiln r48, big Studio, release 39aa0995d):** after hg's history push (84 MB store) the
+> daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
+> STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
+> heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -127,7 +131,9 @@
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
 > (SLATES_DESIGN A-767's status). Rows for a changeset landed through `begin`/`applied`: CLOSED bc0677af9 (`applied`
-> reads the record back and puts every row, as replay does). Owed: the release timing on Mercurial's history against the per-file arm's 91 µs.
+> reads the record back and puts every row, as replay does). Measured 33465d641 (BENCHMARKS "The derived per-path read
+> form"): an old revision of Mercurial's history p50 85-87 µs once the log is in the page cache (bar 91 µs), 234 µs on the
+> log's first read; every read from its own chain alone.
 >
 > **C1 / A-767 C4, hg onto the changeset store (2026-11-20, w-hg; w-store's wiring baa28bfab, d3accba0e, 046628f88,
 > bc0677af9; w-perf's Texts encoder fa5fd0023). BUILT.** A push to a daemon holding a store (`--vcs-store`) lands as one
@@ -599,8 +605,16 @@
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
 > `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
 > no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
-> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
-> block naming the plane's object, no copy).
+> step. Part 3 BUILT (2026-11-20, C1): `Green::make_step` makes a held verdict's files a copy slice a step, so the
+> commit copies none; part 2's bug fixed with it (a whole run moved before the other files were made shifted every later
+> run's bytes: a file spliced from one was made of the wrong bytes). A-760 is whole. Not A-760's: the svn landing's
+> turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
+> no copy; w-engine's queue).
+>
+> **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
+> failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
+> the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
+> reach it.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's
@@ -8585,9 +8599,10 @@
 > its own length, and the runtime harvests its driver between idle slices (median 1,217-1,939 against 2,614-3,096 µs,
 > p999 2.2-3.7 against 4.9-9.7 ms at load 11-15). **Open, blocking 85a:** a plain status request still arms a sweep of
 > tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
-> burst and delays the next message up to half a step quantum per idle slice. Proposed (main's decision): arm the
-> background sweep only for a request that asks for the memory report, and read the content object whole from the
-> kernel's per-mapping figures rather than a page walk. Linux not measured: adacachy's runs froze at load 80-89.
+> burst and delays the next message up to half a step quantum per idle slice. Ruled by main (2026-11-20) and built:
+> only a status that asks for the memory report arms the sweep, and the anchor's objects whole come from the kernel's
+> per-mapping figures (§4.14 status "residency only when asked"). Linux not measured: adacachy's runs froze at load
+> 80-89.
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
@@ -23932,6 +23947,16 @@ runs on the box at load average 74 to 93, and never alone.
   (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
+
+> **A-783 (2026-11-20, w-engine; main's pacing call):** paced work yields at the quantum only when someone waits
+> (`slates-pace`, `slates_rt::futures::others_waiting`, ceiling = the watchdog's look); the push build runs on it. The
+> A/B (BENCHMARKS "Paced work yields only when someone waits"): the build's turns 3 to 20 times fewer in six rounds of
+> seven, wall best 7.864 against 6.011 s, newcomers and provisioning held; it found the probe blind to the rest of a
+> step's batch, fixed in the same change. OWED: (1) git's answer and admission paths (w-git), Mercurial's (w-hg) and
+> Subversion's landings (w-svn) move onto the primitive; (2) in one round of seven every build turn yielded at its first
+> ask (369,778 of 369,786): find which task is ready at nearly every quantum on a push's shard, and whether it waits or
+> only yields for its own sake; (3) the A/B again on a quiet machine (this one ran beside other agents' work, load 5 to
+> 45).
 
 ### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — open (w-forming's finding, not worked: Ada's close order)
 `cargo test -p slates-server --test fleet a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`

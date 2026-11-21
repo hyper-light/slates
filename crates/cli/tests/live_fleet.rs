@@ -1999,6 +1999,21 @@ fn percentiles_us(samples: &mut [Duration]) -> (f64, f64, f64, f64) {
 /// release (`cargo test --release`), at `SLATES_TEST_CLI=1` and `SLATES_TEST_MEASURE=1`.
 #[test]
 fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
+  measure_live_shipping("live-measure", false);
+}
+
+/// [`measure_what_live_shipping_adds_to_a_stable_nfs_write`] with a plain `slates status` asked of the owner again and
+/// again for the whole stream (main's ruling on g228's finding, A-744: a plain status costs no residency work): what a
+/// monitor, an operator or a test polling the daemon's counters adds to a live write. Run it as the other, release.
+#[test]
+fn measure_what_live_shipping_adds_under_a_burst_of_plain_statuses() {
+  measure_live_shipping("live-measure-status", true);
+}
+
+/// The live-shipping measurement, under `tag`, with a thread asking the owner a plain `slates status` for the whole
+/// stream when `status_burst`, and the statuses it asked printed.
+#[allow(clippy::too_many_lines)]
+fn measure_live_shipping(tag: &str, status_burst: bool) {
   /// Shape: interleaved rounds, and the writes of each volume per round.
   const ROUNDS: usize = 5;
   /// Shape: see [`ROUNDS`].
@@ -2018,7 +2033,7 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     );
     return;
   }
-  let fleet = start_fleet("live-measure");
+  let fleet = start_fleet(tag);
   let owner_index = (fleet.bootstrap + 1) % fleet.instances.len();
   let owner = &fleet.instances[owner_index];
   let (mut plain, plain_file, _) = stable_session(owner, "plain", false);
@@ -2034,19 +2049,34 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
   }
   let (mut plain_times, mut live_times) = (Vec::new(), Vec::new());
   let streamed_from = fleet_cpu_ns(&fleet);
-  for _ in 0..ROUNDS {
-    for (stream, file, times) in [
-      (&mut plain, &plain_file, &mut plain_times),
-      (&mut live, &live_file, &mut live_times),
-    ] {
-      for _ in 0..PER_ROUND {
-        xid += 1;
-        let began = Instant::now();
-        nfs::write(stream, file, &data, xid);
-        times.push(began.elapsed());
+  let streaming = std::sync::atomic::AtomicBool::new(true);
+  let statuses = std::sync::atomic::AtomicU64::new(0);
+  std::thread::scope(|scope| {
+    if status_burst {
+      scope.spawn(|| {
+        while streaming.load(std::sync::atomic::Ordering::Acquire) {
+          let (code, _, _) = run(owner, &["status"]);
+          if code == 0 {
+            statuses.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+          }
+        }
+      });
+    }
+    for _ in 0..ROUNDS {
+      for (stream, file, times) in [
+        (&mut plain, &plain_file, &mut plain_times),
+        (&mut live, &live_file, &mut live_times),
+      ] {
+        for _ in 0..PER_ROUND {
+          xid += 1;
+          let began = Instant::now();
+          nfs::write(stream, file, &data, xid);
+          times.push(began.elapsed());
+        }
       }
     }
-  }
+    streaming.store(false, std::sync::atomic::Ordering::Release);
+  });
   let streamed_to = fleet_cpu_ns(&fleet);
   std::thread::sleep(SETTLE);
   let quiet_from = fleet_cpu_ns(&fleet);
@@ -2089,7 +2119,7 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
      p99 {p99:.1} p999 {p999:.1} max {max:.1} us\n  live  p50 {l50:.1} p99 {l99:.1} p999 {l999:.1} max {lmax:.1} us\n  \
      added at p50 {:.1} us; live log at the end {caught:?}; late {late}; (no_session, unanswered, link_lost) {lent:?}; \
      live writes over 50 ms {}\n  cpu ms (process, control shard) in node order, owner {owner_index}: stream {streamed:?}; \
-     the {} ms after it {settling:?}; the {} ms after that {quiet:?}",
+     the {} ms after it {settling:?}; the {} ms after that {quiet:?}; plain statuses asked during the stream {}",
     plain_times.len(),
     load.trim(),
     l50 - p50,
@@ -2098,7 +2128,8 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
       .filter(|time| **time > Duration::from_millis(50))
       .count(),
     SETTLE.as_millis(),
-    QUIET.as_millis()
+    QUIET.as_millis(),
+    statuses.load(std::sync::atomic::Ordering::Acquire)
   );
   assert_eq!(late, 0, "no stable write waited out its bound");
 }

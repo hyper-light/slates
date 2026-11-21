@@ -136,7 +136,9 @@ pub(crate) fn hold_toward(
 /// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range: its length cut on `unit` into
 /// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. At most one part per bit
 /// of `len / unit`.
-/// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]).
+/// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]): what a Windows extent's length is read
+/// from (`crate::content_extents::extent_len`, A-789).
+#[cfg(windows)]
 pub(crate) fn parts_of(config: &DaemonConfig) -> Vec<(usize, usize)> {
   arena_parts(config.shard_content_layout().arena.1, config.pool_unit())
 }

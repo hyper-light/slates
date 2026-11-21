@@ -180,9 +180,9 @@ fn fragmented_status_reassembles_without_losing_fields() {
   let encoded = encode_body(&expected);
   for width in 1..=encoded.len() {
     let mut offset = 0;
-    let actual = collect::<IpcError>(encoded.len(), |request| {
+    let actual = collect::<IpcError>(encoded.len(), false, |request| {
       if offset == 0 {
-        assert_eq!(request, &RequestBody::DaemonStatus);
+        assert_eq!(request, &RequestBody::DaemonStatus { memory: false });
       } else {
         assert_eq!(
           request,
@@ -230,7 +230,7 @@ fn malformed_pages_refuse_at_the_first_bad_page() {
   ];
   for pages in cases {
     let mut pages = pages.into_iter();
-    let result = collect::<IpcError>(encoded.len(), |_| Ok(pages.next().unwrap()));
+    let result = collect::<IpcError>(encoded.len(), false, |_| Ok(pages.next().unwrap()));
     assert!(result.is_err(), "malformed sequence must refuse");
     assert!(
       pages.next().is_none(),
@@ -239,7 +239,13 @@ fn malformed_pages_refuse_at_the_first_bad_page() {
   }
   let wrong = encode_body(&ReplyBody::Acknowledged);
   assert!(
-    collect::<IpcError>(wrong.len(), |_| Ok(page(7, 0, wrong.len() as u64, &wrong))).is_err()
+    collect::<IpcError>(wrong.len(), false, |_| Ok(page(
+      7,
+      0,
+      wrong.len() as u64,
+      &wrong
+    )))
+    .is_err()
   );
 }
 
@@ -254,7 +260,7 @@ fn continuation_refusals_remain_typed() {
   ]
   .into_iter();
   assert_eq!(
-    collect::<IpcError>(2, |_| Ok(pages.next().unwrap())).unwrap(),
+    collect::<IpcError>(2, false, |_| Ok(pages.next().unwrap())).unwrap(),
     ReplyBody::Refused {
       refusal: Refusal::NotFound
     }
