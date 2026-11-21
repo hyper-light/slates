@@ -59528,3 +59528,31 @@ Applied in the same change to:
   reaching the drop holds nothing to drop, and the deterministic case passed only vacuously (an empty journal). Not
   landed (CLAUDE.md §5: a dead-even A/B does not land); the patch is kept outside the tree
   (`~/slates-work/w-fed-move-a817-rejected-drop.patch`, w-fed-move's machine) and its rule is not in the rebase section.
+
+### A-818 piece 2a — Where each byte identity's bytes are now: the location index (2026-11-21, w-rewrite-ops; main's ruling of 10:35 PST, option (ii))
+
+- **Why (ii).** A piece tree whose runs name immutable chunks would keep a whole earlier block a path touched while a
+  reader pins the floor. That is the retention A-793 removed (goal 86b: 94,877 of 100,000 refused `BudgetExceeded`),
+  and it breaks MEMORY SIZING.
+- **What.** `crates/merge/src/byte_places.rs`, a pure module:
+  - A path's bytes carry identities, each given once. A version is a piece tree of identity runs (piece 1).
+  - One index a path says where each identity's bytes are now. Either they are in the newest block, at their node's
+    rank in a treap of the latest order (Seidel and Aragon 1996), so an insert shifts nothing stored. Or they are
+    stored by the caller, copied out once by the change that removed them.
+  - A change hands each removed range to the caller to store, re-points those identities, and inserts the added runs
+    with new identities: O((parts + nodes removed) × depth), with no version walked.
+  - An identity a change stored is read only by versions before it, so once the floor passes that change it is
+    retired, with its chunks.
+  - Its charged bytes (`bytes`) are the entries, the nodes and the log, at their sizes. The bound is two entries a part
+    for each retained change, plus the latest's nodes.
+  - Its caller to come is the content history's engine switch (piece 2b).
+- **Evidence.**
+  - `byte_places::tests::every_version_reads_its_bytes_through_the_places`: a serial model with retirement, the entry
+    bound, and the charge back to the latest's after release.
+  - `history::tests::every_identity_version_reads_as_the_reanchored_history`: main's oracle. Every retained version,
+    whole and at a range, built by the engine's own `segments`, equals the re-anchored value's and `apply`'s, and the
+    stored bytes never pass what the changes removed.
+  - Moving a stored or a current place by one byte fails the oracles.
+- **Open (GAPS).** An old version's read is O(fragments × depth). Today's re-anchor compacts a fragmented value at
+  write time, so today an old read is O(pieces) with pieces bounded by the value's bytes. Main's A/B (piece 2c)
+  decides whether the read loses; the run is requested in `run-requests.md`.
