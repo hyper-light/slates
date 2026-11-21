@@ -250,3 +250,10 @@
   same with the original sleep: GAPS.md, not worked (Ada's order).
 - store literals (56 sites, layout offsets + two Cited: consts) sent to w-store: inbox/w-store-from-w-lint.md.
 - Windows r58 / Linux r60 (A-782, g226, A-786) still running/queued on kiln.
+
+## 2026-11-20 round 11 at 5313ab3cb (landed 833144bd7)
+- Host clippy, fmt, structural, six cross targets: clean.
+- unsafe: slates-store had no budget entry -> `slates-store = 0` (833144bd7). slates-server 8 against 6: A-789's
+  (362bd8c39) two content_pool.rs open_range sites, budget not raised -> w-sizing (inbox/w-sizing-from-w-lint-unsafe.md).
+- literals: 56 sites in slates-store, w-store's (inbox/w-store-from-w-lint.md); none elsewhere.
+- r58/r60 were collected by kiln's restart without results; relaunched on 833144bd7 as r1 (jupiter) and r2 (Linux).
