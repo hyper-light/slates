@@ -50,3 +50,17 @@ Free for the next goal-93 C/R piece.
 - No number from it goes on record. Per "no new performance runs" I haven't resubmitted it. The store scan
   (6a6e35215) is already on main under the fast rule.
 - Logs: MacBook ~/.cache/w-perf/prof/hg-stream-scan-ab-20261121T181133/.
+
+## 6. The SSH edge's fetch keepalive: LANDED (origin/main 1a8859a3f, on 92780f3d0; ~13:00 PST)
+- This closes the item §1 left owed. The SSH upload session (`vcs_ssh::git::UploadCommand::write_answer`) now writes
+  git's `0005\1` inside the packfile section after git's own interval of silence (`GIT_KEEPALIVE_NS`).
+  `ToolServices::with_git_keepalive` sets another interval, and tests use it to set 0.
+- **Red** on main 1a35ab091 (load 29 to 41):
+  `vcs_ssh::tests::receive::a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`.
+  The section's second packet was the pack's first data.
+- **Green:** `slates-server --lib -- vcs_ssh vcs_http::git a_long_fetchs`: 92 passed, load 44 to 51. Format clean.
+- **Still owed (GAPS):**
+  - The wait before the sections (the A-718 encode, A-614's derivations), which has no packet git allows there.
+  - The SSH receive's inline homing and landing (w-git's owed item).
+- **Free:** I've found no unowned goal-93 C/R item; git C1–C3 are w-git's, the hg push spin is w-hg's, svn is
+  w-svn's. Please assign the next one.
