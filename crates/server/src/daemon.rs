@@ -4562,7 +4562,7 @@ async fn start_shard(
 }
 
 /// Format: nanoseconds in a microsecond, for the boot log's slice times.
-const NANOS_PER_MICRO: u64 = 1_000;
+pub(crate) const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.

@@ -327,11 +327,35 @@ enum Class {
   Alone,
 }
 
-/// A byte's class ([`classify`]): four comparisons, which the compiler lowers to a lookup.
+/// Every byte's class ([`classify`]), by the byte's value, looked up rather than branched on in the cut's scan (a
+/// table read is 1.1 to 1.3 times faster a save than the comparisons, A-787's A/B). Kept equal to [`classify`] by
+/// `the_class_table_is_classify_for_every_byte`.
+/// Format: one class a byte value, 256 of them, sixteen a row: `W` a word's, `B` a blank's, `A` alone.
+const CLASSES: [Class; 256] = {
+  const W: Class = Class::Word;
+  const B: Class = Class::Blank;
+  const A: Class = Class::Alone;
+  [
+    A, A, A, A, A, A, A, A, A, B, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A,
+    B, A, A, A, A, A, A, A, A, A, A, A, A, A, A, A, W, W, W, W, W, W, W, W, W, W, A, A, A, A, A, A,
+    A, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, A, A, A, A, W,
+    A, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, A, A, A, A, A,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+    W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W, W,
+  ]
+};
+
+/// A byte's class: [`CLASSES`] read at the byte's value, which the table's length always holds.
 fn class(byte: u8) -> Class {
-  classify(byte)
+  CLASSES
+    .get(usize::from(byte))
+    .copied()
+    .unwrap_or(Class::Alone)
 }
 
+#[cfg(test)]
 const fn classify(byte: u8) -> Class {
   // Format: UTF-8; a byte at or past 0x80 belongs to a character outside ASCII, a word's.
   if byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80 {
@@ -2003,7 +2027,7 @@ struct Chunked<T> {
 
 impl<T> Chunked<T> {
   /// Shape: the items a chunk holds.
-  const CHUNK: usize = UNIT_BYTES as usize;
+  const CHUNK: usize = 1 << UNIT_BYTES.trailing_zeros();
 
   fn new() -> Self {
     Chunked {
