@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "split:d80175d3f"
+      ARMS: "split:9e16e2d90"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -49,7 +49,7 @@ jobs:
               for h in ["build","to_control","lane","exchange","to_owner","round","reply","holder"]:
                   n=d.get("hop."+h,0); ns=d.get("hop."+h+"_ns",0)
                   if n: out.append(f"{h} {ns/n/1000:.1f}")
-              for h in ["reply_wake","reply_poll","reply_tail"]:
+              for h in ["reply_wake","reply_poll","reply_tail","reply_fold_rest"]:
                   n=d.get("hop."+h,0); ns=d.get("hop."+h+"_ns",0)
                   if n: out.append(f"{h} {ns/n/1000:.1f}")
               for k in ["hold.declined","hold.answer","hold.exchange","hold.dispatches","hold.entries","hop.reply_timed"]:
