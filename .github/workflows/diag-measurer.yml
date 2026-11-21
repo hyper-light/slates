@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# g222's Linux A/B of the timerfd wait (84a): ring-stamped arms without (bc688cefc) and with the fix, spin, interleaved, and the lane's ping-pong floor each round. Was: g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
 # single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
 # loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
 # a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
@@ -12,7 +12,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "bc688cefcdd07a0a99e8f6068b69a783115e1ab0"
+  NS9: "120319d60"
+  ARMS: "bc688cefcdd07a0a99e8f6068b69a783115e1ab0 120319d6088e5fbe1363b7b3f74dc797d2f2b6eb"
   ROUNDS: "3"
   G222_SPLIT: "1"
 
@@ -63,6 +64,7 @@ jobs:
               || { echo "build $s failed; the arm is skipped"; tail -15 "$W/logs/build-$s.log"; rm -rf "$W/src-$s"; continue; }
             grep -E "Compiling slates-(server|client)|Finished" "$W/logs/build-$s.log" | tail -3
             cp "$W/target/release/examples/edit_merge_bench$EXE" "$W/bin-$s/edit_merge_bench$EXE"
+            if [ "$s" = "$NS9" ]; then ( cd "$W/src-$s" && cargo build --release --locked -p slates-client --example g222_floor ) >> "$W/logs/build-$s.log" 2>&1 && cp "$W/target/release/examples/g222_floor" "$W/bin-$s/g222_floor"; fi
             sha256sum "$W/bin-$s/edit_merge_bench$EXE" 2>/dev/null || shasum -a 256 "$W/bin-$s/edit_merge_bench$EXE"
           done
       - name: The machine and the load's form
@@ -105,10 +107,10 @@ jobs:
           set +e
           order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
           for round in $(seq 1 "$ROUNDS"); do
-            if [ $((round % 2)) = 1 ]; then modes="spin park"; else modes="park spin"; fi
-            for mode in $modes; do
-              arm=$ARMS; s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; [ -x "$B" ] || continue; L="$W/logs/loaded-$s-$mode-r$round.log"
-              if [ $mode = park ]; then export G222_NO_SPIN=1; else unset G222_NO_SPIN; fi
+            if [ $((round % 2)) = 1 ]; then order="$ARMS"; else order="$(echo $ARMS | awk '{print $2, $1}')"; fi
+            unset G222_NO_SPIN
+            for arm in $order; do
+              mode=spin; s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; [ -x "$B" ] || continue; L="$W/logs/loaded-$s-$mode-r$round.log"
               echo "== loaded round $round arm $s $mode $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
               MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
               G222_DIAG="$W/logs/loaded-$s-$mode-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
@@ -123,6 +125,9 @@ jobs:
           print('split n',len(q),'queued p50/p99/p999/max us',pc(q,.5),pc(q,.99),pc(q,.999),q[-1]/1000,'served p50/p99/p999 us',pc(s,.5),pc(s,.99),pc(s,.999))
           PY
             done
+            F="$W/bin-${NS9}/g222_floor"
+            echo "== floor round $round $(date -u +%FT%TZ) load: $(load)"
+            timeout 600 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 bash -c "( while true; do dd if=/dev/zero of=$W/fsync2.bin bs=1M count=16 conv=fsync status=none; done ) & w=\$!; $F 50000 2; kill \$w" </dev/null 2>&1 | grep floor
           done
           for round in $(seq 1 "$ROUNDS"); do
             for arm in $(order $round); do
