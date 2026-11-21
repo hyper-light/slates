@@ -55,6 +55,10 @@ pub enum Progress {
   /// (`get-file-revs` of a file whose first location the session may not read); nothing more is written, and the
   /// caller ends the connection.
   Close,
+  /// A text's piece the repository reads asynchronously is waited for (C2 stage B part 2;
+  /// [`crate::reads::Repository::fetchable`]): the caller fetches it and resumes the stream again, which reads on from
+  /// where it waited.
+  Waiting(crate::reads::Wanted),
 }
 
 impl Stream {

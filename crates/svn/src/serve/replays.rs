@@ -205,6 +205,13 @@ impl Connection {
           let (replay, writer) = &mut *driving;
           match replay.next_within((sources.index, sources.repository), rules.as_ref(), 1) {
             Ok(Stepped::Paused) => replaying.stage = Stage::Drive(driving),
+            // A text's piece the repository reads asynchronously (C2 stage B part 2): the caller fetches it and calls
+            // again, the replay where it waited.
+            Ok(Stepped::Waiting(wanted)) => {
+              replaying.stage = Stage::Drive(driving);
+              self.phase = Phase::Replaying(established, replaying);
+              return Ok(super::Turn::Waiting(wanted));
+            }
             Ok(Stepped::Call(call)) => {
               writer
                 .write(&call, out)

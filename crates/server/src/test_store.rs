@@ -37,6 +37,7 @@ pub(crate) struct TestStore {
 
 impl TestStore {
   /// A fresh store named `name`, its owner started.
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   pub(crate) fn start(name: &str) -> TestStore {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,6 +95,7 @@ impl Drop for TestStore {
     {
       let _ = owner.stop();
     }
+    #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
     let _ = std::fs::remove_dir_all(&self.dir);
   }
 }
@@ -278,7 +280,8 @@ pub(crate) async fn created(
     !matches!(reply, slates_ipc::protocol::ReplyBody::Refused { .. }),
     "{reply:?}"
   );
-  let deadline = slates_rt::futures::now_ns().saturating_add(CREATION_PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(CREATION_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   loop {
     if let Some(Some(made)) = crate::state::with_state(|state| recorded(state, (asked.0, asked.3)))
     {
@@ -344,15 +347,25 @@ pub(crate) fn land_blocking(
   header: slates_store::log::Header,
   parts: Vec<slates_store::owner::Part>,
 ) -> bool {
+  land_answered_blocking(disk, header, parts).is_ok()
+}
+
+/// [`land_blocking`]'s landing with the store's answer: where it was committed, or why the owner refused it (`Gone` for
+/// a waiting thread that could not run it).
+pub(crate) fn land_answered_blocking(
+  disk: StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
   std::thread::scope(|scope| {
     scope
       .spawn(move || {
         waiting_runtime()
-          .block_on(async move { disk.land(header, parts).await.is_ok() })
-          .unwrap_or(false)
+          .block_on(async move { disk.land(header, parts).await })
+          .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
       })
       .join()
-      .unwrap_or(false)
+      .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
   })
 }
 
@@ -381,13 +394,35 @@ pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
   name: &str,
   history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
 ) -> T {
+  audit_on_stored_shard_configured(name, history, |_| {})
+}
+
+/// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
+/// ([`crate::daemon::audit_on_shard_configured`]).
+pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
+  name: &str,
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> T {
   let store = TestStore::start(name);
   let handle = store.handle();
   let answer = crate::daemon::audit_on_shard_configured(history, move |config| {
     config.vcs_disk = Some(handle);
+    configure(config);
   });
   drop(store);
   answer
+}
+
+/// [`crate::daemon::audit_daemon_of`] holding a fresh store: the store first, so a test binding both as
+/// `let (_store, daemon)` drops the daemon first.
+pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) {
+  let store = TestStore::start("audit-of");
+  let handle = store.handle();
+  let daemon = crate::daemon::audit_daemon_of_configured(shards, move |config| {
+    config.vcs_disk = Some(handle);
+  });
+  (store, daemon)
 }
 
 /// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered
@@ -418,4 +453,102 @@ pub(crate) fn create(
     ),
     other => crate::verbs::dispatch(state, 1, principal, other),
   }
+}
+
+/// A store-holding daemon over `owner`'s repository `name`, whose revision 1 adds `/trunk/a.bin` with `bytes` (a stored text, which
+/// its changeset carries), every hold RAM has on the text let go after: the green's held table's and the content
+/// store's (C2 stage B part 2). The store's guard comes first; keep it alive past the daemon's stop. The repository's id
+/// last.
+pub(crate) fn a_text_only_the_store_holds(
+  owner: &slates_db::catalog::Principal,
+  name: &str,
+  bytes: &[u8],
+) -> (TestStore, crate::Daemon, slates_db::catalog::RepositoryId) {
+  use slates_svn::commit::drive::TextSink;
+  let (store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    name,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, green) = crate::test_store::create_on(&daemon, 0, owner, asked);
+  let committed = bytes.to_vec();
+  let landing = owner.clone();
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let text = slates_svn::commit::drive::text_of(&committed).unwrap();
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage().unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, text.identity).unwrap();
+      let row = |path: &str, kind, text| slates_svn::index::ChangedPath {
+        path: path.to_owned(),
+        action: slates_svn::index::Action::Add,
+        kind,
+        copy_from: None,
+        text,
+        properties: None,
+        mergeinfo_modified: false,
+      };
+      let work = slates_svn::commit::drive::Work {
+        head: 0,
+        record: slates_svn::index::RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", slates_svn::index::NodeKind::Directory, None),
+            row(
+              "/trunk/a.bin",
+              slates_svn::index::NodeKind::File,
+              Some(text),
+            ),
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"noise".to_vec())],
+        texts: std::iter::once(text.identity).collect(),
+        property_lists: std::collections::BTreeMap::new(),
+        locks: slates_svn::lock::CommitLocks::default(),
+      };
+      let landed = crate::repository::svn_commit::land_work((&landing, id), work, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision));
+      // Every hold RAM has on the text let go: the green's held table's and the content store's.
+      crate::state::with_state(|state| {
+        if let Some(mut engine) = state.greens.get_mut(&green) {
+          while engine.held(&text.identity).is_some() {
+            let _ = engine.release_held(&text.identity);
+          }
+        }
+        crate::vcs_store::within_budget(state, 0, |stores| {
+          if let Some(content) = stores.content_mut() {
+            let content_id = slates_vcs::ContentId(text.identity);
+            while content.contains(&content_id) {
+              if content.release(&content_id).is_err() {
+                break;
+              }
+            }
+          }
+        });
+      });
+      landed
+    },
+    std::time::Duration::from_secs(60),
+  );
+  assert_eq!(landed, Some(Ok(1)));
+  (store, daemon, id)
+}
+
+/// Shape: the text the store-read tests commit: noise, so a drive's svndiff carries its bytes as they are.
+pub(crate) fn noise(len: usize) -> Vec<u8> {
+  let mut state = 0x9e37_79b9_7f4a_7c15u64;
+  (0..len)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state.to_le_bytes()[0]
+    })
+    .collect()
 }

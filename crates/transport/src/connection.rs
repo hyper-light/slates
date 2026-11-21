@@ -352,6 +352,10 @@ pub struct Connection {
   probe_copy_pending: bool,
   /// Why fresh sending stopped, counted ([`Connection::send_stops`]).
   stops: SendStops,
+  /// The send streams some of whose bytes the peer acknowledged since [`Connection::take_send_progressed`] last took them:
+  /// a request still going out makes progress as its bytes are acknowledged, before any reply (main's ruling on the
+  /// lane, 2026-11-21). Bounded by the open send streams.
+  send_progressed: BTreeSet<u64>,
   /// The unreliable frames of the packet being built ([`Connection::poll_transmit_into`]: its acknowledgement and its
   /// credit), kept between packets so a packet allocates no list for them; empty between calls. Bounded by what one
   /// packet's budget holds.
@@ -473,6 +477,7 @@ impl Connection {
       probe_copy_pending: false,
       stops: SendStops::default(),
       unreliable: Vec::new(),
+      send_progressed: BTreeSet::new(),
       credit_sent: BTreeMap::new(),
       credit_cursor: 0,
       blocked_sent: None,
@@ -715,16 +720,7 @@ impl Connection {
       self.sent.next_pn()
     };
     if let Some(pn) = packet_number {
-      let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
-      for frame in acknowledgement {
-        frame.encode_into(out);
-      }
-      for carried in &reliable {
-        self.encode_carried(carried, out);
-      }
-      for frame in credit {
-        frame.encode_into(out);
-      }
+      self.encode_packet((&unreliable, acknowledgements), &reliable, out);
       if !reliable.is_empty() {
         // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
         // packet number may encode shorter than its longest form).
@@ -737,6 +733,26 @@ impl Connection {
     unreliable.clear();
     self.unreliable = unreliable;
     packet_number
+  }
+
+  /// Appends a packet's frames to `out` in its order: the first `acknowledgements` of `unreliable` (the
+  /// acknowledgement), the reliable frames `reliable`, then the rest of `unreliable` (the credit).
+  fn encode_packet(
+    &self,
+    (unreliable, acknowledgements): (&[Frame], usize),
+    reliable: &[Carried],
+    out: &mut Vec<u8>,
+  ) {
+    let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
+    for frame in acknowledgement {
+      frame.encode_into(out);
+    }
+    for carried in reliable {
+      self.encode_carried(carried, out);
+    }
+    for frame in credit {
+      frame.encode_into(out);
+    }
   }
 
   /// Appends `carried`'s bytes to `out`: a held frame's encoding, or a stream frame encoded straight from its sender's
@@ -1723,6 +1739,7 @@ impl Connection {
       {
         offsets.remove(&offset);
         touched.push(stream_id);
+        self.send_progressed.insert(stream_id);
       }
     }
     for stream_id in touched {
@@ -1889,6 +1906,16 @@ impl Connection {
   pub fn read_stream(&mut self, now: u64, stream_id: u64) -> Vec<u8> {
     self.advance_stream(now, stream_id);
     self.take_stream(stream_id)
+  }
+
+  /// Takes the send streams some of whose bytes were acknowledged since the last call, still open: what an endpoint
+  /// counts as its exchanges' progress while their requests are still going out.
+  pub fn take_send_progressed(&mut self) -> Vec<u64> {
+    let progressed = std::mem::take(&mut self.send_progressed);
+    progressed
+      .into_iter()
+      .filter(|stream_id| self.send_streams.contains_key(stream_id))
+      .collect()
   }
 
   /// Slides receive stream `stream_id`'s flow-control window past the bytes delivered in order since the last call (at
@@ -3291,6 +3318,29 @@ mod tests {
       "the lone packet arrived"
     );
     assert!(sender.retransmitted() >= 1, "the probe recovered it");
+  }
+
+  /// Main's ruling on the lane (2026-11-21): a request still going out makes progress as its bytes are acknowledged,
+  /// before any reply. Do: open an exchange of eight frames' worth, send one packet, have the receiver acknowledge it.
+  /// Expect: nothing reported before the acknowledgement; the stream reported once after it, and not again until more
+  /// of it is acknowledged.
+  #[test]
+  fn a_request_still_going_out_progresses_as_its_bytes_are_acknowledged() {
+    let mut sender = fixed_window(FRAME_CAP);
+    let mut receiver = fixed_receiver(FRAME_CAP);
+    let stream = open(&mut sender, &stream_content(1, 8 * FRAME_CAP));
+    let (pn, frames) = sender.poll_transmit(0, FRAME_CAP).expect("data goes out");
+    assert!(
+      sender.take_send_progressed().is_empty(),
+      "nothing acknowledged yet"
+    );
+    receiver.handle_incoming(0, pn, &frames);
+    let (ack_pn, ack) = receiver
+      .poll_transmit(MS, FRAME_CAP)
+      .expect("the receiver acknowledges");
+    sender.handle_incoming(MS, ack_pn, &ack);
+    assert_eq!(sender.take_send_progressed(), vec![stream]);
+    assert!(sender.take_send_progressed().is_empty(), "taken once");
   }
 
   /// RFC 9002 §5.1: the round trip is measured from the largest newly acknowledged packet's send to the

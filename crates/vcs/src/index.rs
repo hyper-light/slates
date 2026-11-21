@@ -234,6 +234,34 @@ struct Cut {
   rows: u64,
 }
 
+/// A merge under way ([`Index::merge_begin`]), made a table at a time ([`Index::merge_step`]): the runs it merges, each by
+/// its tables' identities (so a fork that comes to share one, or a run gone, is seen), the last key it cut, and the
+/// tables cut so far, held until the merged run is admitted whole.
+#[derive(Debug)]
+pub struct Merge {
+  runs: Vec<Vec<ContentId>>,
+  after: Option<Box<[u8]>>,
+  cuts: Vec<Cut>,
+}
+
+impl Merge {
+  /// The tables cut so far: the merge's progress.
+  pub fn tables_cut(&self) -> usize {
+    self.cuts.len()
+  }
+}
+
+/// What one step of a merge did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeStep {
+  /// A table cut; more follow.
+  More,
+  /// The merged run admitted in place of the runs it merged: its rows.
+  Done(u64),
+  /// Given up, nothing changed: its runs are no longer all this index's own.
+  GivenUp,
+}
+
 /// A repository's index (module docs).
 #[derive(Debug, Default)]
 pub struct Index {
@@ -394,6 +422,35 @@ fn cut<'a>(
     cuts.push(finish(builder, first)?);
   }
   Ok(cuts)
+}
+
+/// A table cut from rows: its cut, and its first key (none: no row was left).
+type OneTable = (Option<Cut>, Option<Box<[u8]>>);
+
+/// The first table of `rows` (in key order) cut as [`cut`] cuts each, at most `window` bytes, and its last key; none when
+/// no row is left.
+fn one_table<'a>(
+  rows: impl Iterator<Item = RowRef<'a>>,
+  window: usize,
+) -> Result<OneTable, IndexRefused> {
+  let mut builder = TableBuilder::new();
+  let mut first: Option<Box<[u8]>> = None;
+  let mut last: Option<Box<[u8]>> = None;
+  for row in rows {
+    let bytes = row_bytes(row.key(), row.body()).ok_or(TableRefused::TooLarge)?;
+    if !builder.is_empty() && builder.len().saturating_add(bytes) > window {
+      break;
+    }
+    if builder.is_empty() {
+      first = Some(Box::from(row.key()));
+    }
+    builder.push(row.key(), row.body())?;
+    last = Some(Box::from(row.key()));
+  }
+  if builder.is_empty() {
+    return Ok((None, None));
+  }
+  Ok((Some(finish(builder, first)?), last))
 }
 
 /// A finished table's cut.
@@ -878,21 +935,81 @@ impl Index {
     self.rule.due(&rows)
   }
 
-  /// Merges the newest `runs` runs only this index holds into one run (module docs); the rows written. Fewer than two
-  /// such runs merge nothing. The merged run's tables are admitted as one step and take their rows' holds before the
-  /// merged runs give theirs back: refused, nothing changed.
+  /// Merges the newest `runs` runs only this index holds into one run (module docs), at once: [`Index::merge_begin`] and
+  /// every [`Index::merge_step`] to its end; the rows written. Fewer than two such runs merge nothing. The merged run's
+  /// tables are admitted as one step and take their rows' holds before the merged runs give theirs back: refused,
+  /// nothing changed.
   pub fn compact(&mut self, store: &mut ContentStore, runs: usize) -> Result<u64, IndexRefused> {
-    self.relearn(store);
-    let merging: Vec<usize> = (0..self.runs.len())
-      .rev()
-      .filter(|at| self.runs.get(*at).is_some_and(|run| !run.shared))
-      .take(runs)
-      .collect();
-    if merging.len() < 2 {
+    let Some(mut merge) = self.merge_begin(store, runs) else {
       return Ok(0);
+    };
+    loop {
+      match self.merge_step(store, &mut merge)? {
+        MergeStep::More => {}
+        MergeStep::Done(rows) => return Ok(rows),
+        MergeStep::GivenUp => return Ok(0),
+      }
     }
+  }
+
+  /// Plans a merge of the newest `runs` runs only this index holds (module docs, "Merging"), made a table at a time by
+  /// [`Index::merge_step`], so its work fits a step's budget however large the runs are; `None` for fewer than two such
+  /// runs. Nothing changes until its last step: lookups read the runs it merges meanwhile.
+  pub fn merge_begin(&mut self, store: &ContentStore, runs: usize) -> Option<Merge> {
+    self.relearn(store);
+    let merging: Vec<Vec<ContentId>> = self
+      .runs
+      .iter()
+      .rev()
+      .filter(|run| !run.shared)
+      .take(runs)
+      .map(|run| run.fences.iter().map(|fence| fence.table).collect())
+      .collect();
+    (merging.len() >= 2).then_some(Merge {
+      runs: merging,
+      after: None,
+      cuts: Vec::new(),
+    })
+  }
+
+  /// One step of `merge`: the next table of its merged run cut from the rows of the runs it merges past the last key it
+  /// cut; once no row is left, the merged run admitted in their place, as [`Index::compact`] admits it. A merge whose
+  /// runs are no longer all this index's own (a fork shares one, or one is gone) is given up, nothing changed.
+  pub fn merge_step(
+    &mut self,
+    store: &mut ContentStore,
+    merge: &mut Merge,
+  ) -> Result<MergeStep, IndexRefused> {
+    self.relearn(store);
+    let Some(merging) = self.merging_positions(merge) else {
+      return Ok(MergeStep::GivenUp);
+    };
+    let window = store.window();
+    let (cut, last) = {
+      let mut sources: Vec<Source<'_>> = Vec::with_capacity(merging.len());
+      for run in merging.iter().filter_map(|at| self.runs.get(*at)) {
+        let rows: Box<dyn Iterator<Item = RowRef<'_>> + '_> = match &merge.after {
+          Some(after) => {
+            let after = after.clone();
+            Box::new(
+              run
+                .rows_from(store, &after)
+                .skip_while(move |row| row.key() <= after.as_ref()),
+            )
+          }
+          None => Box::new(run.rows(store)),
+        };
+        sources.push(rows.peekable());
+      }
+      one_table(Merged { sources }, window)?
+    };
+    if let Some(cut) = cut {
+      merge.cuts.push(cut);
+      merge.after = last;
+      return Ok(MergeStep::More);
+    }
+    let cuts = take(&mut merge.cuts);
     self.merge_fits(store, &merging)?;
-    let cuts = self.merged_cuts(store, &merging)?;
     let fences = fences_charge(&cuts)?;
     let tables: Vec<&[u8]> = cuts.iter().map(|cut| cut.bytes.as_slice()).collect();
     let stored = store.put_tables(&tables, 0, fences)?;
@@ -913,7 +1030,26 @@ impl Index {
       .saturating_add(u64::try_from(merging.len()).unwrap_or(u64::MAX));
     self.compacted_rows = rows;
     self.restart();
-    given_back.map(|()| rows)
+    given_back.map(|()| MergeStep::Done(rows))
+  }
+
+  /// Where `merge`'s runs are among this index's, each still its own: none when one is gone or shared.
+  fn merging_positions(&self, merge: &Merge) -> Option<Vec<usize>> {
+    merge
+      .runs
+      .iter()
+      .map(|tables| {
+        self.runs.iter().position(|run| {
+          !run.shared
+            && run.fences.len() == tables.len()
+            && run
+              .fences
+              .iter()
+              .zip(tables)
+              .all(|(fence, table)| fence.table == *table)
+        })
+      })
+      .collect()
   }
 
   /// Refuses a merge whose runs' tables alone could not fit the room, before any of their rows is read: the merged run
@@ -932,16 +1068,6 @@ impl Index {
       return Err(ContentRefused::OverBudget { need, room }.into());
     }
     Ok(())
-  }
-
-  /// The rows of the `merging` runs, in key order, cut into tables of at most a window.
-  fn merged_cuts(&self, store: &ContentStore, merging: &[usize]) -> Result<Vec<Cut>, IndexRefused> {
-    let mut sources: Vec<Source<'_>> = Vec::with_capacity(merging.len());
-    for run in merging.iter().filter_map(|at| self.runs.get(*at)) {
-      let rows: Box<dyn Iterator<Item = RowRef<'_>> + '_> = Box::new(run.rows(store));
-      sources.push(rows.peekable());
-    }
-    cut(Merged { sources }, store.window())
   }
 
   /// Takes the runs at `positions` out of the index, keeping the rest in order.

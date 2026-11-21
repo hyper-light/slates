@@ -397,6 +397,9 @@ fn drained(
       Progress::More => {}
       Progress::Done => return Outcome::Answered,
       Progress::Close => return Outcome::Close,
+      Progress::Waiting(wanted) => {
+        panic!("the fixture holds every text, yet a stream waited for {wanted:?}")
+      }
     }
   }
 }
@@ -2577,6 +2580,9 @@ fn dav_log(fixture: &Fixture, case: &LogCase, rules: Option<&PrincipalRules>) ->
   loop {
     match log.resume(&fixture.index, &fixture.green, rules, &mut out, SLICE_ROOM) {
       DavLogProgress::More => {}
+      DavLogProgress::Waiting(wanted) => {
+        panic!("the fixture holds every text, yet a log waited for {wanted:?}")
+      }
       DavLogProgress::Done => break,
       DavLogProgress::Refused { code, message } => {
         assert!(

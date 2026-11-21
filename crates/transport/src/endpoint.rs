@@ -1991,12 +1991,19 @@ impl Endpoint {
       .collect()
   }
 
-  /// The exchanges whose replies read more bytes since the last call and are still open: what a caller judging each
-  /// open exchange's progress reads instead of asking every one ([`Endpoint::reply_bytes_read`]). The forward lane
-  /// asked every one, each ask a drain of the session, and with about 20,000 forwards open a turn held its shard
-  /// 1.09 s (the f = 1 primary-kill rung, 2026-11-08).
+  /// The exchanges whose replies read more bytes, or whose requests had more bytes acknowledged, since the last call,
+  /// and are still open: what a caller judging each open exchange's progress reads instead of asking every one
+  /// ([`Endpoint::reply_bytes_read`]). The forward lane asked every one, each ask a drain of the session, and with about
+  /// 20,000 forwards open a turn held its shard 1.09 s (the f = 1 primary-kill rung, 2026-11-08). A request's bytes
+  /// acknowledged count since 2026-11-21: a forward carrying a large request made no progress before its reply began,
+  /// and its lane gave it up while its bytes still moved (main's ruling on the lane).
   pub fn take_progressed(&mut self) -> Vec<u64> {
     self.drain();
+    for stream_id in self.conn.take_send_progressed() {
+      if let Some(exchange) = self.by_stream.get(&stream_id).copied() {
+        self.progressed.insert(exchange);
+      }
+    }
     let progressed = std::mem::take(&mut self.progressed);
     progressed
       .into_iter()

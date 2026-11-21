@@ -162,6 +162,64 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   );
 }
 
+/// C2 stage B part 2 (the export reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose repository `stored` has a revision 1 adding `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), ask for revisions 0 to 1 in each format, each into a volume of
+/// its own. Expect both held, then within the wait both published, format 2's dump file carrying the text whole and
+/// format 3's its first and last KiB (its svndiff windows: noise, which none compresses), read through
+/// the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after.
+/// Before, the export's first read of the text refused it `Corrupt`, and nothing was published.
+#[test]
+fn an_export_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "stored", &bytes);
+  let asked = crate::daemon::observe_first(&daemon, |state| {
+    routed(state, 1);
+    let two = ask(state, (&owner(), "stored"), ((0, 1), false), "two");
+    routed(state, 2);
+    let three = ask(state, (&owner(), "stored"), ((0, 1), true), "three");
+    [two, three]
+  });
+  let held = (ReplyBody::Acknowledged, true);
+  assert_eq!(asked, [held.clone(), held]);
+  let began = Instant::now();
+  let made = loop {
+    let made = crate::daemon::observe_first(&daemon, |state| {
+      [dump_of(state, "two"), dump_of(state, "three")]
+    });
+    if made.iter().all(Option::is_some) || began.elapsed() > TASK_WAIT {
+      break made;
+    }
+  };
+  let (counted, fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      counters(state),
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let carries = |dump: &Option<Vec<u8>>, run: &[u8]| {
+    dump
+      .as_ref()
+      .is_some_and(|dump| dump.windows(run.len()).any(|window| window == run))
+  };
+  let [two, three] = &made;
+  let lengths = (two.as_ref().map(Vec::len), three.as_ref().map(Vec::len));
+  assert!(carries(two, &bytes), "format 2; {lengths:?}; {counted:?}");
+  assert!(
+    carries(three, &bytes[..1024]) && carries(three, &bytes[bytes.len() - 1024..]),
+    "format 3; {lengths:?}; {counted:?}"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
 /// The shard's counters a failed export test names: the export's, the image tasks' and the replies'.
 fn counters(state: &mut ShardState) -> Vec<String> {
   state
@@ -184,10 +242,9 @@ fn counters(state: &mut ShardState) -> Vec<String> {
 fn t_a652_the_export_is_published_with_its_completion() {
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
+    let mut job = job_of(id, ((0, 3), Format::Two), "published");
+    assert_eq!(walked(&mut job).await.map(drop), Ok(()));
     on(|state| {
-      let mut job = job_of(id, ((0, 3), Format::Two), "published");
-      let walked = measured(state, &mut job).and_then(|()| written(state, &mut job).map(drop));
-      assert_eq!(walked, Ok(()));
       let request = (ORIGIN, RequestId::from_word(1));
       let (reply, _) = crate::image::complete(state, request, |s| match job.publish(s) {
         Ok(reply) => reply,
@@ -208,25 +265,35 @@ fn t_a652_the_export_is_published_with_its_completion() {
   });
 }
 
-/// Runs `job`'s first walk to its end on the shard.
-fn measured(state: &mut ShardState, job: &mut ExportJob) -> Result<(), Refusal> {
+/// Runs `job`'s first walk to its end on the shard, a stored text a slice waits for fetched between slices as the
+/// export's task fetches it (C2 stage B part 2 (b)).
+async fn measured(job: &mut ExportJob) -> Result<(), Refusal> {
   for _ in 0..SLICE_LIMIT {
-    if job.measure_step(state)? {
+    if on(|state| job.measure_step(state))? {
       return Ok(());
     }
+    job.fetch_waited().await?;
   }
   Err(Refusal::ContentUnavailable)
 }
 
-/// Runs `job`'s second walk to its end on the shard: the admitted volume's dump file then, or the walk's refusal.
-fn written(state: &mut ShardState, job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
-  job.prepare(state)?;
+/// Runs `job`'s second walk to its end on the shard, fetching between slices as [`measured`] does: the admitted
+/// volume's dump file then, or the walk's refusal.
+async fn written(job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
+  on(|state| job.prepare(state))?;
   for _ in 0..SLICE_LIMIT {
-    if job.write_step(state)? {
-      return file_of(state, job).ok_or(Refusal::ContentUnavailable);
+    if on(|state| job.write_step(state))? {
+      return on(|state| file_of(state, job)).ok_or(Refusal::ContentUnavailable);
     }
+    job.fetch_waited().await?;
   }
   Err(Refusal::ContentUnavailable)
+}
+
+/// Both of `job`'s walks to their ends: the dump file, or the first refusal.
+async fn walked(job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
+  measured(job).await?;
+  written(job).await
 }
 
 /// The dump file `job`'s admitted volume holds.
@@ -262,16 +329,14 @@ fn t_a652_the_jobs_two_walks_write_the_range_as_svnadmin_dump_wrote_it() {
   const DELTAS: &[u8] = include_bytes!("../../../../svn/fixtures/dump/deltas.dump");
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
-    on(|state| {
-      let mut part = job_of(id, ((0, 3), Format::Two), "part");
-      let made = measured(state, &mut part).and_then(|()| written(state, &mut part));
-      part.release(state);
-      assert!(made.as_deref() == Ok(PART1), "part1.dump");
-      let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
-      let made = measured(state, &mut deltas).and_then(|()| written(state, &mut deltas));
-      deltas.release(state);
-      assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
-    })
+    let mut part = job_of(id, ((0, 3), Format::Two), "part");
+    let made = walked(&mut part).await;
+    on(|state| part.release(state));
+    assert!(made.as_deref() == Ok(PART1), "part1.dump");
+    let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
+    let made = walked(&mut deltas).await;
+    on(|state| deltas.release(state));
+    assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
   });
 }
 
@@ -283,7 +348,7 @@ fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
     let mut job = job_of(id, ((0, 3), Format::Two), "changed");
-    assert_eq!(on(|state| measured(state, &mut job)), Ok(()));
+    assert_eq!(measured(&mut job).await, Ok(()));
     let properties = BTreeMap::from([(b"svn:log".to_vec(), b"changed meanwhile".to_vec())]);
     let changed = Record::RevisionProperties {
       revision: 0,
@@ -291,8 +356,8 @@ fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
     };
     let set = crate::repository::svn_commit::land_record((&owner(), id), changed).await;
     assert_eq!(set, Some(Ok(())));
+    let refused = written(&mut job).await;
     on(|state| {
-      let refused = written(state, &mut job);
       job.release(state);
       assert!(
         matches!(refused, Err(Refusal::Unpublished { .. })),

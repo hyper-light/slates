@@ -2,8 +2,10 @@
 //! its shard past the watchdog's window at git/git's size).
 //!
 //! **What.** [`Repository::admit`]'s work (A-614's D(k) and reached set) cut into units a turn takes as many of as its
-//! quantum allows, one at least: an object the walk of what the move brings meets; a commit the fast-forward's descent
-//! by generation number meets; a commit the search for a base green meets; an object the walk beyond the base meets.
+//! quantum allows, one at least: an object the walk of what a fast-forward brings meets, where its green's sets are
+//! known; a commit the fast-forward's descent by generation number meets. A create and a rewrite are admitted with no
+//! walk (A-614 amended, main's ruling (A) of 2026-11-21): their sets are the closure of their heads, derived on first
+//! read (`super::deriving`), as is a fast-forward's over sets never walked.
 //! [`Repository::admit`] runs the same units to their end, so a move admitted in one turn or many is the same move, and
 //! the store's counters count it alike.
 //!
@@ -37,7 +39,7 @@ pub struct Admitting {
 /// An admission's phase.
 #[derive(Debug)]
 enum Phase {
-  /// A move onto a head: what it brings walked against the green's reached set.
+  /// A move onto a head whose sets are known: what it brings walked against the green's reached set.
   Brought {
     /// The walk.
     walk: Walk,
@@ -46,28 +48,10 @@ enum Phase {
   },
   /// Whether the move is a fast-forward, by descent from its head back by generation number.
   Descent {
-    /// What the move brings.
-    brought: Members,
+    /// What the move brings, walked; none where its green's sets were never walked.
+    brought: Option<Members>,
     /// The descent.
     descent: Descent,
-  },
-  /// A create or a rewrite: the green whose head is the newest commit the move's head descends from.
-  Base {
-    /// What a rewrite brings; none for a create, which brings all its head reaches.
-    brought: Option<Members>,
-    /// The search, none when the head peels to no commit.
-    search: Option<Descent>,
-  },
-  /// The walk beyond the base green's reached set.
-  Beyond {
-    /// What a rewrite brings.
-    brought: Option<Members>,
-    /// The base set.
-    base: Positions,
-    /// The base green and version.
-    from: Option<(u64, usize)>,
-    /// The walk.
-    walk: Walk,
   },
   /// Admitted.
   Done(Box<Move>),
@@ -77,7 +61,7 @@ enum Phase {
 
 /// A walk of the objects reachable from a head that `stop` does not hold (`Repository::walk`), a unit an object.
 #[derive(Debug)]
-struct Walk {
+pub(super) struct Walk {
   stop: Positions,
   pending: Vec<ObjectId>,
   seen: BTreeSet<ObjectId>,
@@ -94,7 +78,7 @@ type StagedRun = (Option<(u64, usize)>, Vec<u64>);
 
 /// A walk back from a commit by generation number, newest first, a unit a commit.
 #[derive(Debug)]
-struct Descent {
+pub(super) struct Descent {
   heap: BinaryHeap<(u64, ObjectId)>,
   seen: BTreeSet<ObjectId>,
   /// For a fast-forward's descent: the ancestor sought and its generation number.
@@ -103,7 +87,7 @@ struct Descent {
 
 impl Walk {
   /// A walk from `from` stopping at what `stop` holds.
-  fn from(from: ObjectId, stop: Positions) -> Walk {
+  pub(super) fn from(from: ObjectId, stop: Positions) -> Walk {
     Walk {
       stop,
       pending: vec![from],
@@ -137,7 +121,7 @@ impl Walk {
   }
 
   /// What the walk found, once its pending objects are none.
-  fn members(self) -> Members {
+  pub(super) fn members(self) -> Members {
     let staged = match self.staged {
       Some((Some(stage), positions)) => Some(StagedAt {
         stage,
@@ -187,25 +171,32 @@ impl Repository {
     }
     let chain = self.chains.get(&green);
     let from = chain.and_then(Chain::head);
-    let phase = match (from, chain) {
-      (Some(from), Some(_)) => {
-        let reached = self.current_reached(store, green)?.unwrap_or_default();
-        let old = self
-          .id_at(store, from)
-          .ok_or(StoreRefused::Unreadable { id: to })?;
-        Phase::Brought {
-          walk: Walk::from(to, reached),
-          old,
-        }
-      }
-      _ => self.base_begun(store, push, None, to)?,
-    };
-    Ok(Admitting {
+    let mut admitting = Admitting {
       green,
       from,
       to,
-      phase,
-    })
+      phase: Phase::Taken,
+    };
+    admitting.phase = match (from, chain) {
+      (Some(from), Some(_)) => {
+        let old = self
+          .id_at(store, from)
+          .ok_or(StoreRefused::Unreadable { id: to })?;
+        match self.current_reached(store, green) {
+          Ok(reached) => Phase::Brought {
+            walk: Walk::from(to, reached.unwrap_or_default()),
+            old,
+          },
+          // Sets never walked: whether it is a fast-forward is still asked, what it brings is not.
+          Err(StoreRefused::Deferred { .. }) => {
+            self.descent_begun(store, push, (None, old), &admitting)?
+          }
+          Err(refused) => return Err(refused),
+        }
+      }
+      _ => self.unwalked(store, push, &admitting)?,
+    };
+    Ok(admitting)
   }
 
   /// One turn of `admitting` (module docs): a unit at least, then units until the quantum is spent. Whether the move
@@ -244,7 +235,7 @@ impl Repository {
           return Ok(Phase::Brought { walk, old });
         }
         let brought = walk.members();
-        self.descent_begun(store, push, (brought, old), admitting)
+        self.descent_begun(store, push, (Some(brought), old), admitting)
       }
       Phase::Descent {
         brought,
@@ -253,56 +244,55 @@ impl Repository {
         None => Ok(Phase::Descent { brought, descent }),
         Some(true) => {
           self.count(|counters| counters.fast_forwards = counters.fast_forwards.saturating_add(1));
-          Ok(self.done(admitting, brought, Reach::Grown))
+          Ok(self.grown(admitting, brought))
         }
-        Some(false) => self.base_begun(store, push, Some(brought), admitting.to),
+        Some(false) => self.unwalked(store, push, admitting),
       },
-      Phase::Base {
-        brought,
-        mut search,
-      } => {
-        let found = match search.as_mut() {
-          Some(search) => match self.base_unit(store, push, search)? {
-            None => {
-              return Ok(Phase::Base {
-                brought,
-                search: Some(core::mem::replace(search, Descent::empty())),
-              });
-            }
-            Some(found) => found,
-          },
-          None => None,
-        };
-        self.beyond_begun(store, brought, found, admitting.to)
-      }
-      Phase::Beyond {
-        brought,
-        base,
-        from,
-        mut walk,
-      } => {
-        if self.walk_unit(store, push, &mut walk)? {
-          return Ok(Phase::Beyond {
-            brought,
-            base,
-            from,
-            walk,
-          });
-        }
-        let beyond = walk.members();
-        self.count(|counters| counters.remade = counters.remade.saturating_add(1));
-        let brought = match brought {
-          Some(brought) => brought,
-          None => Members {
-            indexed: base.union(&beyond.indexed),
-            new: beyond.new.clone(),
-            staged: beyond.staged.clone(),
-          },
-        };
-        Ok(self.done(admitting, brought, Reach::Remade { base, beyond, from }))
-      }
       done @ (Phase::Done(_) | Phase::Taken) => Ok(done),
     }
+  }
+
+  /// The admitted fast-forward: grown by what it brought where that was walked, else left for its first reader.
+  fn grown(&self, admitting: &Admitting, brought: Option<Members>) -> Phase {
+    match brought {
+      Some(brought) => self.done(admitting, brought, Reach::Grown),
+      None => {
+        self.count(|counters| counters.deferred = counters.deferred.saturating_add(1));
+        self.done(admitting, Members::default(), Reach::GrownUnwalked)
+      }
+    }
+  }
+
+  /// A create or a rewrite admitted with no walk (A-614 amended): its sets the closure of its head, derived on first
+  /// read, from the green and version whose head is the move's own head where one is (found by its row, with no walk:
+  /// a branch made at another's head), from the nearest derived ancestor otherwise.
+  fn unwalked(
+    &self,
+    store: &ContentStore,
+    push: &Push,
+    admitting: &Admitting,
+  ) -> Result<Phase, StoreRefused> {
+    // A head neither pushed nor indexed is refused here, as the walk refused it, before the commit takes the push's
+    // stage (a replayed record naming a commit nobody sent, `vcs_store`'s t_a662).
+    let from = match self.locate(store, push, &admitting.to) {
+      Some(Place::Indexed { row, .. }) => self.heads.get(&row.position).and_then(|greens| {
+        let green = greens
+          .iter()
+          .copied()
+          .find(|green| *green != admitting.green)?;
+        Some((green, self.chains.get(&green).and_then(Chain::newest)?))
+      }),
+      Some(Place::Pushed { .. }) => None,
+      None => return Err(StoreRefused::Missing { id: admitting.to }),
+    };
+    self.count(|counters| {
+      counters.remade = counters.remade.saturating_add(1);
+      counters.deferred = counters.deferred.saturating_add(1);
+      if from.is_some() {
+        counters.bases_found = counters.bases_found.saturating_add(1);
+      }
+    });
+    Ok(self.done(admitting, Members::default(), Reach::Remade { from }))
   }
 
   /// The admitted move.
@@ -317,7 +307,7 @@ impl Repository {
   }
 
   /// One object of `walk` (`Repository::walk`'s loop body): whether more remain.
-  fn walk_unit(
+  pub(super) fn walk_unit(
     &self,
     store: &ContentStore,
     push: &Push,
@@ -356,7 +346,7 @@ impl Repository {
     &self,
     store: &ContentStore,
     push: &Push,
-    (brought, old): (Members, ObjectId),
+    (brought, old): (Option<Members>, ObjectId),
     admitting: &Admitting,
   ) -> Result<Phase, StoreRefused> {
     let head = admitting.to;
@@ -365,7 +355,7 @@ impl Repository {
       self.locate(store, push, &old).map(|place| place.kind()),
     );
     if commits != (Some(Kind::Commit), Some(Kind::Commit)) {
-      return self.base_begun(store, push, Some(brought), head);
+      return self.unwalked(store, push, admitting);
     }
     let floor = self.generation(store, push, &old)?;
     let top = self.generation(store, push, &head)?;
@@ -375,9 +365,9 @@ impl Repository {
       });
       if head == old {
         self.count(|counters| counters.fast_forwards = counters.fast_forwards.saturating_add(1));
-        return Ok(self.done(admitting, brought, Reach::Grown));
+        return Ok(self.grown(admitting, brought));
       }
-      return self.base_begun(store, push, Some(brought), head);
+      return self.unwalked(store, push, admitting);
     }
     self.count(|counters| counters.descent_walks = counters.descent_walks.saturating_add(1));
     Ok(Phase::Descent {
@@ -416,86 +406,31 @@ impl Repository {
     }
     Ok(None)
   }
-
-  /// The search for a base green begun (`Repository::base`): none where the head peels to no commit.
-  fn base_begun(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    brought: Option<Members>,
-    head: ObjectId,
-  ) -> Result<Phase, StoreRefused> {
-    let search = match self.peel(store, push, head)? {
-      Some(start) => Some(Descent {
-        heap: BinaryHeap::from([(self.generation(store, push, &start)?, start)]),
-        seen: BTreeSet::new(),
-        ancestor: None,
-      }),
-      None => None,
-    };
-    Ok(Phase::Base { brought, search })
-  }
-
-  /// One commit of the base search: the green found (or none), once decided.
-  fn base_unit(
-    &self,
-    store: &ContentStore,
-    push: &Push,
-    search: &mut Descent,
-  ) -> Result<Option<Option<u64>>, StoreRefused> {
-    let Some((_, id)) = search.heap.pop() else {
-      return Ok(Some(None));
-    };
-    if !search.seen.insert(id) {
-      return Ok(None);
-    }
-    if let Some(green) = self.green_at(store, &id) {
-      return Ok(Some(Some(green)));
-    }
-    for parent in self.parents(store, push, &id)? {
-      search
-        .heap
-        .push((self.generation(store, push, &parent)?, parent));
-    }
-    Ok(None)
-  }
-
-  /// The walk beyond the base begun (`Repository::remade`): the base green's newest reached set, or none.
-  fn beyond_begun(
-    &self,
-    store: &ContentStore,
-    brought: Option<Members>,
-    found: Option<u64>,
-    to: ObjectId,
-  ) -> Result<Phase, StoreRefused> {
-    let (base, from) = match found {
-      Some(green) => {
-        self.count(|counters| counters.bases_found = counters.bases_found.saturating_add(1));
-        let version = self.chains.get(&green).and_then(Chain::newest);
-        let set = match version {
-          Some(version) => self.sets(store, green, version)?.reached,
-          None => Positions::new(),
-        };
-        (set, version.map(|version| (green, version)))
-      }
-      None => (Positions::new(), None),
-    };
-    Ok(Phase::Beyond {
-      brought,
-      walk: Walk::from(to, base.clone()),
-      base,
-      from,
-    })
-  }
 }
 
 impl Descent {
-  /// A descent with nothing left: what a phase holds while its own is borrowed out.
-  fn empty() -> Descent {
+  /// A walk back from `start`, of generation number `generation`, seeking no ancestor: a derivation's search for its
+  /// base (`super::deriving`).
+  pub(super) fn back_from(start: ObjectId, generation: u64) -> Descent {
     Descent {
-      heap: BinaryHeap::new(),
+      heap: BinaryHeap::from([(generation, start)]),
       seen: BTreeSet::new(),
       ancestor: None,
     }
+  }
+
+  /// The next commit of the walk back, newest first, once each; none when none is left.
+  pub(super) fn next(&mut self) -> Option<ObjectId> {
+    while let Some((_, id)) = self.heap.pop() {
+      if self.seen.insert(id) {
+        return Some(id);
+      }
+    }
+    None
+  }
+
+  /// `id`, a parent of generation number `generation`, to walk back to.
+  pub(super) fn push(&mut self, id: ObjectId, generation: u64) {
+    self.heap.push((generation, id));
   }
 }

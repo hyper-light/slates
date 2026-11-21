@@ -66,6 +66,7 @@ fn intake(
     match intake.step(&part.payload, store, admission) {
       Ok(Stepped::More) => {}
       Ok(Stepped::Done) => break,
+      Ok(Stepped::Wanted(range)) => panic!("a whole changegroup wanted {range:?}"),
       Err(refused) => {
         intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
@@ -455,7 +456,11 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
     let (base, data) = deltas[&kept.node];
     let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
     assert_eq!(kept.base, base_identity, "{:?}", kept.node);
-    assert_eq!(&part.payload[kept.place.clone()], data);
+    assert_eq!(
+      &part.payload
+        [usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap()],
+      data
+    );
   }
   for index in [fork, index] {
     index.release(&mut store).unwrap();
@@ -464,12 +469,7 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
 
 /// The sectioned record `sectioned` refused by `Replay::begin` (its payload is not in it), and by kind cut short or with
 /// a byte after it.
-fn sectioned_refused(
-  sectioned: &[u8],
-  payload: &[u8],
-  empty: &mut HgIndex,
-  store: &mut ContentStore,
-) {
+fn sectioned_refused(sectioned: &[u8], empty: &mut HgIndex, store: &mut ContentStore) {
   use crate::import::record::{self, Replay};
   assert!(matches!(
     Replay::begin(sectioned, empty, store),
@@ -477,14 +477,14 @@ fn sectioned_refused(
   ));
   for cut in 0..sectioned.len() {
     assert!(
-      Replay::begin_sectioned(&sectioned[..cut], payload, empty, store).is_err(),
+      Replay::begin_sectioned(&sectioned[..cut]).is_err(),
       "cut at {cut}"
     );
   }
   let mut trailing = sectioned.to_vec();
   trailing.push(0);
   assert!(matches!(
-    Replay::begin_sectioned(&trailing, payload, empty, store),
+    Replay::begin_sectioned(&trailing),
     Err(record::Refused::Trailing)
   ));
 }
@@ -506,9 +506,17 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
   let sectioned = record::write_push_record(1 << 20, part.version);
   assert!(sectioned.len() < 64, "{} bytes", sectioned.len());
   let mut by_sections = HgIndex::new();
-  let mut replay =
-    Replay::begin_sectioned(&sectioned, &part.payload, &mut by_sections, &mut store).unwrap();
-  while replay.step(&part.payload, &mut store).unwrap() {}
+  let mut replay = Replay::begin_sectioned(&sectioned).unwrap();
+  loop {
+    match replay
+      .step_sectioned(part.payload.as_slice(), &mut by_sections, &mut store)
+      .unwrap()
+    {
+      record::Progress::More => {}
+      record::Progress::Done => break,
+      record::Progress::Wanted(range) => panic!("a whole payload wanted {range:?}"),
+    }
+  }
   replay.finish(&mut by_sections, &mut store).unwrap();
   let whole = record::write_changegroup(1 << 20, (part.version, &part.payload), revisions).unwrap();
   let mut by_whole = HgIndex::new();
@@ -518,7 +526,7 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
   assert_eq!(rows(&mut by_whole, &store), expected);
   let held = store.len();
   let mut empty = HgIndex::new();
-  sectioned_refused(&sectioned, &part.payload, &mut empty, &mut store);
+  sectioned_refused(&sectioned, &mut empty, &mut store);
   assert_eq!(store.len(), held, "a refused replay held something");
   for index in [by_sections, by_whole, fork, index, empty] {
     index.release(&mut store).unwrap();
@@ -562,4 +570,148 @@ fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
     Replay::begin(&bytes, &mut index, &mut store),
     Err(record::Refused::Version { version: 7 })
   ));
+}
+
+/// Takes `part` into a fork of `index` from a window filled `piece` bytes at a time (A-767 C1, the piece-reading
+/// intake): framed first, each want put in from the changegroup's bytes, then a step at a time, each want put in. The
+/// fork, what was brought, how many wants were met, and the most bytes the window held at once.
+fn intake_from_pieces(
+  part: &ChangegroupPart,
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  piece: usize,
+) -> (HgIndex, Intaken, u64, u64) {
+  use crate::framing::{Collect, Framed, Framing, Halt, Source, Window};
+  let whole = part.payload.as_slice();
+  let mut window = Window::new(Source::len(whole));
+  let (mut wants, mut most) = (0_u64, 0_u64);
+  let fill =
+    |window: &mut Window, range: core::ops::Range<u64>, wants: &mut u64, most: &mut u64| {
+      *wants += 1;
+      window.keep_from(range.start);
+      while window.end() < range.end {
+        let from = usize::try_from(window.end()).unwrap();
+        let to = (from + piece).min(whole.len());
+        window.put(&whole[from..to], &mut room()).unwrap();
+      }
+      *most = (*most).max(window.held());
+    };
+  let mut framing = Framing::new(part.version, false);
+  let mut framed = Framed::default();
+  loop {
+    let mut sink = Collect {
+      framed: &mut framed,
+      admission: &mut room(),
+    };
+    match framing.step(&window, &mut sink) {
+      Ok(true) => {}
+      Ok(false) => break,
+      Err(Halt::Wanted(wanted)) => fill(&mut window, wanted.range, &mut wants, &mut most),
+      Err(Halt::Refused(refusal)) => panic!("{refusal:?}"),
+    }
+  }
+  let mut intake = Intake::begin_framed(framed, index, store).unwrap();
+  loop {
+    match intake.step(&window, store, &mut room()).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      Stepped::Wanted(range) => fill(&mut window, range, &mut wants, &mut most),
+    }
+  }
+  let (fork, intaken) = intake.finish().ok().unwrap();
+  (fork, intaken, wants, most)
+}
+
+/// A-767 C1 (the piece-reading intake; R2: a replay holding no payload whole). Do: take stock 7.2's push whole, and
+/// again from a window filled 64 bytes at a time. Expect the same fork row for row and the same texts kept, each named
+/// at the same place; the window wanted bytes, and held at most its longest delta and a header past a piece, never the
+/// whole changegroup.
+#[test]
+fn a_changegroup_taken_from_pieces_keeps_what_the_whole_one_keeps() {
+  let part = stock();
+  let mut whole_store = store();
+  let mut whole_index = HgIndex::new();
+  let (mut whole_fork, whole_intaken, _) =
+    intake(&part, &mut whole_index, &mut whole_store, &mut room()).unwrap();
+  let mut piece_store = store();
+  let mut piece_index = HgIndex::new();
+  let (mut piece_fork, piece_intaken, wants, most) =
+    intake_from_pieces(&part, &mut piece_index, &mut piece_store, 64);
+  assert_eq!(
+    rows(&mut piece_fork, &piece_store),
+    rows(&mut whole_fork, &whole_store)
+  );
+  assert_eq!(piece_intaken, whole_intaken);
+  assert!(wants > 1, "the window wanted bytes {wants} times");
+  let longest = whole_intaken
+    .texts
+    .iter()
+    .map(|kept| kept.place.end - kept.place.start)
+    .max()
+    .unwrap_or(0);
+  let header = crate::read::to_u64(part.version.header_len() + 8);
+  assert!(
+    most <= longest + header + 64,
+    "held {most} of {} at once",
+    part.payload.len()
+  );
+  assert!(most < crate::read::to_u64(part.payload.len()));
+}
+
+/// A-767 C1 (R2: a replay holding no payload whole). Do: write stock 7.2's push's sectioned record and replay it with
+/// its payload read from a window filled 64 bytes at a time (`Replay::step_sectioned`, each want put in from the
+/// payload). Expect the fork row for row the whole intake's, and the window never holding the whole payload: at most
+/// its longest delta and a chunk's header past a piece.
+#[test]
+fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
+  use crate::framing::{Source, Window};
+  use crate::import::record::{self, Progress, Replay};
+  let part = stock();
+  let whole = part.payload.as_slice();
+  let mut store = store();
+  let mut index = HgIndex::new();
+  let (mut fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
+  let sectioned = record::write_push_record(1 << 20, part.version);
+  let mut by_pieces = HgIndex::new();
+  let mut replay = Replay::begin_sectioned(&sectioned).unwrap();
+  let mut window = Window::new(Source::len(whole));
+  let (mut wants, mut most) = (0_u64, 0_u64);
+  loop {
+    match replay
+      .step_sectioned(&window, &mut by_pieces, &mut store)
+      .unwrap()
+    {
+      Progress::More => {}
+      Progress::Done => break,
+      Progress::Wanted(range) => {
+        wants += 1;
+        window.keep_from(range.start);
+        while window.end() < range.end {
+          let from = usize::try_from(window.end()).unwrap();
+          window
+            .put(&whole[from..(from + 64).min(whole.len())], &mut room())
+            .unwrap();
+        }
+        most = most.max(window.held());
+      }
+    }
+  }
+  replay.finish(&mut by_pieces, &mut store).unwrap();
+  assert_eq!(rows(&mut by_pieces, &store), rows(&mut fork, &store));
+  assert!(wants > 1, "wanted {wants} times");
+  let longest = intaken
+    .texts
+    .iter()
+    .map(|kept| kept.place.end - kept.place.start)
+    .max()
+    .unwrap_or(0);
+  let header = crate::read::to_u64(part.version.header_len() + 8);
+  assert!(
+    most <= longest + header + 64,
+    "held {most} of {}",
+    whole.len()
+  );
+  for index in [by_pieces, fork, index] {
+    index.release(&mut store).unwrap();
+  }
 }

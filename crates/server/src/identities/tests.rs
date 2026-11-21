@@ -15,7 +15,7 @@ use slates_wire::request::{RequestId, Seen};
 
 use super::{READ, Resumed, record, set_on_channel, with_session};
 use crate::state::{ClientSlot, ShardState};
-use crate::verbs::{Served, dispatch};
+use crate::verbs::Served;
 
 /// Shape: the client ids the session tests seat, on audit daemons that seat none of their own.
 const FIRST_SESSION: u32 = 41;
@@ -46,7 +46,7 @@ fn agent() -> Principal {
 
 /// `body` asked of `state` as the owner.
 fn ask(state: &mut ShardState, body: RequestBody) -> ReplyBody {
-  dispatch(state, 1, &owner(), body)
+  crate::test_store::create(state, &owner(), body)
 }
 
 /// The green `made` creates.
@@ -498,7 +498,7 @@ fn next_answer(end: &mut slates_ipc::ClientEnd) -> Option<(u32, ReplyBody)> {
 /// at version 1; two reads counted in all.
 #[test]
 fn t_a664_a_session_reads_its_identities_once_and_its_clients_claim_never_reaches_the_green() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (work, index, first_behind, first) = crate::daemon::observe_first(&daemon, |state| {
     let work = repository_work(state, "agents", VcsTool::Git);
     let (seat, region) = seat(state, FIRST_SESSION, owner());
@@ -578,7 +578,7 @@ fn t_a664_a_session_reads_its_identities_once_and_its_clients_claim_never_reache
 #[test]
 fn t_a664_a_submit_waiting_for_its_sessions_read_is_refused_when_its_channel_is_revoked_meanwhile()
 {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (behind, region, work) = crate::daemon::observe_first(&daemon, |state| {
     let work = plain_work(state);
     let (seat, region) = seat(state, FIRST_SESSION, owner());
@@ -696,7 +696,7 @@ fn t_a664_a_read_returning_to_a_seat_its_session_left_is_kept_by_no_one_and_runs
 /// refused `Overloaded` naming the fenced shard, and no completion is recorded under its id.
 #[test]
 fn t_a664_a_submit_whose_sessions_read_is_never_answered_is_refused_overloaded_unrecorded() {
-  let daemon = crate::daemon::audit_daemon_of(2);
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(2);
   let fenced = daemon.inject_consensus_failure().is_ok();
   let (control, behind, region) = crate::daemon::observe_at(&daemon, 1, |state| {
     let (seat, region) = seat(state, FIRST_SESSION, agent());

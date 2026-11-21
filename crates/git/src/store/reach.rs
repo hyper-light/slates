@@ -706,7 +706,7 @@ impl DerivedType for ReachSets {
 
 impl Repository {
   /// Version `version` of `green`, and whether the version before it had a head.
-  fn reach_record(&self, green: u64, version: u64) -> Option<(&Version, bool)> {
+  pub(super) fn reach_record(&self, green: u64, version: u64) -> Option<(&Version, bool)> {
     let chain = self.chains.get(&green)?;
     let at = usize::try_from(version).ok()?;
     let record = chain.versions.get(at)?;
@@ -792,12 +792,13 @@ impl Repository {
 
   /// `green`'s newest version and its value of [`ReachSets`]: the very value the store serves the version's sets from,
   /// put as it committed with the sets its admission computed, held once more by the caller: what the owner keeps under
-  /// (type, version) as it commits, with no second walk (module docs).
+  /// (type, version) as it commits, with no second walk (module docs). None for a version admitted with no walk, whose
+  /// sets its first reader derives (A-614 amended, `super::deriving`).
   pub fn reach_value(
     &self,
     store: &mut ContentStore,
     green: u64,
-  ) -> Result<(u64, ContentId), StoreRefused> {
+  ) -> Result<Option<(u64, ContentId)>, StoreRefused> {
     let chain = self
       .chains
       .get(&green)
@@ -806,8 +807,11 @@ impl Repository {
       .versions
       .last()
       .ok_or(StoreRefused::NoVersion { green, version: 0 })?;
-    store.hold(&newest.value)?;
+    let Some(value) = newest.value else {
+      return Ok(None);
+    };
+    store.hold(&value)?;
     let version = u64::try_from(chain.versions.len().saturating_sub(1)).unwrap_or(u64::MAX);
-    Ok((version, newest.value))
+    Ok(Some((version, value)))
   }
 }

@@ -141,6 +141,15 @@ pub struct MergeShardState {
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
+  /// The greens whose checkpoint is being taken in turns ([`checkpoint_green`], A-579): one task each, which folds the
+  /// identity's backlog a paced step at a time and takes the checkpoint at its end.
+  pub(crate) checkpointing: BTreeSet<DbVolumeId>,
+  /// What an identity key's fold costs on this shard, learned across checkpoints (`slates_pace::Costs`, A-579).
+  pub(crate) identity_costs: slates_pace::Costs<1>,
+  /// When each green's last checkpoint was taken here, or when it first asked for one (A-579): the start of the
+  /// interval its next checkpoint's identity fold is paced to finish within. One entry a green this shard holds,
+  /// pruned of greens gone whenever one is added.
+  pub(crate) checkpoint_since: BTreeMap<DbVolumeId, u64>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -221,8 +230,147 @@ pub(crate) fn checkpoint_floor(state: &ShardState, green: DbVolumeId) -> u64 {
 /// Never refuses the verb that called it: a checkpoint the engine cannot take at the floor (its histories already
 /// folded past it) or the partition refuses is counted and skipped, and the chain stays whole and correct.
 pub(crate) fn checkpoint_green(state: &mut ShardState, green: DbVolumeId) {
-  checkpoint_green_when(state, green, Doubling::Wait);
+  if state.merge.checkpointing.contains(&green) {
+    return;
+  }
+  if !state.merge.checkpoint_since.contains_key(&green) {
+    let now = slates_rt::futures::now_ns();
+    let greens = &state.greens;
+    state
+      .merge
+      .checkpoint_since
+      .retain(|held, _| greens.get(held).is_some());
+    state.merge.checkpoint_since.insert(green, now);
+  }
+  if fold_inputs(state, green).is_none_or(FoldInputs::waits) {
+    return;
+  }
+  // The identity's backlog first, in a paced step (A-579): a checkpoint reads the head's identity, and a green whose
+  // identity was last read thousands of versions ago hashed every file changed since in this one step (73.7 ms of a
+  // 100 ms checkpoint at 1,000 clients on the Mac Studio, 2026-11-20; every request the owner serves waited behind it).
+  // When the step's quantum ends with someone waiting, the rest is folded in turns by a task of its own.
+  let quantum = state.config.step_quantum_ns();
+  if identity_folded_in_a_step(state, green, quantum) {
+    taken_now(state, green);
+    return;
+  }
+  match slates_rt::futures::spawn(checkpoint_in_turns(green)) {
+    Ok(task) => {
+      state.merge.checkpointing.insert(green);
+      state.count(CHECKPOINT_IN_TURNS, 1);
+      let _ = slates_rt::futures::detach(task);
+    }
+    // No room for the task: taken here as before, whole.
+    Err(_) => taken_now(state, green),
+  }
 }
+
+/// Takes `green`'s checkpoint now, by the doubling rule, and starts the interval its next one is paced within.
+fn taken_now(state: &mut ShardState, green: DbVolumeId) {
+  checkpoint_green_when(state, green, Doubling::Wait);
+  let now = slates_rt::futures::now_ns();
+  state.merge.checkpoint_since.insert(green, now);
+}
+
+/// One turn's share of a checkpoint's identity fold (A-579), nanoseconds: what is left of it at its measured cost a key
+/// (`left_ns`), spread over the turns left before its deadline, a turn every `gap_ns` (the time since the last turn, the
+/// shard's measured cycle through its ready tasks). The deadline is the doubling interval (`interval_ns`, the time the
+/// increments it folds took to come, from `began_ns`): the next checkpoint is due after as much again, so this one
+/// ends within it. Never under the quantum; past the deadline, what is left at once (a step stops at its ceiling).
+fn turn_budget_ns(
+  left_ns: u64,
+  (gap_ns, quantum_ns): (u64, u64),
+  (began_ns, interval_ns, now_ns): (u64, u64, u64),
+) -> u64 {
+  let deadline = began_ns.saturating_add(interval_ns);
+  let remaining = deadline.saturating_sub(now_ns);
+  if remaining <= gap_ns {
+    return left_ns.max(quantum_ns);
+  }
+  let share = u128::from(left_ns)
+    .saturating_mul(u128::from(gap_ns))
+    .checked_div(u128::from(remaining))
+    .unwrap_or(u128::from(left_ns));
+  u64::try_from(share).unwrap_or(u64::MAX).max(quantum_ns)
+}
+
+/// Folds `green`'s identity backlog a key a unit in one paced step (`slates_pace::Step`, A-579): whether it is all
+/// folded. A green gone is folded (its checkpoint then finds nothing to take).
+fn identity_folded_in_a_step(state: &mut ShardState, green: DbVolumeId, budget_ns: u64) -> bool {
+  let mut env = crate::git_push::shard_pace_env(state);
+  // The step asks whether anyone waits at the end of its budget, not of the bare quantum ([`turn_budget_ns`]).
+  env.quantum_ns = budget_ns.max(env.quantum_ns);
+  let mut costs = state.merge.identity_costs;
+  let folded = state.greens.get_mut(&green).is_none_or(|mut engine| {
+    let mut step = slates_pace::Step::begin(env, (env.clock)());
+    let mut done = engine.identity_backlog() == 0;
+    while !done && step.more(IDENTITY_KEY, &mut costs) {
+      done = engine.fold_identity_step(1);
+    }
+    step.close((env.clock)(), &mut costs);
+    done
+  });
+  state.merge.identity_costs = costs;
+  state.count(CHECKPOINT_IDENTITY_STEPS, 1);
+  folded
+}
+
+/// The pace kind of one identity key's fold ([`identity_folded_in_a_step`]).
+const IDENTITY_KEY: usize = 0;
+
+/// Takes `green`'s checkpoint in turns (A-579): its identity's backlog folded a paced step a turn, yielding between,
+/// then the checkpoint itself, its doubling rule judged again then. Ends when the green or the shard state is gone.
+async fn checkpoint_in_turns(green: DbVolumeId) {
+  let began = slates_rt::futures::now_ns();
+  let mut last_turn = began;
+  loop {
+    let folded = crate::state::with_state(|state| {
+      let now = slates_rt::futures::now_ns();
+      let quantum = state.config.step_quantum_ns();
+      let interval = state
+        .merge
+        .checkpoint_since
+        .get(&green)
+        .map_or(0, |since| began.saturating_sub(*since));
+      let per_key = state.merge.identity_costs.units[IDENTITY_KEY].estimate_ns();
+      let backlog = state
+        .greens
+        .get(&green)
+        .map_or(0, |engine| engine.identity_backlog());
+      let left = per_key.saturating_mul(u64::try_from(backlog).unwrap_or(u64::MAX));
+      let budget = turn_budget_ns(
+        left,
+        (now.saturating_sub(last_turn), quantum),
+        (began, interval, now),
+      );
+      last_turn = now;
+      if identity_folded_in_a_step(state, green, budget) {
+        state.merge.checkpointing.remove(&green);
+        taken_now(state, green);
+        let span = slates_rt::futures::now_ns().saturating_sub(began);
+        let longest = state
+          .refusals
+          .entry(CHECKPOINT_IN_TURNS_LONGEST_NS)
+          .or_insert(0);
+        *longest = (*longest).max(span);
+        return true;
+      }
+      false
+    });
+    if folded.unwrap_or(true) {
+      return;
+    }
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// Counter: checkpoints whose identity backlog outlasted one paced step and were finished by a task in turns (A-579),
+/// the non-vacuity count of [`checkpoint_in_turns`].
+pub(crate) const CHECKPOINT_IN_TURNS: &str = "merge.checkpoint.in_turns";
+/// Counter: the longest a checkpoint in turns took from its first step to its record, nanoseconds (A-579).
+pub(crate) const CHECKPOINT_IN_TURNS_LONGEST_NS: &str = "merge.checkpoint.in_turns_longest_ns";
+/// Counter: the paced steps that folded a checkpoint's identity backlog (A-579).
+pub(crate) const CHECKPOINT_IDENTITY_STEPS: &str = "merge.checkpoint.identity_steps";
 
 /// Whether [`checkpoint_green_when`] waits for the increments to fold to reach the held checkpoint's size.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -356,6 +504,7 @@ pub(crate) fn with_work_base<R>(
     green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
+    entries: Some(&work.entries),
   })
 }
 
@@ -1451,7 +1600,7 @@ pub(crate) fn status_merge_volume(
     state,
     &rights_of(&record, principal),
   )));
-  Some(ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(slates_ipc::protocol::StatusReport {
       transports,
       id: volume,
@@ -1468,8 +1617,7 @@ pub(crate) fn status_merge_volume(
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
-      // A green has no host mount of its own to bind (§4.16: a green is served through pinned
-      // attachments, the record form).
+      // Filled below, in the room the report leaves, as a plain volume's are.
       mounts: Vec::new(),
       mounts_elided: 0,
       drifted_elided: 0,
@@ -1484,7 +1632,15 @@ pub(crate) fn status_merge_volume(
       // reported rather than a zero it was not measured to be.
       loss: slates_ipc::protocol::LossReport::default(),
     }),
-  })
+  };
+  // A mounted work's host mounts, as any volume's (A-774 C1): Windows' unmount finds its drive among the volumes'
+  // reported mounts, so a work that reported none could not be unmounted (jupiter r3, 2026-11-21).
+  let room = crate::verbs::reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      crate::verbs::mounts_of(state, id, room.min(crate::verbs::MOUNTS_REPORT_BYTES));
+  }
+  Some(reply)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2079,6 +2235,9 @@ pub struct PendingMergeRecord {
 pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
 /// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
 pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: the retention a submit secures before its verdict, the settle's fold and the reservation's
+/// charge (A-803's measure).
+pub(crate) const SUBMIT_SECURE: (&str, &str) = ("merge.submit.secure", "merge.submit.secure_ns");
 /// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
 pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
 /// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
@@ -2223,6 +2382,19 @@ fn inputs_of(state: &ShardState, green: DbVolumeId, version: u64) -> Option<Vec<
   inputs_lent(state, green, version).map(<[u8]>::to_vec)
 }
 
+/// A version's merge record as its owner ships it to holders, for a test (P2): its inputs' bytes and the head identity
+/// it carries, read as `enqueue_record` reads them.
+#[cfg(test)]
+pub(crate) fn shipped_for_test(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<(Vec<u8>, [u8; 32])> {
+  let inputs = inputs_of(state, green, version)?;
+  let identity = state.greens.lend_mut(&green)?.head_identity();
+  Some((inputs, identity))
+}
+
 /// [`inputs_of`], lent: a view of the bytes the green's chain holds, copied nowhere.
 fn inputs_lent(state: &ShardState, green: DbVolumeId, version: u64) -> Option<&[u8]> {
   if version == 0 {
@@ -2237,6 +2409,10 @@ fn inputs_lent(state: &ShardState, green: DbVolumeId, version: u64) -> Option<&[
   let held = state.db.partition().green_floor(green);
   let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   let entry = state.db.partition().green_chain(green).get(index)?;
+  // A deferred push's version (P2): its record is the inputs, which a holder defers its replica by.
+  if slates_merge::push::DeferredPush::is_record(entry) {
+    return Some(entry);
+  }
   // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
   slates_merge::chain_entry::increment_bytes(entry).ok()
 }
@@ -2268,9 +2444,11 @@ pub(crate) fn enqueue_record(
     (increment, base, evidence, completion),
     work,
     |state| {
+      // Lent whether or not it owes a push (P2): an owed version's record carries the base's identity, which a holder's
+      // replica owing the same push holds.
       state
         .greens
-        .get_mut(&green)
+        .lend_mut(&green)
         .map(|mut engine| engine.head_identity())
         .unwrap_or_default()
     },
@@ -3870,7 +4048,7 @@ fn record_standing(
   sender: HostId,
 ) -> Option<RecordStanding> {
   let next = match state.merge.replicas.get(&object) {
-    Some(replica) => Some(replica.head().saturating_add(1)),
+    Some(replica) => Some(replica.reached().saturating_add(1)),
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
@@ -4152,21 +4330,18 @@ fn recompute(
     let Some(bytes) = inputs else {
       return Err(INPUTS_UNHELD);
     };
-    let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
     let started = slates_machine::clock::monotonic_ns();
-    let outcome = replica.submit(&increment);
+    let applied = apply_inputs(&mut replica, bytes, value.version);
     count_phase(
       state,
       SUBMIT_RECOMPUTE,
       slates_machine::clock::monotonic_ns().saturating_sub(started),
     );
-    match outcome {
-      // An identical increment is accepted too (A-782): its version commits nothing new.
-      Outcome::Accepted { version } | Outcome::Identical { version }
-        if version == value.version => {}
-      // The owner accepted it; a holder that computes anything else has diverged.
-      _ => return Err(RECOMPUTE_MISMATCH),
+    if let Err(reason) = applied {
+      // Given back as it was: a later record or an adoption meets it again.
+      state.merge.replicas.insert(object, replica);
+      return Err(reason);
     }
     replica
   };
@@ -4199,6 +4374,42 @@ fn recompute(
   Ok(())
 }
 
+/// Counter: a record of a version after an owed one met a replica that still owes it (P2): refused, counted, the record
+/// left for a later attempt (GAPS A-812, a holder's replica is not made from its tool's objects yet).
+pub(crate) const REPLICA_OWES: &str = "merge.replica.owes";
+
+/// Applies a version's inputs to a holder's `replica` as exactly `version` (§4.16 "Apply on holders"): an increment
+/// judged afresh and accepted as that version; or a deferred push's record (P2, `DeferredPush`), the replica then owing
+/// it as its owner's green does, its head identity its base's, as the owner's record carries. A replica that owes a push
+/// cannot judge an increment after it: refused [`REPLICA_OWES`]. Anything else has diverged.
+pub(crate) fn apply_inputs(
+  replica: &mut Green,
+  bytes: &[u8],
+  version: u64,
+) -> Result<(), &'static str> {
+  if slates_merge::push::DeferredPush::is_record(bytes) {
+    let push = slates_merge::push::DeferredPush::decode(bytes).ok_or(INPUTS_UNDECODABLE)?;
+    return match replica.defer(push) {
+      Some(owed) if owed == version => Ok(()),
+      _ => Err(RECOMPUTE_MISMATCH),
+    };
+  }
+  if !replica.is_materialized() {
+    return Err(REPLICA_OWES);
+  }
+  let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
+  match replica.submit(&increment) {
+    // An identical increment is accepted too (A-782): its version commits nothing new.
+    Outcome::Accepted { version: made } | Outcome::Identical { version: made }
+      if made == version =>
+    {
+      Ok(())
+    }
+    // The owner accepted it; a holder that computes anything else has diverged.
+    _ => Err(RECOMPUTE_MISMATCH),
+  }
+}
+
 /// Folds a holder's `replica` of a green below `floor`, the version below which its owner's engine had folded the
 /// green's histories when it made the record this holder now holds (§4.16 "delta retention before folding", A-385): the
 /// replica then keeps no more of the green's history than its owner does. A floor at or below the replica's own fold
@@ -4216,7 +4427,7 @@ pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {
-    version: state.merge.replicas.get(&object).map(Green::head),
+    version: state.merge.replicas.get(&object).map(Green::reached),
     refused: state.merge.refused.contains(&object),
   }
 }
@@ -4233,6 +4444,35 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-579 (a checkpoint's identity fold paced to end within its doubling interval). Do: ask a turn's budget for 80 ms
+  /// of fold left, a turn every 0.5 ms, at several points of a 1 s interval; and past its end; and for almost nothing
+  /// left. Expect: the fold spread evenly over the turns left (80 ms x 0.5 / 1000 = 40 us at the start, twice that half
+  /// way), all of it once the deadline has passed, and never less than the quantum.
+  #[test]
+  fn a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline() {
+    const MS: u64 = 1_000_000;
+    const QUANTUM: u64 = 5_000;
+    let left = 80 * MS;
+    let gap = MS / 2;
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      40_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 500 * MS)),
+      80_000
+    );
+    assert_eq!(
+      turn_budget_ns(left, (gap, QUANTUM), (0, 1_000 * MS, 1_000 * MS)),
+      left
+    );
+    assert_eq!(turn_budget_ns(left, (gap, QUANTUM), (0, 0, 7)), left);
+    assert_eq!(
+      turn_budget_ns(1_000, (gap, QUANTUM), (0, 1_000 * MS, 0)),
+      QUANTUM
+    );
+  }
 
   /// AC-6.8 / A-26, A-294: seed a green from a frozen namespace of FIFO and socket names and device nodes without
   /// reading a stream or opening a device; expect every kind, owner and device number in the green, each alias a link.

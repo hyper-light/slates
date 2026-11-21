@@ -260,7 +260,8 @@ pub(crate) async fn rebuild(svn: RepositoryId) {
 /// `svn`'s changeset `sequence`'s record as the node's store holds it, once landed (a creation lands as a task).
 pub(crate) async fn stored_record(svn: RepositoryId, sequence: u64) -> Record {
   let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
-  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   loop {
     if let Ok(bytes) = super::landing::changeset_record(&disk, svn, sequence).await {
       return Record::decode(&bytes).expect("a Subversion record");
@@ -275,7 +276,8 @@ pub(crate) async fn stored_record(svn: RepositoryId, sequence: u64) -> Record {
 
 /// Waits until `svn`'s records reach revision `youngest` (a submitted version's revision lands as a task, C2).
 pub(crate) async fn youngest_reaches(svn: RepositoryId, youngest: u64) {
-  let deadline = slates_rt::futures::now_ns().saturating_add(PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   while on(|state| kept(state, svn).0) != youngest {
     assert!(
       slates_rt::futures::now_ns() < deadline,
@@ -332,8 +334,9 @@ fn t_a655_a_subversion_repository_is_made_with_its_creation_record() {
 /// A-655 part 2b (§4.17.4 items 1 and 3.5). Do: commit revision 1 (a directory with a property list, a file, a
 /// directory holding a file) through the step. Expect: answered revision 1 with its date and author; the green at
 /// version 1 holding each file's bytes, the directories, and the directory's list named by its identity; the
-/// register's second record a reference to changeset 1, whose record on the node's store is the revision whole (C2);
-/// the records at revision 1 holding the texts; the shard charged what they hold.
+/// register's second record a reference to changeset 1, whose record on the node's store is the revision with its texts
+/// named by identity and length (C2; the texts are its changeset's payload, stage B part 2 (b)); the records at revision
+/// 1 naming the texts stored, none of their bytes in RAM; the shard charged what they hold.
 #[test]
 fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
   stored(|| async move {
@@ -360,21 +363,36 @@ fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
       .get(1)
       .and_then(|bytes| super::landing::sequence_of(bytes));
     assert_eq!(second, Some(1));
-    assert_eq!(stored_record(svn, 1).await, Record::Revision(first()));
+    assert_eq!(
+      stored_record(svn, 1).await,
+      Record::Revision(texts_stored(first()))
+    );
     let alpha = on(|state| {
-      state
-        .vcs_stores
-        .subversion_records(svn)
-        .and_then(|records| {
-          records
-            .text(&identity(b"alpha\n"))
-            .map(std::borrow::Cow::into_owned)
-        })
+      state.vcs_stores.subversion_records(svn).map(|records| {
+        let alpha = identity(b"alpha\n");
+        (records.stored_len(&alpha), records.text(&alpha).is_some())
+      })
     });
-    assert_eq!(alpha, Some(b"alpha\n".to_vec()));
+    assert_eq!(alpha, Some((Some(6), false)));
     let (youngest, held, charged) = on(|state| kept(state, svn));
     assert_eq!((youngest, charged), (1, held));
   });
+}
+
+/// `revision` as its landing records it (C2 stage B part 2 (b)): each text its rows name moved out of its contents and
+/// named among its stored texts by its length.
+fn texts_stored(mut revision: Revision) -> Revision {
+  for text in revision
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text)
+  {
+    if revision.contents.remove(&text.identity).is_some() {
+      revision.stored.insert(text.identity, text.size);
+    }
+  }
+  revision
 }
 
 /// Revision 2: `/branches/b` copied from `/trunk` at revision 1 (the head), its `a.txt` changed and its `sub` deleted.
@@ -1027,13 +1045,12 @@ fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
           Some(copied)
         )]
       );
-      let held = records
+      records
         .index()
         .node("/branches/b/a.txt", 2)
         .ok()
         .flatten()
-        .is_some();
-      held
+        .is_some()
     });
     assert!(held, "the copy brings /trunk/a.txt");
     let rows = vec![file("/branches/b/c.txt", Action::Add, b"gamma\n")];
@@ -1119,16 +1136,20 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
     store: None,
     green: Some(&engine),
     records,
+    pieces: None,
   };
   use slates_svn::migration::TextSource;
   assert!(matches!(
     texts.text(&identity(b"gamma\n")),
     Some(std::borrow::Cow::Borrowed(b"gamma\n"))
   ));
+  // An earlier text is its changeset's on the node's store: the records name it, RAM holds none of it (C2 stage B
+  // part 2 (b)), and a reader reads it through the store.
+  let alpha = identity(b"alpha\n");
   assert_eq!(
-    texts.text(&identity(b"alpha\n")).as_deref(),
-    Some(&b"alpha\n"[..]),
-    "an earlier text is read from the records"
+    (texts.text(&alpha).is_none(), texts.fetchable(&alpha, 0)),
+    (true, false),
+    "a view without the store's pieces reads nothing of an earlier text"
   );
 }
 
@@ -1137,7 +1158,7 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
 /// deleting `/trunk`; 4, replacing `/branches/b/a.txt` by another text; reading each text through the sources' text
 /// source after each. Expect: after 1 the green holds both texts; after 2 those of `trunk` and the branch's changed
 /// `a.txt`, each once though two rows reach it; after 3 the branch's alone; after 4 only the replacing text; each held
-/// text read from the green, borrowed, and an earlier text still read from the records.
+/// text read from the green, borrowed, and an earlier text nowhere in RAM (its changeset's on the node's store).
 #[test]
 fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
   stored(|| async move {
@@ -1219,12 +1240,13 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
 }
 
 /// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step, so one
-/// large revision held its shard). Do: commit a revision adding `/trunk` and twelve files of 50 KiB distinct texts,
-/// then rebuild the repository from its changesets on the node's store, its turns driven to the end. Expect: the same records and green; and the
-/// revision's replay taken over at least a turn a file (`vcs_store.svn_replay_turns`): each turn keeps its rows' texts
-/// until the shard's quantum runs, and a file's delta outlasts it. Before, the record was replayed whole in one turn.
+/// large revision held its shard), under C2 stage B part 2 (b). Do: commit a revision adding `/trunk` and twelve files of
+/// 50 KiB distinct texts, then rebuild the repository from its changesets on the node's store, its turns driven to the
+/// end. Expect: the same records and green; the twelve texts named stored by the records, none kept in RAM, so the
+/// replay makes no text and takes at least one turn (`vcs_store.svn_replay_turns`). Before part 2 (b) the replay
+/// deltified each text, a turn a file at least.
 #[test]
-fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
+fn a_revisions_texts_replay_as_stored_keeping_nothing_in_ram() {
   stored(|| async move {
     let (svn, green) = subversion("svn").await;
     let texts: Vec<Vec<u8>> = (0..12u32)
@@ -1256,6 +1278,568 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
     assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
     assert_eq!(on(|state| whole(state, (svn, green))), live);
     let taken = on(|state| turns(state)) - before;
-    assert!(taken >= 12, "the revision replayed in {taken} turns");
+    assert!(taken >= 1, "the revision replayed in {taken} turns");
+    let stored = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      texts
+        .iter()
+        .filter(|bytes| {
+          let named = identity(bytes);
+          records.stored_len(&named).is_some() && records.text(&named).is_none()
+        })
+        .count()
+    });
+    assert_eq!(stored, 12, "a text kept in RAM");
+  });
+}
+
+/// C2 stage B part 2 (b), P1 (a commit's green increment reads a stored text the content store let go through the
+/// node's changeset store). Do: on a daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), commit revision 2 adding `/trunk/b.bin` with the same text, as a
+/// copy or a revert names one the records hold already. Expect revision 2 committed, the green's `trunk/b.bin` the text
+/// whole, read through the store (`vcs_store.svn_texts.piece_fetched` at least once), and the content store holding
+/// nothing of it after (the commit gave back what it brought). Before, the increment found no bytes and the commit was
+/// refused `Corrupt`.
+#[test]
+fn a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, id) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "copied", &bytes);
+  let named = text(&bytes);
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let work = Work {
+        head: 1,
+        record: RevisionRecord {
+          transaction: "1-2".to_owned(),
+          changes: vec![ChangedPath {
+            path: "/trunk/b.bin".to_owned(),
+            action: Action::Add,
+            kind: NodeKind::File,
+            copy_from: None,
+            text: Some(named),
+            properties: None,
+            mergeinfo_modified: false,
+          }],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"the same".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let sink = slates_svn::commit::drive::HeldTexts::new();
+      super::land_work((&owner(), id), work, &sink)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (file, kept, fetched) = crate::daemon::observe_first(&daemon, move |state| {
+    let green = super::green_of(state, id).ok();
+    let file = green.and_then(|green| green_file(state, green, "trunk/b.bin"));
+    let kept = state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)));
+    let fetched = state
+      .refusals
+      .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+      .copied()
+      .unwrap_or(0);
+    (file, kept, fetched)
+  });
+  daemon.stop();
+  assert!(matches!(landed, Some(Ok(2))), "{landed:?}");
+  assert!(
+    file.as_deref() == Some(bytes.as_slice()),
+    "the green's file is not the text"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert!(!kept, "the content store kept what the commit brought");
+}
+
+/// A work over the Subversion repository's green `green` writing `bytes` at `path`, made by bare dispatches: its id.
+fn made_work(
+  state: &mut ShardState,
+  green: slates_ipc::protocol::VolumeId,
+  (name, path, bytes): (&str, &str, &[u8]),
+) -> slates_ipc::protocol::VolumeId {
+  let made = crate::vcs_store::paths::tests::ask(
+    state,
+    slates_ipc::protocol::RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    },
+  );
+  let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = crate::vcs_store::paths::tests::ask(
+    state,
+    slates_ipc::protocol::RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    },
+  );
+  assert!(
+    !matches!(edited, slates_ipc::protocol::ReplyBody::Refused { .. }),
+    "{edited:?}"
+  );
+  work
+}
+
+/// Whether request `id` of `origin` is completed: answered, its answer recorded.
+fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestId) -> bool {
+  matches!(
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence),
+    slates_wire::request::Seen::Completed(_)
+  )
+}
+
+/// Main's landing order for a server-made commit (inbox w-svn-from-main-c2-made: check, the store's land, the register's
+/// commit, the answer). Do: submit a work to a Subversion repository's green as a client's recorded request; read its
+/// completion, the records' youngest revision and the green's durable head in the verb's own step; then wait for the
+/// revision. Expect: in the verb's step nothing is answered and nothing durable (the revision not landed); once it
+/// landed, the request answered, the green's durable head 1, the register naming the creation and the revision, and the
+/// made revision's text named stored by the records, none of it in RAM (its changeset carries it, C2 stage B part 2 (b)
+/// P4b). Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
+#[test]
+fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed() {
+  stored(|| async move {
+    let (svn, green) = subversion("deferred").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("deferred-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let in_the_verb = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      (
+        completed(state, 7, id),
+        kept(state, svn).0,
+        state.db.partition().green_head(green),
+      )
+    });
+    youngest_reaches(svn, 1).await;
+    let after = on(|state| {
+      (
+        completed(state, 7, id),
+        state.db.partition().green_head(green),
+        logged(state, svn).len(),
+      )
+    });
+    let alpha = identity(b"alpha\n");
+    let kept_as = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .map(|records| (records.stored_len(&alpha), records.text(&alpha).is_some()))
+    });
+    assert_eq!(
+      kept_as,
+      Some((Some(6), false)),
+      "the made text is not stored alone"
+    );
+    assert_eq!(
+      in_the_verb,
+      (false, 0, 0),
+      "nothing answered or durable before the revision landed"
+    );
+    assert_eq!(
+      after,
+      (true, 1, 2),
+      "answered once the revision landed and both committed"
+    );
+  });
+}
+
+/// Main's landing order, its crash case. Do: submit a work to a Subversion repository's green as a client's recorded
+/// request, the made-landing task killed before it commits (as a `kill -9` between the store's land and the register's
+/// commit leaves it); make the green and the records again from what is durable, as a restart does; then run the same
+/// request again. Expect: after the kill, the state before (the green's durable head 0, the records at revision 0, the
+/// request not answered); the retry lands once (the records at revision 1, not 2), the request answered, the green's
+/// durable head 1. Until the deferred-submit hook, the version was durable before its revision landed, so a kill left
+/// version 1 standing with no revision.
+#[test]
+fn a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once()
+ {
+  stored(|| async move {
+    let (svn, green) = subversion("killed").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("killed-work", "trunk/a.txt", b"alpha\n")));
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let submit = move |state: &mut ShardState| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      )
+    };
+    crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
+    on(|state| submit(state));
+    // The killed task: its changeset lands, then the kill fires (clearing itself) where the step would commit.
+    let deadline = slates_rt::futures::now_ns()
+      .saturating_add(u64::try_from(PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+    while crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+      assert!(
+        slates_rt::futures::now_ns() < deadline,
+        "the kill never fired"
+      );
+      slates_rt::futures::yield_now().await;
+    }
+    // A restart: what memory held past the durable state is made again from it.
+    on(crate::verbs::reconcile_unpublished_effects);
+    rebuild(svn).await;
+    let after_kill = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+        completed(state, 7, id),
+      )
+    });
+    assert_eq!(after_kill, (0, 0, false), "the state before the commit");
+    on(|state| submit(state));
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let after_retry = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(after_retry, (1, 1, true, 2), "the retry landed once");
+  });
+}
+
+/// The deferred-submit hook's turn first. Do: hold a Subversion repository's landing turn (as a client's commit landing
+/// holds it), submit a work to its green as a client's recorded request, then give the turn back. Expect: while the
+/// turn is held, nothing of the submit ran (the green's engine and durable head at 0, the request not answered); once
+/// it is given back, the parked submit runs again holding it, its revision lands and the request is answered, the
+/// register naming the creation and the revision.
+#[test]
+fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back() {
+  stored(|| async move {
+    let (svn, green) = subversion("turn-held").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("turn-work", "trunk/a.txt", b"alpha\n")));
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let held = on(|state| crate::repository::svn_commit::landing::Turn::take_now(state, svn));
+    let while_held = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      (
+        green_head(state, green),
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+      )
+    });
+    assert_eq!(
+      while_held,
+      (Some(0), 0, false),
+      "nothing ran while the turn was held"
+    );
+    on(move |state| {
+      if let Some(turn) = held {
+        turn.give_back(state);
+      }
+    });
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let after = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(
+      after,
+      (1, true, 2),
+      "run again holding the turn, landed and answered"
+    );
+  });
+}
+
+/// C2 stage B part 2 (b), P3 (a committed text is its changeset's on the node's store, not the content store's). Do: on
+/// a daemon holding a store, commit a revision adding `/trunk/a.bin`, its text put through the content store as a
+/// client's commit puts it; then read the text as a session does through the repository's view, waiting for any piece
+/// the view does not hold. Expect revision 1, the content store holding nothing of the text once the commit answered,
+/// the green's file the text, and the session's read whole (the head's files are the green's; a text nothing in RAM
+/// holds is read through the store, held by the stage's (a) tests). Before, the content store held every committed text
+/// until the deltify job made it a delta in RAM.
+#[test]
+fn a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store() {
+  use slates_svn::commit::drive::TextSink;
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let asked = (
+    "let-go",
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, green) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  let bytes = crate::test_store::noise(200 << 10);
+  let committed = bytes.clone();
+  let named = text(&bytes);
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let texts = slates_svn::commit::drive::HeldTexts::new();
+      let staged = texts.stage().unwrap();
+      texts.append(staged, &committed).unwrap();
+      texts.seal(staged, named.identity).unwrap();
+      let work = Work {
+        head: 0,
+        record: RevisionRecord {
+          transaction: "0-1".to_owned(),
+          changes: vec![
+            row("/trunk", Action::Add, NodeKind::Directory),
+            ChangedPath {
+              path: "/trunk/a.bin".to_owned(),
+              action: Action::Add,
+              kind: NodeKind::File,
+              copy_from: None,
+              text: Some(named),
+              properties: None,
+              mergeinfo_modified: false,
+            },
+          ],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"let go".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      super::land_work((&owner(), id), work, &texts)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let kept = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)))
+  });
+  let file = crate::daemon::observe_first(&daemon, move |state| {
+    green_file(state, green, "trunk/a.bin")
+  });
+  // A session's read: a piece at a time, waiting for each piece the view does not hold (C2 stage B part 2 (a)).
+  let read = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut out = Vec::new();
+      let mut fetched = Vec::new();
+      while u64::try_from(out.len()).unwrap() < named.size {
+        let at = u64::try_from(out.len()).unwrap();
+        let piece = crate::state::with_state(|state| {
+          crate::vcs_store::svn_view::lend_in(state, id, |lent| {
+            let repository = lent.repository;
+            match slates_svn::reads::Repository::text(repository, &named.identity, at) {
+              Some(piece) => Ok(piece.into_owned()),
+              None => Err(slates_svn::reads::Repository::fetchable(
+                repository,
+                &named.identity,
+                at,
+              )),
+            }
+          })
+        })
+        .flatten();
+        match piece {
+          Some(Ok(piece)) if !piece.is_empty() => out.extend_from_slice(&piece),
+          Some(Err(true)) => {
+            let wanted = slates_svn::reads::Wanted {
+              text: named.identity,
+              offset: at,
+            };
+            assert!(crate::vcs_store::svn_texts::fetch_piece(id, wanted).await);
+            fetched.push(wanted);
+          }
+          other => panic!("the read at {at} answered {other:?}"),
+        }
+      }
+      crate::state::with_state(|state| {
+        for wanted in fetched {
+          crate::vcs_store::svn_texts::let_go(state, wanted);
+        }
+      })
+      .map(|()| out)
+    },
+    std::time::Duration::from_secs(60),
+  );
+  daemon.stop();
+  assert!(matches!(landed, Some(Ok(1))), "{landed:?}");
+  assert!(!kept, "the content store kept the committed text");
+  assert!(
+    file.as_deref() == Some(bytes.as_slice()),
+    "the green's file is not the text"
+  );
+  assert!(read == Some(bytes), "the read is not the text");
+}
+
+/// What a reader of `green`'s engine sees: its head and the bytes at `path` there.
+fn read_green(state: &ShardState, green: DbVolumeId, path: &str) -> Option<(u64, Option<Vec<u8>>)> {
+  let engine = state.greens.get(&green)?;
+  Some((engine.head(), engine.content(path).map(<[u8]>::to_vec)))
+}
+
+/// A server-made commit's verdict is held with its landing, never shown before it commits (A-805; main 02:37, piece 1;
+/// the landing order's "never expose a revision that was never committed"). Do: submit a work writing `trunk/a.txt` to
+/// a Subversion repository's green as a client's recorded request, and read the green's engine in the submit's own step,
+/// while its landing is held. Expect: the old head (0) and no `trunk/a.txt`; once the revision landed and committed,
+/// head 1 with the work's bytes. Under A-804 the verdict applied in memory at the submit, so a reader saw version 1
+/// before it was durable.
+#[test]
+fn a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head() {
+  stored(|| async move {
+    let (svn, green) = subversion("held-read").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("held-read-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let while_held = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      read_green(state, green, "trunk/a.txt")
+    });
+    youngest_reaches(svn, 1).await;
+    let after = on(|state| read_green(state, green, "trunk/a.txt"));
+    assert_eq!(
+      while_held,
+      Some((0, None)),
+      "the old head while the landing is held"
+    );
+    assert_eq!(
+      after,
+      Some((1, Some(b"alpha\n".to_vec()))),
+      "the version once committed"
+    );
+  });
+}
+
+/// A refused landing leaves nothing any reader saw (A-805; main 02:37, piece 1). Do: with the node's store refusing
+/// every changeset, submit a work to a Subversion repository's green as a client's recorded request; read the green in
+/// the submit's own step and after the landing was refused; then let the store take changesets and run the request
+/// again. Expect: every read the old head with no `trunk/a.txt`, nothing durable, the request not answered; the retry
+/// lands revision 1 once. Under A-804 a reader in the submit's step saw version 1, which the refusal then took back.
+#[test]
+fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once() {
+  stored(|| async move {
+    let (svn, green) = subversion("refused").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("refused-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let submit = move |state: &mut ShardState| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      )
+    };
+    crate::repository::svn_commit::landing::REFUSE_LANDING.with(|refuse| refuse.set(true));
+    let in_the_step = on(|state| {
+      submit(state);
+      read_green(state, green, "trunk/a.txt")
+    });
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let refused = on(|state| {
+      (
+        read_green(state, green, "trunk/a.txt"),
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        kept(state, svn).0,
+      )
+    });
+    crate::repository::svn_commit::landing::REFUSE_LANDING.with(|refuse| refuse.set(false));
+    assert_eq!(
+      in_the_step,
+      Some((0, None)),
+      "no reader saw the version in the submit's step"
+    );
+    assert_eq!(
+      refused,
+      (Some((0, None)), 0, false, 0),
+      "nothing of it after the refusal"
+    );
+    on(|state| submit(state));
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let retried = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(retried, (1, true, 2), "the retry landed once");
   });
 }

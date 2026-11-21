@@ -311,13 +311,14 @@ fn reader_reads_main(state: &mut ShardState, name: &str) {
 /// and its blob; neither answer refused.
 #[test]
 fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
-  let (listed, fetched, objects, head) = crate::daemon::audit_on_shard(|state| {
-    let (id, objects, head) = pushed_repository(state, "lent", &[]);
-    let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
-    let wants = fetch(&[head], &[]);
-    let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
-    (listed, fetched, objects, head)
-  });
+  let (listed, fetched, objects, head) =
+    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+      let (id, objects, head) = pushed_repository(state, "lent", &[]);
+      let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
+      let wants = fetch(&[head], &[]);
+      let fetched = answered(state, (id, &owner()), Asked::Request(&wants));
+      (listed, fetched, objects, head)
+    });
   let expected = vec![
     ref_line(head, "HEAD", Some("refs/heads/main")),
     ref_line(head, "refs/heads/main", None),
@@ -334,20 +335,21 @@ fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
 /// refused as git refuses a ref it does not have ("unknown ref").
 #[test]
 fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
-  let (by_owner, by_reader, wanted, head) = crate::daemon::audit_on_shard(|state| {
-    let (id, root) = repository(state, "hidden", VcsTool::Git);
-    reader_reads_main(state, "hidden");
-    let files = [(b"README".to_vec(), b"one\n".to_vec())];
-    let (objects, head) = commit_of(&files, &[], FIRST_DATE);
-    let version = push_through(state, (id, root), &objects, (None, head, tree_of(&objects)));
-    branch_at(state, (id, &objects), ("topic", root, version), head);
-    let ls_refs = ls_refs();
-    let by_owner = answered(state, (id, &owner()), Asked::Request(&ls_refs));
-    let by_reader = answered(state, (id, &reader()), Asked::Request(&ls_refs));
-    let topic = fetch(&[], &["refs/heads/topic"]);
-    let wanted = answered(state, (id, &reader()), Asked::Request(&topic));
-    (by_owner, by_reader, wanted, head)
-  });
+  let (by_owner, by_reader, wanted, head) =
+    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+      let (id, root) = repository(state, "hidden", VcsTool::Git);
+      reader_reads_main(state, "hidden");
+      let files = [(b"README".to_vec(), b"one\n".to_vec())];
+      let (objects, head) = commit_of(&files, &[], FIRST_DATE);
+      let version = push_through(state, (id, root), &objects, (None, head, tree_of(&objects)));
+      branch_at(state, (id, &objects), ("topic", root, version), head);
+      let ls_refs = ls_refs();
+      let by_owner = answered(state, (id, &owner()), Asked::Request(&ls_refs));
+      let by_reader = answered(state, (id, &reader()), Asked::Request(&ls_refs));
+      let topic = fetch(&[], &["refs/heads/topic"]);
+      let wanted = answered(state, (id, &reader()), Asked::Request(&topic));
+      (by_owner, by_reader, wanted, head)
+    });
   let main = vec![
     ref_line(head, "HEAD", Some("refs/heads/main")),
     ref_line(head, "refs/heads/main", None),
@@ -368,7 +370,7 @@ fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
 /// cannot carry; one ref listed twice, which upload-pack's order check refuses).
 #[test]
 fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
-  let (listed, head) = crate::daemon::audit_on_shard(|state| {
+  let (listed, head) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, _, head) = pushed_repository(state, "spaced", &["my topic", "refs/heads/main"]);
     let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
     (listed, head)
@@ -475,7 +477,7 @@ async fn ssh_session(
 /// held a store, so the site's services never started it.
 #[test]
 fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (record, objects, head) = crate::daemon::observe_first(&daemon, |state| {
     let (id, objects, head) = pushed_repository(state, "over-ssh", &[]);
     let record = state.db.partition().repositories().repository(id).cloned();
@@ -523,19 +525,20 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
 /// its tree and its blob, read as index-pack reads one.
 #[test]
 fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments() {
-  let (before, after, encoded_count, again, objects) = crate::daemon::audit_on_shard(|state| {
-    let (id, objects, head) = pushed_repository(state, "encoded", &[]);
-    let wants = fetch(&[head], &[]);
-    let before = fetched_with_counters(state, (id, &owner()), &wants);
-    encoded(state, id);
-    let again = encoded(state, id);
-    let encoded_count = state
-      .refusals
-      .get(super::super::git_encode::ENCODED)
-      .copied();
-    let after = fetched_with_counters(state, (id, &owner()), &wants);
-    (before, after, encoded_count, again, objects)
-  });
+  let (before, after, encoded_count, again, objects) =
+    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+      let (id, objects, head) = pushed_repository(state, "encoded", &[]);
+      let wants = fetch(&[head], &[]);
+      let before = fetched_with_counters(state, (id, &owner()), &wants);
+      encoded(state, id);
+      let again = encoded(state, id);
+      let encoded_count = state
+        .refusals
+        .get(super::super::git_encode::ENCODED)
+        .copied();
+      let after = fetched_with_counters(state, (id, &owner()), &wants);
+      (before, after, encoded_count, again, objects)
+    });
   assert_eq!((encoded_count, again), (Some(1), 0));
   let fresh =
     |counters: &slates_git::store::UploadCounters| counters.loose_whole + counters.loose_deltas;
@@ -599,79 +602,80 @@ fn tagged(
 /// ref, so the tag is lost), so the hold is what keeps it.
 #[test]
 fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile() {
-  let (start, held, unheld) = crate::daemon::audit_on_shard(|state| {
-    let (id, root) = repository(state, "generations", VcsTool::Git);
-    let files = [(b"README".to_vec(), b"one\n".to_vec())];
-    let (objects, first) = commit_of(&files, &[], FIRST_DATE);
-    let first_tree = tree_of(&objects);
-    let version = push_through(state, (id, root), &objects, (None, first, first_tree));
-    tagged(state, (id, root, version), first, "v1");
-    let mut wants = fetch(&[first], &[]);
-    // `include-tag` beside the request's other arguments, before its flush.
-    let flush_at = wants.len() - FLUSH.len();
-    wants.splice(flush_at..flush_at, packet(b"include-tag\n"));
-    let began = super::hold_in(state, id, &owner()).expect("held");
-    let start = answered(state, (id, &owner()), Asked::Request(&wants)).0;
-    let in_turns = |state: &mut ShardState,
-                    hold: super::GitGeneration,
-                    held: bool,
-                    land: &mut dyn FnMut(&mut ShardState)| {
-      let mut admission = Admission::new(ROOM);
-      let mut answer = super::lend_held_in(state, &hold, |served, packs| {
-        upload::serve_in_turns(
-          served,
-          Version::V2,
-          Asked::Request(&wants),
-          packs,
-          &mut admission,
-        )
-      })
-      .expect("the request's step lent");
-      let mut out = Vec::new();
-      for step in 0..STEPS {
-        let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
-          answer.write_within(
+  let (start, held, unheld) =
+    crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
+      let (id, root) = repository(state, "generations", VcsTool::Git);
+      let files = [(b"README".to_vec(), b"one\n".to_vec())];
+      let (objects, first) = commit_of(&files, &[], FIRST_DATE);
+      let first_tree = tree_of(&objects);
+      let version = push_through(state, (id, root), &objects, (None, first, first_tree));
+      tagged(state, (id, root, version), first, "v1");
+      let mut wants = fetch(&[first], &[]);
+      // `include-tag` beside the request's other arguments, before its flush.
+      let flush_at = wants.len() - FLUSH.len();
+      wants.splice(flush_at..flush_at, packet(b"include-tag\n"));
+      let began = super::hold_in(state, id, &owner()).expect("held");
+      let start = answered(state, (id, &owner()), Asked::Request(&wants)).0;
+      let in_turns = |state: &mut ShardState,
+                      hold: super::GitGeneration,
+                      held: bool,
+                      land: &mut dyn FnMut(&mut ShardState)| {
+        let mut admission = Admission::new(ROOM);
+        let mut answer = super::lend_held_in(state, &hold, |served, packs| {
+          upload::serve_in_turns(
             served,
+            Version::V2,
+            Asked::Request(&wants),
             packs,
             &mut admission,
-            &mut out,
-            MAX_LEN,
-            &mut || true,
           )
-        };
-        let written = if held {
-          super::lend_held_in(state, &hold, write)
-        } else {
-          lend_on(state, (id, None), write)
+        })
+        .expect("the request's step lent");
+        let mut out = Vec::new();
+        for step in 0..STEPS {
+          let write = |served: &upload::Served<'_>, packs: &mut super::ShardPacks| {
+            answer.write_within(
+              served,
+              packs,
+              &mut admission,
+              &mut out,
+              MAX_LEN,
+              &mut || true,
+            )
+          };
+          let written = if held {
+            super::lend_held_in(state, &hold, write)
+          } else {
+            lend_on(state, (id, None), write)
+          }
+          .expect("the answer's step lent");
+          if step == 0 {
+            land(state);
+          }
+          if written == Written::End {
+            return out;
+          }
         }
-        .expect("the answer's step lent");
-        if step == 0 {
-          land(state);
-        }
-        if written == Written::End {
-          return out;
-        }
-      }
-      panic!("an answer that never ended")
-    };
-    let mut landed = false;
-    let held = in_turns(state, began, true, &mut |state| {
-      let files = [(b"README".to_vec(), b"two\n".to_vec())];
-      let (objects, second) = commit_of(&files, &[first], FIRST_DATE + 1);
-      let version = push_through(
-        state,
-        (id, root),
-        &objects,
-        (Some(first_tree), second, tree_of(&objects)),
-      );
-      tagged(state, (id, root, version), first, "v2");
-      landed = true;
+        panic!("an answer that never ended")
+      };
+      let mut landed = false;
+      let held = in_turns(state, began, true, &mut |state| {
+        let files = [(b"README".to_vec(), b"two\n".to_vec())];
+        let (objects, second) = commit_of(&files, &[first], FIRST_DATE + 1);
+        let version = push_through(
+          state,
+          (id, root),
+          &objects,
+          (Some(first_tree), second, tree_of(&objects)),
+        );
+        tagged(state, (id, root, version), first, "v2");
+        landed = true;
+      });
+      assert!(landed, "the push landed mid-answer");
+      let hold = super::hold_in(state, id, &owner()).expect("held");
+      let unheld = in_turns(state, hold, false, &mut |_| {});
+      (start, held, unheld)
     });
-    assert!(landed, "the push landed mid-answer");
-    let hold = super::hold_in(state, id, &owner()).expect("held");
-    let unheld = in_turns(state, hold, false, &mut |_| {});
-    (start, held, unheld)
-  });
   // Byte for byte: the encoder's level and window are one function of the bytes and the machine's measured rates
   // (`learn::Rates`), never the shard's clock, so two streams of one generation write one answer.
   assert_eq!(held, start, "held to the generation it began on");

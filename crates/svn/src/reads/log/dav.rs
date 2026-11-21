@@ -169,6 +169,8 @@ pub enum DavLogProgress {
     /// The message.
     message: String,
   },
+  /// A text's piece the repository reads asynchronously is waited for (C2 stage B part 2): fetch it and resume again.
+  Waiting(crate::reads::Wanted),
 }
 
 impl DavLog {
@@ -226,6 +228,7 @@ impl DavLog {
     };
     match self.stream.resume(&mut reads, room) {
       Ok(Progress::More) => DavLogProgress::More,
+      Ok(Progress::Waiting(wanted)) => DavLogProgress::Waiting(wanted),
       Ok(Progress::Done | Progress::Close) => match self.refused() {
         Some(failure) => DavLogProgress::Refused {
           code: failure.code,

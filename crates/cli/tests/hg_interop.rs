@@ -608,6 +608,141 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
 }
 
+/// Format: stock 7.2's warning where `clone --stream` meets a server listing no stream capability
+/// (`mercurial/streamclone.py`, `canperformstreamclone`), before it clones plainly.
+const STREAM_DISABLED_WARNING: &str =
+  "warning: stream clone requested but server has them disabled";
+
+/// The value of counter `name` in the daemon's status report (`slates status --json`, each counter an object
+/// `{"count":N,"kind":"name"}`, one a shard that counted it): their sum, zero where none counted.
+fn counter(instance: &str, name: &str) -> u64 {
+  let (code, status, err) = slates(instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status: {err}");
+  let kind = format!("\"kind\":\"{name}\"");
+  status
+    .match_indices(&kind)
+    .filter_map(|(at, _)| {
+      let object = &status[status[..at].rfind('{')?..at];
+      let count = &object[object.find("\"count\":")? + "\"count\":".len()..];
+      count
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()
+    })
+    .sum()
+}
+
+/// Format: the daemon's counter of the turns a fetch's streamed answer took (`vcs_store::hg_view::STREAM_TURNS`).
+const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
+
+/// Shape: the most turns the pushed repository's stream clone may take: its store asks end a turn each (a pass's rows,
+/// the chunks) and the last turn ends the answer. A turn that yielded at its first quantum took one entry or one
+/// chunk, so this repository's stream was a turn a step before A-783's pacing reached the edge.
+const STREAM_TURNS_AT_MOST: u64 = 6;
+
+/// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
+const STREAMING_LINE: &str = "streaming all changes";
+
+/// Goal 93 perf (main's ruling of 2026-11-21 02:31) and A-767 C1 step 3. A stream clone sends each revision as the
+/// changeset store keeps it, and since C1 step 3 an import lands on the store as segment changesets, each revision its
+/// revlog's own delta, as a push's does; so an imported repository streams as a pushed one does (before, it listed no
+/// stream capability and stock 7.2 cloned it plainly with its warning). Do: over the HTTP edge, import a two-changeset
+/// history (an empty file among its files) into one repository (`slates repository import`) and push the same history
+/// into another; `hg clone --stream` each. Expect both clones to stream, with no warning, each holding the source's
+/// changesets and passing `hg verify` without a warning (the empty file's log streamed split left its `.d` out of the
+/// client's fncache, two warnings on hg-src's prefix); and the pushed one's stream taking at most
+/// [`STREAM_TURNS_AT_MOST`] turns (A-783's pacing: a turn a step, about 460,000 for hg-src, took 15.8 s). Skips loudly
+/// without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's stream clone of an imported repository: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-stream-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's stream clone") else {
+    return;
+  };
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-stream");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  std::fs::write(format!("{source}/file"), "first\n").unwrap();
+  // An empty file too: 7.2 sends its revision against the null base as an empty delta, no hunk (hg-src's
+  // `mercurial/__init__.py` at its first revision; a stream refused it, the answer's body left empty).
+  std::fs::write(format!("{source}/empty"), "").unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  std::fs::write(format!("{source}/file"), "first\nsecond\n").unwrap();
+  hg_ok(&hg, &source, &["commit", "--message", "second"]);
+  create_hg_repository(&instance, "imported");
+  let (code, out, err) = slates(
+    &instance,
+    &[],
+    &["repository", "import", "imported", &source],
+  );
+  assert_eq!(code, 0, "repository import: {out}{err}");
+  create_hg_repository(&instance, "pushed");
+  hg_ok(
+    &hg,
+    &source,
+    &with_config(&["push", &format!("{prefix}pushed")], &config),
+  );
+  let clone_stream = |name: &str| {
+    let clone = format!("{}/{name}-clone", scratch.path);
+    let url = format!("{prefix}{name}");
+    let (code, out, err) = hg_in(
+      &hg,
+      &scratch.path,
+      &with_config(&["clone", "--stream", "-U", &url, &clone], &config),
+    );
+    assert_eq!(code, 0, "clone --stream of {name}: {out}{err}");
+    let said = format!("{out}{err}");
+    let (verified, verify_out, verify_err) = hg_in(&hg, &clone, &["verify"]);
+    let verify_said = format!("{verify_out}{verify_err}");
+    (
+      said.contains(STREAM_DISABLED_WARNING),
+      said.contains(STREAMING_LINE),
+      hg_nodes(&hg, &clone) == hg_nodes(&hg, &source),
+      (verified == 0 && !verify_said.contains("warning"))
+        .then_some(())
+        .ok_or(verify_said),
+    )
+  };
+  let imported = clone_stream("imported");
+  let turns_before = counter(&instance, STREAM_TURNS);
+  let pushed = clone_stream("pushed");
+  let turns = counter(&instance, STREAM_TURNS).saturating_sub(turns_before);
+  assert_eq!(
+    (imported, pushed),
+    ((false, true, true, Ok(())), (false, true, true, Ok(()))),
+    "(warned, streamed, whole, verified clean) for the imported repository's clone, then the pushed one's"
+  );
+  assert!(
+    (1..=STREAM_TURNS_AT_MOST).contains(&turns),
+    "the pushed repository's stream took {turns} turns"
+  );
+}
+
 /// §4.17.3 decision 1 (a client's `--force` makes a line; main's item 6, reading (a), held to stock 7.2's `push -f`). Do:
 /// over the HTTP edge, push a first changeset from copy A; clone it into B, commit and push there, so the line moves;
 /// commit in A on the old head and push without `--force`, then with it; clone the repository again into C and pull

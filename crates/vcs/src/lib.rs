@@ -91,8 +91,8 @@ pub use derived::{
   Derivations, DerivedCounters, DerivedRefused, DerivedType, Fill, Graph, Mode, Progress, Read,
 };
 pub use index::{
-  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, NewRow,
-  TAIL_SLOT_BYTES,
+  AdoptRefused, Batch, FENCE_SLOT_BYTES, Index, IndexCounters, IndexRefused, Inserted, Merge,
+  MergeStep, NewRow, TAIL_SLOT_BYTES,
 };
 pub use rule::Compaction;
 pub use share::{Claim, Granted, amount_of, divide, whole_units};
