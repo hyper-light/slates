@@ -2603,12 +2603,20 @@
 > `a_get_file_reads_a_text_ram_does_not_hold_through_the_store` (red without it: "Filesystem is corrupt" after the
 > first response). Owed in (a): DAV GET, file-revs, the exporter, the deltify job; then (b), the records keep history
 > on the store. Stage C,
-> an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
-> today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
-> between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
-> landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
-> the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
-> `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
+> an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
+> one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
+> a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
+> memory, and the made task lands the revision's changeset, then commits the version, the register's entry naming it,
+> the local work's settle and the completion in one step, then answers; a store's refusal gives the accept up (the
+> green made again from its chain, `Overloaded` unrecorded). Held by
+> `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`,
+> `a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once` and
+> `a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back` (each red before: answered
+> with the version durable before the landing; a kill left version 1 with no revision). Owed (A-804): (a) the verdict
+> is applied in memory, not computed pure (`Green::compute`) and committed by position after the land, so while the
+> landing runs a read of the green sees the version before it is durable; (b) a submit dispatched outside a recorded
+> request (no answer waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's
+> made changeset (`hg_made`) commits in the submit's step; git's adopts the hook (w-git, removing its version-2 path). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a

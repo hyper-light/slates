@@ -1260,3 +1260,222 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
     assert!(taken >= 12, "the revision replayed in {taken} turns");
   });
 }
+
+/// A work over the Subversion repository's green `green` writing `bytes` at `path`, made by bare dispatches: its id.
+fn made_work(
+  state: &mut ShardState,
+  green: slates_ipc::protocol::VolumeId,
+  (name, path, bytes): (&str, &str, &[u8]),
+) -> slates_ipc::protocol::VolumeId {
+  let made = crate::vcs_store::paths::tests::ask(
+    state,
+    slates_ipc::protocol::RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    },
+  );
+  let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = crate::vcs_store::paths::tests::ask(
+    state,
+    slates_ipc::protocol::RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    },
+  );
+  assert!(
+    !matches!(edited, slates_ipc::protocol::ReplyBody::Refused { .. }),
+    "{edited:?}"
+  );
+  work
+}
+
+/// Whether request `id` of `origin` is completed: answered, its answer recorded.
+fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestId) -> bool {
+  matches!(
+    state
+      .db
+      .partition()
+      .completion(origin, id.client, id.sequence),
+    slates_wire::request::Seen::Completed(_)
+  )
+}
+
+/// Main's landing order for a server-made commit (inbox w-svn-from-main-c2-made: check, the store's land, the register's
+/// commit, the answer). Do: submit a work to a Subversion repository's green as a client's recorded request; read its
+/// completion, the records' youngest revision and the green's durable head in the verb's own step; then wait for the
+/// revision. Expect: in the verb's step nothing is answered and nothing durable (the revision not landed); once it
+/// landed, the request answered, the green's durable head 1 and the register naming the creation and the revision.
+/// Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
+#[test]
+fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed() {
+  stored(|| async move {
+    let (svn, green) = subversion("deferred").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| {
+      made_work(
+        state,
+        ipc_green,
+        ("deferred-work", "trunk/a.txt", b"alpha\n"),
+      )
+    });
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let in_the_verb = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      (
+        completed(state, 7, id),
+        kept(state, svn).0,
+        state.db.partition().green_head(green),
+      )
+    });
+    youngest_reaches(svn, 1).await;
+    let after = on(|state| {
+      (
+        completed(state, 7, id),
+        state.db.partition().green_head(green),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(
+      in_the_verb,
+      (false, 0, 0),
+      "nothing answered or durable before the revision landed"
+    );
+    assert_eq!(
+      after,
+      (true, 1, 2),
+      "answered once the revision landed and both committed"
+    );
+  });
+}
+
+/// Main's landing order, its crash case. Do: submit a work to a Subversion repository's green as a client's recorded
+/// request, the made-landing task killed before it commits (as a `kill -9` between the store's land and the register's
+/// commit leaves it); make the green and the records again from what is durable, as a restart does; then run the same
+/// request again. Expect: after the kill, the state before (the green's durable head 0, the records at revision 0, the
+/// request not answered); the retry lands once (the records at revision 1, not 2), the request answered, the green's
+/// durable head 1. Until the deferred-submit hook, the version was durable before its revision landed, so a kill left
+/// version 1 standing with no revision.
+#[test]
+fn a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once()
+ {
+  stored(|| async move {
+    let (svn, green) = subversion("killed").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("killed-work", "trunk/a.txt", b"alpha\n")));
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let submit = move |state: &mut ShardState| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      )
+    };
+    crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
+    on(|state| submit(state));
+    // The killed task's turn: let it run and end.
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    crate::vcs_store::svn_made::KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(false));
+    // A restart: what memory held past the durable state is made again from it.
+    on(|state| crate::verbs::reconcile_unpublished_effects(state));
+    rebuild(svn).await;
+    let after_kill = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+        completed(state, 7, id),
+      )
+    });
+    assert_eq!(after_kill, (0, 0, false), "the state before the commit");
+    on(|state| submit(state));
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let after_retry = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        kept(state, svn).0,
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(after_retry, (1, 1, true, 2), "the retry landed once");
+  });
+}
+
+/// The deferred-submit hook's turn first. Do: hold a Subversion repository's landing turn (as a client's commit landing
+/// holds it), submit a work to its green as a client's recorded request, then give the turn back. Expect: while the
+/// turn is held, nothing of the submit ran (the green's engine and durable head at 0, the request not answered); once
+/// it is given back, the parked submit runs again holding it, its revision lands and the request is answered, the
+/// register naming the creation and the revision.
+#[test]
+fn a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back() {
+  stored(|| async move {
+    let (svn, green) = subversion("turn-held").await;
+    let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+    let work = on(|state| made_work(state, ipc_green, ("turn-work", "trunk/a.txt", b"alpha\n")));
+    let id = slates_wire::request::RequestId {
+      client: 7,
+      sequence: 1,
+    };
+    let held = on(|state| crate::repository::svn_commit::landing::Turn::take_now(state, svn));
+    let while_held = on(|state| {
+      crate::verbs::run_recorded_for_test(
+        state,
+        (7, id),
+        &owner(),
+        crate::identities::authored(work, "made"),
+      );
+      (
+        green_head(state, green),
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+      )
+    });
+    assert_eq!(
+      while_held,
+      (Some(0), 0, false),
+      "nothing ran while the turn was held"
+    );
+    on(move |state| {
+      if let Some(turn) = held {
+        turn.give_back(state);
+      }
+    });
+    youngest_reaches(svn, 1).await;
+    for _ in 0..64 {
+      slates_rt::futures::yield_now().await;
+    }
+    let after = on(|state| {
+      (
+        state.db.partition().green_head(green),
+        completed(state, 7, id),
+        logged(state, svn).len(),
+      )
+    });
+    assert_eq!(
+      after,
+      (1, true, 2),
+      "run again holding the turn, landed and answered"
+    );
+  });
+}

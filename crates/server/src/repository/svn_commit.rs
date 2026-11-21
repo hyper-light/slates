@@ -763,13 +763,15 @@ fn append_record(
 
 /// A revision the server made of a version a work submitted to `repository`'s green (A-664's Subversion objects,
 /// `crate::vcs_store::svn_made`), made by `make` once the repository's landing turn `turn` is held: checked as an
-/// import's is, landed on the node's store, then committed by an entry of the register naming it alone (the version
-/// moved the green already) and applied ([`landed_with`]). Its revision.
-pub(crate) async fn land_made(
+/// import's is, landed on the node's store, then committed by `commit` ([`MadeEntry::commit`]: an entry of the register
+/// naming it alone, then applied; [`landed_with`]): in the step that commits the version too (`crate::made_commit`), or
+/// alone after a version committed already (a bare dispatch's). What `commit` answered.
+pub(crate) async fn land_made<T>(
   turn: landing::Turn,
   repository: RepositoryId,
   make: impl FnOnce(&mut ShardState) -> Result<Revision, Uncommitted>,
-) -> Option<Result<u64, Uncommitted>> {
+  commit: impl FnOnce(&mut ShardState, MadeEntry) -> Result<T, Uncommitted>,
+) -> Option<Result<T, Uncommitted>> {
   landed_with(
     turn,
     (repository, Vec::new()),
@@ -777,10 +779,35 @@ pub(crate) async fn land_made(
       let revision = make(state)?;
       prepare_revision(state, repository, revision, None)
     },
-    |state, reference, prepared| commit_made(state, repository, reference, prepared),
+    |state, reference, prepared| {
+      let entry = MadeEntry {
+        repository,
+        reference,
+        prepared,
+      };
+      commit(state, entry)
+    },
     |_| {},
   )
   .await
+}
+
+/// A made revision landed on the node's store, its register entry not yet committed: what [`land_made`]'s caller
+/// commits, in its own step's transaction where it has one (`crate::made_commit`).
+pub(crate) struct MadeEntry {
+  /// The repository.
+  repository: RepositoryId,
+  /// The reference naming the landed changeset's sequence.
+  reference: Vec<u8>,
+  /// The revision, checked.
+  prepared: Prepared,
+}
+
+impl MadeEntry {
+  /// Commits the entry naming the landed changeset ([`commit_made`]): the revision's number.
+  pub(crate) fn commit(self, state: &mut ShardState) -> Result<u64, Uncommitted> {
+    commit_made(state, self.repository, self.reference, self.prepared)
+  }
 }
 
 /// [`land_made`]'s commit: where the records are as its check found them, the reference admitted and the revision's
