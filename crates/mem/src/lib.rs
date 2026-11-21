@@ -64,6 +64,8 @@ pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
+#[cfg(windows)]
+pub use shared::make_extent_section;
 pub use shared::{
   ExclusiveObject, Handoff, SharedObject, SparseObject, extent_handoff, make_extent,
   mapping_granule, unlink_handoff,

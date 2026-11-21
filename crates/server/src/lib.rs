@@ -59,6 +59,10 @@ mod anchor_hold;
 #[cfg(windows)]
 #[path = "anchor_hold_windows.rs"]
 mod anchor_hold;
+// The content pool's extents as sections of their own on Windows, held by the anchor across a restart (A-789).
+#[cfg(windows)]
+#[path = "content_extents_windows.rs"]
+mod content_extents;
 pub mod dns;
 pub mod doorbell;
 pub mod error;
