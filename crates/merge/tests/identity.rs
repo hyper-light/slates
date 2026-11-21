@@ -21,7 +21,7 @@ proptest! {
   /// removals; some conflict and change nothing) to a green over a generated origin, after one create that always
   /// commits, reading the identity at some steps and folding the history below the head at others; expect the
   /// running identity to equal the from-scratch one at every read. A-579: and bringing a few keys up alone at others
-  /// (`fold_identity_step`), the rest left for the read.
+  /// (`fold_identity_step`), the rest left for the read; each changed file's entry taken out at its change (b).
   #[test]
   fn the_running_identity_equals_a_recount_after_every_step(
     origin in proptest::collection::vec(raw(), 0..24),
@@ -66,12 +66,18 @@ proptest! {
       if step.3 % 3 == 1 {
         green.fold_identity_step(1 + usize::from(step.4 % 3));
       }
+      // A-579: and a few bytes alone at others, so a file's entry is part hashed across commits that may change it.
+      if step.3 % 5 == 2 {
+        green.fold_identity_slice(1 + usize::from(step.4 % 4));
+      }
       if step.4 % 3 == 0 {
         prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after step {} {:?}", index, step);
       }
     }
     prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "at the end");
     prop_assert!(accepted > 0, "not even the first commit was accepted");
+    // A-579 (b): no copy in these histories, so every file a commit changed had its entry taken out at its change.
+    prop_assert!(green.identities_taken_at_change() > 0, "no file's entry was taken out at its change");
   }
 }
 

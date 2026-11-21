@@ -4032,6 +4032,50 @@ fn a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone() {
   );
 }
 
+/// MEMORY SIZING, the sweep's conversions (w-sizing, brief item 2): the content object reserves no address space for a
+/// shard's arena on macOS, where every pool extent is an object of its own (A-789). Do: start a one-shard daemon over a
+/// held anchor and read the daemon's own memory report (`slates status`'s `content` row). Expect the content object's
+/// reserved bytes to end before the arena's range would: the write log, the image slots, the delta log and the DAX
+/// table, and nothing for the arena. Before, each shard's slice also reserved its arena's whole capacity,
+/// `reserve_per_shard` (a third of the machine's memory over its shards), which on macOS nothing ever mapped: 34 GB of
+/// the 146 GB a 23-shard daemon reserved on the 96 GB Studio.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_content_object_reserves_nothing_for_the_arena_on_macos() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-no-arena-range-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let arena = config.shard_content_layout().arena;
+  let tag = format!("no-arena-range-{}", std::process::id());
+  let anchor = held_anchor(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&anchor)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let reserved = client
+    .daemon_status()
+    .unwrap()
+    .memory
+    .iter()
+    .find(|row| row.kind == "content")
+    .map(|row| row.reserved_bytes)
+    .expect("the daemon reports its content object");
+  daemon.stop();
+  drop(anchor);
+  let arena_end = u64::try_from(arena.0.saturating_add(arena.1)).unwrap();
+  eprintln!(
+    "the content object reserves {} MiB; the arena's range would end at {} MiB",
+    reserved >> 20,
+    arena_end >> 20
+  );
+  assert!(
+    reserved < arena_end,
+    "the content object reserves {reserved} bytes, its slice through the arena's {} bytes",
+    arena.1
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated

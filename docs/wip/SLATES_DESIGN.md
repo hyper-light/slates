@@ -2305,7 +2305,8 @@ threshold; racy window = the base filesystem's timestamp granularity (from a cit
 table keyed by the type `statfs` reports) plus the measured clock resolution; watcher coalescing
 window = measured p50 inter-arrival of event bursts; descriptor budget for large-class copy-ups =
 `RLIMIT_NOFILE` (or the Windows handle budget) minus the daemon's measured steady-state use,
-divided by the measured number of concurrently open large-class files.
+divided by the measured number of concurrently open large-class files; the daemon first raises its soft
+`RLIMIT_NOFILE` to min(hard limit, the platform's cap) at its start (A-837).
 
 **Worked example.** `cargo build` in a clone creates 190k files under `target/`: each create
 touches its directory (mostly current-epoch nodes, mutated in place after the first touch), the
@@ -15496,6 +15497,11 @@ and export by landing).
 > already are read through, each held to the repository's revision properties (a stream that differs is refused
 > `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
 > session reads a revision the register has not committed.
+>
+> **Status (2026-11-21, A-835).** A recorded batch is applied to its green a slice a turn under the shard's quantum
+> (`push::RecordedBatch`, `repository.import_batch.apply_slices`), the landing turn and the import's read gate held to
+> the last slice; a kill between slices recovers from the batch's record. A recovered Subversion green folds to its
+> readers' floor, as a landing does.
 >
 > **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
 > revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
@@ -55920,9 +55926,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
   (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
   keepalive, the pack whole after it).
-- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
-  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
-  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+- **The SSH edge** (2026-11-21, same day): `vcs_ssh::git`'s upload session writes it the same way, after git's own
+  interval (`GIT_KEEPALIVE_NS`; `ToolServices::with_git_keepalive` gives a site another). Red on main 1a35ab091:
+  `vcs_ssh::tests::receive::a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`,
+  the section's second packet the pack's first; green after.
+- **Owed.** A fetch's wait before its sections (the A-718 encode and A-614's derivations in `body_end`, the SSH
+  session's encode before its advertisement) has no packet git allows there under side-band-64k alone (a band-2
+  progress packet needs `sideband-all`), so it stays silent.
 
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
@@ -58127,6 +58137,18 @@ with a peer still mapping them; BENCHMARKS "Content give-back per platform").
 - Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
   still only leave the footprint.
 
+### A-839 — On macOS a shard's content slice reserves nothing for its arena (2026-11-21, w-sizing; the sweep's conversions, largest first; A-789)
+Applied in the same change to: `crates/server/src/config.rs` (`shard_content_layout`: the stride ends where the arena's
+range would begin on macOS), the test `the_content_object_reserves_nothing_for_the_arena_on_macos`, GAPS.
+
+Status: built 2026-11-21, macOS.
+- Why: since A-789 every pool extent on macOS is an object of its own, so the arena's range in the content object was
+  address space nothing mapped: `reserve_per_shard` a shard, a third of the machine's memory over its shards.
+- Measured (big Studio): a one-shard daemon's content object reserved 139,264 MiB before and 106,496 after.
+- The layout's `arena` still names the arena's capacity, which the pool cuts into its parts. Linux keeps the range (its
+  extents are ranges of one memfd, holes punched), and so does Windows, whose extents are ranges of the object when no
+  anchor holds their sections.
+
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
 (`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
@@ -59615,9 +59637,26 @@ Applied in the same change to:
   5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
   equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
   wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
-- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
-  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
-  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **(b), built after (main's 05:00 order):** `Green::mark_dirty` takes a file key's entry out of the sum when a commit
+  first changes it, on a green with no copy record (a copy's entry may stand for the entries it brought, A-586; such a
+  green keeps the whole move); the fold then adds the head's entry and gives back what a copy since gave it
+  (`identity_out`), so it hashes current bytes once and reads no history. Counted `identities_taken_at_change`; the
+  identity oracle (partial folds) asserts it moved, and fails with an entry marked out but not taken out.
+- **A bug in the part above, fixed with (b):** `copy_checkpoint::sum_at` moved every dirty key from `identity_version`, so
+  a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
+  mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
+  first). Each key now moves from `identity_since`, its own folded-at version.
+- **A key sliced inside itself (main's 05:00 order):** the paced fold's unit is a slice of the shard's measured BLAKE3
+  rate within its quantum (`archive_slice_bytes_within`), not a key: `Green::fold_identity_slice(bytes)` folds keys whole
+  while each fits, and a file taken out at its change and larger than what is left is hashed a slice a call
+  (`Entry::open_field` / `piece`: the same entry), nothing of it in the sum until whole. A change to the file, or any
+  copy, while it is part hashed begins it again; a whole fold drops it. Counted `identity_slices_within_a_key`. Test:
+  `a_large_files_entry_is_hashed_a_slice_a_call_and_begun_again_if_it_changes` (1 MiB at 64 KiB, red when a change is
+  ignored); the identity oracle folds a few bytes at random steps too (its histories rarely change a file mid-hash, so
+  the named test holds that rule).
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
+  step (~43 ms: build, encode, a 49 MB record) sliced; w-git's member loop in turns on `fold_identity_step` /
+  `fold_identity_slice`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
@@ -60012,6 +60051,40 @@ Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishmen
   request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
 - Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
   increment a refused verdict leaves is released at the next fold or restart.
+
+### A-835 — A recorded import batch is applied to its green a slice a turn; a recovered Subversion green folds to its readers (2026-11-21, w-svn; main's ruling of 12:43 PST on the A-822 watchdog kills, (b) and (c); A-814, A-822, A-820, §4.3 step budget)
+Applied in the same change to:
+- `crates/server/src/repository/push.rs`: `append_versions` records the batch and returns a `RecordedBatch`;
+  `RecordedBatch::apply_slice` applies its versions until the shard's step budget is spent, at least one, counted
+  `repository.import_batch.apply_slices`, and settles the green's retention and checkpoints its chain after the last.
+- `crates/server/src/import_batch.rs`: `ImportBatch::commit` returns the `RecordedBatch` (A-814's module, w-rewrite-ops';
+  `inbox/w-rewrite-ops-from-w-svn-a814-sliced-commit.md` says what moved).
+- `crates/server/src/repository/svn_commit/staging.rs`: `Staging::land` applies the recorded batch a slice a turn, a
+  yield between, holding the landing turn; then counts the flush, folds and lets go of the batch's holds.
+- `crates/server/src/vcs_store.rs`: `remake_greens` folds a recovered Subversion green to its live readers' floor
+  (`svn_commit::fold_to_readers`), as a landing does.
+
+- **Why.** Main's git-2000 run over A-822 (base 67fa7f75a) had the watchdog kill the anchor twice, "stuck in task
+  spawned at `repository/import.rs:235`": the batch's commit applied every version of the batch in one step, 2,000 for
+  git-2000, past the shard's 1 s liveness window (§4.3: a user-scaled loop is sliced). Its heap held 434 MB under
+  `GreenReplay::step -> Green::apply_recorded`: the recovery replayed the green's whole history and nothing folded it,
+  where a landing folds to the readers after each batch (A-820).
+- **What.** The batch's record holds every version, so the apply after it is a recovery's replay done early: a kill
+  between slices recovers from the record to the batch's last version. The apply runs in slices under the shard's
+  quantum. Nothing reads the green before the last slice: a Subversion repository serves no session while it imports
+  (A-822), and the import holds the repository's landing turn through the last slice. After a recovery's replay the
+  green folds to its readers' floor.
+- **Evidence.** `t_c2c_a_large_batch_is_applied_a_slice_at_a_time`: 400 revisions in one batch, the shard's own
+  quantum; the apply takes more than one slice. With the slice's deadline taken out (the apply one loop, as before) it
+  fails: "the batch's apply took 1 slice(s)".
+  `a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_history`: a 13-revision batch, 3 versions
+  a slice, killed at every slice boundary (0 to 4), the daemon restarted over the same store; the recovered green
+  folded to its head, the same dump resumed after the batch (`Ok((0, 13))`) and the export byte-identical to the dump.
+  Without the fold at recovery it fails: "killed at 0: recovered and folded", `Some((0, 13))` against
+  `Some((13, 13))`.
+- **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
+  is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
+  release of the batch's texts) are one step each, scaled by the batch's paths.
 
 ### A-836 — A ref may name any object: a tag chain peeled to its end, a ref naming a blob holding no files (2026-11-21, w-git; main's order from w-interop's A/B of record r16; §4.17.1 item 6, §4.17.2; A-654)
 Applied in the same change to:

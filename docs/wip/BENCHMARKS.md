@@ -17842,6 +17842,52 @@ rejected the same day, what remains of the owner asks after A-817 is one ask a v
 each verdict, each work's first edit of a file, and a creation's admission and name.
 
 
+## 2026-11-21 — A conflicting rebase that carries the head's bytes over its windows: measured and rejected on the owner asks (w-fed-move, goal 86b)
+
+The idea: when a rebase conflicts, its reply carries the head's bytes over each window, taken at the head the owner
+judged. The client then writes them and rebases again with no version read and no window read. Before this, the client
+spent four or more requests between a conflict and its next rebase: the version, then a read and an edit for each
+window. Now it spends an edit for each window and nothing else. The hope was that the shorter gap would cut the 77% of
+rebases that conflict again, and with them the rebase-kind owner asks (20.1 a client at 10 hot files).
+- **Built.** `Rebased` gained an appended `heads` field, filled at the owner from the engine's head
+  (`head_window_bytes`). The work's shard carried the bytes only when every carried window's bytes fit in the reply.
+  A daemon test went red first (`rebase_conflict_part`: one head's bytes a window, equal to the winner's bytes). The
+  harness wrote the carried bytes and rebased at once; `--read-heads` kept the read path as the other arm.
+- **Kept as:** `~/slates-work/w-fed-move-rebase-heads-rejected.patch` (w-fed-move's machine; 279 lines).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`,
+  no think time. Three pairs at each hot-file count, each pair back to back, main eef868f80, this Mac Studio (32 CPUs)
+  under other agents' load (load average 7 to 10). Oracle and own-file failures were 0 and starved clients 0 in all 24
+  runs. Each cell gives the three runs.
+
+| hot files | arm | rebase-kind asks a client | asks a client | window reads a client | rebase conflicts | verdicts/s |
+|---|---|---|---|---|---|---|
+| 300 | read | 1.9, 2.0, 1.9 | 11.0, 11.1, 11.0 | 5.0, 5.2, 4.9 | 586, 614, 465 | 4,145, 4,353, 4,040 |
+| 300 | carry | 1.9, 1.9, 1.9 | 11.0, 11.1, 11.0 | 3.8, 3.9, 3.9 | 514, 509, 489 | 4,075, 4,099, 4,214 |
+| 100 | read | 3.8, 3.3, 3.2 | 13.3, 12.8, 12.7 | 9.7, 8.5, 8.1 | 1,974, 1,567, 1,372 | 4,064, 3,834, 3,701 |
+| 100 | carry | 3.7, 3.3, 3.1 | 13.2, 12.8, 12.6 | 4.9, 5.1, 5.1 | 1,921, 1,431, 1,276 | 4,219, 3,921, 3,958 |
+| 30 | read | 9.0, 8.5, 8.7 | 19.6, 19.1, 19.4 | 23.7, 22.5, 22.9 | 6,052, 5,632, 5,726 | 3,069, 3,301, 3,258 |
+| 30 | carry | 9.2, 8.2, 8.1 | 19.9, 18.9, 18.8 | 8.3, 8.3, 8.5 | 6,167, 5,207, 5,037 | 3,751, 3,579, 3,486 |
+| 10 | read | 20.4, 19.7, 19.3 | 32.7, 31.9, 31.3 | 56.3, 53.9, 53.2 | 15,648, 15,062, 15,051 | 2,633, 2,628, 2,250 |
+| 10 | carry | 19.8, 20.5, 20.1 | 32.2, 33.0, 32.4 | 13.3, 13.3, 12.9 | 14,985, 15,596, 15,433 | 3,323, 3,104, 2,791 |
+
+- **Why rejected.** The owner asks are even at every hot-file count, the rebase-kind ones included (20.4, 19.7 and
+  19.3 against 19.8, 20.5 and 20.1 at 10 hot files). So are the repeat conflicts. The window reads fell 76% at 10 hot
+  files (about 54 to 13 a client), but a window read is answered by the replica the client reads at, not asked of the
+  owner. Verdicts a second rose 17% to 26% at 10 and 30 hot files in every pair, but they were measured on a shared,
+  loaded machine and are not read as a result. A ruling never overrides an even A/B.
+- **Why the gap does not matter here.** The loop is closed: 529 requests are in flight and a request takes about 9 ms
+  (56,901 replies a second). In the two requests the carried bytes save, about 3,300 verdicts a second land some 50
+  verdicts (about 120 over the read path's four requests). At 10 hot files each verdict touches four slots, so a
+  client's slots not yet resolved are almost surely hit in either gap. The repeat rate is saturated, and only a
+  resolution with no gap moves it: the resolution judged at the head took the rebase conflicts from 16,035 to 584 (the
+  record above), but it spent two asks a resolution. The named repeats show it: one client met
+  `bpf/sysfs_btf.c@0+64` on one rebase and `trace/bpf_trace.c@0+64` on the next, both its own slots, both still based
+  at version 0.
+- **What would cut them** (unbuilt; for main's ruling): one ask a resolution with no gap. The conflicting reply would
+  carry the check's stamp, so `ResolveMerge` (discarding the work's operations on its windows, its own slots written
+  again as the replacement) could follow without `CheckMerge`. At 10 hot files that is at most about 6.6 rebase-kind
+  asks a client, from the resolution at the head's 13.2 over two asks.
+
 ## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
 
 w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read

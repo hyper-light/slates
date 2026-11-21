@@ -416,17 +416,29 @@ pub(crate) struct ToolServices<L, H, S> {
   shard: S,
   /// The bytes each Mercurial request may hold: the edge's room.
   room: u64,
+  /// How long a fetch's answer may write nothing before git's keepalive is written (`super::git`'s module doc).
+  git_keepalive_ns: u64,
 }
 
 impl<L, H, S> ToolServices<L, H, S> {
   /// The services over `lender`'s git stores, `hg`'s Mercurial stores and the state `shard` lends, each Mercurial
-  /// request admitted `room` bytes.
+  /// request admitted `room` bytes, git's keepalive written after git's own interval of a silent fetch answer
+  /// ([`crate::config::GIT_KEEPALIVE_NS`]).
   pub(crate) fn new(lender: L, hg: H, shard: S, room: u64) -> Self {
     Self {
       lender,
       hg,
       shard,
       room,
+      git_keepalive_ns: crate::config::GIT_KEEPALIVE_NS,
+    }
+  }
+
+  /// These services, git's keepalive written after `keepalive_ns` of a silent fetch answer.
+  pub(crate) fn with_git_keepalive(self, keepalive_ns: u64) -> Self {
+    Self {
+      git_keepalive_ns: keepalive_ns,
+      ..self
     }
   }
 }
@@ -447,7 +459,7 @@ where
           self.lender.clone(),
           (repository.id, start.principal.clone()),
           version,
-          self.room,
+          (self.room, self.git_keepalive_ns),
         )))
       }
       (Service::GitReceivePack, Some(repository)) => {
