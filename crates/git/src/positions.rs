@@ -241,6 +241,53 @@ impl Positions {
     }
   }
 
+  /// Copies into this set the window of `source`'s kept units from unit `at`, `count` at most: its runs, listed
+  /// positions or table words, whichever its form keeps, read from `at` on and none before (A-745 item 4: a reader takes
+  /// a plan a window a turn, so a turn's work is its window, never the plan). This set is taken as empty when `at` is 0
+  /// and as the windows before otherwise, so once the last window is copied it is equal to `source`, in its form. The
+  /// unit after the window, or `None` once the last is copied; and the units read.
+  pub(crate) fn copy_window(
+    &mut self,
+    source: &Positions,
+    at: usize,
+    count: usize,
+  ) -> (Option<usize>, usize) {
+    /// The units of `units` from `at`, `count` at most, and the unit after them unless they end the slice.
+    fn window<T>(units: &[T], at: usize, count: usize) -> (&[T], Option<usize>) {
+      let end = at.saturating_add(count).min(units.len());
+      let taken = units.get(at..end).unwrap_or_default();
+      (taken, (end < units.len()).then_some(end))
+    }
+    if at == 0 {
+      self.form = match &source.form {
+        Form::Runs(_) => Form::Runs(Vec::new()),
+        Form::List(_) => Form::List(Vec::new()),
+        Form::Bits { start, .. } => Form::Bits {
+          start: *start,
+          words: Vec::new(),
+        },
+      };
+    }
+    match (&source.form, &mut self.form) {
+      (Form::Runs(theirs), Form::Runs(mine)) => {
+        let (taken, next) = window(theirs, at, count);
+        mine.extend_from_slice(taken);
+        (next, taken.len())
+      }
+      (Form::List(theirs), Form::List(mine)) => {
+        let (taken, next) = window(theirs, at, count);
+        mine.extend_from_slice(taken);
+        (next, taken.len())
+      }
+      (Form::Bits { words: theirs, .. }, Form::Bits { words: mine, .. }) => {
+        let (taken, next) = window(theirs, at, count);
+        mine.extend_from_slice(taken);
+        (next, taken.len())
+      }
+      _ => (None, 0),
+    }
+  }
+
   /// The set kept as `runs`, or `None` unless each is non-empty and they ascend with a gap between each two: the one
   /// way a set is encoded, so a decoded set is equal to the set encoded and to no other.
   pub(crate) fn from_runs(runs: Vec<(u64, u64)>) -> Option<Positions> {
@@ -584,6 +631,36 @@ mod tests {
         prop_assert_eq!(mine.contains(probe), model_mine.contains(&probe));
         prop_assert_eq!(mine.next_from(probe), model_mine.range(probe..).next().copied());
       }
+    }
+
+    /// A-745 item 4 (a reader takes a plan a window a turn). Do: draw a set, dense or scattered (all three forms met),
+    /// made whole or by inserts, and copy it a window of a drawn size at a time from unit 0, each window from where the
+    /// last ended. Expect: each window reads at most its size; the copy, once the last window is read, equal to the set.
+    #[test]
+    fn a745_a_set_copied_a_window_at_a_time_is_the_set(
+      steps in proptest::collection::vec((0u64..4, 1u64..400), 0..200),
+      inserted in any::<bool>(),
+      count in 1usize..40,
+    ) {
+      let mut at = 0u64;
+      let positions: Vec<u64> = steps
+        .iter()
+        .flat_map(|&(run, gap)| {
+          at += gap;
+          let from = at;
+          at += run;
+          from..=from + run
+        })
+        .collect();
+      let set = built(&positions, inserted);
+      let mut copy = Positions::new();
+      let mut next = Some(0);
+      while let Some(from) = next {
+        let (after, read) = copy.copy_window(&set, from, count);
+        prop_assert!(read <= count);
+        next = after;
+      }
+      prop_assert_eq!(copy, set);
     }
   }
 
