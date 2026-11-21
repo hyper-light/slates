@@ -431,8 +431,6 @@ pub(crate) struct SvnStore {
 pub(crate) enum ReplayRefused {
   /// A record's bytes.
   Record(RecordRefused),
-  /// An object's bytes are not the content its record names.
-  Identity,
   /// The admission made another record than the one the log holds: the recomputation differs (§4.16).
   Diverged,
   /// The store refused what it took before.
@@ -507,8 +505,7 @@ pub(crate) enum GitRefused {
 /// store cannot read, as its own refusal names it; a pack not made or a room refused, the record's room.
 fn unwritten(refused: WriteRefused) -> GitRefused {
   match refused {
-    WriteRefused::Unreadable { id } => GitRefused::Store(StoreRefused::Unreadable { id }),
-    WriteRefused::Whole(_) | WriteRefused::Allocation => GitRefused::Allocation,
+    WriteRefused::Allocation => GitRefused::Allocation,
   }
 }
 
@@ -930,6 +927,40 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
     state.count(RELEASE_REFUSED, 1);
   }
   settle(state);
+}
+
+/// Lets go of the holds repository `id`'s git records keep of the names and the packs they name (version 5, A-767 C5;
+/// A-824): each record holds one of each, taken when it was written (`put_names`, `hold_for_record`) or replayed. The
+/// records' own, so never [`free`]'s, which a rebuild runs before it replays the same records: what a repository's
+/// destroy lets go of with its records (the destroy verb is owed, GAPS A-662), done by a test meanwhile. Nothing for a
+/// repository of another tool, or one whose store is not held here.
+#[cfg(test)]
+pub(crate) fn release_record_holds(state: &mut ShardState, id: RepositoryId) {
+  let Some(format) = state
+    .vcs_stores
+    .git_ref(id)
+    .map(|(_, git)| git.repository.format())
+  else {
+    return;
+  };
+  let named: Vec<slates_vcs::ContentId> = state
+    .db
+    .partition()
+    .repositories()
+    .objects(id)
+    .filter(|bytes| !owed::is_owed(bytes) && !lfs_record::is_lfs(bytes))
+    .filter_map(|bytes| Record::decode(bytes, format).ok())
+    .flat_map(|record| {
+      record
+        .named
+        .into_iter()
+        .chain(record.packed)
+        .map(|(identity, _)| identity)
+    })
+    .collect();
+  for identity in named {
+    release_names(state, &identity);
+  }
 }
 
 /// Trues the shard's charge for repository `id`'s entries' objects up to what the partition's register holds of them
@@ -2246,7 +2277,7 @@ fn replay_push(
   content: &mut ContentStore,
   store: &mut GitStore,
   push: &mut Push,
-  record: &Record<'_>,
+  record: &Record,
 ) -> Result<u64, ReplayRefused> {
   push.carried(record.deepest);
   // A version-4 record's names and pack (A-724 piece 8c; A-722's record v4): read by their identity before anything is
@@ -2279,31 +2310,21 @@ fn replay_push(
 }
 
 /// Whether the objects the replay's admission would record now, by the predicate the live append wrote its record by
-/// ([`SealedPush::names_now`]), are the record's, by type, content identity and length: in order for a version-1 record, whose
-/// objects are admitted in its order; as sets for a pack's ([`names_alike`]). Each identity was checked
-/// against the record's bytes before the object was admitted, so this compares the record written again without
-/// copying its bytes: a recomputation that differs is refused (§4.16).
+/// ([`SealedPush::names_now`]), are the names the record's content holds, by type, content identity and length, as sets
+/// ([`names_alike`]); none where it names none. This compares the record written again without copying its bytes: a
+/// recomputation that differs is refused (§4.16).
 fn recorded_alike(
   content: &ContentStore,
   store: &GitStore,
   remade: &RecordWriter,
-  record: &Record<'_>,
+  record: &Record,
 ) -> bool {
   if let Some((identity, count)) = record.named {
     return record_names::names_from_content(content, &identity, count)
       .is_ok_and(|names| names_alike(content, store, remade, &names));
   }
-  if record.objects.is_empty() {
-    return names_alike(content, store, remade, &record.names);
-  }
-  let admitted = remade
-    .lacked(lacks(content, store))
-    .map(|noted| (noted.kind, noted.identity, noted.len));
-  let recorded = record.objects.iter().map(|object| {
-    let len = u64::try_from(object.content.len()).unwrap_or(u64::MAX);
-    (object.kind, object.identity, len)
-  });
-  admitted.eq(recorded)
+  // A record that names none: the replay must admit nothing the repository lacks either.
+  names_alike(content, store, remade, &[])
 }
 
 /// Whether the objects the replay's admission would record now are `names`, a pack record's ([`recorded_alike`]), as
@@ -2339,7 +2360,7 @@ fn replay_objects(
   content: &mut ContentStore,
   store: &GitStore,
   (push, remade): (&mut Push, &mut RecordWriter),
-  record: &Record<'_>,
+  record: &Record,
 ) -> Result<(), ReplayRefused> {
   if let Some((identity, len)) = record.packed {
     // A version-4 record's pack is read from the store by its identity (A-722's record v4).
@@ -2350,26 +2371,11 @@ fn replay_objects(
       ))?;
     return replay_pack(content, store, (push, remade), &pack);
   }
-  if !record.pack.is_empty() {
-    return replay_pack(content, store, (push, remade), record.pack);
-  }
-  for object in &record.objects {
-    if content.object_id(object.content) != object.identity {
-      return Err(ReplayRefused::Identity);
-    }
-    let incoming = Incoming {
-      kind: object.kind,
-      claimed: None,
-      content: object.content,
-      depth: record.deepest,
-    };
-    admit_object(content, store, (&mut *push, &mut *remade), (incoming, None))
-      .map_err(ReplayRefused::Git)?;
-  }
+  // A record that names no pack brought no object.
   Ok(())
 }
 
-/// Admits a version-2 record's objects (A-723): its pack read through git's own reader, a reference delta's base from the
+/// Admits a record's objects (A-723, version 5): its pack read through git's own reader, a reference delta's base from the
 /// pack or the store, within the room the content store has left; then each object admitted as a live push admits it,
 /// at its place in its chain. The names the record holds are compared after ([`recorded_alike`]), so a pack that makes
 /// other objects than the live push recorded is refused.
@@ -4011,7 +4017,7 @@ fn git_turn_in(
   };
   let turn = git_replay::Turn { deadline_ns, chunk };
   let mut now = slates_rt::futures::now_ns;
-  replay.step((content, store), bytes, (turn, &mut now))
+  replay.step((content, store), (turn, &mut now))
 }
 
 /// Counter: the turns a Subversion revision record's replay took (R4 of Ada's close list), each its rows' texts kept until

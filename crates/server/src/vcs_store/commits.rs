@@ -1034,6 +1034,17 @@ pub(crate) struct MadeAfter {
   driving: bool,
 }
 
+impl Drop for MadeAfter {
+  /// The stores holding the queue are being let go with the shard's state, the landing gates its turns came from with
+  /// them: a turn still queued is forgotten, never handed back, since handing it back reaches for that state while it
+  /// is dropped (a thread-local's drop that reaches itself aborts the process).
+  fn drop(&mut self) {
+    for (_, turn) in self.jobs.drain(..) {
+      std::mem::forget(turn);
+    }
+  }
+}
+
 impl std::fmt::Debug for MadeAfter {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     formatter
