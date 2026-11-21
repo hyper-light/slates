@@ -78,3 +78,22 @@
 - Still waiting on your ruling: may I home the pack as content before the append? The entry's apply, 19 ms, is now the
   longest step of a v1.5.0 push. Until you answer, I'll take the next memory item in my area: `upload` / clone answers
   reading the store's objects (I'll check for whole-object copies first) unless you redirect me.
+
+## 2026-11-20 ~17:00 — order 1 done: the partial clone regression fixed (w-git)
+- **LANDED 7b66e7225.**
+- **Cause, from a `sample` of the daemon during the partial clone:** since p3 each landing's rows are sealed tables,
+  so a row read searches every run. The `blob:none` walk read two rows an object for its type, and two more a blob for
+  a size `blob:none` never uses.
+- **Fix:**
+  - A blob's size is read only where the filter reads sizes (`Filter::reads_size`).
+  - A type comes from its landing's runs by type (`Repository::kind_at`, from staging's per-type runs), with no row read.
+- **Red first:** 40 sizes asked under `blob:none` before, 0 now; 24 index visits for 12 kinds before, 0 now.
+- **By use** (release, w-perf's git_scale.sh on cut-1.0, ten partial clones against one daemon):
+  - daemon CPU: 700-760 ms before, 250-360 ms now
+  - wall: 0.96-1.05 s before, 0.49-0.63 s now, under the pre-p3 0.62-0.72 s
+- Order 3 (the store commit's 14 ms) was already done today: 15917f29a and ccd07b58c took it to 0.63 ms.
+- **Order 2 (v4) started.** The interface is in inbox/w-store-from-w-git-v4-payload-2026-11-20.md. "Content once"
+  makes landed rows name pack places (B3/B4), so v4 is two parts that must land together, the payload homing and rows
+  by place. It's a multi-landing piece; I'll report each part.
+- The older messages that surfaced on my restart (10:00 restart crash loop, A-713 fetch streaming): the crash loop was
+  addressed by this morning's replay in turns. A-713 is queued after v4 unless you say otherwise.
