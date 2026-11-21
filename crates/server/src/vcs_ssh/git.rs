@@ -218,9 +218,9 @@ impl<L: StoreLender> UploadCommand<L> {
     }
     .ok_or_else(unheld)?;
     let now = slates_rt::futures::now_ns();
-    if out.len() > before {
-      *last_written_ns = now;
-    } else if now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out) {
+    if out.len() > before
+      || (now.saturating_sub(*last_written_ns) >= *keepalive_ns && made.write_keepalive(out))
+    {
       *last_written_ns = now;
     }
     if written == Written::More {

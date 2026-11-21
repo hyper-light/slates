@@ -60085,6 +60085,14 @@ Applied in the same change to:
 - **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
   is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
   release of the batch's texts) are one step each, scaled by the batch's paths.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today, now a chunk a
+  call).
+- **Status (2026-11-21, w-shared): the owner's step halved.** The owner no longer encodes and hashes again an increment
+  it holds by identity (`SealedWork::held`, `merge_service::increment_already_held`, its hold given back on a refused
+  verdict), and the fetched increment reaches the owner shard a chunk a call (`verbs::move_increment`). Release A/B,
+  Mac Studio, load 2-4, 5 rounds (kiln r2, 1a35ab0 vs 0deb19a): owner step 256 MiB 256-267 to 136-144 ms, 320 MiB
+  327-353 to 168-203 ms, 512 MiB 502-594 to 270-299 ms; the late beat 0.52-0.85 s in every 320 and 512 MiB run before,
+  none after; wall 512 MiB 1.98-2.06 to 1.46-1.57 s.
 
 ### A-836 — A ref may name any object: a tag chain peeled to its end, a ref naming a blob holding no files (2026-11-21, w-git; main's order from w-interop's A/B of record r16; §4.17.1 item 6, §4.17.2; A-654)
 Applied in the same change to:

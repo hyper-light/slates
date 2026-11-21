@@ -938,7 +938,7 @@ fn a_batch_killed_between_its_commits_slices_recovers_and_resumes_to_the_same_hi
         std::time::Instant::now() < deadline,
         "the kill at {kill_at} never fired"
       );
-      std::thread::sleep(std::time::Duration::from_millis(5));
+      std::thread::yield_now();
     }
     daemon.stop();
     store.restart_owner();

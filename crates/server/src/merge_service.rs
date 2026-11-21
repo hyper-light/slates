@@ -2547,6 +2547,28 @@ pub(crate) fn hold_increment(
   }
 }
 
+/// [`hold_increment`] for an increment this shard's content store already holds under `inputs` (lane (A) 3b: fetched
+/// from the holder that composed it before its verb ran), nothing copied or hashed again: `fresh`, so a refused verdict
+/// gives it back unless an entry names it (`release_refused_increment` checks). Not held any more (released since):
+/// `Overloaded`, nothing started, and the holder's retry fetches it again.
+pub(crate) fn increment_already_held(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  inputs: slates_merge::chain_entry::Inputs,
+) -> Result<HeldIncrement, Refusal> {
+  if !state
+    .held_content
+    .holds_manifest(ObjectId(green.bytes), &inputs.identity)
+  {
+    return Err(Refusal::Overloaded { shard: state.shard });
+  }
+  state.count(INPUTS_HELD_BY_OWNER, 1);
+  Ok(HeldIncrement {
+    inputs,
+    fresh: true,
+  })
+}
+
 /// Gives back a refused verdict's increment ([`hold_increment`]) when its hold stored it and no chain entry names it.
 pub(crate) fn release_refused_increment(
   state: &mut ShardState,
