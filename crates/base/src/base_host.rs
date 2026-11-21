@@ -24,6 +24,9 @@ pub enum BaseHost {
   Disk(OsHost),
   /// The objects under an S3 base's prefix, read through the shard's fetches.
   S3(Box<S3Host>),
+  /// A tree the shard holds (a mounted work's green version, A-774), read only through a lend of the tree with the host
+  /// (`TreeHost::lend`); lent alone, it refuses every read.
+  Tree(Box<slates_vfs::host::tree::TreeHost>),
 }
 
 impl BaseHost {
@@ -31,7 +34,7 @@ impl BaseHost {
   pub fn as_disk(&self) -> Option<&OsHost> {
     match self {
       BaseHost::Disk(host) => Some(host),
-      BaseHost::S3(_) => None,
+      BaseHost::S3(_) | BaseHost::Tree(_) => None,
     }
   }
 
@@ -45,7 +48,7 @@ impl BaseHost {
   /// The S3 host, when the base is an S3 base's objects.
   pub fn as_s3_mut(&mut self) -> Option<&mut S3Host> {
     match self {
-      BaseHost::Disk(_) => None,
+      BaseHost::Disk(_) | BaseHost::Tree(_) => None,
       BaseHost::S3(host) => Some(host),
     }
   }
@@ -54,7 +57,7 @@ impl BaseHost {
   pub fn into_disk(self) -> Result<OsHost, BaseHost> {
     match self {
       BaseHost::Disk(host) => Ok(host),
-      s3 @ BaseHost::S3(_) => Err(s3),
+      other @ (BaseHost::S3(_) | BaseHost::Tree(_)) => Err(other),
     }
   }
 
@@ -63,6 +66,7 @@ impl BaseHost {
     match self {
       BaseHost::Disk(host) => host,
       BaseHost::S3(host) => host.as_mut(),
+      BaseHost::Tree(host) => host.as_mut(),
     }
   }
 }

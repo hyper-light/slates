@@ -176,7 +176,7 @@ fn fifo_node() -> SpecialNode {
 pub(super) fn accept(green: &mut Green, work: Work, id: u64) -> Result<(), String> {
   let head = green.head();
   match green.submit(&work.at(head, id)) {
-    Outcome::Accepted { version } if version == head + 1 => Ok(()),
+    Outcome::Accepted { version } | Outcome::Identical { version } if version == head + 1 => Ok(()),
     other => Err(format!("a setup work was answered {other:?}")),
   }
 }
@@ -381,7 +381,7 @@ impl History {
   fn submit(&mut self, work: Work, base: u64) -> Outcome {
     self.works += 1;
     let answer = self.green.submit(&work.at(base, self.works));
-    if let Outcome::Accepted { version } = answer {
+    if let Outcome::Accepted { version } | Outcome::Identical { version } = answer {
       let now = History::stands(&self.green);
       let before = self.standing.last().copied().unwrap_or_default();
       for (index, (was, is)) in before.iter().zip(now).enumerate() {
@@ -454,7 +454,7 @@ impl History {
         "{path} {how:?} from {base}: {answer:?}"
       );
       census.count(path, how);
-    } else if matches!(answer, Outcome::Accepted { .. }) {
+    } else if matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }) {
       census.accepted += 1;
     }
     Ok(())
@@ -752,7 +752,9 @@ fn a_hard_link_to_a_target_removed_after_its_base_conflicts() -> Result<(), Stri
     .link_made("linked", TARGET);
   let answer = green.submit(&own.at(0, 9));
   let linked = green.hardlink("linked");
-  if !matches!(answer, Outcome::Accepted { .. }) || linked != Some(TARGET) {
+  if !matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. })
+    || linked != Some(TARGET)
+  {
     return Err(format!("its own target: {answer:?}, linked: {linked:?}"));
   }
   Ok(())
@@ -774,7 +776,9 @@ fn a_rename_over_an_unchanged_link_or_ipc_node_replaces_it() -> Result<(), Strin
       let rename = Work::default().naming(OpKind::Rename, destination, source);
       let answer = green.submit(&rename.at(0, 1));
       let found = (kinds_at(&green, destination), kinds_at(&green, source));
-      if !matches!(answer, Outcome::Accepted { .. }) || found != (vec![kind], Vec::new()) {
+      if !matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. })
+        || found != (vec![kind], Vec::new())
+      {
         return Err(format!(
           "{source} over {destination}: {answer:?}, {found:?}"
         ));
@@ -1145,7 +1149,7 @@ impl Whole {
   fn submit(&mut self, work: Work, base: u64) -> Outcome {
     self.works += 1;
     let answer = self.green.submit(&work.at(base, self.works));
-    if matches!(answer, Outcome::Accepted { .. }) {
+    if matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }) {
       let head = self.kinds.last().copied().unwrap_or(ORIGINAL);
       self.kinds.push(head);
       // The version this one follows is final now: its links as the callers left them.
@@ -1224,7 +1228,7 @@ impl Whole {
       return Ok(());
     }
     prop_assert!(
-      matches!(answer, Outcome::Accepted { .. }),
+      matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "making {path} at the head: {answer:?}"
     );
     self.made_now(index, ORIGINAL[index]);
@@ -1245,7 +1249,7 @@ impl Whole {
     let path = PATHS[index];
     let answer = self.submit(removal_of(path, standing), base);
     prop_assert!(
-      matches!(answer, Outcome::Accepted { .. }),
+      matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "removing {path} from {base}: {answer:?}"
     );
     let links = self.links_of(path);
@@ -1272,7 +1276,7 @@ impl Whole {
     let head = self.green.head();
     let answer = self.submit(work, head);
     prop_assert!(
-      matches!(answer, Outcome::Accepted { .. }),
+      matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "changing {path}'s metadata at the head: {answer:?}"
     );
     self.changed[index] = self.green.head();
@@ -1301,7 +1305,7 @@ impl Whole {
       } else {
         let answer = self.submit(removal_of(path, saw), base);
         prop_assert!(
-          matches!(answer, Outcome::Accepted { .. }),
+          matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
           "removing {path} from {base}: {answer:?}"
         );
         Ok(())
@@ -1336,7 +1340,7 @@ impl Whole {
       }
       Ok(home) => {
         prop_assert!(
-          matches!(answer, Outcome::Accepted { .. }),
+          matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
           "linking {name} to {path} from {base}: {answer:?}"
         );
         self.targets.insert(name.clone(), home);
@@ -1406,7 +1410,7 @@ impl Whole {
       return Ok(());
     }
     prop_assert!(
-      matches!(answer, Outcome::Accepted { .. }),
+      matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. }),
       "renaming {from} over {to} from {base}: {answer:?}"
     );
     if same_file {

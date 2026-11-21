@@ -390,7 +390,9 @@ impl History {
       evidence: Vec::new(),
       named: Default::default(),
     };
-    if let Outcome::Accepted { version } = self.green.submit(&increment) {
+    if let Outcome::Accepted { version } | Outcome::Identical { version } =
+      self.green.submit(&increment)
+    {
       prop_assert_eq!(version, self.texts.len() as u64, "versions are dense");
       self
         .texts

@@ -421,10 +421,6 @@ pub struct DaemonConfig {
   /// second. A §4.6 L2 shift is a block copy, so this is what sizes its slice against the shard's live step
   /// quantum ([`DaemonConfig::copy_slice_bytes`]) — the hash rate would be the wrong question for it.
   pub memcpy_bytes_per_second: u64,
-  /// Measured: the boot profile's base-page fault cost in nanoseconds, at least one: what an idle shard's pre-fault of
-  /// its reserve (A-214) slices by, as §4.2's pre-fault batch is `idle window / fault_ns`
-  /// ([`DaemonConfig::prefault_slice_pages`]).
-  pub page_fault_ns: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
   /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
@@ -967,19 +963,6 @@ impl DaemonConfig {
       ["memcpy", "rt.step_budget_ns"]
     );
     derivations.push(note("copy_slice_bytes", &copy_slice_bytes));
-    let page_fault_ns: Derived<u64> = derived!(
-      profile.faults.base_ns.max(1),
-      "the profile's measured base-page fault cost (at least one)",
-      ["faults.base_ns"]
-    );
-    derivations.push(note("page_fault_ns", &page_fault_ns));
-    // The reserve an idle shard keeps pre-faulted (A-214): its bound is known at boot, its burst only at run time.
-    derivations.push(format!(
-      "prefault_reserve_bytes = min(the shard's last write burst, reserve_per_shard = {}, the arena's free bytes): the \
-       free content pages an idle shard keeps pre-faulted; the burst is measured at each idle tick (anchors \
-       [\"reserve_per_shard\", \"content.allocated_bytes\"])",
-      reserve.get()
-    ));
     let git_rates = git_rates();
     derivations.push(format!(
       "git_rates = deflate ns a KiB by level {:?}, delta search {} ns a KiB: measured once a process over a seeded \
@@ -1242,7 +1225,6 @@ impl DaemonConfig {
       blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
       svn_digest_bytes_per_second,
       memcpy_bytes_per_second: memcpy_bytes_per_second.get(),
-      page_fault_ns: page_fault_ns.get(),
       codec,
       git_rates,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
@@ -1688,20 +1670,6 @@ impl DaemonConfig {
   /// `fleet::seal_quantum_ns`): half of it at the machine's measured memcpy rate.
   pub fn copy_slice_bytes_within(&self, quantum_ns: u64) -> u64 {
     copy_slice_bytes(self.memcpy_bytes_per_second, quantum_ns)
-  }
-
-  /// Derived: the pages an idle shard pre-faults in one slice of its reserve's refill now (A-214): its step quantum
-  /// over the measured base-page fault cost, `step_quantum_ns / page_fault_ns`, at least one (§4.2's pre-fault batch,
-  /// "idle window / fault_ns").
-  pub fn prefault_slice_pages(&self) -> usize {
-    usize::try_from(
-      self
-        .step_quantum_ns()
-        .checked_div(self.page_fault_ns.max(1))
-        .unwrap_or(0),
-    )
-    .unwrap_or(usize::MAX)
-    .max(1)
   }
 
   /// Derived: the bytes the calling shard can copy in one whole step quantum now, at the measured memcpy rate

@@ -265,7 +265,18 @@ pub fn land_verb(
   principal: &Principal,
   call: LandCall<'_>,
 ) -> ReplyBody {
-  // A merge volume has no store-backed snapshot to land (§4.16; the extent-backed green is owed).
+  // A green lands its head through its store-backed view (A-774), under the grant any volume's landing takes; a work
+  // lands through its green.
+  let id = crate::verbs::to_db_volume(call.volume);
+  if matches!(
+    crate::merge_service::merge_role(state, id),
+    Some(crate::merge_service::MergeRole::Green { .. })
+  ) {
+    if let Err(refusal) = crate::mounted_work::ensure_green_view(state, id, call.snapshot) {
+      return crate::verbs::refused(refusal);
+    }
+    return land_verb_os(state, client_id, principal, call);
+  }
   if let Some(reply) = crate::merge_service::refuse_store_verb(
     state,
     call.volume,
@@ -2457,6 +2468,7 @@ fn record_refused(state: &mut ShardState, attempt: &Attempt<'_>) -> Result<(), s
         state: ended,
         written,
         conflicts: attempt.conflicts,
+        superseded_by: None,
       },
     }
   };
@@ -2680,12 +2692,29 @@ struct Presenter<'a> {
   signature: Option<&'a [u8]>,
 }
 
-/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
-/// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
+/// The landings awaiting a grant that a new presentation of `volume` into `target` supersedes (A-779): every one of
+/// that volume and target the partition's waiting index holds, unless a landing of the volume is running now. Read
+/// from the index's range for the volume, so it costs that volume's waiting landings.
+fn superseded_by_presentation(state: &ShardState, volume: DbVolumeId, target: &str) -> Vec<u64> {
+  if state.landing.running.contains_key(&volume) {
+    return Vec::new();
+  }
+  state
+    .db
+    .partition()
+    .awaiting_grant_from(std::ops::Bound::Included((volume, 0)))
+    .take_while(|landing| landing.volume == volume)
+    .filter(|landing| landing.target == target)
+    .map(|landing| landing.id)
+    .collect()
+}
+
+/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: one that replaces a
+/// presentation, its client's own (AUD-29-07) or any client's it supersedes (A-779), never does.
 fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
   let replaces = state.landing.awaiting.values().any(|awaiting| {
     awaiting.client == client && awaiting.volume == volume && awaiting.target == target
-  });
+  }) || !superseded_by_presentation(state, volume, target).is_empty();
   !replaces && state.landing.awaiting.len() >= state.config.landings_awaiting_per_shard
 }
 
@@ -2759,10 +2788,17 @@ fn present(
       refusal: slates_ipc::protocol::TargetRefusal::TooLong { longest },
     });
   }
-  // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
-  // longer grantable (AUD-29-07): re-planning costs no room.
-  state.landing.awaiting.retain(|_, awaiting| {
-    !(awaiting.client == client && awaiting.volume == ids.volume && awaiting.target == ids.target)
+  // A presentation of the same volume into the same target, by any client, supersedes every earlier one still
+  // awaiting its grant (A-779, main's ruling 2026-11-20; AUD-29-07 replaced only the same client's): their ids are no
+  // longer grantable, and re-planning costs no room. A landing of the volume running now is left to finish.
+  let superseded = superseded_by_presentation(state, ids.volume, ids.target);
+  // A granted landing's presentation kept for its resume (an aborted run's) is no presentation awaiting a grant, so it
+  // stays; the same client's own re-presentation replaces it as before (AUD-29-07).
+  state.landing.awaiting.retain(|id, awaiting| {
+    !(superseded.contains(id)
+      || (awaiting.client == client
+        && awaiting.volume == ids.volume
+        && awaiting.target == ids.target))
   });
   state.landing.awaiting.insert(
     landing_id,
@@ -2790,6 +2826,7 @@ fn present(
     state: DbLandingState::AwaitingGrant,
     written: 0,
     conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   let planned = DbAuditRecord {
     seq: 0,
@@ -2808,6 +2845,15 @@ fn present(
     .and_then(|_| write_audit(state, vec![planned], now))
   {
     return refused(crate::error::refusal_of_db(&e));
+  }
+  for older in superseded {
+    let op = Op::LandingSuperseded {
+      id: older,
+      by: landing_id,
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+      return refused(crate::error::refusal_of_db(&e));
+    }
   }
   // The presentation is recorded, so its reply must always fit (A-267): the conflicts one reply holds beside the
   // summary, the rest counted; every entry, its conflict among it, is read a page at a time (`LandingEntries`).
@@ -2909,6 +2955,7 @@ fn finish(
     state: db_state,
     written: u32::try_from(report.written).unwrap_or(u32::MAX),
     conflicts: u32::try_from(report.conflicts).unwrap_or(u32::MAX),
+    superseded_by: None,
   };
   // A landing under a fresh id is recorded; one under its presentation's id moves that presentation's
   // record out of `AwaitingGrant` (AUD-29-07), its grant named by the audit records that follow.
@@ -3268,6 +3315,16 @@ pub fn grant_verb(
     return crate::verbs::forbidden("grant");
   }
   let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
+    // A presentation a newer one superseded is refused by kind, naming the newer (A-779): an older state never lands
+    // over a newer one.
+    if let Some(newer) = state
+      .db
+      .partition()
+      .landing(landing_id)
+      .and_then(|landing| landing.superseded_by)
+    {
+      return crate::verbs::refused(Refusal::LandingSuperseded { newer });
+    }
     return crate::verbs::refused(Refusal::NotFound);
   };
   if !proven_by_launcher(
@@ -4246,6 +4303,7 @@ fn wire_landing_stage(state: DbLandingState) -> slates_ipc::protocol::LandingSta
     DbLandingState::Partial => Stage::Partial,
     DbLandingState::Refused => Stage::Refused,
     DbLandingState::Aborted => Stage::Aborted,
+    DbLandingState::Superseded => Stage::Superseded,
   }
 }
 
@@ -4261,6 +4319,7 @@ fn landing_state_name(state: DbLandingState) -> String {
     DbLandingState::Partial => "partial",
     DbLandingState::Refused => "refused",
     DbLandingState::Aborted => "aborted",
+    DbLandingState::Superseded => "superseded",
   }
   .to_owned()
 }

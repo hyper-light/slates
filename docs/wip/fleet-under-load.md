@@ -308,3 +308,13 @@ owner holds; the unavailability is exactly the cost `set_condemnation_cost` want
 (`crates/cluster/src/member_plane.rs`). Detection then runs at its least bound (~0.9–1.84 s on a LAN), fast for
 **every** host size — the caveat (slow detection for large hosts) would appear only if the detector were charged a
 takeover it need not fear. F = 10 s (`FAILOVER_SLO_NS`) stands; the owner lease carries the correctness.
+
+**A budget read once falls behind an estimate the daemon keeps measuring (2026-11-20, w-forming).** A wait on a bound a
+daemon derives from its failover estimate (A-363: a takeover round's promise wait, a materialization's attempts, a
+re-admission) must read its budget again at each look (`poll_for_live_periods` in `crates/server/tests/fleet.rs`): load
+raises the estimate while the wait runs. Measured on Studio-4 (load 35-39, `taskpolicy -b`): one wait of
+`a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again` began with estimates of 16.3 to 19 s (a
+570-period budget) and ended with 24.2 to 92.5 s; the test failed once that way in a loaded fleet run. Red: the
+successor's estimate raised tenfold on the wait's first look failed it every time (153 periods spent, given up false);
+read at each look it gave up at about 530 periods and passed. The eight waits whose budget folds in
+`promise_wait_periods` or `readmission_periods` read it so now.

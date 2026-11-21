@@ -29,11 +29,12 @@ use slates_ipc::protocol::{
   Conformance, CopyCase, CredentialMaterial, DatabaseRefusal, DeleteWhileOpen, DriftKind,
   EditBytes, EntryKind, Established, GrantScope, GrantState, HookPointName, HostAnswer,
   HostPathReason, ImportFault, Intent, IpcNodeKind, KernelCache, LandingDegradation, LandingStage,
-  MoveRefusal, NamePolicy, ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect, PolicyEntry,
-  PolicyNames, PolicyRight, PolicySubject, PolicyWho, Principal, ReadAt, ReadWritePolicy,
-  RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope, SignatureFault, SignerKey,
-  SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal, UnsupportedReason, VcsTool,
-  Verification, VolumeRefusal, WatcherState, WorkOp, WriteAct, WriteMode,
+  LogLine, MoveRefusal, NamePolicy, ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect,
+  PolicyEntry, PolicyNames, PolicyRight, PolicySubject, PolicyWho, Principal, ReadAt,
+  ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
+  SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal,
+  UnsupportedReason, VcsTool, Verification, VolumeRefusal, WatcherState, WorkMark, WorkOp,
+  WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -70,6 +71,7 @@ fn schemas() -> Vec<&'static str> {
     <KernelCache as Wire>::SCHEMA,
     <LandingDegradation as Wire>::SCHEMA,
     <LandingStage as Wire>::SCHEMA,
+    <LogLine as Wire>::SCHEMA,
     <MoveRefusal as Wire>::SCHEMA,
     <NamePolicy as Wire>::SCHEMA,
     <ObjectFormat as Wire>::SCHEMA,
@@ -101,6 +103,7 @@ fn schemas() -> Vec<&'static str> {
     <Verification as Wire>::SCHEMA,
     <VolumeRefusal as Wire>::SCHEMA,
     <WatcherState as Wire>::SCHEMA,
+    <WorkMark as Wire>::SCHEMA,
     <WorkOp as Wire>::SCHEMA,
     <WriteAct as Wire>::SCHEMA,
     <WriteMode as Wire>::SCHEMA,

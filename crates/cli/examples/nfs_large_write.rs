@@ -8,9 +8,8 @@
 //!
 //! Then, once the idle purge has given the removed rounds' pages back, [`KEPT_ROUNDS`] rounds of the incumbent harness's
 //! pattern: a new [`KEPT_MIB`] MiB file over NFSv4.2, kept, after an idle pause of [`IDLE_PAUSE_NS`], the incumbent harness's
-//! gap. The pause is shorter than the reserve's refill needs (A-214, A-715): a round's write arms a sweep pass an
-//! interval on, which finds the arena busy, and the idle pass that refills comes an interval after that, during the next
-//! round, as it did under the reap tick; so each kept round lands on fresh memory. Rows `nfs_kept_after_idle\t<round>\t<MiB/s>\t<prefaulted bytes so far>\t<purged bytes so far>`.
+//! gap. Each kept round lands on fresh memory: nothing is kept pre-faulted (A-214's reserve removed, w-sizing). Rows
+//! `nfs_kept_after_idle\t<round>\t<MiB/s>\t<purged bytes so far>`.
 //!
 //! Rows are `nfs_large_write\t<v3|v4>\t<round>\t<MiB/s>\t<process cpu ns per MiB>\t<load>`, then per version
 //! `nfs_large_write_best\t<v3|v4>\t<MiB/s>\t<every round's MiB/s>`. The process CPU is the daemon's and the client thread's
@@ -554,8 +553,7 @@ mod unix {
       let rate = KEPT_MIB as f64 / (began.elapsed().as_nanos() as f64 / NS_PER_SECOND);
       kept.push(rate);
       println!(
-        "nfs_kept_after_idle\t{round}\t{rate:.1}\t{}\t{}",
-        counter("content.prefaulted_bytes"),
+        "nfs_kept_after_idle\t{round}\t{rate:.1}\t{}",
         counter("content.purged_bytes")
       );
     }

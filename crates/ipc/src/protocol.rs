@@ -1389,6 +1389,14 @@ pub enum RequestBody {
     /// What the owner judges the write policy, the signature and the commit by.
     carried: ComputedSubmit,
   },
+  /// One page of the session log (`slates log`, A-773): the caller's works, each with the green version it started
+  /// from and how its last submission ended, and the landings presented and awaiting a grant, in key order past
+  /// `after` (`None` begins). A read: a scatter over the shards, each reporting the works and the waiting landings its
+  /// partition holds, never a walk of the landing history. It shows a pending grant and never makes one (R10). Appended.
+  SessionLog {
+    /// The last line of the previous page, or `None` for the first page.
+    after: Option<LogCursor>,
+  },
 }
 
 /// What a policy rule's pattern names (§4.17.1 "Policy"; A-622), as `SetRepositoryPolicy` gives it: the names its
@@ -2477,6 +2485,7 @@ impl RequestBody {
       | RequestBody::Recover { .. }
       | RequestBody::PromoteRegion { .. }
       | RequestBody::Grants { .. }
+      | RequestBody::SessionLog { .. }
       | RequestBody::Audit { .. }
       | RequestBody::Acknowledge { .. }
       | RequestBody::Telemetry { .. }
@@ -4003,6 +4012,9 @@ pub enum LandingStage {
   Refused,
   /// Cancelled or crashed; a resume continues it.
   Aborted,
+  /// Withdrawn before any grant: a newer presentation of the same volume into the same target replaced it (A-779).
+  /// Appended.
+  Superseded,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -4658,6 +4670,12 @@ pub enum Refusal {
     /// The members it must reach.
     needed: u64,
   },
+  /// A grant asked for a landing a newer presentation of the same volume into the same target superseded (A-779, main's
+  /// ruling 2026-11-20): an older state never lands over a newer one. Grant the newer, after reading it. Appended.
+  LandingSuperseded {
+    /// The newer presentation.
+    newer: u64,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the
@@ -5166,6 +5184,9 @@ pub enum ReplyBody {
     conflicts_elided: u32,
     /// The verdict the windows are of, kept with the work for `Conflicts`; 0 when there is none.
     verdict: u64,
+    /// Whether the accepted increment changed nothing: every operation was already at the head (D-27's identical
+    /// verdict, A-782). `false` on a conflict. Appended.
+    identical: bool,
   },
   /// A work volume was rebased onto its green's head (§4.16). The green is unchanged.
   Rebased {
@@ -5584,6 +5605,8 @@ pub enum ReplyBody {
     conflicts_elided: u32,
     /// The conflicting verdict the work keeps, by which `Conflicts` reads it; 0 when none is kept (A-267).
     verdict: u64,
+    /// Whether the accepted increment changed nothing, as `Submitted` says it (A-782). Appended.
+    identical: bool,
   },
   /// A volume's trusted signers were set (A-321). Appended.
   SignersSet,
@@ -5726,6 +5749,87 @@ pub enum ReplyBody {
   /// A work's floor moved or dropped at its green's owner, or left as it was where the move changed nothing
   /// (`MoveWorkFloor`, A-697 part b). Appended.
   WorkFloorMoved,
+  /// One page of the session log (`SessionLog`, A-773), in key order. Appended.
+  SessionLog {
+    /// The lines of this page.
+    lines: Vec<LogLine>,
+    /// The cursor that continues the walk (this page's last line), or `None` when this page ends it.
+    next: Option<LogCursor>,
+  },
+}
+
+/// Where a session log walk stands (A-773): a line's key. A work's line is keyed by the work alone, a waiting landing's
+/// by the volume it lands and its id, so a volume's own line sorts before its landings'.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogCursor {
+  /// The work, or the landed volume.
+  pub volume: VolumeId,
+  /// The landing, for a landing's line; `None` for a work's.
+  pub landing: Option<u64>,
+}
+
+/// One line of the session log (A-773): what a supervisor needs to decide the next action, nothing else.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum LogLine {
+  /// A work over a green.
+  Work {
+    /// The work.
+    id: VolumeId,
+    /// Its name.
+    name: String,
+    /// The green it is over.
+    green: VolumeId,
+    /// The green version it is based on: where it started, or where its last accepted submission or rebase moved it.
+    base: u64,
+    /// How its last submission ended.
+    mark: WorkMark,
+  },
+  /// A landing presented and awaiting its grant (§4.15 `AwaitingGrant`).
+  AwaitingGrant {
+    /// The landing.
+    landing: u64,
+    /// The volume it lands.
+    volume: VolumeId,
+    /// The host directory it would write.
+    target: String,
+    /// The manifest a grant must bind.
+    manifest: [u8; 32],
+  },
+}
+
+/// How a work's last submission ended (A-773). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum WorkMark {
+  /// Nothing submitted since the work was made.
+  Open,
+  /// Accepted as this green version; the work stands on it.
+  Accepted {
+    /// The version it made.
+    version: u64,
+  },
+  /// Collided: the verdict's windows the work must rebase against or resolve.
+  Collided {
+    /// The verdict, as `Conflicts` reads it.
+    verdict: u64,
+    /// How many windows the verdict holds.
+    windows: u32,
+    /// Its first window: the file and range that collided.
+    first: Option<MergeWindow>,
+  },
+  /// Accepted as this green version and changed nothing: every operation was already at the head (A-782). Appended.
+  Identical {
+    /// The version it committed.
+    version: u64,
+  },
+  /// Held for approval: the work's merge mode, or its green's, asks (A-285), so its last submission merged nothing and
+  /// waits for the launcher's approval of exactly this increment (A-785). The log shows it and never approves (R10).
+  /// Appended.
+  AwaitingApproval {
+    /// The increment's identity, which the approval binds.
+    identity: [u8; 32],
+    /// The paths the increment changes.
+    paths: u64,
+  },
 }
 
 /// What a checkout changed in its green's base volume (§4.16 A-201): the head's difference from the origin, by

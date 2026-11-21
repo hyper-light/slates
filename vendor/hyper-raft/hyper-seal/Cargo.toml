@@ -26,7 +26,8 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Securit
 [lints.rust]
 # hyper-seal's `files` feature (`sealed_file`: a whole file sealed through `hyper-block`, which opens, writes and renames
 # files) is left out of slates' build: slates writes files only in its `land` crate (R1), so the feature is declared here
-# as a known value and never enabled, and `hyper-block` is not vendored.
+# as a known value and never enabled. `hyper-block` is vendored since A-767 for the changeset log, written only by
+# `slates-store` under its grant (R1's reading for repositories), never through this feature.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("files"))'] }
 
 [workspace]
