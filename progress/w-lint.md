@@ -324,3 +324,11 @@
   repository::push 11 pass (the commit message says 9: wrong, it was 11), import_batch 2. Owners named in
   run-requests.md. r13 lost to a jupiter restart before it started (third time): asked main in
   inbox/main-from-w-lint-jupiter.md before resubmitting.
+
+## 2026-11-21 rounds 18-19 and Windows (main 37c7a1691, landed 21ed9cd8d)
+- Main 07:50: jupiter's restarts are R2 (the runner's link through the HTTP tunnel), not my runs; short runs, one check
+  each, logs on jupiter, the shared target dir kept. Deleted ~/w-lint-src-1795240804 there (42 GB free after), cloned
+  ~/w-lint-win at a693c49e4, ran Windows clippy: its reds were host reds of new landings (fixed in 21ed9cd8d) plus
+  svn_presenter (w-reaper). `xtask unsafe` refused "no room here now" twice; the rest waits for room.
+- Round 19 at 481d7abef: debug eprintlns removed from the hg replay; replay_sliced -> open_record; t_a729 split; svn
+  examples handle Importing::Base; hg SEGMENT_VERSION Format; svn_commit PieceOf alias. give_up -> w-git.

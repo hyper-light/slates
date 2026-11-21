@@ -7073,3 +7073,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Windows (held requests): A-789's checks + red-first at 20bef898c^ (w-sizing), then w-realtools' real_tools over
   WinFsp. r13 never started (jupiter's runner restarted while it was starting; the third such of mine) -- waiting on
   main's answer in inbox/main-from-w-lint-jupiter.md.
+- ~09:00 update (main 37c7a1691, w-lint round 19 at 21ed9cd8d): open host reds and owners: hg push/intake_tests.rs's
+  intake (w-hg); server made_commit.rs's give_up, unused with an unsanctioned dead_code allow (w-git, A-815); store
+  texts.rs's three literals (w-store). Windows (jupiter, short runs per main's 07:50): workspace clippy at a693c49e4
+  ran (its host reds fixed in 21ed9cd8d; svn_presenter's Windows dead code is w-reaper's); `cargo xtask unsafe` was
+  refused "no room here now" twice; the rest of A-789's checks and w-realtools' real_tools follow when it has room.
