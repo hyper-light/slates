@@ -58132,6 +58132,18 @@ with a peer still mapping them; BENCHMARKS "Content give-back per platform").
 - Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
   still only leave the footprint.
 
+### A-839 — On macOS a shard's content slice reserves nothing for its arena (2026-11-21, w-sizing; the sweep's conversions, largest first; A-789)
+Applied in the same change to: `crates/server/src/config.rs` (`shard_content_layout`: the stride ends where the arena's
+range would begin on macOS), the test `the_content_object_reserves_nothing_for_the_arena_on_macos`, GAPS.
+
+Status: built 2026-11-21, macOS.
+- Why: since A-789 every pool extent on macOS is an object of its own, so the arena's range in the content object was
+  address space nothing mapped: `reserve_per_shard` a shard, a third of the machine's memory over its shards.
+- Measured (big Studio): a one-shard daemon's content object reserved 139,264 MiB before and 106,496 after.
+- The layout's `arena` still names the arena's capacity, which the pool cuts into its parts. Linux keeps the range (its
+  extents are ranges of one memfd, holes punched), and so does Windows, whose extents are ranges of the object when no
+  anchor holds their sections.
+
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
 (`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),

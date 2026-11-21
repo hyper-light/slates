@@ -64,15 +64,7 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open, narrowed (w-fed-faults, A-821, 2026-11-21): the refined submit's one step still holds its commit.** The
-> watchdog's kill at refining.rs:166 (exit 4 in `green_post_state`, debug, a loaded Studio) was not the job's turns
-> (longest 608 µs) but the parked submit, run again in the job's last poll as one 415 ms step: composition 85 ms,
-> verdict 23 ms, encode 11 ms, the commit's history re-anchor 219 ms, the chain's append ~60 ms. A-821 prepares the
-> increment, its verdict and its encoding in the job a bounded slice a turn; the step judges by position and commits.
-> Measured (`merge.submit.longest_step_us`, the 2 MiB re-indent): debug 417.5 to 303.8 ms, release 34.5 to 24.6 ms,
-> against the derived bound of 100 ms (`HEARTBEAT_NS`, the paced ceiling). What stays in the step: the commit's
-> re-anchor (A-818's engine switch, piece 2b, replaces it) and the chain's durable append of a ~5 MB entry. Close once
-> `merge.submit.steps_past_ceiling` reads 0 in a debug build.
+> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release).
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -235,6 +227,9 @@
 >   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
 >   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
 >   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
+>   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
+>   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
