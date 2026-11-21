@@ -982,3 +982,386 @@ fn stock_git_sees_the_branches_the_cli_makes_retires_and_binds() {
     "created: {after_create}; retired: {after_retire}; bound: {after_bind}"
   );
 }
+
+/// Format: the variable naming the repository the whole-repository session carries (a clone of git/git for main's
+/// rounds); unset, the session skips loudly.
+const DATASET: &str = "SLATES_TEST_GIT_DATASET";
+
+/// Format: the variable naming the edges the whole-repository session runs over, comma-separated (`http`, `ssh`);
+/// unset, both.
+const EDGES: &str = "SLATES_TEST_GIT_EDGES";
+
+/// Format: the refs the whole-repository session compares: every branch and every tag, peeled lines included.
+const COMPARED_REFS: [&str; 2] = ["refs/heads/", "refs/tags/"];
+
+/// Format: a tag object carrying a PGP signature block, made with `git mktag` so no signing key is needed: slates must
+/// carry its bytes as they are, signature and all.
+const SIGNED_TAG_BODY: &str =
+  "-----BEGIN PGP SIGNATURE-----\n\niQEzBAABCAAdFiEE\n=test\n-----END PGP SIGNATURE-----\n";
+
+/// The lines of `listing` (a `git ls-remote` or an advertisement's ref lines, "OBJECT\tREF") that name a branch or a
+/// tag ([`COMPARED_REFS`]), sorted.
+fn compared(listing: &str) -> Vec<String> {
+  let mut lines: Vec<String> = listing
+    .lines()
+    .filter(|line| {
+      line
+        .split('\t')
+        .nth(1)
+        .is_some_and(|name| COMPARED_REFS.iter().any(|prefix| name.starts_with(prefix)))
+    })
+    .map(str::to_owned)
+    .collect();
+  lines.sort();
+  lines
+}
+
+/// A bare mirror of `dataset` at `source`, given tags of every kind on its default branch's tip: lightweight, annotated,
+/// a lightweight and an annotated tag of the tip's tree, a tag of a blob, an annotated tag of an annotated tag, and a
+/// tag object carrying a signature block ([`SIGNED_TAG_BODY`], by `git mktag`).
+fn tagged_source(git: &Git, dataset: &str, source: &str) {
+  git.ok(&git.scratch, &["clone", "-q", "--mirror", dataset, source]);
+  let tip = git.commit_of(source, "HEAD");
+  let tree = git.commit_of(source, "HEAD^{tree}");
+  let blob = git
+    .ok(source, &["ls-tree", "-r", "HEAD"])
+    .lines()
+    .find_map(|line| {
+      let mut words = line.split_whitespace();
+      (words.nth(1) == Some("blob")).then(|| words.next().unwrap().to_owned())
+    })
+    .expect("the dataset's tip holds a file");
+  git.ok(source, &["tag", "slates-light", &tip]);
+  git.ok(
+    source,
+    &["tag", "-a", "-m", "annotated", "slates-annotated", &tip],
+  );
+  git.ok(source, &["tag", "slates-tree", &tree]);
+  git.ok(
+    source,
+    &["tag", "-a", "-m", "a tree", "slates-annotated-tree", &tree],
+  );
+  git.ok(source, &["tag", "slates-blob", &blob]);
+  git.ok(
+    source,
+    &[
+      "tag",
+      "-a",
+      "-m",
+      "a tag of a tag",
+      "slates-nested",
+      "slates-annotated",
+    ],
+  );
+  let signed = format!(
+    "object {tip}\ntype commit\ntag slates-signed\ntagger Test <test@example.com> 1700000000 +0000\n\nsigned\n{SIGNED_TAG_BODY}"
+  );
+  let made = mktag(git, source, &signed);
+  git.ok(source, &["update-ref", "refs/tags/slates-signed", &made]);
+}
+
+/// The tag object `git mktag` makes from `text` in the repository at `dir`.
+fn mktag(git: &Git, dir: &str, text: &str) -> String {
+  let (program, leading) = git.program.split_first().expect("a command");
+  let mut child = Command::new(program)
+    .args(leading)
+    .args(["mktag"])
+    .current_dir(dir)
+    .envs(Git::environment(&git.home))
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child
+    .stdin
+    .take()
+    .unwrap()
+    .write_all(text.as_bytes())
+    .unwrap();
+  let out = child.wait_with_output().unwrap();
+  assert!(out.status.success(), "git mktag: {out:?}");
+  String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// `git for-each-ref` over the branches and tags of the repository at `dir`: "OBJECT REF" lines, sorted.
+fn refs_of(git: &Git, dir: &str) -> String {
+  git.ok(
+    dir,
+    &[
+      "for-each-ref",
+      "--format=%(objectname) %(refname)",
+      "refs/heads",
+      "refs/tags",
+    ],
+  )
+}
+
+/// The bytes of `git archive` of `commit` in the repository at `dir`, written to `out`.
+#[allow(clippy::disallowed_methods)]
+fn archive(git: &Git, dir: &str, commit: &str, out: &str) -> Vec<u8> {
+  git.ok(dir, &["archive", "--format=tar", "-o", out, commit]);
+  std::fs::read(out).unwrap()
+}
+
+/// The ref lines of a v0 upload-pack advertisement `body` (pkt-lines): each data line's text, the first ref line's
+/// capabilities (after its NUL) cut, the service line and flushes dropped, as "OBJECT\tREF" lines.
+fn advertised(body: &[u8]) -> String {
+  let mut lines = Vec::new();
+  let mut at = 0;
+  while at + 4 <= body.len() {
+    let length =
+      usize::from_str_radix(std::str::from_utf8(&body[at..at + 4]).unwrap(), 16).unwrap();
+    if length < 4 {
+      at += 4;
+      continue;
+    }
+    let text = String::from_utf8_lossy(&body[at + 4..at + length]).into_owned();
+    at += length;
+    let text = text
+      .split('\0')
+      .next()
+      .unwrap()
+      .trim_end_matches('\n')
+      .to_owned();
+    if text.starts_with("# service=") {
+      continue;
+    }
+    lines.push(text.replacen(' ', "\t", 1));
+  }
+  lines.join("\n")
+}
+
+/// Stock git's own `http-backend`, run as the CGI program a web server would run, answering the v0 advertisement of
+/// `git-upload-pack` for the repository `name` under `root`: the body after its headers.
+fn http_backend_advertisement(git: &Git, root: &str, name: &str) -> Vec<u8> {
+  let (program, leading) = git.program.split_first().expect("a command");
+  let out = Command::new(program)
+    .args(leading)
+    .arg("http-backend")
+    .envs(Git::environment(&git.home))
+    .env("GIT_PROJECT_ROOT", root)
+    .env("GIT_HTTP_EXPORT_ALL", "1")
+    .env("REQUEST_METHOD", "GET")
+    .env("PATH_INFO", format!("/{name}/info/refs"))
+    .env("QUERY_STRING", "service=git-upload-pack")
+    .env_remove("GIT_PROTOCOL")
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "git http-backend: {out:?}");
+  let split = out
+    .stdout
+    .windows(4)
+    .position(|window| window == b"\r\n\r\n")
+    .map(|at| at + 4)
+    .or_else(|| {
+      out
+        .stdout
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|at| at + 2)
+    })
+    .expect("http-backend's headers end");
+  out.stdout[split..].to_vec()
+}
+
+/// slates' HTTP edge's v0 advertisement of `git-upload-pack` for [`REPOSITORY`] at `port`, read with curl and the
+/// bearer `token`: the body; `None` where this host runs no curl, which the caller skips loudly.
+fn edge_advertisement(port: u16, token: &str) -> Option<Vec<u8>> {
+  let out = Command::new("curl")
+    .args(["-s", "-f", "-H", &format!("Authorization: Bearer {token}")])
+    .arg(format!(
+      "http://127.0.0.1:{port}/{REPOSITORY}/info/refs?service=git-upload-pack"
+    ))
+    .output()
+    .ok()?;
+  assert!(
+    out.status.success(),
+    "curl the edge's advertisement: {out:?}"
+  );
+  Some(out.stdout)
+}
+
+/// The whole-repository session against `url`, an empty repository, from `source` ([`tagged_source`]): every branch
+/// and tag pushed; the listing equal to the source's; a mirror clone that `fsck --full --strict` passes, its refs the
+/// source's; a push from a work clone fetched back into the mirror, the listings equal again; a shallow clone one
+/// commit deep, deepened by one; a partial clone (`--filter=blob:none`) that checks its tip out, its archive's bytes
+/// the source's.
+fn whole_session(git: &Git, source: &str, url: &str) {
+  git.ok(
+    source,
+    &[
+      "push",
+      "-q",
+      url,
+      "refs/heads/*:refs/heads/*",
+      "refs/tags/*:refs/tags/*",
+    ],
+  );
+  let listed = git.ok(&git.scratch, &["ls-remote", url]);
+  let local = git.ok(&git.scratch, &["ls-remote", source]);
+  assert_eq!(
+    compared(&listed),
+    compared(&local),
+    "the pushed listing is the source's"
+  );
+  let mirror = git.copy("mirror.git");
+  git.ok(&git.scratch, &["clone", "-q", "--mirror", url, &mirror]);
+  git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
+  assert_eq!(
+    refs_of(git, &mirror),
+    refs_of(git, source),
+    "the mirror clone's refs are the source's"
+  );
+  let work = git.copy("work");
+  git.ok(&git.scratch, &["clone", "-q", url, &work]);
+  let branch = git
+    .ok(&work, &["symbolic-ref", "--short", "HEAD"])
+    .trim()
+    .to_owned();
+  put(&work, "carried\n");
+  git.ok(&work, &["add", FILE]);
+  git.ok(&work, &["commit", "-q", "-m", "carried"]);
+  git.ok(
+    &work,
+    &[
+      "push",
+      "-q",
+      "origin",
+      &branch,
+      &format!("HEAD:refs/heads/slates-topic"),
+    ],
+  );
+  git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);
+  let listed = git.ok(&git.scratch, &["ls-remote", url]);
+  let mirrored = git.ok(&git.scratch, &["ls-remote", &mirror]);
+  assert_eq!(
+    compared(&listed),
+    compared(&mirrored),
+    "the fetch brings the work clone's pushes"
+  );
+  git.ok(&mirror, &["fsck", "--full", "--strict", "--no-progress"]);
+  let shallow = git.copy("shallow");
+  git.ok(
+    &git.scratch,
+    &["clone", "-q", "--depth", "1", url, &shallow],
+  );
+  assert_eq!(
+    git.ok(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
+    "1",
+    "one commit deep"
+  );
+  git.ok(&shallow, &["fsck", "--no-progress"]);
+  git.ok(&shallow, &["fetch", "-q", "--deepen", "1"]);
+  assert_eq!(
+    git.ok(&shallow, &["rev-list", "--count", "HEAD"]).trim(),
+    "2",
+    "deepened by one"
+  );
+  let partial = git.copy("partial");
+  git.ok(
+    &git.scratch,
+    &["clone", "-q", "--filter=blob:none", url, &partial],
+  );
+  git.ok(&partial, &["fsck", "--no-progress"]);
+  let tip = git.commit_of(&partial, "HEAD");
+  let ours = archive(git, &partial, &tip, &git.copy("partial.tar"));
+  let theirs = archive(git, &mirror, &tip, &git.copy("mirror.tar"));
+  assert!(
+    ours == theirs,
+    "the partial clone's checkout is the full one's, byte for byte"
+  );
+}
+
+/// UI goal 93's git correctness by use (main's lane, 2026-11-21; CLAUDE.md §8: an interop round, run by main). Do: make
+/// a bare mirror of the repository [`DATASET`] names and give it tags of every kind ([`tagged_source`]); on each edge
+/// [`EDGES`] names (HTTP with a bearer token, SSH with an enrolled key), run [`whole_session`] against an empty
+/// repository; over HTTP, also read the edge's `git-upload-pack` advertisement right after the push and compare its ref
+/// lines byte for byte with stock git's own `http-backend` serving the source. Expect every step as stated, every
+/// listing, ref and archive equal, and the advertisements' ref lines identical. Skips loudly without stock git, the
+/// dataset, OpenSSH (the SSH edge) or curl (the advertisement), as the round trips do.
+#[test]
+#[ignore = "an interop round over a whole repository (CLAUDE.md §8: main runs it): SLATES_TEST_GIT_DATASET=<repo> cargo test --release -p slates-cli --test git_interop -- --ignored --exact stock_git_carries_a_whole_repository_over_each_edge"]
+fn stock_git_carries_a_whole_repository_over_each_edge() {
+  let Some(program) = stock_git() else {
+    eprintln!("skipping the whole-repository session: no stock git here (set {STOCK_GIT})");
+    return;
+  };
+  let Ok(dataset) = std::env::var(DATASET) else {
+    eprintln!(
+      "skipping the whole-repository session: no dataset (set {DATASET} to a repository, a git/git clone)"
+    );
+    return;
+  };
+  let edges = std::env::var(EDGES).unwrap_or_else(|_| "http,ssh".to_owned());
+  let scratch = Scratch::new("git-whole");
+  let plain = Git::new(&program, &scratch, "source", Vec::new());
+  let source = format!("{}/source.git", scratch.path);
+  tagged_source(&plain, &dataset, &source);
+  if edges.split(',').any(|edge| edge == "http") {
+    let Some(leg) = http_leg("whole") else {
+      return;
+    };
+    let header = format!("http.extraHeader=Authorization: Bearer {}", leg.token);
+    let git = Git::new(&program, &scratch, "http", vec!["-c".to_owned(), header]);
+    let url = format!("http://127.0.0.1:{}/{REPOSITORY}", leg.port);
+    git.ok(
+      &source,
+      &[
+        "push",
+        "-q",
+        &url,
+        "refs/heads/*:refs/heads/*",
+        "refs/tags/*:refs/tags/*",
+      ],
+    );
+    match edge_advertisement(leg.port, &leg.token) {
+      Some(edge) => {
+        let stock = http_backend_advertisement(&plain, &scratch.path, "source.git");
+        assert_eq!(
+          compared(&advertised(&edge)),
+          compared(&advertised(&stock)),
+          "the edge advertises the refs stock http-backend does, byte for byte"
+        );
+      }
+      None => eprintln!("skipping the advertisement's byte compare: no curl here"),
+    }
+    whole_session(&git, &source, &url);
+    eprintln!("whole-repository session over HTTP: every step held");
+  }
+  if edges.split(',').any(|edge| edge == "ssh") {
+    if !openssh() {
+      eprintln!("skipping the whole-repository session over SSH: no OpenSSH ssh here");
+      return;
+    }
+    let Some((key, public)) = fresh_key(&scratch) else {
+      eprintln!("skipping the whole-repository session over SSH: no ssh-keygen here");
+      return;
+    };
+    let instance = format!("git-whole-ssh-{}", std::process::id());
+    let started = start_anchor(&instance, &["--vcs-ssh", "127.0.0.1:0"]);
+    let (port, fingerprint) = started
+      .lines
+      .iter()
+      .find_map(|line| ssh_edge_of(line))
+      .expect("the daemon named its SSH edge's port and host key");
+    let Some(issuer) = issuer_of(&started, "the whole-repository session over SSH") else {
+      return;
+    };
+    let known_hosts = known_hosts(&scratch, port, &fingerprint);
+    create_repository(&instance);
+    let (code, out, err) = slates(&instance, &issuer, &["credential", "key", &public]);
+    assert_eq!(code, 0, "credential key: {out}{err}");
+    let ssh = format!(
+      "core.sshCommand=ssh -F /dev/null -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+       -o StrictHostKeyChecking=yes -o UserKnownHostsFile={known_hosts} -o GlobalKnownHostsFile=/dev/null"
+    );
+    let git = Git::new(&program, &scratch, "ssh", vec!["-c".to_owned(), ssh]);
+    whole_session(
+      &git,
+      &source,
+      &format!("ssh://{USER}@127.0.0.1:{port}/{REPOSITORY}"),
+    );
+    eprintln!("whole-repository session over SSH: every step held");
+  }
+}
