@@ -129,3 +129,7 @@
   4. By-use red: `svn_interop::a_repository_policys_hook_lets_stock_svn_change_a_revision_property` with
      `--vcs-store`; the hook runs `svnlook youngest $1`. Stock svn 1.15 only on Studio-1 (693 MB free).
 - A-748 Windows check: kiln r1 (needs windows) is building `vcs_edge_restart` in C:\Users\corph\w-reaper-win.
+- ~22:45 PST: part 2b/2c landed, 5c90dbcbe (in origin/main at e95c5009e). A configured hook's REPOS-PATH is the view
+  mounted at `<--vcs-store>/<repository>.svn`; the root-mount refusal is gone. Owed to main: the by-use run
+  (run-requests.md), Linux clippy of fuse.rs, and two GAPS items (the revprop refresh is linear; the view isn't
+  unmounted with its repository). w-interop told.
