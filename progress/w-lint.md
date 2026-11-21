@@ -287,3 +287,14 @@
 - Windows run requests (main 20:05: w-sizing R2 at 20bef898c with its red-first at 20bef898c^, w-work-mount's WinFsp
   mounted-work test, w-realtools' real_tools over WinFsp): one combined run by needs "windows". r7 and r8 both ended
   "the kiln server did not answer in time" before any output came back; whether r8 runs on jupiter is unknown.
+
+## 2026-11-21 round 14 (89269ab1b .. c8b77f817): through the network outage
+- The Mac lost GitHub for hours (fetches died mid-pack, then no answer); the transport fix (encode_packet) waited and
+  landed as 89269ab1b once it came back. kiln's server also dropped; r10 (A-789 Windows checks, red-first, real_tools)
+  ran 5h21m with no output past its clippy stage and ended when jupiter's runner restarted: no results. Not resubmitted
+  yet (main's 21:58 rule: once only, after checking).
+- Landed: 4e32bd101 (db, vcs, store, merge, ipc, hg, svn literal), 5d555c7fa (server repository, svn landing,
+  test_store), 6995ff750 (server recovery, ssh hg, git receive, verbs, tests), c22f468e3 (cli merge verbs, load_bench,
+  merge_check, fleet). Tests run for each (listed in the commits).
+- Sent: w-provision-gate (rt spin_kick time-wait; since fixed upstream), w-git (receive tests wide_connectivity),
+  w-hg (push intake_tests intake): both still red on the host. w-store: 3 store literals.
