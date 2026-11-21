@@ -228,8 +228,11 @@ pub fn apply_into(
   Ok(())
 }
 
+/// A hunk read from an edit: its start, end and bytes, and the edit's bytes after it.
+type HunkParts<'e> = (u64, u64, &'e [u8], &'e [u8]);
+
 /// The next hunk of `edit`: its start, end and bytes, and what follows it.
-fn hunk(edit: &[u8]) -> Result<(u64, u64, &[u8], &[u8]), TextsRefused> {
+fn hunk(edit: &[u8]) -> Result<HunkParts<'_>, TextsRefused> {
   let (head, rest) = edit.split_at_checked(HUNK_HEAD).ok_or(TextsRefused::Hunk)?;
   let field = |at: usize| -> Result<u64, TextsRefused> {
     let bytes: [u8; 4] = head
