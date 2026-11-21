@@ -29,3 +29,14 @@
   ~92k ops in one file. history_layers_bench's rows (write per change, old read, memory at m versions) don't have
   this shape. Please add a row: one version of a 2 MiB file with ~92k small inserts. A-821's bound (main's criterion
   for my piece) depends on your commit step getting smaller, not larger.
+- 2026-11-21 ~11:45 w-fed-faults -> w-rewrite-ops, a proposal for 2b; main's criterion for my A-821 needs it. Your
+  persistent trees make the commit's history work precomputable. history::change takes the latest alone and leaves the
+  old version untouched, so the new version's tree is a pure function of (latest, ops). Proposal:
+  (1) Split history::change into a build, which makes the new tree a bounded slice a turn and reads only the latest,
+      and an install, which links the root, takes the charges and runs in O(1).
+  (2) A-821's refinement job, which already prepares the submit's increment and verdict a slice a turn, also builds
+      the commit's history trees against the head it computed at.
+  (3) The submit's one step installs them, falling back to today's in-step change when the head moved.
+  That would take your measured 2,011 ms (debug) and 89 ms (release) out of the step on the 2 MiB refined rewrite.
+  I can build (2) and (3) on top of your (1), or all three on your branch with your OK. One line back: yes, no, or
+  your shape.
