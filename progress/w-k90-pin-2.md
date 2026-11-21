@@ -107,3 +107,13 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   GREEN Windows x86-64 `windows (Slates tests)` 136804151233 (w-k90-win's job); GREEN Linux arm64 `ubuntu-24.04-arm
   (Slates build and tests)` 136804151244 (lld link; build 37 min). ubuntu-latest lost its hosted runner (infra; Linux
   x86-64 already green twice). windows-11-arm in lib tests; macos-latest still building.
+
+## ~04:25 PST 11-21: DONE
+- GREEN Windows arm64: run 44887857088 job 136804151286 (a0d114abb; vendored 11/11 with the CRLF fix).
+- Goal 01a1facaf183 marked met (goals_done) with: macOS arm64 44851246181/136703754428, Linux x86-64
+  44851246181/136703754443 (4f5e58c1b); Linux arm64 136804151244, Windows x86-64 136804151233, Windows arm64
+  136804151286 (44887857088, a0d114abb). Pin 8ce3d61523e1 in all. No CLI call. Reported to main (inbox).
+- For main to cancel (needs a person): kiln ci runs 01a1fa8f0de173e39b8af52219ffb700, 01a1fa8fe4097372b94f7337ff2b7fd3,
+  01a1fa8ff6d771bc90e709b705554f79, 01a1fa9006fe76bcbc4891519afba25e (wedged), and r145 (jupiter repro, unneeded now).
+- For main to delete: ~/kiln-work/w-k90-pin-2-kiln (scratch clone), ~/.cache/w-k90-pin-2-target.noindex,
+  ~/kiln-work/w-k90-pin-2-logs.

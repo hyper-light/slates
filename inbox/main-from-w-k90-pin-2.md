@@ -29,3 +29,15 @@
 10. LANDED 482bd01f8 (Linux arm64 links with the toolchain's lld: GNU ld failed kiln's link after a 90-min build) and
     60c0b27c5 (vendored test reads Cargo.lock as LF: windows-11-arm failed 2/11 on a CRLF checkout; local 11/11 LF+CRLF).
     Next started GitHub main run should give Linux arm64 + Windows arm64. Windows x86-64 waits on w-k90-win.
+
+## ~04:25 PST 11-21: VENDORING PART DONE (goal 01a1facaf183 marked met)
+Pin: vendor/slates at 8ce3d61523e1 (vendor/MANIFEST.toml; the pin moved from 38ed3dfd since 08f1a434, so every run
+below is at 8ce3d615). Green per platform (GitHub ci.yml):
+- macOS arm64: run 44851246181 job 136703754428 (kiln 4f5e58c1b)
+- Linux x86-64: run 44851246181 job 136703754443 (kiln 4f5e58c1b)
+- Linux arm64: run 44887857088 job 136804151244 (kiln a0d114abb)
+- Windows x86-64: run 44887857088 job 136804151233 (w-k90-win's windows-slates; kiln a0d114abb)
+- Windows arm64: run 44887857088 job 136804151286 (kiln a0d114abb)
+No slates CLI call (git grep over a0d114abb). Landed: c0f576eb3, 5264caaa3, e763e394f, eb7194f00, f500759d2, 482bd01f8,
+60c0b27c5. Leftovers for you: kiln's own CI lanes (ci.runs.local 01a1fa8f0de1/01a1fa8fe409/01a1fa8ff6d7/01a1fa9006fe)
+are wedged and need a person's cancel; every clippy leg is red on container.rs:301 (w-k90-a520's).
