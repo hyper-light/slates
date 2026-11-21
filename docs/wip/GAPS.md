@@ -288,6 +288,20 @@
 > the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
 > held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
+> The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
+> push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
+> push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
+> once its body was read whole is answered in git's words on band 3 under side-band-64k, or as the report
+> `unpack <words>` with each command `ng` without it, and the reply ends cleanly, counted
+> `vcs_http.git.push_refused_after_body`; one wording for both edges (`git_push::words`, the SSH site's). Red 2 of 2 on
+> 94ff89fe5 (`vcs_http::git::receive::tests`, the body's end failed, nothing answered), green 2 of 2. Owed: a refusal
+> while the body is still read still cuts the connection, as git's `http-backend` does when receive-pack dies mid-body.
+> Layer 2 OPEN (main's order 01:56 PST, before C5 2b piece 3): the cause of that push's refusal, measured on Studio-2
+> at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
+> 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
+> edge, every tree entry of the whole pack, about 60.6 M for git/git), sized by the pack's history rather than by the
+> slice in flight (A-719). Owed: the checks a slice at a time over the pack held once, charging only the slice; red, the
+> 611 MB push refused today and landing within its room; an A/B against stock git (10.77 s).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no

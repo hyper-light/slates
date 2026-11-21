@@ -58905,3 +58905,37 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
   and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
   works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.
+
+### A-722 amended — A push refused after its body is answered in git's words, never a cut connection (2026-11-21, w-git for UI goal 93; main's priority 01:31 PST and ruling 01:56 PST; found by use, w-interop)
+
+**Found.** A whole-history push of git/git (611 MB) over the HTTP edge failed 6 of 6, cut off at 57 to 63 s with
+curl's error 18 and no word of why. A diagnostic build on Studio-2 (base 94ff89fe5) logged the body read whole in
+2.8 s, the answer kept alive for 45 s, then the answer's step refused `PastAdmission` and the exchange failed `413`.
+The reply's `200` head had gone out before the body was read (A-722's `StatusMode::AtHead`, as `http-backend` writes
+its own), so the engine could only end the connection short.
+
+**Rule.** A push refused once its body was read whole (its checks, seal, decision, homing or landing, or the wait for
+its records at `f + 1`) is answered in git's words, and the reply ends cleanly:
+- under side-band-64k, on band 3, git's band for a fatal error after which the stream ends (`sideband.c`'s "remote
+  error");
+- without it, when a report was asked, as git reports a pack its unpacking refused: `unpack <words>`, each command
+  `ng <ref> <words>`, a flush (`slates_git::receive::write_refused_report`). The commands' names are kept for that
+  case alone, charged to the push's room, since the request moves on through the answer.
+
+The words are the SSH site's, now one module both edges write (`crate::git_push::words`). A refusal while the body is
+still read still cuts the connection, as git's own does when receive-pack dies while `http-backend` pipes it the body.
+Counted `vcs_http.git.push_refused_after_body`.
+
+**Test.** `vcs_http::git::receive::tests`: the site's exchange on a stored daemon's shard, its shard fenced for the
+one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, nothing answered, nothing counted). Green
+2 of 2.
+
+**Layer 2, measured, open.** The refusal itself was the pack's checks: one charge of 485,230,824 bytes asked with
+300,809,433 left, the connectivity walk's edge table (`receive::connect`, `begin_edges`, a `usize` for every tree
+entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
+are to work a slice at a time over the pack held once (GAPS).
+
+Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
+`crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
+`crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
+
