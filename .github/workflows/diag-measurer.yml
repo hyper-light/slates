@@ -1,0 +1,110 @@
+name: diag-measurer
+
+# w-k90-win's Windows 84a A/B (inbox/84a-from-main-loaded-tails-2026-11-21.md): the IOCP driver's timed wait through a
+# high-resolution waitable timer's wait completion packet (FIX) against main without it (BASE), on windows-latest and
+# windows-11-arm. Step 1, red first: the sub-millisecond timed-wait test at RED (the test alone) and at FIX. Step 2: a
+# full edit and merge's loaded and quiet tails, release builds, interleaved, every round shown. Logs need a sign-in to
+# read, so every result is an annotation too. A diagnostics lane run only from `diag-measurer-*` branches, never main.
+
+on:
+  push:
+    branches: ["diag-measurer-w-k90-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  RED: "62f7464cd"
+  FIX: "2b23bd562"
+  BASE: "8f73b6928"
+  ROUNDS: "3"
+
+jobs:
+  windows-84a:
+    name: 84a timed wait A/B (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          if (-not (Test-Path $clang)) { throw "clang-cl is not on this image" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Red first (the sub-millisecond timed wait, at RED and at FIX)
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP")/msr"; mkdir -p "$W/logs"; set +e
+          export CARGO_TARGET_DIR="$(cygpath -w "$W/target-test")"
+          said=""
+          for arm in $RED $FIX; do
+            mkdir -p "$W/t-$arm"; git archive --format=tar "$arm" | tar -xmf - -C "$W/t-$arm"
+            ( cd "$W/t-$arm" && cargo test --locked -p slates-rt --lib -- driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline ) > "$W/logs/test-$arm.log" 2>&1
+            st=$?
+            line=$(grep -E "^test driver|test result|took at least" "$W/logs/test-$arm.log" | tr '\n' ' ' | cut -c1-400)
+            [ -z "$line" ] && line=$(grep -E "^error" "$W/logs/test-$arm.log" | head -3 | tr '\n' ' ' | cut -c1-400)
+            said="$said$arm exit=$st: $line%0A"
+          done
+          echo "::notice title=${{ matrix.os }} red-first::$said"
+      - name: Build the bench at BASE and FIX (release)
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP")/msr"
+          export CARGO_TARGET_DIR="$(cygpath -w "$W/target")"
+          for arm in $BASE $FIX; do
+            mkdir -p "$W/src-$arm" "$W/bin-$arm"; git archive --format=tar "$arm" | tar -xmf - -C "$W/src-$arm"
+            ( cd "$W/src-$arm" && cargo build --release --locked -p slates-client --example edit_merge_bench ) > "$W/logs/build-$arm.log" 2>&1 \
+              || { echo "::error title=${{ matrix.os }} build $arm::$(grep -E '^error' "$W/logs/build-$arm.log" | head -5 | tr '\n' ' ')"; exit 1; }
+            cp "$W/target/release/examples/edit_merge_bench.exe" "$W/bin-$arm/edit_merge_bench.exe"
+          done
+      - name: Interleaved rounds, loaded then quiet
+        run: |
+          W="$(cygpath -u "$RUNNER_TEMP")/msr"; set +e
+          echo "cores: $NUMBER_OF_PROCESSORS"
+          pick() { grep -E "ratchet-info.*(f10_(loaded|quiet)_total_p(50|99|999)|accept_(loaded|quiet)_p(99|999)|conflict_(loaded|quiet)_p(99|999))\b" "$1" | awk -F'\t' '{printf "%s=%.0fus ", $2, $4/1000}'; }
+          loaded=""; quiet=""
+          for round in $(seq 1 "$ROUNDS"); do
+            case $round in 2) order="$FIX $BASE";; *) order="$BASE $FIX";; esac
+            for arm in $order; do
+              B="$W/bin-$arm/edit_merge_bench.exe"; L="$W/logs/loaded-$arm-r$round.log"
+              timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L" 2>&1
+              loaded="${loaded}r$round $arm exit=$?: $(pick "$L")%0A"
+            done
+          done
+          echo "::notice title=${{ matrix.os }} loaded::$loaded"
+          for round in $(seq 1 "$ROUNDS"); do
+            case $round in 2) order="$FIX $BASE";; *) order="$BASE $FIX";; esac
+            for arm in $order; do
+              B="$W/bin-$arm/edit_merge_bench.exe"; L="$W/logs/quiet-$arm-r$round.log"
+              timeout 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null > "$L" 2>&1
+              quiet="${quiet}r$round $arm exit=$?: $(pick "$L")%0A"
+            done
+          done
+          echo "::notice title=${{ matrix.os }} quiet::$quiet"
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: w-k90-win-84a-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
