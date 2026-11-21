@@ -7,3 +7,5 @@ FileFsFullSizeInformation). On jupiter: crates/land/tests/store_root.rs 5/5, and
 repository::store_tests::each_tool_creates_a_repository_into_the_store ok (git, hg, svn created into the store), red
 before the fix. Please rerun your Windows matrix (stock git, hg, svn against a Windows daemon with --vcs-store) and send
 any failure to me as a red test (inbox/w-work-mount-from-w-interop-<topic>.md).
+
+**WITHDRAWN (2026-11-21 14:32 PST):** main runs the Windows rounds itself (w-k90-win is its Windows run keeper) and is telling you directly; take the rerun from main, not from this note.

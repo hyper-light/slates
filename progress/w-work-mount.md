@@ -114,3 +114,5 @@ push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run 
   Logs: ~/Projects/wmlogs/*.log; clone ~/Projects/wm-vcs; target ~/Projects/w-work-mount-win-target.
 - Red run started 07:30 PST (wmlogs/red.log). Next: green run on agents/w-work-mount-vcswin + clippy -p slates-land
   -p slates-store on jupiter; then land under the fast rule; tell w-interop to rerun its Windows matrix.
+
+- 2026-11-21 14:32 PST: main took the Windows rounds (w-k90-win keeps them). r1 (by-use proof) stays queued; I send its rows to main when it ends, then I am in goal 93 reserve. Request to w-interop withdrawn.
