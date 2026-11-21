@@ -7973,6 +7973,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the entry included (`fleet.live.hop.holder`). Held by `a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it`
 > (`crates/server/tests/fleet.rs`: 16 writes in a closed loop; each hop timed once a timed round; the hops' nanoseconds
 > equal to the rounds'). The breakdown under the contract command is owed (the supervisor's run).
+> Since 2026-11-21 (g228) each hop also keeps a bounded per-write histogram (`crate::histogram::DurationHistogram`)
+> and the status report publishes its `p50_ns`, `p99_ns`, `p999_ns` and `max_ns` beside the sums: a sum is a mean,
+> which each run's first held reply (the 100 ms record period) had skewed by 49 µs a write.
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -57731,6 +57734,28 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
 > files: one changeset, sequence 0, its record and its row read back).
 >
+> **Status (2026-11-20, C5 part 1: a git push lands on the store; w-git, main's split of ~21:20 and rulings of ~21:05).**
+> A push's names and pack, once homed in the region at `f + 1` (A-724 piece 8c, A-722's record v4), land on the node's
+> store as one changeset before the register's entry: its `Names` section the names' rows, its `Payload` the pack, the
+> bytes `homes::home_in_region` hands back after homing them, moved into the landing (no further copy), at the
+> repository's next sequence, taken at the landing (`VcsStores::next_changeset`, shared with Mercurial's; the creation
+> is 0). The edge carries it off the shard's step as it carries the homing (`git_push::carry`, the one way the HTTP and
+> SSH edges and the tests' driver run it); landed, the record is written as version 5 (replacing 4): version 4's names
+> and pack by identity, then the changeset's sequence; refused, the push is refused whole (`PushFailed::Unlanded`),
+> nothing of it in the register. The record's pack identity is the plain BLAKE3 of the `Payload` (the content store's
+> identity rule: a put answers the BLAKE3 of the whole bytes, its List root node-local), which the store's `P` row keys,
+> so `piece` reads it as recorded. A recovery reads a version-5 record's changeset before replaying it (its `C` row,
+> its `Names` checked against the record's identity, its `Payload` under the record's pack identity and length), puts
+> what the content store lacks, and notes the sequence, so the next landing takes the last one the register names + 1
+> and a changeset landed past the register's head is overwritten, never replayed (main's ruling 2). Red test:
+> `daemon::tests::t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store` (a store-backed
+> daemon over a retained segment; the push homed and landed; the daemon stopped with nothing more published; the
+> successor recovers from the store's changeset, `main` at the pushed commit, the next at 2; the log read back from its
+> files holds the creation and the push, `Names` and `Payload`, the payload the record's BLAKE3). The one shared test
+> store is `crate::test_store` (main's ruling 1's helper). Owed (C5 part 2): git's creation refused without
+> `--vcs-store`, versions 2 and a sequence of 0 gone, git's tests on the shared store; the replay's pack read a piece at
+> a time through `StorePacks`.
+
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
 > properties, UUID, deltified text) lands whole as one changeset, sequence the count the register names (creation 0),
@@ -58708,6 +58733,28 @@ Applied in the same change to: §4.16 "Composition at seal" (the deriver's shape
   no watchdog end; each of 128 to 320 MiB had ended exit 4 there before. Found, not fixed (GAPS): a holder's forward of
   the increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms), and the control shard's beat task ran 520 to
   1,381 ms late during it (near misses, the watchdog's beat holding).
+
+### A-797 — The green's owner answers a batch of work asks within its step budget and hands the rest back (2026-11-21, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; CLAUDE.md "Bounded work everywhere"; A-247, A-388)
+- **Why.** A shard asks its works' green owner in batches of up to a client region's credit (A-388), and the owner
+  answered a whole batch in one synchronous call, whatever each ask cost (a verdict, a rebase, a whole green's sizes, a
+  file's bytes). At 100,000 clients on one primary and two replicas (main `8a18edcc`) the green's shard spent 1,055 ms
+  of CPU in one poll of such a call (`xshard.rs:926`), past its liveness window, and the anchor killed and restarted the
+  primary; the spinning report recurred five more times that run.
+- **Change.** `crates/server/src/work_home.rs`: `answer_within` answers a batch's asks in order while the owner's step
+  budget (`runtime.step_budget_ns`) is unspent, always the first, and hands back the rest, which the asker puts at the
+  front of its outbox and sends again. Counted: `merge.work.batch_handed_back`. Also a diagnosis line: a work log
+  refused at its partition's merge budget names its largest log's entries (`work_log::describe_log`).
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --lib
+  a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back` (ten asks of 3 ns under 10 ns: all ten
+  answered before, four after and six handed back; a first ask past the budget still answered). `--lib work_home`,
+  `--test merge_load`, and the fleet tests on works and forwards (42) pass.
+- **By use, partial evidence, not proof** (release, `load_scale`, 100,000 clients, main `8a18edcc` with this change,
+  2026-11-21 ~00:00): no `is spinning` report and no watchdog kill in 3,110 s, where the run before had six reports
+  and one kill; 1,570,311 batches handed back. The run was stopped by main at about 3,970 s: the machine was at 96 of
+  97 GB of swap on 96 GiB of RAM (the run held about 30 GB), so its latencies are confounded. It also showed two open
+  walls (GAPS, A-797): about 2,700 clients whose submits, first sent at 11 to 14 s, were never answered (the client
+  node's forwards: 9,116,579 resolved on its control shard, 9,113,196 delivered home, 3,383 lost between); and a work
+  whose log reached 300,898,443 bytes, filling its partition's merge budget.
 
 ### §4.16 amended — A holder's forward is timed on both ends, and a late beat is counted (2026-11-21, w-shared for UI goal 93; main's ruling on the lane, step 1: measure first)
 Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD_BUILD`), `crates/server/src/verbs.rs`

@@ -7867,7 +7867,191 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![4])));
+    assert_eq!(seen, Some((true, true, 0, 0, vec![5])));
+  }
+
+  /// A-767 C5 (git onto the changeset store; main's order of 2026-11-20 ~21:20: "red first: a stock git push lands as
+  /// one changeset, and a daemon restarted with kill -9 replays it"). Do: on a daemon over a retained anchor segment
+  /// holding a store (the one shared test store), create a git repository and push the fixtures' `create` as stock git
+  /// sends it, homed and landed as the edge does; stop the daemon with nothing more published, as a kill -9 leaves it,
+  /// and start a successor over the same segment and store. Expect: the successor recovers the repository by reading the
+  /// changeset its record names from the store (one read, no replay refused), `main` at the pushed commit, its record
+  /// version 5 naming sequence 1, and its next landing at sequence 2; the store's log holds the push as one git
+  /// changeset of the repository at sequence 1, after the creation's 0, whose `Names` and `Payload` sections are the
+  /// record's names and pack, the payload the BLAKE3 the record names. Before C5 no push landed anything into the store.
+  #[test]
+  fn t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store() {
+    use slates_anchor::AnchorSegment;
+    use slates_store::log::{ChangesetLog, SectionKind, Tool};
+    let mut store = crate::test_store::TestStore::start("c5-git-push");
+    let profile = test_profile();
+    let instance = format!("c5-git-push-{}", std::process::id());
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
+    let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+      .unwrap()
+      .with_content(&super::content_name_of(&instance), config.content_bytes())
+      .unwrap();
+    let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    first.bootstrap(true).unwrap();
+    let shard = first.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    first
+      .observe(shard, move |state| {
+        crate::vcs_store::write_version_4_for_test(true);
+        let repository = crate::git_push::tests::git_repository(state, "landed");
+        let request = crate::git_push::tests::chain()
+          .into_iter()
+          .next()
+          .map(|(scenario, _)| scenario.request.to_vec())
+          .unwrap();
+        let task = slates_rt::futures::spawn(async move {
+          let answered = crate::git_push::tests::homed_drive(repository, &request).await;
+          let landed = crate::state::with_state(|state| {
+            state
+              .refusals
+              .get(crate::git_push::PUSH_LANDED)
+              .copied()
+              .unwrap_or(0)
+          });
+          let _ = sent.send((repository, answered.map(|_| ()), landed));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let (repository, answered, landed) = got.recv().expect("the push answered");
+    answered.expect("the push homed, landed and answered");
+    assert_eq!(landed, Some(1), "the push landed one changeset");
+    // The crash: nothing more published.
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let shard = second.shards.first().copied();
+    let (sent, got) = std::sync::mpsc::channel();
+    let watch = move |_: &mut crate::state::ShardState| {
+      let sent = sent.clone();
+      let task = slates_rt::futures::spawn(async move {
+        loop {
+          let seen = crate::state::with_state(|state| {
+            let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+            let recovered = state.vcs_stores.unrecovered(repository).is_none()
+              && !state.vcs_stores.rebuilding(repository)
+              && state.vcs_stores.holds(repository);
+            let main = state
+              .db
+              .partition()
+              .repositories()
+              .branch(repository, "main");
+            let records: Vec<(u32, u64, Option<slates_vcs::ContentId>)> =
+              crate::vcs_store::tests::records(state, repository)
+                .iter()
+                .map(|record| {
+                  let read = crate::vcs_store::record::Record::decode(
+                    record,
+                    slates_git::object_name::ObjectFormat::Sha1,
+                  )
+                  .unwrap();
+                  (
+                    u32::from_le_bytes(record[4..8].try_into().unwrap()),
+                    read.sequence,
+                    read.packed.map(|(identity, _)| identity),
+                  )
+                })
+                .collect();
+            let next = state
+              .vcs_stores
+              .git_ref(repository)
+              .map(|(_, git)| git.landed + 1);
+            (
+              recovered,
+              main.is_some(),
+              count(crate::vcs_store::REPLAY_REFUSED),
+              count(crate::vcs_store::CHANGESET_READ),
+              records,
+              next,
+            )
+          });
+          if let Some(seen) = seen
+            && (seen.0 || seen.2 > 0)
+          {
+            let _ = sent.send(seen);
+            break;
+          }
+          slates_rt::futures::yield_now().await;
+        }
+      });
+      if let Ok(task) = task {
+        let _ = slates_rt::futures::detach(task);
+      }
+    };
+    let started = std::time::Instant::now();
+    let bound = std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    while second.observe(shard, watch.clone()).is_err() {
+      assert!(
+        started.elapsed() < bound,
+        "the successor's shard never took the watch"
+      );
+      std::thread::park_timeout(std::time::Duration::from_millis(50));
+    }
+    let (recovered, main, refused, read, records, next) = got.recv().expect("recovered");
+    second.stop();
+    drop(segment);
+    assert_eq!(
+      (recovered, main, refused, read, next),
+      (true, true, 0, 1, Some(2)),
+      "recovered from the store's changeset, the next at 2"
+    );
+    let [(version, sequence, Some(pack))] = records[..] else {
+      panic!("one record naming a pack: {records:?}")
+    };
+    assert_eq!((version, sequence), (5, 1));
+    // The store's log, read back from its files: the creation, then the push as one changeset.
+    store.stop_owner();
+    let dir = store.dir().to_path_buf();
+    let log_file = hyper_block::file::DeviceFile::adopt(
+      crate::test_store::root(&dir)
+        .open_file(slates_store::store::LOG_FILE)
+        .unwrap(),
+      &dir.join(slates_store::store::LOG_FILE),
+      hyper_block::file::CachingRequest::Buffered,
+      hyper_block::buf::Alignment::BYTE,
+    )
+    .unwrap();
+    let mut found = Vec::new();
+    let log = ChangesetLog::recover(log_file, 0, |_, located| found.push(*located)).unwrap();
+    let ours: Vec<_> = found
+      .iter()
+      .filter(|located| located.header.repository == u128::from_be_bytes(repository.bytes))
+      .copied()
+      .collect();
+    assert_eq!(
+      ours
+        .iter()
+        .map(|located| (located.header.tool, located.header.sequence))
+        .collect::<Vec<_>>(),
+      vec![(Tool::Git, 0), (Tool::Git, 1)]
+    );
+    let sections = log.sections(&ours[1]).unwrap();
+    assert_eq!(
+      sections
+        .iter()
+        .map(|section| section.kind)
+        .collect::<Vec<_>>(),
+      vec![SectionKind::Names, SectionKind::Payload]
+    );
+    let mut payload = vec![0u8; usize::try_from(sections[1].len).unwrap()];
+    log.read_at(&mut payload, sections[1].offset).unwrap();
+    assert_eq!(slates_vcs::ContentId::of(&payload), pack);
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained

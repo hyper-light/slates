@@ -250,20 +250,15 @@ impl<L: ShardLender> Receive<L> {
             return Ok(false);
           }
           turn.yield_holding().await;
-          // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
-          if let Some(bytes) = push.take_homing() {
+          // The push's names and pack homed in the region, then landed on the node's store, before its record names
+          // them (A-724 piece 8c; A-767 C5), off the shard's step.
+          if let Some(asked) = push.take_homing() {
             let (origin, shards) = lender
               .lend(|state| (state.shard, state.shards.clone()))
               .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
-            let homed = crate::vcs_store::homes::home_in_region(
-              origin,
-              &shards,
-              bytes,
-              crate::fleet::live_budget(),
-            )
-            .await;
+            let carried = crate::git_push::carry(origin, &shards, asked).await;
             lender
-              .lend(|state| push.homed(state, homed))
+              .lend(|state| push.homed(state, carried))
               .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
           }
         }
@@ -289,6 +284,7 @@ fn refused(failure: PushFailed) -> ServiceRefused {
     PushFailed::NoStore => ServiceRefused::Unavailable,
     PushFailed::Policy(_) => ServiceRefused::Unreadable,
     PushFailed::Exchange(_) | PushFailed::Unchecked => ServiceRefused::Unwritable,
+    PushFailed::Unlanded => ServiceRefused::Unavailable,
   }
 }
 
@@ -299,6 +295,7 @@ fn failed(failure: PushFailed) -> Failed {
     PushFailed::NoStore => Status::SERVICE_UNAVAILABLE,
     PushFailed::Policy(_) => Status::INTERNAL_SERVER_ERROR,
     PushFailed::Unchecked => Status::BAD_REQUEST,
+    PushFailed::Unlanded => Status::SERVICE_UNAVAILABLE,
     PushFailed::Exchange(refusal) => exchange_status(refusal),
   })
 }
