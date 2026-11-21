@@ -51,6 +51,13 @@ thread_local! {
   pub(crate) static ADMISSION_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A test's kill of a batch's landing after this many slices of its recorded apply (the sliced commit's crash test):
+  /// nothing after it runs, as after a `kill -9`; it clears itself as it fires.
+  pub(crate) static KILL_AT_COMMIT_SLICE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Why a batch lands now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Flush {
@@ -321,8 +328,8 @@ impl Staging {
     let revisions = records.len();
     let landed =
       landing::land_changeset(&disk, (repository, sequence), records, &self.carried).await;
-    crate::state::with_state(|state| {
-      let committed = landed.and_then(|()| {
+    let recorded = crate::state::with_state(|state| {
+      landed.and_then(|()| {
         if landing::next_sequence(state, repository) != sequence {
           state.count(super::DIVERGED, 1);
           return Err(Uncommitted::Diverged);
@@ -338,30 +345,47 @@ impl Staging {
         batch
           .commit(state, (principal, repository), parts)
           .map_err(Uncommitted::Append)
-      });
-      match committed {
-        Ok(_) => {
-          state.count(cause.counter(), 1);
-          let green = self.green;
-          crate::merge_service::checkpoint_green(state, green);
-          super::fold_to_readers(state, green);
-          let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
-            .into_iter()
-            .map(|(path, identity)| (identity, path))
-            .collect();
-          crate::vcs_store::svn_texts::follow(state, green, &self.released, &holding);
-          super::release_texts(state, None, &self.put);
-          self.put.clear();
-          if let Some(turn) = self.turn.take() {
-            turn.give_back(state);
-          }
-          Ok(revisions)
-        }
-        Err(refused) => {
-          self.abandon(state);
-          Err(refused)
-        }
+      })
+    })?;
+    let mut recorded = match recorded {
+      Ok(recorded) => recorded,
+      Err(refused) => {
+        let _ = crate::state::with_state(|state| self.abandon(state));
+        return Some(Err(refused));
       }
+    };
+    // The batch is the register's now: its versions applied to the green a slice a turn (`RecordedBatch`), the
+    // landing turn and the import's read gate held until the last; a kill between slices recovers from the record.
+    let mut slices = 0usize;
+    loop {
+      #[cfg(test)]
+      if KILL_AT_COMMIT_SLICE.with(|kill| kill.get() == Some(slices)) {
+        KILL_AT_COMMIT_SLICE.with(|kill| kill.set(None));
+        // A kill: nothing after it runs, as after a `kill -9` between two slices.
+        std::future::pending::<()>().await;
+      }
+      if crate::state::with_state(|state| recorded.apply_slice(state))?.is_some() {
+        break;
+      }
+      slices = slices.saturating_add(1);
+      slates_rt::futures::yield_now().await;
+    }
+    crate::state::with_state(|state| {
+      state.count(cause.counter(), 1);
+      let green = self.green;
+      crate::merge_service::checkpoint_green(state, green);
+      super::fold_to_readers(state, green);
+      let holding: Vec<(ContentIdentity, String)> = std::mem::take(&mut self.holding)
+        .into_iter()
+        .map(|(path, identity)| (identity, path))
+        .collect();
+      crate::vcs_store::svn_texts::follow(state, green, &self.released, &holding);
+      super::release_texts(state, None, &self.put);
+      self.put.clear();
+      if let Some(turn) = self.turn.take() {
+        turn.give_back(state);
+      }
+      Ok(revisions)
     })
   }
 

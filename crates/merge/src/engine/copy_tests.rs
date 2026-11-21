@@ -2653,3 +2653,80 @@ fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns
   assert_eq!(linked_reads(&restored), expected);
   assert_eq!(restored.head_identity(), green.head_identity());
 }
+
+/// A-579's partial folds, found reading `sum_at` (2026-11-21): a checkpoint's sum at the head, taken while the identity's
+/// backlog is part folded, must be the sum the whole fold reaches. Do: on the trunk, copy it to `branches/x`, then
+/// change three files; fold one key alone (`fold_identity_step(1)`); change the three again; take the sum at the head;
+/// fold the rest. Expect: the
+/// sum taken equals the folded identity's. Before the fix `sum_at` moved every key from `identity_version`, and the key
+/// folded alone was moved from `identity_version`, not from the version it was folded at.
+#[test]
+fn a_checkpoints_sum_taken_mid_fold_is_the_whole_folds() {
+  let mut green = trunk();
+  accept(
+    &mut green,
+    Work::exclusive().copy("trunk", "branches/x", 1),
+    2,
+  );
+  let mut work = Work::default();
+  work
+    .overwrite("trunk/a", 0, b"ALPHA")
+    .overwrite("trunk/c", 0, b"GAMMA")
+    .overwrite("trunk/d/b", 0, b"BETA");
+  accept(&mut green, &work, 3);
+  assert!(
+    green.identity_backlog() > 1,
+    "too few keys to fold one alone"
+  );
+  assert!(!green.fold_identity_step(1));
+  // The key folded alone changes again: dirty once more, its entry in the sum at the version it was folded at.
+  let mut again = Work::default();
+  again
+    .overwrite("trunk/a", 0, b"alpha")
+    .overwrite("trunk/c", 0, b"gamma")
+    .overwrite("trunk/d/b", 0, b"beta");
+  accept(&mut green, &again, 4);
+  let head = green.head();
+  let mid_fold = green.sum_at(head);
+  green.fold_identity();
+  assert_eq!(mid_fold.bytes(), green.sum_at(head).bytes());
+}
+
+/// A-579 (main's 05:00 order: the 13.4 ms single-key folds sliced inside a key). Do: on a green with a 1 MiB file, change
+/// it; fold the identity 64 KiB a call; change the file again half way; fold on. Expect: no call folds a key whole (each
+/// hashes about a slice: the count of slices within a key moves); the change half way begins the file again; and the
+/// identity, once whole, equals its recount.
+#[test]
+fn a_large_files_entry_is_hashed_a_slice_a_call_and_begun_again_if_it_changes() {
+  const FILE: usize = 1 << 20;
+  const SLICE: usize = 64 << 10;
+  let mut green = Green::new();
+  let mut work = Work::default();
+  work.create("big", &vec![1u8; FILE]);
+  accept(&mut green, &work, 1);
+  green.fold_identity();
+  accept(
+    &mut green,
+    Work::default().overwrite("big", 0, b"changed"),
+    2,
+  );
+  let before = green.identity_slices_within_a_key();
+  for _ in 0..4 {
+    assert!(!green.fold_identity_slice(SLICE));
+  }
+  assert!(
+    green.identity_slices_within_a_key() > before,
+    "no slice within the key"
+  );
+  accept(&mut green, Work::default().overwrite("big", 7, b"again"), 3);
+  let mut calls = 0;
+  while !green.fold_identity_slice(SLICE) {
+    calls += 1;
+    assert!(calls <= 2 * FILE / SLICE, "the fold never ended");
+  }
+  assert!(
+    calls >= FILE / SLICE - 1,
+    "{calls} calls: the file was not begun again"
+  );
+  assert_eq!(green.head_identity(), green.head_identity_from_scratch());
+}
