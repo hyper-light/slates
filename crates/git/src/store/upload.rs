@@ -464,7 +464,13 @@ impl<A: Answered> Upload<A> {
       admission,
     };
     loop {
-      match self.step(&mut context, out) {
+      let diag_stage = match &self.stage { Stage::Objects { .. } => "objects", Stage::Gather { .. } => "gather", Stage::Header => "header", Stage::Runs { .. } => "runs", Stage::CoverFrom => "cover-from", Stage::Cover { .. } => "cover", Stage::Holders { .. } => "holders", Stage::Loose { .. } => "loose", Stage::Trailer => "trailer", Stage::Done => "done", Stage::Refused(_) => "refused" };
+      let diag_pending = self.pending.is_some();
+      let diag_by_entry = match &self.by_entry { None => "none", Some(ByEntry { chosen: Chosen::Marked { marking: Some(_), .. }, .. }) => "marking", Some(ByEntry { chosen: Chosen::Marked { .. }, .. }) => "marked-entry", Some(_) => "every-entry" };
+      let diag_began = std::time::Instant::now();
+      let diag_step = self.step(&mut context, out);
+      if diag_began.elapsed().as_millis() > 100 { eprintln!("DIAG stream unit {} ms in stage {diag_stage} pending {diag_pending} by_entry {diag_by_entry}", diag_began.elapsed().as_millis()); }
+      match diag_step {
         Ok(Progress::Done) => return Ok(Progress::Done),
         Ok(Progress::More) => {}
         Err(refused) => {

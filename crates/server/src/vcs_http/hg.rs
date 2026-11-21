@@ -567,6 +567,25 @@ impl<S: HgStores> Exchange for HgExchange<S> {
   }
 
   async fn body_end(&mut self, _gone: ClientGone<'_>) -> Result<(), Failed> {
+    struct DiagGuard(std::time::Instant, String);
+    impl Drop for DiagGuard {
+      fn drop(&mut self) {
+        let ms = self.0.elapsed().as_millis();
+        if ms > 100 {
+          eprintln!("DIAG hg request {} ms: {}", ms, self.1);
+        }
+      }
+    }
+    let _diag = DiagGuard(
+      std::time::Instant::now(),
+      format!(
+        "batch {} pushkey {} push {} query {}",
+        self.batcher.is_some(),
+        self.pushkey,
+        self.pusher.is_some(),
+        String::from_utf8_lossy(&self.query).chars().take(80).collect::<String>()
+      ),
+    );
     let fields: Vec<(&[u8], &[u8])> = self
       .fields
       .iter()
@@ -607,12 +626,30 @@ impl<S: HgStores> Exchange for HgExchange<S> {
       Some(principal) => answered_push(&mut self.stores, (id, principal), &request, &mut admission)
         .await
         .map(|answered| Made::Whole(answered.media_type, answered.body)),
-      None => self.stores.lend(id, &mut answering, |store, room| {
-        match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
-          hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
-          hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
+      None => {
+        let diag_lend = std::time::Instant::now();
+        let diag_begin = std::cell::Cell::new(0_u128);
+        let lent = self.stores.lend(id, &mut answering, |store, room| {
+          let diag_began = std::time::Instant::now();
+          let begun = match hg_http::begin(store, &request, header_line(), &mut Fastest, room) {
+            hg_http::Begun::Answered(answered) => Made::Whole(answered.media_type, answered.body),
+            hg_http::Begun::Streamed(streamed) => Made::Streamed(streamed),
+          };
+          diag_begin.set(diag_began.elapsed().as_millis());
+          begun
+        });
+        let diag_total = diag_lend.elapsed().as_millis();
+        if diag_total > 100 {
+          eprintln!(
+            "DIAG hg body_end {} ms: view {} ms, begin {} ms, query {}",
+            diag_total,
+            diag_total.saturating_sub(diag_begin.get()),
+            diag_begin.get(),
+            String::from_utf8_lossy(&self.query).chars().take(80).collect::<String>()
+          );
         }
-      }),
+        lent
+      }
     }
     .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
     if let Made::Streamed(_) = made {
@@ -671,6 +708,7 @@ impl<S: HgStores> HgExchange<S> {
       .generation
       .as_ref()
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let diag_turn = std::time::Instant::now();
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
@@ -690,6 +728,9 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
+    if diag_turn.elapsed().as_millis() > 100 {
+      eprintln!("DIAG hg turn {} ms", diag_turn.elapsed().as_millis());
+    }
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),
