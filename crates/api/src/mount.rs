@@ -1001,7 +1001,9 @@ mod tests {
     MountBackend, MountKind, ROOT_UID, capture_open, classify, export_path, fuse_available,
     loopback_available, mount_args, nfs_available, winfsp_available,
   };
-  use crate::error::{HoldersUnread, MountFault, MountHolders, MountMissing};
+  #[cfg(unix)]
+  use crate::error::{HoldersUnread, MountHolders};
+  use crate::error::{MountFault, MountMissing};
 
   /// §4.6 A-34 — a read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the read-only
   /// capability too); a writable mount does not.

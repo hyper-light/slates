@@ -4298,7 +4298,7 @@ fn region_name_key(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) ->
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`
 /// marker replaced by `con`, so it stays the same length (within the platform's shared-object name
 /// limit the segment already meets) and is distinct from the segment's own name.
-fn content_name_of(seg_name: &str) -> String {
+pub(crate) fn content_name_of(seg_name: &str) -> String {
   match seg_name.strip_prefix("slates-seg-") {
     Some(rest) => format!("slates-con-{rest}"),
     None => format!("{seg_name}-c"),
@@ -5123,6 +5123,7 @@ async fn init_shard(
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
     vcs_disk: config.vcs_disk.clone(),
+    family_reserved_through: 0,
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),

@@ -685,6 +685,7 @@ fn stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both() {
 
 /// The anchor's next lines (its standard error, as `lines` forwards them), read until `instance`'s daemon says it
 /// serves: the lines read.
+#[cfg(unix)]
 fn lines_until(lines: &std::sync::mpsc::Receiver<String>, instance: &str) -> Vec<String> {
   let serving = format!("{SERVING_LINE}{instance} serving on ");
   let mut read = Vec::new();

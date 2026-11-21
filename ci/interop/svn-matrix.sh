@@ -56,10 +56,14 @@ row() {
   echo "${ROWS[${#ROWS[@]}-1]}"
 }
 
+# The store directory (A-767's standing grant): where the daemon mounts a repository's FSFS view, read-only, as a
+# hook's REPOS-PATH (A-645 (a)); without it a configured hook is refused. The view is unmounted before the anchor ends.
+mkdir -p "$WORK/store"
 "$SLATES" --instance "$INSTANCE" anchor --quick --shards 2 --vcs-svn 127.0.0.1:0 --vcs-http 127.0.0.1:0 \
-  --vcs-ssh 127.0.0.1:0 >/dev/null 2>"$WORK/anchor.log" &
+  --vcs-ssh 127.0.0.1:0 --vcs-store "$WORK/store" >/dev/null 2>"$WORK/anchor.log" &
 ANCHOR=$!
-trap 'kill $ANCHOR 2>/dev/null; wait $ANCHOR 2>/dev/null' EXIT
+trap '[ -d "$WORK/store/project.svn" ] && "$SLATES" --instance "$INSTANCE" unmount "$WORK/store/project.svn" >/dev/null 2>&1
+  kill $ANCHOR 2>/dev/null; wait $ANCHOR 2>/dev/null' EXIT
 for _ in $(seq 600); do
   grep -q "instance $INSTANCE serving on" anchor.log && grep -q 'issuer surface: export' anchor.log && break
   kill -0 $ANCHOR 2>/dev/null || { echo "the anchor ended"; tail -20 anchor.log; exit 1; }

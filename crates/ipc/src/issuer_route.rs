@@ -174,6 +174,14 @@ impl IssuerRoute {
     &self.name
   }
 
+  /// The listener, readable while a claim waits: the anchor polls it beside its other wake sources, so a claim is
+  /// answered as it arrives rather than at the anchor's next look at its daemon, which a running daemon's lapse bound
+  /// puts up to the observation budget away, as long as the claim's own patience (w-interop's loaded Linux matrices,
+  /// 2026-11-20: `recvmsg issuer refused` with `ETIMEDOUT`, code 110).
+  pub fn readiness(&self) -> BorrowedFd<'_> {
+    self.listener.as_fd()
+  }
+
   /// Answers every claim waiting now, each read and written within `patience`: a peer of this user that sends
   /// `secret` is answered with `segment` and its `len`; any other is closed unanswered. Returns at once when none
   /// waits; a refused accept ends the turn.
@@ -370,6 +378,37 @@ mod tests {
         Err(rustix::io::Errno::PIPE),
         1
       )
+    );
+  }
+
+  /// A-754 (a claim wakes its anchor). Do: bind a route; from another thread, claim it; poll the route's readiness with
+  /// a patience far past any scheduling delay, then answer what waits. Expect: the readiness readable before the
+  /// patience ends, and the claim granted by the one turn it woke.
+  #[test]
+  fn a_waiting_claim_makes_its_route_readable() {
+    let instance = format!("issuer-route-wake-{}", std::process::id());
+    let route = IssuerRoute::bind(&instance).unwrap();
+    let segment =
+      rustix::fs::memfd_create("issuer-route-wake", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+    #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+    rustix::fs::ftruncate(&segment, 4096).unwrap();
+    let patience = std::time::Duration::from_secs(30);
+    let claimer = {
+      let name = route.name().to_owned();
+      std::thread::spawn(move || claim(&name, &[5u8; SECRET_BYTES], patience))
+    };
+    let readiness = route.readiness();
+    let mut interest = [rustix::event::PollFd::new(
+      &readiness,
+      rustix::event::PollFlags::IN,
+    )];
+    let timeout = rustix::event::Timespec::try_from(patience).unwrap();
+    let ready = rustix::event::poll(&mut interest, Some(&timeout)).unwrap();
+    let answered = route.answer_waiting(&[5u8; SECRET_BYTES], segment.as_fd(), 4096, patience);
+    let claimed = claimer.join().unwrap();
+    assert_eq!(
+      (ready, answered.granted, claimed.map(|(_, len)| len).ok()),
+      (1, 1, Some(4096))
     );
   }
 

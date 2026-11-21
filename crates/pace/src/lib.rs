@@ -24,6 +24,7 @@
 //! and `slates_rt::futures::others_waiting`), so the engine, git, Mercurial and Subversion pace their work with it
 //! while none of them binds to the runtime.
 
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 #![forbid(unsafe_code)]
 
 /// What a step's owner gives it: its clock, its probe of whether anyone waits, the quantum, the ceiling and the target
@@ -43,6 +44,7 @@ pub struct Env {
 }
 
 /// The parts of a million: the target error's unit.
+/// Format: parts per million.
 const MILLION: u128 = 1_000_000;
 
 /// One unit kind's measured cost (module docs).
@@ -90,8 +92,12 @@ impl UnitCost {
   /// The mean and the variance of the samples so far.
   fn moments(&self) -> (u128, u128) {
     let count = u128::from(self.count.max(1));
-    let mean = self.sum / count;
-    let variance = (self.sum_sq / count).saturating_sub(mean.saturating_mul(mean));
+    let mean = self.sum.checked_div(count).unwrap_or(0);
+    let variance = self
+      .sum_sq
+      .checked_div(count)
+      .unwrap_or(0)
+      .saturating_sub(mean.saturating_mul(mean));
     (mean, variance)
   }
 
@@ -126,10 +132,18 @@ impl UnitCost {
     let span = u128::from(window).saturating_add(1);
     let estimate = u128::from(self.estimate);
     self.estimate = if sample >= estimate {
-      let up = sample.saturating_sub(estimate).saturating_mul(2) / span;
+      let up = sample
+        .saturating_sub(estimate)
+        .saturating_mul(2)
+        .checked_div(span)
+        .unwrap_or(0);
       u64::try_from(estimate.saturating_add(up)).unwrap_or(u64::MAX)
     } else {
-      let down = estimate.saturating_sub(sample).saturating_mul(2) / span;
+      let down = estimate
+        .saturating_sub(sample)
+        .saturating_mul(2)
+        .checked_div(span)
+        .unwrap_or(0);
       u64::try_from(estimate.saturating_sub(down)).unwrap_or(0)
     };
   }

@@ -1578,14 +1578,16 @@ pub(crate) struct PushTurns {
 /// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
 /// own measured jitter over the quantum, at least one part, at most the whole.
 pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
+  // Format: parts per million.
+  const MILLION: u64 = 1_000_000;
   u64::try_from(
     u128::from(jitter_ns)
-      .saturating_mul(1_000_000)
+      .saturating_mul(u128::from(MILLION))
       .checked_div(u128::from(quantum_ns.max(1)))
       .unwrap_or(0),
   )
   .unwrap_or(u64::MAX)
-  .clamp(1, 1_000_000)
+  .clamp(1, MILLION)
 }
 
 impl PushTurns {

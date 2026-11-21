@@ -158,6 +158,9 @@ pub struct StoreOwner {
 #[derive(Debug, Clone)]
 pub struct StoreHandle {
   requests: Sender<Request>,
+  /// The id of the standing grant the store's directory was opened under ([`crate::store::grant_id`]): what a
+  /// landing's header names.
+  grant: u64,
 }
 
 impl fmt::Debug for Request {
@@ -237,6 +240,7 @@ impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
   /// with room for `waiting` requests at once.
   pub fn start(root: StoreRoot, sizing: Sizing, waiting: usize) -> Result<Self, OwnerError> {
+    let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
     let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
@@ -245,7 +249,7 @@ impl StoreOwner {
     .map_err(|_| OwnerError::Gone)?;
     Ok(Self {
       thread,
-      handle: StoreHandle { requests },
+      handle: StoreHandle { requests, grant },
     })
   }
 
@@ -532,6 +536,11 @@ fn sections_of(store: &Store, row: &Changeset) -> Result<Vec<SectionAt>, StoreEr
 }
 
 impl StoreHandle {
+  /// The id of the standing grant the store writes under: the `grant` every landing's header names (its `G` row).
+  pub fn grant(&self) -> u64 {
+    self.grant
+  }
+
   /// Sends `request` and waits for its answer on `answers`, as a task.
   async fn ask<T>(
     &self,
