@@ -2540,9 +2540,15 @@ fn print_owner_counters(setup: &mut Client, label: &str) {
       || refusal.kind.starts_with("merge.work.asked_owner")
       || refusal.kind.starts_with("merge.submit.")
       || refusal.kind.starts_with("merge.reanchor.")
+      || refusal.kind.starts_with("merge.work.log_peak")
     {
       let total = moved.entry(refusal.kind.as_str()).or_default();
-      *total = total.saturating_add(refusal.count);
+      // A peak is the most over the shards (A-806), any other counter their sum.
+      *total = if refusal.kind.contains("_peak") {
+        (*total).max(refusal.count)
+      } else {
+        total.saturating_add(refusal.count)
+      };
     }
   }
   for (name, count) in moved {

@@ -164,8 +164,8 @@ pub(crate) enum RebaseAnswer {
   Rebased {
     /// The green's head the work is now based on.
     version: u64,
-    /// The files that still differ from the head.
-    changed: BTreeMap<String, Option<Vec<u8>>>,
+    /// The files that still differ from the head, each as its parts over the head (A-806), `None` for a removal.
+    changed: BTreeMap<String, Option<crate::work_files::HeldParts>>,
     /// The operations restated over the head.
     journal: Vec<VolumeOp>,
     /// The base entries at the head of every path the restated journal names, for a work that composes its own

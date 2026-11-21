@@ -35,13 +35,18 @@ const FIXED_BYTES: usize = 8 * 1024 * 1024;
 const AT_DIVISOR: usize = 2;
 
 fn daemon() -> (Daemon, String) {
+  daemon_named("srv-work-edit-cow")
+}
+
+/// A daemon under `tag` and this process's id, so the file's tests run side by side.
+fn daemon_named(tag: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
-  let instance = format!("srv-work-edit-cow-{}", std::process::id());
+  let instance = format!("{tag}-{}", std::process::id());
   let daemon = Daemon::start(
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(1)),
     slates_server::SegmentSource::Create {
-      name: format!("slates-seg-work-edit-cow-{}", std::process::id()),
+      name: format!("slates-seg-{instance}"),
     },
   )
   .unwrap();
@@ -154,5 +159,82 @@ fn a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file() {
     added <= bound,
     "{works} one-byte edits of a {file_bytes}-byte file added {added} resident bytes, past {bound}: a work copied the \
      file"
+  );
+}
+
+/// Shape: the large file the work-log test rebases a small edit of: 1 MiB, so a whole copy dwarfs the edit.
+const LOG_FILE_BYTES: usize = 1024 * 1024;
+/// Shape: the bytes the work writes into it, a load slot's (`SLOT_BYTES` in `crates/client/examples/load_bench.rs`).
+const LOG_EDIT_BYTES: usize = 64;
+/// Bound: one work's log after its rebase, beside what it wrote: the restatement's framing, the file's path, the
+/// pieces naming the base's ranges around the write (three at most) and the journal's operations. Fixed, no term for
+/// the file.
+const LOG_FRAMING_BYTES: u64 = 1024;
+
+/// A-806 (goal 86b: at 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its
+/// partition's merge budget; at 1,000 clients over `asic_reg`'s 1 MB headers the largest log was 35,249,811 bytes in 8
+/// entries for 64-byte edits). Do: on a green holding a 1 MiB file and a small one, a work overwrites 64 bytes of the
+/// large file; another work changes the small file and submits; the first work rebases. Expect: the work's log
+/// is at most what the work wrote and a fixed framing, with no term for the file. Before, a rebase answered the work's changed file whole, and its restatement logged it whole.
+#[test]
+fn a_rebased_works_log_holds_what_it_wrote_not_the_file() {
+  let (daemon, instance) = daemon_named("srv-work-log-bound");
+  let mut client = connect(&instance);
+  let green = client.create_green("log-bound-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "log-bound-seed").unwrap();
+  let bytes: Vec<u8> = (0..LOG_FILE_BYTES)
+    .map(|index| u8::try_from(index % 251).unwrap())
+    .collect();
+  client.edit(seed, "big", 0, 0, &bytes).unwrap();
+  client.edit(seed, "small", 0, 0, b"small").unwrap();
+  assert!(matches!(
+    client.submit(seed).unwrap(),
+    Submitted::Accepted(_)
+  ));
+  let (work, _) = client.create_work(green, "log-bound-work").unwrap();
+  let at = u64::try_from(LOG_FILE_BYTES / AT_DIVISOR).unwrap();
+  let written = vec![b'w'; LOG_EDIT_BYTES];
+  let edit_len = u64::try_from(LOG_EDIT_BYTES).unwrap();
+  client.edit(work, "big", at, edit_len, &written).unwrap();
+  let (other, _) = client.create_work(green, "log-bound-other").unwrap();
+  client.edit(other, "small", 0, 5, b"SMALL").unwrap();
+  assert!(matches!(
+    client.submit(other).unwrap(),
+    Submitted::Accepted(_)
+  ));
+  assert!(matches!(
+    client.rebase(work).unwrap(),
+    slates_client::Rebased::Rebased(_)
+  ));
+  // The work's own log, read where it is held (the one shard of this daemon): the seed's log, which wrote the whole
+  // file, is not this work's.
+  let id = slates_db::catalog::VolumeId { bytes: work.bytes };
+  let peak = daemon
+    .observation(
+      daemon.shards().first().copied(),
+      slates_server::daemon::OBSERVE_BUDGET_NS,
+      move |state: &mut slates_server::state::ShardState| {
+        state
+          .db
+          .partition()
+          .work_log(id)
+          .iter()
+          .map(Vec::len)
+          .sum::<usize>()
+      },
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+  let peak = u64::try_from(peak).unwrap();
+  let whole = client.read(work, "big", ReadAt::Head).unwrap();
+  let start = usize::try_from(at).unwrap();
+  let read = whole[start..start + LOG_EDIT_BYTES].to_vec();
+  drop(client);
+  daemon.stop();
+  assert_eq!(read, written, "the rebased work still reads its write");
+  assert!(
+    peak <= edit_len + LOG_FRAMING_BYTES,
+    "the rebased work's log held {peak} bytes for a {LOG_EDIT_BYTES}-byte write into a {LOG_FILE_BYTES}-byte file"
   );
 }

@@ -440,6 +440,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-806 (2026-11-21, w-fed-move; goal 86b's 300 MB work log).** FIXED: a rebase answers each changed file as parts
+> over the head; the work holds and its restatement logs those parts, so a work's log is what it wrote. Largest log at
+> 1,000 clients over `asic_reg` 35,249,811 to 1,957 bytes. Found beside it: `daemon`'s
+> `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
+> A-774 part 3), reported to main.
+>
 > **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
 > re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
 > judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
@@ -757,7 +763,9 @@
 > path), and only then its store hold given back; a replay holds the texts the records still keep stored after its whole
 > log, so a text a later entry deltified is never asked of the store. Held by
 > `a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released` (red: nothing deltified, the
-> whole text held). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
+> whole text held). RETIRED 2026-11-21 (C2 stage B part 2 (b) P3, w-svn): a committed text is its changeset's on the
+> node's store and the content store lets it go once its revision stands, so the job only moved history into RAM.
+> OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -2654,18 +2662,19 @@
 > a commit's green increment brings back whole a stored text the content store let go (a copy, a revert;
 > `svn_texts::bring_whole`), given back after its step; held by
 > `a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment` (red without it: `Corrupt`).
-> Owed: P2 the hook view brings an evicted stored text back before it holds it; P3 the content store lets go a
-> commit's texts once its changeset lands, recovery stops reading them back; P4 imports land texts as Payload with
-> Texts rows, the records keep none in RAM, the deltify job retired. Stage C,
-> an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
-> today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
-> between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
-> landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
-> the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
-> `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
-
-> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. Owed in
-> (a): the deltify job; then (b), the records keep history on the store. Stage C,
+> P2 BUILT: the hook view keeps a layout naming a stored text the content store let go, brings the text back whole
+> between its turns, then writes and holds it (`svn_presenter::show`, `ViewTurn::Bringing`); held by
+> `a_hook_view_brings_back_a_stored_text_the_content_store_let_go` (red without it: never shown). Its cost, recorded:
+> a view pins in RAM every stored text it shows while it lives (views live as long as the shard), since its mount's
+> reads are the vfs's synchronous referenced reads; reads that wait on the store need vfs work, not yet owned.
+> P3 BUILT: the content store lets go every text a commit put once its landing ends (a committed text is its
+> changeset's on the node's store; the head's files are the green's), a recovery no longer reads stored texts back
+> (`fetch_stored_texts`, `svn_text_fetched` and `ReplayRefused::SvnStored` gone), and the deltify job, which turned
+> store-held texts into RAM deltas, is retired; held by
+> `a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store` (red without it: the content store
+> kept the text) and the crash test `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (the text
+> read back whole through the store, nothing in RAM). Owed: P4 imports land texts as Payload with Texts rows and the
+> records keep none in RAM (`KeptText`, `Record::Deltified` retired). Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in

@@ -12,7 +12,8 @@
 //!   learned rule's rent is certain before any lookup is timed.
 //! - Then each lend over the store's own index reports what its lookups took ([`looked_up`]: `Index::lookups_took`), and
 //!   a merge the rule says is due (`Index::compaction_due`) begins: the rule's rent-or-buy over the deployment's own
-//!   timings decides which newest runs, and when.
+//!   timings decides which newest runs, and when. An index never merged has no price (a merge's measured time) for the
+//!   rule to weigh, so its first reported lookups merge it once, which times one (a repository filled by pushes alone).
 //! A fetch reads a fork of the index (A-745's generation), whose runs are shared, so it neither reports nor merges: runs a
 //! fork shares are never merged, and a merge whose runs a fork comes to share is given up (`MergeStep::GivenUp`).
 //!
@@ -82,7 +83,12 @@ pub(crate) fn looked_up(state: &mut ShardState, id: RepositoryId, elapsed_ns: u6
       return;
     };
     index.lookups_took(elapsed_ns);
-    index.compaction_due(content)
+    // The rule's price is a merge's measured time (or inserts' reported time), so an index never merged has none and
+    // no merge would ever come due: its first lookups merge it once, which times the price, and the rule decides every
+    // merge after (a repository filled by pushes alone is never built whole until a restart replays it).
+    index
+      .compaction_due(content)
+      .or_else(|| (index.counters().compactions == 0).then_some(usize::MAX))
   };
   if let Some(runs) = due {
     begin(state, id, runs);
@@ -240,6 +246,62 @@ mod tests {
         assert!(index.get(content, key).is_some(), "{key:?}");
         assert!(index.visits().saturating_sub(before) <= 2);
       }
+    });
+  }
+
+  /// An index never merged (a repository filled by pushes alone) is merged once its lookups are reported, which gives
+  /// the rule its price. Do: give a Mercurial repository's index four runs of its own; report one lend's lookups; drive
+  /// the slices. Expect: one merge, one run left.
+  #[test]
+  fn an_index_never_merged_is_merged_once_its_lookups_are_reported() {
+    crate::test_store::audit_on_stored_shard("upkeep-push", |state| {
+      let owner = slates_db::catalog::Principal::Uid {
+        host: slates_db::HostId(0),
+        uid: 1234,
+      };
+      let reply = crate::test_store::create(
+        state,
+        &owner,
+        RequestBody::CreateRepository {
+          name: "pushed".to_owned(),
+          tool: VcsTool::Mercurial,
+          format: WireFormat::Sha1,
+          default_branch: "branch:default:0".to_owned(),
+          green: None,
+        },
+      );
+      assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
+      let id = state
+        .db
+        .partition()
+        .repositories()
+        .repository_named("pushed")
+        .unwrap()
+        .id;
+      let room = state.store.admittable();
+      within_budget(state, room, |stores| {
+        let (content, index) = index_of(stores, id).unwrap();
+        for batch in 0..4u8 {
+          for at in 0..64u8 {
+            index
+              .insert(
+                content,
+                slates_vcs::NewRow {
+                  key: &[b'Z', batch, at],
+                  contents: &[],
+                  payload: &[7; 512],
+                },
+              )
+              .unwrap();
+          }
+          index.seal_all(content).unwrap();
+        }
+      });
+      looked_up(state, id, 1_000);
+      while slice(state, id, 0) {}
+      let merged = state.refusals.get(MERGED).copied().unwrap_or(0);
+      let (_, index) = index_of(&mut state.vcs_stores, id).unwrap();
+      assert_eq!((merged, index.run_tables().len()), (1, 1));
     });
   }
 

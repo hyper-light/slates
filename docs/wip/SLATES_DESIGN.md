@@ -12297,10 +12297,10 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
-> A stored text a later revision moves past is deltified (A-761's deltify job, main's ruling, form (A)): made a skip-delta
-> svndiff a window a slice (`vcs_store::svn_deltify`), landed as its own entry (`Record::Deltified`, the delta held by the
-> records as every other text is), then its store hold given back; a replay holds the texts still stored after its
-> whole log.
+> A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
+> part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
+> the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
+> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
@@ -59050,6 +59050,36 @@ Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::pr
 - **Cost.** The preview's branch is O(1) and its release is the version's own nodes; the mapped files are made twice
   (owed, GAPS C2 (d)).
 
+### A-806 — A rebase answers each changed file as parts over the head, and a work holds and logs those parts: a work's log is what it wrote (2026-11-21, w-fed-move, goal 86b; main's order 02:37 PST, the 300 MB work log; CLAUDE.md §2 item 8; A-207, A-790)
+- **Why.** At 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its
+  partition's merge budget (A-797's diagnosis line). Named at small scale with a new peak
+  (`merge.work.log_peak_bytes`, `_entries`, the largest work log a partition has held): 1,000 clients, release,
+  in-process, over `kernel/` 752,530 bytes in 7 entries, over `drivers/gpu/drm/amd/include/asic_reg` (512 headers of
+  about 1 MB) 35,249,811 bytes in 8 entries, for 64-byte edits. A rebase answered each file a work still changed
+  whole (`RebaseAnswer::Rebased.changed`), the work held it whole (`WorkFiles::from_changed`), and its restatement
+  (A-207) logged it whole: one small edit of a large file cost the file in memory and in the partition's merge budget,
+  again at every rebase.
+- **Change.** `crates/server/src/work_files.rs`: `HeldParts` (a held file's origin, pieces, written bytes and
+  length) with `WorkFiles::from_parts` / `parts`, and `parts_over_base`: a rebased file as parts over the head's same
+  path, its common prefix and suffix base pieces and, for a same-length file, the equal runs worth a piece kept as
+  base pieces too, compared a page at a time (`equal_run`, `equal_tail`). `RebaseAnswer::Rebased.changed` carries
+  parts (made in `rebase_answer`, kept through `apply_replacement`); `crates/server/src/work_log.rs`: a restatement's
+  own file is its parts (`LoggedParts`), and replay rebuilds the work from them over its base.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --test work_edit_cow
+  a_rebased_works_log_holds_what_it_wrote_not_the_file` (a 64-byte write into a 1 MiB file, rebased: the work's log
+  1,048,635 bytes before, within 64 + 1,024 after, reading back its write). The parts oracle
+  `a_rebased_files_parts_read_back_as_the_file` (generated overwrites, inserts and deletes: read back exactly, never more
+  written than the file, nothing written for an unchanged file) and
+  `an_overwrite_of_a_large_file_is_its_written_bytes_over_the_base`. `work_cow`, `mounted_work_cow`, `merge_load`,
+  `green_post_state`, `verdict_pages`, `works_off_owner`, the fleet's rebase/check/merge tests, `--lib work_home
+  work_log work_files verbs::tests` pass. `daemon`'s `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`
+  fails on main without this change (it expects a green's landing refused; A-774 part 3, `f401f798c`, made a green
+  landable): reported to main.
+- **A/B by use** (same stand-in): the largest work log over `kernel/` 752,530 to 2,036 bytes, over `asic_reg`
+  35,249,811 to 1,957 bytes (2,124 and 2,434 in two more runs); oracle failures 0. Verdicts a second on `asic_reg`
+  were not comparable on the shared machine at the time (1,138 before; 1,703 and 134 after, load average 8, swap
+  96 of 97 GB).
+
 ### A-807 — Mercurial's made changesets take the deferred-submit hook (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 2: "one hook, three tools"; A-731, A-804, A-805)
 Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the repository's tool chosen per green),
 `crates/server/src/vcs_store/hg_made.rs` (`make_deferred`, `made_step`; module docs), GAPS (C2 (c)).
@@ -59062,4 +59092,3 @@ Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the r
   one step); a submit meeting a held turn ran at once (now it waits and commits once the turn is given back).
 - **Owed** (GAPS C2): the made changeset's record lands in the register's entry, not first on the node's store as a
   push's does (a made reference and its replay, with w-hg), and a client's push takes no landing turn.
-

@@ -416,6 +416,9 @@ pub struct Partition {
   /// acknowledged edit survives a daemon restart. Counted in `green_chain_bytes` against the same cap; a work's
   /// restatement (an accepted submit, a rebase) replaces its log, and its destroy reclaims it.
   work_logs: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// The largest work log held since start, bytes and entries ([`Partition::work_log_peak`]). A measure, not state:
+  /// not snapshotted.
+  work_log_peak: (usize, usize),
   /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
   /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
   green_origin_refs: BTreeMap<VolumeId, OriginRef>,
@@ -485,6 +488,7 @@ impl Partition {
       volumes: Slab::new(caps.segment_slots, caps.volumes),
       by_id: Art::new(),
       tenant_volumes: BTreeMap::new(),
+      work_log_peak: (0, 0),
       by_name: Art::new(),
       snapshots: Slab::new(caps.segment_slots, caps.snapshots),
       snapshot_index: Art::new(),
@@ -2779,6 +2783,7 @@ impl Partition {
       Op::WorkLogged { work, entry } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
         self.work_logs.entry(*work).or_default().push(entry.clone());
+        self.note_work_log(*work);
         Ok(())
       }
       Op::WorkRestated { work, entry } => {
@@ -2788,6 +2793,7 @@ impl Partition {
           .saturating_sub(released)
           .saturating_add(entry.len());
         self.work_logs.insert(*work, vec![entry.clone()]);
+        self.note_work_log(*work);
         Ok(())
       }
       Op::GreenCheckpointed {
@@ -2799,6 +2805,21 @@ impl Partition {
         Ok(())
       }
     }
+  }
+
+  /// Notes `work`'s log as it stands after an entry, if it is the largest this partition has held (A-806's measure).
+  fn note_work_log(&mut self, work: VolumeId) {
+    let bytes = self.work_log_bytes(work);
+    if bytes > self.work_log_peak.0 {
+      let entries = self.work_logs.get(&work).map_or(0, Vec::len);
+      self.work_log_peak = (bytes, entries);
+    }
+  }
+
+  /// The largest work log this partition has held since it started, its bytes and its entries then (A-806's measure: a
+  /// work log that grows with one work's history is unbounded growth).
+  pub fn work_log_peak(&self) -> (usize, usize) {
+    self.work_log_peak
   }
 
   /// The bytes a work's log holds now.
