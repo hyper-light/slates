@@ -83,7 +83,7 @@ pub(crate) struct HgCommand<S: HgStores> {
   /// Input that arrived after the session ended, which it dropped: given back to the window at the next step.
   dropped: usize,
   /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
-  costs: crate::vcs_store::hg_view::TurnCosts,
+  costs: crate::vcs_store::TurnCosts,
 }
 
 impl<S: HgStores> HgCommand<S> {
@@ -110,7 +110,7 @@ impl<S: HgStores> HgCommand<S> {
       stdio: Stdio::new(window),
       warning,
       dropped: 0,
-      costs: crate::vcs_store::hg_view::TurnCosts::ZERO,
+      costs: crate::vcs_store::TurnCosts::ZERO,
     }
   }
 }
@@ -172,13 +172,13 @@ fn answered_step<S: HgStores>(
 
 /// A stream's turn (A-745, §4.17.1 "A fetch's answer"): what its next step asks of the node's changeset store answered
 /// first; then a `getbundle`'s answer made a turn at a time, the view lent for the turn, each slice within the shard's
-/// room, the turn paced (A-783, [`crate::vcs_store::hg_view::paced_turn`]) and ending once a room's worth waits to be
+/// room, the turn paced (A-783, [`crate::vcs_store::paced_turn`]) and ending once a room's worth waits to be
 /// sent or the store is asked.
 async fn streamed_turn<S: HgStores>(
   stores: &mut S,
   (generation, repository, room): (&S::Hold, RepositoryId, u64),
   stdio: &mut Stdio,
-  costs: &mut crate::vcs_store::hg_view::TurnCosts,
+  costs: &mut crate::vcs_store::TurnCosts,
 ) -> Result<Progress, Refused> {
   if let Some(wants) = stdio.store_wants()
     && !crate::vcs_store::hg_view::answer_store_wants(wants, repository).await
@@ -189,11 +189,11 @@ async fn streamed_turn<S: HgStores>(
   let mut admission = Admission::new(turn_room);
   let start = slates_rt::futures::now_ns();
   let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
-  let mut paced = crate::vcs_store::hg_view::paced_turn(quantum, start);
+  let mut paced = crate::vcs_store::paced_turn(quantum, start);
   let turned = stores
     .lend_held(generation, &mut admission, |store, _| {
       loop {
-        if !paced.more(crate::vcs_store::hg_view::ANSWER_STEP, costs) {
+        if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
           break Progress::Streamed { more: true };
         }
         match stdio.stream(store, turn_room) {
