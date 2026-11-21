@@ -10871,7 +10871,14 @@ on ubuntu-latest and macos-latest. The lane always includes the loaded form (`PR
 has a baseline, a regression or a failed bench gate fails the job; elsewhere it measures and keeps the histogram
 (`target/provision-histogram.tsv`, the job's artifact) and reports the gates. The Linux bare-metal machine (adacachy,
 32 cores) stood at load 90-104 when its baseline was tried, so it has none yet; it records at its first quiet exclusive
-run.
+run. **Baseline recorded (2026-11-20, kiln r9):** the big Studio (Apple M3 Ultra, 32 cores, 23 shards, id
+1dd57fa5b7f31dce), 15 ceilings, from origin/main a4df5e4. It was cloned over HTTPS and run without a sync, since the
+Studios' kiln sync was failing. The host's load was 10-26 at the start and 71-77 by the end, which an unsynced run cannot
+reserve away, so the ceilings are loose (the loaded spinning p99's between-run drift was 2,130‰). A quiet exclusive
+`--tighten` lowers them. On it, main misses the floor (spinning p99 188-202 µs) and the loaded bound in 1 of 2 runs.
+**Found while recording (not chased):** run 2 of 3 stopped after the 8-client form (8 rows), the bench exiting non-zero
+with only the start-beat line on stderr. Run 3's loaded spinning max read 1,678 s, a create that took about 28 minutes
+or a clock artifact. The lane reports a bench that dies mid-run as a failed gate; it should say the run died.
 
 **The loaded p99, measured (macOS arm64, Apple M4 Max 14 CPUs, this MacBook, host load 4-54 from other agents, release,
 9 shards).** Red on main: 1.62 ms against the bound 0.87 ms (quiet 616 µs, parked 683 -> 939 µs under the load). By the

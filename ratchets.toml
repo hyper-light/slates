@@ -34,6 +34,28 @@
 # and the failure was contention between concurrent bench processes. The ceiling is the widest
 # isolated upper edge and tightens again when the create path is next touched.
 
+[machine.1dd57fa5b7f31dce]
+identity = "Apple M3 Ultra | macOS 26.4 (25E246) | aarch64 | 32 cores | 103079215104 bytes | 16384 page"
+recorded = "2026-11-20"
+runs = 3
+
+[machine.1dd57fa5b7f31dce.ceilings]
+"provision.loaded2_parked_1_p50" = 178375
+"provision.loaded2_parked_1_p99" = 803583
+"provision.loaded2_parked_1_p999" = 1390916
+"provision.loaded2_spinning_1_p50" = 46375
+"provision.loaded2_spinning_1_p99" = 1096583
+"provision.loaded2_spinning_1_p999" = 13212292
+"provision.parked_1_p50" = 118333
+"provision.parked_1_p99" = 277750
+"provision.parked_1_p999" = 351791
+"provision.spinning_1_p50" = 62667
+"provision.spinning_1_p99" = 217458
+"provision.spinning_1_p999" = 286209
+"provision.spinning_8_p50" = 125958
+"provision.spinning_8_p99" = 323375
+"provision.spinning_8_p999" = 417792
+
 [machine.4c62b34d5f545407]
 identity = "Apple M5 Max | macOS 26.4.1 (25E253) | aarch64 | 18 cores | 137438953472 bytes | 16384 page"
 recorded = "2026-09-05"
