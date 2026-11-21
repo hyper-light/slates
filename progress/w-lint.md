@@ -382,3 +382,10 @@
   test 1/1; hg push:: 61; cli five test targets build (61 listed).
 - After the merge, the whole wall is clean: host clippy, fmt, structural, literals, unsafe, and the six cross targets.
 - No new Windows run (goal-93 rule). r29 still queued.
+
+## 2026-11-21 round at 8fb2e33db (landed a9be85e7a, main a9be85e7a)
+- Reds: rt iocp.rs unformatted, and slates-rt unsafe 120/109, both from A-828's 98e150baf (Windows only). Fixed by
+  cargo fmt and by raising the budget to 120 with its sites named. server upload.rs if_same_then_else: one condition,
+  keeping the short-circuit.
+- Focused local: server --lib vcs_http::git 20/20. Literals, structural and the six cross targets were clean.
+- No new Windows run (goal-93 rule). r29 still queued.
