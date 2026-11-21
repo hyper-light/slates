@@ -20,12 +20,10 @@
 
 ## Piece 4: A-785 held merges in the log: LANDED fee55900f (merge 00be8fae1)
 
-## Next (queue, main's order 15:20)
-1. "identical" as a submission outcome: the engine commits an identical increment as a new version; telling it apart
-   needs a field on ReplyBody::Submitted (~100 construct/match sites) or the green recording empty-effect versions.
-2. MCP tool `slates.log` (read-only, no grant verb) and the SDKs' read (sdk-node, sdk-python).
-4. Ask-mode merges held for approval (Submitted::ApprovalRequired) are another "needs you" item not yet shown.
+## Piece 5: A-788 MCP `slates.log` + SDKs: LANDED f5f127497 (merge 1de9e5e6f)
+- See inbox/main-from-w-sessionlog-a788.md.
 
-## Run requests (main's)
-- clippy -p slates-server -p slates-client -p slates-cli -p slates-db -p slates-ipc --all-targets (macOS + Linux);
-  red = any lint in session_log.rs / log_view.rs / partition.rs index.
+## Queue state (2026-11-20 ~17:45 PST)
+main's 15:20 order done: A-779, A-782, A-785, A-788 all on origin/main. Stopped; waiting for main's next piece.
+Owed (not started): async SDK forms of the log; whether a write of the head's own bytes with nothing intervening should
+answer Identical (main's call); an Abandoned landing state for presentations whose client went away (main's call).
