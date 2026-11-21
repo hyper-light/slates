@@ -479,7 +479,8 @@
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Part 2 BUILT (A-824): every made commit lands, version 2 is written by no path and
-> refused `Retired` at replay with version 1. Owed (w-git): the change step over the preview in one turn; the replay reading the pack a piece at
+> refused `Retired` at replay with version 1; a made commit's map is put a slice a turn over the preview. Owed (w-git):
+> the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).

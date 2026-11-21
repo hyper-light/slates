@@ -59880,8 +59880,17 @@ Applied in the same change to:
   - The store's oracle (`vcs_store::tests`, `Live`) writes and replays version 5 only, a recovery fetching each record's
     names and pack as a region fetch does; the hostile-input test runs over version-5 bytes; the A-664 commit tests make
     their commits through the queue.
-- **Owed** (GAPS, C5 part 2b): the change step over the preview in one turn (bounded by the submit's admission), next
-  in this series.
+- **The map a slice a turn** (2026-11-21, main's order: the change step over the preview is bounded work, part of this
+  series). A made commit's map is put from the held preview a slice a turn within the shard's step quantum
+  (`whole_build::PreviewChange`, owned by the made commit's task, which lends the preview each turn): the change's paths
+  over the map before, as a push's change build puts them from the green, then the change applied and kept; a root's
+  first version's whole put the same way, with no map before. The one-call step over the preview (`step_over_preview`)
+  and the numbering offset `stepped` and `plan` took for it are gone; only `over_preview_step` reads the preview's change
+  index in its own numbering. A build given up gives its holds back. Counted `vcs_commits.made_map_turns`;
+  `t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`: with no budget a turn (one path a turn, whatever
+  the machine's load), a root's first version of 8 files and then a change of all 8 each took at least 8 turns, and a
+  stock clone reads the second version's files.
+- **Owed:** none of this series.
 
 ### A-821 — A refined submit's increment, verdict and encoding are prepared by its refinement job a bounded slice a turn, and its step judges by position (2026-11-21, w-fed-faults; main's ruling of 09:25 on the refining.rs:166 kill; §4.3 step budget, §4.16, A-787 part 2, A-697, A-816)
 Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the commit's step); `crates/server/src/refining.rs`
