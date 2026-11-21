@@ -229,3 +229,11 @@
 - At ebd9014c3: host clippy --workspace --all-targets, six cross targets, structural, literals, unsafe, fmt all clean.
 - Windows (jupiter) earlier run at 2e44154 reached the end for the first time today: blocked by merge refine.rs only
   (now fixed). Fresh Windows and Linux runs on ebd9014c3 started in the background.
+
+## 2026-11-20 round 9 at ab760dc65 (landed, main 15d4602ea)
+- db partition.rs check() 12/10 after bbc605ac9 -> nine check_* helpers; svn dav/site.rs decimal Format line and a
+  needless lifetime; svn migration step test cast + match; svn examples replay_bench (slice, cast, sort_by_key) and
+  changeset_ab (read_every_text); server tests/presentations superseded_refused. db lib 182, svn dav 92 / migration
+  48, presentations 10 pass here.
+- Host, six cross targets, structural, literals, unsafe, fmt: clean.
+- Windows r54 (on ebd9014c3) still running on jupiter; Linux resubmitted (r56 had no room).
