@@ -2212,6 +2212,95 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   assert_eq!(after.past_budget, 0, "{after:?}");
 }
 
+/// Goal 93 (main's 2026-11-21 14:56 piece for w-shared, from w-git's queue; A-752's owed "units still one object's size"):
+/// a large file's update is built a slice a unit, never its whole blob in one. Do: create `main` at a tree of one file
+/// of [`LARGE_FILE_BYTES`], then push a commit rewriting that file whole, answering a step at a time. Expect: both `ok`,
+/// and no build unit longer than the watchdog's look ([`crate::daemon::HEARTBEAT_NS`]). Failing first: the post-state
+/// lays each operation's whole blob in one unit (`Posting::unit`, one `PushObjects::blob` read and one `lay`), so the
+/// unit grows with the file; a large enough file outlasts the watchdog's window and the stock client sees its
+/// connection dropped.
+#[test]
+fn t_goal93_a_large_files_update_is_built_a_slice_a_unit() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "large"));
+  let (first, objects) = one_file_commit(LARGE_FILE_BYTES, 1, None);
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_of_objects(&objects),
+  );
+  let created = pushed_in_steps(&daemon, repository, &create);
+  let before = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  let (second, objects) = one_file_commit(LARGE_FILE_BYTES, 2, Some(first));
+  let update = request(
+    &[(&first.to_string(), &second.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_of_objects(&objects),
+  );
+  let updated = pushed_in_steps(&daemon, repository, &update);
+  let after = crate::daemon::observe_first(&daemon, |state| state.push_turns);
+  daemon.stop();
+  let (created, _) = created.unwrap();
+  let (updated, updated_longest) = updated.unwrap();
+  eprintln!(
+    "goal 93 large file {LARGE_FILE_BYTES} B: the update's longest step {updated_longest} ns, its longest unit {} ns; \
+     builds before {before:?} after {after:?}",
+    after.longest_unit_ns
+  );
+  assert_eq!(reasons(&created), [b"ok"]);
+  assert_eq!(reasons(&updated), [b"ok"]);
+  assert!(
+    after.longest_unit_ns <= crate::daemon::HEARTBEAT_NS,
+    "a build unit of {} ns, past the watchdog's look ({} ns): a large file built in one unit",
+    after.longest_unit_ns,
+    crate::daemon::HEARTBEAT_NS
+  );
+}
+
+/// Shape: the file of [`t_goal93_a_large_files_update_is_built_a_slice_a_unit`]: large enough that its blob read and
+/// laid in one unit outlasts the watchdog's look in a debug build, many times the copy slice a unit is held to.
+const LARGE_FILE_BYTES: usize = 64 << 20;
+
+/// A commit of one file `big` of `len` bytes, its bytes a function of `seed` and the offset (so its blob compresses as
+/// real content does, not to nothing), over `parent`.
+fn one_file_commit(
+  len: usize,
+  seed: u64,
+  parent: Option<ObjectId>,
+) -> (ObjectId, Vec<(slates_git::object_name::Kind, Vec<u8>)>) {
+  use slates_git::object_name::{Kind, name_of};
+  let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+  let blob: Vec<u8> = (0..len)
+    .map(|_| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      b'a' + u8::try_from(state % 26).unwrap_or(0)
+    })
+    .collect();
+  let id = name_of(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap();
+  let mut tree = b"100644 big\0".to_vec();
+  tree.extend_from_slice(id.as_bytes());
+  let tree_id = name_of(ObjectFormat::Sha1, Kind::Tree, &tree).unwrap();
+  let parent = parent
+    .map(|parent| format!("parent {parent}\n"))
+    .unwrap_or_default();
+  let commit = format!(
+    "tree {tree_id}\n{parent}author A <a@example.com> 1700000000 +0000\n\
+     committer A <a@example.com> 1700000000 +0000\n\nlarge {seed}\n"
+  )
+  .into_bytes();
+  let commit_id = name_of(ObjectFormat::Sha1, Kind::Commit, &commit).unwrap();
+  (
+    commit_id,
+    vec![
+      (Kind::Commit, commit),
+      (Kind::Tree, tree),
+      (Kind::Blob, blob),
+    ],
+  )
+}
+
 /// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once
 /// they are durable at `f + 1` in the region). Do: with version 4 on for the shard, push stock git's `create` and
 /// `update`, driving each answer as an edge does (a turn, a yield, the names and then the pack it asks to home homed in
