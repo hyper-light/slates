@@ -389,3 +389,12 @@
   keeping the short-circuit.
 - Focused local: server --lib vcs_http::git 20/20. Literals, structural and the six cross targets were clean.
 - No new Windows run (goal-93 rule). r29 still queued.
+
+## 2026-11-21 round at 9adb32044 (nothing to land)
+- Clean: host clippy, fmt, structural, literals, unsafe, the six cross targets.
+- Earlier this hour, from main's list: wire_order was red for w-svn's ImportFault::SubversionLanded; I published it in
+  9adb32044. Server repository|vcs_store: 254/254 on macOS, so it doesn't reproduce.
+- VCS suites lane: r30 (Linux) sat "starting" for over an hour, so I stopped it and resubmitted it once as r32 (sync false,
+  its own clone ~/w-lint-vcs). r31 (Windows) is queued for jupiter. r29 is stopped on main's order; I'll re-queue it
+  after w-work-mount lands.
+- VCS suites per platform: none ended yet (Linux r32, Windows r31).
