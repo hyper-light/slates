@@ -4207,14 +4207,20 @@ pub(crate) fn make_whole(state: &mut ShardState, record: &RepositoryRecord) {
 
 /// Hands `read` the objects a green's owed push reads (P2, `crate::green_ready`): the store of the tool `repository` is
 /// in, as a push's work is built from it, handed over rather than returned so a view borrowing the shard's state
-/// outlives nothing. Git's view lands with w-git's half of P2 (`PushedObjects` over an empty push, which reads the
-/// repository's committed objects); until then none, and a green that owes a push answers its readers
-/// `ContentUnavailable`. Whether there were any.
+/// outlives nothing. For git, the push's own view over an empty push (`PushedObjects`), which reads every object from
+/// the repository's committed index once the push that brought them landed: the objects the eager create's build read
+/// from the same index and the push's quarantine. None for another tool's repository, or a store not held here, whose
+/// owing green answers its readers `ContentUnavailable`. Whether there were any.
 pub(crate) fn with_owed_push_objects(
   state: &crate::state::ShardState,
   repository: Option<RepositoryId>,
   read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
 ) -> bool {
-  let _ = (state, repository, read);
-  false
+  let Some((content, git)) = repository.and_then(|repository| state.vcs_stores.git_ref(repository)) else {
+    return false;
+  };
+  let empty = Push::new(git.repository.format());
+  let objects = slates_git::store::views::PushedObjects::new(&git.repository, content, &empty);
+  read(&objects);
+  true
 }

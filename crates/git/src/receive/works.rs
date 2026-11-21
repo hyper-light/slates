@@ -40,7 +40,9 @@
 //! refusal, with a band-2 line naming the path.
 
 use slates_merge::pace::{Pace, Slices};
-use slates_merge::push::{Building, Built, ObjectKey, Push, PushObjects, PushRefused, build};
+use slates_merge::push::{
+  Building, Built, DeferredPush, ObjectKey, Push, PushObjects, PushRefused, build,
+};
 use slates_merge::{ConflictWindow, Green, Increment};
 use std::cell::Cell;
 
@@ -153,8 +155,11 @@ pub enum Entry {
     name: Vec<u8>,
     /// The green and version it is made at ([`Greens::base_of_create`]); none to make it empty.
     from: Option<(u64, u64)>,
-    /// Its first work, built against that version, or over an empty green.
-    increment: Increment,
+    /// The push it owes as its first version, against that version or over an empty green, its work not built (P2,
+    /// main's ruling of 2026-11-21: a created ref's content is derived on first read, A-647; the push the eager create
+    /// built, so the green made when first reached is the one it made): git/git's 1,019 tags built their whole trees at
+    /// the push, refs times tree.
+    push: DeferredPush,
   },
   /// The green retired (§4.17.1: a deleted branch's chain kept for its retention), only while it
   /// is at `position`.
@@ -357,7 +362,8 @@ where
     (began, env): (u64, slates_pace::Env),
     slices: Slices,
   ) -> bool {
-    if command.is_delete() {
+    // A delete builds nothing, nor does a create, whose push its green owes until first reached (P2).
+    if command.is_delete() || command.is_create() {
       return true;
     }
     let ours = preparing.as_ref().is_some_and(|prepared| {
@@ -461,12 +467,15 @@ where
     })
   }
 
-  /// A create's work, against the version it is made at, or over an empty green (module docs).
+  /// A create's push, against the version it is made at, or over an empty green (module docs), owed and not built (P2).
   fn create(&self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
-    let at = |read: GreenRead<'_>, version: Version| {
+    let owed = |green: &Green, base: Option<Version>| {
       self
-        .work(command, pushed, read.green, Some(version))
-        .map(|increment| (Some((read.id, version.number)), increment))
+        .push_of(command, pushed, green, base)
+        .map(|push| DeferredPush::of(&push, self.room))
+    };
+    let at = |read: GreenRead<'_>, version: Version| {
+      owed(read.green, Some(version)).map(|push| (Some((read.id, version.number)), push))
     };
     let made = match self.greens.holding_head(&command.new, at) {
       Some(made) => Some(made),
@@ -475,14 +484,14 @@ where
         self.greens.base_of_create(parent.as_ref(), at)
       }
     };
-    let (from, increment) = match made {
+    let (from, push) = match made {
       Some(made) => made?,
-      None => (None, self.work(command, pushed, &Green::new(), None)?),
+      None => (None, owed(&Green::new(), None)?),
     };
     Ok(Entry::Create {
       name: command.name.clone(),
       from,
-      increment,
+      push,
     })
   }
 

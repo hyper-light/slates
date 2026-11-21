@@ -2149,14 +2149,10 @@ impl ServerJudge<'_> {
         };
         Ok((change, (Target::Green(green), None)))
       }
-      Entry::Create {
-        name,
-        from,
-        increment,
-      } => created(
+      Entry::Create { name, from, push } => created(
         state,
         self.record,
-        (&name, from, increment),
+        (&name, from, push),
         (command.new, at),
       ),
     }
@@ -2205,7 +2201,7 @@ fn at_position(
 fn created(
   state: &ShardState,
   record: &RepositoryRecord,
-  (name, from, work): (&[u8], Option<(u64, u64)>, Increment),
+  (name, from, push): (&[u8], Option<(u64, u64)>, slates_merge::push::DeferredPush),
   (new, at): (ObjectId, usize),
 ) -> Result<Planned, Unappended> {
   let namespace = namespace_of(name)
@@ -2220,17 +2216,19 @@ fn created(
       let empty = empty_default(state, record).ok_or_else(|| refused_at(at, NO_EMPTY_DEFAULT))?;
       let repositories = state.db.partition().repositories();
       if repositories.branch(record.id, &namespace) == Some(empty) {
-        let change = BranchChange::Update { green: empty, work };
+        // The unborn default's first version owes the push too (P2): the green named already, so an update that defers.
+        let change = BranchChange::UpdateDeferred { green: empty, push };
         return Ok((change, (Target::Green(empty), Some(new))));
       }
       (empty, 0)
     }
   };
-  let change = BranchChange::Create {
+  // The created green owes its push, its content derived when first reached (P2, `crate::green_ready`).
+  let change = BranchChange::CreateDeferred {
     name: namespace.clone(),
     from,
     version,
-    work: Some(work),
+    push,
   };
   Ok((change, (Target::Created(namespace), Some(new))))
 }

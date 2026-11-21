@@ -174,6 +174,9 @@ struct Logs {
   names: Vec<Vec<u8>>,
   racing: Vec<u64>,
   appended: Vec<Entry>,
+  /// Each create's owed push built as its green's materialization builds it (P2: the same builder over the same objects
+  /// the eager create read), in the order appended.
+  materialized: Vec<Increment>,
 }
 
 impl Logs {
@@ -261,6 +264,31 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
   let mut works = Works::new(&read, &indexed, &objects, logs, NAME, ROOM);
   let mut answer = Vec::new();
   let received = session.answer(&mut works, &mut answer, &mut unbounded());
+  drop(works);
+  drop(read);
+  // A create's green owes its push (P2): built here as its first reader's materialization builds it, over the same
+  // objects, against the green it is made at or an empty one.
+  let empty = Green::new();
+  let owed: Vec<Increment> = logs
+    .appended
+    .iter()
+    .filter_map(|entry| match entry {
+      Entry::Create { from, push, .. } => {
+        let base = if from.is_some() {
+          &served.green
+        } else {
+          &empty
+        };
+        Some(
+          work::build(&push.push(), base, &objects, ROOM)
+            .unwrap()
+            .increment,
+        )
+      }
+      _ => None,
+    })
+    .collect();
+  logs.materialized.extend(owed);
   received.unwrap().unwrap()
 }
 
@@ -293,10 +321,11 @@ fn push_of(
   request(&[], commands, capabilities, &[], &pack_of(&objects))
 }
 
-/// The one work `logs` appended, or none.
+/// The one work `logs` appended, or the one create's owed push as its materialization builds it; none otherwise.
 fn only_increment(logs: &Logs) -> Option<&Increment> {
   match logs.appended.as_slice() {
-    [Entry::Work { increment, .. } | Entry::Create { increment, .. }] => Some(increment),
+    [Entry::Work { increment, .. }] => Some(increment),
+    [Entry::Create { .. }] => logs.materialized.first(),
     _ => None,
   }
 }
