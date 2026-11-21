@@ -311,7 +311,7 @@ fn reader_reads_main(state: &mut ShardState, name: &str) {
 /// and its blob; neither answer refused.
 #[test]
 fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
-  let (listed, fetched, objects, head) = crate::daemon::audit_on_shard(|state| {
+  let (listed, fetched, objects, head) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, objects, head) = pushed_repository(state, "lent", &[]);
     let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
     let wants = fetch(&[head], &[]);
@@ -334,7 +334,7 @@ fn t_a682_a_pushed_branch_is_listed_and_fetched_whole_from_the_store() {
 /// refused as git refuses a ref it does not have ("unknown ref").
 #[test]
 fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
-  let (by_owner, by_reader, wanted, head) = crate::daemon::audit_on_shard(|state| {
+  let (by_owner, by_reader, wanted, head) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, root) = repository(state, "hidden", VcsTool::Git);
     reader_reads_main(state, "hidden");
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
@@ -368,7 +368,7 @@ fn t_a682_a_ref_the_reader_may_not_read_is_neither_listed_nor_wanted() {
 /// cannot carry; one ref listed twice, which upload-pack's order check refuses).
 #[test]
 fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
-  let (listed, head) = crate::daemon::audit_on_shard(|state| {
+  let (listed, head) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, _, head) = pushed_repository(state, "spaced", &["my topic", "refs/heads/main"]);
     let listed = answered(state, (id, &owner()), Asked::Request(&ls_refs()));
     (listed, head)
@@ -475,7 +475,7 @@ async fn ssh_session(
 /// held a store, so the site's services never started it.
 #[test]
 fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (record, objects, head) = crate::daemon::observe_first(&daemon, |state| {
     let (id, objects, head) = pushed_repository(state, "over-ssh", &[]);
     let record = state.db.partition().repositories().repository(id).cloned();
@@ -523,7 +523,7 @@ fn t_a682_an_ssh_session_fetches_through_the_daemons_lender() {
 /// its tree and its blob, read as index-pack reads one.
 #[test]
 fn t_a718_a_pushed_version_is_encoded_once_and_fetched_from_its_kept_fragments() {
-  let (before, after, encoded_count, again, objects) = crate::daemon::audit_on_shard(|state| {
+  let (before, after, encoded_count, again, objects) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, objects, head) = pushed_repository(state, "encoded", &[]);
     let wants = fetch(&[head], &[]);
     let before = fetched_with_counters(state, (id, &owner()), &wants);
@@ -599,7 +599,7 @@ fn tagged(
 /// ref, so the tag is lost), so the hold is what keeps it.
 #[test]
 fn a745_a_fetch_answers_from_the_generation_it_began_on_whatever_lands_meanwhile() {
-  let (start, held, unheld) = crate::daemon::audit_on_shard(|state| {
+  let (start, held, unheld) = crate::test_store::audit_on_stored_shard("vcs_store-upload", |state| {
     let (id, root) = repository(state, "generations", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, first) = commit_of(&files, &[], FIRST_DATE);

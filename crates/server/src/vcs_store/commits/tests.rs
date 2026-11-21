@@ -226,7 +226,7 @@ fn counts(state: &ShardState) -> (u64, u64) {
 /// made and none refused. Red before the commit was made: `main` was listed at nothing.
 #[test]
 fn t_a664_p3_a_submitted_version_is_a_commit_a_clone_fetches() {
-  let (clone, made, dated) = crate::daemon::audit_on_shard(|state| {
+  let (clone, made, dated) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "made");
     let before = wall_seconds();
     let ops = vec![
@@ -296,7 +296,7 @@ type RecordFacts = (Vec<(u64, u64, Option<ObjectId>)>, Vec<Kind>);
 /// whole, every record replayed; `main` fetched at the second made commit after it.
 #[test]
 fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "history");
     let root = to_db_volume(green);
     let key = green_key(root);
@@ -346,7 +346,7 @@ fn t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log() 
 /// both. Expect: `topic` at a commit the server made whose parent is `main`'s commit, its tree holding `f` and `t`.
 #[test]
 fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
-  let (main, topic) = crate::daemon::audit_on_shard(|state| {
+  let (main, topic) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "branched");
     version(state, green, 1, vec![create("/f", b"main")]);
     let topic = branch(state, "branched", "topic");
@@ -369,7 +369,7 @@ fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
 /// its tree holding both versions' files.
 #[test]
 fn t_a664_p3_a_commit_git_refuses_is_not_made_and_its_successor_holds_both() {
-  let (unmade, clone, made) = crate::daemon::audit_on_shard(|state| {
+  let (unmade, clone, made) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "refused");
     version_saying(state, (green, 1), vec![create("/f", b"one")], "one\0two");
     let key = green_key(to_db_volume(green));
@@ -402,7 +402,7 @@ fn moved(from: &str, to: &str) -> Op {
 /// POSIX `rename` and `git mv` keep a file's mode.
 #[test]
 fn t_a664_p3_an_executable_file_moved_is_100755_in_its_commit() {
-  let (first, second) = crate::daemon::audit_on_shard(|state| {
+  let (first, second) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "moved");
     let ops = vec![
       mkdir("/d"),
@@ -450,7 +450,7 @@ fn pushed_three(
 /// file, and kept the pushed commit's tree, built once.
 #[test]
 fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "sliced");
     let root = to_db_volume(green);
     let key = green_key(root);
@@ -480,7 +480,7 @@ fn t_a664_live_a_pushs_whole_map_is_built_in_slices_after_its_answer() {
 /// pushed one.
 #[test]
 fn t_a664_live_a_submit_waits_parked_for_its_greens_whole_build() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "parked");
     let root = to_db_volume(green);
     let key = green_key(root);
@@ -536,7 +536,7 @@ fn recorded_submit(state: &mut ShardState, body: slates_ipc::protocol::RequestBo
   };
   state.db.begin();
   state.current_request = Some((1, id));
-  let reply = crate::verbs::dispatch(state, 1, &owner(), body);
+  let reply = crate::test_store::create(state, &owner(), body);
   state.current_request = None;
   let deferred = std::mem::take(&mut state.acceptance_deferred);
   let committed = state.db.commit(&mut state.segment);
@@ -597,7 +597,7 @@ fn staged_owed(
 /// its message, with no parent; nothing owed after it.
 #[test]
 fn t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "owed");
     let version = first_submit_unsettled(state, green, "the owed commit");
     let owed = staged_owed(state, repository);
@@ -632,7 +632,7 @@ fn t_a664_owed_a_first_submits_commit_is_owed_then_made_at_its_staged_second() {
 /// after it lists `main` at the same commit, holds it whole and owes nothing.
 #[test]
 fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_record() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "restarted");
     first_submit_unsettled(state, green, "made after two restarts");
     let owed = staged_owed(state, repository);
@@ -667,7 +667,7 @@ fn t_a664_owed_a_commit_owed_across_two_restarts_is_made_byte_for_byte_from_its_
 /// its slices' boundaries, built once, and the tree kept the last push's.
 #[test]
 fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "storm");
     let root = to_db_volume(green);
     let mut files: Vec<(Vec<u8>, Vec<u8>)> = (0..60)
@@ -717,7 +717,7 @@ fn t_a664_live_a_storm_of_fifty_pushes_never_restarts_a_whole_build() {
 /// the green still at the pushed version, since nothing of the submit ran (its retry runs it again).
 #[test]
 fn t_a664_live_a_parked_submit_waits_at_most_its_bound() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
     let (repository, green) = git_repository(state, "overdue");
     let root = to_db_volume(green);
     pushed_three(state, (repository, root));

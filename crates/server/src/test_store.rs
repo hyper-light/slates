@@ -381,13 +381,35 @@ pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
   name: &str,
   history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
 ) -> T {
+  audit_on_stored_shard_configured(name, history, |_| {})
+}
+
+/// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
+/// ([`crate::daemon::audit_on_shard_configured`]).
+pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
+  name: &str,
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> T {
   let store = TestStore::start(name);
   let handle = store.handle();
   let answer = crate::daemon::audit_on_shard_configured(history, move |config| {
     config.vcs_disk = Some(handle);
+    configure(config);
   });
   drop(store);
   answer
+}
+
+/// [`crate::daemon::audit_daemon_of`] holding a fresh store: the store first, so a test binding both as
+/// `let (_store, daemon)` drops the daemon first.
+pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) {
+  let store = TestStore::start("audit-of");
+  let handle = store.handle();
+  let daemon = crate::daemon::audit_daemon_of_configured(shards, move |config| {
+    config.vcs_disk = Some(handle);
+  });
+  (store, daemon)
 }
 
 /// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered

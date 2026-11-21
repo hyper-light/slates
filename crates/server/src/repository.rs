@@ -1551,7 +1551,7 @@ mod tests {
   }
 
   fn ask(state: &mut ShardState, principal: &Principal, body: RequestBody) -> ReplyBody {
-    dispatch(state, 1, principal, body)
+    crate::test_store::create(state, principal, body)
   }
 
   fn refusal(reply: ReplyBody) -> Refusal {
@@ -1669,7 +1669,7 @@ mod tests {
   /// retired name leaves its green, and binding it again restores it; each wrong verb refused by its kind.
   #[test]
   fn branches_share_their_lineage_and_each_wrong_verb_is_refused_by_its_kind() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let at_one = branches_read_their_versions(state);
       retired_and_bound_again(state, at_one);
       wrong_verbs_refused_by_kind(state);
@@ -2027,7 +2027,7 @@ mod tests {
   /// owed; no unit frees more than one node; once the release is done the lineage holds what the root alone held.
   #[test]
   fn a_destroyed_branch_is_released_a_node_a_unit_and_its_source_is_pinned_until_then() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "kernel", "main"));
       write(state, root, b"root bytes", 1);
       let repo = repository(state, "kernel");
@@ -2195,7 +2195,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_its_owners_to_set_whole_from_the_version_read() {
     use slates_db::catalog::RepositoryPolicy;
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       green_of(create(state, "linux", "main"));
       let first = first_policy_held(state);
       assert_eq!(
@@ -2661,7 +2661,7 @@ mod tests {
   #[test]
   fn a_repositorys_policy_is_read_and_set_by_its_owner_alone() {
     use slates_ipc::protocol::{HookConfig, HookPointName};
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       assert!(matches!(
         create(state, "policy", "main"),
         ReplyBody::GreenCreated { .. }

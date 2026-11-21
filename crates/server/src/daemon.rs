@@ -7361,6 +7361,15 @@ mod tests {
   /// A running audit daemon of `shards` shards, bootstrapped, for a test of one shard's call to another (a wait judged
   /// in its target's own time, A-432); the test stops it.
   pub(crate) fn audit_daemon_of(shards: u16) -> super::Daemon {
+    audit_daemon_of_configured(shards, |_| {})
+  }
+
+  /// [`audit_daemon_of`] with its derived configuration changed by `configure` before it starts (a store's handle,
+  /// `crate::test_store::audit_daemon_of_stored`).
+  pub(crate) fn audit_daemon_of_configured(
+    shards: u16,
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> super::Daemon {
     let profile = test_profile();
     static NEXT_OF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let instance = format!(
@@ -7368,7 +7377,8 @@ mod tests {
       std::process::id(),
       NEXT_OF.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(shards));
+    configure(&mut config);
     audit_daemon_with(&profile, config, instance)
   }
 
@@ -7596,7 +7606,9 @@ mod tests {
     use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
     let profile = test_profile();
     let instance = format!("a724-parts-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a724-parts");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -7761,7 +7773,9 @@ mod tests {
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a727b-barrier-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727b-barrier");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8056,7 +8070,9 @@ mod tests {
     const LARGE: usize = 1 << 20;
     let profile = test_profile();
     let instance = format!("a727-a3b-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727-a3b");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
       .with_content(&super::content_name_of(&instance), config.content_bytes())
@@ -8311,7 +8327,9 @@ mod tests {
     }
     let profile = test_profile();
     let instance = format!("a727-windows-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    let store = crate::test_store::TestStore::start("a727-windows");
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    config.vcs_disk = Some(store.handle());
     // The content object holds the shard's arena, so the windows' chunks survive with it (§4.8).
     let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
       .unwrap()
