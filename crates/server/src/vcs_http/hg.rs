@@ -523,7 +523,7 @@ pub(crate) struct HgExchange<S: HgStores> {
   /// words once the body has ended (A-711).
   past_room: bool,
   /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
-  costs: crate::vcs_store::hg_view::TurnCosts,
+  costs: crate::vcs_store::TurnCosts,
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -572,7 +572,7 @@ impl<S: HgStores> HgExchange<S> {
       generation: None,
       request_room: room,
       past_room: false,
-      costs: crate::vcs_store::hg_view::TurnCosts::ZERO,
+      costs: crate::vcs_store::TurnCosts::ZERO,
     })
   }
 }
@@ -706,7 +706,7 @@ impl<S: HgStores> Exchange for HgExchange<S> {
 
 impl<S: HgStores> HgExchange<S> {
   /// One turn of a streamed answer (A-745, §4.17.1 "A fetch's answer"): the repository's view lent for the turn alone,
-  /// steps taken within the room the lender names, paced (A-783, [`crate::vcs_store::hg_view::paced_turn`]): to the
+  /// steps taken within the room the lender names, paced (A-783, [`crate::vcs_store::paced_turn`]): to the
   /// quantum while someone waits on the shard, on to its ceiling while no one does, or until the answer ends or asks the
   /// changeset store; a step past the turn's room after others ends the turn, and is taken again by the next within a
   /// room of its own. Whether more follow.
@@ -720,13 +720,13 @@ impl<S: HgStores> HgExchange<S> {
       .as_ref()
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
     let costs = &mut self.costs;
-    let mut paced = crate::vcs_store::hg_view::paced_turn(quantum, start);
+    let mut paced = crate::vcs_store::paced_turn(quantum, start);
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
         let mut taken = false;
         loop {
-          if !paced.more(crate::vcs_store::hg_view::ANSWER_STEP, costs) {
+          if !paced.more(crate::vcs_store::ANSWER_STEP, costs) {
             break Ok(true);
           }
           match streamed.step(store, room, out) {

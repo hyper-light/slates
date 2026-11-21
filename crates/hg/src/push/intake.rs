@@ -29,7 +29,7 @@
 
 use core::ops::Range;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use slates_vcs::{ContentStore, IndexRefused};
 
@@ -90,6 +90,10 @@ pub struct Intaken {
   /// Each revision kept, as the changeset log's `Texts` section names it (A-767 C4; w-perf's format, agreed): written as
   /// it is kept, since the intake has rebuilt and checked its text then and naming it later would rebuild every chain.
   pub texts: Vec<KeptText>,
+  /// The whole texts the intake rebuilt from the fork's chains (main's ruling of 2026-11-21 05:12 (c): a push's work
+  /// and memory are to grow with what it brings, not with the history under it): a delta base it did not hold as the
+  /// text kept last. A new manifest's files are checked from the lines its delta wrote, rebuilding nothing.
+  pub rebuilt: u64,
 }
 
 /// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
@@ -238,6 +242,9 @@ pub struct Intake {
   taker: Taker,
 }
 
+/// A new manifest and the entries its delta wrote: each file's path and file revision.
+type ManifestWrites = (Node, Vec<(Vec<u8>, Node)>);
+
 /// What an intake has made so far: its fork, where it stands, and what it keeps across steps.
 struct Taker {
   /// The fork: the repository's revisions, and the push's as they are kept.
@@ -248,8 +255,9 @@ struct Taker {
   brought: BTreeSet<Node>,
   /// Each new changeset and the manifest its text names.
   manifest_of: Vec<(Node, Node)>,
-  /// Each new manifest and its first parent.
-  manifests: Vec<(Node, Node)>,
+  /// Each new manifest and the entries its delta wrote (each file's path and file revision), which its files' check
+  /// reads ([`Taker::files_present`]): what the push changed, never a whole manifest.
+  manifests: Vec<ManifestWrites>,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
   /// The identity of the text kept last, so the next revision's base is named without hashing it again.
@@ -343,7 +351,7 @@ impl Intake {
       }
       Stage::Files { file, at } => taker.file_step((frame, payload), (file, at), store, admission),
       Stage::ManifestsPresent(at) => taker.manifest_present(at, store),
-      Stage::FilesPresent(at) => taker.files_present(at, store, admission),
+      Stage::FilesPresent(at) => taker.files_present(at, store),
       Stage::Done => Ok(Stepped::Done),
     }
   }
@@ -466,6 +474,7 @@ impl Taker {
     self.check_known(log, revision, store)?;
     let mut room = *admission;
     let base_text = self.base_text(log, revision, store);
+    let base_rebuilt = matches!(base_text, Some(Cow::Owned(_)));
     let base = match (&base_text, &self.last_identity) {
       _ if revision.base == NULL_NODE => None,
       (_, Some((node, identity))) if *node == revision.base => Some(*identity),
@@ -473,6 +482,9 @@ impl Taker {
       (None, _) => None,
     };
     let text = rebuilt(base_text, revision, log, &mut room)?;
+    if base_rebuilt {
+      self.intaken.rebuilt = self.intaken.rebuilt.saturating_add(1);
+    }
     node::check(&revision.node, &revision.p1, &revision.p2, &text).map_err(|fault| {
       Unverified::Node {
         log: log_of(log),
@@ -636,8 +648,17 @@ impl Taker {
       }
       _ => {
         manifest::decode(text).map_err(|fault| Unverified::Manifest { node, fault })?;
-        admission.charge_items::<(Node, Node)>(1)?;
-        self.manifests.push((node, revision.p1));
+        let written = written_entries(text, revision).map_err(|fault| Unverified::Delta {
+          log: log_of(log),
+          node,
+          fault,
+        })?;
+        admission.charge_items::<(Node, Vec<(Vec<u8>, Node)>)>(1)?;
+        admission.charge_items::<(Vec<u8>, Node)>(written.len())?;
+        admission.charge(written.iter().fold(0_u64, |bytes, (path, _)| {
+          bytes.saturating_add(to_u64(path.len()))
+        }))?;
+        self.manifests.push((node, written));
       }
     }
     Ok(())
@@ -662,49 +683,22 @@ impl Taker {
     Ok(Stepped::More)
   }
 
-  /// The check of the new manifest at `at`: every file it names beside its first parent's manifest audited and held
-  /// by the fork's file log.
-  fn files_present(
-    &mut self,
-    at: usize,
-    store: &ContentStore,
-    admission: &Admission,
-  ) -> Result<Stepped, Refused> {
-    let Some((node, p1)) = self.manifests.get(at).copied() else {
+  /// The check of the new manifest at `at`: every entry its delta wrote audited and held by the fork's file log (main's
+  /// ruling of 2026-11-21 05:12 (a)). An entry its delta left as its base had it was checked when that base was: held by
+  /// the fork before the push, or checked earlier in it. Its text and its first parent's were rebuilt from their chains
+  /// here before, two whole texts a manifest: 57% of hg-src's first push (w-perf's profile, base 94c1696bb).
+  fn files_present(&mut self, at: usize, store: &ContentStore) -> Result<Stepped, Refused> {
+    let Some((_, written)) = self.manifests.get(at) else {
       self.stage = Stage::Done;
       return Ok(Stepped::Done);
     };
-    let mut room = *admission;
-    let held = IndexHeld::new(&self.fork, store);
-    let parent = match p1 {
-      NULL_NODE => Cow::Borrowed(&[][..]),
-      p1 => held.manifest_text(&p1).unwrap_or(Cow::Borrowed(&[][..])),
-    };
-    let previous: BTreeMap<&[u8], Node> = match manifest::decode(&parent) {
-      Ok(entries) => {
-        room.charge_items::<(&[u8], Node)>(entries.clone().count())?;
-        entries.map(|entry| (entry.path, entry.node)).collect()
-      }
-      Err(_) => BTreeMap::new(),
-    };
-    let text = held
-      .manifest_text(&node)
-      .ok_or(Unverified::MissingManifest {
-        changeset: NULL_NODE,
-        manifest: node,
-      })?;
-    let entries = manifest::decode(&text).map_err(|fault| Unverified::Manifest { node, fault })?;
-    for entry in entries.filter(|entry| previous.get(entry.path) != Some(&entry.node)) {
-      audit(entry.path)?;
-      if self
-        .fork
-        .rev(store, Log::File(entry.path), &entry.node)
-        .is_none()
-      {
+    for (path, node) in written {
+      audit(path)?;
+      if self.fork.rev(store, Log::File(path), node).is_none() {
         return Err(
           Unverified::MissingFile {
-            path: entry.path.to_vec(),
-            node: entry.node,
+            path: path.clone(),
+            node: *node,
           }
           .into(),
         );
@@ -955,6 +949,61 @@ fn rebuilt(
     node: revision.node,
     fault,
   })
+}
+
+/// The entries of manifest `text` its delta wrote (main's ruling of 2026-11-21 05:12 (a)): the whole lines each hunk's
+/// bytes fall on in the new text, every line where the revision came whole or against the null base. O(the lines the
+/// delta touched), never the whole manifest: a delta that rewrote nothing in a line leaves it out, and a hunk cut
+/// mid-line takes the whole line in. `text` is the delta applied to its base, so the hunks are known to apply.
+fn written_entries(
+  text: &[u8],
+  revision: &Revision<'_>,
+) -> Result<Vec<(Vec<u8>, Node)>, delta::Refusal> {
+  let entries_of = |lines: &[u8]| -> Vec<(Vec<u8>, Node)> {
+    lines
+      .split(|byte| *byte == b'\n')
+      .filter_map(manifest::parse)
+      .map(|entry| (entry.path.to_vec(), entry.node))
+      .collect()
+  };
+  if revision.is_full_text() || revision.base == NULL_NODE {
+    return Ok(entries_of(text));
+  }
+  let line_start = |at: usize| {
+    text
+      .get(..at)
+      .and_then(|before| before.iter().rposition(|byte| *byte == b'\n'))
+      .map_or(0, |newline| newline.saturating_add(1))
+  };
+  let line_end = |at: usize| {
+    text
+      .get(at..)
+      .and_then(|after| after.iter().position(|byte| *byte == b'\n'))
+      .map_or(text.len(), |newline| {
+        at.saturating_add(newline).saturating_add(1)
+      })
+  };
+  let mut written = Vec::new();
+  let (mut produced, mut base_at, mut covered) = (0_usize, 0_usize, 0_usize);
+  for hunk in delta::hunks(revision.data) {
+    let hunk = hunk?;
+    let start = usize::try_from(hunk.start).unwrap_or(usize::MAX);
+    let end = usize::try_from(hunk.end).unwrap_or(usize::MAX);
+    let new_start = produced.saturating_add(start.saturating_sub(base_at));
+    let new_end = new_start.saturating_add(hunk.data.len());
+    produced = new_end;
+    base_at = end;
+    if new_start >= text.len() {
+      continue;
+    }
+    let lo = line_start(new_start).max(covered);
+    let hi = line_end(new_end.saturating_sub(1).max(new_start));
+    if lo < hi {
+      written.extend(entries_of(text.get(lo..hi).unwrap_or_default()));
+      covered = hi;
+    }
+  }
+  Ok(written)
 }
 
 /// Verification's name of `log`.

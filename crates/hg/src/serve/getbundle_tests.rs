@@ -1974,7 +1974,7 @@ fn a_pull_whose_store_keeps_no_row_of_a_file_revision_is_refused_by_kind() {
   let outgoing = Outgoing {
     heads: vec![2],
     common: vec![1],
-    missing: [2..3].into_iter().collect(),
+    missing: std::iter::once(2..3).collect(),
   };
   let mut walk = super::Walk::begin(&served, &outgoing, Version::V03, &mut room()).unwrap();
   let mut out = Vec::new();

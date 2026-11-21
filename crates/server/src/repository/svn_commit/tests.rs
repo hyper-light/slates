@@ -725,10 +725,12 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 /// [`SMALL_MERGE_BUDGET`], land revision 1, then eight revisions each bringing a text a quarter of that budget. Expect:
 /// every revision lands, bringing more than the merge budget, while the register holds a reference a changeset alone,
 /// far below it, charged to the shard's budget (A-662, `vcs_store::settle_objects`): a repository's content is
-/// the node's changeset store's and its shard's (C2), never the merge budget the partition's chains share; and a
-/// revision whose entry the chains had no room for checkpointed its green first and was appended once (A-742's counter
-/// moved). Before A-662 each revision's record was charged to the merge budget, so the repository's whole content had
-/// to fit in it.
+/// the node's changeset store's and its shard's (C2), never the merge budget the partition's chains share; and the
+/// chains never ran short of room, so no revision checkpointed its green first (A-742's counter unmoved): since chain
+/// entry format 6 (lane (A)) an entry names its revision's increment, which the owner shard's content store holds and
+/// its room charges, so the chains hold a few hundred bytes a revision. Before A-662 each revision's record was charged
+/// to the merge budget, so the repository's whole content had to fit in it; before format 6 the entry carried the
+/// increment and the chains filled within a few revisions.
 #[test]
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
   let landed = stored_configured(
@@ -759,7 +761,7 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
     |config| config.caps.green_chain_bytes = SMALL_MERGE_BUDGET,
   );
   let expected: Vec<_> = (1..10).map(answered).collect();
-  assert_eq!(landed, (expected, true, true, true));
+  assert_eq!(landed, (expected, true, true, false));
 }
 
 /// Found by use (w-perf, 2026-11-19, release b705a24c5: a 5,000-revision import's record 3,560 refused `Unpublished`,
@@ -1984,11 +1986,11 @@ fn subtree(tree: &ModelTree, path: &str) -> Vec<String> {
     .collect()
 }
 
+/// A green's tree as a test reads it: each path's directory flag, its bytes, and its property list.
+type GreenTree = BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)>;
+
 /// The green `green`'s tree as the model writes one: every node, its text and its property list's identity.
-fn green_tree(
-  state: &ShardState,
-  green: DbVolumeId,
-) -> BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)> {
+fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
   let engine = state.greens.get(&green).expect("the green");
   engine
     .beneath("")
@@ -2008,7 +2010,7 @@ fn green_tree(
 }
 
 /// `tree` as [`green_tree`] reads a green: a property list by its identity.
-fn as_green(tree: &ModelTree) -> BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)> {
+fn as_green(tree: &ModelTree) -> GreenTree {
   tree
     .iter()
     .map(|(path, node)| {
@@ -2168,7 +2170,7 @@ fn copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then() {
                 NodeKind::File
               };
               for found in subtree(then, &source) {
-                let moved = format!("{dest}{}", &found[source.len()..]);
+                let moved = format!("{dest}{}", found.get(source.len()..).unwrap());
                 tree.insert(moved, then[&found].clone());
               }
               let copied = ChangedPath {

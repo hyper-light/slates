@@ -323,6 +323,8 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
       if let Some(Ok(_)) = made {
         state.count(MATERIALIZED, 1);
         let _ = crate::merge_service::settle_green_retention(state, green);
+        // Its tool's derived data follows its first read (P2): a git green's map of paths, in the whole build's slices.
+        crate::vcs_store::paths::derive_once_made(state, green);
         let parked = state
           .materializations
           .parked

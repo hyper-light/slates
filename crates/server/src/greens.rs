@@ -489,3 +489,182 @@ impl Greens {
       .map(|lineage| lineage.walked())
   }
 }
+
+#[cfg(test)]
+mod preview_tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+  use super::*;
+  use slates_merge::engine::{Increment, Judgment, Outcome};
+  use slates_merge::increment::{VolumeOp, compose_volume_planned};
+
+  /// The property list's attribute, as a Subversion repository's green keeps it.
+  const PROPS: &str = "slates.svn.props";
+
+  /// One path's reads as a Subversion revision is made of them (`vcs_store::svn_made`).
+  type Reads = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    bool,
+    Option<String>,
+    bool,
+    Option<String>,
+    bool,
+  );
+
+  fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
+    (
+      green.content(path).map(<[u8]>::to_vec),
+      green.xattr(path, PROPS).map(<[u8]>::to_vec),
+      green.is_dir(path),
+      green.symlink(path).map(str::to_owned),
+      green.special(path).is_some(),
+      green.hardlink(path).map(str::to_owned),
+      green.copied_after(path, since),
+    )
+  }
+
+  /// `journal` composed against `green`'s head as increment `id`, `bytes` its post-state.
+  fn increment(green: &Green, id: u8, journal: &[VolumeOp], bytes: &[u8]) -> Increment {
+    let (doc, _) = compose_volume_planned(&green.current_base(), journal).unwrap();
+    Increment {
+      id: [id; 32],
+      base: green.head(),
+      doc,
+      post_state: bytes.to_vec(),
+      evidence: Vec::new(),
+      named: Default::default(),
+    }
+  }
+
+  /// A-805 through the server's `Greens::preview` (the wrapper svn's landing previews a held verdict with). Do: found a
+  /// repository's lineage with an empty green; for each of six versions (a tree made with a file, its attribute and mode
+  /// set, a symbolic link and a hard link to the file, the file renamed, the renamed file's mode set, the tree copied),
+  /// judge it through the member's engine, preview the held verdict, read every path through `with_preview`, retire the
+  /// preview, then commit the version for real. Expect: the green unchanged by the preview (its head, and the lineage
+  /// back to its one member once retired); the preview's changed paths and every path's reads (bytes, property list,
+  /// kind, link target, IPC node, hard link's primary, copied after) the committed green's at the new version.
+  #[test]
+  fn a_preview_through_greens_reads_as_the_commit_does() {
+    let repository = RepositoryId { bytes: [1; 16] };
+    let id = VolumeId { bytes: [2; 16] };
+    let mut greens = Greens::default();
+    assert!(greens.found(repository, id, Green::new()).is_ok());
+    let paths = [
+      "trunk", "trunk/a", "trunk/b", "trunk/l", "trunk/h", "branch", "branch/b", "branch/l",
+      "branch/h",
+    ];
+    let steps: Vec<(Vec<VolumeOp>, &[u8])> = vec![
+      (
+        vec![
+          VolumeOp::Mkdir {
+            path: "trunk".to_owned(),
+          },
+          VolumeOp::Create {
+            path: "trunk/a".to_owned(),
+          },
+          VolumeOp::Extend {
+            path: "trunk/a".to_owned(),
+            at: 0,
+            len: 5,
+          },
+        ],
+        b"alpha",
+      ),
+      (
+        vec![
+          VolumeOp::SetXattr {
+            path: "trunk/a".to_owned(),
+            name: PROPS.to_owned(),
+            value: b"p".to_vec(),
+          },
+          VolumeOp::SetMode {
+            path: "trunk/a".to_owned(),
+            mode: 0o640,
+          },
+        ],
+        b"",
+      ),
+      (
+        vec![
+          VolumeOp::Symlink {
+            path: "trunk/l".to_owned(),
+            target: "a".to_owned(),
+          },
+          VolumeOp::Link {
+            path: "trunk/h".to_owned(),
+            target: "trunk/a".to_owned(),
+          },
+        ],
+        b"",
+      ),
+      (
+        vec![VolumeOp::Rename {
+          from: "trunk/a".to_owned(),
+          to: "trunk/b".to_owned(),
+        }],
+        b"",
+      ),
+      (
+        vec![VolumeOp::SetMode {
+          path: "trunk/b".to_owned(),
+          mode: 0o600,
+        }],
+        b"",
+      ),
+      (vec![], b""),
+    ];
+    for (index, (journal, bytes)) in steps.into_iter().enumerate() {
+      let step = u8::try_from(index).unwrap();
+      let head = greens.get(&id).unwrap().head();
+      let journal = if journal.is_empty() {
+        vec![VolumeOp::Copy {
+          from: "trunk".to_owned(),
+          to: "branch".to_owned(),
+          version: head,
+          replace: false,
+        }]
+      } else {
+        journal
+      };
+      let inc = increment(&greens.get(&id).unwrap(), step, &journal, bytes);
+      let Judgment::Accepted(judged) = greens.get_mut(&id).unwrap().judge(&inc) else {
+        panic!("step {index} not accepted");
+      };
+      let preview = greens.preview(&id, judged).unwrap();
+      let (changed, viewed) = greens
+        .with_preview(&preview, |view| {
+          let reads: Vec<Reads> = paths.iter().map(|path| reads_at(view, path, 0)).collect();
+          (view.changed_between(0, 1), reads)
+        })
+        .unwrap();
+      greens.retire_preview(preview);
+      assert_eq!(
+        greens.get(&id).unwrap().head(),
+        head,
+        "step {index}: the preview moved the green"
+      );
+      assert_eq!(
+        greens.lineage_len(repository),
+        1,
+        "step {index}: the preview stayed a member"
+      );
+      let outcome = greens.get_mut(&id).unwrap().submit(&inc);
+      assert!(
+        matches!(outcome, Outcome::Accepted { .. }),
+        "step {index}: {outcome:?}"
+      );
+      let green = greens.get(&id).unwrap();
+      assert_eq!(
+        changed,
+        green.changed_between(head, head + 1),
+        "step {index}"
+      );
+      let committed: Vec<Reads> = paths
+        .iter()
+        .map(|path| reads_at(&green, path, head))
+        .collect();
+      assert_eq!(viewed, committed, "step {index}");
+    }
+  }
+}

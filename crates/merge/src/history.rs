@@ -1974,6 +1974,86 @@ mod tests {
     }
   }
 
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::default()))]
+    /// A-818 piece 2a, the oracle (main's ruling of 2026-11-21 10:35: every version's reads equal to today's
+    /// re-anchor). Do: from a generated first value, apply generated op chains version after version, both as the
+    /// engine makes them today and as trees of byte identities whose places one index keeps (`crate::byte_places`):
+    /// the engine's own `segments` the parts, each removed range copied out of the file before the change, a change
+    /// whose post-state is short a whole replace; after every change read every version, whole and at a generated
+    /// range; retire the versions before a generated floor once. Expect: every retained version's bytes and range are
+    /// the re-anchored value's and `apply`'s; the stored bytes are no more than what the changes removed.
+    #[test]
+    fn every_identity_version_reads_as_the_reanchored_history(
+      first in prop::collection::vec(any::<u8>(), 0..512),
+      chain in prop::collection::vec(prop::collection::vec((any::<u8>(), any::<u16>(), any::<u16>(), any::<u16>()), 0..6), 1..16),
+      post in prop::collection::vec(any::<u8>(), 256..512),
+      range in (any::<u16>(), any::<u16>()),
+      floor_at in any::<u8>(),
+    ) {
+      use crate::byte_places::{BytePlaces, Place};
+      use crate::piece_tree::{Part, PieceTrees};
+      let mut chunks = Chunks::default();
+      let mut files = Files::default();
+      let mut values = vec![first_value(&mut chunks, &mut files, &first)];
+      let mut trees = PieceTrees::default();
+      let (mut places, run) = BytePlaces::first(first.len() as u64);
+      let mut versions = vec![trees.of_runs(&run.into_iter().collect::<Vec<_>>()).unwrap()];
+      let mut stored: Vec<Vec<u8>> = Vec::new();
+      let mut bytes = vec![first.clone()];
+      let (mut floor, mut removed) = (0usize, 0usize);
+      for (step, raw) in chain.iter().enumerate() {
+        let previous = bytes.last().unwrap().clone();
+        let ops = ops_over(previous.len() as u64, raw);
+        let next = apply(&previous, &ops, &post);
+        version(&mut chunks, &mut files, &mut values, (&ops, &next));
+        let mut parts = parts_of(previous.len() as u64, &ops, (post.len() as u64, 1, 1, next.len() as u64));
+        if parts.iter().filter_map(|part| match part { Part::Kept { len, .. } => Some(*len), Part::Added(_) => None }).sum::<u64>() + parts.iter().filter_map(|part| match part { Part::Added(run) => Some(run.len), Part::Kept { .. } => None }).sum::<u64>() != next.len() as u64 {
+          parts = vec![Part::Added(crate::piece_tree::Run { source: 1, at: 0, len: next.len() as u64 })];
+        }
+        let made = places.change((step + 1) as u64, &parts, &mut |at, len| {
+          removed += len as usize;
+          stored.push(previous[at as usize..(at + len) as usize].to_vec());
+          Ok((stored.len() - 1, 0))
+        }).unwrap();
+        let tree = trees.rebuild(versions.last().unwrap(), &made).unwrap();
+        versions.push(tree);
+        bytes.push(next);
+        if step == usize::from(floor_at) % chain.len() {
+          floor = step;
+          places.retire_through(floor as u64, &mut |chunk| stored[chunk].clear());
+        }
+        let newest = bytes.last().unwrap().clone();
+        let read = |tree: &crate::piece_tree::Version, (from, take): (u64, u64)| {
+          let mut out = Vec::new();
+          trees.read(tree, (from, take), &mut |run| {
+            places.locate((run.at, run.len), &mut |place| match place {
+              Place::Current { at, len } => out.extend_from_slice(&newest[at as usize..(at + len) as usize]),
+              Place::Stored { chunk, at, len } => out.extend_from_slice(&stored[chunk][at as usize..(at + len) as usize]),
+            }).unwrap();
+          }).unwrap();
+          out
+        };
+        for ((value, tree), expected) in values.iter().zip(&versions).zip(&bytes).skip(floor) {
+          prop_assert_eq!(&read(tree, (0, expected.len() as u64)), expected);
+          prop_assert_eq!(&value.materialize(&chunks, files.blocks()), expected);
+          let len = expected.len();
+          let from = if len == 0 { 0 } else { usize::from(range.0) % len };
+          let take = usize::from(range.1) % (len - from + 1);
+          let cut = read(tree, (from as u64, take as u64));
+          prop_assert_eq!(&cut, &value.read((&chunks, files.blocks()), from, from + take));
+        }
+        let held: usize = stored.iter().map(Vec::len).sum();
+        prop_assert!(held <= removed);
+      }
+      for tree in versions {
+        trees.release(tree);
+      }
+      prop_assert_eq!(trees.live(), 0);
+      release_all(&mut chunks, &mut files, values);
+    }
+  }
+
   /// W2, A-793. Do: a 1 MiB file, then 64 versions each overwriting 64 bytes of its own range, made as the engine
   /// makes them; then release everything. Expect: the history holds the current file's block, which the latest names
   /// and every earlier version shares, and the 64 bytes each change overwrote, owned; not the first file's block (A-728
