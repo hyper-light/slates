@@ -2308,6 +2308,15 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
+> a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
+> every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
+> (`Repository::replay_revision`, `replay_step`) checks and applies its rows at its first step and keeps its rows' texts
+> a step each, kept between turns (`vcs_store::svn_replays`) until the shard's quantum runs, one row at least
+> (`vcs_store.svn_replay_turns`). Held by `a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does` (the
+> same records as a whole commit) and `a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild` (twelve 50 KiB files,
+> at least twelve turns, the same records and green). Left: one row's text is still deltified whole in its step (a
+> row at a time, not a window), and a record's decode is whole. Closed.
 > **R3, the svn hook tests' flake (2026-11-20, w-svn; Ada's close list):** `vcs_svn::tests` waited ten liveness windows
 > for an answer that runs hooks, and its reader returns part-way at a timeout; on a loaded Mac a hook's first run
 > outlasted that (1 in 3, w-perf; 22 s against 2.3 s), read as a wrong answer. The wait is now a hang's bound
