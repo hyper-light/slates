@@ -290,3 +290,11 @@
   A4 replay v4: names from content; pack read from the content store by identity (GitReplay chunks from windows;
      replay_pack whole via object_bytes); record holds the pack content as v3 held names.
   Measure: v1.5.0 landing step (entry apply 18 ms -> ~0) and record bytes; red: no step past the quantum landing v1.5.0.
+- 18:35 v4 PART A LANDED 7a52ef882 (merge 33f17ba0d), tested at c20861789 over ed021dc42 (git 582, server 166 ok).
+  Close note: inbox/main-from-w-git-close.md (P4 7b66e7225, P5 ccd07b58c+15917f29a closed; C1 part done, C5 with
+  w-store left). Worktrees land9/land10 removed; branches v4a, v4a-land, memdiag, decodediag, a665p4 deleted; Studio
+  release target and diag worktrees deleted. Mac worktree now: ~/slates-work/w-git-state (state branch) only.
+- R2 (edge tests under load) IN PROGRESS: repro r139 at load 78-83, 8x the three tests: 19/24 fail, all in the PUSH's
+  chunked body (daemon_edge.rs:571 -> chunked_body), not the fetch. Suspects: Receive::answer_until awaits that skip the
+  keepalive deadline: turns::take, home_in_region (names + pack), names_committed_within. Diag r140
+  (~/.cache/w-git-diag/r2_patch.py, never for main) times each.
