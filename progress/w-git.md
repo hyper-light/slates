@@ -391,3 +391,31 @@
     w-rewrite-ops, inbox/w-rewrite-ops-from-w-git-update-deferred.md; not on main yet).
   Left: git crate works tests (Entry::Create increment), server tests reading created greens' files directly (route via
   the door / lend), the oracle (derived map = eager build, branches and tags, before/after replay), red = git/git push.
+- 2026-11-21 ~11:40 PST: P2's git half LANDED, A-821 (main b2fbe6bf3; docs renumbered 955d6d645, w-svn took A-820).
+  BranchChange::UpdateDeferred built by me on CreateDeferred's pattern (main 08:10). The materialization's turn reads
+  inside vcs_store::with_room (red: build refused Malformed, pack read Unread{at:166}: windows live in the lent chunk
+  store). A push reaches greens only through the door (ShardGreens notes the owing green; build turn / delete wait,
+  bounded: a refused build declines the command). A create passes over an owing non-default holder (t_a719: 40 creates
+  at one commit waited on each other's makes). Tests: t_p2 unborn default (red on main 14,273 quanta -> <=1 turn,
+  made once), t_p2 branch+tag oracle (one owed push byte for byte across a replay before/after make; made = eager files).
+  Focused 298/298 single-threaded (server git_push repository::push green_ready vcs_store vcs_ssh vcs_http), git receive
+  50/50. Load-sensitive (not this change): t_a752 `quanta > FLAT_FILES` (3 of 4 alone pass, routed before); t_a614a
+  (mine, 2b2fc8d80) 15 turns vs 8 under the parallel suite, 3/3 alone pass — owed: bound its turns by wall time/ceiling.
+  Line to w-rewrite-ops: inbox/w-rewrite-ops-from-w-git-p2-git-half-landed.md.
+  NEXT: red = git/git's 611 MB push lands (Studio, push_clone_repro.sh), then A/B vs stock git 10.77 s (main's runs);
+  then C5 2b piece 3 on A-816 (red on agents/w-git-piece3-red). MacBook target trimmed 5.7 -> 5.4 GB; removed
+  ~/.cache/w-git-wt, w-git-clone, w-git-diag (clean, nothing unpushed).
+- 2026-11-21 ~12:00 PST: main 08:20: r61 (git/git push red, release) queued by main; A/B after. Fold t_a614a's
+  wall-time bound into piece 3's series. PIECE 3 STARTED in ~/slates-work/w-git-p2 (from main 30d2e4100; red test
+  applied from cf289fb7d, uncommitted). Design:
+  * made_commit: Tool::Git (made_repository_of via vcs_store::paths::git_repository_of); defer -> commits::make_deferred.
+  * make_deferred: hold_preview(judged); spawn task holding the turn.
+  * task turn 1 (map): paths::stepped(&preview_engine, (store, vcs_stores), ...) through a new made_commit lend giving
+    the preview engine + &mut store/vcs_stores (disjoint fields). Change step if the head before has a map; whole over
+    the preview for a root's first version; else whole_build::start(head version) sliced first, poll, then the change.
+  * then commit_objects -> GitPush::admit_all (already a pack of whole objects) -> seal -> sealed.admit(moves).
+  * homing in the task: names_now/put_names + keep_for_region, pack_to_home/hold_for_record + keep_for_region,
+    landing_of + disk.land(...).await, sealed.landed_as(seq).
+  * step: made_commit::commit(state, pending, |state| sealed.record (v5) -> check -> super::commit(store) -> mutate).
+  * abandon before the step: drop the kept head (paths) so a retry builds again; release homed; sealed.abandon.
+  Later sub-pieces: the kill test; removing record_of/v2 and after_submit/staged/owed; t_a614a wall-time bound.

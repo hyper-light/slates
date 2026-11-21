@@ -7083,3 +7083,11 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   tests (`handles:: held_windows::`, --test-threads 1) were refused "no room here now" twice; reported per main's 07:50
   rule. Still owed on Windows: anchor lib + handles_windows, the two content-extent CLI tests and their red-first at
   20bef898c^ (w-sizing, A-789), then w-realtools' real_tools over WinFsp.
+- 2026-11-21 08:20 (w-lint, main 13ded84f0+): the wall's last two reds closed by w-lint per main's word: store texts.rs
+  literals (w-store's) and hg intake_tests's intake helper (w-hg's, lint-only). Host clippy, fmt, structural, literals,
+  unsafe, the six cross targets: clean.
+- 2026-11-21 (w-lint, Windows, ~/w-lint-win at 02874580e): A-789's anchor checks green on jupiter: `--lib handles::
+  held_windows::` 26/26 (r23), `--test handles_windows` 9 passed, 10 ignored by the test (r24). The two content-extent
+  CLI tests (`a_freed_content_extent_gives_its_commit_back_on_windows`, `a_content_extent_outlives_a_killed_daemon_on_windows`)
+  were refused "no room here now" twice (r25, r26): reported per main's rule. Still owed: those two, their red-first at
+  20bef898c^ (w-sizing), and w-realtools' real_tools over WinFsp.

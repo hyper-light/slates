@@ -152,3 +152,17 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   MBP-2 e30189 167/13/39; jupiter 55/8/86; adacachy 9/0/0. Second sample later -> drops/hour before the fix.
 - r17 stopped (its red half diffed the working tree, empty after the local commit); r19 = red/green on Linux by
   HEAD~1..HEAD, + kiln-rt udp tests + vendor.py check hyper-raft.
+- R2 BEFORE, better measure: kiln's topo.drops did NOT count Studio-4's 15:34:40Z drop (135 at 14:59 and 15:50), so the
+  measure is the runners' own "disconnected from server" lines per hour (UTC, 2026-11-21):
+  Studio-4 (.83): 05h 4, 06h 1, 07h 1, 08h 2, 09h 4, 10h 2, 15h 1 (none 11-14h).
+  Studio-3 cec37f (.84): 00h 24, 01h 8, 02h 2, 04h 2, 05h 5, 06h 3, 07h 1, 08h 3, 09h 4, 10h 3, 11h 3, 15h 1.
+  cec37f has been tunnelled since 2026-11-16T04:54Z ("UDP 192.168.1.90:7071 unreachable"). Probe at 15:50Z: still from .77.
+  AFTER = same counts once the fix is deployed (server + runners), plus each runner's "connected directly" line.
+- ~08:45 PST: macOS green (this Mac, local, own target): crates/kiln-rt/tests/udp_local_address.rs
+  an_arrival_tells_its_local_address_and_an_answer_from_it_arrives 1/1 x4 (sendmsg+IP_PKTINFO answer arrives);
+  udp_batched 18/18 x13 (10/10 clean); hyper-rt --lib udp:: 13/13; cargo check -p kiln --lib --tests OK.
+  CAUTION learned: two worktrees on one CARGO_TARGET_DIR mixed kiln-rt artifacts (a test compiled against origin's
+  lib) -> base worktree removed; never share a target across worktrees.
+- Linux runs waiting on adacachy (load ~40/32, "machine under strain"; fedora offline): r19 = kiln e2e RED/GREEN
+  (32g), r21 = kiln-rt tests + vendor.py check (6g). r18 = kiln e2e on macOS (queued for this Mac).
+- Local commit (unpushed) in ~/kiln-work/w-k90-pin-2-r2: 10 files (+685/-74).

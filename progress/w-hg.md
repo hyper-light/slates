@@ -252,3 +252,37 @@
       the register entry (v7 made reference), the fork placed, and the made map set.
     - The recovery/rebuild replay of v7 already goes through the pieces; replayed_hg sets `made`.
     - Tests poll for the made changeset (async now).
+- ~10:10 LANDED ac25475c1: made changesets on the store (one hook, one path). The v3 made record, `unstored` and
+  `stored_logs` are removed. Close note written; main and w-perf told.
+- NEXT: C1 step 1a, the clone walk (by_links) in serve/getbundle.rs Walk::file through StoreWants.
+  - Walk fields: want, wanted logs, the ahead deque (path, position, node, link, row, chunk), and a sent map
+    (identity -> node) for the open group.
+  - A new `Store::file_entry(path, node) -> ([Node;2], flags)`, read from the index, no text.
+  - A stored delta is sent as it stands (put_delta against the sent node, or NULL for a stored whole).
+  - Producing::Bundle forwards wants to Answering, then the Walk.
+  - The edges already answer wants between turns (vcs_http/hg.rs:653, vcs_ssh/hg.rs:184).
+  - Whole callers (getbundle::changegroup, session::serve whole, the tests) need a want-answerer: render's StoredSource
+    / answer_want style.
+  - Red: a full clone makes no whole text and reads chunks = file revisions; stock 7.2's clone verifies clean.
+  - Then 1b (the pull path, named_changegroup) with main's condition: the base on the client or sent earlier, from the
+    common set; count whole sends; measure a one-changeset pull touching a big file against stock.
+- ~11:20 LANDED 5d2940ff9: C1 step 1a.
+  - The by-links walk (serve/getbundle.rs Walk::file) reads file revisions through StoreWants (Files: ask_rows /
+    ask_chunks / give) and sends stored deltas as they stand.
+  - Store::file_entry and Store::stored_now (test stand-ins; the daemon's Indexed answers nothing at once, and its
+    test seam is `answering_from_its_texts`, cfg(test)).
+  - HgStores::answer_wants: ServedViews overrides it to hg_view::answer_store_wants, and the default answers from the
+    lent view's stored_now.
+  - test_store::answer_wants_blocking.
+  - hg_interop's stream test does a plain clone that asks the store.
+  - Target trimmed for main (27 GB free).
+- NEXT 1b, the pull path:
+  - named_changegroup (getbundle.rs ~910: common_ancestors, changelog_entries, named_revisions, encode_changegroup) is
+    built whole at begin from content-store texts.
+  - Plan: keep the planning (which revisions, by path, node, parents, link) but send each file revision from stored
+    rows and chunks, stepwise.
+  - Ask rows for (path, [node, p1, p2]). The base is sendable if the stored base identity is a revision sent earlier in
+    the group, or p1/p2 when the parent's link is held (on the client) or sent.
+  - Otherwise send a whole text: a new Want::Texts variant answered by StoreHandle::text pieces (render.rs Want and
+    answer_store_wants are w-perf's: tell them), counted WHOLE_SENT.
+  - Measure a one-changeset pull of a large file, slates' bytes against stock (main asked).

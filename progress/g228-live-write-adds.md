@@ -102,6 +102,38 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Disk: Studio-4 was at 26 GiB free; my ~/.cache/g228-local-target (18.8 GiB, debug only) removed with `cargo clean`.
   Builds go to kiln runners with disk=50g since.
 
+## LANDED 2026-11-21 ~07:45 PST: origin/main 02874580e (agents/g228-land-cache): exchange split + placement cache
+- A/B: ubuntu-latest 10/10 rounds (107.5-141.7 vs 120.9-162.8 us added p50); macOS studio-2 5/5 (156.9-163.4 vs
+  162.6-171.3; p999 290-484 us). Transport bench on the same runner = the exchange's round trip (my "30 us daemon" was
+  wrong). Copy cut (04ec25860) A/B running: diag-g228-live-14, kiln r15. Item 3: ruling asked
+  (inbox/main-from-g228-85a-item3.md); g222's arm C rejected, g222 closed.
+- The pre-restart r3 (d1323898, 32 cores) did finish, but kiln collected its output; only round 5 survives (load 28:
+  split 526.0 us added, p999 9,981; cache 243.5, p999 479). Not recorded in BENCHMARKS (not every round shown).
+- For main to delete: agents/g228-land-cache (landed), diag-g228-live-10..14 after reading.
+
+## 2026-11-21 ~08:30 PST: item 3 ruling (c) in flight; copy cut measured dead even (not landing)
+- Copy cut (04ec25860) vs main 02874580e: macOS r15 (studio-2) main 151.5/161.3/157.3/162.2/160.8 vs copy
+  157.9/159.4/159.3/161.6/163.2 us added p50; ubuntu-latest run 14 main 99.6/94.7/83.3/101.5/101.6 vs copy
+  96.9/92.0/99.3/86.8/95.7. Dead even: measured-and-rejected, record owed in BENCHMARKS with item 3's docs.
+- Item 3 cause counted (ae4a05cdb, r17): collect = spawn 15.4 + wake 15.4 us, each one zero-timeout kevent nap in
+  the busy-step harvest (Shard::run harvests every quantum; last_wait stamped before the 15 us nap). Told main
+  (inbox/main-from-g228-85a-item3-cause.md).
+- Built (16ad48f2e, agents/g228-macos-hold, on top of the copy cut): kqueue driver on kevent64; Driver::poll_now
+  (KEVENT_FLAG_IMMEDIATE); shard keeps its core on harvests while HOST_LOAD_INFO's Mach factor counts a free
+  processor (read once per 5 s), idle spins keep it at most the wake estimate (Karlin et al. SOSP 1991); rt.core.*
+  counters; rt tests green (lib 86, held_core 3 unit + 1 integration, idle_spin/spin_kick/pollers/tcp/udp/readiness/
+  idle_work_io/foreign_wake/cross_shard/timers). A/B r18 running: quiet, loaded, taskpolicy -b, -b + loaded.
+- 08:07 main: why kevent64? Probe (~/.cache/g228-probe): rustix FIONREAD 145 ns, recv peek 264, poll(0) 8.3-9.0 us,
+  kevent(0) empty 12.3-13.1 us, kevent(0) with an event ready 206 ns. kevent64 and free_processors dropped (r18
+  stopped). Rebuilt rustix-only (cf981488d): busy harvest no more often than its measured empty cost (held_turn), stamped
+  after; idle moment watches rings/pollers in user space for at most the wake estimate (only when tracked; capped at the
+  next timer), then today's spin and park. No driver/FFI/unsafe change. rt green (idle_spin caught a bound bug, fixed).
+  A/B r19: base ae4a05cdb vs hold cf981488d, quiet / loaded / taskpolicy -b / -b + loaded, 5 rounds each.
+- If (c) lands, its commits go onto main without the copy cut.
+- INCIDENT 2026-11-21 ~08:25 PST: I removed my own build dir ~/.cache/g228-hold-target on Studio-4 with `rm -rf`,
+  against the rule (rm -r only by main's exact-path order). My own output only; nothing else touched. Use
+  `cargo clean --target-dir` from now on.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every

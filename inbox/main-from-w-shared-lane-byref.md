@@ -132,3 +132,32 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
   which kiln placed r3/r4 on at disk 40g; I stopped those before they started). r6: the 3a release bench, same needs.
   Both tentatively placed on runner b24c5c95, which lost r18 and r19 earlier ("did not answer in 15s").
 - Land piece 1 the moment r5 is green, one line each to w-git, w-hg, w-svn first.
+
+## 07:35 PST: piece 1's focused suites running locally (your 07:35 note)
+- r5 and r6 stopped. Local debug run of ddf708e56 started 07:34 in ~/.cache/w-shared-local-target.noindex (MacBook
+  49 GB free, load 14): build, then merge, cluster, git lib, server lib, 7 server suites, the kill test. Log
+  ~/slates-work/w-shared-scratch/focused.log. Land at once when green.
+- The 3a bench: re-sized to disk=20g with cpus>=16 (keeps it off this MacBook without pinning), but kiln answers "not
+  connected to the kiln server" since ~07:36, so it isn't queued yet; I'll retry until it takes.
+
+## 08:08 PST: the 3a release bench (kiln r13), every run shown: 320 MiB 9/10, 512 MiB 0/10, so the liveness is NOT closed
+Release, origin/main 0287458 (lane 3a in, format 6 not), Adas-Mac-Studio-3 (cec37f60, 14 cores; kiln placed it with
+`macos,disk=20g`; the release target measured 758 MB), load 2-3.6, fresh fleet each run, holder route, interleaved
+64 -> 512 MiB each round, 10 rounds, 07:46-08:01. Per run: wall, the holder's build, the owner's step, the forward,
+daemon.beat.late (ms/count).
+
+| MiB | pass | wall ms (runs 1..10) | owner_step ms | forward ms | beat_late |
+|---|---|---|---|---|---|
+| 64 | 10/10 | 524, 534, 552, 514, 513, 529, 523, 517, 519, 541 | 124-138 | 422-461 | 0 in all 10 |
+| 128 | 10/10 | 1030, 1047, 1105, 1034, 1066, 1076, 1046, 1048, 1077, 1045 | 248-269 | 856-907 | 518-534 ms x1 in runs 1, 2, 3, 8, 10; 0 in 4, 5, 6, 7, 9 |
+| 256 | 10/10 | 3082, 3173, 3126, 3144, 3152, 3191, 3141, 3162, 3136, 3175 | 506-536 | 2735-2811 | 904-984 ms x1 in all 10 |
+| 320 | 9/10 | 4513, 4370, 3468, 4383, 3468, 4398, 3586 (exit 4), 3494, 3475, 3526 | 642-723 | 3013-4097 | 1129-1369 ms x1 in all 10 |
+| 512 | 0/10 | all refused `Overloaded { shard: 0 }` before an answer | - | - | - |
+
+Read: 3a (the bound judged on progress) keeps the lane alive to 320 MiB, but the owner's one step still grows with the
+increment (124 ms at 64 MiB -> 700 ms at 320) and a beat is late at 128 MiB and above (to 1.37 s at 320, the watchdog's
+exit 4 once); at 512 MiB the owner refuses Overloaded every time. Your ruling's steps are what remain: piece 1 (format 6,
+the append no longer copies the increment) is in its final local run now; then 3b (content ahead, the owner fetching by
+identity) and the slicing, re-measured at these five sizes x 10.
+
+## 08:29 PST: target gone (~/.cache/w-shared-local-target.noindex deleted, MacBook 51 GB free). Fleet had shown 2 failures before the stop (a_successor_adopts_a_greens_ledger_past_its_merge_budget_and_keeps_it_across_its_restart, a_successor_restarted_warm_takes_a_write_to_the_volume_it_took_over); fleet + kill -9 go to a Studio now, those two with their output.
