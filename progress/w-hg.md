@@ -184,3 +184,20 @@
   2. the intake keeps no whole text with a store;
   3. the import as changesets (R2).
   Then the no-store path dropped.
+- 2026-11-21 ~00:20 LANDED 8cb10f986: C1 step 0, the no-store commit. One `repository::no_store_for` refuses hg and svn
+  without --vcs-store. The v2 path is gone. hg tests are on store-backed daemons through the one shared helper
+  (w-svn's test_store.rs plus mine: audit_on_stored_shard, land_blocking, create → repository::create_blocking).
+  Close note written, with the siblings: 10 failures already on main 68ce3d585 (whole_build's park bound) and the
+  load-bound git_push t_a752.
+- ~00:30 asked main (inbox/main-from-w-hg-c1-order.md) to order C1 as 3, then 1, then 2: step 1 alone can't serve an
+  imported repo, whose texts aren't on the store until 3.
+- ~00:45 step 3 design sent to main and w-store (inbox/main-from-w-hg-c1-import-design.md): the import lands as a run
+  of bounded changesets whose payloads, concatenated, are one cg3 changegroup; the register's one import entry names
+  the run; replay goes through the push intake reading pieces.
+- NOW: the piece-reading intake (needed by both 1 and 3).
+  - slates_hg: a `Source` (bytes by range, or Wanted{range}) and a forward `Window`.
+  - The changegroup framing decoded in steps from a cursor over a Source.
+  - Intake::step reads its delta through a Source; a step asks for its bytes before changing any state.
+  - Server replay (vcs_store replay_hg_referenced / replay_sliced, payload_of): a window filled by
+    `StoreHandle::piece` on Wanted. No whole payload is held.
+  - Red test: a replay's peak bytes against the payload's length.
