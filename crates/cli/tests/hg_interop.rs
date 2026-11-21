@@ -608,6 +608,93 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
 }
 
+/// Format: stock 7.2's warning where `clone --stream` meets a server listing no stream capability
+/// (`mercurial/streamclone.py`, `canperformstreamclone`), before it clones plainly.
+const STREAM_DISABLED_WARNING: &str =
+  "warning: stream clone requested but server has them disabled";
+
+/// Format: stock 7.2's line as a stream clone begins (`mercurial/streamclone.py`, `maybeperformlegacystreamclone`).
+const STREAMING_LINE: &str = "streaming all changes";
+
+/// Goal 93 perf (main's ruling of 2026-11-21 02:31). A stream clone sends each revision as the changeset store keeps
+/// it, and the store keeps no revision of an imported history until w-hg's C1 step 3 lands imports as changesets, so
+/// such a repository must list no stream capability: stock 7.2 then clones plainly with its own warning, where it had
+/// aborted ("operation forbidden by server"). Do: over the HTTP edge, import a two-changeset history into one
+/// repository (`slates repository import`) and push the same history into another; `hg clone --stream` each. Expect the
+/// imported one's clone to succeed with 7.2's warning and no stream, and the pushed one's to stream as before, each
+/// clone holding the source's changesets. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface.
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's stream clone of an imported repository: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-stream-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's stream clone") else {
+    return;
+  };
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-stream");
+  let source = format!("{}/source", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &source]);
+  std::fs::write(format!("{source}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &source,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  std::fs::write(format!("{source}/file"), "first\nsecond\n").unwrap();
+  hg_ok(&hg, &source, &["commit", "--message", "second"]);
+  create_hg_repository(&instance, "imported");
+  let (code, out, err) = slates(
+    &instance,
+    &[],
+    &["repository", "import", "imported", &source],
+  );
+  assert_eq!(code, 0, "repository import: {out}{err}");
+  create_hg_repository(&instance, "pushed");
+  hg_ok(
+    &hg,
+    &source,
+    &with_config(&["push", &format!("{prefix}pushed")], &config),
+  );
+  let clone_stream = |name: &str| {
+    let clone = format!("{}/{name}-clone", scratch.path);
+    let url = format!("{prefix}{name}");
+    let (code, out, err) = hg_in(
+      &hg,
+      &scratch.path,
+      &with_config(&["clone", "--stream", "-U", &url, &clone], &config),
+    );
+    assert_eq!(code, 0, "clone --stream of {name}: {out}{err}");
+    let said = format!("{out}{err}");
+    (
+      said.contains(STREAM_DISABLED_WARNING),
+      said.contains(STREAMING_LINE),
+      hg_nodes(&hg, &clone) == hg_nodes(&hg, &source),
+    )
+  };
+  assert_eq!(
+    (clone_stream("imported"), clone_stream("pushed")),
+    ((true, false, true), (false, true, true)),
+    "(warned, streamed, whole) for the imported repository's clone, then the pushed one's"
+  );
+}
+
 /// §4.17.3 decision 1 (a client's `--force` makes a line; main's item 6, reading (a), held to stock 7.2's `push -f`). Do:
 /// over the HTTP edge, push a first changeset from copy A; clone it into B, commit and push there, so the line moves;
 /// commit in A on the old head and push without `--force`, then with it; clone the repository again into C and pull

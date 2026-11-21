@@ -55,7 +55,7 @@ impl Pieces {
   }
 
   /// The piece of `identity` holding `offset`, from `offset` on; none where no reader fetched it.
-  fn at(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  pub(super) fn at(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
     let ((_, start), (bytes, _)) = self
       .0
       .range(..=(*identity, offset))
@@ -105,6 +105,70 @@ pub(crate) async fn fetch_piece(
     held.1 = held.1.saturating_add(1);
     state.count(PIECE_FETCHED, 1);
     true
+  })
+  .unwrap_or(false)
+}
+
+/// Reads text `identity` of `len` bytes of repository `repository` whole through the node's changeset store into the
+/// content store, a piece at a time, made whole there with one hold (C2 stage B part 2 (b)): for a reader that needs a
+/// stored text whole in one step (a commit's green increment). Whether it did, its bytes its identity's; counted as a
+/// piece fetched each. A busy owner is asked again after a yield.
+pub(crate) async fn bring_whole(
+  repository: slates_db::catalog::RepositoryId,
+  identity: ContentIdentity,
+  len: u64,
+) -> bool {
+  let Some(Some(disk)) = crate::state::with_state(|state| state.vcs_disk.clone()) else {
+    return false;
+  };
+  let from = u128::from_be_bytes(repository.bytes);
+  let mut writing = slates_vcs::Writing::default();
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(from, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      _ => break,
+    };
+    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+    let put = crate::state::with_state(|state| {
+      state.count(PIECE_FETCHED, 1);
+      crate::vcs_store::within_budget(state, brought, |stores| {
+        stores
+          .content_mut()
+          .is_some_and(|content| content.put_window(&mut writing, &piece).is_ok())
+      })
+    });
+    if put != Some(true) {
+      break;
+    }
+    offset = offset.saturating_add(brought);
+  }
+  crate::state::with_state(|state| {
+    let made = crate::vcs_store::within_budget(state, 0, |stores| {
+      let Some(content) = stores.content_mut() else {
+        return false;
+      };
+      if offset != len {
+        content.abandon_object(writing);
+        return false;
+      }
+      match content.finish_object(&mut writing) {
+        Ok(made) if made == slates_vcs::ContentId(identity) => true,
+        Ok(made) => {
+          let _ = content.release(&made);
+          false
+        }
+        Err(_) => false,
+      }
+    });
+    if !made {
+      state.count(PIECE_UNFETCHED, 1);
+    }
+    made
   })
   .unwrap_or(false)
 }

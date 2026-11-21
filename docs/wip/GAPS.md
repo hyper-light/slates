@@ -173,10 +173,20 @@
 > whole (an import placed, a replay or rebuild ended) merged a slice at a time, and each lend over the store's own index
 > reporting its lookups to the rule, a due merge begun. (2) A pull whose client holds the history walked every manifest
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
-> made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
-> accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
-> a consistent snapshot while a push lands; the stream clone's chunks as stored deltas (store side done locally: `H`
-> rows per entry, `I` rows by node).
+> made from what it sends. Git's repository index on the same upkeep BUILT (`Repository::rows`, `upload::lend_on` reports). OWED: inserts reported
+> to the rule (`inserts_took`, its first price before a merge is timed); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
+> a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
+> the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
+> the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
+> whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
+> stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
+> `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
+> kept such a revision bare). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
+> stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
+> warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
+> server" (main's ruling 02:31; the stock-hg test above, and
+> `a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs`). Such a clone is a plain clone's speed.
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
@@ -442,6 +452,26 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-808 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED in part: contention is the knob (1k stand-in: 17.5
+> asks a client at 300 hot files, 69.4 at 10); an edit now reads its length from the work's kept entry and a rebase
+> keeps every touched path's entry: 69.4 to 48.5 at 10 hot files, lengths 18.1 to 4.7. Open: rebases' file asks
+> (13.8 a client at 10 hot files) for journal paths whose change became the head's.
+>
+> **A-774 follow-up (2026-11-21, w-fed-move; main's order):** FIXED the stale assertion in `daemon`'s
+> `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`: a green's landing is judged as any
+> volume's (A-774 part 3), so at a missing target it is refused `Target`, no longer `Unsupported` by role.
+>
+> **A-806 (2026-11-21, w-fed-move; goal 86b's 300 MB work log).** FIXED: a rebase answers each changed file as parts
+> over the head; the work holds and its restatement logs those parts, so a work's log is what it wrote. Largest log at
+> 1,000 clients over `asic_reg` 35,249,811 to 1,957 bytes. Found beside it: `daemon`'s
+> `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
+> A-774 part 3), reported to main.
+>
+> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
+> re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
+> judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
+> the 100k rung's wall (a few values a path there). Open: the fix's design, with main.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
@@ -755,7 +785,9 @@
 > path), and only then its store hold given back; a replay holds the texts the records still keep stored after its whole
 > log, so a text a later entry deltified is never asked of the store. Held by
 > `a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released` (red: nothing deltified, the
-> whole text held). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
+> whole text held). RETIRED 2026-11-21 (C2 stage B part 2 (b) P3, w-svn): a committed text is its changeset's on the
+> node's store and the content store lets it go once its revision stands, so the job only moved history into RAM.
+> OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -2642,14 +2674,52 @@
 > `an_export_waits_for_each_piece_of_a_stored_text_and_writes_the_same_dump` (slates-svn: the same dump as the records'
 > own text, in formats 2 and 3) and `an_export_reads_a_text_ram_does_not_hold_through_the_store` (red without it:
 > nothing published). Found while building it (2026-11-21, w-svn): the svn://, `svnserve -t` and DAV loops have no such
-> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. Owed in
-> (a): the deltify job; then (b), the records keep history on the store. Stage C,
-> an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
-> today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
-> between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
-> landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
-> the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
-> `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
+> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. The
+> deltify job BUILT too: a window's target piece the content store does not hold is fetched through the node's store
+> between slices, the target read so far kept, a text whose piece cannot be given passed over; held by
+> `a_stored_text_the_content_store_let_go_is_deltified_through_the_store` (red without it: passed over, left stored
+> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. (b), the
+> records keep history on the store (w-svn's plan, inbox b2b-plan-corrected: the store holds every text whole already,
+> a commit's in its Payload and an import's in its Record, so the records' RAM deltas and the deltify job go): P1 BUILT,
+> a commit's green increment brings back whole a stored text the content store let go (a copy, a revert;
+> `svn_texts::bring_whole`), given back after its step; held by
+> `a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment` (red without it: `Corrupt`).
+> P2 BUILT: the hook view keeps a layout naming a stored text the content store let go, brings the text back whole
+> between its turns, then writes and holds it (`svn_presenter::show`, `ViewTurn::Bringing`); held by
+> `a_hook_view_brings_back_a_stored_text_the_content_store_let_go` (red without it: never shown). Its cost, recorded:
+> a view pins in RAM every stored text it shows while it lives (views live as long as the shard), since its mount's
+> reads are the vfs's synchronous referenced reads; reads that wait on the store need vfs work, not yet owned.
+> P3 BUILT: the content store lets go every text a commit put once its landing ends (a committed text is its
+> changeset's on the node's store; the head's files are the green's), a recovery no longer reads stored texts back
+> (`fetch_stored_texts`, `svn_text_fetched` and `ReplayRefused::SvnStored` gone), and the deltify job, which turned
+> store-held texts into RAM deltas, is retired; held by
+> `a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store` (red without it: the content store
+> kept the text) and the crash test `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (the text
+> read back whole through the store, nothing in RAM). Owed: P4 imports land texts as Payload with Texts rows and the
+> records keep none in RAM (`KeptText`, `Record::Deltified` retired). Stage C,
+> an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
+> one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
+> a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
+> memory, and the made task lands the revision's changeset, then commits the version, the register's entry naming it,
+> the local work's settle and the completion in one step, then answers; a store's refusal gives the accept up (the
+> green made again from its chain, `Overloaded` unrecorded). Held by
+> `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`,
+> `a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once` and
+> `a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back` (each red before: answered
+> with the version durable before the landing; a kill left version 1 with no revision). Since A-805 (2026-11-21, main
+> 02:37 piece 1) the verdict is judged and held, never applied before the one commit: the revision is read from a
+> preview of the held verdict (`Lineage::preview`, a branch at the head, retired in the submit's step) and the verdict is
+> applied at the commit as its chain entry records it; held by `a_read_of_the_green_while_its_made_commit_lands_sees_the_old_head`
+> and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
+> submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
+> waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
+> takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
+> after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
+> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`), but its record is
+> still written in the register's entry, not landed on the node's store first, and a client's hg push takes no landing
+> turn, so a push in flight and a made changeset are not ordered by it (owed with w-hg: a made reference on the store
+> and its replay); git's adopts the hook (w-git, removing its version-2 path); (d)
+> performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a

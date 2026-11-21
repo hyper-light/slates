@@ -172,7 +172,8 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
 #[test]
 fn an_export_reads_a_text_ram_does_not_hold_through_the_store() {
   let bytes = crate::test_store::noise(200 << 10);
-  let (_store, daemon) = crate::test_store::a_text_only_the_store_holds(&owner(), "stored", &bytes);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "stored", &bytes);
   let asked = crate::daemon::observe_first(&daemon, |state| {
     routed(state, 1);
     let two = ask(state, (&owner(), "stored"), ((0, 1), false), "two");

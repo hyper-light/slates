@@ -21,10 +21,6 @@ use slates_rt::runtime::{Runtime, RuntimeConfig};
 /// Shape: the idle spin window, short so the test's spin ends soon after the ring is injected.
 const SPIN_NS: u64 = 1_000_000;
 
-/// Shape: how long the injecting poller holds the turn after its ring: past the spin window, so the turn it rang in is the
-/// spin's last.
-const PAST_THE_WINDOW: Duration = Duration::from_millis(5);
-
 /// Shape: how long the test waits for the ring to be served. A served ring takes microseconds; a lost one is never served.
 /// Generous for a loaded machine, and the hang a lost wake causes is told apart from slowness by the shard's own state
 /// (parked, the ring unserved).
@@ -59,10 +55,19 @@ static INJECTED: AtomicBool = AtomicBool::new(false);
 static SERVED: AtomicU64 = AtomicU64::new(0);
 /// How many window-opening tasks have run.
 static NOTED: AtomicU64 = AtomicU64::new(0);
+/// When the idle window the test opened ends, on the host's monotonic clock: read right after the activity was noted, so
+/// never before the end the spin compares against (the driver's clock runs at the host's rate).
+static WINDOW_END_NS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// The host's monotonic clock, nanoseconds.
+fn monotonic_ns() -> u64 {
+  slates_machine::clock::monotonic_ns()
+}
 
 /// The poller's question: whether a ring is published (taking it), and, on the ask the test names, a client's ring
 /// landing just after this look: published, then the shard kicked (from another thread, as the doorbell thread does), then
-/// the turn held past the window so the spin ends on it.
+/// the turn held until the window it spins in has ended, so the spin ends on this turn. The hold is that condition on
+/// the clock the window is measured by, never a sleep (D-9), under the test's backstop.
 fn ask() -> bool {
   let n = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
   let rung = RUNG.swap(false, Ordering::AcqRel);
@@ -75,7 +80,10 @@ fn ask() -> bool {
     .join()
     .unwrap();
     INJECTED.store(true, Ordering::Release);
-    std::thread::sleep(PAST_THE_WINDOW);
+    let held = Instant::now();
+    while monotonic_ns() <= WINDOW_END_NS.load(Ordering::Acquire) && held.elapsed() < BACKSTOP {
+      std::hint::spin_loop();
+    }
   }
   rung
 }
@@ -118,7 +126,13 @@ fn a_kick_the_spins_harvest_takes_still_gets_its_ring_served() {
     "the serving task ran once and went idle"
   );
   rt.spawn_on(shard, async {
-    registry::with_current(|ctx| ctx.note_activity());
+    registry::with_current(|ctx| {
+      ctx.note_activity();
+      WINDOW_END_NS.store(
+        monotonic_ns().saturating_add(ctx.idle_window_ns()),
+        Ordering::Release,
+      );
+    });
     NOTED.fetch_add(1, Ordering::AcqRel);
   })
   .unwrap();

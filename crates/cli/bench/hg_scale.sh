@@ -5,7 +5,7 @@
 # The servers, a fresh one for every run, in SERVERS' order:
 # - stock: `hg serve` over HTTP on loopback over a fresh empty repository, push allowed without TLS
 #   (`web.push_ssl=False`, `web.allow-push=*`), as a stock server that takes pushes is configured;
-# - slates: `slates anchor --vcs-http 127.0.0.1:0` from the release build (its shards and budget derived from this
+# - slates: `slates anchor --vcs-http 127.0.0.1:0 --vcs-store WORK/store-N` from the release build (its shards and budget derived from this
 #   machine), a Mercurial repository made by `slates repository create --tool hg`, and a token from `slates credential
 #   token` (run with the anchor's issuer surface) as Basic's password (`auth.*`).
 #
@@ -127,7 +127,9 @@ first() { sed -n "$2" "$1" | head -1; }
 # Starts a fresh slates anchor for run $1 and makes the repository and a token: sets URL, AUTH, ANCHOR, DAEMON.
 start_slates() {
   local instance="w-perf-hg-$$-$1" log="$WORK/anchor-$1.log" exports token streak=0 port
-  "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 > /dev/null 2> "$log" &
+  # A Mercurial repository's history is kept on the node's changeset store (A-767): the run's own, under WORK.
+  mkdir -p "$WORK/store-$1"
+  "$SLATES" --instance "$instance" anchor --vcs-http 127.0.0.1:0 --vcs-store "$WORK/store-$1" > /dev/null 2> "$log" &
   ANCHOR=$!
   for _ in $(seq 1 1200); do
     if grep -q "^slates daemon: instance $instance serving on" "$log" \

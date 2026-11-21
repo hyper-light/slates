@@ -606,7 +606,8 @@ fn a_stock_push_lands_on_the_rebuilt_repository_as_7_2_answered_it() {
 /// repository, then make the repository's store again from its log as a recovery does (`vcs_store::rebuild`, the
 /// sliced task), and read the store once the task ends. Expect the store's index to hold every changeset the pushes
 /// brought, the stock push's among them, as many as before: each push's entry names its changeset on the store, whose
-/// payload the replay read back, in order.
+/// payload the replay read back, in order; and its stream clone still advertised (goal 93 perf, main's ruling of
+/// 2026-11-21 02:31), since the store keeps every revision it replayed.
 #[test]
 fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
@@ -633,19 +634,29 @@ fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
     }
   };
   let nodes: Vec<Node> = [0, 1, 3].iter().map(|at| made[*at].node).collect();
-  let (after, held) = crate::daemon::observe_first(&daemon, move |state| {
+  let (after, held, streams) = crate::daemon::observe_first(&daemon, move |state| {
     let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
-    (
+    let counted = (
       store.index.len(content, Log::Changelog),
       nodes
         .iter()
         .all(|node| store.index.rev(content, Log::Changelog, node).is_some()),
-    )
+    );
+    let streams =
+      crate::vcs_store::hg_view::with_view(state, repository, &mut room(), |view, _, _| {
+        slates_hg::serve::getbundle::Store::streams(view)
+      });
+    (counted.0, counted.1, streams)
   });
   daemon.stop();
   assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
   assert_eq!(after, before);
   assert!(held);
+  assert_eq!(
+    streams,
+    Some(true),
+    "a push replayed from the changeset log keeps its revisions in the store, so its stream clone stays advertised"
+  );
 }
 
 /// Shape: each large file's length in [`LARGE`]: two of the store's 64 KiB pieces, so the payload spans many pieces

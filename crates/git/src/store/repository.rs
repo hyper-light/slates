@@ -1673,6 +1673,12 @@ impl Repository {
     })
   }
 
+  /// The repository's shared index (its object and position rows), for its owner shard's upkeep: the merge of its runs,
+  /// timed against its lookups (goal 93 perf; the server's `vcs_store::index_upkeep`).
+  pub fn rows(&mut self) -> &mut Index {
+    &mut self.index
+  }
+
   /// Where the repository stands (A-745 rule 4): the positions it has given and the versions its greens have, both only
   /// ever growing, so every landing moves it and two moments with the same stamp read the same objects, refs' heads and
   /// versions. A fork taken at a stamp serves every fetch that begins at it.

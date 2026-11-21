@@ -1283,6 +1283,9 @@ fn holds<F: RepositoryFiles>(
 /// its node; then its text rebuilt and held to its node by the reader, from the text rebuilt before it where its chain
 /// passes through that one (7.2's revision cache, counted in `cache_hits`), the cached text charged to `room` beside the
 /// rebuild.
+/// A revision the walk read, as [`emit_revision`] writes it: its log, number, node, parents and link.
+type EmittedRevision<'l> = (Log<'l>, u32, Node, (Node, Node), Node);
+
 /// Writes one revision the walk read into the import's changegroup ([`emit`]): its log, number, node, parents and
 /// link (`read`), its revlog's chunk read and its delta's parent named, its text as rebuilt; what is kept charged to the
 /// log's `room`.
@@ -1290,11 +1293,7 @@ fn emit_revision<F: RepositoryFiles>(
   emitter: &mut emit::Emitter,
   files: &mut F,
   reading: &Reading<'_>,
-  ((log, rev, node, parents, link), entry, text): (
-    (Log<'_>, u32, Node, (Node, Node), Node),
-    &Entry,
-    &[u8],
-  ),
+  ((log, rev, node, parents, link), entry, text): (EmittedRevision<'_>, &Entry, &[u8]),
   room: &mut Admission,
 ) -> Result<(), ImportRefused<F::Refused>> {
   let mut scratch = *room;

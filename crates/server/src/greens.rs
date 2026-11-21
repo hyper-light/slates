@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 use slates_db::catalog::{RepositoryId, VolumeId};
-use slates_merge::engine::{Green, Lent, Lineage, LineageGreen, LineageRefused, Release};
+use slates_merge::engine::{Green, Judged, Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 /// The shard's green engines (module docs).
 #[derive(Default)]
@@ -42,6 +42,15 @@ pub struct Greens {
   pending: VecDeque<(RepositoryId, Release)>,
   /// Whether this shard's release task is running.
   releasing: bool,
+}
+
+/// A held verdict previewed as a member of its green's lineage ([`Greens::preview`]).
+#[must_use = "a preview holds its lineage's nodes until it is retired"]
+pub struct Preview {
+  /// The lineage.
+  repository: RepositoryId,
+  /// The preview's handle there.
+  handle: LineageGreen,
 }
 
 /// What one unit of the queued releases did ([`Greens::release_unit`]).
@@ -234,6 +243,47 @@ impl Greens {
     let handle = lineage.get_mut().branch(source, version)?;
     self.members.insert(id, (repository, handle));
     Ok(())
+  }
+
+  /// The held verdict `judged` of member `id`'s green previewed as a member of its lineage of its own (A-805,
+  /// `Lineage::preview`): what a reader that must see the version before it commits reads ([`Greens::with_preview`]),
+  /// while `id`'s engine shows nothing of it. Retire it with [`Greens::retire_preview`] in the same step. Refused as the
+  /// lineage refuses it; `Stale` for a green standing alone.
+  pub fn preview(&mut self, id: &VolumeId, judged: Judged) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let handle = lineage.get_mut().preview(source, judged)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine.
+  pub fn with_preview<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, |green| call(green))
+  }
+
+  /// Retires `preview`, its holds given back at once: a preview at its green's head shares every node but the ones its
+  /// one version copied, so its release is that version's paths, never the tree.
+  pub fn retire_preview(&mut self, preview: Preview) {
+    let Some(lineage) = self.lineages.get_mut(&preview.repository) else {
+      return;
+    };
+    if let Ok(mut release) = lineage.get_mut().retire(preview.handle) {
+      while self
+        .release_step(preview.repository, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
   }
 
   /// Retires member `id` from its lineage: its engine is gone at once, and what it held comes back as a [`Release`] to

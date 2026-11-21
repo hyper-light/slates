@@ -37,6 +37,7 @@ pub(crate) struct TestStore {
 
 impl TestStore {
   /// A fresh store named `name`, its owner started.
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   pub(crate) fn start(name: &str) -> TestStore {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let number = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,6 +95,7 @@ impl Drop for TestStore {
     {
       let _ = owner.stop();
     }
+    #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
     let _ = std::fs::remove_dir_all(&self.dir);
   }
 }
@@ -278,7 +280,8 @@ pub(crate) async fn created(
     !matches!(reply, slates_ipc::protocol::ReplyBody::Refused { .. }),
     "{reply:?}"
   );
-  let deadline = slates_rt::futures::now_ns().saturating_add(CREATION_PATIENCE.as_nanos() as u64);
+  let deadline = slates_rt::futures::now_ns()
+    .saturating_add(u64::try_from(CREATION_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
   loop {
     if let Some(Some(made)) = crate::state::with_state(|state| recorded(state, (asked.0, asked.3)))
     {
@@ -454,12 +457,13 @@ pub(crate) fn create(
 
 /// A store-holding daemon over `owner`'s repository `name`, whose revision 1 adds `/trunk/a.bin` with `bytes` (a stored text, which
 /// its changeset carries), every hold RAM has on the text let go after: the green's held table's and the content
-/// store's (C2 stage B part 2). The store's guard comes first; keep it alive past the daemon's stop.
+/// store's (C2 stage B part 2). The store's guard comes first; keep it alive past the daemon's stop. The repository's id
+/// last.
 pub(crate) fn a_text_only_the_store_holds(
   owner: &slates_db::catalog::Principal,
   name: &str,
   bytes: &[u8],
-) -> (TestStore, crate::Daemon) {
+) -> (TestStore, crate::Daemon, slates_db::catalog::RepositoryId) {
   use slates_svn::commit::drive::TextSink;
   let (store, daemon) = crate::test_store::audit_daemon_stored();
   let asked = (
@@ -533,7 +537,7 @@ pub(crate) fn a_text_only_the_store_holds(
     std::time::Duration::from_secs(60),
   );
   assert_eq!(landed, Some(Ok(1)));
-  (store, daemon)
+  (store, daemon, id)
 }
 
 /// Shape: the text the store-read tests commit: noise, so a drive's svndiff carries its bytes as they are.

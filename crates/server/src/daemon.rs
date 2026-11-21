@@ -4983,6 +4983,7 @@ async fn init_shard(
     lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
+    made_commits: crate::made_commit::MadeCommits::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -8176,10 +8177,11 @@ mod tests {
   /// copy slices through `svn_commit::land_work`: its text put into the content store a slice a turn, then landed in
   /// the revision's changeset with its record, then the register's entry naming it; then stop the daemon without
   /// publishing anything more, as a crash right after the entry, and start a successor over the same segment and store.
-  /// Expect: the successor replays the revision with its stored text held, no replay refused, the text read back from
-  /// the node's store into the content store (`vcs_store.svn_text_fetched` 1, the shard's image never having kept it),
-  /// and read back whole. Before stage B the entry waited for the shard's image to keep the text (A-727 slice b's
-  /// barrier); without either, the replay is refused `SvnStored`.
+  /// Expect: the successor replays the revision, no replay refused, the content store holding nothing of the text (C2
+  /// stage B part 2 (b): a committed text is its changeset's on the node's store, and neither the commit nor the
+  /// recovery keeps it in RAM), and the text read back whole through the node's store. Before stage B the entry waited
+  /// for the shard's image to keep the text (A-727 slice b's barrier); before part 2 (b) the recovery read every stored
+  /// text back into the content store.
   #[test]
   fn a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry() {
     use slates_anchor::AnchorSegment;
@@ -8267,23 +8269,19 @@ mod tests {
     let read = || {
       second
         .observe(shard, move |state| {
-          let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-          let refused = (
-            counted(crate::vcs_store::REPLAY_REFUSED),
-            counted(crate::vcs_store::SVN_TEXT_FETCHED),
-          );
+          let refused = state
+            .refusals
+            .get(crate::vcs_store::REPLAY_REFUSED)
+            .copied()
+            .unwrap_or(0);
           let recovered = state.vcs_stores.unrecovered(repository).is_none()
             && !state.vcs_stores.rebuilding(repository)
             && state.vcs_stores.holds(repository);
-          let whole = crate::vcs_store::lent_state(state, |state| {
-            let len = state
-              .vcs_stores
-              .subversion_records(repository)?
-              .stored_len(&identity)?;
-            let store = state.vcs_stores.content()?;
-            store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
-          });
-          (recovered, refused, whole)
+          let kept = state
+            .vcs_stores
+            .content()
+            .is_some_and(|content| content.contains(&slates_vcs::ContentId(identity)));
+          (recovered, refused, kept)
         })
         .ok()
     };
@@ -8291,18 +8289,43 @@ mod tests {
       std::time::Instant::now() + std::time::Duration::from_millis(50).saturating_mul(600);
     let mut seen = read();
     while std::time::Instant::now() < deadline
-      && !seen
-        .as_ref()
-        .is_some_and(|seen| (seen.0 && seen.2.is_some()) || seen.1.0 > 0)
+      && !seen.as_ref().is_some_and(|seen| seen.0 || seen.1 > 0)
     {
       std::thread::park_timeout(std::time::Duration::from_millis(50));
       seen = read();
     }
+    // The text read back whole through the node's store, as a reader that needs it whole does, then given back.
+    let (sent, got) = std::sync::mpsc::channel();
+    let len = text.size;
+    second
+      .observe(shard, move |_state| {
+        let task = slates_rt::futures::spawn(async move {
+          let brought = crate::vcs_store::svn_texts::bring_whole(repository, identity, len).await;
+          let whole = crate::state::with_state(|state| {
+            let whole = crate::vcs_store::lent_state(state, |state| {
+              let store = state.vcs_stores.content()?;
+              store.object_bytes(&store.root_of(&slates_vcs::ContentId(identity)), len)
+            });
+            crate::repository::svn_commit::release_texts(state, None, &[identity]);
+            whole
+          })
+          .flatten();
+          let _ = sent.send(whole.filter(|_| brought));
+        })
+        .unwrap();
+        slates_rt::futures::detach(task).unwrap();
+      })
+      .unwrap();
+    let whole = got
+      .recv_timeout(std::time::Duration::from_millis(50).saturating_mul(600))
+      .expect("the read answered");
     second.stop();
     drop(segment);
-    let seen =
-      seen.map(|(recovered, refused, whole)| (recovered, refused, whole == Some(bytes.clone())));
-    assert_eq!(seen, Some((true, (0, 1), true)));
+    assert_eq!(seen, Some((true, 0, false)));
+    assert!(
+      whole == Some(bytes),
+      "the text did not read back whole through the store"
+    );
   }
 
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
