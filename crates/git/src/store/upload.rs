@@ -66,7 +66,8 @@
 //! window, or of a candidate base, read for its search, or a step of the search over the two, a window's bytes at most;
 //! one object at most a window long encoded, its delta trials within the learned window; a window's worth of the
 //! answer's handles read; one object of a run judged by its row; a part's wanted positions marked among its entries
-//! until a window's worth of the part's entries in position order is read, each found by galloping ahead from where the
+//! until a window's bytes of the part's entries in position order are read (each read an entry of the order and the
+//! entry it names), each found by galloping ahead from where the
 //! last was (the positions come ascending), so a part's reading costs what it sends and never the whole part; one wanted entry of a part judged; one object still wanted offered its version's
 //! parts. So no unit outgrows a window and the learned window's trials, and nothing is held whole but what a search
 //! holds, an object past a window and a candidate, while the request's admission holds them (**What it sends** 3):
@@ -747,7 +748,7 @@ impl<A: Answered> Upload<A> {
         &by_entry.keep,
         bits,
         (from, cursor),
-        (handles(cx.store), &mut read),
+        (marking_reads(cx.store), &mut read),
       );
       self.counters.marks_read_most = self.counters.marks_read_most.max(to_u64(read));
       return Ok(Some(by_entry));
@@ -1598,7 +1599,7 @@ fn seek(
 }
 
 /// Marks, among `kept`'s entries, those of `keep`'s positions from `from` on, each found ahead of `cursor` in the
-/// part's position order ([`seek`]), reading `handles` entries of the order at most (a unit's first search may read
+/// part's position order ([`seek`]), reading `handles` entries of the order at most ([`marking_reads`]) (a unit's first search may read
 /// what one whole search reads): the position to go on from (the
 /// one a search stopped short of, when the reading ran out inside it), or `None` once every one is marked.
 fn mark(
@@ -1652,6 +1653,17 @@ fn mark(
 /// The bits `len` takes: the most halvings a search of `len` entries makes.
 fn bits_of_len(len: usize) -> usize {
   usize::try_from(usize::BITS.saturating_sub(len.leading_zeros())).unwrap_or(usize::MAX)
+}
+
+/// The entries of a part's position order one unit of marking reads: a window's bytes, each read an entry of the order
+/// and the entry it names (found by use: counted in handles, eight bytes each, a unit read sixteen times its window and
+/// held its poll 928 ms in a deepen of git v2.0.0).
+pub(super) fn marking_reads(store: &ContentStore) -> usize {
+  store
+    .window()
+    .checked_div(size_of::<u32>().saturating_add(size_of::<Placed>()))
+    .unwrap_or(0)
+    .max(1)
 }
 
 /// The handles a window holds, `size_of::<u64>()` bytes each: what one unit reads of a list of positions.

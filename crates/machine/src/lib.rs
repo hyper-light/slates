@@ -69,6 +69,7 @@ pub mod profile;
 pub mod segment;
 pub mod stats;
 pub mod switches;
+pub mod time_constraint;
 pub mod wake;
 
 pub use derived::Derived;

@@ -87,9 +87,28 @@
 >   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
 >   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325; BENCHMARKS "arm C"):
 >   the client's loaded round-trip p99 is 6.8-8.1 ms. The tail requests are replies written after the step that took
->   them (resumed or forwarded verbs), which the ring stamp does not cover yet. That hop is next. The busy path's
+>   them (resumed or forwarded verbs). **Take 2 (run 44934263888) named the hop:** with those replies stamped, every
+>   request joins, and 574-580 of each round's 580 loaded p99-tail requests are such deferred replies, almost all
+>   waiting in taken -> written (tail median 4.4-7.6 ms, against 0.9-2.7 ms queued and 3-15 µs for the client's own
+>   wake). Deferred taken -> written p99 is 5.8-8.1 ms loaded and 0.24-0.46 ms quiet; a sync reply's is 59-176 µs
+>   loaded. So the macOS loaded tail is the forward to the owner shard and back, not the client's wake. The busy path's
 >   zero-timeout kevent took at least 1 ms in 9-12% of its calls loaded (up to 4 ms; quiet 7-47 calls). The runner's
 >   kevent and ulock timeouts are late about 200 µs at the median, nanosleep 1.7-2.5 ms.
+> - **Linux, the per-thread fair slice on top of A-799 (2026-11-21, g222; BENCHMARKS "84a Linux: the per-thread fair
+>   slice"):** measured, not taken. The kernel holds the 100 µs floor for shard and client threads, across parks. On
+>   both CI runners a ready shard runs only at a 1 ms scheduler tick (arm64 kick -> run p50 0.91 ms, tails at exactly
+>   1/2/3 ms; on x86_64 the runnable shard's queue). The slice turns 2-3 ms tails into about 1 ms, but can't beat the
+>   first tick. arm64 with shard and client slices came close: p99 under 1 ms in 6 of 6 rounds and p999 in 5 of 6. On
+>   x86_64, p99 stays at 1.0-1.8 ms and the client slice costs the loaded p50 (conflict 99-172 against 49-90 µs).
+>   Preempting at a wake needs a privileged class (R10). Open: 84a Linux under this lane's oversubscription.
+> - **macOS, Mach's time-constraint policy (A-831, 2026-11-21, w-provision-gate; BENCHMARKS "84a on macOS"):** LANDED
+>   for a latency-tracking runtime's shards and a client's synchronous reply wait. On CI macos-latest (runs 44934544995
+>   and 44934809949, six rounds against main) the loaded accept p99 fell from 14.0-17.4 to 0.41-2.11 ms and the p999
+>   from 16.6-20.8 to 0.70-4.52 ms; conflict likewise. The busy path's kevent harvests of 1 ms or more fell from
+>   8.7-12.2% to 0.001-0.03%. The quiet medians and R9's uncontended p99 are unchanged. The load's own spinners got
+>   98-137 against 213-242 million turns a second: not starved, but the daemon now takes the CPU it needs ahead of them.
+>   No demotion was seen. **Open:** 84a's bar on macOS. The p99 is under 1 ms in 11 of 12 round medians, the p999 in
+>   4 of 12. The client-only arm (TC) was measured and rejected (p999 up to 29.9 ms).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -141,7 +160,19 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
+> shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
+> arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
+> written ranges of the write log, image slots and delta log, the rings), the memory report's kinds first: measured on
+> the second look, 75-89 ms, 256 of 256 MiB (`a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas`).
+> Steps are timed by a nanosecond step clock: on the shard's microsecond clock steps ran up to 15.5 ms against a ~1.6 us
+> budget unseen. **Open:** a fresh daemon's write log and journal cannot know their memories unwritten until their first
+> give-back, so the split (A-744's per-range rows) walks ~28 GiB a shard whole, 13.9 s on a debug audit daemon; the
+> anchor could tell its first daemon the content object is new. Also open: the runtime's look for work between two idle
+> slices (~17 us against ~1.6 us of sweep in each) sets the honest sweep's rate, about 280 K pages a second. Landed on
+> macOS green under the goal-93 focus rule; the Linux run (kiln r8, adacachy) was in flight at landing and is recorded
+> in BENCHMARKS when it ends; Windows' run is with w-lint (run-requests, 2026-11-21T01:10Z). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -194,6 +225,17 @@
 > to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
+>
+> **Goal 93 correctness, crash consistency (2026-11-21, raft-chaos; main's piece of 10:43).** BUILT, NOT YET RUN AS
+> SWEEPS: `crates/cli/tests/vcs_crash.rs` kills the daemon (`kill -9`) at points spread through a stock client's push
+> and clone of git and hg over the HTTP edge, and its commit and checkout of svn over `svn://`, each at `k·T/(N+1)` of
+> a measured reference run (`SLATES_CRASH_POINTS`, default 12), on a fresh repository per point. After the anchor's
+> restart it holds the repository to before or after, integrity to `git fsck --strict`, `hg verify` or `svnadmin verify`
+> of an `svnrdump` load, a success the client saw to be kept, the client to end within its bound, and a retry to
+> succeed. One focused case ran (this Mac, load 67-75, git push at 2 points, debug): both points before-or-after and
+> fsck clean, both retries after; the client killed 8.6 s into a 25.8 s push failed in git's own words after 102 s.
+> Owed: the sweeps at N=12 on each platform with each client (main's run request), each failure a red test to its
+> server's owner.
 >
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
@@ -315,8 +357,9 @@
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
-> `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); each tool's landing onto it (C4-C6); the
+> `--vcs-store` (the daemon holds the store; shards hold its handle). Windows' store directory built (2026-11-21, w-work-mount: `NtCreateFile`
+> relative to the granted directory's handle, identity by volume serial and `FileIdInfo`; green on jupiter (5/5,
+> clippy clean), `crates/land/tests/store_root.rs`, `repository::store_tests::each_tool_creates_a_repository_into_the_store`). Owed: each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
 > start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
 > `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
@@ -774,6 +817,11 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
+> busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
+> turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
+> NOT on main: its A/B (run 31's shape, three rounds) never ran (adacachy at load 30+, fat-LTO builds timed out at 2-3 h;
+> thin-LTO builds planned). Cap 10 owed: needs about 13.4 GiB free.
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
@@ -3044,6 +3092,12 @@
 > changeset, its replay, the import driver adopting the batch, the daemon-level red of one landing an import, and the
 > crash oracle).
 >
+> **C2 stage C BUILT (A-822, 2026-11-21, w-svn over A-814): an import lands a batch as one changeset and one register
+> entry, bounded by the import's admission; a batch is atomic, differing from `svnadmin load`, which keeps each revision
+> as it goes: a refusal names the last revision landed (`SubversionLanded`) and the same dump resumes after it.** A
+> refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
+> name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
+> (main's run), which closes P7's finding (3) or not. The entry below is its history.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
@@ -3979,6 +4033,9 @@
 > under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
 > the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
 > no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+> The restarted daemon's start spin (`daemon.rs:1186`, `start_shard`, "the most CPU in one [slice] 962,859 µs, ending
+> at unit 1") was the catalog's whole replay in one unit of the sliced start: it is replayed a record a unit since this
+> change (w-bugs; `a_shards_start_replays_its_catalog_a_record_a_unit`, 256 records in one unit before, 1 after).
 
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
@@ -4100,7 +4157,8 @@
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
 >   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
 >   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug), and a delta's the
->   same way (before: 3.3 ms for 1.25 MB); a whole state's image (2.0 to 3.0 ms, debug) is still one turn. **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
+>   same way (before: 3.3 ms for 1.25 MB); and since A-827 (2026-11-21) a whole state's image too, built an inode a step from the volume's held head (before: 26
+>   to 36 us of image and 10.5 to 17 us of encoding in one turn for 311 inodes, release). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
 >   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
@@ -7496,6 +7554,12 @@
 >     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
 >     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
 >     1,000 clients reads `met yes` at 10³ verdicts a second or more.
+>
+>     **89a, paused for goal 93 (2026-11-21, w-balance):** main's ruling: load_bench at 1,000 clients, main against main
+>     before A-400 (57ff29e53), release, quiet box, interleaved, best of N; if edit and merge are not under 1 ms, build a
+>     work whose client sits on its green's owner shard placed elsewhere, and A/B it. Not run: adacachy's fat-LTO builds
+>     timed out (3 h, load 29-31); next, thin-LTO builds once, the same harness in both arms (perf's handoff,
+>     agents/perf-handoff-g257).
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
@@ -24677,3 +24741,14 @@ forwards to the new owner were refused: `fleet.owner_location.route_dropped.refu
 reached it, and the flow failed at `live_chaos.rs:2465` ("the stream made a's log durable at 946, now 906"). The live log
 itself was whole on every node. Not worked by w-forming (Ada's close order); whether it reproduces on main after
 8e4da57ae is r19's replay.
+
+### 2026-11-21: Goal 85b, w-forming's two in-flight measurements (parked for goal 93)
+- **P4, A-827's release A/B (4a0cbd7b7):** the debug bench (Studio-4, 311 inodes, 9 interleaved rounds) gave the one-turn
+  image and encoding 598-849 us against the held capture's longest turn 36-66 us (first turn 6-10 us). The release rounds
+  are kiln run r3: `bash .git/w-forming-ab/p4.sh` (`cargo test --release -p slates-server --lib
+  bench_a_whole_publications_longest_turn -- --ignored --nocapture`); P4 closes on its numbers.
+- **C3, the chaos run:** recorded on c9c9554d8 (7/7 targeted flows, every invariant held; seeded nemesis 0/3 on progress,
+  no safety violation). The two causes in w-forming's code are fixed (bbdea3259, 8e4da57ae); the replay of seeds
+  1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
+  draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
+  10263252121351842258's forwarding stall is the separate entry above.

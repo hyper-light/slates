@@ -6,7 +6,7 @@ use std::borrow::Cow;
 
 use slates_vcs::ContentStore;
 
-use super::{Intake, Intaken, Refused, Stepped};
+use super::{Intake, Intaken, KeptText, Refused, Stepped};
 use crate::bundle2::Bundle2;
 use crate::fixtures::CG03;
 use crate::index::{HgIndex, Log};
@@ -472,17 +472,18 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
     let base_identity = (base != crate::NULL_NODE).then(|| *blake3::hash(&texts[&base]).as_bytes());
     assert_eq!(kept.base, base_identity, "{:?}", kept.node);
     // A whole is kept as its raw text (the store's contract, A-767 C1); an edit as its delta.
-    let kept_bytes = &part.payload
-      [usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap()];
-    if base == crate::NULL_NODE {
-      assert_eq!(kept_bytes, &text[..], "{:?}", kept.node);
-    } else {
-      assert_eq!(kept_bytes, data);
-    }
+    let whole = (base == crate::NULL_NODE).then_some(&text[..]);
+    kept_bytes_are(&part.payload, kept, whole.unwrap_or(data));
   }
   for index in [fork, index] {
     index.release(&mut store).unwrap();
   }
+}
+
+/// The payload's bytes at `kept`'s place are `expected`.
+fn kept_bytes_are(payload: &[u8], kept: &KeptText, expected: &[u8]) {
+  let at = usize::try_from(kept.place.start).unwrap()..usize::try_from(kept.place.end).unwrap();
+  assert_eq!(&payload[at], expected, "{:?}", kept.node);
 }
 
 /// The sectioned record `sectioned` refused by `Replay::begin` (its payload is not in it), and by kind cut short or with

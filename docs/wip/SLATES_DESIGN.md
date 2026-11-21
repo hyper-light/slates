@@ -15472,6 +15472,20 @@ and export by landing).
 > to `part1.dump` then `part2.dump` exporting `full.dump`. Owed: the export verb (a range written as a dump into a
 > volume and landed under a grant; built since, below); an import resumed across a restart.
 >
+> **Status (2026-11-21, C2 stage C, the records' side, A-822; the green's side A-814).** An import lands its revisions a
+> batch at a time: each batch one changeset on the node's store (its texts' `Payload` and `Texts`, then a `Record`
+> section a revision) and one register entry naming every version (`repository::svn_commit::staging`,
+> `import_batch::ImportBatch`). The batch is bounded by the import's admission (main's ruling of 08:17): its increments'
+> post-state bytes are charged as the import's holding beside the texts the content store charges, and it lands before a
+> revision the shard could not admit, at 65,533 records, before a record that moves no version, and at the stream's end
+> (`repository.svn_import.flushed_{admission,sections,end}`). Replay drains a changeset's records in order. **Differs from
+> `svnadmin load`: a batch is atomic.** A refusal gives up the revisions of the batch it ends, where `svnadmin load`
+> keeps each as it goes. So the refusal names the last revision that landed (`ImportRefused { SubversionLanded { code,
+> revision, path, landed } }`, contract 59), and the same dump imported again resumes after it: the revisions it holds
+> already are read through, each held to the repository's revision properties (a stream that differs is refused
+> `OutOfSequence`). A Subversion repository serves no session while it imports, as a Mercurial one is not lent, so no
+> session reads a revision the register has not committed.
+>
 > **Status (2026-11-20, A-652, part 3 continued: the export verb).** Built: a range of a Subversion repository's
 > revisions written by the daemon as the dump `svnadmin dump` writes for it (`slates-server`'s
 > `repository::svn_export`; A-628's exporter). `ExportDump { repository, first, last, deltas, name }`, for the
@@ -59480,6 +59494,41 @@ Applied in the same change to:
   1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
   (slates-svn).
 
+### A-822 — A Subversion import lands a batch of revisions as one changeset and one entry, atomic, resumable (2026-11-21, w-svn; main 01:02, 08:17 and its conditions; C2 stage C, A-814)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit/staging.rs` (new): `Staging`, its bound and its flush counters.
+- `crates/server/src/repository/svn_commit/landing.rs`: `land_changeset` takes a revision's records, `changeset_records`.
+- `crates/server/src/repository/svn_commit.rs`: the increment's head read from the records (an import batch's scratch
+  member counts from 0).
+- `crates/server/src/import_batch.rs`: `with_engine_in`; a work's `Copy` versions moved into the scratch member's
+  numbering for its verdict and back (A-814 staged no copy).
+- `crates/server/src/vcs_store.rs`: replay drains a changeset's records (`svn_fetched` a queue, `svn_more`).
+- `crates/server/src/vcs_store/svn_import.rs`: the import stages its revisions and lands at the bound; `LoadFailed`
+  names the last landed revision.
+- `crates/server/src/vcs_store/svn_view.rs`: no session while a repository imports.
+- `crates/svn/src/migration/import.rs`: a stream resumes over revisions held already, their properties held to the
+  repository's.
+- `crates/ipc/src/protocol.rs`, `crates/api/src/lib.rs`: `ImportFault::SubversionLanded`, contract 59.
+- `docs/wip/GAPS.md`: C2 stage C; P7's finding (3).
+
+- **Why.** git-2000's import landed 2,001 changesets, about 8 ms each (24.5 s against 8.2 s before the store), and
+  held each revision's whole texts at once (P7's finding (3)).
+- **What.** Each revision is staged:
+  - its texts are put into the content store and named stored;
+  - its copies are planned (A-820);
+  - it is checked and applied to the records in RAM;
+  - its increment is built against the batch's scratch member and staged there.
+  The batch lands as one changeset and commits as one register entry, at the bound of the import's admission. A refusal
+  gives the batch up and makes the records again from the register. It names the last revision that landed, and the
+  same dump resumes after it.
+- **Evidence.** In `vcs_store::svn_import::tests`:
+  - `full.dump` and `deltas.dump` exported byte for byte after batched imports.
+  - `part1.dump`'s three revisions in one changeset of three records.
+  - `t_c2c_imports_under_a_small_and_a_large_admission_end_alike_and_resume_after_what_landed`: a tight admission
+    flushes before revision 8, its cut import names revision 7, and the resumed import ends as the roomy one does.
+  - `t_c2c_a_refused_import_names_what_landed_and_the_same_dump_resumes_after_it`.
+  - `t_c2c_a_repository_serves_no_session_while_it_imports`.
+
 ### A-820 — A Subversion copy from an older revision is made from the head and set back from the records; a Subversion green keeps no version for copies (2026-11-21, w-svn; main 10:55 PST, P7's finding (1); A-586, A-626, §4.16 delta retention)
 Applied in the same change to:
 - `crates/server/src/repository/svn_commit/restore.rs` (new): the restore walk, `Restore`, `CopyPlan`, counted
@@ -59840,3 +59889,41 @@ GAPS.
   condition lost on its medians or the owner's CPU. A-218's nap stays everywhere else: the idle spin's turns, and a
   harvest once the interval has passed. Beside it, a user-space ring watch (main's ruling (c)) was measured and
   rejected; its bound, the wake estimate, grew with the contention it was meant to avoid.
+
+### A-827 — A reader's hold on a volume's head: a live log's whole capture is imaged and read in turns (2026-11-21, w-forming; Goal 85b P4, main's ruling (a); §4.10 "Live shipping", §4.2 snapshots and the epoch rule, A-170, A-768)
+Applied in the same change to: §4.2's epoch rule (by this entry: a hold keeps what it reaches as a snapshot does, without
+a record or a charge), GAPS (the live owner's long-turn line), `crates/vfs/src/volume.rs` (`HeadHold`,
+`Volume::hold_head`, `release_hold`, `held_epoch`, `kept_epoch`, `keep_for_hold`; `retire`, `retain_dead_list`,
+`hand_down_deadlist` and `destroy` route through the hold; the release decisions read `kept_epoch`),
+`crates/vfs/src/recover.rs` (`Volume::begin_held_image`, `held_image_step`, `HeldImage`, `HeldFile`),
+`crates/server/src/live_ship.rs` (`held_capture`, `capture_turn`, `take_held_file`; `Capture::{id, imaging, held,
+expected}`; `release_capture` lets a hold go), `crates/vfs/tests/held_head.rs`.
+- **What was there.** A whole publication took the volume's standalone image and encoded it in its own turn (A-768 read
+  its content in turns from pinned chunks, but the image could not be held across turns: every kind of object it walks,
+  inode versions, table nodes, directory nodes and blocks, is freed by the epoch rule the moment the head lets it go).
+  Measured: 26 to 36 us of image and 10.5 to 17 us of encoding for 311 inodes in release (M4 Max), at or past a live
+  write's 50 us median (85a); 598 to 849 us in a debug build.
+- **The hold.** `Volume::hold_head` is a snapshot without a record: it keeps the head's roots and advances the epoch, so
+  every later change copies what it changes (copy-on-write is "born before the current epoch"). What the head lets go of
+  while held, born by the held epoch and kept by no snapshot, goes on the hold's own deadlist (the one rule, `retire`,
+  and the chunk releases, which decide by `kept_epoch`, the later of the last snapshot's epoch and the hold's); a
+  snapshot destroyed meanwhile hands the hold what its previous snapshot does not keep; a volume destroyed frees the
+  hold's list with everything else. `release_hold` frees the list. Nothing is charged: a hold lasts a reader's turns,
+  one at a time.
+- **The capture.** A whole publication holds its volume's head and builds its record in steps: the record's fields and
+  the inode count in its first turn (`begin_held_image`, with the snapshots' and base plane's images as they stand),
+  then an inode a step, each encoded as it is imaged (`held_image_step`), its chunk extents and its open extent's bytes
+  taken as spans in the same step (a copy-up may seal a held version's open extent in place, A-170, between steps: the
+  image then names the seal, the same bytes), then the runs read from the held extents a page at least a turn, with no
+  pin. The hold goes at the capture's last turn or wherever its build ends.
+- **Tests.** `slates-vfs` `held_head` `a_held_heads_image_built_over_changes_is_the_image_it_was_held_at` (an image built
+  an inode a step through 28 rounds of every kind of change, a snapshot taken and destroyed among them: every field and
+  inode the reference's, a body different only where its open extent was sealed in place (24), every file's held bytes
+  its bytes at the hold, and after the release the store's chunk, inode, table and directory counts the twin's never
+  held, 188 objects freed at the release; red without the hold: `StaleHandle` at the first step after a change) and
+  `a_head_is_held_by_one_reader_at_a_time`; `live_ship::tests::a_whole_capture_read_in_turns_reads_the_head_it_began_on`
+  (the body equal to the one-turn read through an overwrite and an unlink between turns), the cancel and queue tests
+  (the head held while each capture waits, let go after; the overwrite's old chunks kept while held, freed at the drop).
+- **Measured.** `cargo test -p slates-server --lib bench_a_whole_publications_longest_turn -- --ignored --nocapture`
+  (311 inodes, 9 interleaved rounds): debug, Studio-4, the one-turn image and encoding 598 to 849 us against the held
+  capture's longest turn 36 to 66 us and its first 6 to 10 us. The release rounds are recorded in BENCHMARKS.
