@@ -16,7 +16,13 @@ C3 the same read-only view over MCP and in the Node and Python SDKs
 - A-788, f5f127497 (merge 1de9e5e6f). MCP `slates.log` (one JSON definition shared with `slates log --json`), Python
   Client.session_log(), Node Client.sessionLog() + index.d.ts.
 - Test: slates-mcp --test mcp (assert_session_log_names_the_collision; red with the dispatch removed; green). SDK tests
-  added to test_sdk.py / sdk.test.mjs; they need a built wheel/addon + daemon -> run-requests.md (main's lane).
+  added to test_sdk.py / sdk.test.mjs, RUN here 2026-11-20 ~16:40 PST (main's 16:18 note) against a real anchor+daemon
+  (the `slates` binary built from origin/main 2c8f89de6 + nothing else), macOS arm64, this Mac, debug build:
+  - Python: the pyo3 abi3 cdylib built by cargo (no maturin here; no installs) loaded as slates.abi3.so;
+    `python3 -m unittest test_sdk.SlatesSdkRoundTrip.test_lifecycle_round_trip_over_a_live_daemon
+    test_sdk.SlatesSdkSurface.test_module_exposes_the_client_surface` -> Ran 2, OK (round trip ran, not skipped).
+  - Node: the napi cdylib as slates.node; `node --test --test-name-pattern="addon loads and exposes|lifecycle round trip
+    over a live daemon" crates/sdk-node/tests/sdk.test.mjs` -> pass 2, fail 0, skipped 0.
 - Recorded in GAPS, not worked (close rule): async SDK forms of the log (sync only, like `drifted`).
 
 Disk (your 15:45 note): this host is Mac.attlocal.net, not Studio-2; my target here was 34 GB. Deleted its

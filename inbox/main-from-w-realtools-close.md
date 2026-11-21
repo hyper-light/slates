@@ -7,3 +7,14 @@
   compile; `make -q` up to date and `git status --porcelain` empty after each event.
 - Result: ok, 1 passed in 10.10 s, adas-macbook-pro-2.local (macOS arm64, APFS), debug, base 316a046f3.
   The red case is a base disk with no birth time: A-781's vfs test was red there (renumbered in lookup order).
+## C2, C3, C4 CLOSED on macOS (2026-11-20 ~17:05 PST): make, cargo incremental and git status across a snapshot, a takeover and memory pressure
+- Commits on origin/main: 617c88102 (the flows), 249f5177d (GAPS), 7f53665a1 (the test builds on Linux too).
+- Tests: crates/cli/tests/real_tools.rs
+  - `a_pragma_once_build_make_cargo_and_git_status_hold_across_a_snapshot_and_a_daemon_restart`: snapshot, then
+    SIGKILL with the anchor's next daemon taking over;
+  - `make_cargo_and_git_status_hold_under_memory_pressure`: an in-process daemon given the whole pressure hold and a
+    host memory stall, then released.
+  After each event: every tracked file's (ino, mtime s/ns, ctime s/ns) unchanged through the mount, `make -q` up to
+  date, `cargo build` printing no "Compiling", `git status --porcelain` empty.
+- Result: 4 passed in 30.97 s, adas-macbook-pro-2.local (macOS arm64, APFS), debug, base 617c88102.
+- Linux FUSE and WinFsp: filed in run-requests.md. The WinFsp port of the flows is owed (GAPS).

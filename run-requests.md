@@ -6903,10 +6903,26 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Finding by observation, not chased: debug `--test mounted_work_cow` was killed once of 4 by the daemon watchdog (shard 0 spun 3.6 s CPU without a step against 3.57 s; load 11.7 on this MacBook) while seeding a 64 MiB green in one submit; work_cow.rs seeds the same. Release runs never tripped it.
 
 ## w-sessionlog (2026-11-20 ~17:45 PST), A-788 / A-782
-- Python SDK: maturin build crates/sdk-python, then `SLATES_DAEMON=<slates binary> python -m unittest crates/sdk-python/tests/test_sdk.py`
+- [DONE by w-sessionlog 16:40, see inbox close note] Python SDK: maturin build crates/sdk-python, then `SLATES_DAEMON=<slates binary> python -m unittest crates/sdk-python/tests/test_sdk.py`
   (macOS + Linux). Red: test_lifecycle_round_trip_over_a_live_daemon fails at the `session_log` block or
   test_module_exposes_the_client_surface lacks `session_log`.
-- Node SDK: build the napi addon, `node --test crates/sdk-node/tests/sdk.test.mjs` (macOS + Linux). Red: `sessionLog` missing
+- [DONE by w-sessionlog 16:40] Node SDK: build the napi addon, `node --test crates/sdk-node/tests/sdk.test.mjs` (macOS + Linux). Red: `sessionLog` missing
   from Client.prototype or the collided-work assertions fail.
 - Cross-platform compile of A-782's touched crates (server, client, api, mcp, sdk-node, sdk-python) on Linux and Windows:
   red = a cfg arm still matching `Submitted`/`Outcome` without `Identical`. Plus clippy on the same crates.
+
+## w-provision-gate, A-786 (landed 2c8f89de6, 2026-11-20): R9's provisioning gate into CI (for w-lint and main)
+- CI wiring (.github/workflows/ci.yml): a job on a reference runner the lane can own (nothing else scheduled beside it):
+  `cargo xtask ratchet --provision` (first time on that machine: `--record`), then `PROVISION_BENCH_LOAD=2 cargo run
+  --release -p slates-client --example provision_bench`; upload target/provision-histogram.tsv as an artifact every run.
+  Red = a `REGRESSION` row, an `ac-2.1 ... FAIL` line (floor or loaded bound). The loaded bound is RED on main until
+  A-786 part 2 lands (macOS 1.62 ms vs 0.87 ms) -- wire it as allowed-to-fail until then, or hold the loaded step.
+- clippy on slates-client (examples) and xtask for 2c8f89de6 (macOS, Linux, Windows); provision_bench builds on Windows
+  (`spin()`'s parent check is cfg(unix)).
+- Linux x86_64 and arm64 measurement: `PROVISION_BENCH_LOAD=2` provision_bench on a many-core Linux box (the 2026-10-20
+  x86 host if it exists): the `tail:` lines name daemon vs client part; Linux's epoll_wait(0) does not nap, so its
+  1.6 ms is another hop -- report the tail split per run.
+
+## 2026-11-21T01:00Z w-realtools main 7f53665a1 (C2-C4: real tools across a snapshot, a takeover and memory pressure)
+- Linux x86_64 and arm64 (FUSE): `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test real_tools -- --test-threads=1 --nocapture` (needs fusermount3, cc, make, cargo, git, mkfifo; mount under $HOME on Ubuntu 26.04's AppArmor). Red: the #pragma once compile failing ("redefinition of 'struct once'"), an untouched file's inode number or times moving, make -q out of date, cargo printing "Compiling", or git status non-empty after a snapshot, the SIGKILL takeover or the injected pressure. Also run once with the base on tmpfs (no birth time on older kernels): A-781's case.
+- Windows x86_64 (WinFsp): the flows are unix-only (FIFO gate, make); the WinFsp port is owed (GAPS): the same identity comparison (file index, LastWriteTime, ChangeTime) plus cargo and git status across a snapshot and a daemon kill. Who: w-realtools.
