@@ -349,3 +349,12 @@
 - 06:20 A-238 amended LANDED 4f6242707: a push makes the chains room before its append, a green a turn (red: 73
   append checkpoints -> 0). The >1 s unit was repository::push::admit folding ~1,000 member greens in one append
   (r44's stack samples). Each fold whole until w-engine lands 507110661. NEXT: path maps derived on first read.
+- 07:10 r52 (branches only on ca444739c): push 72.5 s ok, mirror clone 465 s ok (fsck clean); derive turns 3.0 M,
+  encode units past budget 844 k.
+- 07:55 derivation pacing LANDED 2b2fc8d80 (A-783 pace; red 2,404 turns -> <= 8). Finding: t_a752 flakes under load
+  on main too (1/2 at load 12.8).
+- 06:30 wide_connectivity clippy fix LANDED ca444739c (w-lint told).
+- P2 (main 05:12): created refs' greens unmaterialized, paths derived on first read. Engine half: w-rewrite-ops
+  (interface agreed: PushObjects as source, DeferredPush, green_ready, Applied::Deferred). My git half waits for it.
+- NEXT while blocked on the engine half: C5 2b piece 3 (made commits onto the deferred-submit hook, A-804 landed
+  5a21c11dc; record_of/v2 removed in the same series), per w-rewrite-ops' made-hook note.
