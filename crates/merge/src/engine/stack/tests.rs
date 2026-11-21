@@ -154,7 +154,7 @@ pub(super) fn restated(landed: &Landed) -> Option<&Increment> {
 /// Submits `work` based at `base` as increment `id`; the version it was accepted as.
 fn land(green: &mut Green, work: Work, (id, base): (u64, u64)) -> Option<u64> {
   match green.submit(&work.increment(id, base)) {
-    Outcome::Accepted { version } => Some(version),
+    Outcome::Accepted { version } | Outcome::Identical { version } => Some(version),
     _ => None,
   }
 }

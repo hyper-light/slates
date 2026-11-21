@@ -44,6 +44,7 @@
 //! **Bounds.** Every row is charged to the store's budget by the shared index; a number is 32 bits, with [`NONE`]
 //! reserved, so a log full at `u32::MAX` revisions refuses more ([`Refused::LogFull`]).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use slates_vcs::{
@@ -110,6 +111,12 @@ const CHANGESET_BYTES: usize = COMMON_BYTES + NODE_LEN + 1;
 /// delta's base (A-729: a manifest's previous revision, [`NONE`] for a whole text), its content's length when it is a
 /// delta, and its chain's delta bytes since the whole text it rests on.
 const REVISION_BYTES: usize = COMMON_BYTES + REV_BYTES + 1 + REV_BYTES + LEN_BYTES + LEN_BYTES;
+
+#[cfg(test)]
+std::thread_local! {
+  /// Non-vacuity counter: each previous manifest text an append rebuilt from its chain, not handed by its caller.
+  pub(crate) static PREVIOUS_REBUILT: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
 
 /// A log of the repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -564,6 +571,22 @@ impl HgIndex {
     log: Log<'_>,
     group: &[NewRevision],
   ) -> Result<Vec<u32>, Refused> {
+    self.append_revisions_after(store, log, group, None)
+  }
+
+  /// [`HgIndex::append_revisions`], `previous` the caller's node and whole text of the revision before the group where
+  /// it holds them (A-732: a push's intake keeps a revision a step and holds the one it kept last): a manifest's delta
+  /// is made against that text, never one rebuilt from its chain. A chain is up to its text's length of deltas, so
+  /// rebuilding it applied each in turn over a copy of the whole text: hg's own history spent 130 s of a restart's
+  /// replay, its longest step 277 ms, rebuilding each manifest's predecessor. A text the caller does not hold, or
+  /// holds for another node, is rebuilt from the log as before.
+  pub fn append_revisions_after(
+    &mut self,
+    store: &mut ContentStore,
+    log: Log<'_>,
+    group: &[NewRevision],
+    previous: Option<(&Node, &[u8])>,
+  ) -> Result<Vec<u32>, Refused> {
     let (revs, mut planned) = self.planned(store, log, group.iter())?;
     let previous = match (log, planned.first()) {
       (Log::Manifest, Some(first)) if first.rev > 0 => {
@@ -571,9 +594,18 @@ impl HgIndex {
         let row = self
           .revision(store, log, rev)
           .ok_or(Refused::Unread { rev })?;
-        let text = self
-          .revision_text(store, log, rev)
-          .ok_or(Refused::Unread { rev })?;
+        let text = match previous {
+          Some((node, text)) if *node == row.node => Cow::Borrowed(text),
+          _ => {
+            #[cfg(test)]
+            PREVIOUS_REBUILT.with(|count| count.set(count.get().saturating_add(1)));
+            Cow::Owned(
+              self
+                .revision_text(store, log, rev)
+                .ok_or(Refused::Unread { rev })?,
+            )
+          }
+        };
         Some((rev, text, row.chain))
       }
       _ => None,
@@ -671,11 +703,24 @@ impl HgIndex {
       at = link.base;
     }
     let whole = chain.pop()?;
+    // Each delta is applied into the other of two text buffers and read into one reused delta buffer from the store's
+    // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
+    // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
+    // was its length squared in copies (`delta::apply_into`, w-perf's b568499fe, for the revlog reader's same shape).
     let mut text = store.object_bytes(&whole.bytes, whole.len)?;
+    let mut next = Vec::new();
+    let mut delta = Vec::new();
     let mut room = crate::Admission::new(u64::MAX);
     for step in chain.iter().rev() {
-      let delta = store.object_bytes(&step.bytes, step.stored)?;
-      text = crate::delta::apply(&text, &delta, &mut room).ok()?;
+      delta.clear();
+      for window in store.windows(&step.bytes) {
+        delta.extend_from_slice(&window);
+      }
+      if crate::read::to_u64(delta.len()) != step.stored {
+        return None;
+      }
+      crate::delta::apply_into(&text, &delta, &mut next, &mut room).ok()?;
+      core::mem::swap(&mut text, &mut next);
     }
     (crate::read::to_u64(text.len()) == row.len).then_some(text)
   }
@@ -861,7 +906,7 @@ fn kept_as(
   store: &mut ContentStore,
   log: Log<'_>,
   planned: &mut [Planned],
-  mut previous: Option<(u32, Vec<u8>, u64)>,
+  mut previous: Option<(u32, Cow<'_, [u8]>, u64)>,
 ) -> Result<Vec<ContentId>, Refused> {
   let mut puts = Vec::new();
   for row in planned.iter_mut() {
@@ -881,7 +926,7 @@ fn kept_as(
         && rev.checked_add(1) == Some(row.rev)
       {
         let mut delta = Vec::new();
-        crate::delta::encode_lines(prior, &text, &mut delta)
+        crate::delta::encode_lines(prior.as_ref(), &text, &mut delta)
           .map_err(|_| Refused::Unread { rev: row.rev })?;
         let grown = chain.saturating_add(crate::read::to_u64(delta.len()));
         if grown <= crate::read::to_u64(text.len()) {
@@ -895,7 +940,7 @@ fn kept_as(
           fields = (*rev, crate::read::to_u64(delta.len()), grown);
         }
       }
-      previous = Some((row.rev, text, fields.2));
+      previous = Some((row.rev, Cow::Owned(text), fields.2));
     }
     row.payload.extend_from_slice(&fields.0.to_le_bytes());
     row.payload.extend_from_slice(&fields.1.to_le_bytes());

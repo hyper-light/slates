@@ -631,6 +631,35 @@ pub(crate) fn put_revision(
   Ok(())
 }
 
+/// Appends one revision's chunk whose delta is its whole text against the null base, `revision.data` the text: the
+/// full-text hunk's header written straight before the text, so a whole text is copied once, into `out`, never first
+/// into a delta of its own (Ada's no-allocation rule; a clone sends every file revision so).
+pub(crate) fn put_revision_whole(
+  revision: &Revision<'_>,
+  version: Version,
+  out: &mut Vec<u8>,
+) -> Result<(), EncodeRefusal> {
+  if version == Version::V01 {
+    return Err(EncodeRefusal::Unencodable {
+      node: revision.node,
+      reason: "a changegroup written a revision at a time names each delta's base",
+    });
+  }
+  check_encodable(revision, version, None)?;
+  let header = header_bytes(revision, version);
+  let delta_len = crate::delta::HUNK_HEADER_LEN.saturating_add(revision.data.len());
+  put_chunk_length(out, header.len().saturating_add(delta_len))?;
+  out.put(&header);
+  crate::delta::encode_full_text(revision.data, out).map_err(|_| EncodeRefusal::Unencodable {
+    node: revision.node,
+    reason: "a whole text past a hunk's length",
+  })?;
+  if let Some(sidedata) = revision.sidedata {
+    put_sidedata(out, sidedata)?;
+  }
+  Ok(())
+}
+
 /// Appends a group's name chunk (A-745).
 pub(crate) fn put_name(name: &[u8], out: &mut Vec<u8>) -> Result<(), EncodeRefusal> {
   put_chunk_length(out, name.len())?;

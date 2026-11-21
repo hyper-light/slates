@@ -279,7 +279,7 @@ fn submit_and_replay(
 ) -> Result<(), String> {
   let increment = work.at(live.head(), id);
   match live.submit_resolved(&increment) {
-    (Outcome::Accepted { .. }, Some(applied)) => {
+    (Outcome::Accepted { .. } | Outcome::Identical { .. }, Some(applied)) => {
       replica.apply_recorded(&increment, &applied);
       Ok(())
     }
@@ -415,7 +415,10 @@ fn restated_beside_accepted(work: fn() -> Work) -> Result<(Files, bool, Files), 
   else {
     return Err("the work did not rebase cleanly".to_owned());
   };
-  if !matches!(accepting.submit(&increment), Outcome::Accepted { .. }) {
+  if !matches!(
+    accepting.submit(&increment),
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
+  ) {
     return Err("the twin did not accept the work".to_owned());
   }
   let mut restated = files_of(&rebasing);
@@ -494,11 +497,17 @@ fn resubmitted_beside_submitted(
     named: Default::default(),
   };
   let mut resubmitting = made()?;
-  if !matches!(resubmitting.submit(&next), Outcome::Accepted { .. }) {
+  if !matches!(
+    resubmitting.submit(&next),
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
+  ) {
     return Err("the rebased work's next submit was not accepted".to_owned());
   }
   let mut submitting = made()?;
-  if !matches!(submitting.submit(&increment), Outcome::Accepted { .. }) {
+  if !matches!(
+    submitting.submit(&increment),
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
+  ) {
     return Err("the work itself was not accepted".to_owned());
   }
   Ok((

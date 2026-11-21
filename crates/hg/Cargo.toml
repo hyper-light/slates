@@ -30,6 +30,8 @@ blake3 = { workspace = true }
 [dev-dependencies]
 slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
+# The changeset A/B example (examples/changeset_ab.rs): a landed log's segments in LZ4.
+lz4_flex = { workspace = true }
 
 [lints]
 workspace = true

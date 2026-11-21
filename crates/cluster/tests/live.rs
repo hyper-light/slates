@@ -410,7 +410,8 @@ async fn gather(
 /// cancels its children: a request still in flight when the task ended was dropped with its holder's session in it,
 /// never reported, and the session's slot stayed lent for good, so the owner never shipped that holder again (KIND,
 /// both of an owner's sessions `lent=true`, raft-chaos run 42318867890). Red-checked by mutation: without the settle the
-/// silent holder's session never comes back.
+/// silent holder's session never comes back. The settle waits on the reports' own wakes (the lane's task is the
+/// exchange's collector), never a timer tick at a time (main's sweep, 2026-11-20): its counts say so.
 #[test]
 fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
   let (report_tx, report_rx) = channel::<Vec<HostId>>();
@@ -432,8 +433,14 @@ fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
           .await;
           let mut back = exchanged.reusable;
           let mut stragglers = exchanged.stragglers;
-          // The lane's wait: every request reports before its task ends.
+          // The lane's wait: every request reports before its task ends, woken by the reports themselves (this task is
+          // the exchange's collector), never a timer tick at a time.
           let (late, _) = stragglers.settle().await;
+          let (woken, ticked) = stragglers.waits();
+          assert!(
+            woken >= 1 && ticked == 0,
+            "settled on the reports' wakes: {woken} woken, {ticked} ticked"
+          );
           back.extend(late.into_iter().map(|(host, _, endpoint)| (host, endpoint)));
           let _ = back_tx.send((back, stragglers));
         })

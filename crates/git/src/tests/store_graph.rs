@@ -337,3 +337,24 @@ fn a_sparse_clone_sends_every_tree_and_the_blobs_its_patterns_match() {
   assert_eq!(clone(b""), git.difference(&blobs).copied().collect());
   assert_eq!(graph.fault(), None);
 }
+
+/// A-722 part 3's partial clone (w-perf's A/B: `--filter=blob:none` 1.4-1.5 times slower since the landings sealed
+/// into tables; the profile: `StoreGraph::kind` read two rows an object, an id by position then the object's row, each
+/// a search of every run). Do: ask the type of every object the served repository holds. Expect: each the type its
+/// pack holds it as; no run or tail of the index visited. Red before the change: two lookups an object.
+#[test]
+fn a_type_is_read_from_its_landing_with_no_row_read() {
+  let served = served::served();
+  let graph = StoreGraph::new(&served.repository, &served.store, &REFS);
+  let nodes: Vec<(u64, Kind)> = served
+    .objects
+    .iter()
+    .map(|object| (graph.node(&object.id).unwrap(), object.kind))
+    .collect();
+  let before = served.repository.index_visits();
+  for (node, kind) in &nodes {
+    assert_eq!(graph.kind(*node), *kind);
+  }
+  assert_eq!(served.repository.index_visits(), before, "kinds read rows");
+  assert_eq!(graph.fault(), None);
+}

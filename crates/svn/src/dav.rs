@@ -52,6 +52,7 @@
 //!
 //! No I/O, no clock, no randomness, no panic.
 
+pub mod activity;
 pub mod commit;
 pub mod drive;
 pub mod listing;

@@ -40,7 +40,8 @@ use crate::receive;
 use crate::{Admission, PastAdmission, to_u64};
 
 use super::naming::kind_of;
-use super::push::Push;
+use super::push::{HeldAt, Push, StoredAt};
+use super::repository::IndexBases;
 use super::repository::Repository;
 
 /// What a view lent, by how (module docs).
@@ -121,15 +122,22 @@ impl receive::Repository for IndexedObjects<'_> {
       return Some(kept);
     }
     let (row, content) = self.repository.indexed(self.store, id)?;
-    // A window the store lends is lent again with no copy; one it copies out is kept below, as an assembled object is.
-    if let Some(Cow::Borrowed(window)) = as_kept(self.store, &content, row.len) {
+    // A window the store lends is lent again with no copy; one it copies out, or one read where it lies in its pack,
+    // is kept below, as an assembled object is.
+    let stored = self.repository.stored_of(&row, content);
+    if let StoredAt::Whole(content) = &stored
+      && let Some(Cow::Borrowed(window)) = as_kept(self.store, content, row.len)
+    {
       count(&self.counters, |counters| &mut counters.lent_as_kept);
       return Some((row.kind, window));
     }
     if !self.charge(row.len.saturating_add(kept_overhead())) {
       return None;
     }
-    let bytes = self.store.object_bytes(&content, row.len)?;
+    let bytes = self
+      .repository
+      .read_stored(self.store, &stored, row.len)?
+      .into_owned();
     count(&self.counters, |counters| &mut counters.assembled);
     self.kept.keep(*id, row.kind, bytes)
   }
@@ -167,20 +175,52 @@ impl<'a> PushedObjects<'a> {
     self.counters.get()
   }
 
-  /// The object `key` names: its type, its content's root and its length, from the index first and then the push.
-  fn locate(&self, key: ObjectKey) -> Result<(Kind, ContentId, u64), Unavailable> {
+  /// The object `key` names: its type, where its bytes are and its length, from the index first and then the push.
+  fn locate(&self, key: ObjectKey) -> Result<(Kind, At, u64), Unavailable> {
     let format = self.repository.format();
     let id = ObjectId::from_bytes(format, key.as_bytes()).ok_or(Unavailable::Missing)?;
     if let Some((row, content)) = self.repository.indexed(self.store, &id) {
-      return Ok((row.kind, content, row.len));
+      return Ok((
+        row.kind,
+        At::Indexed(self.repository.stored_of(&row, content)),
+        row.len,
+      ));
     }
-    let (number, content, len) = self.push.object(&id).ok_or(Unavailable::Missing)?;
-    let kind = kind_of(number).ok_or(Unavailable::Malformed)?;
-    Ok((kind, content, len))
+    let held = self.push.object(&id).ok_or(Unavailable::Missing)?;
+    let kind = kind_of(held.number).ok_or(Unavailable::Malformed)?;
+    let at = match held.at {
+      HeldAt::Stored(content) => At::Stored(content),
+      HeldAt::Pack(_) => At::Pushed(id),
+    };
+    Ok((kind, at, held.len))
   }
 
-  /// An object's bytes: as kept when they are one window, otherwise assembled from their windows.
-  fn bytes(&self, content: &ContentId, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
+  /// An object's bytes: in the store as kept when they are one window, otherwise assembled from their windows; or read
+  /// where they lie in the push's pack (`Push::bytes`).
+  fn bytes(&self, at: &At, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
+    let content = match at {
+      At::Stored(content) | At::Indexed(StoredAt::Whole(content)) => content,
+      At::Indexed(stored) => {
+        count(&self.counters, |counters| &mut counters.assembled);
+        return self
+          .repository
+          .read_stored(self.store, stored, len)
+          .ok_or(Unavailable::Malformed);
+      }
+      At::Pushed(id) => {
+        let outside = IndexBases {
+          repository: self.repository,
+          store: self.store,
+        };
+        let read = self.push.bytes(self.store, &outside, id);
+        count(&self.counters, |counters| &mut counters.assembled);
+        return match read {
+          Some(Ok(bytes)) => Ok(bytes),
+          Some(Err(_)) => Err(Unavailable::Malformed),
+          None => Err(Unavailable::Missing),
+        };
+      }
+    };
     if let Some(window) = as_kept(self.store, content, len) {
       count(&self.counters, |counters| &mut counters.lent_as_kept);
       return Ok(window);
@@ -196,6 +236,16 @@ impl<'a> PushedObjects<'a> {
     count(&self.counters, |counters| &mut counters.assembled);
     Ok(Cow::Owned(bytes))
   }
+}
+
+/// Where a [`PushedObjects`] object's bytes are.
+enum At {
+  /// Indexed by the repository: its own content, or where it lies in a pack the repository holds.
+  Indexed(StoredAt),
+  /// In the content store: its root.
+  Stored(ContentId),
+  /// Where it lies in the push's pack, by its name.
+  Pushed(ObjectId),
 }
 
 impl receive::works::PushedBytes for PushedObjects<'_> {

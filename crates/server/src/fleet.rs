@@ -2273,6 +2273,11 @@ fn serve_content_request(
     s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
     return Vec::new();
   }
+  // A test's holder away from this asker (`Daemon::inject_holder_silence`): nothing answered.
+  if s.injected_holder_silence.contains(&peer_host) {
+    s.count(crate::live_ship::HOLDER_SILENCED_BY_FAULT, 1);
+    return Vec::new();
+  }
   // Authority for the object the request names is decided before any lookup (AUD-29-45), from the committed
   // configuration and this holder's records — never from the content hash.
   crate::content_holder::serve(
@@ -3525,13 +3530,14 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
-      // A copy frozen for a move (A-291) is the move's to place: before the switch its handoff places it
-      // ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal from here would
-      // contend with (a frozen copy's heal republished its head once its target died, 2026-11-18).
+      // A copy with a move under way (A-291), prepared or frozen (A-784), is the move's to place: before the switch its
+      // handoff places it ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal
+      // from here would contend with (a frozen copy's heal republished its head once its target died, 2026-11-18; a
+      // prepared one's left a second snapshot that refused the move `Snapshots`, 2026-11-20).
       if record.epoch == 0
         || record.state == VolumeState::Destroying
         || state.seals.contains_key(&object)
-        || crate::moves::frozen(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
+        || crate::moves::moving(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
       {
         return None;
       }
@@ -4778,6 +4784,7 @@ const MATERIALIZE_REFUSED: &str = "fleet.materialize";
 /// stands still. Before, each wait (`fleet.materialize.waits.*`, a fetch that never completed, a refused or unanswered
 /// materialization) retried every period without end.
 async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
+  judge_given_up_afresh(origin).await;
   let pending: Vec<(ObjectId, HeadValue, Option<HostId>)> = state::with_state(|s| {
     s.pending_materializations
       .iter()
@@ -4833,7 +4840,7 @@ async fn materialize_pending(origin: u16, local: HostId, budget: CommitBudget) {
         origin,
         local,
         (object, TakenOver::Volume),
-        waited.named(),
+        (waited.named(), waited.waits_on_members()),
         attempts,
       )
       .await;
@@ -5256,7 +5263,7 @@ async fn materialize_pending_greens(
         origin,
         local,
         (object, TakenOver::Green),
-        waited.named(),
+        (waited.named(), waited.waits_on_members()),
         attempts,
       )
       .await;
@@ -5313,6 +5320,12 @@ impl GreenWait {
   /// catalog register ([`paging_round`]).
   const fn waits_on_the_round(self) -> bool {
     matches!(self, GreenWait::Catalog)
+  }
+
+  /// Whether it waits on members of its takeover, which a member heard again may clear: the inputs its sources hold, or
+  /// its catalog register ([`judge_given_up_afresh`]).
+  const fn waits_on_members(self) -> bool {
+    matches!(self, GreenWait::Inputs | GreenWait::Catalog)
   }
 
   /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).
@@ -5680,6 +5693,103 @@ enum TakenOver {
   Green,
 }
 
+/// Judges afresh each taken-over volume or green given up on while it waited on members of its takeover
+/// ([`ShardState::given_up_taken_over`], A-775: a volume's cohorts, a green's sources) once one of them is heard again:
+/// alive at a later incarnation than when it was given up, back from a pause or a partition the failover SLO's worth of
+/// attempts did not outlast. Its owner shard's unrecovered record goes, so the verbs on it wait for its materialization
+/// again (A-548), and it is pending again with its catalog register and its attempts from zero, counted
+/// [`MATERIALIZE_JUDGED_AFRESH`] or [`GREEN_TAKEOVER_JUDGED_AFRESH`]. Bounded as the takeover round's own fresh judgement
+/// is (`takeover::HostTakeover::heard_since`): once per member's later incarnation, each with the failover SLO's worth of
+/// attempts. Before, a give-up was final until a new configuration: a live volume whose log's holder was stopped about
+/// the failover SLO (`live_chaos`'s fresh-member flow stops it 3 s, its successor's bound 30 periods) answered
+/// `NotRecovered` for good once the holder came back with every acknowledged write (w-forming's anchor log,
+/// `takeover-stall-pr15-run1.log`: `fleet.materialize.given_up` 1 after 22 catalog and 11 quorum waits, the holder left at
+/// fence 1), and a green whose inputs' only other holder was away did the same.
+async fn judge_given_up_afresh(origin: u16) {
+  let heard: Vec<ObjectId> = state::with_state(|s| {
+    let membership = s.fleet.membership();
+    s.given_up_taken_over
+      .iter()
+      .filter(|(_, given_up)| {
+        given_up.heard.iter().any(|(host, incarnation)| {
+          membership
+            .state(*host)
+            .is_some_and(|held| held.liveness == Liveness::Alive && held.incarnation > *incarnation)
+        })
+      })
+      .map(|(object, _)| *object)
+      .collect()
+  })
+  .unwrap_or_default();
+  for object in heard {
+    let id = DbVolumeId { bytes: object.0 };
+    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+    let Some(target) =
+      state::with_state(|s| s.shards.get(usize::from(partition)).copied()).flatten()
+    else {
+      continue;
+    };
+    let cleared = call_within(
+      origin,
+      target,
+      move |s| {
+        let given_up = matches!(
+          s.unrecovered.get(&id),
+          Some(slates_ipc::protocol::RecoveryCause::TakeoverIncomplete { .. })
+        );
+        if given_up {
+          s.unrecovered.remove(&id);
+        }
+        given_up
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    let Some(still_given_up) = cleared else {
+      // The owner shard did not answer this period: judged again next period.
+      continue;
+    };
+    state::with_state(|s| {
+      let given_up = s.given_up_taken_over.remove(&object)?;
+      // Its record gone another way (the object destroyed, or recorded unrecovered for another cause), or adopted again
+      // meanwhile by a new configuration's round, whose record stands: not taken up.
+      let adopted_again = s.pending_materializations.contains_key(&object)
+        || s.pending_green_materializations.contains_key(&object);
+      if !still_given_up || adopted_again {
+        return None;
+      }
+      if let Some(catalog) = given_up.catalog {
+        s.pending_catalogs.entry(object).or_insert(catalog);
+      }
+      match given_up.pending {
+        crate::state::GivenUpRecord::Volume(mut pending) => {
+          pending.attempts = 0;
+          pending.round_seen = None;
+          pending.turns_seen = None;
+          pending.live_adopted = None;
+          s.pending_materializations.insert(object, pending);
+          s.count(MATERIALIZE_JUDGED_AFRESH, 1);
+        }
+        crate::state::GivenUpRecord::Green(mut pending) => {
+          pending.attempts = 0;
+          pending.round_seen = None;
+          pending.fewest_unheld = None;
+          s.pending_green_materializations.insert(object, pending);
+          s.count(GREEN_TAKEOVER_JUDGED_AFRESH, 1);
+        }
+      }
+      Some(())
+    });
+  }
+}
+
+/// Counter: a taken-over volume given up on, judged afresh once a member of its cohorts was heard again
+/// ([`judge_given_up_afresh`]).
+const MATERIALIZE_JUDGED_AFRESH: &str = "fleet.materialize.judged_afresh";
+/// Counter: a taken-over green given up on, judged afresh once one of its sources was heard again
+/// ([`judge_given_up_afresh`]).
+const GREEN_TAKEOVER_JUDGED_AFRESH: &str = "merge.takeover_judged_afresh";
+
 /// Gives up on the taken-over `object` of its kind after `attempts` without progress, the last of which waited on
 /// `waited` ([`materialize_pending`], [`materialize_pending_greens`]): its owner shard records it unrecovered with that
 /// cause, so every verb on it answers `Refusal::NotRecovered`; this node stops attempting it and claims it to lookups
@@ -5691,7 +5801,7 @@ async fn give_up_taken_over(
   origin: u16,
   local: HostId,
   (object, kind): (ObjectId, TakenOver),
-  waited: &'static str,
+  (waited, on_members): (&'static str, bool),
   attempts: u32,
 ) {
   let id = DbVolumeId { bytes: object.0 };
@@ -5725,16 +5835,49 @@ async fn give_up_taken_over(
     TakenOver::Green => ("green", GREEN_TAKEOVER_GIVEN_UP),
   };
   state::with_state(|s| {
-    match kind {
-      TakenOver::Volume => {
-        s.pending_materializations.remove(&object);
-      }
+    let catalog = s.pending_catalogs.remove(&object);
+    // A record that waited on its takeover's members is judged afresh once one is heard again
+    // ([`judge_given_up_afresh`]); each kind's members are its own.
+    let kept = match kind {
+      TakenOver::Volume => s.pending_materializations.remove(&object).map(|pending| {
+        (
+          pending.cohort_hosts.clone(),
+          crate::state::GivenUpRecord::Volume(pending),
+        )
+      }),
       TakenOver::Green => {
-        s.pending_green_materializations.remove(&object);
         crate::green_adopt::forget_completions(s, object);
+        s.pending_green_materializations
+          .remove(&object)
+          .map(|pending| {
+            (
+              pending.sources.clone(),
+              crate::state::GivenUpRecord::Green(pending),
+            )
+          })
       }
+    };
+    if let Some((members, pending)) = kept.filter(|(members, _)| on_members && !members.is_empty())
+    {
+      let membership = s.fleet.membership();
+      let heard = members
+        .iter()
+        .map(|host| {
+          (
+            *host,
+            membership.state(*host).map_or(0, |held| held.incarnation),
+          )
+        })
+        .collect();
+      s.given_up_taken_over.insert(
+        object,
+        crate::state::GivenUpTakenOver {
+          pending,
+          catalog,
+          heard,
+        },
+      );
     }
-    s.pending_catalogs.remove(&object);
     if target.is_some() {
       crate::takeover::track_owner_on_every_shard(s, object, local);
     }
@@ -6822,6 +6965,15 @@ impl VolumeWait {
   /// catalog register or that register's placement ([`paging_round`]).
   const fn waits_on_the_round(self) -> bool {
     matches!(self, VolumeWait::Catalog | VolumeWait::CatalogPlacement)
+  }
+
+  /// Whether it waits on members of the volume's takeover cohorts, which a member heard again may clear: its live log's
+  /// holders, its catalog register's (or that register's placement's), or its content's ([`judge_given_up_afresh`]).
+  const fn waits_on_members(self) -> bool {
+    matches!(
+      self,
+      VolumeWait::Live | VolumeWait::Catalog | VolumeWait::CatalogPlacement | VolumeWait::Content
+    )
   }
 
   /// Its name in a refusal's cause (`RecoveryCause::TakeoverIncomplete`).
@@ -10316,6 +10468,9 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     s.answers_given
       .retain_members(members, slates_machine::clock::monotonic_ns());
     s.fanned.observe_lease(&s.lease);
+    let mut fanned = std::mem::take(&mut s.fanned);
+    fanned.observe_holding(s);
+    s.fanned = fanned;
     // This shard's own parked lease reads meet the evidence it just pruned and observed.
     crate::lease_wait::resolve(s);
     let mut fans = Vec::new();
@@ -10358,13 +10513,14 @@ pub(crate) const FAN_UNCHANGED: &str = "fleet.fan.unchanged";
 pub(crate) const FAN_REFUSED: &str = "fleet.fan.refused";
 
 /// What one shard last received of the configuration fan: the placement and root versions, the readiness
-/// flag, and the lease's generation.
+/// flag, the lease's generation, and the generation of the list of greens this node replicates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delivered {
   placement: u64,
   root: u64,
   ready: Option<bool>,
   lease: u64,
+  holding: u64,
 }
 
 /// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
@@ -10376,6 +10532,11 @@ pub(crate) struct Fanned {
   shards: std::collections::BTreeMap<u16, Delivered>,
   lease: crate::lease::OwnerLease,
   lease_generation: u64,
+  /// The greens this node replicates, each with its owner as the control shard's routing names it, as last fanned
+  /// (A-697 part f: `work_home::green_elsewhere`, the rule "replicated here"), and a generation counting its changes.
+  /// Bounded by the greens this node replicates.
+  holding: std::collections::BTreeMap<ObjectId, HostId>,
+  holding_generation: u64,
   /// The failover delay each other shard last received from the beat's own fan ([`fan_failover`], A-574). Bounded by
   /// the daemon's shards.
   failover: std::collections::BTreeMap<u16, u64>,
@@ -10390,6 +10551,31 @@ impl Fanned {
     }
   }
 
+  /// Notes the greens this node replicates now, with their owners (the control shard's `merge.replicas`, each owner
+  /// as its routing names it, else the green's creator): a change since the last fanned list is a new generation. An
+  /// unchanged list, a period's usual case, is compared in place and copies nothing.
+  fn observe_holding(&mut self, state: &ShardState) {
+    let now = state.merge.replicas.keys().map(|object| {
+      (
+        *object,
+        state
+          .fleet
+          .object_owner(*object)
+          .unwrap_or_else(|| object.creator()),
+      )
+    });
+    if self
+      .holding
+      .iter()
+      .map(|(object, owner)| (*object, *owner))
+      .eq(now.clone())
+    {
+      return;
+    }
+    self.holding = now.collect();
+    self.holding_generation = self.holding_generation.saturating_add(1);
+  }
+
   /// The fan `shard` is owed now — only the parts newer than what it last received — or `None` when it holds
   /// everything already.
   fn owed(&self, state: &ShardState, shard: u16) -> Option<Fan> {
@@ -10402,11 +10588,13 @@ impl Fanned {
       root: (root.version > had.root).then(|| root.clone()),
       ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
       lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
+      holding: (self.holding_generation > had.holding).then(|| self.holding.clone()),
       now: Delivered {
         placement: placement.version,
         root: root.version,
         ready: Some(state.consensus_ready),
         lease: self.lease_generation,
+        holding: self.holding_generation,
       },
     };
     fan.carries().then_some(fan)
@@ -10435,12 +10623,17 @@ struct Fan {
   root: Option<slates_db::register::RootConfiguration>,
   ready: Option<bool>,
   lease: Option<crate::lease::OwnerLease>,
+  holding: Option<std::collections::BTreeMap<ObjectId, HostId>>,
   now: Delivered,
 }
 
 impl Fan {
   fn carries(&self) -> bool {
-    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
+    self.placement.is_some()
+      || self.root.is_some()
+      || self.ready.is_some()
+      || self.lease.is_some()
+      || self.holding.is_some()
   }
 
   fn delivered(&self) -> Delivered {
@@ -10475,6 +10668,50 @@ impl Fan {
     // shortens the lease on that shard until the next period re-fans it (never lengthens it).
     if let Some(lease) = self.lease {
       s.lease = lease;
+    }
+    // The greens this node replicates, which decide where a work over one of them is served (A-697 part f).
+    if let Some(holding) = self.holding {
+      s.work_home.holding = holding;
+    }
+  }
+}
+
+/// Counter: the list of greens this node replicates fanned to a shard at once, when a replica the last fanned list lacked
+/// advanced (A-697 part f; [`fan_holding_at_once`]).
+pub(crate) const HOLDING_FAN_SENT: &str = "fleet.holding_fan.sent";
+/// Counter: a shard's bounded channel refused that fan; the period's configuration fan carries the list instead.
+pub(crate) const HOLDING_FAN_REFUSED: &str = "fleet.holding_fan.refused";
+
+/// On the control shard, when its replica of `object` advanced (`work_home::replica_reached`): if the list of greens
+/// this node replicates last fanned to the other shards lacks `object`, fans the current list to each of them now, so a
+/// creation over the green is served here as its holder from the replica's first version on (A-697 part f), not a
+/// period later. A green already listed costs one lookup, the usual case of a replica's every later version. A shard
+/// whose channel refuses the list gets it with the period's configuration fan ([`fan_configs_to_shards`]).
+pub(crate) fn fan_holding_at_once(state: &mut ShardState, object: ObjectId) {
+  if state.fanned.holding.contains_key(&object) {
+    return;
+  }
+  let mut fanned = std::mem::take(&mut state.fanned);
+  fanned.observe_holding(state);
+  state.fanned = fanned;
+  let generation = state.fanned.holding_generation;
+  let origin = state.shard;
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|shard| *shard != origin)
+    .collect();
+  for shard in others {
+    let holding = state.fanned.holding.clone();
+    match run_on(origin, shard, move |s| s.work_home.holding = holding) {
+      Ok(()) => {
+        if let Some(delivered) = state.fanned.shards.get_mut(&shard) {
+          delivered.holding = generation;
+        }
+        count_refusal_in(state, HOLDING_FAN_SENT);
+      }
+      Err(_) => count_refusal_in(state, HOLDING_FAN_REFUSED),
     }
   }
 }
@@ -13255,6 +13492,39 @@ mod tests {
     });
   }
 
+  /// A-697 part f (the rule "replicated here"): the greens a node replicates reach its other shards with their owners.
+  /// Do: the control shard takes a replica of a green; the period's fan is asked for another shard and installed; the
+  /// next period is asked again. Expect: the fan carries the list, and the receiver then holds the green under its
+  /// creator, as owner (no routing names another); once delivered, the unchanged list is owed no more.
+  #[test]
+  fn a_replica_taken_reaches_the_other_shards_with_its_owner_once() {
+    crate::daemon::audit_on_shard(|s| {
+      let green = ObjectId::new(HostId(7), 1);
+      s.merge
+        .replicas
+        .insert(green, slates_merge::engine::Green::new());
+      let mut fanned = std::mem::take(&mut s.fanned);
+      fanned.observe_holding(s);
+      s.fanned = fanned;
+      let fan = s.fanned.owed(s, OTHER_SHARD).expect("the list changed");
+      let holding = fan.holding.clone().expect("the fan carries the list");
+      assert_eq!(holding.get(&green), Some(&HostId(7)));
+      let delivered = fan.delivered();
+      s.fanned.record(OTHER_SHARD, delivered);
+      fan.install(s);
+      assert_eq!(s.work_home.holding.get(&green), Some(&HostId(7)));
+      let mut fanned = std::mem::take(&mut s.fanned);
+      fanned.observe_holding(s);
+      s.fanned = fanned;
+      assert!(
+        s.fanned
+          .owed(s, OTHER_SHARD)
+          .is_none_or(|fan| fan.holding.is_none()),
+        "an unchanged list is not fanned again"
+      );
+    });
+  }
+
   /// AUD-29-29. Do: install a fan carrying only a lease on a shard whose lease is empty. Expect: the shard's
   /// lease is the fanned one and nothing else it holds changes.
   #[test]
@@ -13271,6 +13541,7 @@ mod tests {
         root: None,
         ready: None,
         lease: Some(fanned.clone()),
+        holding: None,
         now: Delivered::default(),
       }
       .install(s);

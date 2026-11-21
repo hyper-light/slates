@@ -889,3 +889,65 @@ fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
   daemon.stop();
   left_dead_until_its_user_unmounts(&point.path, "the daemon's stop");
 }
+
+/// A-774 C1 (a work mounts and works through FUSE). Do: seed a green with `f` = "one\ntwo\nthree\n"; make a work over it
+/// and attach it through FUSE; through the kernel read `f`, save it as an editor does (the whole new content written to
+/// a temporary beside it, renamed over it); detach; submit the work with no declaration. Expect: the mount reads the
+/// green's bytes, the submit is accepted, and the green's head holds the save.
+#[test]
+fn a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-work-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "fuse-work"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("fuse-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "fuse-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"one\ntwo\nthree\n").unwrap();
+  assert!(matches!(
+    client.submit(seed).unwrap(),
+    slates_client::Submitted::Accepted(_)
+  ));
+  let (work, _) = client.create_work(green, "fuse-work").unwrap();
+  let point = target_dir();
+  let attached = client
+    .attach_fuse(work, Intent::Write, &point.path)
+    .unwrap();
+  #[allow(clippy::disallowed_methods)]
+  // through the kernel's FUSE mount, as an editor reads and saves
+  {
+    let file = format!("{}/f", point.path);
+    assert_eq!(std::fs::read(&file).unwrap(), b"one\ntwo\nthree\n");
+    let temp = format!("{}/.f.swp", point.path);
+    std::fs::write(&temp, b"one\nTWO\nthree\n").unwrap();
+    std::fs::rename(&temp, &file).unwrap();
+  }
+  client.detach(attached.attachment).unwrap();
+  let verdict = client.submit(work).unwrap();
+  assert!(
+    matches!(verdict, slates_client::Submitted::Accepted(_)),
+    "{verdict:?}"
+  );
+  assert_eq!(
+    client
+      .read(green, "f", slates_client::ReadAt::Head)
+      .unwrap(),
+    b"one\nTWO\nthree\n"
+  );
+  drop(client);
+  daemon.stop();
+}

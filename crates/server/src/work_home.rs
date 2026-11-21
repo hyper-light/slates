@@ -234,10 +234,12 @@ pub(crate) struct WorkHome {
   routing: BTreeSet<DbVolumeId>,
   /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
   pub(crate) lose_next_answer: bool,
-  /// Test support (`Daemon::serve_works_on_holders`; A-697, until its last piece puts the rule that a node holding a
-  /// green's replica serves its works in its place): this node serves the works of greens another node owns
-  /// ([`green_elsewhere`]). Never set from the wire; off, nothing here changes.
-  pub(crate) on_holders: bool,
+  /// On every shard but the control shard: the greens this node holds a replica of, each with its owner as the control
+  /// shard's routing names it (A-697 part f), fanned from the control shard with the configuration
+  /// (`fleet::fan_configs_to_shards`), version-gated by a generation. What [`green_elsewhere`] reads off the control shard,
+  /// which holds the replicas themselves. Bounded by the greens this node replicates.
+  pub(crate) holding:
+    std::collections::BTreeMap<slates_db::register::ObjectId, slates_db::register::HostId>,
   /// On the control shard, which holds the node's replicas: the submits of works on this holder node whose versions the
   /// owner committed before the replica held them (A-697 part d), each answered once the replica does. Bounded by the
   /// node's parked verbs: one a parked submit, each let go past its verb's bound ([`hold_until_replica`]).
@@ -339,16 +341,24 @@ fn remote_work(state: &ShardState, body: &RequestBody) -> Option<(DbVolumeId, Db
   (!state.greens.contains_key(&green)).then_some((volume, green))
 }
 
-/// Whether `green` is owned by another node while this node serves works over it (A-697 part a): only with the test hook
-/// on ([`WorkHome::on_holders`]) until A-697's last piece puts the real rule ("replicated here") in its place. The owner
-/// is the one this node's routing names, else the green's creator; a green on this shard never is.
+/// Whether this node serves works over `green` as its holder (A-697; the rule "replicated here", part f): another node
+/// owns the green ([`owned_elsewhere`]) and this node holds its replica. A creation over such a green is made here, on
+/// its client's partition, and admitted by the owner over the fleet; the work's base reads are answered by the replica,
+/// its verdict computed there and committed by the owner by position, its floor moved there over the fleet. A green
+/// another node owns that this node does not replicate is the owner's to serve: its creation is forwarded there. On
+/// the control shard the replica is its own (`merge.replicas`); every other shard reads the control shard's fanned
+/// list ([`WorkHome::holding`]). A green this node adopted in a takeover is a replica no longer, so its works are
+/// served through it here as any of this node's own greens' are.
 pub(crate) fn green_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
-  state.work_home.on_holders && owned_elsewhere(state, green)
+  let object = slates_db::register::ObjectId(green.bytes);
+  (state.merge.replicas.contains_key(&object) || state.work_home.holding.contains_key(&object))
+    && owned_elsewhere(state, green)
 }
 
-/// Whether `green` is owned by another node, as this node's routing names its owner, else by its creator (A-697): a
-/// green this shard holds never is. Unlike [`green_elsewhere`] it holds whatever the test hook says, so a work this node
-/// made as a holder is recovered as one after a restart, which starts with the hook off (part e).
+/// Whether `green` is owned by another node, as this node's routing names its owner (on a shard but the control shard,
+/// as the control shard's fanned list of the greens it replicates names it, [`WorkHome::holding`]), else by its
+/// creator (A-697): a green this shard holds never is. Unlike [`green_elsewhere`] it asks nothing of the replica, so a
+/// work this node made as a holder is recovered as one after a restart, before its replica is back (part e).
 pub(crate) fn owned_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
   if state.greens.contains_key(&green) {
     return false;
@@ -357,6 +367,7 @@ pub(crate) fn owned_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
   state
     .fleet
     .object_owner(object)
+    .or_else(|| state.work_home.holding.get(&object).copied())
     .unwrap_or_else(|| object.creator())
     != state.fleet.host()
 }
@@ -574,11 +585,18 @@ fn declare_need(fetched: bool, op: &WorkOp) -> Option<Need> {
 }
 
 /// The paths a sealed work's journal names whose base the work does not hold, to fetch before it composes (A-247): a
-/// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of. `None` when it has
-/// all it needs, and after this verb's fetch.
+/// path whose base entries it has not fetched, or one it neither holds nor has fetched the bytes of; and every path its
+/// composition replaces whole, whose base bytes its refinement reads (A-776, close item C1: until 2026-11-20 a file
+/// the work held was never fetched, so a work off its green's shard composed a whole-file save unrefined and conflicted
+/// with any edit of the file). `None` when it has all it needs: when this verb's fetch holds every such path (asked
+/// again when it does not, as one ask of the union, since the fetch is the verb's own), or the green is gone.
 fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
   // A journal holding a copy is composed by the owner, which holds the copied trees (`COPY_COMPOSED_BY_OWNER`).
-  if state.work_home.fetched.is_some() || holds_copy(&sealed.journal) {
+  if holds_copy(&sealed.journal) {
+    return None;
+  }
+  let fetched = state.work_home.fetched.as_ref();
+  if fetched.is_some_and(|fetched| fetched.gone) {
     return None;
   }
   let w = state.works.get(&sealed.work)?;
@@ -588,12 +606,33 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     .flat_map(VolumeOp::names)
     .flatten()
     .collect();
-  let missing: Vec<String> = named
-    .into_iter()
-    .filter(|path| !w.entries.contains_key(*path) || !sealed.files.holds(path))
-    .map(str::to_owned)
+  let mut wanted: std::collections::BTreeSet<String> = named
+    .iter()
+    .filter(|path| !w.entries.contains_key(**path) || !sealed.files.holds(path))
+    .map(|path| (*path).to_owned())
     .collect();
-  (!missing.is_empty()).then_some(Need::Files(missing))
+  // With every entry known, the composition says which paths it replaces whole: their base bytes are wanted too.
+  let whole = slates_merge::increment::Base::for_names(&named, &w.entries)
+    .and_then(|base| slates_merge::increment::compose_volume_planned(&base, &sealed.journal).ok())
+    .map(|(doc, _)| slates_merge::refine::whole_replaced_paths(&doc))
+    .unwrap_or_default();
+  match fetched {
+    None => {
+      wanted.extend(whole);
+      (!wanted.is_empty()).then(|| Need::Files(wanted.into_iter().collect()))
+    }
+    // This verb fetched already: what it lacks is only a whole-replaced path's bytes. Asked again, the answer replaces
+    // the verb's fetch, so the ask keeps everything the fetch holds (an edit-and-submit's sealed copy reads its file
+    // from it).
+    Some(fetched) => {
+      if whole.iter().all(|path| fetched.files.contains_key(path)) {
+        return None;
+      }
+      wanted.extend(whole);
+      wanted.extend(fetched.files.keys().cloned());
+      Some(Need::Files(wanted.into_iter().collect()))
+    }
+  }
 }
 
 /// `sealed` with its increment composed on this shard, from the entries the work fetched and its files (over the bytes
@@ -1546,6 +1585,15 @@ fn computed_request(
   };
   state.count(COMPUTED_ON_HOLDER, 1);
   let form = computed.encode(&inc);
+  // Encoded once: the bytes this node holds as the version's inputs, then forwarded (A-697 (1)): held here, they are
+  // never shipped back to this node, which composed them.
+  let increment = inc.encode();
+  let next = state
+    .merge
+    .replicas
+    .get(&slates_db::register::ObjectId(green.bytes))
+    .map_or(0, |replica| replica.head().saturating_add(1));
+  crate::merge_service::hold_composed_inputs(state, green, &increment, next);
   Ok(crate::verbs::forwarded_request(
     state,
     id.word(),
@@ -1553,7 +1601,7 @@ fn computed_request(
     RequestBody::SubmitComputed {
       work: crate::verbs::to_wire_volume(work),
       green: crate::verbs::to_wire_volume(green),
-      increment: inc.encode(),
+      increment,
       computed: form,
       carried,
     },
@@ -1625,6 +1673,8 @@ fn hold_until_replica(
 /// `merge_service::recompute`): every held submit whose version the replica now holds is answered on its work's shard
 /// (`answered_late`, which finds it by its key, so one already released is not answered twice).
 pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::register::ObjectId) {
+  // The other shards learn this node replicates the green, so its creations are served here (A-697 part f).
+  crate::fleet::fan_holding_at_once(state, object);
   replays_resumed(state, object);
   if state.work_home.replica_waits.is_empty() {
     return;
@@ -1989,8 +2039,7 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     ..
   } = item;
   if matches!(need, Need::Files(_) | Need::Page { .. } | Need::Sizes)
-    && state.work_home.on_holders
-    && !state.greens.contains_key(&green)
+    && green_elsewhere(state, green)
   {
     // A holder's base read, answered by its replica of the green (A-697 part a), once that holds the work's base.
     let holds = state
@@ -2023,11 +2072,9 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
       None => Outcome::Deferred,
     },
     // A holder's work is rebased over this node's replica (A-697); any other through the green.
-    Need::Rebase { sealed } if state.work_home.on_holders && !state.greens.contains_key(&green) => {
-      Outcome::Answered(Answered::Rebased(crate::verbs::replica_rebase(
-        state, &sealed,
-      )))
-    }
+    Need::Rebase { sealed } if green_elsewhere(state, green) => Outcome::Answered(
+      Answered::Rebased(crate::verbs::replica_rebase(state, &sealed)),
+    ),
     Need::Rebase { sealed } => Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(
       state, *sealed,
     ))),

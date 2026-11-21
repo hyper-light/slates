@@ -115,7 +115,7 @@ fn seal_one(
   let mut sealing = view.sealing(pack).ok_or(SealRefused::NoPack)?;
   let mut clock = Ticks(0);
   for _ in 0..TURNS {
-    if view.seal_step(&mut sealing, store, one_unit(&mut clock))? {
+    if view.seal_step(&mut sealing, (store, repository), one_unit(&mut clock))? {
       return view.seal(sealing, repository, store, &mut Admission::new(ROOM));
     }
   }
@@ -143,6 +143,12 @@ fn close(view: HookView, seals: BTreeMap<ObjectId, Seal>, store: &mut ContentSto
   view.close(store).unwrap();
 }
 
+/// A repository holding no pack: what a view of objects held whole reads them through (the views these tests build
+/// hold none of an object read from a pack).
+fn whole_only() -> Repository {
+  Repository::new(ObjectFormat::Sha1)
+}
+
 /// The file `path` read whole, `window` bytes a read.
 fn read_file(
   view: &HookView,
@@ -158,7 +164,13 @@ fn read_file(
   let mut at = 0;
   while at < len {
     view
-      .read(store, seals, path, (at, window), &mut bytes)
+      .read(
+        (store, &whole_only()),
+        seals,
+        path,
+        (at, window),
+        &mut bytes,
+      )
       .unwrap();
     at += window;
   }
@@ -415,7 +427,7 @@ fn a_pack_git_wrote_laid_out_and_sealed_reads_back_with_index_packs_index() {
     let mut sealing = Sealing::of(&unit);
     let mut clock = Ticks(0);
     while !sealing
-      .step_on(&unit, &store, one_unit(&mut clock))
+      .step_on(&unit, (&store, &whole_only()), one_unit(&mut clock))
       .unwrap()
     {}
     let seal = sealing
@@ -423,7 +435,12 @@ fn a_pack_git_wrote_laid_out_and_sealed_reads_back_with_index_packs_index() {
       .unwrap();
     let mut read = Vec::new();
     unit
-      .fill(&store, seal.known(), (0, unit.len), &mut read)
+      .fill(
+        (&store, &whole_only()),
+        seal.known(),
+        (0, unit.len),
+        &mut read,
+      )
       .unwrap();
     assert_eq!(read, pack);
     let (content, len) = seal.index();
@@ -584,16 +601,10 @@ fn verified(
 
 /// Every object the store holds, by position, and the push's.
 fn every_object(built: &Built) -> BTreeSet<ObjectId> {
-  let format = built.repository.format();
   let mut ids: BTreeSet<ObjectId> = (0..built.repository.next_position())
     .map(|position| built.repository.id_at(&built.store, position).unwrap())
     .collect();
-  ids.extend(
-    built
-      .push
-      .held()
-      .map(|(id, ..)| ObjectId::from_bytes(format, id).unwrap()),
-  );
+  ids.extend(built.push.held().map(|(id, _)| id));
   ids
 }
 
@@ -744,17 +755,29 @@ fn refused_before_the_seal(view: &HookView, store: &ContentStore, path: &[u8]) {
   let refused = Err(ReadRefused::Unsealed { pack });
   let mut out = Vec::new();
   assert_eq!(
-    view.read(store, &unsealed, path, (trailer, 1), &mut out),
+    view.read(
+      (store, &whole_only()),
+      &unsealed,
+      path,
+      (trailer, 1),
+      &mut out
+    ),
     refused
   );
   let index = index_path(path);
   assert_eq!(
-    view.read(store, &unsealed, &index, (0, 1), &mut out),
+    view.read((store, &whole_only()), &unsealed, &index, (0, 1), &mut out),
     refused
   );
   if kind == PackKind::BasePack {
     view
-      .read(store, &unsealed, path, (0, trailer), &mut out)
+      .read(
+        (store, &whole_only()),
+        &unsealed,
+        path,
+        (0, trailer),
+        &mut out,
+      )
       .unwrap();
     assert_eq!(to_u64(out.len()), trailer);
   }
@@ -775,7 +798,9 @@ fn same_in_every_window(
     assert_eq!(read_file(view, store, seals, path, window), whole);
   }
   let mut past = Vec::new();
-  view.read(store, seals, path, (len, 64), &mut past).unwrap();
+  view
+    .read((store, &whole_only()), seals, path, (len, 64), &mut past)
+    .unwrap();
   assert!(past.is_empty());
 }
 
@@ -1049,7 +1074,7 @@ fn a_base_pack_made_again_stays_readable_and_its_seal_is_refused_by_kind() {
   let unsealed: BTreeMap<ObjectId, Seal> = BTreeMap::new();
   view
     .read(
-      &built.store,
+      (&built.store, &built.repository),
       &unsealed,
       path.as_bytes(),
       before_trailer,

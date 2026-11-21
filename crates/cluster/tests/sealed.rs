@@ -259,6 +259,68 @@ fn opened_in_steps(
   }
 }
 
+/// `sealed` (`len` bytes, opened whole as `whole`) opened in steps at budgets from a byte to everything: the same chunk
+/// at each, in one call at an unbounded budget and in at least two calls a 64 KiB budget for a 1 MiB piece.
+fn same_at_every_budget(tenant: &Tenant, sealed: &SealedChunk, whole: &Chunk, len: usize) {
+  for budget in [1, 4096, 65_536, usize::MAX] {
+    let (stepped, calls) = opened_in_steps(tenant, &tenant.namer, sealed, budget);
+    assert_eq!(
+      stepped.as_ref(),
+      Ok(whole),
+      "{len} bytes at a budget of {budget}"
+    );
+    if budget == usize::MAX {
+      assert_eq!(calls, 1, "{len} bytes opened in one call");
+    }
+    if budget == 65_536 && len == 1 << 20 {
+      assert!(
+        calls >= 2 * len / budget,
+        "{len} bytes: {calls} calls at {budget}"
+      );
+    }
+  }
+}
+
+/// `sealed` (`len` bytes, of `segment`-byte segments) tampered with: a bit flipped in each segment, its last byte cut,
+/// opened under the other tenant's naming. Each refused in steps exactly when it is refused whole.
+fn tampered_refused_in_steps(
+  (tenant, other): (&Tenant, &Tenant),
+  sealed: &SealedChunk,
+  len: usize,
+  segment: usize,
+) {
+  let header = hyper_seal::stream::HEADER;
+  for at in (header..sealed.bytes.len()).step_by(segment) {
+    let mut flipped = sealed.clone();
+    flipped.bytes[at] ^= 1;
+    assert_eq!(
+      opened_in_steps(tenant, &tenant.namer, &flipped, 4096)
+        .0
+        .is_err(),
+      open_chunk(&tenant.lineage, &tenant.namer, &flipped).is_err(),
+      "{len} bytes flipped at {at}"
+    );
+    assert!(
+      opened_in_steps(tenant, &tenant.namer, &flipped, 4096)
+        .0
+        .is_err()
+    );
+  }
+  let mut cut = sealed.clone();
+  cut.bytes.truncate(cut.bytes.len() - 1);
+  assert!(
+    opened_in_steps(tenant, &tenant.namer, &cut, 4096)
+      .0
+      .is_err(),
+    "{len} bytes cut"
+  );
+  assert_eq!(
+    opened_in_steps(tenant, &other.namer, sealed, 4096).0,
+    Err(SealedError::Name),
+    "{len} bytes under another tenant's naming"
+  );
+}
+
 /// A-771: a raw chunk opened in steps is the chunk opened whole, and a step is held to its budget. Do: seal raw chunks of
 /// lengths around the segment and up to a 1 MiB piece, and open each whole and in steps of 1 byte to everything; then
 /// flip a bit of each segment, cut the last, and open under another tenant's naming. Expect: the same chunk at every
@@ -280,57 +342,12 @@ fn a_raw_chunk_opened_in_steps_is_the_chunk_opened_whole() {
     let sealed = seal_chunk(&tenant.lineage, &tenant.namer, &chunk(len, 3), SEGMENT).unwrap();
     let whole = open_chunk(&tenant.lineage, &tenant.namer, &sealed).unwrap();
     let segments = len.div_ceil(segment).max(1);
-    for budget in [1, 4096, 65_536, usize::MAX] {
-      let (stepped, calls) = opened_in_steps(&tenant, &tenant.namer, &sealed, budget);
-      assert_eq!(
-        stepped.as_ref(),
-        Ok(&whole),
-        "{len} bytes at a budget of {budget}"
-      );
-      if budget == usize::MAX {
-        assert_eq!(calls, 1, "{len} bytes opened in one call");
-      }
-      if budget == 65_536 && len == 1 << 20 {
-        assert!(
-          calls >= 2 * len / budget,
-          "{len} bytes: {calls} calls at {budget}"
-        );
-      }
-    }
+    same_at_every_budget(&tenant, &sealed, &whole, len);
     let (_, calls) = opened_in_steps(&tenant, &tenant.namer, &sealed, 1);
     assert!(
       calls >= segments,
       "{len} bytes: a call at least a segment, {calls} for {segments}"
     );
-    let header = hyper_seal::stream::HEADER;
-    for at in (header..sealed.bytes.len()).step_by(segment) {
-      let mut flipped = sealed.clone();
-      flipped.bytes[at] ^= 1;
-      assert_eq!(
-        opened_in_steps(&tenant, &tenant.namer, &flipped, 4096)
-          .0
-          .is_err(),
-        open_chunk(&tenant.lineage, &tenant.namer, &flipped).is_err(),
-        "{len} bytes flipped at {at}"
-      );
-      assert!(
-        opened_in_steps(&tenant, &tenant.namer, &flipped, 4096)
-          .0
-          .is_err()
-      );
-    }
-    let mut cut = sealed.clone();
-    cut.bytes.truncate(cut.bytes.len() - 1);
-    assert!(
-      opened_in_steps(&tenant, &tenant.namer, &cut, 4096)
-        .0
-        .is_err(),
-      "{len} bytes cut"
-    );
-    assert_eq!(
-      opened_in_steps(&tenant, &other.namer, &sealed, 4096).0,
-      Err(SealedError::Name),
-      "{len} bytes under another tenant's naming"
-    );
+    tampered_refused_in_steps((&tenant, &other), &sealed, len, segment);
   }
 }

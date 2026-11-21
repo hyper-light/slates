@@ -1267,6 +1267,76 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
   }
 }
 
+/// MEMORY SIZING (w-sizing; found by use on the big Studio, 2026-11-20: four anchors killed with `SIGKILL` held 21 GB
+/// with no process alive). Do: start an anchor, read its issuer surface for the names of its segment and its content
+/// object, `SIGKILL` the anchor and wait for its daemon to leave. Expect both names gone (`shm_open` answers `ENOENT`),
+/// and every content pool extent's too (objects of their own on macOS since the extents piece),
+/// so the objects and every page written into them go back to the system with their last holder. Before, nothing
+/// removed them: macOS keeps a shared-memory object while its name exists, and only the creator, the killed anchor,
+/// removed the name. Any name the test finds left is removed at the end, so a red run leaks nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_killed_anchors_segment_and_content_go_with_its_daemon() {
+  use rustix::fs::Mode;
+  use rustix::shm::OFlags;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the killed anchor's objects flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-objects-{}", std::process::id());
+  let (anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  let exports = exports.expect("macOS prints the issuer surface");
+  let names: Vec<String> = exports
+    .iter()
+    .filter(|(name, _)| {
+      name == slates_anchor::segment::ENV_HANDOFF || name == slates_anchor::segment::ENV_CONTENT
+    })
+    .map(|(_, value)| value.clone())
+    .collect();
+  assert_eq!(
+    names.len(),
+    2,
+    "the segment's and the content's names: {exports:?}"
+  );
+  let present = |name: &str| rustix::shm::open(name, OFlags::RDONLY, Mode::empty()).is_ok();
+  assert!(
+    names.iter().all(|name| present(name)),
+    "both objects exist while the anchor lives"
+  );
+  kill_anchor_and_wait_for_the_daemon_to_leave(&instance, anchor);
+  let mut progress = process_wait::InstanceWait::new();
+  while !process_wait::instance_processes(&instance).is_empty() {
+    progress.check(&instance, "the daemon's process ended");
+    pause();
+  }
+  // The content pool's extents, objects of their own on macOS, named from the content object's name and their id: every
+  // id a layout of up to 64 partitions can name.
+  let content = exports
+    .iter()
+    .find(|(name, _)| name == slates_anchor::segment::ENV_CONTENT)
+    .map(|(_, value)| slates_mem::Handoff::Name(value.clone()))
+    .expect("the content object's name");
+  let extents: Vec<String> = (0..64 * slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
+    .filter_map(|id| u16::try_from(id).ok())
+    .filter_map(|id| match slates_mem::extent_handoff(&content, id) {
+      Some(slates_mem::Handoff::Name(name)) => Some(name),
+      _ => None,
+    })
+    .collect();
+  let left: Vec<&String> = names
+    .iter()
+    .chain(extents.iter())
+    .filter(|name| present(name))
+    .collect();
+  for name in &left {
+    let _ = rustix::shm::unlink(name.as_str());
+  }
+  assert!(
+    left.is_empty(),
+    "the killed anchor's objects outlived every holder: {left:?}"
+  );
+}
+
 /// The whole flow through the binary: up, the verbs, the refusals, down with the anchor.
 /// The first five minutes, adversarially (a user who never read the docs): do start a fresh node and create a
 /// volume before bootstrapping it. Expect the create refused (exit 1) with the refusal's name, as scripts match it,
@@ -3777,8 +3847,7 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
 /// work, and the events of formation's ordinary work that the counter map carries beside refusals.
 fn formation_counter_allowed(line: &str) -> bool {
   use slates_server::daemon::{
-    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
-    TICKS_SEALING,
+    CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE, TICKS_SEALING,
   };
   let Some(counter) = line
     .split_whitespace()
@@ -3809,7 +3878,7 @@ fn formation_counter_allowed(line: &str) -> bool {
     "fleet.plane.announcements_sent",
     // The idle sweep's events (`slates_server::idle_sweep`, A-715), named by the constants the daemon counts them under, so one added there is not missed
     // here: the idle purge's freed bytes, what a shard was doing at each pass (A-214: sealing, deferred, busy, idle),
-    // the bytes an idle shard kept pre-faulted for its next write burst, and a give-back that left its rest for the
+    // and a give-back that left its rest for the
     // next tick because another task ran on the shard (A-226; c2d87528 added it, and forming three processes counted it
     // on diag-slabs-40 and bug-sweep-27 while this list did not know it).
     CONTENT_PURGED,
@@ -3817,7 +3886,6 @@ fn formation_counter_allowed(line: &str) -> bool {
     TICKS_DEFERRED,
     TICKS_BUSY,
     TICKS_IDLE,
-    CONTENT_PREFAULTED,
     GIVE_BACK_LEFT,
     // A record link dropped because its anchor's learned member became another incarnation
     // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
@@ -3869,8 +3937,7 @@ fn formation_counter_allowed(line: &str) -> bool {
 #[test]
 fn the_formation_check_allows_every_idle_sweep_event() {
   use slates_server::daemon::{
-    CONTENT_PREFAULTED, CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE,
-    TICKS_SEALING,
+    CONTENT_PURGED, GIVE_BACK_LEFT, TICKS_BUSY, TICKS_DEFERRED, TICKS_IDLE, TICKS_SEALING,
   };
   for counter in [
     CONTENT_PURGED,
@@ -3879,7 +3946,6 @@ fn the_formation_check_allows_every_idle_sweep_event() {
     TICKS_DEFERRED,
     TICKS_BUSY,
     TICKS_IDLE,
-    CONTENT_PREFAULTED,
   ] {
     let line = format!("shard 0 refused {counter}: 1");
     assert!(

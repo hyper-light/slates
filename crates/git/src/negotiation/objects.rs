@@ -221,6 +221,21 @@ impl View<'_> {
       .filter
       .is_none_or(|filter| filter.admits(kind, size, depth))
   }
+
+  /// The size the filter decides `node`, of `kind`, by: a blob's, read from `graph` only where the filter reads sizes
+  /// ([`Filter::reads_size`]); none otherwise.
+  fn size_of<S: Graph>(&self, graph: &S, node: S::Node, kind: Kind) -> u64 {
+    size_for(self.filter, graph, node, kind)
+  }
+}
+
+/// The size `filter` decides `node`, of `kind`, by ([`View::size_of`]).
+fn size_for<S: Graph>(filter: Option<&Filter>, graph: &S, node: S::Node, kind: Kind) -> u64 {
+  if kind == Kind::Blob && filter.is_some_and(Filter::reads_size) {
+    graph.size(node)
+  } else {
+    0
+  }
 }
 
 impl<N: Copy + Ord + Into<u64> + TryFrom<u64>, G: Copy> Selecting<N, G> {
@@ -604,11 +619,7 @@ impl<N: Copy + Ord + Into<u64>> Sets<N> {
       .filter(|entry| !view.held.contains(*entry))
     {
       let kind = graph.kind(entry);
-      let size = if kind == Kind::Blob {
-        graph.size(entry)
-      } else {
-        0
-      };
+      let size = view.size_of(graph, entry, kind);
       if view.admits(kind, size, depth) {
         self.objects.insert(entry, admission)?;
       }
@@ -862,11 +873,7 @@ impl Carried<'_> {
       return false;
     }
     let kind = graph.kind(node);
-    let size = if kind == Kind::Blob {
-      graph.size(node)
-    } else {
-      0
-    };
+    let size = size_for(self.filter, graph, node, kind);
     self
       .filter
       .is_none_or(|filter| filter.admits(kind, size, 0))

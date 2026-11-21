@@ -53,6 +53,105 @@ pub enum Handoff {
   Name(String),
 }
 
+/// Removes the name a handed-off object is opened by, so the object lives only as long as its holders (w-sizing, found
+/// by use on 2026-11-20). macOS keeps a shared-memory object while its name exists, whoever holds it, and only its
+/// creator unlinks the name, on drop: an anchor killed with `SIGKILL` never drops, so its segment and content object
+/// (45.9 GB and 146.0 GB of address space on the 96 GB Studio) stayed in the kernel with every page the daemon had
+/// dirtied, until reboot. Four killed anchors held 21 GB of the big Studio's memory with no process alive. A daemon
+/// whose anchor is gone calls this for the anchor's objects as it leaves: nobody adopts them after the anchor (a new
+/// anchor creates its own under a new name). Linux hands objects by descriptor and Windows' sections close with their
+/// last handle, so there is no name to remove there. A name already gone is no refusal.
+#[cfg(target_os = "macos")]
+pub fn unlink_handoff(handoff: &Handoff) -> Result<(), MemError> {
+  match handoff {
+    Handoff::Name(name) => match rustix::shm::unlink(name.as_str()) {
+      Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+      Err(errno) => Err(MemError::OsRefused {
+        call: "shm_unlink",
+        code: Some(errno.raw_os_error()),
+      }),
+    },
+    Handoff::Descriptor(_) => Ok(()),
+  }
+}
+
+/// [`unlink_handoff`] where an object has no name that outlives its holders: nothing to remove.
+#[cfg(not(target_os = "macos"))]
+pub fn unlink_handoff(_handoff: &Handoff) -> Result<(), MemError> {
+  Ok(())
+}
+
+/// The handoff of extent `id` of the content object `content` names, where an extent is an object of its own (macOS;
+/// main's ruling of 2026-11-20 15:20, content as extents made on demand): a name derived from the content object's and
+/// the id, so the daemon that claims it, a successor that adopts it and a daemon releasing its anchor's objects all
+/// reach the same object. A given-back page of one shared object only leaves the footprint on macOS (a 512 MiB probe
+/// stayed resident 10 s under pressure); an extent of its own gives its pages back whole when its name goes and its
+/// last mapping with it. `None` where extents are ranges of the content object (Linux punches holes in a memfd;
+/// Windows decommits a section's view), or for a content object handed by descriptor.
+#[cfg(target_os = "macos")]
+pub fn extent_handoff(content: &Handoff, id: u16) -> Option<Handoff> {
+  match content {
+    Handoff::Name(name) => Some(Handoff::Name(platform::object_name(&format!(
+      "{name}-e{id}"
+    )))),
+    Handoff::Descriptor(_) => None,
+  }
+}
+
+/// [`extent_handoff`] where extents are ranges of the content object: none.
+#[cfg(not(target_os = "macos"))]
+pub fn extent_handoff(_content: &Handoff, _id: u16) -> Option<Handoff> {
+  None
+}
+
+/// Makes the extent object `handoff` names, `len` bytes, if it does not exist yet; one that exists is left as it is
+/// (a successor adopts its bytes). Nothing is mapped and no page touched, so a made extent costs no memory until a
+/// shard maps it and writes. Made ahead of a claim (a shard's own slice at its start, a released extent again at its
+/// release), never on the provisioning path (main's condition (a), R9). Refused `OutOfRange` when an existing object
+/// has another length.
+#[cfg(target_os = "macos")]
+pub fn make_extent(handoff: &Handoff, len: usize) -> Result<(), MemError> {
+  use rustix::fs::Mode;
+  use rustix::shm::OFlags;
+  let Handoff::Name(name) = handoff else {
+    return Ok(());
+  };
+  let refused = |call: &'static str, errno: rustix::io::Errno| MemError::OsRefused {
+    call,
+    code: Some(errno.raw_os_error()),
+  };
+  // structural: allow — shm_open creates or opens a kernel object in RAM, not a filesystem entry (D-10).
+  let fd = rustix::shm::open(
+    name.as_str(),
+    // structural: allow — flags of the shared-memory object, not of a file.
+    OFlags::CREATE | OFlags::RDWR,
+    Mode::RUSR | Mode::WUSR,
+  )
+  .map_err(|e| refused("shm_open", e))?;
+  let size = rustix::fs::fstat(&fd)
+    .map_err(|e| refused("fstat", e))?
+    .st_size;
+  let want = i64::try_from(len).map_err(|_| MemError::OutOfRange { offset: 0, len })?;
+  if size == want {
+    return Ok(());
+  }
+  if size != 0 {
+    return Err(MemError::OutOfRange {
+      offset: usize::try_from(size).unwrap_or(usize::MAX),
+      len,
+    });
+  }
+  #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
+  // structural: allow — sizing the memory object just made (no filesystem entry; D-10).
+  rustix::fs::ftruncate(&fd, want.unsigned_abs()).map_err(|e| refused("ftruncate", e))
+}
+
+/// [`make_extent`] where extents are ranges of the content object: nothing to make.
+#[cfg(not(target_os = "macos"))]
+pub fn make_extent(_handoff: &Handoff, _len: usize) -> Result<(), MemError> {
+  Ok(())
+}
+
 /// A shared memory object and its full view, reached by copy and through its declared words.
 pub struct SharedObject {
   inner: platform::Inner,
@@ -1190,7 +1289,7 @@ mod platform {
   /// suffix; a name that would not fit the limit is replaced by a 64-bit hash of the whole
   /// name (truncation once made two clients' regions one object: GAPS §8d).
   #[cfg(target_os = "macos")]
-  fn object_name(name: &str) -> String {
+  pub(super) fn object_name(name: &str) -> String {
     /// Format: the POSIX shared-memory name limit on macOS (`PSHMNAMLEN`, 31).
     const NAME_LIMIT: usize = 31;
     /// Format: the FNV-1a 64-bit offset basis and prime (Fowler, Noll, Vo).
@@ -1928,6 +2027,73 @@ mod tests {
       Err(MemError::LayoutRefused { reason, .. }) => Some(reason),
       _ => None,
     }
+  }
+
+  /// Content as extents made on demand (main's ruling of 2026-11-20 15:20; w-sizing). Do: make an extent object of
+  /// 64 MiB, map it and write every page; map it a second time (a view that outlives the give-back, as nothing in the
+  /// daemon does, to watch the old object); remove its name and make it again, as a release does; then map the made
+  /// extent afresh. Expect: before the give-back the object holds every page; the made extent holds none and reads
+  /// zeros; and once the last old mapping goes, nothing names the old pages. Before, a released extent was a range of
+  /// the anchor's one content object, and its pages stayed there (a 512 MiB probe: resident 10 s after
+  /// `MADV_FREE_REUSABLE`, under pressure, on Studio-4).
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no shared memory
+  fn a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name() {
+    /// Shape: the extent, large enough that its pages dwarf a page of noise.
+    const EXTENT: usize = 64 << 20;
+    let page = rustix::param::page_size();
+    let content = Handoff::Name(format!("/wsz-ext-{}", std::process::id()));
+    let extent = extent_handoff(&content, 7).expect("macOS names its extents");
+    let _ = unlink_handoff(&extent);
+    make_extent(&extent, EXTENT).unwrap();
+    make_extent(&extent, EXTENT).expect("an existing extent of the same length is adopted");
+    // SAFETY: the test is the only process and these the only mappings of the extent; the writer writes, the watcher
+    // only reads residency.
+    let mut writer = unsafe { ExclusiveObject::open_range(&extent, 0, EXTENT) }.unwrap();
+    writer
+      .bytes_mut()
+      .iter_mut()
+      .step_by(page)
+      .for_each(|byte| *byte = 1);
+    // SAFETY: as above.
+    let watcher = unsafe { ExclusiveObject::open_range(&extent, 0, EXTENT) }.unwrap();
+    let held = crate::resident::of_range(watcher.bytes().as_ptr(), EXTENT, page)
+      .unwrap()
+      .resident;
+    assert_eq!(
+      held,
+      u64::try_from(EXTENT).unwrap(),
+      "the written extent holds every page"
+    );
+    drop(writer);
+    unlink_handoff(&extent).unwrap();
+    make_extent(&extent, EXTENT).unwrap();
+    // SAFETY: as above; the old object is reached only by `watcher`.
+    let fresh = unsafe { ExclusiveObject::open_range(&extent, 0, EXTENT) }.unwrap();
+    let made = crate::resident::of_range(fresh.bytes().as_ptr(), EXTENT, page)
+      .unwrap()
+      .resident;
+    assert_eq!(made, 0, "the extent made again holds no page");
+    assert!(
+      fresh.bytes().iter().step_by(page).all(|byte| *byte == 0),
+      "and reads zeros"
+    );
+    let old = crate::resident::of_range(watcher.bytes().as_ptr(), EXTENT, page)
+      .unwrap()
+      .resident;
+    assert_eq!(
+      old, held,
+      "the old object lives only while a mapping holds it"
+    );
+    drop(watcher);
+    drop(fresh);
+    unlink_handoff(&extent).unwrap();
+    assert!(
+      matches!(make_extent(&extent, EXTENT / 2), Ok(())),
+      "with its name gone, nothing of the old object is reachable: a new length is made afresh"
+    );
+    unlink_handoff(&extent).unwrap();
   }
 
   /// A-117 on macOS (A-110's mark on the shared content object). Do: fill 64 MiB of a sparse object, zero and discard

@@ -30,13 +30,13 @@ proptest! {
     prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after the origin");
     // A create at a path outside the alphabet always commits, so every case runs the commit path at least once.
     let mut accepted = 0u32;
-    if matches!(green.submit(&Build::new().create("outside/new", b"n").at(u8::MAX, green.head())), Outcome::Accepted { .. }) {
+    if matches!(green.submit(&Build::new().create("outside/new", b"n").at(u8::MAX, green.head())), Outcome::Accepted { .. } | Outcome::Identical { .. }) {
       accepted += 1;
     }
     prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after the first commit");
     for (index, step) in history.iter().enumerate() {
       let id = u8::try_from(index).unwrap_or(u8::MAX);
-      if matches!(green.submit(&increment_of(step).at(id, green.head())), Outcome::Accepted { .. }) {
+      if matches!(green.submit(&increment_of(step).at(id, green.head())), Outcome::Accepted { .. } | Outcome::Identical { .. }) {
         accepted += 1;
       }
       // The identity is read only at some steps, so the changes of several commits fold at once; and the history
@@ -76,10 +76,16 @@ fn one_state_reached_in_two_orders_has_one_identity() {
   let mut forward = Green::with_origin(origin.clone());
   let mut backward = Green::with_origin(origin.clone());
   for step in &steps {
-    assert!(matches!(forward.submit(step), Outcome::Accepted { .. }));
+    assert!(matches!(
+      forward.submit(step),
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ));
   }
   for step in steps.iter().rev() {
-    assert!(matches!(backward.submit(step), Outcome::Accepted { .. }));
+    assert!(matches!(
+      backward.submit(step),
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ));
   }
   assert_eq!(forward.head_identity(), backward.head_identity());
   assert_eq!(
@@ -101,13 +107,13 @@ fn one_differing_byte_anywhere_changes_the_identity() {
   let start = green.head_identity();
   assert!(matches!(
     green.submit(&Build::new().overwrite("f", 63, &[8]).at(1, 0)),
-    Outcome::Accepted { .. }
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
   let byte = green.head_identity();
   assert_ne!(byte, start);
   assert!(matches!(
     green.submit(&Build::new().overwrite("f", 63, &[7]).at(2, 1)),
-    Outcome::Accepted { .. }
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
   assert_eq!(
     green.head_identity(),

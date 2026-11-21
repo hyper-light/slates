@@ -841,7 +841,7 @@ fn two_pushes_from_one_base_meet_on_the_roots_head() {
   );
   assert_eq!(
     green.submit(&same.increment),
-    Outcome::Accepted { version: 3 }
+    Outcome::Identical { version: 3 }
   );
   holds_exactly(&green, &first, &head(2));
 }
@@ -1185,7 +1185,7 @@ fn a_link_two_pushes_move_from_one_base_conflicts_unless_they_agree() {
   let agreeing = moved_link(&mut store, &green, base_tree, commits[1], 3);
   assert!(matches!(
     green.submit(&agreeing.increment),
-    Outcome::Accepted { .. }
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
   ));
   assert_eq!(green.special("vendor/lib"), Some(gitlink(commits[1])));
 }
@@ -1549,7 +1549,13 @@ fn a_push_over_a_flat_tree_is_built_a_unit_at_a_time_over_many_turns() {
       .collect()
   };
   let (_, outcome, tree) = land(&mut store, &mut green, None, &named("base"), &head(1));
-  assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
+  assert!(
+    matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ),
+    "{outcome:?}"
+  );
   let pushed = put(&mut store, &named("next"));
   let second = head(2);
   let push = push(green.head(), Some(tree), pushed, &second);

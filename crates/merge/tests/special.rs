@@ -379,7 +379,10 @@ fn assert_reserved_history_covers_apply(green: &mut Green, inc: &Increment) {
   let index_reserved = green.changes_reservation(inc);
   let before = green.retained_bytes().history;
   let index_before = green.changes_bytes();
-  assert!(matches!(green.submit(inc), Outcome::Accepted { .. }));
+  assert!(matches!(
+    green.submit(inc),
+    Outcome::Accepted { .. } | Outcome::Identical { .. }
+  ));
   let added = green.retained_bytes().history - before;
   assert!(
     green.changes_bytes() - index_before <= index_reserved,

@@ -179,6 +179,8 @@ pub(super) struct TextStream {
   at: u64,
   /// Whether the empty string and the second response are written.
   ended: bool,
+  /// The text's window its reads are in, made once and lent across its strings (main's order of 2026-11-20).
+  cache: crate::reads::WindowCache,
 }
 
 impl TextStream {
@@ -189,6 +191,7 @@ impl TextStream {
       size: text.map_or(0, |text| text.size),
       at: 0,
       ended: false,
+      cache: crate::reads::WindowCache::new(),
     }
   }
 
@@ -219,14 +222,14 @@ impl TextStream {
 
   /// The next string: [`STRING_BYTES`] of the text, or what is left of it, gathered from the green's pieces; `None`
   /// when the green does not hold them.
-  fn next_string<R: Repository + ?Sized>(&self, repository: &R) -> Option<Vec<u8>> {
+  fn next_string<R: Repository + ?Sized>(&mut self, repository: &R) -> Option<Vec<u8>> {
     let left = self.size.saturating_sub(self.at);
     let want = usize::try_from(left).map_or(STRING_BYTES, |left| left.min(STRING_BYTES));
     let identity = self.identity.as_ref()?;
     let mut piece = Vec::with_capacity(want);
     while piece.len() < want {
       let offset = self.at.checked_add(u64::try_from(piece.len()).ok()?)?;
-      let held = repository.text(identity, offset)?;
+      let held = repository.text_in(identity, offset, &mut self.cache)?;
       let take = held.len().min(want.saturating_sub(piece.len()));
       if take == 0 {
         return None;

@@ -1,0 +1,192 @@
+//! macOS: the process's thread count from `proc_pidinfo(PROC_PIDTASKINFO)` (<libproc.h>,
+//! <sys/proc_info.h>), the pool ceiling from the `kern.wq_max_threads` sysctl, the workqueue's
+//! own cap on the threads it runs for one process (XNU `pthread_workqueue.c`, research/26
+//! §1.5), and a thread's CPU time from `CLOCK_THREAD_CPUTIME_ID` (clock_gettime(3)) at the
+//! kernel's tick rate.
+#![allow(unsafe_code)]
+
+use std::ffi::{c_char, c_int, c_void};
+use std::io;
+use std::time::Duration;
+
+unsafe extern "C" {
+    fn sysctlbyname(
+        name: *const c_char,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *mut c_void,
+        newlen: usize,
+    ) -> c_int;
+    fn proc_pidinfo(
+        pid: c_int,
+        flavor: c_int,
+        arg: u64,
+        buffer: *mut c_void,
+        buffersize: c_int,
+    ) -> c_int;
+}
+
+/// `PROC_PIDTASKINFO` of <sys/proc_info.h>.
+const PROC_PIDTASKINFO: i32 = 4;
+
+/// `struct proc_taskinfo` of <sys/proc_info.h>, field for field.
+#[repr(C)]
+#[derive(Default)]
+struct TaskInfo {
+    virtual_size: u64,
+    resident_size: u64,
+    total_user: u64,
+    total_system: u64,
+    threads_user: u64,
+    threads_system: u64,
+    policy: i32,
+    faults: i32,
+    pageins: i32,
+    cow_faults: i32,
+    messages_sent: i32,
+    messages_received: i32,
+    syscalls_mach: i32,
+    syscalls_unix: i32,
+    csw: i32,
+    threadnum: i32,
+    numrunning: i32,
+    priority: i32,
+}
+
+pub(super) fn count() -> io::Result<usize> {
+    let mut info = TaskInfo::default();
+    let size = c_int::try_from(std::mem::size_of::<TaskInfo>())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let pid = c_int::try_from(std::process::id())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `info` is a writable proc_taskinfo of `size` bytes that outlives the call, which
+    // writes at most `size` bytes and returns how many it wrote.
+    let wrote = unsafe { proc_pidinfo(pid, PROC_PIDTASKINFO, 0, (&raw mut info).cast(), size) };
+    if wrote != size {
+        return Err(io::Error::last_os_error());
+    }
+    usize::try_from(info.threadnum).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the kernel reports a negative thread count",
+        )
+    })
+}
+
+pub(super) fn ceiling() -> io::Result<usize> {
+    let mut value: c_int = 0;
+    let mut len = std::mem::size_of::<c_int>();
+    // SAFETY: the name is a NUL-terminated literal; `value` is a writable int of `len` bytes
+    // that outlives the call, which writes at most `len` bytes and sets `len` to what it wrote;
+    // nothing is set, so the new value is null and its length zero.
+    let ok = unsafe {
+        sysctlbyname(
+            c"kern.wq_max_threads".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ok != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if len != std::mem::size_of::<c_int>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kern.wq_max_threads is not an int",
+        ));
+    }
+    usize::try_from(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kern.wq_max_threads is negative",
+        )
+    })
+}
+
+// slates: local change 2 (vendor/hyper-raft/README.md, "Local changes").
+/// The calling thread's CPU time, the kernel's thread CPU clock. Upstream restated it at the kernel's tick rate
+/// through hyper-rt's Mach clock, for a process Rosetta 2 translates (whose timebase is 1/1 against Apple silicon's
+/// 24 MHz); slates ships native arm64 and x86_64 macOS builds only, never a translated one, and takes no second
+/// runtime (CLAUDE.md §2 item 2), so the clock is read as the kernel gives it (vendor/UPSTREAM.md, hyper-raft, local
+/// change 2).
+pub(super) fn thread_cpu() -> io::Result<Duration> {
+    /// Format: nanoseconds per second.
+    const NS_PER_SECOND: u64 = 1_000_000_000;
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    let secs = u64::try_from(t.tv_sec).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    let nanos =
+        u64::try_from(t.tv_nsec).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+    let ns = secs
+        .checked_mul(NS_PER_SECOND)
+        .and_then(|ns| ns.checked_add(nanos))
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    Ok(Duration::from_nanos(ns))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thread_cpu;
+
+    /// Shape: the CPU time the thread runs before its reading is judged, a millisecond by the
+    /// kernel's own account, so a reading of 3/125 of it (libc's at a translated process's
+    /// timebase) falls most of it short.
+    const RUN_NS: u64 = 1_000_000;
+
+    /// `thread_info`'s account of the calling thread, user and system time in whole microseconds
+    /// (`thread_read_times`), as nanoseconds.
+    fn accounted_ns() -> u64 {
+        // SAFETY: `pthread_self` names the calling thread, alive for the call; the answer is its
+        // Mach port name, valid in this task for the thread's life, and no right is taken.
+        let port = unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) };
+        // SAFETY: an all-zero `thread_basic_info` is a valid value of the C struct (integers and
+        // `time_value_t`s).
+        let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: `info` is this frame's own value, `count` words long as `THREAD_BASIC_INFO`
+        // requires; the status is checked before the value is read.
+        let status = unsafe {
+            libc::thread_info(
+                port,
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                (&raw mut info).cast(),
+                &mut count,
+            )
+        };
+        assert_eq!(status, libc::KERN_SUCCESS);
+        let micros = |time: libc::time_value_t| {
+            u64::try_from(time.seconds).unwrap() * 1_000_000
+                + u64::try_from(time.microseconds).unwrap()
+        };
+        (micros(info.user_time) + micros(info.system_time)) * 1_000
+    }
+
+    /// The thread's CPU time is the kernel's account of it whatever timebase the process is
+    /// shown: no less than `thread_info`'s account read before it (whole microseconds, so at most
+    /// what the thread had run), and growing no faster than the shard's clock, which reads the
+    /// counter the kernel accounts run time on, each reading rounded down once. Under Rosetta 2
+    /// libc's reading alone was 1/41.667 of the account.
+    #[test]
+    fn a_threads_cpu_time_is_the_kernels_account() {
+        let wall_start = std::time::Instant::now();
+        let cpu_before = thread_cpu().unwrap().as_nanos();
+        let mut spun = 0u64;
+        while accounted_ns() < RUN_NS {
+            spun = std::hint::black_box(spun.wrapping_add(1));
+        }
+        let accounted = u128::from(accounted_ns());
+        let cpu_after = thread_cpu().unwrap().as_nanos();
+        let wall_elapsed = wall_start.elapsed().as_nanos();
+        assert!(
+            accounted <= cpu_after,
+            "thread_info accounted {accounted} ns, the CPU clock read {cpu_after} ns after it"
+        );
+        assert!(
+            cpu_after - cpu_before <= wall_elapsed + 2,
+            "{} ns of CPU in {} ns",
+            cpu_after - cpu_before,
+            wall_elapsed
+        );
+    }
+}

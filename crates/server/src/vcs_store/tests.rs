@@ -166,10 +166,9 @@ fn t_a662_a_record_reads_back_what_it_wrote_and_its_bytes_are_pinned() {
   let (content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"PACK-bytes".to_vec());
   let moves: Vec<RecordedMove> = vec![(7, 4, None), (9, 5, Some(head))];
   let bytes = writer
-    .finish((&content, FORMAT), |_| true, (3, &moves))
+    .finish((&content, FORMAT, b"PACK-bytes"), |_| true, (3, &moves))
     .expect("written");
   let mut head_bytes = Vec::new();
   head_bytes.extend_from_slice(b"SGPR");
@@ -233,7 +232,6 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
   let (mut content, noted) = holding(Kind::Blob, b"hi");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"PACK-bytes".to_vec());
   let moves: Vec<RecordedMove> = vec![(9, 5, Some(head))];
   let names = writer.names_of(|_| true);
   let (identity, count) =
@@ -248,7 +246,12 @@ fn t_a724_a_version_3_record_names_its_names_by_their_contents_identity() {
     "the names' identity is the BLAKE3 of their rows"
   );
   let bytes = writer
-    .finish_named((&content, FORMAT), |_| true, (3, &moves), (identity, count))
+    .finish_named(
+      (&content, FORMAT, b"PACK-bytes"),
+      |_| true,
+      (3, &moves),
+      (identity, count),
+    )
     .expect("written");
   let mut expected = Vec::new();
   expected.extend_from_slice(b"SGPR");
@@ -286,7 +289,6 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
   let mut content = ContentStore::new(BUDGET, WINDOW).expect("a content store");
   let long: Vec<u8> = (0..=u8::MAX).cycle().take(WINDOW * 3 + 5).collect();
   let mut writer = RecordWriter::default();
-  writer.keep_pack(b"the pack".to_vec());
   let mut identities = Vec::new();
   for bytes in [&b"one"[..], b"two", &long] {
     let identity = content.put_object(bytes).expect("held");
@@ -302,7 +304,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
   }
   let (held, _) = blob(b"two");
   let bytes = writer
-    .finish((&content, FORMAT), |id| *id != held, (0, &[]))
+    .finish((&content, FORMAT, b"the pack"), |id| *id != held, (0, &[]))
     .expect("written");
   let read = Record::decode(&bytes, FORMAT).expect("read back");
   let long_len = u64::try_from(long.len()).expect("a length");
@@ -317,7 +319,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     )
   );
   let none = writer
-    .finish((&content, FORMAT), |_| false, (0, &[]))
+    .finish((&content, FORMAT, b"the pack"), |_| false, (0, &[]))
     .expect("written");
   let read = Record::decode(&none, FORMAT).expect("read back");
   assert_eq!((read.names.len(), read.pack), (0, &[][..]));
@@ -330,7 +332,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     len: 12,
   });
   assert_eq!(
-    unpacked.finish((&content, FORMAT), |_| true, (0, &[])),
+    unpacked.finish((&content, FORMAT, &[]), |_| true, (0, &[])),
     Err(WriteRefused::Unreadable { id: ghost })
   );
   let (one, _) = blob(b"one");
@@ -342,7 +344,7 @@ fn t_a662_a_record_holds_what_the_repository_lacks_when_written_and_refuses_byte
     len: 3,
   });
   let made = sent_none
-    .finish((&content, FORMAT), |_| true, (0, &[]))
+    .finish((&content, FORMAT, &[]), |_| true, (0, &[]))
     .expect("written");
   let read = Record::decode(&made, FORMAT).expect("read back");
   assert!(read.pack.starts_with(b"PACK"), "{:?}", read.pack);
@@ -358,9 +360,12 @@ fn t_a662_hostile_records_are_refused_by_kind() {
   let (content, noted) = holding(Kind::Commit, b"commit");
   let mut writer = RecordWriter::default();
   writer.object(noted);
-  writer.keep_pack(b"a pack".to_vec());
   let bytes = writer
-    .finish((&content, FORMAT), |_| true, (0, &[(1, 1, Some(head))]))
+    .finish(
+      (&content, FORMAT, b"a pack"),
+      |_| true,
+      (0, &[(1, 1, Some(head))]),
+    )
     .expect("written");
   for cut in 0..bytes.len() {
     let read = Record::decode(bytes.get(..cut).expect("a prefix"), FORMAT);
@@ -483,13 +488,24 @@ impl Live {
   ) -> Result<Pending, GitRefused> {
     let mut push = Push::new(FORMAT);
     let mut writer = RecordWriter::default();
-    for brought in objects {
-      let arriving = incoming(brought, depth);
+    let arriving: Vec<Incoming<'_>> = objects
+      .iter()
+      .map(|brought| incoming(brought, depth))
+      .collect();
+    let (pack, offsets) = slates_git::pack::of_whole_placed(
+      FORMAT,
+      arriving
+        .iter()
+        .map(|incoming| (incoming.kind, incoming.content)),
+    )
+    .map_err(|_| GitRefused::Allocation)?;
+    push.extend_pack(&pack);
+    for (arriving, offset) in arriving.into_iter().zip(offsets) {
       admit_object(
         &mut self.content,
         &self.store,
         (&mut push, &mut writer),
-        arriving,
+        (arriving, Some(offset)),
       )?;
     }
     Ok(Pending {
@@ -542,7 +558,7 @@ impl Live {
     let record = record_of(
       &self.content,
       &self.store,
-      (&pending.writer, deepest),
+      (&pending.writer, deepest, pending.push.pack()),
       moves,
     )?;
     commit_moves(
@@ -1154,7 +1170,7 @@ fn assert_a_head_nobody_sent_is_refused_and_leaves_nothing(store: &mut Live, bef
   let nobody = ObjectId::from_bytes(FORMAT, &[0x5a; 20]).expect("an id");
   let missing = RecordWriter::default()
     .finish(
-      (&store.content, FORMAT),
+      (&store.content, FORMAT, &[]),
       |_| true,
       (0, &[(1, 1, Some(nobody))]),
     )
@@ -1316,52 +1332,6 @@ fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
 }
 
 /// A push begun on the shard with `objects` admitted at `depth`.
-/// A zlib stream of `data` in stored (uncompressed) blocks, as a pack entry's data may be (RFC 1950, RFC 1951 §3.2.4):
-/// what git's reader inflates, made with no compressor.
-fn zlib_stored(data: &[u8]) -> Vec<u8> {
-  let mut out = vec![0x78, 0x01];
-  let mut blocks = data.chunks(usize::from(u16::MAX)).peekable();
-  if blocks.peek().is_none() {
-    out.extend_from_slice(&[1, 0, 0, 0xff, 0xff]);
-  }
-  while let Some(block) = blocks.next() {
-    out.push(u8::from(blocks.peek().is_none()));
-    let len = u16::try_from(block.len()).expect("a stored block's length");
-    out.extend_from_slice(&len.to_le_bytes());
-    out.extend_from_slice(&(!len).to_le_bytes());
-    out.extend_from_slice(block);
-  }
-  let (mut a, mut b) = (1u32, 0u32);
-  for byte in data {
-    a = (a + u32::from(*byte)) % 65_521;
-    b = (b + a) % 65_521;
-  }
-  out.extend_from_slice(&((b << 16) | a).to_be_bytes());
-  out
-}
-
-/// A pack of `objects`, each whole, as a client sends them (A-723: the pack the record keeps).
-pub(crate) fn pack_of(objects: &[Brought]) -> Vec<u8> {
-  let mut out = Vec::new();
-  let count = u32::try_from(objects.len()).expect("a count");
-  let mut writer = slates_git::pack::Writer::new(FORMAT, count, &mut out);
-  let mut at = slates_git::entry::PACK_HEADER_LEN;
-  for (kind, _, bytes) in objects {
-    let mut head = Vec::new();
-    let header = slates_git::entry::Header {
-      representation: slates_git::entry::Representation::Whole(*kind),
-      size: u64::try_from(bytes.len()).expect("a size"),
-    };
-    slates_git::entry::write(header, at, &mut head).expect("a header");
-    let data = zlib_stored(bytes);
-    slates_git::out::Out::put(&mut writer, &head);
-    slates_git::out::Out::put(&mut writer, &data);
-    at += u64::try_from(head.len() + data.len()).expect("an offset");
-  }
-  writer.finish().expect("a trailer");
-  out
-}
-
 fn begun_at(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1369,7 +1339,6 @@ fn begun_at(
   depth: u64,
 ) -> GitPush {
   let mut push = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
-  push.keep_pack(pack_of(objects));
   let arriving: Vec<Incoming<'_>> = objects
     .iter()
     .map(|brought| incoming(brought, depth))
@@ -1751,7 +1720,7 @@ fn assert_an_abandoned_push_leaves_nothing(
   let mut abandoned = GitPush::begin(&state.vcs_stores, repository).expect("a git store");
   let arriving: Vec<Incoming<'_>> = objects.iter().map(|brought| incoming(brought, 0)).collect();
   abandoned.admit_all(state, &arriving).expect("admitted");
-  assert!(state.vcs_stores.charged() > 0);
+  assert!(!abandoned.quarantine().is_empty());
   abandoned.abandon(state);
   assert_eq!(state.vcs_stores.content().map(ContentStore::used), Some(0));
   assert_eq!(state.vcs_stores.charged(), 0);
@@ -2268,4 +2237,66 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
     "walked {total} of {objects}"
   );
   assert_eq!(most, 1, "the most objects one turn walked");
+}
+
+/// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past
+/// one window by this node's root of it, as records did before the rule, is refused, never read as the object. Do:
+/// push a create of `main` whose one file is 1 MiB; take the push's record and name the file by its root in place of
+/// its BLAKE3; replay the record so altered into the repository's store made again empty. Expect: the record as written
+/// replays; the altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by
+/// their BLAKE3, which the record does not name), never accepted.
+#[test]
+fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
+  crate::daemon::audit_on_shard(|state| {
+    const LARGE: usize = 1 << 20;
+    let repository = crate::git_push::tests::git_repository(state, "old-form");
+    let (request, _) = crate::git_push::tests::large_create(LARGE);
+    crate::git_push::tests::pushed(state, repository, &request);
+    let blob: Vec<u8> = (0..LARGE)
+      .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
+      .collect();
+    let identity = ContentId::of(&blob);
+    // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
+    // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
+    let window = state
+      .vcs_stores
+      .content()
+      .map(ContentStore::window)
+      .unwrap();
+    let mut scratch = ContentStore::new(u64::try_from(4 * LARGE).unwrap(), window).unwrap();
+    let held = scratch.put_object(&blob).unwrap();
+    let root = scratch.root_of(&held);
+    assert_ne!(root, identity, "the file is past one window");
+    let written = records(state, repository)
+      .into_iter()
+      .find(|record| record.windows(32).any(|at| at == identity.0))
+      .expect("a record naming the file");
+    let at = written
+      .windows(32)
+      .position(|bytes| bytes == identity.0)
+      .unwrap();
+    let mut altered = written.clone();
+    altered[at..at + 32].copy_from_slice(&root.0);
+    let record = state
+      .db
+      .partition()
+      .repositories()
+      .repository(repository)
+      .cloned()
+      .unwrap();
+    let mut replayed = |bytes: &[u8]| {
+      state.vcs_stores.entries.remove(&repository);
+      super::make(state, &record);
+      // The room a replay is lent, as `replay_record` lends it: the record's bytes.
+      super::lend(
+        &mut state.store,
+        &mut state.vcs_stores,
+        u64::try_from(bytes.len()).unwrap(),
+      );
+      let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+      super::replay_into(lent.stores, repository, bytes, None).map(|_| ())
+    };
+    assert_eq!(replayed(&written), Ok(()), "the record as written replays");
+    assert_eq!(replayed(&altered), Err(super::ReplayRefused::Diverged));
+  });
 }

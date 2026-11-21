@@ -10,7 +10,7 @@ use crate::entry::{self, Header, PACK_HEADER_LEN, Representation};
 use crate::object_name::{Hasher, Kind, ObjectFormat, ObjectId};
 use crate::pack::{self, idx};
 use crate::store::repository::Kept;
-use crate::store::{Placed, Positions, Push, Repository, kind_of};
+use crate::store::{Placed, Positions, Push, Repository, StoredAt, kind_of};
 use crate::{Admission, to_u64};
 
 use super::stored::{self, Source as StreamSource};
@@ -104,8 +104,8 @@ pub(in crate::store) struct Whole {
   pub(in crate::store) kind: Kind,
   /// Its length.
   pub(in crate::store) len: u64,
-  /// Its bytes' root content, held by the view.
-  pub(in crate::store) content: ContentId,
+  /// Where its bytes are: its own content, or where it lies in a pack, the content held by the view.
+  pub(in crate::store) stored: StoredAt,
   /// Where its entry begins in its pack.
   pub(in crate::store) at: u64,
   /// Its entry header's length.
@@ -159,8 +159,8 @@ pub(in crate::store) struct Object {
   pub(in crate::store) kind: Kind,
   /// Its length.
   pub(in crate::store) len: u64,
-  /// Its bytes' root content.
-  pub(in crate::store) content: ContentId,
+  /// Where its bytes are.
+  pub(in crate::store) stored: StoredAt,
 }
 
 /// What the view's packs are made from: the kept parts taken, in order, and the positions none of
@@ -263,7 +263,7 @@ pub(super) fn build(
     units.push(lay_out(format, PackKind::Rest, &[], objects, admission)?);
   }
   if let Some(push) = push {
-    let objects = pushed(push)?;
+    let objects = pushed(repository, store, push)?;
     counters.pushed = counters.pushed.saturating_add(to_u64(objects.len()));
     units.push(lay_out(format, PackKind::Pushed, &[], objects, admission)?);
   }
@@ -310,30 +310,42 @@ fn objects_at(
   positions
     .iter()
     .map(|position| {
-      let (id, row, content) = repository
+      let (id, row, stored) = repository
         .stored_at(store, position)
         .map_err(ViewRefused::Store)?;
       Ok(Object {
         id,
         kind: row.kind,
         len: row.len,
-        content,
+        stored,
       })
     })
     .collect()
 }
 
-/// The push's objects, in their names' order.
-fn pushed(push: &Push) -> Result<Vec<Object>, ViewRefused> {
+/// The push's objects, in their names' order, each read from the content store: where the push holds it there, or
+/// where it lies in the pack its staging put there (a sealed push's objects new to the repository), or, for an object
+/// the repository held already, the repository's.
+fn pushed(
+  repository: &Repository,
+  store: &ContentStore,
+  push: &Push,
+) -> Result<Vec<Object>, ViewRefused> {
   push
     .held()
-    .map(|(id, number, content, len)| {
-      let format = push.format();
+    .map(|(id, held)| {
+      let stored = match push.stored(&id) {
+        Some(stored) => stored,
+        None => repository
+          .stored(store, &id)
+          .map(|(_, stored, _)| stored)
+          .ok_or(ViewRefused::PushUnreadable)?,
+      };
       Ok(Object {
-        id: ObjectId::from_bytes(format, id).ok_or(ViewRefused::PushUnreadable)?,
-        kind: kind_of(number).ok_or(ViewRefused::PushUnreadable)?,
-        len,
-        content,
+        id,
+        kind: kind_of(held.number).ok_or(ViewRefused::PushUnreadable)?,
+        len: held.len,
+        stored,
       })
     })
     .collect()
@@ -393,7 +405,7 @@ fn place(object: Object, at: u64) -> Result<Whole, ViewRefused> {
     id: object.id,
     kind: object.kind,
     len: object.len,
-    content: object.content,
+    stored: object.stored,
     at,
     header: 0,
   };
@@ -490,7 +502,7 @@ impl Unit {
   /// when the bytes reach what it lacks.
   pub(in crate::store) fn fill(
     &self,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     known: Known<'_>,
     (from, to): (u64, u64),
     out: &mut Vec<u8>,
@@ -513,7 +525,9 @@ impl Unit {
           let part = self.parts.get(index).ok_or(ReadRefused::Unreadable)?;
           content_range(store, &part.content, part.len, within, out)?;
         }
-        Segment::Whole(index) => self.fill_whole(store, known, index, within, out)?,
+        Segment::Whole(index) => {
+          self.fill_whole((store, repository), known, index, within, out)?;
+        }
         Segment::Trailer => {
           let trailer = known
             .trailer
@@ -529,7 +543,7 @@ impl Unit {
   /// Appends the bytes `from..to` of whole object `index`'s entry: its header, then its stream.
   fn fill_whole(
     &self,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     known: Known<'_>,
     index: usize,
     (from, to): (u64, u64),
@@ -545,6 +559,7 @@ impl Unit {
     }
     let mut source = WholeBytes {
       store,
+      repository,
       whole,
       adler: known
         .adlers
@@ -567,15 +582,16 @@ impl Unit {
 /// A whole object's bytes, read from the store, and its Adler-32 as the seal knows it.
 struct WholeBytes<'a> {
   store: &'a ContentStore,
+  repository: &'a Repository,
   whole: &'a Whole,
   adler: Result<u32, ReadRefused>,
 }
 
 impl StreamSource for WholeBytes<'_> {
   fn data(&mut self, from: u64, to: u64, out: &mut Vec<u8>) -> Result<(), ReadRefused> {
-    content_range(
-      self.store,
-      &self.whole.content,
+    stored_range(
+      (self.store, self.repository),
+      &self.whole.stored,
       self.whole.len,
       (from, to),
       out,
@@ -592,6 +608,29 @@ pub(super) fn copy(bytes: &[u8], (from, to): (u64, u64), out: &mut Vec<u8>) {
   let first = usize::try_from(from).unwrap_or(usize::MAX);
   let last = usize::try_from(to).unwrap_or(usize::MAX).min(bytes.len());
   out.extend_from_slice(bytes.get(first..last).unwrap_or_default());
+}
+
+/// Appends the bytes `from..to` of the object `len` bytes long at `stored` to `out`: its content's windows read as
+/// [`content_range`] reads them, or, for an object read where it lies in its pack (A-722's record v4), read whole
+/// through `repository` (its chain from the objects read lately, which hold it for the next range) and the range
+/// copied out.
+pub(in crate::store) fn stored_range(
+  (store, repository): (&ContentStore, &Repository),
+  stored: &StoredAt,
+  len: u64,
+  range: (u64, u64),
+  out: &mut Vec<u8>,
+) -> Result<(), ReadRefused> {
+  match stored {
+    StoredAt::Whole(content) => content_range(store, content, len, range, out),
+    StoredAt::InPack(_) => {
+      let bytes = repository
+        .read_stored(store, stored, len)
+        .ok_or(ReadRefused::Unreadable)?;
+      copy(&bytes, range, out);
+      Ok(())
+    }
+  }
 }
 
 /// Appends the bytes `from..to` of the content `len` bytes long whose root is `root` to `out`, a

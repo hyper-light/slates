@@ -12,14 +12,16 @@
 //! import sets that no revision carries (A-652 part 3), each in an entry that moves no green: [`Record::Uuid`], the
 //! repository named by its stream's UUID record (`svn_fs_set_uuid`, `load-fs-vtable.c` `uuid_record`); and
 //! [`Record::RevisionProperties`], a revision's properties set whole (`svn_fs_change_rev_prop2` for each difference),
-//! as an import sets revision 0's to its stream's (`close_revision`); and [`Record::Locks`], the lock entries a lock verb
-//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
+//! as an import sets revision 0's to its stream's (`close_revision`); [`Record::Locks`], the lock entries a lock verb
+//! made (`lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2); and [`Record::Deltified`], a stored text kept as a
+//! delta from then on, its whole bytes released (the deltify job).
 //!
 //! **The encoding**, little-endian as a green's chain entry and A-662's git record are: the magic, the version and a
 //! kind byte; a creation's UUID, its 36 bytes, and its date; a revision's head, its transaction, its rows, its
 //! properties, its contents and its lock entries, each list as a count and its items, each string as a length and its
 //! bytes, each optional part after a byte that marks it present or absent; a UUID's 36 bytes; a revision's number and
-//! its properties, written as a revision's are; a lock verb's lock entries, a count and each (A-693 part 2). A row is its path, its action, its kind,
+//! its properties, written as a revision's are; a lock verb's lock entries, a count and each (A-693 part 2); a deltified text's identity, its base after a
+//! byte that marks it present or absent, and its delta's length and bytes. A row is its path, its action, its kind,
 //! its copy source, its text (identity, MD5, SHA-1, size), its property list (none, empty, or held by identity with its
 //! mergeinfo mark) and its mergeinfo mark. A lock entry is a tag, then a set lock whole (path, token, owner, comment,
 //! the DAV comment's mark, creation and expiry) or a removal (path, token).
@@ -67,6 +69,8 @@ const UUID_SET: u8 = 2;
 const PROPERTIES_SET: u8 = 3;
 /// Format: the kind byte of lock entries made by a lock verb alone, no revision with them (A-693 part 2).
 const LOCKS_SET: u8 = 4;
+/// Format: the kind byte of a stored text kept as a delta from now on (the deltify job, main's ruling on A-761).
+const DELTIFIED: u8 = 5;
 
 /// Format: the byte that marks an optional part absent, and a mark unset.
 const ABSENT: u8 = 0;
@@ -146,6 +150,17 @@ pub enum Record {
   /// Lock entries a lock verb made, in the order they are applied, no revision with them (`svn_fs_lock_many`,
   /// `svn_fs_unlock_many` through `lock`, `lock-many`, `unlock`, `unlock-many`; A-693 part 2).
   Locks(Vec<LockEntry>),
+  /// A text a commit stored in the content store (A-761), kept by the records as a delta from now on, its whole bytes
+  /// released: the deltify job's entry (main's ruling on A-761; GAPS' A-727 (c)). The delta is an svndiff of version 2
+  /// that makes the text from its base, as the records keep every other text (S4 c2).
+  Deltified {
+    /// The text's identity.
+    text: ContentIdentity,
+    /// The text the delta is against: its node's skip-delta predecessor's, none for a first version.
+    base: Option<ContentIdentity>,
+    /// The delta's bytes.
+    delta: Vec<u8>,
+  },
 }
 
 /// Why bytes were refused as a record. A refused record replays nothing.
@@ -214,6 +229,19 @@ impl Record {
         }
         out
       }
+      Self::Deltified { text, base, delta } => {
+        let mut out = header(DELTIFIED);
+        out.extend_from_slice(text);
+        match base {
+          Some(base) => {
+            out.push(PRESENT);
+            out.extend_from_slice(base);
+          }
+          None => out.push(ABSENT),
+        }
+        put_bytes(&mut out, delta);
+        out
+      }
     }
   }
 
@@ -250,6 +278,19 @@ impl Record {
         properties: properties(&mut reader)?,
       },
       LOCKS_SET => Self::Locks(lock_entries(&mut reader)?),
+      DELTIFIED => {
+        let text = reader.array()?;
+        let base = if reader.mark()? {
+          Some(reader.array()?)
+        } else {
+          None
+        };
+        Self::Deltified {
+          text,
+          base,
+          delta: reader.bytes()?,
+        }
+      }
       byte => return Err(RecordRefused::Tag { byte }),
     };
     if !reader.rest.is_empty() {

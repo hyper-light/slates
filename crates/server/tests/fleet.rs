@@ -842,6 +842,21 @@ fn poll_for_periods(
   daemons: &[&Daemon],
   within: Duration,
   periods: u64,
+  condition: impl FnMut() -> Result<bool, ObserveError>,
+) -> bool {
+  poll_for_live_periods(daemons, within, || periods, condition)
+}
+
+/// [`poll_for_periods`] with its budget read again at each look (`periods`): for a wait on a bound a daemon derives from
+/// an estimate it keeps measuring, such as the failover delay (A-363), which load raises while the wait runs. Read once
+/// at the wait's start, the budget fell behind the bound it waited on: `a_retired_owner_whose_takeover_gave_up_...`
+/// failed once in a loaded run of the fleet tests with the successor not yet giving up, and a successor whose estimate
+/// rose tenfold during the wait failed it every time (w-forming, 2026-11-20).
+#[track_caller]
+fn poll_for_live_periods(
+  daemons: &[&Daemon],
+  within: Duration,
+  mut periods: impl FnMut() -> u64,
   mut condition: impl FnMut() -> Result<bool, ObserveError>,
 ) -> bool {
   let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
@@ -885,7 +900,7 @@ fn poll_for_periods(
       last_advance = Instant::now();
     }
     wait.asked(took, daemons, &advances, last_advance.elapsed());
-    if charged >= periods {
+    if charged >= periods() {
       // Every observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
       wait.end("poll", "period budget spent", daemons, &advances);
@@ -6479,6 +6494,8 @@ const MOVE_ADOPTED: &str = "fleet.move.adopted";
 const MOVE_ADOPTION_REPORTED: &str = "fleet.move.adoption_reported";
 /// Format: a move's old owner's count of the moves it began (`moves::MOVE_BEGUN`).
 const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Counter: moves refused before any report (`crate::moves`'s own).
+const MOVE_REFUSED: &str = "fleet.move.refused";
 /// Format: a move's old owner's count of the copies it let go to the member the move named (`moves::MOVE_RELEASED`).
 const MOVE_RELEASED: &str = "fleet.move.released";
 
@@ -6841,6 +6858,71 @@ fn a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an
     &landed_after_two_moves(),
     &described,
   );
+}
+
+/// Goal 91's live move, its first ask (A-291's bound; kiln's live move across two Macs, 2026-11-20): a move's first ask
+/// succeeds within the fleet's failover delay even when the head it hands over must first be carried and placed off its
+/// owner, which takes longer than that delay. Measured in kiln's lab, release, three runners on one Mac: the first ask
+/// refused `Unplaced` at 3,293 ms (bound 3,200 ms) with its capture not yet carried, the second at 3,187 ms with the head
+/// placed but not yet held off its owner, the third at 3,190 ms with the handoff begun at 142 ms, and the fourth reported
+/// at 120 ms, the work the refused asks began finished meanwhile. Three daemons at `f = 1`. Do: on a, overlay the
+/// captured tree, capture its base and clone it; write the agent's changes and about 780 KB more into the clone and detach;
+/// ask once to move it to b, then only follow the move while it answers `Moving`. Expect: `Moved`, never a refusal, and
+/// a's refusal counter unmoved.
+#[test]
+fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members();
+  let base = captured_tree_dir();
+  let (answers, refused, failover, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let clone = captured_and_cloned(&mut client_a, &base.path, &["first-ask-workspace"])[0];
+    agents_changes(&mut client_a, clone);
+    let attachment = write_attachment(&mut client_a, clone);
+    // About 780 KB (the clone is bounded at 1 MiB) in files a ring's write takes whole (its payload cap is 4 KiB): content the handoff must place.
+    let window = vec![0x5a_u8; 3900];
+    for index in 0..200 {
+      let written = client_a.call(&RequestBody::FsWrite {
+        volume: clone,
+        attachment,
+        path: format!("/bulk-{index}"),
+        bytes: window.clone(),
+        mode: 0o644,
+      });
+      assert!(
+        matches!(written, ReplyBody::FsDone { .. }),
+        "bulk write {index}: {written:?}"
+      );
+    }
+    assert!(matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ));
+    share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
+    let failover = members.daemons[0].failover_ns();
+    let to = members.hosts[1].0;
+    let mut answers: Vec<String> = Vec::new();
+    poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+      let reply = client_a.call(&RequestBody::Move { volume: clone, to });
+      let settled = !matches!(reply, ReplyBody::Moving { .. });
+      let named = format!("{reply:?}");
+      if answers.last() != Some(&named) {
+        answers.push(named);
+      }
+      Ok(settled)
+    });
+    let refused = move_counter(&members.daemons[0], MOVE_REFUSED);
+    (answers, refused, failover, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    answers.last().is_some_and(|last| last.starts_with("Moved")),
+    "the first ask ended moved, not refused: {answers:?} (failover delay {failover:?}); {described}"
+  );
+  assert_eq!(refused, Ok(0), "a refused no ask of the move; {described}");
 }
 
 /// Goal 91's live move (kiln's K4 across runners): a captured clone moved to another node is found there by its name, as
@@ -14445,6 +14527,115 @@ fn a_live_takeover_is_fetched_and_rebuilt_in_turns_and_joined_while_it_runs() {
   );
 }
 
+/// A-775 (main's item (b), the one-off takeover stall: no survivor served the volume; w-forming's anchor log
+/// `takeover-stall-pr15-run1.log`), §4.8 "Promotion and takeover", §4.10: a live volume whose successor gave it up while
+/// the other holder of its log was away is served once that holder is heard again. Do: three nodes at `f = 1`; on a, a
+/// live-shipped volume written its files; the holder that is not the volume's successor leaves the successor's live
+/// reports and fetches unanswered and goes unheard by it on the probe plane (a holder paused or cut off from it alone);
+/// stop a; once the successor has given the volume up, let the holder answer and be heard. Expect the successor to have
+/// given the volume up, judged it afresh, and to serve it with every file read back. Before, a give-up was final until a
+/// new configuration: the live_chaos fresh-member flow's successor gave up after 22 catalog and 11 quorum waits while
+/// the holder with the log was stopped 3 s, and answered `NotRecovered` for the volume through the fleet wait, the
+/// holder left at fence 1.
+#[test]
+fn a_live_volume_given_up_while_its_holder_was_away_is_served_once_the_holder_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch("heard-again")) else {
+    panic!("the volume was created");
+  };
+  share_with_fleet(&mut client, id, &daemons);
+  let attachment = write_attachment(&mut client, id);
+  let shipped = client.call(&RequestBody::LiveShip {
+    volume: id,
+    live_shipped: true,
+  });
+  let written = write_turn_files(&mut client, id, attachment);
+  drop(client);
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], ObjectId(id.bytes)).expect("a survivor takes over");
+  // Indices once a is stopped and removed.
+  let (at, other) = if successor == hosts[1] {
+    (0, 1)
+  } else {
+    (1, 0)
+  };
+  // The holder leaves the successor's live asks unanswered from the start: nothing asks before the takeover.
+  let silent = daemons[other + 1]
+    .inject_holder_silence(&[hosts[at + 1]])
+    .is_ok();
+  daemons.remove(0).stop();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  // Unheard on the probe plane only once the successor adopted the registers, as the chaos flow stopped the holder.
+  let adopted = silent
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&observed),
+      || Ok(summed_count(&daemons[at], "fleet.takeover.adopted") > 0),
+    );
+  let away = adopted
+    && daemons[at]
+      .inject_probe_deafness(&[hosts[other + 1]])
+      .is_ok();
+  let given_up = away
+    && poll_for_live_periods(
+      &observed,
+      RETIREMENT_DEADLINE,
+      || promise_wait_periods(&observed).saturating_mul(4),
+      || Ok(summed_count(&daemons[at], "fleet.materialize.given_up") > 0),
+    );
+  let back = daemons[other].inject_holder_silence(&[]).is_ok()
+    && daemons[at].inject_probe_deafness(&[]).is_ok();
+  let instance = daemons[at].instance().to_owned();
+  let served = back && poll_status_answers(&observed, &instance, id);
+  let read = turn_files_read_back(&instance, id);
+  let counters = summed_counters(&daemons[at]);
+  let counted = |name: &str| counters.get(name).copied().unwrap_or(0);
+  let (gave_up, judged, silenced) = (
+    counted("fleet.materialize.given_up"),
+    counted("fleet.materialize.judged_afresh"),
+    count_of(
+      &summed_counters(&daemons[other]),
+      "fleet.holder.silenced_by_fault",
+    ),
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a live volume given up while its holder was away: given up {given_up} ({gave_up}), {silenced} answers withheld, \
+     judged afresh {judged}, served {served}, read {read:?}"
+  );
+  assert!(
+    matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+    "the volume is live-shipped: {shipped:?}"
+  );
+  assert!(
+    written
+      .iter()
+      .all(|reply| matches!(reply, ReplyBody::FsDone { .. })),
+    "every write was answered: {written:?}"
+  );
+  assert!(
+    given_up && silenced > 0,
+    "the successor gave the volume up while the holder was away ({silenced} answers withheld)"
+  );
+  assert!(
+    served,
+    "the successor serves the volume once the holder is heard again"
+  );
+  assert!(
+    judged >= 1,
+    "the successor judged the volume afresh ({judged})"
+  );
+  assert!(
+    read.iter().all(|read| *read),
+    "every file reads back through the successor: {read:?}"
+  );
+}
+
 /// What the Continuity test saw through the successor: whether it served the volume, its first write's reply, its log's
 /// head (epoch, position) after that write, and whether each file written on the owner read back.
 struct ThroughTheSuccessor {
@@ -15377,10 +15568,10 @@ fn deaf_until_its_takeover_resolves(
   let at_retirement: Vec<String> = daemons.iter().map(configuration_view).collect();
   let before = takeover_outcomes(daemons);
   let resolved = retired
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(2),
+      || promise_wait_periods(&observed).saturating_mul(2),
       || {
         Ok(
           takeover_outcomes(daemons)
@@ -15427,20 +15618,20 @@ fn a_fleet_settles_on_one_configuration_after_the_owner_a_takeover_made_is_retir
   let adopter = if successor == hosts[1] { 1 } else { 2 };
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let after_first: Vec<String> = daemons.iter().map(configuration_view).collect();
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let at_end: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -15645,19 +15836,19 @@ fn retaken_from_its_adopter(by_creator: bool) -> Retaken {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let taken = taken_over_on_the_probe_plane(&daemons, &hosts, &daemons[adopter]);
   let readmitted = taken
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let through_adopter = written_through(&daemons, adopter, id, "/through-the-adopter");
   let spell = deaf_until_its_takeover_resolves(&daemons, &hosts, adopter);
   let settled = spell.healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let owner = shipping_at_the_highest_fence(&daemons, id);
@@ -17229,11 +17420,13 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let silenced = daemons[other].inject_takeover_silence(&[hosts[at]]);
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let cut = silenced.is_ok() && probe_plane_cut(&daemons, &hosts, true);
+  // The successor's bound is its own failover estimate's worth of periods, which load raises while it waits: the
+  // budget follows it.
   let given_up = cut
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      promise_wait_periods(&observed).saturating_mul(3),
+      || promise_wait_periods(&observed).saturating_mul(3),
       || Ok(summed_count(&daemons[at], "fleet.takeover.given_up") > 0),
     );
   let at_give_up: Vec<String> = daemons.iter().map(configuration_view).collect();
@@ -17241,10 +17434,10 @@ fn a_retired_owner_whose_takeover_gave_up_is_readmitted_once_it_is_heard_again()
   let healed = probe_plane_cut(&daemons, &hosts, false);
   let settled = answering
     && healed
-    && poll_for_periods(
+    && poll_for_live_periods(
       &observed,
       RETIREMENT_DEADLINE,
-      readmission_periods(&observed),
+      || readmission_periods(&observed),
       || settled_on_one_configuration(&daemons, &hosts),
     );
   let judged_afresh = summed_count(&daemons[at], "fleet.takeover.judged_afresh");
@@ -19649,10 +19842,10 @@ fn a_superseded_owner_restarted_warm_ships_no_record_of_the_volume_it_lost() {
   drop(through_a);
   daemons.insert(0, fleet.start(0));
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  let settled = poll_for_periods(
+  let settled = poll_for_live_periods(
     &observed,
     RETIREMENT_DEADLINE,
-    readmission_periods(&observed),
+    || readmission_periods(&observed),
     || settled_on_one_configuration(&daemons, &hosts),
   );
   let refused = |daemon: &Daemon| count_of(&summed_counters(daemon), RECORD_REFUSED_UNAUTHORIZED);
@@ -21207,8 +21400,25 @@ fn assert_replicated_at_version_one(
   assert!(replicated, "B and C replicate the green at version 1");
 }
 
-/// The work B's client makes over `green`, named `holders-work`, admitted at base 1: its id.
-fn holders_work_at_base_one(holder: &mut Client, green: VolumeId) -> VolumeId {
+/// Waits until `holder` replicates `green` at `version` or later, within the placement deadline: a node serves works
+/// over a green another node owns once it replicates the green (A-697 part f, the rule "replicated here"); before,
+/// its creations are the owner's.
+fn await_replicated(holder: &Daemon, green: VolumeId, version: u64) {
+  let replicated = poll_until(&[holder], PLACEMENT_DEADLINE, || {
+    Ok(
+      holder
+        .merge_holder_state(green)?
+        .version
+        .is_some_and(|held| held >= version),
+    )
+  });
+  assert!(replicated, "the holder replicates the green at {version}");
+}
+
+/// The work B's client makes over `green`, named `holders-work`, admitted at base 1, once B replicates the green at 1:
+/// its id.
+fn holders_work_at_base_one(daemon_b: &Daemon, holder: &mut Client, green: VolumeId) -> VolumeId {
+  await_replicated(daemon_b, green, 1);
   let created = holder.call(&RequestBody::CreateWork {
     green,
     name: "holders-work".to_owned(),
@@ -21361,8 +21571,7 @@ fn head_bytes(
 
 /// A-697 part a, A-247 step two (a work over a green another node owns lives on the node that made it): in a two-node
 /// `f = 1` fleet, A owns a green at version 1 (`f` holding "hello"), shared with B's account, and another it shares with
-/// no one; B, which holds the green's replica, serves works over greens A owns (`Daemon::serve_works_on_holders`, the
-/// test hook until A-697's last piece). Do: a client on B creates a work over the shared green; reads `f` through it;
+/// no one; B, which replicates the green, serves works over it (A-697 part f, the rule "replicated here"). Do: a client on B creates a work over the shared green; reads `f` through it;
 /// edits it and reads it again; creates a second work under the same name; creates one over the unshared green.
 /// Expect: the work made on B, its id naming B as a volume B made does, admitted at base 1 with A's floor for it at 1;
 /// `f` byte for byte what A reads of its green, read on B from B's replica (its counter moved, and no forward of the
@@ -21376,7 +21585,7 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
   let mut owner = Client::connect(&instance_a);
   let unshared = version_one_beside_an_unshared_green(&mut owner, owners_work);
   let owners_bytes = head_bytes(&mut owner, green, "f");
-  daemon_b.serve_works_on_holders(true).unwrap();
+  await_replicated(&daemon_b, green, 1);
   let mut holder = Client::connect(daemon_b.instance());
   let bs_own = a_volume_of_b(&mut holder, "a-volume-of-b");
   let created = holder.call(&RequestBody::CreateWork {
@@ -21414,7 +21623,6 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
     green: unshared,
     name: "unshared-work".to_owned(),
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_the_work_is_named_by_b(work, bs_own, green);
   assert_eq!(base, 1, "admitted at the green's head");
   assert_eq!(floor, Ok(Some(1)), "A holds the work's base by its floor");
@@ -21427,7 +21635,7 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
 }
 
 /// A-697 part b, A-247 (a work's floor is held at its green's owner while the work reads it): in a two-node `f = 1`
-/// fleet, B serves works over greens A owns (the test hook), and makes a work over A's green at version 1. Do: a client on
+/// fleet, B, which replicates A's green, serves works over it (the rule "replicated here"), and makes a work over A's green at version 1. Do: a client on
 /// B asks `MoveWorkFloor` to drop the work's floor; a client on A asks it too; B destroys the work. Expect: A holds the
 /// work's floor at 1 after the creation; both clients refused `Unsupported` (a node's verb), the floor still 1; after
 /// the destroy, A drops the floor, told by B over the fleet (B's counter moved).
@@ -21438,9 +21646,8 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let admitted_floor = daemon_a.work_floor(green, work);
   let drop = RequestBody::MoveWorkFloor {
     green,
@@ -21466,7 +21673,6 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
     Ok(daemon_a.work_floor(green, work)?.is_none() && told(&daemon_b) > told_before)
   });
   let told_after = told(&daemon_b);
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_eq!(
     admitted_floor,
     Ok(Some(1)),
@@ -21482,7 +21688,7 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
 }
 
 /// A-697 part c, A-658 part 3b (a verdict computed anywhere, committed by position): in a two-node `f = 1` fleet, B
-/// serves works over greens A owns (the test hook), and makes a work over A's green at version 1 (`f` holding "hello").
+/// serves works over A's green, which it replicates (the rule "replicated here"), and makes a work over A's green at version 1 (`f` holding "hello").
 /// Do: the work edits `f` and submits; then a client of A reads the green, and B's client the work. Expect: answered
 /// `Submitted` at version 2, the verdict computed on B's replica (B's counter) and taken by position at A (A's counter),
 /// nothing judged at A from the work's journal; A's green reads "hello world"; B's work, now based on version 2, reads
@@ -21495,9 +21701,8 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let count = |daemon: &Daemon, name: &str| {
     daemon
       .refusals_on_every_shard()
@@ -21526,7 +21731,6 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
       .work_floor(green, work)
       .map(|floor| floor == Some(2))
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
   assert!(
     matches!(
@@ -21576,9 +21780,129 @@ fn assert_answered_once_replicated<E: std::fmt::Debug>(
   );
 }
 
+/// `work` submitted by `holder` until answered within the placement deadline: the holder's routing learns the green's
+/// new owner within the takeover, and until then its ask is answered retryable, so the submit is resent. Whether it was
+/// answered, and the last reply.
+fn submit_until_answered(
+  holder: &mut Client,
+  survivors: &[&Daemon],
+  work: VolumeId,
+) -> (bool, Option<ReplyBody>) {
+  let mut submitted = None;
+  let answered = poll_until(survivors, PLACEMENT_DEADLINE, || {
+    let reply = holder
+      .try_call(&RequestBody::submit(work, Vec::new()), *DEADLINE_NS)
+      .unwrap_or_else(|e| refused_placeholder(&e));
+    let done = matches!(reply, ReplyBody::Submitted { .. });
+    submitted = Some(reply);
+    Ok(done)
+  });
+  (answered, submitted)
+}
+
+/// The submit answered at version 2.
+fn assert_submitted_at_two(submitted: Option<&ReplyBody>) {
+  assert!(
+    matches!(
+      submitted,
+      Some(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      })
+    ),
+    "{submitted:?}"
+  );
+}
+
+/// A-697 part f (takeover; §4.8 "Promotion and takeover"): a holder's work goes on after its green's owner dies, its
+/// verdict taken by position at the green's successor. Do: three nodes at `f = 1`; on a, a green at version 1 (`f`
+/// holding "hello") shared with the fleet; the survivor that does not take the green over (the holder) makes a work
+/// over it, as its replica's holder, and inserts " world" into `f`; both survivors replicate version 1; a dies; once
+/// the successor has taken the green over, the holder submits its work. Expect: the work made on the holder (its id
+/// names the holder); the submit answered version 2, its verdict computed on the holder's replica and taken by position
+/// at the successor (both counters moved); the successor's green reads "hello world" at its head.
+#[test]
+fn a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let (green, owners_work) = green_with_work(&mut owner, "holder-takeover", &daemons);
+  commit_version(&mut owner, owners_work, (0, "hello"), 1);
+  drop(owner);
+  let successor_host = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(green.bytes))
+    .expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let holder_index = 1 - successor_index;
+  await_replicated(&daemons[1 + holder_index], green, 1);
+  let mut holder = Client::connect(daemons[1 + holder_index].instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("the holder made the work at base 1: {created:?}");
+  };
+  edit_work(&mut holder, work, 5, " world");
+  let (both_at_one, unowned) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let taken_over = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  let computed_before = count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap();
+  let taken_before =
+    count_on(&daemons[successor_index], "merge.verdict.taken_by_position").unwrap();
+  let (answered, submitted) = submit_until_answered(&mut holder, &survivors, work);
+  let computed =
+    count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap() - computed_before;
+  let taken =
+    count_on(&daemons[successor_index], "merge.verdict.taken_by_position").unwrap() - taken_before;
+  let view = observe_taken_over_green(&daemons[successor_index], green);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(both_at_one, "both survivors replicated version 1");
+  assert!(unowned, "before the death neither survivor owned the green");
+  assert_eq!(
+    ObjectId(work.bytes).creator(),
+    hosts[1 + holder_index],
+    "the work was made on the holder"
+  );
+  assert!(taken_over, "the successor took the green over");
+  assert!(answered, "the holder's submit was answered: {submitted:?}");
+  assert_submitted_at_two(submitted.as_ref());
+  assert_committed_by_successor((computed, taken), &view);
+}
+
+/// The verdict computed on the holder's replica (`computed` moved) and taken by position at the successor (`taken`
+/// moved); the successor's green at version 2, reading "hello world".
+fn assert_committed_by_successor((computed, taken): (u64, u64), view: &TakenOverGreenView) {
+  assert!(
+    computed >= 1,
+    "the verdict was computed on the holder's replica"
+  );
+  assert!(taken >= 1, "the successor took the verdict by position");
+  assert_eq!(view.head, Ok(2), "{view:?}");
+  assert_eq!(view.at_head, Ok(b"hello world".to_vec()), "{view:?}");
+}
+
 /// A-697 part d (a holder's submit settles once its replica holds the version): in a three-node `f = 1` fleet (every
 /// node a holder, a quorum of two), A owns a green at version 1 (`f` holding "hello"), which B and C replicate; B serves
-/// works over greens A owns (the test hook) and makes one at base 1. Do: B withholds every merge record (A commits with
+/// works over A's green, which it replicates (the rule "replicated here"), and makes one at base 1. Do: B withholds every merge record (A commits with
 /// C alone); B's work edits `f` and submits; once B holds the owner's answer for a version its replica lacks, B takes
 /// records again. Expect: the submit answered `Submitted` at version 2 only after B's replica took version 2 (B's two
 /// counters, held and settled, each moved), and B's work then reads "hello world" on its new base.
@@ -21592,9 +21916,8 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   at_version_one(&mut owner, owners_work);
   let all: Vec<&Daemon> = daemons.iter().collect();
   assert_replicated_at_version_one(&all, [daemon_b, daemon_c], green);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(daemon_b, &mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21641,7 +21964,6 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
     .merge_holder_state(green)
     .map(|state| state.version);
   let works_bytes = head_bytes(&mut holder, work, "f");
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_eq!(withheld, Ok(()));
   assert_eq!(lifted, Ok(()));
   assert!(held, "B held the owner's answer for its replica");
@@ -21683,9 +22005,9 @@ fn assert_served_again_with_its_edit(
 
 /// A-697 part e, A-207 (a work comes back from its log after a restart), A-313 (a holder's replica is rebuilt from the
 /// records it holds): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a
-/// green at version 1 (`f` holding "hello") shared with B, and B, serving works over greens A owns (the test hook),
-/// makes a work over it and edits `f`. Do: restart B over its own segment (the hook is off while it recovers) and turn
-/// the hook on again; read `f` through the work until it is served; submit the work. Expect: the work served again with
+/// green at version 1 (`f` holding "hello") shared with B, and B, serving works over it as its replica's holder (the rule
+/// "replicated here"), makes a work over it and edits `f`. Do: restart B over its own segment; read `f` through the work
+/// until it is served; submit the work. Expect: the work served again with
 /// its edit, "hello world", replayed over B's replica of the green (B's counter moved), never refused for good; its
 /// submit answered version 2.
 #[test]
@@ -21763,9 +22085,8 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
     Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
   });
   assert!(replicated, "B replicates the green at version 1");
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemons[1], &mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21787,7 +22108,6 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
       source(1),
     ),
   );
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
   let mut last: Result<Vec<u8>, Box<ReplyBody>> = Err(Box::new(ReplyBody::Acknowledged));
   let refs: Vec<&Daemon> = daemons.iter().collect();
@@ -21832,7 +22152,7 @@ fn assert_rebased_on_the_replica(
 
 /// A-697 (a holder's work rebased over the holder's replica; A-658: a rebase is a pure function of the versions it maps
 /// through): in a two-node `f = 1` fleet, A owns a green at version 1 (`f` holding "hello") shared with B, and B serves
-/// works over greens A owns (the test hook). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
+/// works over A's green, which it replicates (the rule "replicated here"). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
 /// `f` and submits, version 2; B's work rebases. Expect: answered `Rebased` at version 2, mapped on B's replica (B's
 /// counter moved); the work then reads `f` as version 2 holds it and keeps `g`; A's floor for the work rises to 2.
 #[test]
@@ -21860,9 +22180,8 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
   ));
   let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
   assert_eq!(version_of(&first), Some(1), "{first:?}");
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let wrote = edit(&mut holder, work, "g", 0, b"mine");
   assert!(matches!(
     edit(&mut owner, owners_work, "f", 5, b", there"),
@@ -21884,7 +22203,6 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
       .work_floor(green, work)
       .map(|floor| floor == Some(2))
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(wrote, ReplyBody::Edited), "{wrote:?}");
   assert_eq!(version_of(&second), Some(2), "{second:?}");
   assert!(replica_at_two, "B's replica took version 2");
@@ -21892,8 +22210,8 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
 }
 
 /// A-697 (a copy a holder's work declares, composed over the holder's replica; A-626): in a two-node `f = 1` fleet, A
-/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over greens A owns (the test
-/// hook). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
+/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over it as its replica's holder
+/// (the rule "replicated here"). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
 /// increment composed on B's replica (B's counter moved), since a copy's source is the green's; A's green reads `f2` as
 /// "hello".
 #[test]
@@ -21903,9 +22221,8 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let before = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap();
   let declared = holder.call(&RequestBody::Declare {
     work,
@@ -21919,7 +22236,6 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
   let composed_here = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap() - before;
   let copied = head_bytes(&mut owner, green, "f2");
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(declared, ReplyBody::Declared), "{declared:?}");
   assert!(
     matches!(
@@ -22011,7 +22327,7 @@ fn assert_released_and_made_again(
 
 /// A-697 part e2 (a holder creation a restart caught waiting for its admission releases the owner's floor before it is
 /// dropped): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a green at
-/// version 1 shared with B, and B serves works over greens A owns (the test hook). Do: B loses the next admission its
+/// version 1 shared with B, and B serves works over it as its replica's holder (the rule "replicated here"). Do: B loses the next admission its
 /// owner answers, so a creation's answer is lost after A recorded the work's floor; restart B over its own segment; then
 /// create a work of the same name on B. Expect: the lost creation answered retryable and A holding a floor for a work
 /// whose id names B; after the restart A's floor for that work released (B's counter moved), never left holding the
@@ -22091,7 +22407,6 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
     Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
   });
   assert!(replicated, "B replicates the green at version 1");
-  daemons[1].serve_works_on_holders(true).unwrap();
   lose_every_next_owner_answer(&daemons[1]);
   let floors_before = daemons[0].work_floors_of(green).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
@@ -22122,7 +22437,6 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   let released_count = daemons[1]
     .refusals_on_every_shard()
     .map(|counts| counts.get("merge.work.admission_released").copied());
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
   let made = holder.call(&RequestBody::CreateWork {
     green,
@@ -22199,6 +22513,7 @@ fn bench_green(owner: &mut Client, daemon_b: &Daemon, name: &str) -> VolumeId {
     ),
     "{first:?}"
   );
+  await_replicated(daemon_b, green, 1);
   green
 }
 
@@ -22232,7 +22547,7 @@ fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) ->
 
 /// A-697's measured breakdown (main's ruling of 2026-11-20: the by-reference forward is measured before and after,
 /// release, best of N with every N shown). Ignored: a benchmark, run by its recorded command, never by the suite. Do: in
-/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over greens A owns (the test hook), for
+/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over it as its replica's holder (the rule "replicated here"), for
 /// each size in `SLATES_A697_BENCH_MIB` (comma-separated MiB, default 4) and `SLATES_A697_BENCH_RUNS` runs (default 3):
 /// a work on B (the holder) and one on A (local) each write a file of that size and submit. Prints, a line a submit, its
 /// wall time and every phase's count and milliseconds (both daemons' counters, the submit's own delta), and asserts
@@ -22255,7 +22570,6 @@ fn bench_a697_holder_and_local_submit_phases() {
   let fresh = std::env::var("SLATES_A697_BENCH_FRESH").is_ok_and(|fresh| fresh == "1");
   let mut owner = Client::connect(&instance_a);
   let shared = bench_green(&mut owner, &daemon_b, "bench-green");
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
   for bytes in sizes {
     for run in 0..runs {
@@ -22303,7 +22617,6 @@ fn bench_a697_holder_and_local_submit_phases() {
       }
     }
   }
-  daemon_b.serve_works_on_holders(false).unwrap();
 }
 
 /// AUD-11, §4.9 (a forwarded write whose acceptance waits for its quorum commit is answered by the commit, not by a
@@ -22420,6 +22733,88 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
     "each forward woken by the session's return: {before:?} then {after:?}"
   );
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
+/// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of
+/// 2026-11-20 after A-697's release bench, which measured a holder version's inputs shipped back in three shipments).
+/// Do: in a two-node `f = 1` fleet, B serving works over A's green as its replica's holder, a work on B writes a file of 256
+/// KiB and submits; then a work on A does the same. Expect: both answered `Submitted`; B held its composed increment as
+/// the version's inputs and A was told so; no input chunk was shipped for B's version, while A's own version shipped
+/// its chunks to B (the control, so the count is not vacuous).
+#[test]
+fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "inputs-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let bytes = 256 * 1024;
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let holders_work = bench_work(&mut holder, green, "inputs-holder", bytes);
+  let before = count("merge.inputs.chunks_shipped");
+  let held_before = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let holders = holder.call(&RequestBody::submit(holders_work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let holders_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let after_holders = count("merge.inputs.chunks_shipped");
+  let held_after = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let owners_work = bench_work(&mut owner, green, "inputs-owner", bytes);
+  let owners = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let owners_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 3)
+  });
+  let after_owners = count("merge.inputs.chunks_shipped");
+  assert!(
+    matches!(
+      holders,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{holders:?}"
+  );
+  assert!(
+    matches!(
+      owners,
+      ReplyBody::Submitted {
+        version: Some(3),
+        ..
+      }
+    ),
+    "{owners:?}"
+  );
+  assert!(
+    holders_placed && owners_placed,
+    "both versions placed at the quorum"
+  );
+  assert_eq!(
+    after_holders - before,
+    0,
+    "no input chunk shipped back to B for its own version"
+  );
+  assert_eq!(
+    (held_after.0 - held_before.0, held_after.1 - held_before.1),
+    (1, 1),
+    "B held its composed inputs, and A was told so"
+  );
+  assert!(
+    after_owners > after_holders,
+    "A's own version shipped its chunks to B: {after_holders} then {after_owners}"
+  );
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
@@ -25102,6 +25497,7 @@ fn a_submit_to_a_green_on_a_non_control_shard_is_answered_once_its_record_commit
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit is accepted once its record commits; the record placed {placed:?}; the owner's merge counters \
      {counters:?}"
@@ -25221,6 +25617,7 @@ fn a_work_catalog_with_no_session_to_ship_over_waits_for_the_period() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "once the sessions returned the catalog committed and the submit was answered"
   );
@@ -25344,6 +25741,7 @@ fn a_submit_made_while_the_council_forms_is_answered_once_its_record_commits() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "accepted as version 1"
   );
@@ -25403,6 +25801,7 @@ fn a_submit_at_f1_is_answered_without_waiting_for_the_coordinators_period() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -25490,6 +25889,7 @@ fn a_merge_version_reaches_each_holder_with_its_inputs_in_one_exchange() {
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: 0,
+        identical: false,
       },
       "submit {index} is accepted as the next version"
     );
@@ -27375,6 +27775,7 @@ fn check_resent_after_restart(seen: ResentAfterRestart) {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent under its id after the restart is answered the version it was accepted as: {:?}",
     seen.counters
@@ -28406,6 +28807,137 @@ fn a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_gre
   );
 }
 
+/// A-775 for greens (§4.16 "Green owner loss in a fleet"; main's piece, 2026-11-20): a taken-over green given up while
+/// the only other holder of the inputs it lacked was away is served once that holder is heard again. Do: three nodes at
+/// `f = 1`; on a, a green advanced to version 2 on both holders, then to 3 on a and the other holder alone (the
+/// successor refusing content puts, as in `a_successor_one_version_behind_fetches_the_versions_inputs_and_serves_the_green`);
+/// the other holder leaves the successor's content requests unanswered (`Daemon::inject_holder_silence`); a dies; once
+/// the successor first waits on the inputs, it no longer hears the other holder on the probe plane; once it has given
+/// the green up, the holder answers and is heard again. Expect the green given up, judged afresh, placed at version 3 and
+/// served with the owner's head bytes. Before, a given-up green was final until a new configuration.
+#[test]
+fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_is_heard_again() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "green-heard-again", &daemons);
+  let object = ObjectId(green.bytes);
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  let other_host = hosts[1 + other_index];
+  commit_version(&mut client, work, (0, "hello"), 1);
+  commit_version(&mut client, work, (5, " world"), 2);
+  let (both_at_two, unowned) = holders_before_owner_death_at(&daemons, green, 2);
+  daemons[1 + successor_index]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+      refuse_work_catalogs: false,
+    })
+    .expect("the successor's refusal of content puts installs");
+  commit_version(&mut client, work, (11, "!"), 3);
+  let other_at_three = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      daemons[1 + other_index]
+        .merge_holder_state(green)
+        .map(|state| state.version == Some(3))
+    },
+  );
+  let successor_at_death = daemons[1 + successor_index].merge_holder_state(green);
+  let silent = daemons[1 + other_index]
+    .inject_holder_silence(&[successor_host])
+    .is_ok();
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let counted = |daemon: &Daemon, name: &str| {
+    daemon
+      .refusals_on_every_shard()
+      .map(|counted| counted.get(name).copied().unwrap_or(0))
+  };
+  let waits_inputs = silent
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_waits_inputs")? > 0),
+    );
+  let away = waits_inputs
+    && daemons[successor_index]
+      .inject_probe_deafness(&[other_host])
+      .is_ok();
+  let given_up = away
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || promise_wait_periods(&survivors).saturating_mul(4),
+      || Ok(counted(&daemons[successor_index], "merge.takeover_given_up")? > 0),
+    );
+  let back = daemons[other_index].inject_holder_silence(&[]).is_ok()
+    && daemons[successor_index].inject_probe_deafness(&[]).is_ok();
+  let placed = back
+    && poll_for_live_periods(
+      &survivors,
+      RETIREMENT_DEADLINE,
+      || readmission_periods(&survivors).saturating_mul(2),
+      || daemons[successor_index].merge_record_placed(green, 3),
+    );
+  let judged = counted(&daemons[successor_index], "merge.takeover_judged_afresh");
+  let silenced = counted(&daemons[other_index], "fleet.holder.silenced_by_fault");
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "a green given up while its inputs' holder was away: waited on inputs {waits_inputs}, given up {given_up}, \
+     silenced {silenced:?}, back {back}, judged afresh {judged:?}, placed {placed}, served {served:?}"
+  );
+  expect_the_successor_one_version_behind(
+    (both_at_two, unowned),
+    other_at_three,
+    successor_at_death.map(|state| state.version),
+  );
+  assert!(
+    given_up && silenced.as_ref().is_ok_and(|silenced| *silenced > 0),
+    "the successor gave the green up while the holder of its inputs was away ({silenced:?} answers withheld)"
+  );
+  assert!(
+    placed,
+    "the successor placed the green at version 3 once the holder was heard again"
+  );
+  assert!(
+    judged.as_ref().is_ok_and(|judged| *judged >= 1),
+    "the successor judged the green afresh ({judged:?})"
+  );
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+}
+
 /// Waits, within the placement deadline in the survivors' own periods, for `daemon`'s verdict on the taken-over
 /// `green`: placed at `version`, or given up at its bound. The verdict is read again by the caller.
 fn await_placed_or_given_up(survivors: &[&Daemon], daemon: &Daemon, green: VolumeId, version: u64) {
@@ -28883,6 +29415,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -28909,6 +29442,7 @@ fn a_submit_resent_after_two_takeovers_in_sequence_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend after two takeovers in sequence is answered the version it was accepted as"
   );
@@ -28991,6 +29525,7 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the submit committed at version 1"
   );
@@ -29424,6 +29959,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29447,6 +29983,7 @@ fn a_submit_resent_after_its_owner_was_taken_over_is_answered_its_version() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the resend through the takeover is answered the version it was accepted as"
   );
@@ -29597,6 +30134,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }),
     "the submit committed at version 1"
   );
@@ -29628,6 +30166,7 @@ fn a_works_route_ends_once_the_greens_owner_holds_none_of_its_completions() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "the route answered the resend the version it was accepted as"
   );
@@ -33689,6 +34228,7 @@ fn a_submit_whose_answer_was_lost_with_its_owner_is_answered_its_version_by_the_
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit resent after its owner died is answered its version by the green's successor"
   );
@@ -33822,6 +34362,7 @@ fn a_versions_merge_record_waits_for_its_works_catalog_record() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its record committed"
   );
@@ -33954,6 +34495,7 @@ fn a_submit_off_its_greens_shard_waits_for_its_works_catalog_record_before_its_v
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the submit was answered its version once its route and its record committed"
   );
@@ -34155,6 +34697,7 @@ fn a_request_id_copied_into_another_session_reaches_no_completion_through_a_take
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "the victim's own resend is answered its version"
   );
@@ -34336,6 +34879,7 @@ fn a_survivor_holding_no_copy_of_the_works_catalog_learns_its_green_from_a_locat
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     })),
     "d's resend is answered its version through the green the location round named"
   );
