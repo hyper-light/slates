@@ -1,5 +1,12 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
+> Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
+> `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
+> agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
+> watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
+> The same test on origin/main alone: kiln r29.
+
 > **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
 > `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
