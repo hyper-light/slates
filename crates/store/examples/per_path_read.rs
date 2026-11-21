@@ -85,22 +85,19 @@ struct Read {
   len: u64,
 }
 
-fn main() {
-  let arguments: Vec<String> = std::env::args().skip(1).collect();
-  let root = std::path::PathBuf::from(&arguments[0]);
-  let store_dir = std::path::PathBuf::from(&arguments[1]);
-  let samples: usize = arguments[2].parse().unwrap();
-  // The changesets to land, from the first: all of them unless a fourth argument bounds them (a quick run).
-  let landing: usize = arguments
-    .get(3)
-    .map_or(usize::MAX, |count| count.parse().unwrap());
-  let requires = std::fs::read_to_string(root.join(".hg/requires")).unwrap_or_default();
-  let source = Source {
-    dotencode: requires.lines().any(|line| line == "dotencode"),
-    root: root.clone(),
-  };
+/// The file revisions of `read` by the changeset (link) that made them, in link order.
+fn grouped_by_link(read: &[Read]) -> BTreeMap<u32, Vec<usize>> {
+  let mut by_link: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+  for (at, r) in read.iter().enumerate() {
+    by_link.entry(r.link).or_default().push(at);
+  }
+  by_link
+}
+
+/// Every tracked path of the repository at `root`, read from its store's fncache (each `data/<path>.i`).
+fn tracked_paths(root: &std::path::Path) -> Vec<Vec<u8>> {
   let fncache = std::fs::read(root.join(".hg/store/fncache")).unwrap();
-  let paths: Vec<Vec<u8>> = fncache
+  fncache
     .split(|byte| *byte == b'\n')
     .filter_map(|line| {
       line
@@ -108,10 +105,12 @@ fn main() {
         .strip_suffix(b".i")
         .map(<[u8]>::to_vec)
     })
-    .collect();
+    .collect()
+}
 
-  // Every file revision read once, each text rebuilt and hashed (the intake's work, timed apart).
-  let started = Instant::now();
+/// Every file revision of every one of `paths` read once from `source`: its chunk, link, base, and its whole text's
+/// identity and length.
+fn read_every_revision(source: &Source, paths: &[Vec<u8>]) -> Vec<Read> {
   let mut read: Vec<Read> = Vec::new();
   for (path_index, path) in paths.iter().enumerate() {
     let store_path = [b"data/".as_slice(), path, b".i"].concat();
@@ -133,6 +132,28 @@ fn main() {
       });
     }
   }
+  read
+}
+
+fn main() {
+  let arguments: Vec<String> = std::env::args().skip(1).collect();
+  let root = std::path::PathBuf::from(&arguments[0]);
+  let store_dir = std::path::PathBuf::from(&arguments[1]);
+  let samples: usize = arguments[2].parse().unwrap();
+  // The changesets to land, from the first: all of them unless a fourth argument bounds them (a quick run).
+  let landing: usize = arguments
+    .get(3)
+    .map_or(usize::MAX, |count| count.parse().unwrap());
+  let requires = std::fs::read_to_string(root.join(".hg/requires")).unwrap_or_default();
+  let source = Source {
+    dotencode: requires.lines().any(|line| line == "dotencode"),
+    root: root.clone(),
+  };
+  let paths = tracked_paths(&root);
+
+  // Every file revision read once, each text rebuilt and hashed (the intake's work, timed apart).
+  let started = Instant::now();
+  let read = read_every_revision(&source, &paths);
   let text_of: HashMap<(usize, u32), ([u8; 32], u64)> = read
     .iter()
     .map(|r| ((r.path, r.rev), (r.text, r.len)))
@@ -164,10 +185,7 @@ fn main() {
     },
   )
   .unwrap();
-  let mut by_link: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
-  for (at, r) in read.iter().enumerate() {
-    by_link.entry(r.link).or_default().push(at);
-  }
+  let by_link = grouped_by_link(&read);
   let staging = Staging::new(0);
   let started = Instant::now();
   let mut sequence_of: Vec<u64> = vec![0; read.len()];

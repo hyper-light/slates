@@ -24,6 +24,7 @@ const PATIENCE_NS: u64 = crate::daemon::LIVENESS_BUDGET_NS;
 /// ~60, w-perf 2026-11-20) a hook's process took past the ten windows these tests once waited, 1 run in 3, and the read
 /// that timed out returned the answer part-way, read as a wrong answer (R3, the hook test flake). Sixty windows hold
 /// three times the longest seen (22 s a test against 2.3 s).
+#[cfg(unix)]
 const HOOK_PATIENCE_NS: u64 = 60 * PATIENCE_NS;
 /// Format: what stock `svnserve` 1.15.0 wrote to stock `svn` 1.15.0 asking for [`RECORDED_URL`] under a root holding no
 /// repository: its greeting, then its refusal (recorded on the Mac Studio, 2026-11-19).
@@ -213,22 +214,9 @@ fn name_on(prefix: &str, partition: usize) -> String {
 /// Creates the Subversion repository `name` on partition `partition`, owned by [`owner`], with the defaults `slates
 /// repository create NAME --tool svn` sends (A-685).
 fn create_svn(daemon: &Daemon, partition: usize, name: &str) {
-  let name = name.to_owned();
-  let created = crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Sha1,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    )
-  });
-  assert!(!matches!(created, ReplyBody::Refused { .. }), "{created:?}");
+  // Landed on the daemon's store, then recorded, then answered by the request's route (A-767 item 7).
+  let asked = (name, VcsTool::Subversion, ObjectFormat::Sha1, "trunk");
+  crate::test_store::create_on(daemon, partition, &owner(), asked);
 }
 
 /// The token the tests' owner enrolls, the password a stock client answers CRAM-MD5's challenge with.

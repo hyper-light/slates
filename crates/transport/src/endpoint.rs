@@ -41,7 +41,7 @@ use crate::handshake::{HandshakeError, Identity, client_connection, server_conne
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::params::{ParamsError, TransportParameters};
 use crate::rtt::GRANULARITY_NS;
-use crate::session::{Frame, decode_frames, encode_frames};
+use crate::session::{Frame, decode_frames};
 
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
 /// frame cap and a receive queue's sizing derive from it.
@@ -493,6 +493,11 @@ pub struct Endpoint {
   /// Handshake fragments this end has sent (a non-vacuity counter: a test that forces a multi-fragment
   /// flight asserts this passed one).
   fragments_sent: u64,
+  /// The buffer every 1-RTT packet of [`Endpoint::flush`] is framed and sealed in, reused: it grows once to the largest
+  /// datagram this session sends and keeps that room, so a packet allocates nothing (MEMORY SIZING; main's ruling on
+  /// the lane's throughput, 2026-11-20: before, each packet allocated its payload and its datagram and copied one into
+  /// the other). Empty between packets.
+  send_buffer: Vec<u8>,
   /// Bytes of this end's handshake stream sent so far (`crate::flight`: a flight's stream start is the
   /// count before it, so a retransmit of the last flight starts at `hs_sent - flight.len()`).
   hs_sent: usize,
@@ -604,6 +609,7 @@ impl Endpoint {
       amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
+      send_buffer: Vec::new(),
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
@@ -660,6 +666,7 @@ impl Endpoint {
       amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
+      send_buffer: Vec::new(),
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
@@ -718,6 +725,7 @@ impl Endpoint {
       amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
+      send_buffer: Vec::new(),
       hs_sent: 0,
       handshake_budgets_spent: 0,
       handshake_stall: None,
@@ -1634,18 +1642,11 @@ impl Endpoint {
     // datagram may exceed it.
     let cap = self.conn.path_mtu().unwrap_or(MIN_DATAGRAM_BYTES);
     let budget = self.conn.packet_budget(self.frame_cap);
-    while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), budget) {
-      let largest_acked = self.conn.tx_largest_acked();
-      let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
-      let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames, 0)?;
-      if datagram.len() > cap {
-        return Err(EndpointError::DatagramTooLarge {
-          bytes: datagram.len(),
-          cap,
-        });
-      }
-      self.send(&datagram)?;
-    }
+    let mut buffer = std::mem::take(&mut self.send_buffer);
+    let sent = self.flush_packets(&cid, (cap, budget), &mut buffer);
+    buffer.clear();
+    self.send_buffer = buffer;
+    sent?;
     // A spent packet-number space ends the session here, typed: nothing more can be sent under these keys.
     if self.conn.packet_numbers_exhausted() {
       return Err(EndpointError::PacketNumbersExhausted);
@@ -1666,6 +1667,34 @@ impl Endpoint {
       }
     }
     Ok(())
+  }
+
+  /// Sends every packet the connection wants now, each framed and sealed in `buffer` ([`seal_in_place`]) and sent from
+  /// there: no packet allocates (`send_buffer`). A datagram past the path's `cap` is refused, typed, never sent.
+  fn flush_packets(
+    &mut self,
+    cid: &ConnectionId,
+    (cap, budget): (usize, usize),
+    buffer: &mut Vec<u8>,
+  ) -> Result<(), EndpointError> {
+    loop {
+      buffer.clear();
+      buffer.resize(SEALED_PAYLOAD_AT, 0);
+      let Some(pn) = self.conn.poll_transmit_into(now_ns(), budget, buffer) else {
+        return Ok(());
+      };
+      let largest_acked = self.conn.tx_largest_acked();
+      let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
+      let start = seal_in_place(keys, cid, (pn, largest_acked), buffer, 0)?;
+      let datagram = buffer.get(start..).ok_or(EndpointError::NotReady)?;
+      if datagram.len() > cap {
+        return Err(EndpointError::DatagramTooLarge {
+          bytes: datagram.len(),
+          cap,
+        });
+      }
+      self.send(datagram)?;
+    }
   }
 
   /// Receives one packet, but waits at most `timeout_ns` for it, and folds it into the connection:
@@ -2235,11 +2264,9 @@ impl Endpoint {
   }
 }
 
-/// Protects `frames` into a packet to RFC 9001 shape under `keys` (pure — no socket, no state). Builds
-/// a short header (fixed bit set, the packet-number length in its low bits) carrying `pn` truncated to
-/// the fewest bytes `largest_acked` allows, pads the frame bytes up to the length header protection
-/// needs to sample, AEAD-seals them under the local 1-RTT packet key with that header as associated
-/// data, then masks the first byte and the packet-number field with the local header-protection key.
+/// Protects `frames` into a packet to RFC 9001 shape under `keys` (pure — no socket, no state), in a buffer of its own
+/// sealed by [`seal_in_place`]: what a rare packet (a handshake confirmation, a path-MTU probe) and the tests take. A
+/// session's data packets are sealed in its reused buffer instead ([`Endpoint::flush`]), allocating nothing.
 fn protect_packet(
   keys: &mut crate::keys::OneRtt,
   cid: &ConnectionId,
@@ -2248,26 +2275,57 @@ fn protect_packet(
   frames: &[Frame],
   pad_to: usize,
 ) -> Result<Vec<u8>, EndpointError> {
-  // The short header: fixed bit set, spin/reserved/key-phase zero, low bits = packet-number length; then
-  // the connection id, then the packet number.
+  let mut buffer = vec![0u8; SEALED_PAYLOAD_AT];
+  for frame in frames {
+    frame.encode_into(&mut buffer);
+  }
+  let start = seal_in_place(keys, cid, (pn, largest_acked), &mut buffer, pad_to)?;
+  Ok(buffer.split_off(start))
+}
+
+/// Format: where a packet's frames begin in a buffer [`seal_in_place`] seals: after room for the longest short header
+/// (the first byte, the connection id and the longest packet number), so the header is written just before them once
+/// the packet number's length is known.
+const SEALED_PAYLOAD_AT: usize = PACKET_NUMBER_OFFSET + MAX_PACKET_NUMBER_BYTES as usize;
+
+/// Seals 1-RTT packet `pn` in place in `buffer`, whose frames' bytes start at [`SEALED_PAYLOAD_AT`]: writes the short
+/// header (the fixed bit, the key phase, the packet number's length; the connection id; the packet number, sized
+/// against `largest_acked`) just before the frames, pads them so header protection can sample the ciphertext (and a
+/// path-MTU probe to exactly `pad_to` bytes on the wire), seals them under the header as associated data, appends the
+/// tag and applies header protection. Returns where the datagram starts in `buffer`; it runs to the buffer's end.
+/// Nothing is allocated past `buffer`'s own growth.
+fn seal_in_place(
+  keys: &mut crate::keys::OneRtt,
+  cid: &ConnectionId,
+  (pn, largest_acked): (u64, Option<u64>),
+  buffer: &mut Vec<u8>,
+  pad_to: usize,
+) -> Result<usize, EndpointError> {
   let encoded = encode_packet_number(pn, largest_acked);
   let pn_len = encoded.len();
+  let header_len = PACKET_NUMBER_OFFSET.saturating_add(pn_len);
+  let start = SEALED_PAYLOAD_AT
+    .checked_sub(header_len)
+    .ok_or(EndpointError::NotReady)?;
   // The generation that seals this packet, and its key-phase bit (an update happens here when due).
   let phase = keys.seal(pn).map_err(EndpointError::KeysExhausted)?;
   let phase_bit = if phase { KEY_PHASE_BIT } else { 0 };
   let first_byte = FIXED_BIT | phase_bit | u8::try_from(pn_len.saturating_sub(1)).unwrap_or(0);
-  let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET.saturating_add(pn_len));
-  packet.push(first_byte);
-  packet.extend_from_slice(cid);
-  packet.extend_from_slice(encoded.as_slice());
-  let header_len = packet.len();
-
-  // The frame bytes, padded (RFC 9000 §19.1 PADDING = zero bytes) so the packet is long enough that
-  // header protection can sample the ciphertext even without counting the tag.
+  {
+    let header = buffer
+      .get_mut(start..SEALED_PAYLOAD_AT)
+      .ok_or(EndpointError::NotReady)?;
+    let (first, rest) = header.split_first_mut().ok_or(EndpointError::NotReady)?;
+    *first = first_byte;
+    let (id, number) = rest
+      .split_at_mut_checked(cid.len())
+      .ok_or(EndpointError::NotReady)?;
+    id.copy_from_slice(cid);
+    number.copy_from_slice(encoded.as_slice());
+  }
+  // The frame bytes, padded (RFC 9000 §19.1 PADDING = zero bytes) so the packet is long enough that header protection
+  // can sample the ciphertext even without counting the tag; a path-MTU probe further, to exactly `pad_to` bytes.
   let sample_len = keys.local_header().sample_len();
-  // A path-MTU probe is padded further, to exactly `pad_to` bytes on the wire (`crate::pmtud`); every
-  // other packet passes zero and is only padded for the sample.
-  let mut payload = encode_frames(frames);
   let min_payload = HEADER_PROTECTION_SAMPLE_OFFSET
     .saturating_add(sample_len)
     .saturating_sub(header_len)
@@ -2276,19 +2334,22 @@ fn protect_packet(
         .saturating_sub(header_len)
         .saturating_sub(AEAD_TAG_BYTES),
     );
-  if payload.len() < min_payload {
-    payload.resize(min_payload, 0);
+  let payload_len = buffer.len().saturating_sub(SEALED_PAYLOAD_AT);
+  if payload_len < min_payload {
+    buffer.resize(SEALED_PAYLOAD_AT.saturating_add(min_payload), 0);
   }
-
-  // AEAD-seal the payload with the plaintext header as associated data, then assemble the packet.
-  let tag = keys
-    .local_packet()
-    .encrypt_in_place(pn, &packet, &mut payload)?;
-  packet.extend_from_slice(&payload);
-  packet.extend_from_slice(tag.as_ref());
-
-  // Apply header protection: sample the ciphertext, mask the first byte and packet-number field. The
-  // padding above makes the packet long enough; a shorter one is refused, never indexed past its end.
+  // AEAD-seal the payload with the plaintext header as associated data, then the tag after it.
+  let tag = {
+    let (head, payload) = buffer
+      .split_at_mut_checked(SEALED_PAYLOAD_AT)
+      .ok_or(EndpointError::NotReady)?;
+    let header = head.get(start..).ok_or(EndpointError::NotReady)?;
+    keys.local_packet().encrypt_in_place(pn, header, payload)?
+  };
+  buffer.extend_from_slice(tag.as_ref());
+  // Apply header protection: sample the ciphertext, mask the first byte and packet-number field. The padding above
+  // makes the packet long enough; a shorter one is refused, never indexed past its end.
+  let packet = buffer.get_mut(start..).ok_or(EndpointError::NotReady)?;
   let (head, tail) = packet
     .split_at_mut_checked(HEADER_PROTECTION_SAMPLE_OFFSET)
     .ok_or(EndpointError::NotReady)?;
@@ -2300,14 +2361,9 @@ fn protect_packet(
   keys
     .local_header()
     .encrypt_in_place(sample, first, number)?;
-  Ok(packet)
+  Ok(start)
 }
 
-/// Unprotects a received packet to RFC 9001 shape under `keys`, returning the reconstructed packet
-/// number and the frames (pure — no socket, no state). Removes header protection (sampling the still-
-/// encrypted ciphertext to unmask the first byte and packet-number field), validates the short header,
-/// reconstructs the full number against `rx_largest`, then AEAD-opens the payload under the remote
-/// 1-RTT key with the unmasked header as associated data.
 fn unprotect_packet(
   keys: &mut crate::keys::OneRtt,
   cid: &ConnectionId,

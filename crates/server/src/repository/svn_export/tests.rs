@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{DUMP_FILE, ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{DUMP_FILE, ObjectFormat, Refusal, ReplyBody, VcsTool};
 use slates_svn::commit::record::Record;
 use slates_svn::dump::Format;
 use slates_wire::request::RequestId;
@@ -19,7 +19,6 @@ use crate::state::ShardState;
 use crate::vcs_store::svn_import::tests::{
   FULL, FULL_LAST, PART1, PART2, imported, owner, subversion,
 };
-use crate::verbs::dispatch;
 
 /// Shape: the first revision of `part2.dump` (`make-fixtures.sh` dumps `--incremental -r 4:13` into it).
 const PART2_FIRST: u64 = 4;
@@ -47,7 +46,7 @@ fn stranger() -> Principal {
 
 /// A Subversion repository `name` holding `full.dump`'s history, imported in its two parts: its id and its green.
 async fn holding_the_full_history(name: &str) -> (RepositoryId, DbVolumeId) {
-  let (id, green) = on(|state| subversion(state, name));
+  let (id, green) = subversion(name).await;
   for part in [PART1, PART2] {
     let (loaded, _) = imported(id, part).await;
     assert!(loaded.is_ok(), "{loaded:?}");
@@ -305,23 +304,6 @@ fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
   });
 }
 
-/// Creates a git repository `name` on the shard.
-fn git(state: &mut ShardState, name: &str) {
-  let reply = dispatch(
-    state,
-    1,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Git,
-      format: ObjectFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
-}
-
 /// A-652 part 3 (refused by kind before anything is made). Do: ask for an export of a repository nobody made, of the
 /// owner's repository as another principal, of a git repository, of a range whose first revision is past its last and
 /// of one past the youngest revision (in `svn_repos_dump_fs4`'s words), into the name the repository's green holds,
@@ -331,8 +313,9 @@ fn git(state: &mut ShardState, name: &str) {
 fn t_a652_an_export_is_refused_by_kind_before_anything_is_made() {
   stored(|| async move {
     let (_, green) = holding_the_full_history("svn").await;
+    // A git repository made through a client's request, as every creation on a store-backed daemon is (A-767 item 7).
+    crate::test_store::created(&owner(), ("git", VcsTool::Git, ObjectFormat::Sha1, "main")).await;
     on(|state| {
-      git(state, "git");
       let own = owner();
       let bad = |reason: &str| Refusal::BadRequest {
         reason: reason.to_owned(),

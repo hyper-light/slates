@@ -353,9 +353,9 @@ mod tests {
     let identity = *blake3::hash(&first).as_bytes();
     let (sent, got) = std::sync::mpsc::channel();
     let (one, two) = (first.clone(), second.clone());
-    crate::daemon::observe_first(&daemon, move |state| {
-      let (repository, _) = crate::repository::svn_commit::tests::subversion(state, "deltify");
+    crate::daemon::observe_first(&daemon, move |_state| {
       let task = slates_rt::futures::spawn(async move {
+        let (repository, _) = crate::repository::svn_commit::tests::subversion("deltify").await;
         let added = land(repository, 0, slates_svn::index::Action::Add, one).await;
         let changed = land(repository, 1, slates_svn::index::Action::Modify, two).await;
         let _ = sent.send((repository, added, changed));

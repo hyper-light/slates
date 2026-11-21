@@ -1123,6 +1123,13 @@ impl HostFs for S3Host {
     Ok(self.complete(&path)?.fingerprint)
   }
 
+  /// A directory's identity needs no fetch: the base's device, its path's number and no birth, as its listing's
+  /// fingerprint states them ([`S3Host::dir_fingerprint`]); its count and times are zero here.
+  fn identify_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    let path = self.dir_path(dir)?;
+    Ok(self.dir_fingerprint(&path, 0, 0, 0))
+  }
+
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
     let path = self.dir_path(dir)?;
     self.ask_listing(&path)?;
@@ -1530,6 +1537,25 @@ mod tests {
       "its landing settles the fetch both misses named"
     );
     assert_eq!(host.list(root).unwrap().len(), 1);
+  }
+
+  /// A-791 (an image of a volume over an S3 base never waits on its store): do ask the root's identity before anything
+  /// is listed, then land its listing and ask its whole fingerprint. Expect the identity answered with no fetch asked,
+  /// and the same object (`same_object`) as the fingerprint the listing gives, so a recovery that recorded the identity
+  /// holds the listed directory to it.
+  #[test]
+  fn a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s() {
+    let mut host = host_over(64);
+    let mut store = SimS3::new(false, clock);
+    store.put("base/a", b"a");
+    let root = host.root();
+    let identity = host.identify_dir(root).unwrap();
+    assert_eq!(host.next_fetch(), None, "the identity asks no fetch");
+    let listed = settle(&mut host, &mut store, |host| host.fingerprint_dir(root)).unwrap();
+    assert!(
+      identity.same_object(&listed),
+      "{identity:?} is the listed {listed:?}"
+    );
   }
 
   /// A-524 (a listing serves for the path's round trip): do land the root's listing, list within one measured round

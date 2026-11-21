@@ -411,15 +411,7 @@ pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> 
     read_whole(state);
   }
   let mut rows: Vec<(String, u64)> = Vec::new();
-  for (range, name) in RANGES.iter().enumerate() {
-    if let Some(found) = figure(&state.content_sweep, range) {
-      rows.push((format!("{PREFIX}{name}.bytes"), found.bytes));
-      rows.push((format!("{PREFIX}{name}.resident"), found.resident));
-      if let Some(modified) = found.modified {
-        rows.push((format!("{PREFIX}{name}.modified"), modified));
-      }
-    }
-  }
+  range_rows(&state.content_sweep, &mut rows);
   rows.push((
     format!("{PREFIX}arena.allocated"),
     u64::try_from(state.store.content.allocated_bytes()).unwrap_or(u64::MAX),
@@ -468,6 +460,29 @@ pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> 
   }
   // The runtime's own counters, the shard's since its start: steps, polls, polls past their allowance, the longest
   // poll, and polls by length (A-783; `crates/cli/bench/pacing_ab.py` reads them before and after its pushes).
+  runtime_rows(&mut rows);
+  rows
+    .into_iter()
+    .map(|(kind, count)| RefusalCount { kind, count })
+    .collect()
+}
+
+/// Each range's last figures, as rows: its bytes, resident bytes and, where the OS says, modified bytes.
+fn range_rows(sweep: &Sweep, rows: &mut Vec<(String, u64)>) {
+  for (range, name) in RANGES.iter().enumerate() {
+    if let Some(found) = figure(sweep, range) {
+      rows.push((format!("{PREFIX}{name}.bytes"), found.bytes));
+      rows.push((format!("{PREFIX}{name}.resident"), found.resident));
+      if let Some(modified) = found.modified {
+        rows.push((format!("{PREFIX}{name}.modified"), modified));
+      }
+    }
+  }
+}
+
+/// The runtime's own counters, the shard's since its start, as rows: steps, polls, polls past their allowance, the
+/// longest poll, and polls by length (A-783).
+fn runtime_rows(rows: &mut Vec<(String, u64)>) {
   if let Some(counters) = slates_rt::registry::with_current(|context| context.counters()) {
     for (name, count) in [
       ("rt.steps", counters.steps),
@@ -487,10 +502,6 @@ pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> 
       }
     }
   }
-  rows
-    .into_iter()
-    .map(|(kind, count)| RefusalCount { kind, count })
-    .collect()
 }
 
 /// A range's last figures: the anchor's objects whole from their per-mapping read ([`read_whole`]), every other range

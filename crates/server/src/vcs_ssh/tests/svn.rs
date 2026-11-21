@@ -1149,31 +1149,13 @@ fn realm_of(bytes: &[u8]) -> Vec<u8> {
 #[test]
 fn the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let created = crate::verbs::dispatch(
-      state,
-      1,
-      &principal(OWNER),
-      slates_ipc::protocol::RequestBody::CreateRepository {
-        name: REPOSITORY.to_owned(),
-        tool: slates_ipc::protocol::VcsTool::Subversion,
-        format: slates_ipc::protocol::ObjectFormat::Sha1,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    );
-    assert!(
-      !matches!(created, slates_ipc::protocol::ReplyBody::Refused { .. }),
-      "{created:?}"
-    );
-    let record = state
-      .db
-      .partition()
-      .repositories()
-      .repository_named(REPOSITORY)
-      .cloned();
-    record.expect("the repository").id
-  });
+  let asked = (
+    REPOSITORY,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Sha1,
+    "trunk",
+  );
+  let (id, _) = crate::test_store::create_on(&daemon, 0, &principal(OWNER), asked);
   let (sent, outcome) = std::sync::mpsc::sync_channel(1);
   crate::daemon::observe_first(&daemon, move |_state| {
     let task = slates_rt::futures::spawn(async move {
@@ -1422,28 +1404,17 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let importing = std::time::Instant::now();
   // The import a turn a call, as the server runs it: one call of all of it spins the shard past its watchdog window.
-  let id = crate::daemon::observe_first(&daemon, move |state| {
-    use crate::vcs_store::svn_import::tests::{DUMP, host_holding, owner, subversion};
-    let (id, _) = subversion(state, REPOSITORY);
-    let (host, root) = host_holding(&dump);
-    crate::vcs_store::svn_import::begin(state, (&owner(), id), (Box::new(host), root, DUMP))
-      .expect("the import begun");
-    id
-  });
-  loop {
-    let turned =
-      crate::daemon::observe_first(
-        &daemon,
-        move |state| match crate::vcs_store::svn_import::turn(state, id) {
-          Some(Ok(crate::vcs_store::svn_import::Turned::More)) => None,
-          other => Some(format!("{other:?}")),
-        },
-      );
-    if let Some(ended) = turned {
-      assert!(ended.starts_with("Some(Ok(Done"), "{ended}");
-      break;
-    }
-  }
+  // The import a turn at a time with a yield between, each record landed on the store before the next turn (C2).
+  let (id, loaded) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      use crate::vcs_store::svn_import::tests::{imported, subversion};
+      let (id, _) = subversion(REPOSITORY).await;
+      (id, imported(id, &dump).await.0)
+    },
+    std::time::Duration::from_secs(3600),
+  );
+  assert!(loaded.is_ok(), "{loaded:?}");
   let import = importing.elapsed();
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())

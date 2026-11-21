@@ -859,16 +859,6 @@ fn stock_svn_checks_out_commits_updates_and_logs_over_svn_ssh() {
   round_trip(&svn, &format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"));
 }
 
-/// Writes a hook program at `path` that allows what it is asked, as an administrator writes `exit 0` into a
-/// repository's `hooks/` directory, made executable.
-#[cfg(unix)]
-#[allow(clippy::disallowed_methods)]
-fn allowing_hook(path: &str) {
-  use std::os::unix::fs::PermissionsExt;
-  std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
-  std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-}
-
 /// The svn:// leg of a revision-property test: the anchor, the scratch, the client and the URL, revision 1 committed;
 /// none (the test skipped loudly) without stock Subversion 1.15 or where the platform names no issuer surface. The
 /// anchor is given a store directory in the scratch (`--vcs-store`, A-767's standing grant), where the daemon mounts a

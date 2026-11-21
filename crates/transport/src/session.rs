@@ -231,23 +231,14 @@ const STREAM_FIN: u8 = 0b0000_0001;
 
 impl Frame {
   /// Appends this frame's canonical bytes to `out`.
-  fn encode_into(&self, out: &mut Vec<u8>) {
+  pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
     match self {
       Frame::Stream {
         stream_id,
         offset,
         fin,
         data,
-      } => {
-        out.push(KIND_STREAM);
-        out.extend_from_slice(&stream_id.to_le_bytes());
-        out.extend_from_slice(&offset.to_le_bytes());
-        out.push(if *fin { STREAM_FIN } else { 0 });
-        // A frame is frame-cap-bounded, so the length fits a u32; the builder refuses an oversize
-        // frame first, so a saturating cast is only reachable by a bug.
-        out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(data);
-      }
+      } => encode_stream_frame(out, (*stream_id, *offset, *fin), data),
       Frame::Ack {
         largest,
         range,
@@ -311,6 +302,24 @@ impl Frame {
       }
     }
   }
+}
+
+/// Appends a `Stream` frame's canonical bytes for `data` at `offset` of `stream_id`, its end if `fin`, to `out`: the one
+/// encoding a held frame ([`Frame::Stream`]) and a span of a send stream's bytes (`crate::stream::StreamSpan`, encoded
+/// straight from the sender's buffer) share, so both are byte for byte the same on the wire.
+pub(crate) fn encode_stream_frame(
+  out: &mut Vec<u8>,
+  (stream_id, offset, fin): (u64, u64, bool),
+  data: &[u8],
+) {
+  out.push(KIND_STREAM);
+  out.extend_from_slice(&stream_id.to_le_bytes());
+  out.extend_from_slice(&offset.to_le_bytes());
+  out.push(if fin { STREAM_FIN } else { 0 });
+  // A frame is frame-cap-bounded, so the length fits a u32; the builder refuses an oversize frame first, so a saturating
+  // cast is only reachable by a bug.
+  out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+  out.extend_from_slice(data);
 }
 
 /// Encodes a packet payload's frame sequence to bytes.

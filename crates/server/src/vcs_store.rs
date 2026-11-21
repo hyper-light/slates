@@ -122,6 +122,9 @@ pub(crate) mod record;
 pub(crate) mod record_names;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod referenced;
+#[cfg_attr(not(test), allow(dead_code))]
+// Owed caller: w-git's C5 (the push landed on the store, its replay).
+pub(crate) mod store_packs;
 pub(crate) mod svn_deltify;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;

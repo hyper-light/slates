@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ObjectFormat, Refusal, VcsTool};
 use slates_svn::commit::drive::Work;
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::{Revision, StepRefusal};
@@ -18,7 +18,6 @@ use slates_svn::lock::{AprTime, CommitLocks};
 use super::{Committed, PROPS, UNSUPPORTED, Uncommitted};
 use crate::repository::push::AppendRefused;
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
 
 /// Shape: the date every test revision carries.
 const DATE: &str = "2026-11-19T20:00:00.000000Z";
@@ -33,26 +32,14 @@ pub(crate) fn owner() -> Principal {
   }
 }
 
-/// Creates Subversion repository `name` on the shard: its id and its one green.
-pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
-    state,
-    1,
+/// Creates Subversion repository `name` from a history running as a task on the shard, through a client's request,
+/// once its creation landed on the node's store and was recorded (A-767 item 7): its id and its one green.
+pub(crate) async fn subversion(name: &str) -> (RepositoryId, DbVolumeId) {
+  crate::test_store::created(
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Subversion,
-      format: ObjectFormat::Revisions,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let record = repositories.repository_named(name).expect("the record");
-  (record.id, to_db_volume(id))
+    (name, VcsTool::Subversion, ObjectFormat::Revisions, "main"),
+  )
+  .await
 }
 
 /// `bytes`' content identity.
@@ -306,7 +293,7 @@ pub(crate) async fn youngest_reaches(svn: RepositoryId, youngest: u64) {
 #[test]
 fn t_a655_a_subversion_repository_is_made_with_its_creation_record() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let records = on(|state| logged(state, svn));
     let sequences: Vec<_> = records
       .iter()
@@ -350,7 +337,7 @@ fn t_a655_a_subversion_repository_is_made_with_its_creation_record() {
 #[test]
 fn t_a655_a_revision_lands_as_the_greens_next_version_with_its_record() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let committed = commit((&owner(), svn), first(), None).await;
     assert_eq!(committed, answered(1));
     let seen = (
@@ -416,7 +403,7 @@ fn branched() -> Revision {
 #[test]
 fn t_a655_copies_deletions_and_a_replacement_land_on_the_green() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let after_copy = (
@@ -484,7 +471,7 @@ fn alices() -> CommitLocks {
 #[test]
 fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let locks = alices();
     let judged = Some((&locks, AprTime(1)));
@@ -530,7 +517,7 @@ fn t_a655_a_moved_work_is_judged_again_and_lands_unless_it_conflicts() {
 #[test]
 fn t_a655_a_refused_revision_changes_nothing() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let mut unbrought = revision(1, vec![file("/trunk/c.txt", Action::Add, b"c\n")], &[]);
     unbrought.contents.clear();
@@ -599,7 +586,7 @@ fn t_a655_a_refused_revision_changes_nothing() {
 #[test]
 fn t_a655_the_records_are_made_again_from_the_log() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let deleted = revision(
@@ -636,7 +623,7 @@ fn t_a655_the_records_are_made_again_from_the_log() {
 #[test]
 fn t_a698_a_clients_accepted_work_lands_through_the_step() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let work = Work {
       head: 0,
       record: RevisionRecord {
@@ -689,7 +676,7 @@ const FOLD_WITHIN: u64 = 256;
 #[test]
 fn subversion_revisions_fold_their_greens_chain_as_they_land() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let mut head = 1;
     while on(|state| state.db.partition().green_floor(green)) == 0 && head < FOLD_WITHIN {
@@ -728,7 +715,7 @@ const QUARTER_TEXT: usize = SMALL_MERGE_BUDGET / 4;
 fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget() {
   let landed = stored_configured(
     || async move {
-      let (svn, _green) = on(|state| subversion(state, "svn"));
+      let (svn, _green) = subversion("svn").await;
       let mut answers = vec![commit((&owner(), svn), first(), None).await];
       for head in 1..9u64 {
         let bytes = vec![u8::try_from(head).unwrap_or(0); QUARTER_TEXT];
@@ -766,7 +753,7 @@ fn a_repositorys_content_is_bounded_by_its_shard_not_the_partitions_merge_budget
 #[test]
 fn a_revision_refused_at_publication_leaves_the_green_where_the_log_is_and_the_next_lands() {
   let seen = stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let first_landed = commit((&owner(), svn), first(), None).await;
     let second = || {
       let rows = vec![file("/trunk/a.txt", Action::Modify, b"two\n")];
@@ -807,7 +794,7 @@ impl slates_svn::lock::HeadView for IndexHead<'_> {
 #[test]
 fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
   let seen = stored(|| async move {
-    let (svn, _green) = on(|state| subversion(state, "svn"));
+    let (svn, _green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let request = slates_svn::lock::LockRequest {
       user: Some("alice".to_owned()),
@@ -869,7 +856,7 @@ fn a_lock_verbs_entries_land_through_the_step_and_a_rebuild_keeps_them() {
 #[test]
 fn t_a664_svn_a_submitted_version_is_the_revision_the_server_makes() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "submitted"));
+    let (svn, green) = subversion("submitted").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let made = crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n");
     let version =
@@ -937,7 +924,7 @@ fn real_text(bytes: &[u8]) -> Text {
 #[test]
 fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "linked"));
+    let (svn, green) = subversion("linked").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let link = crate::vcs_store::paths::tests::Op::Declare(slates_ipc::protocol::WorkOp::Symlink {
       path: "/trunk/l".to_owned(),
@@ -984,7 +971,7 @@ fn t_a664_svn_a_submitted_symbolic_link_is_a_special_file() {
 #[test]
 fn t_a664_svn_a_submitted_copy_is_a_copy_from_row() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "copied"));
+    let (svn, green) = subversion("copied").await;
     let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
     let first = vec![
       crate::vcs_store::paths::tests::create("/trunk/a.txt", b"alpha\n"),
@@ -1079,7 +1066,7 @@ fn read_held(
 #[test]
 fn t_a745_a_fetchs_hold_reads_the_records_it_began_on_across_a_rebuild() {
   stored(|| async move {
-    let (svn, _) = on(|state| subversion(state, "held"));
+    let (svn, _) = subversion("held").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     let (_, _, charged) = on(|state| kept(state, svn));
     let retained = on(|state| state.store.budget.retained());
@@ -1154,7 +1141,7 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
 #[test]
 fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let held_by_green = |state: &mut ShardState| {
       let engine = state.greens.get(&green).expect("the green");
       let texts: [&[u8]; 5] = [b"alpha\n", b"beta\n", b"alpha 2\n", b"gamma\n", b"never\n"];
@@ -1205,7 +1192,7 @@ fn t_s4_c1_the_heads_texts_are_held_by_the_green_and_read_through_it() {
 #[test]
 fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
     assert_eq!(commit((&owner(), svn), branched(), None).await, answered(2));
     let texts: [&[u8]; 3] = [b"alpha\n", b"beta\n", b"alpha 2\n"];
@@ -1239,7 +1226,7 @@ fn t_s4_c1_a_green_made_again_holds_its_heads_texts_again_in_one_order() {
 #[test]
 fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let texts: Vec<Vec<u8>> = (0..12u32)
       .map(|at| {
         (0..50 * 1024u32)

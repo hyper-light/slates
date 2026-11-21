@@ -61,14 +61,15 @@ pub(crate) fn next_sequence(state: &ShardState, repository: RepositoryId) -> u64
   u64::try_from(named).unwrap_or(u64::MAX)
 }
 
-/// The store's header of repository `repository`'s changeset `sequence`.
-pub(crate) fn header(repository: RepositoryId, sequence: u64) -> Header {
+/// The store's header of repository `repository`'s changeset `sequence`, landed under the store's standing grant
+/// `grant` (its `G` row, R10: the landing's provenance).
+pub(crate) fn header(repository: RepositoryId, sequence: u64, grant: u64) -> Header {
   Header {
     tool: Tool::Subversion,
     repository: u128::from_be_bytes(repository.bytes),
     sequence,
     judged_over: sequence.saturating_sub(1),
-    grant: 0,
+    grant,
     work: 0,
     time_ns: slates_rt::futures::now_ns(),
     sections: 0,
@@ -89,7 +90,9 @@ pub(crate) async fn land(
   (repository, sequence): (RepositoryId, u64),
   parts: Vec<Part>,
 ) -> Result<(), Uncommitted> {
-  let landed = disk.land(header(repository, sequence), parts).await;
+  let landed = disk
+    .land(header(repository, sequence, disk.grant()), parts)
+    .await;
   let _ = crate::state::with_state(|state| match &landed {
     Ok(_) => state.count(LANDED, 1),
     Err(refused) => {

@@ -1347,6 +1347,18 @@ pub(crate) async fn unbundle(
   {
     return Some(outcome);
   }
+  landed_after_rebases(repository, (principal, bundle), &unbundle, forked, room).await
+}
+
+/// [`unbundle`]'s landing: `forked` recorded and landed in one step against the index as it is then; a fork another
+/// push made stale meanwhile re-based by node (A-720 part 2b), a slice at a time, and the landing tried again.
+async fn landed_after_rebases(
+  repository: RepositoryId,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  mut forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
   loop {
     if let Some(taken) = forked.as_mut()
       && let Err(outcome) = record_sliced(taken).await?
@@ -1359,7 +1371,7 @@ pub(crate) async fn unbundle(
         state,
         repository,
         (principal, bundle),
-        &unbundle,
+        unbundle,
         fresh,
         room,
       )),

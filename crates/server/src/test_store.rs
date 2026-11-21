@@ -87,7 +87,11 @@ impl TestStore {
 
 impl Drop for TestStore {
   fn drop(&mut self) {
-    if let Some(owner) = self.owner.take() {
+    // A test that failed may unwind while a shard that died with it still holds the store's handle, so its owner would
+    // never end: the owner is left to the process's end then, so the failure reads as itself rather than as a hang.
+    if let Some(owner) = self.owner.take()
+      && !std::thread::panicking()
+    {
       let _ = owner.stop();
     }
     let _ = std::fs::remove_dir_all(&self.dir);
@@ -102,18 +106,6 @@ pub(crate) fn root(dir: &Path) -> StoreRoot {
     issued_ns: 0,
   };
   StoreRoot::open(dir, &grant).expect("the store's root")
-}
-
-/// [`crate::daemon::audit_on_shard`] on a daemon holding a fresh store: the store stopped and removed once the history
-/// ran and the daemon stopped.
-pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
-  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
-) -> T {
-  let store = TestStore::start("audit");
-  let handle = store.handle();
-  crate::daemon::audit_on_shard_configured(history, move |config| {
-    config.vcs_disk = Some(handle);
-  })
 }
 
 /// [`crate::daemon::audit_daemon`] holding a fresh store: the store first, so a test binding both as
@@ -206,5 +198,140 @@ impl Drop for StoredDaemon {
     if let Some(daemon) = self.daemon.take() {
       daemon.stop();
     }
+  }
+}
+
+/// Shape: a reply route's client slot no client holds, so a test creation's answer is counted undeliverable.
+const NO_CLIENT: u32 = 4096;
+
+/// What a test asks a creation for: the repository's name, its tool, its object format and its default branch.
+pub(crate) type Asked<'a> = (
+  &'a str,
+  slates_ipc::protocol::VcsTool,
+  slates_ipc::protocol::ObjectFormat,
+  &'a str,
+);
+
+/// Dispatches `CreateRepository` for `asked` by `principal` as the verb runner leaves a client's request numbered
+/// `request` (its origin, its id and a reply route to a slot no client holds), so a creation on a daemon holding a store,
+/// which lands its changeset 0 before it records the repository and answers by the route (A-767 item 7), can answer:
+/// `Acknowledged` there, the reply itself otherwise.
+pub(crate) fn routed_create(
+  state: &mut crate::state::ShardState,
+  (principal, request): (&slates_db::catalog::Principal, u64),
+  (name, tool, format, default_branch): Asked<'_>,
+) -> slates_ipc::protocol::ReplyBody {
+  state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
+  state.reply_route = Some(crate::merge_service::ReplyRoute {
+    shard: state.shard,
+    client_index: NO_CLIENT,
+    request,
+    through_work: false,
+  });
+  let reply = crate::verbs::dispatch(
+    state,
+    1,
+    principal,
+    slates_ipc::protocol::RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: default_branch.to_owned(),
+      green: None,
+    },
+  );
+  // Left as the verb runner leaves them after it took a deferred acceptance.
+  state.current_request = None;
+  state.reply_route = None;
+  state.acceptance_deferred = false;
+  reply
+}
+
+/// Repository `name`'s id and the green its branch `branch` binds, once the partition records it.
+fn recorded(
+  state: &crate::state::ShardState,
+  (name, branch): (&str, &str),
+) -> Option<(
+  slates_db::catalog::RepositoryId,
+  slates_db::catalog::VolumeId,
+)> {
+  let repositories = state.db.partition().repositories();
+  let id = repositories.repository_named(name)?.id;
+  Some((id, repositories.branch(id, branch)?))
+}
+
+/// Shape: how long a test's creation may take to land and be recorded before the test fails.
+const CREATION_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Creates repository `asked` by `principal` from a history running as a task on its owner shard ([`routed_create`]),
+/// waiting for its creation to land and be recorded: its id and its root green.
+pub(crate) async fn created(
+  principal: &slates_db::catalog::Principal,
+  asked: Asked<'_>,
+) -> (
+  slates_db::catalog::RepositoryId,
+  slates_db::catalog::VolumeId,
+) {
+  let reply = crate::state::with_state(|state| routed_create(state, (principal, 1), asked))
+    .expect("the shard's state");
+  assert!(
+    !matches!(reply, slates_ipc::protocol::ReplyBody::Refused { .. }),
+    "{reply:?}"
+  );
+  let deadline = slates_rt::futures::now_ns().saturating_add(CREATION_PATIENCE.as_nanos() as u64);
+  loop {
+    if let Some(Some(made)) = crate::state::with_state(|state| recorded(state, (asked.0, asked.3)))
+    {
+      return made;
+    }
+    assert!(
+      slates_rt::futures::now_ns() < deadline,
+      "repository {} was never recorded",
+      asked.0
+    );
+    slates_rt::futures::yield_now().await;
+  }
+}
+
+/// [`created`] from the test's thread, on `daemon`'s shard of partition `partition`.
+pub(crate) fn create_on(
+  daemon: &crate::Daemon,
+  partition: usize,
+  principal: &slates_db::catalog::Principal,
+  asked: Asked<'_>,
+) -> (
+  slates_db::catalog::RepositoryId,
+  slates_db::catalog::VolumeId,
+) {
+  let (principal, name, tool, format, branch) = (
+    principal.clone(),
+    asked.0.to_owned(),
+    asked.1,
+    asked.2,
+    asked.3.to_owned(),
+  );
+  let reply = {
+    let (name, branch) = (name.clone(), branch.clone());
+    crate::daemon::observe_at(daemon, partition, move |state| {
+      routed_create(state, (&principal, 1), (&name, tool, format, &branch))
+    })
+  };
+  assert!(
+    !matches!(reply, slates_ipc::protocol::ReplyBody::Refused { .. }),
+    "{reply:?}"
+  );
+  let deadline = std::time::Instant::now() + CREATION_PATIENCE;
+  loop {
+    let (named, branch) = (name.clone(), branch.clone());
+    if let Some(made) = crate::daemon::observe_at(daemon, partition, move |state| {
+      recorded(state, (&named, &branch))
+    }) {
+      return made;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "repository {name} was never recorded"
+    );
+    std::thread::yield_now();
   }
 }

@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{ImportFault, ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{ImportFault, ObjectFormat, Refusal, ReplyBody, VcsTool};
 use slates_svn::commit::record::Record;
 use slates_svn::commit::revision::StepRefusal;
 use slates_svn::dump::{DumpError, Format};
@@ -22,7 +22,6 @@ use crate::repository::import::{ANSWERED, import_with, svn_refusal_of, svn_reply
 use crate::repository::svn_commit::Uncommitted;
 use crate::repository::svn_commit::tests::{on, rebuild, stored};
 use crate::state::ShardState;
-use crate::verbs::{dispatch, to_db_volume};
 
 /// Format 2, revisions 0 to 3 (`svnadmin dump -r 0:3`), A-593's golden vector.
 pub(crate) const PART1: &[u8] = include_bytes!("../../../../svn/fixtures/dump/part1.dump");
@@ -67,26 +66,14 @@ pub(crate) fn owner() -> Principal {
   }
 }
 
-/// Creates Subversion repository `name` on the shard: its id and its one green.
-pub(crate) fn subversion(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
-    state,
-    1,
+/// Creates Subversion repository `name` from a history running as a task on the shard, through a client's request,
+/// once its creation landed on the node's store and was recorded (A-767 item 7): its id and its one green.
+pub(crate) async fn subversion(name: &str) -> (RepositoryId, DbVolumeId) {
+  crate::test_store::created(
     &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Subversion,
-      format: ObjectFormat::Revisions,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  let ReplyBody::GreenCreated { id } = reply else {
-    panic!("no repository: {reply:?}")
-  };
-  let repositories = state.db.partition().repositories();
-  let record = repositories.repository_named(name).expect("the record");
-  (record.id, to_db_volume(id))
+    (name, VcsTool::Subversion, ObjectFormat::Revisions, "main"),
+  )
+  .await
 }
 
 /// A simulated host holding `dump` as [`DUMP`] in its root: the host and its root.
@@ -107,6 +94,8 @@ pub(crate) async fn imported(id: RepositoryId, dump: &[u8]) -> (Result<Loaded, L
     return (Err(failed), 0);
   }
   for turns in 1..=TURN_LIMIT {
+    // A yield between turns, as the server's import runs (`super::run`): the shard serves its inbox meanwhile.
+    slates_rt::futures::yield_now().await;
     if let Some(Err(failed)) = super::land_owed(id).await {
       return (Err(failed), turns);
     }
@@ -172,7 +161,7 @@ fn count(state: &ShardState, name: &str) -> u64 {
 #[test]
 fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte() {
   stored(|| async move {
-    let (svn, green) = on(|state| subversion(state, "svn"));
+    let (svn, green) = subversion("svn").await;
     let (loaded, _) = imported(svn, PART1).await;
     let revisions = loaded.map(|loaded| (loaded.revisions, loaded.youngest));
     assert_eq!(revisions, Ok((PART1_LAST, PART1_LAST)));
@@ -203,7 +192,7 @@ fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte
 #[test]
 fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refused() {
   stored(|| async move {
-    let (svn, _) = on(|state| subversion(state, "svn"));
+    let (svn, _) = subversion("svn").await;
     let mut parts = Vec::new();
     for part in [PART1, PART2] {
       parts.push(imported(svn, part).await.0.map(|loaded| loaded.youngest));
@@ -243,7 +232,7 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
 #[test]
 fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
   stored(|| async move {
-    let (svn, _) = on(|state| subversion(state, "svn"));
+    let (svn, _) = subversion("svn").await;
     let cut = PART1.get(..PART1.len() - 3).expect("a shorter dump");
     let (loaded, _) = imported(svn, cut).await;
     let truncated = LoadFailed::Refused {
@@ -271,7 +260,7 @@ fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
 #[test]
 fn t_a652_the_records_an_import_committed_are_made_again_from_the_log() {
   stored(|| async move {
-    let (svn, _) = on(|state| subversion(state, "svn"));
+    let (svn, _) = subversion("svn").await;
     assert!(imported(svn, PART1).await.0.is_ok());
     let replayed = on(|state| count(state, crate::vcs_store::REPLAYED));
     rebuild(svn).await;
@@ -306,8 +295,13 @@ fn routed(state: &mut ShardState, request: u64) {
 #[test]
 fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let id = crate::daemon::observe_first(&daemon, |state| {
-    let (id, _) = subversion(state, "svn");
+  let asked = ("svn", VcsTool::Subversion, ObjectFormat::Revisions, "main");
+  let (id, _) = crate::test_store::create_on(&daemon, 0, &owner(), asked);
+  // The creation's own answer went to the route's empty slot too.
+  let undeliverable = crate::daemon::observe_first(&daemon, |state| {
+    count(state, crate::state::REPLY_UNDELIVERABLE)
+  });
+  crate::daemon::observe_first(&daemon, |state| {
     routed(state, 1);
     let opened = |_: &str| -> Result<(Box<dyn HostFs>, HostDir), HostError> {
       let (host, root) = host_holding(PART1);
@@ -318,7 +312,6 @@ fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
       (reply, state.acceptance_deferred),
       (ReplyBody::Acknowledged, true)
     );
-    id
   });
   let began = Instant::now();
   let seen = loop {
@@ -337,7 +330,7 @@ fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
   daemon.stop();
   let (held, counted, made) = seen;
   assert!(!held, "still held after {TASK_WAIT:?}");
-  assert_eq!(counted, [1, 1]);
+  assert_eq!(counted, [1, undeliverable + 1]);
   assert!(
     made == Some((PART1_LAST, PART1.to_vec())),
     "part1.dump's history"

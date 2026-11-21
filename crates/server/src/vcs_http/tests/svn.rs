@@ -546,37 +546,24 @@ fn added_row(path: &str, kind: NodeKind, text: Option<&[u8]>) -> ChangedPath {
 /// owner's step (A-655 part 2b; C2), from a history running as a task there: `/trunk`, `/trunk/a.txt`, `/trunk/sub` and
 /// `/trunk/sub/b.txt`, by alice. Its id.
 async fn committed_repository() -> RepositoryId {
-  use crate::repository::svn_commit::tests::on;
-  let (id, revision) = on(made_repository);
+  let asked = (
+    COMMITTED,
+    slates_ipc::protocol::VcsTool::Subversion,
+    slates_ipc::protocol::ObjectFormat::Revisions,
+    "main",
+  );
+  let (id, _) = crate::test_store::created(&daemon_owner(), asked).await;
   let committed =
-    crate::repository::svn_commit::tests::commit((&daemon_owner(), id), revision, None).await;
+    crate::repository::svn_commit::tests::commit((&daemon_owner(), id), first_revision(), None)
+      .await;
   assert!(committed.is_ok(), "{committed:?}");
   id
 }
 
-/// [`committed_repository`]'s repository, made, and its revision 1.
-fn made_repository(
-  state: &mut crate::state::ShardState,
-) -> (RepositoryId, slates_svn::commit::revision::Revision) {
-  let create = slates_ipc::protocol::RequestBody::CreateRepository {
-    name: COMMITTED.to_owned(),
-    tool: slates_ipc::protocol::VcsTool::Subversion,
-    format: slates_ipc::protocol::ObjectFormat::Revisions,
-    default_branch: "main".to_owned(),
-    green: None,
-  };
-  let reply = crate::verbs::dispatch(state, 1, &daemon_owner(), create);
-  assert!(
-    matches!(reply, slates_ipc::protocol::ReplyBody::GreenCreated { .. }),
-    "{reply:?}"
-  );
-  let repositories = state.db.partition().repositories();
-  let id = repositories
-    .repository_named(COMMITTED)
-    .expect("the record")
-    .id;
+/// [`committed_repository`]'s revision 1.
+fn first_revision() -> slates_svn::commit::revision::Revision {
   let (a, b): (&[u8], &[u8]) = (b"alpha\n", b"beta\n");
-  let revision = slates_svn::commit::revision::Revision {
+  slates_svn::commit::revision::Revision {
     head: 0,
     record: RevisionRecord {
       transaction: "0-1".to_owned(),
@@ -598,8 +585,7 @@ fn made_repository(
       .collect(),
     stored: BTreeMap::new(),
     lock_entries: Vec::new(),
-  };
-  (id, revision)
+  }
 }
 
 /// What the site reads of [`COMMITTED`] through the daemon's lender, from a task on its shard: whether the lender holds

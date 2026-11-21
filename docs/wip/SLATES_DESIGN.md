@@ -10608,6 +10608,26 @@ entries and refuses base reads typed. The N=1 differential covers the S3 host th
 > whose task cannot be spawned. The unit test (`a_kept_request_is_dispatched_again_before_the_device_is_read`) holds a
 > mount over a socket pair on an audit shard and expects a kept request answered before the device's.
 
+> **Status (2026-11-20, A-791: a volume over an S3 base made through the wire).** Built: `CreateOverS3` (appended to
+> the wire's requests) names the base (`S3BaseSpec`: the endpoint, region, bucket, prefix, addressing and the
+> authorities for TLS) and hands the credential its fetches are signed with (`S3Credential`, whose `Debug` names the
+> access key alone); the client's `create_over_s3` sends it. The volume's owner shard makes the overlay over an
+> `S3Host` of the base (`verbs::open_s3_base`: the root's facts need no fetch; the host's cache is the volume's byte
+> bound within what the shard could admit, refused `BudgetExceeded` below one chunk), puts the host in the slot
+> (`BaseHost::S3`), and starts the base's fetch driver over the store client (`verbs::s3_client_of`, `base_wait::
+> spawn_driver`) before the volume is published, so a full task arena refuses the create `Overloaded` with nothing
+> made. The client's requests may be as late as the daemon's liveness window and never take longer in all than the
+> shard's failover delay, the longest a parked request waits. The catalog records the base alone
+> (`BaseRecord::S3`, appended); the credential is held in RAM by the owner shard and never written (R1). A recovery
+> over an S3 base holds the volume unavailable (`BaseUnavailable`, naming the base) until the credential is handed
+> again, and a clone of such an overlay is refused `BaseUnavailable`: the host's fetch state and its credential are
+> not duplicated. An image of the volume records each listed directory by its identity (`HostFs::identify_dir`: the
+> device, number and birth a recovery holds it to), which an S3 base answers with no fetch; it recorded the whole
+> fingerprint, whose listing had not landed, so every create over an S3 base was skipped by the shard's publication
+> (`EAGAIN`) and answered `ContentUnavailable`. A host directory's identity is its fingerprint, as before. Owed: the anchor's hold of the credential across a daemon restart and the recovery that uses it;
+> name resolution (a host that is not an IPv4 address is refused `BaseUnavailable`) and the platform's trust roots
+> (the caller hands the authorities); the library's `VolumeSpec` over an S3 base.
+
 A verified content digest xattr, if exported, names exactly the current immutable file bytes.
 It is invalidated before any mutation and absent while content is unsealed or unverified;
 missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
@@ -57922,8 +57942,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
 > between land and commit). Owed: the texts as sections read through the owner (stage B), an import as one sliced
-> changeset (stage C), and the two landings that commit before their store lands (a submitted version's revision, a
-> creation; GAPS C2).
+> changeset (stage C), and a submitted version's revision, which still commits after its version: main's ruling puts
+> the submit in the one order, its acceptance deferred until the revision lands (GAPS C2). A creation's changeset 0
+> carries Subversion's creation record (its UUID and revision 0's date) as its second `Record` section.
 >
 > **Status (2026-11-20, A-645's derived per-path read form on the store; w-perf, main's orders of 18:30 and 19:50; the
 > interface agreed with w-hg, inbox `*-per-path-read-2026-11-20`).** A changeset's `Texts` section is one format for
@@ -57955,6 +57976,36 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > and `commit`; other landings wait in the owner's queue, bounded by the request channel's capacity and refused `Busy`
 > past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
 > end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
+
+> **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
+> (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
+> `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
+> into a set bounded by the caller's derived `most`, least recently used let go first, a range past the bound refused
+> `PastBound`, an unknown pack `Missing`; `piece` lends from the set alone and answers `None` on a miss, the caller's
+> cue to await a fill and step again. One way to the bytes (R6). The pack is named by plain BLAKE3 of its `Payload`
+> section, the store's `P` key. Held by `a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time`
+> (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
+> fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
+
+> **Status (2026-11-20, the standing grant's `G` row).** `StoreRoot` keeps the grant it was opened under;
+> `Store::open` finds its `G` row (keyed by `grant_id`: the directory's device and inode, hashed) or puts it and
+> checkpoints the engine before anything lands, so the grant is recorded once and kept as first issued;
+> `StoreHandle::grant` is the id each landing's header names (the creation's since this change). Held by
+> `a_stores_standing_grant_is_recorded_once_and_found_after_a_crash` (`tests/store.rs`) and the creation test's
+> provenance check (`repository/store_tests.rs`). Owed: the audit position (a standing-grant audit kind) and revocation.
+
+> **Status (2026-11-20, a creation in the one landing order).** `CreateRepository` on a node keeping a store now lands
+> first and records second, as every landing does: the repository's record judged (the guard alone), its ids and its
+> root's reserved past the partition's family counter (`ShardState::family_reserved_through`, never lowered, so an id
+> whose creation never recorded is a gap), changeset 0 landed, then in one transaction the repository, its root and
+> its completion recorded, then the answer (deferred, AUD-11). A kill between the two leaves a changeset no repository
+> names, which recovery passes over, and the client's retry creates the repository afresh. Without a store the record
+> is made at once, as before. Every creation has a reply route: repository verbs are served on the node the client
+> reached (A-575; never forwarded to another node), so a fleet answers one as a laptop does (R8). After a restart the
+> successor mints a killed creation's id again (the register's counter never passed it); the store's `(repository,
+> sequence)` row is the newest landing at it, which is the only one the register can ever name (a record follows its
+> landing, and the counter passes the id once recorded), so the new repository never meets the orphan
+> (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, which also asserts the log holds both).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58581,3 +58632,143 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   polls' length histogram; `futures`; `tests/pacing.rs`), `crates/merge` (`pace`, `push`), `crates/git`
   (`receive::works`), `crates/server` (`git_push`, `daemon`, `content_ranges`: the runtime's counters as status rows),
   `crates/cli/bench/pacing_ab.py` (new), §4.3, GAPS, BENCHMARKS.md, amendments.tsv.
+
+### A-791 — A volume over an S3 base is made through the wire, its credential handed with the create (2026-11-20, w-k90-whp; main's dispatch 15:52 PST, goal 92's A-555 parts 2 and 3; §4.15 "An S3 base", A-464, A-524, A-555; R1, R3)
+- **What was missing.** A-555 built the parking of a request on its base's fetch and the fetch driver, but nothing
+  made a volume over an S3 base: no request named one, `spawn_driver` had no caller, and `BaseHost::S3` was built only
+  by tests.
+- **The change.** `RequestBody::CreateOverS3` (appended, tag 97) names the base (`S3BaseSpec`) and hands its credential
+  (`S3Credential`, its `Debug` naming the access key alone); the client's `create_over_s3` sends it. The owner shard
+  makes the overlay over an `S3Host` (`verbs::open_s3_base`; its cache the volume's byte bound within the shard's
+  admittable room, refused `BudgetExceeded` below one chunk), starts the fetch driver with the store client before the
+  volume is published (`verbs::s3_client_of`: the endpoint's host an IPv4 address, plain HTTP to loopback alone, HTTPS
+  with the caller's authorities; requests as late as the liveness window and no longer in all than the failover
+  delay), and records `BaseRecord::S3` (appended, tag 3) without the credential (R1). A recovery holds such a volume
+  unavailable until the credential is handed again; a clone of it is refused `BaseUnavailable`.
+- **Found by its test, fixed in the same change.** The shard's publication imaged each listed base directory with its
+  whole fingerprint, which over S3 needs the directory's listing, so the new volume was skipped (`EAGAIN`) and the
+  create answered `ContentUnavailable`. A recovery holds a directory to its identity alone (`same_object`), so the
+  image now records that (`HostFs::identify_dir`, defaulting to `fingerprint_dir`; an S3 base's needs no fetch).
+- **Applied in the same change to:** §4.15's status (a block after A-555's third piece), GAPS (A-464's owed list:
+  the create and the hand-off built; the anchor's hold, recovery, clone, the library's spec and name resolution owed),
+  `crates/ipc` (the request and its types, tag published), `crates/db` (`BaseRecord::S3`, tag published),
+  `crates/client` (`create_over_s3`), `crates/vfs` (`identify_dir`, the base image), `crates/base` (`S3Host` and
+  `BaseHost` answer it), `crates/server` (the create, the routing, recovery's and the clone's arms, `Lens`).
+- **Evidence (macOS arm64, adas-macbook-pro-2 through kiln run r52, 2026-11-20).** `cargo test --locked -p
+  slates-server --test s3_base`: red with the driver not started (the read still `Unpublished` at its 30 s bound,
+  32.93 s), green 2 of 2 in 5.04 s (`a_volume_made_over_an_s3_base_reads_its_objects_from_the_store` over a loopback
+  store answering `ListObjectsV2` and ranged `GetObject`; `a_credential_s_debug_text_never_names_its_secret`); before
+  the identity fix the create was refused `ContentUnavailable`. `-p slates-base --lib -- s3::host` 16 of 16 (the new
+  `a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s`); `-p slates-ipc --test wire_order` and `-p
+  slates-db --test wire_order` 2 of 2 each; rustfmt's layout applied.
+
+### §4.16 amended — A version's inputs are archived once for every shipment, their chunks lent from the chain, never rebuilt a pass at a time (2026-11-20, w-shared for UI goal 93; main's close list, exit 4 at 64 MiB; A-286)
+Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound), GAPS (the sweep's exit 4 line),
+`crates/server/src/merge_service.rs` (`PendingMergeRecord::inputs_manifest`, `make_inputs_manifest`, `InputsSource`,
+`cut_shipments`, `ShipInputs::cut`, `inputs_lent`), `crates/server/src/merge_origin.rs` (`inputs_manifest_archive`,
+`inputs_extents`, `inputs_manifest`, `inputs_archive_of`), `crates/cluster/src/content.rs` (`raw_chunk_request`),
+`crates/server/tests/fleet.rs`.
+- **What was there.** Inputs past a shipment's bound cross in several shipments, one a record-plane pass (A-286). Each
+  pass of a later version copied its increment out of the green's chain (`inputs_of`, `to_vec`), rebuilt its inputs
+  archive whole (every chunk copied again and BLAKE3-hashed), cut one bound's chunks from it and dropped the rest. All of
+  it ran in one owner-shard step. A shipment carries at least one 1 MiB chunk, so a 64 MiB version took at least 64
+  passes, each copying about 128 MB and hashing 64 MB: the inputs' size times their shipments. At 320 MiB one such step
+  nears the watchdog's second of CPU (exit 4).
+- **Change.** The version's archive is made once, at its first shipment that carries inputs, without its chunks
+  (`merge_origin::inputs_manifest_archive`: each chunk's identity hashed over the chain's bytes in place). The pending
+  record keeps it (a manifest of extents, one per 1 MiB of inputs) until the version places. Every shipment offers that
+  manifest and cuts its chunks as views of the bytes the chain already holds (`InputsSource::Lent`). Each chunk request
+  is encoded straight from its slice (`content::raw_chunk_request`), so a pass allocates only the messages it sends.
+  Version 0's origin archive, kept whole while it ships (A-286), is cut as before (`InputsSource::Whole`).
+- **Counter.** `merge.inputs.manifest_made`, once a version.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20).
+  - `slates-server --lib a_shipment_cut_from_lent_bytes_is_the_whole_archives_byte_for_byte`: lent shipments equal a
+    whole archive's (offer, chunk requests in order, wholeness), over bounds of zero, one chunk, two and past the whole,
+    for targets lacking every chunk and only the last, over a short last chunk and a repeated chunk.
+  - `slates-cluster --lib a_lent_raw_chunks_request_is_the_held_chunks_byte_for_byte`.
+  - `slates-server --test fleet a_version_crossing_in_several_shipments_is_archived_once`: a 4.5 MiB version crosses to
+    B in parts over several shipments, its manifest made once. Red, with the manifest made again every pass: made
+    equals the shipments.
+- **Owed.** An RSS-bound measurement of a 64 to 320 MiB version's placement before and after (main's run-requests),
+  and the watchdog's own report from the Studio reruns, to say whether this was exit 4's cause.
+
+### A-794 — A forwarded work's creation is made on the partition its name hashes to, and a forwarded verb parked at its work's gate answers its exchange when it resumes (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; §4.8 "Lookup", §4.16 "Role", A-247, A-400, A-697, AUD-11)
+- **Why.** A work over a green another node owns is made on its client's own partition when that node holds the
+  green's replica (A-697); otherwise its creation is forwarded to the owner, where `serve_forward` ran it on the green's
+  own shard (`forwarded_to` of the verb's volume, the green). At 100,000 clients the client node held no replica for
+  most of the run, so 76,955 works were made on the primary's one partition, whose merge budget (373 MB, the green's
+  chain's too) filled with their logs: 60,349 edits, 3,883 rebases and 7,544 accepted submits refused `TableAtCapacity`
+  (A-793's first-occurrence line: 76,955 work logs, 341 MB, beside the chain's 32 MB). And a forwarded verb that parked
+  at a work's gate (A-247) had no way back to its exchange, which awaited only a deferred acceptance (AUD-11) and
+  answered `Overloaded` otherwise, so the origin's resend under the id met the completion.
+- **Change.** `crates/server/src/verbs.rs` `serve_forward`: a forwarded `CreateWork` runs on the shard its name hashes
+  to, as a create is placed; whether the green is made yet is still asked of the green's shard first
+  (`forwarded_before_made`, so a forward racing the green's creation answers retryable, nothing recorded);
+  `forwarded_write` takes the volume to check as an option. `crates/server/src/work_home.rs`: `attach_forwarded` keeps
+  a forward's waiter beside its parked verb, and the resume answers it from the verb's completion, or attaches it to
+  the verb's next wait (parked again, or its acceptance deferred to a fleet commit), else `Overloaded`
+  (`answer_forwarded`); `await_deferred_completion` attaches there when merge holds no acceptance for it. Counted:
+  `merge.work.forwarded_attached`, `merge.work.forwarded_answered`.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --test fleet
+  a_forwarded_work_creation_is_made_on_the_partition_its_name_hashes_to` (three nodes, each its own region, two shards
+  each; works made through a node that does not replicate the green): `spread-work-1` was made on the green's partition
+  1, its name's is 0; after, every work on its name's partition, each edited through the forwarding node, the
+  forwards answered at resume (`merge.work.forwarded_answered` > 0). The fleet tests on works and forwards (42),
+  `--lib work_home`, `--test merge_load` pass.
+- **By use** (release, `load_scale`, 100,000 clients, one round, the kernel v7.4-rc4; base `e4c2ad76`): `TableAtCapacity`
+  71,776 to 0, CreateWork p50 18.3 s to 10.0 s (p99 269 s to 20.1 s), rebases 13,468 to 91,076, accepted 28,224 to
+  31,223, verdicts 125 to 153 a second, oracle failures 0. The next bound: 64,072 accepted submits, 4,169 edits and 536
+  rebases refused `BudgetExceeded`; a first-occurrence line now logs what the green's retention holds when its cap
+  refuses a reservation with room left.
+
+### §4.8 amended — A session's packets are encoded in place and sealed in one reused buffer: no frame cloned, nothing allocated a packet (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's sending), GAPS (the sweep's lane line), BENCHMARKS (the bulk
+row's before and after), `crates/transport/src/connection.rs` (`Connection::poll_transmit_into`; `poll_transmit` now
+the tests' decoding of it), `crates/transport/src/endpoint.rs` (`seal_in_place`, `Endpoint::send_buffer`,
+`flush_packets`; `protect_packet` the rare packets' and tests' wrapper), `crates/transport/src/session.rs`
+(`Frame::encode_into` crate-visible).
+- **What was there.** Each packet's frames were gathered into a list of their own: the acknowledgement, then a clone of
+  every reliable frame (a stream frame's whole payload, about 9 KB at the 9,209-byte path MTU), then the credit. The
+  originals went to the sent packet's record. `protect_packet` then encoded the list into a new payload, sealed it, and
+  copied it into a new datagram. Per packet: a 9 KB clone, an encode, a copy and four allocations.
+- **Change.** `Connection::poll_transmit_into` encodes the packet's frames straight into its caller's buffer, the
+  reliable ones from where they are held before they move into the sent record, never cloned. The acknowledgement and
+  credit frames go through a list the connection keeps between packets. The endpoint frames every 1-RTT packet in one
+  buffer it keeps, with room left for the longest short header, and `seal_in_place` writes the header just before the
+  frames once the packet number's length is known. It seals the payload in place, appends the tag and applies header
+  protection there, and the datagram is sent from that buffer. The buffer grows once to the session's largest datagram.
+- **Measured** (BENCHMARKS, the bulk row, Studio-1): `memmove` samples 604 to 491; goodput median 1,066.5 to 1,103 MB/s,
+  min 874 to 961.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test: lib 148 of 148, admission 3,
+  amplification 2, exchanges 8, handshake_levels 4, key_update 1, receive_refusal 3, session 25, stateless_reset 7. The
+  connection's tests read each packet through `poll_transmit`, which decodes what `poll_transmit_into` wrote, so the
+  encoded bytes are what they assert on.
+- **Owed (the next step):** frames kept as references into the send stream's bytes until acknowledged (no copy into a
+  frame at all), and the receiver's copies (the frame decode's, the reassembly's).
+
+### §4.8 amended — A packet in flight names its stream data as a span of the sender's bytes, encoded from there, never copied into a frame (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput, its second step; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's sending and loss recovery), GAPS (the sweep's lane line),
+BENCHMARKS (the bulk row's third row), `crates/transport/src/stream.rs` (`StreamSpan`, `StreamSender::next_span`,
+`StreamSender::bytes`; `next_frame` now the tests' copying view of it), `crates/transport/src/conn.rs` (`Carried`, the
+tracker's in-flight records, `Acked`, `Lost`, `copy_oldest`, `drop_copied`, `forget_stream`, `tracked_bytes`),
+`crates/transport/src/connection.rs` (`poll_transmit_into`'s encoding, `encode_carried`, the retransmission queue and
+its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget_send_stream`),
+`crates/transport/src/session.rs` (`encode_stream_frame`, the one stream-frame encoding).
+- **What was there.** Each stream frame copied its bytes out of its sender when framed, and the copy was held until
+  the frame was acknowledged: in the packet's in-flight record, in the retransmission queue after a loss, in a probe's
+  copy, and split by copying again when a smaller path MTU cut a resend.
+- **Change.** A sent item is a `Carried`: a frame held whole (a control frame, a reset, a blocked report), or a span of
+  a send stream's bytes (`StreamSpan`: stream, offset, length, end). A span is encoded straight from its sender's
+  buffer each time its packet is built (`encode_carried`, `encode_stream_frame`, byte for byte the held frame's
+  encoding). The sender keeps every byte until its connection forgets the stream, after the last byte is acknowledged;
+  forgetting drops the stream's spans from flight and from the retransmission queue, so an owed span's bytes are always
+  there. A span that finds no stream (a probe's copy of data acknowledged since) writes nothing. A resend split for a
+  smaller path MTU names two ranges of the same bytes.
+- **Measured** (BENCHMARKS, Studio-1, quiet): `memmove` samples 491 to 433 (604 before the first step); goodput level,
+  median 1,092 MB/s.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test: lib 148 of 148 and admission,
+  amplification, exchanges, handshake_levels, key_update, receive_refusal, session and stateless_reset. The connection
+  tests read every packet as the bytes `poll_transmit_into` wrote, resends and split resends included, so a span's
+  encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
+- **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
+  one `sendto` and one `recvfrom` a datagram.
