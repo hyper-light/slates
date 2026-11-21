@@ -2387,6 +2387,14 @@
 > Since A-713 (fetch admission) the v1.0.0 cut passes 26 of 27 (clone, deepen and partial clone among them; the 27th
 > the script's tag row, since fixed); cut at v2.0.0 (56 MB) the push still spins shard 0 and the daemon is killed
 > (main 168ddfa, debug, Mac Studio). hg after A-711 and A-696: 17 of 24, its pushes of hg's history spinning alike.
+> **A-830, the git server's memory held to the change (clients, 2026-11-21; Ada's MEMORY SIZING ruling):**
+> `the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the_history` (`crates/cli/tests/
+> git_interop.rs`) holds the daemon's resident set at its peak and settled after a push and a clone to the warm-up's
+> end plus `2N + W` (N the pack's bytes, W the warm-up round's range). Its made history (2,000 files, 200 one-line
+> commits, N 258,770 bytes) passes on main 67fa7f75a (this Mac, debug: peak 68.2 MiB, bound 90.5 MiB), so w-interop
+> r2's 7,421 MiB against git/git v2.0.0 (base 26c98c76d) is not reproduced at that size; the same test over git/git's
+> cut (`SLATES_TEST_GIT_SOURCE`, `SLATES_TEST_GIT_CUT=v2.0.0`) is main's run (run-requests.md), its red the piece's
+> next step (attribution by `slates status --memory`, then the fix with w-git).
 > **Stock hg command matrix (w-interop, 2026-11-20):** `ci/interop/hg-matrix.sh` (24 rows, hg's own repository): any
 > real push over HTTP is refused `413` (189 changesets and up; one changeset passes), the site offers no `lookup`
 > (`hg identify URL`, `clone -r`), SSH pushes wait on A-696; clone, verify, log, diff, pull, phases, stream and SSH
