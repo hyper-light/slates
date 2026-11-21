@@ -60010,5 +60010,11 @@ Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishmen
 - Why: a 320 MiB and larger holder submit crossed the forward lane whole and the lane gave up on silence under load
   (GAPS). Measured in `fleet` `a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity` (8 MiB: the
   request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
-- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
-  increment a refused verdict leaves is released at the next fold or restart.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today, now a chunk a
+  call).
+- **Status (2026-11-21, w-shared): the owner's step halved.** The owner no longer encodes and hashes again an increment
+  it holds by identity (`SealedWork::held`, `merge_service::increment_already_held`, its hold given back on a refused
+  verdict), and the fetched increment reaches the owner shard a chunk a call (`verbs::move_increment`). Release A/B,
+  Mac Studio, load 2-4, 5 rounds (kiln r2, 1a35ab0 vs 0deb19a): owner step 256 MiB 256-267 to 136-144 ms, 320 MiB
+  327-353 to 168-203 ms, 512 MiB 502-594 to 270-299 ms; the late beat 0.52-0.85 s in every 320 and 512 MiB run before,
+  none after; wall 512 MiB 1.98-2.06 to 1.46-1.57 s.
