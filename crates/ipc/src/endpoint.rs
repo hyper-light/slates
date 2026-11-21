@@ -723,7 +723,10 @@ impl ClientEnd {
   /// The wait both forms share: the spin, then one park at a time until the reply, the end `ends` names, or a refusal.
   fn wait_ending(&mut self, ends: Ends) -> Result<Waited, IpcError> {
     let started = Instant::now();
-    let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
+    // A caller that names a spin gets it; by default the wait parks at once (84a): a client spinning for its reply holds
+    // the CPU the shard it just woke needs whenever the cores are all busy, so the shard ran only when the spin ended
+    // (the loaded edit-and-merge p99 followed the spin: 1.7-5.1 ms on the wake estimate's spin, 0.32-0.39 ms parked).
+    let spin_ns = self.spin_override_ns.unwrap_or(0);
     loop {
       if let Some(reply) = self.try_take()? {
         return Ok(Waited::Reply(reply));
