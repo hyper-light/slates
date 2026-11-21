@@ -57758,6 +57758,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > task lands two changesets, lists them, reads a 200,000-byte payload back by identity; a new owner after the stop
 > reads the same). Owed with C4: the daemon holding the owner (the node's `StoreGrant` at enrollment, the store's
 > directory in its configuration, `Sizing` from its machine profile).
+>
+> **Status (2026-11-20, C4 groundwork: the daemon holds the store).** `slates daemon --vcs-store DIR` (and the anchor,
+> which passes it to each daemon it starts): the daemon identifies the directory, issues the node's `StoreGrant` (the
+> operator's naming of it is the grant, on R10's CLI surface; logged with its device and inode), opens the root
+> through `slates_land::store_root`, sizes the store from its own derivations (memory the shard's reserve, disk the
+> directory's free space by `fstatvfs`, extent the content plane's chunk, fanout SplinterDB's under `derived!` until
+> the engine's E-step measures it), starts the owner and puts its handle in `DaemonConfig::vcs_disk`, which every
+> `ShardState` clones (`ShardState::vcs_disk`); `serve` stops the owner after the daemon, so its checkpoint is written.
+> Without the flag nothing changes. Windows: `store_root` refuses `Unsupported` there until its handle-relative
+> counterpart is written (GAPS), so the crates build on every target. Test: `slates-api role` the flag parsed and
+> passed on (1/1, with the role's 38/38).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

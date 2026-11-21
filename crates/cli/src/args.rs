@@ -838,6 +838,7 @@ const VALUES: &[&str] = &[
   "--vcs-http",
   "--vcs-ssh",
   "--vcs-svn",
+  "--vcs-store",
   "--bounded",
   "--dynamic",
   "--base",
@@ -2171,6 +2172,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           "--vcs-http",
           "--vcs-ssh",
           "--vcs-svn",
+          "--vcs-store",
         ],
         switches: &["--quick"],
       })?;
@@ -2182,6 +2184,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
         vcs_ssh: vcs_ssh_of(&taken)?,
         vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
+        vcs_store: taken.value("--vcs-store").map(str::to_owned),
         fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
@@ -3062,6 +3065,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert_eq!(
@@ -3172,6 +3176,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert!(matches!(
@@ -3202,6 +3207,7 @@ mod tests {
         vcs_http: Some(loopback),
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3243,6 +3249,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: Some(loopback),
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3282,6 +3289,7 @@ mod tests {
         vcs_http: Some(loopback(8080)),
         vcs_ssh: None,
         vcs_svn: Some(loopback(3690)),
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(

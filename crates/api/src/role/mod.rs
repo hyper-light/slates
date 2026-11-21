@@ -60,7 +60,7 @@ pub const EXIT_NEVER_SERVED: u8 = 5;
 
 /// Format: the role arguments [`Role::parse`] takes, for its usage message.
 pub const ROLE_USAGE: &str = "[--instance NAME] (anchor | daemon) [--shards N] [--quick] [--fleet PATH --node NAME] \
-   [--vcs-http ADDRESS] [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS]";
+   [--vcs-http ADDRESS] [--vcs-ssh ADDRESS] [--vcs-svn ADDRESS] [--vcs-store DIR]";
 
 /// Options of the anchor and the daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +85,10 @@ pub struct ProcessOptions {
   /// 2): A-656's connection on each connection, ra_svn being cleartext, on a loopback address alone for a daemon that
   /// is no fleet node ([`vcs_address`]). None starts no listener.
   pub vcs_svn: Option<slates_rt::tcp::SocketAddrV4>,
+  /// The directory the version-control store keeps repositories' history in, when the operator gives one (`--vcs-store
+  /// DIR`, A-767): an absolute path the operator grants by giving it, a standing grant for the node's store. None keeps
+  /// every repository in RAM, as before.
+  pub vcs_store: Option<String>,
 }
 
 /// Which fleet node this process is: the operator's shared manifest and this node's name in it
@@ -195,6 +199,7 @@ struct Given {
   vcs_http: Option<String>,
   vcs_ssh: Option<String>,
   vcs_svn: Option<String>,
+  vcs_store: Option<String>,
   quick: bool,
   word: Option<String>,
 }
@@ -210,6 +215,7 @@ impl Given {
       "--vcs-http" => &mut self.vcs_http,
       "--vcs-ssh" => &mut self.vcs_ssh,
       "--vcs-svn" => &mut self.vcs_svn,
+      "--vcs-store" => &mut self.vcs_store,
       other => return Err(RoleArgsError::UnknownFlag(other.to_owned())),
     };
     *slot = Some(value);
@@ -251,6 +257,7 @@ impl Given {
       vcs_http,
       vcs_ssh,
       vcs_svn,
+      vcs_store: self.vcs_store,
     })
   }
 }
@@ -327,7 +334,14 @@ pub fn vcs_ssh_address(text: &str) -> Result<slates_rt::tcp::SocketAddrV4, Strin
 fn takes_value(flag: &str) -> bool {
   matches!(
     flag,
-    "--instance" | "--shards" | "--fleet" | "--node" | "--vcs-http" | "--vcs-ssh" | "--vcs-svn"
+    "--instance"
+      | "--shards"
+      | "--fleet"
+      | "--node"
+      | "--vcs-http"
+      | "--vcs-ssh"
+      | "--vcs-svn"
+      | "--vcs-store"
   )
 }
 
@@ -413,6 +427,11 @@ impl Role {
     if let Some(address) = options.vcs_svn {
       args.push("--vcs-svn".to_owned());
       args.push(address.to_string());
+    }
+    // So is the version-control store (A-767): the daemon opens it under the grant the operator gave by naming it.
+    if let Some(dir) = &options.vcs_store {
+      args.push("--vcs-store".to_owned());
+      args.push(dir.clone());
     }
     args
   }
@@ -506,6 +525,30 @@ mod tests {
     text.split_whitespace().map(str::to_owned).collect()
   }
 
+  /// A-767. Do: parse a daemon given `--vcs-store DIR`, and an anchor given it, and read each back through its args.
+  /// Expect: the directory is the options' store, and the anchor passes it to the daemon it starts unchanged.
+  #[test]
+  fn the_store_directory_is_parsed_and_passed_on() {
+    let daemon = Role::parse(&words("daemon --vcs-store /var/lib/slates/vcs")).unwrap();
+    assert_eq!(
+      daemon.options().vcs_store.as_deref(),
+      Some("/var/lib/slates/vcs")
+    );
+    let anchor = Role::parse(&words("anchor --vcs-store=/srv/vcs")).unwrap();
+    assert_eq!(anchor.options().vcs_store.as_deref(), Some("/srv/vcs"));
+    assert_eq!(Role::parse(&anchor.args()), Ok(anchor.clone()));
+    assert!(
+      anchor
+        .args()
+        .windows(2)
+        .any(|pair| pair == ["--vcs-store", "/srv/vcs"])
+    );
+    assert_eq!(
+      Role::parse(&words("daemon")).unwrap().options().vcs_store,
+      None
+    );
+  }
+
   /// §2.5, A-278. Do: parse an anchor's and a daemon's arguments in any order, with values after their flags and
   /// joined by `=`, then make each role's arguments and parse them back. Expect: the roles named, and every role equal
   /// to its own arguments read back — the anchor starts its daemon from exactly what this pair agrees on.
@@ -522,6 +565,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       })
     );
     let daemon = Role::parse(&words("daemon --instance a --fleet /f.json --node a")).unwrap();
@@ -538,6 +582,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       })
     );
     for role in [anchor, daemon] {

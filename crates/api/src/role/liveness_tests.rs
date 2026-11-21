@@ -117,6 +117,7 @@ fn options(instance: String) -> ProcessOptions {
     vcs_http: None,
     vcs_ssh: None,
     vcs_svn: None,
+    vcs_store: None,
   }
 }
 

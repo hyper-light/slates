@@ -5114,6 +5114,7 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
+    vcs_disk: config.vcs_disk.clone(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),

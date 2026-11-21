@@ -116,8 +116,9 @@
 > `unsafe impl Send`/`Sync`), their unit tests green here; their files opened through `slates_land::store_root` under a
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
-> owed with C4). C3 steps 1-2 built: the changeset log and the
-> store (landing, `C` rows, recovery).
+> owed with C4). C3 closed; C4 groundwork built: the owner thread and
+> `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
+> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6).
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
