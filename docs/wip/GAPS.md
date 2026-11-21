@@ -2673,8 +2673,17 @@
 > store-held texts into RAM deltas, is retired; held by
 > `a_committed_text_is_let_go_by_the_content_store_and_read_through_the_store` (red without it: the content store
 > kept the text) and the crash test `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry` (the text
-> read back whole through the store, nothing in RAM). Owed: P4 imports land texts as Payload with Texts rows and the
-> records keep none in RAM (`KeptText`, `Record::Deltified` retired). Stage C,
+> read back whole through the store, nothing in RAM). P4a BUILT: a revision that brings its texts (an import's,
+> `svn_commit::land_revision`) lands them as its changeset's Payload with Texts rows, put through the content store as
+> a client's commit's are and let go after, and its record names them stored, so the records keep none of an import's
+> texts in RAM; an import's delta whose base is only on the store asks for it (`Importing::Base`,
+> `Importer::supply_base`), answered from RAM where the green or the content store holds it, else brought whole
+> through the store between turns (`svn_import::supply_owed_base`). Held by
+> `an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere` (slates-svn) and
+> `t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte` (every imported text stored, none in
+> RAM; red before: 0 stored), with `full.dump` and `deltas.dump` exported byte for byte through the store. Owed: P4b a
+> server-made revision's texts (`land_made`, A-804's made commits) land the same way; the records' `KeptText` and
+> `Record::Deltified` then serve only logs written before P4a, and go with them. Stage C,
 > an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
 > one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
 > a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
@@ -2726,9 +2735,9 @@
 > (`Repository::replay_revision`, `replay_step`) checks and applies its rows at its first step and keeps its rows' texts
 > a step each, kept between turns (`vcs_store::svn_replays`) until the shard's quantum runs, one row at least
 > (`vcs_store.svn_replay_turns`). Held by `a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does` (the
-> same records as a whole commit) and `a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild` (twelve 50 KiB files,
-> at least twelve turns, the same records and green). Left: one row's text is still deltified whole in its step (a
-> row at a time, not a window), and a record's decode is whole. Closed.
+> same records as a whole commit) and, since C2 stage B part 2 (b) P4a, `a_revisions_texts_replay_as_stored_keeping_nothing_in_ram`
+> (twelve 50 KiB files named stored, none made in RAM, the same records and green). Left: a record's decode is whole.
+> Closed.
 > **R3, the svn hook tests' flake (2026-11-20, w-svn; Ada's close list):** `vcs_svn::tests` waited ten liveness windows
 > for an answer that runs hooks, and its reader returns part-way at a timeout; on a loaded Mac a hook's first run
 > outlasted that (1 in 3, w-perf; 22 s against 2.3 s), read as a wrong answer. The wait is now a hang's bound

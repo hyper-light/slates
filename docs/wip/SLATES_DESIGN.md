@@ -12300,7 +12300,9 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
 > part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
 > the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
-> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
+> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS). An import's
+> revision lands its texts the same way since P4a (its changeset's Payload and Texts rows, its record naming them
+> stored), and an import's delta whose base is only on the store asks its caller for the base (`Importing::Base`).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule

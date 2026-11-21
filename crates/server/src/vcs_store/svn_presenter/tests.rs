@@ -51,6 +51,9 @@ fn imported(dump: &[u8]) -> SvnRecords {
         rest = &rest[consumed..];
         records.commit_record(*record).unwrap();
       }
+      Importing::Base { text, .. } => {
+        panic!("the records hold every text, yet the import asked for {text:?}")
+      }
     }
   }
 }
