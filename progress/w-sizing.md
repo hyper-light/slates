@@ -161,3 +161,4 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 
 ## 2026-11-21: STANDING BY
 - New main 01a1ff31 recorded C1 closed (21a306a04) and R2 closed on all three platforms; R3 closes on w-hg/w-store numbers. I hold nothing else.
+- 2026-11-21 10:25: main is now 01a1ff2e. w-store answered R3: content leaves RAM when w-hg lands through the store. R3 waits on w-hg; close note updated.
