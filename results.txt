@@ -1,0 +1,13 @@
+runner 4 cores, 15 GiB, load 1.91 0.56 0.19 1/270 2310
+probe at 65133486d on 4 cores, model name	: AMD EPYC 9V74 80-Core Processor
+    [1m[94m|[0m
+    [1m[94m= [0m[1mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+copy of the body (to_vec)                    best     55 ns a call; rounds [56, 55, 59]
+blake3 of the body                           best   2073 ns a call; rounds [2089, 2074, 2073]
+raw_chunk (copy + identity hash)             best   2135 ns a call; rounds [2135, 2145, 2138]
+derive_child (HKDF-SHA384 + wrap)            best   2713 ns a call; rounds [2715, 2713, 2713]
+content_keyed (2 derive + commit + schedule) best   6092 ns a call; rounds [6101, 6099, 6092]
+namer.name (HMAC)                            best    216 ns a call; rounds [218, 219, 216]
+seal_chunk whole                             best   9602 ns a call; rounds [9602, 9613, 9613]
+raw_chunk + seal_chunk (seal_body's piece)   best  11780 ns a call; rounds [11780, 11785, 11789]
+/home/runner/work/_temp/029ff9a4-1a4c-478c-8ad9-60bb67352985.sh: line 59: cd: ../arm-: No such file or directory
