@@ -8097,7 +8097,8 @@
 > each). **Sliced 2026-11-07:** a give-back takes one measured slice a step from the top down. So does its sibling,
 > the Linux FUSE write log's purge, which gave back its whole area per emptying (red first: 12,288 bytes for one
 > 15-byte record). On CI (diag-perf-5, run 42173825162) A-226 is even on Linux and halves Windows x86_64's paced accept
-> p99 (1.21 to 1.40 ms became 0.42 to 0.76 ms). **Open:** the latency A/B on a quiet Mac.
+> p99 (1.21 to 1.40 ms became 0.42 to 0.76 ms). **Closed (goal 84b, g222, 2026-11-20):** the quiet-Mac paced run has no
+> 17–31 ms late wake: 18 runs of 1,000 samples, the largest 10.2 ms (BENCHMARKS, "The quiet-Mac paced run").
 >
 >
 

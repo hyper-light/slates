@@ -16109,3 +16109,26 @@ Kept: A-787.
   fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
   to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
   (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.
+
+## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
+
+**What it is.** A-226's paced form (2026-11-06, above: "The macOS paced tail was the recovery give-back") on the quietest
+Mac kiln gave: each sample meets parked shards, so each edit and submit pays the doorbell and a kicked shard's wake.
+Before A-226 its p99 samples held 17 to 31 ms between the doorbell's wake and the shard's read; A-226 removed the cause
+and the run on a quiet Mac was owed.
+
+**Command.** `edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept --form conflict`, release,
+built from main `f47668e74` with `--pause-ns` restored (this change), 3 invocations × 3 runs × 1,000 samples, run after
+the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 14 CPUs, macOS; 9 shards derived),
+2026-11-21 02:14 to 02:19 UTC, load 2.00 / 1.75 / 1.98 at each invocation's start and 2.58 after.
+
+| invocation | accept total p50 / p99 / max per run (µs) | conflict total p50 / p99 / max per run (µs) |
+|---|---|---|
+| 1 | 91 / 196 / 331; 99 / 200 / 307; 178 / 1,209 / 2,748 | 187 / 782 / 1,974; 190 / 859 / 2,353; 172 / 803 / 1,928 |
+| 2 | 329 / 1,644 / 2,939; 327 / 1,592 / 3,674; 329 / 1,429 / 10,202 | 179 / 646 / 1,466; 191 / 1,237 / 7,950; 185 / 942 / 2,609 |
+| 3 | 333 / 1,530 / 3,673; 336 / 1,527 / 3,525; 329 / 1,919 / 3,895 | 182 / 779 / 2,924; 188 / 849 / 2,854; 191 / 816 / 2,624 |
+
+- **No sample in 17–31 ms**: the largest of the 18,000 is 10.2 ms (one accept run); every other run's largest is 0.3
+  to 7.9 ms. Every sample answered as the model said.
+- What is left at the paced p99 (0.2 to 1.9 ms) is the kicked park's own wake on macOS, part of goal 84a's open
+  loaded and paced tail (GAPS), not the late wake this run was owed for.
