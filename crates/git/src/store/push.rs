@@ -111,6 +111,9 @@ pub(crate) struct Staged {
   pub(crate) positions: BTreeMap<ObjectId, u64>,
   /// The repository's next position when the fork was made, which the positions follow.
   pub(crate) base: u64,
+  /// The runs of positions given each type, `[start, end)` (A-639: by type, then id): what a position's type is read
+  /// from once the push lands, with no row read (`Repository::kind_at`). One run a type the push brought.
+  pub(crate) kinds: Vec<(u64, u64, Kind)>,
 }
 
 /// Where a held object's bytes are.
