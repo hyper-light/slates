@@ -2334,6 +2334,15 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **C2 / A-767 C6, svn onto the changeset store (2026-11-20, w-svn; w-store's wiring baa28bfab, d3accba0e,
+> 046628f88):** part 1 BUILT: a client's commit (`svn_commit::land_work`, svn:// and svn+ssh and DAV) lands its
+> revision into the node's store as one changeset, sequence the revision, judged over the one before, its Record
+> section the revision's record as the register holds it, answered once durable (`store_changeset`; counters
+> `repository.svn.revision_stored`/`_unstored`; refused `Unstored`). Held by
+> `a_subversion_commit_lands_as_a_changeset_in_the_store` (the real store: the log recovered from its files holds the
+> creation and revision 1, whose Record decodes to `/trunk` added). Owed: the replay from the store (asked w-store for
+> a section read through its owner, and which log recovery replays from), an import as one changeset, green-made
+> versions, the texts as the changeset's sections.
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
