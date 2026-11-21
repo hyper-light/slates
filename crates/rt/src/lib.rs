@@ -95,3 +95,48 @@ pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;
 pub use task::{Admission, AdmissionReceipt};
+
+/// Diagnostic only (g222, never main): raises this thread to macOS's user-interactive QoS class.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn g222_raise_qos() {
+  // SAFETY: diagnostic only; sets the calling thread's own QoS class.
+  unsafe {
+    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+  }
+}
+
+/// Diagnostic only (g222, never main): every park's asked timeout, how long it waited, and how it ended
+/// (0 timer or other, 1 kicked, 2 untimed, 3 found pending).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types, missing_docs)]
+pub mod g222_parks {
+  use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+  pub const CAP: usize = 600_000;
+  pub static ROWS: [[AtomicU64; 3]; CAP] = [const { [const { AtomicU64::new(0) }; 3] }; CAP];
+  pub static N: AtomicUsize = AtomicUsize::new(0);
+  pub fn dump(path: &str) {
+    use std::io::Write;
+    let n = N.load(Relaxed).min(CAP);
+    let mut out = String::from("timeout\twaited\tended\n");
+    for row in ROWS.iter().take(n) {
+      out.push_str(&format!("{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed)));
+    }
+    if let Ok(mut f) = std::fs::File::create(path) {
+      let _ = f.write_all(out.as_bytes());
+    }
+    N.store(0, Relaxed);
+  }
+}
+
+#[doc(hidden)]
+pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64) {
+  use std::sync::atomic::Ordering::Relaxed;
+  let n = g222_parks::N.fetch_add(1, Relaxed);
+  if let Some(row) = g222_parks::ROWS.get(n) {
+    row[0].store(timeout, Relaxed);
+    row[1].store(waited, Relaxed);
+    row[2].store(ended, Relaxed);
+  }
+}

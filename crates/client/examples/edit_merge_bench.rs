@@ -952,7 +952,27 @@ fn sweep(instance: &str, load: &str, selection: &Selection) {
   }
 }
 
+struct G222Dump;
+impl Drop for G222Dump {
+  fn drop(&mut self) {
+    if let Ok(path) = std::env::var("G222_DIAG") {
+      slates_server::g222_diag::dump(&path);
+      slates_server::g222_diag::dump_ring(&format!("{path}.ring"));
+      slates_server::g222_diag::dump_parks(&format!("{path}.parks"));
+    }
+  }
+}
+
 fn main() {
+  let _g222 = G222Dump;
+  #[cfg(target_os = "macos")]
+  if std::env::var_os("G222_CLIENT_QOS").is_some() {
+    // SAFETY: diagnostic only (g222); this thread's own QoS class.
+    unsafe {
+      libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
+    }
+  }
+
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -998,6 +1018,11 @@ fn main() {
             std::hint::spin_loop();
           }
         });
+      }
+      // Diagnostic (g222): the client thread raised after the spinners were made, so they keep the default class.
+      #[cfg(target_os = "macos")]
+      if std::env::var_os("G222_CLIENT_QOS2").is_some() {
+        slates_server::g222_diag::raise_qos();
       }
       sweep(&instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);

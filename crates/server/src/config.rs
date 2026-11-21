@@ -1201,6 +1201,15 @@ impl DaemonConfig {
       tracking.idle_floor_ns = PROVISION_FLOOR_NS;
       tracking.idle_ceiling_ns = IDLE_SPIN_CEILING_NS;
     }
+    // Diagnostic only (g222, never main): an idle shard parks at once, no spin window.
+    #[allow(clippy::disallowed_methods)]
+    if std::env::var_os("G222_NO_SPIN").is_some() {
+      runtime.spin_ns = 0;
+      if let Some(tracking) = runtime.wake_tracking.as_mut() {
+        tracking.idle_floor_ns = 0;
+        tracking.idle_ceiling_ns = 0;
+      }
+    }
     // A client in R9's closed loop finds the shards it goes round still polling: a forward made for it holds them for
     // the loop's revisit at R9's percentile (§4.7; A-326), each owner keeping the hold only while its idle turns poll
     // faster than it wakes (A-387).
