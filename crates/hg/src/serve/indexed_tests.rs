@@ -1256,7 +1256,9 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1356,7 +1358,9 @@ fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
   let mut deltas = 0usize;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }

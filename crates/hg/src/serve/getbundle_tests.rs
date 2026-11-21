@@ -66,6 +66,9 @@ pub(crate) struct Served {
   /// Whether its file revisions' texts are lost while their logs still list them, as an index whose content store lost
   /// them would answer.
   files_lost: bool,
+  /// Whether its changeset store keeps each file revision after a log's first as its delta against the one before it in
+  /// the log, as a push's changegroup usually brings it (A-767 C1), rather than whole.
+  stored_deltas: bool,
 }
 
 impl Repository for Served {
@@ -117,7 +120,70 @@ impl Repository for Served {
   }
 }
 
+impl Served {
+  /// The revision before `kept` in its log, where the store keeps deltas ([`Served::stored_deltas`]).
+  fn before<'l>(&self, log: &'l Log, kept: &Kept) -> Option<&'l Kept> {
+    if !self.stored_deltas {
+      return None;
+    }
+    let position = kept.position.checked_sub(1)?;
+    log.values().find(|other| other.position == position)
+  }
+}
+
 impl Store for Served {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
+  /// plain BLAKE3 of its text, its place named by that identity, its chunk the full-text hunk; none where its text is
+  /// lost.
+  fn stored_now(&self, want: &crate::render::Want) -> Option<super::Given> {
+    use crate::render::{StoredPlace, StoredRevision, Want};
+    match want {
+      Want::Rows { logs } => {
+        let mut rows = Vec::new();
+        for (path, nodes) in logs {
+          let mut log_rows = Vec::new();
+          for node in nodes {
+            let row = self.files.get(path).and_then(|log| {
+              let kept = log.get(node).filter(|_| !self.files_lost)?;
+              let identity = *blake3::hash(&kept.text).as_bytes();
+              let before = self.before(log, kept);
+              Some(StoredRevision {
+                text: identity,
+                base: before.map(|before| *blake3::hash(&before.text).as_bytes()),
+                // A delta's place is told from a whole's by its offset: the test store's own convention.
+                place: StoredPlace {
+                  payload: identity,
+                  offset: u64::from(before.is_some()),
+                  len: u64::try_from(delta::HUNK_HEADER_LEN + kept.text.len()).unwrap(),
+                },
+              })
+            });
+            log_rows.push(row);
+          }
+          rows.push(log_rows);
+        }
+        Some(super::Given::Rows(rows))
+      }
+      Want::Chunks { places } => {
+        let mut chunks = Vec::new();
+        for place in places {
+          let (log, kept) = self
+            .files
+            .values()
+            .flat_map(|log| log.values().map(move |kept| (log, kept)))
+            .find(|(_, kept)| *blake3::hash(&kept.text).as_bytes() == place.payload)?;
+          let mut chunk = Vec::new();
+          match self.before(log, kept).filter(|_| place.offset == 1) {
+            Some(before) => delta::encode_lines(&before.text, &kept.text, &mut chunk).ok()?,
+            None => delta::encode_full_text(&kept.text, &mut chunk).ok()?,
+          }
+          chunks.push(chunk);
+        }
+        Some(super::Given::Chunks(chunks))
+      }
+    }
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,
@@ -1528,7 +1594,8 @@ fn listkeys_is_split_as_mercurial_splits_it() {
 }
 
 /// AC-HG.9, A-619: do clone from a store that lost a changeset's text, then one that lost a manifest revision, then
-/// one that lost a file revision. Expect each refused naming what it lost.
+/// one that lost a file revision (its changeset store keeping no row of it, A-767 C1). Expect each refused naming what it
+/// lost.
 #[test]
 fn a_store_that_lost_a_text_is_refused_by_kind() {
   let blob = caps(CLIENT_BLOB);
@@ -1552,7 +1619,7 @@ fn a_store_that_lost_a_text_is_refused_by_kind() {
   );
   assert_eq!(
     lost(|served| served.files_lost = true),
-    store("a file revision")
+    store("a file revision the changeset store keeps no row of")
   );
 }
 
@@ -1736,4 +1803,55 @@ fn a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history() {
     lacking(ours, &served, &held),
     lacking(oracle, &served, &held)
   );
+}
+
+/// A-767 C1 step 1a (a clone's file revisions as the changeset store keeps them; main's ruling of 2026-11-21 08:45). Do:
+/// clone 7.2's captured history from a store keeping each file revision after a log's first as its delta against the
+/// one before it. Expect every file revision after its log's first sent as a delta against the node sent just before it
+/// in its group, never whole, and every file text rebuilt from what was sent equal to the store's.
+#[test]
+fn a_clone_sends_each_file_revision_as_the_changeset_store_keeps_it() {
+  let mut served = cloned();
+  served.stored_deltas = true;
+  let blob = caps(CLIENT_BLOB);
+  let asked = Asked {
+    bundlecaps: &blob,
+    ..Asked::default()
+  };
+  let mut stream = Vec::new();
+  getbundle(&served, &asked, &mut room(), &mut stream).unwrap();
+  let bundle = Bundle2::decode(&stream, &mut room()).unwrap();
+  let (index, part) = bundle
+    .top_level()
+    .find(|(_, part)| part.is(b"changegroup"))
+    .unwrap();
+  let version = Version::from_part_param(part.param(b"version")).unwrap();
+  let payload = bundle.payload_bytes(index, &mut room()).unwrap();
+  let group = Changegroup::decode(&payload, version, &mut room()).unwrap();
+  let mut deltas = 0;
+  for file in &group.files {
+    let mut texts: HashMap<Node, Vec<u8>> = HashMap::new();
+    let mut previous: Option<Node> = None;
+    for revision in group.group(&file.revisions) {
+      let base = match previous {
+        Some(previous) => {
+          assert_eq!(
+            revision.base, previous,
+            "a delta against the revision sent before it"
+          );
+          deltas += 1;
+          texts[&previous].clone()
+        }
+        None => {
+          assert_eq!(revision.base, NULL_NODE, "a log's first revision whole");
+          Vec::new()
+        }
+      };
+      let text = delta::apply(&base, revision.data, &mut room()).unwrap();
+      assert_eq!(text, served.text(Named::File(file.name), &revision.node));
+      texts.insert(revision.node, text);
+      previous = Some(revision.node);
+    }
+  }
+  assert!(deltas > 0, "the clone sent stored deltas");
 }

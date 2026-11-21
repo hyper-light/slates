@@ -170,6 +170,10 @@ pub struct Indexed<'a> {
   census: Census,
   /// How the texts were lent.
   lends: Cell<Lends>,
+  /// The tests' changeset store answered at once from the index's own texts ([`Indexed::answering_from_its_texts`]),
+  /// each text by its identity as the rows named it; none in the daemon, whose changeset store answers between steps.
+  #[cfg(test)]
+  from_texts: Option<core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>>,
 }
 
 impl<'a> Indexed<'a> {
@@ -210,7 +214,66 @@ impl<'a> Indexed<'a> {
       markers,
       census,
       lends,
+      #[cfg(test)]
+      from_texts: None,
     })
+  }
+
+  /// The view, its changeset store answered at once from the index's own texts, each file revision as a stored whole
+  /// (the tests' stand-in for the node's changeset store, which the daemon asks between steps).
+  #[cfg(test)]
+  pub(crate) fn answering_from_its_texts(mut self) -> Self {
+    self.from_texts = Some(core::cell::RefCell::new(std::collections::BTreeMap::new()));
+    self
+  }
+
+  /// [`Store::stored_now`] from the index's own texts ([`Indexed::answering_from_its_texts`]).
+  #[cfg(test)]
+  fn given_from_texts(
+    &self,
+    texts: &core::cell::RefCell<std::collections::BTreeMap<[u8; 32], Vec<u8>>>,
+    want: &crate::render::Want,
+  ) -> Option<super::getbundle::Given> {
+    use crate::render::{StoredPlace, StoredRevision, Want};
+    match want {
+      Want::Rows { logs } => {
+        let mut rows = Vec::new();
+        for (path, nodes) in logs {
+          let mut log = Vec::new();
+          for node in nodes {
+            let mut room = Admission::new(u64::MAX);
+            let logged = self.logged(Log::File(path), node, &mut room).ok()?;
+            log.push(logged.map(|logged| {
+              let text = logged.text.into_owned();
+              let identity = *blake3::hash(&text).as_bytes();
+              let len = to_u64(crate::delta::HUNK_HEADER_LEN.saturating_add(text.len()));
+              texts.borrow_mut().insert(identity, text);
+              StoredRevision {
+                text: identity,
+                base: None,
+                place: StoredPlace {
+                  payload: identity,
+                  offset: 0,
+                  len,
+                },
+              }
+            }));
+          }
+          rows.push(log);
+        }
+        Some(super::getbundle::Given::Rows(rows))
+      }
+      Want::Chunks { places } => {
+        let held = texts.borrow();
+        let mut chunks = Vec::new();
+        for place in places {
+          let mut chunk = Vec::new();
+          crate::delta::encode_full_text(held.get(&place.payload)?, &mut chunk).ok()?;
+          chunks.push(chunk);
+        }
+        Some(super::getbundle::Given::Chunks(chunks))
+      }
+    }
   }
 
   /// Why the changeset `node` is not served; `None` for one it serves, or one the changelog does not hold.
@@ -441,6 +504,29 @@ impl Store for Indexed<'_> {
     room: &mut Admission,
   ) -> Result<Option<Logged<'_>>, PastAdmission> {
     self.logged(Log::File(path), node, room)
+  }
+
+  fn stored_now(&self, want: &crate::render::Want) -> Option<super::getbundle::Given> {
+    #[cfg(test)]
+    if let Some(texts) = &self.from_texts {
+      return self.given_from_texts(texts, want);
+    }
+    let _ = want;
+    None
+  }
+
+  /// A file revision's parents and flags from its log's row, no text read (A-767 C1).
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<([Node; 2], u16)> {
+    let log = Log::File(path);
+    let rev = self.index.rev(self.store, log, node)?;
+    let row = self
+      .index
+      .revision(self.store, log, rev)
+      .filter(|row| row.node == *node)?;
+    Some((
+      [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      row.flags,
+    ))
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {

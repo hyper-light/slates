@@ -97,6 +97,22 @@ pub trait Store: Repository {
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
 
+  /// The parents' nodes and the flags of the file revision at `path` whose node is `node`, from its log's row, with no
+  /// text read (A-767 C1: a clone sends each file revision as the changeset store keeps it); none where the log lacks
+  /// it. By default read through [`Store::file`].
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<([Node; 2], u16)> {
+    let mut room = Admission::new(u64::MAX);
+    let logged = self.file(path, node, &mut room).ok()??;
+    Some((logged.parents, logged.flags))
+  }
+
+  /// What a whole answer, which cannot wait between its steps, reads of the changeset store where its walk asks it
+  /// ([`crate::render::Want`]), at once; none where the store answers only between steps, as the daemon's does (its
+  /// changeset store is its owner's thread's): its edges stream such answers and ask it between turns. None by default.
+  fn stored_now(&self, _want: &crate::render::Want) -> Option<Given> {
+    None
+  }
+
   /// The manifest log's revision at `position` (A-745: a fetch walks the log in its order): its node, and the served
   /// revision of the changeset the log links it to; `None` past the log's end.
   fn manifest_linked(&self, position: u64) -> Option<Linked>;
@@ -136,6 +152,16 @@ pub trait Store: Repository {
   fn revlogs(&self) -> Option<(&crate::index::HgIndex, &slates_vcs::ContentStore)> {
     None
   }
+}
+
+/// What the changeset store gives back for a walk's want ([`crate::render::Want`]): a log's rows in turn, or the
+/// chunks at the places asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Given {
+  /// Each log's rows, in the order asked, none for a revision the store keeps no row of.
+  Rows(Vec<Vec<Option<crate::render::StoredRevision>>>),
+  /// The bytes at each place asked, in order.
+  Chunks(Vec<Vec<u8>>),
 }
 
 /// A manifest revision as the store keeps it, a delta ([`Store::manifest_delta`]): its base's position in the log, its
@@ -237,7 +263,11 @@ pub fn getbundle(
   out: &mut Vec<u8>,
 ) -> Result<(), Refusal> {
   let mut answering = Answering::begin(store, asked, admission)?;
-  while answering.step(store, admission, out)? {}
+  while answering.step(store, admission, out)? {
+    if answering.wants().is_some() {
+      return Err(unanswered());
+    }
+  }
   Ok(())
 }
 
@@ -258,6 +288,18 @@ pub struct Answering {
 }
 
 impl Answering {
+  /// What the answer's next step asks of the changeset store, if anything (its changegroup's file section, [`Walk`]).
+  pub fn wants(&self) -> Option<&crate::render::Want> {
+    self.walk.as_ref()?.wants()
+  }
+
+  /// The changeset store's answer to [`Answering::wants`].
+  pub fn give(&mut self, given: Given) {
+    if let Some(walk) = &mut self.walk {
+      walk.give(given);
+    }
+  }
+
   /// Begins the answer to `asked` over `store` (the module docs' parts, in 7.2's order), what it holds charged to
   /// `admission`; refused before anything is written, as 7.2 refuses before its first part.
   pub fn begin(
@@ -604,8 +646,20 @@ pub fn changegroup(
 ) -> Result<Vec<u8>, Refusal> {
   let mut walk = Walk::begin(store, outgoing, version, admission)?;
   let mut out = Vec::new();
-  while walk.step(store, admission, &mut out)? {}
+  while walk.step(store, admission, &mut out)? {
+    if walk.wants().is_some() {
+      return Err(unanswered());
+    }
+  }
   Ok(out)
+}
+
+/// The refusal of a whole answer whose walk asks the changeset store between steps, which only an edge answering a step
+/// at a time can ask ([`Store::stored_now`]).
+fn unanswered() -> Refusal {
+  Refusal::Store {
+    what: "a file revision read from the changeset store between steps",
+  }
 }
 
 /// Where a changegroup's walk stands (A-745).
@@ -645,6 +699,75 @@ pub struct Walk {
   /// A fetch the links cannot walk ([`named_changegroup`]): its changegroup, made whole when it began, written in one
   /// step.
   named: Option<Vec<u8>>,
+  /// The file revisions read from the changeset store ahead of their steps ([`Ahead`]).
+  files: Files,
+}
+
+/// The file section's reads of the changeset store (A-767 C1 step 1; main's ruling of 2026-11-21 08:45): each file
+/// revision sent as the store keeps it, its stored delta against the revision its base text was sent as earlier in
+/// this answer (an earlier revision of the same log), or its stored whole against the null base; no whole text read or
+/// made. The walk asks the store by [`Walk::wants`] before the step that needs it, a batch at a time: the rows of as
+/// many revisions ahead as the room the step was given holds, then the chunks of as many of those as it holds, given
+/// back by [`Walk::give`]. A revision the store keeps no row of, or whose stored base this answer did not send, is
+/// refused typed.
+#[derive(Debug, Default)]
+struct Files {
+  /// What the next step asks of the store.
+  want: Option<crate::render::Want>,
+  /// The revisions whose rows are asked, each log's path and its revisions' positions and nodes, in the walk's order.
+  asked: Vec<(Vec<u8>, Vec<(u64, Node)>)>,
+  /// The revisions read ahead, in the walk's order.
+  ahead: std::collections::VecDeque<Ahead>,
+  /// How many of `ahead`'s front revisions have their chunks asked.
+  chunks_asked: usize,
+  /// A revision the store keeps no row of: refused at the next step.
+  unkept: bool,
+  /// The open group's texts sent, by identity: the node each was sent as, which a later revision's stored delta names.
+  sent: BTreeMap<[u8; 32], Node>,
+  /// The revisions sent as the store keeps them.
+  stored: u64,
+  /// The room the step that asked was given: what sizes the chunks asked after the rows.
+  room: u64,
+}
+
+impl Files {
+  /// Asks the store for the chunks of the revisions read ahead that lack theirs, as many as `room`'s bytes hold (one
+  /// at least).
+  fn ask_chunks(&mut self, room: u64) {
+    let mut places = Vec::new();
+    let mut bytes = 0_u64;
+    for ahead in self.ahead.iter().filter(|ahead| ahead.chunk.is_none()) {
+      if !places.is_empty() && bytes.saturating_add(ahead.row.place.len) > room {
+        break;
+      }
+      bytes = bytes.saturating_add(ahead.row.place.len);
+      places.push(ahead.row.place.clone());
+    }
+    self.chunks_asked = self
+      .ahead
+      .iter()
+      .take_while(|ahead| ahead.chunk.is_some())
+      .count()
+      .saturating_add(places.len());
+    if !places.is_empty() {
+      self.want = Some(crate::render::Want::Chunks { places });
+    }
+  }
+}
+
+/// A file revision read ahead of its step: where it is, its stored row, and its chunk once given.
+#[derive(Debug)]
+struct Ahead {
+  /// Its log's path.
+  path: Vec<u8>,
+  /// Its position in its log.
+  position: u64,
+  /// Its node.
+  node: Node,
+  /// How the store keeps it.
+  row: crate::render::StoredRevision,
+  /// Its stored edit or whole, once given.
+  chunk: Option<Vec<u8>>,
 }
 
 impl Walk {
@@ -662,6 +785,7 @@ impl Walk {
       version,
       at: Some(At::Changelog(0)),
       named: None,
+      files: Files::default(),
     };
     if !by_links(store, outgoing) {
       walk.named = Some(named_changegroup(store, outgoing, version, admission)?);
@@ -681,20 +805,85 @@ impl Walk {
       out.extend_from_slice(&named);
       return Ok(false);
     }
-    // A refused step leaves the walk where it was, so a step given more room takes the same unit again.
-    let Some(at) = self.at.clone() else {
-      return Ok(false);
-    };
-    self.at = match at {
-      At::Changelog(from) => self.changeset(store, from, room, out)?,
-      At::Manifests(position, sent) => self.manifest(store, (position, sent), room, out)?,
-      At::Files {
-        path,
-        position,
-        open,
-      } => self.file(store, (path, position), open, room, out)?,
-    };
-    Ok(self.at.is_some())
+    loop {
+      // A want the store answers at once (a whole answer's, [`Store::stored_now`]) is given here and the unit taken
+      // again; one it answers only between steps (the daemon's) stays, and the step takes nothing: its edge asks the
+      // store before the next.
+      while let Some(want) = self.files.want.clone() {
+        let Some(given) = store.stored_now(&want) else {
+          return Ok(true);
+        };
+        self.give(given);
+      }
+      // A refused step leaves the walk where it was, so a step given more room takes the same unit again.
+      let Some(at) = self.at.clone() else {
+        return Ok(false);
+      };
+      self.at = match at {
+        At::Changelog(from) => self.changeset(store, from, room, out)?,
+        At::Manifests(position, sent) => self.manifest(store, (position, sent), room, out)?,
+        At::Files {
+          path,
+          position,
+          open,
+        } => self.file(store, (path, position), open, room, out)?,
+      };
+      if self.files.want.is_none() {
+        return Ok(self.at.is_some());
+      }
+    }
+  }
+
+  /// What the next step asks of the changeset store, if anything ([`Files`]): given back by [`Walk::give`] before it.
+  pub fn wants(&self) -> Option<&crate::render::Want> {
+    self.files.want.as_ref()
+  }
+
+  /// The changeset store's answer to [`Walk::wants`]: rows ask the chunks of as many of their revisions as the room the
+  /// asking step was given holds, at once.
+  pub fn give(&mut self, given: Given) {
+    let files = &mut self.files;
+    let room = files.room;
+    files.want = None;
+    match given {
+      Given::Rows(rows) => {
+        let asked = core::mem::take(&mut files.asked);
+        if rows.len() != asked.len() {
+          files.unkept = true;
+        }
+        for ((path, revisions), rows) in asked.into_iter().zip(rows) {
+          if rows.len() != revisions.len() {
+            files.unkept = true;
+          }
+          for ((position, node), row) in revisions.into_iter().zip(rows) {
+            match row {
+              Some(row) => files.ahead.push_back(Ahead {
+                path: path.clone(),
+                position,
+                node,
+                row,
+                chunk: None,
+              }),
+              None => files.unkept = true,
+            }
+          }
+        }
+        if !files.unkept {
+          files.ask_chunks(room);
+        }
+      }
+      Given::Chunks(chunks) => {
+        let asked = core::mem::take(&mut files.chunks_asked);
+        for (ahead, chunk) in files.ahead.iter_mut().take(asked).zip(chunks) {
+          ahead.chunk = Some(chunk);
+        }
+      }
+    }
+  }
+
+  /// The file revisions this walk sent as the changeset store keeps them.
+  pub fn stored_sent(&self) -> u64 {
+    self.files.stored
   }
 
   /// The missing changeset at or after `from`, or the changelog group's end.
@@ -782,9 +971,11 @@ impl Walk {
   }
 
   /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
-  /// one, the open group's end first where it is another path's), or the file list's end.
+  /// one, the open group's end first where it is another path's), or the file list's end: sent as the changeset store
+  /// keeps it ([`Files`]), read ahead of this step; where it is not read yet, this step asks the store and takes the
+  /// same place again.
   fn file(
-    &self,
+    &mut self,
     store: &impl Store,
     (path, position): (Vec<u8>, u64),
     open: Option<Vec<u8>>,
@@ -806,25 +997,99 @@ impl Walk {
     let Some(link) = linked.link.filter(|link| self.missing.contains(*link)) else {
       return Ok(Some(next(open)));
     };
-    let logged = store
-      .file(&found, &linked.node, room)?
-      .ok_or(Refusal::Store {
-        what: "a file revision",
-      })?;
+    if self.files.unkept {
+      return Err(Refusal::Store {
+        what: "a file revision the changeset store keeps no row of",
+      });
+    }
+    let here = At::Files {
+      path: found.clone(),
+      position,
+      open: open.clone(),
+    };
+    let ready = matches!(
+      self.files.ahead.front(),
+      Some(ahead) if ahead.path == found && ahead.position == position
+    );
+    if !ready {
+      self.files.ahead.clear();
+      self.files.chunks_asked = 0;
+      self.ask_rows(store, (&found, position), room.left());
+      return Ok(Some(here));
+    }
+    if self
+      .files
+      .ahead
+      .front()
+      .is_some_and(|ahead| ahead.chunk.is_none())
+    {
+      self.files.ask_chunks(room.left());
+      return Ok(Some(here));
+    }
+    let Some(Ahead {
+      node, row, chunk, ..
+    }) = self.files.ahead.pop_front()
+    else {
+      return Ok(Some(here));
+    };
+    let chunk = chunk.unwrap_or_default();
+    let (parents, flags) = store.file_entry(&found, &node).ok_or(Refusal::Store {
+      what: "a file revision",
+    })?;
     if open.as_deref() != Some(found.as_slice()) {
       if open.is_some() {
         changegroup::put_end(out);
       }
       changegroup::put_name(&found, out).map_err(|_| unencodable("a path"))?;
+      self.files.sent.clear();
     }
+    let base = match row.base {
+      None => NULL_NODE,
+      Some(base) => *self.files.sent.get(&base).ok_or(Refusal::Store {
+        what: "a file revision whose stored base this answer did not send",
+      })?,
+    };
     let link = node_of(store, link)?;
-    self.put(
-      (linked.node, logged.parents, link, logged.flags),
-      &logged.text,
-      room,
-      out,
-    )?;
+    self.put_delta((node, parents, link, flags), (base, &chunk), room, out)?;
+    self.files.sent.insert(row.text, node);
+    self.files.stored = self.files.stored.saturating_add(1);
     Ok(Some(next(Some(found.clone()))))
+  }
+
+  /// Asks the store for the rows of the file revisions from `from` on that a missing changeset links, as many as
+  /// `room` holds (one at least), each log's in turn.
+  fn ask_rows(&mut self, store: &impl Store, (path, position): (&[u8], u64), room: u64) {
+    let most = usize::try_from(room / to_u64(core::mem::size_of::<Ahead>()).max(1))
+      .unwrap_or(usize::MAX)
+      .max(1);
+    let mut asked: Vec<(Vec<u8>, Vec<(u64, Node)>)> = Vec::new();
+    let mut taken = 0_usize;
+    let mut at = (path.to_vec(), position);
+    while taken < most {
+      let Some((found, position, linked)) = store.file_linked_from((&at.0, at.1)) else {
+        break;
+      };
+      if linked.link.is_some_and(|link| self.missing.contains(link)) {
+        match asked.last_mut() {
+          Some((last, revisions)) if *last == found => revisions.push((position, linked.node)),
+          _ => asked.push((found.clone(), vec![(position, linked.node)])),
+        }
+        taken = taken.saturating_add(1);
+      }
+      at = (found, position.saturating_add(1));
+    }
+    let logs = asked
+      .iter()
+      .map(|(path, revisions)| {
+        (
+          path.clone(),
+          revisions.iter().map(|(_, node)| *node).collect(),
+        )
+      })
+      .collect();
+    self.files.asked = asked;
+    self.files.room = room;
+    self.files.want = Some(crate::render::Want::Rows { logs });
   }
 
   /// Appends one revision (its node, parents, link and flags) as the delta `data` against `base`, a revision sent
