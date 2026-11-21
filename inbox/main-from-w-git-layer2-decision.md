@@ -11,7 +11,7 @@ Measured on Studio-2 (release plus timeline diagnostic; git/git whole-history pu
 
 Pieces landed or landing:
 - Piece 1, ON MAIN (b7d2ae37e): the connectivity check charges per object, not per edge. The push is no longer refused.
-- Piece 2, landing now (8baa1cf16): every decision step had folded over all of the push's commits (about 75,000) to
+- Piece 2, ON MAIN (8baa1cf16, merge 339f7e73d): every decision step had folded over all of the push's commits (about 75,000) to
   size a restage nobody needed; a stack sample put 3,408 of 3,620 busy samples there. It is now two counts. Decision
   steps went from about 0.5 ms to about 30 µs. Focused tests green: git store 115/115, server 51/51.
 

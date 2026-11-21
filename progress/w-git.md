@@ -328,3 +328,13 @@
 - NEXT (main 01:56): layer 2 before C5 2b piece 3. The checks a slice at a time over the pack held once, charging
   only the slice (no whole edge table); red = the 611 MB push refused today, then landing within its room; A/B vs
   stock git (release, interleaved, all N). Merge w-shared format 6 piece 1 when it lands.
+- 02:40 Layer 2 piece 1 LANDED b295ea7b3 (merge b7d2ae37e): connectivity check charges per object, no edge table
+  (red asked 134,176 B / 2,254 left). The 611 MB push no longer refused; it lands its changeset.
+- 04:10 Layer 2 piece 2 LANDED 8baa1cf16 (merge 339f7e73d): stage_room from counts; restage_turn skips when nothing
+  due (decision step 0.5 ms -> ~30 us). Focused on merged tree: git store 115, receive 50, server 53.
+- Measured (Studio-2, git/git push): checks 16.0 s, seal 3.7 s, homing+landing 1.3 s, decision >350 s unfinished.
+  The decision wall: a create walks its whole history for its green's reached set (A-614), refs x history. Options
+  (A) lazy reached sets, (B') generation order + peeled-commit head map; asked main (inbox
+  main-from-w-git-layer2-decision.md), holding. Next on my side meanwhile: the checks' 16 s.
+- Diag kit on Studio-2: ~/.cache/w-git-diag/{cut,phase_cut,timeline2}_patch.py, push_repro.sh, slates-l2diag.
+  Removed there: w-git-wt, w-git-wt2 (worktrees), w-git-target.noindex (8 GB).
