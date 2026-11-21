@@ -147,9 +147,6 @@ pub(crate) enum Uncommitted {
   },
   /// The append refused (A-635's refusal): nothing applied.
   Append(AppendRefused),
-  /// The commit's texts were not answered durable in the shard's image (A-727 slice b's barrier): nothing applied,
-  /// the texts given back.
-  NotDurable(crate::vcs_store::BarrierRefused),
   /// The node's changeset store refused the record's changeset, or the daemon holds none (C2, A-767 C6): nothing of it
   /// is in the register.
   Unstored,
@@ -205,10 +202,6 @@ impl Uncommitted {
         SVN_ERR_FS_GENERAL,
         format!("The repository's log refused the commit: {refused:?}"),
       ),
-      Uncommitted::NotDurable(refused) => (
-        SVN_ERR_FS_GENERAL,
-        format!("The commit's texts were not made durable: {refused:?}"),
-      ),
       Uncommitted::Unstored => (
         SVN_ERR_FS_GENERAL,
         "The repository's store did not take the commit".to_owned(),
@@ -246,17 +239,11 @@ pub(crate) async fn land_work(
       }
     }
   }
-  // Only a landing that put texts has content to make durable: the texts the records already held were made durable
-  // by the landing that put them, and a work of directories and properties alone names no content.
-  if !storing.put.is_empty() {
-    let (origin, ticket) =
-      crate::state::with_state(|state| (state.shard, crate::vcs_store::content_ticket(state)))?;
-    let budget_ns = crate::fleet::live_budget().max_deadline_ns();
-    if let Err(refused) = crate::vcs_store::content_durable(origin, ticket, budget_ns).await {
-      let _ = crate::state::with_state(|state| release_stored(state, storing));
-      return Some(Err(Uncommitted::NotDurable(refused)));
-    }
-  }
+  // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
+  // entry names a text that is durable only in the shard's image, and a recovery reads one the content store lacks back
+  // from there (`vcs_store::fetch_stored_texts`). The texts the records already held landed with the changeset that
+  // put them.
+  let carried = texts_carried(&work, &storing.put);
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
   // the store and committed in the register (`landing`); the texts held twice given back once it stands, every text
   // the landing put given back where it was refused.
@@ -267,7 +254,7 @@ pub(crate) async fn land_work(
     }
   };
   landed(
-    repository,
+    (repository, carried),
     |state| {
       let now = AprTime::from_wall_ns(slates_vfs::clock::Clock::wall_ns(&mut state.clock));
       let locks = work.locks.clone();
@@ -297,19 +284,38 @@ pub(crate) async fn land_work(
 /// before the commit runs `undo` with what `prepare` made, where it made something. None where the shard's state is
 /// gone (its shutdown).
 async fn landed<P, T>(
-  repository: RepositoryId,
+  (repository, texts): (RepositoryId, Vec<landing::LandedText>),
   prepare: impl FnOnce(&mut ShardState) -> Result<(Vec<u8>, P), Uncommitted>,
   commit: impl FnOnce(&mut ShardState, Vec<u8>, P) -> Result<T, Uncommitted>,
   undo: impl FnOnce(&mut ShardState),
 ) -> Option<Result<T, Uncommitted>> {
   let turn = landing::turn(repository).await?;
-  landed_with(turn, repository, prepare, commit, undo).await
+  landed_with(turn, (repository, texts), prepare, commit, undo).await
+}
+
+/// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
+/// path a row sets it at, with its length: what its changeset carries (C2 stage B).
+fn texts_carried(work: &Work, put: &[ContentIdentity]) -> Vec<landing::LandedText> {
+  let mut carried: Vec<landing::LandedText> = Vec::with_capacity(put.len());
+  for change in &work.record.changes {
+    let Some(text) = change.text else {
+      continue;
+    };
+    if put.contains(&text.identity) && !carried.iter().any(|kept| kept.identity == text.identity) {
+      carried.push(landing::LandedText {
+        path: change.path.as_bytes().to_vec(),
+        identity: text.identity,
+        len: text.size,
+      });
+    }
+  }
+  carried
 }
 
 /// [`landed`] holding repository `repository`'s landing turn `turn` already.
 pub(crate) async fn landed_with<P, T>(
   turn: landing::Turn,
-  repository: RepositoryId,
+  (repository, texts): (RepositoryId, Vec<landing::LandedText>),
   prepare: impl FnOnce(&mut ShardState) -> Result<(Vec<u8>, P), Uncommitted>,
   commit: impl FnOnce(&mut ShardState, Vec<u8>, P) -> Result<T, Uncommitted>,
   undo: impl FnOnce(&mut ShardState),
@@ -329,12 +335,7 @@ pub(crate) async fn landed_with<P, T>(
       return Some(Err(refused));
     }
   };
-  let stored = landing::land(
-    &disk,
-    (repository, sequence),
-    vec![(slates_store::log::SectionKind::Record, record)],
-  )
-  .await;
+  let stored = landing::land_changeset(&disk, (repository, sequence), record, &texts).await;
   crate::state::with_state(move |state| {
     let committed = match stored {
       // Another changeset named at this sequence meanwhile (none while the turn is held, in a correct use).
@@ -363,7 +364,7 @@ pub(crate) async fn land_revision(
   judged: Option<(&CommitLocks, AprTime)>,
 ) -> Option<Result<Committed, Uncommitted>> {
   landed(
-    repository,
+    (repository, Vec::new()),
     |state| prepare_revision(state, repository, revision, judged),
     |state, reference, prepared| {
       commit_prepared(state, (principal, repository), reference, prepared)
@@ -628,7 +629,7 @@ pub(crate) async fn land_record_with(
 ) -> Option<Result<(), Uncommitted>> {
   landed_with(
     turn,
-    repository,
+    (repository, Vec::new()),
     |state| record_prepared(state, repository, record),
     |state, reference, record| record_committed(state, (principal, repository), reference, record),
     |_| {},
@@ -771,7 +772,7 @@ pub(crate) async fn land_made(
 ) -> Option<Result<u64, Uncommitted>> {
   landed_with(
     turn,
-    repository,
+    (repository, Vec::new()),
     |state| {
       let revision = make(state)?;
       prepare_revision(state, repository, revision, None)
