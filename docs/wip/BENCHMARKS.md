@@ -17663,3 +17663,21 @@ slots written again), against its read-and-rebase loop.
   plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
   measured on a shared, loaded machine and is not read as a result.
 
+## 2026-11-21 — A shard-level cache of base lengths (option 3): its ceiling measured, rejected unbuilt (w-fed-move, goal 86b)
+
+After A-817 a work's first edit of each file asks its green's owner for that file's length (4.8 a client at 300 hot
+files, 4.7 at 10, in the 1,000-client stand-in: release, in-process, `kernel/`, one round). The question was whether a
+cache of lengths shared by the works on one shard would cut it. A temporary diagnostic on the owner counted, for each
+length ask, whether the same asking shard had asked the same path before at a version since which the path had not
+changed: the asks a cache with perfect invalidation could have served.
+
+| hot files | length asks sampled | reusable | share |
+|---|---|---|---|
+| 300 | 4,000 | 398 | 10% |
+| 10 | 4,000 | 704 | 18% |
+
+So even a perfect cache saves at most about 0.5 to 0.8 asks a client, and a real one less: a work's shard cannot
+know that a file is unchanged since a cached answer without asking. Not built. With the resolution at the head
+rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
+each verdict, each work's first edit of a file, and a creation's admission and name.
+
