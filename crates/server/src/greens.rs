@@ -317,6 +317,33 @@ impl Greens {
     lineage.get_mut().with(preview.handle, |green| call(green))
   }
 
+  /// A scratch member of member `id`'s lineage at its head, O(1) (`Lineage::branch`): what an import's batch advances its
+  /// revisions in (C2 stage C, A-814), the green showing nothing of them until the batch commits. Retire it with
+  /// [`Greens::retire_preview`]. Refused as the lineage refuses a branch; `Stale` for a green standing alone.
+  pub fn preview_at_head(&mut self, id: &VolumeId) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let head = lineage.get_mut().with(source, |green| green.head())?;
+    let handle = lineage.get_mut().branch(source, head)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine, for a write.
+  pub fn with_preview_mut<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&mut Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, call)
+  }
+
   /// Retires `preview`, its holds given back at once: a preview at its green's head shares every node but the ones its
   /// one version copied, so its release is that version's paths, never the tree.
   pub fn retire_preview(&mut self, preview: Preview) {

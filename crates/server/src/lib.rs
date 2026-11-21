@@ -93,6 +93,9 @@ mod held_send;
 pub mod histogram;
 mod identities;
 mod image;
+#[cfg_attr(not(test), allow(dead_code))]
+// Its caller outside tests is svn's import driver (w-svn, C2 stage C).
+mod import_batch;
 pub mod landing;
 mod landing_entries;
 pub mod lease;
