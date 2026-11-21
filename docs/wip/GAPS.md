@@ -2682,7 +2682,12 @@
 > and `a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once` (red before: a read in the
 > submit's step saw head 1 and the new bytes). Owed: (b) a submit dispatched outside a recorded request (no answer
 > waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
-> (`hg_made`) commits in the submit's step; git's adopts the hook (w-git, removing its version-2 path); (d)
+> takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
+> after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
+> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`), but its record is
+> still written in the register's entry, not landed on the node's store first, and a client's hg push takes no landing
+> turn, so a push in flight and a made changeset are not ordered by it (owed with w-hg: a made reference on the store
+> and its replay); git's adopts the hook (w-git, removing its version-2 path); (d)
 > performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's

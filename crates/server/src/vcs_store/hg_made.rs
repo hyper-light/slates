@@ -14,8 +14,12 @@
 //! once, its branch its parent's (a root takes its line's). The changeset, its manifest and its file revisions are kept
 //! in a fork of the index (`commit::fork_with`) and recorded as a push's are, in the one Mercurial record kind with the
 //! green's key and the version beside them (`import::record::write_made`, `Source::Made`), in an entry of the register
-//! holding it alone (A-662), appended in the submit's own transaction after the version's record: judged by the
-//! register's guard first, the fork kept only once the entry is appended, given back otherwise.
+//! holding it alone (A-662), appended in the transaction of the version's record, after it: judged by the register's
+//! guard first, the fork kept only once the entry is appended, given back otherwise. A recorded submit takes the
+//! deferred-submit hook (A-807, `crate::made_commit`, [`make_deferred`]): the repository's landing turn before its
+//! verdict, the verdict held, and the version with its changeset committed in one step by a task, then the answer. A
+//! bare dispatch ([`make`]) still makes it in the submit's step. Owed (GAPS C2): the record landed on the node's store
+//! before the entry, as a push's is, and a push ordered by the same turn.
 //!
 //! **Its head** ([`head_of`]): a line's or a bookmark's changeset is the one the server made of its green's head version
 //! where it made one (the store's `made` map, green by green, the newest only), else the one its head names
@@ -113,6 +117,56 @@ pub(crate) fn make(
   }
 }
 
+/// Makes the changeset of the version `pending` holds, of a Mercurial repository's green, through the deferred-submit
+/// hook (A-806, `crate::made_commit`): a task holding the repository's landing turn, which the submit took before its
+/// verdict, applies the held verdict and commits the version and its changeset in one step, then answers.
+pub(crate) fn make_deferred(
+  state: &mut ShardState,
+  turn: crate::repository::svn_commit::landing::Turn,
+  pending: crate::made_commit::Pending,
+  copies: Vec<MadeCopy>,
+) {
+  let (green, _) = pending.version();
+  let request = pending.request();
+  let task = made_step(turn, pending, copies);
+  if slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    // The task could not start (the shard's arena full): nothing of the accept is applied or durable.
+    state.count(UNMADE, 1);
+    crate::made_commit::abandon(state, (request, green));
+  }
+}
+
+/// [`make_deferred`]'s task: the one step, the changeset made of the version once the verdict is applied (as [`make`]
+/// makes it), in that step's transaction; counted.
+async fn made_step(
+  turn: crate::repository::svn_commit::landing::Turn,
+  pending: crate::made_commit::Pending,
+  copies: Vec<MadeCopy>,
+) {
+  let _ = crate::state::with_state(move |state| {
+    let (green, version) = pending.version();
+    let authorship = pending.authorship().clone();
+    let committed = crate::made_commit::commit(state, pending, |state| {
+      made(state, green, version, &authorship, &copies)
+    });
+    match committed {
+      Some(Ok(true)) => state.count(MADE, 1),
+      Some(Err(why)) => {
+        slates_machine::log_line!(
+          "slates-server: partition {}: no changeset was made of a submitted version: {why:?}",
+          state.partition
+        );
+        state.count(UNMADE, 1);
+      }
+      Some(Ok(false)) | None => {}
+    }
+    turn.give_back(state);
+  });
+}
+
 /// The changeset that is `green`'s head (module docs): the one the server made of its head version, else the one its
 /// head names.
 pub(crate) fn head_of(state: &ShardState, green: DbVolumeId) -> Option<Node> {
@@ -192,7 +246,10 @@ fn made(
 }
 
 /// The Mercurial repository `green` is the green of.
-fn mercurial_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
+pub(crate) fn mercurial_repository_of(
+  state: &ShardState,
+  green: DbVolumeId,
+) -> Option<RepositoryId> {
   let repositories = state.db.partition().repositories();
   let repository = repositories.member(green)?.repository;
   let record = repositories.repository(repository)?;
