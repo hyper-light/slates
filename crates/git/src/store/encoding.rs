@@ -42,6 +42,7 @@ use crate::to_u64;
 use super::fragment::{self, Encoded, Encoder, Named, Placed, Put, Putting, ToEncode};
 use super::learn::{Clock, Exchange};
 use super::positions::Positions;
+use super::push::StoredAt;
 use super::repository::{Repository, StoreRefused};
 use super::upload::{Progress, Turn};
 
@@ -93,21 +94,36 @@ struct Reading {
   position: u64,
   kind: Kind,
   len: u64,
-  content: ContentId,
+  stored: StoredAt,
   bytes: Vec<u8>,
 }
 
 impl Reading {
-  /// The next window of the object read, when one is left: whether one was.
-  fn read_window(&mut self, store: &ContentStore) -> Result<bool, StoreRefused> {
+  /// The next window of the object read, when one is left: whether one was. An object read where it lies in a pack
+  /// (A-722's record v4) is read whole at its first window, its chain resolved at once.
+  fn read_window(
+    &mut self,
+    repository: &Repository,
+    store: &ContentStore,
+  ) -> Result<bool, StoreRefused> {
     let id = self.id;
     if to_u64(self.bytes.len()) >= self.len {
       return Ok(false);
     }
+    let content = match &self.stored {
+      StoredAt::Whole(content) => *content,
+      StoredAt::InPack(_) => {
+        let bytes = repository
+          .read_stored(store, &self.stored, self.len)
+          .ok_or(StoreRefused::Unreadable { id })?;
+        self.bytes.extend_from_slice(&bytes);
+        return Ok(true);
+      }
+    };
     let window = to_u64(store.window().max(1));
     let index = to_u64(self.bytes.len()).checked_div(window).unwrap_or(0);
     let bytes = store
-      .window_at(&self.content, self.len, index)
+      .window_at(&content, self.len, index)
       .ok_or(StoreRefused::Unreadable { id })?;
     self.bytes.extend_from_slice(&bytes);
     Ok(true)
@@ -438,11 +454,11 @@ impl Encoding {
         ref mut named,
       } => {
         let before = object.bytes.len();
-        let mut read = object.read_window(store)?;
+        let mut read = object.read_window(repository, store)?;
         let mut taken = object.bytes.len().saturating_sub(before);
         if !read && let Some(named) = named.as_mut() {
           let before = named.bytes.len();
-          read = named.read_window(store)?;
+          read = named.read_window(repository, store)?;
           taken = named.bytes.len().saturating_sub(before);
         }
         self.counters.most_bytes_a_unit = self.counters.most_bytes_a_unit.max(to_u64(taken));
@@ -521,7 +537,7 @@ impl Encoding {
       position,
       kind: row.kind,
       len: row.len,
-      content,
+      stored: repository.stored_of(&row, content),
       bytes: Vec::new(),
     };
     let named = match self.named.get(&id) {
@@ -534,7 +550,7 @@ impl Encoding {
           position: row.position,
           kind: row.kind,
           len: row.len,
-          content,
+          stored: repository.stored_of(&row, content),
           bytes: Vec::new(),
         })
       }

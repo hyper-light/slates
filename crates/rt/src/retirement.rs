@@ -604,6 +604,7 @@ const ORIGINAL_PUBLISHING: u64 = 1;
 /// Native ownership encoding: the whole resource was published before this state.
 const ORIGINAL_OWNED: u64 = 2;
 /// Native ownership encoding: unused or refused admission can never reopen.
+/// Format: the encoding's fourth state, after open, publishing and owned.
 const ORIGINAL_CLOSED: u64 = 3;
 
 struct OriginalAdmission(CellRef);
@@ -925,6 +926,7 @@ impl Owner {
     // Each group can have one worker Adopt-or-Retire, one original publication
     // notification, and one original retirement command outstanding; Stop owns its
     // independent final slot. All retries consume a refusal before publishing again.
+    // Derived: the three commands a group can have outstanding, named above.
     let command_capacity = groups
       .checked_mul(3)
       .and_then(|n| n.checked_add(1))
@@ -1312,6 +1314,20 @@ impl Reaper {
     let (owner, leases) = Owner::new_with_original(capacities)?;
     self.owners.push(owner);
     Ok(leases)
+  }
+
+  /// Joins every owner, after the workers and services that used its leases have ended (upstream's
+  /// `Runtime::shutdown`, which joined its retirement owners last): the first owner's failure is the answer, a group
+  /// whose native thread ended abnormally among them (`BadConfig`), and every owner is joined either way.
+  pub fn shutdown(mut self) -> Result<(), RtError> {
+    let mut first = Ok(());
+    for mut owner in std::mem::take(&mut self.owners) {
+      let joined = owner.join();
+      if first.is_ok() {
+        first = joined;
+      }
+    }
+    first
   }
 
   /// Joins the owners that are done, then checks the new groups fit the bound and an owner's place is reserved.

@@ -52,12 +52,16 @@ fn reformat(text: &str) -> String {
     .enumerate()
     .map(|(n, line)| {
       let lead = line.len() - line.trim_start_matches(' ').len();
-      let body = &line[lead..];
+      let body = line.get(lead..).unwrap();
       let body = if n % 100 == 0 {
         let word = body
           .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
           .unwrap_or(0);
-        format!("{}_x{}", &body[..word], &body[word..])
+        format!(
+          "{}_x{}",
+          body.get(..word).unwrap(),
+          body.get(word..).unwrap()
+        )
       } else {
         body.to_owned()
       };
@@ -151,7 +155,10 @@ fn sliced_round(base: &[u8], post: &[u8]) -> Option<(f64, u64, f64)> {
   ))
 }
 
-fn print_sliced(rows: &[(String, Vec<Option<(f64, u64, f64)>>)]) {
+/// A case's name and each round's (sliced ms, turns, longest unit µs), when it ran.
+type SlicedRow = (String, Vec<Option<(f64, u64, f64)>>);
+
+fn print_sliced(rows: &[SlicedRow]) {
   println!(
     "\n{:<18} {:>12} {:>8} {:>16}  rounds (ms / longest unit µs)",
     "case", "sliced ms", "turns", "longest unit µs"

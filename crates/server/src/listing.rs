@@ -216,6 +216,30 @@ fn green_entries(
 ) -> Result<Vec<DirEntry>, Refusal> {
   let engine = state.greens.get(&green).ok_or(Refusal::NotFound)?;
   let version = crate::merge_service::green_version(state, &engine, green, at)?;
+  // At the head, only the directory's own subtree is read (A-792): the whole green's base, every path of it copied,
+  // was most of a primary's busy core under many clients listing the Linux kernel's tree (goal 86b).
+  if version >= engine.head() {
+    let under = engine.head_under(dir);
+    let paths = under
+      .files
+      .into_iter()
+      .map(|(path, size)| (path, EntryKind::File, size))
+      .chain(under.dirs.into_iter().map(|path| (path, EntryKind::Dir, 0)))
+      .chain(
+        under
+          .symlinks
+          .into_iter()
+          .map(|path| (path, EntryKind::Symlink, 0)),
+      )
+      .chain(
+        under
+          .specials
+          .into_iter()
+          .map(|path| (path, EntryKind::Other, 0)),
+      )
+      .collect();
+    return listed(paths, dir).ok_or(Refusal::NotFound);
+  }
   let base = engine.base_at(version);
   let paths = base
     .files

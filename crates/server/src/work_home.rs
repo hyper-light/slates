@@ -234,10 +234,12 @@ pub(crate) struct WorkHome {
   routing: BTreeSet<DbVolumeId>,
   /// Test support (`Daemon::lose_next_owner_answer`): the next verdict or admission an ask brings back is lost.
   pub(crate) lose_next_answer: bool,
-  /// Test support (`Daemon::serve_works_on_holders`; A-697, until its last piece puts the rule that a node holding a
-  /// green's replica serves its works in its place): this node serves the works of greens another node owns
-  /// ([`green_elsewhere`]). Never set from the wire; off, nothing here changes.
-  pub(crate) on_holders: bool,
+  /// On every shard but the control shard: the greens this node holds a replica of, each with its owner as the control
+  /// shard's routing names it (A-697 part f), fanned from the control shard with the configuration
+  /// (`fleet::fan_configs_to_shards`), version-gated by a generation. What [`green_elsewhere`] reads off the control shard,
+  /// which holds the replicas themselves. Bounded by the greens this node replicates.
+  pub(crate) holding:
+    std::collections::BTreeMap<slates_db::register::ObjectId, slates_db::register::HostId>,
   /// On the control shard, which holds the node's replicas: the submits of works on this holder node whose versions the
   /// owner committed before the replica held them (A-697 part d), each answered once the replica does. Bounded by the
   /// node's parked verbs: one a parked submit, each let go past its verb's bound ([`hold_until_replica`]).
@@ -342,16 +344,24 @@ fn remote_work(state: &ShardState, body: &RequestBody) -> Option<(DbVolumeId, Db
   (!state.greens.contains_key(&green)).then_some((volume, green))
 }
 
-/// Whether `green` is owned by another node while this node serves works over it (A-697 part a): only with the test hook
-/// on ([`WorkHome::on_holders`]) until A-697's last piece puts the real rule ("replicated here") in its place. The owner
-/// is the one this node's routing names, else the green's creator; a green on this shard never is.
+/// Whether this node serves works over `green` as its holder (A-697; the rule "replicated here", part f): another node
+/// owns the green ([`owned_elsewhere`]) and this node holds its replica. A creation over such a green is made here, on
+/// its client's partition, and admitted by the owner over the fleet; the work's base reads are answered by the replica,
+/// its verdict computed there and committed by the owner by position, its floor moved there over the fleet. A green
+/// another node owns that this node does not replicate is the owner's to serve: its creation is forwarded there. On
+/// the control shard the replica is its own (`merge.replicas`); every other shard reads the control shard's fanned
+/// list ([`WorkHome::holding`]). A green this node adopted in a takeover is a replica no longer, so its works are
+/// served through it here as any of this node's own greens' are.
 pub(crate) fn green_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
-  state.work_home.on_holders && owned_elsewhere(state, green)
+  let object = slates_db::register::ObjectId(green.bytes);
+  (state.merge.replicas.contains_key(&object) || state.work_home.holding.contains_key(&object))
+    && owned_elsewhere(state, green)
 }
 
-/// Whether `green` is owned by another node, as this node's routing names its owner, else by its creator (A-697): a
-/// green this shard holds never is. Unlike [`green_elsewhere`] it holds whatever the test hook says, so a work this node
-/// made as a holder is recovered as one after a restart, which starts with the hook off (part e).
+/// Whether `green` is owned by another node, as this node's routing names its owner (on a shard but the control shard,
+/// as the control shard's fanned list of the greens it replicates names it, [`WorkHome::holding`]), else by its
+/// creator (A-697): a green this shard holds never is. Unlike [`green_elsewhere`] it asks nothing of the replica, so a
+/// work this node made as a holder is recovered as one after a restart, before its replica is back (part e).
 pub(crate) fn owned_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
   if state.greens.contains_key(&green) {
     return false;
@@ -360,6 +370,7 @@ pub(crate) fn owned_elsewhere(state: &ShardState, green: DbVolumeId) -> bool {
   state
     .fleet
     .object_owner(object)
+    .or_else(|| state.work_home.holding.get(&object).copied())
     .unwrap_or_else(|| object.creator())
     != state.fleet.host()
 }
@@ -1733,6 +1744,8 @@ fn hold_until_replica(
 /// `merge_service::recompute`): every held submit whose version the replica now holds is answered on its work's shard
 /// (`answered_late`, which finds it by its key, so one already released is not answered twice).
 pub(crate) fn replica_reached(state: &mut ShardState, object: slates_db::register::ObjectId) {
+  // The other shards learn this node replicates the green, so its creations are served here (A-697 part f).
+  crate::fleet::fan_holding_at_once(state, object);
   replays_resumed(state, object);
   if state.work_home.replica_waits.is_empty() {
     return;
@@ -2097,8 +2110,7 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
     ..
   } = item;
   if matches!(need, Need::Files(_) | Need::Page { .. } | Need::Sizes)
-    && state.work_home.on_holders
-    && !state.greens.contains_key(&green)
+    && green_elsewhere(state, green)
   {
     // A holder's base read, answered by its replica of the green (A-697 part a), once that holds the work's base.
     let holds = state
@@ -2131,11 +2143,9 @@ fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
       None => Outcome::Deferred,
     },
     // A holder's work is rebased over this node's replica (A-697); any other through the green.
-    Need::Rebase { sealed } if state.work_home.on_holders && !state.greens.contains_key(&green) => {
-      Outcome::Answered(Answered::Rebased(crate::verbs::replica_rebase(
-        state, &sealed,
-      )))
-    }
+    Need::Rebase { sealed } if green_elsewhere(state, green) => Outcome::Answered(
+      Answered::Rebased(crate::verbs::replica_rebase(state, &sealed)),
+    ),
     Need::Rebase { sealed } => Outcome::Answered(Answered::Rebased(crate::verbs::owner_rebase(
       state, *sealed,
     ))),

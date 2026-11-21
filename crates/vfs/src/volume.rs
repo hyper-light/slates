@@ -1749,8 +1749,10 @@ impl Volume {
     self.read_body(store, no, off, buf)
   }
 
-  /// Holds file `no`'s content as the head has it now for a reader that reads it over turns (A-768: a live log's whole
-  /// capture): appends each sealed extent that names a chunk to `out`, its chunk pinned ([`ChunkStore::pin_chunk`]), so
+  /// Holds file `no`'s content as the head has it now for a reader that reads it over turns (A-768: a live log's
+  /// capture): appends each sealed extent that names a chunk and that `wanted` keeps (by its offset and length; a delta's
+  /// record names only the extents within the windows its writes touched) to `out`, its chunk pinned
+  /// ([`ChunkStore::pin_chunk`]), so
   /// a write that replaces it, the publication that frees it and the deadlist walk leave its bytes readable until the
   /// reader lets go ([`ChunkStore::unpin_extents`]); an open extent, which the next write changes in place, is copied.
   /// `None`, appending nothing, for a body that holds no chunked content. Refused whole: what it pinned before a refusal
@@ -1760,6 +1762,7 @@ impl Volume {
     store: &mut Store,
     no: InodeNo,
     out: &mut Vec<Extent>,
+    wanted: impl Fn(u64, u64) -> bool,
   ) -> Result<Option<PinnedFile>, VfsError> {
     let inode = self.inode(store, no)?;
     let size = inode.attrs.size;
@@ -1772,11 +1775,9 @@ impl Volume {
       _ => return Ok(None),
     };
     let from = out.len();
-    out.extend(
-      sealed
-        .iter()
-        .filter(|extent| matches!(extent.src, ExtentSrc::Chunk { .. })),
-    );
+    out.extend(sealed.iter().filter(|extent| {
+      matches!(extent.src, ExtentSrc::Chunk { .. }) && wanted(extent.off, extent.len)
+    }));
     for at in from..out.len() {
       let pinned = match out.get(at).map(|extent| extent.src) {
         Some(ExtentSrc::Chunk { chunk, .. }) => store.content.pin_chunk(chunk),

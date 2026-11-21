@@ -2492,3 +2492,60 @@ fn an_overlay_of_a_windows_directory_keeps_its_files_read_only_state_and_attribu
   cmd(&["attrib", "-R", &format!("{base}\\locked.txt")]);
   cmd(&["rmdir", "/S", "/Q", &base]);
 }
+
+/// A-774 C1 (a work mounts and works through WinFsp). Do: through the SDK seed a green with `f` = "one\ntwo\nthree\n"
+/// and make a work over it; mount the work at a drive with `slates mount`; through Windows read `f`, save it as an
+/// editor does (the whole new content written to a temporary beside it, renamed over it); unmount; submit the work with
+/// no declaration. Expect: the drive reads the green's bytes, the submit is accepted, and the green's head holds the
+/// save.
+#[test]
+fn a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = instance("work");
+  let _anchor = start_anchor(&instance);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut client = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let green = client.create_green("winfsp-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "winfsp-seed").unwrap();
+  client.edit(seed, "f", 0, 0, b"one\ntwo\nthree\n").unwrap();
+  assert!(matches!(
+    client.submit(seed).unwrap(),
+    slates_client::Submitted::Accepted(_)
+  ));
+  let (work, _) = client.create_work(green, "winfsp-work").unwrap();
+  let id: String = work
+    .bytes
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  assert_eq!(volume_id_of(&id), work);
+  let drive = free_drive_letter();
+  let (code, _, err) = run(&instance, &["mount", &id, &drive]);
+  assert_eq!(code, 0, "mount: {err}");
+  let root = format!("{drive}\\");
+  wait_ready(&root);
+  let file = format!("{root}f");
+  assert_eq!(std::fs::read(&file).unwrap(), b"one\ntwo\nthree\n");
+  let temp = format!("{root}.f.swp");
+  std::fs::write(&temp, b"one\nTWO\nthree\n").unwrap();
+  std::fs::rename(&temp, &file).unwrap();
+  let (code, _, err) = run(&instance, &["unmount", &drive]);
+  assert_eq!(code, 0, "unmount: {err}");
+  let verdict = client.submit(work).unwrap();
+  assert!(
+    matches!(verdict, slates_client::Submitted::Accepted(_)),
+    "{verdict:?}"
+  );
+  assert_eq!(
+    client
+      .read(green, "f", slates_client::ReadAt::Head)
+      .unwrap(),
+    b"one\nTWO\nthree\n"
+  );
+}

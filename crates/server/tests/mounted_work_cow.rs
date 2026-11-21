@@ -175,14 +175,16 @@ fn mounted_works_cost_their_divergence_not_the_green() {
   let _ = mounted_work(&daemon, &mut client, small, "cow-small-warm");
   let (_, mut stream, root) = mounted_work(&daemon, &mut client, large, "cow-large-warm");
   read_and_save(&mut stream, &root, &path(0));
-  let small_times: Vec<Duration> = (0..SMALL_WORKS)
-    .map(|index| mounted_work(&daemon, &mut client, small, &format!("cow-small-{index}")).0)
-    .collect();
-
   let before = resident();
+  let mut small_times = Vec::new();
   let mut large_times = Vec::new();
   let mut streams = Vec::new();
   for index in 0..works {
+    // A mount over the small green just before each of the first large ones, so both medians meet the same load (a
+    // debug run at load 16 timed them apart and failed the ratio once). Its own bytes are within the fixed term.
+    if index < SMALL_WORKS {
+      small_times.push(mounted_work(&daemon, &mut client, small, &format!("cow-small-{index}")).0);
+    }
     let (took, mut stream, root) =
       mounted_work(&daemon, &mut client, large, &format!("cow-large-{index}"));
     large_times.push(took);

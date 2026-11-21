@@ -51,6 +51,12 @@ const BENCHES: &[(&str, &str)] = &[
 /// `ratchets.toml`'s machine entries, so its ceilings only tighten as the others' do.
 const PROVISION: &[(&str, &str)] = &[("slates-client", "provision_bench")];
 
+/// The bench's variable for its loaded form, and the load the lane runs it with: two busy processes a logical CPU, the
+/// loaded condition every loaded row in BENCHMARKS and GAPS is measured under.
+const PROVISION_LOAD_VARIABLE: &str = "PROVISION_BENCH_LOAD";
+/// Shape: see [`PROVISION_LOAD_VARIABLE`].
+const PROVISION_LOAD: &str = "2";
+
 /// Format: the file each `--provision` run's rows are appended to, under the target directory, one TSV line a row:
 /// the date, the machine id, the run, the row's key, its lower edge, median and upper edge in nanoseconds. The
 /// histogram of every run is kept, as R9 asks, for CI to keep as an artifact.
@@ -159,18 +165,27 @@ pub(crate) fn run(root: &Path, flags: Flags) -> Result<(), Failure> {
   }
   let known = file.machine.contains_key(&hash);
   let writing = flags.record || flags.tighten || flags.reset;
-  if !known && !writing {
-    println!("ratchet: skipped — no baseline recorded for this machine ({identity}, id {hash});");
-    println!("ratchet: run `cargo xtask ratchet --record` here to set one");
-    return Ok(());
-  }
   let runs = flags.runs.unwrap_or(DEFAULT_RUNS).max(1);
-
   let benches = if flags.provision { PROVISION } else { BENCHES };
   let record = flags
     .provision
     .then(|| (root.join(PROVISION_RECORD), hash.clone()));
-  let across = measure_all(root, runs, benches, record.as_ref())?;
+  if !known && !writing {
+    println!("ratchet: skipped — no baseline recorded for this machine ({identity}, id {hash});");
+    println!("ratchet: run `cargo xtask ratchet --record` here to set one");
+    // R9 keeps every run's histogram, a machine with no baseline included: it is measured and kept, and the bench's
+    // floor and loaded bound are reported, never failed here (a shared runner's tail is its neighbours').
+    if flags.provision {
+      measure_all(root, runs, benches, record.as_ref(), false)?;
+      println!(
+        "ratchet: the provisioning histogram was measured and kept, informational on this machine"
+      );
+    }
+    return Ok(());
+  }
+  // A check against a recorded baseline fails on the bench's own gates; a run that writes ceilings records them
+  // whatever the gates said, which it reports (a ceiling holds the path where it is; the floor is the bench's).
+  let across = measure_all(root, runs, benches, record.as_ref(), !writing)?;
   let entry = file.machine.entry(hash.clone()).or_default();
   if !known {
     entry.identity = identity.clone();
@@ -268,12 +283,17 @@ fn measure_all(
   runs: usize,
   benches: &[(&str, &str)],
   record: Option<&(std::path::PathBuf, String)>,
+  fatal: bool,
 ) -> Result<BTreeMap<String, Across>, Failure> {
   let mut across: BTreeMap<String, Across> = BTreeMap::new();
   let date = today();
   for (krate, example) in benches {
     for run in 1..=runs {
-      let output = Command::new(env!("CARGO"))
+      let mut command = Command::new(env!("CARGO"));
+      if record.is_some() {
+        command.env(PROVISION_LOAD_VARIABLE, PROVISION_LOAD);
+      }
+      let output = command
         .args([
           "run",
           "--quiet",
@@ -292,11 +312,15 @@ fn measure_all(
           .lines()
           .filter(|l| l.starts_with("ac-") || l.starts_with("gate"))
           .collect();
-        return Err(Failure(format!(
+        let failed = format!(
           "{krate} bench failed: {}\n{}",
           String::from_utf8_lossy(&output.stderr).trim(),
           gates.join("\n")
-        )));
+        );
+        if fatal {
+          return Err(Failure(failed));
+        }
+        println!("ratchet: informational here — {failed}");
       }
       let rows = parse(&String::from_utf8_lossy(&output.stdout));
       println!("{krate} run {run}/{runs}: {} rows", rows.len());
@@ -415,6 +439,7 @@ mod tests {
     append_rows(&path, "2026-11-20", "abcd", 1, &rows(2)).unwrap();
     append_rows(&path, "2026-11-20", "abcd", 2, &rows(7)).unwrap();
     let kept = std::fs::read_to_string(&path).unwrap();
+    #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
     std::fs::remove_file(&path).unwrap();
     assert_eq!(
       kept.lines().collect::<Vec<_>>(),

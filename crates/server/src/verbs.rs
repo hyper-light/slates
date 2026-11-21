@@ -2271,8 +2271,8 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
   if !(is_forwardable_read(body) || is_forwardable_write(body)) {
     return None;
   }
-  // A work over a green another node owns is made here, on the client's own partition, and admitted by the green's
-  // owner (A-697 part a; with `WorkHome::on_holders` on, until its last piece).
+  // A work over a green another node owns and this node replicates is made here, on the client's own partition, and
+  // admitted by the green's owner (A-697 part a; the rule "replicated here", part f).
   if let RequestBody::CreateWork { green, .. } = body
     && crate::work_home::green_elsewhere(state, to_db_volume(*green))
   {
@@ -6616,7 +6616,7 @@ pub(crate) fn find(
 /// budget is the formula's product measured at the moment of need: the mutation rate times a reader's lag times the
 /// record size. Until 2026-10-23 every volume reserved a fixed 10‰ of its quota here, whatever it needed. Shared by
 /// creation and recovery: a rebuilt journal starts empty, at the floor.
-fn journal_floor_bytes(state: &ShardState) -> usize {
+pub(crate) fn journal_floor_bytes(state: &ShardState) -> usize {
   derived!(
     usize::try_from(state.config.geometry.page)
       .unwrap_or(1)
@@ -7066,25 +7066,9 @@ pub(crate) fn admit_over(
   }
   // A tree's entries show the volume's own owner, so its user may write what it mounts (A-774).
   if let AdmitBase::Tree { identity } = base {
-    let owner = volume
-      .root_inode(&state.store)
-      .and_then(|root| volume.stat(&state.store, root));
-    match owner {
-      Ok(attrs) => {
-        host = Some(BaseHost::Tree(Box::new(
-          slates_vfs::host::tree::TreeHost::new(identity, (attrs.uid, attrs.gid)),
-        )));
-      }
-      Err(e) => {
-        return Err(Box::new(give_back(
-          state,
-          reservation,
-          version_credit,
-          metadata_credit,
-          refusal_of_vfs(&e),
-        )));
-      }
-    }
+    host = Some(BaseHost::Tree(Box::new(
+      slates_vfs::host::tree::TreeHost::new(identity, tree_owner(principal)),
+    )));
   }
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
   // `next_no` enforces, to the same allowance already reserved against the version slab above.
@@ -10809,7 +10793,7 @@ fn admit_work(
 }
 
 /// The engine a work's base reads are answered from (A-247): the green's own, on its owner shard; or, for a work on a
-/// holder node (A-697 part a, with `WorkHome::on_holders` on), this node's replica of the green, on the control shard
+/// holder node (A-697 part a; `work_home::green_elsewhere`), this node's replica of the green, on the control shard
 /// that holds it, which `work_home::answer_on_owner` has checked holds the work's base version.
 enum BaseEngine<'a> {
   Owned(crate::greens::GreenRef<'a>),
@@ -10832,7 +10816,7 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
   if let Some(engine) = state.greens.get(&green) {
     return Some(BaseEngine::Owned(engine));
   }
-  if !state.work_home.on_holders {
+  if !crate::work_home::green_elsewhere(state, green) {
     return None;
   }
   state
@@ -16159,7 +16143,7 @@ pub fn longest_recordable_base() -> usize {
 
 /// `reason` as a recovery cause records it: whole, as every reason the daemon builds is, or cut at a character boundary
 /// to [`RECOVERY_REASON_BYTES`].
-fn recorded_reason(mut reason: String) -> String {
+pub(crate) fn recorded_reason(mut reason: String) -> String {
   let mut keep = reason.len().min(RECOVERY_REASON_BYTES);
   while !reason.is_char_boundary(keep) {
     keep = keep.saturating_sub(1);
@@ -17686,6 +17670,45 @@ fn keep_unrecovered_mounts(state: &mut ShardState, record: &VolumeRecord) -> usi
   ended
 }
 
+/// A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127); refused and
+/// counted where it cannot be rebuilt.
+fn rebuild_mounted_slot(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  (images, claims): (
+    &std::collections::BTreeMap<[u8; 16], VolumeImage>,
+    Option<&slates_vfs::recover::Claims>,
+  ),
+  max_prefix: &mut u16,
+) {
+  let Some(pin) = crate::mounted_work::recovered_pin(state, record.id) else {
+    return;
+  };
+  if !images.contains_key(&record.id.bytes) {
+    return;
+  }
+  match rebuild_volume(
+    state,
+    record,
+    images.get(&record.id.bytes),
+    claims,
+    Some(pin),
+  ) {
+    Ok(prefix) => {
+      *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+      state.merge.mounted.insert(record.id, pin);
+    }
+    Err(cause) => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
+        state.partition,
+        record.name
+      );
+      state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
+    }
+  }
+}
+
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never
 /// presented empty), which leaves it out of the reconciliation.
 async fn rebuild_record(
@@ -17729,26 +17752,29 @@ async fn rebuild_record(
     Role::Work { green, .. } => {
       rebuild_work(state, record, green);
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
+      rebuild_mounted_slot(state, record, (images, claims), max_prefix);
     }
-    Role::Plain => match rebuild_volume(state, record, images.get(&record.id.bytes), claims) {
-      Ok(prefix) => {
-        rebuilt.volumes = rebuilt.volumes.saturating_add(1);
-        *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
-        rebuilt.snapshots_trimmed = rebuilt
-          .snapshots_trimmed
-          .saturating_add(trim_unrecorded_snapshots(state, record.id));
+    Role::Plain => {
+      match rebuild_volume(state, record, images.get(&record.id.bytes), claims, None) {
+        Ok(prefix) => {
+          rebuilt.volumes = rebuilt.volumes.saturating_add(1);
+          *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+          rebuilt.snapshots_trimmed = rebuilt
+            .snapshots_trimmed
+            .saturating_add(trim_unrecorded_snapshots(state, record.id));
+        }
+        Err(cause) => {
+          rebuilt.skipped = rebuilt.skipped.saturating_add(1);
+          slates_machine::log_line!(
+            "slates-server: partition {}: volume {} not rebuilt: {cause:?}",
+            state.partition,
+            record.name
+          );
+          state.unrecovered.insert(record.id, cause);
+          return false;
+        }
       }
-      Err(cause) => {
-        rebuilt.skipped = rebuilt.skipped.saturating_add(1);
-        slates_machine::log_line!(
-          "slates-server: partition {}: volume {} not rebuilt: {cause:?}",
-          state.partition,
-          record.name
-        );
-        state.unrecovered.insert(record.id, cause);
-        return false;
-      }
-    },
+    }
   }
   true
 }
@@ -20046,8 +20072,13 @@ fn rebuild_volume(
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
+  tree: Option<crate::mounted_work::MountPin>,
 ) -> Result<u16, RecoveryCause> {
-  let size = wire_size(record.policy.size);
+  // A mounted work's slot has no quota of its own (`crate::mounted_work`), whatever its record's size says.
+  let size = match tree {
+    Some(_) => crate::mounted_work::MOUNT_SIZE,
+    None => wire_size(record.policy.size),
+  };
   let reservation = match size {
     SizeClass::Bounded { limit } => Some(
       state
@@ -20087,7 +20118,7 @@ fn rebuild_volume(
       )));
     }
   };
-  let built = build_recovered_volume(state, record, image, claims, size);
+  let built = build_recovered_volume(state, record, image, claims, (size, tree));
   let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
     Err(cause) => {
@@ -20197,8 +20228,11 @@ fn build_recovered_volume(
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   claims: Option<&slates_vfs::recover::Claims>,
-  size: SizeClass,
+  (size, tree): (SizeClass, Option<crate::mounted_work::MountPin>),
 ) -> Result<(Volume, Option<BaseHost>, u16), RecoveryCause> {
+  if let Some(pin) = tree {
+    return crate::mounted_work::rebuild_mounted(state, record, image, claims, (size, pin));
+  }
   let image = image.ok_or(RecoveryCause::NoImage)?;
   let quota = quota_for(size);
   let journal = journal_floor_bytes(state);
@@ -20750,6 +20784,15 @@ fn stamp_root_owner(
   };
   let root = volume.root_inode(store)?;
   volume.chown(store, root, *uid, creator_gid())
+}
+
+/// The owner a tree base's entries show for a volume provisioned by `principal` (A-774): its root's owner, as
+/// [`stamp_root_owner`] stamps it, so a mount and its recovery fingerprint the tree alike.
+pub(crate) fn tree_owner(principal: &Principal) -> (u32, u32) {
+  match principal {
+    Principal::Uid { uid, .. } => (*uid, creator_gid()),
+    _ => (0, 0),
+  }
 }
 
 /// The group a provisioned volume's root takes: this process's effective gid. The rendezvous admits
@@ -24309,11 +24352,11 @@ mod tests {
         .unwrap()
         .clone();
       state.content = None;
-      let scratch = super::build_recovered_volume(state, &record, None, None, size).err();
+      let scratch = super::build_recovered_volume(state, &record, None, None, (size, None)).err();
       record.base = super::BaseRecord::Path {
         path: ".".to_owned(),
       };
-      let overlay = super::build_recovered_volume(state, &record, None, None, size).err();
+      let overlay = super::build_recovered_volume(state, &record, None, None, (size, None)).err();
       (scratch, overlay)
     });
     assert_eq!(scratch, Some(slates_ipc::protocol::RecoveryCause::NoImage));
@@ -24364,7 +24407,8 @@ mod tests {
       let before = (state.store.inodes.len(), state.store.dirs.len());
       let small = super::SizeClass::Bounded { limit: 64 };
       let refusal =
-        super::build_recovered_volume(state, &record, Some(&image), Some(&claims), small).err();
+        super::build_recovered_volume(state, &record, Some(&image), Some(&claims), (small, None))
+          .err();
       let after = (state.store.inodes.len(), state.store.dirs.len());
       (refusal, before, after)
     });

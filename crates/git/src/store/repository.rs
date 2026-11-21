@@ -2,7 +2,7 @@
 //! 5, part 1): the store's module docs say what each holds and why.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::mem::size_of;
 
@@ -18,9 +18,9 @@ use super::fragment::{self, FragmentRefused, Learning, Placed, Stored};
 use super::hook_view::Quantum;
 use super::learn::{Clock, Depth, Exchange, Levels, Rebuild, Window};
 use super::naming::{GitNaming, kind_of};
-use super::packed::{Base, Bases};
+use super::packed::{self, Base, Bases, InPack, Scratch};
 use super::positions::Positions;
-use super::push::{Push, Staged, stored_bytes};
+use super::push::{Push, Staged, StoredAt, stored_bytes};
 use super::rows::{self, CommitRow, ObjectRow};
 use reach::Sets;
 
@@ -451,10 +451,16 @@ impl Bases for IndexBases<'_> {
     if row.len > room {
       return None;
     }
-    let bytes = stored_bytes(self.store, &content, row.len)?;
-    whole.clear();
-    whole.extend_from_slice(&bytes);
-    Some(Base::Whole(row.kind))
+    // An object read from a pack is followed into its pack, its chain read there; one held whole is written out.
+    match self.repository.stored_of(&row, content) {
+      StoredAt::InPack(place) => Some(Base::InPack(place)),
+      StoredAt::Whole(content) => {
+        let bytes = stored_bytes(self.store, &content, row.len)?;
+        whole.clear();
+        whole.extend_from_slice(&bytes);
+        Some(Base::Whole(row.kind))
+      }
+    }
   }
 }
 
@@ -472,6 +478,17 @@ pub struct Repository {
   /// The version that brought each position, as runs: each run's first position to its end (exclusive), the green and
   /// that green's version (A-722: kept beside the rows, which no longer carry it, so a push can write its rows before it
   /// lands).
+  /// The packs its rows name (A-722's record v4: an object a push brought is read where it lies in the push's pack,
+  /// held once as content), each one's length by its identity: what a row's offset is read against. One entry a
+  /// landing that brought a pack.
+  packs: BTreeMap<ContentId, u64>,
+  /// The buffers its objects are read from their packs with, and the objects read lately (`packed::Scratch`), held to
+  /// its largest pack's length; in a cell because a read is a look, not a change.
+  reading: RefCell<Scratch>,
+  /// The longest object its packs hold: what a read from them is held to (§4.9: every size a stored entry's header
+  /// names, and its chain's, checked against it before a buffer grows to it; a read allocates nothing in the store, so
+  /// the store's lent room is no bound for it).
+  largest: u64,
   /// Each landing's runs of positions by type, by first position: `start -> (end, kind)` (A-639: a landing gives its
   /// objects positions by type, then id, so each type's are one run). A position's type is read here, with no row read
   /// (`kind_at`; A-722 part 3's partial clone read two rows an object for it). A run a type each landing brought.
@@ -497,6 +514,9 @@ impl Repository {
       charged: 0,
       landings: BTreeMap::new(),
       kinds: BTreeMap::new(),
+      packs: BTreeMap::new(),
+      reading: RefCell::new(Scratch::default()),
+      largest: 0,
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
       window: Window::default(),
@@ -565,11 +585,65 @@ impl Repository {
     self.indexed(store, id).map(|(row, _)| row)
   }
 
-  /// The type, root content and length of the object `id` the index holds: where its bytes are read from (A-753: a
-  /// pack resending an object the repository holds is read back from the index, its quarantine holding none).
-  pub fn stored(&self, store: &ContentStore, id: &ObjectId) -> Option<(Kind, ContentId, u64)> {
+  /// The type, place and length of the object `id` the index holds: where its bytes are read from (A-753: a pack
+  /// resending an object the repository holds is read back from the index, its quarantine holding none).
+  pub fn stored(&self, store: &ContentStore, id: &ObjectId) -> Option<(Kind, StoredAt, u64)> {
     let (row, content) = self.indexed(store, id)?;
-    Some((row.kind, content, row.len))
+    Some((row.kind, self.stored_of(&row, content), row.len))
+  }
+
+  /// Where the object whose row is `row`, naming `content`, is: at its offset in the pack the row names, for an object
+  /// read from a pack; its own content otherwise.
+  pub fn stored_of(&self, row: &ObjectRow, content: ContentId) -> StoredAt {
+    match row.offset {
+      Some(offset) => StoredAt::InPack(InPack {
+        pack: content,
+        len: self.packs.get(&content).copied().unwrap_or(0),
+        offset,
+      }),
+      None => StoredAt::Whole(content),
+    }
+  }
+
+  /// The bytes of the object at `stored`, `len` long: lent where the store holds it whole as one window, else
+  /// assembled; read where it lies in its pack otherwise (`packed::read`, its chain from the objects read lately, a
+  /// REF_DELTA's base followed through the index), the reader's buffer handed over.
+  pub fn read_stored<'s>(
+    &self,
+    store: &'s ContentStore,
+    stored: &StoredAt,
+    len: u64,
+  ) -> Option<Cow<'s, [u8]>> {
+    match stored {
+      StoredAt::Whole(content) => stored_bytes(store, content, len),
+      StoredAt::InPack(place) => {
+        let bases = IndexBases {
+          repository: self,
+          store,
+        };
+        let mut out = Vec::new();
+        let mut reading = self.reading.borrow_mut();
+        packed::read(
+          store,
+          (*place, self.format),
+          &bases,
+          (&mut *reading, self.largest.max(len)),
+          &mut out,
+        )
+        .ok()?;
+        (u64::try_from(out.len()).ok() == Some(len)).then_some(Cow::Owned(out))
+      }
+    }
+  }
+
+  /// The bytes of the indexed object whose row is `row`, naming `content` ([`Repository::read_stored`]).
+  pub fn row_bytes<'s>(
+    &self,
+    store: &'s ContentStore,
+    row: &ObjectRow,
+    content: ContentId,
+  ) -> Option<Cow<'s, [u8]>> {
+    self.read_stored(store, &self.stored_of(row, content), row.len)
   }
 
   /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
@@ -612,7 +686,7 @@ impl Repository {
   ) -> Result<Cow<'s, [u8]>, StoreRefused> {
     let unreadable = StoreRefused::Unreadable { id: *id };
     match place {
-      Place::Indexed { row, content } => stored_bytes(store, content, row.len).ok_or(unreadable),
+      Place::Indexed { row, content } => self.row_bytes(store, row, *content).ok_or(unreadable),
       Place::Pushed { push, .. } => {
         let outside = IndexBases {
           repository: self,
@@ -1103,6 +1177,18 @@ impl Repository {
       return Err(refused);
     }
     self.landings.extend(landed);
+    if !positions.is_empty()
+      && let Some((pack, len)) = push.stored_pack()
+    {
+      self.packs.insert(pack, len);
+      self.largest = self.largest.max(push.largest());
+      let largest = self.packs.values().copied().max().unwrap_or(0);
+      self
+        .reading
+        .get_mut()
+        .recent()
+        .set_budget(usize::try_from(largest).unwrap_or(usize::MAX));
+    }
     self.kinds.extend(
       kinds
         .into_iter()
@@ -1522,8 +1608,8 @@ impl Repository {
     let (row, content) = self
       .indexed(store, tree)
       .ok_or(StoreRefused::Missing { id: *tree })?;
-    let bytes = store
-      .object_bytes(&content, row.len)
+    let bytes = self
+      .row_bytes(store, &row, content)
       .ok_or(StoreRefused::Unreadable { id: *tree })?;
     let malformed = StoreRefused::Malformed { id: *tree };
     let parsed =
@@ -1580,6 +1666,9 @@ impl Repository {
       charged: self.charged,
       landings: self.landings.clone(),
       kinds: self.kinds.clone(),
+      packs: self.packs.clone(),
+      reading: RefCell::new(Scratch::default()),
+      largest: self.largest,
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),
       window: self.window.clone(),
@@ -1829,9 +1918,10 @@ impl Repository {
     let (row, content) = self
       .indexed(store, id)
       .ok_or(StoreRefused::Missing { id: *id })?;
-    let bytes = store
-      .object_bytes(&content, row.len)
-      .ok_or(StoreRefused::Unreadable { id: *id })?;
+    let bytes = self
+      .row_bytes(store, &row, content)
+      .ok_or(StoreRefused::Unreadable { id: *id })?
+      .into_owned();
     Ok((row.kind, bytes))
   }
 
@@ -2224,13 +2314,14 @@ impl Repository {
     &self,
     store: &ContentStore,
     position: u64,
-  ) -> Result<(ObjectId, ObjectRow, ContentId), StoreRefused> {
+  ) -> Result<(ObjectId, ObjectRow, StoredAt), StoreRefused> {
     let id = self
       .id_at(store, position)
       .ok_or(StoreRefused::NoPosition { position })?;
     let (row, content) = self
       .indexed(store, &id)
       .ok_or(StoreRefused::Missing { id })?;
-    Ok((id, row, content))
+    let stored = self.stored_of(&row, content);
+    Ok((id, row, stored))
   }
 }

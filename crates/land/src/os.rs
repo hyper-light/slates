@@ -177,7 +177,7 @@ fn check_crossing(dir: BorrowedFd<'_>, name: &str) -> Result<(), TargetRefusal> 
 
 /// Walks an absolute target path from `/` one component at a time (no `..`, no symlink: containment), checks
 /// the target is owned by this process's user, and returns its descriptor and the key it lands under.
-fn walk_target(path: &Path) -> Result<(OwnedFd, String), TargetRefusal> {
+pub(crate) fn walk_target(path: &Path) -> Result<(OwnedFd, String), TargetRefusal> {
   let mut components = path.components();
   if components.next() != Some(Component::RootDir) {
     return Err(TargetRefusal::NotAbsolute);
