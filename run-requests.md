@@ -7311,3 +7311,28 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Green:** passes; every command's output equal on both legs.
 - **Red:** a step fails naming the command (`svn [...]`), or an assert_eq naming the label (left HTTPv2, right svnserve).
   Expected by reading: `revprop set log` refused (no PROPPATCH on !svn/rev/N). Send to w-svn, copy w-interop.
+
+## loadtest-scale → main: goal 93, git under concurrent pushes (correctness; main's rounds)
+- **Command:** `SLATES_GIT_CONCURRENCY=2,10,50 cargo test --release --locked -p slates-cli --test git_interop -- --ignored concurrent_pushes --nocapture --test-threads 1`
+  on release current main (≥ the commit carrying 8ff29de8a), macOS and Linux; Windows too if Git for Windows is on the PATH.
+  `--test-threads 1` keeps the three tests' anchors apart; each test runs every N in turn, one anchor per N.
+- **Dataset:** none. Each test makes its own commits. Stock git only: `git` on the PATH, or `SLATES_TEST_GIT`. It skips
+  loudly without git, or where the anchor prints no issuer surface.
+- **The tests:**
+  - `concurrent_pushes_to_one_branch_land_one_and_refuse_the_rest_cleanly`;
+  - `concurrent_pushes_to_distinct_branches_all_land_while_readers_see_consistent_refs`;
+  - `concurrent_pushes_of_tags_land_and_one_raced_tag_name_lands_once`.
+- **Proved locally:** N=2, 3 of 3 pass (macOS arm64, this Mac, 110 to 237 s a run).
+- **Red looks like:**
+  - more or fewer than one winner on one branch or one tag name;
+  - a loser refused with anything but git's lost-race words. "fetch first", "non-fast-forward", "already exists" and
+    "[remote rejected] … (failed to update ref)" are clean (stock receive-pack answers that last one too: 6 of 6 races
+    over file://). "hung up", "RPC failed", "HTTP 5", "unpack" or "internal server error" are not;
+  - any distinct-branch or tag push failing;
+  - a concurrent reader's clone or fetch failing, its clone failing fsck, or it seeing a branch at a commit no push
+    sent;
+  - the served refs differing from the accepted pushes;
+  - a mirror failing `fsck --full --strict`, or the three mirrors' refs and objects differing.
+  - A git command past the file's `PATIENCE` (120 s) panics the test. At N=50, read that as a server stall to report,
+    not a harness limit.
+- **Each red goes to w-git** as a minimal red test (main routes it). I fix nothing unless w-git says so in writing.
