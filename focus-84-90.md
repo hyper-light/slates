@@ -1553,3 +1553,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - RULING: (b): subtract a key's old entry at first change, half the hashing and no history reads, no format change. Measure again; (a) and (b) land together only if Z=20 p99 is no worse. (c), the format change, only if needed and inside w-shared's format 6 bump. Push through the MacBook (Studio-4 unreliable).
   - LANDED: 302da8b45 (w-svn B2 (a): DAV GET reads a stored text's piece through the store). kiln CI: run 44887857088 on a0d114abb, carrying w-k90-win's w2/w7 fix, holds the lane; no dispatch needed.
   - The MacBook disk back to 44 GB.
+- 2026-11-21 02:08 PST LANDED:
+  - 98a39ef1c (w-fed-move, A-802, goal 86b): a destroy asks its tenant's volume count instead of collecting every volume of the partition. With 10^4 idle works pinning the floor, 1,000 clients go from 2,506 to 5,956 verdicts/s; verdict 84 -> 44 us; cycle p99 501 -> 212 ms. Red first. Injection flags (--idle-works, --preload, --lagged-submit) added to the harness.
+  - 1946bd8ea (w-svn B2 (a): get-file-revs through the store).
+  The injection table: (a) bases behind is flat; (b) history grows the verdict 41 -> 90 us at 10^5; (c) idle works was the wall, fixed.
+  RULING: w-fed-move's (b) next, first re-measured on main after 2c32af2b5 (reanchor O((n+k) log k)), which may be the same scan.
+  The MacBook disk is 40 GB.
