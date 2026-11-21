@@ -750,7 +750,7 @@ impl Repository {
     text: &ContentIdentity,
     base: Option<&ContentIdentity>,
     delta: &[u8],
-  ) -> Result<(u64, Vec<(u64, u64, usize)>), StepRefusal> {
+  ) -> Result<CheckedDelta, StepRefusal> {
     let len = self.stored.get(text).copied().ok_or(StepRefusal::Corrupt)?;
     if base.is_some_and(|base| self.kept_len(base).is_none()) {
       return Err(StepRefusal::Corrupt);
@@ -1091,6 +1091,10 @@ impl KeptText {
 /// to the first version at every step (module docs, "Texts"), so a chain longer than this does not hold together.
 /// Derived: a `u64`'s 64 halvings, and the first version.
 const MAX_CHAIN: usize = 65;
+
+/// A delta checked against its text: the text's length and the delta's windows (target offset, target length,
+/// offset into the delta).
+type CheckedDelta = (u64, Vec<(u64, u64, usize)>);
 
 /// An encoded delta and its windows: each window's (offset into the target, target length, offset into the delta).
 type EncodedDelta = (Vec<u8>, Vec<(u64, u64, usize)>);
