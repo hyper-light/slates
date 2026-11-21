@@ -275,7 +275,7 @@ fn submit_when_room(client: &mut Client, work: VolumeId) -> Submitted {
 }
 
 /// Advances the green from `writer` until it is refused, a held floor having kept it from folding; the version the
-/// refused submit would have been, its edit still in the work. Since chain entry format 6 (A-815) an entry names its
+/// refused submit would have been, its edit still in the work. Since chain entry format 6 (A-825) an entry names its
 /// increment in the content store, so the green's history retention, held by the same floor and bounded by the same
 /// derived cap, refuses first (`BudgetExceeded`); before it the chain's own cap did (`TableAtCapacity`). Either is the
 /// held floor's typed refusal.

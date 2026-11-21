@@ -59720,7 +59720,7 @@ Applied in the same change to:
 - **Owed** (GAPS, C5 part 2b): `record_of` and version 2 removed with
   the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
   test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).
-### A-815 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
+### A-825 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
 - **Why.** The lane's liveness (A-697's holder route at 32 MiB and above): the owner's one durable step copied the
   increment into its chain entry and the entry into the partition's log, 2.3 to 6.9 s of one shard's step in a debug
   build at 32 to 64 MiB (the append 1.2 s, its commit and publication about 1.1 s), so the holder's lane gave up
