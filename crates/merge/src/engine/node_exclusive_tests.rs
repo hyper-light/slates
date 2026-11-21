@@ -132,6 +132,7 @@ fn conflicted(outcome: &Outcome) -> Option<BTreeSet<String>> {
       Some(windows.iter().map(|window| window.path.clone()).collect())
     }
     Outcome::Accepted { .. }
+    | Outcome::Identical { .. }
     | Outcome::BaseUnavailable { .. }
     | Outcome::CopyRefused { .. }
     | Outcome::ContentUnread { .. } => None,
@@ -147,6 +148,7 @@ fn classes_on(outcome: &Outcome, path: &str) -> Vec<MergeConflictClass> {
       .map(|window| window.class)
       .collect(),
     Outcome::Accepted { .. }
+    | Outcome::Identical { .. }
     | Outcome::BaseUnavailable { .. }
     | Outcome::CopyRefused { .. }
     | Outcome::ContentUnread { .. } => Vec::new(),
@@ -190,7 +192,7 @@ fn an_identical_change_after_its_base_conflicts_for_a_node_exclusive_work() {
       w.overwrite("f", 5, b"AAAA");
     },
   );
-  assert_eq!(plain, Outcome::Accepted { version: 3 });
+  assert_eq!(plain, Outcome::Identical { version: 3 });
   assert_eq!(
     conflicted(&exclusive),
     Some(BTreeSet::from(["f".to_owned()]))
@@ -251,7 +253,7 @@ fn an_identical_addition_after_its_base_conflicts_for_a_node_exclusive_work() {
       w.create("h", b"same");
     },
   );
-  assert_eq!(plain, Outcome::Accepted { version: 3 });
+  assert_eq!(plain, Outcome::Identical { version: 3 });
   assert_eq!(
     conflicted(&exclusive),
     Some(BTreeSet::from(["h".to_owned()]))

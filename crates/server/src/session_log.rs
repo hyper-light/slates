@@ -41,9 +41,18 @@ fn cursor_of(line: &LogLine) -> LogCursor {
   }
 }
 
-/// How `work`'s last submission ended: collided while its conflicting verdict stands, accepted while it stands on the
-/// version its last accepted submission made, and open otherwise (made, or rebased since).
+/// How `work`'s last submission ended: held for approval while the increment it held is still the work's (A-785),
+/// collided while its conflicting verdict stands, accepted or identical while it stands on the version its last
+/// accepted submission made, and open otherwise (made, or rebased since).
 fn mark_of(work: &WorkState) -> WorkMark {
+  if let Some(held) = work.held
+    && held.revision == work.revision
+  {
+    return WorkMark::AwaitingApproval {
+      identity: held.identity,
+      paths: held.paths,
+    };
+  }
   if let Some(kept) = &work.verdict {
     return WorkMark::Collided {
       verdict: kept.id,
@@ -52,7 +61,8 @@ fn mark_of(work: &WorkState) -> WorkMark {
     };
   }
   match work.accepted {
-    Some(version) if version == work.base_version => WorkMark::Accepted { version },
+    Some((version, true)) if version == work.base_version => WorkMark::Identical { version },
+    Some((version, false)) if version == work.base_version => WorkMark::Accepted { version },
     _ => WorkMark::Open,
   }
 }

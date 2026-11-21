@@ -296,3 +296,106 @@ fn a_newer_presentation_supersedes_the_older_whose_grant_is_refused() {
   drop((client, other));
   daemon.stop();
 }
+
+/// A-782 (main's order, 2026-11-20): D-27's verdict is accept, identical or conflict, and the submit says which. Do: two
+/// works over one green make the same edit to `shared.txt`; the first submits, then the second; a third makes a
+/// different edit elsewhere. Expect: the first `Accepted`, the second `Identical` (every operation was already at the
+/// head), the third `Accepted`; the session log marks the second `Identical` at the version it committed. Before A-782
+/// the second answered `Accepted` and nothing told it from a change.
+#[test]
+fn an_identical_submission_is_told_from_an_accepted_one() {
+  let (daemon, instance) = daemon("identical");
+  let mut client = connect(&instance);
+  let green = client.create_green("converging", false).unwrap();
+  let (seed, _) = client.create_work(green, "seed").unwrap();
+  client.edit(seed, "/shared.txt", 0, 0, b"base\n").unwrap();
+  assert_eq!(client.submit(seed).unwrap(), Submitted::Accepted(1));
+  let (first, _) = client.create_work(green, "first").unwrap();
+  let (second, _) = client.create_work(green, "second").unwrap();
+  let (third, _) = client.create_work(green, "third").unwrap();
+  client.edit(first, "/shared.txt", 0, 4, b"same").unwrap();
+  client.edit(second, "/shared.txt", 0, 4, b"same").unwrap();
+  client.edit(third, "/other.txt", 0, 0, b"new\n").unwrap();
+  assert_eq!(client.submit(first).unwrap(), Submitted::Accepted(2));
+  assert_eq!(
+    client.submit(second).unwrap(),
+    Submitted::Identical(3),
+    "the same edit again changes nothing"
+  );
+  assert_eq!(client.submit(third).unwrap(), Submitted::Accepted(4));
+  let log = client.session_log().unwrap();
+  let mark_of = |work| {
+    log
+      .works
+      .iter()
+      .find(|w| w.id == work)
+      .map(|w| w.mark.clone())
+  };
+  assert_eq!(mark_of(first), Some(WorkMark::Accepted { version: 2 }));
+  assert_eq!(mark_of(second), Some(WorkMark::Identical { version: 3 }));
+  assert_eq!(mark_of(third), Some(WorkMark::Accepted { version: 4 }));
+  assert!(
+    log.needs_you().is_empty(),
+    "an identical submission needs no one"
+  );
+  drop(client);
+  daemon.stop();
+}
+
+/// Main's order 2026-11-20, item 3 (A-785): a merge an ask policy holds needs the human as a collision and a waiting
+/// landing do. Do: set a green's merge mode to ask; a work submits (held, nothing merged); read the log; approve the
+/// increment under the launcher's proof and read the log again. Expect: the log names the held merge (its work, the
+/// increment's identity and paths) as needing the human, and nothing once it is approved and merged. The log never
+/// approves (R10).
+#[test]
+fn a_merge_held_for_approval_needs_the_human_until_approved() {
+  use slates_client::{PolicySubject, WriteMode, WritePolicy};
+  let (daemon, instance) = daemon("held");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("asking", false).unwrap();
+  let subject = PolicySubject::Volume { volume: green };
+  let (_, version) = client.policy(subject).unwrap();
+  let policy = WritePolicy {
+    merge: WriteMode::Ask,
+    land: WriteMode::Ask,
+    require_signed_merges: false,
+  };
+  client
+    .set_policy(
+      subject,
+      (policy, version),
+      slates_server::landing::policy_proof(&secret, &subject, &policy, version),
+    )
+    .unwrap();
+  let (work, _) = client.create_work(green, "asking-agent").unwrap();
+  client.edit(work, "/f.txt", 0, 0, b"held\n").unwrap();
+  let Submitted::ApprovalRequired { identity, paths } = client.submit(work).unwrap() else {
+    panic!("an asked merge is held for approval");
+  };
+
+  let needs = client.session_log().unwrap().needs_you();
+  assert_eq!(
+    needs,
+    vec![NeedsYou::AwaitingApproval {
+      work,
+      name: "asking-agent".to_owned(),
+      green,
+      identity,
+      paths,
+    }],
+    "the held merge, and only it"
+  );
+
+  let proof = slates_server::landing::merge_approval_proof(&secret, work, &identity);
+  assert_eq!(
+    client.submit_approved(work, &[], identity, proof).unwrap(),
+    Submitted::Accepted(1)
+  );
+  assert!(
+    client.session_log().unwrap().needs_you().is_empty(),
+    "an approved merge needs no one"
+  );
+  drop(client);
+  daemon.stop();
+}

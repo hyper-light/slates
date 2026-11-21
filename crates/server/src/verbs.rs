@@ -6880,6 +6880,35 @@ pub(crate) fn admit(
   require_locked: bool,
   base: Option<&str>,
 ) -> Result<Admitted, Box<ReplyBody>> {
+  let base = match base {
+    None => AdmitBase::Scratch,
+    Some(path) => AdmitBase::Path(path),
+  };
+  admit_over(state, principal, (size, names, require_locked), base)
+}
+
+/// What an admitted volume is made over: nothing (a scratch volume), a host directory, or a tree the shard holds, lent
+/// per request (a mounted work's green version, A-774; `slates_vfs::host::tree`), named by its identity.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmitBase<'a> {
+  /// A scratch volume.
+  Scratch,
+  /// An overlay over the host directory at this path.
+  Path(&'a str),
+  /// An overlay over a tree the shard holds, of this identity.
+  Tree {
+    /// The tree's identity: its fingerprints' device.
+    identity: u64,
+  },
+}
+
+/// [`admit`] over any [`AdmitBase`].
+pub(crate) fn admit_over(
+  state: &mut ShardState,
+  principal: &Principal,
+  (size, names, require_locked): (SizeClass, NamePolicy, bool),
+  base: AdmitBase<'_>,
+) -> Result<Admitted, Box<ReplyBody>> {
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
@@ -6971,8 +7000,32 @@ pub(crate) fn admit(
     }
   };
   let config = volume_config(state, names, quota);
-  let (mut volume, host) = match base {
-    None => match Volume::create(&mut state.store, config) {
+  let (mut volume, mut host) = match base {
+    AdmitBase::Tree { .. } => {
+      let probe = slates_vfs::host::tree::TreeHost::new(0, (0, 0));
+      let made = Volume::create_overlay(
+        &mut state.store,
+        config,
+        BaseConfig {
+          root: probe.root(),
+          facts: probe.tree_facts(),
+          large_class_bytes: state.config.large_class_bytes,
+        },
+      );
+      match made {
+        Ok(v) => (v, None),
+        Err(e) => {
+          return Err(Box::new(give_back(
+            state,
+            reservation,
+            version_credit,
+            metadata_credit,
+            refusal_of_vfs(&e),
+          )));
+        }
+      }
+    }
+    AdmitBase::Scratch => match Volume::create(&mut state.store, config) {
       Ok(v) => (v, None),
       Err(e) => {
         return Err(Box::new(give_back(
@@ -6984,7 +7037,7 @@ pub(crate) fn admit(
         )));
       }
     },
-    Some(path) => match open_base(state, path, config) {
+    AdmitBase::Path(path) => match open_base(state, path, config) {
       Ok(pair) => pair,
       Err(reply) => {
         return Err(Box::new(give_back(
@@ -7010,6 +7063,28 @@ pub(crate) fn admit(
       metadata_credit,
       refusal_of_vfs(&e),
     )));
+  }
+  // A tree's entries show the volume's own owner, so its user may write what it mounts (A-774).
+  if let AdmitBase::Tree { identity } = base {
+    let owner = volume
+      .root_inode(&state.store)
+      .and_then(|root| volume.stat(&state.store, root));
+    match owner {
+      Ok(attrs) => {
+        host = Some(BaseHost::Tree(Box::new(
+          slates_vfs::host::tree::TreeHost::new(identity, (attrs.uid, attrs.gid)),
+        )));
+      }
+      Err(e) => {
+        return Err(Box::new(give_back(
+          state,
+          reservation,
+          version_credit,
+          metadata_credit,
+          refusal_of_vfs(&e),
+        )));
+      }
+    }
   }
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
   // `next_no` enforces, to the same allowance already reserved against the version slab above.
@@ -8477,6 +8552,7 @@ fn create_work_here(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9265,12 +9341,14 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::Submitted {
         version: None,
         conflicts: Vec::new(),
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::Submitted {
@@ -9278,6 +9356,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         conflicts,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::SubmittedSigned {
@@ -9286,6 +9365,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
       verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     } => {
       let room = reply_room(&ReplyBody::SubmittedSigned {
         version: None,
@@ -9293,6 +9373,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided: 0,
         verdict: u64::MAX,
+        identical: false,
       });
       let (conflicts, conflicts_elided, verdict) = keep_verdict(state, work_id, conflicts, room);
       ReplyBody::SubmittedSigned {
@@ -9301,6 +9382,7 @@ fn kept_conflict(state: &mut ShardState, work_id: DbVolumeId, reply: ReplyBody) 
         verification,
         conflicts_elided,
         verdict,
+        identical: false,
       }
     }
     ReplyBody::Rebased {
@@ -9685,6 +9767,7 @@ fn conflicted_reply(
       verification: signed.verification,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   } else {
     ReplyBody::Submitted {
@@ -9692,6 +9775,7 @@ fn conflicted_reply(
       conflicts,
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   }
 }
@@ -9709,6 +9793,40 @@ pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
     } => Some(*version),
     _ => None,
   }
+}
+
+/// Notes on the work a submission an ask policy held for approval (A-785, the session log's mark), at the work's
+/// revision now; any other answer leaves the mark as it is, to stand or go stale with the revision.
+fn note_held(state: &mut ShardState, work_id: DbVolumeId, reply: &ReplyBody) {
+  let ReplyBody::MergeApprovalRequired {
+    identity, paths, ..
+  } = reply
+  else {
+    return;
+  };
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.held = Some(crate::state::HeldMerge {
+      identity: *identity,
+      paths: *paths,
+      revision: work.revision,
+    });
+  }
+}
+
+/// Whether a submit's reply says its accepted increment changed nothing (A-782).
+fn accepted_identical(reply: &ReplyBody) -> bool {
+  matches!(
+    reply,
+    ReplyBody::Submitted {
+      version: Some(_),
+      identical: true,
+      ..
+    } | ReplyBody::SubmittedSigned {
+      version: Some(_),
+      identical: true,
+      ..
+    }
+  )
 }
 
 /// What a submit brings its verdict from its write policy (A-285): its work's own merge mode, read on the work's shard
@@ -9871,6 +9989,7 @@ fn settle_submit(
   reply: ReplyBody,
 ) -> ReplyBody {
   let Some(version) = accepted_version(&reply) else {
+    note_held(state, work_id, &reply);
     return kept_conflict(state, work_id, reply);
   };
   // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
@@ -9891,9 +10010,11 @@ fn settle_submit(
     return refused(refusal_of_db(&e));
   }
   reset_accepted_work(state, work_id, version);
-  // The session log's mark (A-773): the version the work's last submission made, which it now stands on.
+  // The session log's mark (A-773): the version the work's last submission made, which it now stands on, and whether
+  // it changed nothing (A-782).
+  let identical = accepted_identical(&reply);
   if let Some(work) = state.works.get_mut(&work_id) {
-    work.accepted = Some(version);
+    work.accepted = Some((version, identical));
   }
   crate::work_home::tell_floor(state, green_id, work_id, Some(version));
   reply
@@ -10097,6 +10218,7 @@ fn judge_submission(
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }
+      | slates_merge::engine::Outcome::Identical { .. }
   ));
   let verdict = match state.current_span {
     Some(cause) => state
@@ -10111,7 +10233,10 @@ fn judge_submission(
   };
   crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
-    slates_merge::engine::Outcome::Accepted { version } => {
+    // An identical increment commits its (empty) version as an accept does, so retries and the chain's replay answer
+    // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
+    slates_merge::engine::Outcome::Accepted { version }
+    | slates_merge::engine::Outcome::Identical { version } => {
       // The copies the version made, read before the increment's parts move: a Subversion green's revision names them
       // (`vcs_store::svn_made`).
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
@@ -10147,6 +10272,16 @@ fn judge_submission(
         inc.evidence,
         (completion, Some(sealed.work)),
       );
+      // A verdict a holder computed came with its increment, which that holder holds as the version's inputs (A-697 (1)):
+      // its shipment carries none of them back. The work's id names that holder's member.
+      if sealed.computed.is_some() {
+        crate::merge_service::inputs_held_by(
+          state,
+          green_id,
+          version,
+          ObjectId(sealed.work.bytes).creator(),
+        );
+      }
       // True the retention charge up to what the commit retained (the secured surplus credited). A settle after an
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
       // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
@@ -14598,7 +14733,7 @@ pub(crate) fn adopt_taken_over_green(
     );
     return Ok(());
   }
-  record_taken_over_completions(state, &completions);
+  record_taken_over_completions(state, id, &completions);
   let object = ObjectId(id.bytes);
   let placed = state.merge.placed.entry(object).or_insert(head);
   *placed = (*placed).max(head);
@@ -14731,6 +14866,7 @@ const TAKEN_OVER_COMPLETION_UNRECORDED: &str = "merge.takeover.completion_unreco
 /// typed and runs nothing (the work is gone with its owner). Counted.
 fn record_taken_over_completions(
   state: &mut ShardState,
+  green: DbVolumeId,
   completions: &[(u64, crate::merge_service::SubmitCompletion)],
 ) {
   let bound = usize::try_from(completion_bound(state)).unwrap_or(usize::MAX);
@@ -14759,6 +14895,7 @@ fn record_taken_over_completions(
           conflicts: Vec::new(),
           conflicts_elided: 0,
           verdict: 0,
+          identical: crate::merge_service::identical_at(state, green, version),
         },
         work,
       );
@@ -18628,6 +18765,7 @@ fn install_rebuilt_work(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
 }

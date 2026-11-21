@@ -42,6 +42,8 @@ use slates_client::{
 pub mod http;
 
 pub mod query;
+mod session_log;
+pub use session_log::session_log_json;
 mod skills;
 
 pub use http::serve;
@@ -430,6 +432,7 @@ impl McpServer {
       "slates.base.pin" => self.pin(&args),
       "slates.land.materialize" => self.land_materialize(&args),
       "slates.status" => self.status(),
+      "slates.log" => self.session_log(),
       other => {
         // An unknown tool is a protocol error (MCP server/tools: `-32602`), not a tool-execution one.
         return Err(McpError {
@@ -522,7 +525,13 @@ impl McpServer {
         .submit_with_evidence(work, &evidence)
         .map_err(refusal)?
       {
-        Submitted::Accepted(version) => json!({ "accepted": true, "version": version }),
+        Submitted::Accepted(version) => {
+          json!({ "accepted": true, "identical": false, "version": version })
+        }
+        // Accepted, changing nothing (A-782): every operation was already at the head.
+        Submitted::Identical(version) => {
+          json!({ "accepted": true, "identical": true, "version": version })
+        }
         Submitted::Conflict(windows) => {
           json!({ "accepted": false, "conflicts": windows_json(&windows) })
         }
@@ -847,6 +856,14 @@ impl McpServer {
   fn status(&mut self) -> Result<Value, McpError> {
     let (report, telemetry) = gather_daemon_status(&mut self.client).map_err(refusal)?;
     Ok(daemon_json(&report, &telemetry))
+  }
+
+  /// The session log (A-773): what needs the human (collided works, merges held for approval, landings awaiting a
+  /// grant), then each green's works, as `slates log --json` prints it ([`session_log_json`]). A read: it shows a
+  /// pending grant or approval and makes none (R10).
+  fn session_log(&mut self) -> Result<Value, McpError> {
+    let log = self.client.session_log().map_err(refusal)?;
+    Ok(session_log_json(&log))
   }
 
   /// Lands onto a host directory (§4.15) as the volume's write policy allows (A-285). MCP never passes a grant (R10):
@@ -1236,6 +1253,14 @@ fn tool_list() -> Vec<Value> {
       "Create a volume: `bounded` (a byte limit) or `dynamic` (a max), optional `base` host path.",
       json!({ "name": string, "bounded": integer, "dynamic": integer, "fold": { "type": "boolean" }, "base": string }),
       json!(["name"]),
+    ),
+    tool(
+      "slates.log",
+      "The session log: what needs a person first (collided works, merges held for approval, landings awaiting \
+       approval), then each green's head and its works (base, versions behind, last submission). Read-only: it never \
+       approves anything.",
+      json!({}),
+      json!([]),
     ),
     tool(
       "slates.volume.list",

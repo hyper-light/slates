@@ -579,7 +579,7 @@ proptest! {
           let expected = twin.copy.submit(&inc);
           let outcome = lineage.with(twin.handle, |green| green.submit(&inc)).unwrap();
           prop_assert_eq!(&outcome, &expected);
-          if let Outcome::Accepted { version } = expected
+          if let Outcome::Accepted { version } | Outcome::Identical { version } = expected
             && !twin.recorded.contains_key(&version)
           {
             twin.recorded.insert(version, snapshot(&mut twin.copy));
@@ -1110,7 +1110,7 @@ fn change_a_tenth(lineage: &mut Lineage, branch: LineageGreen) {
       .unwrap();
     assert!(matches!(
       lineage.with(branch, |green| green.submit(&inc)).unwrap(),
-      Outcome::Accepted { .. }
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
     ));
   }
 }

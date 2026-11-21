@@ -123,7 +123,7 @@ impl LogRoute {
     let taken = self
       .queued
       .bytes
-      .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+      .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
         queued
           .checked_add(bytes)
           .filter(|after| *after <= self.queued.capacity)

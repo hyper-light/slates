@@ -78,7 +78,7 @@ fn compose(
 fn accept(green: &mut Green, id: u8, journal: &[VolumeOp], files: &Files) -> Result<(), String> {
   let increment = compose(green, (green.head(), id), journal, files)?;
   match green.submit(&increment) {
-    Outcome::Accepted { .. } => Ok(()),
+    Outcome::Accepted { .. } | Outcome::Identical { .. } => Ok(()),
     other => Err(format!("a fixture's work was answered {other:?}")),
   }
 }
@@ -318,7 +318,7 @@ fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
         changed,
         journal,
       },
-      Outcome::Accepted { .. },
+      Outcome::Accepted { .. } | Outcome::Identical { .. },
     ) if !work.refused => {
       let mut files: Files = rebasing
         .files()
@@ -344,7 +344,9 @@ fn restate(work: &Work, census: &mut Census) -> Result<(), String> {
           green.head_identity(),
         )
       };
-      if !matches!(answer, Outcome::Accepted { .. }) || read(&mut again) != read(&mut accepting) {
+      if !matches!(answer, Outcome::Accepted { .. } | Outcome::Identical { .. })
+        || read(&mut again) != read(&mut accepting)
+      {
         return Err(format!(
           "the restated journal {journal:?} was answered {answer:?}"
         ));

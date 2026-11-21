@@ -50,6 +50,14 @@ pub enum MergeOutcome {
     /// The merge's signature, as judged.
     verification: Verification,
   },
+  /// The increment was accepted and changed nothing: every operation was already at the head (D-27's identical verdict,
+  /// A-782). Its version commits nothing new.
+  Identical {
+    /// The green version the increment committed as.
+    version: u64,
+    /// The merge's signature, as judged.
+    verification: Verification,
+  },
   /// The caller's mode asks: the merge awaits the approver. Nothing was merged.
   ApprovalRequired(MergeApproval),
   /// The increment met intervening changes: each conflict window, typed. Nothing was merged; rebase, resolve and merge

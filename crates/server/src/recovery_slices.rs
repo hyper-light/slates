@@ -107,6 +107,11 @@ impl RecoverySlices {
     }
   }
 
+  /// The least a slice is given: what a unit that runs several steps of its own holds itself to (A-732 part 5).
+  pub(crate) fn budget_ns(&self) -> u64 {
+    self.budget_ns
+  }
+
   /// One unit done: when the slice is spent ([`slice_is_spent`]), it ends and the task yields, so the shard completes a
   /// step before the next unit begins.
   pub(crate) async fn unit_done(&mut self) {

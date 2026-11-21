@@ -286,7 +286,10 @@ fn two_rewrites_of_different_lines_merge_as_their_edits_would() {
   let second = base.replacen("a + 190\n", "a - 190\n", 1);
   let both = first.replacen("a + 190\n", "a - 190\n", 1);
   let (one, two, _) = judge(&base, &first, &second, (false, false));
-  assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
+  assert!(
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+    "{one:?}"
+  );
   assert!(
     matches!(two, Outcome::Conflict { .. }),
     "unrefined: {two:?}"
@@ -299,8 +302,14 @@ fn two_rewrites_of_different_lines_merge_as_their_edits_would() {
 fn both_edits_held(base: &str, (first, second): (&str, &str), both: &str) {
   for rename in [false, true] {
     let (one, two, content) = judge(base, first, second, (rename, true));
-    assert!(matches!(one, Outcome::Accepted { .. }), "{one:?}");
-    assert!(matches!(two, Outcome::Accepted { .. }), "{two:?}");
+    assert!(
+      matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+      "{one:?}"
+    );
+    assert!(
+      matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
+      "{two:?}"
+    );
     assert_eq!(content, both);
   }
 }
@@ -314,7 +323,8 @@ fn different_tokens_of_one_line_merge_and_one_token_conflicts() {
   let second = base.replacen("fn f7(a: u32)", "fn f7(a: u64)", 1);
   let (one, two, content) = judge(&base, &first, &second, (true, true));
   assert!(
-    matches!(one, Outcome::Accepted { .. }) && matches!(two, Outcome::Accepted { .. }),
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. })
+      && matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
     "{two:?}"
   );
   assert_eq!(content, base.replacen("fn f7(a: u32)", "fn g7(a: u64)", 1));
@@ -333,7 +343,8 @@ fn a_formatter_pass_beside_an_edit_merges() {
   let edited = base.replacen("a + 42\n", "a + 4200\n", 1);
   let (one, two, content) = judge(&base, &formatted, &edited, (false, true));
   assert!(
-    matches!(one, Outcome::Accepted { .. }) && matches!(two, Outcome::Accepted { .. }),
+    matches!(one, Outcome::Accepted { .. } | Outcome::Identical { .. })
+      && matches!(two, Outcome::Accepted { .. } | Outcome::Identical { .. }),
     "{two:?}"
   );
   assert_eq!(content, formatted.replacen("a + 42\n", "a + 4200\n", 1));

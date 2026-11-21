@@ -2323,23 +2323,29 @@ fn replay_record(
   Some(replayed.map(|unkept| state.count(VALUE_UNKEPT, unkept)))
 }
 
+/// Counter: the units a Mercurial record's sliced replay ran (A-732 part 5), each under one lend of the stores and one
+/// settle of the charge, as many of the record's steps as its time allowed. Format: a counter name in the status report.
+pub(crate) const HG_REPLAY_TURNS: &str = "vcs_store.hg_replay_turns";
+
 /// Replays repository `id`'s Mercurial record at `index` a unit at a time, a unit of `slices` each (A-732; the
-/// record's `Replay`): its bytes read from the register afresh at each step, the room its bytes take lent once and the
-/// shard's charge settled after each step; none when it has no record there.
+/// record's `Replay`): its bytes read from the register afresh at each unit, the room its bytes take lent once and the
+/// shard's charge settled after each unit. A unit takes the record's steps until a slice's budget is spent (part 5:
+/// found by use, a restart of hg's history ran 259,321 units of one revision each, each lending the stores and settling
+/// the charge); none when it has no record there.
 async fn replay_hg_sliced(
   state: &mut ShardState,
   id: RepositoryId,
   index: usize,
   slices: &mut crate::recovery_slices::RecoverySlices,
 ) -> Option<Result<(), ReplayRefused>> {
-  let begun = hg_record_step(state, id, index, None)?;
+  let begun = hg_record_step(state, id, index, None, slices.budget_ns())?;
   let mut replay = match begun {
     Ok(HgStep::Begun(replay)) => replay,
     Ok(HgStep::Stepped(..)) => return Some(Ok(())),
     Err(refused) => return Some(Err(refused)),
   };
   loop {
-    match hg_record_step(state, id, index, Some(replay))? {
+    match hg_record_step(state, id, index, Some(replay), slices.budget_ns())? {
       Ok(HgStep::Stepped(Some(more))) => {
         replay = more;
         slices.unit_done().await;
@@ -2359,14 +2365,17 @@ enum HgStep {
   Stepped(Option<slates_hg::import::record::Replay>),
 }
 
-/// [`replay_hg_sliced`]'s one step over the shard's state (its type's docs); none when the register holds no record at
-/// `index`.
+/// [`replay_hg_sliced`]'s one unit over the shard's state (its type's docs): the record's steps taken under one lend
+/// until `ns` of the shard's clock pass or the record ends, the first always; none when the register holds no record
+/// at `index`. Each unit counted ([`HG_REPLAY_TURNS`]).
 fn hg_record_step(
   state: &mut ShardState,
   id: RepositoryId,
   index: usize,
   replay: Option<slates_hg::import::record::Replay>,
+  ns: u64,
 ) -> Option<Result<HgStep, ReplayRefused>> {
+  let deadline_ns = slates_rt::futures::now_ns().saturating_add(ns);
   let ShardState {
     db,
     store,
@@ -2382,12 +2391,13 @@ fn hg_record_step(
   lend(store, vcs_stores, lent);
   let stepped = {
     let lent = Lent::new(&mut *store, vcs_stores);
-    hg_step_in(lent.stores, id, bytes, replay)
+    hg_step_in(lent.stores, id, bytes, replay, deadline_ns)
   };
   let whole = settle_in(store, vcs_stores);
   if !whole {
     state.count(CHARGE_SHORT, 1);
   }
+  state.count(HG_REPLAY_TURNS, 1);
   Some(stepped)
 }
 
@@ -2397,6 +2407,7 @@ fn hg_step_in(
   id: RepositoryId,
   bytes: &[u8],
   replay: Option<slates_hg::import::record::Replay>,
+  deadline_ns: u64,
 ) -> Result<HgStep, ReplayRefused> {
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
@@ -2408,7 +2419,11 @@ fn hg_step_in(
       .map(HgStep::Begun)
       .map_err(ReplayRefused::Mercurial);
   };
-  match replay.step(bytes, content) {
+  let mut stepped = replay.step(bytes, content);
+  while matches!(stepped, Ok(true)) && slates_rt::futures::now_ns() < deadline_ns {
+    stepped = replay.step(bytes, content);
+  }
+  match stepped {
     Ok(true) => Ok(HgStep::Stepped(Some(replay))),
     Ok(false) => {
       let replayed = replay
@@ -3170,7 +3185,10 @@ async fn replay_sliced(id: RepositoryId, aside: Option<slates_hg::index::HgIndex
   let mut index = 0usize;
   let mut replay = None;
   loop {
-    let stepped = crate::state::with_state(|state| hg_record_step(state, id, index, replay.take()));
+    let stepped = crate::state::with_state(|state| {
+      let ns = state.config.step_quantum_ns();
+      hg_record_step(state, id, index, replay.take(), ns)
+    });
     match stepped.flatten() {
       Some(Ok(HgStep::Begun(begun) | HgStep::Stepped(Some(begun)))) => replay = Some(begun),
       Some(Ok(HgStep::Stepped(None))) => {
