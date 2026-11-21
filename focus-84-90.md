@@ -1460,3 +1460,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-perf: (c) confirmed from w-hg's code: the text identity is of the framed text, so a stream chunk is the stored bytes. It builds the stream fix now while the pull profile runs.
   - w-fed-move claimed an A-number for counting and resending lost replies.
   DISK: Studio-4 42 GB free (82 at 23:58). g226's worktree is 30 GB and is told to trim. ~/.cache/kiln-gate (44 GB) is kiln's own, not ours. Studio-1 73 GB, the big Studio 777 GB, the MacBook 56 GB. Studio-2 unreachable.
+- 2026-11-21 00:45 PST LANDED (on main):
+  - 9249a6a73 (w-fed-move, A-800, goal 86b's lost replies): every place a reply carried home can be lost is counted apart, and the silent ones resend; three red tests.
+  - cf6b3c98a (w-git C5 part 2a): git creation refused without a store, and git's tests on the shared test_store.
+  RUN: main's 100k rerun is queued as kiln r48 (needs macos,cpus=16,mem=40g,disk=40g; 2 h bound; a fresh clone of main; kernel tree 5f22fb204). kiln refuses a pinned run when the pinned machine lacks room, so it goes unpinned and carries its own tree. kiln's estimate: the big Studio, by about 02:42. Results go to w-fed-move.
+  RULING: w-git C5 2b approved. Pushes write version 5 only and are refused when short. Made commits adopt w-svn's deferred-submit hook (one hook); version 2 stays in GAPS until then. A new refusal variant publishes its wire tag in the same commit.
+  MEMORY: Studio-4 had 0.3-14 GB free, with swap at 18.6 of 19.5 GB. Most of it is a Virtualization VM up since boot (18 GB resident plus 30 GB compressed), not an agent's. g226 trimmed its worktree: 42 -> 53 GB disk free.
