@@ -74,16 +74,50 @@ pub fn dump(path: &str) {
 
 // Ring split: for every request a shard takes, (landed → taken, taken → reply written), ns.
 const RING_CAP: usize = 300_000;
-static RING: [[AtomicU64; 4]; RING_CAP] = [const { [const { AtomicU64::new(0) }; 4] }; RING_CAP];
+static RING: [[AtomicU64; 5]; RING_CAP] = [const { [const { AtomicU64::new(0) }; 5] }; RING_CAP];
 static RING_TAKEN: AtomicUsize = AtomicUsize::new(0);
 
+thread_local! {
+  static TAKES: std::cell::RefCell<std::collections::HashMap<u64, (u64, u64)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A request a shard took: kept until its reply is written, so a reply written in a later step is split too.
+pub fn took(request: u64, landed: u64, taken: u64) {
+  TAKES.with(|t| {
+    let mut t = t.borrow_mut();
+    if t.len() < 100_000 {
+      t.insert(request, (landed, taken));
+    }
+  });
+}
+
+pub fn forget(request: u64) {
+  TAKES.with(|t| t.borrow_mut().remove(&request));
+}
+
+/// A reply written for a request taken in an earlier step (resumed or forwarded): a ring row flagged deferred.
+pub fn deferred_written(request: u64) {
+  if let Some((landed, taken)) = TAKES.with(|t| t.borrow_mut().remove(&request)) {
+    ring_row(landed, taken, now_mono(), 1);
+  }
+}
+
+fn now_mono() -> u64 {
+  slates_machine::clock::monotonic_ns()
+}
+
 pub fn ring(landed: u64, taken: u64, written: u64) {
+  ring_row(landed, taken, written, 0);
+}
+
+fn ring_row(landed: u64, taken: u64, written: u64, deferred: u64) {
   let n = RING_TAKEN.fetch_add(1, Relaxed);
   if n < RING_CAP {
     RING[n][0].store(taken.saturating_sub(landed), Relaxed);
     RING[n][1].store(written.saturating_sub(taken), Relaxed);
     RING[n][2].store(landed, Relaxed);
     RING[n][3].store(written, Relaxed);
+    RING[n][4].store(deferred, Relaxed);
   }
 }
 
@@ -91,12 +125,12 @@ pub fn dump_ring(path: &str) {
   use std::io::Write;
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
   let mut out = format!(
-    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\n",
+    "# client sends {} rings {}\nqueued\tserved\tlanded\twritten\tdeferred\n",
     slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
     slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
   );
   for row in RING.iter().take(n) {
-    out.push_str(&format!("{}\t{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed), row[3].load(Relaxed)));
+    out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed), row[3].load(Relaxed), row[4].load(Relaxed)));
   }
   if let Ok(mut f) = std::fs::File::create(path) {
     let _ = f.write_all(out.as_bytes());

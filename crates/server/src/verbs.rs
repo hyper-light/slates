@@ -17842,6 +17842,9 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
       u32::try_from(slates_ipc::endpoint::G222_LAST_STAMP.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0),
       g222_taken,
     );
+    if let Some(landed) = g222_landed {
+      crate::g222_diag::took(request.request, landed, g222_taken);
+    }
     // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
     // is the entry point, its request id the replay identity. `now` (this round's single clock read,
     // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
@@ -17858,6 +17861,7 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     state.forward_hold_ns = 0;
     match served {
       Served::Reply(mut reply) => {
+        crate::g222_diag::forget(request.request);
         if send_reply(state, index, request.request, &mut reply) {
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
@@ -17963,7 +17967,10 @@ pub(crate) fn send_reply(
   // Room first, then the body (`DaemonEnd::reply_message`): a reply packed before a full ring refused it was written
   // over the bulk body of the oldest reply the client had not taken.
   match client.end.reply_message(request, reply) {
-    Ok(()) => true,
+    Ok(()) => {
+      crate::g222_diag::deferred_written(request);
+      true
+    }
     Err(IpcError::RingFull) => false,
     Err(_) => {
       let fallback = ReplyBody::Refused {

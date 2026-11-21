@@ -5,8 +5,10 @@ def rows(p):
     except OSError: return []
     return [l.split('\t') for l in L if l and not l.startswith('#') and l[0].isdigit()]
 ring={}
-for q,s,landed,written in (r for r in rows(base+'.ring') if len(r)==4):
-    ring[int(landed)//1000]=(int(q),int(s),int(written))
+for r in rows(base+'.ring'):
+    if len(r)<4: continue
+    q,s_,landed,written=r[:4]; dfr=int(r[4]) if len(r)>4 else 0
+    ring[int(landed)//1000]=(int(q),int(s_),int(written),dfr)
 def landed_ns(stamp,by):
     low=(by & 0xFFFFFFFF) & ~1; back=(low-(stamp & ~1)) & 0xFFFFFFFF; return by-back
 tot=[];m=[]
@@ -17,7 +19,7 @@ for st,seen,parks in rows(base+'.client'):
     r=None
     for k in (L//1000, L//1000-1, L//1000+1):
         if k in ring: r=ring[k]; break
-    tot.append((t,parks,r and (r[0],r[1],seen-r[2])))
+    tot.append((t,parks,r and (r[0],r[1],seen-r[2]),r[3] if r else None))
 tot.sort(key=lambda x:x[0])
 pc=lambda a,p: a[min(len(a)-1,int(len(a)*p))] if a else 0
 n=len(tot); print(f'client n {n} total p50/p99/p999/max us {pc(tot,.5)[0]/1e3:.0f} {pc(tot,.99)[0]/1e3:.0f} {pc(tot,.999)[0]/1e3:.0f} {tot[-1][0]/1e3:.0f}' if n else 'client n 0')
@@ -27,16 +29,18 @@ for name,lo in (('p99 tail',.99),('p999 tail',.999)):
     j=[x[2] for x in tail if x[2]]
     med=lambda a: sorted(a)[len(a)//2]/1e3 if a else float('nan')
     parked=sum(1 for x in tail if x[1]>0)
-    print(f'  {name}: n {len(tail)} parked {parked} parks med {sorted(x[1] for x in tail)[len(tail)//2]}; joined {len(j)}: queued med {med([a for a,_,_ in j]):.0f} served med {med([b for _,b,_ in j]):.0f} wake(written->seen) med {med([c for _,_,c in j]):.0f} us; max q/s/w {max([a for a,_,_ in j],default=0)/1e3:.0f}/{max([b for _,b,_ in j],default=0)/1e3:.0f}/{max([c for _,_,c in j],default=0)/1e3:.0f}')
+    kinds={'sync':sum(1 for x in tail if x[3]==0),'deferred':sum(1 for x in tail if x[3]==1),'unjoined':sum(1 for x in tail if x[3] is None)}
+    print(f'  {name}: n {len(tail)} {kinds} parked {parked} parks med {sorted(x[1] for x in tail)[len(tail)//2]}; joined {len(j)}: queued med {med([a for a,_,_ in j]):.0f} served med {med([b for _,b,_ in j]):.0f} wake(written->seen) med {med([c for _,_,c in j]):.0f} us; max q/s/w {max([a for a,_,_ in j],default=0)/1e3:.0f}/{max([b for _,b,_ in j],default=0)/1e3:.0f}/{max([c for _,_,c in j],default=0)/1e3:.0f}')
     if j:
         big=collections=None
         dom={'queued':0,'served':0,'wake':0}
         for a,b,c in j: dom[max((('queued',a),('served',b),('wake',c)),key=lambda x:x[1])[0]]+=1
         print('    dominant hop:',dom)
-j=[x[2] for x in tot if x[2]]
-for i,nm in enumerate(('queued','served','wake')):
-    a=sorted(x[i] for x in j)
-    if a: print(f'  all joined {nm} p50/p99/p999 us {pc(a,.5)/1e3:.0f} {pc(a,.99)/1e3:.0f} {pc(a,.999)/1e3:.0f}')
+for kind,flag in (('sync',0),('deferred',1)):
+    j=[x[2] for x in tot if x[2] and x[3]==flag]
+    for i,nm in enumerate(('queued','served','wake')):
+        a=sorted(x[i] for x in j)
+        if a: print(f'  {kind} n {len(a)} {nm} p50/p99/p999 us {pc(a,.5)/1e3:.0f} {pc(a,.99)/1e3:.0f} {pc(a,.999)/1e3:.0f}')
 P=rows(base+'.parks')
 if P:
     w=sorted(int(r[1]) for r in P); print(f'  shard parks n {len(P)} waited p50/p99/p999/max us {pc(w,.5)/1e3:.0f} {pc(w,.99)/1e3:.0f} {pc(w,.999)/1e3:.0f} {w[-1]/1e3:.0f}')

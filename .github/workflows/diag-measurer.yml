@@ -1,5 +1,5 @@
 name: diag measurer
-# g222's macOS split (84a, main's step 4): main with B (A-799) and the busy path's zero-timeout kevent nap, stamped by
+# g222's macOS split, take 2 (84a, main's step 4): replies written after their taking step (resumed or forwarded) now stamped too (deferred flag). Was: main with B (A-799) and the busy path's zero-timeout kevent nap, stamped by
 # hop (diag-g222-hops-mac 2e30acc9a): per reply the client's send -> shard taken (queued), taken -> written (served),
 # written -> the client saw it (wake), with the client's parks; every shard park's timeout and lateness; the
 # zero-timeout harvests' durations; and the runner's timer lateness (nanosleep and kevent, 200 us) quiet and under the
