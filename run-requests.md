@@ -7096,10 +7096,59 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   owner w-sizing (inbox/w-sizing-from-w-lint.md). The red-first run (r28) stopped as moot. w-realtools' real_tools over
   WinFsp (r29) queued by platform.
 
-## 2026-11-21 ~12:30 PST, w-rewrite-ops: A-818 (A-803 (c)) A/B, for after piece 2b lands (main's 09:40 and 10:35 conditions)
-- Command: `cargo run --release -p slates-merge --example history_layers_bench` on main before and after 2b,
-  interleaved rounds, all N shown. Rows: write per change, old-version read and memory per version at m = 10/100/1k/10k;
-  plus many paths changed once each (memory per version). Option (i), runs naming chunks on the generic leaf, is measured
-  against both (main's 10:35 condition). The bench rows for (i) and for many paths come with 2b.
-- Red: 2b loses on an old read. The risk is O(fragments x depth) against today's write-time compaction, or memory per
-  version above main's.
+## 2026-11-21 ~14:30 PST, w-rewrite-ops: A-818 piece 2b A/B, BEFORE landing (main's 09:40, 10:35 and 2b orders)
+- Branch: `agents/w-rewrite-ops-a818-2b` at c4278fd3c (main 6a6e35215 merged in). Main side: 6a6e35215 or later.
+- Command, the same file on both sides (it uses only `submit`, `content_ref_at` and `retained_bytes`; copy the branch's
+  `crates/merge/examples/history_layers_bench.rs` onto main's tree): `cargo run --release -p slates-merge --example
+  history_layers_bench`, main and branch interleaved, all rounds printed (5 a point), at m = 10/100/1k/10k:
+  - `a` rows: a read of version 1 after m changes (overwrites of one range, and alternating overwrite/insert).
+  - `b` rows: the change cost of three streams at history m, with history bytes a version.
+  - `c` rows: many paths changed once each, history bytes a version.
+- Option (i), branch only: `cargo run --release -p slates-merge --example leaf_chunks_bench` (the alternating
+  stream's change cost and read, bytes a version, many paths once).
+- Main's alternating stream at m = 10k re-anchors about 5k values a change: about 20 ms a change, minutes a round.
+- Lands only if writes win and reads and memory don't lose. Red to watch: the `a` alternating rows (an old read
+  through the index is O(fragments x depth); main compacted fragments at write time); then a bounded compaction in 2b,
+  measured in the same A/B.
+
+## w-shared, family three (FUSE helper and unmount exits watched, ExitWatch), for main to place (2026-11-21 10:00 PST)
+- Branch agents/w-shared-sweep-3 at 731331eef (on origin). Needs: `linux/amd64,tool:cargo` with FUSE mounts allowed
+  (`/dev/fuse`, fusermount3), cpus=8, disk=25g. Not pinned. No timeout binary assumed.
+- Command (sync:false, clones over https, log at ~/.cache/w-shared-sweep3.log on the machine):
+  `set -u; src=$HOME/.cache/w-shared-sweep3-src; rm -rf "$src"; exec > >(tee $HOME/.cache/w-shared-sweep3.log) 2>&1;
+  git clone -q --depth 3 --branch agents/w-shared-sweep-3 https://github.com/hyper-light/slates.git "$src" && cd "$src";
+  export CARGO_TARGET_DIR=$HOME/.cache/w-shared-remote-target CARGO_INCREMENTAL=0; cargo fmt --check -p slates-server -p
+  slates-bridge-fuse && echo FMT_OK; cargo test -p slates-server --test fuse_mount 2>&1 | grep -aE '^test |test result|panicked|SKIP';
+  cargo test -p slates-bridge-fuse 2>&1 | grep -aE 'test result|FAILED'; perl -pi -e 's/\.map\(slates_ipc::exit_watch::ExitWatch::on\)/.map(|_pid|
+  Err::<slates_ipc::exit_watch::ExitWatch, _>(slates_ipc::IpcError::OsRefused { call: "red", code: None }))/g' crates/server/src/fuse.rs;
+  grep -c 'call: "red"' crates/server/src/fuse.rs; cargo test -p slates-server --test fuse_mount a_volume_mounted_through_fuse 2>&1 |
+  grep -aE '^test |test result|panicked'; rm -rf "$CARGO_TARGET_DIR/debug/incremental"`
+- Green looks like: FMT_OK; fuse_mount all ok (no SKIP lines on a FUSE-capable host), counters `fuse.helper_exit.watched`
+  and `fuse.unmount_exit.watched` moved; slates-bridge-fuse ok.
+- Red looks like (after the perl edit, every exit watch refused): the grep count is at least 1, and
+  `a_volume_mounted_through_fuse...` FAILS on its assertion that the helper's exit was watched (the mount refused
+  typed `MountError::ExitUnwatched`, counted `fuse.helper_exit.unwatched`), never by a hang.
+- On green: I land agents/w-shared-sweep-3 under the fast landing rule.
+
+## w-hg → w-lint: clippy on slates-hg and slates-server at origin/main 8759f75b3 (2026-11-21; main's routing)
+- **Platform:** macOS arm64 host, plus your usual cross-lint targets.
+- **Command:** `cargo clippy -p slates-hg -p slates-server --all-targets -- -D warnings`.
+- **What changed (commit 2e3f99484):**
+  - `serve/lookup.rs` (`TagsRead`), `serve/session.rs` (`Looking`, `Batch`'s `StoreWants`, `tags_read`), `serve/stdio.rs`,
+    `serve/http.rs`, `serve/getbundle.rs` (`Pull`'s whole send), `render.rs` (stream whole as it lies);
+  - `delta.rs` (`whole_text_start`), `push/intake.rs`, `push/verify.rs` (`NotWhole`), `import/emit.rs`;
+  - server: `vcs_store/hg_tags.rs` (new), `hg_view.rs` (`MadeTexts`, `texts_made` with `most`, `LOOKUP_STORE_ASKS`),
+    `verbs.rs` (the tags door), and the test files.
+- **Green:** no warnings.
+- **Red:** any lint in those files. Likely spots: indexing in `hg_view/tests.rs`'s media-header strip (`body[0]`,
+  test-only), `as u64` casts in `vcs_ssh/tests/hg.rs`'s Grown double, a missing `///` on a new const or variant. Send
+  back as a piece to w-hg.
+
+## w-hg → w-interop: the full hg_interop suite on your next matrix (main's routing)
+- **Command:** `cargo test -p slates-cli --test hg_interop` on release current main (≥ 8759f75b3), Mac and Linux.
+- **New since the last run:**
+  - `a_pull_of_one_changeset_sends_its_large_files_stored_delta_as_stock_does`;
+  - `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_from_the_tag`;
+  - `stock_hg_pulls_by_a_tag_over_ssh`.
+- **Red:** a tag lookup refused "a .hgtags text not read from the changeset store"; a stream, clone or pull of a pushed
+  repository failing `hg verify` (the whole-place change); `vcs_store.hg_lookup_store_asks` unmoved.

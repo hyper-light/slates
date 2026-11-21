@@ -158,3 +158,6 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 
 ## For main to delete
 - (none)
+
+## 2026-11-21: STANDING BY
+- New main 01a1ff31 recorded C1 closed (21a306a04) and R2 closed on all three platforms; R3 closes on w-hg/w-store numbers. I hold nothing else.

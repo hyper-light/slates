@@ -256,3 +256,29 @@ landing and its replay red first.
   short".
 - **Next (your order):** the other synchronous readers (lookup's `.hgtags`, the push intake's base text), then step 2
   after w-perf's intake change lands.
+
+## Whole place = raw text; lookup's .hgtags and --from through the store: LANDED on origin/main 8759f75b3 (2026-11-21; commit 2e3f99484, base 20c2bc961)
+- **Whole place (main's approval):**
+  - Both writers (push intake, import emitter) now record a whole's place as its raw text, past the trivial hunk.
+    Before, `StoreHandle::text` refused `BadRow` for every hg text.
+  - The stream sends a whole as it lies (`text_after_trivial_hunk` removed). Clone and pull write a whole with
+    `put_revision_whole`. A non-trivial delta against null is refused typed (`Unverified::NotWhole`).
+  - Old stores refuse `BadRow` until re-imported or re-pushed; no shim.
+- **Lookup, ruling (A):**
+  - `TagsRead` reads all heads' `.hgtags` rows in one want, then texts in one, under `Want::Texts`' `most`.
+  - `Producing::Lookup` over SSH and HTTP (0.1, uncompressed). `Batch` reads once via `BatchStep::Store`.
+  - The `--from` door (`vcs_store::hg_tags`) parks `CreateBranch` while a task reads.
+  - `Repository::tags_text` removed. Counted `vcs_store.hg_lookup_store_asks`.
+  - New `hidden-tag` fixture made by stock 7.2.
+- **Tests (on the merged tree):**
+  - slates-hg 401/401; server hg 71/71, including the red store test (red before the fix), the five-format two-writer
+    oracle, and `--from v1` through the door;
+  - daemon_edge 28/29, the one failure git's A-713 long-history push, which passes alone.
+- **For you to run:**
+  - hg_interop: the stock `pull -r <tag>` over SSH and HTTP, a batched `pull -r a -r b`, and the `--from` verb by use
+    (not yet written as interop tests; I can add them next if you want);
+  - the full hg_interop suite;
+  - clippy on slates-hg and slates-server.
+  - Red would be a tag lookup refused "a .hgtags text not read", or a stream or clone of a pushed repository failing
+    verify.
+- **Next:** the intake's base text, waiting on w-perf's answer about intake.rs. Then step 2.

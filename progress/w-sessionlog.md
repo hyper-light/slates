@@ -32,3 +32,5 @@ answer Identical (main's call); an Abandoned landing state for presentations who
 inbox/main-from-w-sessionlog-close.md written. Findings recorded, not worked: async SDK log forms (GAPS A-773 entry).
 Disk: deleted ~/.cache/w-sessionlog-target.noindex/debug/incremental (12 GB), 2026-11-20 16:30.
 SDK session-log tests run 16:40 (main's 16:18): Python 2 OK, Node 2 pass / 0 skipped, real daemon, this Mac. List done.
+
+2026-11-21: new main 01a1ff31 ruled (1) head own bytes -> Identical, (2) Abandoned state: both GAPS lines only, landed dec29e51b (merge 8de740fc2). Standing by.

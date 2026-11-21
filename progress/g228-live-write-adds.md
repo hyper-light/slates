@@ -140,6 +140,11 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   Proposed to main (inbox/main-from-g228-85a-item3-closed.md): an interval-only A/B, not started.
 - 85a open: Linux ~95-140 us added p50, macOS 156-163; macOS p999 < 1 ms quiet.
 
+## LANDED 2026-11-21 ~10:20 PST: origin/main 5e3ec5bc5, A-826 (busy harvest no more often than an empty ask costs)
+- r21 A/B (d1323898): quiet 5/5, loaded 5/5 (less CPU), -b and -b+loaded 4/5 medians; -b tail soft spot recorded.
+- 85a not closable on ubuntu-latest by daemon work: the bare transport's round trip (42-83 us) is at the 50 us goal.
+  Asked main (inbox/main-from-g228-85a-next.md): split the build next, and/or restate the goal as the daemon's share.
+
 ## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
