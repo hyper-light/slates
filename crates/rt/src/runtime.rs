@@ -568,9 +568,23 @@ impl Runtime {
       };
       let id = seed.id;
       let ready = ready.clone();
+      // A latency-tracking runtime's shard runs in macOS's real-time band (A-831, `slates_machine::time_constraint`):
+      // woken behind busy time-share neighbours it ran only when their quanta ended (84a: a loaded edit and merge's p99
+      // 14-17 ms, 0.4-2.1 ms under the policy). Its computation is its idle window, doubled until the kernel takes it.
+      let real_time_window_ns = config.wake_tracking.is_some().then_some(config.spin_ns);
       let spawned = std::thread::Builder::new()
         .name(format!("slates-shard-{id}"))
-        .spawn(move || run_worker(seed, core, ready));
+        .spawn(move || {
+          if let Some(window_ns) = real_time_window_ns
+            && cfg!(target_os = "macos")
+            && slates_machine::time_constraint::set_current_from(window_ns).is_none()
+          {
+            slates_machine::log_line!(
+              "slates-rt: shard {id} runs time-share: the kernel took no time-constraint policy from {window_ns} ns"
+            );
+          }
+          run_worker(seed, core, ready)
+        });
       match spawned {
         Ok(thread) => {
           workers.push(Worker { id, thread });
