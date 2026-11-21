@@ -16,6 +16,7 @@ use hyper_seal::Secret32;
 use hyper_seal::keys::{KeyId, WrappingKey};
 use slates_anchor::AnchorSegment;
 use slates_anchor::layout::{SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES};
+use std::collections::BTreeMap;
 
 /// Format: the generation a node root is made at; a rotation (a new root wrapping the tenant keys again, seal.md
 /// §3.1) is a later generation.
@@ -185,6 +186,15 @@ pub fn namer(
   account: u64,
 ) -> Result<hyper_seal::name::Namer, SealKeyError> {
   let lineage_key = lineage(state, volume, account)?;
+  namer_under(state, volume, &lineage_key)
+}
+
+/// [`namer`] under the lineage key the caller already holds, so a caller holding both asks the lineage once.
+pub(crate) fn namer_under(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  lineage_key: &WrappingKey,
+) -> Result<hyper_seal::name::Namer, SealKeyError> {
   let owner = slates_db::catalog::SealKeyOwner::Naming { volume };
   let secret = match state.db.partition().seal_key(&owner).cloned() {
     Some(record) => lineage_key.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?,
@@ -196,6 +206,89 @@ pub fn namer(
     }
   };
   Ok(hyper_seal::name::Namer::new(&secret)?)
+}
+
+/// A live volume's sealing keys as one publication uses them: its lineage key and namer, and the ids of the three
+/// records they were unwrapped from (the tenant's, the lineage's, the naming key's).
+struct CachedBodyKeys {
+  records: [[u8; 16]; 3],
+  lineage: WrappingKey,
+  namer: hyper_seal::name::Namer,
+}
+
+/// Each live volume's sealing keys, kept between its publications (g228, 85a): a publication fetched them afresh, five
+/// unwraps and three record clones each time (the tenant key twice, the lineage key twice, the naming key once), about
+/// half a live write's build (`fleet.live.hop.build.keys`). An entry serves only while the three records it was unwrapped
+/// from are the ones recorded, compared by key id at every use, so a key rotated, adopted or erased is a miss. Bounded by
+/// the volumes this shard ships live: each use keeps only theirs, so a volume that stops shipping drops its keys at the
+/// shard's next publication.
+#[derive(Default)]
+pub(crate) struct BodyKeys {
+  entries: BTreeMap<[u8; 16], CachedBodyKeys>,
+}
+
+/// Counter: publications sealed under a volume's kept keys ([`with_body_keys`]): the non-vacuity count of [`BodyKeys`].
+const BODY_KEYS_KEPT: &str = "fleet.live.body_keys.kept";
+/// Counter: publications whose keys were fetched, unwrapped from their records: a volume's first, and any after a record
+/// changed.
+const BODY_KEYS_FETCHED: &str = "fleet.live.body_keys.fetched";
+
+/// The ids of the records `volume`'s body keys come from, owned by `account`, or `None` while one is unrecorded.
+fn body_key_records(
+  state: &crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u64,
+) -> Option<[[u8; 16]; 3]> {
+  use slates_db::catalog::SealKeyOwner;
+  let partition = state.db.partition();
+  let tenant = partition.seal_key(&SealKeyOwner::Tenant { account })?.id;
+  let lineage = partition.seal_key(&SealKeyOwner::Lineage { volume })?.id;
+  let naming = partition.seal_key(&SealKeyOwner::Naming { volume })?.id;
+  Some([tenant, lineage, naming])
+}
+
+/// Runs `with` over `volume`'s lineage key and namer, owned by `account`: the kept ones while their records stand
+/// ([`BodyKeys`]), else fetched as [`lineage`] and [`namer`] fetch them (made and recorded when none is, on this owner's
+/// seal path) and kept for the next publication.
+pub(crate) fn with_body_keys<R>(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u64,
+  with: impl FnOnce(&WrappingKey, &hyper_seal::name::Namer) -> R,
+) -> Result<R, SealKeyError> {
+  let shipping = &state.live.shipping;
+  state
+    .body_keys
+    .entries
+    .retain(|kept, _| shipping.contains_key(kept));
+  let records = body_key_records(state, volume, account);
+  if let (Some(records), Some(kept)) = (records, state.body_keys.entries.get(&volume.bytes))
+    && kept.records == records
+  {
+    let answer = with(&kept.lineage, &kept.namer);
+    state.count(BODY_KEYS_KEPT, 1);
+    return Ok(answer);
+  }
+  state.count(BODY_KEYS_FETCHED, 1);
+  let lineage_key = lineage(state, volume, account)?;
+  let namer = namer_under(state, volume, &lineage_key)?;
+  let answer = with(&lineage_key, &namer);
+  match body_key_records(state, volume, account) {
+    Some(records) if state.live.shipping.contains_key(&volume.bytes) => {
+      state.body_keys.entries.insert(
+        volume.bytes,
+        CachedBodyKeys {
+          records,
+          lineage: lineage_key,
+          namer,
+        },
+      );
+    }
+    _ => {
+      state.body_keys.entries.remove(&volume.bytes);
+    }
+  }
+  Ok(answer)
 }
 
 /// The lineage key of `volume`, owned by `account`, under its tenant key: what seals the volume's chunks for holders.

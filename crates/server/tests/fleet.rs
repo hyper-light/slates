@@ -16582,11 +16582,17 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
     .collect();
+  // A sealed volume's keys are unwrapped once and kept for its later publications (`seal_keys::BodyKeys`).
+  let body_keys = (
+    count(&daemons[0], "fleet.live.body_keys.kept"),
+    count(&daemons[0], "fleet.live.body_keys.fetched"),
+  );
   for daemon in daemons {
     daemon.stop();
   }
   eprintln!(
-    "hops: (timed, ns) {hops:?}; round {round:?}; build steps {build_steps:?}; holders' serves {holders:?}"
+    "hops: (timed, ns) {hops:?}; round {round:?}; build steps {build_steps:?}; body keys (kept, fetched) {body_keys:?}; \
+     holders' serves {holders:?}"
   );
   assert!(
     replies
@@ -16609,6 +16615,10 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert!(
     steps_timed > 0 && build_steps.iter().all(|(timed, _)| *timed == steps_timed),
     "every build step was timed, as often as each other: {build_steps:?}"
+  );
+  assert!(
+    body_keys.1 >= 1 && body_keys.0 > body_keys.1,
+    "the volume's keys were fetched and then kept for most publications: (kept, fetched) {body_keys:?}"
   );
   let steps_ns: u64 = build_steps.iter().map(|(_, ns)| ns).sum();
   assert!(

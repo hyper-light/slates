@@ -4095,9 +4095,17 @@ fn sealed_payload(
     payload.extend_from_slice(&body);
     return Some((payload, None));
   }
-  let (lineage, namer, segment) = body_keys(state, id)?;
-  mark_build(state, id, |marks, now| marks.keyed_ns = Some(now));
-  let pieces = seal_body(&lineage, &namer, body, segment)?;
+  let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
+  let segment = u32::try_from(state.config.page).ok()?;
+  let keyed_ns = std::cell::Cell::new(None);
+  let pieces = crate::seal_keys::with_body_keys(state, id, account, |lineage, namer| {
+    keyed_ns.set(Some(slates_machine::clock::monotonic_ns()));
+    seal_body(lineage, namer, body, segment)
+  })
+  .ok()??;
+  if let Some(keyed) = keyed_ns.get() {
+    mark_build(state, id, |marks, _| marks.keyed_ns = Some(keyed));
+  }
   let (sealing, anchors) = whole_sealing(state, id, whole)?;
   let mut payload = vec![kind, BODY_SEALED];
   payload.extend_from_slice(&SealedBody { sealing, pieces }.to_bytes());
@@ -4112,7 +4120,7 @@ fn body_keys(
 ) -> Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer, u32)> {
   let account = crate::seal_keys::tenant_of(&state.db.partition().volume(id)?.owner);
   let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
-  let namer = crate::seal_keys::namer(state, id, account).ok()?;
+  let namer = crate::seal_keys::namer_under(state, id, &lineage).ok()?;
   let segment = u32::try_from(state.config.page).ok()?;
   Some((lineage, namer, segment))
 }
