@@ -55,3 +55,15 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
 - Main's order: deleted my Studio-4 scratch by exact path: ~/.cache/w-realtools-target.noindex and the clone
   ~/slates-work/w-realtools (free space 52 -> 58 GiB). Still kept: this state folder, and ~/.cache/w-realtools-clone on
   adas-macbook-pro-2 (it has 51 GB free; that's the place for a Windows-build fix).
+
+## Goal 93 piece (main 01a1ff2e, 2026-11-21 10:43, corrected 10:48 and 10:51 under §8)
+- Piece: stock git against slates' git server with --vcs-store, Windows names. I WRITE the test, prove ONE focused case
+  on macOS, land it, and put the jupiter round in run-requests.md. Main runs the rounds. hg is blocked: no Mercurial on
+  jupiter, and main is asking Ada about installing it. svn: no client on jupiter.
+- Stopped per the correction: r11 (a harness run on a Mac, never started) and r12 (a git/git download on jupiter,
+  stopped partway). Its partial folder ~/w-realtools-93 on jupiter is deleted; I ended its git processes by PID, and
+  the one git-remote-https.exe running was mine.
+- The harness w-realtools-tools/git_interop_by_use.sh on this branch is superseded by the test (kept for reference).
+- Test: crates/cli/tests/git_interop.rs `stock_git_carries_windows_paths_byte_identically` (#[ignore]d, beside the
+  existing whole-repository session over git/git). Checkout: ~/slates-work/w-realtools-93 (shallow, branch
+  w-realtools-93; I made it with `git checkout -b`, against the rule, on a fresh clone). Focused macOS run: r16.
