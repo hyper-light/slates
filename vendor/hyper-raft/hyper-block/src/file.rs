@@ -92,6 +92,45 @@ impl DeviceFile {
                 Alignment::BYTE,
             ),
         };
+        Self::finish(file, path, caching, align)
+    }
+
+    // slates: local change 3 (vendor/hyper-raft/README.md, "Local changes"): a file another crate opened (slates'
+    // `land`, relative to a store root its standing grant names, so no path is opened here), made direct after the
+    // open where `request` asks and the platform can, buffered where it cannot, as `open` falls back.
+    /// Takes `file`, already open for reading and writing, as a device file; `path` names it in errors and in
+    /// [`DeviceFile::path`]. `request` and `align` mean what they mean to [`DeviceFile::open`].
+    pub fn adopt(
+        file: File,
+        path: &Path,
+        request: CachingRequest,
+        align: Alignment,
+    ) -> Result<Self, DiskError> {
+        let (caching, align) = match request {
+            CachingRequest::PreferDirect => match sys::make_direct(&file) {
+                Ok(()) => (Caching::Direct, align),
+                Err(e) if sys::refuses_direct(&e) || e.kind() == std::io::ErrorKind::Unsupported => {
+                    (Caching::Buffered, Alignment::BYTE)
+                }
+                Err(source) => {
+                    return Err(DiskError::Io {
+                        op: "make direct",
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            },
+            CachingRequest::Buffered => (Caching::Buffered, Alignment::BYTE),
+        };
+        Self::finish(file, path, caching, align)
+    }
+
+    /// What every open file goes through once it is open (`open`'s own steps, shared with `adopt`).
+    fn finish(file: File, path: &Path, caching: Caching, align: Alignment) -> Result<Self, DiskError> {
+        let wrap = |op: &'static str| {
+            let path = path.to_path_buf();
+            move |source| DiskError::Io { op, path, source }
+        };
         let node = crate::node::is_node(&file, path).map_err(wrap("stat"))?;
         refuse_zones(path, &file, node)?;
         // A file still empty is asked to be written in place where its file system would copy it
@@ -823,6 +862,14 @@ mod sys {
         None
     }
 
+    /// slates: local change 3. `O_DIRECT` set on an open file (fcntl(2) `F_SETFL` takes it).
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn make_direct(file: &File) -> io::Result<()> {
+        let flags = rustix::fs::fcntl_getfl(file)?;
+        rustix::fs::fcntl_setfl(file, flags | rustix::fs::OFlags::DIRECT)?;
+        Ok(())
+    }
+
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -839,6 +886,13 @@ mod sys {
         e.raw_os_error() == Some(rustix::io::Errno::INVAL.raw_os_error())
     }
 
+    /// slates: local change 3. `F_NOCACHE` on an open file, as `open_direct` sets it after its open.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn make_direct(file: &File) -> io::Result<()> {
+        rustix::fs::fcntl_nocache(file, true)?;
+        Ok(())
+    }
+
     #[cfg(target_vendor = "apple")]
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
         let file = super::options(create).open(path)?;
@@ -853,6 +907,12 @@ mod sys {
             Some(code) if code == rustix::io::Errno::INVAL.raw_os_error()
                 || code == rustix::io::Errno::NOTSUP.raw_os_error()
         )
+    }
+
+    /// slates: local change 3. No way to bypass the cache on an open file here.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    pub(super) fn make_direct(_file: &File) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
@@ -922,6 +982,12 @@ mod sys {
 
     pub(super) fn written_in_place_marked(_file: &File) -> Option<bool> {
         None
+    }
+
+    /// slates: local change 3. `FILE_FLAG_NO_BUFFERING` is taken only at `CreateFileW`; an open handle stays
+    /// buffered.
+    pub(super) fn make_direct(_file: &File) -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
     pub(super) fn open_direct(path: &Path, create: bool) -> io::Result<File> {
