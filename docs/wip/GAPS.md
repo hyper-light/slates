@@ -2983,8 +2983,10 @@
 >   fixture, made by stock 7.2: one rows want naming the visible head's `.hgtags` alone), `a_batch_of_lookups_reads_the_tags_once`,
 >   `a_repository_without_hgtags_asks_the_store_nothing_for_a_lookup`, `a_hgtags_past_the_room_is_refused_past_its_admission`,
 >   and `a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch` (red at first: `default` and `v1`
->   refused with no door; now one read each). OPEN: stock 7.2's `pull -r <tag>` over SSH and HTTP and a batched
->   `pull -r a -r b` by use (hg_interop), and the `--from` verb by use, run by main or w-interop.
+>   refused with no door; now one read each), and by use against stock 7.2 (hg_interop
+>   `stock_hg_pulls_by_a_tag_over_http_and_a_branch_is_made_from_the_tag`, `stock_hg_pulls_by_a_tag_over_ssh`:
+>   `pull -r v1` brings the tagged changeset alone, `pull -r v1 -r tip` one batch reading the tags in the lone lookup's
+>   asks, `branch create --from v1` the bookmark at the tagged changeset, `vcs_store.hg_lookup_store_asks` moved each).
 > **C1 step 1b, a pull's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45 with its
 > condition on pulls). BUILT.**
 > - A pull (any fetch the links do not walk) still makes its changelog and manifests whole when it begins
