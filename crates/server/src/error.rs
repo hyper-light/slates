@@ -329,8 +329,6 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
   }
 }
 
-/// A base directory unavailable at `path`, by the code its host named, in the variant of its numbering (A-539): an
-/// errno in `BaseUnavailable` (0 where the host named none), a Win32 code in `BaseUnavailableWin32`.
 /// The wire refusal for descriptor exhaustion (A-837): the host's code in the field of its numbering (A-539).
 pub fn descriptors_exhausted(code: slates_vfs::host::OsCode) -> Refusal {
   match code {
@@ -339,6 +337,8 @@ pub fn descriptors_exhausted(code: slates_vfs::host::OsCode) -> Refusal {
   }
 }
 
+/// A base directory unavailable at `path`, by the code its host named, in the variant of its numbering (A-539): an
+/// errno in `BaseUnavailable` (0 where the host named none), a Win32 code in `BaseUnavailableWin32`.
 pub fn base_unavailable(path: String, code: Option<slates_vfs::host::OsCode>) -> Refusal {
   match code {
     Some(slates_vfs::host::OsCode::Win32(code)) => Refusal::BaseUnavailableWin32 { path, code },
