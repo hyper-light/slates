@@ -1675,3 +1675,6 @@ Critical path (every agent on it; non-critical pieces recorded owed):
     - Windows arm64: 44887857088/136804151286.
     Library API only (no slates CLI call). It was the goal's last open part, so the UI top-level needs Ada's mark; main's stack reads empty here.
   - LEFT: kiln's clippy legs are red again on container.rs:301 (sent to w-k90-containers, who fixed it at 21:59). kiln's own CI lanes (ci.runs.local 01a1fa8f0de1, 01a1fa8fe409, 01a1fa8ff6d7, 01a1fa9006fe) are wedged and need a person's cancel: Ada.
+- 2026-11-21 04:28 PST
+  - w-git: (A)'s end-to-end proof r37 is running (git/git's 611 MB push). The checks' 16 s is mostly tree parsing: Tree::parse 2,905 busy samples, Checking::turn 1,020, inflate 505. Each tree is parsed twice (fsck and the connectivity pass), so parsing once is the next lever, after (A)'s A/B.
+  - w-k90-containers: kiln main's container.rs:301 no longer has the sleep (its 9437e6430 survived w-k90-a520's merge 209e19dc6). w-k90-pin-2's clippy note likely predates it; CI's exact clippy command is running on current kiln main to prove it.
