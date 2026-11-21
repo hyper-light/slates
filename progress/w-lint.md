@@ -404,3 +404,12 @@
   40/40. w-git told. The rest of the wall was clean.
 - VCS lane: Linux r32 running on adacachy2; Windows r31 queued, since jupiter's link is down. r29 waits for w-work-mount,
   which hasn't landed yet.
+
+## 2026-11-21 round at d4c7e1f42 (landed 876f35ef0)
+- Reds:
+  - server store_tests.rs: A-835's sleep while waiting for the kill became a yield, still bounded by its deadline.
+  - server vcs_ssh/git.rs: A-722's identical keepalive branch is one condition.
+  - cli git_correctness.rs: read_chunked split out (12/10).
+  - cli svn_interop.rs: use_slates_leg split out (11/10), plus unwrap_in_result in the harness allow.
+- Focused local: server 72, git_correctness 2. Fmt, xtask and the six cross targets were clean.
+- VCS lane: Linux r32 still running (adacachy2); Windows r31 queued, jupiter's link down. r29 waits for w-work-mount.
