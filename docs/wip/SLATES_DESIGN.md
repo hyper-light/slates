@@ -59713,6 +59713,10 @@ Applied in the same change to:
   - `t_a664_live_a_submit_waits_parked_for_its_greens_whole_build`: a submit parked behind a push's whole build runs
     again, takes the hook, and a stock clone reads the pushed files with the edit made (red while the preview's
     numbering was taken as the green's: the commit held the pushed tree).
-- **Owed** (GAPS, C5 part 2b): the kill test between the landing and the step; `record_of` and version 2 removed with
+  - `t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_before_and_the_retry_lands_once`: the
+    task killed after its changeset landed and before its step (`commits::KILL_BEFORE_MADE_COMMIT`, as Subversion's);
+    made again from what is durable, the state before (durable head 0, no store version, the records as before, the
+    request unanswered); the retry lands once (one record more, version 5) and is answered.
+- **Owed** (GAPS, C5 part 2b): `record_of` and version 2 removed with
   the paths that still write them (a submit outside a recorded request, `commits::after_submit`'s owed commit, a store
   test sealing a push directly); the change step over the preview in one turn (bounded by the submit's admission).

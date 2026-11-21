@@ -16,6 +16,7 @@ use slates_git::upload::Asked;
 use slates_ipc::protocol::WorkOp;
 use slates_vfs::clock::{Clock, HostClock};
 
+use super::KILL_BEFORE_MADE_COMMIT;
 use super::{MADE, UNMADE};
 use crate::state::ShardState;
 use crate::vcs_store::green_key;
@@ -898,5 +899,125 @@ fn t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_com
     seen.1,
     (true, 1, 1, Some(5u32.to_le_bytes().to_vec())),
     "answered once its changeset landed and both committed, recorded v5"
+  );
+}
+
+/// C5 part 2b piece 3, its crash case (main's landing order). Do: on a store-backed daemon, submit a work making `/README`
+/// to a git repository's root green as a client's recorded request, the made commit's task killed after its changeset
+/// landed and before its step commits (as a `kill -9` there leaves it); make the store again from what is durable, as a
+/// restart does; then run the same request again. Expect: after the kill, the state before (the durable head 0, no store
+/// version of the green, the register's records as before the submit, the request not answered); the retry lands once
+/// (one record more than before the submit, version 5), the request answered, the durable head 1, the green at its
+/// first store version. Before the hook the version and its commit were durable in the verb's step, landed nowhere.
+#[test]
+fn t_c5b_p3_a_kill_between_a_made_commits_landing_and_its_step_recovers_to_before_and_the_retry_lands_once()
+ {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let seen = crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      let id = slates_wire::request::RequestId {
+        client: 7,
+        sequence: 1,
+      };
+      let (repository, root, work, held) = crate::state::with_state(|state| {
+        let (repository, green) = git_repository(state, "killed");
+        let ask = crate::vcs_store::paths::tests::ask;
+        let made = ask(
+          state,
+          slates_ipc::protocol::RequestBody::CreateWork {
+            green,
+            name: "work-killed".to_owned(),
+          },
+        );
+        let slates_ipc::protocol::ReplyBody::WorkCreated { id: work, .. } = made else {
+          panic!("no work: {made:?}");
+        };
+        ask(
+          state,
+          slates_ipc::protocol::RequestBody::Edit {
+            work,
+            path: "/README".to_owned(),
+            at: 0,
+            delete_len: 0,
+            bytes: b"made\n".to_vec(),
+          },
+        );
+        (
+          repository,
+          to_db_volume(green),
+          work,
+          records(state, repository).len(),
+        )
+      })
+      .expect("the shard's state");
+      let submit = move |state: &mut ShardState| {
+        crate::verbs::run_recorded_for_test(
+          state,
+          (7, id),
+          &owner(),
+          crate::identities::authored(work, "made"),
+        );
+      };
+      let read = move |state: &ShardState| {
+        let versions = state
+          .vcs_stores
+          .git_ref(repository)
+          .map_or(0, |(_, git)| git.versions(green_key(root)).len());
+        (
+          state.db.partition().green_head(root),
+          versions,
+          records(state, repository).len(),
+          completed(state, 7, id),
+        )
+      };
+      let deadline = slates_rt::futures::now_ns()
+        .saturating_add(u64::try_from(MADE_PATIENCE.as_nanos()).unwrap_or(u64::MAX));
+      KILL_BEFORE_MADE_COMMIT.with(|kill| kill.set(true));
+      crate::state::with_state(submit).expect("the shard's state");
+      // The killed task: its changeset lands, then the kill fires (clearing itself) where the step would commit.
+      while KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+        assert!(
+          slates_rt::futures::now_ns() < deadline,
+          "the kill never fired"
+        );
+        slates_rt::futures::yield_now().await;
+      }
+      // A restart: what memory held past the durable state is made again from it.
+      crate::state::with_state(|state| {
+        crate::verbs::reconcile_unpublished_effects(state);
+        crate::vcs_store::rebuild(state, repository);
+      })
+      .expect("the shard's state");
+      crate::vcs_store::rebuilt(repository).await;
+      let after_kill = crate::state::with_state(|state| read(state)).expect("the shard's state");
+      crate::state::with_state(submit).expect("the shard's state");
+      while !crate::state::with_state(|state| completed(state, 7, id)).unwrap_or(false)
+        && slates_rt::futures::now_ns() < deadline
+      {
+        slates_rt::futures::yield_now().await;
+      }
+      let after_retry = crate::state::with_state(|state| {
+        let newest = records(state, repository)
+          .last()
+          .and_then(|bytes| bytes.get(4..8).map(<[u8]>::to_vec));
+        (read(state), newest)
+      })
+      .expect("the shard's state");
+      (held, after_kill, after_retry)
+    },
+    MADE_PATIENCE,
+  );
+  daemon.stop();
+  let (held, after_kill, (after_retry, newest)) = seen;
+  assert_eq!(
+    after_kill,
+    (0, 0, held, false),
+    "the state before the submit"
+  );
+  assert_eq!(
+    (after_retry, newest),
+    ((1, 1, held + 1, true), Some(5u32.to_le_bytes().to_vec())),
+    "the retry landed once, recorded version 5, and answered"
   );
 }

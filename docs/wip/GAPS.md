@@ -331,8 +331,8 @@
 > a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Piece 3 part 1 BUILT
 > (A-822, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
-> (`t_c5b_p3_…`; counter `vcs_commits.made_landed`). Owed (w-git): the kill test between the landing and the step;
-> `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
+> (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
+> retry lands once (`t_c5b_p3_a_kill_…`). Owed (w-git): `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
 > `after_submit`'s owed commit, `push_through`); the change step over the preview in one turn; the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their

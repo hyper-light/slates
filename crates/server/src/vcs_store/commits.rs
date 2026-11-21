@@ -638,6 +638,14 @@ fn record_and_commit(
   Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A test's kill of a git made commit's task after its changeset landed and before its step commits (as a `kill -9`
+  /// there leaves the register): the task ends there, nothing after it run. It fires once, clearing itself, so a test
+  /// waits for it to read false.
+  pub(crate) static KILL_BEFORE_MADE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The status count of git commits the server made under the deferred-submit hook (C5 2b piece 3, [`make_deferred`]):
 /// landed on the node's store as one changeset and recorded with their version in one step. The path's non-vacuity
 /// count.
@@ -695,6 +703,12 @@ async fn made_landing(
 ) {
   let (green, version) = pending.version();
   let before = made_before_step(&mut pending).await;
+  #[cfg(test)]
+  if matches!(before, Before::Landed(_)) && KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false))
+  {
+    // A test's kill between the landing and the commit: nothing after it runs, as after a `kill -9`.
+    return;
+  }
   let _ = crate::state::with_state(move |state| {
     match before {
       Before::Landed(mut sealed) => {
