@@ -489,8 +489,10 @@ mod tests {
   /// shortest under one millisecond. epoll's `epoll_wait` takes whole milliseconds and rustix rounds a shorter timeout
   /// up, so every such wait lasted a full millisecond: a shard parked to the end of its idle window slept to the next
   /// millisecond with a client's request waiting (the 1.00-1.02 ms band of a loaded Linux edit and merge, GAPS 84a).
+  /// The completion port's `GetQueuedCompletionStatusEx` takes whole milliseconds too (and a short wait lasts a
+  /// timer tick, 15.6 ms by default): the IOCP driver's deadline timer is held to the same bar.
   #[test]
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   #[cfg_attr(miri, ignore)]
   fn a_sub_millisecond_timed_wait_ends_by_its_deadline() {
     /// Shape: one millisecond, the granularity a whole-millisecond wait rounds up to.
@@ -522,9 +524,9 @@ mod tests {
   }
 
   /// Shape: a wait well under a millisecond, well over a system call's cost.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   const SUB_MILLISECOND_WAIT_NS: u64 = 200_000;
   /// Shape: the waits whose shortest is judged, so one preemption of the test thread decides nothing.
-  #[cfg(unix)]
+  #[cfg(any(unix, windows))]
   const SUB_MILLISECOND_WAITS: usize = 50;
 }
