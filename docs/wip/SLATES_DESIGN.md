@@ -74,8 +74,11 @@ the two cross-cutting sections keep their numbers.
 > `provision_bench` alone, every gated row (spinning and parked p50, p99, p999; max informational) held to its machine's
 > ceilings, which only tighten, every run's rows kept (`target/provision-histogram.tsv`); the bench itself fails past the
 > 50 µs floor and, run with `PROVISION_BENCH_LOAD=<n>`, past a loaded bound derived from the quiet run and the load (the
-> load may add to the spinning 1-client p99 at most what it adds to the parked p99). Wiring the lane into CI on a
-> reference machine is a run request (w-lint, main). **Open, in flight:** the loaded p99 misses its bound on main
+> load may add to the spinning 1-client p99 at most what it adds to the parked p99). The lane always runs the loaded
+> form (two spinners a logical CPU). **Wired (2026-11-20):** kiln's `provision-gate-linux` and `provision-gate-macos`
+> take a bare-metal machine whole (`exclusive`) on every push and nightly and fail on a regression or on the bench's
+> gates where the machine has a baseline; a machine without one, and GitHub's shared runners
+> (`provision-histogram`), measure and keep the histogram as the artifact, the gates reported. **Open, in flight:** the loaded p99 misses its bound on main
 > (macOS arm64: 1.62 ms against 0.87 ms; GAPS 8a-r9-gate), measured to macOS's zero-timeout `kevent` in the shard's busy
 > harvest.
 

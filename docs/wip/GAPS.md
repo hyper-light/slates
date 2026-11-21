@@ -1,8 +1,8 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
 > **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
-> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included. Its CI wiring is a
-> run request. **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
+> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
+> and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
 > switches between a forwarded reply's two tasks); the A/B and the next step are in 8a-r9-gate.
 
@@ -10748,8 +10748,14 @@ and parked p50/p99/p999; max informational) to the machine's recorded ceilings, 
 machine with no baseline, and appends every run's rows to `target/provision-histogram.tsv` for CI to keep. The bench
 fails past R9's floor and, with `PROVISION_BENCH_LOAD=<n>` (n busy processes a logical CPU, started after the quiet forms),
 past the loaded bound: the load may add to the spinning 1-client p99 at most what it adds to the parked one. Each
-1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`). CI wiring on
-a reference runner: run request (w-lint, main).
+1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`).
+**Wired (2026-11-20, C1):** `.kiln/ci.yaml` and `.kiln/nightly.yaml` run the lane as `provision-gate-linux` and
+`provision-gate-macos`, each taking a bare-metal machine whole (`exclusive: true`); GitHub's `provision-histogram` runs it
+on ubuntu-latest and macos-latest. The lane always includes the loaded form (`PROVISION_BENCH_LOAD=2`). Where the machine
+has a baseline, a regression or a failed bench gate fails the job; elsewhere it measures and keeps the histogram
+(`target/provision-histogram.tsv`, the job's artifact) and reports the gates. The Linux bare-metal machine (adacachy,
+32 cores) stood at load 90-104 when its baseline was tried, so it has none yet; it records at its first quiet exclusive
+run.
 
 **The loaded p99, measured (macOS arm64, Apple M4 Max 14 CPUs, this MacBook, host load 4-54 from other agents, release,
 9 shards).** Red on main: 1.62 ms against the bound 0.87 ms (quiet 616 µs, parked 683 -> 939 µs under the load). By the
