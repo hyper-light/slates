@@ -17122,6 +17122,21 @@ and every round shown, as main extracted them from the run's log.
     median both idle and loaded, and loaded p999 0.7-2.2 ms (at most 18 of 2,000 at least 1 ms late). nanosleep is late
     1.7-2.5 ms at the median (1,221-1,947 of 2,000 at least 1 ms late). On Studio-4 under kiln, kevent and ulock are
     late 54 µs at the median, nanosleep 1.60 ms. Nothing on the request path sleeps.
+- **The macOS hop split, take 2** (run 44934263888, `diag-measurer-g222-23`, `diag-g222-hops-mac` f88fcc9fd, never
+  main). The same lane and rounds, now also stamping replies written after the step that took their request (a
+  resumed or forwarded verb). Every request joins: about 41,400 sync and 16,500 deferred a round. Loaded (3 rounds;
+  bench accept p99 8.0-12.2 ms, conflict 8.0-10.2 ms):
+  - **The p99 tail (580 requests a round):** deferred 574, 580, 580. In 567-579 of them the dominant hop is
+    taken -> written. Tail medians: queued 0.94 / 1.44 / 2.70 ms, taken -> written 7.6 / 4.4 / 5.0 ms, and the client's
+    wake (written -> seen) 3 / 4 / 15 µs.
+  - **By kind:** deferred taken -> written p50 209-393 µs, p99 5.8-8.1 ms, p999 8.0-10.7 ms. Sync taken -> written
+    p99 59-176 µs. Queued (both kinds) p99 2.7-3.4 ms, p999 3.7-3.9 ms. The client's wake p99 173-737 µs.
+  - **Quiet** (3 rounds): the client's round-trip p99 235-413 µs. The tail is again deferred taken -> written (p99
+    240-464 µs); every quiet hop of a sync reply is under 160 µs at p999.
+  - **Reading:** the macOS loaded tail is the deferred reply's trip to the owner shard and back, plus the queue in
+    front of the taking shard. It is not the client's wake, which the quiet smoke run on Studio-4 had suggested before
+    the deferred replies were stamped. The zero-timeout kevent again took at least 1 ms in 7,000-13,000 of
+    128,000-150,000 calls loaded, and in 0-8 quiet.
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 

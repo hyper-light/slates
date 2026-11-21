@@ -414,6 +414,9 @@ pub struct Volume {
   pub(crate) unrecorded_counters: std::ops::Range<u64>,
   pub(crate) snapshots: Slab<Snapshot>,
   pub(crate) last_snapshot: Option<SnapshotId>,
+  /// A reader's hold on the head (A-827, [`Volume::hold_head`]): its roots as they were, and what the head let go since
+  /// that the held head still reaches, kept until the reader lets go ([`Volume::release_hold`]). At most one.
+  pub(crate) hold: Option<Box<HeadHold>>,
   pub(crate) origin_epoch: Option<Epoch>,
   pub(crate) quota: Quota,
   /// The base plane of an overlay volume (§4.5, D-25); `None` for a scratch volume.
@@ -814,6 +817,7 @@ impl Volume {
         SNAPSHOT_SLOT_CAP,
       ),
       last_snapshot: None,
+      hold: None,
       origin_epoch: None,
       quota: config.quota,
       base: None,
@@ -945,6 +949,7 @@ impl Volume {
         SNAPSHOT_SLOT_CAP,
       ),
       last_snapshot: None,
+      hold: None,
       origin_epoch: Some(epoch),
       quota: config.quota,
       base: match base {
@@ -1057,6 +1062,7 @@ impl Volume {
         SNAPSHOT_SLOT_CAP,
       ),
       last_snapshot: None,
+      hold: None,
       origin_epoch: seed.origin_epoch,
       quota: seed.quota,
       base: None,
@@ -4010,7 +4016,10 @@ impl Volume {
         _ => match self.origin_epoch {
           Some(origin) if dead.born() <= origin => {}
           _ => {
-            release_dead(store, *dead)?;
+            // A reader's hold keeps what its held head reaches (A-827).
+            if let Some(dead) = self.keep_for_hold(*dead) {
+              release_dead(store, dead)?;
+            }
           }
         },
       }
@@ -4069,6 +4078,10 @@ impl Volume {
       }
     }
     self.last_snapshot = None;
+    // What a reader's hold kept goes with the volume (A-827): no reader reads a volume being destroyed.
+    if let Some(mut hold) = self.hold.take() {
+      queue.extend(hold.deadlist.take());
+    }
     // The head's own objects: every node, inode version and chunk it reaches.
     // A clone walks only what it made: nodes born after its origin's epoch.
     let since = self.origin_epoch;
@@ -4804,6 +4817,18 @@ impl Volume {
   /// from here on its block is this volume's retained bytes, charged, and credited back when freed.
   fn retain_dead_list(&mut self, store: &mut Store, mut dead: Deadlist) {
     for item in dead.take() {
+      // Kept for a reader's hold alone (A-827): no snapshot reaches it, so it is neither charged nor a snapshot's.
+      let snapshot_keeps = self
+        .last_snapshot_epoch()
+        .is_some_and(|snap| item.born() <= snap);
+      let item = if snapshot_keeps {
+        item
+      } else {
+        match self.keep_for_hold(item) {
+          None => continue,
+          Some(item) => item,
+        }
+      };
       if let Dead::Chunk(handle, born) = item
         && self.retains(born)
       {
@@ -4986,6 +5011,76 @@ impl Volume {
       .or(self.origin_epoch)
   }
 
+  /// Holds the head for a reader that reads it over turns (A-827, [`HeadHold`]): its roots frozen and the epoch
+  /// advanced, so every later change copies what it changes; what the head lets go of meanwhile that the held head
+  /// reaches is kept until [`Volume::release_hold`]. The held epoch, which the held head's image carries. Refused
+  /// [`VfsError::Destroying`] for a volume being destroyed and [`VfsError::Invalid`] while a hold is held (one at a time).
+  pub fn hold_head(&mut self) -> Result<Epoch, VfsError> {
+    self.live()?;
+    if self.hold.is_some() {
+      return Err(VfsError::Invalid);
+    }
+    let epoch = self.epoch;
+    self.hold = Some(Box::new(HeadHold {
+      epoch,
+      root: self.root,
+      inode_root: self.inode_root,
+      deadlist: Deadlist::default(),
+    }));
+    self.epoch = self.epoch.next();
+    Ok(epoch)
+  }
+
+  /// Lets a reader's hold go ([`Volume::hold_head`]): what the head let go of while it was held is freed now (no
+  /// snapshot reaches it: what one did went on its deadlist). The objects freed; zero with no hold. Every object is
+  /// tried, and the first refusal is returned.
+  pub fn release_hold(&mut self, store: &mut Store) -> Result<usize, VfsError> {
+    let Some(mut hold) = self.hold.take() else {
+      return Ok(0);
+    };
+    let mut freed = 0usize;
+    let mut first = Ok(());
+    for dead in hold.deadlist.take() {
+      match release_dead(store, dead) {
+        Ok(_) => freed = freed.saturating_add(1),
+        Err(refusal) => {
+          if first.is_ok() {
+            first = Err(refusal);
+          }
+        }
+      }
+    }
+    first.map(|()| freed)
+  }
+
+  /// The epoch the head is held at, while a reader holds it ([`Volume::hold_head`]).
+  pub fn held_epoch(&self) -> Option<Epoch> {
+    self.hold.as_ref().map(|hold| hold.epoch)
+  }
+
+  /// The newest epoch whose objects something keeps when the head lets them go: the last snapshot's (or the clone
+  /// origin's), or a reader's hold's when later. The release decisions read it; the retention a volume is charged reads
+  /// the snapshots' alone ([`Volume::retains`]), since a hold lasts a reader's turns.
+  fn kept_epoch(&self) -> Option<Epoch> {
+    match (self.last_snapshot_epoch(), self.held_epoch()) {
+      (Some(snap), Some(held)) => Some(if held.0 > snap.0 { held } else { snap }),
+      (snap, held) => snap.or(held),
+    }
+  }
+
+  /// Keeps `dead` on the hold's deadlist when the held head may reach it (born by the held epoch, owned here); else
+  /// gives it back.
+  fn keep_for_hold(&mut self, dead: Dead) -> Option<Dead> {
+    let owned = self.owns(dead.born());
+    match self.hold.as_mut() {
+      Some(hold) if owned && dead.born().0 <= hold.epoch.0 => {
+        hold.deadlist.push(dead);
+        None
+      }
+      _ => Some(dead),
+    }
+  }
+
   pub(crate) fn deadlist_mut(&mut self) -> Option<&mut Deadlist> {
     let id = self.last_snapshot?;
     self
@@ -5012,7 +5107,11 @@ impl Volume {
         }
         Ok(())
       }
-      _ => release_dead(store, dead).map(drop),
+      // A reader's hold keeps what its held head reaches (A-827).
+      _ => match self.keep_for_hold(dead) {
+        None => Ok(()),
+        Some(dead) => release_dead(store, dead).map(drop),
+      },
     }
   }
 
@@ -6605,7 +6704,7 @@ impl Volume {
       self.bytes.sub(epoch, len);
     }
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
-    let last = self.last_snapshot_epoch();
+    let last = self.kept_epoch();
     let mut dead = Deadlist::default();
     match body {
       Body::Sealed(extents) => release_extents(store, &extents, last, &mut dead)?,
@@ -6949,7 +7048,7 @@ impl Volume {
       }
     };
     if let ExtentSrc::Chunk { chunk: c, .. } = e.src {
-      let last = self.last_snapshot_epoch();
+      let last = self.kept_epoch();
       let mut dead = Deadlist::default();
       store.content.release_chunk(c, last, &mut dead)?;
       self.retain_dead_list(store, dead);
@@ -7027,7 +7126,7 @@ impl Volume {
     // truncate with the file unchanged, as a failed `ftruncate(2)` leaves it.
     truncated_chunks(&store.inodes.get(handle)?.body, len)
       .try_for_each(|chunk| store.content.check_chunk(chunk))?;
-    let last = self.last_snapshot_epoch();
+    let last = self.kept_epoch();
     let epoch = self.epoch;
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
@@ -7664,6 +7763,25 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
+/// A reader's hold on a volume's head (A-827): a snapshot with no record, for a reader that reads the head over turns (a
+/// live log's whole capture). Taken, it freezes the head's roots and advances the volume's epoch, as a snapshot does, so
+/// every later change copies what it changes rather than changing it in place (a copy-up seals an open extent and
+/// rewrites the record it copies, so a reader takes each inode's image and content in one step). What the head lets go
+/// of while it is held, born by the held epoch and kept by no snapshot, waits on its own deadlist instead of being
+/// freed, so the held head stays whole; the reader's release frees it ([`Volume::release_hold`]). Nothing is charged
+/// for it: it lasts the reader's turns.
+#[derive(Debug)]
+pub(crate) struct HeadHold {
+  /// The epoch the head was held at: its objects are born by it.
+  pub(crate) epoch: Epoch,
+  /// The head's directory root then.
+  pub(crate) root: Handle<DirNode>,
+  /// The head's inode table root then.
+  pub(crate) inode_root: Handle<TrieNode>,
+  /// What the head let go of since that the held head may reach: freed at the release.
+  pub(crate) deadlist: Deadlist,
+}
+
 /// What [`Volume::pin_extents`] held of one file: its size then, how many sealed extents it appended (each chunk pinned),
 /// and a copy of its open extent with the offset it begins at.
 #[derive(Debug)]
