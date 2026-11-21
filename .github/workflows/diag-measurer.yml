@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's Linux test: the client's reply spin capped at the daemon's published window (50 us) against the library default and 0, loaded and quiet. Was: yielding (G222_SPIN_YIELD) with the library default and the harness's 1 ms, against the default and 0 (G222_CLIENT_SPIN_NS); does the 1 ms band follow it? Was: every park's kick delay and wake delay, and the client's sends and rings, main's mode. Was: shard threads unpinned (G222_NO_PIN) against main's pinned ones. Was: a shard thread's EEVDF slice of 100 us (A-224's ask, G222_SLICE_NS), with and without idle spin, against main's. Was: a shard that never spins idle (no window, no hold: G222_NO_SPIN, G222_NO_HOLD) against main's, one binary with the timerfd fix, interleaved, the floor each round. Was: g222's Linux A/B of the timerfd wait (84a): ring-stamped arms without (bc688cefc) and with the fix, spin, interleaved, and the lane's ping-pong floor each round. Was: g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# g222's Linux x86_64 split: the client parked at once (B), the ring split and park stamps, to name x86_64's remaining hold. Was: the client's reply spin capped at the daemon's published window (50 us) against the library default and 0, loaded and quiet. Was: yielding (G222_SPIN_YIELD) with the library default and the harness's 1 ms, against the default and 0 (G222_CLIENT_SPIN_NS); does the 1 ms band follow it? Was: every park's kick delay and wake delay, and the client's sends and rings, main's mode. Was: shard threads unpinned (G222_NO_PIN) against main's pinned ones. Was: a shard thread's EEVDF slice of 100 us (A-224's ask, G222_SLICE_NS), with and without idle spin, against main's. Was: a shard that never spins idle (no window, no hold: G222_NO_SPIN, G222_NO_HOLD) against main's, one binary with the timerfd fix, interleaved, the floor each round. Was: g222's Linux A/B of the timerfd wait (84a): ring-stamped arms without (bc688cefc) and with the fix, spin, interleaved, and the lane's ping-pong floor each round. Was: g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
 # single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
 # loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
 # a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 330
     defaults:
@@ -107,7 +107,7 @@ jobs:
           set +e
           order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
           for round in $(seq 1 "$ROUNDS"); do
-            case $round in 1) modes="dflt spin50 spin0";; 2) modes="spin0 spin50 dflt";; *) modes="spin50 dflt spin0";; esac
+            modes="spin0"
             for mode in $modes; do
               unset G222_NO_SPIN G222_NO_HOLD G222_SLICE_NS G222_NO_PIN G222_CLIENT_SPIN_NS G222_SPIN_YIELD
               case $mode in dflt) export G222_CLIENT_SPIN_NS=default;; spin50) export G222_CLIENT_SPIN_NS=50000;; spin0) export G222_CLIENT_SPIN_NS=0;; esac
