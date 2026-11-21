@@ -123,9 +123,25 @@ pub(crate) fn green_ready(state: &mut ShardState, green: DbVolumeId) -> GreenRea
   GreenReady::Materializing
 }
 
+/// Whether `green`'s materialization is under way: started by [`green_ready`] and neither made nor refused yet.
+pub(crate) fn is_building(state: &ShardState, green: DbVolumeId) -> bool {
+  state.materializations.building.contains_key(&green)
+}
+
 /// The green owing a push that `body` reaches, if any: its volume when that is such a green, or the green of the work it
-/// names.
+/// names; for a branch made from another, the green it is made from, named by its repository and branch (git's names:
+/// only a git create owes its push).
 pub(crate) fn owing_green_of(state: &ShardState, body: &RequestBody) -> Option<DbVolumeId> {
+  if let RequestBody::CreateBranch {
+    repository, from, ..
+  } = body
+  {
+    let repositories = state.db.partition().repositories();
+    let green = repositories
+      .repository_named(repository)
+      .and_then(|record| repositories.branch(record.id, from))?;
+    return state.greens.is_owing(&green).then_some(green);
+  }
   let volume = crate::verbs::to_db_volume(body.volume()?);
   let green = state.works.get(&volume).map_or(volume, |work| work.green);
   state.greens.is_owing(&green).then_some(green)
@@ -196,6 +212,26 @@ pub(crate) fn park_request(
   }
 }
 
+/// Runs every materialization under way to its end now, a turn at a time, as its task would: for a test that drives a
+/// push or a read synchronously and holds the shard, so the task cannot run until it returns. The task, run later,
+/// finds its build done.
+#[cfg(test)]
+pub(crate) fn make_building_now(state: &mut ShardState) {
+  let greens: Vec<DbVolumeId> = state.materializations.building.keys().copied().collect();
+  for green in greens {
+    while !turn(state, green) {}
+  }
+}
+
+/// `green` reached through the door and, if it owed its push, made now ([`make_building_now`]): for a test that reads
+/// it synchronously.
+#[cfg(test)]
+pub(crate) fn made_now(state: &mut ShardState, green: DbVolumeId) {
+  if green_ready(state, green) == GreenReady::Materializing {
+    make_building_now(state);
+  }
+}
+
 /// Starts `green`'s materialization: its owed push's build, driven by a task of the shard a turn at a time.
 fn start(state: &mut ShardState, green: DbVolumeId) {
   let pace = slates_merge::pace::Pace::new(slates_rt::futures::now_ns);
@@ -242,23 +278,25 @@ fn turn(state: &mut ShardState, green: DbVolumeId) -> bool {
   building
     .pace()
     .turn(slates_rt::futures::now_ns().saturating_add(quantum.max(1)));
-  // The build's turn over the green and its tool's objects; why it cannot run, where it cannot.
-  let advanced: Option<Result<slates_merge::push::Built, String>> = match state.greens.lend(&green)
-  {
-    Some(engine) => {
-      let mut turned = None;
-      let found = with_objects(state, repository, &mut |objects| {
-        turned = Some(building.advance(&engine, objects));
-      });
-      match turned {
-        Some(advanced) if found => {
-          advanced.map(|built| built.map_err(|refused| format!("{refused:?}")))
+  // The build's turn over the green and its tool's objects; why it cannot run, where it cannot. Read with the stores
+  // lent room and the shard's chunk store, as a push's build reads them: a tool's objects lie in windows that chunk
+  // store keeps, and a settled content store admits no parse.
+  let advanced: Option<Result<slates_merge::push::Built, String>> =
+    crate::vcs_store::with_room(state, |state| match state.greens.lend(&green) {
+      Some(engine) => {
+        let mut turned = None;
+        let found = with_objects(state, repository, &mut |objects| {
+          turned = Some(building.advance(&engine, objects));
+        });
+        match turned {
+          Some(advanced) if found => {
+            advanced.map(|built| built.map_err(|refused| format!("{refused:?}")))
+          }
+          _ => Some(Err("no objects for the green's repository".to_owned())),
         }
-        _ => Some(Err("no objects for the green's repository".to_owned())),
       }
-    }
-    None => Some(Err("the green is not here".to_owned())),
-  };
+      None => Some(Err("the green is not here".to_owned())),
+    });
   match advanced {
     None => {
       state.materializations.building.insert(green, building);

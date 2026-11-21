@@ -15751,7 +15751,7 @@ fn committed_placed(state: &ShardState, object: ObjectId, sequence: u64) -> bool
     .placed_heads
     .get(&object)
     .filter(|head| head.sequence == sequence)
-    .is_some_and(|head| head.placed_under(state.fleet.configuration(), object))
+    .is_some_and(|head| head.placed_under(state, object))
     || state.fleet.configuration().quorum.f == 0
 }
 
@@ -19345,6 +19345,16 @@ pub(crate) fn replay_green_for_test(
     .deferred()
     .map(slates_merge::push::DeferredPush::version);
   Some((replayed.0.head(), owed))
+}
+
+/// [`replay_green`] for a test: green `id` replayed from its durable chain into a fresh engine, as a recovery replays
+/// it, the engine itself (P2's oracle: a replayed green that owes its push, made, reads as the live one).
+#[cfg(test)]
+pub(crate) fn replayed_green_for_test(
+  state: &ShardState,
+  id: DbVolumeId,
+) -> Option<slates_merge::engine::Green> {
+  replay_green(state, id).ok().map(|replayed| replayed.0)
 }
 
 fn replay_green(

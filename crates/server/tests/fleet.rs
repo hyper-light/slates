@@ -26,6 +26,50 @@
 
 use std::time::{Duration, Instant};
 
+/// The allocator calls each thread makes (85a, g228: a live entry's allocations on its owner, counted per shard thread
+/// so the count is exact whatever the host's load, as `slates-db`'s `live_fold_cost` counts a fold's).
+struct CountingAllocator;
+thread_local! {
+  // Const initialization and no destructor: observing an allocation never allocates recursively.
+  static ALLOCATOR_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// SAFETY: forwards the allocator contract unchanged to the system allocator; the counter observes calls only.
+unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+  unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+    ALLOCATOR_CALLS.set(ALLOCATOR_CALLS.get().wrapping_add(1));
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.alloc(layout) }
+  }
+  unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.dealloc(pointer, layout) }
+  }
+  unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+    ALLOCATOR_CALLS.set(ALLOCATOR_CALLS.get().wrapping_add(1));
+    // SAFETY: forwarded unchanged.
+    unsafe { std::alloc::System.realloc(pointer, layout, size) }
+  }
+}
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+/// The allocator calls each of `daemon`'s shard threads has made so far, in shard order.
+fn shard_allocations(daemon: &Daemon) -> Vec<u64> {
+  daemon
+    .shards()
+    .iter()
+    .map(|shard| {
+      daemon
+        .observation(Some(*shard), LIVENESS_BUDGET_NS, |_| ALLOCATOR_CALLS.get())
+        .unwrap()
+        .wait()
+        .unwrap()
+    })
+    .collect()
+}
+
 use rustls::pki_types::PrivateKeyDer;
 use slates_anchor::{AnchorSegment, Geometry};
 use slates_db::HostId;
@@ -16540,6 +16584,106 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   assert!(
     holders.iter().any(|served| *served > 0),
     "a holder's serves were timed: {holders:?}"
+  );
+}
+
+/// 85a's entry build (main's order, MEMORY SIZING: zero-alloc first): what a live write costs its owner node in allocator
+/// calls beyond a plain one. Do: on a formed three-node fleet, a plain and a live-shipped volume on the owner, each
+/// written in a warm-up and then a closed loop of writes of `BURST_WRITE_BYTES` (a request fits one ring slot), each answered (the live one at durability); count the
+/// allocator calls of every shard thread of the owner across each loop. Expect: every write answered, and the live loop
+/// costing more calls a write than the plain one (the count's non-vacuity); the difference a write is printed, the
+/// number the entry's build is cut against.
+#[test]
+fn a_live_writes_allocations_on_its_owner_are_counted_against_a_plain_ones() {
+  /// Shape: the writes of each loop, and of each warm-up.
+  const WRITES: u64 = 64;
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, _hosts) = formed_mesh(&["a", "b", "c"]);
+  let owner = daemons[0].instance().to_owned();
+  let mut client = Client::connect(&owner);
+  let mut volume = |name: &str, live: bool| {
+    let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+      name: name.to_owned(),
+      size: SizeClass::Bounded {
+        limit: BURST_VOLUME_LIMIT,
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    }) else {
+      panic!("{name} was created");
+    };
+    let attachment = write_attachment(&mut client, id);
+    if live {
+      let shipped = client.call(&RequestBody::LiveShip {
+        volume: id,
+        live_shipped: true,
+      });
+      assert!(
+        matches!(shipped, ReplyBody::LiveShippingSet { live_shipped: true }),
+        "{name} is live-shipped: {shipped:?}"
+      );
+    }
+    (id, attachment)
+  };
+  let plain = volume("plain-allocations", false);
+  let live = volume("live-allocations", true);
+  let mut write = |(id, attachment): (VolumeId, u64), round: u64| {
+    client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: "/counted".to_owned(),
+      bytes: vec![u8::try_from(round % 251).unwrap(); BURST_WRITE_BYTES],
+      mode: 0o644,
+    })
+  };
+  let mut answered = 0;
+  let mut counted = |target: (VolumeId, u64),
+                     write: &mut dyn FnMut((VolumeId, u64), u64) -> ReplyBody| {
+    for round in 0..WRITES {
+      write(target, round);
+    }
+    let before: Vec<Vec<u64>> = daemons.iter().map(shard_allocations).collect();
+    for round in 0..WRITES {
+      if matches!(write(target, round), ReplyBody::FsDone { .. }) {
+        answered += 1;
+      }
+    }
+    let after: Vec<Vec<u64>> = daemons.iter().map(shard_allocations).collect();
+    // Per node, per shard: the calls a write.
+    before
+      .iter()
+      .zip(&after)
+      .map(|(was, now)| {
+        was
+          .iter()
+          .zip(now)
+          .map(|(was, now)| now.saturating_sub(*was) / WRITES)
+          .collect::<Vec<u64>>()
+      })
+      .collect::<Vec<Vec<u64>>>()
+  };
+  let plain_split = counted(plain, &mut write);
+  let live_split = counted(live, &mut write);
+  let owner_total =
+    |split: &Vec<Vec<u64>>| split.first().map_or(0, |shards| shards.iter().sum::<u64>());
+  let (plain_calls, live_calls) = (owner_total(&plain_split), owner_total(&live_split));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "allocator calls a write, per node (owner first) and shard: plain {plain_split:?}, live {live_split:?}; on the owner \
+     plain {plain_calls}, live {live_calls}: live shipping costs {} a write there",
+    live_calls.saturating_sub(plain_calls)
+  );
+  assert_eq!(
+    answered,
+    2 * WRITES,
+    "every write of both loops was answered"
+  );
+  assert!(
+    live_calls > plain_calls,
+    "a live write costs its owner more allocator calls than a plain one: live {live_calls}, plain {plain_calls}"
   );
 }
 

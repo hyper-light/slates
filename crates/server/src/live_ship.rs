@@ -1174,7 +1174,7 @@ fn head_placed(state: &ShardState, volume: [u8; 16]) -> bool {
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| head.placed_under(configuration, ObjectId(volume)))
+      .is_some_and(|head| head.placed_under(state, ObjectId(volume)))
 }
 
 /// A verb's reply held until its volume's log is durable where its publication put it.
@@ -1619,9 +1619,7 @@ fn tombstone_placed(state: &ShardState, volume: [u8; 16], sequence: u64) -> bool
     || state
       .placed_heads
       .get(&ObjectId(volume))
-      .is_some_and(|head| {
-        head.sequence >= sequence && head.placed_under(configuration, ObjectId(volume))
-      })
+      .is_some_and(|head| head.sequence >= sequence && head.placed_under(state, ObjectId(volume)))
 }
 
 /// Holds a destroy's reply until its volume's tombstone is placed at `f + 1` ([`tombstone_target`]): its effects are
@@ -3938,12 +3936,15 @@ fn published_whole(state: &ShardState, id: slates_db::catalog::VolumeId) -> bool
 fn follow_candidates(state: &mut ShardState, volume: [u8; 16]) {
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
-  let candidates: Vec<HostId> = configuration
-    .place(ObjectId(volume))
-    .candidates
-    .into_iter()
-    .filter(|host| *host != local)
-    .collect();
+  // The shard's cached placement, computed once a configuration (85a, g228).
+  let candidates: Vec<HostId> = state.with_placement(ObjectId(volume), |placement| {
+    placement
+      .candidates
+      .iter()
+      .copied()
+      .filter(|host| *host != local)
+      .collect()
+  });
   let Some(live) = state.live.shipping.get_mut(&volume) else {
     return;
   };
@@ -4174,9 +4175,9 @@ fn log_covers(
 fn remote_candidates(state: &ShardState, volume: [u8; 16]) -> impl Iterator<Item = HostId> + '_ {
   let configuration = state.fleet.configuration();
   let local = configuration.owner;
-  configuration
-    .place(ObjectId(volume))
-    .candidates
+  // The shard's cached placement (`ShardState::with_placement`), computed once a configuration (85a, g228).
+  state
+    .with_placement(ObjectId(volume), |placement| placement.candidates.clone())
     .into_iter()
     .filter(move |candidate| *candidate != local && configuration.neighbourhood.contains(candidate))
 }
@@ -4471,7 +4472,7 @@ fn catalog_placed_at(state: &ShardState, volume: [u8; 16], version: u64) -> bool
     || state
       .placed_heads
       .get(&catalog)
-      .is_some_and(|head| head.sequence >= version && head.placed_under(configuration, catalog))
+      .is_some_and(|head| head.sequence >= version && head.placed_under(state, catalog))
 }
 
 /// A catalog register's placement moved (`fleet::record_acks_in`): when it is a live volume's and now places that
@@ -4956,7 +4957,9 @@ async fn ship_lane(
   // When this lane was free to take its next message: the dispatch's arrival, then each exchange's end.
   let mut ready_ns = began_ns;
   while let Some(first) = queue.pop_front() {
+    let borrowing_ns = slates_machine::clock::monotonic_ns();
     let sessions = borrow_session(holder, budget.max_deadline_ns()).await;
+    let borrowed_ns = slates_machine::clock::monotonic_ns();
     let send = take_batch(first, &mut queue, &sessions);
     // Each message under its own budget: the liveness budget plus its transfer on the session it rides, so an install of
     // the whole volume is not given up the moment an entry would be (`exchange_budget`).
@@ -4976,7 +4979,36 @@ async fn ship_lane(
       answered_ns,
     };
     ready_ns = answered_ns;
+    let entry = send.stream == slates_cluster::live::LIVE_ENTRY_STREAM;
+    let round_trip = exchanged.round_trips.first().map(|(_, ns)| *ns);
     let (replies, stragglers) = settle_sessions(exchanged);
+    if entry {
+      // The exchange split (85a, g228): the session's borrow, the transport's round trip as the session timed it, this
+      // side's tasks around it (the exchange less that round trip), and the sessions' return, a histogram each.
+      let settled_ns = slates_machine::clock::monotonic_ns();
+      let _ = state::with_state(|s| {
+        count_hop(
+          s,
+          HOP_EXCHANGE_BORROW,
+          borrowed_ns.saturating_sub(borrowing_ns),
+        );
+        if let Some(round_trip) = round_trip {
+          count_hop(s, HOP_EXCHANGE_ROUND_TRIP, round_trip);
+          count_hop(
+            s,
+            HOP_EXCHANGE_COLLECT,
+            answered_ns
+              .saturating_sub(sent_ns)
+              .saturating_sub(round_trip),
+          );
+        }
+        count_hop(
+          s,
+          HOP_EXCHANGE_SETTLE,
+          settled_ns.saturating_sub(answered_ns),
+        );
+      });
+    }
     let answered = !replies.is_empty();
     if answered {
       // How long this holder took to answer: the window the next exchange with it is held for (A-396).
@@ -5314,6 +5346,28 @@ struct LaneStamps {
 /// the record's owed breakdown of A-200's 2026-11-05 measurement). Each pair is counted once a write, by the fold that
 /// makes its entry durable, so over a run the five hops' nanoseconds add up to the round's exactly, and a mean is
 /// nanoseconds over count. On the owner node.
+/// The exchange split, on the control shard, an entry at a time (85a, g228): waiting for the holder's session.
+const HOP_EXCHANGE_BORROW: (&str, &str) = (
+  "fleet.live.hop.exchange.borrow",
+  "fleet.live.hop.exchange.borrow_ns",
+);
+/// The transport's round trip as the session timed it: the request sent to its reply read (the wire both ways, both
+/// sides' sealing, and the holder's receive, serve and answer).
+const HOP_EXCHANGE_ROUND_TRIP: (&str, &str) = (
+  "fleet.live.hop.exchange.round_trip",
+  "fleet.live.hop.exchange.round_trip_ns",
+);
+/// The exchange less that round trip: this side's tasks around it (the request's task spawned and its message copied,
+/// the reply handed to the exchange and the exchange woken to take it).
+const HOP_EXCHANGE_COLLECT: (&str, &str) = (
+  "fleet.live.hop.exchange.collect",
+  "fleet.live.hop.exchange.collect_ns",
+);
+/// The answered sessions returned to their links and the unanswered ones dropped ([`settle_sessions`]).
+const HOP_EXCHANGE_SETTLE: (&str, &str) = (
+  "fleet.live.hop.exchange.settle",
+  "fleet.live.hop.exchange.settle_ns",
+);
 /// The entry built on the owner shard: from its publication reaching the shipper to its message made.
 const HOP_BUILD: (&str, &str) = ("fleet.live.hop.build", "fleet.live.hop.build_ns");
 /// From the message made on the owner shard to its lane on the control shard free to take it: the cross-shard hop and

@@ -64,17 +64,31 @@ fn intake(
   loop {
     steps += 1;
     match intake.step(&part.payload, store, admission) {
-      Ok(Stepped::More) => {}
-      Ok(Stepped::Done) => break,
-      Ok(Stepped::Wanted(range)) => panic!("a whole changegroup wanted {range:?}"),
+      Ok(stepped) if more(&stepped) => {}
+      Ok(_) => break,
       Err(refused) => {
         intake.abandon(store).map_err(Unindexed::Fork)?;
         return Err(refused);
       }
     }
   }
-  let (fork, intaken) = intake.finish().ok().unwrap();
+  let (fork, intaken) = finished(intake);
   Ok((fork, intaken, steps))
+}
+
+/// Whether a whole changegroup's intake steps again: more to take, or done. It never wants a range of a payload it holds
+/// whole.
+fn more(stepped: &Stepped) -> bool {
+  match stepped {
+    Stepped::More => true,
+    Stepped::Done => false,
+    Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+  }
+}
+
+/// A done intake's fork and what it brought.
+fn finished(intake: Intake) -> (HgIndex, Intaken) {
+  intake.finish().ok().unwrap()
 }
 
 /// An index's rows, each key with its body.

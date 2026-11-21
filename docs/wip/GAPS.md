@@ -531,12 +531,16 @@
 > A-774 part 3), reported to main.
 >
 > **A-812, P2's engine half (2026-11-21, w-rewrite-ops; main's order of 05:16, w-git's request). BUILT, engine and
-> server; git's half (w-git) owed.** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
+> server; git's half BUILT (A-821, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
 > and is made when first reached, through one door (`crate::green_ready`). The made green is the eager create's by
 > construction, and requests park until it is made. The full description and tests are in the design entry A-812.
 > Owed:
-> - (a) `vcs_store::with_owed_push_objects` answers none for every tool until w-git registers git's view. Until then an
->   owing green's readers get `ContentUnavailable`.
+> - (a) FIXED by A-821 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
+>   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door (a command whose
+>   wait ends with the build refused is declined, not retried). Owed from it: a replayed owing green has not been made
+>   over a restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met
+>   `ContentOnMissing`), owed with the f = 1 kill test below; git/git's 611 MB push landing and its A/B against stock
+>   git's 10.77 s (w-git, next).
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,
 >   and a holder's replica owes the same push at the base's identity, so a takeover adopts a green that owes it
 >   (`a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`).
@@ -2940,7 +2944,11 @@
 > import on the real daemon"; main's order: after C2 stage B part 2, completion then robustness then performance).**
 > Owed, each measured on git-2000's import (437 MiB dump, 2,000 revisions): (1) the green charges 440 MB of retention
 > for a history the records keep in 35 MB (12x): its kept versions serve copies from older revisions (folding them was
-> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first;
+> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first. BUILT
+> (A-820): a copy from an older revision is made from the head and set back from the records, and a Subversion green
+> folds to its live readers' floor after each landing. It also fixed the robustness bug the fold exposed: a copy was
+> refused `VersionFolded` once a tight budget had folded the green. Owed: the A/B of main's condition 3 (main's run,
+> `measure_copies_from_older_revisions` at 3bf21428b against A-820's commit) and the memory it frees;
 > (2) 593 MB of live small allocations with no owner attributed; (3) ~1 GB of whole-text transients during the import
 > (a revision's whole texts, its record's encoding and the reader's buffer held at once) and 1.5 GB of freed large
 > blocks the test binary's allocator keeps (the daemon's own allocator gives them back; the real daemon peaks at
@@ -9174,6 +9182,13 @@
 > shard gains about 15 µs on Linux and loses about 10 on macOS (rejected); the reply's "wake" was a run's one 100 ms
 > first write averaged over 2,051 (about 6-8 µs a write), and polling it while due gained nothing (rejected). What
 > remains is the entry's build and the exchange itself; the next count is per-write percentiles of each hop.
+> Since (2026-11-21, BENCHMARKS "The exchange split, and a shard's placements cached"): the exchange is timed in four
+> parts, and its daemon-side share (borrow, collect, settle) is about 7 µs of 61 on Linux, the session's round trip the
+> rest; a shard's placements are cached (`crate::placement_cache`), 107.5-114.0 against 120.9-134.7 µs added at the
+> median on ubuntu-latest (5 of 5 rounds, twice). The exchange's round trip equals the bare transport's on the same
+> runner (at most 65.5 against 60.6-83.0 µs at p50), so the daemon hides nothing there. Still open: 2.2x on Linux;
+> the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
+> spin primitive with g222's 84a arm C).
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
