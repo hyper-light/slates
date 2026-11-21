@@ -12,4 +12,5 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod log;
+pub mod staging;
 pub mod store;

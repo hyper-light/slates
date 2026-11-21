@@ -41,7 +41,7 @@ fn append(log: &mut ChangesetLog<SimFile>, sequence: u64, payload: &[u8], piece:
 
 fn recovered(file: SimFile) -> (ChangesetLog<SimFile>, Vec<Located>) {
   let mut found = Vec::new();
-  let log = ChangesetLog::recover(file, 0, |located| found.push(*located)).unwrap();
+  let log = ChangesetLog::recover(file, 0, |_, located| found.push(*located)).unwrap();
   (log, found)
 }
 

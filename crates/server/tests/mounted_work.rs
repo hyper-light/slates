@@ -405,3 +405,46 @@ fn one_save_changing_two_lines_does_not_cover_another_editors_line_between() {
   drop(client);
   daemon.stop();
 }
+
+/// A-774 R4 (a mount refreshes when its work's base moves). Do: two works A and B over one green; through A's mount read
+/// f1; B changes f1 through the SDK and is accepted; A saves f2 through its mount and is accepted, which moves A's base
+/// past B's version; read f1 and f2 through A's same mount. Expect: f1 is B's (the mount shows its work's new base), f2
+/// is A's save.
+#[test]
+fn a_mount_shows_its_works_new_base_once_the_base_moves() {
+  let (daemon, mut client, _) = start("refresh");
+  let green = seeded_green(&mut client);
+  let (a, _) = client.create_work(green, "mounted-refresh-a2").unwrap();
+  let (b, _) = client.create_work(green, "mounted-refresh-b").unwrap();
+  let (mut stream, root) = mounted(&daemon, "mounted-refresh-a2");
+  let f1 = lookup(&mut stream, &root, "f1", 2);
+  assert_eq!(read_whole(&mut stream, &f1, 3), base_file(1));
+
+  let b_f1 = with_line(&base_file(1), 2, "editor B's line");
+  client
+    .edit(
+      b,
+      "f1",
+      0,
+      u64::try_from(base_file(1).len()).unwrap(),
+      &b_f1,
+    )
+    .unwrap();
+  assert!(matches!(client.submit(b).unwrap(), Submitted::Accepted(_)));
+  let a_f2 = with_line(&base_file(2), 0, "editor A's line");
+  let mut xid = 10;
+  editor_save(&mut stream, &root, "f2", &a_f2, &mut xid);
+  let verdict = client.submit(a).unwrap();
+  assert!(matches!(verdict, Submitted::Accepted(_)), "{verdict:?}");
+
+  let f1 = lookup(&mut stream, &root, "f1", 40);
+  assert_eq!(
+    read_whole(&mut stream, &f1, 41),
+    b_f1,
+    "the mount shows B's f1 once A's base moved past it"
+  );
+  let f2 = lookup(&mut stream, &root, "f2", 42);
+  assert_eq!(read_whole(&mut stream, &f2, 43), a_f2);
+  drop(client);
+  daemon.stop();
+}

@@ -2044,7 +2044,6 @@ fn step_beginning(
     &mut state.store,
     (&mut state.landing.grants, &mut state.landing.audit),
   );
-  drop(lens);
   *writer = if base_is_target(slot) {
     let (host, away) = os.lend();
     slot.host = Some(BaseHost::Disk(host));
@@ -2181,7 +2180,6 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
     budget_ns,
     base,
   );
-  drop(lens);
   if granted.was_overlay {
     lend_back(slot, granted);
   }

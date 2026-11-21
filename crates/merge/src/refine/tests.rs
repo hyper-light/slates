@@ -601,12 +601,10 @@ fn a_rewrite_renamed_over_another_file_is_refined_against_its_source() {
         &mut plan,
         &mut Refiner::new(),
         &mut |from, path| {
-          (from == other && path == PATH).then(|| {
-            (
-              Cow::Borrowed(base.as_bytes()),
-              Cow::Borrowed(first.as_bytes()),
-            )
-          })
+          (from == other && path == PATH).then_some((
+            Cow::Borrowed(base.as_bytes()),
+            Cow::Borrowed(first.as_bytes()),
+          ))
         },
       );
       assert_eq!(done.paths, 1, "{done:?}");

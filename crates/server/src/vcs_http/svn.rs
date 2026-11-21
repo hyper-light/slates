@@ -837,8 +837,15 @@ impl<S: SvnStores> SvnExchange<S> {
       (method, [first, "txr", name, rest @ ..]) if special(first) => {
         self.on_transaction_root(method, name, &format!("/{}", rest.join("/")))
       }
-      // DeltaV v1 (A-766 part 2): an activity's DELETE ends it; its working baseline takes the revision properties; a
-      // working resource is its transaction's root.
+      _ => return self.on_deltav_v1_path(method, segments),
+    })
+  }
+
+  /// DeltaV v1's special paths (A-766 part 2): an activity's DELETE ends it; its working baseline takes the revision
+  /// properties; a working resource is its transaction's root. None for every other path.
+  fn on_deltav_v1_path(&mut self, method: &str, segments: &[&str]) -> Option<HttpAnswer> {
+    let special = |segment: &str| segment == site::SPECIAL;
+    Some(match (method, segments) {
       ("DELETE", [first, "act", activity]) if special(first) => self.delete_activity(activity),
       ("PROPPATCH", [first, "wbl", activity, _]) if special(first) => {
         self.working_baseline_proppatch(activity)
