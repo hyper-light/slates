@@ -1590,3 +1590,4 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - A-803 (the re-anchor's O(k) per change with a pinned floor): option (1), the per-path anchor indirection with an interval index, O(log + pieces touched), oracle against today's reanchor, A/B with --preload. Option (2) rejected (gives back A-793's memory saving). Built by w-rewrite-ops.
   - w-fed-move stays on the 100k walls. While r48 waits it takes the 300 MB work log, unbounded growth: a counter-named mechanism, red, fix.
   2c32af2b5 was already in w-fed-move's profiled build; the growth survives it.
+- 2026-11-21 02:38 PST LANDED: 2659cfe39 (w-perf: git's repository index is kept up as Mercurial's is, merged a table at a time once built whole, its lends reporting lookups; red: no merge without its arm). The compaction ruling now covers git as well as hg. No agent waiting on main. r48 still queued (no start notice). The MacBook disk is 46 GB.
