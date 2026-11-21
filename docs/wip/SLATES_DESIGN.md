@@ -11976,6 +11976,21 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
+> **Status (2026-11-20, A-796: a merge check publishes nothing, and a resolution is bound to what was checked).**
+> `CheckMerge` answers the verdict a submit would get now, judged by the green's half as a rebase is (`Green::rebase`,
+> a pure function) and settled by nothing: the head and base it judged and the work's revision (its stamp), the
+> canonical declaration by index, and the windows, kept for `Conflicts` (A-267) as a conflicting rebase keeps them.
+> `ReadMergeCheck` reads the work as checked (refused `StaleMergeView` once it changed); the green's view is a read at
+> the stamp's head. `ResolveMerge` retires the canonical operations the agent names, rebases the rest onto the stamp's
+> head, applies the agent's replacement there (its edits as pieces over the head, A-790) and restates the work as a
+> rebase restates it, one recorded step; refused `StaleMergeView` with nothing changed when the work moved (checked on
+> its shard) or the head did (checked on the green's half, before anything is mapped). Off the green's shard the ask
+> travels with the sealed work (A-247). No merge is inferred: every byte of a resolution is declared (D-27). Ported
+> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli); its `rebase_with`
+> refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
+> resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
+> (one history on one shard and on eight).
+
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
 > does the deriver composing the work's next submit. A hard link names the node at its target when it is made
@@ -58730,3 +58745,29 @@ the tests' decoding of it), `crates/transport/src/endpoint.rs` (`seal_in_place`,
   encoded bytes are what they assert on.
 - **Owed (the next step):** frames kept as references into the send stream's bytes until acknowledged (no copy into a
   frame at all), and the receiver's copies (the frame decode's, the reassembly's).
+
+### A-796 — A merge check publishes nothing, and a resolution is bound to what was checked (2026-11-20, w-work-cow; main's order, the unowned Codex goal; §4.16 "Rebase, the only corrective path", D-27)
+Applied in the same change to: §4.16 (its status), `crates/ipc/src/protocol.rs` (`CheckMerge`, `ReadMergeCheck`,
+`ResolveMerge`, `MergeStamp`, `MergeView`, `WorkChange`, `MergeOp`, `MergeChecked`, `StaleMergeView`),
+`crates/server/src/verbs.rs` (`check_merge`, `read_merge_check`, `resolve_merge`, `merge_answer`,
+`apply_replacement`, `volume_op_of` taken out of `declare`), `crates/server/src/work_home.rs` (`MergeAsk` on the sealed
+work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `read_merge_check`, `resolve_merge`),
+`crates/api/src/error.rs` (`Stale::MergeView`), GAPS (the Codex record).
+- **Why.** The Codex agent's early-conflict work (476 branches on adacachy, none on origin; GAPS) found what main still
+  lacked: an agent could learn of a conflict only by submitting (which publishes when it does not conflict) or
+  rebasing (which moves a clean work), and could act on a conflict only by appending more declarations to a journal
+  whose conflicting operations stay. FoundationDB validates a transaction against the read version it decided on
+  [B: FoundationDB developer guide, conflict ranges]; SQLite refuses to promote a stale snapshot [B: sqlite.org
+  isolation]: a decision made on an observed state may publish only while that state holds.
+- **Rule.** A check is a rebase's verdict with nothing settled, answered with its stamp (work, green, base, head,
+  revision). A resolution names the stamp and is refused `StaleMergeView`, nothing changed, unless the work is at the
+  stamp's revision and base and the green at its head; it retires canonical operations by index, rebases the rest
+  onto that head, applies the agent's changes there, and restates the work (A-207's restatement, one recorded step).
+  The windows reuse A-267's kept verdict; nothing pages them twice. None of A-255, A-257 or A-263-A-267 is changed.
+- **Tests.** `crates/server/tests/merge_check.rs` on one shard and on eight (every work off its green's shard): a
+  conflicting check names the head and base and changes neither the work's bytes nor the green; a clean check leaves
+  the base where it was; the views read both sides; a resolution retiring the work's operations on the file and writing
+  the agent's bytes at the head merges as written; a moved head and a changed work refuse the resolution and the work
+  read; a resolution keeping a conflicting operation answers the windows with nothing changed. Red: with the stamped
+  head's check removed, the moved head's resolution was applied (the test failed there).
+
