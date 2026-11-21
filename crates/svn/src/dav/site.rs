@@ -1200,6 +1200,7 @@ fn decimal_in(digits: &mut [u8; 20], mut number: usize) -> &str {
   let mut at = digits.len();
   loop {
     at = at.saturating_sub(1);
+    // Format: decimal, base 10.
     if let Some(digit) = digits.get_mut(at) {
       *digit = b'0'.saturating_add(u8::try_from(number % 10).unwrap_or(0));
     }
@@ -1213,10 +1214,10 @@ fn decimal_in(digits: &mut [u8; 20], mut number: usize) -> &str {
 
 /// The responses a PROPFIND of `node` at `place` writes at `depth`, each written into `body` as it is described through
 /// one [`Described`]; the lock headers its own lock gives.
-fn described<'a, R: Repository + ?Sized>(
+fn described<R: Repository + ?Sized>(
   served: &Served<'_, R>,
   (place, node): (&Place, &Node<'_>),
-  asked: &'a PropfindRequest,
+  asked: &PropfindRequest,
   depth: Depth,
   body: &mut Body,
 ) -> Result<Headers, HttpAnswer> {

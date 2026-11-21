@@ -221,6 +221,54 @@ fn rebuilt(
   (text, depth)
 }
 
+/// A text as the row that first names it: its path's index, its revision, identity, delta base and delta, and its
+/// whole length.
+struct TextRead {
+  path: usize,
+  revision: u64,
+  identity: ContentIdentity,
+  base: Option<ContentIdentity>,
+  delta: Vec<u8>,
+  text_len: usize,
+}
+
+/// Every text of `repository` once, in revision order, as the rows that first name it: the paths, the texts, and each
+/// text's place among them by identity.
+fn read_every_text(
+  repository: &Repository,
+) -> (Vec<String>, Vec<TextRead>, HashMap<ContentIdentity, usize>) {
+  let youngest = repository.youngest();
+  let mut paths: Vec<String> = Vec::new();
+  let mut path_index: HashMap<String, usize> = HashMap::new();
+  let mut read: Vec<TextRead> = Vec::new();
+  let mut position: HashMap<ContentIdentity, usize> = HashMap::new();
+  for revision in 1..=youngest {
+    for change in repository.index().changes(revision).unwrap() {
+      let Some(text) = change.text else { continue };
+      if position.contains_key(&text.identity) {
+        continue;
+      }
+      let (base, delta) = repository
+        .text_delta(&text.identity)
+        .expect("every text a row names is kept as a delta");
+      let path = *path_index.entry(change.path.clone()).or_insert_with(|| {
+        paths.push(change.path.clone());
+        paths.len() - 1
+      });
+      position.insert(text.identity, read.len());
+      read.push(TextRead {
+        path,
+        revision,
+        identity: text.identity,
+        base,
+        delta: delta.to_vec(),
+        text_len: usize::try_from(text.size).unwrap(),
+      });
+    }
+  }
+  (paths, read, position)
+}
+
 fn main() {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
   let dump = &arguments[0];
@@ -240,44 +288,8 @@ fn main() {
     rss_mib()
   );
 
-  // Every text once, in revision order, as the rows that first name it: its path, its revision, its delta and base.
-  struct Read {
-    path: usize,
-    revision: u64,
-    identity: ContentIdentity,
-    base: Option<ContentIdentity>,
-    delta: Vec<u8>,
-    text_len: usize,
-  }
   let started = Instant::now();
-  let mut paths: Vec<String> = Vec::new();
-  let mut path_index: HashMap<String, usize> = HashMap::new();
-  let mut read: Vec<Read> = Vec::new();
-  let mut position: HashMap<ContentIdentity, usize> = HashMap::new();
-  for revision in 1..=youngest {
-    for change in repository.index().changes(revision).unwrap() {
-      let Some(text) = change.text else { continue };
-      if position.contains_key(&text.identity) {
-        continue;
-      }
-      let (base, delta) = repository
-        .text_delta(&text.identity)
-        .expect("every text a row names is kept as a delta");
-      let path = *path_index.entry(change.path.clone()).or_insert_with(|| {
-        paths.push(change.path.clone());
-        paths.len() - 1
-      });
-      position.insert(text.identity, read.len());
-      read.push(Read {
-        path,
-        revision,
-        identity: text.identity,
-        base,
-        delta: delta.to_vec(),
-        text_len: usize::try_from(text.size).unwrap(),
-      });
-    }
-  }
+  let (paths, read, position) = read_every_text(&repository);
   let text_bytes: usize = read.iter().map(|r| r.text_len).sum();
   println!(
     "history: {} paths, {} texts, {:.1} MiB as whole texts, {:.1} MiB of deltas, read out in {:.1} s",
