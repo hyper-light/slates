@@ -1,5 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
+> complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
+> the lane hears nothing back while the request crosses, resends it in place on silence (6 to 9 times) and gives up at
+> its bound after 7 to 10 s, and the submit is refused `Overloaded { shard: 0 }` with the owner never having run it.
+> Release, big Studio, load 11.5 to 24: main 6a6e352 0 of 12 at 320, 384, 448 and 512 MiB (kiln r21); interleaved A/B
+> 895b80994 (before A-825) against 545cf46c5 (A-825), 3 rounds: 256 MiB 3 of 3 both, 320 and 512 MiB 0 of 3 both
+> (r23). On a quiet Studio (load 2 to 3.6, r13) 320 MiB passed 9 of 10 and 512 MiB 0 of 10. Not an admission bound a
+> client could split against: the increment's size alone decides it. A-825 took a third off the owner's step at 256
+> MiB (667-681 ms to 437-476 ms) and the late beat from 1.2 s to 0.55 s or none. A-826 (lane 3b) names the increment
+> instead, the owner fetching it by identity on the content plane.
+
 > **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
 > `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
