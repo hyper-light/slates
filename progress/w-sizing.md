@@ -165,3 +165,13 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - 2026-11-21 ~11:00: w-lint found the A-789 Windows CLI tests compiled out (cli.rs is cfg(unix)). Moved to crates/cli/tests/content_extents_windows.rs, LANDED acff9a6e8 (merge d3f2810e0); xwin check clean; run-requests entry updated; --list on jupiter = kiln r1 (queued). Slip: r1 detached a fresh scratch clone on jupiter with git checkout (rule: worktree add); no other tree touched.
 - 2026-11-21 11:09: main put me in goal 93 RESERVE for memory (svn import heap attribution, git client RSS red when main sends them). Start no runs meanwhile; r1 (--list on jupiter) finishes on its own.
 - 11:21: r1 stopped (main). No runs of mine in flight.
+
+## 2026-11-21: BRIEF AUDIT (the person: "Examine all of your assigned goal. If you have not completed it, you are not done.")
+- 1 segment/prefault: DONE (A-777, A-778, A-789 macOS+Windows).
+- 2 sweep: list DONE (GAPS MEMORY SIZING); CONVERSIONS NOT DONE. Largest first: (a) the content object's per-slice
+  address space from reserve_per_shard (write log R/4, image slots 2R, delta log R, arena R; arena R is unused on
+  macOS/Windows since A-789); (b) the segment's log ring (table_bytes) and snapshot slots (2 x table_bytes); (c) the
+  tables (bounds only); (d) the client/fleet/NFS shares.
+- 3 device-pressure seam: NOT DONE.
+- 4 zero-alloc: idle purge DONE (2dc414a84); NFS reply path (results Vec + framed record Vec per request) NOT DONE.
+- Resuming 2 -> 3 -> 4, each red first, landed within ~30 min a piece.
