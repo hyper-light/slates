@@ -299,3 +299,14 @@ landing and its replay red first.
   goes red I fix it at once.
 - **Next:** `push/tree.rs`, which needs your ruling (inbox/main-from-w-hg-tree-through-store.md). Meanwhile
   `push/made.rs`, `push/verify.rs`, `Indexed::file`.
+
+## Three more readers of whole file texts gone: LANDED on origin/main a6f4465ba (commit fe30843fc; 2026-11-21)
+- **`push/made.rs`:** whether a file keeps its parent's node is told by the texts' names (block and bytes identities,
+  `Held::file_names`); `IndexHeld` reads them from the row with no text read.
+- **`push/verify.rs`:** the presence check reads rows. The whole `verify` has no production caller and stays the
+  intake's test oracle.
+- **`getbundle::Store::file` and `Indexed::file` removed:** `file_entry` (the row) is the served view's one file read.
+- **Tests:** slates-hg 402/402 and server hg 71/71 on the merged tree. The last merge brought only git's `upload.rs`.
+- **Left before step 2:** `push/tree.rs`, after the push spin (your order).
+- **Now:** the push spin. Piece A, the intake a window a step, is written with its red test; it compiles in the retest
+  build and its own run is next.
