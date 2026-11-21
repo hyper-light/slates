@@ -144,6 +144,7 @@ fn logged_kinds(state: &ShardState, id: RepositoryId) -> Vec<&'static str> {
     Ok(Record::RevisionProperties { .. }) => "properties",
     Ok(Record::Revision(_)) => "revision",
     Ok(Record::Locks(_)) => "locks",
+    Ok(Record::Deltified { .. }) => "deltified",
     Err(_) => "refused",
   };
   let repositories = state.db.partition().repositories();

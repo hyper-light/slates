@@ -407,8 +407,13 @@
 > held again at a recovery. c2 BUILT 14215b0c3: the records keep texts as skip-delta svndiffs. c3 BUILT: `HeadTexts`
 > reads a head text from the green and any other from the one place the records say it is kept (the content store for
 > a stored text, A-761 p2; the records' delta for an imported or made one), no arm tried after another. a3b BUILT
-> 9b9d8dec6 (lists and names in the shard image). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); the
-> background deltify of a superseded stored text (main's ruling on A-761); (d) replication.
+> 9b9d8dec6 (lists and names in the shard image). The deltify job BUILT (main's ruling on A-761, form (A) of 16:10): a
+> stored text a later revision moved past is made a skip-delta svndiff a window a slice (`vcs_store::svn_deltify`), landed
+> as its own entry (`Record::Deltified`, the delta held by the records as c2 holds every other text: one form, one read
+> path), and only then its store hold given back; a replay holds the texts the records still keep stored after its whole
+> log, so a text a later entry deltified is never asked of the store. Held by
+> `a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released` (red: nothing deltified, the
+> whole text held). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -2230,8 +2235,8 @@
 > (`svn_commit::land_work`, `store_step`); the revision names each by (identity, length) (`Revision::stored`, record
 > version 2) and the records keep the reference, no bytes; the entry is appended only once the store answers the texts
 > durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
-> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
-> refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity the records
+> still keep stored once its whole log is applied, and refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
 > Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. **The export's text
 > read sliced (A-762, same day, w-svn, main's item 2; found by reading):** the exporter rebuilt a text through its whole delta
 > chain in one call (512 KiB, a chain of 6: the longest call 6.18 ms against a whole read of 6.04 ms, debug). Now a text
