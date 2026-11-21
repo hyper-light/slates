@@ -440,6 +440,7 @@ pub(crate) fn record(
       bytes_of(properties.iter(), core::iter::empty::<&Vec<u8>>())
     }
     Record::Uuid(_) | Record::Locks(_) => 0,
+    Record::Deltified { delta, .. } => u64::try_from(delta.len()).unwrap_or(u64::MAX),
     Record::Created { .. } | Record::Revision(_) => return Err(corrupt()),
   };
   if !crate::vcs_store::lend_svn(state, repository, brought) {
@@ -474,6 +475,9 @@ fn record_growth(
       properties,
     } => records
       .check_revision_properties(*revision, properties)
+      .map_err(Uncommitted::Step),
+    Record::Deltified { text, base, delta } => records
+      .check_deltified(text, base.as_ref(), delta)
       .map_err(Uncommitted::Step),
     Record::Created { .. } | Record::Revision(_) => Err(corrupt()),
   }
@@ -757,7 +761,10 @@ fn applied(
   } else {
     None
   };
-  if made != Some(Ok(answer.revision)) {
+  if made == Some(Ok(answer.revision)) {
+    // The stored texts this revision moved past, handed to the deltify job (`vcs_store::svn_deltify`).
+    crate::vcs_store::svn_deltify::after_revision(state, repository, answer.revision);
+  } else {
     state.count(if moved { APPLY_REFUSED } else { DIVERGED }, 1);
     crate::vcs_store::rebuild(state, repository);
   }

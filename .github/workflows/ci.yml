@@ -325,6 +325,34 @@ jobs:
       - name: Ratchet
         run: cargo xtask ratchet
 
+  # R9's provisioning histogram (A-786): `cargo xtask ratchet --provision` runs `provision_bench` alone, quiet and beside
+  # two spinners a logical CPU. A shared runner has no baseline in ratchets.toml, so here it measures and keeps the
+  # histogram (the artifact), its floor and loaded bound reported, not failed; kiln's exclusive bare-metal legs
+  # (.kiln/ci.yaml `provision-gate-*`) hold it to their machines' ceilings and fail on the bench's gates.
+  provision-histogram:
+    name: R9 provisioning histogram (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Provisioning histogram and ratchet
+        run: cargo xtask ratchet --provision
+      - name: Upload the provisioning histogram
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provision-histogram-${{ matrix.os }}
+          path: target/provision-histogram.tsv
+          if-no-files-found: ignore
+
   # The live guest (AUD-29-68, AC-9.7): QEMU's vhost-user-fs-pci drives a Linux guest whose /init mounts a
   # daemon volume's tag, then runs the conformance roster on slates and on its RAM. QEMU, the distribution
   # kernel and a busybox initramfs come from ci/guest (Ada authorized QEMU in CI, 2026-10-01). KVM accelerates

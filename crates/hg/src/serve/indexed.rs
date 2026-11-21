@@ -56,7 +56,7 @@ use std::borrow::Cow;
 
 use slates_vcs::{ContentId, ContentStore};
 
-use super::getbundle::{Linked, Logged, Store};
+use super::getbundle::{Linked, Logged, Store, StoredDelta};
 use super::{Refusal, Repository, Rev};
 use crate::filerev::MARKER;
 use crate::index::{ChangesetRow, HgIndex, Log, NONE};
@@ -450,6 +450,34 @@ impl Store for Indexed<'_> {
         .into_iter()
         .flat_map(|markers| markers.iter())
     })
+  }
+
+  /// A manifest kept as a delta (A-729) lent as it is kept: its base's number, its parents' nodes, its flags and its
+  /// delta's bytes, in place where the store holds them in one window.
+  fn manifest_delta(
+    &self,
+    position: u64,
+    room: &mut Admission,
+  ) -> Result<Option<StoredDelta<'_>>, PastAdmission> {
+    let Ok(rev) = u32::try_from(position) else {
+      return Ok(None);
+    };
+    let Some(row) = self.index.revision(self.store, Log::Manifest, rev) else {
+      return Ok(None);
+    };
+    if row.base == NONE || row.block.is_some() {
+      return Ok(None);
+    }
+    let (Some(p1), Some(p2)) = (
+      self.log_node(Log::Manifest, row.p1),
+      self.log_node(Log::Manifest, row.p2),
+    ) else {
+      return Ok(None);
+    };
+    let Some(delta) = lend(self.store, &row.bytes, row.stored, &self.lends, room)? else {
+      return Ok(None);
+    };
+    Ok(Some((u64::from(row.base), [p1, p2], row.flags, delta)))
   }
 
   fn manifest_linked(&self, position: u64) -> Option<Linked> {

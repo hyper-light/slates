@@ -10,6 +10,7 @@
 //! One departure, stated: a custom revision property's name is quoted with its quotes escaped, where `mod_dav_svn`
 //! passes 0 and so writes an attribute a `"` would break.
 
+use super::locking::HttpAnswer;
 use super::xml::{base64_lines, fuzzy_escape, is_xml_safe, quote};
 use super::{DavRefusal, RevisionArg};
 use crate::index::Revision;
@@ -751,4 +752,67 @@ pub fn multistatus(
   }
   body.push("</D:multistatus>\n")?;
   Ok(body.into_bytes())
+}
+
+/// Created.
+/// Format: RFC 9110 §15.3.2.
+const HTTP_CREATED: u16 = 201;
+
+/// The start of `mod_dav`'s HTML answer body, before the status line.
+/// Format: httpd 2.4 `modules/dav/main/mod_dav.h` `DAV_RESPONSE_BODY_1`.
+const DAV_RESPONSE_BODY_1: &str = "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01//EN\" \"http://www.w3.org/TR/html4/strict.dtd\">\n<html>\n<head>\n<title>";
+
+/// After the status line, before the status's words.
+/// Format: `mod_dav.h` `DAV_RESPONSE_BODY_2`.
+const DAV_RESPONSE_BODY_2: &str = "</title>\n</head><body>\n<h1>";
+
+/// After the status's words, before the message.
+/// Format: `mod_dav.h` `DAV_RESPONSE_BODY_3`.
+const DAV_RESPONSE_BODY_3: &str = "</h1>\n<p>";
+
+/// After the message, before the server's signature (none: httpd's `ServerSignature` is off by default).
+/// Format: `mod_dav.h` `DAV_RESPONSE_BODY_4`.
+const DAV_RESPONSE_BODY_4: &str = "</p>\n";
+
+/// The end of the body.
+/// Format: `mod_dav.h` `DAV_RESPONSE_BODY_5`.
+const DAV_RESPONSE_BODY_5: &str = "</body></html>\n";
+
+/// `201`, as `mod_dav`'s `dav_created` answers a resource it made (DeltaV v1's MKACTIVITY, "Activity", and CHECKOUT,
+/// "Checked-out resource"; A-766 part 2): `location` the resource's absolute URL, `Cache-Control: no-cache` (both
+/// methods set it), and `dav_error_response`'s HTML body: "WHAT URI has been created.", `uri` the resource's path with
+/// HTML's specials escaped (`ap_escape_html`).
+pub fn created(what: &str, uri: &str, location: &str) -> HttpAnswer {
+  let mut body = String::new();
+  body.push_str(DAV_RESPONSE_BODY_1);
+  body.push_str("201 Created");
+  body.push_str(DAV_RESPONSE_BODY_2);
+  body.push_str("Created");
+  body.push_str(DAV_RESPONSE_BODY_3);
+  body.push_str(what);
+  body.push(' ');
+  for character in uri.chars() {
+    match character {
+      '<' => body.push_str("&lt;"),
+      '>' => body.push_str("&gt;"),
+      '&' => body.push_str("&amp;"),
+      '"' => body.push_str("&quot;"),
+      other => body.push(other),
+    }
+  }
+  body.push_str(" has been created.");
+  body.push_str(DAV_RESPONSE_BODY_4);
+  body.push_str(DAV_RESPONSE_BODY_5);
+  HttpAnswer {
+    status: HTTP_CREATED,
+    headers: vec![
+      ("Location", location.to_owned()),
+      ("Cache-Control", String::from("no-cache")),
+      (
+        "Content-Type",
+        String::from("text/html; charset=ISO-8859-1"),
+      ),
+    ],
+    body: body.into_bytes(),
+  }
 }

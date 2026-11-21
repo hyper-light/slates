@@ -1222,3 +1222,40 @@ fn a_stream_clone_is_sent_a_row_at_a_time_each_within_its_own_room() {
     assert_eq!(stepped(step_room).unwrap(), whole, "{name}");
   }
 }
+
+/// Ada's no-allocation rule and goal 93's clone (found in the code, 2026-11-20: a clone sent every manifest as its whole
+/// text against the null base, about 57,000 texts of up to 179 KB for hg's own history, each rebuilt from its chain on
+/// the server and diffed again by the client). Do: import each of `fixtures/state`'s repositories, its manifests kept
+/// as deltas (A-729), and clone each view that serves every changeset by its links; rebuild every manifest the answer
+/// carries from its base as a client does, each checked against its node. Expect every text to rebuild to its node,
+/// and some manifest sent as its stored delta against the one sent before it rather than whole.
+#[test]
+fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
+  let mut deltas = 0usize;
+  for name in ["amended-root", "divergent", "states"] {
+    let (imported, store) = imported(name);
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    if !view.serves_every_changeset() {
+      continue;
+    }
+    let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
+    let packed = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
+    let packed = Changegroup::decode(&packed, Version::V03, &mut room()).unwrap();
+    let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+    for revision in packed.group(&packed.manifests) {
+      let base: &[u8] = if revision.base == NULL_NODE {
+        &[]
+      } else {
+        deltas += 1;
+        texts
+          .get(&revision.base)
+          .map(Vec::as_slice)
+          .expect("a base sent before")
+      };
+      let text = delta::apply(base, revision.data, &mut room()).unwrap();
+      node::check(&revision.node, &revision.p1, &revision.p2, &text).unwrap();
+      texts.insert(revision.node, text);
+    }
+  }
+  assert!(deltas > 0, "every manifest was sent whole");
+}
