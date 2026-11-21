@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "base:fbc6bc971 cache:8b67b484f"
+      ARMS: ""
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -28,6 +28,48 @@ jobs:
           set -u
           exec > >(tee ../results.txt) 2>&1
           echo "runner $(nproc) cores, $(free -g | awk '/Mem/{print $2}') GiB, load $(cat /proc/loadavg)"
+          # g228's seal probe (85a): each part of sealing one live entry's body, release, from main.
+          PROBE_COMMIT=65133486d
+          mkdir -p ../probe-src ../probe/src && git archive "$PROBE_COMMIT" | tar -x -C ../probe-src
+          P=$(cd .. && pwd)
+          printf '%s\n' '[package]' 'name = "g228-sealprobe"' 'version = "0.1.0"' 'edition = "2024"' '[workspace]' '[dependencies]' \
+            "slates-cluster = { path = \"$P/probe-src/crates/cluster\" }" "slates-archive = { path = \"$P/probe-src/crates/archive\" }" \
+            "hyper-seal = { path = \"$P/probe-src/vendor/hyper-raft/hyper-seal\" }" 'blake3 = "1"' > ../probe/Cargo.toml
+          cat > ../probe/src/main.rs <<'RS'
+          use std::time::Instant;
+          use hyper_seal::keys::WrappingKey;
+          use hyper_seal::name::Namer;
+          use hyper_seal::stream::FileSealer;
+          const BODY: usize = 4627;
+          const CALLS: u32 = 5000;
+          fn time(name: &str, mut f: impl FnMut()) {
+            for _ in 0..200 { f(); }
+            let mut best = u128::MAX; let mut all = Vec::new();
+            for _ in 0..3 { let t = Instant::now(); for _ in 0..CALLS { f(); } let ns = t.elapsed().as_nanos() / u128::from(CALLS); best = best.min(ns); all.push(ns); }
+            println!("{name:<44} best {best:>6} ns a call; rounds {all:?}");
+          }
+          fn main() {
+            hyper_seal::lock_keys(64).unwrap();
+            let tenant = WrappingKey::generate(1).unwrap();
+            let (naming, _) = tenant.make_child().unwrap();
+            let namer = Namer::new(&naming).unwrap();
+            let lineage = WrappingKey::generate(1).unwrap();
+            let body: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+            let content = *blake3::hash(&body).as_bytes();
+            time("copy of the body (to_vec)", || { std::hint::black_box(body.to_vec()); });
+            time("blake3 of the body", || { std::hint::black_box(blake3::hash(&body)); });
+            time("raw_chunk (copy + identity hash)", || { std::hint::black_box(slates_archive::Archive::raw_chunk(body.to_vec())); });
+            time("derive_child (HKDF-SHA384 + wrap)", || { std::hint::black_box(lineage.derive_child(b"hyper-seal content key", &content).unwrap()); });
+            time("content_keyed (2 derive + commit + schedule)", || { std::hint::black_box(FileSealer::content_keyed(&lineage, &content, 4096).unwrap()); });
+            let chunk = slates_archive::Archive::raw_chunk(body.to_vec());
+            time("namer.name (HMAC)", || { std::hint::black_box(namer.name(&chunk.identity).unwrap()); });
+            time("seal_chunk whole", || { std::hint::black_box(slates_cluster::sealed::seal_chunk(&lineage, &namer, &chunk, 4096).unwrap()); });
+            time("raw_chunk + seal_chunk (seal_body's piece)", || { let c = slates_archive::Archive::raw_chunk(body.to_vec()); std::hint::black_box(slates_cluster::sealed::seal_chunk(&lineage, &namer, &c, 4096).unwrap()); });
+          }
+          RS
+          sed -i 's/^          //' ../probe/src/main.rs
+          echo "probe at $PROBE_COMMIT on $(nproc) cores, $(grep -m1 'model name' /proc/cpuinfo)"
+          (cd ../probe && CARGO_TARGET_DIR=../t-probe cargo run --release -q 2>&1 | grep -vE "^warning|^\s+(\||=|-->)|^$" | tail -10)
           for pair in $ARMS; do
             arm=${pair%%:*}; commit=${pair#*:}
             mkdir -p "../arm-$arm" && git archive "$commit" | tar -x -C "../arm-$arm"
