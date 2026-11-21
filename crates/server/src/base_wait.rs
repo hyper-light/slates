@@ -249,7 +249,6 @@ impl HostCell for ShardCell {
 /// client): it runs the host's fetches, one at a time, until the host is gone, its own end (the host wakes it as it is
 /// dropped), so the task is detached and needs no other owner. Refused off a shard, or when the shard's task arena is
 /// full.
-#[allow(dead_code)] // Its caller is the S3 volume's create and recovery (A-555's next piece, GAPS A-464).
 pub(crate) fn spawn_driver<S: Store + 'static>(
   volume: VolumeId,
   store: S,
@@ -448,6 +447,11 @@ impl HostFs for Lens<'_> {
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
     let answer = self.host.fingerprint_dir(dir);
+    self.note(answer)
+  }
+
+  fn identify_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    let answer = self.host.identify_dir(dir);
     self.note(answer)
   }
 
