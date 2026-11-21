@@ -165,7 +165,7 @@ fn hunk(start: u32, end: u32, data: &[u8]) -> Vec<u8> {
   [
     start.to_be_bytes().as_slice(),
     &end.to_be_bytes(),
-    &(data.len() as u32).to_be_bytes(),
+    &u32::try_from(data.len()).unwrap().to_be_bytes(),
     data,
   ]
   .concat()
@@ -186,8 +186,8 @@ fn a_shard_reads_an_old_file_revision_through_the_owner_across_a_restart() {
       (versions[0].clone(), None)
     } else {
       let before = versions.last().unwrap().clone();
-      let at = ((sequence - 1) * 40_000 + 3) as u32;
-      let data = [sequence as u8; 16];
+      let at = u32::try_from((sequence - 1) * 40_000 + 3).unwrap();
+      let data = [u8::try_from(sequence).unwrap(); 16];
       let mut text = before.clone();
       text[at as usize..at as usize + 16].copy_from_slice(&data);
       versions.push(text);

@@ -133,6 +133,41 @@ fn expected_revision(view: &View, source: &SvnView<'_>, revision: Revision) -> V
   }
 }
 
+/// Every fixed file of `records`' FSFS view read back through the view as `fsfs` makes it.
+fn fixed_files_read_back(
+  (volume, store, root): (&Volume, &Store, InodeNo),
+  records: &SvnRecords,
+  texts: &ViewTexts<'_>,
+) {
+  for (path, bytes) in fsfs::fixed_files(records.uuid().as_bytes(), records.youngest()) {
+    assert_eq!(read_path(volume, store, root, path, texts), bytes, "{path}");
+  }
+}
+
+/// Revision `revision`'s files read back through the view: its revision file the bytes `fsfs` makes for it and
+/// refused a write (`EROFS`), its properties file `fsfs`'s. The revision file's bytes read.
+fn revision_reads_back(
+  (volume, store, root): (&mut Volume, &mut Store, InodeNo),
+  (view, source, texts): (&View, &SvnView<'_>, &ViewTexts<'_>),
+  revision: Revision,
+) -> u64 {
+  let path = fsfs::revision_file_path(revision);
+  let bytes = read_path(volume, store, root, &path, texts);
+  assert_eq!(bytes, expected_revision(view, source, revision), "{path}");
+  let mut at = root;
+  for name in path.split('/') {
+    at = volume.lookup_no(store, at, name).unwrap().inode;
+  }
+  assert_eq!(volume.write(store, at, 0, b"x"), Err(VfsError::ReadOnly));
+  let path = fsfs::revision_properties_path(revision);
+  assert_eq!(
+    read_path(volume, store, root, &path, texts),
+    fsfs::revision_properties_file(source, revision).unwrap(),
+    "{path}"
+  );
+  u64::try_from(bytes.len()).unwrap()
+}
+
 /// A-645 P3. Do: present the golden repository's view into a volume a node-revision a call (the smallest budget);
 /// then read every file through the view's text seam. Expect: every revision file, every revision properties file and
 /// every fixed file the bytes `slates_svn::fsfs` makes for them; `db/current` naming the youngest; each revision file
@@ -172,32 +207,13 @@ fn the_presented_volume_holds_the_fsfs_view_byte_for_byte() {
   let texts = ViewTexts(&head);
   let mut read = 0u64;
   for revision in 0..=youngest {
-    let path = fsfs::revision_file_path(revision);
-    let bytes = read_path(&volume, &store, root, &path, &texts);
-    assert_eq!(bytes, expected_revision(&view, &source, revision), "{path}");
-    read += u64::try_from(bytes.len()).unwrap();
-    let mut at = root;
-    for name in path.split('/') {
-      at = volume.lookup_no(&store, at, name).unwrap().inode;
-    }
-    assert_eq!(
-      volume.write(&mut store, at, 0, b"x"),
-      Err(VfsError::ReadOnly)
-    );
-    let path = fsfs::revision_properties_path(revision);
-    assert_eq!(
-      read_path(&volume, &store, root, &path, &texts),
-      fsfs::revision_properties_file(&source, revision).unwrap(),
-      "{path}"
+    read += revision_reads_back(
+      (&mut volume, &mut store, root),
+      (&view, &source, &texts),
+      revision,
     );
   }
-  for (path, bytes) in fsfs::fixed_files(records.uuid().as_bytes(), youngest) {
-    assert_eq!(
-      read_path(&volume, &store, root, path, &texts),
-      bytes,
-      "{path}"
-    );
-  }
+  fixed_files_read_back((&volume, &store, root), &records, &texts);
   assert_eq!(
     read_path(&volume, &store, root, "db/current", &texts),
     format!("{youngest}\n").into_bytes()

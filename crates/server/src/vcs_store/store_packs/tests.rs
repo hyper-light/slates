@@ -13,6 +13,7 @@ use slates_vcs::ContentId;
 
 use super::{PackFillRefused, StorePacks};
 
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn store_directory(name: &str) -> PathBuf {
   let binary = std::env::current_exe().unwrap();
   let dir = binary
@@ -102,7 +103,7 @@ fn a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time() {
       while (read.len() as u64) < len {
         let at = read.len() as u64;
         let held = packs.piece(&identity, len, at).map(|bytes| {
-          let take = bytes.len().min(step as usize);
+          let take = bytes.len().min(usize::try_from(step).unwrap());
           bytes[..take].to_vec()
         });
         match held {
@@ -145,5 +146,6 @@ fn a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time() {
     "{unknown:?}"
   );
   owner.stop().unwrap();
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   let _ = std::fs::remove_dir_all(&dir);
 }

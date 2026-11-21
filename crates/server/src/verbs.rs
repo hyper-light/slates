@@ -1027,21 +1027,9 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
   // chain, not every forwarded work's log. Run on the green's shard, 76,955 of 100,000 works over the Linux kernel were
   // made on the primary's one partition, whose budget then refused their edits and the green's own versions.
   // Whether the green is made yet is still asked of the green's shard, which holds it, before the work is made.
-  let (shard, made_on) = match &body {
-    RequestBody::CreateWork { name, .. } => {
-      let named = match crate::state::try_with_state(|s| {
-        shard_of_partition(s, owner_of_name(name, s.shards.len()))
-      }) {
-        Ok(named) => named.unwrap_or(shard),
-        Err(access) => return encode_body(&refusal_of_access(&access, control)),
-      };
-      match call_owner(control, shard, move |s| forwarded_before_made(s, volume)).await {
-        Ok(None) => (named, None),
-        Ok(Some(refusal)) => return encode_body(&refusal),
-        Err(refusal) => return encode_body(&refusal),
-      }
-    }
-    _ => (shard, Some(volume)),
+  let (shard, made_on) = match forward_placement(&body, (control, shard), volume).await {
+    Ok(placed) => placed,
+    Err(refusal) => return encode_body(&*refusal),
   };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
@@ -1067,6 +1055,30 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
+/// partition its name hashes to (A-794), once the green's own shard has said the green is made (A-247); any other
+/// verb on `shard`, about `volume`. Refused, the answer.
+async fn forward_placement(
+  body: &RequestBody,
+  (control, shard): (u16, u16),
+  volume: VolumeId,
+) -> Result<(u16, Option<VolumeId>), Box<ReplyBody>> {
+  let RequestBody::CreateWork { name, .. } = body else {
+    return Ok((shard, Some(volume)));
+  };
+  let named = match crate::state::try_with_state(|s| {
+    shard_of_partition(s, owner_of_name(name, s.shards.len()))
+  }) {
+    Ok(named) => named.unwrap_or(shard),
+    Err(access) => return Err(Box::new(refusal_of_access(&access, control))),
+  };
+  match call_owner(control, shard, move |s| forwarded_before_made(s, volume)).await {
+    Ok(None) => Ok((named, None)),
+    Ok(Some(refusal)) => Err(Box::new(refusal)),
+    Err(refusal) => Err(refusal),
+  }
 }
 
 /// The work a node's verb is about (A-697: `AdmitWork`, `MoveWorkFloor`, `SubmitComputed`), whose creator alone may send
