@@ -1,5 +1,23 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~14:40 PST: a third rebase cut (window bytes in the conflicting reply) -- measured, even, rejected; record on main a457405da (756cad83f)
+- No ruling from main on inbox/main-from-w-fed-move-rebase-race.md; main had said not to wait, so I built it locally:
+  `Rebased` + appended `heads` (the head's bytes over each window, from the owner's engine), the daemon test red first
+  (`rebase_conflict_part`), and the harness writing them with no read (`--read-heads` the other arm).
+- A/B, three pairs at each of 300/100/30/10 hot files (1,000 clients, release, in-process, kernel/, one round,
+  `--per-connection 32`, main eef868f80, Studio at load 7-10). Oracle, own-file and starved all 0 in 24 runs.
+  Rebase-kind asks a client, read vs carried: 300: 1.9/2.0/1.9 vs 1.9/1.9/1.9; 100: 3.8/3.3/3.2 vs 3.7/3.3/3.1;
+  30: 9.0/8.5/8.7 vs 9.2/8.2/8.1; 10: 20.4/19.7/19.3 vs 19.8/20.5/20.1. Even. Window reads at 10: ~54 -> 13 a client
+  (not owner asks). Verdicts/s +17-26% at 10 and 30 hot files on the loaded box (not read as a result).
+- Why: a closed loop (529 in flight, ~9 ms a request); in either gap some 50-120 verdicts land, so a client's
+  unresolved slots are surely hit again. Only a gapless resolution moves the repeats (check+resolve: 16,035 -> 584
+  rebase conflicts, at two asks).
+- Patch: ~/slates-work/w-fed-move-rebase-heads-rejected.patch (279 lines). Tree clean.
+- GOAL NOT MET: no cut of the rebase-kind asks has landed. One unbuilt idea is left for main's ruling (a conflicting
+  reply carries the check's stamp, so `ResolveMerge` follows without `CheckMerge`: at most ~6.6 rebase-kind asks a
+  client at 10 hot files). Asked main in inbox/main-from-w-fed-move-rebase-heads.md: rule it, or clear the goal and give
+  me a goal-93 piece.
+
 ## 2026-11-21 ~11:50 PST: owner asks after A-817 -- both cuts measured and rejected (records on main: 99dc2e932, eef868f80)
 - Push route fixed: ~/.local/bin/kiln is EMPTY (0 bytes); I push through ~/.cache/w-fed-move-target/release/kiln via the
   MacBook (~/.cache/w-fed-move-publish-state.sh for the state branch, ~/.cache/w-fed-move-publish-main.sh for main),
