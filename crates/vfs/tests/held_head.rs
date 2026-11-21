@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use common::{store, volume};
 use slates_vfs::ids::InodeNo;
-use slates_vfs::recover::BodyImage;
+use slates_vfs::recover::{BodyImage, VolumeImage};
 use slates_vfs::volume::{Store, Volume};
 
 /// Shape: the directories and files a directory the scene makes, each file a few windows long.
@@ -120,6 +120,64 @@ fn change(
   }
 }
 
+/// A file as a held image step handed it: its size, its sealed extents, and its open extent's place and bytes.
+type HeldFile = (
+  u64,
+  Vec<slates_vfs::content::Extent>,
+  Option<(u64, Vec<u8>)>,
+);
+
+/// Asserts `image` is `reference` but for bodies sealed in place between steps, and counts those.
+fn imaged_as_held(image: &VolumeImage, reference: &VolumeImage) -> usize {
+  // Every field but the inodes' bodies is the reference's; a body differs only where a copy-up or the idle sweep sealed
+  // the held version's open extent in place (A-170 rewrites the old record so every view sees the seal), and then it
+  // names the sealed chunks where the reference named the open extent: the same bytes, checked below.
+  let mut sealed_in_place = 0;
+  for (held_inode, then) in image.inodes.iter().zip(&reference.inodes) {
+    let (mut a, mut b) = (held_inode.clone(), then.clone());
+    if a.body != b.body {
+      let opened_then = matches!(b.body, BodyImage::Chunked { open: Some(_), .. });
+      let sealed_now = matches!(a.body, BodyImage::Chunked { open: None, .. });
+      assert!(
+        opened_then && sealed_now,
+        "inode {}'s body differs other than by a seal in place: held {:?}, then {:?}",
+        a.no,
+        a.body,
+        b.body
+      );
+      sealed_in_place += 1;
+      a.body = BodyImage::Empty;
+      b.body = BodyImage::Empty;
+    }
+    assert!(a == b, "inode {} is imaged as it was held", a.no);
+  }
+  let (mut header, mut header_then) = (image.clone(), reference.clone());
+  header.inodes.clear();
+  header_then.inodes.clear();
+  assert!(
+    header == header_then,
+    "the held image's fields are the head's when it was held"
+  );
+  sealed_in_place
+}
+
+/// A held file's bytes: its held extents read from `store`, its open extent's bytes laid over them.
+fn held_bytes(store: &Store, (size, extents, open): &HeldFile) -> Vec<u8> {
+  let mut bytes = vec![0u8; usize::try_from(*size).unwrap()];
+  for extent in extents {
+    store
+      .content
+      .read_extent_into(extent, 0, &mut bytes)
+      .expect("a held extent stays readable through every change");
+  }
+  if let Some((at, open)) = open {
+    let at = usize::try_from(*at).unwrap();
+    let end = (at + open.len()).min(bytes.len());
+    bytes[at..end].copy_from_slice(&open[..end - at]);
+  }
+  bytes
+}
+
 /// A-827. Do: make the scene, take the head's standalone image and every file's bytes as the reference, hold the head,
 /// and image it one inode a step with a round of changes between steps (every kind: overwrites of sealed and open files,
 /// a truncate, an unlink, new files, a directory, a rename, a chmod, a seal of every open extent, a snapshot taken and
@@ -138,14 +196,7 @@ fn a_held_heads_image_built_over_changes_is_the_image_it_was_held_at() {
   let epoch = vol.hold_head().unwrap();
   assert_eq!(epoch.0, reference.epoch, "the held epoch is the head's");
   let mut imaging = vol.begin_held_image(&held_store, None).unwrap();
-  let mut held: BTreeMap<
-    u64,
-    (
-      u64,
-      Vec<slates_vfs::content::Extent>,
-      Option<(u64, Vec<u8>)>,
-    ),
-  > = BTreeMap::new();
+  let mut held: BTreeMap<u64, HeldFile> = BTreeMap::new();
   let mut snapshot = Some(first);
   let mut round = 0;
   loop {
@@ -182,52 +233,13 @@ fn a_held_heads_image_built_over_changes_is_the_image_it_was_held_at() {
     reference.inodes.len(),
     "every inode the head held is imaged"
   );
-  // Every field but the inodes' bodies is the reference's; a body differs only where a copy-up or the idle sweep sealed
-  // the held version's open extent in place (A-170 rewrites the old record so every view sees the seal), and then it
-  // names the sealed chunks where the reference named the open extent: the same bytes, checked below.
-  let mut sealed_in_place = 0;
-  for (held_inode, then) in image.inodes.iter().zip(&reference.inodes) {
-    let (mut a, mut b) = (held_inode.clone(), then.clone());
-    if a.body != b.body {
-      let opened_then = matches!(b.body, BodyImage::Chunked { open: Some(_), .. });
-      let sealed_now = matches!(a.body, BodyImage::Chunked { open: None, .. });
-      assert!(
-        opened_then && sealed_now,
-        "inode {}'s body differs other than by a seal in place: held {:?}, then {:?}",
-        a.no,
-        a.body,
-        b.body
-      );
-      sealed_in_place += 1;
-      a.body = BodyImage::Empty;
-      b.body = BodyImage::Empty;
-    }
-    assert!(a == b, "inode {} is imaged as it was held", a.no);
-  }
-  let (mut header, mut header_then) = (image.clone(), reference.clone());
-  header.inodes.clear();
-  header_then.inodes.clear();
-  assert!(
-    header == header_then,
-    "the held image's fields are the head's when it was held"
-  );
+  let sealed_in_place = imaged_as_held(&image, &reference);
   println!("{sealed_in_place} held versions' open extents were sealed in place between steps");
   for no in &files {
-    let (size, extents, open) = held
+    let file = held
       .get(&no.0)
       .expect("every file was handed with its image");
-    let mut bytes = vec![0u8; usize::try_from(*size).unwrap()];
-    for extent in extents {
-      held_store
-        .content
-        .read_extent_into(extent, 0, &mut bytes)
-        .expect("a held extent stays readable through every change");
-    }
-    if let Some((at, open)) = open {
-      let at = usize::try_from(*at).unwrap();
-      let end = (at + open.len()).min(bytes.len());
-      bytes[at..end].copy_from_slice(&open[..end - at]);
-    }
+    let bytes = held_bytes(&held_store, file);
     assert_eq!(
       &bytes,
       bytes_then.get(&no.0).unwrap(),
