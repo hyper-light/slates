@@ -18,6 +18,7 @@ use super::{
   CLIENT_CHANNEL, CLIENT_PACKET, CLIENT_WINDOW, HELD_SEED, HOST_SEED, ONE_SEAT, Peer, ROOM_BYTES,
   TICK_NS, Transcript, blob, put_string, query, send_data, sign, transcript,
 };
+use crate::config::GIT_KEEPALIVE_NS;
 use crate::daemon::observe_first;
 use crate::git_push::tests::{chain, files, git_repository, gits_report, owner, text};
 use crate::git_push::{ReceivePack, Unpresented};
@@ -71,12 +72,16 @@ impl KeyHolders for OwnerKeys {
 /// The edge's production site: the owner's key, repositories found on the shard's own partition as the HTTP edge finds
 /// them, and the services the daemon's sites run: upload-pack lent each store from A-662's map ([`ShardStores`], A-682),
 /// `serve --stdio` each served view ([`ServedViews`], A-680 part 2a), and each push lent the state of the shard the
-/// connection runs on ([`ThisShard`]) and admitted [`ROOM`].
-fn site_within(room: u64) -> ToolSite<OwnerKeys, ShardRepositories, DaemonServices> {
+/// connection runs on ([`ThisShard`]) and admitted [`ROOM`]; git's keepalive written after `keepalive_ns` of a silent
+/// fetch answer.
+fn site_within(
+  room: u64,
+  keepalive_ns: u64,
+) -> ToolSite<OwnerKeys, ShardRepositories, DaemonServices> {
   ToolSite::new(
     OwnerKeys,
     ShardRepositories,
-    ToolServices::new(ShardStores, ServedViews, ThisShard, room),
+    ToolServices::new(ShardStores, ServedViews, ThisShard, room).with_git_keepalive(keepalive_ns),
   )
 }
 
@@ -87,11 +92,15 @@ type DaemonServices = ToolServices<ShardStores, ServedViews, ThisShard>;
 /// the repository, the listener's address, and the advertisement the driver makes the owner now (git's refs in the
 /// repository, none yet, under this server's capabilities).
 fn serving(state: &mut ShardState) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
-  serving_within(state, ROOM)
+  serving_within(state, ROOM, GIT_KEEPALIVE_NS)
 }
 
-/// [`serving`], each request admitted `room`.
-fn serving_within(state: &mut ShardState, room: u64) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
+/// [`serving`], each request admitted `room`, git's keepalive written after `keepalive_ns` of a silent fetch answer.
+fn serving_within(
+  state: &mut ShardState,
+  room: u64,
+  keepalive_ns: u64,
+) -> (RepositoryId, SocketAddrV4, Vec<u8>) {
   let repository = git_repository(state, NAME);
   let mut advertised = Vec::new();
   ReceivePack::start(
@@ -111,7 +120,7 @@ fn serving_within(state: &mut ShardState, room: u64) -> (RepositoryId, SocketAdd
       .expect("the shard's thread")
       .expect("the edge's state kept on its shard");
   slates_rt::futures::spawn(async move {
-    let _ = serve(listener, edge, move || site_within(room)).await;
+    let _ = serve(listener, edge, move || site_within(room, keepalive_ns)).await;
   })
   .and_then(slates_rt::futures::detach)
   .expect("the listener's task");
@@ -339,7 +348,9 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
     LONG_HISTORY, fetch_of, fetched_pack, ids_in, long_history, packets_from,
   };
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
-  let (_, address, _) = observe_first(&daemon, |state| serving_within(state, REQUEST_ROOM));
+  let (_, address, _) = observe_first(&daemon, |state| {
+    serving_within(state, REQUEST_ROOM, GIT_KEEPALIVE_NS)
+  });
   let (request, last) = long_history(LONG_HISTORY);
   let pushed = pushed_patiently(address, &request);
   let fetched = fetched_over_ssh(address, &fetch_of(last));
@@ -362,6 +373,54 @@ fn a745_a_long_historys_clone_over_ssh_is_answered_within_one_requests_room() {
     u64::try_from(pack.len()).unwrap_or(u64::MAX) > REQUEST_ROOM,
     "a pack of {} bytes",
     pack.len()
+  );
+}
+
+/// A-722's keepalive on the fetch over SSH (the HTTP edge's since 2ab402b95; GAPS: the SSH edge's upload wrote none, its
+/// answer silent from its `packfile` section's head until its pack's first packet while the objects were chosen; git's
+/// upload-pack writes `0005\1` while `pack-objects` is silent, git 2.50.1's `create_pack_file`). Do: on an audit
+/// daemon's shard, serve the SSH edge with the production site, git's keepalive interval none; push a history of
+/// `vcs_http::daemon_edge_tests::KEPT_ALIVE_HISTORY` commits over SSH; then clone it over SSH at protocol v2 (a `fetch`
+/// of its last commit with `done`, then a flush). Expect: both sessions exit 0; the answer after the advertisement a
+/// `packfile` section whose first packet is git's keepalive (an empty band-1 packet), its pack whole after the
+/// keepalives, every object pushed.
+#[test]
+fn a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen() {
+  use crate::vcs_http::daemon_edge_tests::{
+    KEPT_ALIVE_HISTORY, OPENING_SHOWN, fetch_of, fetched_pack, ids_in, long_history, packets_from,
+  };
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (_, address, _) = observe_first(&daemon, |state| serving_within(state, ROOM, 0));
+  let (request, last) = long_history(KEPT_ALIVE_HISTORY);
+  let pushed = pushed_patiently(address, &request);
+  let fetched = fetched_over_ssh(address, &fetch_of(last));
+  daemon.stop();
+  assert_eq!(pushed.map(|transcript| transcript.status), Some(Some(0)));
+  let fetched = fetched.expect("the clone's session");
+  assert_eq!(
+    fetched.status,
+    Some(0),
+    "{}",
+    String::from_utf8_lossy(&fetched.err)
+  );
+  let (_, advertised_end) = packets_from(&fetched.out, 0);
+  let answer = fetched.out.get(advertised_end..).unwrap_or_default();
+  let (lines, _) = packets_from(answer, 0);
+  let opening: Vec<&[u8]> = lines
+    .iter()
+    .take(2)
+    .map(|line| {
+      line
+        .get(..line.len().min(OPENING_SHOWN))
+        .unwrap_or_default()
+    })
+    .collect();
+  assert_eq!(opening, [b"packfile\n".as_slice(), [1].as_slice()]);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(answer)).len(),
+    ids_in(pushed_pack).len()
   );
 }
 
