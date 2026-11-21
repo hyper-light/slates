@@ -4209,14 +4209,17 @@ pub(crate) fn make_whole(state: &mut ShardState, record: &RepositoryRecord) {
 /// in, as a push's work is built from it, handed over rather than returned so a view borrowing the shard's state
 /// outlives nothing. For git, the push's own view over an empty push (`PushedObjects`), which reads every object from
 /// the repository's committed index once the push that brought them landed: the objects the eager create's build read
-/// from the same index and the push's quarantine. None for another tool's repository, or a store not held here, whose
-/// owing green answers its readers `ContentUnavailable`. Whether there were any.
+/// from the same index and the push's quarantine. Its caller lends the stores room and the shard's chunk store first
+/// (`vcs_store::with_room`), as a push's build has them: the pack's windows are read from that chunk store, and its
+/// parses are admitted the lent room. None for another tool's repository, or a store not held here, whose owing green
+/// answers its readers `ContentUnavailable`. Whether there were any.
 pub(crate) fn with_owed_push_objects(
   state: &crate::state::ShardState,
   repository: Option<RepositoryId>,
   read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
 ) -> bool {
-  let Some((content, git)) = repository.and_then(|repository| state.vcs_stores.git_ref(repository)) else {
+  let Some((content, git)) = repository.and_then(|repository| state.vcs_stores.git_ref(repository))
+  else {
     return false;
   };
   let empty = Push::new(git.repository.format());

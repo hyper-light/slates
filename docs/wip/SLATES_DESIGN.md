@@ -59370,3 +59370,48 @@ Applied in the same change to:
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
 
+
+### A-820 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
+Applied in the same change to:
+- `crates/git/src/receive/works.rs`: a create builds nothing; its entry carries the push it owes (`DeferredPush`),
+  based at the new green's version 0; a create's turn reaches the greens its verdict will read.
+- `crates/server/src/git_push.rs`: `created` answers `BranchChange::CreateDeferred`, or `BranchChange::UpdateDeferred`
+  for the unborn default branch; `ShardGreens` notes the first green it reached that owes its push; a command's build
+  turn, and a delete, wait at the door for it.
+- `crates/server/src/repository/push.rs`: `BranchChange::UpdateDeferred` (`Step::Defer`, `plan_update_deferred`),
+  counted `repository.push.updates_deferred`.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects` answers git's objects (`PushedObjects` over an empty push).
+- `crates/server/src/green_ready.rs`: a materialization's turn reads with the stores lent room and the shard's chunk
+  store (`vcs_store::with_room`); the door reaches a `CreateBranch`'s source green; test-only `make_building_now` and
+  `made_now`.
+- GAPS (A-812).
+
+- **Why.** git/git's history push made 1,027 greens of a 4,876-file tree, each composed whole at the push, and its
+  unborn `master` built whole in one step: the push could not land (main's ruling, P2: a created ref's green is
+  unmaterialized, its paths derived on first read; uniform, no tag special case).
+- **What.**
+  - A git create's verdict names the push its green owes, `DeferredPush::of` the push the eager create built, rebased
+    to version 0, since the new green holds the version it is made at as its own version 0. The push's append makes
+    the green owing (A-812). The unborn default branch's first push is an update that defers
+    (`BranchChange::UpdateDeferred`): its green is already named, so its next version is the push's record, planned and
+    committed the way a deferred create's version 1 is, and replayed the same.
+  - A materialization reads git's objects from the repository's committed index through the push's own view. The pack's
+    windows live in the shard's chunk store, which a read reaches only while it is lent, so the door's turn reads with
+    the stores lent (found by the red: the build was refused `Object Malformed`, the pack read `Unread { at: 166 }`).
+  - A push reaches greens only through the door. `ShardGreens` lends no owing green and notes the first it met (its
+    `lent` and its branch check); the command's turn starts that green's materialization (`green_ready`) and waits a
+    turn at a time, not counted as a build turn, until it is made, then judges. A create's turn reaches the ref's own
+    green and the one it would be made at; a delete reaches its own.
+  - A `CreateBranch` request made from a green that owes its push parks at the door like any request on such a green.
+- **Evidence.**
+  - `t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`: 1,500 files; the push takes at
+    most its command's one turn (red on main: 14,273 quanta, the green holding the tree at once), the green owes,
+    `repository.push.updates_deferred` 1; reached, it is made once (`merge.green.materialized` 1) and holds every file.
+  - `t_p2_a_created_branch_and_tag_owe_one_push_across_a_replay_and_are_made_as_the_eager_create`: `refs/tags/v1` and
+    `copy` owe at version 0; a replay before and after the live green is made holds the same head and the same owed
+    push's record byte for byte; made, each holds the second commit's text at version 1.
+  - The A-654, A-743, A-753 and A-238 tests read created greens through the door and pass unchanged in what they
+    assert; A-238's creates are followed by updates, whose works now fill the chains.
+- **Owed** (GAPS, A-812): a push waiting on a green whose materialization is refused retries it each turn; a replayed
+  owing green made over a restarted node's shares (the restart test); git/git's push landing (the red) and the A/B
+  against stock git's 10.77 s.

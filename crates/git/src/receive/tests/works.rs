@@ -274,16 +274,19 @@ fn pushed(served: &mut Served, bytes: &[u8], logs: &mut Logs) -> Received {
     .iter()
     .filter_map(|entry| match entry {
       Entry::Create { from, push, .. } => {
-        let base = if from.is_some() {
-          &served.green
-        } else {
-          &empty
+        // The made green holds `from`'s version as its own version 0, so the push is based there; here, built over
+        // `from` itself at that version.
+        let (base, push) = match from {
+          Some((_, version)) => (
+            &served.green,
+            work::Push {
+              base_version: *version,
+              ..push.push()
+            },
+          ),
+          None => (&empty, push.push()),
         };
-        Some(
-          work::build(&push.push(), base, &objects, ROOM)
-            .unwrap()
-            .increment,
-        )
+        Some(work::build(&push, base, &objects, ROOM).unwrap().increment)
       }
       _ => None,
     })
