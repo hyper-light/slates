@@ -8009,7 +8009,7 @@ mod tests {
     };
     assert_eq!((version, sequence), (5, 1));
     // The store's log, read back from its files: the creation, then the push as one changeset.
-    store.stop();
+    store.stop_owner();
     let dir = store.dir().to_path_buf();
     let log_file = hyper_block::file::DeviceFile::adopt(
       crate::test_store::root(&dir)

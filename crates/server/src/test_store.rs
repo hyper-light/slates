@@ -34,7 +34,7 @@ impl TestStore {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dir = dir.canonicalize().unwrap();
-    let owner = StoreOwner::start(root(&dir), sizing(), WAITING).unwrap();
+    let owner = StoreOwner::start(root(&dir), SIZING, WAITING).unwrap();
     TestStore {
       dir,
       owner: Some(owner),
@@ -51,17 +51,18 @@ impl TestStore {
     &self.dir
   }
 
-  /// Stops the owner, so the store can be read back from its files ([`root`], [`sizing`]).
-  pub(crate) fn stop(&mut self) {
+  /// Stops the owner, so the store can be read back from its files ([`root`], [`SIZING`]); every handle let go first (a
+  /// daemon holding one stopped), or the owner never ends.
+  pub(crate) fn stop_owner(&mut self) {
     if let Some(owner) = self.owner.take() {
       owner.stop().unwrap();
     }
   }
 
   /// Starts an owner over the same directory again (a node's restart), stopping the one serving first.
-  pub(crate) fn restart(&mut self) {
-    self.stop();
-    self.owner = Some(StoreOwner::start(root(&self.dir), sizing(), WAITING).unwrap());
+  pub(crate) fn restart_owner(&mut self) {
+    self.stop_owner();
+    self.owner = Some(StoreOwner::start(root(&self.dir), SIZING, WAITING).unwrap());
   }
 }
 
@@ -86,11 +87,9 @@ pub(crate) fn root(dir: &Path) -> StoreRoot {
 }
 
 /// Shape: a test's store as the daemon sizes one (a memtable of one trunk node: eight 64 KiB extents), 1 GiB of disk.
-pub(crate) fn sizing() -> Sizing {
-  Sizing {
-    memory: 512 << 10,
-    disk: 1 << 30,
-    extent_bytes: 64 << 10,
-    fanout: 8,
-  }
-}
+pub(crate) const SIZING: Sizing = Sizing {
+  memory: 512 << 10,
+  disk: 1 << 30,
+  extent_bytes: 64 << 10,
+  fanout: 8,
+};

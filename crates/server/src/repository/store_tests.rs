@@ -8,7 +8,7 @@ use slates_land::store_root::StoreRoot;
 use slates_store::log::{ChangesetLog, SectionKind, Tool};
 use slates_store::store::{LOG_FILE, Store};
 
-use crate::test_store::{TestStore, root, sizing};
+use crate::test_store::{SIZING, TestStore, root};
 use crate::{Daemon, SegmentSource};
 
 /// Shape: the daemon's shards.
@@ -54,7 +54,7 @@ fn creation_recovered(dir: &std::path::Path) {
   let record = String::from_utf8(record).unwrap();
   assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
   drop(log);
-  let mut reopened = Store::open(root(dir), sizing()).unwrap();
+  let mut reopened = Store::open(root(dir), SIZING).unwrap();
   let rows = reopened.changesets(creation.header.repository, 0, 10).unwrap();
   assert_eq!(rows.len(), 1);
   assert_eq!(rows[0].identity, creation.identity);
@@ -94,7 +94,7 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   });
   assert_eq!(unlanded, 0, "the store refused the creation");
   daemon.stop();
-  store.stop();
+  store.stop_owner();
 
   creation_recovered(&dir);
 }
@@ -176,7 +176,7 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
     .recv_timeout(std::time::Duration::from_secs(60))
     .expect("the landing answered");
   daemon.stop();
-  store.stop();
+  store.stop_owner();
   assert_eq!(landed, Some(Ok(1)));
 
   let log_file = hyper_block::file::DeviceFile::adopt(
@@ -324,8 +324,8 @@ fn a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_it
   });
   let created = created.expect("the retry created the repository");
   daemon.stop();
-  store.stop();
-  let mut reopened = Store::open(root(&dir), sizing()).unwrap();
+  store.stop_owner();
+  let mut reopened = Store::open(root(&dir), SIZING).unwrap();
   let rows = reopened
     .changesets(u128::from_be_bytes(created.bytes), 0, 10)
     .unwrap();
@@ -383,9 +383,9 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
   assert!(!matches!(first, ReplyBody::Refused { .. }), "{first:?}");
   wait_for(&daemon, partition, super::CREATION_KILLED, 1);
   daemon.stop();
-  store.stop();
+  store.stop_owner();
 
-  store.restart();
+  store.restart_owner();
   let daemon = start(&store);
   // The same partition, so the new id is minted from the same counter the killed creation's was.
   let second = crate::daemon::observe_at(&daemon, partition, move |state| {
@@ -408,7 +408,7 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
   })
   .expect("the second creation recorded");
   daemon.stop();
-  store.stop();
+  store.stop_owner();
 
   // Non-vacuity: the restarted node minted the killed creation's id again, so the log holds two changesets 0 of it.
   let log_file = hyper_block::file::DeviceFile::adopt(
@@ -429,7 +429,7 @@ fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset(
   .unwrap();
   drop(log);
   assert_eq!(at_zero, 2, "the orphan and the new creation share the id");
-  let mut reopened = Store::open(root(&dir), sizing()).unwrap();
+  let mut reopened = Store::open(root(&dir), SIZING).unwrap();
   let rows = reopened
     .changesets(u128::from_be_bytes(created.bytes), 0, 10)
     .unwrap();
