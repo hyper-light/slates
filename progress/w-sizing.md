@@ -73,6 +73,13 @@
   1,622 (content object 259 MiB kept, RSS 1,362 kept). Fix d0f3199f9: slates_mem::extent_handoff/make_extent; pool
   makes own slice's extents at start, maps by name, release unlinks + remakes empty; daemon unlinks every extent name
   when the anchor is gone. mem shared:: 6/6 local. Green run r22 queued.
+- GREEN r22 (adas-macbook-pro-2, quiet): 256 MiB burst: pool 420 -> 1,648 -> 123 MiB after destroy (content object
+  2 -> 0 MiB). (d) r24 (big Studio): cli killed-anchor (incl. extents), locked-volume SIGKILL-daemon restart byte for
+  byte, anchor-supervises, recovery acknowledged-content restart: all ok; fmt clean. (a) provision A/B r25 (A=1b63ab896
+  base, B=3f24e4fea) queued -- the last gate before landing A-789 (claimed). Docs drafted in the worktree.
+- g226's Linux/Windows give-back numbers: inbox/w-sizing-from-g226-giveback.md. Linux: one memfd + punch (keep);
+  Windows: section per extent (decommit refused, discard per process, commit only back at close). Asked g226 to land
+  them in BENCHMARKS as "Content give-back per platform"; told g226 its status residency reads 0 on macOS.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
