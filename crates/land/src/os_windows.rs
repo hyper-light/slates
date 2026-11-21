@@ -1536,3 +1536,187 @@ impl LandFs for OsLand {
     flush_dir(self.dir(dir)?)
   }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The version-control store's directory (`crate::store_root`, A-767; the store's Windows lane): the same contract as the
+// Unix `openat` side, every verb a single name relative to the granted directory's handle.
+
+/// Format: a store file's access: read and written in place (positioned I/O through `FileExt`), flushed
+/// (`FlushFileBuffers` needs a handle that may write), waited on synchronously.
+const STORE_FILE_ACCESS: u32 =
+  windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE;
+/// Format: a name looked up for its existence alone: its attributes read, nothing of its data.
+const LOOKUP_ACCESS: u32 = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+/// Format: `ERROR_DIRECTORY` (winerror.h, 267): "The directory name is invalid", what a mount point that is not a
+/// directory is refused with, as `ENOTDIR` refuses it on Unix.
+pub(crate) const STORE_NOT_A_DIRECTORY: u32 = 267;
+/// Format: `ERROR_FILE_NOT_FOUND` (winerror.h, 2), a refusal that named no code of its own.
+const STORE_NOT_FOUND: u32 = 2;
+/// Format: `ERROR_ACCESS_DENIED` (winerror.h, 5): a store file that is a link or a junction, never followed.
+const STORE_REPARSE_REFUSED: u32 = 5;
+
+/// The granted directory at `path`, walked from its drive's root with every component opened
+/// `FILE_OPEN_REPARSE_POINT` (links and junctions refused, `slates_base::walk_dir`) and owned by this process's user
+/// (compared by SID, [`owned_by_this_user`]): its handle and the key it is named under.
+pub(crate) fn store_dir(path: &Path) -> Result<(OwnedHandle, String), TargetRefusal> {
+  let dir = walk_target(path)?;
+  Ok((dir, key_of(path)))
+}
+
+/// The directory's identity: its volume's serial number and its 128-bit file id (`GetFileInformationByHandleEx`,
+/// `FileIdInfo`), so a directory replaced at the same path is another one. The id is folded to the identity's 64 bits by
+/// its two halves' exclusive or: NTFS's ids fit the low half (the high is zero, the fold is the id itself); ReFS uses all
+/// 128.
+pub(crate) fn store_identity(dir: BorrowedHandle<'_>) -> Result<(u64, u64), HostError> {
+  let mut info = windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO::default();
+  let size = u32::try_from(size_of_val(&info)).unwrap_or(0);
+  // SAFETY: `dir` is open for the call; `info` is a writable record of the class named, of the size passed.
+  let ok = unsafe {
+    GetFileInformationByHandleEx(
+      dir.as_raw_handle().cast(),
+      windows_sys::Win32::Storage::FileSystem::FileIdInfo,
+      (&raw mut info).cast(),
+      size,
+    )
+  };
+  if ok == 0 {
+    return Err(last_refusal());
+  }
+  let id = info.FileId.Identifier;
+  let low = u64::from_le_bytes(
+    id.get(..8)
+      .and_then(|b| b.try_into().ok())
+      .unwrap_or([0; 8]),
+  );
+  let high = u64::from_le_bytes(
+    id.get(8..)
+      .and_then(|b| b.try_into().ok())
+      .unwrap_or([0; 8]),
+  );
+  Ok((info.VolumeSerialNumber, low ^ high))
+}
+
+/// Creates the file `name` in `dir`, new and empty, for reading and writing (`FILE_CREATE`: refused when the name
+/// exists, a link or junction there included), and makes its name durable: the directory flushed (`flush_dir`).
+pub(crate) fn store_create(dir: BorrowedHandle<'_>, name: &str) -> Result<OwnedHandle, HostError> {
+  let file = nt_create(
+    dir,
+    name,
+    STORE_FILE_ACCESS,
+    nt::FILE_CREATE,
+    nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+    FILE_ATTRIBUTE_NORMAL,
+  )?;
+  flush_dir(dir)?;
+  Ok(file)
+}
+
+/// Opens the existing file `name` in `dir` for reading and writing, the name itself (`FILE_OPEN_REPARSE_POINT`): a link
+/// or a junction under the name is refused, never followed.
+pub(crate) fn store_open(dir: BorrowedHandle<'_>, name: &str) -> Result<OwnedHandle, HostError> {
+  let file = nt_create(
+    dir,
+    name,
+    STORE_FILE_ACCESS,
+    nt::FILE_OPEN,
+    nt::FILE_NON_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+    0,
+  )?;
+  if attributes(file.as_handle())?
+    & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+    != 0
+  {
+    return Err(code_refusal(STORE_REPARSE_REFUSED));
+  }
+  Ok(file)
+}
+
+/// Whether the name `name` exists in `dir`, the name itself, never through a link.
+pub(crate) fn store_exists(dir: BorrowedHandle<'_>, name: &str) -> Result<bool, HostError> {
+  match nt_create(
+    dir,
+    name,
+    LOOKUP_ACCESS,
+    nt::FILE_OPEN,
+    nt::FILE_OPEN_REPARSE_POINT,
+    0,
+  ) {
+    Ok(_) => Ok(true),
+    Err(HostError::NotFound) => Ok(false),
+    Err(other) => Err(other),
+  }
+}
+
+/// The bytes free to this process on `dir`'s volume (`FileFsFullSizeInformation`: the allocation units available to the
+/// caller, its quota applied, times the unit's sectors and the sector's bytes).
+pub(crate) fn store_free_bytes(dir: BorrowedHandle<'_>) -> Result<u64, HostError> {
+  let mut size = windows_sys::Wdk::System::SystemServices::FILE_FS_FULL_SIZE_INFORMATION::default();
+  let mut status_block = windows_sys::Win32::System::IO::IO_STATUS_BLOCK::default();
+  let length =
+    u32::try_from(size_of_val(&size)).map_err(|_| code_refusal(ERROR_FILENAME_EXCED_RANGE))?;
+  // SAFETY: `dir` is open for the call; `size` is a writable record of the class asked, of the length passed, and
+  // `status_block` a writable status record.
+  let status = unsafe {
+    nt::NtQueryVolumeInformationFile(
+      dir.as_raw_handle().cast(),
+      &mut status_block,
+      (&raw mut size).cast(),
+      length,
+      nt::FileFsFullSizeInformation,
+    )
+  };
+  if status < 0 {
+    return Err(status_refusal(status));
+  }
+  let units = u64::try_from(size.CallerAvailableAllocationUnits).unwrap_or(0);
+  Ok(
+    units
+      .saturating_mul(u64::from(size.SectorsPerAllocationUnit))
+      .saturating_mul(u64::from(size.BytesPerSector)),
+  )
+}
+
+/// The directory `name` in `dir`, made empty where missing (its name made durable), kept where it is already a
+/// directory and no reparse point; anything else under the name is refused [`STORE_NOT_A_DIRECTORY`].
+pub(crate) fn store_mount_point(dir: BorrowedHandle<'_>, name: &str) -> Result<(), HostError> {
+  match nt_create(
+    dir,
+    name,
+    MADE_DIR_ACCESS,
+    nt::FILE_CREATE,
+    nt::FILE_DIRECTORY_FILE | nt::FILE_OPEN_REPARSE_POINT,
+    FILE_ATTRIBUTE_DIRECTORY,
+  ) {
+    Ok(_) => flush_dir(dir),
+    Err(HostError::Exists(_)) => {
+      let found = nt_create(
+        dir,
+        name,
+        LOOKUP_ACCESS,
+        nt::FILE_OPEN,
+        nt::FILE_OPEN_REPARSE_POINT,
+        0,
+      )?;
+      let word = attributes(found.as_handle())?;
+      let directory = word & FILE_ATTRIBUTE_DIRECTORY != 0;
+      let reparse =
+        word & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0;
+      if directory && !reparse {
+        Ok(())
+      } else {
+        Err(code_refusal(STORE_NOT_A_DIRECTORY))
+      }
+    }
+    Err(other) => Err(other),
+  }
+}
+
+/// A store verb's refusal as the Win32 code it carries, or the one its kind stands for.
+pub(crate) fn store_code(error: &HostError) -> i32 {
+  let code = match (error, error.code()) {
+    (_, Some(OsCode::Win32(code))) => code,
+    (HostError::NotDirectory, _) => STORE_NOT_A_DIRECTORY,
+    _ => STORE_NOT_FOUND,
+  };
+  i32::try_from(code).unwrap_or(i32::MAX)
+}
