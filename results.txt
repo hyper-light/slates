@@ -1,0 +1,45 @@
+runner 4 cores, 15 GiB, load 1.20 0.32 0.11 4/270 2301
+arm split = 63d19f184
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 7m 04s
+[1m[92m  Executable[0m tests/live_fleet.rs (../t-split/release/deps/live_fleet-1db8d50c5882a503)
+split /home/runner/work/slates/arm-split/../t-split/release/deps/live_fleet-1db8d50c5882a503
+== round 1 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.37 2.10 1.19
+exit 0
+  live  p50 165.0 p99 483.5 p999 1993.6 max 2997.8 us
+  added at p50 128.8 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(800.0), Some(380.0)), (Some(340.0), Some(340.0)), (Some(350.0), Some(360.0))]; plain statuses asked during the stream 0
+  the owner: build 57.5, to_control 11.9, lane 1.0, exchange 69.0, to_owner 4.0, round 143.4, reply 57.3, reply_wake 49.5, reply_poll 6.3, reply_tail 1.5, hold.declined=44, hold.answer=2054, hold.exchange=3686, hold.dispatches=2267, fold=2050, placement=1
+  candidate 1: holder 11.9, hold.declined=7, hold.entries=1305
+  candidate 2: holder 12.4, hold.declined=18, hold.entries=1847
+== round 2 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.37 2.10 1.19
+exit 0
+  live  p50 165.7 p99 309.6 p999 966.5 max 2685.3 us
+  added at p50 129.0 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(370.0), Some(360.0)), (Some(740.0), Some(350.0)), (Some(330.0), Some(330.0))]; plain statuses asked during the stream 0
+  the owner: build 55.1, to_control 11.2, lane 1.0, exchange 67.7, to_owner 3.8, round 138.7, reply 57.3, reply_wake 49.5, reply_poll 6.3, reply_tail 1.5, hold.declined=23, hold.answer=2052, hold.exchange=3619, hold.dispatches=2359, fold=2050, placement=1
+  candidate 0: holder 11.9, hold.entries=1897
+  candidate 2: holder 10.6, hold.declined=1, hold.entries=1150
+== round 3 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.37 2.10 1.19
+exit 0
+  live  p50 156.4 p99 390.9 p999 781.2 max 999.8 us
+  added at p50 120.0 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(280.0), Some(300.0)), (Some(770.0), Some(360.0)), (Some(350.0), Some(350.0))]; plain statuses asked during the stream 0
+  the owner: build 57.6, to_control 10.7, lane 1.1, exchange 69.2, to_owner 3.9, round 142.5, reply 57.7, reply_wake 49.5, reply_poll 6.5, reply_tail 1.7, hold.declined=3, hold.answer=2051, hold.exchange=3950, hold.dispatches=1977, fold=2050, placement=1
+  candidate 0: holder 14.4, hold.declined=27, hold.entries=1861
+  candidate 2: holder 12.5, hold.declined=6, hold.entries=1784
+== round 4 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.26 2.07 1.19
+exit 0
+  live  p50 172.7 p99 375.5 p999 1788.0 max 2867.6 us
+  added at p50 136.5 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(320.0), Some(330.0)), (Some(380.0), Some(380.0)), (Some(810.0), Some(390.0))]; plain statuses asked during the stream 0
+  the owner: build 46.7, to_control 11.5, lane 0.9, exchange 71.8, to_owner 4.1, round 135.0, reply 57.1, reply_wake 49.4, reply_poll 6.3, reply_tail 1.4, hold.answer=2052, hold.exchange=3608, hold.dispatches=2280, fold=2050, placement=1
+  candidate 0: holder 13.6, hold.declined=226, hold.entries=1158
+  candidate 1: holder 13.0, hold.entries=1892
+== round 5 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.26 2.07 1.19
+exit 0
+  live  p50 154.0 p99 435.9 p999 1073.1 max 3214.7 us
+  added at p50 118.9 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(310.0), Some(300.0)), (Some(750.0), Some(360.0)), (Some(310.0), Some(310.0))]; plain statuses asked during the stream 0
+  the owner: build 61.0, to_control 10.7, lane 0.9, exchange 69.7, to_owner 3.8, round 146.1, reply 57.0, reply_wake 49.5, reply_poll 6.1, reply_tail 1.5, hold.declined=20, hold.answer=2053, hold.exchange=3474, hold.dispatches=2027, fold=2050, placement=1
+  candidate 0: holder 17.5, hold.entries=1910
+  candidate 2: holder 12.5, hold.entries=1292
