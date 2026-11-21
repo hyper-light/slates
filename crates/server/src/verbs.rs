@@ -9089,6 +9089,24 @@ fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option
   })
 }
 
+/// The post-state's length: past the last laid byte of a content, xattr or node op.
+fn post_state_size(doc: &slates_merge::ops_doc::OpsDoc) -> u64 {
+  use slates_merge::ops_doc::OpKind;
+  doc
+    .ops
+    .iter()
+    .filter(|op| {
+      op.src != u64::MAX
+        && matches!(
+          op.kind,
+          OpKind::Overwrite | OpKind::Insert | OpKind::Extend | OpKind::SetXattr | OpKind::Mknod
+        )
+    })
+    .map(|op| op.src.saturating_add(op.len))
+    .max()
+    .unwrap_or(0)
+}
+
 /// Assembles an increment's post-state from a work's content and journal (§4.16): the deriver lays the runs its
 /// content ops add out compactly, then the extended-attribute values and the special nodes, and each such op names
 /// its slice (`slates_merge::increment::compose_volume_planned`). A content op copies `len` bytes of its file from
@@ -9110,15 +9128,7 @@ fn assemble_post_state(
   use slates_merge::ops_doc::OpKind;
   let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
-  let mut size = 0u64;
-  for op in &doc.ops {
-    if op.src != u64::MAX
-      && (is_file_content(op.kind) || matches!(op.kind, OpKind::SetXattr | OpKind::Mknod))
-    {
-      size = size.max(op.src.saturating_add(op.len));
-    }
-  }
-  let mut post = vec![0u8; usize::try_from(size).unwrap_or(0)];
+  let mut post = vec![0u8; usize::try_from(post_state_size(doc)).unwrap_or(0)];
   for op in &doc.ops {
     if op.src == u64::MAX {
       continue;
