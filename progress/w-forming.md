@@ -1,3 +1,10 @@
+# STATUS 2026-11-20 ~17:30 (w-forming), Goal 85b under Ada's close order. C1 CLOSED 95adf9632, R2 CLOSED c922a41d1
+# (inbox/main-from-w-forming-close.md). C3 the chaos run: kiln r3 (macos/arm64; .git/w-forming-ab/c3.sh: nemesis x3,
+# replicas offline x3, volume failure x3, client disconnect) QUEUED -- fleet saturated. P4: delta reads sliced
+# (c9e00c01b); image: debug unit split 0.31 ms image + 0.28 ms encode for 311 inodes / 55 KB; release probe kiln r5
+# QUEUED; the hold across turns needs a CoW reader-epoch amendment (asked main, no ruling yet). Piece-4 A/B kiln r2 QUEUED.
+# Finding to GAPS (c9c9554d8): fleet a_live_whole_entry_is_sealed_in_turns... fails on main under load.
+
 # STATUS 2026-11-20 evening (w-forming), main's 15:20 list: (1) flake LANDED c922a41d1 (poll_for_live_periods; the
 # test is A-351's, not mine); (2) greens LANDED 95adf9632; (3a) delta capture in turns LANDED c9e00c01b; (3b) image
 # slicing needs a CoW reader-epoch amendment -- asked main; (4) release A/B running on kiln (run r1, linux/amd64,

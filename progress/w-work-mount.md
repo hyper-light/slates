@@ -83,3 +83,8 @@ mount; only NFS/FUSE lend the tree (WinFsp, virtio-fs, fs verbs refuse typed); g
 re-landing a green into a target holding an earlier landing conflicts on changed files (needs witnesses); the views'
 tree loads in one step (slice owed).
 Lessons: never build two worktrees into one target dir (poisoned release artifacts); `git commit --no-gpg-sign`.
+
+## 2026-11-20 ~17:00 — Ada's close list (briefs/close-list.md) DONE
+C1 77fcae73a (FUSE+WinFsp tests written, runs in run-requests), C2 1b0f5679c, R3 9d73a77c6, R4 60a71db8a, P5 f6660f0ab +
+f401f798c. Close notes: inbox/main-from-w-work-mount-close.md. Queue empty; new findings go to GAPS only.
+Target on Studio-2 kept at ~3 GB (focused tests, CARGO_PROFILE_TEST_DEBUG=0).

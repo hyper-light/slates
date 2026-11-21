@@ -31,3 +31,9 @@ reported 24.6 s after the ask (carried 12.3 s, records placed 12.4 s, held off i
 
 **Open (not chased):** preparation is paced by the seal periods: the carry and the handoff took about 12 s each for under
 1 MB. A next piece if you want the move itself faster.
+
+**Update ~18:10 PST: kiln carries it.** kiln main 4f5e58c1b (dcbd4e0ba): vendor/patches/slates/0002 over the Slates
+kiln now takes (8ce3d615), vendor check clean. Release, kiln main 648c57184 + the patch, one Mac: the live move's first
+ask moved, reported 25.8 s after the ask (carried 13.1 s, held off its owner and frozen 25.7 s), test 67 s against 112 s.
+Also in that commit: the live-move test waits on `connected_as_is`, since `common::agents::connected` now sets the
+engine and reads `<name>-state`, which the lab's runners don't use.

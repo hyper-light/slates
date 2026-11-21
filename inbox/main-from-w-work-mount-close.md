@@ -19,4 +19,17 @@
   +0.72-0.82 MB; a mount made 9.4-12.9 ms -> 0.53-0.78 ms; presenting the green's landing +69.2-69.4 MB -> +1.5-1.8 MB.
 - Tests: crates/server/tests/mounted_work_cow.rs, crates/server/tests/green_landing_cow.rs.
 
-## Open: C1 (FUSE and WinFsp), R4 (a mount refreshes when its work's base moves) — in work now.
+## C1 a Work mounts and works through FUSE and WinFsp too — CLOSED (code); Linux/Windows runs in run-requests
+- Commit on origin/main: 77fcae73a (main 1527ecfe0). WinFsp's mount turn lends the green to a mounted work's base, as
+  NFS and FUSE do; attach makes a work's slot for every form.
+- Tests written: crates/server/tests/fuse_mount.rs `a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save`
+  (Linux, gated on fusermount3 + /dev/fuse) and crates/cli/tests/winfsp.rs
+  `a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save` (Windows, live WinFsp). Neither runs on macOS;
+  the run commands are in run-requests.md (2026-11-20, w-work-mount C1/R4). winfsp.rs is cfg(windows): not compiled here.
+
+## R4 a mount refreshes when its Work's base moves — CLOSED
+- Commit on origin/main: 60a71db8a (main 56e44c7f8).
+- Test: crates/server/tests/mounted_work.rs `a_mount_shows_its_works_new_base_once_the_base_moves` (red on 1527ecfe0:
+  another work's accepted f1 unseen through the mount after its own accept; green after).
+
+All five items (C1 C2 R3 R4 P5) are closed on origin/main.

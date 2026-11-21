@@ -90,6 +90,15 @@
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
 
+## CLOSE LIST (Ada 16:05-16:15, binding; briefs/close-list.md): C1, R2, R3 only. New findings -> GAPS + here.
+- C1 CLOSED: inbox/main-from-w-sizing-close.md (A-777 21a306a04; r6 A/B).
+- R2 (7.1 GB resident after an 84 MB push; extents made on demand): macOS extents A-789 362bd8c39 + leak A-778
+  779840fba + prefault A-777. Linux: no change needed (g226: one memfd + punch frees with peers mapped). Windows:
+  section per extent needed (only close returns commit) -- needs anchor-held per-extent handles; ask main whether R2
+  includes Windows. Measurement for the close: r30 (hg history push, before 47dc24b72 vs after 92f7a756b, RSS + status
+  split + system free after the anchor's SIGKILL) queued.
+- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md).
+
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =
    write log R/4 + images 2R + delta log R + arena R (R = reserve_per_shard = memory/shards/3) ~ 1.42 x memory, plus
