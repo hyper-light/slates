@@ -413,3 +413,5 @@
   - cli svn_interop.rs: use_slates_leg split out (11/10), plus unwrap_in_result in the harness allow.
 - Focused local: server 72, git_correctness 2. Fmt, xtask and the six cross targets were clean.
 - VCS lane: Linux r32 still running (adacachy2); Windows r31 queued, jupiter's link down. r29 waits for w-work-mount.
+- VCS lane, round at d4c7e1f42: Linux didn't run (r30 sync stuck, r32 clone broke after 66 min; in run-requests.md).
+  Windows: r31 dropped, resubmitted as r33, queued. No platform has a pass/fail count yet.

@@ -7429,3 +7429,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Platforms:** Linux (adacachy or fedora, ideally one under systemd's LimitNOFILE), Windows (jupiter).
 - **Green:** all pass; Windows' descriptor_limit line shows before = after = 16,777,216, nothing refused. **Red:** the
   Linux child refused (setrlimit past fs.nr_open) or not raised; send it to w-bugs.
+
+## 2026-11-21 w-lint: the VCS suites lane on Linux didn't run (second failure, reported per the drop rule)
+- r30 (sync from Studio-2 onto adacachy2) sat at "starting" for over an hour; stopped.
+- r32 (sync false, fresh https clone into ~/w-lint-vcs on adacachy2) ran 1h 6m and ended with "the kiln runner closed
+  the connection". The clone never finished: ~/w-lint-vcs is broken ("your current branch appears to be broken") and no
+  log was written. No test ran.
+- Owner: the runner path (kiln / adacachy2's link), not a slates test. What I need: a working clone on a Linux x86_64
+  runner, or sync that completes. Next try: next round, from a fetch into a fixed path, with --depth 1.
+- Windows r31 dropped before it started (jupiter stopped answering); I resubmitted it once as r33, which is queued.
