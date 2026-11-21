@@ -178,8 +178,15 @@
 > a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
 > the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
-> whole; a log the store does not keep (an imported repository's, until w-hg's C1 step 3) serves no stream (`1\n`,
-> which stock `hg clone --stream` takes as "operation forbidden by server").
+> whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
+> stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
+> `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
+> kept such a revision bare). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
+> stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
+> warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
+> server" (main's ruling 02:31; the stock-hg test above, and
+> `a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs`). Such a clone is a plain clone's speed.
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests

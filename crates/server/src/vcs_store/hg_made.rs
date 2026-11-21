@@ -389,6 +389,8 @@ fn recorded(
     let replaced = match stores.mercurial(repository) {
       Some((content, store)) => {
         store.made.insert(green_key(green), (version, node));
+        // A made changeset's revisions are held outside the changeset store.
+        store.unstored = true;
         core::mem::replace(&mut store.index, fork).release(content)
       }
       None => stores

@@ -5,10 +5,11 @@ use slates_db::catalog::{Principal, RepositoryId};
 use slates_hg::Admission;
 use slates_hg::import::Clock;
 use slates_hg::serve::Repository;
+use slates_hg::serve::getbundle::Store as _;
 use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, VcsTool};
 
 use super::{UNMADE, lend_in};
-use crate::hg_base::tests::{STATES, laid_out};
+use crate::hg_base::tests::{FILE_INDEX, STATES, laid_out};
 use crate::state::ShardState;
 use crate::vcs_store::hg_import::{Turned, begin, land, turn};
 use crate::verbs::dispatch;
@@ -393,6 +394,49 @@ fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
       ReplyBody::Refused {
         refusal: Refusal::NotFound
       }
+    );
+  });
+}
+
+/// Whether repository `id`'s view advertises a stream clone (`stream`/`streamreqs` in its capabilities), lent now and
+/// lent over a held generation: both, which must agree.
+fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {
+  let room = || Admission::new(ROOM);
+  let lent = lend_in(state, id, &mut room(), |view, _| view.streams()).expect("the view lent");
+  let generation = super::hold_in(state, id, &mut room()).expect("the generation held");
+  let held = super::lend_held_in(state, &generation, &mut room(), |view, _| view.streams())
+    .expect("the held view lent");
+  generation.give_back(state);
+  (lent, held)
+}
+
+/// Goal 93 perf (main's ruling of 2026-11-21 02:31). A stream clone sends each revision as the changeset store keeps it,
+/// so a repository whose history the store does not keep (an import's, until w-hg's C1 step 3 lands imports as
+/// changesets) must advertise no stream, and stock `hg clone --stream` then clones plainly with its own warning rather
+/// than abort ("operation forbidden by server"). Do: import `fileindex` (public, no secret changeset, so nothing else
+/// withholds its stream) into one Mercurial repository and push three
+/// changesets to another; ask each view, lent now and over a held generation, whether it streams. Expect the imported
+/// one not to, either way, and the pushed one to, either way.
+#[test]
+fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs() {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
+    let imported_id = created(state, "imported", VcsTool::Mercurial);
+    let (host, directory) = laid_out(FILE_INDEX.iter().copied());
+    assert_eq!(
+      begin(state, imported_id, (Box::new(host), directory)),
+      Ok(())
+    );
+    imported(state, imported_id);
+    let pushed_id = created(state, "pushed", VcsTool::Mercurial);
+    let made = crate::repository::hg_push::tests::history_of(&[
+      ("base", "a", b"a\n", None, "default"),
+      ("second", "b", b"b\n", Some(0), "default"),
+      ("third", "c", b"c\n", Some(1), "default"),
+    ]);
+    pushed(state, pushed_id, &made, &[0, 1, 2]);
+    assert_eq!(
+      (streams_of(state, imported_id), streams_of(state, pushed_id)),
+      ((false, false), (true, true))
     );
   });
 }
