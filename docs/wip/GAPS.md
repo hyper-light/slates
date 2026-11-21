@@ -256,6 +256,13 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-794 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a forwarded
+> work's creation is made on the partition its name hashes to, not its green's (76,955 works had filled the primary's
+> one partition's merge budget: `TableAtCapacity` 71,776 to 0), and a forwarded verb parked at its work's gate answers
+> its exchange when it resumes (before, `Overloaded` and the origin's resend). CreateWork p50 18.3 s to 10.0 s. Open
+> (goal 86b's next bound): 64,072 accepted submits, 4,169 edits and 536 rebases refused `BudgetExceeded`; a
+> first-occurrence line logs the green's retention at its cap at the next run.
+>
 > **A-793 (2026-11-20, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: a change
 > re-anchors its path's content history on the new block (`history::reanchor`), so the history keeps what a change
 > overwrote, not the earlier file; A-728 part 2's splice and seal are replaced. At 100,000 clients: `BudgetExceeded`
