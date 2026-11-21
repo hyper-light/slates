@@ -6975,3 +6975,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   - a recovery slice past the step quantum (r2 had 265-277 ms), or recovery CPU near r2's 130 s;
   - "killing it" in the anchor log;
   - the clone no faster than r14's 42 s quiet (the manifests are now deltas).
+
+## 2026-11-20, w-work-cow: A-790 a work's changed file is pieces over its base (main af045255b; commit 0c5dd0cb5)
+- clippy + xtask over crates/server/src/work_files.rs (new Held/Piece, indexing-free), work_home.rs, work_log.rs, work_charge.rs, verbs.rs (owner_lengths, post-state copy), tests/work_edit_cow.rs.
+- Linux/Windows: `cargo test --locked --release -p slates-server --test work_edit_cow -- --nocapture` and `--test works_off_owner`; red = live heap past the bound (a copy per work) or the generated history differing on 8 shards.
