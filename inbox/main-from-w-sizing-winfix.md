@@ -5,3 +5,4 @@
 - Checked: `cargo xwin check -p slates-cli --test content_extents_windows --target x86_64-pc-windows-msvc` clean, no
   warnings (big Studio); fmt clean. `--list` on jupiter (kiln r1) is queued behind its strain; I'll append the listing
   here when it answers. run-requests' Windows entry now names the new target.
+- 11:21: r1 (--list on jupiter) stopped before it started, on main's order (jupiter jammed; not goal 93). acff9a6e8 stands on its xwin check; w-lint's Windows round lists the target.
