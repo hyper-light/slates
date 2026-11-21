@@ -23852,3 +23852,12 @@ owes a whole state, and each owed whole state is another 3 MiB build the writes 
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
 256 MiB burst (bound: under a quarter of the burst). The same with the wait's original 250 ms sleep as with a yield, so
 the wait is not the cause. Not chased.
+
+### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — open (w-work-cow's finding, not worked: Ada's close order)
+A seed work holding a whole 1 GiB green (1,000 files of 1 MiB) or a 32 MiB green of 100,000 files, submitted at once,
+spun shard 0 for 1,097 ms of CPU without a step against its 1,025 ms window; with no anchor the watchdog ended the
+daemon (exit 4: "shard 0 is spinning ... in task spawned at crates/server/src/identities.rs:243"). Release, Mac Studio
+32 cores, main 283d646b7, `tests/work_cow.rs` with `SLATES_WORK_COW_FILES=1000 SLATES_WORK_COW_FILE_BYTES=1073741`
+before its seed was split. An initial clone or import is one changeset (the storage ruling), so its submit and
+landing need slicing under the shard's step budget. P2's grid seeds in parts of at most 16 MiB and 5,000 files.
+

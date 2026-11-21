@@ -16363,3 +16363,194 @@ loaded to count. It showed two things to measure on a quiet machine:
   lane on loopback.
 The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
 datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
+
+## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
+- **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
+  quiesced; before and after interleave within each point, so drift hits both).
+- **Binaries.** Release `cargo test --locked --release -p slates-server --test work_cow --no-run` on main 283d646b7 with
+  this change's test (after), and the same tree with a copy of the green put back into each new work
+  (`create_work_here` seeding `WorkFiles::from_changed(green.files())`, 896233d1f's shape) (before).
+- **Command.** `~/.cache/w-work-cow-grid-run/grid.sh`: for green in 1 MiB, 32 MiB, 1 GiB; files in 1,000, 10,000,
+  100,000 (each file green/files bytes); works in 1, 10, 100; three rounds, each round after then before, every run a
+  fresh process: `SLATES_WORK_COW_FILES=<f> SLATES_WORK_COW_FILE_BYTES=<g/f> SLATES_WORK_COW_WORKS=<w> <binary>
+  --nocapture`. A run seeds the green in parts of at most 16 MiB and 5,000 files (one submit of the whole green stalls
+  its shard past the liveness window, GAPS), makes one warm work, then times each work from its request through reading
+  one existing file whole and editing one byte of it. Before runs only where works x green <= 2 GiB, to keep the shared
+  machine out of swap. 135 runs, none failed.
+- **Measure.** Live heap a work: the allocator's bytes in use (`slates_mem::heap::stats().in_use`) the N works added,
+  over N (resident memory hides copies made into freed blocks the allocator reuses, A-790's A/B).
+- **Result.** After: 1.6 to 5.6 KB a work at every point (0 B at three 1-work points, within the allocator's noise),
+  flat across 1 MiB to 1 GiB and 1 to 100 works: O(N x metadata), never N x G. Its time follows the one file read
+  (7.7 ms reading a 1 MiB file at 1 GiB in 1,000 files; 76 to 165 us where files are 10 KiB or less), not the green.
+  Before: the green per work (1.5 MB at 1 MiB in 1,000 files to 1.25 GB at 1 GiB in 100,000 files, the green plus its
+  files' overhead), its time growing with it (to 129 ms). Kept: after (main since A-247/A-534, its first edit A-790).
+
+| green | files | works | after: live heap a work (min of 3) | after: best mean | before: live heap a work | before: best mean |
+|---|---|---|---|---|---|---|
+| 1 MiB | 1,000 | 1 | 1,648 B | 112 us | 1,527,232 B | 326 us |
+| 1 MiB | 1,000 | 10 | 3,788 B | 80 us | 1,530,441 B | 293 us |
+| 1 MiB | 1,000 | 100 | 3,501 B | 79 us | 1,529,250 B | 280 us |
+| 1 MiB | 10,000 | 1 | 2,032 B | 85 us | 3,576,128 B | 1,020 us |
+| 1 MiB | 10,000 | 10 | 3,430 B | 80 us | 3,569,876 B | 980 us |
+| 1 MiB | 10,000 | 100 | 3,281 B | 76 us | 3,568,177 B | 958 us |
+| 1 MiB | 100,000 | 1 | 1,904 B | 80 us | 26,036,256 B | 8,290 us |
+| 1 MiB | 100,000 | 10 | 3,161 B | 92 us | 26,039,129 B | 8,876 us |
+| 1 MiB | 100,000 | 100 | 3,332 B | 89 us | 26,040,766 B | 8,744 us |
+| 32 MiB | 1,000 | 1 | 0 B | 294 us | 49,417,264 B | 1,484 us |
+| 32 MiB | 1,000 | 10 | 5,590 B | 332 us | 49,434,916 B | 3,377 us |
+| 32 MiB | 1,000 | 100 | 3,591 B | 325 us | not run (N x G > 2 GiB) | |
+| 32 MiB | 10,000 | 1 | 5,488 B | 82 us | 38,289,616 B | 4,633 us |
+| 32 MiB | 10,000 | 10 | 3,478 B | 80 us | 38,292,627 B | 4,427 us |
+| 32 MiB | 10,000 | 100 | 3,380 B | 80 us | not run (N x G > 2 GiB) | |
+| 32 MiB | 100,000 | 1 | 2,288 B | 98 us | 62,831,472 B | 11,837 us |
+| 32 MiB | 100,000 | 10 | 3,228 B | 81 us | 62,840,518 B | 11,989 us |
+| 32 MiB | 100,000 | 100 | 3,388 B | 80 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 1,000 | 1 | 0 B | 7,661 us | 1,082,667,584 B | 65,387 us |
+| 1 GiB | 1,000 | 10 | 4,537 B | 7,743 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 1,000 | 100 | 3,784 B | 7,886 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 10,000 | 1 | 0 B | 908 us | 1,149,444,064 B | 43,987 us |
+| 1 GiB | 10,000 | 10 | 0 B | 821 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 10,000 | 100 | 2,986 B | 877 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 100,000 | 1 | 13,216 B | 147 us | 1,253,254,176 B | 129,091 us |
+| 1 GiB | 100,000 | 10 | 3,952 B | 165 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 100,000 | 100 | 3,441 B | 102 us | not run (N x G > 2 GiB) | |
+
+All runs:
+
+| side | green | files | works | round | live heap a work | resident (all works) | mean |
+|---|---|---|---|---|---|---|---|
+| after | 1 MiB | 1,000 | 1 | 1 | 1,648 B | 81,920 B | 112 us |
+| before | 1 MiB | 1,000 | 1 | 1 | 1,527,232 B | 1,589,248 B | 341 us |
+| after | 1 MiB | 1,000 | 1 | 2 | 1,648 B | 81,920 B | 116 us |
+| before | 1 MiB | 1,000 | 1 | 2 | 1,527,232 B | 1,654,784 B | 356 us |
+| after | 1 MiB | 1,000 | 1 | 3 | 1,648 B | 98,304 B | 113 us |
+| before | 1 MiB | 1,000 | 1 | 3 | 1,527,232 B | 1,589,248 B | 326 us |
+| after | 1 MiB | 1,000 | 10 | 1 | 3,788 B | 278,528 B | 84 us |
+| before | 1 MiB | 1,000 | 10 | 1 | 1,530,550 B | 15,384,576 B | 300 us |
+| after | 1 MiB | 1,000 | 10 | 2 | 3,788 B | 311,296 B | 80 us |
+| before | 1 MiB | 1,000 | 10 | 2 | 1,530,441 B | 15,384,576 B | 293 us |
+| after | 1 MiB | 1,000 | 10 | 3 | 3,788 B | 327,680 B | 89 us |
+| before | 1 MiB | 1,000 | 10 | 3 | 1,532,041 B | 15,515,648 B | 295 us |
+| after | 1 MiB | 1,000 | 100 | 1 | 3,501 B | 606,208 B | 82 us |
+| before | 1 MiB | 1,000 | 100 | 1 | 1,529,467 B | 162,054,144 B | 287 us |
+| after | 1 MiB | 1,000 | 100 | 2 | 3,502 B | 573,440 B | 79 us |
+| before | 1 MiB | 1,000 | 100 | 2 | 1,529,250 B | 161,808,384 B | 286 us |
+| after | 1 MiB | 1,000 | 100 | 3 | 3,502 B | 573,440 B | 80 us |
+| before | 1 MiB | 1,000 | 100 | 3 | 1,529,480 B | 162,086,912 B | 280 us |
+| after | 1 MiB | 10,000 | 1 | 1 | 2,080 B | 65,536 B | 85 us |
+| before | 1 MiB | 10,000 | 1 | 1 | 3,592,544 B | 3,604,480 B | 1,024 us |
+| after | 1 MiB | 10,000 | 1 | 2 | 2,032 B | 65,536 B | 108 us |
+| before | 1 MiB | 10,000 | 1 | 2 | 3,576,128 B | 3,784,704 B | 1,020 us |
+| after | 1 MiB | 10,000 | 1 | 3 | 2,048 B | 98,304 B | 109 us |
+| before | 1 MiB | 10,000 | 1 | 3 | 3,593,152 B | 3,473,408 B | 1,041 us |
+| after | 1 MiB | 10,000 | 10 | 1 | 3,478 B | 294,912 B | 80 us |
+| before | 1 MiB | 10,000 | 10 | 1 | 3,570,185 B | 35,815,424 B | 980 us |
+| after | 1 MiB | 10,000 | 10 | 2 | 3,430 B | 278,528 B | 89 us |
+| before | 1 MiB | 10,000 | 10 | 2 | 3,570,280 B | 35,815,424 B | 985 us |
+| after | 1 MiB | 10,000 | 10 | 3 | 3,430 B | 294,912 B | 85 us |
+| before | 1 MiB | 10,000 | 10 | 3 | 3,569,876 B | 35,799,040 B | 985 us |
+| after | 1 MiB | 10,000 | 100 | 1 | 3,653 B | 704,512 B | 80 us |
+| before | 1 MiB | 10,000 | 100 | 1 | 3,568,338 B | 365,740,032 B | 961 us |
+| after | 1 MiB | 10,000 | 100 | 2 | 3,417 B | 671,744 B | 78 us |
+| before | 1 MiB | 10,000 | 100 | 2 | 3,568,177 B | 365,690,880 B | 958 us |
+| after | 1 MiB | 10,000 | 100 | 3 | 3,281 B | 589,824 B | 76 us |
+| before | 1 MiB | 10,000 | 100 | 3 | 3,568,241 B | 366,772,224 B | 962 us |
+| after | 1 MiB | 100,000 | 1 | 1 | 18,368 B | 65,536 B | 83 us |
+| before | 1 MiB | 100,000 | 1 | 1 | 26,052,848 B | 26,968,064 B | 9,036 us |
+| after | 1 MiB | 100,000 | 1 | 2 | 18,368 B | 65,536 B | 80 us |
+| before | 1 MiB | 100,000 | 1 | 2 | 26,036,336 B | 31,588,352 B | 8,290 us |
+| after | 1 MiB | 100,000 | 1 | 3 | 1,904 B | 65,536 B | 92 us |
+| before | 1 MiB | 100,000 | 1 | 3 | 26,036,256 B | 30,556,160 B | 8,504 us |
+| after | 1 MiB | 100,000 | 10 | 1 | 3,168 B | 409,600 B | 97 us |
+| before | 1 MiB | 100,000 | 10 | 1 | 26,039,129 B | 268,173,312 B | 8,876 us |
+| after | 1 MiB | 100,000 | 10 | 2 | 3,161 B | 409,600 B | 113 us |
+| before | 1 MiB | 100,000 | 10 | 2 | 26,040,768 B | 268,582,912 B | 8,881 us |
+| after | 1 MiB | 100,000 | 10 | 3 | 3,161 B | 393,216 B | 92 us |
+| before | 1 MiB | 100,000 | 10 | 3 | 26,040,848 B | 269,795,328 B | 9,016 us |
+| after | 1 MiB | 100,000 | 100 | 1 | 3,332 B | 1,359,872 B | 89 us |
+| before | 1 MiB | 100,000 | 100 | 1 | 26,041,190 B | 2,697,543,680 B | 9,117 us |
+| after | 1 MiB | 100,000 | 100 | 2 | 3,385 B | 1,392,640 B | 99 us |
+| before | 1 MiB | 100,000 | 100 | 2 | 26,040,766 B | 2,694,856,704 B | 8,989 us |
+| after | 1 MiB | 100,000 | 100 | 3 | 3,478 B | 1,327,104 B | 90 us |
+| before | 1 MiB | 100,000 | 100 | 3 | 26,041,025 B | 2,970,632,192 B | 8,744 us |
+| after | 32 MiB | 1,000 | 1 | 1 | 0 B | 163,840 B | 360 us |
+| before | 32 MiB | 1,000 | 1 | 1 | 49,417,280 B | 24,788,992 B | 2,466 us |
+| after | 32 MiB | 1,000 | 1 | 2 | 0 B | 180,224 B | 294 us |
+| before | 32 MiB | 1,000 | 1 | 2 | 49,417,264 B | 24,133,632 B | 2,395 us |
+| after | 32 MiB | 1,000 | 1 | 3 | 0 B | 196,608 B | 327 us |
+| before | 32 MiB | 1,000 | 1 | 3 | 49,417,264 B | 409,600 B | 1,484 us |
+| after | 32 MiB | 1,000 | 10 | 1 | 5,590 B | 573,440 B | 332 us |
+| before | 32 MiB | 1,000 | 10 | 1 | 49,435,313 B | 470,974,464 B | 3,744 us |
+| after | 32 MiB | 1,000 | 10 | 2 | 5,608 B | 606,208 B | 354 us |
+| before | 32 MiB | 1,000 | 10 | 2 | 49,437,155 B | 434,110,464 B | 3,377 us |
+| after | 32 MiB | 1,000 | 10 | 3 | 5,640 B | 557,056 B | 360 us |
+| before | 32 MiB | 1,000 | 10 | 3 | 49,434,916 B | 471,990,272 B | 3,446 us |
+| after | 32 MiB | 1,000 | 100 | 1 | 4,014 B | 4,014,080 B | 325 us |
+| after | 32 MiB | 1,000 | 100 | 2 | 3,591 B | 3,948,544 B | 326 us |
+| after | 32 MiB | 1,000 | 100 | 3 | 3,973 B | 3,997,696 B | 328 us |
+| after | 32 MiB | 10,000 | 1 | 1 | 5,488 B | 65,536 B | 82 us |
+| before | 32 MiB | 10,000 | 1 | 1 | 38,305,616 B | 43,499,520 B | 4,633 us |
+| after | 32 MiB | 10,000 | 1 | 2 | 5,488 B | 81,920 B | 110 us |
+| before | 32 MiB | 10,000 | 1 | 2 | 38,289,920 B | 43,630,592 B | 4,796 us |
+| after | 32 MiB | 10,000 | 1 | 3 | 5,488 B | 65,536 B | 123 us |
+| before | 32 MiB | 10,000 | 1 | 3 | 38,289,616 B | 44,548,096 B | 4,655 us |
+| after | 32 MiB | 10,000 | 10 | 1 | 3,478 B | 327,680 B | 107 us |
+| before | 32 MiB | 10,000 | 10 | 1 | 38,292,627 B | 436,813,824 B | 4,478 us |
+| after | 32 MiB | 10,000 | 10 | 2 | 3,478 B | 344,064 B | 116 us |
+| before | 32 MiB | 10,000 | 10 | 2 | 38,292,684 B | 437,026,816 B | 4,427 us |
+| after | 32 MiB | 10,000 | 10 | 3 | 3,478 B | 344,064 B | 80 us |
+| before | 32 MiB | 10,000 | 10 | 3 | 38,292,630 B | 435,847,168 B | 4,480 us |
+| after | 32 MiB | 10,000 | 100 | 1 | 3,417 B | 983,040 B | 82 us |
+| after | 32 MiB | 10,000 | 100 | 2 | 3,380 B | 819,200 B | 80 us |
+| after | 32 MiB | 10,000 | 100 | 3 | 3,444 B | 966,656 B | 80 us |
+| after | 32 MiB | 100,000 | 1 | 1 | 2,288 B | 81,920 B | 100 us |
+| before | 32 MiB | 100,000 | 1 | 1 | 62,831,472 B | 63,127,552 B | 12,004 us |
+| after | 32 MiB | 100,000 | 1 | 2 | 2,288 B | 98,304 B | 103 us |
+| before | 32 MiB | 100,000 | 1 | 2 | 62,847,776 B | 66,535,424 B | 11,837 us |
+| after | 32 MiB | 100,000 | 1 | 3 | 2,288 B | 65,536 B | 98 us |
+| before | 32 MiB | 100,000 | 1 | 3 | 62,847,856 B | 64,356,352 B | 12,436 us |
+| after | 32 MiB | 100,000 | 10 | 1 | 3,292 B | 425,984 B | 81 us |
+| before | 32 MiB | 100,000 | 10 | 1 | 62,840,614 B | 648,167,424 B | 12,077 us |
+| after | 32 MiB | 100,000 | 10 | 2 | 3,228 B | 442,368 B | 85 us |
+| before | 32 MiB | 100,000 | 10 | 2 | 62,840,585 B | 645,005,312 B | 12,108 us |
+| after | 32 MiB | 100,000 | 10 | 3 | 3,228 B | 458,752 B | 82 us |
+| before | 32 MiB | 100,000 | 10 | 3 | 62,840,518 B | 647,380,992 B | 11,989 us |
+| after | 32 MiB | 100,000 | 100 | 1 | 3,635 B | 1,441,792 B | 82 us |
+| after | 32 MiB | 100,000 | 100 | 2 | 3,658 B | 1,458,176 B | 80 us |
+| after | 32 MiB | 100,000 | 100 | 3 | 3,388 B | 1,261,568 B | 80 us |
+| after | 1 GiB | 1,000 | 1 | 1 | 0 B | 1,179,648 B | 7,821 us |
+| before | 1 GiB | 1,000 | 1 | 1 | 1,082,667,584 B | 761,069,568 B | 69,066 us |
+| after | 1 GiB | 1,000 | 1 | 2 | 0 B | 1,130,496 B | 8,066 us |
+| before | 1 GiB | 1,000 | 1 | 2 | 1,082,667,584 B | 782,221,312 B | 65,387 us |
+| after | 1 GiB | 1,000 | 1 | 3 | 0 B | 1,130,496 B | 7,661 us |
+| before | 1 GiB | 1,000 | 1 | 3 | 1,082,667,616 B | 805,584,896 B | 65,645 us |
+| after | 1 GiB | 1,000 | 10 | 1 | 4,537 B | 11,075,584 B | 7,825 us |
+| after | 1 GiB | 1,000 | 10 | 2 | 4,537 B | 11,075,584 B | 7,743 us |
+| after | 1 GiB | 1,000 | 10 | 3 | 4,585 B | 11,042,816 B | 8,022 us |
+| after | 1 GiB | 1,000 | 100 | 1 | 3,949 B | 110,755,840 B | 7,886 us |
+| after | 1 GiB | 1,000 | 100 | 2 | 3,954 B | 111,902,720 B | 7,915 us |
+| after | 1 GiB | 1,000 | 100 | 3 | 3,784 B | 110,804,992 B | 8,095 us |
+| after | 1 GiB | 10,000 | 1 | 1 | 0 B | 163,840 B | 1,016 us |
+| before | 1 GiB | 10,000 | 1 | 1 | 1,149,444,064 B | 317,669,376 B | 43,987 us |
+| after | 1 GiB | 10,000 | 1 | 2 | 0 B | 147,456 B | 908 us |
+| before | 1 GiB | 10,000 | 1 | 2 | 1,149,444,096 B | 247,496,704 B | 44,246 us |
+| after | 1 GiB | 10,000 | 1 | 3 | 0 B | 212,992 B | 928 us |
+| before | 1 GiB | 10,000 | 1 | 3 | 1,149,452,352 B | 641,712,128 B | 58,413 us |
+| after | 1 GiB | 10,000 | 10 | 1 | 0 B | 1,196,032 B | 1,013 us |
+| after | 1 GiB | 10,000 | 10 | 2 | 0 B | 1,294,336 B | 997 us |
+| after | 1 GiB | 10,000 | 10 | 3 | 0 B | 1,327,104 B | 821 us |
+| after | 1 GiB | 10,000 | 100 | 1 | 3,084 B | 11,485,184 B | 877 us |
+| after | 1 GiB | 10,000 | 100 | 2 | 2,986 B | 11,780,096 B | 949 us |
+| after | 1 GiB | 10,000 | 100 | 3 | 3,050 B | 11,501,568 B | 886 us |
+| after | 1 GiB | 100,000 | 1 | 1 | 13,216 B | 81,920 B | 147 us |
+| before | 1 GiB | 100,000 | 1 | 1 | 1,253,270,656 B | 1,345,929,216 B | 130,068 us |
+| after | 1 GiB | 100,000 | 1 | 2 | 13,216 B | 65,536 B | 188 us |
+| before | 1 GiB | 100,000 | 1 | 2 | 1,253,254,272 B | 1,340,686,336 B | 129,091 us |
+| after | 1 GiB | 100,000 | 1 | 3 | 13,232 B | 65,536 B | 175 us |
+| before | 1 GiB | 100,000 | 1 | 3 | 1,253,254,176 B | 1,347,043,328 B | 153,341 us |
+| after | 1 GiB | 100,000 | 10 | 1 | 3,952 B | 311,296 B | 165 us |
+| after | 1 GiB | 100,000 | 10 | 2 | 3,952 B | 327,680 B | 204 us |
+| after | 1 GiB | 100,000 | 10 | 3 | 3,952 B | 311,296 B | 191 us |
+| after | 1 GiB | 100,000 | 100 | 1 | 3,565 B | 1,163,264 B | 102 us |
+| after | 1 GiB | 100,000 | 100 | 2 | 3,655 B | 2,310,144 B | 133 us |
+| after | 1 GiB | 100,000 | 100 | 3 | 3,441 B | 2,211,840 B | 130 us |
