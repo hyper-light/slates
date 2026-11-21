@@ -126,3 +126,22 @@ shard parks at once) off and on, interleaved 3 rounds, ring split every request:
   1 ms tick. That is the kernel's: no unprivileged raise exists on Linux (R10), and A-224's short slice was rejected.
 - So on Linux I find no daemon lever for the 1 ms; the loaded p99/p999 bound there is the scheduler's, on this lane
   (2 CPUs, 4 spinners and a writer at the shard's own weight). I'm putting it to main as 84a's Linux question.
+
+## 2026-11-20 20:55 PST — finding 7: Linux's 1 ms is a woken shard's CPU wait (it spun), not a timer; your holds matter
+
+Main's lead was epoll's millisecond timeout. It was real: rustix (no `linux_5_11`) rounds a sub-millisecond
+`epoll_wait` timeout up to 1 ms, so every short timed park lasted a millisecond. Red, then green with a timerfd
+deadline (branch `agents/g222-loaded-p99-p999-epoll-ns`, 445082604; `driver::tests::a_sub_millisecond_timed_wait_ends_by_its_deadline`:
+red 3/3 on ubuntu-latest and ubuntu-24.04-arm, shortest 200 µs wait 1,018–1,059 µs; green 3/3, slates-rt whole green;
+CI runs 44860111648). **But it is not the band**: with it, queued p99 stays 1,009.5–1,010.8 µs (A/B, run 44860060964).
+
+Floor (main's ask), the lane's own: a ping-pong of two threads through park/unpark inside the same scope (4 spinners and
+the fsync writer): p50 2.8–4.3 µs, **p99 4.7–5.1 µs**, p999 0.8–2.7 ms, no 1 ms band. So the lane allows <1 ms p99.
+
+Park stamps, every park on that run (~100,000 a run, both arms): 13,000–14,600 a run waited 0.95–1.10 ms, and ~11,000
+of those were **ended by a kick** (or by a deadline under 100 µs). So the shard was made runnable on time and did not
+get a CPU for a millisecond. The ping-pong threads sleep between hand-offs and are preferred when woken; a shard spins
+(its idle window and A-326's holds) and is not, so it waits for the spinner's slice to end at the 1 ms tick (EEVDF).
+My earlier "park at once" zeroed only the window; the holds still spun. Running now (diag-measurer-g222-10): no window
+**and** no hold (`G222_NO_SPIN`, `G222_NO_HOLD`) against main's, one binary, the floor each round. If the band empties,
+Linux's fix is the hold rule (yours, A-387) telling an oversubscribed machine not to spin — we should land it together.
