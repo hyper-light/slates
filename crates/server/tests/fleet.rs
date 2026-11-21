@@ -6479,6 +6479,8 @@ const MOVE_ADOPTED: &str = "fleet.move.adopted";
 const MOVE_ADOPTION_REPORTED: &str = "fleet.move.adoption_reported";
 /// Format: a move's old owner's count of the moves it began (`moves::MOVE_BEGUN`).
 const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Counter: moves refused before any report (`crate::moves`'s own).
+const MOVE_REFUSED: &str = "fleet.move.refused";
 /// Format: a move's old owner's count of the copies it let go to the member the move named (`moves::MOVE_RELEASED`).
 const MOVE_RELEASED: &str = "fleet.move.released";
 
@@ -6841,6 +6843,71 @@ fn a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an
     &landed_after_two_moves(),
     &described,
   );
+}
+
+/// Goal 91's live move, its first ask (A-291's bound; kiln's live move across two Macs, 2026-11-20): a move's first ask
+/// succeeds within the fleet's failover delay even when the head it hands over must first be carried and placed off its
+/// owner, which takes longer than that delay. Measured in kiln's lab, release, three runners on one Mac: the first ask
+/// refused `Unplaced` at 3,293 ms (bound 3,200 ms) with its capture not yet carried, the second at 3,187 ms with the head
+/// placed but not yet held off its owner, the third at 3,190 ms with the handoff begun at 142 ms, and the fourth reported
+/// at 120 ms, the work the refused asks began finished meanwhile. Three daemons at `f = 1`. Do: on a, overlay the
+/// captured tree, capture its base and clone it; write the agent's changes and about 780 KB more into the clone and detach;
+/// ask once to move it to b, then only follow the move while it answers `Moving`. Expect: `Moved`, never a refusal, and
+/// a's refusal counter unmoved.
+#[test]
+fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members();
+  let base = captured_tree_dir();
+  let (answers, refused, failover, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let clone = captured_and_cloned(&mut client_a, &base.path, &["first-ask-workspace"])[0];
+    agents_changes(&mut client_a, clone);
+    let attachment = write_attachment(&mut client_a, clone);
+    // About 780 KB (the clone is bounded at 1 MiB) in files a ring's write takes whole (its payload cap is 4 KiB): content the handoff must place.
+    let window = vec![0x5a_u8; 3900];
+    for index in 0..200 {
+      let written = client_a.call(&RequestBody::FsWrite {
+        volume: clone,
+        attachment,
+        path: format!("/bulk-{index}"),
+        bytes: window.clone(),
+        mode: 0o644,
+      });
+      assert!(
+        matches!(written, ReplyBody::FsDone { .. }),
+        "bulk write {index}: {written:?}"
+      );
+    }
+    assert!(matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ));
+    share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
+    let failover = members.daemons[0].failover_ns();
+    let to = members.hosts[1].0;
+    let mut answers: Vec<String> = Vec::new();
+    poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+      let reply = client_a.call(&RequestBody::Move { volume: clone, to });
+      let settled = !matches!(reply, ReplyBody::Moving { .. });
+      let named = format!("{reply:?}");
+      if answers.last() != Some(&named) {
+        answers.push(named);
+      }
+      Ok(settled)
+    });
+    let refused = move_counter(&members.daemons[0], MOVE_REFUSED);
+    (answers, refused, failover, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    answers.last().is_some_and(|last| last.starts_with("Moved")),
+    "the first ask ended moved, not refused: {answers:?} (failover delay {failover:?}); {described}"
+  );
+  assert_eq!(refused, Ok(0), "a refused no ask of the move; {described}");
 }
 
 /// Goal 91's live move (kiln's K4 across runners): a captured clone moved to another node is found there by its name, as

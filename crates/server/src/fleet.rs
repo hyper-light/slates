@@ -3525,13 +3525,14 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
-      // A copy frozen for a move (A-291) is the move's to place: before the switch its handoff places it
-      // ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal from here would
-      // contend with (a frozen copy's heal republished its head once its target died, 2026-11-18).
+      // A copy with a move under way (A-291), prepared or frozen (A-784), is the move's to place: before the switch its
+      // handoff places it ([`start_move_handoff`]), and after it the volume is another member's, whose records a heal
+      // from here would contend with (a frozen copy's heal republished its head once its target died, 2026-11-18; a
+      // prepared one's left a second snapshot that refused the move `Snapshots`, 2026-11-20).
       if record.epoch == 0
         || record.state == VolumeState::Destroying
         || state.seals.contains_key(&object)
-        || crate::moves::frozen(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
+        || crate::moves::moving(state, slates_ipc::protocol::VolumeId { bytes: id.bytes })
       {
         return None;
       }

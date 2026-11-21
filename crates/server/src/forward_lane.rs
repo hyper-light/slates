@@ -298,6 +298,17 @@ fn enqueue(peer: HostId, requests: &[Vec<u8>], place: &mut Place) -> Option<(u64
 }
 
 impl ForwardLanes {
+  /// The widest floor this shard has measured on any lane to a peer ([`path_floor_ns`]), nanoseconds; zero with none:
+  /// what a move's report of its hops puts beside its bound (`crate::moves`).
+  pub(crate) fn widest_floor_ns(&self) -> u64 {
+    self
+      .lanes
+      .values()
+      .map(|lane| lane.floor_ns)
+      .max()
+      .unwrap_or(0)
+  }
+
   /// Queues `requests` on `peer`'s lane under a new forwarder at `place`, at `now`: its id and its tickets, in order,
   /// or `None` when the lane would hold more than `bound`. A first issue takes its own tickets as its place and records
   /// it in `place`; a resend (`place` already recorded) is queued at the first issue's place, each request at the

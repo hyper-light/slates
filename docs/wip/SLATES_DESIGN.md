@@ -57691,3 +57691,32 @@ Applied in the same change to: §4.8 "Lookup" (a location round's stragglers), G
   `owner_location` lib tests, fmt and the red (the collector's wake disabled: the lane test must fail on its ticks) ran
   on a kiln runner, this Mac being at 7 GiB free; their results are in the landing's commit.
 
+### A-784 — A planned move is prepared unfrozen and frozen only once ready to hand over; its hops are logged (2026-11-20, w-fed-move, kiln goal 91; main's piece; found by use: kiln's live move, most first asks refused `Unplaced`, every ask for five minutes once; §4.10 "Ownership follows the writer"; A-291, A-525, A-544)
+- **Why.** A move froze its volume at its ask and was refused `Unplaced` once unreported for the failover delay (A-525),
+  so the bound counted the preparation: a captured clone's capture carried on its head (A-544) and the head placed on
+  `f + 1` members besides its owner (the handoff), each seconds of sliced seal work that ran on after the refusal.
+  Measured with the hops now logged (release, kiln's lab, three runners on one Mac, the agent's workspace): ask 1 refused
+  at 3,293 ms (bound 3,200 ms) before its carry; ask 2 at 3,187 ms, carried at 38 ms, placed at 141 ms, its handoff
+  not begun (a seal job running); ask 3 at 3,190 ms, its handoff begun at 142 ms; ask 4 reported at 120 ms, the work the
+  refused asks began done meanwhile. The forward lanes' floor was 0 ms there.
+- **Change.** The ask records the move unfrozen (`MoveOut::frozen_ns` zero): the volume takes writes while the move is
+  prepared (`moves::frozen` is false; `moves::moving` true, which the healer passes by as it passes a frozen copy). Once
+  ready to hand over, the control shard's step is `Freeze` (`moves::freeze`, on the owner shard): what the ask judged
+  judged again (`moves::unmovable_after`: attachments, lease, clones, the target), snapshots only those taken after the
+  move's own head (`MoveOut::own_since`), since a head the move took leaves the one before it as an older snapshot; the
+  head taken for the move again (`verbs::head_for_move`), frozen when it is the head prepared, or
+  prepared again on a new head when written to meanwhile (`fleet.move.prepared_again`). The failover bound runs from the
+  freeze; a prepared move is overdue once its mover has not asked for a failover delay (`MoveOut::asked_ns`), or at once
+  when its carry was refused (`carry::refused_for_head`). Each move's hops (carried, records placed, held off this node,
+  handoff begun, frozen) are logged with its bound and the widest forward-lane floor when it is reported or refused
+  (`moves::log_hops`).
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its_owner` (a captured clone with the
+  agent's changes and about 780 KB more, asked once): red before (refused `Unplaced` at 3,214 ms of a 3,200 ms bound),
+  green after (reported at 87.2 s in this debug build, frozen 0.1 s). `--lib moves::` 6 passed, among them
+  `a_move_prepared_unfrozen_lasts_while_its_mover_asks_and_a_frozen_one_is_bound_from_its_freeze`; the fleet's eight
+  move tests pass (`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` found the healer
+  re-placing a prepared volume, now passed by). By use, release, kiln's lab: the first ask reported at 24.6 s (carried
+  12.3 s, held off its owner 24.5 s), the whole live move 49.5 s against 112 s before.
+- **Open.** The preparation is paced by the seal periods: the carry and the handoff took about 12 s each for under
+  1 MB.

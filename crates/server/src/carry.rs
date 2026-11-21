@@ -188,6 +188,21 @@ pub(crate) fn carries_its_head(state: &ShardState, id: DbVolumeId) -> bool {
   })
 }
 
+/// Whether volume `id`'s carry for its current head was refused (A-544): a move waiting on it would wait for good, so it
+/// is refused at once (`crate::moves`).
+pub(crate) fn refused_for_head(state: &ShardState, id: DbVolumeId) -> bool {
+  let Some(head) = state.db.partition().volume(id).map(|record| record.head) else {
+    return false;
+  };
+  matches!(
+    state.carries.get(&id),
+    Some(Carry {
+      snapshot,
+      stage: Stage::Refused,
+    }) if *snapshot == head
+  )
+}
+
 /// Forgets the carries of volumes this shard no longer serves (released to a move's new owner, relinquished to a
 /// successor, or destroyed), at the end of each home seal walk: the walk visits only the volumes it serves, so an entry
 /// refused or waiting for its seal would otherwise outlive its volume. A task whose entry is gone ends ([`slices`]).

@@ -182,6 +182,14 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-784 (2026-11-20, w-fed-move; main's piece, found by use: kiln's live move, goal 91).** FIXED: a planned move
+> (A-291) is prepared unfrozen and frozen only once ready to hand over, so its first ask is no longer refused
+> `Unplaced` while its head is carried and placed off its owner: the failover bound runs from the freeze; preparing, the
+> volume takes writes and the move lasts while its mover asks (refused at once when its carry is refused). Each move logs
+> its hops when reported or refused. Measured, release, kiln's lab, three runners on one Mac: before, asks 1-3 refused at
+> 3.2 s and ask 4 reported 120 ms after it; after, ask 1 reported at 24.6 s (carried 12.3 s, held off its owner 24.5 s),
+> frozen 0.1 s. Open: preparation is paced by the seal periods (the carry and the handoff, about 12 s each for under 1 MB).
+>
 > **A-756 (2026-11-20, w-fed-move; BUG found by use: kiln's live move, goal 91).** FIXED: a volume a node made by
 > materialization (moved there, or taken over) is found there by its name: the node claims the alias its name's
 > partition holds for it (A-236), as a clone made under another partition's name does; the old owner releases its own.
