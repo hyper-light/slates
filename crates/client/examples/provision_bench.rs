@@ -6,7 +6,14 @@
 //! doorbell, the shard's wake and the client's wake), with 1, 8 and 64 concurrent clients.
 //! Rows are `ratchet\t<key>\t<lower>\t<median>\t<upper>` in nanoseconds over the runs; the
 //! max rows are informational (a scheduler's worst case is not a code property). The
-//! `ac-2.1` lines gate the spinning p99 against the floor.
+//! `ac-2.1` lines gate the spinning p99 against the floor. `cargo xtask ratchet --provision` runs this alone and holds
+//! every gated row, spinning and parked, to its machine's ceilings, which only tighten (R9's ratchet).
+//!
+//! **Under load (A-786).** With `PROVISION_BENCH_LOAD=<n>` the 1-client forms run again, after the quiet ones, beside
+//! `n` busy processes per logical CPU, as `loaded<n>_` rows, and the spinning p99 is held to a bound derived from the
+//! quiet run and the load ([`loaded_bound_ns`]); the bench exits non-zero past it, as past the floor. Every 1-client
+//! run prints where its slowest creates' time went, split by A-559's stamps into the daemon's part (from the request's
+//! landing in its ring to the reply's) and the client's.
 //!
 //! The CPU the process spends is reported beside the latencies, in thousandths of one core: each form's runs, and the
 //! daemon at rest with no client. The paced form is the case the idle window prices: one client every
@@ -25,6 +32,9 @@
 use std::time::{Duration, Instant};
 
 use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass};
+use slates_ipc::slot::landed_ns;
+use slates_machine::attribution::{Exchange, harness_part};
+use slates_machine::clock::monotonic_ns;
 use slates_machine::process_clock::process_cpu;
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::config::PROVISION_FLOOR_NS;
@@ -54,6 +64,62 @@ fn ns(elapsed: Duration) -> u64 {
 
 /// The environment variable that sets the daemon's shard count in place of the derived one.
 const SHARDS_VARIABLE: &str = "PROVISION_BENCH_SHARDS";
+
+/// The environment variable that measures the bench under load: that many spinning processes per logical CPU run
+/// beside it (copies of this binary given [`SPIN_ARGUMENT`]), each a busy loop at the default priority, as GAPS'
+/// loaded rows ("two spinners a logical CPU") are measured. Unset or 0, the machine is left as it is.
+const LOAD_VARIABLE: &str = "PROVISION_BENCH_LOAD";
+
+/// Format: the argument that makes this binary one of the load's spinners.
+const SPIN_ARGUMENT: &str = "--spin";
+
+/// Shape: the busy loop's iterations between its looks at whether the bench that started it is still there.
+const SPIN_LOOK_EVERY: u64 = 1 << 22;
+
+/// A spinner of the load: a busy loop until the bench that started it ends (Unix: its parent changes) or kills it.
+fn spin() -> ! {
+  #[cfg(unix)]
+  let parent = std::os::unix::process::parent_id();
+  let mut turns: u64 = 0;
+  loop {
+    turns = std::hint::black_box(turns.wrapping_add(1));
+    #[cfg(unix)]
+    if turns.is_multiple_of(SPIN_LOOK_EVERY) && std::os::unix::process::parent_id() != parent {
+      std::process::exit(0);
+    }
+  }
+}
+
+/// The load's spinners, killed when dropped, so a bench that panics leaves none behind.
+struct Load(Vec<std::process::Child>);
+
+impl Load {
+  /// Starts `per_cpu` spinners per logical CPU.
+  fn start(per_cpu: usize) -> Self {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let exe = std::env::current_exe().unwrap();
+    Self(
+      (0..per_cpu * cpus)
+        .map(|_| {
+          std::process::Command::new(&exe)
+            .arg(SPIN_ARGUMENT)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap()
+        })
+        .collect(),
+    )
+  }
+}
+
+impl Drop for Load {
+  fn drop(&mut self) {
+    for child in &mut self.0 {
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+  }
+}
 
 /// Shape: how long the daemon is watched at rest, with no client: long enough that the shards' timers, which run
 /// at rest too, are counted many times over, so the row reads the idle daemon and not one tick.
@@ -109,8 +175,18 @@ fn deadlines() -> Deadlines {
   .get()
 }
 
+/// One create as the client saw it: the whole latency, the daemon's part of it by A-559's stamps (from the request's
+/// landing in the command ring to the reply's landing in the completion ring; the whole latency where a stamp is
+/// missing, so the daemon's time is never hidden), and whether the client parked waiting for it.
+#[derive(Clone, Copy, Debug)]
+struct Sample {
+  total: u64,
+  daemon: u64,
+  parked: bool,
+}
+
 /// One client's samples: `count` creates (each followed by a destroy that is not timed).
-fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<u64> {
+fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> Vec<Sample> {
   let mut client = connect(instance);
   // The spinning form spins for the floor (the reply lands without a wake when the daemon
   // meets it); the parked form keeps the daemon's published window and parks.
@@ -133,9 +209,23 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
       require_locked: false,
       base: None,
     };
-    let started = Instant::now();
+    let (parks_before, _) = client.park_ratio();
+    let (started, sent_ns) = (Instant::now(), monotonic_ns());
     let id = client.create(&spec).unwrap();
-    samples.push(ns(started.elapsed()));
+    let total = ns(started.elapsed());
+    let taken_ns = monotonic_ns();
+    let exchange = Exchange {
+      sent_ns,
+      request_landed_ns: landed_ns(client.request_stamp(), taken_ns),
+      reply_landed_ns: landed_ns(client.reply_stamp(), taken_ns),
+      taken_ns,
+    };
+    let daemon = harness_part(&exchange).map_or(total, |harness| total.saturating_sub(harness));
+    samples.push(Sample {
+      total,
+      daemon,
+      parked: client.park_ratio().0 > parks_before,
+    });
     client.destroy(id).unwrap();
   }
   if pause.is_some() {
@@ -145,6 +235,30 @@ fn sample(instance: &str, tag: &str, count: usize, pause: Option<Duration>) -> V
     );
   }
   samples
+}
+
+/// Where the slow creates' time went: of the samples at or past the run's p99, the median daemon part and the median
+/// client part, and how many of them the client parked in. The daemon's part is its rings and shards, the client's is
+/// its own send and its wait's end (a spin that lost its core, or a park and its wake).
+fn print_tail(key: &str, run: usize, samples: &[Sample]) {
+  let mut totals: Vec<u64> = samples.iter().map(|s| s.total).collect();
+  totals.sort_unstable();
+  let p99 = totals[(totals.len() - 1) * 990 / 1000];
+  let tail: Vec<&Sample> = samples.iter().filter(|s| s.total >= p99).collect();
+  let median = |mut values: Vec<u64>| {
+    values.sort_unstable();
+    values[values.len() / 2]
+  };
+  let daemon = median(tail.iter().map(|s| s.daemon).collect());
+  let client = median(tail.iter().map(|s| s.total - s.daemon).collect());
+  let parked = tail.iter().filter(|s| s.parked).count();
+  let all_parked = samples.iter().filter(|s| s.parked).count();
+  println!(
+    "  provision.{key} run {run} tail: {} creates at or past p99 {p99} ns: daemon part {daemon} ns, client part {client} ns at the median, {parked} parked (all creates: {all_parked} of {} parked, daemon part p50 {} ns)",
+    tail.len(),
+    samples.len(),
+    median(samples.iter().map(|s| s.daemon).collect()),
+  );
 }
 
 /// The percentiles of one run's samples.
@@ -243,10 +357,12 @@ fn form(
     let mut all = Vec::new();
     for handle in handles {
       let samples = handle.join().unwrap();
+      let totals: Vec<u64> = samples.iter().map(|s| s.total).collect();
       if clients == 1 {
-        print_growth(key, run, &samples);
+        print_growth(key, run, &totals);
+        print_tail(key, run, &samples);
       }
-      all.extend(samples);
+      all.extend(totals);
     }
     cpu.push(cores_permille(
       cpu_now_ns().saturating_sub(cpu_before),
@@ -332,7 +448,63 @@ fn p99_median(rows: &[(&'static str, Vec<u64>)]) -> u64 {
   sorted[sorted.len() / 2]
 }
 
+/// The loaded bound on the 1-client spinning p99 (R9 under load; A-786), from the quiet run and the load: what the load
+/// adds to the spinning form's tail may be at most what it adds to the parked form's, whose every create pays its
+/// threads' wakes under that load. Spinning exists so a create never waits for a park, so under the same load it never
+/// does worse than parking. `quiet` and `loaded` are each form's `(spinning, parked)` p99, nanoseconds.
+fn loaded_bound_ns(quiet: (u64, u64), loaded_parked: u64) -> u64 {
+  let (spinning, parked) = quiet;
+  spinning.saturating_add(loaded_parked.saturating_sub(parked))
+}
+
+/// The 1-client forms again beside `load_per_cpu` spinners per logical CPU, started after the quiet forms so those are
+/// the machine's own; each row's key gains `loaded<N>_`. Asserts [`loaded_bound_ns`] on the spinning p99 against the
+/// quiet `(spinning, parked)` p99s; whether it held.
+fn loaded_forms(daemon: &Daemon, instance: &str, load_per_cpu: usize, quiet: (u64, u64)) -> bool {
+  let shards = daemon.config().runtime.shards;
+  let load = Load::start(load_per_cpu);
+  println!(
+    "  provision.load: {} spinning processes ({load_per_cpu} per logical CPU, {LOAD_VARIABLE})",
+    load.0.len()
+  );
+  let key = format!("loaded{load_per_cpu}_spinning_1");
+  let before = daemon.shard_pulses();
+  let (spinning, cpu) = form(instance, &key, 1, SPINNING_SAMPLES, None);
+  print_cpu(&key, shards, &cpu);
+  print_parks(
+    &key,
+    &before,
+    &daemon.shard_pulses(),
+    RUNS * SPINNING_SAMPLES,
+  );
+  print_rows_gated(&key, &spinning, true);
+  let key = format!("loaded{load_per_cpu}_parked_1");
+  let before = daemon.shard_pulses();
+  let (parked, cpu) = form(instance, &key, 1, PARKED_SAMPLES, Some(PARKED_PAUSE));
+  print_cpu(&key, shards, &cpu);
+  print_parks(&key, &before, &daemon.shard_pulses(), RUNS * PARKED_SAMPLES);
+  print_rows_gated(&key, &parked, true);
+  drop(load);
+  let (spinning, parked) = (p99_median(&spinning), p99_median(&parked));
+  let bound = loaded_bound_ns(quiet, parked);
+  let ok = spinning <= bound;
+  println!(
+    "ac-2.1: 1 client spinning beside {load_per_cpu} spinners a logical CPU, provisioning p99 {spinning} ns vs the loaded bound {bound} ns (quiet spinning p99 {} ns + the load's addition to the parked p99, {parked} - {} ns): {}",
+    quiet.0,
+    quiet.1,
+    if ok { "ok" } else { "FAIL" }
+  );
+  ok
+}
+
 fn main() {
+  if std::env::args().any(|argument| argument == SPIN_ARGUMENT) {
+    spin();
+  }
+  let load_per_cpu = std::env::var(LOAD_VARIABLE).ok().map_or(0, |n| {
+    n.parse::<usize>()
+      .expect("the load is a count of spinners per logical CPU")
+  });
   let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
@@ -384,6 +556,7 @@ fn main() {
   let cores = profile.facts.cpus_at_once();
   let runnable = cores.saturating_sub(usize::from(shards)).max(1);
   let mut failed = false;
+  let mut quiet_spinning = 0;
   for clients in CLIENT_COUNTS {
     let key = format!("spinning_{clients}");
     let before = daemon.shard_pulses();
@@ -405,6 +578,7 @@ fn main() {
     let p99 = p99_median(&rows);
     let floor_gated = *clients == 1;
     if floor_gated {
+      quiet_spinning = p99;
       let ok = p99 <= PROVISION_FLOOR_NS;
       failed |= !ok;
       println!(
@@ -450,12 +624,22 @@ fn main() {
     &daemon.shard_pulses(),
     RUNS * PARKED_SAMPLES,
   );
-  print_rows_gated("parked_1", &rows, false);
+  // R9: the parked form is ratcheted as the spinning one is, never floored: its latency is a wake, which the
+  // scheduler's park granularity dominates.
+  print_rows_gated("parked_1", &rows, true);
+  let quiet_parked = p99_median(&rows);
   println!(
-    "ac-2.1: 1 client parked (paced {} µs), create p99 {} ns: reported, not gated",
+    "ac-2.1: 1 client parked (paced {} µs), create p99 {quiet_parked} ns: ratcheted, not floored",
     PARKED_PAUSE.as_micros(),
-    p99_median(&rows)
   );
+  if load_per_cpu > 0 {
+    failed |= !loaded_forms(
+      &daemon,
+      &instance,
+      load_per_cpu,
+      (quiet_spinning, quiet_parked),
+    );
+  }
   daemon.stop();
   if failed {
     std::process::exit(1);
