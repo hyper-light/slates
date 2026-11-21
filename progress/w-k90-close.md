@@ -53,5 +53,13 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
   Open red: harness (fake-claude) runs in pod but opening prompt never reaches it (status stays starting). Run 7 diagnoses.
 - Each new commit rebuilds the kiln lib (~40 min under load: build.rs embeds the commit).
 
+## 2026-11-20 ~18:40 PST (restarted by main 17:20: item = goal 90c, the W10 cluster proof only)
+- Deleted ~/.cache/w-k90-close-local-target.noindex (23 GB) on Studio-4 per main.
+- Cycle 10 (bec9fdf5f93) PROVEN: fleet node, node certs, pod start, pod folder = kubelet nfs4 xprtsec=mtls, agent's
+  files in home volume (plan: create 1, replace 1), review (change request branch holds pod's file), drift, landing over
+  a person's change refused (ModifyModify). Failed only at: landing after the person rewrote README back (Slates judges
+  changed-since-base, not bytes) -> test reordered: land through grant first, then drift (5767f795898). Cycle 11 running.
+- docs/agentic.md W10 status paragraph drafted in ~/.cache/k90-close/wt (uncommitted), to land with the passing run.
+
 ## For main to delete
 - adacachy ~/.cache/w-k90-close/kiln2 (partial SSH clone, 84K) and ~/.cache/w-k90-close/wt (broken half-checkout; `git -C ~/.cache/w-k90-close/kiln3 worktree remove` needs --force)

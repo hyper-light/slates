@@ -73,8 +73,43 @@
   1,622 (content object 259 MiB kept, RSS 1,362 kept). Fix d0f3199f9: slates_mem::extent_handoff/make_extent; pool
   makes own slice's extents at start, maps by name, release unlinks + remakes empty; daemon unlinks every extent name
   when the anchor is gone. mem shared:: 6/6 local. Green run r22 queued.
+- GREEN r22 (adas-macbook-pro-2, quiet): 256 MiB burst: pool 420 -> 1,648 -> 123 MiB after destroy (content object
+  2 -> 0 MiB). (d) r24 (big Studio): cli killed-anchor (incl. extents), locked-volume SIGKILL-daemon restart byte for
+  byte, anchor-supervises, recovery acknowledged-content restart: all ok; fmt clean. (a) provision A/B r25 (A=1b63ab896
+  base, B=3f24e4fea) queued -- the last gate before landing A-789 (claimed). Docs drafted in the worktree.
+- g226's Linux/Windows give-back numbers: inbox/w-sizing-from-g226-giveback.md. Linux: one memfd + punch (keep);
+  Windows: section per extent (decommit refused, discard per process, commit only back at close). Asked g226 to land
+  them in BENCHMARKS as "Content give-back per platform"; told g226 its status residency reads 0 on macOS.
+- A-789 LANDED main 362bd8c39 (merge 4e461fd36): macOS extents as own objects. Provision A/B r26 (big Studio, load
+  44-79): p50 equal, p99 not worse; quiet rerun in run-requests.md. Branch agents/w-sizing-extents deleted; worktree
+  w-sizing-a778 removed; now ~/slates-work/w-sizing-a789 (landed, removable).
+- Flaky, not mine: mem arena::tests::a_purged_block_leaves_the_footprint_and_is_cleared_before_reuse failed once in a
+  parallel run on pressured Studio-4 (footprint 69,812,680 -> 69,632,408), passes alone.
+- NEXT (extents): Windows section per extent (g226: only a closed section returns commit); the content object's arena
+  address-space range (layout); the 5x process RSS over a burst (1,362 MiB for 256 MiB, r21) -- find what holds it.
 - Then item 2 (if prefault pays: EWMA of pages turns touch) or remove; item 3 reserve_per_shard work-derived + pressure.
 - Disk here 14 GiB free (others' caches; mine 2.5 GB).
+
+## CLOSE LIST (Ada 16:05-16:15, binding; briefs/close-list.md): C1, R2, R3 only. New findings -> GAPS + here.
+- C1 CLOSED: inbox/main-from-w-sizing-close.md (A-777 21a306a04; r6 A/B).
+- R2 (7.1 GB resident after an 84 MB push; extents made on demand): macOS extents A-789 362bd8c39 + leak A-778
+  779840fba + prefault A-777. Linux: no change needed (g226: one memfd + punch frees with peers mapped). Windows:
+  section per extent needed (only close returns commit) -- needs anchor-held per-extent handles; ask main whether R2
+  includes Windows. Measurement for the close: r30 (hg history push, before 47dc24b72 vs after 92f7a756b, RSS + status
+  split + system free after the anchor's SIGKILL) queued.
+- R2 measured by use, r35 (big Studio, release, hg history push; before 47dc24b72 / after 92f7a756b): RSS after push
+  6,198-6,200 MiB both arms, unchanged at 20 s idle; after SIGKILL system free: after-arm 5,569 -> 11,951 MiB, before-arm
+  stays 732 (leak; 2 names unlinked by the script). R2 status written to inbox/main-from-w-sizing-close.md (macOS +
+  Linux closed; Windows section-per-extent: asked main whether it is inside R2).
+- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md). Remaining 6.2 GB after an hg
+  history push is held content (w-hg 4,495.5 MiB content store) + register + heap; status split came back empty in r35
+  (g226 is fixing the status residency).
+- 16:46: main asked to land agents/w-sizing-extents: already landed as A-789 362bd8c39 (squashed; branch deleted).
+- Disk (Studio-4): deleted my targets incl. two whose names contained "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=6" (an
+  `env $E` quoting slip made cargo use the whole string as CARGO_TARGET_DIR; 15 GB + 4.8 GB) and w-sizing-ab-target.
+  Studio-4 now 97 GiB free. Builds go through kiln with needs "macos,disk=60g" from now on.
+- g226: status residency fix choice (a) filed with main (inbox/main-from-g226-close.md); g226 frozen by the close order.
+- Worktree ~/slates-work/w-sizing-a789 (landed; removable). Scripts ~/.cache/w-sizing-logs (hgmem.sh, hgmem-cmd.txt).
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =

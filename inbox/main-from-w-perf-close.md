@@ -20,3 +20,20 @@
 - Measurement: w-svn's replay_bench over git-2000 on b51f908f2: 328 s before, best 1.82 s after (0.91 ms a revision).
 
 Next on my list: the deltify job (C1, and svn's P), then R2 (the hg import's peak, through w-store's payload).
+
+## C1, goal 93 shared (and 93 svn's P): the deltify job: CLOSED
+- Commit on origin/main: **1b168038c** (landed through merge **e1d896547**). Form (A), as you ruled at 16:10.
+- What it is: a text a commit stored whole in the content store (A-761) is kept as a skip-delta svndiff by the
+  records once a later revision moves its node past it (`vcs_store::svn_deltify`). Its delta is made a 100 KiB window
+  a slice, landed as its own entry (`Record::Deltified`, the delta held by the records as c2 holds every other text),
+  and only then is the store's hold given back. A recovery's replay holds still-stored texts after the whole log
+  (`hold_svn_stored`), so a text a later entry deltified is never asked of the store; it then hands the job whatever a
+  restart cut off.
+- Test: `vcs_store::svn_deltify::tests::a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released`.
+  Red with the job not handed its texts: (deltified, windows, refused) = (0, 0, 0), the whole text held. Green: (1, 3,
+  0), the records no longer keep it stored, the store's holders 0, read back byte for byte before and after a rebuild
+  from the log, no replay refused. Codec: `a_deltified_texts_record_is_pinned_read_back_and_refused_by_kind`.
+  slates-svn --lib 580/580; slates-server --lib `svn vcs_store::` 176/176 (macOS arm64, this MacBook).
+
+C1 is now closed whole (svn storage A/B, c3, deltify job). Next: R2, the hg import's 5.73 GB, through w-store's
+payload (the per-phase profile is rerunning as kiln r20).

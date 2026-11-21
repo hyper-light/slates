@@ -260,3 +260,13 @@
   cbf7c84c3: push-all 97 s, shallow-clone 3 s, deepen 217 s, partial-clone 50 s, partial-blame pass. Owed to the
   stream's owner: read_objects remakes every run of a bit table each window.
 - 2026-11-20 svn diag run 13 (after 2502607c4, base 2d3f218cb) reported to main.
+- 2026-11-20 P1 (close list): deepen's 217 s against stock git. Measured on Studio-4, git v2.0.0, `clone --depth 1`
+  then `fetch --deepen 100` (24,885 commits, 150 shallow, 123,216 objects):
+  - Quiet, base 2e4415441: stock `git daemon` 4.55/4.51/4.48 s; slates, the first fetch after the push 193-235 s (it
+    pays the version's whole encoding, git_encode's encode_behind on the same shard), settled 31.3 s.
+  - Loaded (g222's spinner bench, load ~40), best of 5 interleaved: stock 11.13 s, base 114.05 s, candidate 74.07 s
+    (reader cursor + typed tree entries). Settled time is the negotiation's index lookups (kind, size per tree entry).
+  - Robustness, blocks the item: every settled deepen spins one poll of the HTTP edge task (vcs_http.rs:850) past
+    1 s of CPU at about its 100,000th poll, base and candidate alike (5 of 5 rounds each; 3 on the quiet run); the
+    watchdog killed the candidate's daemon in round 5 (client: curl 18, bad pack header). Being located with a scratch
+    diag build on the big Studio (kiln r3); builds moved off Studio-4 by main's order, caches deleted.

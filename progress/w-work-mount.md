@@ -39,7 +39,7 @@ Signing: kiln's GIT_CONFIG_* env beats `-c commit.gpgsign=false`; use `git commi
    slates-vfs/db as fresh); the A/B's before side uses ~/.cache/w-work-mount-ab-target.noindex (delete after).
    NEXT (part 3): landing of a green without a head copy: land crate needs a read-only base host beside the target
    host (Source::read_at uses landing.host) + PlanWalk listing untouched tree-base entries as created.
-   PART 3 DESIGN (17:15): green landing view = overlay over the tree host (like a mount, pin = head; reuse
+   PART 3 LANDED 18:00 f401f798c (main 5d29b9572); presenting 69 MB -> 1.6 MB release. Design was (17:15): green landing view = overlay over the tree host (like a mount, pin = head; reuse
    mounted_work::lend). Land crate: (a) PlanWalk::materializing(vol, source): a stage walking the merged tree through
    Overlay::readdir (host = the tree lens) emitting Diverged{Created} for every entry, then the existing Entries stage;
    (b) Beginning::materializing + Beginning::unit_over(host, base: Option<&mut dyn HostFs>, ..): plan reads via base;
@@ -48,7 +48,16 @@ Signing: kiln's GIT_CONFIG_* env beats `-c commit.gpgsign=false`; use `git commi
    field: ~25 literals). Server landing.rs: green view path like a scratch volume's (prepared.os, Writer::Own), and
    lend the tree lens at beginning.unit (~2010), run.step (~2135), finish_step (~2194). Red: presenting/landing the
    64 MiB green adds <= 8 MB resident (was +69 MB); ten-editor test still lands == oracle.
-2. Restart durability of unsubmitted mount writes (red: save, restart, submit, save is there; A-127 anchor segment).
+2. NOW (18:00) Restart durability of unsubmitted mount writes. Facts: publication already images the mounted overlay
+   (TreeHost::fingerprint_dir answers without the tree); recovery (verbs.rs ~17355 `Role::Plain => rebuild_volume`)
+   skips merge roles, so the slot is rebuilt fresh from the work and the writes are lost. Plan: (a) red test in
+   tests/mounted_work.rs style over SegmentSource::Handoff restart (see crates/client/tests/client.rs restart oracle):
+   mount, save, barrier, restart over the same segment, submit, expect the save in the green; (b) recovery: for a
+   Role::Work record with an image, rebuild an overlay slot with BaseHost::Tree and re-insert the pin
+   (pin version = the work's durable base_version; make TreeHost identity depend on the green only, so a re-pin shows
+   drift only where bytes differ); greens must be recovered before (check order); base plane reacquire needs the lens
+   (open_dir) at recovery -> lend the green there.
+2b. Restart durability (red: save, restart, submit, save is there; A-127 anchor segment).
 3. D-O17 multi-span: w-rewrite-ops' minimiser on main 561c655a3, one call site (`changed_span` in mounted_work.rs).
 4. Kernel-mount real-editors variant -> run-requests.md only.
 w-work-cow fixes "first edit copies whole file" at chunk grain in the content layer; tell them files via inbox first.
@@ -62,3 +71,20 @@ w-work-cow fixes "first edit copies whole file" at chunk grain in the content la
 2. Kernel variant with real editor processes (gated, run-request filed).
 3. Restart: unsubmitted mount writes lost at restart (slot not recorded); mount refresh when the work's base moves.
 4. D-O17 several spans a file: swap `changed_span` for w-rewrite-ops' minimiser at its one call site.
+
+## 2026-11-20 18:40 — main's 15:20 order done
+1. Lazy base: part 2 f6660f0ab (mounts: release 547 MB -> 0.75 MB for 8, 9.4-12.9 ms -> 0.5-0.8 ms), part 3 f401f798c
+   (green landing: presenting 69 MB -> 1.6 MB, release A/B in BENCHMARKS).
+2. Restart: part 4 9d73a77c6 (recovery rebuilds a mounted work's slot from its image over its green).
+3. D-O17: part 5 1b0f5679c (declare whole-file replacement; A-776 refine at composition).
+4. Kernel real-editor variant: run-requests.md.
+Remaining GAPS (A-774 row): mount not refreshed when its work's base moves; a work with declared changes refused a
+mount; only NFS/FUSE lend the tree (WinFsp, virtio-fs, fs verbs refuse typed); green on another shard mounts nothing;
+re-landing a green into a target holding an earlier landing conflicts on changed files (needs witnesses); the views'
+tree loads in one step (slice owed).
+Lessons: never build two worktrees into one target dir (poisoned release artifacts); `git commit --no-gpg-sign`.
+
+## 2026-11-20 ~17:00 — Ada's close list (briefs/close-list.md) DONE
+C1 77fcae73a (FUSE+WinFsp tests written, runs in run-requests), C2 1b0f5679c, R3 9d73a77c6, R4 60a71db8a, P5 f6660f0ab +
+f401f798c. Close notes: inbox/main-from-w-work-mount-close.md. Queue empty; new findings go to GAPS only.
+Target on Studio-2 kept at ~3 GB (focused tests, CARGO_PROFILE_TEST_DEBUG=0).

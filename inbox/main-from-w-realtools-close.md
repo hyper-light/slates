@@ -18,3 +18,11 @@
   date, `cargo build` printing no "Compiling", `git status --porcelain` empty.
 - Result: 4 passed in 30.97 s, adas-macbook-pro-2.local (macOS arm64, APFS), debug, base 617c88102.
 - Linux FUSE and WinFsp: filed in run-requests.md. The WinFsp port of the flows is owed (GAPS).
+## C2-C4 WinFsp port CLOSED (2026-11-20 ~17:40 PST): the flows build on every platform
+- Commits on origin/main: 9793d9218 (the port), 3620554c6 (GAPS).
+- crates/cli/tests/real_tools.rs now builds for macOS, Linux and Windows. On Windows each file's identity is its file
+  index plus its LastWriteTime and ChangeTime (FILE_BASIC_INFO); the daemon is ended with TerminateProcess, and the
+  test waits for winfsp.adopted to rise; the mount is a free drive letter. cargo and git status are checked across a
+  snapshot, the takeover and the injected pressure. The FIFO-held #pragma once compile and make stay Unix-only.
+- macOS re-run after the port: 4 passed in 44.71 s, adas-macbook-pro-2.local, base 9793d9218.
+- Windows and Linux runs are filed in run-requests.md. The Windows build is unverified, since I compile macOS only.

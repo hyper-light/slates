@@ -20,6 +20,32 @@
   Worktree ~/slates-work/w-provision-gate-land (branch agents/w-provision-gate). Scratch clone ~/slates-work/w-provision-gate
   has DIAG-free tree + local wip merge (do not push it). Arms/logs ~/.cache/w-provision-gate-arms.
 
+- 2026-11-20 ~17:10 (close list: C1 then P2): C1 wiring LANDED 2157188b4 (kiln ci+nightly exclusive bare-metal
+  provision-gate-linux/-macos; GHA provision-histogram; xtask lane informational w/o baseline, always loaded form).
+  By use: local lane exit 0, 28 rows kept. Baseline: adacachy (Linux, 451397…) at load 90-104 -> not recorded (r2
+  stopped); kiln r3 (`macos exclusive`, `--record`) queued — when it ends, commit its ratchets.toml diff to main, then
+  write inbox/main-from-w-provision-gate-close.md for C1. Worktree ~/slates-work/w-provision-gate-ci.
+
+- ~18:30: P2 in ~/slates-work/w-provision-gate-land (branch has b01a0ef7b kqueue; uncommitted: shard.rs idle_turn_rest =
+  macOS explicit sleep(1ns) per idle-spin turn). Saved variants in ~/.cache/w-provision-gate-fix/p2/ (held_turn.timew.rs +
+  shard.timew.rs = time-horizon estimator, unit tests 7/7, red vs old 400 ns). ab5 r1 (kqueue+timew): loaded p99 2.00 ->
+  0.46 ms but p999 13.0 -> 37.3 ms. ab6 running: p2main / p2fix(timew) / p2nap (kqueue + explicit macOS nap, old
+  estimator), 3 rounds, ~/.cache/w-provision-gate-arms/ab6.txt. r3 (macOS exclusive --record baseline) lost its runner,
+  requeued.
+
+- ~21:00: C1 robustness LANDED 99c599ce5 (bound = max(quiet spinning p99, loaded parked p99); main red 3/3, candidates
+  green 6/6). P2 A/B ab6 done (BENCHMARKS "the candidates"): time + nap arms meet R9 quiet (28-43 us), loaded p99 3-5x
+  better, but loaded p999 5.6-23.4 vs main 2.1-2.5 ms and 2-6x quiet CPU -> NOT landed; P2 open (loaded p999 hop next,
+  with g222). Land worktree's uncommitted shard.rs = nap arm; time arm saved in ~/.cache/w-provision-gate-fix/p2/.
+  C1 remaining: kiln r4 (`macos exclusive`, ratchet --provision --record from the ci worktree) queued. When it ends:
+  commit its ratchets.toml diff to main (area `ratchet:`), then write inbox/main-from-w-provision-gate-close.md for C1.
+
+- ~18:50: C1 baseline still unrecorded. Per main 18:36 resubmitted by needs ("macos,cpus=16,disk=60g exclusive"):
+  r7 and r8 both placed on d1323898 (big Studio) and both failed "did not answer the sync in 60s"; earlier r3/r4/r5
+  failed the same way on b24c5c95 (draining). r6 (named cec37f60, adas-mac-studio.local) was stopped per main's no-naming
+  rule. BLOCKER for main: the Studios' sync. To resume: rerun the same command by needs from
+  ~/slates-work/w-provision-gate-ci, commit the ratchets.toml diff, write the C1 close note.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh

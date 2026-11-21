@@ -1,5 +1,21 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-20 ~19:00 PST: CLOSE LIST (Ada's order). My items: C1 goal 86b; R2 unplaced (CLOSED, inbox/main-from-w-fed-move-close.md)
+- C1: 100,000 clients, 1 primary + 2 replicas, the Linux kernel tree, every p99 < 1 ms, conflicts judged right (oracle).
+  State found (GAPS ~6224+, BENCHMARKS 13870/14213): single in-process node reaches 10,000 clients (p99 200-440 ms);
+  1,000 clients <1 ms in 1 run of 15 on the shared Studio; the 3-node topology (crates/cli/tests/load_scale.rs) over the
+  whole kernel never run at 100k; f=1 version-0 over the kernel "measurement owed".
+- Kernel: ~/.cache/w-fed-move-linux (torvalds v7.4-rc4 5f22fb204, 97,371 files, shallow).
+- Harness: ~/.cache/w-fed-move-target/release/examples/load_bench (slates main 1527ecfe).
+- Rung 1,000 on the topology: ~/slates-work/w-fed-move-c1-rung1k.log (SLATES_LOADTEST_* env; cargo test --release -p
+  slates-cli --test load_scale).
+
+## 2026-11-20 ~18:10 PST: main's piece "moves refused unplaced" DONE -- A-784 LANDED slates main 5f9e4287 (fix 3f4fadda), kiln carries it at main 4f5e58c1b (vendor 0002)
+- Report: inbox/main-from-w-fed-move-move-unplaced.md. kiln carry = vendor/patches/slates/0002 in worktree
+  ~/slates-work/w-fed-move-kv (kiln main 648c57184; kiln now pins Slates 8ce3d615 which has A-756), docs W7 updated;
+  checks + release local run in flight (~/slates-work/w-fed-move-a784-local2.log), then land via bundle + Studio-4.
+- Kiln findings 1, 3, 4 sent to w-k90-microvm (inbox/w-k90-microvm-from-w-fed-move.md).
+
 ## 2026-11-20 ~14:30 PST: the live move ACROSS TWO MACS proven (kiln main 4c19f1aad, test 798cb9259)
 - Run 10 (this Studio .88 -> adas-macbook-pro.local .86, third node beside A): fleet formed across Macs; agent worked
   on A; moved at ask 9; carried on in its moved mount on the MacBook byte for byte; old runner refused a write

@@ -46,3 +46,5 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   adas-macbook-pro-2 in 30.97 s. Linux FUSE and WinFsp runs are filed in run-requests.md. Runs go through my clone
   ~/.cache/w-realtools-clone on adas-macbook-pro-2 (sync:false; kiln's sync to that runner failed 3 times).
   Open in GAPS: the WinFsp port of the flows; memory pressure from a host actually short of memory.
+- 17:40 PST: WinFsp port LANDED 9793d9218 (+ GAPS 3620554c6); macOS 4/4 in 44.71 s. Windows and Linux runs filed.
+  Close list C1-C4 done. Branch agents/w-realtools deleted once landed.
