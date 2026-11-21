@@ -362,9 +362,10 @@ fn bound(state: &ShardState, repository: RepositoryId, name: &str) -> bool {
   repositories.branch(repository, name).is_some()
 }
 
-/// The files the green `repository`'s branch `name` binds holds, with their bytes.
+/// The files the green `repository`'s branch `name` binds holds, with their bytes: reached through the door, made first
+/// if it owes its push (P2).
 pub(crate) fn files(
-  state: &ShardState,
+  state: &mut ShardState,
   repository: RepositoryId,
   name: &str,
 ) -> Vec<(String, Vec<u8>)> {
@@ -374,6 +375,7 @@ pub(crate) fn files(
     .repositories()
     .branch(repository, name)
     .unwrap();
+  crate::green_ready::made_now(state, green);
   let engine = state.greens.get(&green).unwrap();
   engine
     .files()
@@ -396,7 +398,7 @@ pub(crate) fn text(rewritten: bool) -> Vec<u8> {
 }
 
 /// Asserts that each of `names` binds a green holding one file, `text`, as the fixtures' second commit names it.
-fn assert_hold_the_second_text(state: &ShardState, repository: RepositoryId, names: &[&str]) {
+fn assert_hold_the_second_text(state: &mut ShardState, repository: RepositoryId, names: &[&str]) {
   let second = vec![("text".to_owned(), text(true))];
   for name in names {
     assert_eq!(files(state, repository, name), second, "{name}");
@@ -680,7 +682,13 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
   crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "bindings");
     pushed_from_the_fixtures(state, repository, &["create"]);
-    let branch = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
+    // Through the door, as `verbs::run_recorded` reaches a green: one that owes its push is made first (P2).
+    let branch = |state: &mut ShardState, body: RequestBody| {
+      if let Some(green) = crate::green_ready::owing_green_of(state, &body) {
+        crate::green_ready::made_now(state, green);
+      }
+      dispatch(state, 1, &owner(), body)
+    };
     let made = branch(
       state,
       RequestBody::CreateBranch {
@@ -882,38 +890,46 @@ const ROOMY_CREATES: usize = 16;
 /// A-238 moved off the append's step (main's order of 2026-11-21, 04:58 PST; found by use: git/git's whole-history push
 /// had its daemon killed by the watchdog, shard 10 spinning 1,142 ms in one append that met `green_chains` at its cap
 /// and checkpointed the repository's every member green, about a thousand, each folding its identity whole). Do: with a
-/// small green-chain budget, push [`ROOMY_CREATES`] creates of branches, each its own commit of a tree of
-/// [`ROOMY_FILES`] files, each a push of its own, so the chains fill and later appends meet their cap with many members.
+/// small green-chain budget, push [`ROOMY_CREATES`] creates of branches, each its own commit of a one-file tree, then
+/// an update of each to its own tree of [`ROOMY_FILES`] files, each a push of its own (a create owes its push since P2,
+/// so the updates' works are what fill the chains), so the chains fill and later appends meet their cap with many members.
 /// Expect: every create `ok`; no green checkpointed inside an append's step (the counter none); the room made in the
 /// pushes' turns before their appends, a green a turn (the turns' counter moved). Red before the change: the appends
 /// checkpointed the members themselves, in their steps.
 #[test]
 fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step() {
-  let (refused, in_appends, in_turns) = crate::test_store::audit_on_stored_shard_configured(
-    "git-push",
-    |state| {
-      let repository = git_repository(state, "roomy");
-      let mut refused = Vec::new();
-      for k in 0..ROOMY_CREATES {
-        let (commit, objects) = flat_commit(ROOMY_FILES, &format!("create {k} file"), None);
-        let pack = pack_of_objects(&objects);
-        let commit = commit.to_string();
-        let name = format!("refs/heads/r{k}");
-        let created = [("", commit.as_str(), name.as_bytes())];
-        let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
-        if reasons(&received) != [b"ok".to_vec()] {
-          refused.push(k);
-        }
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET;
+  });
+  let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "roomy"));
+  let mut refused = Vec::new();
+  for k in 0..ROOMY_CREATES {
+    // A create owes its push (P2), so its update is what builds a work into its green's chain.
+    let (first, objects) = flat_commit(1, &format!("create {k} file"), None);
+    let (second, more) = flat_commit(ROOMY_FILES, &format!("update {k} file"), Some(first));
+    let (first, second) = (first.to_string(), second.to_string());
+    let name = format!("refs/heads/r{k}");
+    let created = [("", first.as_str(), name.as_bytes())];
+    let updated = [(first.as_str(), second.as_str(), name.as_bytes())];
+    for (commands, objects) in [(created, &objects), (updated, &more)] {
+      let pushing = request(&commands, CAPABILITIES, &pack_of_objects(objects));
+      // A push a poll of the shard, as a client's push is its own task.
+      let answered = crate::daemon::observe_first(&daemon, move |state| {
+        reasons(&pushed(state, repository, &pushing))
+      });
+      if answered != [b"ok".to_vec()] {
+        refused.push(k);
       }
-      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-      (
-        refused,
-        count(crate::repository::push::APPEND_CHECKPOINTED),
-        count(super::ROOM_CHECKPOINTED),
-      )
-    },
-    |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
-  );
+    }
+  }
+  let (in_appends, in_turns) = crate::daemon::observe_first(&daemon, |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::repository::push::APPEND_CHECKPOINTED),
+      count(super::ROOM_CHECKPOINTED),
+    )
+  });
+  daemon.stop();
   assert_eq!((refused, in_appends), (Vec::new(), 0));
   assert!(in_turns > 0, "the room made in the turns: {in_turns}");
 }
@@ -971,6 +987,144 @@ fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_obj
   let (turns, derived) = (after.0 - before.0, after.1 - before.1);
   assert_eq!(derived, 1);
   assert!(turns <= PACED_TURNS, "{turns} turns");
+}
+
+/// Shape: the files of [`t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`]'s first
+/// version: enough that building it is many quanta.
+const UNBORN_FILES: usize = 1_500;
+
+/// P2 (main's ruling of 2026-11-21 08:10 PST, `BranchChange::UpdateDeferred`; found by use: git/git's unborn master,
+/// 4,876 files, built whole in one step at its push). Do: push the unborn default branch `main` at a commit of a flat
+/// tree of [`UNBORN_FILES`] files, a step at a time; then reach its green through the door (`green_ready`) and wait for
+/// it to be made. Expect: the push `ok`, its build taking at most the one turn its command takes to name the owed
+/// push, its green owing the push (an update deferred, counted); once reached, the green made once, holding every file
+/// of the commit with its bytes, as the eager update made it.
+/// Red before the change: the push built the whole tree in its steps (14,273 quanta) and the green held it at once.
+#[test]
+fn t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let (first, objects) = flat_commit(UNBORN_FILES, "unborn", None);
+  let (repository, green, before) = crate::daemon::observe_first(&daemon, |state| {
+    let repository = git_repository(state, "unborn");
+    let green = state
+      .db
+      .partition()
+      .repositories()
+      .branch(repository, "main")
+      .unwrap();
+    (repository, green, state.push_turns)
+  });
+  let create = request(
+    &[("", &first.to_string(), b"refs/heads/main")],
+    CAPABILITIES,
+    &pack_of_objects(&objects),
+  );
+  let (created, _) = pushed_in_steps(&daemon, repository, &create).unwrap();
+  let (after, owing, deferred) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state.push_turns,
+      state.greens.is_owing(&green),
+      state
+        .refusals
+        .get("repository.push.updates_deferred")
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  crate::daemon::observe_first(&daemon, move |state| {
+    crate::green_ready::green_ready(state, green);
+  });
+  let began = std::time::Instant::now();
+  while crate::daemon::observe_first(&daemon, move |state| state.greens.is_owing(&green))
+    && began.elapsed() < std::time::Duration::from_secs(120)
+  {}
+  let materialized = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .refusals
+      .get(crate::green_ready::MATERIALIZED)
+      .copied()
+      .unwrap_or(0)
+  });
+  let read = crate::daemon::observe_first(&daemon, move |state| files(state, repository, "main"));
+  daemon.stop();
+  assert_eq!(reasons(&created), [b"ok"]);
+  let quanta = (after.more_quanta - before.more_quanta) + (after.turns - before.turns);
+  assert_eq!(
+    (quanta <= 1, owing, deferred),
+    (true, true, 1),
+    "the push built nothing, its one turn the create's naming its owed push; its green owes the push ({quanta} quanta)"
+  );
+  let expected: Vec<(String, Vec<u8>)> = (0..UNBORN_FILES)
+    .map(|at| (format!("f{at:05}"), format!("unborn {at}\n").into_bytes()))
+    .collect();
+  assert_eq!(materialized, 1, "made once, through the door");
+  assert_eq!(read, expected, "made as the eager update made it");
+}
+
+/// `green`'s owed push as its record encodes it, and its head: what a replay of it must hold again (P2).
+fn owed_of(green: &slates_merge::engine::Green) -> (u64, Option<Vec<u8>>) {
+  (
+    green.head(),
+    green
+      .deferred()
+      .map(slates_merge::push::DeferredPush::encode),
+  )
+}
+
+/// P2's oracle (main's order of 2026-11-21 08:10 PST: the deferred green, materialized, equals the eager one byte for
+/// byte, before and after a replay, per branch and tag). Do: push the fixtures' `create` (the unborn default `main`, an
+/// update deferred), `update`, `tag` (`refs/tags/v1`, a create deferred, its owed push the change from `main`'s first
+/// version) and `copy` (`refs/heads/copy`, a create deferred at the commit `main` holds); for each created ref, replay
+/// its green from its durable chain, make the live green through the door, then replay it again. Expect: each created
+/// green owes its push after the pushes, at its base, version 0; each replay holds the live green's debt byte for byte
+/// (the same head and the same owed push's record, version 1), before the live green was made and after; made, the live
+/// green holds the second commit's text, as the eager create's did, at version 1. The made content follows from the base
+/// and the push alone (one builder over one input, A-812), so a replay owing the same push at the same base is made the
+/// same; making a recovered owing green over a restarted node's shares is the fleet test GAPS owes (A-812 (b)).
+#[test]
+fn t_p2_a_created_branch_and_tag_owe_one_push_across_a_replay_and_are_made_as_the_eager_create() {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
+    let repository = git_repository(state, "p2-oracle");
+    pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
+    let second = vec![("text".to_owned(), text(true))];
+    for name in ["refs/tags/v1", "copy"] {
+      let green = state
+        .db
+        .partition()
+        .repositories()
+        .branch(repository, name)
+        .unwrap();
+      let live = owed_of(&state.greens.lend(&green).expect("the green"));
+      assert_eq!(
+        (live.0, live.1.is_some()),
+        (0, true),
+        "{name}: owes its push at its base"
+      );
+      let before = crate::verbs::replayed_green_for_test(state, green).unwrap();
+      assert_eq!(owed_of(&before), live, "{name}: replayed before it is made");
+      assert_eq!(
+        before
+          .deferred()
+          .map(slates_merge::push::DeferredPush::version),
+        Some(1),
+        "{name}: version 1 owed"
+      );
+      crate::green_ready::made_now(state, green);
+      let engine = state.greens.get(&green).expect("made");
+      let files: Vec<(String, Vec<u8>)> = engine
+        .files()
+        .map(|(path, bytes)| (path, bytes.to_vec()))
+        .collect();
+      assert_eq!(
+        (engine.head(), files),
+        (1, second.clone()),
+        "{name}: the eager create's"
+      );
+      drop(engine);
+      let after = crate::verbs::replayed_green_for_test(state, green).unwrap();
+      assert_eq!(owed_of(&after), live, "{name}: replayed after it is made");
+    }
+  });
 }
 
 /// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
@@ -1685,6 +1839,9 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
 /// real, from a thread of its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked
 /// nothing.
 pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
+  // The shard's materializations run between the push's turns, as their tasks would (P2's door): a synchronous driver
+  // holds the shard, so a push waiting at the door for a green would otherwise wait forever.
+  crate::green_ready::make_building_now(state);
   let Some(asked) = push.take_homing() else {
     return;
   };

@@ -11,7 +11,7 @@ use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, V
 use super::{UNMADE, lend_in};
 use crate::hg_base::tests::{FILE_INDEX, STATES, laid_out};
 use crate::state::ShardState;
-use crate::vcs_store::hg_import::{Turned, begin, land, turn};
+use crate::vcs_store::hg_import::{Turned, begin, land_imported, turn};
 use crate::verbs::dispatch;
 
 /// Shape: room enough for the view of every fixture these tests import.
@@ -69,7 +69,7 @@ fn imported(state: &mut ShardState, id: RepositoryId) {
     match turn(state, id, (&mut clock, 1)) {
       Some(Ok(Turned::More)) => {}
       Some(Ok(Turned::Done(_))) => {
-        assert_eq!(land(state, id), Ok(()));
+        assert_eq!(land_imported(state, id), Ok(()));
         return;
       }
       other => panic!("the import did not end: {other:?}"),
@@ -264,11 +264,35 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       body: &[],
     };
     let room = || Admission::new(ROOM);
-    let whole = lend_in(state, hg, &mut room(), |view, left| {
-      hg_http::answer(view, &request, 0, &mut Plain, left)
-    })
-    .expect("the whole answer");
-    assert_eq!(whole.refused, None);
+    let disk = state.vcs_disk.clone().expect("the store");
+    let repository = u128::from_be_bytes(hg.bytes);
+    // The whole answer as the edges make it: a step at a time, each want of the changeset store answered between steps
+    // (A-767 C1: a clone's file revisions as the store keeps them).
+    let whole = {
+      let begun = lend_in(state, hg, &mut room(), |view, left| {
+        hg_http::begin(view, &request, 0, &mut Plain, left)
+      })
+      .expect("the answer begun");
+      let Begun::Streamed(mut streamed) = begun else {
+        panic!("a clone's answer is streamed");
+      };
+      let mut body = Vec::new();
+      loop {
+        assert!(crate::test_store::answer_wants_blocking(
+          &disk,
+          repository,
+          &mut *streamed
+        ));
+        let more = lend_in(state, hg, &mut room(), |view, left| {
+          streamed.step(view, left, &mut body)
+        })
+        .expect("a step")
+        .expect("a slice");
+        if !more {
+          break body;
+        }
+      }
+    };
     let begun = lend_in(state, hg, &mut room(), |view, left| {
       hg_http::begin(view, &request, 0, &mut Plain, left)
     })
@@ -279,6 +303,11 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
     let generation = super::hold_in(state, hg, &mut room()).expect("the generation held");
     let mut body = Vec::new();
     let mut turn = |state: &mut ShardState, body: &mut Vec<u8>| {
+      assert!(crate::test_store::answer_wants_blocking(
+        &disk,
+        repository,
+        &mut *streamed
+      ));
       super::lend_held_in(state, &generation, &mut room(), |view, left| {
         streamed.step(view, left, body)
       })
@@ -296,7 +325,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       rebuilding, None,
       "the repository's view was lent mid-rebuild"
     );
-    assert_eq!(body, whole.body);
+    assert_eq!(body, whole);
   });
 }
 
@@ -411,12 +440,12 @@ fn streams_of(state: &mut ShardState, id: RepositoryId) -> (bool, bool) {
 }
 
 /// Goal 93 perf (main's ruling of 2026-11-21 02:31). A stream clone sends each revision as the changeset store keeps it,
-/// so a repository whose history the store does not keep (an import's, until w-hg's C1 step 3 lands imports as
-/// changesets) must advertise no stream, and stock `hg clone --stream` then clones plainly with its own warning rather
-/// than abort ("operation forbidden by server"). Do: import `fileindex` (public, no secret changeset, so nothing else
-/// withholds its stream) into one Mercurial repository and push three
-/// changesets to another; ask each view, lent now and over a held generation, whether it streams. Expect the imported
-/// one not to, either way, and the pushed one to, either way.
+/// so a repository whose history the store does not keep must advertise no stream, and stock `hg clone --stream` then
+/// clones plainly with its own warning rather than abort ("operation forbidden by server"). Since w-hg's C1 step 3 an
+/// import lands on the store as segment changesets, so an imported repository's history is the store's as a pushed
+/// one's is. Do: import `fileindex` (public, no secret changeset, so nothing else withholds its stream) into one
+/// Mercurial repository and push three changesets to another; ask each view, lent now and over a held generation,
+/// whether it streams. Expect both to, either way.
 #[test]
 fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs() {
   crate::test_store::audit_on_stored_shard("hg", |state| {
@@ -436,7 +465,7 @@ fn a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs(
     pushed(state, pushed_id, &made, &[0, 1, 2]);
     assert_eq!(
       (streams_of(state, imported_id), streams_of(state, pushed_id)),
-      ((false, false), (true, true))
+      ((true, true), (true, true))
     );
   });
 }

@@ -238,14 +238,17 @@ type HunkParts<'e> = (u64, u64, &'e [u8], &'e [u8]);
 /// The next hunk of `edit`: its start, end and bytes, and what follows it.
 fn hunk(edit: &[u8]) -> Result<HunkParts<'_>, TextsRefused> {
   let (head, rest) = edit.split_at_checked(HUNK_HEAD).ok_or(TextsRefused::Hunk)?;
-  let field = |at: usize| -> Result<u64, TextsRefused> {
-    let bytes: [u8; 4] = head
-      .get(at..at.saturating_add(4))
+  // Derived: a hunk's head is three big-endian u32 words (start, end, length), each a u32's width in turn.
+  const WORD: usize = size_of::<u32>();
+  let field = |n: usize| -> Result<u64, TextsRefused> {
+    let at = n.saturating_mul(WORD);
+    let bytes: [u8; WORD] = head
+      .get(at..at.saturating_add(WORD))
       .and_then(|bytes| bytes.try_into().ok())
       .ok_or(TextsRefused::Hunk)?;
     Ok(u64::from(u32::from_be_bytes(bytes)))
   };
-  let (start, end, len) = (field(0)?, field(4)?, field(8)?);
+  let (start, end, len) = (field(0)?, field(1)?, field(2)?);
   let (data, after) = rest
     .split_at_checked(index(len)?)
     .ok_or(TextsRefused::Hunk)?;

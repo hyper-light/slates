@@ -114,22 +114,40 @@ pub(crate) async fn imported(
   (Err(LoadFailed::Busy), TURN_LIMIT)
 }
 
-/// Revisions `first` to `last` of `records`, exported in format 2 (A-628's export).
-fn exported(records: &Repository, first: u64, last: u64) -> Vec<u8> {
-  let mut exporter = Exporter::new(records, first, last, Format::Two).expect("a range held");
+/// What the shard holds of repository `id`'s history: its records' youngest revision, and the whole of it exported in
+/// format 2 (A-628's export) through the repository's view, each stored text's piece it waits for fetched through the
+/// node's store and let go after the next call, as the export's task fetches them (C2 stage B part 2 (b)).
+async fn history(id: RepositoryId) -> Option<(u64, Vec<u8>)> {
+  let youngest = on(|state| {
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(Repository::youngest)
+  })?;
+  let mut exporter = on(|state| {
+    let records = state.vcs_stores.subversion_records(id)?;
+    Exporter::new(records, 0, youngest, Format::Two).ok()
+  })?;
   let mut out = Vec::new();
-  while exporter
-    .export(records, records, &mut out)
-    .expect("exported")
-    != Exporting::Done
-  {}
-  out
-}
-
-/// What the shard holds of repository `id`'s history: its records' youngest revision, and the whole of it exported.
-fn history(state: &ShardState, id: RepositoryId) -> Option<(u64, Vec<u8>)> {
-  let records = state.vcs_stores.subversion_records(id)?;
-  Some((records.youngest(), exported(records, 0, records.youngest())))
+  let mut fetched = None;
+  loop {
+    let step = on(|state| {
+      crate::vcs_store::svn_view::with_view(state, (id, None), |view| {
+        exporter.export(view.records, view.texts, &mut out)
+      })
+    });
+    if let Some(read) = fetched.take() {
+      on(|state| crate::vcs_store::svn_texts::let_go(state, read));
+    }
+    match step?.expect("exported") {
+      Exporting::Done => return Some((youngest, out)),
+      Exporting::Wrote(_) => {}
+      Exporting::Waiting(wanted) => {
+        assert!(crate::vcs_store::svn_texts::fetch_piece(id, wanted).await);
+        fetched = Some(wanted);
+      }
+    }
+  }
 }
 
 /// The kinds of the records repository `id`'s register names, in its order, each read back from the node's store (C2:
@@ -146,7 +164,6 @@ async fn logged_kinds(id: RepositoryId) -> Vec<&'static str> {
         Record::RevisionProperties { .. } => "properties",
         Record::Revision(_) => "revision",
         Record::Locks(_) => "locks",
-        Record::Deltified { .. } => "deltified",
       },
     );
   }
@@ -160,9 +177,10 @@ fn count(state: &ShardState, name: &str) -> u64 {
 
 /// A-652 part 3 (export(import(D)) = D, §4.17.4 piece 6's gate, through the owner's step). Do: import `part1.dump`
 /// (revisions 0 to 3, its UUID and revision 0's date) into a repository `CreateRepository` made. Expect: three revisions
-/// committed, the youngest 3; the repository's records exporting `part1.dump` byte for byte; the green at version 3; the
-/// register holding the creation, the UUID, revision 0's properties and the three revisions, in that order; counted
-/// three revisions and one import done.
+/// committed, the youngest 3; every text the import brought named stored by the records, none of its bytes kept in RAM
+/// (C2 stage B part 2 (b): each revision's changeset carries its texts); the repository exporting `part1.dump` byte for
+/// byte through the store; the green at version 3; the register holding the creation, the UUID, revision 0's
+/// properties and the three revisions, in that order; counted three revisions and one import done.
 #[test]
 fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte() {
   stored(|| async move {
@@ -170,8 +188,27 @@ fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte
     let (loaded, _) = imported(svn, PART1).await;
     let revisions = loaded.map(|loaded| (loaded.revisions, loaded.youngest));
     assert_eq!(revisions, Ok((PART1_LAST, PART1_LAST)));
+    let (stored, kept_in_ram) = on(|state| {
+      let records = state
+        .vcs_stores
+        .subversion_records(svn)
+        .expect("the records");
+      let stored: Vec<_> = records
+        .stored_texts()
+        .map(|(identity, _)| *identity)
+        .collect();
+      let kept = stored
+        .iter()
+        .filter(|identity| records.text(identity).is_some())
+        .count();
+      (stored.len(), kept)
+    });
     assert!(
-      on(|state| history(state, svn)) == Some((PART1_LAST, PART1.to_vec())),
+      stored > 0 && kept_in_ram == 0,
+      "{stored} stored, {kept_in_ram} kept in RAM"
+    );
+    assert!(
+      history(svn).await == Some((PART1_LAST, PART1.to_vec())),
       "part1.dump again"
     );
     let head = on(|state| state.greens.get(&green).map(|engine| engine.head()));
@@ -204,7 +241,7 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
     }
     assert_eq!(parts, [Ok(PART1_LAST), Ok(FULL_LAST)]);
     assert!(
-      on(|state| history(state, svn)) == Some((FULL_LAST, FULL.to_vec())),
+      history(svn).await == Some((FULL_LAST, FULL.to_vec())),
       "full.dump"
     );
     let (again, _) = imported(svn, PART1).await;
@@ -224,7 +261,7 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
     };
     assert_eq!(wire, Refusal::ImportRefused { fault: wanted });
     assert!(
-      on(|state| history(state, svn)) == Some((FULL_LAST, FULL.to_vec())),
+      history(svn).await == Some((FULL_LAST, FULL.to_vec())),
       "as it was"
     );
   });
@@ -271,7 +308,7 @@ fn t_a652_the_records_an_import_committed_are_made_again_from_the_log() {
     rebuild(svn).await;
     assert_eq!(on(|state| state.vcs_stores.unrecovered(svn).cloned()), None);
     assert!(
-      on(|state| history(state, svn)) == Some((PART1_LAST, PART1.to_vec())),
+      history(svn).await == Some((PART1_LAST, PART1.to_vec())),
       "made again"
     );
     let logged = u64::try_from(logged_kinds(svn).await.len()).unwrap_or(u64::MAX);
@@ -326,14 +363,15 @@ fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
         count(state, ANSWERED),
         count(state, crate::state::REPLY_UNDELIVERABLE),
       ];
-      (held, counted, history(state, id))
+      (held, counted)
     });
     if !seen.0 || began.elapsed() > TASK_WAIT {
       break seen;
     }
   };
+  let made = crate::test_store::run_on_first(&daemon, move || history(id), TASK_WAIT);
   daemon.stop();
-  let (held, counted, made) = seen;
+  let (held, counted) = seen;
   assert!(!held, "still held after {TASK_WAIT:?}");
   assert_eq!(counted, [1, undeliverable + 1]);
   assert!(

@@ -191,12 +191,9 @@ async fn made_landing(
       return;
     }
   };
-  let landed = land_made(
-    turn,
-    repository,
-    move |_| Ok(revision),
-    |state, entry| entry.commit(state),
-  )
+  let landed = land_made(turn, repository, revision, |state, entry| {
+    entry.commit(state)
+  })
   .await;
   let _ = crate::state::with_state(|state| match landed {
     Some(Ok(_)) => state.count(MADE, 1),
@@ -303,22 +300,17 @@ async fn made_commit_landing(
   };
   let waiting = std::cell::Cell::new(Some(pending));
   let killed = std::cell::Cell::new(false);
-  let landed = land_made(
-    turn,
-    repository,
-    move |_| Ok(revision),
-    |state, entry| {
-      #[cfg(test)]
-      if KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false)) {
-        killed.set(true);
-        return Ok(None);
-      }
-      let pending = waiting.take().ok_or(Uncommitted::NotHeld)?;
-      Ok(crate::made_commit::commit(state, pending, |state| {
-        entry.commit(state)
-      }))
-    },
-  )
+  let landed = land_made(turn, repository, revision, |state, entry| {
+    #[cfg(test)]
+    if KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false)) {
+      killed.set(true);
+      return Ok(None);
+    }
+    let pending = waiting.take().ok_or(Uncommitted::NotHeld)?;
+    Ok(crate::made_commit::commit(state, pending, |state| {
+      entry.commit(state)
+    }))
+  })
   .await;
   if killed.get() {
     // A test's kill between the landing and the commit: nothing after it runs, as after a `kill -9`.

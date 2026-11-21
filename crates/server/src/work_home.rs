@@ -778,10 +778,40 @@ fn base_missing(state: &ShardState, sealed: &SealedWork) -> Option<Need> {
     .map(|path| (*path).to_owned())
     .collect();
   // With every entry known, the composition says which paths it replaces whole: their base bytes are wanted too.
-  let whole = slates_merge::increment::Base::for_names(&named, &w.entries)
+  // Only a replacement whose declared base length is the base file's (as the work's kept entry names it) is one the
+  // refinement refines; any other it keeps as declared, so its base bytes would be asked for nothing (A-817: an overwrite
+  // at offset 0 shorter than its file asked them at every rebase and submit).
+  let whole: Vec<String> = slates_merge::increment::Base::for_names(&named, &w.entries)
     .and_then(|base| slates_merge::increment::compose_volume_planned(&base, &sealed.journal).ok())
-    .map(|(doc, _)| slates_merge::refine::whole_replaced_paths(&doc))
-    .unwrap_or_default();
+    .map(|(doc, _)| slates_merge::refine::whole_replaced_lengths(&doc))
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|(path, base_len)| {
+      let known = crate::work_files::Base {
+        green: None,
+        fetched: None,
+        version: sealed.base_version,
+        entries: Some(&w.entries),
+      }
+      .entry_len(path);
+      // Unknown length, or one equal to what the replacement replaces: the refinement may read it.
+      known.is_none_or(|len| len == Some(*base_len))
+    })
+    .map(|(path, _)| path)
+    .collect();
+  // Why a file is asked (A-817's measure), counted on the thread: no entry, not held, or replaced whole.
+  BASE_MISSING_WHY.with(|why| {
+    let (mut unentried, mut unheld, mut replaced) = why.get();
+    for path in &named {
+      if !w.entries.contains_key(*path) {
+        unentried = unentried.saturating_add(1);
+      } else if !sealed.files.holds(path) {
+        unheld = unheld.saturating_add(1);
+      }
+    }
+    replaced = replaced.saturating_add(u64::try_from(whole.len()).unwrap_or(u64::MAX));
+    why.set((unentried, unheld, replaced));
+  });
   match fetched {
     None => {
       wanted.extend(whole);
@@ -1363,6 +1393,12 @@ fn length_from_entry(state: &ShardState, work: DbVolumeId, body: &RequestBody) -
       .works
       .get(&work)
       .is_some_and(|w| !w.files.holds(key) && w.entries.contains_key(key))
+}
+
+std::thread_local! {
+  /// Why `base_missing` wanted a path, on this shard thread (A-817's measure): no kept entry, the work holds no file of
+  /// it, or the composition replaces it whole. Reported in status.
+  pub(crate) static BASE_MISSING_WHY: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// The counter a base read's ask (files or lengths) is counted under by the verb that asked it (A-808).
