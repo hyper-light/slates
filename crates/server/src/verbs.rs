@@ -10264,6 +10264,10 @@ type Judged = (
   Option<Vec<slates_merge::chain_entry::Applied>>,
 );
 
+/// Format: the history values a submit's commit re-anchored (A-803's measure), summed: over `merge.submit.judge`, what a
+/// verdict walks of its paths' histories.
+const REANCHOR_VALUES_WALKED: &str = "merge.reanchor.values_walked";
+
 /// Secures `secured` bytes of `green_id`'s retention for the merge: folds what the retention budget allows first, leaving
 /// that room (never a live reader's version), then secures it, the first refusal reported. The bytes available where
 /// it cannot.
@@ -10441,9 +10445,17 @@ fn judge_submission(
   // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
   // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
   // reader's version).
-  if let Err(available) = secure_retention(state, green_id, secured) {
+  let secure_start = state.clock.monotonic_ns();
+  let secured_now = secure_retention(state, green_id, secured);
+  let secure_ns = state.clock.monotonic_ns().saturating_sub(secure_start);
+  crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_SECURE, secure_ns);
+  if let Err(available) = secured_now {
     return refused(Refusal::BudgetExceeded { available });
   }
+  let walked_before = state
+    .greens
+    .get(&green_id)
+    .map_or(0, |engine| engine.history_reanchored_values());
   let verdict_start = state.clock.monotonic_ns();
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
   let Some(judged) = verdict_of(state, green_id, sealed, &inc) else {
@@ -10468,6 +10480,12 @@ fn judge_submission(
     crate::merge_service::SUBMIT_JUDGE,
     verdict_end.saturating_sub(verdict_start),
   );
+  let walked = state
+    .greens
+    .get(&green_id)
+    .map_or(0, |engine| engine.history_reanchored_values())
+    .saturating_sub(walked_before);
+  state.count(REANCHOR_VALUES_WALKED, walked);
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }

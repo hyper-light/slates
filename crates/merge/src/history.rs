@@ -367,6 +367,8 @@ pub(crate) struct Reanchored {
   pub(crate) blocks_cut: u64,
   /// The bytes copied out of those blocks: the runs the change overwrote or removed, which earlier versions still read.
   pub(crate) bytes_cut: usize,
+  /// The values the re-anchor walked: the path's history (A-803's measure of what a change costs as history grows).
+  pub(crate) values: usize,
 }
 
 /// A run of the bytes the engine's `apply` writes ([`Value::applied_runs`]): a run of the value it keeps, or bytes of the
@@ -896,7 +898,9 @@ pub(crate) fn reanchor(
     .map(|value| value.list_bytes())
     .fold(0usize, usize::saturating_add);
   let latest_after = values.last().map_or(0, |value| value.list_bytes());
+  let walked = values.len();
   Some(Reanchored {
+    values: walked,
     value: latest_value,
     lists: (lists_before, lists_after),
     latest_list: (latest_before, latest_after),
