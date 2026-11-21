@@ -66,6 +66,11 @@ pub(crate) struct Served {
   /// Whether its file revisions' texts are lost while their logs still list them, as an index whose content store lost
   /// them would answer.
   files_lost: bool,
+  /// Whether its changeset store keeps each file revision after a log's first as its delta against the one before it in
+  /// the log, as a push's changegroup usually brings it (A-767 C1), rather than whole.
+  stored_deltas: bool,
+  /// Whether its changeset store keeps no row of a file revision while its logs still list each.
+  rows_lost: bool,
 }
 
 impl Repository for Served {
@@ -117,7 +122,84 @@ impl Repository for Served {
   }
 }
 
+impl Served {
+  /// The revision before `kept` in its log, where the store keeps deltas ([`Served::stored_deltas`]).
+  fn before<'l>(&self, log: &'l Log, kept: &Kept) -> Option<&'l Kept> {
+    if !self.stored_deltas {
+      return None;
+    }
+    let position = kept.position.checked_sub(1)?;
+    log.values().find(|other| other.position == position)
+  }
+}
+
 impl Store for Served {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole, its identity the
+  /// plain BLAKE3 of its text, its place named by that identity, its chunk the full-text hunk; none where its text is
+  /// lost.
+  fn stored_now(&self, want: &crate::render::Want) -> Option<super::Given> {
+    use crate::render::{StoredPlace, StoredRevision, Want};
+    match want {
+      Want::Rows { logs } => {
+        let mut rows = Vec::new();
+        for (path, nodes) in logs {
+          let mut log_rows = Vec::new();
+          for node in nodes {
+            let row = self.files.get(path).and_then(|log| {
+              let kept = log
+                .get(node)
+                .filter(|_| !self.files_lost && !self.rows_lost)?;
+              let identity = *blake3::hash(&kept.text).as_bytes();
+              let before = self.before(log, kept);
+              Some(StoredRevision {
+                text: identity,
+                base: before.map(|before| *blake3::hash(&before.text).as_bytes()),
+                // A delta's place is told from a whole's by its offset: the test store's own convention.
+                place: StoredPlace {
+                  payload: identity,
+                  offset: u64::from(before.is_some()),
+                  len: u64::try_from(delta::HUNK_HEADER_LEN + kept.text.len()).unwrap(),
+                },
+              })
+            });
+            log_rows.push(row);
+          }
+          rows.push(log_rows);
+        }
+        Some(super::Given::Rows(rows))
+      }
+      Want::Chunks { places } => {
+        let mut chunks = Vec::new();
+        for place in places {
+          let (log, kept) = self
+            .files
+            .values()
+            .flat_map(|log| log.values().map(move |kept| (log, kept)))
+            .find(|(_, kept)| *blake3::hash(&kept.text).as_bytes() == place.payload)?;
+          let mut chunk = Vec::new();
+          match self.before(log, kept).filter(|_| place.offset == 1) {
+            Some(before) => delta::encode_lines(&before.text, &kept.text, &mut chunk).ok()?,
+            None => delta::encode_full_text(&kept.text, &mut chunk).ok()?,
+          }
+          chunks.push(chunk);
+        }
+        Some(super::Given::Chunks(chunks))
+      }
+      Want::Texts { texts } => {
+        let mut made = Vec::new();
+        for identity in texts {
+          let kept = self
+            .files
+            .values()
+            .flat_map(|log| log.values())
+            .find(|kept| blake3::hash(&kept.text).as_bytes() == identity)?;
+          made.push(kept.text.clone());
+        }
+        Some(super::Given::Texts(made))
+      }
+    }
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,
@@ -1528,7 +1610,8 @@ fn listkeys_is_split_as_mercurial_splits_it() {
 }
 
 /// AC-HG.9, A-619: do clone from a store that lost a changeset's text, then one that lost a manifest revision, then
-/// one that lost a file revision. Expect each refused naming what it lost.
+/// one that lost a file revision (its changeset store keeping no row of it, A-767 C1). Expect each refused naming what it
+/// lost.
 #[test]
 fn a_store_that_lost_a_text_is_refused_by_kind() {
   let blob = caps(CLIENT_BLOB);
@@ -1552,7 +1635,7 @@ fn a_store_that_lost_a_text_is_refused_by_kind() {
   );
   assert_eq!(
     lost(|served| served.files_lost = true),
-    store("a file revision")
+    store("a file revision the changeset store keeps no row of")
   );
 }
 
@@ -1730,10 +1813,181 @@ fn a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history() {
   while walk.step(&served, &mut room(), &mut out).unwrap() {
     steps = steps.saturating_add(1);
   }
-  let ours = picked(&Changegroup::decode(&out, Version::V03, &mut room()).unwrap());
-  assert_eq!(steps, 1, "one step, not a walk of every row");
+  let decoded = Changegroup::decode(&out, Version::V03, &mut room()).unwrap();
+  let sent: usize = decoded
+    .files
+    .iter()
+    .map(|file| decoded.group(&file.revisions).len())
+    .sum();
+  let ours = picked(&decoded);
+  // The changelog and manifests in one step; then a step a file revision sent, a step a group's end and one the file
+  // section's end.
+  assert_eq!(
+    steps,
+    1 + sent + decoded.files.len() + 1,
+    "a step a unit sent, not a walk of every row"
+  );
   assert_eq!(
     lacking(ours, &served, &held),
     lacking(oracle, &served, &held)
+  );
+}
+
+/// A-767 C1 step 1a (a clone's file revisions as the changeset store keeps them; main's ruling of 2026-11-21 08:45). Do:
+/// clone 7.2's captured history from a store keeping each file revision after a log's first as its delta against the
+/// one before it. Expect every file revision after its log's first sent as a delta against the node sent just before it
+/// in its group, never whole, and every file text rebuilt from what was sent equal to the store's.
+#[test]
+fn a_clone_sends_each_file_revision_as_the_changeset_store_keeps_it() {
+  let mut served = cloned();
+  served.stored_deltas = true;
+  let blob = caps(CLIENT_BLOB);
+  let asked = Asked {
+    bundlecaps: &blob,
+    ..Asked::default()
+  };
+  let mut stream = Vec::new();
+  getbundle(&served, &asked, &mut room(), &mut stream).unwrap();
+  let bundle = Bundle2::decode(&stream, &mut room()).unwrap();
+  let (index, part) = bundle
+    .top_level()
+    .find(|(_, part)| part.is(b"changegroup"))
+    .unwrap();
+  let version = Version::from_part_param(part.param(b"version")).unwrap();
+  let payload = bundle.payload_bytes(index, &mut room()).unwrap();
+  let group = Changegroup::decode(&payload, version, &mut room()).unwrap();
+  let mut deltas = 0;
+  for file in &group.files {
+    let mut texts: HashMap<Node, Vec<u8>> = HashMap::new();
+    let mut previous: Option<Node> = None;
+    for revision in group.group(&file.revisions) {
+      let base = match previous {
+        Some(previous) => {
+          assert_eq!(
+            revision.base, previous,
+            "a delta against the revision sent before it"
+          );
+          deltas += 1;
+          texts[&previous].clone()
+        }
+        None => {
+          assert_eq!(revision.base, NULL_NODE, "a log's first revision whole");
+          Vec::new()
+        }
+      };
+      let text = delta::apply(&base, revision.data, &mut room()).unwrap();
+      assert_eq!(text, served.text(Named::File(file.name), &revision.node));
+      texts.insert(revision.node, text);
+      previous = Some(revision.node);
+    }
+  }
+  assert!(deltas > 0, "the clone sent stored deltas");
+}
+
+/// Pulls `heads` from `served` for a client holding `common` and their ancestors: the walk's changegroup, decoded, its
+/// file revisions sent whole and as stored.
+fn pulled(served: &Served, heads: &[Rev], common: &[Rev]) -> (Vec<u8>, u64, u64) {
+  let held = ancestors(&served.history, common);
+  let missing: Vec<Rev> = ancestors(&served.history, heads)
+    .difference(&held)
+    .copied()
+    .collect();
+  let outgoing = Outgoing {
+    heads: heads.to_vec(),
+    common: common.to_vec(),
+    missing: missing.iter().map(|rev| *rev..rev + 1).collect(),
+  };
+  let mut walk = super::Walk::begin(served, &outgoing, Version::V03, &mut room()).unwrap();
+  let mut out = Vec::new();
+  while walk.step(served, &mut room(), &mut out).unwrap() {}
+  (out, walk.whole_sent(), walk.stored_sent())
+}
+
+/// A-767 C1 step 1b (a pull's file revisions as the changeset store keeps them; main's ruling of 2026-11-21 08:45: a
+/// stored delta is sendable when its base is on the client, decided from the common set). Do: on a line of twenty
+/// changesets editing two files in turn, the store keeping each file revision after its log's first as its delta
+/// against the one before it, pull the newest, the client holding the rest. Expect the one file revision sent as its
+/// stored delta against its parent, which the client holds, none sent whole, and the text the client rebuilds from its
+/// own parent text equal to the store's.
+#[test]
+fn a_pull_sends_a_stored_delta_against_a_parent_the_client_holds() {
+  let parents: Vec<[Option<Rev>; 2]> = (0..20u32).map(|rev| [rev.checked_sub(1), None]).collect();
+  let edits: Vec<Edit> = (0..20u8).map(|at| (vec![(at % 2, at)], 0)).collect();
+  let (mut served, _) = filled(shaped(&parents), &edits);
+  served.stored_deltas = true;
+  let (out, whole, stored) = pulled(&served, &[19], &[18]);
+  let group = Changegroup::decode(&out, Version::V03, &mut room()).unwrap();
+  let mut checked = 0;
+  for file in &group.files {
+    for revision in group.group(&file.revisions) {
+      assert_ne!(revision.base, NULL_NODE, "sent as its stored delta");
+      assert_eq!(
+        revision.base, revision.p1,
+        "against the parent the client holds"
+      );
+      let base = served.text(Named::File(file.name), &revision.base);
+      let text = delta::apply(&base, revision.data, &mut room()).unwrap();
+      assert_eq!(text, served.text(Named::File(file.name), &revision.node));
+      checked += 1;
+    }
+  }
+  assert_eq!(checked, 1);
+  assert_eq!((whole, stored), (0, 1));
+}
+
+/// A-767 C1 step 1b (main's ruling of 2026-11-21 08:45: count the revisions a pull sends whole against the null base).
+/// Do: on a history whose root has two children, each editing one file, the store keeping the second child's file
+/// revision as its delta against the first child's (the revision before it in its log, which is not its parent), pull
+/// the second child, the client holding the root alone. Expect that revision sent whole against the null base, its
+/// text the store's, and counted whole; the first child, not pulled, never sent.
+#[test]
+fn a_pull_sends_whole_and_counts_a_revision_whose_stored_base_the_client_lacks() {
+  let parents = [[None, None], [Some(0), None], [Some(0), None]];
+  let edits: Vec<Edit> = (0..3u8).map(|at| (vec![(0, at)], 0)).collect();
+  let (mut served, _) = filled(shaped(&parents), &edits);
+  served.stored_deltas = true;
+  let (out, whole, stored) = pulled(&served, &[2], &[0]);
+  let group = Changegroup::decode(&out, Version::V03, &mut room()).unwrap();
+  let mut checked = 0;
+  for file in &group.files {
+    for revision in group.group(&file.revisions) {
+      assert_eq!(revision.base, NULL_NODE, "sent whole");
+      let text = delta::apply(&[], revision.data, &mut room()).unwrap();
+      assert_eq!(text, served.text(Named::File(file.name), &revision.node));
+      checked += 1;
+    }
+  }
+  assert_eq!(checked, 1);
+  assert_eq!((whole, stored), (1, 0));
+}
+
+/// A-767 C1 step 1b. Do: pull the newest of three changesets from a store that keeps no row of its file revisions.
+/// Expect the pull refused by kind, the store's, at the step that sends the file section, never a whole text from the
+/// content store.
+#[test]
+fn a_pull_whose_store_keeps_no_row_of_a_file_revision_is_refused_by_kind() {
+  let parents: Vec<[Option<Rev>; 2]> = (0..3u32).map(|rev| [rev.checked_sub(1), None]).collect();
+  let edits: Vec<Edit> = (0..3u8).map(|at| (vec![(0, at)], 0)).collect();
+  let (mut served, _) = filled(shaped(&parents), &edits);
+  served.rows_lost = true;
+  let outgoing = Outgoing {
+    heads: vec![2],
+    common: vec![1],
+    missing: std::iter::once(2..3).collect(),
+  };
+  let mut walk = super::Walk::begin(&served, &outgoing, Version::V03, &mut room()).unwrap();
+  let mut out = Vec::new();
+  let refused = loop {
+    match walk.step(&served, &mut room(), &mut out) {
+      Ok(true) => {}
+      Ok(false) => panic!("the pull ended with no row of its file revision"),
+      Err(refusal) => break refusal,
+    }
+  };
+  assert_eq!(
+    refused,
+    Refusal::Store {
+      what: "a file revision the changeset store keeps no row of"
+    }
   );
 }

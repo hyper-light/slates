@@ -106,6 +106,9 @@ pub(crate) enum Refusal {
   OutOfRange,
   /// A length past `u64`.
   Overflow,
+  /// A change's kept ranges out of order or overlapping (`crate::byte_places`): its caller answers it as a whole
+  /// replace.
+  Unordered,
 }
 
 /// One version of a file's content: a held root in the arena. Not `Clone`: [`PieceTrees::fork`] makes another hold,

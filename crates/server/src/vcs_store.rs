@@ -2618,6 +2618,32 @@ async fn fetch_svn(
   }
 }
 
+/// A paced turn (A-783, the one primitive every paced path uses: a fetch's answer, A-745 rule 2; a git version's
+/// encoding, A-718): its steps run while the
+/// turn's quantum has room for the next one's estimated cost, and at the quantum's end it asks once whether anyone else
+/// waits on the shard: if someone does it yields there; if no one does it takes another quantum, up to the shard's
+/// ceiling (the watchdog's look). The quantum is a few microseconds (2.2 us on an M4 Max), and a stream's step is one
+/// index entry or one chunk, so a turn that yielded at its first quantum took one step: hg-src's stream was about
+/// 460,000 turns of 64 bytes or a chunk each, each with its view made and its bytes written (r23 on bbcf0f72f: 15.8 s
+/// against stock's 0.44-0.50 s, the serving shard idle two thirds of it). A step's unit is one answer step; its cost
+/// is measured across the exchange's turns (`costs`).
+pub(crate) fn paced_turn(quantum_ns: u64, began: u64) -> slates_pace::Step {
+  let env = slates_pace::Env {
+    clock: slates_rt::futures::now_ns,
+    waiting: slates_rt::futures::others_waiting,
+    quantum_ns,
+    ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum_ns),
+    target_ppm: crate::git_push::target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum_ns),
+  };
+  slates_pace::Step::begin(env, began)
+}
+
+/// The unit kinds a paced turn measures ([`paced_turn`]): one, the turn's step.
+pub(crate) type TurnCosts = slates_pace::Costs<1>;
+
+/// The one unit kind of a paced turn: its step (an answer's step, an encoding's advance).
+pub(crate) const ANSWER_STEP: usize = 0;
+
 /// Counter: the units a Mercurial record's sliced replay ran (A-732 part 5), each under one lend of the stores and one
 /// settle of the charge, as many of the record's steps as its time allowed. Format: a counter name in the status report.
 pub(crate) const HG_REPLAY_TURNS: &str = "vcs_store.hg_replay_turns";

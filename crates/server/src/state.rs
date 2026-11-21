@@ -1545,6 +1545,16 @@ impl ShardState {
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
   }
+
+  /// Raises the count of `kind` to `value` when it is larger: a counter that reads the most a figure reached (a longest
+  /// step), in the same report as the sums. Zero changes nothing, as [`ShardState::count`]'s does.
+  pub(crate) fn count_max(&mut self, kind: &'static str, value: u64) {
+    if value == 0 {
+      return;
+    }
+    let count = self.refusals.entry(kind).or_insert(0);
+    *count = (*count).max(value);
+  }
 }
 
 impl std::fmt::Debug for ShardState {
