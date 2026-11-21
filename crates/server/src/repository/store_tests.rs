@@ -134,6 +134,12 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
     (creation.header.tool, creation.header.sequence),
     (Tool::Git, 0)
   );
+  let target = StoreRoot::identify(&dir).unwrap();
+  assert_eq!(
+    creation.header.grant,
+    slates_store::store::grant_id(target.device, target.inode),
+    "landed under the store's standing grant (its G row, R10)"
+  );
   let sections = log.sections(&creation).unwrap();
   assert_eq!(sections.len(), 1);
   assert_eq!(sections[0].kind, SectionKind::Record);

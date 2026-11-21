@@ -441,7 +441,8 @@ fn land_creation(
     repository: u128::from_be_bytes(repository.bytes),
     sequence: 0,
     judged_over: 0,
-    grant: 0,
+    // The store's standing grant (its `G` row, R10): the landing's provenance.
+    grant: disk.grant(),
     work: 0,
     time_ns: slates_rt::futures::now_ns(),
     sections: 0,

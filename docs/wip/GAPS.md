@@ -165,7 +165,7 @@
 > engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
 > owed with C4). C3 closed; C4 groundwork built: the owner thread and
 > `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
-> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6); the
+> refuses `Unsupported` there); each tool's landing onto it (C4-C6); the
 > engine's memtable learned upward from its rows (it starts at one trunk node, fanout extents, since the machine-sized
 > start passed the engine's 4 GiB bound on a 128 GiB Mac; held at both extremes by
 > `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`: 8 GiB and 128 GiB profiles injected,
@@ -180,6 +180,10 @@
 > synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6). Owed (w-git): the
 > push landed as a changeset before its entry, recovery of named sequences, the replay through the adapter, and the
 > pack named by the plain BLAKE3 of its `Payload`.
+> The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
+> checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
+> (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
+> standing-grant kind yet), and its revocation.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
