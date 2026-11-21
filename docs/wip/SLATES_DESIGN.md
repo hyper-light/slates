@@ -11848,6 +11848,9 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > (the base's ranges and the bytes written), so 8 works each overwriting one byte of a 64 MiB file add 32 KiB, not
 > 201 MB (`crates/server/tests/work_edit_cow.rs`); off the green's shard an edit asks the owner for the file's length
 > alone. The A/B is in BENCHMARKS.
+> **The brief's grid (2026-11-20, w-work-cow P2, BENCHMARKS).** Over 1 MiB to 1 GiB greens of 1,000 to 100,000 files and
+> 1 to 100 works, a work requested, reading one file and editing it adds 1.6 to 5.6 KB of live heap, flat in both; with a
+> copy of the green per work put back, 1.5 MB to 1.25 GB. Release, Mac Studio, 135 runs, before and after interleaved.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
