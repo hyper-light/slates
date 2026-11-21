@@ -88,6 +88,9 @@ pub(crate) struct Importing {
   turns: u64,
   /// The record the import handed over last, owed its landing before the import reads on ([`land_owed`]).
   owed: Option<Record>,
+  /// The delta base the import asked for that RAM does not hold, owed through the node's store before it reads on
+  /// ([`supply_owed_base`]; C2 stage B part 2 (b)).
+  base_owed: Option<slates_svn::index::ContentIdentity>,
 }
 
 impl std::fmt::Debug for Importing {
@@ -195,6 +198,7 @@ pub(crate) fn begin(
     revisions: 0,
     turns: 0,
     owed: None,
+    base_owed: None,
   };
   state.vcs_stores.svn_imports.insert(id, importing);
   state.count(STARTED, 1);
@@ -218,8 +222,8 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
 /// way, what it held is given back and its file closed. `None` when no import of `id` is under way.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
-  // A record owed its landing first: the import reads on only from the records it made.
-  if importing.owed.is_some() {
+  // A record owed its landing first, or a base owed: the import reads on only from the records it made.
+  if importing.owed.is_some() || importing.base_owed.is_some() {
     state.vcs_stores.svn_imports.insert(id, importing);
     return Some(Ok(Turned::More));
   }
@@ -289,9 +293,99 @@ fn unit(
       importing.owed = Some(*record);
       Ok(Unit::Owed)
     }
+    Ok(Imported::Base { consumed, text }) => {
+      importing.consume(consumed);
+      importing.needed = 0;
+      // The base read whole from what RAM holds (the green's head text, the content store), else owed through the
+      // node's store before the import reads on.
+      match base_in_ram(state, id, &text) {
+        Some(bytes) => {
+          supply(state, id, importing, (&text, bytes))?;
+          Ok(Unit::More)
+        }
+        None => {
+          importing.base_owed = Some(text);
+          Ok(Unit::Owed)
+        }
+      }
+    }
     Ok(Imported::Done) => Ok(Unit::Done),
     Err(refusal) => Err(refused(state, refusal, importing.importer.loading())),
   }
+}
+
+/// Text `text` of repository `id` whole, as its view reads it from RAM: the green's held head text, else the content
+/// store's; none where neither holds it.
+fn base_in_ram(
+  state: &mut ShardState,
+  id: RepositoryId,
+  text: &slates_svn::index::ContentIdentity,
+) -> Option<Vec<u8>> {
+  crate::vcs_store::svn_view::with_view(state, (id, None), |view| {
+    slates_svn::migration::TextSource::text(view.texts, text).map(std::borrow::Cow::into_owned)
+  })
+  .flatten()
+}
+
+/// Hands repository `id`'s import the delta base `text`'s `bytes` it asked for.
+fn supply(
+  state: &mut ShardState,
+  id: RepositoryId,
+  importing: &mut Importing,
+  (text, bytes): (&slates_svn::index::ContentIdentity, Vec<u8>),
+) -> Result<(), LoadFailed> {
+  // Charged within the room the shard lends the records, as an import's call is.
+  crate::vcs_store::lend_svn(state, id, 0);
+  let supplied = state
+    .vcs_stores
+    .subversion_records(id)
+    .map(|records| importing.importer.supply_base(records, text, bytes));
+  crate::vcs_store::settle_svn(state, id);
+  supplied
+    .ok_or(LoadFailed::NoStore)?
+    .map_err(|refusal| refused(state, refusal, importing.importer.loading()))
+}
+
+/// Brings the delta base repository `id`'s import owes whole through the node's store (C2 stage B part 2 (b)), hands it
+/// to the import and gives the content store's hold back. Refused, the import ends as a refused turn ends it. None
+/// where no import of `id` is under way or the shard's state is gone.
+pub(crate) async fn supply_owed_base(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
+  let owed = crate::state::with_state(|state| {
+    let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
+    let text = importing.base_owed?;
+    let len = state.vcs_stores.subversion_records(id)?.stored_len(&text)?;
+    Some((text, len))
+  })?;
+  let Some((text, len)) = owed else {
+    return Some(Ok(()));
+  };
+  let brought = super::svn_texts::bring_whole(id, text, len).await;
+  crate::state::with_state(|state| {
+    let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
+    importing.base_owed = None;
+    let bytes = brought.then(|| base_in_ram(state, id, &text)).flatten();
+    if brought {
+      svn_commit::release_texts(state, None, &[text]);
+    }
+    let supplied = match bytes {
+      Some(bytes) => supply(state, id, &mut importing, (&text, bytes)),
+      None => Err(LoadFailed::Refused {
+        refusal: MigrationRefusal::Corrupt,
+        revision: importing.importer.loading(),
+      }),
+    };
+    match supplied {
+      Ok(()) => {
+        state.vcs_stores.svn_imports.insert(id, importing);
+      }
+      Err(_) => {
+        end(state, importing);
+        state.count(REFUSED, 1);
+      }
+    }
+    Some(supplied)
+  })
+  .flatten()
 }
 
 impl Importing {
@@ -469,6 +563,9 @@ pub(crate) async fn run(id: RepositoryId) -> Option<Result<Loaded, LoadFailed>> 
   loop {
     slates_rt::futures::yield_now().await;
     if let Err(failed) = land_owed(id).await? {
+      return Some(Err(failed));
+    }
+    if let Err(failed) = supply_owed_base(id).await? {
       return Some(Err(failed));
     }
     let turned = crate::state::with_state(|state| turn(state, id))??;

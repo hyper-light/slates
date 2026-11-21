@@ -893,6 +893,8 @@ pub struct ShardState {
   pub(crate) refining: crate::refining::Refining,
   /// The shard's server-made commits waiting on their landing (the deferred-submit hook, `crate::made_commit`).
   pub(crate) made_commits: crate::made_commit::MadeCommits,
+  /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
+  pub(crate) materializations: crate::green_ready::Materializations,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

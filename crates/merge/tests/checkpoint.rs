@@ -72,7 +72,7 @@ fn changes_match_the_model(green: &Green) -> Result<(), String> {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+  #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("checkpoint.proptest-regressions")).unwrap())]
 
   /// W3, §4.16. Do: build a green from a generated origin and chain; optionally fold its histories below `F`; take its
   /// checkpoint at `F`; restore a green from the origin and the checkpoint and replay every increment accepted after
@@ -334,5 +334,49 @@ fn a_hostile_checkpoint_is_refused_typed() {
   assert_eq!(
     Checkpoint::decode(&trailing),
     Err(DocDecodeError::TrailingBytes)
+  );
+}
+
+/// A-264's model against the index, for a link whose target becomes a special node after the span (the seed in
+/// `checkpoint.proptest-regressions`). Do: an origin with `a` a hard link to `e/f`, which holds nothing, and `d/y` a FIFO;
+/// version 1 links `e/f` to `d/y`; version 2 removes `d/y`, so `e/f` becomes the FIFO. Expect: `a` reads the same at
+/// versions 0 and 1 (a link resolves one level, and `e/f` is no special node yet), so neither the index nor its model
+/// names it in `(0, 1]`; both name it in `(1, 2]`, where `e/f` became the FIFO `a` names. Until the model asked whether
+/// the target was special by its change, it named `a` in `(0, 1]` too, and the checkpoint suite failed about one run in
+/// five on main.
+#[test]
+fn a_link_changes_with_its_target_only_once_the_target_is_a_special_node() {
+  let rows: Vec<Raw> = vec![(53, 0, 48, 0, 0), (90, 46, 0, 0, 0)];
+  let chain: Vec<Raw> = vec![(114, 76, 18, 0, 0), (235, 165, 0, 0, 0)];
+  let (green, accepted) = chain_of(&rows, &chain);
+  assert_eq!(
+    accepted
+      .iter()
+      .map(|(_, version)| *version)
+      .collect::<Vec<_>>(),
+    [1, 2]
+  );
+  let specials = |version| {
+    green
+      .base_at(version)
+      .specials
+      .into_iter()
+      .map(|(path, _)| path)
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(
+    (specials(0), specials(1), specials(2)),
+    (
+      vec!["d/y".to_owned()],
+      vec!["d/y".to_owned()],
+      vec!["e/f".to_owned()]
+    )
+  );
+  assert_eq!(green.changed_between(0, 1), ["e/f"]);
+  assert_eq!(green.changed_between_by_histories(0, 1), ["e/f"]);
+  assert_eq!(green.changed_between(1, 2), ["a", "d/y", "e/f"]);
+  assert_eq!(
+    green.changed_between_by_histories(1, 2),
+    ["a", "d/y", "e/f"]
   );
 }

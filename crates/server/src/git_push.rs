@@ -232,6 +232,10 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   refusal_names: Option<Vec<Vec<u8>>>,
 }
 
+/// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
+/// entry, a green a turn (A-238 moved off the append's step). Format: a counter name.
+pub(crate) const ROOM_CHECKPOINTED: &str = "git_push.room_checkpointed";
+
 /// The shard's clock as the store's and the checks' passes read it: the runtime's monotonic
 /// nanoseconds (§4.3).
 pub(crate) struct ShardClock;
@@ -317,6 +321,9 @@ struct DecidingPush {
   restaging: Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
   preparing: Option<slates_git::receive::works::Preparing>,
+  /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
+  /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
+  making_room: Option<Vec<DbVolumeId>>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
   homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
@@ -796,6 +803,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
+      making_room: None,
       homing: Homing::Due,
       #[cfg(unix)]
       then: None,
@@ -825,6 +833,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        making_room,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -837,6 +846,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        making_room,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1769,6 +1779,20 @@ pub(crate) struct PushTurns {
   pub(crate) yielded: u64,
 }
 
+/// The shard's pacing environment (A-783): its clock, its probe of whether anyone else waits, its step quantum, its
+/// ceiling (the watchdog's look) and a unit estimate's target error (the scheduler's own measured jitter over the
+/// quantum). Every paced path on a shard steps under it: the push build, a checkpoint's identity fold (A-579).
+pub(crate) fn shard_pace_env(state: &ShardState) -> slates_pace::Env {
+  let quantum = state.config.step_quantum_ns();
+  slates_pace::Env {
+    clock: slates_rt::futures::now_ns,
+    waiting: slates_rt::futures::others_waiting,
+    quantum_ns: quantum,
+    ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
+    target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
+  }
+}
+
 /// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
 /// own measured jitter over the quantum, at least one part, at most the whole.
 pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
@@ -1847,6 +1871,8 @@ struct ServerJudge<'j> {
   restaging: &'j mut Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time before its verdict (A-752).
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
+  /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
+  making_room: &'j mut Option<Vec<DbVolumeId>>,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -1877,6 +1903,7 @@ impl Judge for ServerJudge<'_> {
       .push
       .admission_turn(self.state, (green, command.new), (self.admitting, ns))
       && self.build_turn(command, pushed, began)
+      && self.room_turn()
   }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
@@ -1914,6 +1941,50 @@ impl Judge for ServerJudge<'_> {
 }
 
 impl ServerJudge<'_> {
+  /// A turn of making the chains room for the command under way's entry before its append (A-238, moved off the
+  /// append's step: git/git's whole-history push had an append meet `green_chains` at its cap and checkpoint the
+  /// repository's every member green in its one step, about a thousand folds, 1,142 ms, and the watchdog killed the
+  /// daemon): where the chains have less room than its built work's entry can take (`entry_bound`, as a Subversion
+  /// commit sizes its own, `svn_commit`), one member green checkpointed, counted [`ROOM_CHECKPOINTED`], and another turn
+  /// due; ready once there is room, or once every member is checkpointed (the append's guard then judges the entry,
+  /// `repository::push`'s A-238, which finds nothing left to fold).
+  fn room_turn(&mut self) -> bool {
+    let Some(bound) = self
+      .preparing
+      .as_ref()
+      .and_then(slates_git::receive::works::Preparing::entry_bound)
+    else {
+      *self.making_room = None;
+      return true;
+    };
+    if self.state.db.partition().green_chain_room() >= bound {
+      *self.making_room = None;
+      return true;
+    }
+    let repository = self.record.id;
+    let members = self.making_room.get_or_insert_with(|| {
+      self
+        .state
+        .db
+        .partition()
+        .repositories()
+        .members_of(repository)
+        .map(|member| member.green)
+        .collect()
+    });
+    let Some(green) = members.pop() else {
+      *self.making_room = None;
+      return true;
+    };
+    self.state.count(ROOM_CHECKPOINTED, 1);
+    crate::merge_service::checkpoint_green_when(
+      self.state,
+      green,
+      crate::merge_service::Doubling::Now,
+    );
+    false
+  }
+
   /// The policy's verdict on `command` (module docs, "Answering", item 3): A-644's store answers how the change moves
   /// its ref and so the right it needs, and A-622's check point judges that right and, where a rule imposes one, the
   /// requirements on what the change brings (A-644 part 2's `StoreBrings`: a linear history, signed commits); a
@@ -2003,13 +2074,7 @@ impl ServerJudge<'_> {
     // A-783: the turn yields at its quantum when someone waits on the shard, and goes on to the shard's ceiling (the
     // watchdog's look) when no one does; a unit's estimate aims at the scheduler's own measured jitter over the
     // quantum, its target relative error.
-    let env = slates_pace::Env {
-      clock: slates_rt::futures::now_ns,
-      waiting: slates_rt::futures::others_waiting,
-      quantum_ns: quantum,
-      ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
-      target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
-    };
+    let env = shard_pace_env(state);
     // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
     let slices = slates_merge::pace::Slices {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),

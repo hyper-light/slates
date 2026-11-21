@@ -4984,6 +4984,7 @@ async fn init_shard(
     work_home: crate::work_home::WorkHome::default(),
     refining: crate::refining::Refining::default(),
     made_commits: crate::made_commit::MadeCommits::default(),
+    materializations: crate::green_ready::Materializations::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
@@ -8444,6 +8445,7 @@ mod tests {
   #[test]
   fn t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity() {
     use crate::vcs_store::hg_import::tests::{created, directory, rows_of, to_its_end};
+    // The import lands as segment changesets whose records hold its rows by identity (A-767 C1 step 3).
     use slates_anchor::AnchorSegment;
     let profile = test_profile();
     let instance = format!("a729-identities-{}", std::process::id());
@@ -8473,7 +8475,22 @@ mod tests {
         let laid = directory(crate::hg_base::tests::STATES.iter().copied());
         assert_eq!(crate::vcs_store::hg_import::begin(state, id, laid), Ok(()));
         assert!(to_its_end(state, id).1.is_ok(), "imported");
-        assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+        assert_eq!(
+          crate::vcs_store::hg_import::land_imported(state, id),
+          Ok(())
+        );
+        let segments = state
+          .refusals
+          .get(crate::vcs_store::hg_import::SEGMENTS_LANDED)
+          .copied()
+          .unwrap_or(0);
+        assert!(segments >= 1, "the import landed as segment changesets");
+        let records = state.db.partition().repositories();
+        let named = (0..)
+          .map_while(|index| records.object_record(id, index))
+          .filter_map(slates_hg::import::record::run_of)
+          .count();
+        assert_eq!(named, 1, "the register names the import's run");
         (id, rows_of(state, id))
       })
       .unwrap();
@@ -8495,6 +8512,12 @@ mod tests {
             count(crate::vcs_store::WINDOWS_RESTORED),
             count(crate::vcs_store::WINDOWS_UNRESTORED),
             count(crate::vcs_store::WINDOWS_UNHELD),
+            [
+              count(crate::vcs_store::HG_REPLAY_SEGMENTS),
+              count(crate::vcs_store::HG_REPLAY_RECORD_BYTES),
+              count(crate::vcs_store::HG_REPLAY_TURNS),
+              count(crate::vcs_store::HG_REPLAY_WANTS),
+            ],
           )
         })
         .ok()
@@ -8510,8 +8533,14 @@ mod tests {
       std::thread::park_timeout(std::time::Duration::from_millis(50).min(left));
       seen = read();
     }
-    let (after, restored, unrestored, unheld) = seen.expect("the successor answered");
+    let (after, restored, unrestored, unheld, [segments, record_bytes, turns, wants]) =
+      seen.expect("the successor answered");
     second.stop();
+    println!(
+      "A-767 C1 step 3 restart: {} rows from {segments} segment records ({record_bytes} bytes) in {turns} replay \
+       turns, {wants} payload reads",
+      before.len()
+    );
     assert!(!before.is_empty(), "the import kept rows");
     assert_eq!(
       after, before,
@@ -8519,7 +8548,26 @@ mod tests {
     );
     assert!(restored > 0, "no window was restored");
     assert_eq!((unrestored, unheld), (0, 0));
+    // Main's red (ruling of 2026-11-21 01:16): a restart reads the index's rows, never a text nor a payload, so its cost
+    // is the rows', whatever the texts: no payload read, no text rebuilt (the intake never runs), and the records'
+    // bytes within one identity row's worth a row.
+    assert!(
+      segments >= 1,
+      "the run's segments were replayed from the store"
+    );
+    assert_eq!(wants, 0, "a payload was read at the restart");
+    assert!(turns >= 1);
+    let rows = u64::try_from(before.len()).unwrap();
+    assert!(
+      record_bytes <= rows.saturating_mul(IDENTITY_ROW_MOST),
+      "{record_bytes} record bytes for {rows} rows"
+    );
   }
+
+  /// Shape: the most bytes one revision takes in an identity record, a file revision's (node, parents, link, flags,
+  /// length, delta fields, content identity, block marker and identity): the per-row bound a restart's reading is held
+  /// to, a path's group head amortized over its revisions.
+  const IDENTITY_ROW_MOST: u64 = 256;
 
   /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's
   /// change is in flight its records go to both cohorts and its lease needs confirmations in both, so it keeps

@@ -309,7 +309,7 @@ impl crate::render::StoreWants for Producing {
     }
   }
 
-  fn give_rows(&mut self, rows: Vec<Option<crate::render::StoredRevision>>) {
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
     if let Producing::Revlogs(streaming) = self {
       streaming.give_rows(rows);
     }

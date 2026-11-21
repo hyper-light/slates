@@ -872,6 +872,107 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
   assert_eq!(refused, (Vec::new(), 0));
 }
 
+/// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
+/// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
+const ROOMY_FILES: usize = 64;
+
+/// Shape: the branches it creates, each at a tree of its own: enough that their works pass the chains' cap many times.
+const ROOMY_CREATES: usize = 16;
+
+/// A-238 moved off the append's step (main's order of 2026-11-21, 04:58 PST; found by use: git/git's whole-history push
+/// had its daemon killed by the watchdog, shard 10 spinning 1,142 ms in one append that met `green_chains` at its cap
+/// and checkpointed the repository's every member green, about a thousand, each folding its identity whole). Do: with a
+/// small green-chain budget, push [`ROOMY_CREATES`] creates of branches, each its own commit of a tree of
+/// [`ROOMY_FILES`] files, each a push of its own, so the chains fill and later appends meet their cap with many members.
+/// Expect: every create `ok`; no green checkpointed inside an append's step (the counter none); the room made in the
+/// pushes' turns before their appends, a green a turn (the turns' counter moved). Red before the change: the appends
+/// checkpointed the members themselves, in their steps.
+#[test]
+fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step() {
+  let (refused, in_appends, in_turns) = crate::test_store::audit_on_stored_shard_configured(
+    "git-push",
+    |state| {
+      let repository = git_repository(state, "roomy");
+      let mut refused = Vec::new();
+      for k in 0..ROOMY_CREATES {
+        let (commit, objects) = flat_commit(ROOMY_FILES, &format!("create {k} file"), None);
+        let pack = pack_of_objects(&objects);
+        let commit = commit.to_string();
+        let name = format!("refs/heads/r{k}");
+        let created = [("", commit.as_str(), name.as_bytes())];
+        let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
+        if reasons(&received) != [b"ok".to_vec()] {
+          refused.push(k);
+        }
+      }
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        refused,
+        count(crate::repository::push::APPEND_CHECKPOINTED),
+        count(super::ROOM_CHECKPOINTED),
+      )
+    },
+    |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
+  );
+  assert_eq!((refused, in_appends), (Vec::new(), 0));
+  assert!(in_turns > 0, "the room made in the turns: {in_turns}");
+}
+
+/// Shape: the commits of [`t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`]'s line,
+/// three objects each: enough that a few units a turn is hundreds of turns.
+const PACED_HISTORY: usize = 600;
+
+/// Shape: the most turns that line's one derivation may take while nobody else waits on the shard: a turn to begin it,
+/// one or two to derive it within the step's ceiling, one to find nothing due.
+const PACED_TURNS: u64 = 8;
+
+/// A-614 amended, paced (main's report of 2026-11-21, r52: a clone of git/git's branches took 465 s, its derivation of 8
+/// versions 3,024,021 turns, each paying the shard's lend, its settle and a yield). Do: push a line of [`PACED_HISTORY`]
+/// commits as one create, then turn the repository's derivation until it is idle, nobody else waiting on the shard.
+/// Expect: the one version derived, in at most [`PACED_TURNS`] turns: a derivation runs while nobody waits to the step's
+/// ceiling (A-783), never a few units a turn. Red before the change: hundreds of turns.
+#[test]
+fn t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects() {
+  use crate::vcs_store::git_derive::{DERIVED, TURNS, derive_for_read};
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let count = |state: &ShardState, name: &str| state.refusals.get(name).copied().unwrap_or(0);
+  let (repository, before) = crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "paced");
+    let mut objects = Vec::new();
+    let mut parent = None;
+    for at in 0..PACED_HISTORY {
+      let (commit, made) = flat_commit(1, &format!("line {at}"), parent);
+      objects.extend(made);
+      parent = Some(commit);
+    }
+    let head = parent.unwrap().to_string();
+    let created = [("", head.as_str(), b"refs/heads/main".as_slice())];
+    let pack = pack_of_objects(&objects);
+    let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
+    assert_eq!(reasons(&received), [b"ok".to_vec()]);
+    (repository, (count(state, TURNS), count(state, DERIVED)))
+  });
+  // The derivation runs as a fetch's does, a task of the shard; this thread waits on a channel, not on the shard, so
+  // nobody else waits there.
+  let (done, finished) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |_| {
+    let task = slates_rt::futures::spawn(async move {
+      derive_for_read(repository).await;
+      let _ = done.send(());
+    })
+    .unwrap();
+    slates_rt::futures::detach(task).unwrap();
+  });
+  finished.recv().unwrap();
+  let after = crate::daemon::observe_first(&daemon, move |state| {
+    (count(state, TURNS), count(state, DERIVED))
+  });
+  daemon.stop();
+  let (turns, derived) = (after.0 - before.0, after.1 - before.1);
+  assert_eq!(derived, 1);
+  assert!(turns <= PACED_TURNS, "{turns} turns");
+}
+
 /// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
 /// once, a step of each in turn.
 #[cfg(unix)]

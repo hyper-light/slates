@@ -105,6 +105,7 @@ pub(crate) fn commit(
     })
     .collect();
   let versions = repository.commit(store, &mut push, &admitted).unwrap();
+  derive_all(repository, store);
   versions
     .into_iter()
     .zip(admitted.iter().map(Move::is_fast_forward))
@@ -154,4 +155,16 @@ pub(crate) fn pack_names(pack: &[u8], objects: &[Object]) -> std::collections::B
   assert_eq!(reader.read(pack, &mut admission).unwrap(), pack.len());
   let unpacked = reader.finish_with(&Bases(objects), &mut admission).unwrap();
   unpacked.objects.iter().map(|object| object.id).collect()
+}
+
+/// Derives every version of every green the store left for its first reader (A-614 amended), as a reader would before
+/// reading their sets, keeping each in the memo: so a test reads every version's sets as the store served them before
+/// the amendment, and the map model holds derived sets to its closures (main's condition 1).
+pub(crate) fn derive_all(repository: &Repository, store: &mut ContentStore) {
+  let greens: Vec<u64> = repository.greens().collect();
+  for green in greens {
+    for version in 0..repository.versions(green) {
+      repository.derive(store, green, version).unwrap();
+    }
+  }
 }

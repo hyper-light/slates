@@ -72,7 +72,7 @@ use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
 use slates_db::catalog::VolumeId as DbVolumeId;
 use slates_db::register::{HostId, ObjectId, Record};
 use slates_ipc::protocol::Refusal;
-use slates_merge::engine::{Green, Increment, OriginLoad, Outcome};
+use slates_merge::engine::{Green, OriginLoad};
 use slates_merge::origin::{DecodeCursor, EncodeCursor, Origin};
 
 use crate::merge_service::{
@@ -760,7 +760,7 @@ pub(crate) fn rebuild_replica_through(
     ReplicaSeed::rebuild(object, zero.inputs, zero.identity, through),
   );
   match state.merge.replicas.get(&object) {
-    Some(replica) => Rebuild::Installed(replica.head()),
+    Some(replica) => Rebuild::Installed(replica.reached()),
     None => Rebuild::Later,
   }
 }
@@ -778,14 +778,14 @@ pub(crate) fn advance_replica(state: &mut ShardState, object: ObjectId, through:
   let Some(replica) = state.merge.replicas.remove(&object) else {
     return Rebuild::Nothing;
   };
-  let head = replica.head();
+  let head = replica.reached();
   if head >= through {
     state.merge.replicas.insert(object, replica);
     return Rebuild::Installed(head);
   }
   build(state, ReplicaSeed::advance(object, replica, through));
   match state.merge.replicas.get(&object) {
-    Some(replica) => Rebuild::Installed(replica.head()),
+    Some(replica) => Rebuild::Installed(replica.reached()),
     None => Rebuild::Later,
   }
 }
@@ -820,7 +820,7 @@ pub(crate) fn rewind_past_replaced(state: &mut ShardState, record: &Record) {
   let Some(replica) = state.merge.replicas.get_mut(&record.object) else {
     return;
   };
-  let head = replica.head();
+  let head = replica.reached();
   if head < record.sequence
     || (head == record.sequence && replica.head_identity() == value.identity)
   {
@@ -1161,7 +1161,7 @@ impl ReplicaSeed {
   /// An advance of `object`'s `replica` from its head to version `through` (A-333): every version after the head
   /// recomputed from the records this node accepted. The caller has checked that the head is below `through`.
   fn advance(object: ObjectId, replica: Green, through: u64) -> ReplicaSeed {
-    let head = replica.head();
+    let head = replica.reached();
     let next = head.saturating_add(1);
     ReplicaSeed {
       object,
@@ -1344,14 +1344,9 @@ impl ReplicaSeed {
       self.stage = SeedStage::Chain(step);
       return Ok(None);
     };
-    let increment = Increment::decode(&bytes).map_err(|_| INPUTS_UNDECODABLE)?;
-    match step.replica.submit(&increment) {
-      // An identical increment is accepted too (A-782): its version commits nothing new.
-      Outcome::Accepted { version } | Outcome::Identical { version } if version == step.version => {
-      }
-      // The owner accepted it, and this holder too before its restart; anything else has diverged.
-      _ => return Err(RECOMPUTE_MISMATCH),
-    }
+    // An increment judged afresh, or a deferred push's record deferring the replica (P2), as the record's recomputation
+    // applies them.
+    crate::merge_service::apply_inputs(&mut step.replica, &bytes, step.version)?;
     self.held = Some(gather.manifest);
     self.check(state, &mut step.replica, identity)?;
     if let Some(value) = ledger_value(state, self.object, step.version) {
@@ -1411,7 +1406,7 @@ impl ReplicaSeed {
     if state.merge.refused.contains(&self.object) {
       return;
     }
-    let head = replica.head();
+    let head = replica.reached();
     if ledger_value(state, self.object, head)
       .is_some_and(|value| value.identity != replica.head_identity())
     {
@@ -1494,6 +1489,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_merge::engine::{Increment, Outcome};
 
   /// The streams pushed in [`a_stream_pushed_in_any_cut_makes_the_archive_its_whole_bytes_make`]: about three and a
   /// half chunks, so whole chunks, a chunk's boundary and a short last chunk are all met.
@@ -1889,7 +1885,7 @@ mod tests {
         .merge
         .replicas
         .get_mut(&object)
-        .map(|replica| (replica.head(), replica.head_identity()));
+        .map(|replica| (replica.reached(), replica.head_identity()));
       (
         accepted_first && accepted_second && rebuilt == Some((2, two)),
         units,
@@ -2018,7 +2014,7 @@ mod tests {
           .merge
           .replicas
           .get_mut(&object)
-          .map(|replica| (replica.head(), replica.head_identity() == one));
+          .map(|replica| (replica.reached(), replica.head_identity() == one));
         let counts = [
           count_of(state, REPLICA_ADVANCED),
           count_of(state, REPLICA_REBUILT),
@@ -2129,7 +2125,7 @@ mod tests {
       .merge
       .replicas
       .get_mut(&object)
-      .map(|replica| (replica.head(), replica.head_identity()))
+      .map(|replica| (replica.reached(), replica.head_identity()))
   }
 
   /// The merge shipment (`fleet::serve_merge_shipment`'s request) of `record`, carrying the whole inputs archive of
@@ -2413,7 +2409,7 @@ mod tests {
         Ack::decode(&reply).is_ok_and(|ack| ack.sequence == 2 && ack.identity == record.identity());
       let replica = state.merge.replicas.get_mut(&object).map(|replica| {
         (
-          replica.head(),
+          replica.reached(),
           replica.head_identity(),
           replica.folded_below(),
           replica.content_at("f", 1),
@@ -2467,7 +2463,7 @@ mod tests {
       let _ = seed_to_end(state, &mut seed);
       state.merge.replicas.get_mut(&object).map(|replica| {
         (
-          replica.head(),
+          replica.reached(),
           replica.head_identity(),
           replica.folded_below(),
           replica.content_at("f", 1),

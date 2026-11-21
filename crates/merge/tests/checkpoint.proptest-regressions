@@ -1,0 +1,2 @@
+# Seeds for crates/merge/tests/checkpoint.rs (crates/test-seeds). Reviewed: each line names a failure that was fixed.
+cc 59538896987fc02990742a07d68e2acef5218ae1f88be939df06c058ec966005 # a restore's change index (changed_between(0, 1)) lost a path the histories name

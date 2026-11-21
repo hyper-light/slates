@@ -355,3 +355,75 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
   }
   let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Goal 93 perf (r25 on 5d7e05b81, hg-src: a stream's store thread read each chunk with its own payload lookup and its
+/// own `pread`, about 230,000 a stream; a later stream, the log out of the page cache, took 10.7 s against stock's
+/// 0.47 s). A log's revisions lie in order in their push's payload, apart only by each chunk's header, so a batch of
+/// their places is read in one read. Do: land a payload of three versions of `f` each after a short header, and a
+/// fourth after a gap longer than the three together; ask for the four places in one batch. Expect each place's bytes
+/// as read alone, and two log reads: the three near ones together, the far one alone.
+#[test]
+fn a_batch_of_places_in_order_in_one_payload_is_read_in_one_read() {
+  let dir = scratch("coalesced");
+  let mut store = open(&dir);
+  let staging = Staging::new(0);
+  let header = b"chunkhdr".to_vec();
+  let versions: Vec<Vec<u8>> = (0..4)
+    .map(|at| format!("version {at} of f, sixteen+").into_bytes())
+    .collect();
+  let gap = vec![b'.'; versions.iter().map(Vec::len).sum::<usize>() * 2];
+  let mut payload = Vec::new();
+  let mut places = Vec::new();
+  for (at, version) in versions.iter().enumerate() {
+    payload.extend_from_slice(if at == 3 { &gap } else { &header });
+    places.push((payload.len(), version.len()));
+    payload.extend_from_slice(version);
+  }
+  let payload_id = *blake3::hash(&payload).as_bytes();
+  let places: Vec<Place> = places
+    .iter()
+    .map(|(offset, len)| Place {
+      payload: payload_id,
+      offset: *offset as u64,
+      len: *len as u64,
+    })
+    .collect();
+  let entries: Vec<TextEntry> = versions
+    .iter()
+    .zip(&places)
+    .enumerate()
+    .map(|(at, (version, place))| TextEntry {
+      path: b"f".to_vec(),
+      tool_id: format!("n{at}").into_bytes(),
+      text: *blake3::hash(version).as_bytes(),
+      len: version.len() as u64,
+      base: None,
+      place: *place,
+    })
+    .collect();
+  let section = texts::encode(&entries);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence: 1,
+        judged_over: 0,
+        grant: 1,
+        work: 1,
+        time_ns: 1,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Payload, Contents::Bytes(&payload)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+  let before = store.place_reads();
+  let read = store.places_bytes(&staging, &places).unwrap();
+  assert_eq!(read, versions);
+  assert_eq!(store.place_reads() - before, 2, "log reads for the batch");
+  let _ = std::fs::remove_dir_all(&dir);
+}

@@ -4,8 +4,9 @@
 //!
 //! **The shape.** `.hg/requires` names a store 7.2 makes by default without `share-safe`: `dotencode`, `fncache`,
 //! `generaldelta`, `revlogv1`, `sparserevlog` and `store`. Every log is a revlog version 1 with generaldelta, split (an
-//! index file of 64-byte entries and a data file), never inline: 7.2 reads either, and one shape keeps the renderer one
-//! path. Each revision is stored whole (its delta base itself, a full snapshot, which `sparserevlog` allows), its chunk
+//! index file of 64-byte entries and a data file), never inline but where the data file would be empty (every text
+//! empty): that log is inline, its index file alone, as 7.2 keeps it, since a client lists in its fncache the files it
+//! was sent and a split log missing its data file there fails `hg verify` (hg-src's `mercurial/__init__.py`). Each revision is stored whole (its delta base itself, a full snapshot, which `sparserevlog` allows), its chunk
 //! as 7.2's `revlog.compress` stores what it does not compress: `u` and the text, or the text itself when it is empty or
 //! begins with a NUL. Its entry holds the chunk's offset, the revision's flags, the chunk's and the text's lengths, the
 //! base, the link (a changeset's own number), the parents' numbers (-1 for none) and the node, all big-endian, the
@@ -46,6 +47,9 @@ const REQUIRES: &[u8] = b"dotencode\nfncache\ngeneraldelta\nrevlogv1\nsparserevl
 const DECIMAL_BYTES: u64 = 20;
 /// Format: the index header: revlog version 1 with generaldelta (`FLAG_GENERALDELTA`, bit 17), big-endian.
 const HEADER: [u8; 4] = [0, 2, 0, 1];
+/// Format: the index header of a log whose every chunk is empty: [`HEADER`] with the inline flag (`FLAG_INLINE_DATA`,
+/// bit 16), as 7.2 keeps such a log (its data, none, inside the index file). Module docs, "The shape".
+const INLINE_HEADER: [u8; 4] = [0, 3, 0, 1];
 /// Format: a version 1 index entry's bytes: the node's field is 32 bytes, its last 12 zero.
 const ENTRY_BYTES: usize = 64;
 /// Format: the node field's padding after the node.
@@ -58,7 +62,9 @@ const UNCOMPRESSED: u8 = b'u';
 /// start 0, end 0 and the text's length, three big-endian 32-bit words). The store keeps such a revision as it came,
 /// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
 /// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
-/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`).
+/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`).
+/// An empty text comes with no hunk at all, an empty delta (7.2's `hg debugbundle --all`: an empty file's delta is of
+/// length 0), which is sent as it is: refused, it left hg-src's stream empty (`mercurial/__init__.py`'s first revision).
 /// Format: three big-endian 32-bit words.
 const TRIVIAL_HUNK_BYTES: u64 = 12;
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
@@ -237,7 +243,11 @@ fn revlog(
     entry.write(&mut entries)?;
   }
   if let Some(header) = entries.get_mut(..HEADER.len()) {
-    header.copy_from_slice(&HEADER);
+    header.copy_from_slice(if data.is_empty() {
+      &INLINE_HEADER
+    } else {
+      &HEADER
+    });
   }
   Ok((entries, data))
 }
@@ -327,13 +337,13 @@ pub struct StoredRevision {
 /// What a stream asks of the changeset store before its next step ([`Streaming::wants`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Want {
-  /// A log's revisions by node, in the log's order: the log as the store's `Texts` section names it (a file's path,
-  /// `\0manifest`, `\0changelog`).
+  /// Logs' revisions by node, each log in its order and the logs in the walk's: a log as the store's `Texts` section
+  /// names it (a file's path, `\0manifest`, `\0changelog`) and its revisions' nodes. As many logs as the room the last
+  /// step was given holds, one at least, so a stream asks by its bytes and never once a log (r20 on hg-src: about 12,000
+  /// asks, the serving shard idle half the stream).
   Rows {
-    /// The log's name.
-    log: Vec<u8>,
-    /// Its revisions' nodes, in order.
-    nodes: Vec<Node>,
+    /// Each log's name and its revisions' nodes, in order.
+    logs: Vec<(Vec<u8>, Vec<Node>)>,
   },
   /// These places' bytes, in order.
   Chunks {
@@ -344,9 +354,9 @@ pub enum Want {
 
 /// What answers a stream's wants at once (a whole answer, [`crate::serve::stream::stream_out`]; a test).
 pub trait StoredSource {
-  /// Each revision of `log` named in `nodes`, in order: none for one the store does not keep; none whole where it
-  /// cannot answer.
-  fn rows(&mut self, log: &[u8], nodes: &[Node]) -> Option<Vec<Option<StoredRevision>>>;
+  /// Each log's revisions named by its nodes, in order, the logs in order: none for one the store does not keep; none
+  /// whole where it cannot answer.
+  fn rows(&mut self, logs: &[(Vec<u8>, Vec<Node>)]) -> Option<Vec<Vec<Option<StoredRevision>>>>;
   /// Each place's bytes, in order; none where it cannot answer.
   fn chunks(&mut self, places: &[StoredPlace]) -> Option<Vec<Vec<u8>>>;
 }
@@ -356,8 +366,8 @@ pub trait StoredSource {
 pub trait StoreWants {
   /// What the next step needs, if anything.
   fn wants(&self) -> Option<&Want>;
-  /// The rows a [`Want::Rows`] asked for.
-  fn give_rows(&mut self, rows: Vec<Option<StoredRevision>>);
+  /// The rows a [`Want::Rows`] asked for, a log's in turn.
+  fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>);
   /// The chunks a [`Want::Chunks`] asked for.
   fn give_chunks(&mut self, chunks: Vec<Vec<u8>>);
 }
@@ -367,7 +377,7 @@ impl StoreWants for Streaming {
     Streaming::wants(self)
   }
 
-  fn give_rows(&mut self, rows: Vec<Option<StoredRevision>>) {
+  fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     Streaming::give_rows(self, rows);
   }
 
@@ -382,8 +392,13 @@ impl StoreWants for Streaming {
 pub struct NotKept;
 
 impl StoredSource for NotKept {
-  fn rows(&mut self, _log: &[u8], nodes: &[Node]) -> Option<Vec<Option<StoredRevision>>> {
-    Some(vec![None; nodes.len()])
+  fn rows(&mut self, logs: &[(Vec<u8>, Vec<Node>)]) -> Option<Vec<Vec<Option<StoredRevision>>>> {
+    Some(
+      logs
+        .iter()
+        .map(|(_, nodes)| vec![None; nodes.len()])
+        .collect(),
+    )
   }
 
   fn chunks(&mut self, _places: &[StoredPlace]) -> Option<Vec<Vec<u8>>> {
@@ -400,8 +415,8 @@ pub fn answer_want(
     return Ok(false);
   };
   match want {
-    Want::Rows { log, nodes } => {
-      let rows = source.rows(&log, &nodes).ok_or(Refused::TooLong)?;
+    Want::Rows { logs } => {
+      let rows = source.rows(&logs).ok_or(Refused::TooLong)?;
       streaming.give_rows(rows);
     }
     Want::Chunks { places } => {
@@ -412,10 +427,11 @@ pub fn answer_want(
   Ok(true)
 }
 
-/// The store's rows of the log being walked: each revision's stored form, and the first revision of each text (a base
-/// names its text, the entry its revision).
+/// The store's rows of a log the walk holds: its number among the logs given (which tags its chunks), each revision's
+/// stored form, and the first revision of each text (a base names its text, the entry its revision).
 #[derive(Debug)]
 struct StoredLog {
+  seq: u64,
   log: Walked,
   revisions: Vec<StoredRevision>,
   first: BTreeMap<[u8; 32], u32>,
@@ -430,7 +446,9 @@ struct StoredLog {
 /// index file's entries a row a step (each entry's base the revision of the log that first holds its base's text), then
 /// its data file's chunks, a batch a step. A log whose revision the store does not keep (an imported repository's,
 /// before its import lands as changesets) serves no stream: the answer is `1\n`, 7.2's "operation forbidden by
-/// server", and the client clones. What the walk holds: its place, two counts, one log's rows and one batch of chunks.
+/// server", and the client clones. What the walk holds: its place, two counts, a batch of logs' rows and a batch of
+/// chunks, each as much as the room the last step was given holds (one log, one chunk at least); a chunk batch runs on
+/// into the logs held after the one being written, so the store is asked by the stream's bytes, never once a log.
 /// The store's rows and chunks are asked for by [`Streaming::wants`] and given back before the next step
 /// ([`Streaming::give_rows`], [`Streaming::give_chunks`]).
 #[derive(Debug)]
@@ -441,12 +459,16 @@ pub struct Streaming {
   counted: (u64, u64),
   /// What it asks of the store before its next step.
   want: Option<Want>,
-  /// The log the asked rows are for.
-  wanted_log: Option<Walked>,
-  /// The rows of the log being walked.
-  stored: Option<StoredLog>,
-  /// A batch of chunks given: the revision of its first, and the chunks.
-  chunks: (u32, VecDeque<Vec<u8>>),
+  /// The logs the asked rows are for, in order.
+  wanted_logs: Vec<Walked>,
+  /// The rows of the logs held, the one being walked first.
+  held: VecDeque<StoredLog>,
+  /// The number the next log given takes.
+  next_seq: u64,
+  /// The log number and revision each asked chunk is for, in order.
+  wanted_chunks: Vec<(u64, u32)>,
+  /// A batch of chunks given, each with its log's number and its revision.
+  chunks: VecDeque<(u64, u32, Vec<u8>)>,
   /// Whether a revision the store does not keep was met: no stream is served.
   not_served: bool,
   /// The room the last step was given, which sizes the next batch of chunks.
@@ -459,9 +481,11 @@ impl Default for Streaming {
       stage: Stage::Start,
       counted: (0, 0),
       want: None,
-      wanted_log: None,
-      stored: None,
-      chunks: (0, VecDeque::new()),
+      wanted_logs: Vec::new(),
+      held: VecDeque::new(),
+      next_seq: 0,
+      wanted_chunks: Vec::new(),
+      chunks: VecDeque::new(),
       not_served: false,
       room_hint: 0,
     }
@@ -475,36 +499,45 @@ impl Streaming {
     self.want.as_ref()
   }
 
-  /// The rows a [`Want::Rows`] asked for, in order: a revision the store does not keep ends the stream unserved.
-  pub fn give_rows(&mut self, rows: Vec<Option<StoredRevision>>) {
+  /// The rows a [`Want::Rows`] asked for, a log's in turn, each in order: a revision the store does not keep ends the
+  /// stream unserved, and so does a log the answer leaves out.
+  pub fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>) {
     self.want = None;
-    let Some(log) = self.wanted_log.take() else {
-      return;
-    };
-    let mut revisions = Vec::with_capacity(rows.len());
-    let mut first = BTreeMap::new();
-    for (rev, row) in (0_u32..).zip(rows) {
-      match row {
-        Some(row) => {
-          first.entry(row.text).or_insert(rev);
-          revisions.push(row);
-        }
-        None => self.not_served = true,
-      }
+    let wanted = core::mem::take(&mut self.wanted_logs);
+    if rows.len() != wanted.len() {
+      self.not_served = true;
     }
-    self.stored = Some(StoredLog {
-      log,
-      revisions,
-      first,
-    });
+    for (log, rows) in wanted.into_iter().zip(rows) {
+      let mut revisions = Vec::with_capacity(rows.len());
+      let mut first = BTreeMap::new();
+      for (rev, row) in (0_u32..).zip(rows) {
+        match row {
+          Some(row) => {
+            first.entry(row.text).or_insert(rev);
+            revisions.push(row);
+          }
+          None => self.not_served = true,
+        }
+      }
+      self.held.push_back(StoredLog {
+        seq: self.next_seq,
+        log,
+        revisions,
+        first,
+      });
+      self.next_seq = self.next_seq.saturating_add(1);
+    }
   }
 
   /// The chunks a [`Want::Chunks`] asked for, in order.
   pub fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
-    if let Some(Want::Chunks { .. }) = self.want.take()
-      && let Stage::Data(_, rev) = &self.stage
-    {
-      self.chunks = (*rev, chunks.into());
+    if let Some(Want::Chunks { .. }) = self.want.take() {
+      let tags = core::mem::take(&mut self.wanted_chunks);
+      self.chunks = tags
+        .into_iter()
+        .zip(chunks)
+        .map(|((seq, rev), chunk)| (seq, rev, chunk))
+        .collect();
     }
   }
 
@@ -536,31 +569,40 @@ impl Streaming {
     Ok(self.stage != Stage::Done)
   }
 
-  /// Whether the rows of `log` are held; asks for them when not.
+  /// Whether the rows of `log` are held, the logs walked before it let go; asks for them when not, with the logs after
+  /// it, as many as the room the last step was given holds (one at least).
   fn rows_held(
     &mut self,
     index: &HgIndex,
     store: &ContentStore,
     log: &Walked,
   ) -> Result<bool, Refused> {
-    if self
-      .stored
-      .as_ref()
-      .is_some_and(|stored| stored.log == *log)
-    {
-      return Ok(true);
+    while let Some(front) = self.held.front() {
+      if front.log == *log {
+        return Ok(true);
+      }
+      self.held.pop_front();
     }
-    self.stored = None;
-    let count = index.len(store, log.log());
-    let mut nodes = Vec::with_capacity(usize::try_from(count).map_err(|_| Refused::TooLong)?);
-    for rev in 0..count {
-      nodes.push(node_of(index, store, log, rev)?);
+    let row_bytes = to_u64(core::mem::size_of::<StoredRevision>());
+    let (mut logs, mut wanted, mut bytes) = (Vec::new(), Vec::new(), 0_u64);
+    let mut next = Some(log.clone());
+    while let Some(at) = next {
+      let count = index.len(store, at.log());
+      let cost = u64::from(count).saturating_mul(row_bytes);
+      if !logs.is_empty() && bytes.saturating_add(cost) > self.room_hint {
+        break;
+      }
+      bytes = bytes.saturating_add(cost);
+      let mut nodes = Vec::with_capacity(usize::try_from(count).map_err(|_| Refused::TooLong)?);
+      for rev in 0..count {
+        nodes.push(node_of(index, store, &at, rev)?);
+      }
+      logs.push((at.stored_name(), nodes));
+      next = next_log(&at, index, store);
+      wanted.push(at);
     }
-    self.want = Some(Want::Rows {
-      log: log.stored_name(),
-      nodes,
-    });
-    self.wanted_log = Some(log.clone());
+    self.want = Some(Want::Rows { logs });
+    self.wanted_logs = wanted;
     Ok(false)
   }
 
@@ -577,7 +619,7 @@ impl Streaming {
     if self.not_served {
       return Ok(Stage::Head);
     }
-    let stored = self.stored.as_ref().ok_or(Refused::TooLong)?;
+    let stored = self.held.front().ok_or(Refused::TooLong)?;
     let entries = to_u64(stored.revisions.len()).saturating_mul(to_u64(ENTRY_BYTES));
     let data = stored.revisions.iter().try_fold(0_u64, |data, row| {
       sent_len(row).map(|sent| data.saturating_add(sent))
@@ -632,7 +674,10 @@ impl Streaming {
     if !self.rows_held(index, store, &log)? {
       return Ok(Stage::Index(log, rev, offset));
     }
-    let count = index.len(store, log.log());
+    // The log's length is its held rows' count: asked of the index, each entry took a search of the log's keys.
+    let count = self.held.front().map_or(Ok(0), |stored| {
+      u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)
+    })?;
     if rev >= count {
       if offset == 0 {
         return Ok(
@@ -653,7 +698,7 @@ impl Streaming {
       file_line(&name, size, admission, out)?;
     }
     admission.charge(to_u64(ENTRY_BYTES))?;
-    let stored = self.stored.as_ref().ok_or_else(unreadable)?;
+    let stored = self.held.front().ok_or_else(unreadable)?;
     let row = stored
       .revisions
       .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
@@ -680,8 +725,10 @@ impl Streaming {
       }
     };
     // A revision against the null base is sent as its text alone: its place must be the trivial hunk and the text.
+    let whole_text =
+      row.place.len == 0 && text == 0 || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES);
     let chunk = sent_len(row)
-      .filter(|_| based || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES))
+      .filter(|_| based || whole_text)
       .ok_or_else(unreadable)?;
     let entry = Entry {
       offset,
@@ -698,7 +745,9 @@ impl Streaming {
     if rev == 0
       && let Some(header) = out.get_mut(at..at.saturating_add(HEADER.len()))
     {
-      header.copy_from_slice(&HEADER);
+      // Once a log, at its first entry: inline where no revision has a chunk to send.
+      let no_data = stored.revisions.iter().all(|row| sent_len(row) == Some(0));
+      header.copy_from_slice(if no_data { &INLINE_HEADER } else { &HEADER });
     }
     Ok(Stage::Index(
       log,
@@ -721,36 +770,45 @@ impl Streaming {
       log: unreadable_name(&log),
       rev,
     };
-    let stored = self.stored.as_ref().ok_or_else(unreadable)?;
+    let stored = self.held.front().ok_or_else(unreadable)?;
     let count = u32::try_from(stored.revisions.len()).map_err(|_| Refused::TooLong)?;
     if rev >= count {
-      self.stored = None;
-      self.chunks = (0, VecDeque::new());
+      // The next log's rows let go of this one's ([`Streaming::rows_held`]); chunks asked for after it are kept.
       return Ok(next_log(&log, index, store).map_or(Stage::Done, |next| Stage::Index(next, 0, 0)));
     }
-    if self.chunks.0 != rev || self.chunks.1.is_empty() {
-      // A batch from this revision: as many places as fit the room the last step was given, at least one.
-      let mut places = Vec::new();
-      let mut bytes = 0_u64;
-      for row in stored
-        .revisions
-        .iter()
-        .skip(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
-      {
-        if !places.is_empty() && bytes.saturating_add(row.place.len) > self.room_hint {
-          break;
+    let seq = stored.seq;
+    if self
+      .chunks
+      .front()
+      .is_none_or(|(at_seq, at_rev, _)| (*at_seq, *at_rev) != (seq, rev))
+    {
+      // A batch from this revision on, running into the logs held after this one: as many places as fit the room the
+      // last step was given, at least one.
+      self.chunks.clear();
+      let (mut places, mut tags, mut bytes) = (Vec::new(), Vec::new(), 0_u64);
+      'logs: for held in &self.held {
+        let from = if held.seq == seq { rev } else { 0 };
+        for (at, row) in (0_u32..)
+          .zip(&held.revisions)
+          .skip(usize::try_from(from).map_err(|_| Refused::TooLong)?)
+        {
+          if !places.is_empty() && bytes.saturating_add(row.place.len) > self.room_hint {
+            break 'logs;
+          }
+          bytes = bytes.saturating_add(row.place.len);
+          places.push(row.place);
+          tags.push((held.seq, at));
         }
-        bytes = bytes.saturating_add(row.place.len);
-        places.push(row.place);
       }
       self.want = Some(Want::Chunks { places });
+      self.wanted_chunks = tags;
       return Ok(Stage::Data(log, rev));
     }
     let row = stored
       .revisions
       .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
       .ok_or_else(unreadable)?;
-    let chunk = self.chunks.1.pop_front().ok_or_else(unreadable)?;
+    let (_, _, chunk) = self.chunks.pop_front().ok_or_else(unreadable)?;
     let sent = if row.base.is_some() {
       chunk.as_slice()
     } else {
@@ -761,7 +819,6 @@ impl Streaming {
       out.push(UNCOMPRESSED);
       out.extend_from_slice(sent);
     }
-    self.chunks.0 = rev.saturating_add(1);
     Ok(Stage::Data(log, rev.saturating_add(1)))
   }
 }
@@ -820,10 +877,10 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
 }
 
 /// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a delta against
-/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]); none for a place too short to hold
-/// that hunk.
+/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]; an empty delta, an empty text's, as it
+/// is); none for a place too short to hold that hunk.
 fn sent_len(row: &StoredRevision) -> Option<u64> {
-  let sent = if row.base.is_some() {
+  let sent = if row.base.is_some() || row.place.len == 0 {
     row.place.len
   } else {
     row.place.len.checked_sub(TRIVIAL_HUNK_BYTES)?
@@ -832,8 +889,11 @@ fn sent_len(row: &StoredRevision) -> Option<u64> {
 }
 
 /// The text a delta against the null base carries ([`TRIVIAL_HUNK_BYTES`]): what follows its one hunk, which must
-/// replace bytes 0 to 0 with exactly the rest; none for anything else.
+/// replace bytes 0 to 0 with exactly the rest; an empty delta, an empty text's, as it is; none for anything else.
 fn text_after_trivial_hunk(delta: &[u8]) -> Option<&[u8]> {
+  if delta.is_empty() {
+    return Some(delta);
+  }
   let header = usize::try_from(TRIVIAL_HUNK_BYTES).ok()?;
   let (hunk, text) = (delta.get(..header)?, delta.get(header..)?);
   let words: Vec<u32> = hunk

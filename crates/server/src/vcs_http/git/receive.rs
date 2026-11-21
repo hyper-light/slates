@@ -92,6 +92,59 @@ pub(crate) struct ReceiveServices<L> {
   keepalive_ns: u64,
 }
 
+/// A homing or a landing in flight (R2), awaited no longer than the answer may stay silent (`silent_until`): what it
+/// carried, or none once the silence is up (its keepalive is written, and the wait goes on at the next turn).
+async fn carried_within(
+  waiting: &mut slates_rt::sync::ChannelReceiver<crate::git_push::Carried>,
+  silent_until: Option<u64>,
+) -> Result<Option<crate::git_push::Carried>, Cut> {
+  let unavailable = || Cut::Unserved;
+  let Some(until) = silent_until else {
+    return waiting.recv().await.map(Some).map_err(|_| unavailable());
+  };
+  let left = until.saturating_sub(slates_rt::futures::now_ns());
+  match slates_rt::futures::within(left, waiting.recv()).await {
+    Ok(Some(Ok(carried))) => Ok(Some(carried)),
+    Ok(None) => Ok(None),
+    Ok(Some(Err(_))) | Err(_) => Err(unavailable()),
+  }
+}
+
+/// The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
+/// are (true), refused when they are not within the commit's budget, or, once `silent_until` passes, left for the
+/// next turn (false) so git's keepalive is written meanwhile (R2).
+async fn held_report_given<L: ShardLender>(
+  lender: &mut L,
+  repository: slates_db::catalog::RepositoryId,
+  (held_report, given): (&mut Option<(Vec<u8>, u64)>, &mut Vec<u8>),
+  silent_until: Option<u64>,
+) -> Result<bool, Cut> {
+  let unavailable = || Cut::Unserved;
+  let began = held_report.as_ref().map_or(0, |(_, began)| *began);
+  let budget = crate::fleet::live_budget();
+  loop {
+    if lender
+      .lend(|state| crate::state_log::names_committed(state, repository))
+      .ok_or_else(unavailable)?
+    {
+      if let Some((report, _)) = held_report.take() {
+        given.extend_from_slice(&report);
+      }
+      return Ok(true);
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
+      let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
+      return Err(unavailable());
+    }
+    if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
+      return Ok(false);
+    }
+    slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
+      .await
+      .map_err(|_| unavailable())?;
+  }
+}
+
 impl<L> ReceiveServices<L> {
   /// receive-pack over the state `lender` lends, git's keepalive written after `keepalive_ns` of a silent answer.
   pub(crate) fn new(lender: L, keepalive_ns: u64) -> Self {
@@ -313,47 +366,16 @@ impl<L: ShardLender> Receive<L> {
       // A homing or a landing in flight (R2): awaited no longer than the answer may stay silent, then its keepalive is
       // written and the wait goes on at the next turn.
       if let Some(waiting) = carrying.as_mut() {
-        let carried = match silent_until {
-          Some(until) => {
-            let left = until.saturating_sub(slates_rt::futures::now_ns());
-            match slates_rt::futures::within(left, waiting.recv()).await {
-              Ok(Some(Ok(carried))) => carried,
-              Ok(None) => return Ok(false),
-              Ok(Some(Err(_))) | Err(_) => return Err(unavailable()),
-            }
-          }
-          None => waiting.recv().await.map_err(|_| unavailable())?,
+        let Some(carried) = carried_within(waiting, silent_until).await? else {
+          return Ok(false);
         };
         *carrying = None;
         lender
           .lend(|state| push.homed(state, carried))
           .ok_or_else(unavailable)?;
       }
-      // The report held until the push's records are held at f + 1 (§4.8's commit rule; A-724 piece 8c): given once they
-      // are, refused when they are not within the commit's budget, git's keepalive written meanwhile (R2).
-      if let Some(began) = held_report.as_ref().map(|(_, began)| *began) {
-        let budget = crate::fleet::live_budget();
-        loop {
-          if lender
-            .lend(|state| crate::state_log::names_committed(state, repository))
-            .ok_or_else(unavailable)?
-          {
-            if let Some((report, _)) = held_report.take() {
-              given.extend_from_slice(&report);
-            }
-            return Ok(true);
-          }
-          if slates_rt::futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
-            let _ = lender.lend(|state| state.count(crate::state_log::PUSH_UNCOMMITTED, 1));
-            return Err(unavailable());
-          }
-          if silent_until.is_some_and(|until| slates_rt::futures::now_ns() >= until) {
-            return Ok(false);
-          }
-          slates_rt::futures::sleep(budget.poll_interval_ns.max(1))
-            .await
-            .map_err(|_| unavailable())?;
-        }
+      if held_report.is_some() {
+        return held_report_given(lender, repository, (held_report, given), silent_until).await;
       }
       let turn = crate::vcs_share::turns::take(repository).await;
       let before = given.len();

@@ -34,6 +34,10 @@ const IDENTITY: usize = 32;
 const ABSENT: u8 = 0;
 /// Format: the mark of a present base.
 const PRESENT: u8 = 1;
+/// Shape: the most a coalesced read of places reads, as a multiple of the bytes its places ask ([`Store::places_bytes`]):
+/// the gaps between them (in a changegroup, each chunk's header before its delta) at most as many bytes as the places,
+/// so one read stands for many and never reads more than double what was asked.
+const COALESCED_SPAN_TIMES: u64 = 2;
 /// Format: the fewest bytes an entry takes: the path's and the tool id's lengths, the identity and length, the mark,
 /// and the place.
 const ENTRY_FEWEST: usize = LONG + LONG + IDENTITY + LONG + 1 + IDENTITY + LONG + LONG;
@@ -672,8 +676,84 @@ impl Store {
   /// # Errors
   /// [`StoreError::BadRow`] for a place past its payload, or a payload no landed changeset holds; the log's refusals.
   pub fn place_bytes(&mut self, staging: &Staging, place: &Place) -> Result<Vec<u8>, StoreError> {
-    let mut counted = TextCache::new(0);
-    self.read_place(staging, place, &mut counted)
+    self
+      .places_bytes(staging, core::slice::from_ref(place))?
+      .pop()
+      .ok_or(StoreError::BadRow)
+  }
+
+  /// The bytes at each of `places`, in order (a stream's chunks, read in place): each run of places in one landed
+  /// payload, in order, read in one read of the log while that read stays within [`COALESCED_SPAN_TIMES`] the bytes the
+  /// run asks, each payload's place in the log found once. A log's revisions lie in order in their push's payload,
+  /// apart only by each chunk's header, so a stream's batch is a read or a few, never a read a chunk (r25 on hg-src:
+  /// about 230,000 reads a stream, a later stream 10.7 s). A place whose payload is still in flight is read from the
+  /// staging.
+  ///
+  /// # Errors
+  /// [`StoreError::BadRow`] for a place past its payload, or a payload no landed changeset holds; the log's refusals.
+  pub fn places_bytes(
+    &mut self,
+    staging: &Staging,
+    places: &[Place],
+  ) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut out = Vec::with_capacity(places.len());
+    let mut at = 0;
+    while let Some(first) = places.get(at) {
+      if staging.get(&first.payload).is_some() {
+        let mut counted = TextCache::new(0);
+        out.push(self.read_place(staging, first, &mut counted)?);
+        at = at.saturating_add(1);
+        continue;
+      }
+      let (base, payload_len) = self
+        .content_place(&first.payload)?
+        .ok_or(StoreError::BadRow)?;
+      let span_start = first.offset;
+      let mut span_end = first
+        .offset
+        .checked_add(first.len)
+        .ok_or(StoreError::BadRow)?;
+      let mut asked = first.len;
+      let mut end = at.saturating_add(1);
+      while let Some(next) = places.get(end) {
+        let Some(next_end) = next.offset.checked_add(next.len) else {
+          break;
+        };
+        let grown = asked.saturating_add(next.len);
+        let within =
+          next_end.saturating_sub(span_start) <= grown.saturating_mul(COALESCED_SPAN_TIMES);
+        if next.payload != first.payload || next.offset < span_end || !within {
+          break;
+        }
+        span_end = next_end;
+        asked = grown;
+        end = end.saturating_add(1);
+      }
+      if span_end > payload_len {
+        return Err(StoreError::BadRow);
+      }
+      let mut span = vec![
+        0u8;
+        usize::try_from(span_end.saturating_sub(span_start))
+          .map_err(|_| StoreError::BadRow)?
+      ];
+      self.log().read_at(
+        &mut span,
+        base.checked_add(span_start).ok_or(StoreError::BadRow)?,
+      )?;
+      self.place_read();
+      for place in places.get(at..end).unwrap_or_default() {
+        let from = usize::try_from(place.offset.saturating_sub(span_start))
+          .map_err(|_| StoreError::BadRow)?;
+        let len = usize::try_from(place.len).map_err(|_| StoreError::BadRow)?;
+        let bytes = span
+          .get(from..from.checked_add(len).ok_or(StoreError::BadRow)?)
+          .ok_or(StoreError::BadRow)?;
+        out.push(bytes.to_vec());
+      }
+      at = end;
+    }
+    Ok(out)
   }
 
   /// Makes `text` and every text of its chain the cache lacks, keeping each: whether a landed changeset kept it.
