@@ -18,6 +18,8 @@
 ## Piece 3: A-782 identical vs accepted: LANDED ea730edb8 (merge c9be876f1)
 - See inbox/main-from-w-sessionlog-a782.md.
 
+## Piece 4: A-785 held merges in the log: LANDED fee55900f (merge 00be8fae1)
+
 ## Next (queue, main's order 15:20)
 1. "identical" as a submission outcome: the engine commits an identical increment as a new version; telling it apart
    needs a field on ReplyBody::Submitted (~100 construct/match sites) or the green recording empty-effect versions.
