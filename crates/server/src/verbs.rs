@@ -4467,6 +4467,24 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            "merge.work.base_missing.unentried",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .0,
+          ),
+          (
+            "merge.work.base_missing.unheld",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .1,
+          ),
+          (
+            "merge.work.base_missing.replaced_whole",
+            crate::work_home::BASE_MISSING_WHY
+              .with(std::cell::Cell::get)
+              .2,
+          ),
+          (
             WORK_LOG_PEAK_BYTES,
             u64::try_from(state.db.partition().work_log_peak().0).unwrap_or(u64::MAX),
           ),
@@ -10711,6 +10729,31 @@ pub(crate) struct AcceptedParts {
   pub(crate) authorship: slates_ipc::protocol::Authorship,
 }
 
+impl AcceptedParts {
+  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test.
+  #[cfg(test)]
+  pub(crate) fn for_test(
+    (green, work, version): (DbVolumeId, DbVolumeId, u64),
+    (increment, applied): (
+      slates_merge::engine::Increment,
+      Vec<slates_merge::chain_entry::Applied>,
+    ),
+  ) -> AcceptedParts {
+    let increment_bytes = increment.encode();
+    AcceptedParts {
+      green,
+      work,
+      version,
+      increment_bytes,
+      increment,
+      applied: Some(applied),
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      computed: false,
+      authorship: slates_ipc::protocol::Authorship::default(),
+    }
+  }
+}
+
 /// Commits `parts` in the running transaction, under the running request (`state.current_request`): the wait staged
 /// first (A-252), the chain entry appended, the merge record enqueued, the retention trued up, and a git repository's
 /// commit recorded (A-664 part 3). Refused where the wait or the entry is.
@@ -15708,7 +15751,7 @@ fn committed_placed(state: &ShardState, object: ObjectId, sequence: u64) -> bool
     .placed_heads
     .get(&object)
     .filter(|head| head.sequence == sequence)
-    .is_some_and(|head| head.placed_under(state.fleet.configuration(), object))
+    .is_some_and(|head| head.placed_under(state, object))
     || state.fleet.configuration().quorum.f == 0
 }
 

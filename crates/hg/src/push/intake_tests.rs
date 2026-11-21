@@ -552,6 +552,7 @@ fn a_pushs_reference_names_its_changeset_and_payload_by_identity() {
       payload: *blake3::hash(&part.payload).as_bytes(),
       len: u64::try_from(part.payload.len()).unwrap(),
       sequence: 5,
+      made: None,
     }
   );
   assert_eq!(

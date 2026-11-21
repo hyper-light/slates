@@ -1780,6 +1780,20 @@ pub(crate) struct PushTurns {
   pub(crate) yielded: u64,
 }
 
+/// The shard's pacing environment (A-783): its clock, its probe of whether anyone else waits, its step quantum, its
+/// ceiling (the watchdog's look) and a unit estimate's target error (the scheduler's own measured jitter over the
+/// quantum). Every paced path on a shard steps under it: the push build, a checkpoint's identity fold (A-579).
+pub(crate) fn shard_pace_env(state: &ShardState) -> slates_pace::Env {
+  let quantum = state.config.step_quantum_ns();
+  slates_pace::Env {
+    clock: slates_rt::futures::now_ns,
+    waiting: slates_rt::futures::others_waiting,
+    quantum_ns: quantum,
+    ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
+    target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
+  }
+}
+
 /// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
 /// own measured jitter over the quantum, at least one part, at most the whole.
 pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
@@ -2071,13 +2085,7 @@ impl ServerJudge<'_> {
     // A-783: the turn yields at its quantum when someone waits on the shard, and goes on to the shard's ceiling (the
     // watchdog's look) when no one does; a unit's estimate aims at the scheduler's own measured jitter over the
     // quantum, its target relative error.
-    let env = slates_pace::Env {
-      clock: slates_rt::futures::now_ns,
-      waiting: slates_rt::futures::others_waiting,
-      quantum_ns: quantum,
-      ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
-      target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
-    };
+    let env = shard_pace_env(state);
     // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
     let slices = slates_merge::pace::Slices {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),

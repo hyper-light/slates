@@ -1305,7 +1305,6 @@ fn cut_record(
           link: *link,
           flags: *flags,
           text,
-          base: None,
         })
         .collect();
       (*log, given)

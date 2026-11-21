@@ -59,6 +59,15 @@ pub enum Importing {
     /// The record to commit.
     record: Box<Record>,
   },
+  /// A delta text opened on a base the repository names but keeps elsewhere (C2 stage B part 2 (b): a text stored on a
+  /// node's changeset store, which the records name by identity and length alone): the caller hands its bytes whole to
+  /// [`Importer::supply_base`], then drops the first `consumed` bytes and calls again.
+  Base {
+    /// The bytes, from the start of the buffer, the import is done with.
+    consumed: usize,
+    /// The base text's identity.
+    text: ContentIdentity,
+  },
   /// The stream ended, and every record it made was handed to the caller.
   Done,
 }
@@ -101,6 +110,9 @@ pub struct Importer {
   loading: Option<Revision>,
   /// Whether the stream has ended and every record it made been handed over.
   done: bool,
+  /// The base of the delta text just opened, which the repository keeps elsewhere: asked of the caller before the import
+  /// reads on ([`Importing::Base`]).
+  wanted_base: Option<ContentIdentity>,
 }
 
 /// A revision being read: its number, its properties and its transaction (none for revision 0).
@@ -164,6 +176,9 @@ struct OpenText {
   expected: (Option<Md5>, Option<Sha1>),
   /// The text made so far.
   bytes: Vec<u8>,
+  /// A delta's base the repository keeps elsewhere, as its caller supplied it ([`Importing::Base`]); none where the
+  /// transaction or the repository holds the base, read from there a window at a time.
+  base: Option<Vec<u8>>,
 }
 
 impl Importer {
@@ -180,7 +195,33 @@ impl Importer {
       pending: None,
       loading: None,
       done: false,
+      wanted_base: None,
     }
+  }
+
+  /// Hands the import the base `bytes` of the open delta text it asked for ([`Importing::Base`]), charged as the text's
+  /// own bytes are.
+  ///
+  /// # Errors
+  /// [`MigrationRefusal::Corrupt`] where no open text asked for `text`, or `bytes` are not its identity's; the room's
+  /// refusal past it.
+  pub fn supply_base(
+    &mut self,
+    repository: &Repository,
+    text: &ContentIdentity,
+    bytes: Vec<u8>,
+  ) -> Result<(), MigrationRefusal> {
+    let asked = matches!(
+      self.text.as_ref().map(|open| open.form),
+      Some(TextForm::Delta { base: Some(base) }) if base == *text
+    );
+    if !asked || *blake3::hash(&bytes).as_bytes() != *text {
+      return Err(MigrationRefusal::Corrupt);
+    }
+    self.charge(repository, bytes.len())?;
+    let open = self.text.as_mut().ok_or(MigrationRefusal::Corrupt)?;
+    open.base = Some(bytes);
+    Ok(())
   }
 
   /// The bytes the import holds outside the repository: the open revision's properties, section and text, and what its
@@ -260,6 +301,12 @@ impl Importer {
             .ok_or(MigrationRefusal::Corrupt)?;
           if let Some(record) = made {
             return Ok(commit(offset, record));
+          }
+          if let Some(text) = self.wanted_base.take() {
+            return Ok(Importing::Base {
+              consumed: offset,
+              text,
+            });
           }
         }
         Read::NeedMore { consumed, needed } => {
@@ -414,7 +461,17 @@ impl Importer {
       });
     }
     if let Some(section) = header.text {
-      self.text = Some(open_text(&path, facts, section)?);
+      let open = open_text(&path, facts, section)?;
+      // A base the records name but keep elsewhere is asked of the caller before a window reads it.
+      if let TextForm::Delta {
+        base: Some(identity),
+      } = open.form
+        && transaction.content(repository, &identity).is_none()
+        && repository.stored_len(&identity).is_some()
+      {
+        self.wanted_base = Some(identity);
+      }
+      self.text = Some(open);
     }
     self.node = Some(OpenNode { path });
     Ok(())
@@ -484,14 +541,18 @@ impl Importer {
       .as_ref()
       .and_then(|revision| revision.transaction.as_ref())
       .ok_or(MigrationRefusal::Corrupt)?;
-    let base: std::borrow::Cow<'_, [u8]> = match open.form {
-      TextForm::Delta {
-        base: Some(identity),
-      } => transaction
+    let base: std::borrow::Cow<'_, [u8]> = match (open.form, open.base.as_deref()) {
+      (TextForm::Delta { base: Some(_) }, Some(supplied)) => std::borrow::Cow::Borrowed(supplied),
+      (
+        TextForm::Delta {
+          base: Some(identity),
+        },
+        None,
+      ) => transaction
         .content(repository, &identity)
         .ok_or(MigrationRefusal::Corrupt)?,
-      TextForm::Delta { base: None } => std::borrow::Cow::Borrowed(&[]),
-      TextForm::Whole => return Err(MigrationRefusal::Corrupt),
+      (TextForm::Delta { base: None }, _) => std::borrow::Cow::Borrowed(&[]),
+      (TextForm::Whole, _) => return Err(MigrationRefusal::Corrupt),
     };
     let view = source_view(&base, window.source_offset, window.source_len)
       .ok_or(MigrationRefusal::Delta(SvndiffError::SourceShort))?;
@@ -726,6 +787,7 @@ fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText,
     form,
     expected: (section.md5, section.sha1),
     bytes: Vec::new(),
+    base: None,
   })
 }
 

@@ -2,6 +2,8 @@
 //!
 //! - (a) A read of an earlier value against the layers over it: a 16 KiB file's same 64 bytes overwritten `m` times,
 //!   then version 1 read whole (`content_ref_at`), which resolves the anchor through every layer over that range.
+//! - (a') The same read after `m` changes alternating overwrites and inserts: each insert a shift the read carries the
+//!   range through.
 //! - (b) A change's cost against its path's history, for three streams over a 16 KiB file: overwrites alone (the layered
 //!   path), overwrites alternating with inserts (each insert resolves the layers and re-anchors in full), and an SDK
 //!   edit's same-length replacement, a delete and an insert at one offset.
@@ -105,6 +107,28 @@ fn read_after(m: u64) -> (u128, usize) {
   (best, len)
 }
 
+/// (a'): the fastest read of version 1 whole after `m` changes alternating an overwrite and an insert, each insert a
+/// shift a read carries the range through (A-803's leftover (b)).
+fn read_after_shifts(m: u64) -> u128 {
+  let mut best = u128::MAX;
+  for _ in 0..ROUNDS {
+    let mut green = green();
+    for n in 0..m {
+      let change = if n % 2 == 0 {
+        Change::Overwrite
+      } else {
+        Change::Insert
+      };
+      submit(&mut green, change, (n * 97) % 8192);
+    }
+    let started = Instant::now();
+    let bytes = green.content_ref_at(PATH, 1).unwrap();
+    best = best.min(started.elapsed().as_nanos());
+    assert!(!bytes.is_empty());
+  }
+  best
+}
+
 /// (b): the fastest mean submit, in ns, of `TIMED` changes made once the path's history holds `history` versions, the
 /// stream `stream` naming each version's change; and the values those changes walked a change.
 fn change_cost(history: u64, stream: fn(u64) -> Change) -> (u128, f64) {
@@ -136,6 +160,12 @@ fn main() {
   for m in [10u64, 100, 1_000, 10_000] {
     let (ns, len) = read_after(m);
     println!("a\tread_version_1_after_overwrites\t{m}\tns\t{ns}\tbytes\t{len}");
+  }
+  for m in [10u64, 100, 1_000, 10_000] {
+    println!(
+      "a\tread_version_1_after_alternating\t{m}\tns\t{}",
+      read_after_shifts(m)
+    );
   }
   let streams: [Stream; 3] = [
     ("overwrites", |_| Change::Overwrite),
