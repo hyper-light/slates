@@ -512,8 +512,16 @@
 > (`Increment::named`, plain BLAKE3 + length), read a slice a step through the owner's `named::Objects`, refused
 > `ContentUnread` while unread. Part 2 BUILT: each run read into its own buffer, which the commit makes the file with
 > no copy (`judge_named`); the server's `PlaneObjects` over vcs_store's plane (range reads); replay reads runs a slice a
-> step. OWED: the svn landing's turns (w-svn); a partial splice of a run copies at the commit; items 3-7 (the green's
-> block naming the plane's object, no copy).
+> step. Part 3 BUILT (2026-11-20, C1): `Green::make_step` makes a held verdict's files a copy slice a step, so the
+> commit copies none; part 2's bug fixed with it (a whole run moved before the other files were made shifted every later
+> run's bytes: a file spliced from one was made of the wrong bytes). A-760 is whole. Not A-760's: the svn landing's
+> turns, calling `make_step` between judge and commit (w-svn); items 3-7 (the green's block naming the plane's object,
+> no copy; w-engine's queue).
+>
+> **Finding, 2026-11-20 (w-engine, not chased under the close order):** `cargo test -p slates-merge --test checkpoint`
+> failed once in 10 runs (`a_green_restored_from_its_checkpoint_answers_as_the_green_it_was`, a proptest, unseeded) on
+> the big Studio at load ~20; its failing case was not kept. The test names no runs, so A-760's commit order does not
+> reach it.
 >
 > **A-716 slice 1a (2026-11-20, w-perf, UI goal 93; A-64 content once):** the green's identity table (`crates/merge/src/held.rs`)
 > holds a text by path (the file's block shared) or by bytes (no path), outliving the file, bounded by its owner's

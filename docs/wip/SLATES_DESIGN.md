@@ -57392,8 +57392,22 @@ BENCHMARKS (two sections), `crates/server/src/verbs.rs` (`await_deferred_complet
   kept a copy slice a step until its runs are read (`GreenReplayPhase::Chain::reading`; a missing object fences
   `ContentMissing`). Measured (`t_a760_a_large_named_text_lands_a_slice_a_turn_held_once`, debug): an 8 MiB text read
   in 149 turns of a 56,656-byte copy slice, no turn reading more; the committed file the read buffer itself.
-- **Owed, named.** w-svn's landing driving the turns (`svn.land.*`); a splice of part of a run still copies the file at
-  the commit; items 3-7 then name the plane's object from the green's block, so the text is held once in all.
+- **Part 3, the files made before the commit** (2026-11-20, closing A-760, main's close order C1). `Green::make_step`
+  makes a held verdict's files a copy slice a step (a file is its pieces of base and post-state, `segments`, copied
+  in order into its bytes reserved once), so the commit copies none: a splice of five bytes into a large file costs
+  its turns, never the commit's one step. Every file but those a run makes whole is made first, and each whole run's
+  buffer is moved into its file last; a green that moved since the verdict refuses the step `HeadMoved`, as the commit
+  does. Counted: `files_made_in_steps`. Test: a 1 MiB file spliced from one run beside a file made whole of another,
+  made a 64 KiB slice a step: no step past its slice, the spliced file copied once over the steps, the commit making
+  none, the whole run's buffer the created file.
+- **A bug in part 2, fixed with it.** The commit moved a whole run's buffer into its file before it made the others,
+  and a moved buffer shortens the post-state's one address space: every later run's bytes moved down by its length, so
+  a file spliced from a later run was made of the wrong bytes, silently
+  (`a_run_moved_into_its_file_leaves_later_runs_where_they_were`: `bytes` where `secon` belonged). Now the whole runs
+  are found first, every other file made with every buffer in place, the buffers moved last.
+- **Owed, named, not A-760's.** w-svn's landing driving the turns (`svn.land.*`, with `make_step` between its judge and
+  its commit); items 3-7 (w-engine's queue) then name the plane's object from the green's block, so the text is held
+  once in all.
 - **Applied in the same change to** `crates/merge` (`named`, `engine::Increment`, the refusal variants, every
   `Increment` built), GAPS, amendments.tsv.
 
