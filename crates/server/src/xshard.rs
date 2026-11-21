@@ -1048,6 +1048,27 @@ where
   async move { within(call?, deadline_ns).await }
 }
 
+/// Runs the future `start` makes as a task on `shard`, and awaits its result on this shard (`origin`) until the task
+/// ends: for a task that bounds itself, its every wait judged by its own progress, so a wall deadline here would only cut
+/// it short while it still progressed and drop its late result. A holder's forward is one (main's ruling on the lane,
+/// 2026-11-21): its lane gives it up once none of its own bytes have moved for a stall budget (`forward_lane::Stall`),
+/// and the replica's wait has its own bound (`work_home::hold_until_replica`); a fixed bound here refused a 320 MiB
+/// submit still crossing, whose retry sent it all again. `None` when the target's task arena refused the task. Labelled
+/// with the line that called this, as [`task_within`]'s is.
+#[track_caller]
+pub fn task_to_its_end<T, F>(
+  origin: u16,
+  shard: u16,
+  start: impl FnOnce() -> F + Send + 'static,
+) -> impl Future<Output = Option<T>>
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
+  let call = task_on(origin, shard, std::panic::Location::caller(), start);
+  async move { call?.await }
+}
+
 /// [`task_within`], awaited while the target is working, up to `budget_ns` of the target's own CPU time
 /// ([`within_shard_time`]).
 /// The task is labelled with the line that called this, as [`task_within`]'s is.
