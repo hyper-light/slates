@@ -223,6 +223,11 @@ pub(crate) struct VcsStores {
   /// The Subversion record read back from the node's store for the record a rebuild or recovery replays next (C2),
   /// by repository, with the register's index it is for: at most one a repository.
   svn_fetched: BTreeMap<RepositoryId, (usize, Vec<u8>)>,
+  /// The stored texts a recovery read back from the node's store into the content store (C2 stage B,
+  /// [`fetch_stored_texts`]), by repository: each written with the hold its replay's end would take, so that end takes
+  /// none more for them ([`hold_svn_stored`]). Bounded by the records' stored texts.
+  svn_fetched_texts:
+    BTreeMap<RepositoryId, std::collections::BTreeSet<slates_svn::index::ContentIdentity>>,
   /// The generations git fetches hold, by repository (A-745 rule 4, [`upload::GitGeneration`]): one fork a stamp the
   /// repository stood at when a fetch began, shared by every fetch that began there, given back with its last holder;
   /// bounded by the fetches the shard's edges seat.
@@ -867,6 +872,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   abandon_git_replay(state, id);
   state.vcs_stores.svn_replays.remove(&id);
   state.vcs_stores.svn_fetched.remove(&id);
+  state.vcs_stores.svn_fetched_texts.remove(&id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -2961,10 +2967,17 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
 /// hands the deltify job the stored texts it may take, so a job a restart cut off goes on. A text the store lacks is
 /// refused `SvnStored`. Nothing for a repository of another tool.
 fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), ReplayRefused> {
+  // A text read back from the node's store holds the hold its writing took already (`fetch_stored_texts`).
+  let fetched = state
+    .vcs_stores
+    .svn_fetched_texts
+    .remove(&id)
+    .unwrap_or_default();
   let Some(stored) = state.vcs_stores.subversion_records(id).map(|records| {
     records
       .stored_texts()
       .map(|(identity, _)| *identity)
+      .filter(|identity| !fetched.contains(identity))
       .collect::<Vec<_>>()
   }) else {
     return Ok(());
@@ -2982,6 +2995,108 @@ fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), Repla
     svn_deltify::resume(state, id);
   }
   held
+}
+
+/// Counter: a stored Subversion text a recovery read back from the node's store into the content store (C2 stage B):
+/// the shard's image had not kept it. Format: a counter name in the status report.
+pub(crate) const SVN_TEXT_FETCHED: &str = "vcs_store.svn_text_fetched";
+/// Counter: a stored Subversion text the content store lacked and the node's store could not give back whole; the
+/// replay's end then refuses it `SvnStored`. Format: a counter name.
+pub(crate) const SVN_TEXT_UNFETCHED: &str = "vcs_store.svn_text_unfetched";
+
+/// Reads back from the node's store every text repository `id`'s records keep stored that the content store lacks (C2
+/// stage B: a commit's changeset carries the texts it put, so the store holds each, while the content store holds only
+/// what the shard's last image kept), a piece at a time into the content store, each checked against its identity;
+/// counted. One not whole there is left out, and the replay's end refuses it `SvnStored`.
+async fn fetch_stored_texts(state: &mut ShardState, id: RepositoryId) {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return;
+  };
+  let missing: Vec<(slates_svn::index::ContentIdentity, u64)> = {
+    let content = state.vcs_stores.content.as_ref();
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| {
+        records
+          .stored_texts()
+          .filter(|(identity, _)| {
+            !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(**identity)))
+          })
+          .map(|(identity, len)| (*identity, len))
+          .collect()
+      })
+      .unwrap_or_default()
+  };
+  let repository = u128::from_be_bytes(id.bytes);
+  for (identity, len) in missing {
+    let fetched = fetch_text(state, &disk, (repository, identity, len)).await;
+    if fetched {
+      state
+        .vcs_stores
+        .svn_fetched_texts
+        .entry(id)
+        .or_default()
+        .insert(identity);
+    }
+    state.count(
+      if fetched {
+        SVN_TEXT_FETCHED
+      } else {
+        SVN_TEXT_UNFETCHED
+      },
+      1,
+    );
+  }
+}
+
+/// Text `identity` of `len` bytes of repository `repository`, read back from the node's store `disk` a piece at a time
+/// into the content store and made whole there (one hold); whether it was, its bytes its identity's. A busy owner is
+/// asked again after a yield.
+async fn fetch_text(
+  state: &mut ShardState,
+  disk: &slates_store::owner::StoreHandle,
+  (repository, identity, len): (u128, slates_svn::index::ContentIdentity, u64),
+) -> bool {
+  let mut writing = slates_vcs::Writing::default();
+  let mut offset = 0u64;
+  while offset < len {
+    let piece = match disk.text(repository, identity, offset).await {
+      Ok(Some(piece)) if !piece.is_empty() => piece,
+      Err(slates_store::owner::OwnerError::Busy) => {
+        slates_rt::futures::yield_now().await;
+        continue;
+      }
+      _ => break,
+    };
+    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
+    let put = within_budget(state, brought, |stores| {
+      stores
+        .content_mut()
+        .map(|content| content.put_window(&mut writing, &piece).is_ok())
+    });
+    if put != Some(true) {
+      break;
+    }
+    offset = offset.saturating_add(brought);
+  }
+  within_budget(state, 0, |stores| {
+    let Some(content) = stores.content_mut() else {
+      return false;
+    };
+    if offset != len {
+      content.abandon_object(writing);
+      return false;
+    }
+    match content.finish_object(&mut writing) {
+      Ok(made) if made == slates_vcs::ContentId(identity) => true,
+      Ok(made) => {
+        let _ = content.release(&made);
+        false
+      }
+      Err(_) => false,
+    }
+  })
 }
 
 /// Replay's end for repository `id`: its stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's
@@ -3183,6 +3298,9 @@ async fn recover_repository(
       }
     };
     let Some(outcome) = outcome else {
+      // A Subversion text a commit stored, which the shard's image did not keep, is read back from the node's store
+      // first (C2 stage B): its changeset carried it.
+      fetch_stored_texts(state, record.id).await;
       replay_ended(state, record.id);
       break;
     };

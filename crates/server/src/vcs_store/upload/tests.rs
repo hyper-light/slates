@@ -386,11 +386,10 @@ fn t_a682_a_name_that_is_no_git_ref_is_not_lent() {
 /// (its store held, its objects still lent to an answer's later steps), and the unnamed one holds nothing here.
 #[test]
 fn t_a682_a_store_not_held_here_is_not_lent() {
-  let lent = crate::daemon::audit_on_shard(|state| {
+  let lent = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (mercurial, _) = repository(state, "elsewhere", VcsTool::Mercurial);
-    let reply = crate::verbs::dispatch(
+    let reply = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: "unnamed-head".to_owned(),

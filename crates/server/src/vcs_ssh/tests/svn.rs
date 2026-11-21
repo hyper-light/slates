@@ -1390,8 +1390,11 @@ fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
 /// Measurement, not a gate (main's order of 2026-11-20: svnsync over the matrix took 0.54 s a revision of
 /// git-2000.dump). Do: on a daemon's shard, create `repo` and import the dump `SLATES_SVN_REPLAY_DUMP` names; then,
 /// through the daemon's SSH site, hand `svnserve -t` the recorded tunnel handshake and one
-/// `replay-range ( 1 LAST 0 true )`, as `svnsync synchronize` asks (`SLATES_SVN_REPLAY_LAST`, 200 by default).
-/// Printed: the import's and the replay's wall time, the replay's bytes and its mean a revision.
+/// `replay-range ( 1 LAST 0 true )`, as `svnsync synchronize` asks (`SLATES_SVN_REPLAY_LAST`, 200 by default); then an
+/// update across `SLATES_SVN_UPDATE` (`FROM:TO`, 1000:1500 by default) and a checkout at `TO`, as stock svn asks them
+/// (P6 of Ada's close list). Printed: the import's wall time and the changesets it landed on the store (C2: one a
+/// record), the replay's wall time, bytes and mean a revision, each fetch's wall time and bytes, and this process's
+/// resident set at each step against the dump's bytes (P7).
 #[test]
 #[ignore = "measurement: needs SLATES_SVN_REPLAY_DUMP"]
 fn measure_svnsync_replay_range_over_the_tunnel() {
@@ -1401,9 +1404,10 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .and_then(|last| last.parse().ok())
     .unwrap_or(200);
   let dump = std::fs::read(&path).expect("the dump");
+  let dump_bytes = dump.len();
   let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let started_kib = resident_kib();
   let importing = std::time::Instant::now();
-  // The import a turn a call, as the server runs it: one call of all of it spins the shard past its watchdog window.
   // The import a turn at a time with a yield between, each record landed on the store before the next turn (C2).
   let (id, loaded) = crate::test_store::run_on_first(
     &daemon,
@@ -1416,6 +1420,20 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
   );
   assert!(loaded.is_ok(), "{loaded:?}");
   let import = importing.elapsed();
+  let imported_kib = resident_kib();
+  let (text_bytes, landed) = crate::daemon::observe_first(&daemon, move |state| {
+    (
+      state
+        .vcs_stores
+        .subversion_records(id)
+        .map(|records| records.text_bytes()),
+      state
+        .refusals
+        .get(crate::repository::svn_commit::landing::LANDED)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
   let handshake_end = MKDIR_CLIENT
     .windows(b"( commit".len())
     .position(|window| window == b"( commit")
@@ -1437,6 +1455,70 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .recv_timeout(std::time::Duration::from_secs(3600))
     .expect("the tunnel ended");
   let replay = replaying.elapsed();
+  let replayed_kib = resident_kib();
+  // An update and a checkout as stock svn asks them (the recorded update-alice session's commands; P6: svn:// update
+  // 2.7 s at w-bugs' run 8, 5.6 s at run 13). The client's closing `success` is a run of its own, handed over only once
+  // the server waits after its drive: sent with the report, it arrives during the drive, which svnserve answers
+  // E210004 "Successful edit status returned too soon" and aborts.
+  let (from, to): (u64, u64) = std::env::var("SLATES_SVN_UPDATE")
+    .ok()
+    .and_then(|range| {
+      let (from, to) = range.split_once(':')?;
+      Some((from.parse().ok()?, to.parse().ok()?))
+    })
+    .unwrap_or((1000, 1500));
+  let fetch = |report: String| {
+    let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+    client.extend_from_slice(report.as_bytes());
+    let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+    let began = std::time::Instant::now();
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let task = slates_rt::futures::spawn(async move {
+        let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+        let owner = crate::vcs_store::svn_import::tests::owner();
+        let closing: &[u8] = b"( success ( ) ) ";
+        let _ = sent.send(tunnel_awaited(&mut site, &owner, &[&client, closing]).await);
+      })
+      .expect("the fetch's task");
+      slates_rt::futures::detach(task).expect("detached");
+    });
+    let (answered, _) = outcome
+      .recv_timeout(std::time::Duration::from_secs(3600))
+      .expect("the fetch ended");
+    let whole = answered
+      .out
+      .windows(b"( close-edit ( ) )".len())
+      .any(|window| window == b"( close-edit ( ) )");
+    if !whole {
+      println!(
+        "MEASURE fetch not whole: {}",
+        String::from_utf8_lossy(
+          answered
+            .out
+            .get(answered.out.len().saturating_sub(800)..)
+            .unwrap_or_default()
+        )
+      );
+    }
+    (began.elapsed(), answered.out.len(), whole)
+  };
+  let updated = fetch(format!(
+    "( update ( ( {to} ) 0: true unknown false false ) ) ( set-path ( 0: {from} false ( ) infinity ) ) \
+     ( finish-report ( ) ) "
+  ));
+  let checked_out = fetch(format!(
+    "( update ( ( {to} ) 0: true unknown false false ) ) ( set-path ( 0: {to} true ( ) infinity ) ) \
+     ( finish-report ( ) ) "
+  ));
+  println!(
+    "MEASURE update r{from}..r{to} wall_s {:.2} bytes {} whole {} checkout r{to} wall_s {:.2} bytes {} whole {}",
+    updated.0.as_secs_f64(),
+    updated.1,
+    updated.2,
+    checked_out.0.as_secs_f64(),
+    checked_out.1,
+    checked_out.2
+  );
   let youngest = crate::daemon::observe_first(&daemon, move |state| {
     state
       .vcs_stores
@@ -1450,12 +1532,27 @@ fn measure_svnsync_replay_range_over_the_tunnel() {
     .filter(|window| *window == b"finish-replay")
     .count();
   println!(
-    "MEASURE import_s {:.1} youngest {youngest:?} replay r1..r{last} wall_s {:.2} mean_ms {:.1} out_bytes {} \
-     finished {finished} err {}",
+    "MEASURE dump_bytes {dump_bytes} resident_kib started {started_kib} imported {imported_kib} replayed \
+     {replayed_kib} records_text_bytes {text_bytes:?}"
+  );
+  println!(
+    "MEASURE import_s {:.1} changesets_landed {landed} youngest {youngest:?} replay r1..r{last} wall_s {:.2} \
+     mean_ms {:.1} out_bytes {} finished {finished} err {}",
     import.as_secs_f64(),
     replay.as_secs_f64(),
     replay.as_secs_f64() * 1e3 / last as f64,
     answered.out.len(),
     String::from_utf8_lossy(&answered.err)
   );
+}
+
+/// This process's resident set in KiB, as `ps` reads it; 0 where it cannot be read (a measurement's checkpoint).
+fn resident_kib() -> u64 {
+  std::process::Command::new("ps")
+    .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+    .output()
+    .ok()
+    .and_then(|out| String::from_utf8(out.stdout).ok())
+    .and_then(|text| text.trim().parse().ok())
+    .unwrap_or(0)
 }

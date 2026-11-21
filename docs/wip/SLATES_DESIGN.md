@@ -7973,6 +7973,9 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the entry included (`fleet.live.hop.holder`). Held by `a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it`
 > (`crates/server/tests/fleet.rs`: 16 writes in a closed loop; each hop timed once a timed round; the hops' nanoseconds
 > equal to the rounds'). The breakdown under the contract command is owed (the supervisor's run).
+> Since 2026-11-21 (g228) each hop also keeps a bounded per-write histogram (`crate::histogram::DurationHistogram`)
+> and the status report publishes its `p50_ns`, `p99_ns`, `p999_ns` and `max_ns` beside the sums: a sum is a mean,
+> which each run's first held reply (the 100 ms record period) had skewed by 49 µs a write.
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -57741,7 +57744,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
 > no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
-> between land and commit). Owed: the texts as sections read through the owner (stage B), an import as one sliced
+> between land and commit). Stage B part 1: a client's commit lands its texts in its changeset (`Payload`, `Texts`,
+> `Record`), and a recovery reads a stored text the shard's image lacks back from the store. Owed: the texts read
+> through the owner (stage B part 2), an import as one sliced
 > changeset (stage C), and a submitted version's revision, which still commits after its version: main's ruling puts
 > the submit in the one order, its acceptance deferred until the revision lands (GAPS C2). A creation's changeset 0
 > carries Subversion's creation record (its UUID and revision 0's date) as its second `Record` section.
@@ -57806,6 +57811,21 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > sequence)` row is the newest landing at it, which is the only one the register can ever name (a record follows its
 > landing, and the counter passes the id once recorded), so the new repository never meets the orphan
 > (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, which also asserts the log holds both).
+
+> **Status (2026-11-20, C4: no store, no Mercurial; main's ruling, inbox w-svn-from-main-c2-rulings decision 1).** A
+> daemon without `--vcs-store` refuses `repository create --tool hg`, typed `Unsupported` naming the flag, as it
+> refuses Subversion's (C2), through one `repository::no_store_for`: the store is the repository's history, and a
+> register-held copy beside it would be a second path. The register-held v2 record path is removed (`unbundle_in`'s
+> whole-history record and `record_sliced` in `crates/server/src/repository/hg_push.rs`); a push's register entry is
+> the store reference (record v7) alone, and a landing with none is refused `UNRECORDED`. Tests run on store-backed
+> daemons through the one shared helper, `crates/server/src/test_store.rs` (w-svn's `TestStore`, `audit_daemon_stored`
+> and routed `created`/`create_on`; for a test's synchronous shard history, `audit_on_stored_shard`, `land_blocking`,
+> which waits for the owner's answer on a thread of its own since a shard's thread cannot wait on a wake its runtime
+> would deliver, and `create`, a creation in the one landing order landed and recorded before it returns:
+> `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the two halves
+> `land_then_record` runs). Recovery applies only the sequences the register names (decision 2), as C4's replay already
+> did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
+> hg test on the helper. Git's create follows as its C item lands.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58663,3 +58683,53 @@ declined).
   `vcs_store::commits::tests` fail alike on origin/main 17bb639aa without this change (a submit refused `Overloaded`),
   and `content_ranges`' sweep test passes alone on both. `cargo clippy` of the touched crates' libraries: nothing in a
   touched line.
+
+### §4.16 amended — A path's composition finds each op's offset in about √ops steps, new runs merged as made (2026-11-20, w-shared for UI goal 93; main's close list, exit 4 at 64 MiB)
+Applied in the same change to: §4.16 "Composition at seal" (the deriver's shape), GAPS (the sweep's exit 4 line),
+`crates/merge/src/derive.rs` (`PieceList`, `apply`, `compose_content_sized`, `compose_examined`),
+`crates/merge/tests/derive.rs`.
+- **What was measured.** A-697's release bench, one fresh submit of 128, 256 and 320 MiB: the watchdog ended the daemon
+  (exit 4), shard 1 spinning 1,009 to 1,201 ms of CPU in one poll of the session's first submit (`identities.rs:243`,
+  which runs the submit inline once the session's identities are read), on this MacBook at load 42 to 60 and on
+  Studio-1 at load 3.7. `/usr/bin/sample` on Studio-1: 1,001 of the shard's 1,011 busy samples in `work_home::need_of`,
+  997 at the top of the stack in `slates_merge::derive::split_at`.
+- **Why.** The deriver kept a path's file as a flat list of pieces and, for every declared op, walked the list from its
+  front to find the op's offset, then inserted into it. A file written a few KiB a write has as many ops as writes, so
+  its composition cost the square of its writes. The module's own note had named the replacement, a measured one owed.
+- **Change.** The list is kept in blocks of pieces, each knowing its length (`PieceList`), so an offset is found by
+  walking the blocks, then one block's pieces; a block splits at twice its size, which is about `√ops` pieces, derived
+  from the journal. An append at the end skips every block by its length. Adjacent new runs merge as they are made, since
+  a new run is a length alone, so a file written by appends is one run. The net ops are the same: the oracle holds
+  them to a byte-level replay of every generated journal.
+- **Tests** (macOS arm64, local). `slates-merge --test derive`, 10 of 10: the proptest oracle (the net ops reproduce
+  the post-state byte for byte, are ordered, are deterministic) and the new
+  `a_paths_composition_costs_about_root_ops_an_op_not_its_pieces`. It composes 100,000 1 KiB appends (at most 4 pieces
+  or blocks examined an op) and 10,000 scattered inserts and deletes (at most 12 √ops an op). Red with one unbounded
+  block and no merging: 55,109,413 examined for the scattered ops, against a bound of 12,000,000. `slates-merge`'s
+  every test.
+- **Measured after** (BENCHMARKS; Studio-1, load 2.9 to 4.2, `ffb2a65`): 64, 128, 256 and 320 MiB each pass, exit 0,
+  no watchdog end; each of 128 to 320 MiB had ended exit 4 there before. Found, not fixed (GAPS): a holder's forward of
+  the increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms), and the control shard's beat task ran 520 to
+  1,381 ms late during it (near misses, the watchdog's beat holding).
+
+### A-797 — The green's owner answers a batch of work asks within its step budget and hands the rest back (2026-11-21, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; CLAUDE.md "Bounded work everywhere"; A-247, A-388)
+- **Why.** A shard asks its works' green owner in batches of up to a client region's credit (A-388), and the owner
+  answered a whole batch in one synchronous call, whatever each ask cost (a verdict, a rebase, a whole green's sizes, a
+  file's bytes). At 100,000 clients on one primary and two replicas (main `8a18edcc`) the green's shard spent 1,055 ms
+  of CPU in one poll of such a call (`xshard.rs:926`), past its liveness window, and the anchor killed and restarted the
+  primary; the spinning report recurred five more times that run.
+- **Change.** `crates/server/src/work_home.rs`: `answer_within` answers a batch's asks in order while the owner's step
+  budget (`runtime.step_budget_ns`) is unspent, always the first, and hands back the rest, which the asker puts at the
+  front of its outbox and sends again. Counted: `merge.work.batch_handed_back`. Also a diagnosis line: a work log
+  refused at its partition's merge budget names its largest log's entries (`work_log::describe_log`).
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --lib
+  a_batch_is_answered_within_the_owners_step_budget_and_the_rest_handed_back` (ten asks of 3 ns under 10 ns: all ten
+  answered before, four after and six handed back; a first ask past the budget still answered). `--lib work_home`,
+  `--test merge_load`, and the fleet tests on works and forwards (42) pass.
+- **By use, partial evidence, not proof** (release, `load_scale`, 100,000 clients, main `8a18edcc` with this change,
+  2026-11-21 ~00:00): no `is spinning` report and no watchdog kill in 3,110 s, where the run before had six reports
+  and one kill; 1,570,311 batches handed back. The run was stopped by main at about 3,970 s: the machine was at 96 of
+  97 GB of swap on 96 GiB of RAM (the run held about 30 GB), so its latencies are confounded. It also showed two open
+  walls (GAPS, A-797): about 2,700 clients whose submits, first sent at 11 to 14 s, were never answered (the client
+  node's forwards: 9,116,579 resolved on its control shard, 9,113,196 delivered home, 3,383 lost between); and a work
+  whose log reached 300,898,443 bytes, filling its partition's merge budget.
