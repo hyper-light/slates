@@ -495,6 +495,9 @@ pub struct Client {
   /// Replies dropped on arrival because nothing awaited them: a protocol-only acknowledgement's, or an
   /// abandoned operation's.
   unawaited_dropped: u64,
+  /// The stamp the daemon wrote with the last reply a synchronous call took (A-559; `slates_ipc::slot`, "The stamp"):
+  /// zero before any, or when the daemon wrote none.
+  reply_stamp: u32,
   /// The async path's bind of a reconnected channel (AUD-29-19): the attest's request word while it is in
   /// flight, its reply handled where replies are drained, so a reconnect never blocks an event loop on a
   /// round trip.
@@ -1555,6 +1558,7 @@ impl Client {
       verdict_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
+      reply_stamp: 0,
       attest_in_flight: None,
       attest_refused: None,
       consumer: None,
@@ -2468,6 +2472,7 @@ impl Client {
             self.buffer(reply.request, body, reply.stamp);
             continue;
           }
+          self.reply_stamp = reply.stamp;
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
         // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
@@ -2815,6 +2820,13 @@ impl Client {
   /// `slates_ipc::slot`, "The stamp"): zero before any. Read right after a send, it is that send's.
   pub fn request_stamp(&self) -> u32 {
     self.end.request_stamp()
+  }
+
+  /// The stamp the daemon wrote with the last reply a synchronous call ([`Self::call`] and the verbs over it) took, as
+  /// it landed in the completion ring (A-559): zero before any. With [`Self::request_stamp`] it splits a call's latency
+  /// between the daemon and this client (`slates_machine::attribution`).
+  pub fn reply_stamp(&self) -> u32 {
+    self.reply_stamp
   }
 
   /// Spins for `spin_ns` taking `id`'s reply if it lands — the async fast path: most replies arrive
