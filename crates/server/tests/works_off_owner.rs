@@ -1522,3 +1522,49 @@ fn expect_the_sessions_ask_to_hold_its_agents_merge(
   );
   assert_eq!(agent.versions(green).unwrap(), 0, "nothing merged");
 }
+
+/// D-O17 for a work off its green's shard (A-776, A-247; close item C1). Do: on eight shards, seed a green made by
+/// another shard's client with a file of 200 short functions; from two works of this client (so off the green's shard,
+/// composed on their own), rewrite the file whole, one changing a line near the top and one a line near the end;
+/// submit both; read the head. Expect: both accepted and the head holding both edits, the increments composed on the
+/// works' shard. Until the work's shard asked its owner for the base bytes of a file it replaced whole, it composed
+/// the whole replacement unrefined, and the second submit was an overlap conflict.
+#[test]
+fn whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits() {
+  let (daemon, instance) = daemon(MANY_SHARDS, "rewrites");
+  let mut client = connect(&instance);
+  let green = green_off(&mut client, &instance, MANY_SHARDS, "rewrites-green");
+  let base: String = (0..200)
+    .map(|n| format!("fn f{n}(a: u32) -> u32 {{\n    a + {n}\n}}\n"))
+    .collect();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let second = base.replacen("a + 190\n", "a - 190\n", 1);
+  let (seed, _) = client.create_work(green, "rewrites-seed").unwrap();
+  client.edit(seed, "f", 0, 0, base.as_bytes()).unwrap();
+  let seeded = submitted(&mut client, seed);
+  let (one, _) = client.create_work(green, "rewrites-one").unwrap();
+  let (two, _) = client.create_work(green, "rewrites-two").unwrap();
+  let whole = u64::try_from(base.len()).unwrap();
+  client.edit(one, "f", 0, whole, first.as_bytes()).unwrap();
+  client.edit(two, "f", 0, whole, second.as_bytes()).unwrap();
+  let answers = (submitted(&mut client, one), submitted(&mut client, two));
+  let head = client.read(green, "f", ReadAt::Head).unwrap();
+  let composed = daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(COMPOSED_ON_WORK)
+    .copied()
+    .unwrap_or(0);
+  drop(client);
+  daemon.stop();
+  assert_eq!(seeded, "accepted 1");
+  assert_eq!(answers, ("accepted 2".to_owned(), "accepted 3".to_owned()));
+  assert_eq!(
+    String::from_utf8(head).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1)
+  );
+  assert!(
+    composed >= 2,
+    "the works composed on their own shard: {composed}"
+  );
+}

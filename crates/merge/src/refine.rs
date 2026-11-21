@@ -1559,6 +1559,28 @@ async fn replacements(
   found
 }
 
+/// The paths `doc` replaces whole, the ones [`refine_rewrites`] refines when it has their bytes (A-776): what a work's
+/// shard asks its green's owner for the base of, besides the files it does not hold (C1, A-247). One walk of the
+/// document's ops, as its composition's own walks are.
+pub fn whole_replaced_paths(doc: &OpsDoc) -> Vec<String> {
+  let mut found = Vec::new();
+  let mut start = 0;
+  while start < doc.ops.len() {
+    let path = doc.ops.get(start).map_or(0, |op| op.path);
+    let mut end = start;
+    while doc.ops.get(end).is_some_and(|op| op.path == path) {
+      end = end.saturating_add(1);
+    }
+    if whole_replacement(doc.ops.get(start..end).unwrap_or_default()).is_some()
+      && let Some(name) = doc.paths.path(path)
+    {
+      found.push(name.to_owned());
+    }
+    start = end;
+  }
+  found
+}
+
 /// [`refine_rewrites`] a unit at a time under `ticks` (module docs, "Sliced"): each replacement's refinement, the
 /// relaid post-state's sort and the document's canonical order are paced; the same document and plan whatever the
 /// pace. The document's operations are walked once to find the replacements before any is refined.
