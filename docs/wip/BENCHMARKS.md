@@ -16917,6 +16917,35 @@ read too (`push.build.turns`, both sides).
 and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
 (`do_freezer_trap`) and was stopped unbuilt.
 
+## Subversion on the changeset store (C2 stage A): an import's cost a landing, svnsync's replay, an update and a checkout, and the import's memory (P6, P7 of Ada's close list; 2026-11-20)
+
+- **Machine, tree, load.** adas-macbook-pro-2.local (M-series, 18 cores, 128 GB), load 20 to 30 with other agents'
+  builds. Main 72576cb1f (C2 stage A: every record lands on the node's store before the register names it) with the
+  measurement's own additions (this change). Release, one run.
+- **Command.** `CARGO_INCREMENTAL=0 cargo test --release -p slates-server --lib --no-run`, then
+  `SLATES_SVN_REPLAY_DUMP=~/.cache/w-svn-gitgit/git-2000.dump SLATES_SVN_REPLAY_LAST=300 SLATES_SVN_UPDATE=1000:1500
+  /usr/bin/time -l <binary> measure_svnsync_replay_range_over_the_tunnel --ignored --nocapture --test-threads 1`
+  (git-2000.dump: git/git's first 2,000 commits as a format-3 dump, 458,114,318 bytes).
+
+| What | Measured | Before C2 (same test, earlier today) |
+|---|---|---|
+| import of 2,000 revisions | 24.5 s, 2,001 changesets landed | 8.2 s at load ~40, 46.5 s at load ~43 (no store) |
+| svnsync `replay-range 1 300` over the tunnel | 0.73 s, 2.4 ms a revision, 27.3 MB | 3.41 s (11.4 ms) and 0.51 s for 10 |
+| `update` r1000 to r1500 over the tunnel | 0.14 s, 2.3 MB, the edit whole | refused: the script's fault (below) |
+| checkout at r1500 over the tunnel | 0.46 s, 24.6 MB, the edit whole | refused: the script's fault |
+| resident: start, after the import, after the replay | 480 MiB, 4,065 MiB, 4,076 MiB | 478 MiB, 5,582 MiB, 5,566 MiB |
+| the records' texts | 34.8 MB | 34.8 MB |
+
+- **What it says.** (1) Each imported revision now lands as a changeset of its own, one flush each: about 8 ms a
+  revision of the import's 24.5 s against the 8.2 s before the store (load differs; the 2,001 landings are counted).
+  C2 stage C, an import as one sliced changeset, is what takes that back. (2) The server's side of P6's update (stock
+  svn's 2.7 s at w-bugs' run 8, 5.6 s at run 13) is 0.14 s for 500 revisions: the gap is outside the server's drive.
+  The stock-client leg runs on the big Studio. (3) The import holds about 3.6 GiB above the process's start for a 458 MB
+  dump whose records keep 34.8 MB of texts: P7's daemon peak is not the records; still to attribute.
+- **The earlier refusal was the measurement's.** The scripted update sent the client's closing `( success ( ) )` with
+  its report, so it arrived during the server's drive, which svnserve answers E210004 "Successful edit status returned
+  too soon" and aborts (slates as svnserve). The test now hands it over as a run of its own once the server waits.
+
 ## A-697's release bench at 64 to 320 MiB: exit 4 found and fixed (2026-11-20, w-shared; main's close list)
 
 `SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n> SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test

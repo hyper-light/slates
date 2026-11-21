@@ -57741,7 +57741,9 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
 > no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
-> between land and commit). Owed: the texts as sections read through the owner (stage B), an import as one sliced
+> between land and commit). Stage B part 1: a client's commit lands its texts in its changeset (`Payload`, `Texts`,
+> `Record`), and a recovery reads a stored text the shard's image lacks back from the store. Owed: the texts read
+> through the owner (stage B part 2), an import as one sliced
 > changeset (stage C), and a submitted version's revision, which still commits after its version: main's ruling puts
 > the submit in the one order, its acceptance deferred until the revision lands (GAPS C2). A creation's changeset 0
 > carries Subversion's creation record (its UUID and revision 0's date) as its second `Record` section.

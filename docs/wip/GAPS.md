@@ -2480,7 +2480,13 @@
 > arbiter: two revisions, a revision's properties and a deltified text recovered after a stop equal to the state before,
 > the register five references and no record's bytes) and
 > `a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once` (the crash between land and
-> commit). Owed: stage B, the texts as the changeset's sections read async through the owner (HeadTexts; R6); stage C,
+> commit). Stage B part 1 BUILT: a client's commit lands the texts it put in its changeset (the `Payload` section
+> streamed from the content store a piece at a time, a `Texts` entry naming each, then the `Record`; one flush), so the
+> store holds every text the history names; the commit no longer waits for the shard's image to keep its texts (A-727
+> slice b's barrier, gone for Subversion), and a recovery reads a stored text the image lacks back from the store
+> (`vcs_store::fetch_stored_texts`, counted `svn_text_fetched`). Held by the arbiter's sections and the barrier test
+> (`a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`: the text fetched once). Owed: stage B
+> part 2, the texts read async through the owner (HeadTexts; R6) so the content store need not hold them all; stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
