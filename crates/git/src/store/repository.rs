@@ -472,6 +472,10 @@ pub struct Repository {
   /// The version that brought each position, as runs: each run's first position to its end (exclusive), the green and
   /// that green's version (A-722: kept beside the rows, which no longer carry it, so a push can write its rows before it
   /// lands).
+  /// Each landing's runs of positions by type, by first position: `start -> (end, kind)` (A-639: a landing gives its
+  /// objects positions by type, then id, so each type's are one run). A position's type is read here, with no row read
+  /// (`kind_at`; A-722 part 3's partial clone read two rows an object for it). A run a type each landing brought.
+  kinds: BTreeMap<u64, (u64, Kind)>,
   landings: BTreeMap<u64, (u64, u64, u64)>,
   /// What the landing map charges the store.
   landings_charged: u64,
@@ -492,6 +496,7 @@ impl Repository {
       heads: BTreeMap::new(),
       charged: 0,
       landings: BTreeMap::new(),
+      kinds: BTreeMap::new(),
       landings_charged: 0,
       counters: Cell::new(StoreCounters::default()),
       window: Window::default(),
@@ -565,6 +570,18 @@ impl Repository {
   pub fn stored(&self, store: &ContentStore, id: &ObjectId) -> Option<(Kind, ContentId, u64)> {
     let (row, content) = self.indexed(store, id)?;
     Some((row.kind, content, row.len))
+  }
+
+  /// The tail and runs of its index its lookups have visited since the index's merge rule last took them.
+  pub fn index_visits(&self) -> u64 {
+    self.index.visits()
+  }
+
+  /// The type of the object at `position`, read from its landing's runs ([`Repository`]'s `kinds`): none for a position
+  /// no landing gave.
+  pub fn kind_at(&self, position: u64) -> Option<Kind> {
+    let (_, (end, kind)) = self.kinds.range(..=position).next_back()?;
+    (position < *end).then_some(*kind)
   }
 
   /// The id of the object at `position`.
@@ -1035,6 +1052,7 @@ impl Repository {
       fork,
       positions,
       base,
+      kinds,
     } = staged;
     let given = u64::try_from(positions.len()).unwrap_or(u64::MAX);
     // A stage that gives no position leaves the next position where it is, however long ago it was made.
@@ -1055,7 +1073,7 @@ impl Repository {
       give_back(store, &values)?;
       return Err(refused.into());
     }
-    let landing_cost = bytes(landed.len(), LANDING_BYTES);
+    let landing_cost = bytes(landed.len().saturating_add(kinds.len()), LANDING_BYTES);
     if let Err(refused) = store.charge(landing_cost) {
       store.discharge(more)?;
       give_back(store, &values)?;
@@ -1085,6 +1103,11 @@ impl Repository {
       return Err(refused);
     }
     self.landings.extend(landed);
+    self.kinds.extend(
+      kinds
+        .into_iter()
+        .map(|(start, end, kind)| (start, (end, kind))),
+    );
     self.landings_charged = self.landings_charged.saturating_add(landing_cost);
     store.discharge(self.charged.saturating_sub(total))?;
     self.charged = total;
@@ -1556,6 +1579,7 @@ impl Repository {
       heads: self.heads.clone(),
       charged: self.charged,
       landings: self.landings.clone(),
+      kinds: self.kinds.clone(),
       landings_charged: self.landings_charged,
       counters: Cell::new(StoreCounters::default()),
       window: self.window.clone(),

@@ -55968,6 +55968,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
+- **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
+  cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
+  adopt its index fork sealed into tables, where the rows had stayed in the index's tail; a row read is now a search of
+  each run, newest first.
+- **The profile** (`sample` of the daemon during the partial clone, release, main ab760dc65): the answer's object walk
+  (`Negotiating::step`) was `Index::get` and `ContentStore::get` under `StoreGraph::kind` (two rows an object: the id
+  by position, then its row) and under the tree entries' positions; and each blob's size was read (two rows more) for
+  a filter that sends no blob whatever its size.
+- **Change.** A blob's size is read only where the filter reads sizes (`Filter::reads_size`: `blob:limit`, alone or
+  combined; the object walk and the runs' carried objects). A position's type is read from its landing's runs
+  (`Repository::kind_at`): a landing gives positions by type, then id (A-639), so staging records each type's run
+  (`Staged::kinds`) and the landing keeps it (four runs at most a landing, charged with the landing map), and
+  `StoreGraph::kind` reads no row.
+- **Tests.** `slates-git` `negotiation::tests::a_filter_that_reads_no_size_asks_none` (red before: 40 sizes asked
+  under `blob:none`) and `store::repository::graph::tests::a_type_is_read_from_its_landing_with_no_row_read` (red
+  before: 24 index visits for 12 objects); `slates-git --lib` 582 passed; `slates-server --lib -- git vcs_store vcs_http` 220 passed.
+- **By use** (adas-mac-studio.local-2, release, w-perf's `git_scale.sh` on git/git cut at v1.0.0 with ten partial
+  clones each against one daemon after its steps, load 33-36): the daemon's CPU a partial clone 700-760 ms on main
+  (ab760dc65) and 250-360 ms after; wall 0.96-1.05 s and 0.49-0.63 s, under the 0.62-0.72 s before part 3.
+
 ### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
 - **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
   (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
