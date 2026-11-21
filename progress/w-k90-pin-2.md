@@ -93,3 +93,11 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   CRLF Cargo.lock on Windows checkouts vs "\n" patterns. Fix in worktree: kiln_lock() normalizes \r\n. Testing:
   kiln run r2 (d13238) `cargo test -p kiln --test vendored`, own target ~/.cache/w-k90-pin-2-target.noindex.
 - Note: my code_run sleep loop spun 2000 calls when machines.run failed fast during kiln's restart (now shell waits).
+
+## ~01:15 PST 11-21 (09:15Z)
+- LANDED kiln 60c0b27c5 (merge-base confirmed, base 60c0b27c5): tests/vendored.rs kiln_lock() normalizes \r\n.
+  Local (this Mac, own target): `cargo test --locked -p kiln --test vendored` 11/11 with LF lock and with a CRLF lock.
+- kiln restarted twice on this Mac; runs r2 (d13238 went silent), r4 lost. Local shell used instead.
+- State per platform (GitHub ci.yml `slates` job): macOS arm64 GREEN (44841298533/136653837819), Linux x86-64 GREEN
+  (44851246181/136703754443; again 44867288588/136745995680). Linux arm64: lld link fix 482bd01f8 awaiting a run.
+  Windows arm64: CRLF fix 60c0b27c5 awaiting a run. Windows x86-64: w-k90-win (2 Unix-path tests in workspace::tests).
