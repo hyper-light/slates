@@ -1340,3 +1340,68 @@ fn a_large_commit_measured() {
     );
   }
 }
+
+/// P7 of Ada's close list (A-772's daemon peak against the dump; a measurement, not a gate). Do: start an anchor whose
+/// daemon holds a changeset store, create a Subversion repository, and import the dump `SLATES_SVN_IMPORT_DUMP` names
+/// through the CLI (`slates repository import`), sampling the daemon's resident bytes while it runs; then ask the daemon
+/// its memory by kind (`slates status --memory`). Expect nothing: print the import's answer and seconds, the daemon's
+/// resident bytes before and at its peak against the dump's bytes, and the memory report's lines. The real daemon
+/// binary, so its own allocator (a large allocation a mapping of its own, given back when freed), not a test binary's.
+#[test]
+#[ignore = "a measurement: SLATES_SVN_IMPORT_DUMP=... cargo test --release -p slates-cli --test svn_interop -- --ignored an_import_measured --nocapture"]
+fn an_import_measured() {
+  let Ok(dump) = std::env::var("SLATES_SVN_IMPORT_DUMP") else {
+    eprintln!("skipping the import's measurement: SLATES_SVN_IMPORT_DUMP names no dump");
+    return;
+  };
+  let dump_bytes = std::fs::metadata(&dump).unwrap().len();
+  let instance = format!("svn-import-{}", std::process::id());
+  let (_anchor, _lines, _issuer) = start_anchor(&instance, &[]);
+  create_repository(&instance);
+  let before = daemon_rss_kib(&instance);
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "repository",
+      "import",
+      REPOSITORY,
+      &dump,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let out = read_on_a_thread(child.stdout.take().unwrap());
+  let err = read_on_a_thread(child.stderr.take().unwrap());
+  let started = Instant::now();
+  let mut peak = 0;
+  let code = loop {
+    peak = peak.max(daemon_rss_kib(&instance));
+    if let Some(status) = child.try_wait().unwrap() {
+      break status.code().unwrap_or(-1);
+    }
+    pause();
+  };
+  let seconds = started.elapsed().as_secs_f64();
+  let after = daemon_rss_kib(&instance);
+  let (_, memory, _) = slates(&instance, &["status", "--memory"]);
+  let kinds: Vec<&str> = memory
+    .lines()
+    .filter(|line| {
+      [
+        "heap", "arena", "segment", "content", "region", "memory", "budget",
+      ]
+      .iter()
+      .any(|word| line.contains(word))
+    })
+    .collect();
+  println!(
+    "an_import_measured: exit {code} in {seconds:.1} s; dump {} KiB; daemon RSS {before} KiB before, peak {peak} KiB, \
+     after {after} KiB\n  import: {}{}\n  memory: {kinds:#?}",
+    dump_bytes >> 10,
+    out.join().unwrap().trim(),
+    err.join().unwrap().trim()
+  );
+}

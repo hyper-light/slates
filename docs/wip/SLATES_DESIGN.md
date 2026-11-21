@@ -57753,9 +57753,12 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > daemon over a retained segment; the push homed and landed; the daemon stopped with nothing more published; the
 > successor recovers from the store's changeset, `main` at the pushed commit, the next at 2; the log read back from its
 > files holds the creation and the push, `Names` and `Payload`, the payload the record's BLAKE3). The one shared test
-> store is `crate::test_store` (main's ruling 1's helper). Owed (C5 part 2): git's creation refused without
-> `--vcs-store`, versions 2 and a sequence of 0 gone, git's tests on the shared store; the replay's pack read a piece at
-> a time through `StorePacks`.
+> store is `crate::test_store` (main's ruling 1's helper). Part 2a (2026-11-21): a daemon without `--vcs-store`
+> refuses a git repository's creation, `Unsupported` naming the flag, as it refuses Mercurial's and Subversion's (one
+> rule for the three tools), and git's tests run on store-backed daemons through that helper; a rebuild on a node whose
+> store holds the changeset reads it from there, not from the region. Owed (part 2b): versions 2 and a sequence of 0
+> gone (a homing or landing that falls short refuses the push); the replay's pack read a piece at a time through
+> `StorePacks`.
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision

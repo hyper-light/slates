@@ -17035,6 +17035,13 @@ is the invocation's median of 3 runs. µs unless marked.
   could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
   the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
   reader's buffer) held once (Ada's MEMORY SIZING rule).
+- **Measured and rejected (2026-11-21): folding a Subversion green's history to its readers at each landing.** Sixteen
+  revisions rewriting a 16 KiB file left 246,150 bytes of green history, and the fold
+  (`merge_service::settle_green_retention_leaving` with room for all of it, after each landing) took it under one
+  text; but a copy from an older revision is the green's `Copy` of that version (A-586), so the import of
+  `part2.dump` refused `CopyRefused { case: VersionFolded }` at revision 12 (`svn_export` tests). The green's retained
+  versions are what serve such copies. Freeing them needs a copy's source tree built from the records when the green
+  has folded past it; until then the retention stays.
 
 ## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
 
@@ -17092,3 +17099,27 @@ holder's own serve is 8-12. The transport bench makes a 4 KiB write durable on t
 about 30 µs of the Linux exchange is the daemon's own (the lane, the session's borrow and return, the control shards'
 receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
 both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
+
+## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
+  change's measurement. `SLATES_SVN_IMPORT_DUMP=~/.cache/w-svn-gitgit/git-2000.dump cargo test --release -p slates-cli
+  --test svn_interop -- --ignored an_import_measured --nocapture` (`an_import_measured`: an anchor and a two-shard
+  release daemon holding a changeset store, `slates repository create --tool svn`, `slates repository import` of the
+  dump, the daemon's resident bytes sampled by `ps` every pause, then `slates status --memory`). One run read whole (a
+  first run's memory report agreed; its headline line was cut by the command's own `tail`).
+
+| What | Measured |
+|---|---|
+| import of git-2000 (2,000 revisions, 437 MiB dump) | exit 0, 26.2 s |
+| daemon RSS before, at its peak, after | 57 MiB, 1,570 MiB, 1,563 MiB (3.6 times the dump) |
+| segment (the register's log and snapshot), resident | 782 MiB; the log appended 838 MiB during the import, the snapshot's chain entries 39 MiB and checkpoints 44 MiB |
+| content object, resident | 0.8 MiB |
+| the records' texts (in-process run above) | 34.8 MB |
+
+- **What it says.** The daemon's own allocator gives large blocks back, so the test binary's 1.5 GB of freed blocks is
+  not the daemon's. Half the peak is the segment: the green's chain entries carry each revision's file bytes into the
+  register's log, so a Subversion repository's history is held three ways: the records' deltas (35 MB, RAM), the
+  store's changesets (disk, C2), and the green's chain in the register (782 MiB resident). The rest is the heap
+  (~790 MiB). The chain's copy of the texts is the largest; naming texts by identity in a Subversion green's chain,
+  their bytes the store's, is the change that moves it (not svn's alone: the green's chain is the register's).
