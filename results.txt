@@ -1,0 +1,45 @@
+runner 4 cores, 15 GiB, load 2.04 0.71 0.25 1/279 2535
+arm split = d80175d3f
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 9m 17s
+[1m[92m  Executable[0m tests/live_fleet.rs (../t-split/release/deps/live_fleet-1db8d50c5882a503)
+split /home/runner/work/slates/arm-split/../t-split/release/deps/live_fleet-1db8d50c5882a503
+== round 1 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.15 2.21 1.53
+exit 0
+  live  p50 250.5 p99 515.2 p999 1032.2 max 2202.3 us
+  added at p50 203.8 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(480.0), Some(480.0)), (Some(490.0), Some(480.0)), (Some(1100.0), Some(530.0))]; plain statuses asked during the stream 0
+  the owner: build 92.9, to_control 20.2, lane 2.1, exchange 91.3, to_owner 5.3, round 211.7, reply 64.9, reply_wake 50.2, reply_poll 11.8, reply_tail 2.9, hold.declined=22, hold.answer=2054, hold.exchange=3233, hold.dispatches=2494, not_durable=4, placement=2, fold=2050, placement=1
+  candidate 0: holder 18.3, hold.declined=4, hold.entries=774
+  candidate 1: holder 20.5, hold.declined=1, hold.entries=1876
+== round 2 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.15 2.21 1.53
+exit 0
+  live  p50 262.3 p99 689.3 p999 2280.8 max 3682.6 us
+  added at p50 216.7 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(510.0), Some(510.0)), (Some(560.0), Some(540.0)), (Some(1190.0), Some(560.0))]; plain statuses asked during the stream 0
+  the owner: build 67.0, to_control 23.8, lane 2.4, exchange 106.0, to_owner 6.0, round 205.2, reply 65.6, reply_wake 50.1, reply_poll 12.2, reply_tail 3.3, hold.declined=104, hold.answer=2055, hold.exchange=3562, hold.dispatches=2378, not_durable=5, placement=2, fold=2050, placement=1
+  candidate 0: holder 19.4, hold.declined=31, hold.entries=1101
+  candidate 1: holder 20.8, hold.declined=6, hold.entries=1847
+== round 3 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.13 2.19 1.52
+exit 0
+  live  p50 258.9 p99 723.6 p999 1358.2 max 1457.1 us
+  added at p50 220.7 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(500.0), Some(490.0)), (Some(1180.0), Some(560.0)), (Some(560.0), Some(550.0))]; plain statuses asked during the stream 0
+  the owner: build 88.3, to_control 23.3, lane 2.4, exchange 107.9, to_owner 5.9, round 227.8, reply 66.6, reply_wake 50.3, reply_poll 12.9, reply_tail 3.4, hold.declined=135, hold.answer=2054, hold.exchange=3806, hold.dispatches=2109, not_durable=4, placement=2, fold=2050, placement=1
+  candidate 0: holder 20.1, hold.declined=28, hold.entries=1810
+  candidate 2: holder 18.7, hold.entries=1543
+== round 4 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.13 2.19 1.52
+exit 0
+  live  p50 259.3 p99 693.5 p999 1411.8 max 2039.4 us
+  added at p50 213.0 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(500.0), Some(500.0)), (Some(570.0), Some(550.0)), (Some(1170.0), Some(570.0))]; plain statuses asked during the stream 0
+  the owner: build 51.3, to_control 21.5, lane 2.4, exchange 104.3, to_owner 6.4, round 185.8, reply 66.3, reply_wake 50.2, reply_poll 12.7, reply_tail 3.3, hold.declined=26, hold.answer=2053, hold.exchange=3702, hold.dispatches=2278, not_durable=3, placement=2, fold=2050, placement=1
+  candidate 0: holder 18.6, hold.entries=1795
+  candidate 1: holder 17.6, hold.entries=1360
+== round 5 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.12 2.17 1.52
+exit 0
+  live  p50 249.9 p99 805.2 p999 2075.7 max 2991.9 us
+  added at p50 207.0 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(490.0), Some(490.0)), (Some(1180.0), Some(550.0)), (Some(480.0), Some(480.0))]; plain statuses asked during the stream 0
+  the owner: build 88.5, to_control 21.1, lane 2.5, exchange 108.0, to_owner 5.2, round 225.1, reply 65.3, reply_wake 50.2, reply_poll 12.0, reply_tail 3.1, hold.declined=60, hold.answer=2054, hold.exchange=3660, hold.dispatches=1999, not_durable=4, placement=2, fold=2050, placement=1
+  candidate 0: holder 19.4, hold.declined=83, hold.entries=1734
+  candidate 2: holder 19.6, hold.declined=8, hold.entries=1578
