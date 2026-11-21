@@ -600,11 +600,21 @@ const FOLD_WITHIN: u64 = 256;
 /// cap refused the next.
 #[test]
 fn subversion_revisions_fold_their_greens_chain_as_they_land() {
-  crate::daemon::audit_on_shard(|state| {
+  // Each revision lands in its own look at the shard, as each commit is its own request: a checkpoint the owner takes in
+  // turns (A-579, `merge_service::checkpoint_green`) runs between them, as it does in the daemon.
+  let daemon = crate::daemon::audit_daemon();
+  let (svn, green) = crate::daemon::observe_first(&daemon, |state| {
     let (svn, green) = subversion(state, "svn");
     assert_eq!(commit(state, (&owner(), svn), first(), None), answered(1));
-    let mut head = 1;
-    while state.db.partition().green_floor(green) == 0 && head < FOLD_WITHIN {
+    (svn, green)
+  });
+  let mut head = 1;
+  while crate::daemon::observe_first(&daemon, move |state| {
+    state.db.partition().green_floor(green)
+  }) == 0
+    && head < FOLD_WITHIN
+  {
+    crate::daemon::observe_first(&daemon, move |state| {
       let bytes = format!("alpha {head}\n").into_bytes();
       let rows = vec![file("/trunk/a.txt", Action::Modify, &bytes)];
       let next = revision(head, rows, &[&bytes]);
@@ -612,13 +622,14 @@ fn subversion_revisions_fold_their_greens_chain_as_they_land() {
         commit(state, (&owner(), svn), next, None),
         answered(head + 1)
       );
-      head += 1;
-    }
-    assert!(
-      state.db.partition().green_floor(green) > 0,
-      "no checkpoint after {head} revisions"
-    );
+    });
+    head += 1;
+  }
+  let floor = crate::daemon::observe_first(&daemon, move |state| {
+    state.db.partition().green_floor(green)
   });
+  daemon.stop();
+  assert!(floor > 0, "no checkpoint after {head} revisions");
 }
 
 /// Shape: the partition's merge budget in the content test: small, so a few revisions' records pass it.
