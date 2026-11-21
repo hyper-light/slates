@@ -570,3 +570,48 @@ impl Driver for IocpDriver {
     self.pipes.write(raw, bytes)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// 84a: the deadline is made on this Windows, and a sub-millisecond arm posts its packet to the port, ending an
+  /// untimed wait before a millisecond. Each step's status is said, so a refusal names its call.
+  #[test]
+  #[cfg_attr(miri, ignore)]
+  fn a_deadline_armed_for_200_us_posts_its_packet_before_a_millisecond() {
+    /// Shape: a wait well under a millisecond, as the driver test's.
+    const WAIT_NS: u64 = 200_000;
+    let port = prepare().unwrap();
+    let handle: HANDLE = std::ptr::with_exposed_provenance_mut(port.raw());
+    let deadline = Deadline::new();
+    eprintln!("deadline made: {}", deadline.is_some());
+    let deadline = deadline.unwrap();
+    // SAFETY: the deadline's packet is open.
+    let first_cancel = unsafe { (deadline.cancel)(deadline.packet, 1) };
+    eprintln!("first cancel: {first_cancel:#x}");
+    let started = Instant::now();
+    let armed = deadline.arm(handle, WAIT_NS);
+    eprintln!(
+      "armed: {}",
+      match armed {
+        Armed::Armed => "armed",
+        Armed::Fired => "fired",
+        Armed::Busy => "busy",
+      }
+    );
+    // SAFETY: an all-zero OVERLAPPED_ENTRY is a valid, empty record.
+    let mut entries: [OVERLAPPED_ENTRY; 4] = unsafe { std::mem::zeroed() };
+    let mut count = 0u32;
+    // SAFETY: `entries` holds 4 records and `count` is writable; the port is open.
+    let ok = unsafe {
+      GetQueuedCompletionStatusEx(handle, entries.as_mut_ptr(), 4, &raw mut count, 1_000, 0)
+    };
+    let took = started.elapsed();
+    let keys: Vec<usize> = entries.iter().take(count as usize).map(|e| e.lpCompletionKey).collect();
+    eprintln!("dequeued ok={ok} count={count} keys={keys:?} took={took:?}");
+    assert!(matches!(armed, Armed::Armed), "the deadline didn't arm");
+    assert!(keys.contains(&DEADLINE_KEY), "no deadline packet came: {keys:?}");
+    assert!(took.as_nanos() < 1_000_000, "the deadline's packet took {took:?}");
+  }
+}
