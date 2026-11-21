@@ -138,6 +138,15 @@ pub enum MountError {
     /// The code.
     code: Option<i32>,
   },
+  /// The kernel would not watch the helper's exit (a pidfd or `NOTE_EXIT` refused, as at a descriptor limit), so its
+  /// exit could not be awaited; the helper was killed and reaped and the mount refused (family three of main's sweep,
+  /// 2026-11-20: an exit is awaited by its watch, never polled).
+  ExitUnwatched {
+    /// The code the kernel refused the watch with, when it gave one.
+    code: Option<i32>,
+    /// How the helper ended (killed, unless it exited in the moment before).
+    exit: HelperExit,
+  },
   /// The device the helper returned could not be used.
   #[cfg(target_os = "linux")]
   Channel(ChannelError),
@@ -172,6 +181,10 @@ impl std::fmt::Display for MountError {
         "the mount helper did not answer within {deadline:?}; killed ({exit:?})"
       ),
       Self::Recv { code } => write!(f, "receiving the device descriptor refused (code {code:?})"),
+      Self::ExitUnwatched { code, exit } => write!(
+        f,
+        "the kernel would not watch the mount helper's exit (code {code:?}); killed ({exit:?})"
+      ),
       #[cfg(target_os = "linux")]
       Self::Channel(e) => write!(f, "the mounted device: {e}"),
     }
@@ -310,6 +323,12 @@ pub fn begin_unmount(mount_point: &str) -> Result<PendingExit, MountError> {
 pub struct PendingExit(HelperGuard);
 
 impl PendingExit {
+  /// The helper's process id while it runs, for its owner to watch its exit (an exit watch, never a poll); `None` once
+  /// it is reaped.
+  pub fn helper_pid(&self) -> Option<u32> {
+    self.0.0.as_ref().map(std::process::Child::id)
+  }
+
   /// The helper's outcome once it has exited and been reaped; `None` while it runs.
   pub fn poll(&mut self) -> Option<Result<(), MountError>> {
     match self.0.try_finish() {
@@ -409,7 +428,8 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
 pub enum Awaiting {
   /// The helper's answer on the socket: await [`PendingHandshake::socket`]'s readability.
   Socket,
-  /// The helper's exit after it answered: poll again after the owner's tick (an exit raises no readiness).
+  /// The helper's exit after it answered: poll again once it has exited, which the owner awaits through an exit watch
+  /// on [`PendingHandshake::helper_pid`] (a pidfd on Linux, readable at the exit).
   Exit,
 }
 
@@ -490,6 +510,12 @@ pub fn begin_handshake(mut helper: Command) -> Result<PendingHandshake, MountErr
 }
 
 impl PendingHandshake {
+  /// The helper's process id while it is not yet reaped: the owner takes an exit watch on it while [`Awaiting::Exit`],
+  /// so the wait ends at the exit itself. `None` once the helper is reaped.
+  pub fn helper_pid(&self) -> Option<u32> {
+    self.guard.0.as_ref().map(std::process::Child::id)
+  }
+
   /// The socket the helper answers on: the owner awaits its readability while [`Awaiting::Socket`].
   pub fn socket(&self) -> std::os::fd::BorrowedFd<'_> {
     self.socket.as_fd()
@@ -566,6 +592,15 @@ impl PendingHandshake {
   pub fn abort(mut self, deadline: Duration) -> MountError {
     MountError::Timeout {
       deadline,
+      exit: self.guard.abort(),
+    }
+  }
+
+  /// Gives the handshake up because the kernel refused to watch the helper's exit, refused with `code` (the owner
+  /// awaits an exit only by its watch, [`Awaiting::Exit`]): kills and reaps the helper, as [`PendingMount::abort`] does.
+  pub fn abort_unwatched(mut self, code: Option<i32>) -> MountError {
+    MountError::ExitUnwatched {
+      code,
       exit: self.guard.abort(),
     }
   }

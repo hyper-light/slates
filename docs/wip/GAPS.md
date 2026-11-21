@@ -1,5 +1,12 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
+> Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
+> `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
+> agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
+> watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
+> The same test on origin/main alone: kiln r29.
+
 > **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
 > `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
 > (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
@@ -5989,6 +5996,15 @@
 > blocks of about `√ops` pieces, new runs merged as made (`derive::PieceList`).
 > Found then, open: a holder's forward of its increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms; BENCHMARKS),
 > against the transport's 1.3 GB/s; and the control shard's beat task runs 520 to 1,381 ms late during it.
+> interval at a time before). A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch since 2026-11-20 (family three: polled
+> a heartbeat tick at a time before; a watch the kernel refuses refuses the mount, typed). Owed from that sweep: the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> bench run's exit 4 at 64 MiB under memory pressure.
+
+> **Open (test, 2026-11-20, found by w-shared): a flaky handshake count.** `slates-bridge-fuse --test handshake
+> a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac (macOS arm64,
+> load about 70) at `waits >= 1` (handshake.rs:252): a helper that sends its descriptor at once can answer before the
+> owner's first poll, so the owner never waits. The test should hold the helper until the owner has polled once (a pipe
+> the helper reads before it sends), not assume a race's order. Predates family three's change.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
