@@ -54,6 +54,29 @@ pub struct PartitionCaps {
   pub audit_records: usize,
 }
 
+/// What holds a partition's merge budget, by kind ([`Partition::merge_budget_held`]), in bytes unless named otherwise.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeBudgetHeld {
+  /// The budget charged in all.
+  pub charged: usize,
+  /// The budget's cap.
+  pub cap: usize,
+  /// The green chains' entries.
+  pub chains: usize,
+  /// The green origins held whole.
+  pub origins: usize,
+  /// The green checkpoints.
+  pub checkpoints: usize,
+  /// The works holding a log.
+  pub work_logs: usize,
+  /// Their logs' bytes.
+  pub work_log_bytes: usize,
+  /// The largest one log's bytes.
+  pub largest_work_log: usize,
+  /// Their logs' entries.
+  pub work_log_entries: usize,
+}
+
 /// One client's completion state, as the snapshot carries it.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct ClientCompletions {
@@ -587,6 +610,50 @@ impl Partition {
       .caps
       .green_chain_bytes
       .saturating_sub(self.green_chain_bytes)
+  }
+
+  /// What holds the partition's merge budget (`green_chain_bytes`), by kind (A-793 part 2's diagnosis): the green chains,
+  /// origins and checkpoints, the work logs with how many works hold one and the largest, and the total charged, which
+  /// the kinds named here need not sum to (repositories, reviews and credentials count there too). Walks every table it
+  /// names: a cold path, asked once at a refusal.
+  pub fn merge_budget_held(&self) -> MergeBudgetHeld {
+    let bytes = |entries: &Vec<Vec<u8>>| {
+      entries
+        .iter()
+        .map(Vec::len)
+        .fold(0usize, usize::saturating_add)
+    };
+    MergeBudgetHeld {
+      charged: self.green_chain_bytes,
+      cap: self.caps.green_chain_bytes,
+      chains: self
+        .green_chains
+        .values()
+        .map(bytes)
+        .fold(0, usize::saturating_add),
+      origins: self
+        .green_origins
+        .values()
+        .map(Vec::len)
+        .fold(0, usize::saturating_add),
+      checkpoints: self
+        .green_checkpoints
+        .values()
+        .map(|(_, checkpoint)| checkpoint.len())
+        .fold(0, usize::saturating_add),
+      work_logs: self.work_logs.len(),
+      work_log_bytes: self
+        .work_logs
+        .values()
+        .map(bytes)
+        .fold(0, usize::saturating_add),
+      largest_work_log: self.work_logs.values().map(bytes).max().unwrap_or(0),
+      work_log_entries: self
+        .work_logs
+        .values()
+        .map(Vec::len)
+        .fold(0, usize::saturating_add),
+    }
   }
 
   /// A green volume's merge chain (§4.16): its accepted increments after its checkpoint

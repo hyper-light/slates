@@ -1788,7 +1788,7 @@ impl Green {
         tree
           .files
           .iter()
-          .map(|path| self.superseded_bytes(path))
+          .map(|path| self.superseded_bytes(path, 0))
           .fold(nodes, usize::saturating_add)
       })
       .fold(0, usize::saturating_add)

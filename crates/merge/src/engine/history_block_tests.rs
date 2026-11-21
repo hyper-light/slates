@@ -1,6 +1,7 @@
 //! A-728's tests (step S2 of A-723's content-once plan): a green's content history names a file's block where it holds
-//! a value whole, so a changed file's bytes are held once; earlier versions still read back exactly; a small edit still
-//! shares runs and owns only what it added; and the running totals stay equal to their recount.
+//! a value whole, so a changed file's bytes are held once; earlier versions still read back exactly; a small edit
+//! re-anchors the history on the new block and owns only what it overwrote (A-793); and the running totals stay equal to
+//! their recount.
 
 use super::{Green, Increment, Outcome};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -109,11 +110,12 @@ fn created_then_replaced_whole(green: &mut Green, first: &[u8], second: &[u8]) {
   reads_back(green, &[(1, first), (2, second)]);
 }
 
-/// A-728 (the shared path's non-vacuity counters). Do: create a 64 KiB file, replace it whole, overwrite 8 of its
-/// bytes, overwrite 4 more, remove it, then fold the history to the head. Expect: the create and the whole replace each
-/// name the file's block and the history owns no byte after them; the first overwrite's added runs name the new block,
-/// nothing copied; the second seals it (its 8 bytes copied out, its block let go) and the removal seals the second (4
-/// more); every version reads back exactly; the fold keeps the head; the running totals equal their recount throughout.
+/// A-728, A-793 (the shared path's non-vacuity counters). Do: create a 64 KiB file, replace it whole, overwrite 8 of
+/// its bytes, overwrite 4 more, remove it, then fold the history to the head. Expect: the create and the whole replace
+/// each name the file's block and the history owns no byte after them; the first overwrite re-anchors the history on
+/// its new block and cuts the replaced block to the 8 bytes it overwrote, letting the block go; the second cuts the
+/// next block to its 4; every version reads back exactly; the fold keeps the head; the running totals equal their
+/// recount throughout.
 #[test]
 fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   const LEN: usize = 64 * 1024;
@@ -128,39 +130,40 @@ fn a_whole_value_names_the_files_block_and_the_history_owns_no_copy() {
   assert_eq!(
     green.history_blocks_named().0,
     2,
-    "a splice names no whole block"
+    "a re-anchor names no whole block beyond the new file's"
   );
   assert_eq!(
-    green.history_splices_named(),
-    ((1, LEN), (0, 0)),
-    "added runs named in the new block"
+    green.history_reanchored(),
+    (1, 1, 8),
+    "re-anchored, the replaced block cut to the 8 bytes overwritten"
   );
-  assert_eq!(green.history_owned_bytes(), 0, "the splice copied nothing");
+  assert_eq!(green.history_owned_bytes(), 8);
   reads_back(&green, &[(1, &first), (2, &second), (3, &third)]);
 
   let fourth = overwrite(&mut green, 4, (200, b"WXYZ"), &third);
   assert_eq!(
-    green.history_splices_named(),
-    ((2, 2 * LEN), (1, 8)),
-    "version 3 sealed"
+    green.history_reanchored(),
+    (2, 2, 12),
+    "version 3's block cut to its 4 overwritten bytes"
   );
-  assert_eq!(green.history_owned_bytes(), 8);
+  assert_eq!(green.history_owned_bytes(), 12);
   reads_back(&green, &[(2, &second), (3, &third), (4, &fourth)]);
 
   removed_then_folded(&mut green, &fourth);
 }
 
-/// Removes the test's file as version 5 and folds the history to it. Expect the removal to seal version 4 (4 more bytes
-/// copied), version 4 to read back, and the file to stay absent after the fold, the totals balanced.
+/// Removes the test's file as version 5 and folds the history to it. Expect the removal to keep version 4's block whole
+/// (a removal keeps nothing of the value, and versions 2 to 4 read their kept runs from it), nothing re-anchored,
+/// version 4 to read back, and the file to stay absent after the fold, the totals balanced.
 fn removed_then_folded(green: &mut Green, fourth: &[u8]) {
   let mut unlink = increment(5, 4, "f", &[(OpKind::Unlink, 0, 0)], b"");
   unlink.doc.ops[0].src = u64::MAX;
   assert_eq!(green.submit(&unlink), Outcome::Accepted { version: 5 });
   assert_eq!(green.content("f"), None);
   assert_eq!(
-    green.history_splices_named().1,
-    (2, 12),
-    "a removal seals what it supersedes"
+    (green.history_reanchored(), green.history_owned_bytes()),
+    ((2, 2, 12), 12),
+    "a removal re-anchors nothing and copies nothing"
   );
   reads_back(green, &[(4, fourth)]);
   green.fold_history_before(5);

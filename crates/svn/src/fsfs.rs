@@ -198,6 +198,16 @@ pub trait TextDeltas {
   fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>>;
 }
 
+/// The records with their texts read from a source keep no delta the view can name: each text is where its source
+/// holds it (a content store, a green), never as the records' own svndiff, so a view over them shows every text whole,
+/// `PLAIN` (A-645 P3: the presenter's view, its texts content-store references, until per-file deltas are derived forms
+/// of the changeset log, Ada's ruling of 2026-11-20 ~13:35).
+impl<T: crate::migration::TextSource + ?Sized> TextDeltas for crate::migration::WithTexts<'_, T> {
+  fn text_delta(&self, _identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
+    None
+  }
+}
+
 impl TextDeltas for crate::migration::Repository {
   fn text_delta(&self, identity: &ContentIdentity) -> Option<StoredDelta<'_>> {
     let (base, bytes) = crate::migration::Repository::text_delta(self, identity)?;
@@ -343,6 +353,45 @@ impl RevisionFile {
     let taken = run.len().min(most);
     out.extend_from_slice(run.get(..taken).unwrap_or_default());
     Ok(taken)
+  }
+}
+
+/// One piece of a revision file as [`RevisionFile::pieces`] names it: what a presenter shows the file as without making
+/// it (A-645 P3 ruling 2: a referenced file's pieces, each text by its identity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePiece<'a> {
+  /// Bytes the view made: headers, node-revisions, lists, the changed paths, the trailer.
+  Made(&'a [u8]),
+  /// A text the green holds, whole: `size` bytes of the text `identity` names.
+  Text {
+    /// The text's content identity (the BLAKE3 of its bytes).
+    identity: ContentIdentity,
+    /// Its length.
+    size: u64,
+  },
+  /// A text's delta as the records keep it ([`TextDeltas`]): `size` bytes.
+  Delta {
+    /// The text's content identity.
+    identity: ContentIdentity,
+    /// The delta's length.
+    size: u64,
+  },
+}
+
+impl RevisionFile {
+  /// Its pieces in file order, nothing read: the made bytes, and each text or delta by identity and length.
+  pub fn pieces(&self) -> impl Iterator<Item = FilePiece<'_>> {
+    self.segments.iter().map(|(_, segment)| match segment {
+      Segment::Bytes(bytes) => FilePiece::Made(bytes),
+      Segment::Text { identity, size } => FilePiece::Text {
+        identity: *identity,
+        size: *size,
+      },
+      Segment::Delta { identity, size } => FilePiece::Delta {
+        identity: *identity,
+        size: *size,
+      },
+    })
   }
 }
 

@@ -60,7 +60,7 @@ const CONTENT_KEY_BYTES: usize = AFTER_TAG + IDENTITY;
 const CONTENT_VALUE_BYTES: usize = U64 + U64;
 /// Format: the most bytes one [`Store::piece`] reads from the log: the read's unit (a caller walks pieces of any length
 /// until what it needs is whole), not a tuning of the reader.
-const PIECE_BYTES: usize = 1 << 16;
+pub const PIECE_BYTES: usize = 1 << 16;
 /// Format: a changeset row key's sequence, after the tag and the repository.
 const K_SEQUENCE: usize = AFTER_TAG + U128;
 /// Format: a changeset row's key: the tag, the repository, the sequence.
@@ -214,6 +214,18 @@ impl Store {
               let identity = identity_of_range(file, section.offset, section.len, &mut buffer)?;
               put_content(&mut rows, &identity, section.offset, section.len)?;
             }
+            if section.kind == SectionKind::Texts {
+              buffer.clear();
+              buffer.resize(
+                usize::try_from(section.len)
+                  .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+                0,
+              );
+              file
+                .read_exact_at(&mut buffer, section.offset)
+                .map_err(LogError::from)?;
+              crate::texts::put_rows(&mut rows, &located.header, &buffer)?;
+            }
           }
           Ok(())
         });
@@ -278,6 +290,15 @@ impl Store {
       record.commit()?
     };
     put_changeset(&mut self.rows, &located, &mut self.value)?;
+    for (kind, contents) in sections {
+      if *kind == SectionKind::Texts {
+        let bytes = match contents {
+          Contents::Bytes(bytes) => *bytes,
+          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
+        };
+        crate::texts::put_rows(&mut self.rows, &located.header, bytes)?;
+      }
+    }
     let mut payload = payloads.iter();
     for section in self.log.sections(&located)? {
       if section.kind == SectionKind::Payload
@@ -329,6 +350,26 @@ impl Store {
     Ok(Some(Cow::Owned(bytes)))
   }
 
+  /// Where the landed content `identity` lies in the log: its offset and length; none where no `P` row names it.
+  pub(crate) fn content_place(
+    &mut self,
+    identity: &Identity,
+  ) -> Result<Option<(u64, u64)>, StoreError> {
+    let mut key = [0u8; CONTENT_KEY_BYTES];
+    content_key(identity, &mut key);
+    if !self.rows.get(&key, &mut self.value)? {
+      return Ok(None);
+    }
+    decode_content(&self.value)
+      .map(Some)
+      .ok_or(StoreError::BadRow)
+  }
+
+  /// The engine's rows, for the derived tables beside the store's own (`crate::texts`).
+  pub(crate) fn rows_mut(&mut self) -> &mut ShardDb<DeviceFile> {
+    &mut self.rows
+  }
+
   /// The changeset log, for reading committed records' sections.
   pub fn log(&self) -> &ChangesetLog<DeviceFile> {
     &self.log
@@ -344,6 +385,17 @@ impl Store {
       len: row.len,
     };
     Ok(self.log.sections(&located)?)
+  }
+
+  /// At most [`PIECE_BYTES`] of the log from `offset` (a section's bytes, by the place [`Store::sections`] gave), as
+  /// far as `len` reaches.
+  pub fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>, StoreError> {
+    let take =
+      usize::try_from(len.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
+        .map_err(|_| StoreError::BadRow)?;
+    let mut bytes = vec![0u8; take];
+    self.log.read_at(&mut bytes, offset)?;
+    Ok(bytes)
   }
 
   /// The repository's landed changesets from sequence `from` on, at most `limit`, in order.
