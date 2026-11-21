@@ -6979,3 +6979,16 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-cow: A-790 a work's changed file is pieces over its base (main af045255b; commit 0c5dd0cb5)
 - clippy + xtask over crates/server/src/work_files.rs (new Held/Piece, indexing-free), work_home.rs, work_log.rs, work_charge.rs, verbs.rs (owner_lengths, post-state copy), tests/work_edit_cow.rs.
 - Linux/Windows: `cargo test --locked --release -p slates-server --test work_edit_cow -- --nocapture` and `--test works_off_owner`; red = live heap past the bound (a copy per work) or the generated history differing on 8 shards.
+
+- w-sizing, R2 Windows (A-789's Windows shape; main 18:40; for w-lint when jupiter is back), branch/commit on main once
+  landed (see progress/w-sizing.md). On Windows x86_64 (jupiter), from the landed commit:
+  1. Build + lint: `cargo clippy --workspace --all-targets -- -D warnings` (new Windows-only code: crates/mem/src/shared.rs
+     make_section/from_section, crates/server/src/content_extents_windows.rs, anchor_hold_windows.rs hold_extent/
+     release_extent + adopt, content_pool.rs cfg(windows) arms, cli tests); `cargo xtask unsafe` (mem 86, server 9).
+  2. `cargo test --locked -p slates-anchor --lib handles:: held_windows::` and `--test handles_windows`.
+  3. `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test cli -- a_freed_content_extent_gives_its_commit_back_on_windows
+     a_content_extent_outlives_a_killed_daemon_on_windows --nocapture --test-threads=1`.
+     Red would look like: commit after the destroy within N/4 of with-burst (extents kept their commit), or the read after
+     TerminateProcess differing / refused (an extent's section not held across the restart).
+  4. RED-FIRST CHECK: run 3 also at the commit before this piece (origin/main before it) -- the commit test must fail
+     there (each extent a range of the content section; commit kept), the restart test must pass (guard).
