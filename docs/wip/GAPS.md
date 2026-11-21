@@ -180,7 +180,7 @@
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
 > whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
 > stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
-> `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
+> `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`; the unit test's store had
 > kept such a revision bare). An empty text comes with no hunk (an empty delta), sent as it is, and a log whose every
 > chunk is empty is sent inline, as 7.2 keeps it: at hg-src's scale the first refused the stream (an empty body, "unexpected
 > response from remote server: empty string", `mercurial/__init__.py`) and the second left two warnings in `hg verify`
@@ -245,14 +245,32 @@
 > in 14 fills, the window at most 193,859 bytes (one 128 KiB delta, a 64 KiB piece and a header). Counters
 > `vcs_store.hg_replay_wants` and `vcs_store.hg_replay_window_most`.
 > Owed:
-> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main, inbox/main-from-w-hg-c1-import-design.md).
->   BUILT, its first part: `slates_hg::import::emit` writes an import's history as the changegroup (03) a push of it
->   would bring, each revision's chunk its revlog's own delta against its delta parent (`Outline::delta_parent`, 7.2's
->   `deltaparent`), cut into segments of at least a bound only between chunks, each naming its texts as a push's
->   `Texts` section does (`Import::emitting`, `take_segment`). Held by
->   `import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`: for each of the five stores 7.2
->   wrote, the segments concatenated and taken through the push's intake give the import's index row for row. Owed:
->   the server landing each segment as a changeset and the import's entry naming the run, and the replay of a run;
+> **C1 step 3, the import as changesets (main's ruling of 2026-11-21 01:16: segment records hold the index rows by
+> identity). CLOSED.**
+> - `slates_hg::import::emit` writes the import's history as the changegroup (03) a push of it would bring, each
+>   revision its revlog's own delta against its delta parent, cut into segments of at least one trunk node of the
+>   store's memtable (`hg_import::segment_bytes`).
+> - Each segment lands on the changeset store as one changeset as it is cut, between the import's turns: `Record` (its
+>   revisions' index rows by identity, record v8), `Payload` and `Texts` (`hg_import::segment_changeset`,
+>   `segment_landed`).
+> - The import's register entry names the run, first and last sequence (record v9, `write_run_reference`). A
+>   recovery or rebuild reads each segment's `Record` back from the store and appends its rows by identity
+>   (`vcs_store::replay_hg_run`, `rebuild_hg_run`), reading no payload and rebuilding no text.
+> - An import given back sets the repository's next sequence back to the last the register names (decision 2).
+> - An imported repository is stored (`HgStore::unstored` false), so it streams as a pushed one does.
+> - Held by:
+>   - main's oracle (`import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`): for each of the
+>     five stores 7.2 wrote, the segments' records replayed equal the rows the push's intake derives from the same
+>     changegroup, and the import's;
+>   - `daemon::tests::t_a729_an_imported_mercurial_repository_survives_a_warm_restart_by_identity`: segments landed,
+>     the register naming the run, and a successor's restart reading 32 rows from 1 segment record (2,259 bytes), 0
+>     payload reads, the record bytes within 256 a row;
+>   - `crates/cli/tests/hg_interop.rs` `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`: stock
+>     7.2 streams the imported repository and verifies it clean.
+> - The two recovery tests that polled a register-held import record by hand are gone with that path; the restart test
+>   holds the run's recovery.
+> Owed (C1's remaining steps, main's order): step 1, file texts read through the store; step 2, the intake keeping no
+> whole text. Then w-perf measures R2.
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -523,6 +541,9 @@
 > - (d) FIXED by A-813. A materialization secures its history and change index before it commits, as a submit's
 >   admission does, and is refused `BudgetExceeded` past the room, counted `merge.green.materialize_over_room`
 >   (`a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`).
+> - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
+>   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3.
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.

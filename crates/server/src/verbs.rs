@@ -10711,6 +10711,31 @@ pub(crate) struct AcceptedParts {
   pub(crate) authorship: slates_ipc::protocol::Authorship,
 }
 
+impl AcceptedParts {
+  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test.
+  #[cfg(test)]
+  pub(crate) fn for_test(
+    (green, work, version): (DbVolumeId, DbVolumeId, u64),
+    (increment, applied): (
+      slates_merge::engine::Increment,
+      Vec<slates_merge::chain_entry::Applied>,
+    ),
+  ) -> AcceptedParts {
+    let increment_bytes = increment.encode();
+    AcceptedParts {
+      green,
+      work,
+      version,
+      increment_bytes,
+      increment,
+      applied: Some(applied),
+      verification: slates_ipc::protocol::Verification::Unsigned,
+      computed: false,
+      authorship: slates_ipc::protocol::Authorship::default(),
+    }
+  }
+}
+
 /// Commits `parts` in the running transaction, under the running request (`state.current_request`): the wait staged
 /// first (A-252), the chain entry appended, the merge record enqueued, the retention trued up, and a git repository's
 /// commit recorded (A-664 part 3). Refused where the wait or the entry is.

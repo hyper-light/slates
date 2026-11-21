@@ -57885,6 +57885,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
 > replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
+> **Status (2026-11-21, C1 step 3: an import lands as a run of segment changesets; main's ruling of 01:16).** The
+> import's changegroup is cut into segments of one trunk node of the store's memtable. Each lands as one changeset as it
+> is cut, its `Record` the index rows of its revisions by identity (record v8: groups continuing the logs, markers in
+> the last), its `Payload` its slice of the changegroup, and its `Texts` each revision's text, delta parent and place.
+> The register's import entry names the run (record v9: first and last sequence). A restart reads each segment's
+> record back and appends its rows by identity: its cost is the rows', with no payload read and no text rebuilt,
+> whatever the history's texts (main's red, held at a warm restart). The rows a segment's record stores equal the rows
+> the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
+> An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
+> sequence plus one (decision 2).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -59374,6 +59385,30 @@ Applied in the same change to:
   - a replay before the commit reaches the version before the batch, and after it the batch's last;
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
+
+### A-816 — A held verdict's preview lives across turns until its one step (2026-11-21, w-rewrite-ops; main 07:30 PST, P2's interface, for w-git's C5 2b piece 3; A-804, A-805, A-664)
+Applied in the same change to:
+- `crates/server/src/made_commit.rs`: `HeldPreview`, `hold_preview`, `with_held_preview`, `give_up`,
+  `PREVIEW_HELD_ACROSS_TURNS`, and the retire in `commit`.
+- `crates/server/src/greens.rs`: `lineage_len`, a test's view.
+- `crates/server/src/verbs.rs`: `AcceptedParts::for_test`.
+
+- **Why.** A git made commit takes its trees from A-664's path map, stepped from the version's engine. A green whose map
+  is built whole (a first version, one past a copy) builds it a slice a turn on a task. Under the deferred-submit hook
+  the verdict is held, never applied, until the one step (A-805), and its preview was retired in the submit's step.
+- **What.** The preview is engine state kept with the pending accept:
+  - `hold_preview` makes it from the held verdict (`Greens::preview`).
+  - `with_held_preview` lends it on any later turn, so a sliced build steps against the version the verdict makes while
+    the green shows nothing of it.
+  - It is retired in the one step (`commit`, whatever the step does), or by `give_up` when the accept is abandoned. A
+    pending accept dropped otherwise gives its member back as it drops.
+  - The first lend after the submit's step counts `vcs.made.preview_held_across_turns`, the non-vacuity counter.
+- **Evidence.** `a_held_verdicts_preview_lives_across_turns_until_its_one_step`. In a later step of the shard the
+  preview reads as version 2 while the green shows version 1 and its lineage holds one member more, counted once.
+  Committed in a third step, the green is at version 2 and the preview is retired.
+  Main's red for the made commit itself (a first version past a copy answered (false, 0, 0) through a sliced build) is
+  w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
+  piece 3 over this interface.
 
 ### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
 
