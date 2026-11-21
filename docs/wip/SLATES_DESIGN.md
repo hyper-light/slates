@@ -57847,3 +57847,31 @@ Evidence: `cargo test --locked -p slates-server --test session_log a_merge_held_
 red with the note disabled (the log named nothing), green with it; `--test session_log` 4 passed; `-p slates-cli --bin
 slates log_view` 3; `-p slates-client --lib session_log` 1; `-p slates-ipc --test wire_order` 2 (macOS arm64, this
 Mac, local).
+
+### A-697 (1) — A holder's composed increment crosses once: the inputs it composed are never shipped back to it (2026-11-20, w-shared for UI goal 93; main's ruling after A-697's release bench)
+Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), GAPS (A-247's step two),
+`crates/server/src/work_home.rs` (`computed_request`), `crates/server/src/merge_service.rs` (`hold_composed_inputs`,
+`inputs_held_by`, the chunk count in `ship_version`), `crates/server/src/verbs.rs` (`judge_submission`),
+`crates/server/tests/fleet.rs`.
+- **What was measured.** A-697's release bench (BENCHMARKS, 2026-11-20): a holder's 64 MiB version took three input
+  shipments to place, a local one one. The holder had composed the increment and sent it to the owner, and the owner's
+  record plane then shipped the same bytes back to it as the version's inputs, chunk by chunk, before the record.
+- **Change.** The inputs a record names are the increment's own bytes (`inputs_of`: `chain_entry::increment_bytes`), and
+  the archive's identity is the bytes' alone, so the holder can hold exactly what the owner will name before the owner
+  judges. `computed_request` encodes the increment once and holds it as the archive of the green's next version in the
+  node's held content (`hold_composed_inputs`; the owner's offer refreshes the placement to the version it commits),
+  then forwards the same bytes. The owner, committing a verdict a holder computed, marks that holder (the work id's
+  creator, which the node-verb authority guarantees sent it) as lacking none of the inputs (`inputs_held_by`), so its
+  shipment carries the offer and no chunk, which the holder acknowledges from its hold, with the record. A hold the
+  content plane refused (no room) is counted, and the holder's answer to the offer names what it lacks, which the next
+  shipment carries: the ordinary path.
+- **Memory.** One held copy of the inputs on the holder, where before the owner's chunks made the same copy after a
+  round trip; the encoded increment is made once, for the hold and the forward both. The archive builder's own
+  chunking is the owner's as well (owed with the record plane's per-pass archive build, below).
+- **Counters.** `merge.inputs.held_at_compose`, `merge.inputs.held_by_composer`, `merge.inputs.chunks_shipped` (the
+  test's red), `merge.inputs.held_at_compose_refused`.
+- **Owed (found reading).** The owner's record plane builds a version's inputs archive afresh at every pass that ships
+  chunks (`cut_shipments` → `inputs_of` → `inputs_archive`: every byte hashed and chunked again) to ship one shipment's
+  bound of it: work of the order of the size squared over the bound for a large increment. Main's lane-throughput
+  item.
+
