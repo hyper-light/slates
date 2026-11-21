@@ -703,11 +703,24 @@ impl HgIndex {
       at = link.base;
     }
     let whole = chain.pop()?;
+    // Each delta is applied into the other of two text buffers and read into one reused delta buffer from the store's
+    // windows (main's order of 2026-11-20, Ada's no-allocation rule): a chain costs the two longest texts and its
+    // longest delta, never a text and a delta a link. A chain is up to its text's length of deltas, so a text a link
+    // was its length squared in copies (`delta::apply_into`, w-perf's b568499fe, for the revlog reader's same shape).
     let mut text = store.object_bytes(&whole.bytes, whole.len)?;
+    let mut next = Vec::new();
+    let mut delta = Vec::new();
     let mut room = crate::Admission::new(u64::MAX);
     for step in chain.iter().rev() {
-      let delta = store.object_bytes(&step.bytes, step.stored)?;
-      text = crate::delta::apply(&text, &delta, &mut room).ok()?;
+      delta.clear();
+      for window in store.windows(&step.bytes) {
+        delta.extend_from_slice(&window);
+      }
+      if crate::read::to_u64(delta.len()) != step.stored {
+        return None;
+      }
+      crate::delta::apply_into(&text, &delta, &mut next, &mut room).ok()?;
+      core::mem::swap(&mut text, &mut next);
     }
     (crate::read::to_u64(text.len()) == row.len).then_some(text)
   }

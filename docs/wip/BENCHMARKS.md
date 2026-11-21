@@ -15896,3 +15896,66 @@ the anchor's reclaim answered 0 and the second's 170, `ERROR_BUSY`).
 Decided by them (w-sizing, 2026-11-20): Linux keeps one memfd with its free extents removed through the shard's view
 (`MADV_REMOVE`, today's design); Windows needs a section per extent, the commit returned only by closing it; macOS an
 object per extent (w-sizing's `agents/w-sizing-extents`).
+## A mounted work reads its green where it lies: a mount costs its divergence (A-774 part 2; main's order 1; 2026-11-20)
+
+`crates/server/tests/mounted_work_cow.rs`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a side, all
+shown. A 64 MiB green of 1,024 files of 64 KiB; 8 works each requested, mounted over the daemon's NFS, one file read
+through the mount and saved by temp file and rename. Before: main 3406df928 (each mount's slot seeded with a copy of the
+work's files, a2415c930). After: the slot an overlay over the green's pinned version (`slates_vfs::host::tree`).
+
+| side | resident added by 8 mounts (MB) | mount made, median, 64 MiB green (ms) | over a 16-file green (ms) |
+|---|---|---|---|
+| before | 547.0, 547.1, 547.0, 547.1, 547.1 | 11.14, 9.45, 12.94, 9.38, 10.41 | 0.54, 0.65, 0.58, 0.67, 0.68 |
+| after | 0.75, 0.75, 0.72, 0.82, 0.79 | 0.53, 0.78, 0.69, 0.60, 0.71 | 0.32, 0.56, 0.46, 0.42, 6.91 |
+
+Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.
+
+
+## R9's loaded p99 on macOS: where it goes, and the immediate poll A/B (A-786; R9; 2026-11-20, w-provision-gate)
+
+**Machine and load.** This MacBook: Apple M4 Max, 14 CPUs (10 P + 4 E), 36 GB, macOS 26. Release builds,
+`provision_bench`, 9 shards (derived). The host's own load was 4 to 54 from other agents' builds through the day, so "quiet"
+below is the machine as it was, not a quiesced one. "Loaded" adds `PROVISION_BENCH_LOAD=2`: 28 busy processes at default
+priority (two a logical CPU), started after the daemon's boot. Each figure is the median of the bench's three runs, and
+the arms ran interleaved round by round. Diagnostic code (hop stamps, harvest counters, the arms' switches) lived only in
+the scratch tree, and the arms' binaries were compared by MD5 before running.
+
+**Red on main (base 37c84db43; host load 36-38).** Quiet 1-client spinning p50/p99/p999
+88.5 µs / 616 µs / 1.92 ms; parked p99 683 µs. Loaded: spinning 85.0 µs / 1.62 ms / 13.4 ms; parked p99 939 µs. Bound
+616 + (939 - 683) = 873 µs: FAIL.
+
+**Whose time.** A-559's stamps split each create: the creates at or past the loaded p99 spent 1.1 to 1.7 ms in the
+daemon at the median and 14 to 28 µs in the client (all of them parked their client). Stamps at each hop of a
+forwarded create, at the tail median (loaded): pickup by the client's shard 16-64 µs, the forward to the owner 7-13 µs,
+the owner's create 13-30 µs, the reply's task back on the client's shard 6-21 µs, from that task to the shard's serve task
+**0.77-1.37 ms** (quiet: 15 µs at the median, every create), the write into the client's ring 1 µs.
+
+**Why.** `Shard::run` harvests the driver with a zero-timeout wait whenever it has been busy a step quantum, and that ran
+between the two tasks. On macOS that wait is `kevent` with a zero timespec, which sleeps 12-15 µs with an involuntary
+switch (A-218). Counted in one 3-run form: quiet, 0 of 79,591 harvests over 100 µs (max 89 µs); loaded, 2,695 of 59,622
+(max 9.1 ms).
+
+**The A/B (loaded, three interleaved rounds, host load 41-54).** Arms: main; `immediate` (every zero-timeout wait on the
+queue is `kevent64` with `KEVENT_FLAG_IMMEDIATE`, the registrations and the kick moved to `kevent64` with it); and
+`immediate, no hold` (the same, with the closed-loop hold at 0).
+
+| arm | p50 µs | p99 ms | p999 ms | CPU, thousandths of a core |
+|---|---|---|---|---|
+| main | 114.8 / 82.3 / 77.8 | 1.04 / 0.49 / 0.91 | 2.74 / 2.26 / 7.78 | 773-1,167 / 2-1,017 / 656-811 |
+| immediate | 80.7 / 57.9 / 85.8 | 0.43 / 0.54 / 0.73 | 12.1 / 10.6 / 12.0 | 2,084-4,918 / 2,176-2,388 / 1,717-2,488 |
+| immediate, no hold | 29.6 / 68.3 / 58.9 | 0.17 / 0.38 / 0.27 | 0.30 / 11.3 / 6.65 | 1,358-3,093 / 1,270-3,518 / 1,202-2,458 |
+
+Slow harvests (over 100 µs) fell from 1,410-5,832 a form on main to 3-19 with the immediate poll. An earlier round of the
+same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against 0.67 / 0.46 / 0.74 ms, p999 13-18 against
+26-36 ms.
+
+**Measured and rejected:**
+- `immediate` with a `sched_yield` in each idle-spin turn. Quiet, it gave the best p50 (35 µs) at 0.1-0.9 cores. Loaded,
+  every p99 was 10.1 ms: each yield gave a spinner macOS's whole 10 ms quantum.
+- Zero-timeout polls of two forms on one queue (`IMMEDIATE` for the busy harvest, a zero timespec for the spin's turn, to
+  keep the spin's nap). 3 of 3 runs hung at the first create, every shard parked in `kevent64` and the client waiting: a
+  kick was lost. Not chased.
+
+**Reading.** The immediate poll removes the hop's millisecond tail. Alone, it makes A-387 keep holds, since turns now cost
+0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
+next piece; the immediate poll lands with it, not before.

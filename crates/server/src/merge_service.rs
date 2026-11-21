@@ -135,9 +135,9 @@ pub struct MergeShardState {
   /// (`crate::green_adopt::readopt_at_boot`). Every verb on it is answered `Overloaded` meanwhile. Bounded by the greens
   /// this shard owns; empty once the boot has re-adopted or fenced each.
   pub(crate) awaiting_adoption: BTreeMap<DbVolumeId, crate::green_adopt::AwaitingAdoption>,
-  /// The base snapshot of each mounted work of this shard (A-774, `crate::mounted_work`): what its mount changed is its
-  /// slot's op log since it. One entry a mounted work, dropped with the work.
-  pub(crate) mounted: crate::mounted_work::MountedBases,
+  /// Each mounted work's pin (A-774, `crate::mounted_work::MountPin`): the green version its mount's base reads, kept
+  /// readable while the mount lives ([`reachable_floor`]). One entry a mounted work, dropped with its slot.
+  pub(crate) mounted: crate::mounted_work::MountedPins,
   /// The head version each green's landing view holds (A-774, `crate::mounted_work::ensure_green_view`): one entry a
   /// green landed, dropped with the green.
   pub(crate) green_views: crate::mounted_work::GreenViews,
@@ -177,7 +177,15 @@ pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
   let oldest_work = state.db.partition().oldest_work_floor(green);
   // A live branch of the green's lineage made at a version keeps it, so a recovery branches it there again (A-575).
   let oldest_branch = state.db.partition().repositories().branch_floor(green);
+  // A mounted work's base reads its green at its pin (A-774).
+  let mounts = state
+    .merge
+    .mounted
+    .values()
+    .filter(|pin| pin.green == green)
+    .map(|pin| pin.version);
   pins
+    .chain(mounts)
     .chain(oldest_work)
     .chain(oldest_branch)
     .min()
