@@ -1527,3 +1527,11 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - LANDED: 35786a9dd (w-svn C2 stage B part 2 (a): a drive waits for a stored text's piece RAM doesn't hold, through the store's owner, in the svn://, svnserve -t and DAV loops) and 2d079c44 (w-fed-move A-801: the throughput wall's mechanism counted; r48 will name it).
   - DISK: the MacBook at 27 GB. clean-aggressive freed 0: every slates target is active, and the kiln sessions' 69 GB is Ada's.
   - LEAK FOUND: /var/folders/1s/ldpdh04d7d7219qts5t19d7h0000gn/T/ held 1,637 slates-<hex>.sock files, the macOS socket route's nodes (A-161/A-173). Killed test daemons leave them under never-reused per-pid instance names (CLAUDE.md §4 and §2 item 8). Main deleted the 971 older than 2 days (1,638 -> 667). Routed to w-bugs for GAPS, with a red test.
+- 2026-11-21 01:38 PST
+  - LANDED:
+    - f5a14f6a8 (w-git C5 2b piece 2: an ask no edge takes refuses the push too).
+    - 203c96a79 and 0d026a455 (a store replay counts the region's hold apart from its record's, so a home keeps both across a restart).
+    - 5ee55fde3 (GAPS: the socket-route node leak, w-bugs).
+    - w-shared gave w-git, w-hg and w-svn the hour's notice of chain format 6.
+  - RULING (w-fed-move): its 1,000-client stand-in is clean at 6,040 verdicts/s, so the 100k wall grows with scale. Inject the three scale knobs one at a time (bases N behind, history length, M works pinning the floor) and measure per-kind answer times; the knob whose cost grows is the mechanism and the red. r48 confirms it.
+  - DISK: the MacBook at 26 GB, every slates target active. Holding unless under 20 GB.
