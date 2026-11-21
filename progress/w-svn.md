@@ -341,3 +341,8 @@
   A-818 72a1bbb24 (main's 09:20 "RETIRE"): Record::Deltified and the deltify APIs gone, a pre-P4a log refused typed
   (Retired::Deltified at decode, SvnTextsInline at replay). KeptText stays for records standing alone (told main; a
   fixture move if main wants it gone). C2 stage B complete. Next: P7's findings, re-measured on this tree first.
+- 2026-11-21 ~08:30 PST (date clock): A-819 renumber 6652f7717; P7 re-measured by main (r50: peak 1,630 MiB, heap
+  not down). Finding (1) BUILT as A-820 be9a33e34 (copies from older revisions made from the head and set back from the
+  records; svn greens fold to readers' floor); A-side measurement test 3bf21428b (landed 8940003ed). Owed, main's
+  runs: the A/B (measure_copies_from_older_revisions) and the stock svn leg (the big Studio d1323898 offline in kiln).
+  Next after P7: KeptText fixtures onto a test-side text source (main's 10:35 item 3).
