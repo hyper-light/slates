@@ -1491,3 +1491,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - KILN SERVER UNREACHABLE from the MacBook at 01:03 ("not connected to the kiln server"). Rulings go to the state branch's inboxes until it's back.
   - FINDING (w-perf): hg's one-changeset pull takes 24.95 s (vs 0.23 s for hg serve) because `Index::get` walks every run: the learned compaction has no caller outside slates-vcs's tests, so the index never merges. The stream clone, 288 s, has the same leaves.
   - RULING: wire the compaction once where the shared index is owned, for every tool that uses it (git and svn too if they share it): reported lookup and insert times, compaction_due then compact, sliced under the step budget. Red per tool: O(log N) runs per lookup after N seals. The view is held across turns only if it stays a consistent snapshot. inbox/w-perf-from-main-index-compaction.md.
+- 2026-11-21 01:06 PST NETWORK, the Studios only:
+  - kiln's link round trips: Studio-4 163 ms, Studio-1 265 ms, the big Studio 18 s (47 s outage). Studio-2 is disconnected; w-lint saw 50% loss to github.com there.
+  - The big Studio's Ethernet en0 is inactive, so it's on Wi-Fi.
+  - The MacBook (4.7 ms to kiln's server, 46 ms to github.com, 0% loss), jupiter (4 ms) and adacachy (0 ms) are fine. Looks like the Studios' wired path (a switch?): Ada's to check.
+  - Effects: Studio-2's seven agents show offline, kiln runs there stall or are lost, and main's 100k rerun r48 waits on the big Studio.
+  - kiln's server was unreachable from the MacBook at about 01:03 and back by 01:07.
