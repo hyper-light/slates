@@ -468,6 +468,18 @@
 > `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
 > A-774 part 3), reported to main.
 >
+> **A-810 (2026-11-21, w-rewrite-ops; main's order of 04:02). FIXED.** `crates/merge/tests/checkpoint.rs`'s restore test
+> failed about one run in five on main: `changed_between(0, 1)` named `["e/f"]` and its model `["a", "e/f"]`.
+> - It was not the restore. The index's model (A-264's oracle) asked whether a link's target was ever a special node,
+>   timelessly, while the index asks it as the version commits.
+> - A link whose target becomes special only after a span was modelled as changed within it, though it reads the same
+>   there (a link resolves one level).
+> - The model now asks it by the target's last change in the span.
+> - Red: the seed, now in `checkpoint.proptest-regressions`. Pinned by
+>   `a_link_changes_with_its_target_only_once_the_target_is_a_special_node`.
+> - After: 0 failures in 25 runs of the suite.
+> - Record: `docs/bugs/2026-11-21-the-change-index-model-asked-specialness-timelessly.md`.
+>
 > **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, then FIXED by A-809 (w-rewrite-ops, main's order
 > of 02:37, w-fed-move's option 1). The verdict's growth with history was the re-anchor, which walked every value of a
 > changed path: 7.9 values a verdict with no preload, 231 with 10^5 versions; judge 24 to 71 µs; compose and secure
