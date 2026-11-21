@@ -7859,7 +7859,7 @@ mod tests {
     let seen = got.recv().ok();
     second.stop();
     drop(segment);
-    assert_eq!(seen, Some((true, true, 0, 0, vec![4])));
+    assert_eq!(seen, Some((true, true, 0, 0, vec![5])));
   }
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained

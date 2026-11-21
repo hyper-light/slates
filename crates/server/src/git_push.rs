@@ -190,6 +190,9 @@ pub(crate) enum PushFailed {
   Exchange(receive::Refusal),
   /// `answer` asked of a push not yet read whole and checked, or already answered.
   Unchecked,
+  /// The node's changeset store refused the push's changeset (busy, gone, or its write failed; A-767 C5): nothing of it
+  /// is in the register, so the push is refused whole.
+  Unlanded,
 }
 
 /// One git push over one connection, on its repository's owner shard (module docs), its hooks'
@@ -314,12 +317,16 @@ struct DecidingPush {
   then: Option<hooks::PushHooks>,
 }
 
-/// Where the homing of a push's names and pack stands (A-724 piece 8c; A-722's record v4; main's ruling of 2026-11-20
-/// (ii): content durable at `f + 1` in the region before the record that names it). While
+/// Where the homing of a push's names and pack, and their landing on the node's changeset store, stands (A-724 piece
+/// 8c; A-722's record v4; A-767 C5; main's rulings of 2026-11-20: content durable at `f + 1` in the region before the
+/// record that names it, and the changeset landed durable before the register's entry names its sequence). While
 /// `crate::vcs_store::write_version_4`, the decision's first turn puts the names the record would carry as one content
 /// and asks the edge to home them ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge
-/// hands back the outcome ([`ReceivePack::homed`]); then it asks the same of the pack its staging put in the store.
-/// Both homed, the record is written as version 4, naming each; else as version 2.
+/// hands back the outcome ([`ReceivePack::homed`]); then it asks the same of the pack its staging put in the store. Both
+/// homed, where the daemon holds a changeset store, the edge lands them as one changeset (`Names` and `Payload`, the
+/// bytes the homing gave back moved in), its sequence taken now; landed, the record is written as version 5 naming the
+/// contents and the sequence. A refused landing refuses the push ([`PushFailed::Unlanded`]); a homing that fell short
+/// writes version 2.
 #[derive(Debug)]
 enum Homing {
   /// Not yet asked.
@@ -328,14 +335,70 @@ enum Homing {
   Asked(Vec<u8>, (slates_vcs::ContentId, u64)),
   /// Taken by the edge, its outcome awaited.
   Waiting((slates_vcs::ContentId, u64)),
-  /// The names homed: the pack is asked next.
-  PackDue,
-  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record).
-  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64)),
-  /// The pack taken by the edge, its outcome awaited.
-  PackWaiting((slates_vcs::ContentId, u64)),
+  /// The names homed, their rows given back for the landing: the pack is asked next.
+  PackDue(Vec<u8>),
+  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record), and the names' rows.
+  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64), Vec<u8>),
+  /// The pack taken by the edge, its outcome awaited, with the names' rows.
+  PackWaiting((slates_vcs::ContentId, u64), Vec<u8>),
+  /// Both homed: the changeset for the edge to land.
+  LandAsked(Box<Landing>),
+  /// The changeset taken by the edge, the store's answer awaited, at its sequence.
+  LandWaiting(u64),
+  /// The store refused the changeset: the push is refused.
+  Unlanded,
   /// Done, or never asked: the decision goes on.
   Done,
+}
+
+/// A push's changeset as the edge lands it on the node's changeset store (A-767 C5): the store's handle, the header, and
+/// the sections, their bytes moved in.
+#[derive(Debug)]
+pub(crate) struct Landing {
+  /// The node's store.
+  disk: slates_store::owner::StoreHandle,
+  /// The changeset's header: the repository, its sequence.
+  header: slates_store::log::Header,
+  /// Its `Names` and its `Payload`.
+  parts: Vec<slates_store::owner::Part>,
+}
+
+/// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
+#[derive(Debug)]
+pub(crate) enum Carry {
+  /// Content to home in the region (its names, then its pack).
+  Home(Vec<u8>),
+  /// Its changeset to land on the node's store.
+  Land(Box<Landing>),
+}
+
+/// What the edge hands back of a [`Carry`] ([`ReceivePack::homed`]).
+#[derive(Debug)]
+pub(crate) enum Carried {
+  /// The homing's outcome, and its bytes given back.
+  Homed(crate::vcs_store::homes::Homed),
+  /// The store's answer.
+  Landed(Result<slates_store::log::Located, slates_store::owner::OwnerError>),
+}
+
+/// Carries `carry` off the shard's step, asked from shard `origin` of the node's `shards`: content homed in the region
+/// (`crate::vcs_store::homes::home_in_region`), or a changeset landed on the node's store, answered once durable. The one
+/// way every edge (HTTP, SSH, the tests' driver) runs a push's homing.
+pub(crate) async fn carry(origin: u16, shards: &[u16], carry: Carry) -> Carried {
+  match carry {
+    Carry::Home(bytes) => Carried::Homed(
+      crate::vcs_store::homes::home_in_region(origin, shards, bytes, crate::fleet::live_budget())
+        .await,
+    ),
+    Carry::Land(landing) => {
+      let Landing {
+        disk,
+        header,
+        parts,
+      } = *landing;
+      Carried::Landed(disk.land(header, parts).await)
+    }
+  }
 }
 
 /// Where a push's answer stands between its steps.
@@ -697,7 +760,7 @@ impl<P> ReceivePack<P> {
     state: &mut ShardState,
     mut decision: DecidingPush,
   ) -> Result<Option<(Received, Then)>, PushFailed> {
-    if !self.homing_turn(state, &mut decision) {
+    if !self.homing_turn(state, &mut decision)? {
       self.answer = AnswerState::Deciding(Box::new(decision));
       return Ok(None);
     }
@@ -742,12 +805,16 @@ impl<P> ReceivePack<P> {
 }
 
 impl<P> ReceivePack<P> {
-  /// The homing of the decision's names ([`Homing`]): whether the decision may go on. Due, the names the record would
-  /// carry are put as one content (held for the record) and asked of the edge; a push that brings no object, or whose
-  /// names are not put, goes on as version 2.
-  fn homing_turn(&mut self, state: &mut ShardState, decision: &mut DecidingPush) -> bool {
+  /// The homing of the decision's names and pack and their landing ([`Homing`]): whether the decision may go on. Due,
+  /// the names the record would carry are put as one content (held for the record) and asked of the edge; a push that
+  /// brings no object, or whose names are not put, goes on as version 2. Refused where the store refused the landing.
+  fn homing_turn(
+    &mut self,
+    state: &mut ShardState,
+    decision: &mut DecidingPush,
+  ) -> Result<bool, PushFailed> {
     match core::mem::replace(&mut decision.homing, Homing::Done) {
-      Homing::Done => true,
+      Homing::Done => Ok(true),
       Homing::Due => {
         let names = {
           let lent = crate::vcs_store::Lent::new(&mut state.store, &mut state.vcs_stores);
@@ -762,47 +829,60 @@ impl<P> ReceivePack<P> {
         match put {
           Some((bytes, named)) => {
             decision.homing = Homing::Asked(bytes, named);
-            false
+            Ok(false)
           }
-          None => true,
+          None => Ok(true),
         }
       }
       // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the content is given back
       // and the record is version 2, never a decision waiting for a homing nobody runs.
-      Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _)) => {
+      Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _), _) => {
         crate::vcs_store::release_names(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
-        true
+        Ok(true)
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge.
-      Homing::PackDue => match decision.sealed.pack_to_home() {
+      Homing::PackDue(names) => match decision.sealed.pack_to_home() {
         Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
-          decision.homing = Homing::PackAsked(bytes, packed);
-          false
+          decision.homing = Homing::PackAsked(bytes, packed, names);
+          Ok(false)
         }
-        _ => true,
+        _ => Ok(true),
       },
-      waiting @ (Homing::Waiting(_) | Homing::PackWaiting(_)) => {
+      // A changeset no edge took: no edge lands it, so the record names none (sequence 0), as a daemon with no store's.
+      Homing::LandAsked(_) => {
+        crate::vcs_store::homes::count_untaken(state);
+        Ok(true)
+      }
+      Homing::Unlanded => {
+        decision.sealed.release_homed(state);
+        Err(PushFailed::Unlanded)
+      }
+      waiting @ (Homing::Waiting(_) | Homing::PackWaiting(..) | Homing::LandWaiting(_)) => {
         decision.homing = waiting;
-        false
+        Ok(false)
       }
     }
   }
 
-  /// The names a decision asks the edge to home in the region (A-724 piece 8c, [`Homing`]), once: the edge awaits
-  /// `crate::vcs_store::homes::home_in_region` off the shard's step and hands the outcome to [`Self::homed`].
-  pub(crate) fn take_homing(&mut self) -> Option<Vec<u8>> {
+  /// What a decision asks the edge to carry off the shard's step ([`Homing`], [`Carry`]), once: the edge awaits
+  /// [`carry`] and hands the outcome to [`Self::homed`].
+  pub(crate) fn take_homing(&mut self) -> Option<Carry> {
     let AnswerState::Deciding(decision) = &mut self.answer else {
       return None;
     };
     match core::mem::replace(&mut decision.homing, Homing::Done) {
       Homing::Asked(bytes, named) => {
         decision.homing = Homing::Waiting(named);
-        Some(bytes)
+        Some(Carry::Home(bytes))
       }
-      Homing::PackAsked(bytes, packed) => {
-        decision.homing = Homing::PackWaiting(packed);
-        Some(bytes)
+      Homing::PackAsked(bytes, packed, names) => {
+        decision.homing = Homing::PackWaiting(packed, names);
+        Some(Carry::Home(bytes))
+      }
+      Homing::LandAsked(landing) => {
+        decision.homing = Homing::LandWaiting(landing.header.sequence);
+        Some(Carry::Land(landing))
       }
       other => {
         decision.homing = other;
@@ -811,36 +891,84 @@ impl<P> ReceivePack<P> {
     }
   }
 
-  /// What the region answered of the names or the pack [`Self::take_homing`] gave: the names homed under their identity,
-  /// the pack is asked next; the pack homed too, the record is written as version 4 naming both; else the content's
-  /// hold is given back and the record is version 2.
-  pub(crate) fn homed(
-    &mut self,
-    state: &mut ShardState,
-    homed: Result<slates_vcs::ContentId, crate::vcs_store::homes::HomeRefused>,
-  ) {
+  /// What the edge carried of what [`Self::take_homing`] gave: the names homed under their identity, the pack is asked
+  /// next; the pack homed too, the changeset is asked of the edge where the daemon holds a store, its sequence taken now,
+  /// else the record is written as version 5 naming no changeset; landed, it names the sequence. A homing that fell
+  /// short gives its content's hold back and the record is version 2; a refused landing refuses the push.
+  pub(crate) fn homed(&mut self, state: &mut ShardState, carried: Carried) {
+    let repository = self.repository;
     let AnswerState::Deciding(decision) = &mut self.answer else {
       return;
     };
-    match core::mem::replace(&mut decision.homing, Homing::Done) {
-      Homing::Waiting((identity, count)) => {
-        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+    match (core::mem::replace(&mut decision.homing, Homing::Done), carried) {
+      (Homing::Waiting((identity, count)), Carried::Homed(homed)) => {
+        if homed.outcome.as_ref().is_ok_and(|homed| *homed == identity) {
           decision.sealed.homed_as((identity, count));
-          decision.homing = Homing::PackDue;
+          decision.homing = Homing::PackDue(homed.bytes);
           return;
         }
         crate::vcs_store::release_names(state, &identity);
       }
-      Homing::PackWaiting((identity, len)) => {
-        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
-          decision.sealed.pack_homed_as((identity, len));
+      (Homing::PackWaiting((identity, len), names), Carried::Homed(homed)) => {
+        if !homed.outcome.as_ref().is_ok_and(|homed| *homed == identity) {
+          crate::vcs_store::release_names(state, &identity);
           return;
         }
-        crate::vcs_store::release_names(state, &identity);
+        decision.sealed.pack_homed_as((identity, len));
+        decision.homing = match landing_of(state, repository, (names, homed.bytes)) {
+          Some(landing) => Homing::LandAsked(Box::new(landing)),
+          None => Homing::Done,
+        };
       }
-      other => decision.homing = other,
+      (Homing::LandWaiting(sequence), Carried::Landed(landed)) => {
+        let ok = landed.is_ok();
+        state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1);
+        if ok {
+          decision.sealed.landed_as(sequence);
+        } else {
+          decision.homing = Homing::Unlanded;
+        }
+      }
+      (other, _) => decision.homing = other,
     }
   }
+}
+
+/// Counter: git pushes landed as one changeset on the node's changeset store before their entry (A-767 C5). Format: a
+/// counter name.
+pub(crate) const PUSH_LANDED: &str = "git_push.landed";
+/// Counter: git pushes whose changeset the node's store refused: each refused whole, nothing of it in the register.
+/// Format: a counter name.
+pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
+
+/// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
+/// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
+/// landing side by side never share one. None where the daemon holds no store, or the repository no store here.
+fn landing_of(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (names, pack): (Vec<u8>, Vec<u8>),
+) -> Option<Landing> {
+  let disk = state.vcs_disk.clone()?;
+  let sequence = state.vcs_stores.next_changeset(repository)?;
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Git,
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  Some(Landing {
+    disk,
+    header,
+    parts: vec![
+      (slates_store::log::SectionKind::Names, names),
+      (slates_store::log::SectionKind::Payload, pack),
+    ],
+  })
 }
 
 /// What follows a push's decision: `post-receive`'s hooks where one runs.

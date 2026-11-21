@@ -1602,20 +1602,20 @@ pub(crate) async fn homed_drive(
       Answering::Answered(received) => return Ok(*received),
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
-        if let Some(bytes) = push.take_homing() {
+        if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
-          let homed = crate::vcs_store::homes::home_in_region(
-            origin,
-            &shards,
-            bytes,
-            crate::fleet::live_budget(),
-          )
-          .await;
-          if homed.is_err() {
-            return Err(format!("not homed: {homed:?}"));
+          let carried = crate::git_push::carry(origin, &shards, asked).await;
+          match &carried {
+            crate::git_push::Carried::Homed(homed) if homed.outcome.is_err() => {
+              return Err(format!("not homed: {:?}", homed.outcome));
+            }
+            crate::git_push::Carried::Landed(Err(refused)) => {
+              return Err(format!("not landed: {refused:?}"));
+            }
+            _ => {}
           }
-          with_state(|state| push.homed(state, homed)).ok_or("no state for the homing")?;
+          with_state(|state| push.homed(state, carried)).ok_or("no state for the homing")?;
         }
       }
       #[cfg(unix)]
