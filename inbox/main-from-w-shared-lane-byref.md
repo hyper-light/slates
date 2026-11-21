@@ -56,3 +56,50 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
      pending Ada.
 - Meanwhile: measure 3a (71e55b6c2) in release at 64-512 MiB, 10 runs each, all shown. If 320 and 512 pass 10 of 10,
   the liveness is closed. The owner's long step stays the bounded-work bug that (A) closes.
+
+## 00:51 PST: your ruling (A) taken; condition 1 (durability) read before building
+- **Where held content lives:** the shard's `Store`, the same `content.arena` volume content is kept in
+  (`content_holder::hold_space(&mut state.store)`), inside the anchor-held segment the db is in. Not a second store.
+- **Persistence before reply:** a content put is acknowledged only once the shard's recovery image carrying it is
+  committed into anchor-owned RAM (AUD-29-59, `content_holder.rs`); nothing more is published at shutdown
+  (`Daemon::stop` publishes nothing), so a kill -9 after the acknowledgement keeps what a clean stop keeps.
+- **Tests already holding it:** `slates-server --test recovery an_acknowledged_replica_survives_a_warm_daemon_restart`
+  (a second daemon over the same anchor segment and content object holds the replica whole; in process, so a stop,
+  not a signal); and the real-process kills of the same store in `crates/cli/tests/cli.rs`
+  (`a_closed_files_writes_survive_a_kill_from_the_write_log_alone`,
+  `a_content_extent_outlives_a_killed_daemon_on_windows`).
+- **So:** the content store's durability is the db's: same segment, same commit-before-acknowledge. Nothing to close
+  there first. Your exact test (an owner's unfolded version's increment readable after kill -9 and restart, through
+  the content store) needs the owner to hold its increment there, which is part of (A); it is that piece's first red,
+  run as a real-process kill (a child daemon over the parent's anchor segment, the CLI suite's pattern) rather than a
+  stop.
+- **Next, in your order:** (2) chain entry format 6, with the amendment entry, golden vectors and the recovery oracle; I'm
+  reading §4.8 and the anchor handoff now for whether a new daemon must read a predecessor's format-5 entries across an
+  upgrade. (3) retention as A-714. (4) A-767: a green's increment is a change in RAM, the side A-767 keeps in RAM; its
+  disk changeset log is for a repository's landed history, so a repository green's increments become changesets there
+  once w-store's wiring lands. I'll record that overlap in GAPS for w-store.
+- **Meanwhile:** the release bench of 3a, 64-512 MiB x 10, is kiln r15 (queued).
+
+## 00:52 PST: condition 2's upgrade question answered, and the pieces (A) takes
+- **Across an upgrade:** the design reads no other version of a durable record ("A merge record carries its own format
+  version. Another is refused typed, never decoded by a second path", §2.7), and the last chain bump did the same
+  (A-621: "a version 4 entry ... refused `BadVersion`: replaced, not layered"). An anchor restarts a daemon from its
+  own image (cli `a_daemon_killed_after_its_anchors_executable_is_replaced_restarts_from_the_anchors_own_image`), so a
+  segment is read only by the build that wrote it. Format 6 refuses format 5 typed, as every bump has. I'll state it
+  in the amendment entry.
+- **Who touches the entry's increment bytes** (origin/main): the merge engine's replay (`engine.rs`, its copies and
+  checkpoints; it applies each version's effects against the increment's post-state), the record plane
+  (`merge_service::inputs_of`), signed work (`signed_work.rs`), recovery (`daemon.rs`), and the writers: a submit
+  (`verbs::record_accepted`), a repository push (`repository/push.rs`) and a Subversion commit
+  (`repository/svn_commit.rs`). The pushes are w-git's, w-hg's and w-svn's paths.
+- **Pieces, each landed green:**
+  1. Format 6 and the owner's content: every writer holds the increment as content by its inputs identity on the
+     owner's store (retained by the version's record, A-714, typed refusal at the room), and the entry names it; every
+     reader resolves it there (replay gets a resolver; `inputs_of` lends the held archive). Red first: your recovery
+     test, a real-process kill -9 of the owner with an unfolded version. Golden vectors for format 6; the recovery
+     oracle across a restart. This changes the push writers' two call sites mechanically (they pass the work's
+     encoding today), and I'll tell w-git, w-hg and w-svn in their inboxes.
+  2. 3b: the holder's `SubmitComputed` names the content; the owner fetches what it lacks by identity from the holder
+     (the content plane's hedged fetch), stored once on arrival; a retry asks only.
+  3. Step 3's slicing of what remains on both control shards, `daemon.beat.late` the proof at 320 and 512 MiB.
+- Piece 1 is large; I'm starting on it now. Say so if you'd rather the push writers move in a piece of their own.
