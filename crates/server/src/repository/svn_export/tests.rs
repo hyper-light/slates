@@ -242,10 +242,9 @@ fn counters(state: &mut ShardState) -> Vec<String> {
 fn t_a652_the_export_is_published_with_its_completion() {
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
+    let mut job = job_of(id, ((0, 3), Format::Two), "published");
+    assert_eq!(walked(&mut job).await.map(drop), Ok(()));
     on(|state| {
-      let mut job = job_of(id, ((0, 3), Format::Two), "published");
-      let walked = measured(state, &mut job).and_then(|()| written(state, &mut job).map(drop));
-      assert_eq!(walked, Ok(()));
       let request = (ORIGIN, RequestId::from_word(1));
       let (reply, _) = crate::image::complete(state, request, |s| match job.publish(s) {
         Ok(reply) => reply,
@@ -266,25 +265,35 @@ fn t_a652_the_export_is_published_with_its_completion() {
   });
 }
 
-/// Runs `job`'s first walk to its end on the shard.
-fn measured(state: &mut ShardState, job: &mut ExportJob) -> Result<(), Refusal> {
+/// Runs `job`'s first walk to its end on the shard, a stored text a slice waits for fetched between slices as the
+/// export's task fetches it (C2 stage B part 2 (b)).
+async fn measured(job: &mut ExportJob) -> Result<(), Refusal> {
   for _ in 0..SLICE_LIMIT {
-    if job.measure_step(state)? {
+    if on(|state| job.measure_step(state))? {
       return Ok(());
     }
+    job.fetch_waited().await?;
   }
   Err(Refusal::ContentUnavailable)
 }
 
-/// Runs `job`'s second walk to its end on the shard: the admitted volume's dump file then, or the walk's refusal.
-fn written(state: &mut ShardState, job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
-  job.prepare(state)?;
+/// Runs `job`'s second walk to its end on the shard, fetching between slices as [`measured`] does: the admitted
+/// volume's dump file then, or the walk's refusal.
+async fn written(job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
+  on(|state| job.prepare(state))?;
   for _ in 0..SLICE_LIMIT {
-    if job.write_step(state)? {
-      return file_of(state, job).ok_or(Refusal::ContentUnavailable);
+    if on(|state| job.write_step(state))? {
+      return on(|state| file_of(state, job)).ok_or(Refusal::ContentUnavailable);
     }
+    job.fetch_waited().await?;
   }
   Err(Refusal::ContentUnavailable)
+}
+
+/// Both of `job`'s walks to their ends: the dump file, or the first refusal.
+async fn walked(job: &mut ExportJob) -> Result<Vec<u8>, Refusal> {
+  measured(job).await?;
+  written(job).await
 }
 
 /// The dump file `job`'s admitted volume holds.
@@ -320,16 +329,14 @@ fn t_a652_the_jobs_two_walks_write_the_range_as_svnadmin_dump_wrote_it() {
   const DELTAS: &[u8] = include_bytes!("../../../../svn/fixtures/dump/deltas.dump");
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
-    on(|state| {
-      let mut part = job_of(id, ((0, 3), Format::Two), "part");
-      let made = measured(state, &mut part).and_then(|()| written(state, &mut part));
-      part.release(state);
-      assert!(made.as_deref() == Ok(PART1), "part1.dump");
-      let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
-      let made = measured(state, &mut deltas).and_then(|()| written(state, &mut deltas));
-      deltas.release(state);
-      assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
-    })
+    let mut part = job_of(id, ((0, 3), Format::Two), "part");
+    let made = walked(&mut part).await;
+    on(|state| part.release(state));
+    assert!(made.as_deref() == Ok(PART1), "part1.dump");
+    let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
+    let made = walked(&mut deltas).await;
+    on(|state| deltas.release(state));
+    assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
   });
 }
 
@@ -341,7 +348,7 @@ fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
   stored(|| async move {
     let (id, _) = holding_the_full_history("svn").await;
     let mut job = job_of(id, ((0, 3), Format::Two), "changed");
-    assert_eq!(on(|state| measured(state, &mut job)), Ok(()));
+    assert_eq!(measured(&mut job).await, Ok(()));
     let properties = BTreeMap::from([(b"svn:log".to_vec(), b"changed meanwhile".to_vec())]);
     let changed = Record::RevisionProperties {
       revision: 0,
@@ -349,8 +356,8 @@ fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
     };
     let set = crate::repository::svn_commit::land_record((&owner(), id), changed).await;
     assert_eq!(set, Some(Ok(())));
+    let refused = written(&mut job).await;
     on(|state| {
-      let refused = written(state, &mut job);
       job.release(state);
       assert!(
         matches!(refused, Err(Refusal::Unpublished { .. })),

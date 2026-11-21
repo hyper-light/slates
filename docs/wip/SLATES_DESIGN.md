@@ -11489,7 +11489,10 @@ checkpoint deltas by the same composition, which is exact, so every base back to
 maps at O(log) checkpoint lookups plus the raw deltas after the last checkpoint. (Since A-238 the durable
 checkpoint is the green's state at its reachable floor, and a base below it is refused `UnknownBase`: no live reader
 names one.) A holder's replica folds where its owner's engine had folded when it made the merge record the holder
-holds (the record names the floor), so no replica keeps more history than its owner (A-385).
+holds (the record names the floor), so no replica keeps more history than its owner (A-385). A checkpoint reads the
+head's identity, whose backlog (every key changed since it was last read) is folded a paced step at a time on the owner
+and finished in turns by a task of its own, each turn's share the fold left spread over the turns before the next
+checkpoint is due (A-579): no step hashes the backlog whole.
 
 > **Status (2026-11-19, A-668: two inserts at one point meet in both orders).** A delta's operations are walked in
 > order and the walk stops at the first one lying past the range: one starting after the range's end, or at its end
@@ -12300,7 +12303,9 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
 > part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
 > the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
-> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
+> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS). An import's
+> revision lands its texts the same way since P4a (its changeset's Payload and Texts rows, its record naming them
+> stored), and an import's delta whose base is only on the store asks its caller for the base (`Importing::Base`).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
@@ -57880,6 +57885,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
 > replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
+> **Status (2026-11-21, C1 step 3: an import lands as a run of segment changesets; main's ruling of 01:16).** The
+> import's changegroup is cut into segments of one trunk node of the store's memtable. Each lands as one changeset as it
+> is cut, its `Record` the index rows of its revisions by identity (record v8: groups continuing the logs, markers in
+> the last), its `Payload` its slice of the changegroup, and its `Texts` each revision's text, delta parent and place.
+> The register's import entry names the run (record v9: first and last sequence). A restart reads each segment's
+> record back and appends its rows by identity: its cost is the rows', with no payload read and no text rebuilt,
+> whatever the history's texts (main's red, held at a warm restart). The rows a segment's record stores equal the rows
+> the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
+> An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
+> sequence plus one (decision 2).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -59370,7 +59386,7 @@ Applied in the same change to:
   - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
 - **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
 
-### A-815 — A held verdict's preview lives across turns until its one step (2026-11-21, w-rewrite-ops; main 07:30 PST, P2's interface, for w-git's C5 2b piece 3; A-804, A-805, A-664)
+### A-816 — A held verdict's preview lives across turns until its one step (2026-11-21, w-rewrite-ops; main 07:30 PST, P2's interface, for w-git's C5 2b piece 3; A-804, A-805, A-664)
 Applied in the same change to:
 - `crates/server/src/made_commit.rs`: `HeldPreview`, `hold_preview`, `with_held_preview`, `give_up`,
   `PREVIEW_HELD_ACROSS_TURNS`, and the retire in `commit`.
@@ -59393,4 +59409,37 @@ Applied in the same change to:
   Main's red for the made commit itself (a first version past a copy answered (false, 0, 0) through a sliced build) is
   w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
   piece 3 over this interface.
+
+### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
+
+- **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
+  landed): the slow submits of a run came in one or two clusters, each starting with one poll on the green's owner
+  shard, the cross-shard call running `verbs::owner_floor` → `merge_service::checkpoint_green`, 76-112 ms. Of a 100 ms
+  checkpoint the head's identity was 73.66 ms (A-202 folds the identity only when it is read, and nothing read it
+  between checkpoints, so the first read hashed every file changed since, at its old and new versions), the record 16.07,
+  the encoding 4.79, the build 4.17. Every request the owner serves waited behind it: p999 and max near 100 ms, and the
+  p99 tens of milliseconds whenever a stall caught 1% of a run's samples. w-git met the same fold, run whole for ~1,000
+  member greens at a chain's cap, as a 1,124 ms step the watchdog killed the daemon for.
+- **The rule.** `Green::fold_identity_step(keys)` brings a slice of the backlog to the head, each key moved from the
+  version its entry was taken at (`identity_folded`), so commits between steps leave every key exact; the read folds
+  the rest. `merge_service::checkpoint_green` folds in one paced step (`slates_pace::Step`); if the backlog outlasts it
+  (someone waited), a task on the owner finishes it in turns and then takes the checkpoint. A turn's budget
+  (`turn_budget_ns`) is the fold left (the backlog at its measured cost a key) times the measured gap between turns over
+  the time left before the next checkpoint is due (the doubling interval, the time the increments it folds took to come),
+  never under the quantum: under steady contention, yielding at every quantum gave the fold one key a trip round the
+  owner's ready queue and took 7.2-13.0 s.
+- **Counters:** `merge.checkpoint.in_turns`, `merge.checkpoint.identity_steps`, `merge.checkpoint.in_turns_longest_ns`.
+- **Tests.** The identity oracle with partial folds at random steps (`crates/merge/tests/identity.rs`; red with each key
+  moved from `identity_version`); `a_checkpoint_with_someone_waiting_folds_the_identity_in_turns` (red on the one-step
+  checkpoint); `a_folds_turn_budget_spreads_what_is_left_over_the_turns_before_its_deadline`.
+- **A/B** (BENCHMARKS, "A checkpoint's identity fold in paced turns"): at Z = 50 ms every kind's server p99 under 1 ms in
+  5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
+  equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
+  wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
+- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
+  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
+  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
+  `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
+  `repository` tests), §4.16, GAPS, BENCHMARKS.md.
 

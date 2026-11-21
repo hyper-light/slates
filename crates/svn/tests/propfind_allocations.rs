@@ -115,6 +115,9 @@ fn imported() -> Repository {
     match importer.import(&mut repository, rest, true).unwrap() {
       Importing::Done => return repository,
       Importing::NeedMore { .. } => panic!("the whole dump was given"),
+      Importing::Base { text, .. } => {
+        panic!("the records hold every text, yet the import asked for {text:?}")
+      }
       Importing::Commit { consumed, record } => {
         rest = rest.get(consumed..).unwrap_or_default();
         repository.commit_record(*record).unwrap();
