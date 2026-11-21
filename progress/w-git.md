@@ -280,3 +280,13 @@
      Push::put_placed/Step::Putting go away. Store per v1.5.0 push 309 MiB -> ~10 MiB + rows. Record unchanged.
   A. then record v4: record names pack (identity,len) + names (identity,count) homed via vcs_store::homes; replay
      reads pack via content store PackSource; v3 removed (no second path).
+- 17:40 v4 part B LANDED 92f7a756b (rows by pack place; v1.5.0 store 309 -> 14.1 MiB). Reported to main inbox.
+- v4 PART A PLAN (in progress, worktree ~/slates-work/w-git-land9):
+  A1 record.rs VERSION 4: head, moves, names (identity,count), payload (identity,len); no inline pack. v3 writer AND
+     reader removed (main: no second path); v3 tests -> v4.
+  A2 SealedPush: packed: Option<(ContentId,u64)>; record() writes v4 when names and pack both homed, else v2.
+  A3 git_push Homing: Due -> names Asked -> homed -> PackDue -> pack Asked (push.pack() bytes) -> homed -> Done;
+     edges (vcs_http git receive, vcs_ssh receive, git_push tests driver) call take_homing/homed in a loop.
+  A4 replay v4: names from content; pack read from the content store by identity (GitReplay chunks from windows;
+     replay_pack whole via object_bytes); record holds the pack content as v3 held names.
+  Measure: v1.5.0 landing step (entry apply 18 ms -> ~0) and record bytes; red: no step past the quantum landing v1.5.0.
