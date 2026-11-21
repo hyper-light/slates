@@ -250,7 +250,7 @@ pub(crate) async fn land_work(
   // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
   // entry names a text that is durable only in the shard's image, and every reader reads one RAM does not hold back
   // from there (C2 stage B part 2). The texts the records already held landed with the changeset that put them.
-  let carried = texts_carried(&work, &storing.put);
+  let carried = texts_carried(&work.record.changes, &storing.put);
   // The revision made of the work at the owner's instant, judged again with the commit's locks then, checked, landed on
   // the store and committed in the register (`landing`); every text the landing put given back once it ends.
   let storing = core::cell::Cell::new(Some(storing));
@@ -337,9 +337,9 @@ async fn landed<P, T>(
 
 /// The texts of `work` that `put` names (those its landing put whole into the content store), each once, at the first
 /// path a row sets it at, with its length: what its changeset carries (C2 stage B).
-fn texts_carried(work: &Work, put: &[ContentIdentity]) -> Vec<landing::LandedText> {
+fn texts_carried(changes: &[ChangedPath], put: &[ContentIdentity]) -> Vec<landing::LandedText> {
   let mut carried: Vec<landing::LandedText> = Vec::with_capacity(put.len());
-  for change in &work.record.changes {
+  for change in changes {
     let Some(text) = change.text else {
       continue;
     };
@@ -405,22 +405,114 @@ pub(crate) async fn land_revision(
   revision: Revision,
   judged: Option<(&CommitLocks, AprTime)>,
 ) -> Option<Result<Committed, Uncommitted>> {
+  let mut revision = revision;
+  // The texts the revision brings land on the node's store, as a client's commit's do, and the records name them by
+  // identity and length, keeping none of their bytes in RAM (C2 stage B part 2 (b)).
+  let texts = crate::state::with_state(|state| take_texts(state, repository, &mut revision))?;
   // A stored text a row names that the content store let go is brought back whole for the green's increment.
   let brought = match bring_stored(repository, &revision.record.changes).await? {
     Ok(brought) => brought,
     Err(refused) => return Some(Err(refused)),
   };
+  let begun = crate::state::with_state(|state| {
+    storing_of(state, repository, (&revision.record.changes, texts.keys()))
+  })?;
+  let mut storing = match begun {
+    Ok(storing) => storing,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+      return Some(Err(refused));
+    }
+  };
+  let piece = |identity: &ContentIdentity, offset: u64, len: usize| {
+    let bytes = texts.get(identity)?;
+    let start = usize::try_from(offset).ok()?;
+    bytes
+      .get(start..start.saturating_add(len).min(bytes.len()))
+      .map(<[u8]>::to_vec)
+  };
+  loop {
+    let stepped = crate::state::with_state(|state| store_step_from(state, &mut storing, &piece))?;
+    match stepped {
+      Ok(true) => break,
+      Ok(false) => slates_rt::futures::yield_now().await,
+      Err(refused) => {
+        let _ = crate::state::with_state(|state| {
+          release_stored(state, storing);
+          release_texts(state, None, &brought);
+        });
+        return Some(Err(refused));
+      }
+    }
+  }
+  // The bytes are the content store's now, until the landing ends.
+  drop(texts);
+  let carried = texts_carried(&revision.record.changes, &storing.put);
+  let storing = core::cell::Cell::new(Some(storing));
+  let give_back = |state: &mut ShardState| {
+    if let Some(storing) = storing.take() {
+      release_stored(state, storing);
+    }
+  };
   let landed = landed(
-    (repository, Vec::new()),
+    (repository, carried),
     |state| prepare_revision(state, repository, revision, judged),
     |state, reference, prepared| {
-      commit_prepared(state, (principal, repository), reference, prepared)
+      let committed = commit_prepared(state, (principal, repository), reference, prepared);
+      give_back(state);
+      committed
     },
-    |_| {},
+    give_back,
   )
   .await;
-  let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+  let _ = crate::state::with_state(|state| {
+    give_back(state);
+    release_texts(state, None, &brought);
+  });
   landed
+}
+
+/// Takes out of `revision`'s contents every text its rows name that repository `repository`'s records do not hold, and
+/// names each in its stored texts by its length instead (C2 stage B part 2 (b)): the texts to land in its changeset. A
+/// text whose bytes a row also names as a property list stays among the contents, the records keeping a list whole.
+fn take_texts(
+  state: &ShardState,
+  repository: RepositoryId,
+  revision: &mut Revision,
+) -> BTreeMap<ContentIdentity, Vec<u8>> {
+  let Some(records) = state.vcs_stores.subversion_records(repository) else {
+    return BTreeMap::new();
+  };
+  let lists: std::collections::BTreeSet<ContentIdentity> = revision
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| match change.properties {
+      Some(PropertyList::Held { identity, .. }) => Some(identity),
+      _ => None,
+    })
+    .collect();
+  let mut texts = BTreeMap::new();
+  for text in revision
+    .record
+    .changes
+    .iter()
+    .filter_map(|change| change.text)
+  {
+    if records.holds(&text.identity) || texts.contains_key(&text.identity) {
+      continue;
+    }
+    let bytes = if lists.contains(&text.identity) {
+      revision.contents.get(&text.identity).cloned()
+    } else {
+      revision.contents.remove(&text.identity)
+    };
+    if let Some(bytes) = bytes {
+      revision.stored.insert(text.identity, text.size);
+      texts.insert(text.identity, bytes);
+    }
+  }
+  texts
 }
 
 /// A revision checked for its landing ([`prepare_revision`]): the check, the work identity of its record, the room
@@ -528,18 +620,29 @@ pub(crate) fn begin_storing(
   repository: RepositoryId,
   work: &Work,
 ) -> Result<Storing, Uncommitted> {
+  storing_of(state, repository, (&work.record.changes, &work.texts))
+}
+
+/// The texts of `texts` that `changes` name and repository `repository`'s records do not hold, to put
+/// ([`store_step`]).
+fn storing_of<'t>(
+  state: &ShardState,
+  repository: RepositoryId,
+  (changes, texts): (
+    &[ChangedPath],
+    impl IntoIterator<Item = &'t ContentIdentity>,
+  ),
+) -> Result<Storing, Uncommitted> {
   let records = state
     .vcs_stores
     .subversion_records(repository)
     .ok_or(Uncommitted::NotHeld)?;
-  let lengths: BTreeMap<ContentIdentity, u64> = work
-    .record
-    .changes
+  let lengths: BTreeMap<ContentIdentity, u64> = changes
     .iter()
     .filter_map(|change| change.text.map(|text| (text.identity, text.size)))
     .collect();
   let mut queue = std::collections::VecDeque::new();
-  for identity in &work.texts {
+  for identity in texts {
     if records.holds(identity) {
       continue;
     }
@@ -564,6 +667,17 @@ pub(crate) fn store_step(
   storing: &mut Storing,
   texts: &dyn slates_svn::commit::drive::TextSink,
 ) -> Result<bool, Uncommitted> {
+  store_step_from(state, storing, &|identity, offset, len| {
+    texts.sealed_piece(identity, offset, len)
+  })
+}
+
+/// [`store_step`] reading each piece from `piece` (a text, an offset, at most a length).
+fn store_step_from(
+  state: &mut ShardState,
+  storing: &mut Storing,
+  piece: &dyn Fn(&ContentIdentity, u64, usize) -> Option<Vec<u8>>,
+) -> Result<bool, Uncommitted> {
   let slice = usize::try_from(state.config.copy_slice_bytes())
     .unwrap_or(usize::MAX)
     .max(1);
@@ -574,9 +688,7 @@ pub(crate) fn store_step(
       None => return Ok(true),
     },
   };
-  let piece = texts
-    .sealed_piece(&identity, sent, slice)
-    .ok_or_else(corrupt)?;
+  let piece = piece(&identity, sent, slice).ok_or_else(corrupt)?;
   let piece_len = u64::try_from(piece.len()).unwrap_or(u64::MAX);
   let kept = crate::vcs_store::within_budget(state, piece_len, |stores| {
     let store = stores.content_mut().ok_or(Uncommitted::NotHeld)?;

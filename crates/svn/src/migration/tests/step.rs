@@ -890,3 +890,100 @@ fn a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does() {
     (true, true, vec![1 + 7, 1 + 6])
   );
 }
+
+/// C2 stage B part 2 (b), P4 (an import's delta whose base the records keep elsewhere asks its caller for the base).
+/// Do: commit [`first`] twice, once with its text `alpha\n` kept by the records and once stored beside them (the records
+/// naming it alone); into each import a format-3 stream whose revision 2 changes [`FILE`] by a delta against that text
+/// (a window copying it and adding `beta\n`), supplying the base whole when the import asks for it. Expect: the stored
+/// one asks once, for `alpha\n`'s identity, before any record is made, and takes it; the kept one never asks; each
+/// imports revision 2 with the text `alpha\nbeta\n`; and a base the import did not ask for, or bytes not its identity's,
+/// refused `Corrupt`.
+#[test]
+fn an_import_asks_its_caller_for_a_delta_base_the_records_keep_elsewhere() {
+  use super::support::{Dump, revision_properties};
+  use crate::dump::{DeltaBase, Format};
+  use crate::migration::{Importer, Importing, MigrationRefusal};
+  use crate::svndiff::{Instruction, Window};
+  let (alpha, alpha_bytes) = content(b"alpha\n");
+  let made = b"alpha\nbeta\n";
+  let window = Window {
+    source_offset: 0,
+    source_len: 6,
+    target_len: 11,
+    instructions: vec![
+      Instruction::Source {
+        offset: 0,
+        length: 6,
+      },
+      Instruction::New { length: 5 },
+    ],
+    new_data: b"beta\n".to_vec(),
+  };
+  let base = digests(b"alpha\n");
+  let mut dump = Dump::new(Format::Three, None);
+  dump.revision(2, &revision_properties(2)).delta(
+    FILE,
+    DeltaBase {
+      md5: Some(base.0),
+      sha1: Some(base.1),
+    },
+    &[window],
+    digests(made),
+  );
+  let stream = dump.bytes();
+  // Imports `stream` into `repository`, supplying the base when asked: the bases asked for, and revision 2's text.
+  let imported = |repository: &mut Repository| {
+    let mut importer = Importer::new(super::support::ADMISSION);
+    let mut rest = stream.as_slice();
+    let mut asked = Vec::new();
+    loop {
+      match importer.import(repository, rest, true).unwrap() {
+        Importing::Base { consumed, text } => {
+          asked.push(text);
+          assert_eq!(
+            importer.supply_base(repository, &text, b"not it".to_vec()),
+            Err(MigrationRefusal::Corrupt)
+          );
+          importer
+            .supply_base(repository, &text, alpha_bytes.clone())
+            .unwrap();
+          rest = &rest[consumed..];
+        }
+        Importing::Commit { consumed, record } => {
+          rest = &rest[consumed..];
+          repository.commit_record(*record).unwrap();
+        }
+        Importing::NeedMore { .. } => panic!("the whole stream was given"),
+        Importing::Done => break,
+      }
+    }
+    let identity = *blake3::hash(made).as_bytes();
+    let text = repository.text(&identity).map(std::borrow::Cow::into_owned);
+    (
+      asked,
+      repository.youngest(),
+      text,
+      repository.stored_len(&identity),
+    )
+  };
+  let mut kept = created();
+  let checked = kept.check(first()).unwrap();
+  kept.apply(checked).unwrap();
+  let mut naming = first();
+  naming.contents.remove(&alpha);
+  naming.stored.insert(alpha, 6);
+  let mut stored = created();
+  let checked = stored.check(naming).unwrap();
+  stored.apply(checked).unwrap();
+  let made_text = Some(made.to_vec());
+  assert_eq!(
+    imported(&mut kept),
+    (Vec::new(), 2, made_text.clone(), None)
+  );
+  assert_eq!(imported(&mut stored), (vec![alpha], 2, made_text, None));
+  let mut unasked = Importer::new(super::support::ADMISSION);
+  assert_eq!(
+    unasked.supply_base(&kept, &alpha, alpha_bytes),
+    Err(MigrationRefusal::Corrupt)
+  );
+}

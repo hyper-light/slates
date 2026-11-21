@@ -17291,3 +17291,42 @@ w-rewrite-ops, main's order of 04:11.
 - **The last rows:** a change that walks one value still grows sublinearly with the history. That cost is elsewhere in
   the submit and is not chased.
 
+## A checkpoint's identity fold in paced turns: the owner's 100 ms stall gone, p99 under 1 ms at Z = 50 ms, worse at Z = 20 ms (A-579; goal 89b; 2026-11-20/21)
+
+- **Command:** `load_bench --tree <linux-v7.4-rc1>/fs --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+  --reply-patience 60 --think-us <Z>`, release, in process, A and B back to back, order alternating by round, every round
+  shown; the big Studio (Apple M3 Ultra, 32 cores, macOS 26.4) beside other agents' work, the load recorded. Server-side
+  latencies (A-559's split), milliseconds.
+- **The mechanism** (scratch diagnostics): the green's first checkpoint in one owner poll of 76-112 ms; of 100 ms,
+  `head_identity` 73.66, record 16.07, encode 4.79, build 4.17 (36,256,116 bytes). A-783 alone does not reach it: its A/B
+  against main without it was even (its pacing is the push build's).
+
+**Pass 1 (2026-11-20 22:28-22:36, load 12-27):** A = main 585b89299, B = + the fold in turns (yield at each quantum).
+
+| Z | | A p999 | B p999 | A max | B max |
+|---|---|---|---|---|---|
+| 50 ms | SubmitAccepted | 82.1, 70.6, 76.1, 97.7, 59.6 | 3.3, 4.5, 7.3, 12.0, 23.9 | 119, 90, 95, 120, 99 | 18, 21, 29, 29, 43 |
+| 20 ms | SubmitAccepted | 124.5, 142.8, 109.2, 102.9, 118.8 | 19.7, 39.3, 30.3, 21.7, 28.1 | 133, 162, 119, 119, 138 | 51, 63, 46, 43, 48 |
+
+The fold in turns took 7.2-13.0 s at Z = 20 ms (one key a trip round the owner's ready queue), and SubmitAccepted's p50
+rose (2.68-3.13 against 2.00-2.35 ms): rejected for the deadline-sized share below. A fixed 0.5 ms slice a turn
+(scratch C, never landed) finished in 0.62 s but put p99 at 24.3 ms once.
+
+**Pass 2 (2026-11-21 01:50-02:05, load 6.6-17.2):** A = main 585b89299, B = the fold in turns, each turn's share the fold
+left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.46 s at Z = 50, 0.89-1.62 s at Z = 20.
+
+| Z | kind | A p99 | B p99 | A p999 | B p999 |
+|---|---|---|---|---|---|
+| 50 ms | SubmitAccepted | 1.13, 2.66, 0.79, 3.98, 0.81 | 0.97, 0.91, 0.84, 0.96, 0.98 | 77.2, 73.4, 64.7, 85.4, 89.5 | 3.6, 2.8, 1.4, 9.2, 2.2 |
+| 50 ms | ReadHead | 0.32, 1.31, 0.24, 2.17, 0.26 | 0.28, 0.31, 0.28, 0.36, 0.33 | 70.9, 81.5, 56.3, 75.7, 83.7 | 2.0, 3.3, 2.1, 10.8, 3.8 |
+| 50 ms | Rebase | 1.13, 3.13, 0.75, 4.69, 0.78 | 0.81, 0.85, 0.78, 0.98, 0.91 | 83.0, 92.9, 70.8, 89.2, 97.4 | 6.5, 8.0, 3.3, 15.1, 6.9 |
+| 20 ms | SubmitAccepted | 4.47, 2.48, 4.47, 2.91, 2.94 | 5.90, 9.73, 6.41, 5.43, 7.01 | 88.0, 89.1, 100.8, 92.0, 72.9 | 43.5, 44.5, 53.4, 47.4, 51.3 |
+| 20 ms | ReadHead | 1.94, 1.04, 1.70, 1.23, 1.50 | 3.09, 4.38, 3.37, 3.47, 3.56 | 85.8, 76.8, 94.8, 87.3, 63.4 | 34.2, 29.2, 36.5, 29.3, 33.3 |
+
+- **What it says.** At Z = 50 ms (1,500 verdicts/s) every kind's server p99 is under 1 ms in 5 of 5 rounds with B (A at
+  most 2), p999 an order of magnitude lower, p50 equal. At Z = 20 ms (3,500 verdicts/s) p50 is equal again (0.66-0.75
+  against 0.62-0.68), p999 and max lower, but p99 worse: the owner is saturated there, and the fold's 74 ms of work
+  costs wherever it lands, p999 done at once and p99 spread out. Landed for robustness (main, 2026-11-21 ~05:00: the
+  whole fold killed a daemon on w-git's push); the Z = 20 ms p99 is a measured gap in GAPS, and the fold's work itself
+  is the next cut.
+
