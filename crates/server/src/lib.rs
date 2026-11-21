@@ -78,6 +78,7 @@ mod own_nfs;
 mod checkout;
 // A green's takeover successor adopts its holder ledger rather than copying it (§4.16 owner-loss recovery, A-333).
 mod green_adopt;
+mod green_tree;
 pub mod greens;
 pub mod head;
 #[cfg(target_os = "linux")]
