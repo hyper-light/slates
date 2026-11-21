@@ -1472,3 +1472,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - cc917a1bf and 8508a8d52 (w-svn P7): the git-2000 import takes 26.2 s, peak 1,570 MiB (3.6x the dump).
   - 1bfe51f88: stock svnsync 1.15 measured against a store-backed daemon (A-772).
   RULING (w-shared, the owner's durable step): (A), by reference, not (B). (B) is a layer that (A) deletes, and it keeps two copies. (A) removes the work and carries 3b. Durability is proven first, then chain entry format 6 as a durable format change, retention until checkpoint, one content store. Meanwhile 3a is measured in release at 64-512 MiB, 10 runs each.
+- 2026-11-21 00:53 PST LANDED (on main):
+  - 2c32af2b5 (w-rewrite-ops, A-787 part 2's red): the cause was the merge engine's reanchor at O(n k) twice over, not the refinement job's slicing. It now runs in O((n + k) log k): 80,000 ops take 90 ms, was 22.5 s, with a property test against the old scan. green_post_state passes 8 of 8 in debug.
+  - 73cbdfc42 (w-shared): a file's mode moves with its rename.
+  w-git R2 found: the keepalive went out only after two 5 s intervals, exactly the edge tests' 10 s patience, so they failed 18 of 18 under load. Fix d9c014fa0, on test.
+  RULING: w-shared's (A) pieces approved. The push writers move in piece 1, one format at a time, and w-git, w-hg and w-svn get an hour's notice.
+  KILN: an outage around 00:45-00:50 cost w-rewrite-ops its close-note push. Every runner but Studio-2 was back at 00:54.
