@@ -1984,11 +1984,11 @@ fn subtree(tree: &ModelTree, path: &str) -> Vec<String> {
     .collect()
 }
 
+/// A green's tree as a test reads it: each path's directory flag, its bytes, and its property list.
+type GreenTree = BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)>;
+
 /// The green `green`'s tree as the model writes one: every node, its text and its property list's identity.
-fn green_tree(
-  state: &ShardState,
-  green: DbVolumeId,
-) -> BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)> {
+fn green_tree(state: &ShardState, green: DbVolumeId) -> GreenTree {
   let engine = state.greens.get(&green).expect("the green");
   engine
     .beneath("")
@@ -2008,7 +2008,7 @@ fn green_tree(
 }
 
 /// `tree` as [`green_tree`] reads a green: a property list by its identity.
-fn as_green(tree: &ModelTree) -> BTreeMap<String, (bool, Vec<u8>, Option<Vec<u8>>)> {
+fn as_green(tree: &ModelTree) -> GreenTree {
   tree
     .iter()
     .map(|(path, node)| {
@@ -2168,7 +2168,7 @@ fn copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then() {
                 NodeKind::File
               };
               for found in subtree(then, &source) {
-                let moved = format!("{dest}{}", &found[source.len()..]);
+                let moved = format!("{dest}{}", found.get(source.len()..).unwrap());
                 tree.insert(moved, then[&found].clone());
               }
               let copied = ChangedPath {
