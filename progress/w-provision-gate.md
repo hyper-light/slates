@@ -12,10 +12,20 @@
   Uncommitted WIP in ~/slates-work/w-provision-gate: kqueue.rs kevent64 sys layer + Driver::poll_now; DIAG code
   (crates/server/src/diag_stages.rs, DIAG_* statics in rt lib.rs/shard.rs, bench DIAG knobs) must be stripped before commit.
 
+- 2026-11-20 ~18:40: LANDED 2c8f89de6 on main (A-786 part 1: the gate's lane + bench assertions + loaded bound, red
+  1.62 ms vs 0.87 ms; docs: design R9 note, GAPS head + 8a-r9-gate, BENCHMARKS). Run request filed (CI wiring, clippy,
+  Linux measurement).
+- Part 2 on branch agents/w-provision-gate-kqueue (b01a0ef7b): kqueue -> kevent64, zero timeout IMMEDIATE; driver test
+  red on main (14.6 us vs 14.9 us sleep), green. NOT for main alone: p999 regresses via A-387 holds (BENCHMARKS table).
+  Worktree ~/slates-work/w-provision-gate-land (branch agents/w-provision-gate). Scratch clone ~/slates-work/w-provision-gate
+  has DIAG-free tree + local wip merge (do not push it). Arms/logs ~/.cache/w-provision-gate-arms.
+
 ## Queue
-1. Measure where the loaded p99 goes (instrument provision_bench), on this Mac (M4 Max 14 cores) quiet vs loaded.
-2. Red: loaded-p99 bound derived from quiet p99 + load; fix.
-3. Gate: provision_bench assertions + ratchet (floor only tightens), histogram recorded per run; CI wiring = run request.
+1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
+2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
+   turns by time (horizon = the hold's length), A/B main vs kqueue+new rule vs kqueue+no-hold (loaded and quiet, macOS),
+   then land kqueue + rule together with the bench's loaded bound green. Linux needs its own hop split (run request).
 
 ## For main to delete
-(none)
+- ~/slates-work/w-provision-gate (scratch clone, after part 2 lands)
+- ~/.cache/w-provision-gate-arms, ~/.cache/w-provision-gate-fix (scratch)
