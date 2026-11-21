@@ -1019,6 +1019,7 @@ impl<S: SvnStores> SvnExchange<S> {
     if named.status != HTTP_OK {
       return named;
     }
+    let _ = crate::state::with_state(|state| state.count(V1_ACTIVITIES, 1));
     let uri = format!(
       "{}/{}/act/{}",
       self.root.trim_end_matches('/'),
@@ -1698,6 +1699,52 @@ impl HeadView for IndexHead<'_> {
   }
 }
 
+/// Counter: DeltaV v1 activities made (MKACTIVITY, A-766): the by-use test's proof that a stock client committed over
+/// v1, not HTTPv2.
+pub(crate) const V1_ACTIVITIES: &str = "vcs_http.svn_v1_activities";
+
+/// The name prefix of a test repository whose OPTIONS withholds HTTPv2's headers, so a stock 1.7+ client speaks DeltaV
+/// v1 to it (ra_serf takes HTTPv2 only where `SVN-Me-Resource` is sent, `options.c`): the by-use test of A-766 part 4.
+/// Compiled into tests alone, so no daemon has a mode to switch.
+#[cfg(test)]
+pub(crate) const V1_ONLY_PREFIX: &str = "v1-only-";
+
+/// `headers` as OPTIONS answers them for repository `name`: unchanged, but in a test for a repository named with
+/// [`V1_ONLY_PREFIX`], whose HTTPv2 headers are withheld.
+#[cfg(test)]
+fn v1_only_headers(
+  name: &str,
+  method: &str,
+  headers: Vec<(&'static str, String)>,
+) -> Vec<(&'static str, String)> {
+  if method != "OPTIONS" || !name.starts_with(V1_ONLY_PREFIX) {
+    return headers;
+  }
+  headers
+    .into_iter()
+    // What `version.c` `get_option` sends only `if (resource->info->repos->v2_protocol)`.
+    .filter(|(field, _)| {
+      !matches!(
+        *field,
+        "SVN-Repository-Root"
+          | "SVN-Me-Resource"
+          | "SVN-Allow-Bulk-Updates"
+          | "SVN-Supported-Posts"
+      ) && !field.ends_with("-Stub")
+    })
+    .collect()
+}
+
+/// `headers` as OPTIONS answers them: unchanged outside the tests.
+#[cfg(not(test))]
+fn v1_only_headers(
+  _name: &str,
+  _method: &str,
+  headers: Vec<(&'static str, String)>,
+) -> Vec<(&'static str, String)> {
+  headers
+}
+
 /// An answer of `status` alone, with no body.
 fn bare_status(status: u16) -> HttpAnswer {
   HttpAnswer {
@@ -1872,7 +1919,7 @@ impl<S: SvnStores> Exchange for SvnExchange<S> {
     let answered = match answer {
       SiteAnswer::Whole(whole) => Answered::Whole {
         status: status_of(whole.status),
-        headers: whole.headers,
+        headers: v1_only_headers(&self.name, &self.method, whole.headers),
         body: whole.body,
       },
       SiteAnswer::Text { headers, text } => Answered::Text {

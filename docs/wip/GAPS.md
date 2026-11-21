@@ -2303,7 +2303,9 @@
 > `a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it` (the daemon's edge, ra_serf 1.14's requests) and
 > `dav::activity` tests. Departures, each stated: a MERGE answers HTTPv2's short form (no per-path `D:response`s a
 > working copy's wc-props take), `Location` is the path alone, a CHECKOUT's out-of-date check is the drive's at the
-> next request. Owed: part 4 by-use (stock svn 1.15 against an OPTIONS with no v2 headers, on a host with svn).
+> next request. Part 4 by use DONE: `stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge` (stock svn 1.15.0's
+> mkdir, checkout, add, commit and log against a repository whose OPTIONS withholds the v2 headers in tests, as
+> `SVNAdvertiseV2Protocol Off` does; at least two v1 activities made; passed on the big Studio, kiln r15). A-766 closed.
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
