@@ -709,3 +709,94 @@ fn a_replay_makes_each_delta_window_a_bounded_number_of_times() {
     "{made} delta windows made replaying a {LEN}-byte text with a chain of {chain}; bound {bound}"
   );
 }
+
+/// R4 of Ada's close list (a recovery replayed a revision's record whole, its every text deltified in one step). Do:
+/// commit a revision adding `/trunk` and six files of distinct texts, once whole (`check` and `apply`) and once replayed
+/// a row's text a step (`replay_revision`, `replay_step` with one row a step), then a second revision changing every
+/// file the same two ways. Expect: the same records (their whole export byte for byte, every text's chain), and each
+/// replay taken in one step to apply its rows, one a row, none left: never a revision's texts in one step.
+#[test]
+fn a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does() {
+  use crate::migration::RevisionReplay;
+  let files: Vec<(String, Vec<u8>)> = (0..6)
+    .map(|at| {
+      (
+        format!("/trunk/f{at}.txt"),
+        format!("file {at}\n").repeat(200).into_bytes(),
+      )
+    })
+    .collect();
+  let made = |head: u64, edit: &dyn Fn(&[u8]) -> Vec<u8>| {
+    let mut rows = Vec::new();
+    let mut contents = BTreeMap::new();
+    if head == 0 {
+      rows.push(row("/trunk", Action::Add, NodeKind::Directory));
+    }
+    for (path, bytes) in &files {
+      let bytes = edit(bytes);
+      rows.push(ChangedPath {
+        text: Some(text_of(&bytes)),
+        ..row(
+          path,
+          if head == 0 {
+            Action::Add
+          } else {
+            Action::Modify
+          },
+          NodeKind::File,
+        )
+      });
+      let (identity, held) = content(&bytes);
+      contents.insert(identity, held);
+    }
+    RevisionToCommit {
+      head,
+      record: RevisionRecord {
+        transaction: format!("{head}-1"),
+        changes: rows,
+      },
+      properties: properties(&[
+        ("svn:author", "alice"),
+        ("svn:date", FIRST_DATE),
+        ("svn:log", "r"),
+      ]),
+      contents,
+      stored: BTreeMap::new(),
+      lock_entries: Vec::new(),
+    }
+  };
+  let same = |bytes: &[u8]| bytes.to_vec();
+  let changed = |bytes: &[u8]| {
+    let mut bytes = bytes.to_vec();
+    bytes.extend_from_slice(b"one more line\n");
+    bytes
+  };
+  let mut whole = created();
+  let mut replayed = created();
+  let mut steps = Vec::new();
+  for (head, edit) in [(0u64, &same as &dyn Fn(&[u8]) -> Vec<u8>), (1, &changed)] {
+    let checked = whole.check(made(head, edit)).unwrap();
+    whole.apply(checked).unwrap();
+    let mut replay: RevisionReplay = replayed.replay_revision(made(head, edit)).unwrap();
+    let mut taken = 1u64;
+    while replayed.replay_step(&mut replay, 1).unwrap().is_none() {
+      taken += 1;
+      assert!(taken < 100, "the replay never ended");
+    }
+    steps.push(taken);
+  }
+  let chains = |repository: &Repository| -> Vec<Option<usize>> {
+    files
+      .iter()
+      .map(|(_, bytes)| repository.text_chain(blake3::hash(&changed(bytes)).as_bytes()))
+      .collect()
+  };
+  assert_eq!(
+    (
+      super::support::export_all(&replayed).unwrap() == super::support::export_all(&whole).unwrap(),
+      chains(&replayed) == chains(&whole),
+      steps,
+    ),
+    (true, true, vec![1 + 7, 1 + 6])
+  );
+}

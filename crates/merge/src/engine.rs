@@ -889,6 +889,20 @@ impl OriginLoad {
   }
 }
 
+/// What a green holds at its head under one directory ([`Green::head_under`]): each dimension's paths there (the
+/// directory's own path among them where it holds one), a file with its length.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadUnder {
+  /// Every file at or under the directory, with its length.
+  pub files: Vec<(String, u64)>,
+  /// Every directory at or under it.
+  pub dirs: Vec<String>,
+  /// Every symlink at or under it.
+  pub symlinks: Vec<String>,
+  /// Every special node (FIFO, socket, device) at or under it.
+  pub specials: Vec<String>,
+}
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
 /// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
@@ -2455,6 +2469,70 @@ impl Green {
       }
     }
     changed.into_iter().collect()
+  }
+
+  /// What the green holds at its head under `dir` (A-792): every file, directory, symlink and special node whose
+  /// path is `dir` or starts with `dir/` (every path for the root, `""`), each found by one descent of its map, so a
+  /// listing of one directory reads that directory's subtree rather than the whole green. [`Green::current_base`]
+  /// copies every path of every dimension, which a listing did per page: on the Linux kernel's 97,371 files that was
+  /// most of a primary's one busy core at 1,000 and 10,000 clients (goal 86b, 2026-11-20; 144 and 192 verdicts a
+  /// second).
+  pub fn head_under(&self, dir: &str) -> HeadUnder {
+    let prefix = if dir.is_empty() {
+      String::new()
+    } else {
+      format!("{dir}/")
+    };
+    let at_or_under = |path: &str| dir.is_empty() || path == dir || path.starts_with(&prefix);
+    let mut under = HeadUnder::default();
+    // `dir` itself is the prefix less its slash: a lookup of its own, then the walk under it.
+    let own = |held: bool| held.then(|| dir.to_owned());
+    under.files.extend(
+      own(!dir.is_empty() && self.content.contains_key(dir)).and_then(|path| {
+        self
+          .content
+          .get(&path)
+          .map(|bytes| (path, bytes.len() as u64))
+      }),
+    );
+    under.files.extend(
+      self
+        .content
+        .prefix(&prefix)
+        .filter(|(path, _)| at_or_under(path))
+        .map(|(path, bytes)| (path, bytes.len() as u64)),
+    );
+    under
+      .dirs
+      .extend(own(!dir.is_empty() && self.dirs.contains_key(dir)));
+    under.dirs.extend(
+      self
+        .dirs
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
+      .symlinks
+      .extend(own(!dir.is_empty() && self.symlinks.contains_key(dir)));
+    under.symlinks.extend(
+      self
+        .symlinks
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
+      .specials
+      .extend(own(!dir.is_empty() && self.specials.contains_key(dir)));
+    under.specials.extend(
+      self
+        .specials
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
   }
 
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
@@ -6560,6 +6638,9 @@ mod restate_tests;
 
 #[cfg(test)]
 mod copy_restate_tests;
+
+#[cfg(test)]
+mod head_under_tests;
 
 #[cfg(test)]
 mod tests {
