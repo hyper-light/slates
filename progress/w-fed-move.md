@@ -1,6 +1,6 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
-## 2026-11-20 ~17:30 PST: main's piece "moves refused unplaced" -- A-784 LANDED slates main 5f9e4287 (fix 3f4fadda)
+## 2026-11-20 ~18:10 PST: main's piece "moves refused unplaced" DONE -- A-784 LANDED slates main 5f9e4287 (fix 3f4fadda), kiln carries it at main 4f5e58c1b (vendor 0002)
 - Report: inbox/main-from-w-fed-move-move-unplaced.md. kiln carry = vendor/patches/slates/0002 in worktree
   ~/slates-work/w-fed-move-kv (kiln main 648c57184; kiln now pins Slates 8ce3d615 which has A-756), docs W7 updated;
   checks + release local run in flight (~/slates-work/w-fed-move-a784-local2.log), then land via bundle + Studio-4.
