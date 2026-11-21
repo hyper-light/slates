@@ -145,3 +145,93 @@ fn a_checkpoint_and_the_log_after_it_recover_every_row_once() {
     identities
   );
 }
+
+/// Reads the whole content `identity` of `len` bytes through `piece`, a piece at a time.
+fn read_whole(
+  store: &mut Store,
+  staging: &slates_store::staging::Staging,
+  identity: &[u8; 32],
+  len: u64,
+) -> Vec<u8> {
+  let mut whole = Vec::new();
+  while (whole.len() as u64) < len {
+    let piece = store
+      .piece(staging, identity, len, whole.len() as u64)
+      .unwrap()
+      .unwrap();
+    whole.extend_from_slice(&piece);
+  }
+  whole
+}
+
+/// Do: stage a 300,001-byte pack, read it through `piece`, land it as the payload, release it, read it again, reopen
+/// the store with and without a checkpoint and read it again. Expect: the staged read is borrowed (no copy) and every
+/// read is the same bytes, the landed ones from the log by identity, a piece at a time.
+#[test]
+fn a_staged_content_reads_the_same_in_flight_landed_and_recovered() {
+  use slates_store::staging::Staging;
+  use slates_store::store::Contents;
+  let dir = scratch("seam");
+  let pack: Vec<u8> = (0..300_001u32)
+    .map(|at| (at.wrapping_mul(2_654_435_761) >> 24) as u8)
+    .collect();
+  let len = pack.len() as u64;
+  let mut staging = Staging::new(1 << 20);
+  let identity = {
+    let mut store = open(&dir);
+    let identity = staging.stage(pack.clone()).unwrap();
+    let staged = store.piece(&staging, &identity, len, 0).unwrap().unwrap();
+    assert!(
+      matches!(staged, std::borrow::Cow::Borrowed(_)),
+      "in flight: lent, not copied"
+    );
+    drop(staged);
+    assert_eq!(read_whole(&mut store, &staging, &identity, len), pack);
+    let header = Header {
+      tool: Tool::Git,
+      repository: 5,
+      sequence: 1,
+      judged_over: 0,
+      grant: 1,
+      work: 9,
+      time_ns: 1,
+      sections: 0,
+    };
+    store
+      .land(
+        header,
+        &[
+          (SectionKind::Record, Contents::Bytes(b"refs")),
+          (SectionKind::Payload, Contents::Staged(identity)),
+        ],
+        &staging,
+      )
+      .unwrap();
+    staging.release(&identity);
+    assert_eq!(staging.bytes(), 0, "landed: RAM holds none of it");
+    assert_eq!(
+      read_whole(&mut store, &staging, &identity, len),
+      pack,
+      "landed: read from the log"
+    );
+    identity
+  };
+  let mut store = open(&dir);
+  assert_eq!(
+    read_whole(&mut store, &staging, &identity, len),
+    pack,
+    "recovered from the log alone"
+  );
+  store.checkpoint().unwrap();
+  drop(store);
+  let mut store = open(&dir);
+  assert_eq!(
+    read_whole(&mut store, &staging, &identity, len),
+    pack,
+    "recovered from the checkpoint"
+  );
+  assert!(
+    store.piece(&staging, &[7u8; 32], 3, 0).unwrap().is_none(),
+    "an identity nothing holds"
+  );
+}
