@@ -23746,3 +23746,12 @@ runs on the box at load average 74 to 93, and never alone.
   (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
+
+### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — open (w-forming's finding, not worked: Ada's close order)
+`cargo test -p slates-server --test fleet a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`
+failed on main's own code twice of two on Adas-Mac-Studio-4 at load ~39 (base 621cb6ce6 + w-forming's delta capture
+reverse-applied): 4 of the 8 writes made while the whole entry sealed were answered, the rest refused
+`DurabilityPending` after ~4.5 s; 6 whole builds where a quiet run makes 2, `fleet.live.refused.no_credit` 1,
+`fleet.live.build_waited` 16-20. An earlier run of the same code on the same machine passed (8 of 8, 2 builds). The
+shape: under the injected zero seal quantum, a delta queued behind the build is refused for credit, the volume then
+owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. Not chased.
