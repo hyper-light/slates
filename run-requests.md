@@ -7200,3 +7200,30 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Green:** the branch passes every run. **Red:** main fails "the update's work took N quanta for M files" at the
   extremes (w-git: 1 in 2 at load 12.8). A branch failure on "turns for quanta" means the second assertion is timing
   too: send it to w-bugs.
+
+## 2026-11-21T19:40Z raft-chaos main 3b298acb (goal 93 correctness: crash consistency of the git, hg and svn servers)
+- Commands (release, from a checkout of main at or after 3b298acb; each sweep is one test, `--ignored`):
+  1. git: `SLATES_CRASH_POINTS=12 cargo test --release --locked -p slates-cli --test vcs_crash -- --ignored --nocapture
+     a_git_push_killed_at_any_point_leaves_the_repository_before_or_after a_git_clone_killed_at_any_point_leaves_the_repository_whole_and_a_retry_clones`
+  2. hg: the same with `an_hg_push_killed_at_any_point_leaves_the_repository_before_or_after
+     an_hg_clone_killed_at_any_point_leaves_the_repository_whole_and_a_retry_clones`
+  3. svn: the same with `an_svn_commit_killed_at_any_point_leaves_the_repository_before_or_after
+     an_svn_checkout_killed_at_any_point_leaves_the_repository_whole_and_a_retry_checks_out`
+  Each sweep is about a minute a point at N=12 (one anchor; a fresh repository per point). Give each a timeout_s of 45
+  minutes.
+- Platform(s): git on the Mac Studio (git 2.50.1) and Linux x86_64. hg on this Mac (hg 7.2; no other Mac has it) and
+  Linux (apt `mercurial`). svn on the big Studio (svn 1.15 with svnrdump and svnadmin) and Linux (apt `subversion`).
+  Windows once the others are clean.
+- Datasets: none. Each sweep makes its own 8 MiB incompressible commit (256 files of 32 KiB).
+- What red looks like: a `VIOLATION <sweep> point K: ...` line (the test fails at its end naming every one). The kinds:
+  - the branch / default head / youngest revision is neither before nor after;
+  - `git fsck --strict`, `hg verify` or `svnadmin verify` of an svnrdump load fails after the crash or the retry;
+  - the client saw success and the repository is before (an acknowledged write lost);
+  - the client ran past 180 s (a hang);
+  - the retry fails or does not leave after.
+  Every point also prints a `POINT` line (kill time, pids, client exit and last words, state), which is the record.
+- Already run: one focused case, this Mac at load 67-75, debug, git push at N=2. Both points before-or-after, fsck
+  clean, both retries after. Worth watching: the client killed 8.6 s into a 25.8 s push took 102 s to fail ("the remote
+  end hung up unexpectedly"). If the release sweep shows clients waiting that long after a kill, that is a finding for
+  w-git (how long the edge holds a dead daemon's connection).
+- Who gets failures: each red goes to its server's owner as a minimal test (w-git, w-hg, w-svn), copied to raft-chaos.
