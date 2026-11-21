@@ -913,6 +913,7 @@ fn reading_hook(path: &str, svnlook: &str, out: &str) {
 }
 
 /// Stock `svnlook`'s absolute path, found on this process's `PATH`; none where it is not.
+#[cfg(unix)]
 fn svnlook_path() -> Option<String> {
   let path = std::env::var_os("PATH")?;
   std::env::split_paths(&path)

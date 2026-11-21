@@ -11976,6 +11976,21 @@ The agent reads green's bytes for each window (a read of the named version), rew
 bytes, and calls `rebase` again. A rebased increment has a new identity; deduplication never
 blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 
+> **Status (2026-11-20, A-796: a merge check publishes nothing, and a resolution is bound to what was checked).**
+> `CheckMerge` answers the verdict a submit would get now, judged by the green's half as a rebase is (`Green::rebase`,
+> a pure function) and settled by nothing: the head and base it judged and the work's revision (its stamp), the
+> canonical declaration by index, and the windows, kept for `Conflicts` (A-267) as a conflicting rebase keeps them.
+> `ReadMergeCheck` reads the work as checked (refused `StaleMergeView` once it changed); the green's view is a read at
+> the stamp's head. `ResolveMerge` retires the canonical operations the agent names, rebases the rest onto the stamp's
+> head, applies the agent's replacement there (its edits as pieces over the head, A-790) and restates the work as a
+> rebase restates it, one recorded step; refused `StaleMergeView` with nothing changed when the work moved (checked on
+> its shard) or the head did (checked on the green's half, before anything is mapped). Off the green's shard the ask
+> travels with the sealed work (A-247). No merge is inferred: every byte of a resolution is declared (D-27). Ported
+> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli); its `rebase_with`
+> refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
+> resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
+> (one history on one shard and on eight).
+
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
 > does the deriver composing the work's next submit. A hard link names the node at its target when it is made
@@ -58772,3 +58787,56 @@ its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget
   encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
 - **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
   one `sendto` and one `recvfrom` a datagram.
+
+### §4.8 amended — A received packet is opened where it arrived, its stream bytes delivered once and a message taken whole by move (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput, its third step; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's receiving), GAPS (the sweep's lane line), BENCHMARKS (the bulk
+row's fourth row), `crates/transport/src/endpoint.rs` (`unprotect_in_place`, `ingest`, `fold_or_discard`, `drain`,
+`take_reply`, `reply_bytes_read`, `Exchange::received`, `arriving` a set; `unprotect_packet` now the tests' copying
+wrapper), `crates/transport/src/session.rs` (`FrameRef`, `frame_refs`, `validate_frames`; `decode_frames` the owning
+view of them), `crates/transport/src/connection.rs` (`handle_frames`, `advance_stream`, `take_stream`;
+`handle_incoming` and `read_stream` built on them), `crates/transport/src/stream.rs` (`StreamAssembler`'s delivered
+bytes, `advance`, `read` by move), `crates/transport/src/reset.rs` (`tail_of`, `is_reset_tail`).
+- **What was there.** A received packet was copied whole, its header and payload copied again, and the payload opened
+  in the copy. Each stream frame's bytes were copied out into a frame of their own, again into a reassembly segment,
+  again into each read's output, and each read chunk copied onto its message.
+- **Change.** The packet is opened in place in the datagram it arrived in (`unprotect_in_place`); the payload is checked
+  to decode whole (`validate_frames`), so a packet is taken whole or refused whole as before, then applied from there,
+  a stream frame's bytes lent (`frame_refs`, `FrameRef`). A stream's reassembler appends bytes that reach its cursor
+  straight to its delivered bytes, their one copy, and buffers apart only bytes past a gap. The endpoint slides each
+  stream's window as bytes are delivered (`advance_stream`) and takes a reply or a request whole, by move, when it
+  completes (`take_stream`). The receiver holds the same bytes as before, a message's worth. A failed open may leave
+  the datagram rewritten, so the bytes a stateless reset is told by (its length and last token's worth) are kept on
+  the stack before it, and checked from there (`reset::tail_of`, `is_reset_tail`).
+- **Measured** (BENCHMARKS, Studio-1, quiet): goodput median 1,092 to 1,308 MB/s, min 927 to 966, max 1,206 to
+  1,382; a 64 MiB transfer's p50 about 61 to 51 ms; `memmove` 0.53 of `sendto`'s samples before, 0.36 after.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test (lib 148 of 148; admission,
+  amplification, exchanges, handshake_levels, key_update, receive_refusal, session, stateless_reset). `slates-cluster`
+  lib 248 of 248 and `--test live` 4 of 4, real exchanges over the changed path.
+- **Owed.** One `sendto` and one `recvfrom` a datagram, the profile's top now; and a datagram's copy out of the shard's
+  receive buffer into its own allocation (`crate::receive`).
+
+### A-796 — A merge check publishes nothing, and a resolution is bound to what was checked (2026-11-20, w-work-cow; main's order, the unowned Codex goal; §4.16 "Rebase, the only corrective path", D-27)
+Applied in the same change to: §4.16 (its status), `crates/ipc/src/protocol.rs` (`CheckMerge`, `ReadMergeCheck`,
+`ResolveMerge`, `MergeStamp`, `MergeView`, `WorkChange`, `MergeOp`, `MergeChecked`, `StaleMergeView`),
+`crates/server/src/verbs.rs` (`check_merge`, `read_merge_check`, `resolve_merge`, `merge_answer`,
+`apply_replacement`, `volume_op_of` taken out of `declare`), `crates/server/src/work_home.rs` (`MergeAsk` on the sealed
+work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `read_merge_check`, `resolve_merge`),
+`crates/api/src/error.rs` (`Stale::MergeView`), GAPS (the Codex record).
+- **Why.** The Codex agent's early-conflict work (476 branches on adacachy, none on origin; GAPS) found what main still
+  lacked: an agent could learn of a conflict only by submitting (which publishes when it does not conflict) or
+  rebasing (which moves a clean work), and could act on a conflict only by appending more declarations to a journal
+  whose conflicting operations stay. FoundationDB validates a transaction against the read version it decided on
+  [B: FoundationDB developer guide, conflict ranges]; SQLite refuses to promote a stale snapshot [B: sqlite.org
+  isolation]: a decision made on an observed state may publish only while that state holds.
+- **Rule.** A check is a rebase's verdict with nothing settled, answered with its stamp (work, green, base, head,
+  revision). A resolution names the stamp and is refused `StaleMergeView`, nothing changed, unless the work is at the
+  stamp's revision and base and the green at its head; it retires canonical operations by index, rebases the rest
+  onto that head, applies the agent's changes there, and restates the work (A-207's restatement, one recorded step).
+  The windows reuse A-267's kept verdict; nothing pages them twice. None of A-255, A-257 or A-263-A-267 is changed.
+- **Tests.** `crates/server/tests/merge_check.rs` on one shard and on eight (every work off its green's shard): a
+  conflicting check names the head and base and changes neither the work's bytes nor the green; a clean check leaves
+  the base where it was; the views read both sides; a resolution retiring the work's operations on the file and writing
+  the agent's bytes at the head merges as written; a moved head and a changed work refuse the resolution and the work
+  read; a resolution keeping a conflicting operation answers the windows with nothing changed. Red: with the stamped
+  head's check removed, the moved head's resolution was applied (the test failed there).
+

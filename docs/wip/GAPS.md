@@ -3350,6 +3350,17 @@
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
 
+> **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
+> and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**
+> adacachy (Linux x86_64, 32 cores, load 31-55, shared with CI), release main 90e9b720c, `ci/interop/hg-matrix.sh` over
+> Mercurial's whole history (57,053 changesets): 22 of 24. The watchdog named `hg_push::unbundle` (1,091 ms of CPU
+> without a step), the HTTP edge's connection task (`vcs_http.rs:850`, `drive`, twice, each killed) and the restarted
+> daemon's start (`daemon.rs:1186`, `start_shard`, at its first poll, killed): spins 5, kills 4, restarts 4. clone-rev
+> failed `bad HTTP status line: ''` and ssh-push `stream ended unexpectedly`, each a client whose daemon was killed
+> under it. The same matrix on the Mac Studio (release 907c246ac, load 13-30) was 24 of 24 with no spin. git v2.0.0 on
+> the same Linux run: 26 of 27, two spins in `git_encode.rs:359` (`settle_encodings`, w-k90-vendor's encode spin) and
+> no kill; deepen's bad pack is w-bugs'. Report: adacachy `~/.cache/w-interop/r-linuxc-2239.txt`, anchor logs beside it.
+
 > **A daemon whose control shard was busy with recovered work stopped itself, and its anchor restarted it into the same
 > work (2026-11-20; CLOSED, g226; found by w-interop's git matrix).** On debug main 3e1983bc9, a 56 MB push of git/git
 > at v2.0.0 left the daemon in a restart loop: 78 exits, each `daemon exited (Some(0))`. Each restart served,
@@ -5283,7 +5294,7 @@
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
-> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; each packet's frame clone, its allocations and its stream bytes' copy removed; owed: the receiver's copies, and one syscall a datagram, the profile's top); and the shared-green
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; 1.3 GB/s median after the sender's and receiver's per-packet copies were removed, BENCHMARKS 2026-11-20; owed: one syscall a datagram, the profile's top, and a datagram's copy out of the shard's receive buffer); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a
 > shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
 > inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
@@ -24057,7 +24068,7 @@ experiment/*, codex/*), none on origin: 1,387 commits not on main (cc29bfc4c), 6
 (VFS, DAX, FUSE, catalog, reclaim, runtime) are outside this goal and untouched. None duplicates A-255, A-257 or A-263-A-267
 in what lands. Branch tips as of 2026-11-10:
 
-- **LAND (port onto main, red first; in flight).** Evidence: main has no non-publishing check and no head-conditional resolution: `submit`/`rebase` and A-267's kept-verdict paging only.
+- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** Not ported: the Codex `rebase_with` refinement (a kept operation conflicting only on a path the replacement re-establishes answers the windows instead), and its CLI and MCP review adapters (next).
   `work/slates-atomic-conflicts` 6420b7ee7, `work/slates-conflict-cli` 0d5ab5141, `work/slates-conflict-mutants` 65472f43a.
 - **superseded: A-257 (a green's chain records its verdict; recovery applies it), A-782 (one typed outcome).** Evidence: `green_checkpoint.rs` (0782fdb0c), `recovery.rs`.
   `work/slates-owned-merge-verdict` fd456c059, `work/slates-runtime-step-verdict` f5f26fe41, `work/slates-server-root-publication` 246b88842, `work/slates-verdict-counter-mutant` 246b88842, `work/slates-verdict-force-inline` f065ee4ad, `work/slates-verdict-inline-commit` 2bf699369, `work/slates-verdict-ordinary-path` 2bf699369.

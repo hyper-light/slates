@@ -202,11 +202,20 @@ pub enum StreamError {
   },
 }
 
-/// The receive side of one ordered stream: a read cursor, the out-of-order segments buffered above
-/// it (non-overlapping, keyed by start offset), the final length once `fin` is seen, and the window.
+/// The receive side of one ordered stream: the bytes delivered in order and not yet read, the cursor past them, the
+/// out-of-order segments buffered above it (non-overlapping, keyed by start offset), the final length once `fin` is
+/// seen, and the window. A segment that reaches the cursor is appended to the delivered bytes as it is offered, its
+/// only copy, and [`StreamAssembler::read`] hands them over whole, by move: before 2026-11-20 every in-order segment
+/// was copied into a buffered segment of its own and copied again into the read's output (MEMORY SIZING; main's ruling
+/// on the lane). Only bytes that arrive past a gap are buffered apart, and moved to the delivered bytes once it fills.
 #[derive(Debug)]
 pub struct StreamAssembler {
+  /// The offset past the last delivered byte: every byte below it is in `delivered` or was read.
   read_offset: u64,
+  /// The bytes delivered in order and not yet read, ending at `read_offset`. Bounded by the window.
+  delivered: Vec<u8>,
+  /// The cursor as [`StreamAssembler::advance`] last reported it.
+  advanced: u64,
   buffered: BTreeMap<u64, Vec<u8>>,
   fin: Option<u64>,
   window: u64,
@@ -220,6 +229,8 @@ impl StreamAssembler {
   pub fn new(window: u64) -> StreamAssembler {
     StreamAssembler {
       read_offset: 0,
+      delivered: Vec::new(),
+      advanced: 0,
       buffered: BTreeMap::new(),
       fin: None,
       window,
@@ -295,7 +306,21 @@ impl StreamAssembler {
     if pos < end {
       self.buffer_gap(offset, pos, end, data);
     }
+    self.deliver_contiguous();
     Ok(())
+  }
+
+  /// Moves every buffered segment that now starts at the cursor to the delivered bytes, advancing the cursor past it.
+  /// The first, when nothing is delivered and unread, is taken as it is, copied nowhere.
+  fn deliver_contiguous(&mut self) {
+    while let Some(segment) = self.buffered.remove(&self.read_offset) {
+      self.read_offset = self.read_offset.saturating_add(segment.len() as u64);
+      if self.delivered.is_empty() {
+        self.delivered = segment;
+      } else {
+        self.delivered.extend_from_slice(&segment);
+      }
+    }
   }
 
   /// Buffers `data`'s bytes for the absolute range `[from, to)` (a gap), keyed by `from`. `from` and
@@ -309,20 +334,30 @@ impl StreamAssembler {
       .unwrap_or(data.len())
       .min(data.len());
     if let Some(gap) = data.get(lo..hi).filter(|gap| !gap.is_empty()) {
-      self.buffered.insert(from, gap.to_vec());
+      if from == self.read_offset {
+        // In order: delivered at once, its one copy, and the cursor moves past it.
+        self.delivered.extend_from_slice(gap);
+        self.read_offset = to;
+      } else {
+        self.buffered.insert(from, gap.to_vec());
+      }
     }
   }
 
-  /// Drains and returns the bytes now contiguous from the read cursor (empty when the next byte is
-  /// still missing), advancing the cursor past them. Adjacent buffered segments are consumed across
-  /// their boundaries.
+  /// The bytes delivered in order since the last call: how far the stream came, for its reader to slide its window and
+  /// count its progress by, the bytes themselves left delivered until [`StreamAssembler::read`] takes them.
+  pub fn advance(&mut self) -> u64 {
+    self.deliver_contiguous();
+    let newly = self.read_offset.saturating_sub(self.advanced);
+    self.advanced = self.read_offset;
+    newly
+  }
+
+  /// Takes the bytes delivered in order since the last read (empty when the next byte is still missing): handed over
+  /// whole, by move, never copied. The cursor already stands past them.
   pub fn read(&mut self) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(segment) = self.buffered.remove(&self.read_offset) {
-      self.read_offset = self.read_offset.saturating_add(segment.len() as u64);
-      out.extend_from_slice(&segment);
-    }
-    out
+    self.deliver_contiguous();
+    std::mem::take(&mut self.delivered)
   }
 
   /// Raises the receive window to `max` (monotonic) — the receiver granting itself more buffer as it
@@ -351,7 +386,7 @@ impl StreamAssembler {
       .max(self.fin.unwrap_or(0))
   }
 
-  /// Whether every byte through `fin` has been delivered by `read`.
+  /// Whether every byte through `fin` has been delivered: read, or waiting for [`StreamAssembler::read`].
   pub fn is_complete(&self) -> bool {
     self.fin == Some(self.read_offset)
   }

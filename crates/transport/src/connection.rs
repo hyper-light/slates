@@ -44,7 +44,9 @@ use crate::pacer::Pacer;
 use crate::pmtud::{BASE_PLPMTU, PathMtu, PathMtuStats};
 use crate::reorder::Reordering;
 use crate::rtt::RttEstimator;
-use crate::session::{ACK_FRAME_BASE_BYTES, ACK_RANGE_BYTES, Frame, STREAM_FRAME_HEADER_BYTES};
+use crate::session::{
+  ACK_FRAME_BASE_BYTES, ACK_RANGE_BYTES, Frame, FrameRef, STREAM_FRAME_HEADER_BYTES,
+};
 use crate::stream::{StreamAssembler, StreamSender};
 use crate::streams::{Arrival, ReplyAdmission, StreamSpace, priority};
 
@@ -1294,6 +1296,19 @@ impl Connection {
   /// queues for retransmission whatever is declared lost. An acknowledgement-only packet does not oblige
   /// an acknowledgement in return (RFC 9002 §2).
   pub fn handle_incoming(&mut self, now: u64, pn: u64, frames: &[Frame]) {
+    self.handle_frames(now, pn, frames.iter().map(FrameRef::lend));
+  }
+
+  /// [`Connection::handle_incoming`] of frames as a payload yields them in place (`session::frame_refs`), a stream
+  /// frame's bytes lent from the received packet and offered from there, copied once, into their stream's delivered
+  /// bytes (MEMORY SIZING; main's ruling on the lane, 2026-11-20). The caller has checked the payload decodes whole
+  /// (`session::validate_frames`), so a packet is taken whole or not at all.
+  pub fn handle_frames<'a>(
+    &mut self,
+    now: u64,
+    pn: u64,
+    frames: impl IntoIterator<Item = FrameRef<'a>>,
+  ) {
     // A packet whose number was already processed is a network duplicate (RFC 9000 §12.3): dropped whole.
     if self.acks.is_duplicate(pn) {
       self.duplicates = self.duplicates.saturating_add(1);
@@ -1301,7 +1316,25 @@ impl Connection {
     }
     self.acks.record(pn);
     let mut ack_eliciting = false;
-    for frame in frames {
+    for item in frames {
+      let owned;
+      let frame = match item {
+        FrameRef::Stream {
+          stream_id,
+          offset,
+          fin,
+          data,
+        } => {
+          ack_eliciting = true;
+          self.on_stream_frame(stream_id, offset, data, fin);
+          continue;
+        }
+        FrameRef::Owned(frame) => {
+          owned = frame;
+          &owned
+        }
+        FrameRef::Held(frame) => frame,
+      };
       match frame {
         Frame::Stream {
           stream_id,
@@ -1852,13 +1885,23 @@ impl Connection {
   /// next acknowledgement advertises fresh credit a window ahead of the new read cursor. Empty if the
   /// stream is unknown.
   pub fn read_stream(&mut self, now: u64, stream_id: u64) -> Vec<u8> {
+    self.advance_stream(now, stream_id);
+    self.take_stream(stream_id)
+  }
+
+  /// Slides receive stream `stream_id`'s flow-control window past the bytes delivered in order since the last call (at
+  /// `now`), auto-tuning the window as [`Connection::read_stream`] does, and returns how many they were; the bytes stay
+  /// delivered for [`Connection::take_stream`]. What an endpoint does with a message's stream until the message is
+  /// whole, then takes it by move: before 2026-11-20 every chunk read was copied onto the message's bytes (MEMORY
+  /// SIZING; main's ruling on the lane). The receiver holds the same bytes either way, a message's worth.
+  pub fn advance_stream(&mut self, now: u64, stream_id: u64) -> u64 {
     let Some(assembler) = self.recv_streams.get_mut(&stream_id) else {
-      return Vec::new();
+      return 0;
     };
-    let bytes = assembler.read();
+    let newly = assembler.advance();
     let read_offset = assembler.read_offset();
     self.flow.on_stream_consumed(stream_id, read_offset);
-    if !bytes.is_empty() {
+    if newly > 0 {
       self.credit_dirty.insert(stream_id);
       let window = self.flow.window();
       let rtt = self.rtt.has_sample().then(|| self.rtt.smoothed_rtt());
@@ -1868,7 +1911,17 @@ impl Connection {
         self.credit_dirty.extend(self.recv_streams.keys().copied());
       }
     }
-    bytes
+    newly
+  }
+
+  /// Takes receive stream `stream_id`'s bytes delivered in order and not yet taken, by move. Empty if the stream is
+  /// unknown.
+  pub fn take_stream(&mut self, stream_id: u64) -> Vec<u8> {
+    self
+      .recv_streams
+      .get_mut(&stream_id)
+      .map(StreamAssembler::read)
+      .unwrap_or_default()
   }
 
   /// The receive streams a stream frame reached since the last call, still open: what a reader must read now. A
