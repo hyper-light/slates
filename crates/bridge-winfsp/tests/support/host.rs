@@ -46,6 +46,7 @@ const RELIEF_BEAT: std::time::Duration = std::time::Duration::from_millis(100);
 const ONE_MOUNT: HoldBounds = HoldBounds {
   attachments: 1,
   sections: 0,
+  extents: 0,
 };
 
 /// Format: the role selected by this fixture, the inherited channel's hex handle and its drive text.

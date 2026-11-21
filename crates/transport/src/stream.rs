@@ -12,7 +12,23 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 use crate::session::Frame;
+
+/// One frame's worth of a send stream's bytes, named rather than copied ([`StreamSender::next_span`]): the stream, the
+/// offset, the length and whether it carries the stream's end. What a packet in flight keeps of the stream data it
+/// carried, and what a resend encodes again from the sender's buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamSpan {
+  /// The stream.
+  pub stream_id: u64,
+  /// The first byte's offset in the stream.
+  pub offset: u64,
+  /// The bytes it carries.
+  pub len: u64,
+  /// Whether it ends the stream.
+  pub fin: bool,
+}
 
 /// The send side of one ordered stream (§4.10a §8): buffered application bytes framed into
 /// `Stream` frames **only within the flow-control credit** the peer grants (its `MaxStreamData`),
@@ -72,52 +88,65 @@ impl StreamSender {
     self.finished = true;
   }
 
-  /// The next `Stream` frame to send on `stream_id`, at most `max_frame_len` bytes, bounded by the
-  /// credit — or `None` when nothing is sendable yet (no bytes within credit, and no `fin` to mark).
-  pub fn next_frame(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Frame> {
-    let sendable_end = (self.buffered.len() as u64).min(self.credit);
+  /// The next frame's span of this stream's buffered bytes within the flow-control credit, at most `max_frame_len`
+  /// bytes, or the terminating empty `fin` once every byte is framed and the credit covers the final offset; `None`
+  /// with nothing to frame. The bytes stay here: the span names them (`offset`, `len`), and the frame is encoded from
+  /// them when its packet is built and again if it is resent ([`StreamSender::bytes`]). The sender keeps every written
+  /// byte until its connection forgets the stream, after the last of them is acknowledged, so an owed span's bytes are
+  /// always here. Before 2026-11-20 each frame copied its bytes out (MEMORY SIZING; main's ruling on the lane).
+  pub fn next_span(&mut self, stream_id: u64, max_frame_len: usize) -> Option<StreamSpan> {
+    let buffered = self.buffered.len() as u64;
+    let sendable_end = buffered.min(self.credit);
     if self.send_offset >= sendable_end {
       // No data within credit. Emit the terminating empty fin frame once, when every buffered byte
       // has been framed and the credit covers the final offset.
       if self.finished
         && !self.fin_framed
-        && self.send_offset == self.buffered.len() as u64
+        && self.send_offset == buffered
         && self.send_offset <= self.credit
       {
         self.fin_framed = true;
-        return Some(Frame::Stream {
+        return Some(StreamSpan {
           stream_id,
           offset: self.send_offset,
+          len: 0,
           fin: true,
-          data: Vec::new(),
         });
       }
       return None;
     }
     let start = self.send_offset;
-    let want = sendable_end.saturating_sub(start).min(max_frame_len as u64);
-    let lo = usize::try_from(start)
-      .unwrap_or(usize::MAX)
-      .min(self.buffered.len());
-    let hi = lo
-      .saturating_add(usize::try_from(want).unwrap_or(0))
-      .min(self.buffered.len());
-    let data = self
-      .buffered
-      .get(lo..hi)
-      .map(<[u8]>::to_vec)
-      .unwrap_or_default();
-    self.send_offset = start.saturating_add(hi.saturating_sub(lo) as u64);
+    let len = sendable_end.saturating_sub(start).min(max_frame_len as u64);
+    self.send_offset = start.saturating_add(len);
     // The fin rides the frame that carries the final byte (when the credit reaches the end).
-    let fin = self.finished && self.send_offset == self.buffered.len() as u64;
+    let fin = self.finished && self.send_offset == buffered;
     if fin {
       self.fin_framed = true;
     }
-    Some(Frame::Stream {
+    Some(StreamSpan {
       stream_id,
       offset: start,
+      len,
       fin,
-      data,
+    })
+  }
+
+  /// The buffered bytes a span names: `len` from `offset`; `None` past what is buffered.
+  pub fn bytes(&self, offset: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    self.buffered.get(start..end)
+  }
+
+  /// [`StreamSender::next_span`] as a frame holding a copy of its bytes: how the tests read what a stream frames.
+  #[cfg(test)]
+  pub fn next_frame(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Frame> {
+    let span = self.next_span(stream_id, max_frame_len)?;
+    Some(Frame::Stream {
+      stream_id,
+      offset: span.offset,
+      fin: span.fin,
+      data: self.bytes(span.offset, span.len)?.to_vec(),
     })
   }
 
@@ -173,11 +202,20 @@ pub enum StreamError {
   },
 }
 
-/// The receive side of one ordered stream: a read cursor, the out-of-order segments buffered above
-/// it (non-overlapping, keyed by start offset), the final length once `fin` is seen, and the window.
+/// The receive side of one ordered stream: the bytes delivered in order and not yet read, the cursor past them, the
+/// out-of-order segments buffered above it (non-overlapping, keyed by start offset), the final length once `fin` is
+/// seen, and the window. A segment that reaches the cursor is appended to the delivered bytes as it is offered, its
+/// only copy, and [`StreamAssembler::read`] hands them over whole, by move: before 2026-11-20 every in-order segment
+/// was copied into a buffered segment of its own and copied again into the read's output (MEMORY SIZING; main's ruling
+/// on the lane). Only bytes that arrive past a gap are buffered apart, and moved to the delivered bytes once it fills.
 #[derive(Debug)]
 pub struct StreamAssembler {
+  /// The offset past the last delivered byte: every byte below it is in `delivered` or was read.
   read_offset: u64,
+  /// The bytes delivered in order and not yet read, ending at `read_offset`. Bounded by the window.
+  delivered: Vec<u8>,
+  /// The cursor as [`StreamAssembler::advance`] last reported it.
+  advanced: u64,
   buffered: BTreeMap<u64, Vec<u8>>,
   fin: Option<u64>,
   window: u64,
@@ -191,6 +229,8 @@ impl StreamAssembler {
   pub fn new(window: u64) -> StreamAssembler {
     StreamAssembler {
       read_offset: 0,
+      delivered: Vec::new(),
+      advanced: 0,
       buffered: BTreeMap::new(),
       fin: None,
       window,
@@ -266,7 +306,21 @@ impl StreamAssembler {
     if pos < end {
       self.buffer_gap(offset, pos, end, data);
     }
+    self.deliver_contiguous();
     Ok(())
+  }
+
+  /// Moves every buffered segment that now starts at the cursor to the delivered bytes, advancing the cursor past it.
+  /// The first, when nothing is delivered and unread, is taken as it is, copied nowhere.
+  fn deliver_contiguous(&mut self) {
+    while let Some(segment) = self.buffered.remove(&self.read_offset) {
+      self.read_offset = self.read_offset.saturating_add(segment.len() as u64);
+      if self.delivered.is_empty() {
+        self.delivered = segment;
+      } else {
+        self.delivered.extend_from_slice(&segment);
+      }
+    }
   }
 
   /// Buffers `data`'s bytes for the absolute range `[from, to)` (a gap), keyed by `from`. `from` and
@@ -280,20 +334,30 @@ impl StreamAssembler {
       .unwrap_or(data.len())
       .min(data.len());
     if let Some(gap) = data.get(lo..hi).filter(|gap| !gap.is_empty()) {
-      self.buffered.insert(from, gap.to_vec());
+      if from == self.read_offset {
+        // In order: delivered at once, its one copy, and the cursor moves past it.
+        self.delivered.extend_from_slice(gap);
+        self.read_offset = to;
+      } else {
+        self.buffered.insert(from, gap.to_vec());
+      }
     }
   }
 
-  /// Drains and returns the bytes now contiguous from the read cursor (empty when the next byte is
-  /// still missing), advancing the cursor past them. Adjacent buffered segments are consumed across
-  /// their boundaries.
+  /// The bytes delivered in order since the last call: how far the stream came, for its reader to slide its window and
+  /// count its progress by, the bytes themselves left delivered until [`StreamAssembler::read`] takes them.
+  pub fn advance(&mut self) -> u64 {
+    self.deliver_contiguous();
+    let newly = self.read_offset.saturating_sub(self.advanced);
+    self.advanced = self.read_offset;
+    newly
+  }
+
+  /// Takes the bytes delivered in order since the last read (empty when the next byte is still missing): handed over
+  /// whole, by move, never copied. The cursor already stands past them.
   pub fn read(&mut self) -> Vec<u8> {
-    let mut out = Vec::new();
-    while let Some(segment) = self.buffered.remove(&self.read_offset) {
-      self.read_offset = self.read_offset.saturating_add(segment.len() as u64);
-      out.extend_from_slice(&segment);
-    }
-    out
+    self.deliver_contiguous();
+    std::mem::take(&mut self.delivered)
   }
 
   /// Raises the receive window to `max` (monotonic) — the receiver granting itself more buffer as it
@@ -322,7 +386,7 @@ impl StreamAssembler {
       .max(self.fin.unwrap_or(0))
   }
 
-  /// Whether every byte through `fin` has been delivered by `read`.
+  /// Whether every byte through `fin` has been delivered: read, or waiting for [`StreamAssembler::read`].
   pub fn is_complete(&self) -> bool {
     self.fin == Some(self.read_offset)
   }

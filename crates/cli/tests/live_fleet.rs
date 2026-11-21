@@ -2020,11 +2020,6 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
   const PER_ROUND: usize = 400;
   /// Shape: each write's bytes, a page.
   const WRITE_BYTES: usize = 4096;
-  /// Shape: the wait after the stream before the idle reading: far past any shard's idle window (the wake estimate
-  /// times the idle ratio, a few milliseconds at most), so the reading sees the daemons as they idle.
-  const SETTLE: Duration = Duration::from_millis(500);
-  /// Shape: the quiet stretch the idle CPU is read over: ten heartbeats of the daemons' own periodic work.
-  const QUIET: Duration = Duration::from_secs(1);
   if std::env::var_os("SLATES_TEST_CLI").is_none()
     || std::env::var_os("SLATES_TEST_MEASURE").is_none()
   {
@@ -2077,16 +2072,10 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
     }
     streaming.store(false, std::sync::atomic::Ordering::Release);
   });
-  let streamed_to = fleet_cpu_ns(&fleet);
-  std::thread::sleep(SETTLE);
-  let quiet_from = fleet_cpu_ns(&fleet);
-  std::thread::sleep(QUIET);
-  let quiet_to = fleet_cpu_ns(&fleet);
-  let (streamed, settling, quiet) = (
-    cpu_used_ms(&streamed_from, &streamed_to),
-    cpu_used_ms(&streamed_to, &quiet_from),
-    cpu_used_ms(&quiet_from, &quiet_to),
-  );
+  // The CPU over the stream alone: the idle after it was read over fixed windows the test waited out (D-9 refuses the
+  // sleep), and what they answered is recorded (BENCHMARKS, g228: 10-30 ms a second a daemon once a status does no
+  // residency work).
+  let streamed = cpu_used_ms(&streamed_from, &fleet_cpu_ns(&fleet));
   let caught = live_line(owner, "shipping", &live_id);
   let late = counter(owner, "fleet.live.durable_late");
   let lent = (
@@ -2119,7 +2108,7 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
      p99 {p99:.1} p999 {p999:.1} max {max:.1} us\n  live  p50 {l50:.1} p99 {l99:.1} p999 {l999:.1} max {lmax:.1} us\n  \
      added at p50 {:.1} us; live log at the end {caught:?}; late {late}; (no_session, unanswered, link_lost) {lent:?}; \
      live writes over 50 ms {}\n  cpu ms (process, control shard) in node order, owner {owner_index}: stream {streamed:?}; \
-     the {} ms after it {settling:?}; the {} ms after that {quiet:?}; plain statuses asked during the stream {}",
+     plain statuses asked during the stream {}",
     plain_times.len(),
     load.trim(),
     l50 - p50,
@@ -2127,8 +2116,6 @@ fn measure_live_shipping(tag: &str, status_burst: bool) {
       .iter()
       .filter(|time| **time > Duration::from_millis(50))
       .count(),
-    SETTLE.as_millis(),
-    QUIET.as_millis(),
     statuses.load(std::sync::atomic::Ordering::Acquire)
   );
   assert_eq!(late, 0, "no stable write waited out its bound");

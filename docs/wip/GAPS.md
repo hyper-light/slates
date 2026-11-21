@@ -23,6 +23,14 @@
 >   stays 1,009–1,011 µs (run 44860060964), and the band survives no idle spin and no hold (run 44861831509): a kicked
 >   shard waits a millisecond for a CPU. The lane's own ping-pong floor beside the bench: p99 4.7–5.1 µs, p999 0.8–2.7 ms.
 >   New finding, not worked: Windows' completion-port wait rounds up to whole milliseconds too (`crates/rt/src/iocp.rs`).
+> - **Linux's band found (2026-11-20, g222): the client's own reply spin.** While a client spins for its reply, the
+>   shard it woke gets no CPU on the oversubscribed lane, so the shard runs when the spin ends: the queued wait clusters
+>   where the spin ends (1 ms spin: 1.0 ms; 200 µs: 0.2 ms; park at once: none; runs 44868692669, 44869944205), and the
+>   per-park stamps show a kicked shard running ~1 ms after it parked whatever the kick's time (run 44867818237).
+>   Loaded accept p99 by the client's wait: the library default (its wake estimate) 1.7–5.1 ms, capped at 50 µs 1.9–2.1,
+>   yielding each spin turn 12–18 (rejected), parked at once **0.32–0.39 ms** (conflict 0.30–0.91); parking at once
+>   costs the quiet median 15–30 µs (runs 44871159397, 44873199369). Loaded p999 0.9–4.0 ms in every arm (the floor's
+>   0.8–2.8). **Owed:** main's decision on the client's sync wait (§4.7's spin, R9's spinning provisioning form).
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
 >   p999 0.2–62 ms. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–7).
 >
@@ -5261,7 +5269,7 @@
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
-> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; each packet's frame clone and allocations removed, the stream bytes' copy into each frame and the receiver's copies owed); and the shared-green
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; 1.3 GB/s median after the sender's and receiver's per-packet copies were removed, BENCHMARKS 2026-11-20; owed: one syscall a datagram, the profile's top, and a datagram's copy out of the shard's receive buffer); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a
 > shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
 > inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
