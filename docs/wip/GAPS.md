@@ -7,9 +7,12 @@
 > switches between a forwarded reply's two tasks); the A/B and the next step are in 8a-r9-gate.
 
 > **REAL TOOLS ACROSS SNAPSHOTS, EVICTION AND TAKEOVER (w-realtools, 2026-11-20).** A-781 BUILT: without a birth time,
-> an unchanged base file keeps its inode number across a takeover (`#pragma once`). Open: the kernel-mount acceptance
-> runs (a `#pragma once` build, `make`, `cargo build` and `git status` over a mount across a snapshot, a restart and a
-> takeover) on macOS NFS, Linux FUSE and Windows WinFsp.
+> an unchanged base file keeps its inode number across a takeover (`#pragma once`). BUILT on macOS NFS:
+> `crates/cli/tests/real_tools.rs` (a `#pragma once` compile held across the events, `make -q`, `cargo build` a no-op,
+> `git status` clean, every tracked file's inode number and times compared) across a snapshot, a SIGKILL takeover by
+> the anchor's next daemon and memory pressure (an injected hold and stall); green on adas-macbook-pro-2 (APFS).
+> Open: the same flows over Linux FUSE and Windows WinFsp (the test is macOS-only; run-requests.md), and memory
+> pressure from a host actually short of memory (the test injects it).
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
