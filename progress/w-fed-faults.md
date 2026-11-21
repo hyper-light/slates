@@ -1,4 +1,5 @@
 # RESUME HERE (2026-11-20 ~20:45 PST): CLOSE LIST DONE
+- 92b STOPPED on main's order (no S3 work: Ada never asked for it): adacachy unit w-fed-faults-92b stopped before any result; nothing committed; only an untracked build script in ~/slates-work/w-fed-faults-slates. Waiting for main.
 - C1 (goal 91) closed: inbox/main-from-w-fed-faults-close.md 7aa3c86; kiln 73712cc last. All six flows PASS on macOS;
   killed/restarted/partitioned PASS on Linux; Linux link flows filed for main's lane (run-requests a89aeaa).
 - C2 (goal 85c) closed: slates c733506 (GAPS), live_chaos client-killed-mid-write PASSED macOS (9.3 s); inbox 7d202fd.
