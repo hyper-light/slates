@@ -991,17 +991,30 @@ fn main() {
     let stop = AtomicBool::new(false);
     let spinners = cores.saturating_mul(selection.spinners_per_core);
     println!("loaded: {spinners} spinning threads on {cores} cores");
+    // DIAG (84a macOS; never main): the load's own throughput, its spinners' turns a second, so an arm that runs the
+    // daemon ahead of the load shows what it took from it.
+    let turns = std::sync::atomic::AtomicU64::new(0);
+    let started = std::time::Instant::now();
     std::thread::scope(|scope| {
       for _ in 0..spinners {
         scope.spawn(|| {
+          let mut mine = 0_u64;
           while !stop.load(Ordering::Relaxed) {
             std::hint::spin_loop();
+            mine = mine.wrapping_add(1);
           }
+          turns.fetch_add(mine, Ordering::Relaxed);
         });
       }
       sweep(&instance, "loaded", &selection);
       stop.store(true, Ordering::Relaxed);
     });
+    let seconds = started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE);
+    #[allow(clippy::cast_precision_loss)]
+    let rate = turns.load(Ordering::Relaxed) as f64 / seconds / 1e6;
+    println!(
+      "load throughput: {rate:.1} million spinner turns a second over {seconds:.1} s ({spinners} spinners)"
+    );
   }
   // Each shard's pulse as the runtime holds it (§4.14): its longest step tells a request held behind a long task from
   // one whose shard was woken late; its overrun says how late its timed waits ran.
