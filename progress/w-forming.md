@@ -1,3 +1,8 @@
+# 2026-11-21 ~12:00 (w-forming): NOT DONE. Goal 93 piece: vcs_concurrency.rs LANDED 7f1e5a13e (compiles clean),
+# focused case NEVER RUN -- BLOCKED: no reachable machine has stock svn 1.15 / hg 7.2 (kiln runners: none; Studio-4
+# none; Studios .local/-2 at 2 GB / 80 MB free, not answering; d1323898 dead); installs need Ada. Asked main
+# (inbox/main-from-w-forming-blocked.md). 85b: C1, R2 closed; C3 and P4 open on rounds main runs (run-requests.md).
+
 # 2026-11-21 (w-forming), 85b: C1 CLOSED 95adf9632, R2 CLOSED c922a41d1. P4: A-827 (reader's hold on a volume's
 # head; whole captures imaged + read in turns) LANDED 4a0cbd7b7; debug 311 inodes: one-turn 598-849 us -> held longest
 # turn 36-66 us; release A/B kiln r3 queued (.git/w-forming-ab/p4.sh). Acted on 01a1ff31's P4 ruling (a) -- asked new
