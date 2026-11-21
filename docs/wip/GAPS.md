@@ -257,12 +257,15 @@
 > landing, or names that changed between the homing and the append (another push committed one of its objects) refuse
 > it, `PushFailed::Unlanded` (`GitRefused::Unlanded` at the append), for the client's retry. An append that brings no
 > object names none (version 5, no names, no pack, sequence 0). The test switch `write_version_4[_for_test]` is gone.
-> The one register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody
-> homed, which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing
-> order, and a push whose driver never takes the homing it asks (the tests' synchronous drivers, `git_push::tests::
-> answered`/`pushed`; counted `HOMING_UNTAKEN`). Owed (w-git): piece 2, those drivers made async on stored daemons and an
-> untaken ask refusing; piece 3, made commits onto the deferred-submit hook, and `record_of` removed with them; the
-> replay reading the pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
+> Piece 2 BUILT (2026-11-21): an ask no edge takes by the turn after refuses the push too (counted `HOMING_UNTAKEN`), so
+> a client's push has no version-2 path at all; the tests' synchronous push drivers carry it through a stand-in edge
+> (`git_push::tests::carry_blocking`: the homing handed back under its own BLAKE3 on the one-node test daemon, the
+> changeset landed for real from a thread of its own), their async ones through the edge's own `carry`. The one
+> register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody homed,
+> which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing order, and
+> a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Owed (w-git): piece 3,
+> made commits onto the deferred-submit hook, and `record_of` removed with them; the replay reading the pack a piece at
+> a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first

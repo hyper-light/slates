@@ -321,7 +321,7 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   loop {
     match push.answer_step(state, &mut answer).expect("answered") {
       Answering::Answered(received) => return (answer, *received),
-      Answering::Turned => {}
+      Answering::Turned => carry_blocking(state, push),
       #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
@@ -912,6 +912,8 @@ fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_appen
         {
           outcomes[at] = reasons(&received);
           *slot = None;
+        } else {
+          carry_blocking(state, push);
         }
       }
     }
@@ -1055,7 +1057,10 @@ async fn driven(
     went();
     match step {
       Answering::Answered(received) => break *received,
-      Answering::Turned => slates_rt::futures::yield_now().await,
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
         with_state(|state| push.hook_ran(state, ran, &mut answer))
@@ -1399,7 +1404,7 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
     let received = loop {
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break *received,
-        Answering::Turned => {}
+        Answering::Turned => carry_blocking(state, &mut push),
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
@@ -1492,7 +1497,10 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
       let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break *received,
-        Answering::Turned => deciding += usize::from(was_deciding),
+        Answering::Turned => {
+          deciding += usize::from(was_deciding);
+          carry_blocking(state, &mut push);
+        }
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
@@ -1535,7 +1543,7 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
       turns += 1;
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break received,
-        Answering::Turned => {}
+        Answering::Turned => carry_blocking(state, &mut push),
         #[cfg(unix)]
         step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
       }
@@ -1567,6 +1575,47 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
       &[crate::vcs_store::green_key(main)],
     );
   });
+}
+
+/// The edge's carry as a test's synchronous driver stands in for it (C5 part 2b piece 2: a push whose homing no edge
+/// takes is refused): its names and pack handed back homed under their own identity (the BLAKE3 the region would home
+/// them by; a test's daemon is one node, whose content store already holds them, and the region's crossing is held by
+/// the async drivers' tests, [`homed_drive`]), and its changeset landed on the node's store for real, from a thread of
+/// its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked nothing.
+pub(crate) fn carry_blocking(state: &mut ShardState, push: &mut ReceivePack) {
+  let Some(asked) = push.take_homing() else {
+    return;
+  };
+  let carried = match asked {
+    super::Carry::Home(bytes) => super::Carried::Homed(crate::vcs_store::homes::Homed {
+      outcome: Ok(slates_vcs::ContentId::of(&bytes)),
+      bytes,
+    }),
+    super::Carry::Land(landing) => {
+      let super::Landing {
+        disk,
+        header,
+        parts,
+      } = *landing;
+      super::Carried::Landed(crate::test_store::land_answered_blocking(
+        disk, header, parts,
+      ))
+    }
+  };
+  push.homed(state, carried);
+}
+
+/// The edge's carry as a test's async driver runs it ([`super::carry`]): the homing or the landing the push asked,
+/// handed back. Refused only where the shard's state is not lent.
+pub(crate) async fn carry_awaited(push: &mut ReceivePack) -> Result<(), String> {
+  use crate::state::with_state;
+  if let Some(asked) = push.take_homing() {
+    let (origin, shards) =
+      with_state(|state| (state.shard, state.shards.clone())).ok_or("no state to carry")?;
+    let carried = super::carry(origin, &shards, asked).await;
+    with_state(|state| push.homed(state, carried)).ok_or("no state for the carried")?;
+  }
+  Ok(())
 }
 
 /// One push of `request` driven as an edge drives it (`crate::vcs_http::git::receive`): its answer a step at a time,
@@ -1813,7 +1862,10 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
     timed(began);
     match step {
       Answering::Answered(received) => break *received,
-      Answering::Turned => slates_rt::futures::yield_now().await,
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
       #[cfg(unix)]
       Answering::Hook(_) => return Err("no hook is configured".to_owned()),
     }
@@ -2091,21 +2143,35 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
   });
 }
 
-/// A-724 piece 8c (a decision never waits for a homing nobody runs: found by the takeover test, where the HTTP edge had
-/// lost its homing in a refactor and a version-3 push hung). Do: with version 3 on, push stock git's `create` through a
-/// driver that never takes the homing its decision asks for (`pushed`). Expect: answered `ok`, its record version 2,
-/// the untaken homing counted.
+/// A-724 piece 8c and C5 part 2b piece 2 (a decision never waits for a homing nobody runs, found by the takeover test;
+/// and no record names a push's objects inline). Do: push stock git's `create` through a driver that never takes the
+/// homing its decision asks for. Expect: the push refused `Unlanded`, the untaken homing counted, and the repository's
+/// register holding no record. Red before piece 2: answered `ok`, its record version 2.
 #[test]
-fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
+fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
   crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "untaken");
-    pushed_from_the_fixtures(state, repository, &["create"]);
-    let records = crate::vcs_store::tests::records(state, repository);
-    let versions: Vec<u32> = records
-      .iter()
-      .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
-      .collect();
-    assert_eq!(versions, vec![2]);
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let (_, mut push) = started(state, repository);
+    for piece in request.chunks(PIECE) {
+      push.input(state, piece).expect("taken");
+    }
+    push.end(state).expect("ended");
+    let mut answer = Vec::new();
+    let refused = loop {
+      match push.answer_step(state, &mut answer) {
+        Ok(Answering::Answered(_)) => break None,
+        Ok(Answering::Turned) => {}
+        #[cfg(unix)]
+        Ok(step @ Answering::Hook(_)) => panic!("no hook runs here: {step:?}"),
+        Err(failed) => break Some(format!("{failed:?}")),
+      }
+    };
+    assert_eq!(refused.as_deref(), Some("Unlanded"));
     assert_eq!(
       state
         .refusals
@@ -2113,5 +2179,6 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
         .copied(),
       Some(1)
     );
+    assert_eq!(records(state, repository), 0, "nothing of the push in the register");
   });
 }

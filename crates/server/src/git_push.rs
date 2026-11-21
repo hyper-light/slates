@@ -327,9 +327,8 @@ struct DecidingPush {
 /// them on the node's store as one changeset (`Names` and `Payload`, the bytes the homing gave back moved in), its
 /// sequence taken now; landed, the record is written as version 5 naming the contents and the sequence. A push that
 /// brings no object the repository lacks homes nothing and names none. Any shortfall (a homing short, a pack not held, no
-/// store, a refused landing) refuses the push ([`PushFailed::Unlanded`], C5 part 2b), never a record naming its objects
-/// inline. A driver that never takes an ask (a test's synchronous one) leaves the record version 2, the one such path
-/// left (GAPS).
+/// store, a refused landing, an ask no edge took by the turn after) refuses the push ([`PushFailed::Unlanded`], C5 part
+/// 2b), never a record naming its objects inline.
 #[derive(Debug)]
 enum Homing {
   /// Not yet asked.
@@ -832,12 +831,14 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::Asked(bytes, (identity, count));
         Ok(false)
       }
-      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the content is given back
-      // and the record is version 2, never a decision waiting for a homing nobody runs.
+      // Asked and not taken by the turn after: no edge carries it (a driver that never asks), so the content is given
+      // back and the push refused (C5 part 2b), never a decision waiting for a homing nobody runs, nor a record naming
+      // its objects inline.
       Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _), _) => {
         crate::vcs_store::release_names(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
-        Ok(true)
+        decision.sealed.release_homed(state);
+        Err(PushFailed::Unlanded)
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
@@ -856,10 +857,11 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::LandAsked(landing);
         Ok(false)
       }
-      // A changeset no edge took: no edge lands it, so the record names none (sequence 0), as a daemon with no store's.
+      // A changeset no edge took: no edge lands it, so the push is refused (C5 part 2b).
       Homing::LandAsked(_) => {
         crate::vcs_store::homes::count_untaken(state);
-        Ok(true)
+        decision.sealed.release_homed(state);
+        Err(PushFailed::Unlanded)
       }
       Homing::Unlanded => {
         decision.sealed.release_homed(state);
