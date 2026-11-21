@@ -22548,6 +22548,90 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
 }
 
+/// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of
+/// 2026-11-20 after A-697's release bench, which measured a holder version's inputs shipped back in three shipments).
+/// Do: in a two-node `f = 1` fleet, B serving works over greens A owns (the test hook), a work on B writes a file of 256
+/// KiB and submits; then a work on A does the same. Expect: both answered `Submitted`; B held its composed increment as
+/// the version's inputs and A was told so; no input chunk was shipped for B's version, while A's own version shipped
+/// its chunks to B (the control, so the count is not vacuous).
+#[test]
+fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "inputs-green");
+  daemon_b.serve_works_on_holders(true).unwrap();
+  let mut holder = Client::connect(daemon_b.instance());
+  let bytes = 256 * 1024;
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let holders_work = bench_work(&mut holder, green, "inputs-holder", bytes);
+  let before = count("merge.inputs.chunks_shipped");
+  let held_before = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let holders = holder.call(&RequestBody::submit(holders_work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let holders_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let after_holders = count("merge.inputs.chunks_shipped");
+  let held_after = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let owners_work = bench_work(&mut owner, green, "inputs-owner", bytes);
+  let owners = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let owners_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 3)
+  });
+  let after_owners = count("merge.inputs.chunks_shipped");
+  daemon_b.serve_works_on_holders(false).unwrap();
+  assert!(
+    matches!(
+      holders,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{holders:?}"
+  );
+  assert!(
+    matches!(
+      owners,
+      ReplyBody::Submitted {
+        version: Some(3),
+        ..
+      }
+    ),
+    "{owners:?}"
+  );
+  assert!(
+    holders_placed && owners_placed,
+    "both versions placed at the quorum"
+  );
+  assert_eq!(
+    after_holders - before,
+    0,
+    "no input chunk shipped back to B for its own version"
+  );
+  assert_eq!(
+    (held_after.0 - held_before.0, held_after.1 - held_before.1),
+    (1, 1),
+    "B held its composed inputs, and A was told so"
+  );
+  assert!(
+    after_owners > after_holders,
+    "A's own version shipped its chunks to B: {after_holders} then {after_owners}"
+  );
+}
+
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
 /// submits answered `DuplicateRequest`): in a two-node `f = 1` fleet whose holder B withholds every merge record, a
 /// client on B submits a work whose green A owns. The forwarded submit runs on A, and its acceptance waits for the
