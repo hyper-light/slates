@@ -7421,3 +7421,11 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   daemon edge's port). Each red goes to w-svn as a minimal red test, `inbox/w-svn-from-<runner>-<topic>.md`. Known
   by reading, from clients' A-681 entry above: `propset --revprop` over HTTPv2 may be refused (no PROPPATCH on
   !svn/rev/N).
+
+## w-bugs (A-837, descriptor backstop parts 1-2, landed 9fefaa054): Linux and Windows rounds
+- **Commands:** `cargo test -p slates-machine --lib a837` and `cargo test -p slates-machine --lib descriptors` (every
+  platform); `cargo test -p slates-machine --test descriptor_raise` (Linux: a child lowered to 64 raised to
+  min(hard, fs.nr_open)). Then a daemon's boot log: `grep descriptor_limit` shows `refused: false` and `after` raised.
+- **Platforms:** Linux (adacachy or fedora, ideally one under systemd's LimitNOFILE), Windows (jupiter).
+- **Green:** all pass; Windows' descriptor_limit line shows before = after = 16,777,216, nothing refused. **Red:** the
+  Linux child refused (setrlimit past fs.nr_open) or not raised; send it to w-bugs.
