@@ -11607,8 +11607,10 @@ writer made, the minimal token-grain ranges in which the file it wrote differs f
 alone runs out of its budget, anchors on tokens unique to both files with Myers between them; the cost bounded linear
 in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
 merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
-base yields the writer's file byte for byte (the property test). A path with namespace ops or node-exclusive flags keeps its whole
-replacement. A work off its green's shard asks the owner for the base bytes of every path its composition replaces
+base yields the writer's file byte for byte (the property test). A file renamed over a path carries content relative to the rename's
+source (A-547), so it is refined against the source's base bytes, the `Rename` kept as it was (close item C2); only a
+path's content ops are replaced, its rename, mode and attributes kept (until 2026-11-20 a refined path lost them). A path
+with other namespace ops or node-exclusive flags keeps its whole replacement. A work off its green's shard asks the owner for the base bytes of every path its composition replaces
 whole, as it asks for those of files it does not hold, so it refines them too (A-776, close item C1, 2026-11-20). The refinement runs a unit at a time under its
 owner's turns (A-787): every piece of its work is metered and asks for the next unit at `refine::WORK_PER_TICK` of it, so
 its longest step stays tens of microseconds whatever the file's size. The submit still calls it in one step until

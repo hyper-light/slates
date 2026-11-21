@@ -565,3 +565,73 @@ fn two_whole_file_rewrites_of_different_lines_merge_as_their_edits() {
     "the head holds both edits"
   );
 }
+
+/// Close item C2 (A-776, A-547). Do: on a one-shard daemon, make a green whose `a` holds 200 short functions and whose
+/// `b` holds a line; from one work, edit `a` near its end; from another, rewrite `a` whole with a line near its top
+/// changed and rename it over `b` (a tool writing a file and moving it into place); submit the edit, then the rename.
+/// Expect: both accepted, `b` holding both edits, `a` gone. The rename's carried content is refined against `a`'s base,
+/// so the edit, mapped through the move, meets no overlap; unrefined, it replaced `a` whole and conflicted.
+#[test]
+fn a_rewrite_renamed_over_another_file_merges_with_an_edit_of_its_source() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-rename-rewrite-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "rename-rewrite"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let base: String = (0..200)
+    .map(|n| format!("fn f{n}(a: u32) -> u32 {{\n    a + {n}\n}}\n"))
+    .collect();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let mut client = connect(&instance);
+  let green = client.create_green("rename-rewrite-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "rename-rewrite-seed").unwrap();
+  client.edit(seed, "a", 0, 0, base.as_bytes()).unwrap();
+  client.edit(seed, "b", 0, 0, b"fn old() {}\n").unwrap();
+  let seeded = client.submit(seed);
+  let (editor, _) = client.create_work(green, "rename-rewrite-edit").unwrap();
+  let (mover, _) = client.create_work(green, "rename-rewrite-move").unwrap();
+  let at = u64::try_from(base.find("a + 190\n").unwrap() + 2).unwrap();
+  client.edit(editor, "a", at, 1, b"-").unwrap();
+  let whole = u64::try_from(base.len()).unwrap();
+  client.edit(mover, "a", 0, whole, first.as_bytes()).unwrap();
+  client
+    .declare(
+      mover,
+      slates_ipc::protocol::WorkOp::Rename {
+        from: "a".to_owned(),
+        to: "b".to_owned(),
+      },
+    )
+    .unwrap();
+  let edited = client.submit(editor);
+  let moved = client.submit(mover);
+  let b = client.read(green, "b", ReadAt::Head);
+  let a = client.read(green, "a", ReadAt::Head);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(edited, Ok(Submitted::Accepted(2))),
+    "edit: {edited:?}"
+  );
+  assert!(
+    matches!(moved, Ok(Submitted::Accepted(3))),
+    "rename: {moved:?}"
+  );
+  assert_eq!(
+    String::from_utf8(b.unwrap()).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1)
+  );
+  assert!(a.is_err(), "a was moved: {a:?}");
+}
