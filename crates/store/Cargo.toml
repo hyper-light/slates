@@ -19,6 +19,8 @@ mantle-engine = { path = "../../vendor/mantle/engine" }
 slates-land = { workspace = true }
 
 [dev-dependencies]
+# The per-path read form's example reads Mercurial's own history through slates-hg's revlog reader.
+slates-hg = { workspace = true }
 # The simulated file with power-loss semantics the log's crash tests run on.
 hyper-block = { path = "../../vendor/hyper-raft/hyper-block", features = ["sim"] }
 
