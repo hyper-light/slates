@@ -1866,7 +1866,7 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 4),
+    versions.iter().all(|version| *version == 5),
     "versions {versions:?}"
   );
 }
