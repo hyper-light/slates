@@ -266,3 +266,23 @@
   - Red: a full clone makes no whole text and reads chunks = file revisions; stock 7.2's clone verifies clean.
   - Then 1b (the pull path, named_changegroup) with main's condition: the base on the client or sent earlier, from the
     common set; count whole sends; measure a one-changeset pull touching a big file against stock.
+- ~11:20 LANDED 5d2940ff9: C1 step 1a.
+  - The by-links walk (serve/getbundle.rs Walk::file) reads file revisions through StoreWants (Files: ask_rows /
+    ask_chunks / give) and sends stored deltas as they stand.
+  - Store::file_entry and Store::stored_now (test stand-ins; the daemon's Indexed answers nothing at once, and its
+    test seam is `answering_from_its_texts`, cfg(test)).
+  - HgStores::answer_wants: ServedViews overrides it to hg_view::answer_store_wants, and the default answers from the
+    lent view's stored_now.
+  - test_store::answer_wants_blocking.
+  - hg_interop's stream test does a plain clone that asks the store.
+  - Target trimmed for main (27 GB free).
+- NEXT 1b, the pull path:
+  - named_changegroup (getbundle.rs ~910: common_ancestors, changelog_entries, named_revisions, encode_changegroup) is
+    built whole at begin from content-store texts.
+  - Plan: keep the planning (which revisions, by path, node, parents, link) but send each file revision from stored
+    rows and chunks, stepwise.
+  - Ask rows for (path, [node, p1, p2]). The base is sendable if the stored base identity is a revision sent earlier in
+    the group, or p1/p2 when the parent's link is held (on the client) or sent.
+  - Otherwise send a whole text: a new Want::Texts variant answered by StoreHandle::text pieces (render.rs Want and
+    answer_store_wants are w-perf's: tell them), counted WHOLE_SENT.
+  - Measure a one-changeset pull of a large file, slates' bytes against stock (main asked).
