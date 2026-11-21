@@ -254,12 +254,8 @@ mod mapping {
   use crate::error::MemError;
 
   /// The `Rss` and dirty bytes of the mappings meeting `[at, at + len)`, from `/proc/self/smaps` (module docs).
-  pub(super) fn query(at: usize, len: usize, _page: usize) -> Result<Residency, MemError> {
-    let smaps =
-      std::fs::read_to_string("/proc/self/smaps").map_err(|error| MemError::OsRefused {
-        call: "read /proc/self/smaps",
-        code: error.raw_os_error(),
-      })?;
+  pub(super) fn query(at: usize, len: usize, page: usize) -> Result<Residency, MemError> {
+    let smaps = read_smaps(page)?;
     let (rss, dirty) =
       super::smaps_figures(&smaps, at, at.saturating_add(len)).ok_or(MemError::OsRefused {
         call: "/proc/self/smaps (no mapping at the range)",
@@ -270,6 +266,37 @@ mod mapping {
       bytes,
       resident: rss.min(bytes),
       modified: Some(dirty.min(bytes)),
+    })
+  }
+
+  /// `/proc/self/smaps` whole, read through rustix's open and read (the kernel's pseudo-file, never a host path: R1's
+  /// structural check refuses `std::fs` here), a page of bytes a call. The file is the process's own mappings, so its
+  /// length follows them.
+  fn read_smaps(page: usize) -> Result<String, MemError> {
+    let refused = |call: &'static str| {
+      move |error: rustix::io::Errno| MemError::OsRefused {
+        call,
+        code: Some(error.raw_os_error()),
+      }
+    };
+    let file = rustix::fs::open(
+      "/proc/self/smaps",
+      rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+      rustix::fs::Mode::empty(),
+    )
+    .map_err(refused("open /proc/self/smaps"))?;
+    let mut text = Vec::new();
+    let mut chunk = vec![0u8; page.max(1)];
+    loop {
+      let read = rustix::io::read(&file, &mut chunk).map_err(refused("read /proc/self/smaps"))?;
+      let Some(bytes) = chunk.get(..read).filter(|bytes| !bytes.is_empty()) else {
+        break;
+      };
+      text.extend_from_slice(bytes);
+    }
+    String::from_utf8(text).map_err(|_| MemError::OsRefused {
+      call: "/proc/self/smaps (not UTF-8)",
+      code: None,
     })
   }
 }

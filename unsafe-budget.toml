@@ -324,7 +324,10 @@ slates-machine = 97
 # `mach_vm_region(mach_task_self_, ..., VM_REGION_TOP_INFO, ...)` call that reads a mapping's VM objects' resident pages
 # (libc binds neither the call nor the struct, and its `mach_task_self` is deprecated), one block with its `// SAFETY:`
 # line, so the anchor's objects whole cost O(mappings) where `mincore` walked tens of GiB.
-slates-mem = 87
+# 2026-11-20 (+1, the same site, w-lint's count): the `unsafe extern "C"` block in `resident::mapping` (macOS) that
+# declares `mach_vm_region` and `mach_task_self_` counts as its own item beside the call; libc binds neither (and
+# deprecates its `mach_task_self`), so the declaration cannot be folded into an existing one.
+slates-mem = 88
 # 2026-11-20 (+3, A-789's Windows shape, main's ruling of 18:40: a content extent is a section of its own, closed when
 #   wholly free; compiled only for Windows; a `// SAFETY:` line directly above each):
 #   1. `shared.rs` Windows `make_section`: `CreateFileMappingW` of an unnamed `SEC_RESERVE` section (Win32 FFI, no safe
