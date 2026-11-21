@@ -2489,3 +2489,41 @@ fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns
   assert_eq!(linked_reads(&restored), expected);
   assert_eq!(restored.head_identity(), green.head_identity());
 }
+
+/// A-579's partial folds, found reading `sum_at` (2026-11-21): a checkpoint's sum at the head, taken while the identity's
+/// backlog is part folded, must be the sum the whole fold reaches. Do: on the trunk, copy it to `branches/x`, then
+/// change three files; fold one key alone (`fold_identity_step(1)`); change the three again; take the sum at the head;
+/// fold the rest. Expect: the
+/// sum taken equals the folded identity's. Before the fix `sum_at` moved every key from `identity_version`, and the key
+/// folded alone was moved from `identity_version`, not from the version it was folded at.
+#[test]
+fn a_checkpoints_sum_taken_mid_fold_is_the_whole_folds() {
+  let mut green = trunk();
+  accept(
+    &mut green,
+    Work::exclusive().copy("trunk", "branches/x", 1),
+    2,
+  );
+  let mut work = Work::default();
+  work
+    .overwrite("trunk/a", 0, b"ALPHA")
+    .overwrite("trunk/c", 0, b"GAMMA")
+    .overwrite("trunk/d/b", 0, b"BETA");
+  accept(&mut green, &work, 3);
+  assert!(
+    green.identity_backlog() > 1,
+    "too few keys to fold one alone"
+  );
+  assert!(!green.fold_identity_step(1));
+  // The key folded alone changes again: dirty once more, its entry in the sum at the version it was folded at.
+  let mut again = Work::default();
+  again
+    .overwrite("trunk/a", 0, b"alpha")
+    .overwrite("trunk/c", 0, b"gamma")
+    .overwrite("trunk/d/b", 0, b"beta");
+  accept(&mut green, &again, 4);
+  let head = green.head();
+  let mid_fold = green.sum_at(head);
+  green.fold_identity();
+  assert_eq!(mid_fold.bytes(), green.sum_at(head).bytes());
+}
