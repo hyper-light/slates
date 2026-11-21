@@ -67,6 +67,9 @@ const PRESSURE_LOOKS: u32 = 10;
 const LOOK: Duration = Duration::from_millis(100);
 /// Shape: the drives a restart's successor adopts: one on Windows (the drive held across the restart), none elsewhere.
 const ADOPTED_A_RESTART: u64 = if cfg!(windows) { 1 } else { 0 };
+/// Format: the C compilers the held compile runs, each where it is on the PATH (clang and gcc, as EdenFS's record
+/// names `#pragma once` for both; on macOS `gcc` is Apple's clang under that name), and `cc`, the system's own.
+const COMPILERS: [&str; 3] = ["clang", "gcc", "cc"];
 /// Whether the flows build with `make` here: Unix's own tool (Windows ships none).
 const BUILDS_WITH_MAKE: bool = cfg!(unix);
 /// Format: the tools the flows drive on this platform.
@@ -324,24 +327,27 @@ fn text(output: &Output) -> String {
   )
 }
 
-/// The base: a git repository holding a `#pragma once` header, a C file including it by two paths with a FIFO's
-/// include between them, and a Makefile building that file's object into the volume (the object is the overlay's own).
-fn make_base(base: &Path, gate: &Path) {
+/// The base: a git repository holding a `#pragma once` header, for each of [`COMPILERS`] a C file including it by two
+/// paths with that compiler's FIFO include between them ([`gate_of`] under `root`), and a Makefile building another
+/// file's object into the volume (the object is the overlay's own).
+fn make_base(base: &Path, root: &Path) {
   std::fs::create_dir_all(base.join("inc")).unwrap();
   std::fs::create_dir_all(base.join("sub")).unwrap();
   std::fs::write(base.join("inc/once.h"), HEADER).unwrap();
   std::fs::write(base.join("sub/keep.h"), "/* a sibling */\n").unwrap();
-  std::fs::write(
-    base.join("main.c"),
-    format!(
-      concat!(
-        "#include \"inc/once.h\"\n#include \"{}\"\n#include \"sub/../inc/once.h\"\n",
-        "int main(void) {{ struct once o = {{0}}; return o.x; }}\n"
+  for compiler in COMPILERS {
+    std::fs::write(
+      base.join(format!("main-{compiler}.c")),
+      format!(
+        concat!(
+          "#include \"inc/once.h\"\n#include \"{}\"\n#include \"sub/../inc/once.h\"\n",
+          "int main(void) {{ struct once o = {{0}}; return o.x; }}\n"
+        ),
+        gate_of(root, compiler).display()
       ),
-      gate.display()
-    ),
-  )
-  .unwrap();
+    )
+    .unwrap();
+  }
   std::fs::write(
     base.join("plain.c"),
     "#include \"inc/once.h\"\nint plain(void) { struct once o = {0}; return o.x; }\n",
@@ -595,19 +601,20 @@ fn wait_ready(root: &Path) {
 /// A compile, `make`, `cargo build` and `git status` over a real kernel mount across a snapshot of the volume and a
 /// daemon's death (w-realtools; A-781). On Windows the compile and `make` are left out (the module's note). Do: mount
 /// an overlay over a git checkout; build `plain.o` with make and the crate with cargo, and refresh git's index; start a
-/// compile of `main.c`, which includes `inc/once.h`, then blocks on a FIFO's include; take a snapshot and kill the
-/// daemon (the anchor starts the next); let the compile go on to `sub/../inc/once.h`. Expect the compile to succeed
-/// (one header: one inode number before and after), and after each event every tracked file's number and times
-/// unchanged, `make -q` up to date, `cargo build` a no-op and `git status` clean.
+/// compile under each of clang, gcc and `cc` here ([`COMPILERS`]), each of `main-COMPILER.c`, which includes
+/// `inc/once.h`, then blocks on its FIFO's include; take a snapshot and kill the daemon (the anchor starts the next);
+/// let each compile go on to `sub/../inc/once.h`. Expect each compile to succeed (one header: one inode number before
+/// and after), and after each event every tracked file's number and times unchanged, `make -q` up to date, `cargo
+/// build` a no-op and `git status` clean.
 #[test]
 fn a_pragma_once_build_make_cargo_and_git_status_hold_across_a_snapshot_and_a_daemon_restart() {
   if !runnable() {
     return;
   }
   let root = fresh_dir("pragma");
-  let (base, mount_point, gate) = (root.join("base"), root.join("mnt"), root.join("gate.h"));
+  let (base, mount_point) = (root.join("base"), root.join("mnt"));
   std::fs::create_dir_all(&mount_point).unwrap();
-  make_base(&base, &gate);
+  make_base(&base, &root);
 
   let instance = format!("real-tools-{}", std::process::id());
   let anchor = start_anchor(&instance);
@@ -618,7 +625,16 @@ fn a_pragma_once_build_make_cargo_and_git_status_hold_across_a_snapshot_and_a_da
   nothing_moved(&tree, "the first build", &before);
 
   #[cfg(unix)]
-  let compile = held_compile(&root, &gate, &tree);
+  let compiles: Vec<_> = COMPILERS
+    .into_iter()
+    .filter(|compiler| on_path(compiler))
+    .map(|compiler| held_compile(&root, &tree, compiler))
+    .collect();
+  #[cfg(unix)]
+  assert!(
+    !compiles.is_empty(),
+    "a compiler of {COMPILERS:?} is on this host"
+  );
 
   let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
   assert_eq!(code, 0, "snapshot: {err}");
@@ -627,41 +643,54 @@ fn a_pragma_once_build_make_cargo_and_git_status_hold_across_a_snapshot_and_a_da
   nothing_moved(&tree, "a daemon restart", &before);
 
   #[cfg(unix)]
-  compiled_once(compile, &gate);
+  for (compiler, compile) in compiles {
+    compiled_once(&root, compiler, compile);
+  }
 
   drop(mounted);
   drop(anchor);
 }
 
-/// Starts a compile of `main.c` in `tree`, which reads `inc/once.h` and then blocks on the FIFO made at `gate` (Unix:
-/// the compiler's open of the FIFO waits for a writer).
+/// The FIFO `compiler`'s C file includes between its two includes of the header, under `root` (outside the mount).
+fn gate_of(root: &Path, compiler: &str) -> PathBuf {
+  root.join(format!("gate-{compiler}.h"))
+}
+
+/// Starts `compiler` on `main-COMPILER.c` in `tree`, which reads `inc/once.h` and then blocks on its FIFO ([`gate_of`]:
+/// the compiler's open of a FIFO waits for a writer).
 #[cfg(unix)]
-fn held_compile(root: &Path, gate: &Path, tree: &Path) -> std::process::Child {
+fn held_compile(
+  root: &Path,
+  tree: &Path,
+  compiler: &'static str,
+) -> (&'static str, std::process::Child) {
+  let gate = gate_of(root, compiler);
   let made = tool(root, "mkfifo", &[gate.to_str().unwrap()]);
   assert!(made.status.success(), "mkfifo: {}", text(&made));
-  Command::new("cc")
-    .args(["-fsyntax-only", "main.c"])
+  let child = Command::new(compiler)
+    .args(["-fsyntax-only", &format!("main-{compiler}.c")])
     .current_dir(tree)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .spawn()
-    .unwrap()
+    .unwrap();
+  (compiler, child)
 }
 
 /// Lets the held compile go on (opening the FIFO for writing releases its include; closing it ends it) and expects it
 /// to compile: `sub/../inc/once.h`, read after the events, is the header it read before them.
 #[cfg(unix)]
-fn compiled_once(compile: std::process::Child, gate: &Path) {
+fn compiled_once(root: &Path, compiler: &str, compile: std::process::Child) {
   std::fs::OpenOptions::new()
     .write(true)
-    .open(gate)
+    .open(gate_of(root, compiler))
     .unwrap()
     .write_all(b"/* the gate */\n")
     .unwrap();
   let compiled = compile.wait_with_output().unwrap();
   assert!(
     compiled.status.success(),
-    "a header read before the events and again after them is two files to the compiler: {}",
+    "a header read before the events and again after them is two files to {compiler}: {}",
     text(&compiled)
   );
 }
@@ -678,9 +707,9 @@ fn make_cargo_and_git_status_hold_under_memory_pressure() {
     return;
   }
   let root = fresh_dir("pressure");
-  let (base, mount_point, gate) = (root.join("base"), root.join("mnt"), root.join("gate.h"));
+  let (base, mount_point) = (root.join("base"), root.join("mnt"));
   std::fs::create_dir_all(&mount_point).unwrap();
-  make_base(&base, &gate);
+  make_base(&base, &root);
 
   let instance = format!("real-tools-pressure-{}", std::process::id());
   let profile =
