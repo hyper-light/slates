@@ -241,6 +241,13 @@
 > a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
+> keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
+> appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
+> diagnostic's reply gaps 6.7-7.0 s). Now the keepalive is written once due, the silence measured from the last write;
+> the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
+> held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
+> Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
