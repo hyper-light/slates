@@ -1,0 +1,101 @@
+name: diag-measurer
+
+# w-k90-win's 84a Windows mechanism (never main): the timer fix (4b7f653ef) with g222's stamps (diag-g222-hops-base),
+# loaded, every round's hops, ring split and parks summarized as annotations (logs need a sign-in).
+
+on:
+  push:
+    branches: ["diag-measurer-w-k90-win-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ROUNDS: "3"
+
+jobs:
+  windows-84a-stamps:
+    name: 84a stamps (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: NASM (x86_64 Windows)
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/setup-nasm@v1.5.2
+      - name: clang-cl (arm64 Windows)
+        if: matrix.os == 'windows-11-arm'
+        shell: pwsh
+        run: |
+          $clang = (Get-Command clang-cl -ErrorAction SilentlyContinue).Source
+          if (-not $clang) { $clang = "C:\Program Files\LLVM\bin\clang-cl.exe" }
+          (Split-Path $clang) | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CC_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CXX_aarch64_pc_windows_msvc=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build (release)
+        env:
+          AWS_LC_SYS_PREBUILT_NASM: "0"
+        run: cargo build --release --locked -p slates-client --example edit_merge_bench > build.log 2>&1 || { echo "::error title=${{ matrix.os }} build::$(grep -E '^error' build.log | head -5 | tr '\n' ' ')"; exit 1; }
+      - name: Loaded rounds with stamps
+        run: |
+          set +e
+          W="$(cygpath -u "$RUNNER_TEMP")/msr"; mkdir -p "$W"
+          cat > "$W/sum.py" <<'PY'
+          import sys
+          base = sys.argv[1]
+          def pc(a, p):
+              return a[min(len(a) - 1, int(len(a) * p))] / 1000 if a else -1
+          def show(name, a):
+              a = sorted(a)
+              big = sum(1 for v in a if v > 10_000_000)
+              return f"{name} n={len(a)} p50={pc(a,.5):.0f} p99={pc(a,.99):.0f} p999={pc(a,.999):.0f} max={a[-1]/1000 if a else -1:.0f} >10ms={big}"
+          out = []
+          try:
+              rows = [l.split('\t') for l in open(base).read().splitlines() if l and not l.startswith('#')]
+              head, rows = rows[0], rows[1:]
+              for i, h in enumerate(head):
+                  out.append(show(h, [int(r[i]) for r in rows if len(r) > i]))
+          except Exception as e:
+              out.append(f"hops: {e}")
+          try:
+              rows = [l.split('\t') for l in open(base + '.ring').read().splitlines()[1:]]
+              out.append(show('ring.queued', [int(r[0]) for r in rows]))
+              out.append(show('ring.served', [int(r[1]) for r in rows]))
+          except Exception as e:
+              out.append(f"ring: {e}")
+          try:
+              rows = [l.split('\t') for l in open(base + '.parks').read().splitlines()[1:]]
+              for end, label in ((0, 'timer'), (1, 'kicked'), (2, 'untimed'), (3, 'pending')):
+                  w = [int(r[1]) for r in rows if int(r[2]) == end]
+                  if w:
+                      out.append(show('park.' + label + '.waited', w))
+              late = [int(r[1]) - int(r[0]) for r in rows if int(r[2]) == 0 and int(r[0]) > 0]
+              if late:
+                  out.append(show('park.timer.past_deadline', [max(0, v) for v in late]))
+          except Exception as e:
+              out.append(f"parks: {e}")
+          print('%0A'.join(out))
+          PY
+          B=target/release/examples/edit_merge_bench.exe
+          for round in $(seq 1 "$ROUNDS"); do
+            L="$W/loaded-r$round.log"; D="$W/stamps-r$round.tsv"
+            G222_DIAG="$(cygpath -w "$D")" timeout 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null > "$L" 2>&1
+            st=$?
+            tails=$(grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b" "$L" | awk -F'\t' '{printf "%s=%.0fus ", $2, $4/1000}')
+            echo "::notice title=${{ matrix.os }} r$round::exit=$st $tails%0A$(python "$W/sum.py" "$D")"
+          done
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: w-k90-win-84a-stamps-${{ matrix.os }}
+          path: ${{ runner.temp }}/msr
+          if-no-files-found: warn
