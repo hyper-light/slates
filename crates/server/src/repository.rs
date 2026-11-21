@@ -1807,7 +1807,7 @@ mod tests {
   /// adopted green's line, another one.
   #[test]
   fn a_repository_and_every_green_made_for_it_share_one_line() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "linux", "main"));
       let topic = green_of(branch(state, ("linux", "topic", "main"), None));
       let other = green_of(branch(state, ("linux", "other", "main"), None));
@@ -1884,7 +1884,7 @@ mod tests {
   /// move no log of the repository; and no verb or lone version is an atomic record.
   #[test]
   fn each_verb_moves_the_names_log_and_each_members_version_its_own_log() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let root = green_of(create(state, "tree", "main"));
       let repo = repository(state, "tree");
       let names = |state: &ShardState| {
@@ -2115,7 +2115,7 @@ mod tests {
   /// none served.
   #[test]
   fn a_recovery_rebuilds_every_member_the_way_it_joined_and_fences_what_its_source_cannot_give() {
-    crate::daemon::audit_on_shard(|state| {
+    crate::test_store::audit_on_stored_shard("repository", |state| {
       let members = members_made_past_a_held_checkpoint(state);
       assert_rebuilt_as_before(state, members);
       let [root, ..] = members;

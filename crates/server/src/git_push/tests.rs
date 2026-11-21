@@ -1870,14 +1870,15 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   );
 }
 
-/// A-724 piece 8c (main's ruling (ii): a replay reads a version-3 record's names locally, else from their region homes).
-/// Do: on a node of four shards, with version 3 on, push stock git's `create` on a shard that is not its names' home
-/// (pushed again on another where the first was); drop the names from that owner's content store, so only their home
-/// shard holds them for the region; make the store again from the log, a task on the owner waiting for the rebuild's
-/// end. Expect: the rebuild reads the names from their home before the record's replay (counted fetched), and the store
-/// made again is the live one. Every wait is on its event, none on a fixed time: a loaded machine is the norm.
+/// A-724 piece 8c and A-767 C5 (a replay reads a record's names locally, else from the node's changeset store; a node
+/// whose store lacks the changeset reads them from their region homes). Do: on a store-backed node of four shards, with
+/// the homing on, push stock git's `create` on a shard that is not its names' home (pushed again on another where the
+/// first was); drop the names from that owner's content store; make the store again from the log, a task on the owner
+/// waiting for the rebuild's end. Expect: the rebuild reads the record's changeset back from the node's store before its
+/// replay (counted read), and the store made again is the live one. Every wait is on its event, none on a fixed time: a
+/// loaded machine is the norm.
 #[test]
-fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
+fn t_a767_c5_a_rebuild_reads_a_records_names_back_from_the_nodes_store() {
   let (_store, daemon) = crate::test_store::audit_daemon_of_stored(4);
   let (first, identity, home) = pushed_v3_at(&daemon, 0, "fetched");
   let (partition, repository) =
@@ -1897,7 +1898,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       .expect("main");
     let before = state
       .refusals
-      .get(crate::vcs_store::NAMES_FETCHED)
+      .get(crate::vcs_store::CHANGESET_READ)
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, repository);
@@ -1916,7 +1917,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       let fetched = crate::state::with_state(|state| {
         state
           .refusals
-          .get(crate::vcs_store::NAMES_FETCHED)
+          .get(crate::vcs_store::CHANGESET_READ)
           .copied()
           .unwrap_or(0)
       })
@@ -1931,7 +1932,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
     home, owner_shard,
     "the names' home is the owner shard: the case reads nothing from the region"
   );
-  assert!(fetched, "the names were not read from their region home");
+  assert!(fetched, "the names were not read back from the node's store");
   let (whole, compared) = std::sync::mpsc::channel();
   crate::daemon::observe_at(&daemon, partition, move |state| {
     crate::vcs_store::tests::assert_made_again_whole(
