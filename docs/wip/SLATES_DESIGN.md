@@ -58151,3 +58151,19 @@ Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and i
     `f = 1` end-to-end test on production routing, with `merge.verdict.taken_by_position` as its counter.
   - Every holder test runs with no hook. Each waits until B replicates the green before B's creation, since B's
     creations are A's until then.
+
+### A-792 — A green listed at its head reads the directory's subtree, not the whole green (2026-11-20, w-fed-move, goal 86b; found by use: 1,000 and 10,000 clients over the Linux kernel on one primary and two replicas held the primary's one busy core; §4.16 "Greens", the listing verbs)
+- **Why.** A green's listing (`listing::green_entries`) built the green's whole base at the version asked
+  (`Green::base_at`, at the head `Green::current_base`: every file, directory, symlink, special node, mode, xattr and
+  hard link, each path copied into a new string) and then kept the directory's entries, for every page of a listing.
+  Sampled on the primary at 100,000 clients (release, `load_scale` over the kernel's 97,371 files): 5,866 of 7,284
+  samples of its busiest shard in `listing::read_dir`, 2,212 in `current_base`, most of them copying paths.
+- **Change.** `Green::head_under(dir)`: each dimension's paths that are `dir` or lie under it, one descent of its map
+  (`Dim::prefix`, `Files::prefix`), a file with its length. `green_entries` lists from it at the head; an older version
+  still reconstructs its base (`base_at`).
+- **Tests** (macOS arm64, Mac Studio, local). `slates-merge --lib head_under`:
+  `a_greens_head_under_a_directory_is_its_subtree_of_the_whole_base` (the whole base filtered to each directory as the
+  oracle, the prefix trap `a`/`ab`, a file and a missing path); `slates-server --lib listing` 3 passed. By use (release,
+  `crates/cli/tests/load_scale.rs`, one primary, two replicas, one client node, the kernel v7.4-rc4, one round, 10,000
+  clients, `--hot-files 8000 --per-connection 32`): wall 201 s to 75 s, the primary's CPU 175 s to 53 s, verdicts 192
+  to 228 a second, edits p50 1.04 s to 0.60 s, the cycle's p99 43.9 s to 23.6 s; oracle failures 0 in both.

@@ -213,6 +213,13 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-792 (2026-11-20, w-fed-move; goal 86b, found by use: the many-client rung on one primary and two replicas over
+> the Linux kernel).** FIXED: a green listed at its head reads the directory's subtree (`Green::head_under`, one descent
+> of each dimension's map), not the whole green's base, which every page of a listing copied (every path of 97,371). At
+> 10,000 clients (release, this Mac Studio, `load_scale`, one round): wall 201 s to 75 s, the primary's CPU 175 s to
+> 53 s, verdicts 192 to 228 a second, the oracle clean before and after. Open, the next walls (goal 86b): every accepted
+> submit waited about 31 s at 1,000 clients (p50 31.4 s), and verdicts stay near 230 a second.
+>
 > **A-784 (2026-11-20, w-fed-move; main's piece, found by use: kiln's live move, goal 91).** FIXED: a planned move
 > (A-291) is prepared unfrozen and frozen only once ready to hand over, so its first ask is no longer refused
 > `Unplaced` while its head is carried and placed off its owner: the failover bound runs from the freeze; preparing, the
