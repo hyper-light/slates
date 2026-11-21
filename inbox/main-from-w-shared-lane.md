@@ -40,3 +40,13 @@ lib 148 of 148 plus every integration test.
 What the profile names now: sendto (811) and recvfrom (382), one syscall a datagram; AES-GCM (247 / 233); the
 receiver's copies (frame decode, reassembly) inside memmove. Next in the lane item: the receiver's copies (MEMORY
 SIZING), then batching datagrams per syscall if the profile still puts sendto first.
+
+## 2026-11-20 ~23:20 PST (machine clock; my earlier "00:40" stamps ran ahead): step three landed (c3db76bcd on main)
+The receiver's copies: packets opened in place, frames applied from the opened packet (stream bytes lent), stream
+bytes delivered once, messages taken whole by move. Studio-1, load 2.3-2.6: goodput 966 / 1,308 / 1,382 MB/s (median
++20% over step two's 1,092), 64 MiB p50 ~51 ms (~61 before). Tests: slates-transport lib 148 of 148 plus every
+integration test; slates-cluster lib 248 of 248 and --test live 4 of 4.
+Lane so far: ~1.07 GB/s -> ~1.31 GB/s median on a quiet Mac, with every per-packet copy main named removed (and the
+receiver's). The profile's top is now sendto / recvfrom, one syscall a datagram. The next lever is batching datagrams
+per syscall (sendmsg_x/recvmsg_x on macOS, sendmmsg/recvmmsg or GSO/GRO on Linux). Shall I take that under the lane
+item, or close the lane item here (the ~200 MB/s question answered: it was load, and the copies are gone)?

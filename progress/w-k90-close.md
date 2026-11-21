@@ -68,8 +68,10 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
 - Mac scratch deleted (worktree, targets). adacachy ~/.cache/w-k90-close + my 3 docker images: deletion pending kiln
   reconnect (see below).
 
+## DONE (2026-11-20 ~22:00 PST)
+90c met on cycle 10 (bec9fdf5f93) and the W10 docs (kiln main b928a782a96). All scratch deleted: adacachy
+~/.cache/w-k90-close and images k90-close-agent:live, k90-close-kicbase:{tls,base} gone (images_left=0); minikube
+k90-close deleted; units stopped; Mac worktrees/targets and branch agents/w-k90-close deleted.
+
 ## For main to delete
-(kiln said "not connected to the kiln server" for every run from this session at ~21:40 PST, so these stay:)
-- adacachy: /home/adalundhe/.cache/w-k90-close (my clone kiln3 + worktrees wt/wt2 + target + images + logs; ~50+ GB)
-- adacachy docker images: k90-close-agent:live, k90-close-kicbase:tls, k90-close-kicbase:base
-- adacachy: the `tls` kernel module stays loaded (harmless; `sudo modprobe -r tls` if wanted)
+(nothing left; the `tls` kernel module stays loaded on adacachy, harmless)

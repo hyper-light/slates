@@ -364,3 +364,7 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
 ## LANDED 2026-11-21 ~00:40 PST: lane step two = 35c740150 (main 585b89299): spans of the sender's bytes, no copy
   into frames. memmove 604 -> 491 -> 433 over the two steps; goodput ~1.1 GB/s quiet, level. NEXT in lane: receiver
   copies (decode, reassembly), then datagram batching per syscall. Family three: kiln r15 (Linux, queued). Exit 4: r9.
+
+## LANDED 2026-11-20 ~23:20 PST (machine clock): lane step three = c3db76bcd (receiver copies). Lane ~1.31 GB/s median
+  quiet (from ~1.07). Asked main: batch datagrams per syscall next, or close the lane item. Kiln: r4 family three on
+  adacachy (running), r3 exit 4 (queued for this MacBook).

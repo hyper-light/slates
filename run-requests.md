@@ -7021,3 +7021,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   and MTU splits now encode from the sender's buffer). The fleet suites and the chaos/loss lanes on Linux and Windows.
   Red would be a resend carrying wrong bytes (a decode or reassembly refusal on the peer) or a stream that never completes
   after a loss.
+- w-shared, transport receive path (c3db76bcd): packets opened in place, messages taken whole at completion. The fleet
+  suites and the loss/chaos lanes on Linux and Windows. Red would be a stateless reset no longer recognised, a reply
+  taken partial, or a stalled exchange (its progress now counted on delivery).
