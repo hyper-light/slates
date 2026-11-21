@@ -5298,8 +5298,14 @@
 > shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
 > inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
 > step each, so N shipments cost N times the inputs (64 MiB: at least 64 passes of 128 MB copied and 64 MB hashed);
-> the archive is now made once, chunks lent (`merge.inputs.manifest_made`). Whether it was exit 4's cause is open,
-> until the 64 to 320 MiB reruns on the Studio report the watchdog's line.
+> the archive is now made once, chunks lent (`merge.inputs.manifest_made`). It was not exit 4's cause.
+> The watchdog's line named it (2026-11-20, 128 to 320 MiB, this MacBook at load 42 to 60 and Studio-1 at load 3.7):
+> shard 1 spinning 1,009 to 1,201 ms of CPU in one poll of a session's first submit (`identities.rs:243`), and the
+> sample's top was `slates_merge::derive::split_at`: a path's composition walked a flat piece list from its front for
+> every declared op, so a file written a few KiB a write composed in time squared in its writes. Fixed the same day:
+> blocks of about `√ops` pieces, new runs merged as made (`derive::PieceList`).
+> Found then, open: a holder's forward of its increment runs at about 105 to 150 MB/s (320 MiB in 3,047 ms; BENCHMARKS),
+> against the transport's 1.3 GB/s; and the control shard's beat task runs 520 to 1,381 ms late during it.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
