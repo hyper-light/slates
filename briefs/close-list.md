@@ -63,13 +63,15 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
     the pacing primitive is its lever)
 90a vendoring, every platform's build and CI, the library API  w-k90-vendor (incl. the export_engine re-vendor),
     w-k90-pin-2 (lanes green; R: the cec37f60 kiln link closing every 1-5 min)
-90b OCI/Docker engine ........................................ w-k90-containers; w-k90-a520 the session-end fix (r49)
-90c Kubernetes on KIND ....................................... w-k90-close
+90b slates volumes attach to OCI containers: MET 21:05 (Ada ~21:00: kiln runs agents in slates microVMs and Hex;
+    the part only checks the attach). w-k90-containers: the clippy fix at kiln container.rs:301 for 90a, then done
+90c slates volumes attach to Kubernetes pods: MET 21:05 (kiln's Kubernetes engine rework is its own task).
+    w-k90-close: the W10 docs paragraph, stop its cycles and cluster, done
 90d microVM on KVM (HVF and WHP done) ........................ w-k90-kvm, w-k90-microvm (then R: kiln's take_down,
     first-mount wait and collapsed notices, already given)
 90e slates_e2e bare_metal on Windows ......................... w-k90-win
 90f SlatesVolumes' resync end on KVM ......................... w-k90-kvm, w-k90-microvm
-90g A-520 piece 5 ............................................ w-k90-a520
+90g A-520 piece 5: REMOVED 21:05 (kiln container-engine wiring, not this goal). w-k90-a520: stop r81, done
 91  the multi-runner test with injected faults ............... w-fed-faults
 92a the Shards-owed items with Shards' side .................. w-k90-whp
 92b A-555 parts 2-3 .......................................... w-k90-whp
