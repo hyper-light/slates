@@ -126,3 +126,35 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
 - WITHDRAWN: while kiln was down w-engine landed the same oracle with a fix (607e5e02a, A-816; 20c2bc961): a preview
   now names a renamed home's links as changed as its commit does, a case my generator never hit. Mine (60733f959,
   agents/w-work-cow-post-view) duplicates it and is not landed. w-svn's note has a correction.
+
+## Large single submit (goal 8251d154) -- step 2 in progress, 2026-11-21 ~15:45 PST; NOT landed, decisions asked of main
+- Branch agents/w-work-cow-slice (merged with main c5e157467): a5c27aa9f + 03e97b265. Claimed A-841.
+  - refining::owed_for_submit: a local submit whose post-state is more than one copy slice (measured memcpy rate over
+    half the quantum) parks behind a prepare-only job (A-821's prepare reused).
+  - The job composes, hashes, computes and encodes, then holds the verdict (judge_computed) and makes its files
+    (Green::make_step), a slice a turn.
+  - The step commits the made verdict (new Green::submit_judged) and copies none of the bytes.
+  - Counters: merge.submit.sliced, merge.submit.make_slices, merge.submit.prepared_made.
+- Focused tests (release): merge_check 3/3, works_off_owner 18/18, verdict_pages 5/5, work_cow 2/2, work_edit_cow 2/2,
+  green_post_state 8/8 (its refinement test now counts a sliced seed's parts); debug green_post_state 8/8 with A-821's
+  oracle (2 compared, 0 differed); slates-merge lib 270/270.
+- Red test on the fix: the submit's own stalls (identities.rs:243, the job's last turn) are gone. What remains is the
+  green's checkpoint right after (merge_service.rs:257): build 52 ms, encode 71 ms, record 527 ms (db.mutate_owned),
+  measured 650 to 1,063 ms in one step. The test passed 1 of 2 runs on timing. That's w-engine's owed item (A-579,
+  "slice the checkpoint's last step"); main asked whether I take it (inbox/main-from-w-work-cow-checkpoint-scope.md).
+- A/B, Mac Studio M3 Ultra, release, interleaved, A = main c5e157467 + the test, B = a5c27aa9f/03e97b265, one
+  submit, work_cow's populated_green (logs ~/.cache/w-work-cow-ab/ab-*.log, one .out per run). The box was loaded
+  (load 9 to 18):
+  - Run 1 (15:29), load 9.2-12.0:
+    - 1.5 MB (24 x 64 KiB): A 4.23, 3.29, 3.36, 3.48, 3.45 ms; B 17.97, 15.25, 13.97, 14.22, 13.38 ms.
+    - 1 GiB: A exit 4 x5 (watchdog, identities.rs:243); B 10.65 s, exit 4, exit 4, 4.64 s, exit 4.
+  - Run 2 (15:37), load 10.8-18.9, with an experiment (the job's turns paced by A-783's step ceiling; REVERTED):
+    - 1.5 MB: A 7.78, 7.02, 6.94, 7.21, 6.94 ms; B 12.06, 21.61, 19.01, 12.80, 14.58 ms.
+    - 1 GiB: A exit 4 x5; B exit 4 x5 (the job's task, refining.rs:241, past its window in one poll: the experiment's
+      fault).
+  - So against the plan's bars: 1.5 MB is 3 to 4 times A, not within 10%. At this machine's slice a 1.5 MB submit
+    parks, and its job's ~10 turns each yield. 1 GiB still ends the Alone daemon in most runs (the checkpoint step and
+    load).
+- Open, for main: (1) the checkpoint step (scope question above); (2) the park threshold. Slicing a 1.5 MB submit costs
+  3 to 4 times its latency. Either park only above a step-ceiling's worth of work (the step then runs up to ~100 ms
+  unsliced, HEARTBEAT_NS), or accept the latency.
