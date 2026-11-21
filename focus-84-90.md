@@ -1659,3 +1659,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - 2026-11-21 04:03 PST
   - RUN r5 (Studio-4, main c8b77f817): slates-merge's full suite is green (lib 253/253, every target). Clippy had one error, the layered overlay's cognitive complexity at 11/10, which w-lint's round 15 had already fixed: 7db3bdba6 on main.
   - r4 (jupiter, w-work-mount's C1 fix 705f4d7e5) is still running.
+- 2026-11-21 04:08 PST
+  - LANDED: 2bd701897 and d9bc5f00c (w-rewrite-ops, A-810). The checkpoint-restore failure was the change index's MODEL asking "ever special" instead of "special by its change"; the model now states the design's rule. fd031603d (GAPS: A-803's leftovers (a) and (b) were found by design, not measured).
+  - RULING: w-rewrite-ops measures (a) and (b) for about half an hour; the one that grows gets fixed, the one that's flat is closed as measured. Then svn's C2 stage C on the merge engine's side, split with w-svn: the import's revisions advance the green in RAM and commit in one transaction (A-804's mechanism extended); red: one landing per revision today.
+  - r4 (jupiter, the WinFsp C1 fix) is still building or running.
