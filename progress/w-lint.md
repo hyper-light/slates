@@ -357,3 +357,13 @@
   Viewed). Host, fmt, structural, literals, unsafe, the six cross targets clean. real_tools (r29) still queued.
 
 - 10:40 main (01a1ff2e): give_up stays annotated until w-git C5 2b piece 3 lands; re-check give_up on the first round after it. r29: report to main only if red. w-sizing and w-reaper told by main.
+
+## 2026-11-21 round at 67fa7f75a (landed 5216ce4e2, main 5216ce4e2)
+- Reds (host clippy): hg intake.rs take 11/10, intake_tests.rs kept-text test 11/10, vfs volume.rs destroy 11/10 (A-827),
+  then vfs tests/held_head.rs 19/10 + type_complexity. Split into note_logged, kept_bytes_are, kept_dead, imaged_as_held,
+  held_bytes; HeldFile alias. Focused local: hg push:: 60/60, vfs held_head 2/2, vfs destroy 8/8.
+- fmt, structural, literals, unsafe, six cross targets clean.
+- w-sizing moved A-789's _on_windows CLI tests into content_extents_windows.rs (#![cfg(windows)]), so that item is closed. Host clippy clean.
+- Windows-only (xwin, slates-cli's build): server verbs.rs:3020 run_recorded 11/10 -> w-hg; vcs_store/svn_import.rs:506
+  14/10 -> w-svn. Owners told in their inbox files; not edited (goal-93 files under active edits; not on the CI cross set).
+- Per the goal-93 focus I started no new Windows run. r29 still queued. I'm free for a goal-93 piece (inbox/main-from-w-lint-free.md).
