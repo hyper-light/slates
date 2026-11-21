@@ -4,7 +4,8 @@
 //! of the primitive's type, only words: the waiting task's word, a state word and a second word, so sharing one is
 //! a generational arena, never shared ownership of a value (R2: no `Arc`).
 //!
-//! **Bounded.** At most [`MAX_CELLS`] cells live at once; past it a claim is refused [`SyncRefusal::Capacity`].
+//! **Bounded.** At most [`MAX_CELLS`] cells live at once, and fewer when the consumer sets a lower [`set_limit`];
+//! past it a claim is refused [`RtError::Capacity`].
 //! Cells are allocated a segment of [`SEGMENT`] at a time, when first needed, and a segment is never freed (its
 //! cells are reused), so the table's memory is the most cells ever live at once, rounded up to a segment.
 //!
@@ -25,7 +26,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 
 use slates_mem::Encoded;
 
-use super::SyncRefusal;
+use crate::error::RtError;
 
 /// Format: cells per segment, one bit each in the segment's `u64` free word.
 pub const SEGMENT: usize = 64;
@@ -121,6 +122,16 @@ static NONFULL: [AtomicU64; SUMMARY_WORDS] = [const { AtomicU64::new(u64::MAX) }
 /// Cells live now.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 
+/// The consumer's bound on live cells, at most [`MAX_CELLS`].
+static LIMIT: AtomicUsize = AtomicUsize::new(MAX_CELLS);
+
+/// Sets the most cells that may be live at once (at most [`MAX_CELLS`]): the consumer's bound on its live
+/// synchronization primitives (upstream's, kept for the vendored issuer's refusal tests). A claim past it is refused
+/// `Capacity`.
+pub fn set_limit(cells: usize) {
+  LIMIT.store(cells.min(MAX_CELLS), Ordering::Release);
+}
+
 /// Cells live now (a test's and a census's reading).
 pub fn live() -> usize {
   LIVE.load(Ordering::Acquire)
@@ -155,12 +166,13 @@ fn bit(low: usize) -> u64 {
 
 /// Claims a cell for a primitive with `handles` handles, its words zeroed and no waiter. Refused `Capacity` at
 /// [`MAX_CELLS`].
-pub(crate) fn claim(handles: u32) -> Result<CellRef, SyncRefusal> {
-  let refused = SyncRefusal::Capacity {
+pub(crate) fn claim(handles: u32) -> Result<CellRef, RtError> {
+  let limit = LIMIT.load(Ordering::Acquire);
+  let refused = RtError::Capacity {
     what: "synchronization cells",
-    bound: MAX_CELLS,
+    bound: limit,
   };
-  if LIVE.fetch_add(1, Ordering::AcqRel) >= MAX_CELLS {
+  if LIVE.fetch_add(1, Ordering::AcqRel) >= limit {
     LIVE.fetch_sub(1, Ordering::AcqRel);
     return Err(refused);
   }

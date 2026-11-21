@@ -11239,7 +11239,10 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
 > judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
 > a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
-> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> A mount's unsaved-to-the-green writes survive a restart: recovery rebuilds a mounted work's slot from its
+> published image, its base reacquired through the green at the work's durable base
+> (`tests/mounted_work.rs` `a_save_through_a_mount_survives_a_daemon_restart`). Owed: a green landed again into a
+> directory holding an earlier landing plans every file again (identical ones are
 > skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
 
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
@@ -55985,6 +55988,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's record v4, part B — rows by pack place: a landed object is where it lies in its push's pack (2026-11-20, w-git for UI goal 93; main's pack-homing ruling: content once, the store's bytes a push must not grow)
+- **Why.** A push's staging put every object new to the repository in the content store inflated (git/git's v1.5.0:
+  309 MiB for a 9.4 MiB pack), its row naming that copy. Main's ruling for record v4: the landed objects are places
+  in the one pack the push brought, not second copies.
+- **Change.**
+  - Staging's first step after the generations puts the push's pack in the content store as one content, a window a
+    unit (`Step::Packing`; `Push::set_stored_pack`).
+  - Each object's row names that pack and carries where its entry begins (`ObjectRow::offset`, the kind byte marked
+    `rows::IN_PACK`); the row holds the pack.
+  - The repository keeps each pack's length (`Repository`'s `packs`) and reads an indexed object through one read
+    (`Repository::read_stored`/`row_bytes`/`stored_of`): whole, or where it lies through `packed::read` (B1), its
+    chain from the objects read lately (held to the largest pack), a REF_DELTA's base followed through the index into
+    its own pack (`IndexBases`). A read is held to the longest object the packs hold (`largest`), not the store's lent
+    room: it allocates nothing in the store.
+  - Every reader goes through it: the index view a push's thin bases are read from, the pushed-objects view, the
+    walks, the fragments' encoder (an in-pack object read whole at its first window), the upload stream's loose and
+    large objects (`StoredAt` in place of a content; an in-pack object deflated from its bytes read whole), and the
+    hook view (its whole objects by `StoredAt`; its reads and seal handed the repository).
+  - A push's reads take its own pack and the store's packs by identity (`PushSource`), so a thin pack's REF_DELTA base
+    in a landed pack is read where it lies.
+  - Every push's objects are a pack's: the server's own commits are written as a pack of whole objects first
+    (`pack::of_whole_placed`) and admitted where they lie, so a record is always its push's pack and a replay makes the
+    store the live one made (the whole replay `replay_pack` places objects as the stepped one does).
+  - Gone, as no object is put inflated any more: `Push::put_placed`, the resolution-order putting (47dc24b72) and the
+    holds given back in turns after a landing (ccd07b58c): a landing gives back the push's one hold of its pack.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, 9.4 MiB of pack): the
+  content store after the push lands holds 14.1 MiB (309.0 MiB before: every object inflated), its peak 15.4 MiB
+  (310.3); the process's peak RSS 356.6 MiB (781.8); the store made again from the log in 1,468 turns, its content
+  at most 14.1 MiB. The longest step, 27.3 ms, is still the landing's entry apply (the record carrying the pack: part
+  A, the record v4 itself).
+- **Tests.** `slates-git` `store::tests::packed::a_landed_push_is_read_where_it_lies_in_its_stored_pack` (the captured
+  `create` push: every object read back from its stored pack; the store grew by 1,919 bytes for 11,076 bytes of
+  objects inflated, a 748-byte pack); `slates-git --lib` 582 passed; `slates-server --lib` 1,032 passed (one lease
+  deadline test failed once under the suite's load and passed three times alone).
+
 ### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
 - **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
   cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
@@ -57613,6 +57651,12 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `RtError::Capacity`, and `futures::race2`/`Either` (pinned on its own frame, no pin-projection crate). The engine's
 > machine facts are already `slates_machine::facts` by the same names (hyper-rt took them from slates). Tests:
 > retirement 2/2, race 1/1, sync 11/11.
+> Step 3 (2026-11-20): the crates vendored and ported. `vendor/mantle/` holds `mantle-engine`, `-chunk`, `-disk`,
+> `-crc`, `-codec` at mantle `87ab09e1`; `hyper-block`'s issuer is back, on `slates_rt`; every `hyper_rt::` path is
+> `slates_rt`'s or `slates_machine`'s (`vendor/mantle/README.md`, `vendor/hyper-raft/README.md`, "Local changes");
+> `ranges` stays upstream. No `hyper-rt` and no `unsafe impl Send`/`Sync` anywhere. Unit tests on slates' runtime:
+> engine 155/155, chunk 52/52, `hyper-block` 101/101 (issuer included), slates-rt sync 11/11 and retirement 3/3.
+> Owed in C2: the engine's and the chunk store's file creation behind `land`'s write seam, under the grant.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -57737,6 +57781,27 @@ Evidence: `cargo test --locked -p slates-server --test session_log` 1 passed (tw
 one waiting landing: exactly two named; the landing gone once granted and run); `-p slates-db --test model
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
+
+### A-789 — On macOS each content pool extent is an object of its own, made ahead of need and given back whole (2026-11-20, w-sizing; main's ruling of 15:20, "content as extents made on demand", piece 1; §4.2, A-98, A-110)
+Applied in the same change to: `crates/mem/src/shared.rs` (`extent_handoff`, `make_extent`), `crates/server/src/content_pool.rs`
+(`make_own_extents`, `map`, `give_back`), `crates/api/src/role/daemon.rs` (the extents released with the anchor's
+objects, A-778), the tests (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`,
+`a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name`, the killed anchor's extents), BENCHMARKS,
+GAPS.
+
+Status: built 2026-11-20, macOS. Linux keeps one memfd with holes punched and Windows needs a section per extent (g226's
+measurements, BENCHMARKS "Content give-back per platform").
+- Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
+  back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
+  volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).
+- The rule: an extent is named from the content object's name and its id. Its owner shard makes its slice's extents at
+  its start, and a release makes the extent again, so a claim only opens and maps one, never makes it on the
+  provisioning path. A release unmaps the extent and removes its name, which gives every page back, then makes it
+  again empty. A successor adopts held extents by name. A daemon whose anchor is gone removes every extent's name.
+  Counts are bounded: at most `POOL_EXTENTS_PER_PARTITION` (64) a partition, one name each.
+- After: the same burst's volume destroyed left the object at 0 MiB and the process at 123 MiB.
+- Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
+  still only leave the footprint.
 
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`

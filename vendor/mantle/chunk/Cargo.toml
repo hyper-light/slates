@@ -1,0 +1,29 @@
+[package]
+name = "mantle-chunk"
+description = "mantle's chunk store: a log-structured volume of checksummed records (vendored at mantle 87ab09e1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/mantle"
+publish = false
+
+[dependencies]
+getrandom = "0.4"
+hyper-block = { path = "../../hyper-raft/hyper-block" }
+mantle-codec = { path = "../codec" }
+mantle-crc = { path = "../crc" }
+mantle-disk = { path = "../disk" }
+thiserror = "2.0"
+
+[dev-dependencies]
+# The reader's unit tests run here (README, local change 1): the runtime under them changed.
+hyper-block = { path = "../../hyper-raft/hyper-block", features = ["sim"] }
+hyper-measure = { path = "../../hyper-raft/hyper-measure" }
+proptest = "1.11"
+slates-rt = { path = "../../../crates/rt" }
+slates-machine = { path = "../../../crates/machine" }
+tempfile = "3.20"
+
+# A root of its own: a vendored snapshot of mantle (vendor/mantle/SNAPSHOT), outside slates' workspace.
+[workspace]

@@ -189,13 +189,10 @@ fn a_channel_gives_its_cells_back() {
 /// value handed back (a shard never blocks).
 #[test]
 fn a_bad_channel_and_a_blocking_call_on_a_shard_are_refused() {
-  assert!(matches!(
-    channel::<u8>(0),
-    Err(SyncRefusal::BadConfig { .. })
-  ));
+  assert!(matches!(channel::<u8>(0), Err(RtError::BadConfig { .. })));
   assert!(matches!(
     channel_with::<u8>(1, 0),
-    Err(SyncRefusal::BadConfig { .. })
+    Err(RtError::BadConfig { .. })
   ));
   let runtime = runtime();
   let (sender, _receiver) = channel::<u8>(1).unwrap();

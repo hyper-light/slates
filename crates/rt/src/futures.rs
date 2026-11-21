@@ -336,6 +336,14 @@ impl Drop for Sleep {
   }
 }
 
+/// Spawns `future` on the current shard and detaches it, so its slot is freed when it ends (hyper-rt's
+/// `spawn_detached`, A-767 piece C2). Refused as [`spawn`] is, or `NotOnShardThread` off a shard.
+pub fn spawn_detached<F: Future<Output = ()> + 'static>(future: F) -> Result<TaskId, RtError> {
+  let id = spawn(future)?;
+  detach(id)?;
+  Ok(id)
+}
+
 /// Which of two futures finished first, with its output ([`race2`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Either<A, B> {

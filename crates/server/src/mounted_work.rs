@@ -20,8 +20,13 @@
 //! it is idempotent: a second submit declares only what differs from the work by then. A finer minimiser (several
 //! spans a file, D-O17) replaces [`changed_span`] at its one call site.
 //!
-//! **What is owed (GAPS, A-774).** The slot is not recorded: a restart rebuilds it from the work, and a mount's writes
-//! not yet submitted are lost with it. A mount is not refreshed when its work's base moves past its pin: it shows the
+//! **A restart (main's order 2, A-127).** A mount's writes are published at each barrier as any volume's are (the tree
+//! host fingerprints a directory without its tree), and recovery rebuilds a mounted work's slot from that image after
+//! its work ([`rebuild_mounted`]), the base plane reacquired through the tree host lent with its green at the work's
+//! durable base ([`recovered_pin`]): a save made before a restart is there to submit after it. A tree's identity is its
+//! green's alone, so a slot rebuilt at another version shows drift only where an entry's bytes differ.
+//!
+//! **What is owed (GAPS, A-774).** A mount is not refreshed when its work's base moves past its pin: it shows the
 //! pinned version under its own changes, and a later submit of a file it changed declares its bytes against the work's,
 //! undoing another work's change to that file. A work holding declared changes when first mounted is refused. A
 //! directory renamed through the mount is refused at the submit, as is a special file. Only the NFS and FUSE bridges
@@ -56,18 +61,87 @@ pub(crate) struct MountPin {
 /// Each mounted work's pin, by work: one entry a mounted work of this shard, dropped with its slot.
 pub(crate) type MountedPins = std::collections::BTreeMap<DbVolumeId, MountPin>;
 
-/// The tree identity of `pin`: its fingerprints' device, telling one mount's base from another's.
+/// The tree identity of `pin`: its fingerprints' device, the green's alone, so a mount rebuilt at another version of the
+/// same green (a restart re-pins at the work's durable base) finds drift only where an entry's bytes differ there.
 fn identity(pin: MountPin) -> u64 {
-  // Format: a `u64`'s little-endian bytes: the green's id folded into eight.
-  let mut word = [0u8; size_of::<u64>()];
-  let width = word.len();
+  let mut word = [0u8; 8];
   for (at, byte) in pin.green.bytes.iter().enumerate() {
-    if let Some(slot) = word.get_mut(at.checked_rem(width).unwrap_or(0)) {
+    if let Some(slot) = word.get_mut(at % 8) {
       *slot ^= *byte;
     }
   }
-  // Shape: the version turned half a word, so it mixes into the folded id's other half.
-  u64::from_le_bytes(word) ^ pin.version.rotate_left(u64::BITS / 2)
+  u64::from_le_bytes(word)
+}
+
+/// The size a mounted work's or a green view's slot is admitted and recovered with: no quota of its own
+/// ([`MOUNT_QUOTA_NONE`]).
+pub(crate) const MOUNT_SIZE: SizeClass = SizeClass::Dynamic {
+  max: MOUNT_QUOTA_NONE,
+};
+
+/// The pin a recovered mounted work's slot is rebuilt at (A-774; main's order 2): its green at the work's durable base
+/// version, read once `rebuild_work` has restored the work; `None` for a work whose green is not on this shard.
+pub(crate) fn recovered_pin(state: &ShardState, id: DbVolumeId) -> Option<MountPin> {
+  let work = state.works.get(&id)?;
+  state.greens.get(&work.green)?;
+  Some(MountPin {
+    green: work.green,
+    version: work.base_version,
+  })
+}
+
+/// A mounted work's slot rebuilt from its image (A-774; main's order 2: a mount's unsubmitted writes survive a restart as
+/// a volume's do, A-127): the overlay's base plane reacquired through the tree host lent with its green at `pin`. What
+/// the mount wrote is in the image, published at each barrier as any volume's is.
+pub(crate) fn rebuild_mounted(
+  state: &mut ShardState,
+  record: &slates_db::catalog::VolumeRecord,
+  image: Option<&slates_vfs::recover::VolumeImage>,
+  claims: Option<&slates_vfs::recover::Claims>,
+  (size, pin): (SizeClass, MountPin),
+) -> Result<(Volume, Option<slates_base::BaseHost>, u16), slates_ipc::protocol::RecoveryCause> {
+  use slates_ipc::protocol::RecoveryCause;
+  let image = image.ok_or(RecoveryCause::NoImage)?;
+  let claims = claims.ok_or(RecoveryCause::BlocksUnclaimed)?;
+  let journal = crate::verbs::journal_floor_bytes(state);
+  let quota = crate::verbs::quota_for(size);
+  let mut host =
+    slates_vfs::host::tree::TreeHost::new(identity(pin), crate::verbs::tree_owner(&record.owner));
+  let root = host.root();
+  let ShardState { store, greens, .. } = state;
+  let green = greens
+    .get(&pin.green)
+    .ok_or(RecoveryCause::OriginNotRecovered)?;
+  let tree = crate::green_tree::GreenTree::at(&green, pin.version);
+  let mut volume = {
+    let mut lens = host.lend(&tree);
+    Volume::from_image(
+      store,
+      image,
+      claims,
+      Box::new(slates_vfs::clock::HostClock::new()),
+      journal,
+      Some((&mut lens, root)),
+    )
+    .map_err(|error| RecoveryCause::ImageRefused {
+      reason: crate::verbs::recorded_reason(error.to_string()),
+    })?
+  };
+  let acknowledged = quota.limit();
+  if volume.capacity_bytes() != acknowledged
+    && let Err(error) = volume.resize(acknowledged)
+  {
+    let mut lens = host.lend(&tree);
+    let _discarded = volume.discard_partial_releasing(store, Some(&mut lens));
+    return Err(RecoveryCause::ImageRefused {
+      reason: crate::verbs::recorded_reason(format!("a mounted work's quota: {error}")),
+    });
+  }
+  Ok((
+    volume,
+    Some(slates_base::BaseHost::Tree(Box::new(host))),
+    image.prefix,
+  ))
 }
 
 /// The slot of mounted work `id`, made on its first mount (the module doc): `true` when the work has one now, `false`
@@ -98,13 +172,7 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   let Ok(admitted) = crate::verbs::admit_over(
     state,
     &record.owner,
-    (
-      SizeClass::Dynamic {
-        max: MOUNT_QUOTA_NONE,
-      },
-      NamePolicy::Exact,
-      false,
-    ),
+    (MOUNT_SIZE, NamePolicy::Exact, false),
     crate::verbs::AdmitBase::Tree {
       identity: identity(pin),
     },
@@ -455,13 +523,7 @@ pub(crate) fn ensure_green_view(
   let admitted = crate::verbs::admit_over(
     state,
     &record.owner,
-    (
-      SizeClass::Dynamic {
-        max: MOUNT_QUOTA_NONE,
-      },
-      NamePolicy::Exact,
-      false,
-    ),
+    (MOUNT_SIZE, NamePolicy::Exact, false),
     crate::verbs::AdmitBase::Tree {
       identity: identity(pin),
     },
