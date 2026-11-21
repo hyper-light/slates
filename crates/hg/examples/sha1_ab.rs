@@ -26,6 +26,9 @@ use sha1_checked::{Digest, Sha1};
 /// revision's: the two piece lengths a push hashes.
 const PIECES: [usize; 2] = [240 * 1024, 8 * 1024];
 
+/// A way of hashing a piece: its name and its hasher.
+type Way<'a> = (&'a str, &'a dyn Fn(&[u8]) -> [u8; 20]);
+
 fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
   let mut state = Sha1::builder()
     .detect_collision(detect)
@@ -76,7 +79,7 @@ fn main() {
   for piece_len in PIECES {
     let pieces: Vec<&[u8]> = corpus.chunks(piece_len).collect();
     let reference: Vec<[u8; 20]> = pieces.iter().map(|piece| sha1dc(true, piece)).collect();
-    let ways: [(&str, &dyn Fn(&[u8]) -> [u8; 20]); 4] = [
+    let ways: [Way<'_>; 4] = [
       ("sha1dc (node.rs)", &|piece| sha1dc(true, piece)),
       ("sha1dc, detection off", &|piece| sha1dc(false, piece)),
       ("aws-lc hardware", &hardware),

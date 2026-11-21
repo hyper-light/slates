@@ -39,6 +39,9 @@ const RANGES: [&str; 10] = [
   "client_regions",
 ];
 
+/// Format: the dax ranges' place in [`RANGES`].
+const DAX_RANGES: usize = 3;
+
 /// Format: the arena's place in [`RANGES`].
 const ARENA: usize = 4;
 
@@ -253,7 +256,7 @@ fn targets(state: &ShardState) -> Plan {
     targets.push(object(2, (deltas.0.saturating_add(logged.0), logged.1)));
     let (dax_from, dax_to) = layout.dax_ranges;
     targets.push(object(
-      3,
+      DAX_RANGES,
       (
         start.saturating_add(dax_from),
         dax_to.saturating_sub(dax_from),
@@ -925,6 +928,20 @@ mod tests {
     );
   }
 
+  /// The sweeps completed once one has, asking the memory report at most `bound` times (zero if none did).
+  fn first_sweep_within(daemon: &crate::daemon::Daemon, bound: usize) -> u64 {
+    let mut asked = 0;
+    let mut sweeps = 0;
+    while sweeps == 0 && asked < bound {
+      sweeps = crate::daemon::observe_first(daemon, |state| {
+        report(state, true);
+        state.content_sweep.sweeps
+      });
+      asked += 1;
+    }
+    sweeps
+  }
+
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
     let daemon = crate::daemon::audit_daemon();
@@ -943,15 +960,7 @@ mod tests {
         .sum();
       (total + targets.len() + 1, arena_len, targets.len())
     });
-    let mut asked = 0;
-    let mut sweeps = 0;
-    while sweeps == 0 && asked < bound {
-      sweeps = crate::daemon::observe_first(&daemon, |state| {
-        report(state, true);
-        state.content_sweep.sweeps
-      });
-      asked += 1;
-    }
+    let sweeps = first_sweep_within(&daemon, bound);
     let (done, past_budget, longest_ns, ranges, kinds) =
       crate::daemon::observe_first(&daemon, |state| {
         let sweep = &state.content_sweep;

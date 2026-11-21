@@ -10257,22 +10257,7 @@ mod tests {
   fn bench_a_whole_publications_longest_turn() {
     crate::daemon::audit_on_shard(|state| {
       let id = volume_here_of(state, "bench-held", 1 << 26)?;
-      let handle = *state.by_id.get(&id)?;
-      {
-        let ShardState { store, volumes, .. } = &mut *state;
-        let slot = volumes.get_mut(handle).ok()?;
-        let root = slot.volume.root_inode(store).ok()?;
-        for d in 0..BENCH_DIRS {
-          let dir = slot.volume.mkdir_no(store, root, &format!("d{d}"), 0o755).ok()?;
-          for f in 0..BENCH_FILES {
-            let file = slot.volume.create_file_no(store, dir, &format!("f{f}"), 0o644).ok()?;
-            slot.volume.write(store, file, 0, &[u8::try_from(f % 251).ok()?; BENCH_FILE_BYTES]).ok()?;
-          }
-        }
-        slot.volume.age_writes();
-        slot.volume.age_writes();
-        slot.volume.seal_idle(store, u64::MAX);
-      }
+      bench_volume_filled(state, id)?;
       let quantum = crate::config::wrap_slice_ns(crate::fleet::seal_quantum_ns(state));
       for round in 0..BENCH_ROUNDS {
         let began = std::time::Instant::now();
@@ -10310,6 +10295,39 @@ mod tests {
       Some(())
     })
     .expect("the bench ran");
+  }
+
+  /// Fills `id`'s volume with [`BENCH_DIRS`] x [`BENCH_FILES`] files of [`BENCH_FILE_BYTES`], aged and sealed.
+  fn bench_volume_filled(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Option<()> {
+    let handle = *state.by_id.get(&id)?;
+    let ShardState { store, volumes, .. } = &mut *state;
+    let slot = volumes.get_mut(handle).ok()?;
+    let root = slot.volume.root_inode(store).ok()?;
+    for d in 0..BENCH_DIRS {
+      let dir = slot
+        .volume
+        .mkdir_no(store, root, &format!("d{d}"), 0o755)
+        .ok()?;
+      for f in 0..BENCH_FILES {
+        let file = slot
+          .volume
+          .create_file_no(store, dir, &format!("f{f}"), 0o644)
+          .ok()?;
+        slot
+          .volume
+          .write(
+            store,
+            file,
+            0,
+            &[u8::try_from(f % 251).ok()?; BENCH_FILE_BYTES],
+          )
+          .ok()?;
+      }
+    }
+    slot.volume.age_writes();
+    slot.volume.age_writes();
+    slot.volume.seal_idle(store, u64::MAX);
+    Some(())
   }
 
   /// Whether `id`'s volume's head is held for a reader (A-827).

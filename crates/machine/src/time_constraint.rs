@@ -137,7 +137,10 @@ mod mach {
       u128::from(timebase.numer.max(1)),
       u128::from(timebase.denom.max(1)),
     );
-    let ticks = u128::from(ns).saturating_mul(denom) / numer;
+    let ticks = u128::from(ns)
+      .saturating_mul(denom)
+      .checked_div(numer)
+      .unwrap_or(u128::MAX);
     // The record's fields are `uint32_t`, passed through an integer array: the bits of a u32 in a c_int.
     let ticks = u32::try_from(ticks).unwrap_or(u32::MAX);
     libc::c_int::from_ne_bytes(ticks.to_ne_bytes())
