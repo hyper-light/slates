@@ -711,6 +711,10 @@ impl Held {
 pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
+  /// Each timed hop's per-write durations ([`count_hop`]), by its count's name: its sums alone are means, which one long
+  /// write skews (each run's first held reply waited the 100 ms record period, 49 us a write averaged over 2,051;
+  /// g228, BENCHMARKS "85a's two named costs"). A fixed set, one histogram a hop, each of fixed size.
+  pub(crate) hop_times: BTreeMap<&'static str, crate::histogram::DurationHistogram>,
   /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
   /// copies reached since the last (A-270).
   pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
@@ -5334,6 +5338,29 @@ const HOP_HOLDER: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holde
 fn count_hop(state: &mut ShardState, (count, sum): (&'static str, &'static str), ns: u64) {
   state.count(count, 1);
   state.count(sum, ns);
+  state.live.hop_times.entry(count).or_default().record(ns);
+}
+
+/// Each timed hop's per-write percentiles for the shard's status report ([`count_hop`]): `<hop>.p50_ns`, `.p99_ns`,
+/// `.p999_ns` and `.max_ns`, each a histogram bucket's upper bound within an eighth above the exact value, the maximum
+/// exact.
+pub(crate) fn hop_rows(state: &ShardState) -> Vec<slates_ipc::protocol::RefusalCount> {
+  let mut rows = Vec::new();
+  for (hop, times) in &state.live.hop_times {
+    let quantiles = times.quantiles();
+    for (figure, value) in [
+      ("p50_ns", quantiles.p50_ns),
+      ("p99_ns", quantiles.p99_ns),
+      ("p999_ns", quantiles.p999_ns),
+      ("max_ns", quantiles.max_ns),
+    ] {
+      rows.push(slates_ipc::protocol::RefusalCount {
+        kind: format!("{hop}.{figure}"),
+        count: value,
+      });
+    }
+  }
+  rows
 }
 
 /// The round of `volume`'s newest entry, hop by hop, once an answer made it durable: its publication's arrival at the

@@ -984,22 +984,34 @@ pub(crate) async fn home_in_region(
   shards: &[u16],
   bytes: Vec<u8>,
   budget: slates_cluster::CommitBudget,
-) -> Result<ContentId, HomeRefused> {
-  let (local, members, f) = crate::state::with_state(|state| {
+) -> Homed {
+  let Some((local, members, f)) = crate::state::with_state(|state| {
     (
       state.fleet.host(),
       state.fleet.members().to_vec(),
       usize::try_from(state.fleet.configuration().quorum.f).unwrap_or(usize::MAX),
     )
-  })
-  .ok_or(HomeRefused::Unanswered)?;
+  }) else {
+    return Homed {
+      outcome: Err(HomeRefused::Unanswered),
+      bytes,
+    };
+  };
   let identity = ContentId::of(&bytes);
   let homes = slates_db::identity_homes::homes(&identity.0, &members, f);
   let budget_ns = budget.max_deadline_ns();
   let mut kept = 0usize;
   let began = slates_rt::futures::now_ns();
   if homes.contains(&local) {
-    kept = kept_here(origin, shards, &bytes, budget_ns).await?;
+    match kept_here(origin, shards, &bytes, budget_ns).await {
+      Ok(here) => kept = here,
+      Err(refused) => {
+        return Homed {
+          outcome: Err(refused),
+          bytes,
+        };
+      }
+    }
   }
   let local_ns = slates_rt::futures::now_ns().saturating_sub(began);
   let others: Vec<slates_db::HostId> = homes
@@ -1010,18 +1022,21 @@ pub(crate) async fn home_in_region(
   // The other homes reached from the control shard, which holds the record sessions (`crate::fleet::take_sessions`):
   // on any other shard none is found and every homing there fell short (the three-node A/B, 2026-11-20).
   let began = slates_rt::futures::now_ns();
+  let mut bytes = bytes;
   if !others.is_empty() {
     let control = shards.first().copied().unwrap_or(origin);
-    kept = kept.saturating_add(
-      crate::xshard::task_in_shard_time(
-        origin,
-        control,
-        move || put_remote(others, identity, bytes, budget),
-        budget_ns,
-      )
-      .await
-      .unwrap_or(0),
-    );
+    // The bytes go to the control shard's task and come back with its count, so a caller that moves them on (a push's
+    // pack into the changeset store, A-767 C5) makes no copy; a task that never answered took them with it.
+    let (remote, back) = crate::xshard::task_in_shard_time(
+      origin,
+      control,
+      move || put_remote(others, identity, bytes, budget),
+      budget_ns,
+    )
+    .await
+    .unwrap_or_default();
+    kept = kept.saturating_add(remote);
+    bytes = back;
   }
   let region_ns = slates_rt::futures::now_ns().saturating_sub(began);
   crate::state::with_state(|state| {
@@ -1032,11 +1047,25 @@ pub(crate) async fn home_in_region(
   crate::state::with_state(|state| {
     state.count(if homed { HOMED_IN_REGION } else { HOMED_SHORT }, 1)
   });
-  if homed {
-    Ok(identity)
-  } else {
-    Err(HomeRefused::Unanswered)
+  Homed {
+    outcome: if homed {
+      Ok(identity)
+    } else {
+      Err(HomeRefused::Unanswered)
+    },
+    bytes,
   }
+}
+
+/// What [`home_in_region`] answers: its outcome, and the bytes it was handed, given back so the caller can move them on
+/// (a push's pack into the node's changeset store, A-767 C5) with no copy; empty where a home's task took them and
+/// never answered.
+#[derive(Debug)]
+pub(crate) struct Homed {
+  /// The object's identity once `f + 1` homes kept it; refused otherwise.
+  pub(crate) outcome: Result<ContentId, HomeRefused>,
+  /// The bytes homed.
+  pub(crate) bytes: Vec<u8>,
 }
 
 /// The object `identity` read from the region (A-724 piece 8c: a version-3 record's names, read where its replay runs):
@@ -1136,17 +1165,22 @@ async fn put_remote(
   identity: ContentId,
   bytes: Vec<u8>,
   budget: slates_cluster::CommitBudget,
-) -> usize {
+) -> (usize, Vec<u8>) {
   use slates_cluster::homes::{HomeMessage, HomeOutcome, PART_BYTES};
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PART_BYTES {
-    return put_in_parts(&homes, identity, &bytes, budget).await.len();
+    let kept = put_in_parts(&homes, identity, &bytes, budget).await.len();
+    return (kept, bytes);
   }
-  let request = HomeMessage::Put {
+  let message = HomeMessage::Put {
     identity: identity.0,
     bytes,
-  }
-  .encode();
-  exchange(&homes, &request, budget)
+  };
+  let request = message.encode();
+  let bytes = match message {
+    HomeMessage::Put { bytes, .. } => bytes,
+    _ => Vec::new(),
+  };
+  let kept = exchange(&homes, &request, budget)
     .await
     .into_iter()
     .filter(|(_, reply)| {
@@ -1155,7 +1189,8 @@ async fn put_remote(
         Ok(HomeMessage::Answer { identity: answered, outcome: HomeOutcome::Kept { .. } }) if answered == identity.0
       )
     })
-    .count()
+    .count();
+  (kept, bytes)
 }
 
 /// The object named `identity` read from one of the other homes `homes`, a part at a time from each in turn

@@ -87,9 +87,14 @@ pub(crate) fn host_holding(dump: &[u8]) -> (SimHost, HostDir) {
 /// Imports `dump` into repository `id` from a history running as a task on the shard, a turn at a time, each record
 /// handed over landed on the node's store before the next turn (C2, `super::land_owed`), to its end: what the turns
 /// ended with, and how many there were.
-pub(crate) async fn imported(id: RepositoryId, dump: &[u8]) -> (Result<Loaded, LoadFailed>, u64) {
+pub(crate) async fn imported(
+  id: RepositoryId,
+  dump: impl AsRef<[u8]>,
+) -> (Result<Loaded, LoadFailed>, u64) {
   use crate::repository::svn_commit::tests::on;
-  let (host, root) = host_holding(dump);
+  let (host, root) = host_holding(dump.as_ref());
+  // The simulated host holds the dump now: the caller's copy goes, so a measurement counts one.
+  drop(dump);
   if let Err(failed) = on(|state| begin(state, (&owner(), id), (Box::new(host), root, DUMP))) {
     return (Err(failed), 0);
   }

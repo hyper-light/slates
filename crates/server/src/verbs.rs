@@ -2390,24 +2390,30 @@ fn deliver_owner_forward(
   ),
 ) {
   if origin == control {
-    finish_owner_forward(client, request, reply, after);
+    finish_owner_forward((origin, client, request), reply, after);
     return;
   }
   crate::xshard::send_reply_home(origin, move || {
-    finish_owner_forward(client, request, reply, after);
+    finish_owner_forward((origin, client, request), reply, after);
   });
 }
 
 fn finish_owner_forward(
-  client: Handle<ClientSlot>,
-  request: u64,
+  (origin, client, request): (u16, Handle<ClientSlot>, u64),
   reply: OwnerReplies,
   (route, plan): (
     Option<crate::owner_location::CachedRoute>,
     Option<ReadAhead>,
   ),
 ) {
-  let delivered = crate::state::with_state(move |state| {
+  // Held outside the borrow (A-800), so a borrow that does not run the closure leaves it to be sent home again, and a
+  // retention refusal after the closure ran (whose effect stands) leaves its reply to deliver.
+  let mut pending = Some((reply, route, plan));
+  let mut delivered = None;
+  let access = crate::state::try_with_state(|state| {
+    let Some((reply, route, plan)) = pending.take() else {
+      return;
+    };
     state.count(FORWARD_CLIENT_DELIVERED_HOME, 1);
     let ShardState {
       clients,
@@ -2418,26 +2424,51 @@ fn finish_owner_forward(
       // The client went: its reap credited the batch's charge with it.
       state.forwarded_rings.remove(&request);
       state.count("fleet.owner_location.client_gone", 1);
-      return None;
+      return;
     };
     slot.owner_route = route;
     // A window answered for a read: kept for the client's next pages, and its first page is the reply.
-    Some(match plan {
+    delivered = Some(match plan {
       Some(plan) => {
         let (reply, joined) = keep_window(read_ahead, slot, plan, reply);
         state.count(READ_AHEAD_JOINED, joined);
         reply
       }
       None => reply.first,
-    })
-  })
-  .flatten();
+    });
+  });
+  match access {
+    Ok(()) => {}
+    Err(crate::state::StateAccess::Retention(_)) => {
+      crate::state::with_state_counted(|s| s.count(FORWARD_CLIENT_DELIVERED_PAST_RETENTION, 1));
+    }
+    // Borrowed: the closure never ran; the reply goes home again, to run once the borrow is let go.
+    Err(crate::state::StateAccess::Borrowed) => {
+      if let Some((reply, route, plan)) = pending.take() {
+        crate::xshard::send_reply_home(origin, move || {
+          finish_owner_forward((origin, client, request), reply, (route, plan));
+        });
+        crate::state::count_forward_resent_borrowed();
+      }
+      return;
+    }
+    // No state here or a fenced shard: nobody here can take it (counted with the orphaned replies).
+    Err(crate::state::StateAccess::Absent | crate::state::StateAccess::Fenced) => {
+      crate::state::count_forward_unservable();
+      return;
+    }
+  }
   if let Some(reply) = delivered {
     // The executing owner owns the completion. In particular, a transient routing refusal
     // must not become a permanent completion at the origin and prevent this id's retry.
     crate::state::deliver(client.index(), request, reply, true);
   }
 }
+
+/// Counter: a forwarded reply whose shard's retention check refused after the reply was taken (the borrow's effect
+/// stands), delivered all the same (A-800); before, the reply was dropped with the borrow's result.
+const FORWARD_CLIENT_DELIVERED_PAST_RETENTION: &str =
+  "fleet.forward.client.delivered_past_retention";
 
 /// Proposes a lost region's promotion to its declared mirror on this shard's root group (§4.8, D-14). Refuses
 /// `Unsupported` when the region has no declared mirror (the operator declares mirrors in the manifest), and
@@ -4413,6 +4444,34 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            crate::xshard::REPLY_HOME_HANDED,
+            crate::xshard::reply_home_counts().handed,
+          ),
+          (
+            crate::xshard::REPLY_HOME_RAN,
+            crate::xshard::reply_home_counts().ran,
+          ),
+          (
+            crate::xshard::REPLY_RESENT_BORROWED,
+            crate::xshard::reply_home_counts().resent_borrowed,
+          ),
+          (
+            crate::xshard::REPLY_ORPHANED,
+            crate::xshard::reply_home_counts().orphaned,
+          ),
+          (
+            crate::state::REPLY_UNDELIVERED_BORROWED,
+            crate::state::undelivered_borrowed(),
+          ),
+          (
+            crate::state::FORWARD_RESENT_BORROWED,
+            crate::state::forward_undelivered().0,
+          ),
+          (
+            crate::state::FORWARD_UNSERVABLE,
+            crate::state::forward_undelivered().1,
+          ),
+          (
             crate::xshard::ROOM_WAITS_STARTED,
             crate::xshard::room_waits().started,
           ),
@@ -4480,6 +4539,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(crate::live_ship::hop_rows(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -5301,7 +5361,14 @@ fn dispatch_inner(
       increment,
       computed,
       carried,
-    } => submit_computed(state, (work, green), (&increment, computed), carried),
+    } => {
+      // The owner's whole step for a holder's submit (main's ruling on the lane, 2026-11-20: measured on both ends).
+      let start = slates_machine::clock::monotonic_ns();
+      let reply = submit_computed(state, (work, green), (&increment, computed), carried);
+      let step_ns = slates_machine::clock::monotonic_ns().saturating_sub(start);
+      crate::merge_service::count_phase(state, SUBMIT_OWNER_STEP, step_ns);
+      reply
+    }
     RequestBody::Edit {
       work,
       path,
@@ -9003,8 +9070,12 @@ fn report_first_work_log_refusal(state: &ShardState) {
     return;
   }
   let held = state.db.partition().merge_budget_held();
+  let largest = held
+    .largest_work
+    .map(|work| crate::work_log::describe_log(state.db.partition().work_log(work)))
+    .unwrap_or_default();
   slates_machine::log_line!(
-    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?}",
+    "slates-server: work log refused at the merge budget (first occurrence): shard={} {held:?} largest log: {largest}",
     state.shard
   );
 }
@@ -10031,7 +10102,7 @@ fn submit(
         return refused(refusal);
       }
       // A whole-file rewrite is refined first, a slice a turn, by a job of this shard (A-787 part 2): the submit waits.
-      if let Some(owed) = refinement_owed(state, (work_id, green_id)) {
+      if let Some(owed) = parkable_refinement(state, (work_id, green_id)) {
         let kind = ParkedKind::Local {
           principal: principal.clone(),
           work,
@@ -10627,7 +10698,7 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
     Some(answer) => answer,
     None => {
       if state.greens.contains_key(&green_id)
-        && let Some(owed) = refinement_owed(state, (work_id, green_id))
+        && let Some(owed) = parkable_refinement(state, (work_id, green_id))
       {
         let kind = ParkedKind::LocalRebase {
           principal: principal.clone(),
@@ -11351,6 +11422,12 @@ fn base_engine(state: &ShardState, green: DbVolumeId) -> Option<BaseEngine<'_>> 
 /// 3b), the non-vacuity count of [`judge_submission`]'s computed path.
 pub(crate) const TAKEN_BY_POSITION: &str = "merge.verdict.taken_by_position";
 
+/// Counter pair: a holder's `SubmitComputed` served on this owner, and its steps' time in all, nanoseconds (the decode,
+/// the verdict taken by position, the append), measured on both ends of the forward (main's ruling on the lane,
+/// 2026-11-20).
+pub(crate) const SUBMIT_OWNER_STEP: (&str, &str) =
+  ("merge.submit.owner_step", "merge.submit.owner_step_ns");
+
 /// `SubmitComputed` (A-697 part c; A-658 part 3b): the node holding a work over this green sends the work's increment and
 /// the verdict its replica computed, and the owner judges and commits it as a submit asked from a work's shard is
 /// ([`judge_submission`]), the verdict taken by position. Only as a forward from another node (its completion record
@@ -11746,6 +11823,18 @@ fn park_on_refinement(
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// The refinement a local verb of `work` parks behind (A-787 part 2): the one its journal owes, when the verb runs in a
+/// recorded request. A verb dispatched outside one has no route its answer could be sent on after the job, so it is
+/// not parked: it composes unrefined, as a remote edit-and-submit does, and is answered now. Refusing it `Overloaded`
+/// (as `park_on_refinement` would) refused every whole-file rewrite such a dispatch submitted, whatever its size.
+fn parkable_refinement(
+  state: &ShardState,
+  (work, green): (DbVolumeId, DbVolumeId),
+) -> Option<crate::refining::Owed> {
+  state.current_request?;
+  refinement_owed(state, (work, green))
 }
 
 /// The refinement `work`'s journal owes on this shard (A-787 part 2), read where the work holds it.
@@ -21369,6 +21458,62 @@ fn creator_gid() -> u32 {
 #[cfg(test)]
 mod tests {
   use super::{Continued, next_batch};
+
+  /// A-800 (goal 86b's lost replies; CLAUDE.md §2 item 9). Do: on a shard, while its state is borrowed, finish a
+  /// forwarded reply there for a client the shard does not hold (the reply's run meeting a borrowed state). Expect: the
+  /// reply is sent home again and, once the borrow is let go, runs and is answered for (its client gone, counted
+  /// `fleet.owner_location.client_gone`), the resend counted (`fleet.forward.client.resent_borrowed`). Before, the
+  /// borrow's refusal dropped the reply with nothing counted.
+  #[test]
+  // The test thread waits off-shard for the shard to run the resent reply.
+  #[allow(clippy::disallowed_methods)]
+  fn a_forwarded_reply_that_meets_a_borrowed_state_is_sent_home_again() {
+    let daemon = crate::daemon::audit_daemon();
+    let before = crate::daemon::observe_first(&daemon, |state| {
+      let gone = state
+        .refusals
+        .get("fleet.owner_location.client_gone")
+        .copied()
+        .unwrap_or(0);
+      let at = state.shard;
+      super::finish_owner_forward(
+        (at, slates_mem::Handle::from_raw(0, u32::MAX), 1),
+        super::OwnerReplies {
+          first: ReplyBody::Acknowledged,
+          later: Vec::new(),
+        },
+        (None, None),
+      );
+      gone
+    });
+    let deadline =
+      std::time::Instant::now() + std::time::Duration::from_nanos(crate::daemon::OBSERVE_BUDGET_NS);
+    let mut seen = (before, 0);
+    while std::time::Instant::now() < deadline {
+      seen = crate::daemon::observe_first(&daemon, |state| {
+        (
+          state
+            .refusals
+            .get("fleet.owner_location.client_gone")
+            .copied()
+            .unwrap_or(0),
+          crate::state::forward_undelivered().0,
+        )
+      });
+      if seen.0 > before {
+        break;
+      }
+      std::thread::sleep(std::time::Duration::from_nanos(
+        crate::daemon::HEARTBEAT_NS / 10,
+      ));
+    }
+    daemon.stop();
+    assert_eq!(
+      seen,
+      (before + 1, 1),
+      "the reply ran once its borrow was let go, its resend counted"
+    );
+  }
   use super::{
     HostId, ObjectId, Principal, ReadAheadLedger, Refusal, RegionId, ReplyBody, VolumeId,
     home_redirect, join_batch, verify_attestation,

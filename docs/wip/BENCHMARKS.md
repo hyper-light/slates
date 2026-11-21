@@ -17005,5 +17005,90 @@ is the invocation's median of 3 runs. µs unless marked.
   under 1 ms, and no arm's p999 is under 1 ms anywhere (Linux 1.0–7.4 ms, macOS 8–12 ms, Windows 0.2–59 ms).
 - B costs the quiet median 10–30 µs on Linux and Windows (not on macOS) and leaves R9's uncontended spinning p99 where
   it was (its form names its own spin): Linux 31.6–37.7 µs against A's 33.4–56.0; macOS's CI runner misses R9 in both.
+- **B landed as A-799 (2026-11-21), its measured cost the quiet median: +10–30 µs** (Linux arm64 86–92 → 100–101 µs,
+  x86_64 93–100 → 109–121, Windows x86_64 116 → 133–134; macOS not slower).
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
+
+## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** As "Subversion on the changeset store" above (adas-macbook-pro-2.local, release, load 15
+  to 25), on main 40c3f8d1e with the measurement's attribution (this change): after the import, the shard's own figures
+  (`slates_mem::heap::stats`, the shard budget, its arena's extents, the stores' charges, the records' bytes) and
+  `vmmap -summary` of the test process. The dump is read once inside the history and dropped once the simulated host
+  holds it (a first run held it three more times through the history's clones: 4.0 GB footprint, 2.5 GB of it freed
+  large blocks).
+
+| Region after the import of 2,000 revisions (458 MB dump) | Resident |
+|---|---|
+| process footprint (vmmap) | 3.0 GB; 2.5 GB after the replay |
+| freed large blocks the allocator keeps (`MALLOC_LARGE (empty)`) | 1.5 GB: the simulated host's 458 MB dump, freed at the import's end, and ~1 GB of the import's own large transients |
+| live small allocations (`MALLOC_SMALL`) | 593 MB |
+| the shard's arena (`shared memory`) | 840 MB; the shard budget charges 440 MB of it, all as retention |
+| live large allocations | 57 MB |
+| the records' own bytes (texts, properties, index) | 35.5 MB |
+| the register's references | 62 KB |
+
+- **What it says.** A 458 MB dump whose history the records keep in 35.5 MB leaves the shard holding ~1.4 GB live: 440
+  MB charged as retention (the green's kept versions) inside an 840 MB-resident arena, and 593 MB of small allocations
+  not yet attributed by owner; plus ~1 GB of transient large buffers the allocator keeps. None of it is texts the store
+  could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
+  the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
+  reader's buffer) held once (Ada's MEMORY SIZING rule).
+
+## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
+
+**Command (the contract):** the live-shipping measurement, release, five rounds a run; arms interleaved. Linux:
+GitHub CI on `ubuntu-latest` (4 cores, 15 GiB, load 1.1-1.9), `diag-g228-live-2` to `-9`, each arm built from its
+commit (the workflow on those branches only; results pushed to `diag-results/`). macOS: adas-mac-studio.local-2 (32
+cores, load 9-17), CARGO_BUILD_JOBS=4. The hop counters are sums over a run; the per-write figures below divide them by
+the writes, which a single long write skews (see the correction).
+
+### The exchange on the data shard: measured and rejected
+
+With one shard a daemon, the volume's owner shard is the control shard, so an entry is sent and answered on the data
+shard with no control-shard hop: the most per-shard sessions could gain, measured before building them (arm
+`72af2d1ed`, the test's `SHARDS` constant only). Added at the median, µs, rounds 1-5:
+
+| host | two shards | one shard |
+|---|---|---|
+| ubuntu-latest (63d19f184 against 72af2d1ed) | 205.1, 210.1, 222.7, 197.5, 210.3 | 194.5, 173.8, 213.5, 219.0, 178.5 |
+| Studio (d80175d3f against 72af2d1ed) | 190.8, 188.2, 183.8, 177.0, 180.7 | 200.5, 200.8, 194.4, 192.3, 194.5 |
+
+On Linux about 15 µs better at the median with the spreads overlapping; on macOS about 10 µs worse (the hop back to the
+owner nearly vanishes, 7 to 1 µs, but the dispatch competes with the write on the one shard, 23 to 31 µs out). Neither
+justifies per-shard transport sessions.
+
+### The held reply's wake: not a cost; a run's one long first write, averaged
+
+Counted on main (b72aff1f, Studio, load 13-17): the reply's wake read 62.7-65.0 µs a write every round, and 68.2-68.6
+on ubuntu-latest, holds kept or declined. Split by stamps (fold to its wake of the reply; the wake to the reply's poll;
+the wait's end): 0.5-1.4, 54.8-64.6 and 1.3-3.3 µs a write, the reply woken by the fold itself in 2,050 of 2,051 writes,
+one step and about two task polls between the fold and the reply, no driver wait, no long step. **Correction:** the
+first held reply of each run waited 100.45 ms (the record period: its volume's head placed), and a second one in about a
+round in five; spread over 2,051 writes that is 49 µs a write, which is the whole constant (112.8 ms of `reply_poll`
+in a round: 100.45 ms for one write, about 6 µs for each of the others; the first logged replies, 5.8-7.8 µs). A reply
+is answered about 6-8 µs after its fold.
+
+**Measured and rejected: a held reply polled without a park while its answer is due** (e9f66a253, ubuntu-latest):
+added 224.9, 217.5, 214.9, 204.7 µs against parked 209.1, 210.3, 203.8, 214.2, 202.4 (its fifth round printed nothing);
+there was no wake to remove.
+
+**Reading.** Neither named cost is where 85a's median goes. What remains a write, from these runs: the entry's build on
+the owner (about 45-90 µs), the hop to the control shard (10-35), the exchange with the holders (about 50-170, the holder's
+own serve 12-25 of it), and the hop back (1-14); those are means, which the same kind of skew may inflate, so the next
+count is per-write percentiles of each hop.
+
+**Per-write medians of each hop on main e1f246ca8** (the hops' histograms, landed the same day; the contract command,
+release, five rounds). Microseconds, p50 (bucket upper bounds, within an eighth above the exact value):
+
+| host | added p50 | build | to control | exchange (holder's serve) | to owner | reply |
+|---|---|---|---|---|---|---|
+| ubuntu-latest, 4 cores, load 1.4-1.6, holds kept (diag-g228-live-10) | 112.2, 113.4, 107.5, 106.7, 112.8 | 24.6 | 8.2-9.2 | 57.3-61.4 (7.7-9.2) | 3.3-3.6 | 7.2-8.2 |
+| Studio, 32 cores, load 13-17, holds declined | 168.5, 195.0, 186.0, 189.2, 205.4 | 22.5-26.6 | 24.6-30.7 | 106.5-114.7 (9.2-12.3) | 6.1-8.2 | 8.2-20.5 |
+
+**Reading.** The exchange is half the median added cost and more: about 59 µs on Linux and 107 on macOS, of which the
+holder's own serve is 8-12. The transport bench makes a 4 KiB write durable on two hosts in 22.6-27.2 µs (above), so
+about 30 µs of the Linux exchange is the daemon's own (the lane, the session's borrow and return, the control shards'
+receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
+both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
