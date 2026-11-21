@@ -4480,6 +4480,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       )
       .chain(large_counts(state))
       .chain(content_ranges)
+      .chain(crate::live_ship::hop_rows(state))
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
