@@ -10906,7 +10906,12 @@ the immediate poll with a time-horizon turn estimate, and the immediate poll wit
 spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards (p99 28-43 and 38-40 µs against main's
 99-111) and cut the loaded p99 3-5x (0.25-0.46 ms against 1.06-1.34). Both make the loaded p999 worse (5.6-23.4 ms against
 2.1-2.5) and spend 2-6x main's quiet CPU (3.3-10 cores against 1.7). Neither lands under the data rule: P2 stays open.
-**Next:** the loaded p999's own hop (g222's ~1 ms timer band and the shards' priority under a true spin), with g222.
+**The p999's hop, named (2026-11-20 night):** g222's 1.00-1.02 ms band was the busy harvest's nap. The kqueue commit alone
+empties it on their path (queued p99 1.05-1.17 ms -> 22-23 µs), and on Linux the same band is the kernel tick. On
+provisioning the candidates' p999 sits in cross-shard hops to a shard that spins without sleeping, which macOS demotes
+and which then waits quanta for a core: 7-29 ms. QoS user-interactive does not move it (rejected; BENCHMARKS "Where the
+loaded p999 goes, per hop"). **Decision needed (main/Ada):** land the immediate poll for p99 3-5x better and R9's quiet
+floor (with the p999 4-5x worse and 4-6x the quiet CPU with holds), or keep main's nap.
 Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:

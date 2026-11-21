@@ -16074,7 +16074,35 @@ p999 13.0 -> 37.3 ms.
 
 **Measured, not landed.** Both arms meet R9's floor quiet at nine shards, which main never has, and cut the loaded p99
 3-5x. Both lose the loaded p999 and spend 2-6x the quiet CPU. Under the data rule neither lands. The loaded p999 is the
-open item; its hop is still to be named.
+open item; its hop is named below.
+
+### Where the loaded p999 goes, per hop, and the shards' QoS (A-786; 2026-11-20 night, w-provision-gate)
+
+Same MacBook. The host was quiet for once (load 4 to 18). `PROVISION_BENCH_LOAD=2`. Diagnostic hop stamps (never on main)
+split each create in the loaded p999 tail, three per run. Two rounds, interleaved.
+
+- **main:** the tail is the client's own wake after it parked (from the reply landing to its taking, 15 to 33 ms) and the
+  nap hop (from the reply's task to the serve task, 0.6 to 2.9 ms). Loaded p99 0.88 to 1.44 ms, p999 2.2 to 2.7 ms.
+- **immediate poll + time-horizon estimate:** the tail is almost all cross-shard hops. The forward to the owner's task
+  took 7 to 19 ms, and the owner's reply to its task on the client's shard 13 to 29 ms. The client wakes fast. A shard
+  that spins without ever sleeping looks CPU-bound to macOS, which demotes it; preempted beside the spinners, it waits
+  quanta for a core, and a kick cannot help because it is not parked. Loaded p99 0.26 to 0.55 ms, p999 10.6 to 12.2 ms.
+  Quiet: p99 41 to 89 µs, at 6.1 to 10.0 cores (holds keep all nine shards spinning for one client).
+- **The same, with shard threads at `QOS_CLASS_USER_INTERACTIVE`:** loaded p99 0.26 to 0.45 ms, p999 6.5 / 9.8 ms. The
+  tail is still the cross-shard hops (6 to 22 ms). **Measured and rejected,** the third time for a shard QoS class
+  (2026-10-07 twice, and g222's G222_QOS before the kqueue fix).
+
+| arm | quiet p99 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|
+| main | 96.7 / 89.3 | 0.88 / 1.06 | 2.42 / 2.24 | 1.66-1.70 |
+| immediate + time estimate | 89.2 / 48.1 | 0.43 / 0.26 | 11.2 / 10.6 | 6.1-10.0 |
+| the same, QoS user-interactive | 39.6 / 34.8 | 0.45 / 0.26 | 6.45 / 9.83 | 6.2-10.0 |
+
+**Reading.** On macOS beside two spinners a logical CPU, the nap is both the cause of the loaded p99 (it hands the core
+away between two tasks of a request) and what keeps a spinning shard at its priority. Removing it cuts the loaded p99 3 to
+5 times and loses the p999 4 to 5 times. No priority lever moved it. On g222's edit-and-merge path the immediate poll
+improved the p999 too (15 -> 7-9 ms, the client's spin there); on provisioning it does not. That makes it a trade-off for
+main and Ada, not a fix.
 
 ## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
