@@ -3140,6 +3140,14 @@ fn run_recorded(
     state.current_request = None;
     return parked;
   }
+  // A Mercurial name that reaches the tags reads the heads' `.hgtags` from the changeset store first, between turns
+  // (A-767 C1, `crate::vcs_store::hg_tags`): the request parks until the read is done, nothing of it run before.
+  if let Some(owed) = crate::vcs_store::hg_tags::owing(state, &body) {
+    state.current_request = Some((origin, id));
+    let parked = crate::vcs_store::hg_tags::park_request(state, owed, (client_id, principal, body));
+    state.current_request = None;
+    return parked;
+  }
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -4688,6 +4696,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       .chain(large_counts(state))
       .chain(content_ranges)
       .chain(crate::live_ship::hop_rows(state))
+      .chain(busy_harvest_rows())
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -10705,6 +10714,146 @@ pub(crate) const SUBMIT_LONGEST_STEP_US: &str = "merge.submit.longest_step_us";
 /// Counter: submit judgments whose one step ran past the shard's derived step bound (`step_ceiling_ns`, A-783).
 pub(crate) const SUBMIT_STEPS_PAST_CEILING: &str = "merge.submit.steps_past_ceiling";
 
+/// `inc` admitted and held before its verdict: encoded (by the refinement job where it prepared it, A-787 part 3, else
+/// here), its chain room admitted and its retention secured, then held in the shard's content store, where its chain
+/// entry names it (lane (A), chain entry format 6), refused typed at the shard's room, the green's retention settled
+/// again on that refusal.
+fn increment_held(
+  state: &mut ShardState,
+  sealed: &crate::work_home::SealedWork,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<crate::merge_service::HeldIncrement, Refusal> {
+  let increment_bytes =
+    crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
+  chain_room_admitted(state, green_id, inc)?;
+  retention_secured(state, green_id, inc)?;
+  let next = state.db.partition().green_head(green_id).saturating_add(1);
+  crate::merge_service::hold_increment(state, green_id, next, &increment_bytes).inspect_err(|_| {
+    let _ = crate::merge_service::settle_green_retention(state, green_id);
+  })
+}
+
+/// The `merge.verdict` chokepoint span (§4.14) from `start` to `end`, labeled `accepted` (1) or not (0), opened within
+/// the submit's own `shard.op` span; a submit always runs inside a recorded verb, so without one its cause is declared
+/// missing.
+fn verdict_span_emitted(state: &mut ShardState, (start, end): (u64, u64), accepted: u32) {
+  let verdict = match state.current_span {
+    Some(cause) => state
+      .tracer
+      .open_within(&cause, Chokepoint::MergeVerdict, start),
+    None => state
+      .tracer
+      .open_unlinked(RequestId::default(), Chokepoint::MergeVerdict, start),
+  };
+  crate::telemetry::emit(state, verdict.end(accepted, end));
+}
+
+/// Whether green `green_id`'s chain admits an entry for `inc`, at the most it can be: its bound plus the room a copy
+/// from a version its source changed after adds (A-626 part 2), derived from what the green's histories hold.
+fn chain_room_admitted(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<(), Refusal> {
+  let room = state
+    .greens
+    .get(&green_id)
+    .map(|engine| engine.copy_entry_room(inc))
+    .ok_or(Refusal::NotFound)?;
+  let bound = slates_merge::chain_entry::entry_bound(inc).saturating_add(room);
+  let admission = Op::GreenAdvanced {
+    green: green_id,
+    increment: vec![0; bound],
+  };
+  let now = state.clock.monotonic_ns();
+  chain_admits(state, green_id, &admission, now)
+}
+
+/// The retention `inc` will take secured before the verdict: the superseded values it charges (incoming bytes do not
+/// bound the retained history: unlink carries none and a short overwrite retains the complete previous file) and the
+/// change index it grows (A-264), room made first by folding what the retention budget allows (never a live reader's
+/// version). An accepted work is reset to its green at the new version, holding nothing of its own, so nothing is
+/// secured for it.
+fn retention_secured(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  inc: &slates_merge::engine::Increment,
+) -> Result<(), Refusal> {
+  let reserved = state
+    .greens
+    .get(&green_id)
+    .map(|engine| {
+      engine
+        .history_reservation(inc)
+        .saturating_add(engine.changes_reservation(inc))
+    })
+    .ok_or(Refusal::NotFound)?;
+  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
+  let secure_start = state.clock.monotonic_ns();
+  let secured_now = secure_retention(state, green_id, secured);
+  let secure_ns = state.clock.monotonic_ns().saturating_sub(secure_start);
+  crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_SECURE, secure_ns);
+  secured_now.map_err(|available| Refusal::BudgetExceeded { available })
+}
+
+/// An accepted (or identical) verdict answered: a Subversion green's held verdict deferred to the task holding the
+/// repository's landing turn (`crate::made_commit`), else committed here; the version made into the revision or
+/// changeset its repository's server makes of it; and published once its merge record is committed at the quorum.
+fn accepted_answer(
+  state: &mut ShardState,
+  (green_id, version): (DbVolumeId, u64),
+  parts: AcceptedParts,
+  (copies, held_verdict): (
+    Vec<crate::vcs_store::svn_made::MadeCopy>,
+    Option<slates_merge::engine::Judged>,
+  ),
+) -> ReplyBody {
+  let authorship = parts.authorship.clone();
+  let authorship = &authorship;
+  // A Subversion repository's green whose submit took the repository's landing turn before its verdict
+  // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
+  // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
+  // the accept is durable in this step, and the request is answered when that step commits.
+  if let Some(judged) = held_verdict {
+    match crate::made_commit::take_held(state, green_id) {
+      Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
+      // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
+      None => {
+        let committed = state
+          .greens
+          .get_mut(&green_id)
+          .map(|mut engine| engine.commit_judged(judged).is_ok());
+        if committed != Some(true) {
+          return refused(Refusal::Overloaded { shard: state.shard });
+        }
+      }
+    }
+  }
+  if let Err(refusal) = commit_accepted(state, parts) {
+    return refused(refusal);
+  }
+  // A Subversion repository's green, run outside a recorded request (a bare dispatch, which no answer waits on): the
+  // version becomes the revision the server makes of it, landed by a task after this step (`vcs_store::svn_made`).
+  crate::vcs_store::svn_made::make(state, green_id, version, authorship, &copies);
+  // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
+  // transaction (A-731, `vcs_store::hg_made`).
+  crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
+  // The acceptance is published only once the version's merge record is **committed at the
+  // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
+  // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
+  // goes now; at `f > 0` the reply and the completion record wait for the record plane
+  // (`merge_service::resolve_accepted`), so a client is never told a version a surviving quorum
+  // may not hold.
+  let object = ObjectId(green_id.bytes);
+  if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
+    crate::merge_service::defer_acceptance(state, green_id, version);
+  }
+  // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
+  // had accepted before is that first submit's.
+  crate::merge_service::accepted_reply(state, green_id, version)
+}
+
 /// [`judge_submission`]'s judgment itself.
 fn judged_submission(
   state: &mut ShardState,
@@ -10756,61 +10905,10 @@ fn judged_submission(
   // What the chain will hold is the increment and what its verdict resolves it to (A-257), known only after the verdict,
   // so the admission charges the most an entry for this increment can be.
   // Encoded by the refinement job where it prepared the increment (A-787 part 3), else here.
-  let increment_bytes =
-    crate::refining::take_encoded(state, sealed.work, inc.id).unwrap_or_else(|| inc.encode());
-  // A copy from a version its source changed after records the source's values then in its entry (A-626 part 2): the
-  // green adds that room, derived from what its histories hold, never a fixed allowance.
-  let Some(room) = state
-    .greens
-    .get(&green_id)
-    .map(|engine| engine.copy_entry_room(&inc))
-  else {
-    return refused(Refusal::NotFound);
+  let held_increment = match increment_held(state, sealed, green_id, &inc) {
+    Ok(held) => held,
+    Err(refusal) => return refused(refusal),
   };
-  let bound = slates_merge::chain_entry::entry_bound(&inc).saturating_add(room);
-  let admission = Op::GreenAdvanced {
-    green: green_id,
-    increment: vec![0; bound],
-  };
-  let now = state.clock.monotonic_ns();
-  if let Err(refusal) = chain_admits(state, green_id, &admission, now) {
-    return refused(refusal);
-  }
-  // Charge superseded values before the verdict. Incoming bytes do not bound the retained
-  // history: unlink carries none and a short overwrite retains the complete previous file.
-  // The change index grows with the version too (A-264), charged with the history it indexes.
-  let Some(reserved) = state.greens.get(&green_id).map(|engine| {
-    engine
-      .history_reservation(&inc)
-      .saturating_add(engine.changes_reservation(&inc))
-  }) else {
-    return refused(Refusal::NotFound);
-  };
-  let secured = u64::try_from(reserved).unwrap_or(u64::MAX);
-  // An accepted work is reset to its green at the new version, where it holds nothing of its own
-  // (`crate::work_files`): the reset only releases charge, so nothing is secured for it here.
-  // Make room first: fold whatever the retention budget allows, leaving room for what is secured (never a live
-  // reader's version).
-  let secure_start = state.clock.monotonic_ns();
-  let secured_now = secure_retention(state, green_id, secured);
-  let secure_ns = state.clock.monotonic_ns().saturating_sub(secure_start);
-  crate::merge_service::count_phase(state, crate::merge_service::SUBMIT_SECURE, secure_ns);
-  if let Err(available) = secured_now {
-    return refused(Refusal::BudgetExceeded { available });
-  }
-  // The increment is held in the shard's content store, where its chain entry names it (lane (A), chain entry format
-  // 6): before the verdict, so an accepted version is always recorded, and refused typed at the shard's room. A verdict
-  // that accepts nothing gives back what this hold stored.
-  let next = state.db.partition().green_head(green_id).saturating_add(1);
-  let held_increment =
-    match crate::merge_service::hold_increment(state, green_id, next, &increment_bytes) {
-      Ok(held) => held,
-      Err(refusal) => {
-        let _ = crate::merge_service::settle_green_retention(state, green_id);
-        return refused(refusal);
-      }
-    };
-  drop(increment_bytes);
   let walked_before = state
     .greens
     .get(&green_id)
@@ -10860,18 +10958,7 @@ fn judged_submission(
     slates_merge::engine::Outcome::Accepted { .. }
       | slates_merge::engine::Outcome::Identical { .. }
   ));
-  let verdict = match state.current_span {
-    Some(cause) => state
-      .tracer
-      .open_within(&cause, Chokepoint::MergeVerdict, verdict_start),
-    // A submit always runs inside a recorded verb; without its span the cause is declared missing.
-    None => state.tracer.open_unlinked(
-      RequestId::default(),
-      Chokepoint::MergeVerdict,
-      verdict_start,
-    ),
-  };
-  crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
+  verdict_span_emitted(state, (verdict_start, verdict_end), accepted);
   match outcome {
     // An identical increment commits its (empty) version as an accept does, so retries and the chain's replay answer
     // alike; its reply says it changed nothing (A-782, `merge_service::accepted_reply`).
@@ -10891,48 +10978,7 @@ fn judged_submission(
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
-      // A Subversion repository's green whose submit took the repository's landing turn before its verdict
-      // (`crate::made_commit`, main's landing order): the version, its revision's register entry and the answer are one
-      // durable step after the revision's changeset lands on the node's store, by a task holding the turn. Nothing of
-      // the accept is durable in this step, and the request is answered when that step commits.
-      if let Some(judged) = held_verdict {
-        match crate::made_commit::take_held(state, green_id) {
-          Some(held) => return crate::made_commit::defer(state, held, parts, (copies, judged)),
-          // No turn to hold it with (not reached: `holds` said one was held): applied in this step as any accept is.
-          None => {
-            let committed = state
-              .greens
-              .get_mut(&green_id)
-              .map(|mut engine| engine.commit_judged(judged).is_ok());
-            if committed != Some(true) {
-              return refused(Refusal::Overloaded { shard: state.shard });
-            }
-          }
-        }
-      }
-      if let Err(refusal) = commit_accepted(state, parts) {
-        return refused(refusal);
-      }
-      // A Subversion repository's green, run outside a recorded request (a bare dispatch, which no answer waits on): the
-      // version becomes the revision the server makes of it, landed by a task after this step (`vcs_store::svn_made`).
-      let authorship = &policy.authorship;
-      crate::vcs_store::svn_made::make(state, green_id, version, authorship, &copies);
-      // A Mercurial repository's green: the version becomes the changeset the server makes of it, recorded in this
-      // transaction (A-731, `vcs_store::hg_made`).
-      crate::vcs_store::hg_made::make(state, green_id, version, authorship, &copies);
-      // The acceptance is published only once the version's merge record is **committed at the
-      // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
-      // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
-      // goes now; at `f > 0` the reply and the completion record wait for the record plane
-      // (`merge_service::resolve_accepted`), so a client is never told a version a surviving quorum
-      // may not hold.
-      let object = ObjectId(green_id.bytes);
-      if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
-        crate::merge_service::defer_acceptance(state, green_id, version);
-      }
-      // The version's own record answers (A-321): the signature recorded with it, which for an increment the engine
-      // had accepted before is that first submit's.
-      crate::merge_service::accepted_reply(state, green_id, version)
+      accepted_answer(state, (green_id, version), parts, (copies, held_verdict))
     }
     slates_merge::engine::Outcome::Conflict { windows } => {
       // The work is not reset: the bound secured for a reset is released.
@@ -27776,4 +27822,18 @@ mod resize_admission_tests {
     );
     assert_eq!(refused, 0, "no allowance was refused");
   }
+}
+
+/// This shard's busy harvests deferred because a harvest costs more than its quantum (`slates_rt::busy_harvest`), as
+/// the `rt.core.harvests_deferred` row: the longer interval's non-vacuity count. Left out at zero, as every count of the
+/// report is.
+fn busy_harvest_rows() -> Vec<RefusalCount> {
+  slates_rt::registry::with_current(|ctx| ctx.counters().harvests_deferred)
+    .filter(|deferred| *deferred > 0)
+    .map(|deferred| RefusalCount {
+      kind: "rt.core.harvests_deferred".to_owned(),
+      count: deferred,
+    })
+    .into_iter()
+    .collect()
 }

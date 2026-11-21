@@ -139,6 +139,11 @@ pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
 /// 2026-11-21 08:45; `slates_hg::serve::getbundle::Pull`). Format: a counter name in the status report.
 pub(crate) const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
 
+/// Counter: the asks a `lookup` or a `batch` made of the node's changeset store for the heads' `.hgtags` (A-767 C1,
+/// main's ruling (A) of 2026-11-21; `slates_hg::serve::lookup::TagsRead`), each a want of rows or of texts. Format: a
+/// counter name in the status report.
+pub(crate) const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
+
 /// Counter: the nanoseconds a fetch's streamed answer waited on the changeset store's answers, summed over its asks
 /// ([`STORE_ASKS`]). Format: a counter name in the status report.
 pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
@@ -219,35 +224,56 @@ pub(crate) async fn answer_store_wants(
         wants.give_chunks(chunks);
       }
       (Want::Chunks { .. }, None) => return false,
-      (Want::Texts { texts }, Some(disk)) => {
-        let Some(made) = texts_made(&disk, repository, &texts).await else {
-          return false;
-        };
-        let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
-        let _ = crate::state::with_state(|state| state.count(PULL_WHOLE_TEXTS, whole));
-        wants.give_texts(made);
+      (Want::Texts { texts, most }, Some(disk)) => {
+        match texts_made(&disk, repository, &texts, most).await {
+          None => return false,
+          Some(MadeTexts::Past) => wants.texts_past(),
+          Some(MadeTexts::Made(made)) => {
+            if !wants.reads_tags() {
+              let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+              let _ = crate::state::with_state(|state| state.count(PULL_WHOLE_TEXTS, whole));
+            }
+            wants.give_texts(made);
+          }
+        }
       }
       (Want::Texts { .. }, None) => return false,
     }
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let tags = wants.reads_tags();
     let _ = crate::state::with_state(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
+      if tags {
+        state.count(LOOKUP_STORE_ASKS, 1);
+      }
     });
   }
   true
 }
 
+/// The full texts of a [`texts_made`] read: each made, or past the bytes they could hold together.
+#[derive(Debug)]
+pub(crate) enum MadeTexts {
+  /// Each text, in the order asked.
+  Made(Vec<Vec<u8>>),
+  /// The texts held more than the bytes allowed: none read past them.
+  Past,
+}
+
 /// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains and read
-/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1 step 1b, a pull's revision sent
-/// whole); none where the store keeps no such text.
+/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1: a pull's revision sent whole,
+/// a lookup's `.hgtags`), together at most `most` bytes: past them the reading stops, so a hostile or huge text is
+/// never held whole ([`MadeTexts::Past`]). None where the store keeps no such text.
 pub(crate) async fn texts_made(
   disk: &slates_store::owner::StoreHandle,
   repository: u128,
   texts: &[[u8; 32]],
-) -> Option<Vec<Vec<u8>>> {
+  most: u64,
+) -> Option<MadeTexts> {
   let mut made = Vec::new();
   made.try_reserve_exact(texts.len()).ok()?;
+  let mut total = 0_u64;
   for identity in texts {
     let mut text = Vec::new();
     loop {
@@ -256,11 +282,15 @@ pub(crate) async fn texts_made(
       if piece.is_empty() {
         break;
       }
+      total = total.saturating_add(u64::try_from(piece.len()).ok()?);
+      if total > most {
+        return Some(MadeTexts::Past);
+      }
       text.extend_from_slice(&piece);
     }
     made.push(text);
   }
-  Some(made)
+  Some(MadeTexts::Made(made))
 }
 
 /// [`held`], for the tests.
@@ -371,7 +401,7 @@ fn held(state: &ShardState, id: RepositoryId) -> bool {
 
 /// Runs `step` over repository `id`'s view, made within `room` from what `state` holds now; none when it is not lent
 /// (module docs), an unmade view counted.
-fn lend_in<R>(
+pub(crate) fn lend_in<R>(
   state: &mut ShardState,
   id: RepositoryId,
   room: &mut Admission,
@@ -405,8 +435,18 @@ pub(crate) fn resolved_in(
   name: &[u8],
   room: &mut Admission,
 ) -> Option<Result<Option<Node>, slates_hg::serve::Refusal>> {
+  let tags = match super::hg_tags::owed(state, id, name, room)? {
+    Ok(super::hg_tags::Owed::Ready(tags)) => tags,
+    // The verb's door reads the tags first (`super::hg_tags`); a dispatch that passed no door cannot wait for them.
+    Ok(super::hg_tags::Owed::Read(_)) => {
+      return Some(Err(slates_hg::serve::Refusal::Store {
+        what: "a .hgtags text not read from the changeset store",
+      }));
+    }
+    Err(refusal) => return Some(Err(refusal)),
+  };
   lend_in(state, id, room, |view, room| {
-    slates_hg::serve::lookup::resolve_name(view, name, room)
+    slates_hg::serve::lookup::resolve_name(view, tags.as_ref(), name, room)
   })
 }
 

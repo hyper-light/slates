@@ -29,6 +29,7 @@ use slates_mem::{Encoded, Handle, Slab, ring};
 
 use slates_machine::wake::WakeEstimate;
 
+use crate::busy_harvest::busy_harvest_due;
 use crate::held_turn::{HeldTurn, hold_pays};
 
 use crate::attribution::{self, Attribution, Tracker};
@@ -121,6 +122,9 @@ pub struct Counters {
   pub held_turn_ns: u64,
   /// Idle turns the shard has measured (a non-vacuity count of [`Counters::held_turn_ns`]).
   pub held_turns: u64,
+  /// Busy steps past a quantum whose driver harvest waited because a harvest costs more than the quantum
+  /// ([`crate::busy_harvest::busy_harvest_due`]): the non-vacuity count of the longer interval.
+  pub harvests_deferred: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -1395,10 +1399,17 @@ impl ShardContext {
         break;
       }
       if outcome.did_work {
+        // No more often than a harvest costs, measured from the last one's end ([`crate::busy_harvest`]): on macOS an
+        // empty harvest sleeps about 13 µs, and stamped before it, every busy step after the first slept.
         let now = self.now_ns();
-        if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
+        let quantum = self.quantum_ns();
+        if busy_harvest_due(last_wait_ns, now, quantum, self.harvest_cost_ns()) {
           let _ = self.harvest_io();
-          last_wait_ns = now;
+          last_wait_ns = self.now_ns();
+        } else if now.saturating_sub(last_wait_ns) >= quantum {
+          self.with_inner(|inner| {
+            inner.counters.harvests_deferred = inner.counters.harvests_deferred.saturating_add(1)
+          });
         }
         continue;
       }
@@ -1528,6 +1539,16 @@ impl ShardContext {
       }
       std::hint::spin_loop();
     }
+  }
+
+  /// What one empty driver harvest costs this shard, as its idle turns have measured it ([`crate::held_turn`]): the
+  /// interval a busy shard harvests at no shorter than ([`crate::busy_harvest::busy_harvest_due`]); 0 until measured.
+  fn harvest_cost_ns(&self) -> u64 {
+    self
+      .held_turn
+      .get()
+      .and_then(|turns| turns.met_ns())
+      .unwrap_or(0)
   }
 
   /// Folds one idle turn's length into what a held turn costs (A-387): every turn of every idle spin, the window's and

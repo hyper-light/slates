@@ -126,6 +126,17 @@ impl ImportBatch {
       .ok()
   }
 
+  /// [`ImportBatch::with_engine`] over `greens` alone, so the caller reads the rest of the shard's state beside it (a
+  /// Subversion revision's increment is built from its records and the scratch member together, C2 stage C).
+  pub(crate) fn with_engine_in<R>(
+    &self,
+    greens: &mut crate::greens::Greens,
+    read: impl FnOnce(&Green) -> R,
+  ) -> Option<R> {
+    let preview = self.preview.as_ref()?;
+    greens.with_preview(preview, |engine| read(engine)).ok()
+  }
+
   /// Judges `work`, based at the batch's head in the green's numbering, into the scratch member, and keeps it: the
   /// version it is in the green's numbering. Refused, nothing kept, where it is not based at the head or not accepted.
   pub(crate) fn stage(
@@ -140,13 +151,25 @@ impl ImportBatch {
     let preview = self.preview.as_ref().ok_or(StageRefused::Unavailable)?;
     let holders = crate::merge_service::record_goes_to_holders(state, self.green);
     let judged = state.greens.with_preview_mut(preview, |engine| {
-      // The scratch member counts its versions from 0: the work's base, read there.
+      // The scratch member counts its versions from 0: the work's base, read there, and each copy's source version
+      // (a Subversion copy names the head it copies from, w-svn's C2 stage C) moved into its numbering for the verdict.
+      let offset = head.saturating_sub(engine.head());
       work.base = engine.head();
+      in_numbering(&mut work, |version| version.checked_sub(offset));
       let reserved = engine
         .history_reservation(&work)
         .saturating_add(engine.changes_reservation(&work));
-      let (outcome, applied) = engine.submit_resolved(&work);
+      let (outcome, mut applied) = engine.submit_resolved(&work);
       let identity = holders.then(|| engine.head_identity());
+      // Back into the green's numbering: the work's copies, and those its verdict records.
+      in_numbering(&mut work, |version| version.checked_add(offset));
+      if let Some(applied) = applied.as_mut() {
+        for step in applied.iter_mut() {
+          if let Applied::CopyTree { version, .. } = step {
+            *version = version.saturating_add(offset);
+          }
+        }
+      }
       (outcome, applied, identity, reserved)
     });
     work.base = head;
@@ -197,6 +220,22 @@ impl ImportBatch {
   fn retire(&mut self, state: &mut ShardState) {
     if let Some(preview) = self.preview.take() {
       state.greens.retire_preview(preview);
+    }
+  }
+}
+
+/// Moves each `Copy` operation of `work` to the version `moved` answers for its own: from the green's numbering into a
+/// scratch member's and back ([`ImportBatch::stage`]). A copy `moved` answers none for (a version before the scratch
+/// member's first) is left as it is, and its verdict refuses it as a copy past what the member holds.
+fn in_numbering(work: &mut Increment, moved: impl Fn(u64) -> Option<u64>) {
+  for op in work
+    .doc
+    .ops
+    .iter_mut()
+    .filter(|op| op.kind == slates_merge::ops_doc::OpKind::Copy)
+  {
+    if let Some(version) = moved(op.at) {
+      op.at = version;
     }
   }
 }

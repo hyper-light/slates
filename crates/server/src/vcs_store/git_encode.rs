@@ -174,7 +174,7 @@ fn turn_lent(
   let encoding_at = stores.encodings.0.get(&id).map(|(_, at)| *at);
   let mut kept = 0;
   let mut past = 0;
-  let mut past_by_stage = [0_u64; 4];
+  let mut past_by_stage = [0_u64; UNITS_PAST_BUDGET_BY_STAGE.len()];
   let advanced: Option<Result<Progress, StoreRefused>> =
     stores.encodings.0.get_mut(&id).map(|(encoding, _)| {
       let before = encoding.counters().units_past_quantum;

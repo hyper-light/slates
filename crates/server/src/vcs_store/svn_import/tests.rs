@@ -38,6 +38,8 @@ const PATH: &str = "/dumps/repository.dump";
 
 /// Shape: the last revision of `part1.dump` and of `full.dump` (`make-fixtures.sh` dumps `-r 0:3`, then 13 revisions).
 const PART1_LAST: u64 = 3;
+/// Shape: the first revision of `part2.dump` (`make-fixtures.sh` dumps `--incremental -r 4:13` into it).
+const PART2_FIRST: u64 = 4;
 
 /// Shape: the youngest revision of `full.dump`.
 pub(crate) const FULL_LAST: u64 = 13;
@@ -180,7 +182,9 @@ fn count(state: &ShardState, name: &str) -> u64 {
 /// committed, the youngest 3; every text the import brought named stored by the records, none of its bytes kept in RAM
 /// (C2 stage B part 2 (b): each revision's changeset carries its texts); the repository exporting `part1.dump` byte for
 /// byte through the store; the green at version 3; the register holding the creation, the UUID, revision 0's
-/// properties and the three revisions, in that order; counted three revisions and one import done.
+/// properties and one changeset of the three revisions (C2 stage C: an import's batch lands as one changeset, a
+/// `Record` section a revision, landed at the import's end), in that order; counted three revisions, one batch landed
+/// at the end and one import done.
 #[test]
 fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte() {
   stored(|| async move {
@@ -213,24 +217,35 @@ fn t_a652_a_dump_imports_through_the_owners_step_and_exports_again_byte_for_byte
     );
     let head = on(|state| state.greens.get(&green).map(|engine| engine.head()));
     assert_eq!(head, Some(PART1_LAST));
-    let wanted = [
-      "created",
-      "uuid",
-      "properties",
-      "revision",
-      "revision",
-      "revision",
-    ];
+    let wanted = ["created", "uuid", "properties", "revision"];
     assert_eq!(logged_kinds(svn).await, wanted);
-    let counted = on(|state| [count(state, super::REVISIONS), count(state, super::DONE)]);
-    assert_eq!(counted, [PART1_LAST, 1]);
+    let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+    let batch = crate::repository::svn_commit::landing::changeset_records(&disk, svn, 3)
+      .await
+      .map(|records| records.len());
+    assert_eq!(
+      batch,
+      Ok(3),
+      "the batch's changeset holds a record a revision"
+    );
+    let counted = on(|state| {
+      [
+        count(state, super::REVISIONS),
+        count(state, super::DONE),
+        count(state, crate::repository::svn_commit::staging::FLUSHED_END),
+      ]
+    });
+    assert_eq!(counted, [PART1_LAST, 1, 1]);
   });
 }
 
-/// A-652 part 3 (a dump made in parts loads part after part; a stream out of its sequence refused). Do: import
-/// `part1.dump`, then `part2.dump` (format 3, revisions 4 to 13 as changes), then `part1.dump` again. Expect: the two
-/// parts making the history `full.dump` holds, exported as `full.dump` byte for byte; the third import refused at
-/// revision 0 as `svnadmin load` refuses a revision out of its sequence (`E160006`, on the wire), the history as it was.
+/// A-652 part 3 with C2 stage C's resume (a dump made in parts loads part after part; a part the repository holds
+/// already reads through; a stream out of its sequence refused). Do: import `part1.dump`, then `part2.dump` (format 3,
+/// revisions 4 to 13 as changes), then `part1.dump` again; and `part2.dump` into a repository holding nothing. Expect:
+/// the two parts making the history `full.dump` holds, exported as `full.dump` byte for byte; the third import ended,
+/// committing nothing (every revision held already, its properties the repository's), the history as it was; the
+/// fourth refused at revision 4 as `svnadmin load` refuses a revision out of its sequence (`E160006` on the wire,
+/// naming revision 0 the last landed).
 #[test]
 fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refused() {
   stored(|| async move {
@@ -245,19 +260,29 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
       "full.dump"
     );
     let (again, _) = imported(svn, PART1).await;
+    let again = again.map(|loaded| (loaded.revisions, loaded.youngest));
+    assert_eq!(
+      again,
+      Ok((0, FULL_LAST)),
+      "a part held already reads through"
+    );
+    let (other, _) = subversion("other").await;
+    let (ahead, _) = imported(other, PART2).await;
     let out_of_sequence = LoadFailed::Refused {
       refusal: MigrationRefusal::OutOfSequence {
-        expected: FULL_LAST + 1,
-        found: 0,
+        expected: 1,
+        found: PART2_FIRST,
       },
-      revision: Some(0),
+      revision: Some(PART2_FIRST),
+      landed: 0,
     };
-    assert_eq!(again, Err(out_of_sequence.clone()));
+    assert_eq!(ahead, Err(out_of_sequence.clone()));
     let wire = svn_refusal_of(PATH, ROOM, out_of_sequence);
-    let wanted = ImportFault::Subversion {
+    let wanted = ImportFault::SubversionLanded {
       code: 160_006,
-      revision: Some(0),
+      revision: Some(PART2_FIRST),
       path: String::new(),
+      landed: 0,
     };
     assert_eq!(wire, Refusal::ImportRefused { fault: wanted });
     assert!(
@@ -267,12 +292,13 @@ fn t_a652_a_dump_in_parts_loads_part_after_part_and_one_out_of_sequence_is_refus
   });
 }
 
-/// A-652 part 3 (a refusal keeps the revisions before it, as `svnadmin load` keeps them). Do: import `part1.dump` cut
-/// three bytes short of its end. Expect: refused as the dump codec refuses a stream that ends inside a record
-/// (`Truncated`, `E200003`) at revision 3; revisions 1 and 2 committed and kept, revision 3 not; the import's holds given
-/// back, its counter of refusals one.
+/// A-652 part 3 under C2 stage C (a refusal gives up the revisions its batch staged; those earlier batches landed stay).
+/// Do: import `part1.dump` cut three bytes short of its end. Expect: refused as the dump codec refuses a stream that
+/// ends inside a record (`Truncated`, `E200003`) at revision 3; revisions 1 and 2, staged in the batch the refusal ends,
+/// given up with it, the records made again at revision 0 (`svnadmin load` keeps each revision as it goes: GAPS); the
+/// import's holds given back, its counter of refusals one.
 #[test]
-fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
+fn t_a652_a_dump_cut_short_is_refused_and_gives_up_its_batch() {
   stored(|| async move {
     let (svn, _) = subversion("svn").await;
     let cut = PART1.get(..PART1.len() - 3).expect("a shorter dump");
@@ -280,8 +306,11 @@ fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
     let truncated = LoadFailed::Refused {
       refusal: MigrationRefusal::Stream(DumpError::Truncated),
       revision: Some(PART1_LAST),
+      landed: 0,
     };
     assert_eq!(loaded, Err(truncated));
+    // The batch given up makes the records again from the register, in turns.
+    crate::vcs_store::rebuilt(svn).await;
     let seen = on(|state| {
       (
         state
@@ -292,7 +321,7 @@ fn t_a652_a_dump_cut_short_is_refused_and_keeps_the_revisions_before_it() {
         count(state, super::REFUSED),
       )
     });
-    assert_eq!(seen, (Some(PART1_LAST - 1), false, 1));
+    assert_eq!(seen, (Some(0), false, 1));
   });
 }
 
@@ -389,10 +418,11 @@ fn t_a652_the_verb_imports_a_dump_and_answers_when_it_ends() {
 fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
   let fault = |fault| Refusal::ImportRefused { fault };
   let numbered = |code, revision, path: &str| {
-    fault(ImportFault::Subversion {
+    fault(ImportFault::SubversionLanded {
       code,
       revision,
       path: path.to_owned(),
+      landed: 3,
     })
   };
   let cases: [(LoadFailed, Refusal); 9] = [
@@ -409,6 +439,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
           admitted: 1,
         }),
         revision: None,
+        landed: 3,
       },
       fault(ImportFault::PastRoom { room: ROOM }),
     ),
@@ -419,6 +450,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
           path: "/trunk/a".to_owned(),
         },
         revision: Some(4),
+        landed: 3,
       },
       numbered(160_013, Some(4), "/trunk/a"),
     ),
@@ -426,6 +458,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
       LoadFailed::Uncommitted {
         refusal: Uncommitted::Step(StepRefusal::Corrupt),
         revision: 5,
+        landed: 3,
       },
       numbered(160_004, Some(5), ""),
     ),
@@ -435,6 +468,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
           path: "/trunk".to_owned(),
         },
         revision: 6,
+        landed: 3,
       },
       fault(ImportFault::Format),
     ),
@@ -444,6 +478,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
           Refusal::NotFound,
         )),
         revision: 7,
+        landed: 3,
       },
       Refusal::NotFound,
     ),
@@ -451,6 +486,7 @@ fn t_a652_each_dump_import_failure_maps_to_its_refusal() {
       LoadFailed::Uncommitted {
         refusal: Uncommitted::Diverged,
         revision: 8,
+        landed: 3,
       },
       Refusal::ContentUnavailable,
     ),
@@ -489,4 +525,122 @@ fn check_host_refusal_and_answers() {
     youngest: 3,
   };
   assert_eq!(answers, [imported, abandoned]);
+}
+
+/// C2 stage C, main's conditions 1 and 2 of 2026-11-21 (a refused import names what landed; the same dump resumes).
+/// Do: import `part1.dump` whole (revisions 1 to 3 land), then `part2.dump` cut short (refused inside its batch), then
+/// `part2.dump` whole. Expect: the cut one refused `Truncated` naming revision 3 the last landed, the repository at 3
+/// (the cut batch's revisions given up); the whole one resuming after 3, committing revisions 4 to 13, and the history
+/// then `full.dump` byte for byte, as an import never cut short leaves it.
+#[test]
+fn t_c2c_a_refused_import_names_what_landed_and_the_same_dump_resumes_after_it() {
+  stored(|| async move {
+    let (svn, _) = subversion("resumed").await;
+    let first = imported(svn, PART1).await.0.map(|loaded| loaded.youngest);
+    assert_eq!(first, Ok(PART1_LAST));
+    let cut = PART2.get(..PART2.len() / 2).expect("a shorter dump");
+    let (refused, _) = imported(svn, cut).await;
+    let landed = match refused {
+      Err(LoadFailed::Refused {
+        refusal: MigrationRefusal::Stream(DumpError::Truncated),
+        landed,
+        ..
+      }) => landed,
+      other => panic!("not refused as cut short: {other:?}"),
+    };
+    assert_eq!(landed, PART1_LAST, "the refusal names what landed");
+    crate::vcs_store::rebuilt(svn).await;
+    let standing = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .map(Repository::youngest)
+    });
+    assert_eq!(standing, Some(PART1_LAST));
+    let resumed = imported(svn, PART2)
+      .await
+      .0
+      .map(|loaded| (loaded.revisions, loaded.youngest));
+    assert_eq!(resumed, Ok((FULL_LAST - PART1_LAST, FULL_LAST)));
+    assert!(
+      history(svn).await == Some((FULL_LAST, FULL.to_vec())),
+      "the resumed history is full.dump's"
+    );
+  });
+}
+
+/// Shape: the admission a tight import of `full.dump` is held to: past twice its largest revision's texts (revision 7's
+/// 106,750 bytes, whole in the content store and again in its increment: 214 KB), short of twice two such revisions
+/// (428 KB), so the batch lands before revision 8.
+const TIGHT_ROOM: u64 = 320 << 10;
+
+/// C2 stage C, main's oracle of 2026-11-21 08:17 (the batch bounded by the import's admission) with conditions 1 and 2
+/// (a refusal names what landed; the same dump resumes, reading through what it holds). Do: import `full.dump` into one
+/// repository with the shard's room as it is; into another with the import's admission held to [`TIGHT_ROOM`]
+/// (`svn_commit::staging::ADMISSION_CAP`, against what its batch holds), first cut three bytes short, then whole. Expect: the roomy import one batch, no flush for admission; the
+/// tight one's cut import refused naming revision 7 the last landed (its batch landed before revision 8 for
+/// admission, the batch after given up); its whole import resuming (revisions 0 to 7 read through, 8 to 13 committed);
+/// both histories `full.dump` byte for byte, at the same youngest revision.
+#[test]
+fn t_c2c_imports_under_a_small_and_a_large_admission_end_alike_and_resume_after_what_landed() {
+  stored(|| async move {
+    let flushed = || {
+      on(|state| {
+        count(
+          state,
+          crate::repository::svn_commit::staging::FLUSHED_ADMISSION,
+        )
+      })
+    };
+    let (roomy, _) = subversion("roomy").await;
+    let whole = imported(roomy, FULL).await.0.map(|loaded| loaded.youngest);
+    assert_eq!(whole, Ok(FULL_LAST));
+    assert_eq!(flushed(), 0, "a roomy import landed for admission");
+    let (tight, _) = subversion("tight").await;
+    let cap = &crate::repository::svn_commit::staging::ADMISSION_CAP;
+    cap.with(|cap| cap.set(Some(TIGHT_ROOM)));
+    let cut = FULL.get(..FULL.len() - 3).expect("a shorter dump");
+    let landed = match imported(tight, cut).await.0 {
+      Err(LoadFailed::Refused {
+        refusal: MigrationRefusal::Stream(DumpError::Truncated),
+        landed,
+        ..
+      }) => landed,
+      other => panic!("not refused as cut short: {other:?}"),
+    };
+    assert_eq!(landed, 7, "the refusal names what landed");
+    assert!(flushed() >= 1, "no batch landed for admission");
+    crate::vcs_store::rebuilt(tight).await;
+    let resumed = imported(tight, FULL)
+      .await
+      .0
+      .map(|loaded| (loaded.revisions, loaded.youngest));
+    cap.with(|cap| cap.set(None));
+    assert_eq!(resumed, Ok((FULL_LAST - 7, FULL_LAST)));
+    for repository in [roomy, tight] {
+      assert!(
+        history(repository).await == Some((FULL_LAST, FULL.to_vec())),
+        "full.dump"
+      );
+    }
+  });
+}
+
+/// C2 stage C (an import's batch advances the records ahead of the register): no session reads a repository while it
+/// imports. Do: make a repository; lend it as a session does; begin an import of `part1.dump`; lend it again; give the
+/// import back; lend it once more. Expect: lent, then not lent while the import is under way, then lent again.
+#[test]
+fn t_c2c_a_repository_serves_no_session_while_it_imports() {
+  stored(|| async move {
+    let (svn, _) = subversion("gated").await;
+    let lent =
+      move || on(|state| crate::vcs_store::svn_view::lend_in(state, svn, |_| ()).is_some());
+    let before = lent();
+    let (host, root) = host_holding(PART1);
+    let begun = on(|state| begin(state, (&owner(), svn), (Box::new(host), root, DUMP)));
+    assert!(begun.is_ok(), "{begun:?}");
+    let during = lent();
+    on(|state| super::abandon(state, svn));
+    assert_eq!((before, during, lent()), (true, false, true));
+  });
 }
