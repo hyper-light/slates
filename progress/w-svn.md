@@ -307,3 +307,6 @@
   svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
 - P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
   status returned too soon" (the script's report). Fix the script after C2.
+- C2 stage A LANDED 72576cb1f (0703e62d2 + 65f69e1da). Tests: server 136/136 affected; cli svn_interop 4/4,
+  svn_http_reports 9/9, cli create 1/1. Main's ruling on svn_made (inbox w-svn-from-main-c2-made): submit acceptance
+  deferred until the made revision lands, no recovery remake -> next piece. Then stage B, stage C.
