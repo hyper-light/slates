@@ -379,8 +379,16 @@ fn edits_beneath_a_copy_in_its_own_increment_land_on_what_it_brought() {
   assert_eq!(outcome, Outcome::Accepted { version: 2 });
   edits_landed_on_the_copy(&mut green);
   let applied = applied.expect("an accepted version's effects");
-  let entry = chain_entry::encode(&increment.encode(), &increment, &applied, None, None, None);
-  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  let increment_bytes = increment.encode();
+  let entry = chain_entry::encode(
+    chain_entry::held_for_tests(&increment_bytes),
+    &increment,
+    &applied,
+    None,
+    None,
+    None,
+  );
+  let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(decoded.applied, applied);
   assert_eq!(
     replica.apply_recorded(&decoded.increment, &decoded.applied),
@@ -791,8 +799,16 @@ fn assert_replays_alike(
   increment: &Increment,
   applied: &[chain_entry::Applied],
 ) {
-  let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
-  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  let increment_bytes = increment.encode();
+  let entry = chain_entry::encode(
+    chain_entry::held_for_tests(&increment_bytes),
+    increment,
+    applied,
+    None,
+    None,
+    None,
+  );
+  let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(decoded.applied, applied);
   assert_eq!(
     replica.apply_recorded(&decoded.increment, &decoded.applied),
@@ -1182,8 +1198,16 @@ fn assert_replay_reads_alike(
   entries: &[(Increment, Vec<chain_entry::Applied>)],
 ) {
   for (increment, applied) in entries {
-    let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
-    let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+    let increment_bytes = increment.encode();
+    let entry = chain_entry::encode(
+      chain_entry::held_for_tests(&increment_bytes),
+      increment,
+      applied,
+      None,
+      None,
+      None,
+    );
+    let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
     assert_eq!(&decoded.applied, applied);
     replica.apply_recorded(&decoded.increment, &decoded.applied);
   }
@@ -1211,8 +1235,15 @@ fn assert_fits_its_room(increment: &Increment, applied: &[chain_entry::Applied],
   assert!(fixes > 0, "no fix recorded");
   assert_eq!(room, fixes);
   let bytes = increment.encode();
-  let entry = chain_entry::encode(&bytes, increment, applied, None, None, None);
-  let bound = chain_entry::entry_bound(bytes.len(), increment) + room;
+  let entry = chain_entry::encode(
+    chain_entry::held_for_tests(&bytes),
+    increment,
+    applied,
+    None,
+    None,
+    None,
+  );
+  let bound = chain_entry::entry_bound(increment) + room;
   assert!(entry.len() <= bound, "{} bytes past {bound}", entry.len());
 }
 
@@ -1340,8 +1371,16 @@ fn replay_entry(
   increment: &Increment,
   applied: &[chain_entry::Applied],
 ) -> u64 {
-  let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
-  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  let increment_bytes = increment.encode();
+  let entry = chain_entry::encode(
+    chain_entry::held_for_tests(&increment_bytes),
+    increment,
+    applied,
+    None,
+    None,
+    None,
+  );
+  let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   replica.apply_recorded(&decoded.increment, &decoded.applied)
 }
 
@@ -2201,9 +2240,17 @@ impl Oracle {
     let mut replica = Green::new();
     let mut identities = vec![replica.head_identity()];
     for (increment, applied) in &self.entries {
-      let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
-      let decoded =
-        chain_entry::decode(&entry).map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
+      let increment_bytes = increment.encode();
+      let entry = chain_entry::encode(
+        chain_entry::held_for_tests(&increment_bytes),
+        increment,
+        applied,
+        None,
+        None,
+        None,
+      );
+      let decoded = chain_entry::decode(&entry, &increment_bytes)
+        .map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
       replica.apply_recorded(&decoded.increment, &decoded.applied);
       identities.push(replica.head_identity());
     }
@@ -2252,9 +2299,17 @@ impl Oracle {
       at
     );
     for (version, (increment, applied)) in self.entries.iter().enumerate().skip(at) {
-      let entry = chain_entry::encode(&increment.encode(), increment, applied, None, None, None);
-      let decoded =
-        chain_entry::decode(&entry).map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
+      let increment_bytes = increment.encode();
+      let entry = chain_entry::encode(
+        chain_entry::held_for_tests(&increment_bytes),
+        increment,
+        applied,
+        None,
+        None,
+        None,
+      );
+      let decoded = chain_entry::decode(&entry, &increment_bytes)
+        .map_err(|error| TestCaseError::fail(format!("{error:?}")))?;
       restored.apply_recorded(&decoded.increment, &decoded.applied);
       prop_assert_eq!(
         Some(restored.head_identity()),
@@ -2572,8 +2627,16 @@ fn a_copied_trees_links_share_the_copys_nodes_and_one_naming_a_node_outside_owns
   assert_eq!(linked_reads(&green), expected);
   assert_eq!(green.head_identity(), green.head_identity_from_scratch());
   let applied = applied.expect("an accepted version's effects");
-  let entry = chain_entry::encode(&increment.encode(), &increment, &applied, None, None, None);
-  let decoded = chain_entry::decode(&entry).expect("the entry decodes");
+  let increment_bytes = increment.encode();
+  let entry = chain_entry::encode(
+    chain_entry::held_for_tests(&increment_bytes),
+    &increment,
+    &applied,
+    None,
+    None,
+    None,
+  );
+  let decoded = chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
   assert_eq!(
     replica.apply_recorded(&decoded.increment, &decoded.applied),
     4

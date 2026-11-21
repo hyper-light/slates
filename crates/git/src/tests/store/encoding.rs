@@ -195,3 +195,64 @@ fn every_version_is_offered_for_encoding_once_in_order_until_all_are_kept() {
   assert_eq!(repository.first_unencoded(), None);
   repository.release(&mut store).unwrap();
 }
+
+/// Shape: the bytes of search or deflate the red test's quantum buys at its rates ([`A_NANOSECOND_A_BYTE`]): under the
+/// tests' 1 KiB window, so a unit sized by its cost is told from one sized by the window.
+const PUT_BYTES: u64 = 64;
+
+/// The tests' exchange with the machine's rates set to a nanosecond a byte for search and every deflate level (1,024
+/// ns a KiB), so a quantum of [`PUT_BYTES`] nanoseconds buys [`PUT_BYTES`] bytes of either.
+const A_NANOSECOND_A_BYTE: crate::store::learn::Exchange = crate::store::learn::Exchange {
+  rates: crate::store::learn::Rates {
+    deflate_ns_per_kib: [1024; 10],
+    search_ns_per_kib: 1024,
+  },
+  ..EXCHANGE
+};
+
+/// A-718 (main's ruling of 2026-11-21 07:30; w-git's r52 on git/git: 844,380 of the encoder's 992,574 turns ran a unit
+/// past the step budget, every search and deflate step a window's work at a quantum of a few microseconds). Do: encode
+/// the second of two versions a turn at a time at a quantum of [`PUT_BYTES`] nanoseconds, the machine's rates a
+/// nanosecond a byte; and the same version of a twin in one pass at those rates. Expect no search or deflate step given
+/// more than the [`PUT_BYTES`] bytes the quantum buys, a deflate step one piece at least
+/// (`fragment::DEFLATE_PIECE`), against the window each was given before; and both fragments the twin's, byte for byte.
+#[test]
+fn an_objects_search_and_deflate_steps_are_sized_by_their_measured_cost_within_the_quantum() {
+  let format = ObjectFormat::Sha1;
+  let (mut store_turned, mut store_whole) = (store(), store());
+  let mut turned = two_versions(format, &mut store_turned);
+  let mut whole = two_versions(format, &mut store_whole);
+  whole
+    .encode_fragments(&mut store_whole, (1, 1), &mut Ticks(0), A_NANOSECOND_A_BYTE)
+    .unwrap();
+  let mut encoding = Encoding::fragments(&turned, &store_turned, 1, 1).unwrap();
+  let mut clock = Ticks(0);
+  loop {
+    let turn = Turn {
+      clock: &mut clock,
+      exchange: A_NANOSECOND_A_BYTE,
+      quantum_ns: PUT_BYTES,
+    };
+    if encoding
+      .advance(&mut turned, &mut store_turned, turn)
+      .unwrap()
+      == Progress::Done
+    {
+      break;
+    }
+  }
+  let counters = encoding.counters();
+  assert!(
+    counters.objects > 0
+      && counters.most_put_bytes <= PUT_BYTES.max(crate::store::fragment::DEFLATE_PIECE as u64),
+    "{counters:?}"
+  );
+  for blobs in [false, true] {
+    assert_eq!(
+      turned.fragment_part(1, 1, blobs),
+      whole.fragment_part(1, 1, blobs)
+    );
+  }
+  turned.release(&mut store_turned).unwrap();
+  whole.release(&mut store_whole).unwrap();
+}

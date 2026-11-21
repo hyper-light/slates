@@ -116,6 +116,7 @@ struct Order {
 
 /// SplitMix64's finalizer (Steele, Lea and Flood 2014): a counter to a well-mixed priority.
 fn mix(counter: u64) -> u64 {
+  // Format: SplitMix64's increment, multipliers and shifts, as Steele, Lea and Flood give them.
   let mut z = counter.wrapping_add(0x9e37_79b9_7f4a_7c15);
   z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
   z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

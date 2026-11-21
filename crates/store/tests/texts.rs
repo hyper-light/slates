@@ -341,10 +341,13 @@ fn a_changeset_holding_several_versions_of_a_path_lists_them_all() {
   let history = store.path_texts(1, b"f", 0, 10).unwrap();
   assert_eq!(history, vec![(1, ids[0]), (1, ids[1]), (1, ids[2])]);
   // Each version found by its tool's id (Mercurial's node), with its place: what a stream sends as its chunk.
-  let (by_tool, row) = store.text_by_tool(1, b"f", b"n2").unwrap().unwrap();
+  let by_tools = store
+    .texts_by_tools(1, b"f", &[b"n2".to_vec(), b"n9".to_vec()])
+    .unwrap();
+  let (by_tool, row) = by_tools[0].unwrap();
   assert_eq!((by_tool, row.base), (ids[1], Some(ids[0])));
   assert_eq!(store.place_bytes(&staging, &row.place).unwrap(), edit_two);
-  assert_eq!(store.text_by_tool(1, b"f", b"n9").unwrap(), None);
+  assert_eq!(by_tools[1], None);
   for (identity, text) in ids.iter().zip([&first, &second, &third]) {
     let mut cache = TextCache::new(0);
     let read = store
@@ -425,5 +428,86 @@ fn a_batch_of_places_in_order_in_one_payload_is_read_in_one_read() {
   let read = store.places_bytes(&staging, &places).unwrap();
   assert_eq!(read, versions);
   assert_eq!(store.place_reads() - before, 2, "log reads for the batch");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Goal 93 perf (r27 on e0b677380, hg-src: a stream asked the store for every revision's row by node, about 230,000
+/// lookups a stream, 1.35 s of its 3.7 s waiting on them). A log's tool id rows share a key prefix, so its versions are
+/// read in one scan. Do: land one changeset holding three versions of `f` and one of `g`; ask for `f`'s three by their
+/// tool ids, in an order of their own, with one no changeset named. Expect each version's identity in the order asked,
+/// none for the stranger, `g`'s never among them, and one engine read for the four asked (`Store::tool_reads`).
+#[test]
+fn a_logs_versions_by_tool_id_are_read_in_one_scan() {
+  let dir = scratch("by-tools");
+  let mut store = open(&dir);
+  let staging = Staging::new(0);
+  let texts: Vec<(&[u8], &[u8], Vec<u8>)> = vec![
+    (b"f", b"n1", b"one of f".to_vec()),
+    (b"f", b"n2", b"two of f".to_vec()),
+    (b"f", b"n3", b"three of f".to_vec()),
+    (b"g", b"m1", b"one of g".to_vec()),
+  ];
+  let payload: Vec<u8> = texts.iter().flat_map(|(_, _, text)| text.clone()).collect();
+  let payload_id = *blake3::hash(&payload).as_bytes();
+  let mut offset = 0_u64;
+  let entries: Vec<TextEntry> = texts
+    .iter()
+    .map(|(path, tool_id, text)| {
+      let entry = TextEntry {
+        path: path.to_vec(),
+        tool_id: tool_id.to_vec(),
+        text: *blake3::hash(text).as_bytes(),
+        len: text.len() as u64,
+        base: None,
+        place: Place {
+          payload: payload_id,
+          offset,
+          len: text.len() as u64,
+        },
+      };
+      offset += text.len() as u64;
+      entry
+    })
+    .collect();
+  let section = texts::encode(&entries);
+  store
+    .land(
+      Header {
+        tool: Tool::Mercurial,
+        repository: 1,
+        sequence: 1,
+        judged_over: 0,
+        grant: 1,
+        work: 1,
+        time_ns: 1,
+        sections: 0,
+      },
+      &[
+        (SectionKind::Payload, Contents::Bytes(&payload)),
+        (SectionKind::Texts, Contents::Bytes(&section)),
+      ],
+      &staging,
+    )
+    .unwrap();
+  let before = store.tool_reads();
+  let asked = [
+    b"n3".to_vec(),
+    b"n9".to_vec(),
+    b"n1".to_vec(),
+    b"n2".to_vec(),
+  ];
+  let found: Vec<Option<[u8; 32]>> = store
+    .texts_by_tools(1, b"f", &asked)
+    .unwrap()
+    .into_iter()
+    .map(|found| found.map(|(identity, _)| identity))
+    .collect();
+  let identity = |at: usize| Some(*blake3::hash(&texts[at].2).as_bytes());
+  assert_eq!(found, vec![identity(2), None, identity(0), identity(1)]);
+  assert_eq!(
+    store.tool_reads() - before,
+    1,
+    "engine reads for the four asked"
+  );
   let _ = std::fs::remove_dir_all(&dir);
 }
