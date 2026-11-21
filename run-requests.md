@@ -6939,3 +6939,8 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   plus loadtest-scale's three-node rungs. Production routing now serves a green's works on every node that replicates
   it, so any test whose client on B created a work over A's green and expected the work on A may change. Red: a test
   asserting a work id names the green's owner while its client was on another node.
+
+## 2026-11-20, w-work-mount A-774 parts 4-5 (9d73a77c6, 1b0f5679c; main 64bbc241f)
+- clippy + xtask over crates/server/src/{mounted_work,verbs}.rs (rebuild_volume's tree pin, rebuild_mounted, tree_owner).
+- Suites touched: `cargo test -p slates-server --test recovery --test daemon` (recovery now rebuilds a mounted work's slot); `--lib recover` passed 25/25 here. Red: a recovery refusal or a work NotRecovered.
+- Main's order 4, owed to main: real editors on kernel mounts of works. macOS (root): `slates attach <work>` then `mount_nfs` the capability path; ten works over one green; per mount run `vim -es -c '3s/.*/editor N/' -c wq f3` (temp+rename save), `sed -i ''`, and `python3 -c` write-then-os.replace; then `slates submit` each, grant via the CLI, land; red = any verdict other than the in-process test's (tests/mounted_work.rs) or landed bytes != oracle. Linux the same with `mount -t nfs -o vers=3` and FUSE (`slates mount --fuse`). Gate it as `mounted_work_kernel` on SLATES_TEST_MOUNTED_WORK_KERNEL=1 when main schedules it.
