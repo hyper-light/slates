@@ -59187,3 +59187,72 @@ What changed:
 - **Measured and left open (GAPS):** an insert or a delete still re-anchors in full (17.5 ms a change at a history of
   5,000 when overwrites and inserts alternate). The fix is layers that carry an offset shift.
 
+
+### A-614 amended — A create or a rewrite is admitted with no walk, its sets derived on first read (2026-11-21, w-git for UI goal 93; main's ruling (A), 03:52 PST; found by use: git/git's whole-history push)
+
+**Found.** With layer 2's pieces 1 and 2 in, git/git's whole-history push (611 MB, 1,027 refs, mostly tags at old
+commits) landed its changeset and then decided its commands for over 350 s, unfinished, at about 30 µs a step (Studio-2,
+release, 8baa1cf16). A create walked everything its head reached that no green's head did. An old tag's head descends
+from no green's head, so each tag walked its whole history for its green's reached set: refs times history. Stock git
+walks a push once and asks reachability only when something is read.
+
+**Rule.** A move is admitted with no walk unless it is a fast-forward over sets already known:
+- A create or a rewrite records `Followed::Remade`, its base only the green whose head is its own head, found by that
+  head's row with no walk. Its version has no value.
+- A fast-forward over a version with no value records `Followed::Grown` after the descent that decides it is one, and
+  has no value either.
+- A fast-forward over known sets still walks what it brings (its new objects) and keeps its value.
+- A head neither pushed nor indexed is still refused at admission.
+
+A version with no value has as its sets the closure of its head, derived on first read (`slates_git::store::Deriving`):
+- Sliced: a unit is an object of a walk or a commit of the search back, under the step budget.
+- A version first derives the versions it follows from.
+- A create or rewrite with no recorded base searches back by generation to the nearest commit a known version peels to.
+  It takes that version's reached set less its own tags as its base, and walks only beyond it.
+- `Repository::deriving_due` derives every unknown version, the oldest heads first, so a run of tags walks its history
+  about once in total.
+- Derived values are content, charged as puts are and held by a memo, which forks copy. The memo can be let go whole
+  (`forget_derived`). It is never recorded or replayed.
+
+What changes where:
+- **Policy** judges what a move brings by git's two-colour `new ^old` walk, with no reached set.
+- **The server** derives before a fetch holds its generation, and before any encoding turn (`vcs_store::git_derive`).
+- **Replay** walks nothing.
+- **Fresh objects of a create** are attributed to the push's first move in the landing map. Upload then offers that
+  move's fragment and encodes the rest loose: correct, maybe slower (GAPS).
+
+**Tests** (main's conditions):
+1. The map-model oracle (`store::tests::oracle`) has tags (annotated and lightweight, at old commits) and a replay. Every
+   derived set equals the model's closures before and after the replay, and the replay walks nothing.
+2. `t_a614a_tags_at_old_commits_derive_each_from_the_one_before_a_unit_a_turn`: sliced, a base found for each tag, and
+   fewer objects walked than twice the line's.
+3. `vcs_store::tests::t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn` now holds a replay to no walk.
+
+Also applied to: `crates/git/src/store/{repository,admitting,deriving,protect,reach,mod}.rs`, the git store's tests,
+`crates/server/src/vcs_store.rs`, `crates/server/src/vcs_store/{git_derive,git_encode,upload,tests}.rs`,
+`docs/wip/GAPS.md`.
+
+### A-238 amended — A push makes the chains room before its append, a green a turn (2026-11-21, w-git for UI goal 93; main's order 04:58 PST; found by use: git/git's whole-history push)
+
+**Found.** git/git's whole-history push had its daemon killed by the watchdog, in two runs: "shard 10 is spinning:
+1,142 ms of CPU without a step" (and 1,095 ms, 1,124 ms). Stack samples in one-second windows up to the kill put 748 of
+762 samples in one append (`repository::push::admit`). Its entry met `green_chains` at its cap, so it checkpointed every
+member green of the repository (A-753), about a thousand, in the append's one step, each folding its identity whole
+(`Green::head_identity`).
+
+**Rule.** A push's judge makes the room before the append (`git_push`'s `ServerJudge::room_turn`, after the command's
+work is built):
+- Where the chains have less room than the built work's entry can take (`Preparing::entry_bound`, as a Subversion
+  commit sizes its own), it checkpoints one member green a turn, counted `git_push.room_checkpointed`, until there is
+  room or every member is done.
+- The append's own A-238 guard stays as the guard. A green it still checkpoints in its step is counted
+  `repository.push.append_checkpointed`.
+- Each checkpoint's own fold is w-engine's to run in turns (`fold_identity_step`, landing).
+
+**Test.** `git_push::tests::t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`: 16 creates,
+each its own 64-file tree, against a 64 KiB chain budget. Red at 30e89672f: every create ok, 73 greens checkpointed
+inside appends. Green: none inside an append, and the room made in the turns.
+
+Also applied to: `crates/server/src/git_push.rs`, `crates/server/src/git_push/hooks.rs`,
+`crates/server/src/repository/push.rs`, `crates/git/src/receive/works.rs`, `docs/wip/GAPS.md`.
+

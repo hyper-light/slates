@@ -1031,6 +1031,11 @@ fn entry(
   entry
 }
 
+/// Counter: a green checkpointed inside an append's own step, its entry meeting the chains at their cap (A-238): each a
+/// whole fold of the green's identity in the step that appends (the git/git push's watchdog kill, 2026-11-21: about a
+/// thousand members folded in one step, 1,142 ms). Format: a counter name.
+pub(crate) const APPEND_CHECKPOINTED: &str = "repository.push.append_checkpointed";
+
 /// The entry judged whole by the register's guard, the new greens counted held, before anything is applied; a chain
 /// past the merge budget is checkpointed at each green's floor first and judged again (A-238, as a submit's admission):
 /// each green the entry updates, and every other member of its repository (A-753: an entry that only makes branches
@@ -1059,6 +1064,9 @@ fn admit(
     });
     let folded: std::collections::BTreeSet<DbVolumeId> = updated.chain(members).collect();
     for green in folded {
+      // Counted: each a fold run inside the append's own step, which a push's judge makes room for in its turns before
+      // (`git_push`'s chains' room, A-238 moved off the append's step), so for a push this counts what its turns left.
+      state.count(APPEND_CHECKPOINTED, 1);
       crate::merge_service::checkpoint_green_when(
         state,
         green,

@@ -129,12 +129,15 @@ fn change_cost(history: u64, stream: fn(u64) -> Change) -> (u128, f64) {
   (best, walked)
 }
 
+/// A stream of changes: its name, and the change it makes at each step.
+type Stream = (&'static str, fn(u64) -> Change);
+
 fn main() {
   for m in [10u64, 100, 1_000, 10_000] {
     let (ns, len) = read_after(m);
     println!("a\tread_version_1_after_overwrites\t{m}\tns\t{ns}\tbytes\t{len}");
   }
-  let streams: [(&str, fn(u64) -> Change); 3] = [
+  let streams: [Stream; 3] = [
     ("overwrites", |_| Change::Overwrite),
     ("overwrite_insert_alternating", |n| {
       if n % 2 == 0 {

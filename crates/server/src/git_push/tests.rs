@@ -872,6 +872,52 @@ fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
   assert_eq!(refused, (Vec::new(), 0));
 }
 
+/// Shape: the files of each tree [`t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`] pushes:
+/// enough that each create's work is a large part of [`SMALL_CHAIN_BUDGET`].
+const ROOMY_FILES: usize = 64;
+
+/// Shape: the branches it creates, each at a tree of its own: enough that their works pass the chains' cap many times.
+const ROOMY_CREATES: usize = 16;
+
+/// A-238 moved off the append's step (main's order of 2026-11-21, 04:58 PST; found by use: git/git's whole-history push
+/// had its daemon killed by the watchdog, shard 10 spinning 1,142 ms in one append that met `green_chains` at its cap
+/// and checkpointed the repository's every member green, about a thousand, each folding its identity whole). Do: with a
+/// small green-chain budget, push [`ROOMY_CREATES`] creates of branches, each its own commit of a tree of
+/// [`ROOMY_FILES`] files, each a push of its own, so the chains fill and later appends meet their cap with many members.
+/// Expect: every create `ok`; no green checkpointed inside an append's step (the counter none); the room made in the
+/// pushes' turns before their appends, a green a turn (the turns' counter moved). Red before the change: the appends
+/// checkpointed the members themselves, in their steps.
+#[test]
+fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step() {
+  let (refused, in_appends, in_turns) = crate::test_store::audit_on_stored_shard_configured(
+    "git-push",
+    |state| {
+      let repository = git_repository(state, "roomy");
+      let mut refused = Vec::new();
+      for k in 0..ROOMY_CREATES {
+        let (commit, objects) = flat_commit(ROOMY_FILES, &format!("create {k} file"), None);
+        let pack = pack_of_objects(&objects);
+        let commit = commit.to_string();
+        let name = format!("refs/heads/r{k}");
+        let created = [("", commit.as_str(), name.as_bytes())];
+        let received = pushed(state, repository, &request(&created, CAPABILITIES, &pack));
+        if reasons(&received) != [b"ok".to_vec()] {
+          refused.push(k);
+        }
+      }
+      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      (
+        refused,
+        count(crate::repository::push::APPEND_CHECKPOINTED),
+        count(super::ROOM_CHECKPOINTED),
+      )
+    },
+    |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
+  );
+  assert_eq!((refused, in_appends), (Vec::new(), 0));
+  assert!(in_turns > 0, "the room made in the turns: {in_turns}");
+}
+
 /// Shape: the pushes [`t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append`] answers at
 /// once, a step of each in turn.
 #[cfg(unix)]

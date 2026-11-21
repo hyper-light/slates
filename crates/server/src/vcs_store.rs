@@ -106,6 +106,7 @@ pub(crate) mod commits;
 pub(crate) mod durable;
 #[allow(unused_imports)] // `ContentTicket` names the barrier's term for its callers.
 pub(crate) use durable::{BarrierRefused, ContentTicket, content_durable, content_ticket};
+pub(crate) mod git_derive;
 pub(crate) mod git_encode;
 pub(crate) mod git_replay;
 pub(crate) mod hg_import;
@@ -254,6 +255,9 @@ pub(crate) struct VcsStores {
   /// Each git repository's version being encoded as its fragments, between its turns ([`git_encode`], A-718): one a
   /// repository, so bounded by the partition's repositories.
   encodings: git_encode::Encodings,
+  /// Each git repository's derivation of the sets its versions admitted with no walk reach, between its turns
+  /// ([`git_derive`], A-614 amended): one a repository, so bounded by the partition's repositories.
+  derivings: git_derive::Derivings,
   /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
   /// whole builds): one a green, so bounded by the partition's greens.
   whole_builds: paths::whole_build::Builds,
@@ -893,6 +897,7 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
+  git_derive::abandon(state, id);
   svn_import::abandon(state, id);
   if let Some(charged) = state.vcs_stores.objects_charged.remove(&id) {
     state.store.budget.credit_retention(charged);
@@ -2160,9 +2165,14 @@ fn keep_values(content: &mut ContentStore, store: &mut GitStore, moves: &[Move])
   let mut unkept = 0u64;
   for movement in moves {
     let green = movement.green();
-    let Ok((version, root)) = store.repository.reach_value(content, green) else {
-      unkept = unkept.saturating_add(1);
-      continue;
+    let (version, root) = match store.repository.reach_value(content, green) {
+      Ok(Some(value)) => value,
+      // Admitted with no walk: its sets are its first reader's to derive (A-614 amended), nothing to keep now.
+      Ok(None) => continue,
+      Err(_) => {
+        unkept = unkept.saturating_add(1);
+        continue;
+      }
     };
     let kept = store.derivations.keep(
       content,

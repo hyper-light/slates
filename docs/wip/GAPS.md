@@ -328,10 +328,24 @@
 > a stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits): `restage_turn`, asked every
 > decision step, reckoned `Repository::stage_room` by a pass over every commit pushed. Now the push keeps its commits'
 > parents as they arrive and the room is two counts; `restage_turn` reckons none when no stage is due. Measured: about
-> 30 µs a decision step (6.9 M steps, 210 s stepping, in 350 s). Owed, the next wall: a created ref whose head descends
-> from no green's head (git/git's old tags) walks its whole history for its green's reached set (A-614), so the
-> decision is about refs times history; design to main. Then red, that push landing within its room; an A/B against
-> stock git (10.77 s). Also measured: the checks take 16 s and the seal 3.7 s of that push.
+> 30 µs a decision step (6.9 M steps, 210 s stepping, in 350 s). The next wall, a created ref walking its whole
+> history for its green's reached set (refs times history), CLOSED by A-614's amendment (main's ruling (A), 2026-11-21):
+> a create, a rewrite and a fast-forward over sets never walked are admitted with no walk, their sets derived on first
+> read, sliced and memoized; a replay walks nothing. Owed, measured on 40d961807 (Studio-2): the third wall, each
+> created ref's green composing an increment and building its whole path map at the push (`slates_merge::push::
+> Building`, `vcs_store::paths::whole_build`: about 9,700 of 11,642 decision samples), refs times tree size; and a unit
+> running past the watchdog's window (1,142 ms, 1,095 ms: the daemon killed mid-push), named and its loop CLOSED
+> (A-238 amended, 2026-11-21): an append meeting `green_chains` at its cap checkpointed every member green in its one
+> step; a push now makes that room in its turns before the append, a green a turn. Owed there: each checkpoint's fold
+> is still whole until w-engine's `fold_identity_step` lands (507110661, main's order to land it). Then red, that push
+> landing within its room; an A/B against stock git (10.77 s). Also measured: the checks take 15.8 s (mostly
+> `Tree::parse`, each tree parsed by fsck and by the walk) and the seal 3.8 s.
+> A-614 amended, owed: a create's fresh objects are attributed in the landing map to its push's first move, so upload
+> offers that move's fragment and encodes the rest loose (correct, maybe slower); the memo is let go whole on need,
+> never by a measured price (`Repository::forget_derived`); a fetch waits for its repository's derivations whole, with
+> no keepalive while they run (git/git's first fetch after a restart derives its whole history once); `Repository::
+> commit` keeps a push's stage it took when it refuses after (a latent leak; the no-walk admission's refusal of a head
+> nobody sent closes the path that met it, `vcs_store::tests::t_a662`).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -516,10 +530,17 @@
 >   replacements now.
 > - (b) OPEN, measured: a path alternating overwrites and inserts re-anchors in full at each insert. That is A-793's
 >   cost, unchanged by A-809: 0.53, 3.6 and 17.5 ms a change at history 100, 1,000 and 5,000 (101, 551 and 2,551
->   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. Its design
->   is with main.
-> - Observed, not chased: overwrites and replacements that walk one value still take 2.6 to 9–10 µs a change over
->   history 100 to 5,000. The growth is sublinear and comes from elsewhere in the submit.
+>   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. It is
+>   queued (main, 04:36): w-rewrite-ops' next piece after stage C, red on the values walked per insert.
+> - OPEN, measured, queued after (b) (main, 04:36): a change that walks one value still grows with its path's history.
+>   Over history 100, 1,000 and 5,000 the cost a change was:
+>
+>   | change | history 100 | history 1,000 | history 5,000 |
+>   |---|---|---|---|
+>   | overwrites | 2,568 ns | 3,607 ns | 9,034 ns |
+>   | SDK replacements | 3,087 ns | 4,270 ns | 10,398 ns |
+>
+>   The growth is sublinear, and the re-anchor is not it: one value is walked. Not yet attributed.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
