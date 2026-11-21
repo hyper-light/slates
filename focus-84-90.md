@@ -1508,3 +1508,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-k90-win: kiln's CI lane frees at ~01:31; main dispatches from the MacBook if no run with f16212799 starts by 01:45.
   LANDED (w-hg): 8cb10f986 (step 0: hg refused without a store) and d571ffbca (replay a piece at a time: 790 KB read in 14 fills, peak 194 KB).
   NETWORK: the big Studio is now off kiln entirely (its 8 agents offline); Studio-2's agents are back.
+- 2026-11-21 01:13 PST
+  - The big Studio's agents are back on kiln; only w-k90-whp is offline (its Mac).
+  - DISK: the MacBook at 39 GB free. Active slates targets: w-svn 33 GB (trim asked at 00:33, queued behind a long turn), w-hg 7.3, w-git 4.6, w-shared 3.4, w-perf 2.0. Docker's remaining 60 GB of reclaimable volumes and the ~2 GB of slates-* images aren't worth it or aren't ours. Clean-aggressive waits for 30 GB.
+  - AUDIT: agents/w-shared-exit4-derive is a pre-squash leftover; its code is on main as c592a81f0. g222's arm C waits on its A/B; w-git's C5 2b piece 2 (1e0613233) is on test.
