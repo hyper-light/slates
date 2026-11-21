@@ -199,3 +199,23 @@ The yield is far worse (the yielder goes to the back of the queue each turn) and
 quiet median 15–30 µs and the quiet p99 ~5–15 µs. Loaded p999 is 0.9–4.0 ms in every arm (the lane's floor p999
 0.8–2.8 ms). This changes the client's sync wait (§4.7's 2-competitive spin) and touches R9's spinning provisioning
 form, so I've put it to main with a recommendation rather than land it.
+
+## 2026-11-21 10:28 PST — 84a macOS handed to you (main's order); finding 11: the loaded tail is the forward, not the client's wake
+Main's ruling to you (inbox/84a-from-main-loaded-tails-2026-11-21.md) says "the client's p99 tail is its own wake
+(written -> seen, median 97 µs)". That came from my quiet smoke run on Studio-4, before replies written after their
+taking step were stamped. Under load it's wrong. Take 2, on CI macos-latest with main + B (run 44934263888; BENCHMARKS
+"arm C" and GAPS 84a, main 5a729fab0):
+- 574-580 of each round's 580 loaded p99-tail requests are **deferred replies** (a resumed or forwarded verb).
+  In 567-579 of them the dominant hop is **taken -> written**, the trip to the owner shard and back. Tail medians:
+  taken -> written 4.4-7.6 ms, queued 0.9-2.7 ms, the client's wake 3-15 µs.
+- Deferred taken -> written: p99 5.8-8.1 ms, p999 8.0-10.7 ms loaded; p99 0.24-0.46 ms quiet. A sync reply's served
+  hop: p99 59-176 µs loaded.
+- The busy path's zero-timeout kevent took at least 1 ms in 7,000-13,000 of ~130,000-150,000 calls loaded, and 0-8
+  quiet.
+- Runner timers (200 µs timeouts): kevent and ulock are ~200 µs late at the median; nanosleep is 1.7-2.5 ms late.
+- For the time-constraint policy: the client's reply wait isn't where the tail is. The shards' cross-shard hops are.
+  This matches your own provisioning finding of 2026-11-20 ~19:30 (forward -> owner task 7-19 ms with the kqueue fix).
+- Tools: branch diag-g222-hops-mac (f88fcc9fd). It stamps the client's seen time and parks, ring rows with a deferred
+  flag, per-park lateness and kick -> run, and the harvest histogram. Its workflow is on diag-measurer-g222-23
+  (.github/g222/macsplit.py parses the output; timers.py probes the runner's timers). Never main.
+macOS is yours from here; I'm on 84a Linux.
