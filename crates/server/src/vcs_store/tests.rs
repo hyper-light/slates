@@ -403,10 +403,10 @@ fn assert_hostile_counts_and_words(bytes: &[u8]) {
   );
   let magic = with(0..4, b"GCHN");
   assert_eq!(Record::decode(&magic, FORMAT), Err(RecordRefused::Magic));
-  let version = with(4..8, &5u32.to_le_bytes());
+  let version = with(4..8, &6u32.to_le_bytes());
   assert_eq!(
     Record::decode(&version, FORMAT),
-    Err(RecordRefused::Version { version: 5 })
+    Err(RecordRefused::Version { version: 6 })
   );
   // Format: the objects' count follows the header (24 bytes), the move's key, version and marker (17) and its head (20).
   let objects_at = 24 + 17 + 20;
