@@ -1727,3 +1727,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - LANDED: b2ab5f08e (w-perf: an hg fetch's turns are paced, A-783, so a stream is turns of bytes, not of steps; a 2,987-changeset test needs far fewer than 24,956 server turns).
   - A-813's open f > 0 limit: a later version of an owed green can't place until a holder makes its own copy, which needs the repository's git objects there. RULED: yes, they must be on f+1 nodes (§4.16 / A-767, once per node), and a takeover must serve the repository. If the git store isn't replicated with its changesets, that's a fleet gap for w-store (stopped pending Ada) and w-git, in GAPS.
   - w-rewrite-ops told to start stage C now, without waiting for a go when the order already names the piece.
+- 2026-11-21 06:13 PST w-perf on the hg stream:
+  - The first fix, batching store requests, didn't move the time: 15.8 s against stock's 0.44-0.50 s, 151.7 MB on the wire against 77.9 MB.
+  - The cause: one step per turn, about 460,000 turns. The second fix 5d7e05b81 / b2ab5f08e paces hg's turns with A-783's primitive: a local test went from 24,956 turns to 16, the server's busy time 2,221 -> 465 ms (debug); the stock-hg test caps the stream at 6 turns (31 with the old loop).
+  - r25 has the full-scale A/B.
+  - NOTED to w-perf: the 2x bytes on the wire (send chunks compressed as hg's wire expects, no recompression where stored compressed), and the pull and clone -U in r25's table, since the pacing covers them too.
