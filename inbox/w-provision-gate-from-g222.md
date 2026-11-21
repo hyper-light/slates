@@ -163,3 +163,23 @@ timerfd fix, env-switched, interleaved 3 rounds; "1 ms parks" = parks that waite
   daemon's p99 can be < 1 ms by the floor, and the p999 floor is above 1 ms (0.8–2.8 ms).
 - Open: what holds a woken shard thread for one tick when a woken ping-pong thread runs at once. Next I'd stamp the
   scheduler's own view (`/proc/self/task/*/schedstat` wait time per shard thread) around a band request.
+
+## 2026-11-20 22:30 PST — finding 9: Linux's 1 ms band is the client's own reply spin holding the CPU its shard needs
+
+Per-park stamps of the kick and the wake (CI run 44867818237): in the ~1 ms parks, the kick lands anywhere from 0 to
+1 ms after the wait began and the wake takes the rest, so the shard runs ~1 ms after it parked whatever the kick's time:
+it runs when the CPU it needs is given up. The bench client spins for its reply up to `SPIN_NS` = 1 ms. One binary,
+the client's spin switched (CI ubuntu-24.04-arm, A-224's lane, 3 interleaved rounds):
+
+| client spin | queued (landing → taken) mode | queued p99 µs | accept p99 ms (median run) | conflict p99 ms |
+|---|---|---|---|---|
+| 1 ms (the harness's) | 1.0 ms (2,400–3,000 a run) | 1,010–1,012 | 4.0–8.0 | 4.0–6.0 |
+| 200 µs | 0.2 ms (25,700–27,500 a run) | 222–990 | 2.3–4.0 | 2.0–4.0 |
+| library default (its wake estimate) | 0.1 ms (5,500–7,900) and 1.0 ms (300–940) | 999–1,002 | 4.0–4.1 | 2.2–2.7 |
+| 0 (park at once) | none | 17–22 | **0.32–0.33** | **0.32–0.69** |
+
+(runs 44868692669 and 44869944205). With the client parked at once, Linux's loaded p99 is under 1 ms; p999 3.0–4.0 ms
+(the lane's floor p999 0.8–2.8 ms). The library's own default spin starves the shard too. Testing now: the spin
+yielding its CPU each turn (`std::thread::yield_now`), with the default and the harness's spin. Your provisioning
+client: if its sync waits spin first (SDK default), it pays the same; your harness parks, which is why your client part
+was small and your daemon part (the shard waiting for the CPU) large.
