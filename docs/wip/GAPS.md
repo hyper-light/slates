@@ -2579,6 +2579,24 @@
 > the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
 > `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
+> ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
+> revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
+> svnsync and client commits land a revision at a time either way and are not affected. Two shapes take it back, each
+> outside the Subversion path and not built on svn's reading: (a) the import as one changeset, the records and the
+> green advancing in RAM ahead of the register, one transaction at its end, a refusal rolling both back (the green's
+> side is the merge engine's, w-engine); (b) a cheaper barrier than F_FULLFSYNC where the store's durability allows it
+> (w-store's call; A-130 has the history).
+> **P7's memory findings (2026-11-21, w-svn; BENCHMARKS "Where a Subversion import's memory is" and "A Subversion
+> import on the real daemon"; main's order: after C2 stage B part 2, completion then robustness then performance).**
+> Owed, each measured on git-2000's import (437 MiB dump, 2,000 revisions): (1) the green charges 440 MB of retention
+> for a history the records keep in 35 MB (12x): its kept versions serve copies from older revisions (folding them was
+> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first;
+> (2) 593 MB of live small allocations with no owner attributed; (3) ~1 GB of whole-text transients during the import
+> (a revision's whole texts, its record's encoding and the reader's buffer held at once) and 1.5 GB of freed large
+> blocks the test binary's allocator keeps (the daemon's own allocator gives them back; the real daemon peaks at
+> 1,570 MiB, half of it the segment, where the green's chain entries carry each revision's file bytes). C2 stage C holds
+> each whole text once and measures it.
 > **svnsync from slates over the HTTP edge (2026-11-21, w-svn; found by P7's `an_svnsync_measured` on the big Studio):**
 > stock `svnsync init` refused E200007 "The method 'PROPFIND' is not served here": HTTPv2's revision resource
 > (`!svn/rev/REV`, where ra_serf reads revision properties) was not served. Fixed: it is answered as the revision's
