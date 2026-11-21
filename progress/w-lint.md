@@ -273,3 +273,14 @@
   with no output at all (not even the clone's line: a hung clone or no output streamed). Resubmitted by needs with the
   warm CARGO_TARGET_DIR and a 600 s clone cap: r5 and r6 both refused "no room here now" on jupiter. Not resubmitting
   again until the next round. Linux r60 still queued.
+
+## 2026-11-20 round 13 at e4cfbd38d (landed 7a9ace19f, 785e0a94f, 55038e039, part 3)
+- main's five Windows reds: two fixed (winfsp HostFs, vcs_svn HOOK_PATIENCE_NS cfg(unix)), three already in e51d9adeb;
+  `cargo xwin clippy` works on this Mac and ran the server and cli Windows check.
+- Host: hg, mem, merge, rt (Rc -> mpsc), db, land, server (push boxed verdict, hg_push, content_ranges, verbs
+  forward_placement, scratch-dir allows, svn_presenter), store tests and example, cli dead helper. slates-pace: no-panic
+  attribute (+4 checked divisions), budget 0; literals derived/named.
+- Correction to 785e0a94f's message: the rt pacing failure happened once, on my version only, under load; both versions
+  then passed 3 of 3. content_ranges failed once at load 7, then passed 2 of 2 on both versions.
+- To g228 (inbox/g228-from-w-lint.md): live_fleet's two time-waits, resident.rs's /proc read (structural), mem unsafe
+  88 > 87. Still with w-store: 3 store literals; w-sizing: server unsafe (now ok? see next round).
