@@ -1,5 +1,13 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **KILN ON A LOADED KVM HOST (w-k90-kvm, 2026-11-20; kiln goal 90d/90f, closed at kiln c0f576eb3; findings recorded,
+> not worked, per the close order).** Seen on adacachy (load 60-85, io some avg10 ~10%) in kiln's `slates_e2e microvm::`
+> drive: (1) an agent's act asked while its runner's link to the server is down is refused at once (`reach/node.rs`
+> `on_local`, deliberate per `reach/tests.rs`), so a link blip fails an agent's landing; (2) a session start sent just
+> before a link drop can be lost, and the server marks the session crashed ("the runner doesn't hold it") for a person to
+> resume; (3) a runner's sqlite stores took 48-96 s to open under that I/O pressure. The link itself drops when a
+> starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
+
 > **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
 > gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included. Its CI wiring is a
 > run request. **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
