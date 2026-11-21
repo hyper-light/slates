@@ -568,9 +568,19 @@ impl Runtime {
       };
       let id = seed.id;
       let ready = ready.clone();
+      let window_ns = config.spin_ns;
       let spawned = std::thread::Builder::new()
         .name(format!("slates-shard-{id}"))
-        .spawn(move || run_worker(seed, core, ready));
+        .spawn(move || {
+          // DIAG (84a macOS, T-both arm; never main): the shard's thread in the real-time band, its computation and
+          // constraint the idle window (R9's floor in the daemon, the kernel's minimum real-time quantum).
+          let taken = slates_machine::time_constraint::set_current_from(window_ns).is_some();
+          let ended = run_worker(seed, core, ready);
+          if taken && slates_machine::time_constraint::holds() == Some(false) {
+            slates_machine::log_line!("diag 84a: shard {id}'s time-constraint policy was demoted");
+          }
+          ended
+        });
       match spawned {
         Ok(thread) => {
           workers.push(Worker { id, thread });
