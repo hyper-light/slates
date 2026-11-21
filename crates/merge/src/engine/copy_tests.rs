@@ -1940,7 +1940,26 @@ impl Oracle {
   fn submit(&mut self, work: &Work, expected: Option<Landed>) -> Result<bool, TestCaseError> {
     self.next += 1;
     let increment = work.at(self.next, self.green.head());
+    let head = self.green.head();
+    // The paths the view is held to, from the model (a walk of either green would move the walk count the copies are
+    // held to): every path of the head's tree and of the tree the model expects next, and every directory above one.
+    let mut universe = self.model.current().paths();
+    if let Some((next, _, _)) = &expected {
+      universe.extend(next.paths());
+    }
+    let universe = with_parents(universe);
+    let viewed = self.view_of(&increment, &universe)?;
     let (outcome, applied) = self.green.submit_resolved(&increment);
+    // A-805: the view of the held verdict read as the green reads once it commits.
+    if let Some((changed, reads)) = viewed
+      && self.green.head() == head + 1
+    {
+      prop_assert_eq!(&changed, &self.green.changed_between(head, head + 1));
+      for path in universe.iter().chain(&changed) {
+        let committed = reads_at(&self.green, path, head);
+        prop_assert_eq!(reads.get(path), Some(&committed), "path {}", path);
+      }
+    }
     let accepted = matches!(
       outcome,
       Outcome::Accepted { .. } | Outcome::Identical { .. }
@@ -1951,6 +1970,42 @@ impl Oracle {
       self.model.push(landed);
     }
     Ok(accepted)
+  }
+
+  /// A-805: the green lent to a lineage, the increment judged there and, when held accepted, viewed as it would commit
+  /// (`Lineage::preview`): the paths it changes and every path's reads, with the fork's numbering (the head its 0).
+  /// The fork is retired and released, and the green taken back, judged but unchanged.
+  fn view_of(
+    &mut self,
+    increment: &Increment,
+    universe: &BTreeSet<String>,
+  ) -> Result<Option<Viewed>, TestCaseError> {
+    let (mut lineage, handle) = Lineage::new(std::mem::take(&mut self.green));
+    let judgment = lineage
+      .with(handle, |green| green.judge(increment))
+      .unwrap();
+    let viewed = match judgment {
+      Judgment::Accepted(judged) => {
+        let fork = lineage.preview(handle, judged).unwrap();
+        let viewed = lineage
+          .with(fork, |view| {
+            let changed = view.changed_between(0, 1);
+            let reads = universe
+              .iter()
+              .chain(&changed)
+              .map(|path| (path.clone(), reads_at(view, path, 0)))
+              .collect();
+            (changed, reads)
+          })
+          .unwrap();
+        let mut release = lineage.retire(fork).unwrap();
+        while !lineage.release_step(&mut release).unwrap() {}
+        Some(viewed)
+      }
+      _ => None,
+    };
+    self.green = lineage.take(handle).unwrap();
+    Ok(viewed)
   }
 
   /// A one-byte file at `path` and its attribute: an overwrite where a file stands, refused where a directory does.
@@ -2460,6 +2515,47 @@ fn a_copy_computed_before_the_green_moved_is_judged_again_by_position() {
   assert_eq!(judged, (1, 2, own.applied()));
   owner.commit_judged(held).expect("committed at its head");
   assert_eq!(owner.content("b/a"), Some(&b"alpha"[..]));
+}
+
+/// What a view answers (A-805, [`Oracle::view_of`]): the paths its version changed, and each path's reads.
+type Viewed = (Vec<String>, BTreeMap<String, Reads>);
+
+/// One path's reads as a Subversion revision is made of them (`vcs_store::svn_made`): its bytes, its property list, its
+/// kind, its link target, its IPC node, its hard link's primary, and whether a copy after `since` brought it.
+type Reads = (
+  Option<Vec<u8>>,
+  Option<Vec<u8>>,
+  bool,
+  Option<String>,
+  bool,
+  Option<String>,
+  bool,
+);
+
+/// `path`'s reads in `green`, a copy counted after `since` ([`Reads`]).
+fn reads_at(green: &Green, path: &str, since: u64) -> Reads {
+  (
+    green.content(path).map(<[u8]>::to_vec),
+    green.xattr(path, PROPS).map(<[u8]>::to_vec),
+    green.is_dir(path),
+    green.symlink(path).map(str::to_owned),
+    green.special(path).is_some(),
+    green.hardlink(path).map(str::to_owned),
+    green.copied_after(path, since),
+  )
+}
+
+/// `paths` and every directory above one.
+fn with_parents(paths: BTreeSet<String>) -> BTreeSet<String> {
+  let mut all = paths.clone();
+  for path in &paths {
+    let mut at = path.as_str();
+    while let Some(cut) = at.rfind('/') {
+      at = &at[..cut];
+      all.insert(at.to_owned());
+    }
+  }
+  all
 }
 
 /// A green at version 2 holding `outside/f` and a trunk with two hard links: `trunk/l` naming `trunk/a`, a node inside
