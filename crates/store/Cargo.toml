@@ -14,6 +14,8 @@ blake3 = { workspace = true }
 hyper-block = { path = "../../vendor/hyper-raft/hyper-block" }
 # CRC-32C of every header, section and trailer (vendor/mantle).
 mantle-crc = { path = "../../vendor/mantle/crc" }
+# The engine the store's rows live in (vendor/mantle; A-767 item 3).
+mantle-engine = { path = "../../vendor/mantle/engine" }
 slates-land = { workspace = true }
 
 [dev-dependencies]

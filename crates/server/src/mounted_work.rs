@@ -67,9 +67,11 @@ pub(crate) type MountedPins = std::collections::BTreeMap<DbVolumeId, MountPin>;
 /// The tree identity of `pin`: its fingerprints' device, the green's alone, so a mount rebuilt at another version of the
 /// same green (a restart re-pins at the work's durable base) finds drift only where an entry's bytes differ there.
 fn identity(pin: MountPin) -> u64 {
-  let mut word = [0u8; 8];
+  // Format: a `u64`'s little-endian bytes: the green's id folded into eight.
+  let mut word = [0u8; size_of::<u64>()];
+  let width = word.len();
   for (at, byte) in pin.green.bytes.iter().enumerate() {
-    if let Some(slot) = word.get_mut(at % 8) {
+    if let Some(slot) = word.get_mut(at.checked_rem(width).unwrap_or(0)) {
       *slot ^= *byte;
     }
   }
