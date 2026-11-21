@@ -1,4 +1,4 @@
-//! How often a busy shard asks its driver for I/O (§4.3 "Loop"; A-823, amending A-218; 85a, g228, 2026-11-21).
+//! How often a busy shard asks its driver for I/O (§4.3 "Loop"; A-826, amending A-218; 85a, g228, 2026-11-21).
 //!
 //! A shard that stays busy never reaches its park, where the driver is asked for ready I/O, so it asks between steps
 //! with a zero-timeout wait, so an I/O-bound task is not starved behind CPU-bound ones. On Linux and Windows that wait

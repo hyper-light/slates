@@ -7210,8 +7210,16 @@ mod tests {
     );
     assert_eq!(green.content("a"), None, "the rename's source is gone");
     let applied = applied.expect("an accepted version's effects");
-    let entry = crate::chain_entry::encode(&edited.encode(), &edited, &applied, None, None, None);
-    let decoded = crate::chain_entry::decode(&entry).expect("the entry decodes");
+    let increment_bytes = edited.encode();
+    let entry = crate::chain_entry::encode(
+      crate::chain_entry::held_for_tests(&increment_bytes),
+      &edited,
+      &applied,
+      None,
+      None,
+      None,
+    );
+    let decoded = crate::chain_entry::decode(&entry, &increment_bytes).expect("the entry decodes");
     assert_eq!(
       decoded.applied, applied,
       "the entry carries what the verdict resolved"

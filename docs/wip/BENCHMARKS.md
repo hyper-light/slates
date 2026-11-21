@@ -17341,7 +17341,7 @@ scheduler's queueing until one daemon spent 1.70 s of a round watching. "No core
 wake estimate rose before any free-core reading could fall. A spin's bound must come from something that shrinks under
 contention, or the spin must be absent; the busy interval, which spins nothing, is measured on its own next.
 
-**A busy shard asks its driver no more often than an empty ask costs: the interval alone, accepted (A-823)**
+**A busy shard asks its driver no more often than an empty ask costs: the interval alone, accepted (A-826)**
 (agents/g228-busy-interval bc64bc20c against main a8ee99bf7; kiln r21, adas-mac-studio.local-2, Apple silicon, 32 cores,
 17:06-17:20 UTC 2026-11-21; the contract command, release, CARGO_BUILD_JOBS=4, each arm built from its commit, five
 rounds a condition, arms interleaved, order alternating). Loaded: 32 busy loops, one a core, started 30 s before the

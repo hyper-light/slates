@@ -763,4 +763,21 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
     taken, 3,
     "the increment, its encoding and its verdict taken"
   );
+  // The oracle (a debug build): the sliced increment equals, whole, the one the submit's step composes on main.
+  if cfg!(debug_assertions) {
+    let checked = counts
+      .get("merge.refine.prepared_checked")
+      .copied()
+      .unwrap_or(0);
+    let mismatched = counts
+      .get("merge.refine.prepared_mismatch")
+      .copied()
+      .unwrap_or(0);
+    eprintln!("oracle: {checked} increments compared, {mismatched} differed");
+    assert!(checked > 0, "the prepared increment was compared");
+    assert_eq!(
+      mismatched, 0,
+      "the prepared increment equals main's composition"
+    );
+  }
 }

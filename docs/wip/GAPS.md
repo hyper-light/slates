@@ -1,5 +1,20 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
+> `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
+> (`crates/server/tests/fleet.rs`) fail alone at origin/main 37c7a1691 and identically with A-825 (macOS arm64,
+> Mac Studio, kiln r18, load 4-5): the successor takes the volume over, but every write through the superseded node a
+> is refused, `StaleEpoch { current: 2 }` once and then `Overloaded` until the wait gives up ("a write through a was
+> answered at durability"). Not looked into; A-825 touches neither live shipping nor a volume's takeover.
+
+> **Open (A-825, w-shared, 2026-11-21): a repository green's increment is held twice until w-store's wiring lands it.**
+> Chain entry format 6 holds every version's increment in its owner shard's content store until the version folds
+> (main's ruling 00:52 PST, condition 4: one content store). A git, Mercurial or Subversion green's increment is also
+> its changeset, which A-767's log holds on disk once landed (w-store's wiring): the two carry the same content until
+> the changeset store names it, so a repository's increments are charged in RAM until their versions fold. Owed with
+> A-767's wiring: the entry naming the changeset's content where the log holds it. Also owed: the extra publication
+> before an entry's append (A-825 "Cost owed"), measured by the lane's release bench.
+
 > **FIXED (w-fed-faults, 2026-11-21): a whole-file rewrite outside a recorded request was refused `Overloaded`**
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
@@ -207,7 +222,9 @@
 > (`vcs_store.hg_stream_turns`); hg's first 2987 changesets stream in 16 turns where they took 24,956. r25 on
 > 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
 > store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
-> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
+> (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). r27 on e0b677380: 38 store
+> asks a stream, 1.35 s of its 3.7 s waiting on them, a lookup a revision's row by node; BUILT: a log's rows read in one
+> scan of its key prefix (`Store::texts_by_tools`, counted `Store::tool_reads`). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
 > against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). CLOSED by w-hg's C1 (imports since
 > step 3, made changesets since the made-on-store piece): a repository whose history the store did not keep (an
 > import's, a made changeset's) advertised no stream (`State::stored_logs`, from `HgStore::unstored`, both removed),
@@ -333,7 +350,7 @@
 > register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody homed,
 > which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing order, and
 > a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Piece 3 part 1 BUILT
-> (A-822, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
+> (A-824, w-git, 2026-11-21): a recorded submit's git made commit takes the deferred-submit hook, its map stepped over
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Owed (w-git): `record_of` and version 2 removed with the paths that still write them (a submit outside a recorded request,
@@ -539,11 +556,11 @@
 > A-774 part 3), reported to main.
 >
 > **A-812, P2's engine half (2026-11-21, w-rewrite-ops; main's order of 05:16, w-git's request). BUILT, engine and
-> server; git's half BUILT (A-821, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
+> server; git's half BUILT (A-823, w-git).** A created ref's green may owe its push (`DeferredPush`, recorded as its version 1)
 > and is made when first reached, through one door (`crate::green_ready`). The made green is the eager create's by
 > construction, and requests park until it is made. The full description and tests are in the design entry A-812.
 > Owed:
-> - (a) FIXED by A-821 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
+> - (a) FIXED by A-823 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
 >   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door (a command whose
 >   wait ends with the build refused is declined, not retried). Owed from it: a replayed owing green has not been made
 >   over a restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met
@@ -573,7 +590,7 @@
 >   compacts a fragmented value at write time.
 > - A-816 (main's 07:30 ruling): a held verdict's preview lives across turns until the one step (`made_commit::
 >   hold_preview`, `with_held_preview`), for git's made commit's sliced map build; counted
->   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-822).
+>   `vcs.made.preview_held_across_turns`. git's made commit over it is w-git's C5 2b piece 3, BUILT (A-824).
 > - (e) Paths outside a recorded request or an owner's step are not routed through the door. A reach that skips it gets
 >   a typed miss from `Greens::get`, counted by `Greens::owing_reached`, never wrong content. That count is the detector
 >   for a missed path.
@@ -9236,7 +9253,7 @@
 > runner (at most 65.5 against 60.6-83.0 µs at p50), so the daemon hides nothing there. A live entry's request taken whole (one copy a holder for four) is measured dead even and rejected (BENCHMARKS, same
 > section). The macOS collect (two empty zero-timeout `kevent`s between busy steps, about 30 µs) was attacked by main's
 > ruling (c) and the candidate measured and rejected, losing under contention (BENCHMARKS, same section): item 3
-> closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-823 (a busy shard asks its driver
+> closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-826 (a busy shard asks its driver
 > no more often than an empty ask costs): macOS 137.0-141.2 against 164.5-167.7 µs added at the median, no contended
 > condition lost. Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one

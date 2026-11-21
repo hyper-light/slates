@@ -3101,15 +3101,19 @@ impl Daemon {
         identities.sort_unstable();
         identities.extend(partition.green_chain(volume).iter().enumerate().filter_map(
           |(index, bytes)| {
-            slates_merge::chain_entry::decode(bytes).ok().map(|entry| {
-              (
-                u64::try_from(index)
-                  .unwrap_or(u64::MAX)
-                  .saturating_add(held)
-                  .saturating_add(1),
-                entry.increment.id,
-              )
-            })
+            let inputs = slates_merge::chain_entry::inputs(bytes).ok()?;
+            let increment = crate::merge_service::increment_of(s, volume, &inputs)?;
+            slates_merge::chain_entry::decode(bytes, &increment)
+              .ok()
+              .map(|entry| {
+                (
+                  u64::try_from(index)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(held)
+                    .saturating_add(1),
+                  entry.increment.id,
+                )
+              })
           },
         ));
         // A green its takeover adopted from this node's holder ledger, with no checkpoint past the adoption, names the
@@ -8071,7 +8075,7 @@ mod tests {
 
   /// A-727 slice a3b (an object past a window across a warm restart; the identity rule). Do: on a daemon over a retained
   /// anchor segment and content object, write `main`'s one file, 1 MiB (past any node's window), in a work and submit it,
-  /// so the version's map holds the file's object (a pushed create owes its push since P2, A-821, and holds nothing until
+  /// so the version's map holds the file's object (a pushed create owes its push since P2, A-823, and holds nothing until
   /// first read; a submitted version's map is made with it and made again by the replay); read the file's object by its
   /// identity, the BLAKE3 of its bytes; publish; stop; start a successor and read it again.
   /// Expect: the object whole by its identity on both; the successor taking back every list and name of the content
@@ -8197,7 +8201,7 @@ mod tests {
     );
   }
 
-  /// P2 with A-727 a3b (main's ruling of 2026-11-21: the pushed path's survival, derived on first read, A-821). Do: on a
+  /// P2 with A-727 a3b (main's ruling of 2026-11-21: the pushed path's survival, derived on first read, A-823). Do: on a
   /// daemon over a retained anchor segment and content object, push a create of `main` whose one file is 1 MiB (past any
   /// node's window), and read the file's object by its identity; read `main` through the door and read the object
   /// again; publish; stop; start a successor, read the object, then read `main` through the door and read it again.
@@ -8455,7 +8459,7 @@ mod tests {
   /// A-727 slice a3 (repository windows across a warm restart). Do: on a daemon over a retained anchor segment, make a
   /// git repository and push the fixtures' `create` and `update` into it; note `main`'s map of paths (its version and
   /// tree), then let go of the greens' derived maps; publish every shard; stop; start a successor over the same segment;
-  /// once its windows are back, read `main` through the door. Expect, P2's rule both halves (A-821: a created green owes
+  /// once its windows are back, read `main` through the door. Expect, P2's rule both halves (A-823: a created green owes
   /// its push again on replay, and its paths are derived on first read): every window the records hold (by identity,
   /// with its holders and its bytes) kept by the successor, taken back from the shard image (every one restored, none
   /// refused, none left unheld once the records were replayed), so the replay's puts were answered by the windows kept,
@@ -8534,7 +8538,7 @@ mod tests {
         crate::vcs_store::paths::whole_build::settle(state);
         let map = main_map(state).and_then(|(_, map)| map);
         // The greens' maps are derived data: a successor replays a created green owing its push again, and derives its
-        // paths on first read (P2, A-821), so the windows compared are those the repository's records hold.
+        // paths on first read (P2, A-823), so the windows compared are those the repository's records hold.
         crate::vcs_store::paths::forget_maps_for_test(state, repository);
         map
       })

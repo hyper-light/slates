@@ -68,12 +68,63 @@ fn id(n: usize) -> [u8; 32] {
   id
 }
 
-/// The durable state a crash leaves: the last checkpoint, and the entries after it.
+/// The durable state a crash leaves: the last checkpoint, the entries after it, and the content store holding each
+/// entry's increment by the identity it names (format 6, lane (A)): released only when no entry names it.
 #[derive(Default)]
 struct Durable {
   checkpoint: Option<Vec<u8>>,
   held: u64,
   chain: Vec<Vec<u8>>,
+  store: std::collections::BTreeMap<[u8; 32], Vec<u8>>,
+}
+
+impl Durable {
+  /// Holds `increment`'s encoding in the store, then appends its entry naming it: the service's order, the content
+  /// durable before the entry that names it.
+  fn record(
+    &mut self,
+    increment: &Increment,
+    applied: &[chain_entry::Applied],
+    completion: Option<chain_entry::Completion>,
+    recorded: Option<[u8; 32]>,
+    signature: Option<chain_entry::Signature>,
+  ) {
+    let bytes = increment.encode();
+    let inputs = held(&bytes);
+    self.store.insert(inputs.identity, bytes);
+    self.chain.push(chain_entry::encode(
+      inputs, increment, applied, completion, recorded, signature,
+    ));
+  }
+
+  /// `entry` decoded with its increment resolved in the store.
+  fn decode(&self, entry: &[u8]) -> chain_entry::ChainEntry {
+    let inputs = chain_entry::inputs(entry).unwrap();
+    let bytes = self
+      .store
+      .get(&inputs.identity)
+      .expect("the store holds every increment an entry names");
+    chain_entry::decode(entry, bytes).unwrap()
+  }
+
+  /// Keeps the entries from `kept` on, releasing every increment no kept entry names (A-714's retention: held until
+  /// its version folds into a checkpoint).
+  fn fold(&mut self, kept: Vec<Vec<u8>>) {
+    let named: std::collections::BTreeSet<[u8; 32]> = kept
+      .iter()
+      .map(|entry| chain_entry::inputs(entry).unwrap().identity)
+      .collect();
+    self.store.retain(|identity, _| named.contains(identity));
+    self.chain = kept;
+  }
+}
+
+/// Where the test's content store holds `bytes`: their BLAKE3, standing in for the inputs archive's identity.
+fn held(bytes: &[u8]) -> chain_entry::Inputs {
+  chain_entry::Inputs {
+    identity: *blake3::hash(bytes).as_bytes(),
+    len: bytes.len() as u64,
+  }
 }
 
 /// A green rebuilt from what is durable, as recovery rebuilds it: every entry through its encoding, applied, and compared
@@ -88,7 +139,7 @@ fn recovered(
     None => Green::with_origin(origin_of(origin_rows)),
   };
   for bytes in &durable.chain {
-    let entry = chain_entry::decode(bytes).unwrap();
+    let entry = durable.decode(bytes);
     let version = green.apply_recorded(&entry.increment, &entry.applied);
     assert_eq!(
       entry.completion,
@@ -331,14 +382,13 @@ impl History {
         .then(|| self.live.head_identity());
       // A request made most versions (A-255): its completion key rides the entry, and recovery reads it back.
       let completion = completion_for(*version);
-      self.durable.chain.push(chain_entry::encode(
-        &increment.encode(),
+      self.durable.record(
         &increment,
         &applied,
         completion,
         recorded,
         signature_for(*version),
-      ));
+      );
       // The service records a version's verdict once its entry is durable (A-321).
       if let Some(signature) = signature_for(*version) {
         assert!(self.live.record_signature(*version, signature));
@@ -363,9 +413,9 @@ impl History {
       .split_off(folded.min(self.durable.chain.len()));
     self.ran.entries_below_a_checkpoint += kept
       .iter()
-      .filter(|bytes| chain_entry::decode(bytes).unwrap().increment.base < at)
+      .filter(|bytes| self.durable.decode(bytes).increment.base < at)
       .count() as u64;
-    self.durable.chain = kept;
+    self.durable.fold(kept);
     self.durable.checkpoint = Some(checkpoint.encode());
     self.durable.held = at;
   }
@@ -690,14 +740,13 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
     };
     bases[who] = version;
     identities.insert(version, live.head_identity());
-    durable.chain.push(chain_entry::encode(
-      &increment.encode(),
+    durable.record(
       &increment,
       &applied.unwrap(),
       completion_for(version),
       None,
       signature_for(version),
-    ));
+    );
     if let Some(signature) = signature_for(version) {
       assert!(live.record_signature(version, signature));
     }
@@ -710,13 +759,19 @@ fn two_clients_taking_turns_keep_folding_and_stay_bounded() {
         .split_off(usize::try_from(floor - durable.held).unwrap());
       folded_past_a_base += kept
         .iter()
-        .filter(|bytes| chain_entry::decode(bytes).unwrap().increment.base < floor)
+        .filter(|bytes| durable.decode(bytes).increment.base < floor)
         .count();
-      durable.chain = kept;
+      durable.fold(kept);
       durable.checkpoint = Some(checkpoint.encode());
       durable.held = floor;
     }
     longest = longest.max(durable.chain.len());
+    assert!(
+      durable.store.len() <= durable.chain.len(),
+      "the store holds only what an entry names: {} increments for {} entries",
+      durable.store.len(),
+      durable.chain.len()
+    );
   }
   assert!(
     longest <= 2,
@@ -770,8 +825,9 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let (_, applied) = green.submit_resolved(&increment);
   // A completion naming its submitting work (A-288), so every byte of the work's marker and id is truncated and flipped.
   // A signature's verdict too (A-321), so every byte of its section is truncated and flipped.
+  let increment_bytes = increment.encode();
   let bytes = chain_entry::encode(
-    &increment.encode(),
+    held(&increment_bytes),
     &increment,
     &applied.unwrap(),
     Some(completion_of(2)),
@@ -779,13 +835,13 @@ fn a_hostile_chain_entry_is_refused_typed() {
     signature_for(2),
   );
   assert_eq!(
-    chain_entry::decode(&bytes).map(|entry| (entry.completion, entry.signature)),
+    chain_entry::decode(&bytes, &increment_bytes).map(|entry| (entry.completion, entry.signature)),
     Ok((Some(completion_of(2)), signature_for(2))),
     "the entry decodes, its completion key, submitting work and signature verdict with it"
   );
   for len in 0..bytes.len() {
     assert!(
-      chain_entry::decode(&bytes[..len]).is_err(),
+      chain_entry::decode(&bytes[..len], &increment_bytes).is_err(),
       "truncated at {len}"
     );
   }
@@ -793,12 +849,12 @@ fn a_hostile_chain_entry_is_refused_typed() {
     let mut flipped = bytes.clone();
     flipped[at] ^= 0x40;
     assert!(
-      chain_entry::decode(&flipped).is_err(),
+      chain_entry::decode(&flipped, &increment_bytes).is_err(),
       "a byte flipped at {at}"
     );
   }
   assert_eq!(
-    chain_entry::decode(&increment.encode()),
+    chain_entry::decode(&increment_bytes, &increment_bytes),
     Err(DocDecodeError::BadMagic),
     "a bare increment from an earlier layout"
   );
@@ -806,22 +862,29 @@ fn a_hostile_chain_entry_is_refused_typed() {
   let mut earlier = bytes.clone();
   earlier[4..8].copy_from_slice(&2u32.to_le_bytes());
   assert_eq!(
-    chain_entry::decode(&earlier),
+    chain_entry::decode(&earlier, &increment_bytes),
     Err(DocDecodeError::BadVersion),
     "an entry of version 2, before the submitting work rode it"
   );
   // Nor one of the version before A-321, which carried no signature's verdict.
   earlier[4..8].copy_from_slice(&3u32.to_le_bytes());
   assert_eq!(
-    chain_entry::decode(&earlier),
+    chain_entry::decode(&earlier, &increment_bytes),
     Err(DocDecodeError::BadVersion),
     "an entry of version 3, before the signature's verdict rode it"
   );
   // Nor one of the version before A-621, whose ops named their paths in 16 bits.
   earlier[4..8].copy_from_slice(&4u32.to_le_bytes());
   assert_eq!(
-    chain_entry::decode(&earlier),
+    chain_entry::decode(&earlier, &increment_bytes),
     Err(DocDecodeError::BadVersion),
     "an entry of version 4, before an op's path index was 64 bits"
+  );
+  // Nor one of the version before lane (A), which carried the increment's bytes (format 6 names them by identity).
+  earlier[4..8].copy_from_slice(&5u32.to_le_bytes());
+  assert_eq!(
+    chain_entry::decode(&earlier, &increment_bytes),
+    Err(DocDecodeError::BadVersion),
+    "an entry of version 5, before the content store held its increment"
   );
 }

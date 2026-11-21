@@ -540,6 +540,11 @@ pub(crate) const PREPARED: &str = "merge.refine.prepared";
 /// identity's hash slices, and one each for its document's encoding, its verdict and the increment's encoding): the
 /// non-vacuity figure of the slicing. Format: a counter name in the daemon's status report.
 pub(crate) const PREPARE_SLICES: &str = "merge.submit.prepare_slices";
+/// Counter: a prepared increment compared whole with the one `verbs::compose_increment` composes (a debug build's
+/// oracle, A-821), and those that differed. Format: counter names in the daemon's status report.
+pub(crate) const PREPARED_CHECKED: &str = "merge.refine.prepared_checked";
+/// Counter: see [`PREPARED_CHECKED`].
+pub(crate) const PREPARED_MISMATCH: &str = "merge.refine.prepared_mismatch";
 /// Counter: a prepared increment, verdict or encoding the submit took (each part once). Format: a counter name in the
 /// daemon's status report.
 pub(crate) const PREPARED_TAKEN: &str = "merge.submit.prepared_taken";
@@ -600,6 +605,23 @@ async fn prepare(
     evidence: evidence.clone(),
     named: Default::default(),
   };
+  // The oracle, in a debug build: the increment composed whole as the submit's own step composes it (main's
+  // `compose_increment`), compared whole with the sliced one, in a turn of its own (A-821).
+  #[cfg(debug_assertions)]
+  let _ = prepare_turn((&mut *turns, &mut *longest), |s| {
+    let whole = crate::verbs::composed_whole(
+      s,
+      (work, green, key.0),
+      (doc.clone(), plan.clone()),
+      evidence.clone(),
+    )?;
+    s.count(PREPARED_CHECKED, 1);
+    if whole != increment {
+      s.count(PREPARED_MISMATCH, 1);
+    }
+    Some(())
+  })
+  .await;
   let computed = prepare_turn((&mut *turns, &mut *longest), |s| {
     still_owed(s, at)?;
     s.greens.get(&green)?.compute(&increment).ok()
