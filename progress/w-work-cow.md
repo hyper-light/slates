@@ -82,3 +82,34 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
 - OWED (kiln down at 00:40): delete on adacachy by exact path: ~/.cache/w-work-cow-codex.git, ~/.cache/w-work-cow-codex.bundle,
   ~/.cache/w-work-cow-{uniq,gw,amend}.txt, ~/.cache/w-work-cow-serve. And push this state commit.
 - Queue empty.
+
+## Large single submit (main's goal 8251d154) -- red, 2026-11-21 ~07:22 PST
+- Test (uncommitted, worktree ~/slates-work/w-work-cow-slice over main 6a0600ff1): work_cow.rs
+  a_single_large_submit_does_not_hold_its_shard_past_the_window, which runs the supervised role a_single_large_submit_role
+  (common::supervised, 1 shard, anchored, so a stuck shard withholds the beat instead of exit 4). The role makes one
+  seed work per case, then reads watchdog_turns before and after its ONE submit.
+- RED on main 6a0600ff1, release, Mac Studio (log ~/.cache/w-work-cow-red/red-main-both.log):
+  - one-gib (1000 x 1,073,741 B): edits 9.48 s; submit Ok(Accepted(1)) in 8.29 s; beat withheld at 49 of 56 looks.
+    "shard 0 is spinning: 1066 ms of CPU without a step, past its 1025 ms window of CPU, in task spawned at
+    crates/server/src/identities.rs:243, at its poll 1; the watchdog withholds the beat"
+  - many-files (100,000 x 335 B): edits 5.33 s; submit Ok(Accepted(1)) in 1.32 s; beat withheld at 1 of 8 looks.
+    "shard 0 is spinning: 1112 ms of CPU without a step, past its 1025 ms window of CPU, in task spawned at
+    crates/server/src/daemon.rs:5206, at its poll 432676"
+  - panic: "a single large submit held its shard past the liveness window: [one-gib ... the beat withheld at 49 of 56
+    looks during one submit, many-files ... the beat withheld at 1 of 8 looks during one submit]"
+- Two earlier runs that day, with the Studio loaded by other agents' builds, recorded rather than hidden:
+  (a) the 1 GiB submit gave no answer for 92 s, and the parent's 100 s role limit failed the test; (b) an edit during
+  seeding was refused NotFound (work_cow.rs:131) while the control shard's beat task ran 3,467 ms late. Both go to step 2
+  as things to explain: the 8.3 s submit (not ~1.4 s) shows more than the hash runs in that one turn.
+- adacachy cleanup (owed above): already done, ls of ~/.cache/w-work-cow* there found nothing (recorded at goal start).
+
+## rebase_with (main's goal 88) -- settled 2026-11-21
+- It landed: 4930bf14b (main 544020bd2), Green::rebase_establishing (crates/merge/src/engine.rs:6637); GAPS:24412 says LANDED.
+  The close note's line saying "not ported" was stale; corrected.
+- Proof the test holds it (merge_check a_kept_mode_on_a_file_the_resolution_writes_anew_is_not_a_conflict: the head
+  removes f, the work's kept SetMode conflicts, the resolution writes f anew -> Rebased):
+  - mutant (resolution_establishes forced empty, release): RED, left Conflict([MergeWindow { path: "f", at: 0, len: 0,
+    class: 5 }]), right Rebased(2). Log ~/.cache/w-work-cow-red/rebase-with-mutant.log. engine.rs restored (git diff empty).
+  - rule as on main (worktree over 6a0600ff1, release): merge_check 3/3 ok, the test included. Log
+    ~/.cache/w-work-cow-red/rebase-with-green.log.
+- Nothing to land for it (GAPS already closed at 24412); the close note is updated. Queue empty.
