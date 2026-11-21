@@ -86,9 +86,10 @@ impl Disk {
   }
 }
 
-fn percentile(values: &mut [f64], p: f64) -> f64 {
+/// The `per_mille`th of `values` (rounded to the nearest rank, as `((n - 1) * p).round()`).
+fn percentile(values: &mut [f64], per_mille: usize) -> f64 {
   values.sort_by(f64::total_cmp);
-  values[((values.len() as f64 - 1.0) * p).round() as usize]
+  values[(values.len().saturating_sub(1) * per_mille + 500) / 1000]
 }
 
 fn main() {
@@ -151,11 +152,11 @@ fn main() {
       counters.seals,
       counters.compactions,
       counters.runs_merged,
-      percentile(&mut micros.clone(), 0.5),
-      percentile(&mut micros, 0.99),
-      percentile(&mut visits.clone(), 0.5),
-      percentile(&mut visits.clone(), 0.99),
-      percentile(&mut visits, 1.0),
+      percentile(&mut micros.clone(), 500),
+      percentile(&mut micros, 990),
+      percentile(&mut visits.clone(), 500),
+      percentile(&mut visits.clone(), 990),
+      percentile(&mut visits, 1000),
     );
   };
   measure("after the import", &mut imported, &store);

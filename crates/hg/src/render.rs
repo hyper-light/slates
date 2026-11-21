@@ -54,6 +54,13 @@ const NODE_PADDING: [u8; 12] = [0; 12];
 const FLAGS_BITS: u32 = 16;
 /// Format: the chunk header of a text stored as it is (`revlog.compress`'s `u`).
 const UNCOMPRESSED: u8 = b'u';
+/// Format: the hunk a changegroup puts before a text it deltas against the null base (7.2's `mdiff.trivialdiffheader`:
+/// start 0, end 0 and the text's length, three big-endian 32-bit words). The store keeps such a revision as it came,
+/// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
+/// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
+/// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`).
+/// Format: three big-endian 32-bit words.
+const TRIVIAL_HUNK_BYTES: u64 = 12;
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
 
@@ -572,9 +579,14 @@ impl Streaming {
     }
     let stored = self.stored.as_ref().ok_or(Refused::TooLong)?;
     let entries = to_u64(stored.revisions.len()).saturating_mul(to_u64(ENTRY_BYTES));
-    let data = stored.revisions.iter().fold(0_u64, |data, row| {
-      data.saturating_add(chunk_len(row.place.len))
+    let data = stored.revisions.iter().try_fold(0_u64, |data, row| {
+      sent_len(row).map(|sent| data.saturating_add(sent))
     });
+    // A place too short for the trivial hunk it must hold: the store's row is not one a stream can send.
+    let data = data.ok_or(Refused::Unreadable {
+      log: unreadable_name(&log),
+      rev: 0,
+    })?;
     for bytes in [entries, data] {
       if bytes > 0 {
         self.counted.0 = self.counted.0.saturating_add(1);
@@ -646,6 +658,7 @@ impl Streaming {
       .revisions
       .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
       .ok_or_else(unreadable)?;
+    let based = row.base.is_some();
     let base = match row.base {
       None => rev,
       Some(base) => stored
@@ -666,7 +679,10 @@ impl Streaming {
         (found.node, found.flags, found.len)
       }
     };
-    let chunk = chunk_len(row.place.len);
+    // A revision against the null base is sent as its text alone: its place must be the trivial hunk and the text.
+    let chunk = sent_len(row)
+      .filter(|_| based || row.place.len == text.saturating_add(TRIVIAL_HUNK_BYTES))
+      .ok_or_else(unreadable)?;
     let entry = Entry {
       offset,
       flags,
@@ -730,11 +746,20 @@ impl Streaming {
       self.want = Some(Want::Chunks { places });
       return Ok(Stage::Data(log, rev));
     }
+    let row = stored
+      .revisions
+      .get(usize::try_from(rev).map_err(|_| Refused::TooLong)?)
+      .ok_or_else(unreadable)?;
     let chunk = self.chunks.1.pop_front().ok_or_else(unreadable)?;
-    admission.charge(chunk_len(to_u64(chunk.len())))?;
-    if !chunk.is_empty() {
+    let sent = if row.base.is_some() {
+      chunk.as_slice()
+    } else {
+      text_after_trivial_hunk(&chunk).ok_or_else(unreadable)?
+    };
+    admission.charge(chunk_len(to_u64(sent.len())))?;
+    if !sent.is_empty() {
       out.push(UNCOMPRESSED);
-      out.extend_from_slice(&chunk);
+      out.extend_from_slice(sent);
     }
     self.chunks.0 = rev.saturating_add(1);
     Ok(Stage::Data(log, rev.saturating_add(1)))
@@ -792,6 +817,33 @@ fn unreadable_name(log: &Walked) -> Vec<u8> {
     Walked::Manifest => vec![0],
     Walked::Changelog => Vec::new(),
   }
+}
+
+/// A stored revision's chunk length as a stream sends it ([`chunk_len`]): its stored delta's, or for a delta against
+/// the null base its text's, the trivial hunk not sent ([`TRIVIAL_HUNK_BYTES`]); none for a place too short to hold
+/// that hunk.
+fn sent_len(row: &StoredRevision) -> Option<u64> {
+  let sent = if row.base.is_some() {
+    row.place.len
+  } else {
+    row.place.len.checked_sub(TRIVIAL_HUNK_BYTES)?
+  };
+  Some(chunk_len(sent))
+}
+
+/// The text a delta against the null base carries ([`TRIVIAL_HUNK_BYTES`]): what follows its one hunk, which must
+/// replace bytes 0 to 0 with exactly the rest; none for anything else.
+fn text_after_trivial_hunk(delta: &[u8]) -> Option<&[u8]> {
+  let header = usize::try_from(TRIVIAL_HUNK_BYTES).ok()?;
+  let (hunk, text) = (delta.get(..header)?, delta.get(header..)?);
+  let words: Vec<u32> = hunk
+    .as_chunks::<{ size_of::<u32>() }>()
+    .0
+    .iter()
+    .map(|word| u32::from_be_bytes(*word))
+    .collect();
+  let length = u32::try_from(text.len()).ok()?;
+  (words == [0, 0, length]).then_some(text)
 }
 
 /// A chunk's length in its data file: its stored bytes and the `u` that marks a chunk stored as it is (7.2's reader

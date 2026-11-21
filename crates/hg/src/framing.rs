@@ -40,6 +40,11 @@ pub trait Source {
   /// The changegroup's whole length.
   fn len(&self) -> u64;
 
+  /// Whether the changegroup holds no bytes at all.
+  fn is_empty(&self) -> bool {
+    self.len() == 0
+  }
+
   /// The bytes of `range`, clipped to the source's length (empty past it), or the range the source does not hold.
   fn bytes(&self, range: Range<u64>) -> Result<&[u8], Wanted>;
 }

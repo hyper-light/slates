@@ -718,16 +718,7 @@ impl Connection {
       self.sent.next_pn()
     };
     if let Some(pn) = packet_number {
-      let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
-      for frame in acknowledgement {
-        frame.encode_into(out);
-      }
-      for carried in &reliable {
-        self.encode_carried(carried, out);
-      }
-      for frame in credit {
-        frame.encode_into(out);
-      }
+      self.encode_packet((&unreliable, acknowledgements), &reliable, out);
       if !reliable.is_empty() {
         // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
         // packet number may encode shorter than its longest form).
@@ -740,6 +731,26 @@ impl Connection {
     unreliable.clear();
     self.unreliable = unreliable;
     packet_number
+  }
+
+  /// Appends a packet's frames to `out` in its order: the first `acknowledgements` of `unreliable` (the
+  /// acknowledgement), the reliable frames `reliable`, then the rest of `unreliable` (the credit).
+  fn encode_packet(
+    &self,
+    (unreliable, acknowledgements): (&[Frame], usize),
+    reliable: &[Carried],
+    out: &mut Vec<u8>,
+  ) {
+    let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
+    for frame in acknowledgement {
+      frame.encode_into(out);
+    }
+    for carried in reliable {
+      self.encode_carried(carried, out);
+    }
+    for frame in credit {
+      frame.encode_into(out);
+    }
   }
 
   /// Appends `carried`'s bytes to `out`: a held frame's encoding, or a stream frame encoded straight from its sender's

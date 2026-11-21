@@ -59,7 +59,7 @@ pub(crate) fn reference(sequence: u64) -> Vec<u8> {
 /// The sequence a register's reference names; none for bytes that are not one.
 pub(crate) fn sequence_of(bytes: &[u8]) -> Option<u64> {
   let rest = bytes.strip_prefix(MARK)?;
-  let digits: [u8; 8] = rest.try_into().ok()?;
+  let digits: [u8; size_of::<u64>()] = rest.try_into().ok()?;
   Some(u64::from_le_bytes(digits))
 }
 

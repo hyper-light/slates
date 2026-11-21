@@ -59080,6 +59080,19 @@ Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::pr
   were not comparable on the shared machine at the time (1,138 before; 1,703 and 134 after, load average 8, swap
   96 of 97 GB).
 
+### A-807 — Mercurial's made changesets take the deferred-submit hook (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 2: "one hook, three tools"; A-731, A-804, A-805)
+Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the repository's tool chosen per green),
+`crates/server/src/vcs_store/hg_made.rs` (`make_deferred`, `made_step`; module docs), GAPS (C2 (c)).
+- **What.** A recorded submit to a Mercurial repository's green takes the repository's landing turn before its verdict
+  (or parks for it, as a Subversion one does), its verdict is held (A-805), and a task holding the turn makes one step:
+  the verdict applied, the version's durable parts, the changeset made of the version and its register entry, the
+  work's settle and the completion, then the answer. A bare dispatch keeps the step it had.
+- **Red, then green.** `vcs_store::hg_made::tests`: the submit's own step answered with the green's durable and engine
+  heads at 1 and the made changeset the line's head (now unanswered, heads 0, no changeset, then all of them after the
+  one step); a submit meeting a held turn ran at once (now it waits and commits once the turn is given back).
+- **Owed** (GAPS C2): the made changeset's record lands in the register's entry, not first on the node's store as a
+  push's does (a made reference and its replay, with w-hg), and a client's push takes no landing turn.
+
 ### A-808 — An edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched (2026-11-21, w-fed-move, goal 86b; main's order 03:16 PST: owner asks per client grow with scale; A-247, A-801)
 - **How it was found.** Owner asks per client were 17.5 at 1,000 clients and about 101 at the 100k rung. Contention
   injected into the 1,000-client stand-in (release, in-process, `kernel/`, one round, `--per-connection 32`), the
