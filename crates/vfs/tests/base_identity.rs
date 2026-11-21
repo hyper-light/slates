@@ -303,8 +303,10 @@ fn an_open_racing_a_replacement_is_refused_never_bound_to_the_new_file() {
   );
 }
 
-/// A-151 on a filesystem that records no birth time (some older and network filesystems): a recovered volume cannot tell
-/// a reused inode number from the file it numbered, so it proves nothing it cannot. Do: over such a disk, look two base
+/// A-151 on a filesystem that records no birth time (some older and network filesystems) and whose change times here
+/// are whole seconds (these files are stamped at time zero): a recovered volume cannot tell a reused inode number from
+/// the file it numbered, so it proves nothing it cannot. A change time with a sub-second part does prove it
+/// ([`without_birth_times_an_unchanged_base_file_keeps_its_number_and_times_across_a_takeover`]). Do: over such a disk, look two base
 /// files up and open one, publish, let the daemon die and recover; read through the open handle's number, look both
 /// names up, and open and read the second. Expect the old handle refused `StaleHandle`, the first listing after the
 /// takeover giving both entries new numbers (the bytes unchanged), and a file the successor numbered itself opened and
@@ -346,5 +348,83 @@ fn without_birth_times_a_recovered_volume_renumbers_its_untouched_entries_and_re
   assert_eq!(
     read_no(&mut recovered, &mut host, &mut after, renumbered).unwrap(),
     b"first opened after the takeover"
+  );
+}
+
+/// The attributes a real tool keys on for the untouched base file at `path`: the inode number (`#pragma once` tells a
+/// header by it), and the modification and change times (`make` and cargo rebuild what moved).
+fn identity(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> (InodeNo, i64, i64) {
+  let no = lookup(vol, host, store, path);
+  let attrs = vol.with_host(host).stat(store, no).unwrap();
+  (no, attrs.mtime, attrs.ctime)
+}
+
+/// Real tools across a daemon restart on a disk that records no birth time (w-realtools; EdenFS's own record,
+/// `eden/fs/docs/InodeStorage.md`: unstable inode numbers broke C++ `#pragma once`, a moved timestamp made `make`
+/// rebuild). Do: over such a disk, look three untouched base headers up (no handle opens them: a compiler's `stat` of a
+/// header it already read), publish, let the daemon die and recover, then look them up again in the opposite order.
+/// Expect each to keep its number, its modification time and its change time: nothing on the disk changed, so a
+/// compiler that read `inc/s.h` before the restart and `sub/../inc/s.h` after it sees one header, and `make` rebuilds
+/// nothing. Until 2026-11-20 every untouched entry was renumbered at the first listing after the takeover (A-151's
+/// rule for a disk with no birth time), so a header seen across the restart was two files.
+#[test]
+fn without_birth_times_an_unchanged_base_file_keeps_its_number_and_times_across_a_takeover() {
+  let mut host = SimHost::new().without_birth_times();
+  host.mkdir("/inc");
+  host.advance_ns(STEP_NS);
+  for path in ["/inc/s.h", "/inc/t.h", "/inc/u.h"] {
+    host.replace_file(path, b"#pragma once\n");
+    host.advance_ns(STEP_NS);
+  }
+  let mut store = common::store();
+  let mut vol = overlay(&mut host, &mut store);
+  let before: Vec<_> = ["/inc/s.h", "/inc/t.h", "/inc/u.h"]
+    .into_iter()
+    .map(|path| identity(&mut vol, &mut host, &mut store, path))
+    .collect();
+  let image = published(&mut vol, &store, &mut host);
+  let (mut after, mut recovered) = taken_over(&store, &image, &mut host);
+  host.advance_ns(STEP_NS);
+  let mut again: Vec<_> = ["/inc/u.h", "/inc/t.h", "/inc/s.h"]
+    .into_iter()
+    .map(|path| identity(&mut recovered, &mut host, &mut after, path))
+    .collect();
+  again.reverse();
+  assert_eq!(
+    again, before,
+    "an unchanged header keeps its number and its times across the restart"
+  );
+}
+
+/// The guard the rule above keeps (A-151): without a birth time, a number the filesystem reused for a new file is still
+/// a new entry. Do: over such a disk, look a base file up, publish, let the daemon die and recover; save over the name
+/// twice so the second save takes the first file's number back; look the name up. Expect a new inode: the reused
+/// number's file was made after the image, so its change time is not the one the inode recorded.
+#[test]
+fn without_birth_times_a_reused_number_is_still_a_new_entry_after_a_takeover() {
+  let mut host = SimHost::new().without_birth_times();
+  host.replace_file("/notes", b"before the takeover");
+  let number = host.fingerprint("/notes").unwrap().ino;
+  host.advance_ns(STEP_NS);
+  let mut store = common::store();
+  let mut vol = overlay(&mut host, &mut store);
+  let no = lookup(&mut vol, &mut host, &mut store, "/notes");
+  let image = published(&mut vol, &store, &mut host);
+  let (mut after, mut recovered) = taken_over(&store, &image, &mut host);
+  host.advance_ns(STEP_NS);
+  host.replace_file("/notes", b"the first save");
+  host.advance_ns(STEP_NS);
+  assert!(host.replace_file_with_number("/notes", b"the second save", number));
+  host.advance_ns(STEP_NS);
+  let now = lookup(&mut recovered, &mut host, &mut after, "/notes");
+  assert_ne!(now, no, "a reused number is a new entry");
+  assert_eq!(
+    read_no(&mut recovered, &mut host, &mut after, now).unwrap(),
+    b"the second save"
   );
 }

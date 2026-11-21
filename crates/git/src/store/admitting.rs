@@ -18,7 +18,7 @@ use slates_vcs::ContentStore;
 use super::super::hook_view::Quantum;
 use super::super::positions::Positions;
 use super::super::push::Push;
-use super::{Chain, Members, Move, Place, Reach, Repository, StoreRefused};
+use super::{Chain, Members, Move, Place, Reach, Repository, StagedAt, StoreRefused};
 use crate::object_name::{Kind, ObjectId};
 
 /// A move's admission under way (module docs).
@@ -83,7 +83,14 @@ struct Walk {
   seen: BTreeSet<ObjectId>,
   indexed: Vec<u64>,
   new: Vec<ObjectId>,
+  /// The positions the push's stage gives the new objects met, and that stage (its base and how many positions it
+  /// gives), while every one met had one under the same stage; none once one had none or the stage was made again.
+  /// Kept so the commit that adopts that stage takes them rather than looking each up in its step (one word an object).
+  staged: Option<StagedRun>,
 }
+
+/// The stage a walk's new objects met (its base and how many positions it gives, once known) and their positions in it.
+type StagedRun = (Option<(u64, usize)>, Vec<u64>);
 
 /// A walk back from a commit by generation number, newest first, a unit a commit.
 #[derive(Debug)]
@@ -103,14 +110,45 @@ impl Walk {
       seen: BTreeSet::new(),
       indexed: Vec::new(),
       new: Vec::new(),
+      staged: Some((None, Vec::new())),
+    }
+  }
+
+  /// Notes the position `push`'s stage gives `id`, a new object met: none kept from now on where it has none, or the
+  /// stage is another than the one the walk met before.
+  fn note_staged(&mut self, push: &Push, id: &ObjectId) {
+    let Some((met, positions)) = self.staged.as_mut() else {
+      return;
+    };
+    let given = push.staged().and_then(|staged| {
+      let stage = (staged.base, staged.positions.len());
+      let position = staged.positions.get(id).copied()?;
+      met
+        .is_none_or(|met| met == stage)
+        .then_some((stage, position))
+    });
+    match given {
+      Some((stage, position)) => {
+        *met = Some(stage);
+        positions.push(position);
+      }
+      None => self.staged = None,
     }
   }
 
   /// What the walk found, once its pending objects are none.
   fn members(self) -> Members {
+    let staged = match self.staged {
+      Some((Some(stage), positions)) => Some(StagedAt {
+        stage,
+        positions: Positions::of(positions),
+      }),
+      _ => None,
+    };
     Members {
       indexed: Positions::of(self.indexed),
       new: self.new,
+      staged,
     }
   }
 }
@@ -258,6 +296,7 @@ impl Repository {
           None => Members {
             indexed: base.union(&beyond.indexed),
             new: beyond.new.clone(),
+            staged: beyond.staged.clone(),
           },
         };
         Ok(self.done(admitting, brought, Reach::Remade { base, beyond, from }))
@@ -299,7 +338,10 @@ impl Repository {
         return Ok(true);
       }
       Place::Indexed { row, .. } => walk.indexed.push(row.position),
-      Place::Pushed { .. } => walk.new.push(id),
+      Place::Pushed { .. } => {
+        walk.new.push(id);
+        walk.note_staged(push, &id);
+      }
     }
     self.count(|counters| counters.walked = counters.walked.saturating_add(1));
     walk

@@ -64,6 +64,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   land ID TARGET [--snapshot N] [--include P]... [--exclude P]... [--grant N] [--json]
   image build ID SNAPSHOT NAME --capacity SIZE [--json]   a snapshot as an ext2 image file in a new volume
   image merge IMAGE NAME [--json]                  merge an image's tree into a new clone of its snapshot
+  log [--json]                                     what needs you (collided works, landings awaiting a grant),
+                                                   then each green's works: base, how far behind, last submission
   grants [--json]
   grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
   audit [--since N] [--json]
@@ -516,6 +518,8 @@ pub(crate) enum Verb {
   },
   /// The caller's grants (`grants`).
   Grants,
+  /// The session log (`log`, A-773): what needs the human, then each green's works.
+  Log,
   /// The audit log (`audit`).
   Audit {
     /// Every record at or after this sequence.
@@ -2468,6 +2472,10 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
     ["grants"] => {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::Grants))
+    }
+    ["log"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Log))
     }
     ["grant", landing, manifest] => {
       taken.only(&Spec {

@@ -324,6 +324,9 @@ const FLEET_APPLIED: &str = "credential.fleet.applied";
 const FLEET_NOT_APPLIED: &str = "credential.fleet.not_applied";
 /// Counter: an enrollment or revocation that reached fewer members than it must, refused `CredentialUnreplicated`.
 const FLEET_SHORT: &str = "credential.fleet.short";
+/// Counter: an enrollment a member sent of a credential revoked here, refused: a revoked credential never comes back
+/// (A-764's tombstones).
+const FLEET_REVOKED_REFUSED: &str = "credential.fleet.revoked_refused";
 /// Counter: a credential this node offered the region at a configuration change (the healer).
 const FLEET_OFFERED: &str = "credential.fleet.offered";
 
@@ -335,17 +338,21 @@ pub(crate) fn apply_here(
   message: &slates_cluster::credentials::CredentialMessage,
 ) -> bool {
   use slates_cluster::credentials::CredentialMessage;
-  let held = state
-    .db
-    .partition()
-    .credentials()
-    .get(&message.id())
-    .is_some();
+  let credentials = state.db.partition().credentials();
+  let held = credentials.get(&message.id()).is_some();
+  let revoked = credentials.revoked(&message.id());
   let op = match message {
+    // A credential revoked here never comes back, whoever offers it: a member that missed its revocation offers it
+    // when it rejoins, and is answered not held, the revocation offered to it in turn (`heal_region`).
+    CredentialMessage::Enroll { .. } if revoked => {
+      state.count(FLEET_REVOKED_REFUSED, 1);
+      return false;
+    }
     CredentialMessage::Enroll { record } if !held => Op::CredentialEnrolled {
       record: record.clone(),
     },
-    CredentialMessage::Revoke { id } if held => Op::CredentialRevoked { id: *id },
+    // Revoked elsewhere: its record goes if held, and its id is kept revoked, held or not.
+    CredentialMessage::Revoke { id } if held || !revoked => Op::CredentialTombstoned { id: *id },
     CredentialMessage::Enroll { .. } | CredentialMessage::Revoke { .. } => return true,
     CredentialMessage::Answer { .. } => return false,
   };
@@ -528,10 +535,17 @@ pub(crate) async fn revoke_in_region(
   .unwrap_or_else(|| refused(Refusal::NotFound));
   match reply {
     ReplyBody::CredentialRevoked => {}
+    // Not held here (an enrollment this node missed): its id is kept revoked here too, so no member's offer brings it
+    // back.
     ReplyBody::Refused {
       refusal: Refusal::NotFound,
       ..
-    } => {}
+    } => {
+      let message = slates_cluster::credentials::CredentialMessage::Revoke { id };
+      if !apply_on_partition(origin, message, budget.max_deadline_ns()).await {
+        return refused(Refusal::NotFound);
+      }
+    }
     other => return other,
   }
   let (held, total) = to_region(
@@ -565,28 +579,30 @@ pub(crate) async fn heal_region(origin: u16, shards: &[u16], budget: slates_clus
   }
   HEALED.with(|healed| healed.set(Some(version)));
   for shard in shards {
-    let records = crate::xshard::call_in_shard_time(
+    // Its credentials and its revocations alike: a member holding a record revoked here lets it go (A-764).
+    let (records, tombstones) = crate::xshard::call_in_shard_time(
       origin,
       *shard,
       |state| {
-        state
-          .db
-          .partition()
-          .credentials()
-          .records()
-          .cloned()
-          .collect::<Vec<_>>()
+        let credentials = state.db.partition().credentials();
+        let records: Vec<_> = credentials.records().cloned().collect();
+        let tombstones: Vec<_> = credentials.tombstones().copied().collect();
+        (records, tombstones)
       },
       budget.max_deadline_ns(),
     )
     .await
     .unwrap_or_default();
-    for record in records {
-      let _ = to_region(
-        &slates_cluster::credentials::CredentialMessage::Enroll { record },
-        budget,
-      )
-      .await;
+    let messages = records
+      .into_iter()
+      .map(|record| slates_cluster::credentials::CredentialMessage::Enroll { record })
+      .chain(
+        tombstones
+          .into_iter()
+          .map(|id| slates_cluster::credentials::CredentialMessage::Revoke { id }),
+      );
+    for message in messages {
+      let _ = to_region(&message, budget).await;
       crate::state::with_state(|state| state.count(FLEET_OFFERED, 1));
     }
   }

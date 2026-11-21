@@ -656,22 +656,10 @@ impl ContentStore {
     ContentId::of(bytes)
   }
 
-  /// The node an object's identity names in this store, its root (module docs, "The identity rule"): what a record
-  /// written before the rule named an object longer than a window by, so a replay of one can tell it is the same
-  /// object. Node-local: never sent or recorded.
+  /// The node an object's identity names in this store, its root (module docs, "The identity rule"). Node-local: never
+  /// sent or recorded.
   pub fn root_of(&self, identity: &ContentId) -> ContentId {
     self.resolve(identity)
-  }
-
-  /// The root this store would cut `bytes` into ([`ContentStore::root_of`] for bytes not held): what a version-1 git
-  /// record, written before the identity rule, named an object longer than a window by.
-  pub fn root_id(&self, bytes: &[u8]) -> ContentId {
-    if bytes.len() <= self.window.get() {
-      return ContentId::of(bytes);
-    }
-    Tree::plan(bytes, self.window, self.fanout)
-      .root()
-      .map_or_else(|| ContentId::of(bytes), |root| root.identity)
   }
 
   /// `identity`, the BLAKE3 of an object's bytes, named for `root`, the tree this store keeps it as (module docs, "The

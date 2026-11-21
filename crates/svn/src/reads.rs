@@ -412,6 +412,34 @@ pub trait Repository: Contents {
   /// `None` when the green does not hold the text. Borrowed where the source holds the bytes, owned where it must copy
   /// them (a text read through a lent [`crate::migration::TextSource`]).
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<std::borrow::Cow<'_, [u8]>>;
+
+  /// [`Repository::text`] for a reader that keeps a [`WindowCache`] across its steps: a source that makes its texts a
+  /// window at a time (a delta's window, A-727 (c)) makes the window the reader is in once, keeps it in `cache`, and
+  /// lends it for every read inside it. A source that holds its texts in place reads them as `text` does.
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    _cache: &'a mut WindowCache,
+  ) -> Option<std::borrow::Cow<'a, [u8]>> {
+    self.text(identity, offset)
+  }
+}
+
+/// The one window a reader of a text is in, made once from its delta and lent across the reader's steps (main's order
+/// of 2026-11-20 after w-bugs' run 13; Ada's sizing ruling: a reader's own, dropped with it, never shared): the text's
+/// identity, where the window starts in it, and its bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WindowCache {
+  /// The window held: its text, its start, its bytes.
+  pub(crate) held: Option<(ContentIdentity, u64, Vec<u8>)>,
+}
+
+impl WindowCache {
+  /// A cache holding nothing.
+  pub fn new() -> Self {
+    Self::default()
+  }
 }
 
 /// What the handler made of a command.

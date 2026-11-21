@@ -4,9 +4,8 @@
 //! **What it reports.** For each range of the shard's slice (`DaemonConfig::shard_content_layout`): the write log, the
 //! two image slots, the delta log, the DAX range table, and the chunk arena summed over the regions the shard holds,
 //! the range's bytes, the bytes of its pages in RAM, and the bytes written where the OS says (macOS), read from the
-//! kernel's page table (`slates_mem::resident`); for the arena also the bytes allocated in it and the reserve an idle
-//! shard keeps pre-faulted. Beside them, the register (the partition's log since its last snapshot, and that snapshot)
-//! by what its bytes carry: repository records, green chain entries, checkpoints and the rest (A-745,
+//! kernel's page table (`slates_mem::resident`); for the arena also the bytes allocated in it. Beside them, the
+//! register (the partition's log since its last snapshot, and that snapshot) by what its bytes carry: repository records, green chain entries, checkpoints and the rest (A-745,
 //! `slates_db::replay::RegisterSplit`). `slates status --json` prints them per shard under `content_ranges`.
 //!
 //! **Bounded.** The kernel answers a page at a time, about 3 ns a page on the Mac Studio (1 GiB in 0.23 ms, 64 GiB in
@@ -385,10 +384,6 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
   rows.push((
     format!("{PREFIX}arena.allocated"),
     u64::try_from(state.store.content.allocated_bytes()).unwrap_or(u64::MAX),
-  ));
-  rows.push((
-    format!("{PREFIX}arena.prefault_reserve"),
-    u64::try_from(crate::daemon::prefault_reserve_bytes(state)).unwrap_or(u64::MAX),
   ));
   // The register (the partition's log and snapshot in the anchor segment) by what its bytes carry (A-745): the log
   // since the last snapshot, and the last snapshot.

@@ -18,7 +18,7 @@
 //! records are still read, since a segment holds entries written by them.
 //!
 //! **Written when an append commits.** The writer notes each object as the push admits it: its type, id, identity and
-//! length; and it is handed the pack the receive session kept as it arrived (`slates_git::receive::Session::take_pack`).
+//! length; and it is handed the pack the push kept as it arrived (`slates_git::store::Push::pack`).
 //! The record is written whole when an append commits ([`RecordWriter::finish`]); only the first append of a push that
 //! brings objects carries the pack, and an append that brings none carries no pack. Objects no client sent as a pack (the
 //! server's own commits, A-664 part 3) are written as a pack of whole objects, deflated (`slates_git::pack::of_whole`),
@@ -171,18 +171,11 @@ pub(crate) struct Record<'a> {
 /// noted as it comes, the record written whole when an append commits ([`RecordWriter::finish`]).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RecordWriter {
-  /// The push's pack as the client sent it (A-723), written in place of the objects' bytes.
-  pack: Vec<u8>,
   /// The objects noted, in the order they were admitted.
   noted: Vec<Noted>,
 }
 
 impl RecordWriter {
-  /// Keeps the push's pack as the client sent it (A-723), which the record holds in place of its objects' bytes.
-  pub(crate) fn keep_pack(&mut self, pack: Vec<u8>) {
-    self.pack = pack;
-  }
-
   /// Notes one object as the push admits it.
   pub(crate) fn object(&mut self, noted: Noted) {
     self.noted.push(noted);
@@ -201,11 +194,11 @@ impl RecordWriter {
   /// record's room is refused.
   pub(crate) fn finish(
     &self,
-    (content, format): (&ContentStore, ObjectFormat),
+    (content, format, pack): (&ContentStore, ObjectFormat, &[u8]),
     lacks: impl Fn(&ObjectId) -> bool,
     (deepest, moves): (u64, &[RecordedMove]),
   ) -> Result<Vec<u8>, WriteRefused> {
-    self.finish_as((content, format), lacks, (deepest, moves), None)
+    self.finish_as((content, format, pack), lacks, (deepest, moves), None)
   }
 
   /// The names a version-3 record of the objects `lacks` says the repository lacks keeps as a content
@@ -221,18 +214,23 @@ impl RecordWriter {
   /// identity and count, put and homed by the caller before) in place of each name.
   pub(crate) fn finish_named(
     &self,
-    (content, format): (&ContentStore, ObjectFormat),
+    (content, format, pack): (&ContentStore, ObjectFormat, &[u8]),
     lacks: impl Fn(&ObjectId) -> bool,
     (deepest, moves): (u64, &[RecordedMove]),
     named: (ContentId, u64),
   ) -> Result<Vec<u8>, WriteRefused> {
-    self.finish_as((content, format), lacks, (deepest, moves), Some(named))
+    self.finish_as(
+      (content, format, pack),
+      lacks,
+      (deepest, moves),
+      Some(named),
+    )
   }
 
   /// [`RecordWriter::finish`] and [`RecordWriter::finish_named`]: version 3 when `named`, else version 2.
   fn finish_as(
     &self,
-    (content, format): (&ContentStore, ObjectFormat),
+    (content, format, sent): (&ContentStore, ObjectFormat, &[u8]),
     lacks: impl Fn(&ObjectId) -> bool,
     (deepest, moves): (u64, &[RecordedMove]),
     named: Option<(ContentId, u64)>,
@@ -243,11 +241,11 @@ impl RecordWriter {
     let made;
     let pack: &[u8] = if objects.is_empty() {
       &[]
-    } else if self.pack.is_empty() {
+    } else if sent.is_empty() {
       made = whole_pack(content, format, &objects)?;
       &made
     } else {
-      &self.pack
+      sent
     };
     let inline: &[&Noted] = if named.is_some() { &[] } else { &objects };
     let len = record_len(moves, inline, pack.len()).ok_or(WriteRefused::Allocation)?;

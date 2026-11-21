@@ -306,11 +306,36 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
     }
   } else if !parent.anchor_alive() {
     slates_machine::log_line!("slates daemon: the anchor is gone; leaving");
+    release_the_anchors_objects();
   } else {
     slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
   Ok(())
+}
+
+/// Removes the names of the anchor's segment and content object once the anchor is gone (`slates_mem::unlink_handoff`):
+/// on macOS an object outlives every holder while its name exists, so a `SIGKILL`ed anchor left both in the kernel with
+/// every page the daemon had written (21 GB of the big Studio after four killed anchors, 2026-11-20). Done before the
+/// stop, so a daemon killed while it stops has already let them go; its own mappings keep the bytes until it exits.
+fn release_the_anchors_objects() {
+  for variable in [
+    slates_anchor::segment::ENV_HANDOFF,
+    slates_anchor::segment::ENV_CONTENT,
+  ] {
+    let Ok(value) = std::env::var(variable) else {
+      continue;
+    };
+    let handoff = match value.parse::<i32>() {
+      Ok(descriptor) => slates_mem::Handoff::Descriptor(descriptor),
+      Err(_) => slates_mem::Handoff::Name(value),
+    };
+    if let Err(refusal) = slates_mem::unlink_handoff(&handoff) {
+      slates_machine::log_line!(
+        "slates daemon: the anchor's {variable} was not released: {refusal}"
+      );
+    }
+  }
 }
 
 #[cfg(test)]

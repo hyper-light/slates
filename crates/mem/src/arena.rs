@@ -158,89 +158,16 @@ pub struct Purged {
   pub more: bool,
 }
 
-/// A run of adjacent free blocks in one region that an idle arena keeps resident (A-214): what the next allocations of
-/// one size would take ([`ChunkArena::upcoming`]). Named only by this arena.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeptRun {
-  region: u16,
-  start: usize,
-  end: usize,
-}
-
-impl KeptRun {
-  /// The run's bytes.
-  pub fn len(&self) -> usize {
-    self.end.saturating_sub(self.start)
-  }
-
-  /// Whether the run holds no byte.
-  pub fn is_empty(&self) -> bool {
-    self.end <= self.start
-  }
-}
-
-/// What one refill slice of an idle arena's reserve did ([`ChunkArena::prefault`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Prefaulted {
-  /// Bytes faulted in and recorded resident.
-  pub bytes: usize,
-  /// Whether pages of the reserve remain to fault: the slice's page budget ran out.
-  pub more: bool,
-}
-
-/// One resident free run `(first, reach)` of `slot` (region `region`) through the idle purge (A-105, A-214): taken out of
-/// the resident set, its pieces outside `keep` of at least `discard_from` bytes given back to the OS, its pieces inside
-/// `keep` marked resident again. The bytes kept and the bytes given back.
-fn purge_run(
-  slot: &mut Slot,
-  region: u16,
-  (first, reach): (usize, usize),
-  keep: &[KeptRun],
-  discard_from: usize,
-) -> (usize, usize) {
+/// One resident free run `(first, reach)` of `slot` through the idle purge (A-105): taken out of the resident set and,
+/// when it is at least `discard_from` bytes, given back to the OS. The bytes given back.
+fn purge_run(slot: &mut Slot, (first, reach): (usize, usize), discard_from: usize) -> usize {
   slot.dirty.take(first, reach);
-  let (mut kept, mut discarded) = (0usize, 0usize);
-  for_each_piece(region, (first, reach), keep, |piece, inside| {
-    let piece_len = piece.1.saturating_sub(piece.0);
-    if inside {
-      // The reserve's pages stay resident and counted (A-214).
-      slot.dirty.mark(piece.0, piece.1);
-      kept = kept.saturating_add(piece_len);
-    } else if piece_len >= discard_from && slot.region.discard(piece.0, piece_len) {
-      // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
-      discarded = discarded.saturating_add(piece_len);
-    }
-  });
-  (kept, discarded)
-}
-
-/// Visits the pieces of the run `(first, reach)` in `region`, in address order, each with whether a run of `keep`
-/// covers it. Allocates nothing (w-sizing, MEMORY SIZING's zero-alloc rule: it ran once per resident free run of every
-/// idle purge pass, and built a sorted copy of the covers and a list of pieces each time): each step takes the cover
-/// that starts first past the position, a scan of `keep`, which holds a handful of runs (the reserve's adjacent blocks
-/// merge into one run a region, `ChunkArena::upcoming`).
-fn for_each_piece(
-  region: u16,
-  (first, reach): (usize, usize),
-  keep: &[KeptRun],
-  mut visit: impl FnMut((usize, usize), bool),
-) {
-  let mut at = first;
-  while at < reach {
-    let next_cover = keep
-      .iter()
-      .filter(|run| run.region == region && run.start < reach && run.end > at)
-      .map(|run| (run.start.max(at), run.end.min(reach)))
-      .min();
-    let Some((start, end)) = next_cover else {
-      visit((at, reach), false);
-      return;
-    };
-    if start > at {
-      visit((at, start), false);
-    }
-    visit((start, end), true);
-    at = end;
+  let len = reach.saturating_sub(first);
+  // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
+  if len >= discard_from && slot.region.discard(first, len) {
+    len
+  } else {
+    0
   }
 }
 
@@ -333,13 +260,6 @@ impl ChunkArena {
   /// faulted in again), and an idle arena returns what it no longer uses. Nothing to do while no region records a
   /// resident free unit and no walk is under way.
   pub fn purge(&mut self, max_blocks: usize) -> Purged {
-    self.purge_keeping(max_blocks, &[])
-  }
-
-  /// [`ChunkArena::purge`], keeping the free blocks of `keep` resident (A-214: an idle shard's pre-faulted reserve,
-  /// [`ChunkArena::upcoming`]): every other resident free block of at least the discard size goes back. The kept
-  /// bytes stay in the resident free count.
-  pub fn purge_keeping(&mut self, max_blocks: usize, keep: &[KeptRun]) -> Purged {
     // Nothing to do only when no walk is under way and no region records a resident free unit: the sets are what the
     // walk visits, so they answer, not the count, which a walk that stopped between calls once left at zero with
     // freed blocks still recorded (A-205's give-back on Windows, main CI 42184319025: every later purge returned here).
@@ -378,16 +298,16 @@ impl ChunkArena {
           return done;
         }
         visited = visited.saturating_add(1);
-        let (kept, discarded) = purge_run(slot, region, (first, reach), keep, discard_from);
-        drained = drained.saturating_add(reach.saturating_sub(first).saturating_sub(kept));
+        let discarded = purge_run(slot, (first, reach), discard_from);
+        drained = drained.saturating_add(reach.saturating_sub(first));
         done.bytes = done.bytes.saturating_add(discarded);
         at = reach;
       }
       self.resident_free = self.resident_free.saturating_sub(drained);
     }
-    // The walk is done: what is left resident and free is what the regions' sets still record, the reserve this walk kept
-    // and whatever was freed or faulted in behind its cursor while it waited between calls (a publication releasing a
-    // delete's blocks, the reserve's refill), whatever the count drifted to. Before 2026-11-07 the count became what
+    // The walk is done: what is left resident and free is what the regions' sets still record, whatever was freed behind
+    // its cursor while it waited between calls (a publication releasing a delete's blocks), whatever the count drifted
+    // to. Before 2026-11-07 the count became what
     // this walk had kept, so a block released behind the cursor was left resident, uncounted, and every later purge
     // returned at once: A-205's give-back counted 118,337,536 of 134,217,728 deleted bytes on Windows (main CI
     // 42184319025; `a_block_freed_behind_an_unfinished_purge_still_goes_back`).
@@ -396,126 +316,6 @@ impl ChunkArena {
       .map(|slot| slot.dirty.recorded_bytes())
       .fold(0usize, usize::saturating_add);
     done
-  }
-
-  /// The free blocks the next allocations of `len` bytes would take, until `bytes` are named, as runs of adjacent
-  /// blocks in the order they would be taken (A-214): each held region's [`Buddy::upcoming`], in the order allocation
-  /// tries the regions. Read without changing anything; it holds while only allocations of `len` come.
-  pub fn upcoming(&self, len: usize, bytes: usize) -> Vec<KeptRun> {
-    let mut runs: Vec<KeptRun> = Vec::new();
-    let mut named = 0usize;
-    for &region in &self.order {
-      if named >= bytes {
-        break;
-      }
-      let Some(slot) = self.slot(region) else {
-        continue;
-      };
-      for (offset, block) in slot.buddy.upcoming(len, bytes.saturating_sub(named)) {
-        named = named.saturating_add(block);
-        let end = offset.saturating_add(block);
-        match runs.last_mut() {
-          Some(last) if last.region == region && last.end == offset => last.end = end,
-          _ => runs.push(KeptRun {
-            region,
-            start: offset,
-            end,
-          }),
-        }
-      }
-    }
-    runs
-  }
-
-  /// Faults in the pages of `keep`'s free runs that are not resident, at most `max_pages` of them, and records them as
-  /// resident free bytes (A-214: an idle shard's reserve, refilled a slice at a time). A page is faulted by writing a
-  /// zero to a byte of the run on it: a free block's bytes are all zero (released blocks are zeroed, A-99; fresh and
-  /// given-back pages read zero), so no byte changes, and no byte outside the run is touched, though a page may also
-  /// hold the edge of a live block (a 4 KiB granule under a 16 KiB page). A run whose OS mark the region cannot clear
-  /// first (A-110) is left as it is.
-  pub fn prefault(&mut self, keep: &[KeptRun], max_pages: usize) -> Prefaulted {
-    let mut done = Prefaulted::default();
-    let mut budget = max_pages;
-    for run in keep {
-      let before = done.bytes;
-      let filled = self.prefault_run(*run, &mut budget, &mut done);
-      self.resident_free = self
-        .resident_free
-        .saturating_add(done.bytes.saturating_sub(before));
-      if !filled {
-        done.more = true;
-        return done;
-      }
-    }
-    done
-  }
-
-  /// [`ChunkArena::prefault`] for one run, within `budget` pages: whether the run was finished (every page of it
-  /// resident or left as the OS marks it) before the budget ran out.
-  fn prefault_run(&mut self, run: KeptRun, budget: &mut usize, done: &mut Prefaulted) -> bool {
-    let mut cleared = 0usize;
-    let finished = {
-      let Some(slot) = self.slot_mut(run.region) else {
-        return true;
-      };
-      let page = slot.region.page().max(1);
-      let mut at = run.start;
-      loop {
-        if at >= run.end {
-          break true;
-        }
-        let gap_end = match slot.dirty.next_run_within(at, run.end) {
-          // Resident already: past it.
-          Some((resident, reach)) if resident == at => {
-            at = reach;
-            continue;
-          }
-          Some((resident, _)) => resident,
-          None => run.end,
-        };
-        if *budget == 0 {
-          break false;
-        }
-        // At most the budget's pages of the gap, ending on a page boundary unless the gap ends first.
-        let first_page = at.checked_div(page).unwrap_or(0);
-        let pages = gap_end
-          .div_ceil(page)
-          .saturating_sub(first_page)
-          .min(*budget);
-        let until = first_page
-          .saturating_add(pages)
-          .saturating_mul(page)
-          .clamp(at, gap_end);
-        match slot.region.prepare(at, until.saturating_sub(at)) {
-          Ok(marks) => cleared = cleared.saturating_add(marks),
-          Err(_) => {
-            at = gap_end;
-            continue;
-          }
-        }
-        let bytes = slot.region.bytes_mut();
-        let mut touch = at;
-        while touch < until {
-          if let Some(byte) = bytes.get_mut(touch) {
-            *byte = 0;
-            std::hint::black_box(byte);
-          }
-          touch = touch
-            .checked_div(page)
-            .unwrap_or(0)
-            .saturating_add(1)
-            .saturating_mul(page);
-        }
-        slot.dirty.mark(at, until);
-        done.bytes = done.bytes.saturating_add(until.saturating_sub(at));
-        *budget = budget.saturating_sub(pages);
-        at = until;
-      }
-    };
-    self.reused = self
-      .reused
-      .saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
-    finished
   }
 
   /// Sets the pool this arena grows from (A-98).
@@ -1288,72 +1088,6 @@ impl ChunkArena {
 mod tests {
   use super::*;
 
-  /// The reference the allocation-free walk replaced: the covers clipped to the run, sorted, and the pieces between.
-  fn pieces_by_sorting(
-    region: u16,
-    (first, reach): (usize, usize),
-    keep: &[KeptRun],
-  ) -> Vec<(usize, bool)> {
-    let mut covers: Vec<(usize, usize)> = keep
-      .iter()
-      .filter(|run| run.region == region && run.start < reach && run.end > first)
-      .map(|run| (run.start.max(first), run.end.min(reach)))
-      .collect();
-    covers.sort_unstable();
-    let mut inside = vec![false; reach];
-    for (start, end) in covers {
-      inside[start..end].fill(true);
-    }
-    (first..reach).map(|unit| (unit, inside[unit])).collect()
-  }
-
-  /// One run `(first, reach)` of region 0 walked against `keep` with `for_each_piece`: the pieces tile it, contiguous and
-  /// in address order, and cover exactly the units the sorting reference covers.
-  fn walk_matches_sorting((first, reach): (usize, usize), keep: &[KeptRun]) {
-    let mut walked = Vec::new();
-    let mut at = first;
-    for_each_piece(0, (first, reach), keep, |(start, end), inside| {
-      assert_eq!(start, at, "the pieces are contiguous, in address order");
-      assert!(end > start, "no empty piece");
-      walked.extend((start..end).map(|unit| (unit, inside)));
-      at = end;
-    });
-    assert_eq!(at, reach, "the pieces reach the run's end");
-    assert_eq!(walked, pieces_by_sorting(0, (first, reach), keep));
-  }
-
-  /// w-sizing (MEMORY SIZING, zero-alloc). Do: walk every run `(first, reach)` of a 12-unit region against every set
-  /// of up to three kept runs (overlapping, adjacent, out of order, outside the run, in another region) with
-  /// `for_each_piece`, and with the sorting reference it replaced. Expect the pieces to tile the run exactly, in address
-  /// order, each unit covered exactly when the reference covers it.
-  #[test]
-  fn the_allocation_free_walk_tiles_a_run_as_the_sorting_one_did() {
-    const UNITS: usize = 12;
-    let mut runs = Vec::new();
-    for start in 0..UNITS {
-      for end in start + 1..=UNITS {
-        for region in [0u16, 1] {
-          runs.push(KeptRun { region, start, end });
-        }
-      }
-    }
-    let mut checked = 0usize;
-    for (a, first) in runs.iter().enumerate().step_by(7) {
-      for second in runs.iter().skip(a).step_by(11) {
-        for third in runs.iter().step_by(13) {
-          let keep = [*third, *first, *second];
-          for run_first in 0..UNITS {
-            for run_reach in run_first + 1..=UNITS {
-              walk_matches_sorting((run_first, run_reach), &keep);
-              checked += 1;
-            }
-          }
-        }
-      }
-    }
-    assert!(checked > 10_000, "the enumeration ran: {checked} walks");
-  }
-
   fn page() -> usize {
     if cfg!(miri) {
       // Miri cannot call sysctl; a common base page is enough for the arithmetic under test.
@@ -1387,11 +1121,12 @@ mod tests {
     }
     calls + 1
   }
-  /// Purges keeping `keep` until the purge reports nothing more: the bytes given back.
-  fn purge_to_the_end_keeping(arena: &mut ChunkArena, keep: &[KeptRun]) -> usize {
+
+  /// Purges one block per call until the purge reports nothing more: the bytes given back.
+  fn purge_to_the_end_given(arena: &mut ChunkArena) -> usize {
     let mut given = 0;
     loop {
-      let step = arena.purge_keeping(1, keep);
+      let step = arena.purge(1);
       given += step.bytes;
       if !step.more {
         return given;
@@ -1479,23 +1214,6 @@ mod tests {
     );
   }
 
-  /// Four one-page blocks in a region of eight pages, each filled with its index plus one, the first and third freed.
-  fn arena_with_two_freed_pages() -> (ChunkArena, Vec<Extent>) {
-    let p = page();
-    let mut arena = ChunkArena::new(p).discarding_from(p);
-    arena
-      .add_region(Region::map(p * 8, p, false).unwrap())
-      .unwrap();
-    let blocks: Vec<Extent> = (0..4).map(|_| arena.alloc(p).unwrap()).collect();
-    for (index, block) in blocks.iter().enumerate() {
-      let value = u8::try_from(index + 1).unwrap();
-      arena.bytes_mut(*block).unwrap().fill(value);
-    }
-    arena.free(blocks[0]).unwrap();
-    arena.free(blocks[2]).unwrap();
-    (arena, blocks)
-  }
-
   /// A-205 against A-214 (main CI 42184319025: the Windows give-back test counted 118,337,536 of 134,217,728 deleted
   /// bytes given back). Do: free two blocks, purge one block a call so the pass stops between them, free a third block
   /// behind the pass's cursor (as a publication releases a delete's blocks while an interrupted pass waits for an idle
@@ -1515,15 +1233,14 @@ mod tests {
     }
     arena.free(blocks[1]).unwrap();
     arena.free(blocks[3]).unwrap();
-    let first = arena.purge_keeping(1, &[]);
+    let first = arena.purge(1);
     assert!(
       first.more,
       "the pass stops between the two freed blocks: {first:?}"
     );
     arena.free(blocks[0]).unwrap();
-    let given = first.bytes
-      + purge_to_the_end_keeping(&mut arena, &[])
-      + purge_to_the_end_keeping(&mut arena, &[]);
+    let given =
+      first.bytes + purge_to_the_end_given(&mut arena) + purge_to_the_end_given(&mut arena);
     // Miri models no madvise, so under it no page goes back and the purge counts none; the count of what stays
     // resident holds either way.
     if !cfg!(miri) {
@@ -1537,104 +1254,6 @@ mod tests {
     assert!(
       all_are(arena.bytes_mut(blocks[2]).unwrap(), 0, p, 7),
       "the live block keeps its bytes"
-    );
-  }
-
-  /// A-214. Do: free two of four one-page blocks; purge keeping the reserve of the next three one-page allocations
-  /// (`upcoming`), then keeping one of one page. Expect: the first purge gives nothing back and keeps both freed pages
-  /// counted resident; the second gives back the freed page outside the reserve and keeps one counted.
-  #[test]
-  fn an_idle_purge_keeps_the_reserve_and_gives_back_the_rest() {
-    let p = page();
-    let (mut arena, _blocks) = arena_with_two_freed_pages();
-    // The free lists are LIFO: the next one-page allocations take blocks[2]'s page, then blocks[0]'s, then fresh ones.
-    let keep = arena.upcoming(p, 3 * p);
-    assert_eq!(keep.iter().map(KeptRun::len).sum::<usize>(), 3 * p);
-    assert_eq!(
-      purge_to_the_end_keeping(&mut arena, &keep),
-      0,
-      "both freed pages are in the reserve"
-    );
-    assert_eq!(
-      arena.resident_free_bytes(),
-      2 * p,
-      "the reserve's resident pages stay counted"
-    );
-    let keep = arena.upcoming(p, p);
-    let given = purge_to_the_end_keeping(&mut arena, &keep);
-    // Miri models no madvise, so under it no page goes back and the purge counts none; the reserve's accounting holds
-    // either way (main CI 42119714654 ran this under Miri and failed on the count).
-    if !cfg!(miri) {
-      assert_eq!(given, p, "the freed page outside the reserve goes back");
-    }
-    assert_eq!(
-      arena.resident_free_bytes(),
-      p,
-      "the reserve's page stays counted, the other leaves the count"
-    );
-  }
-
-  /// A-214. Do: free two of four one-page blocks, purge keeping a one-page reserve, then refill a three-page reserve a
-  /// page per slice and allocate three pages. Expect: the refill faults only the reserve's two pages not resident, one a
-  /// slice, and counts them resident; freed and refilled bytes read zero and live blocks keep theirs; the allocations
-  /// take the reserve's blocks in order.
-  #[test]
-  fn the_refill_faults_only_the_reserves_missing_pages_and_allocation_takes_them() {
-    let p = page();
-    let (mut arena, blocks) = arena_with_two_freed_pages();
-    let keep = arena.upcoming(p, p);
-    purge_to_the_end_keeping(&mut arena, &keep);
-    let keep = arena.upcoming(p, 3 * p);
-    assert_eq!(
-      arena.prefault(&keep, 1),
-      Prefaulted {
-        bytes: p,
-        more: true
-      },
-      "one missing page a slice"
-    );
-    assert_eq!(
-      arena.prefault(&keep, 1),
-      Prefaulted {
-        bytes: p,
-        more: false
-      },
-      "the last, and done"
-    );
-    assert_eq!(
-      arena.prefault(&keep, 1),
-      Prefaulted::default(),
-      "nothing left to fault"
-    );
-    assert_eq!(
-      arena.resident_free_bytes(),
-      3 * p,
-      "refilled pages count as resident free bytes"
-    );
-    let bytes = arena.slot(blocks[0].region).unwrap().region.bytes();
-    assert!(
-      all_are(bytes, 0, p, 0) && all_are(bytes, 2 * p, p, 0) && all_are(bytes, 4 * p, 4 * p, 0),
-      "freed and refilled bytes read zero"
-    );
-    assert!(
-      all_are(bytes, p, p, 2) && all_are(bytes, 3 * p, p, 4),
-      "live blocks keep their bytes"
-    );
-    let reserved: Vec<usize> = keep
-      .iter()
-      .flat_map(|run| (run.start..run.end).step_by(p))
-      .collect();
-    for offset in reserved {
-      assert_eq!(
-        arena.alloc(p).unwrap().offset(),
-        offset,
-        "the allocation took a reserved page"
-      );
-    }
-    assert_eq!(
-      arena.resident_free_bytes(),
-      0,
-      "every reserved page was taken"
     );
   }
 

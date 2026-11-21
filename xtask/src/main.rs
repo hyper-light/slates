@@ -24,8 +24,9 @@
 //! - `cargo xtask toolchain` — every image, build and workflow pin names `rust-toolchain.toml`'s channel (see
 //!   `toolchain.rs`).
 //! - `cargo xtask check` — structural, literals, the unsafe budget, the version and the toolchain pins.
-//! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
-//!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
+//! - `cargo xtask ratchet [--provision] [--record] [--tighten] [--reset] [--runs N]` — the performance
+//!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`); `--provision` runs R9's
+//!   provisioning histogram alone, its own lane.
 //! - `cargo xtask conformance (plan | run --suite S | all | matrix [--write]) [--records DIR]
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
@@ -137,6 +138,7 @@ fn main() -> ExitCode {
         record: args.iter().any(|a| a == "--record"),
         tighten: args.iter().any(|a| a == "--tighten"),
         reset: args.iter().any(|a| a == "--reset"),
+        provision: args.iter().any(|a| a == "--provision"),
         runs,
       };
       ratchet::run(&root, flags)

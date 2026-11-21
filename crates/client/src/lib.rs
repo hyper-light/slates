@@ -36,6 +36,7 @@ pub mod driver;
 pub mod error;
 pub mod exec;
 pub mod hold;
+pub mod session_log;
 
 pub use client::{
   Advanced, ArchiveExported, ArchiveImported, Attachment, Client, Connecting, CreateSpec,
@@ -51,6 +52,9 @@ pub use client::{MappedRead, MappedWrite, page_bytes};
 pub use error::ClientError;
 /// A CLI attachment held alive by its holder (A-384).
 pub use hold::Hold;
+/// The session log (`slates log`, A-773): the works, their marks and the landings awaiting a grant, and what needs the
+/// human.
+pub use session_log::{LogLanding, LogWork, NeedsYou, SessionLog};
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a
 /// workload on an inherited descriptor, and the typed faults of a delivery a consumer cannot take.
 pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, ENV_CONSUMER_FD};
@@ -61,14 +65,14 @@ pub use slates_ipc::protocol::{
   DetectorPoolReport, DetectorRelayReport, DirEntry, EntriesCursor, EntryKind, Established, Filter,
   FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
   HostPathReason, IMAGE_FILE, ImageMergeReport, Intent, JournalReport, KernelCache,
-  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, LearnerReport, NamePolicy,
-  ObjectFormat, OciBinding, PlacedState, PlannedAction, PlannedContent, PlannedEntry,
-  PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal, RefusalCount,
-  Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal,
-  SignatureFault, Signer, SignerKey, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
-  SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
-  UnsupportedReason, VcsTool, Verification, VolumeId, VolumeSummary, WorkOp, WriteAct, WriteMode,
-  WritePolicy,
+  LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, LearnerReport, LogCursor,
+  LogLine, NamePolicy, ObjectFormat, OciBinding, PlacedState, PlannedAction, PlannedContent,
+  PlannedEntry, PolicySubject, Principal, ReadAt, ReadWritePolicy, RecoveryCause, Refusal,
+  RefusalCount, Residency, RetirementReport, Rights, Scope, SessionReport, ShardReport,
+  SharingSemantics, Signal, SignatureFault, Signer, SignerKey, SizeClass, SnapshotBoundary,
+  SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport, TargetPathConstraint,
+  TelemetryReport, TransportReport, UnsupportedReason, VcsTool, Verification, VolumeId,
+  VolumeSummary, WorkMark, WorkOp, WriteAct, WriteMode, WritePolicy,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

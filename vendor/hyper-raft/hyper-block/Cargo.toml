@@ -1,0 +1,42 @@
+[package]
+name = "hyper-block"
+description = "Block I/O for the shared log: aligned direct I/O, the platform's full flush, buffers that meet the device's alignment, group commit's wait and a simulated device with power-loss semantics"
+# slates: the device issuer (`src/issuer.rs`) and its hyper-rt dependency are left out (vendor/hyper-raft/README.md,
+# "Local changes"): slates runs one executor (CLAUDE.md §2 item 2), and the changeset log (A-767) needs none of it.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/hyper-raft"
+publish = false
+
+[features]
+# Test support for other crates: the simulated power-loss file, over hyper-sim's block device, and,
+# on macOS, a disk image attached as a device node.
+sim = ["dep:hyper-sim"]
+
+[dependencies]
+# A kept record's checksum (`record`), the log's CRC-32C.
+crc32c = "0.6"
+getrandom = "0.4"
+# The simulated device's model (`sim`, test support only): hyper-sim's block device.
+hyper-sim = { path = "../hyper-sim", optional = true }
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "system", "param", "process", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux's native AIO system calls (`aio`): io_setup, io_submit, io_getevents, io_destroy.
+libc = "0.2.189"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+# mmap(2), mincore(2) and munmap(2) (`resident`): which pages of a file the unified buffer cache
+# holds, so a read of them is made without waiting for the device.
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Kernel", "Win32_System_Performance", "Win32_System_Ioctl", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+
+[workspace]

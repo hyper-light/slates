@@ -90,6 +90,8 @@ pub struct Repository {
   /// How many texts were made whole from their chains ([`Repository::text`]): a read makes a window at a time
   /// ([`Repository::text_at`]) and never counts here.
   made_whole: std::cell::Cell<u64>,
+  /// How many delta windows reads made ([`Repository::windows_made`]).
+  windows_made: std::cell::Cell<u64>,
   /// Every text a commit brought through its sink (§4.17.1 "A push's intake"; main's ruling of 2026-11-20 on c2 and
   /// (B)), by content identity, with its length: held once in the repository's content store, read through the lent
   /// [`TextSource`], never copied or deltified here. A later version's background job deltifies one its node moved past
@@ -122,6 +124,7 @@ impl Repository {
       contents: BTreeMap::new(),
       texts: BTreeMap::new(),
       made_whole: std::cell::Cell::new(0),
+      windows_made: std::cell::Cell::new(0),
       stored: BTreeMap::new(),
       locks: LockTable::new(),
       transactions: 0,
@@ -242,6 +245,46 @@ impl Repository {
     self.made_whole.get()
   }
 
+  /// How many delta windows reads asked for were made ([`Repository::text_at`], [`Repository::text_in`]; the base windows
+  /// each is made from are not counted): the reads' non-vacuity counter (a reader with a [`WindowCache`] makes each
+  /// window it reads once).
+  pub fn windows_made(&self) -> u64 {
+    self.windows_made.get()
+  }
+
+  /// [`Repository::text_at`] for a reader keeping `cache` across its steps: the window holding `offset` lent from the
+  /// cache when it holds it, else made once, kept in the cache and lent. A text kept whole is lent in place.
+  pub fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut crate::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    if let Some(bytes) = self.contents.get(identity) {
+      return bytes
+        .get(usize::try_from(offset).ok()?..)
+        .map(Cow::Borrowed);
+    }
+    let kept = self.texts.get(identity)?;
+    if offset >= kept.len() {
+      return (offset == kept.len()).then_some(Cow::Borrowed(&[]));
+    }
+    let holds = cache.held.as_ref().is_some_and(|(held, start, bytes)| {
+      held == identity
+        && *start <= offset
+        && offset < start.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+    });
+    if !holds {
+      let index = kept.window_holding(offset)?;
+      let (start, made) = self.made_window(kept, index, 0)?;
+      cache.held = Some((*identity, start, made));
+    }
+    let (_, start, bytes) = cache.held.as_ref()?;
+    bytes
+      .get(usize::try_from(offset.checked_sub(*start)?).ok()?..)
+      .map(Cow::Borrowed)
+  }
+
   /// The bytes of the text held under `identity` from `offset` to the end of the delta window that holds `offset`: one
   /// window made, its source view made the same way from its base's windows, never the text whole (§4.17.4 item 11: a
   /// read streams, nothing is assembled whole). Empty at the text's end; none past it, or for a text not held.
@@ -293,6 +336,12 @@ impl Repository {
     };
     let mut made = Vec::with_capacity(usize::try_from(window.target_len).ok()?);
     svndiff::apply(&window, &source, &mut made).ok()?;
+    // A window a read asked for; the base windows its source view is made from are part of making it.
+    if depth == 0 {
+      self
+        .windows_made
+        .set(self.windows_made.get().saturating_add(1));
+    }
     Some((start, made))
   }
 
@@ -1012,6 +1061,15 @@ impl ReadSource for Repository {
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
     TextSource::text_at(self, identity, offset)
   }
+
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut crate::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    Repository::text_in(self, identity, offset, cache)
+  }
 }
 
 /// Where a repository's texts are read (S4, with A-716: a text held once, by the green's content-identity index, the
@@ -1027,6 +1085,16 @@ pub trait TextSource {
   /// text. A source that keeps texts in pieces answers the piece holding `offset` and makes nothing whole.
   fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
     from_offset(self.text(identity)?, offset)
+  }
+
+  /// [`TextSource::text_at`] for a reader keeping `cache` across its steps (`crate::reads::Repository::text_in`).
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    _cache: &'a mut crate::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    self.text_at(identity, offset)
   }
 
   /// Reads `identity`'s text into `reading` a bounded step (§4.17.1 "A fetch's answer", rule 3: the export's text
@@ -1045,6 +1113,15 @@ impl TextSource for Repository {
 
   fn text_at(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
     Repository::text_at(self, identity, offset).map(Cow::Owned)
+  }
+
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut crate::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    Repository::text_in(self, identity, offset, cache)
   }
 
   fn read_step(&self, identity: &ContentIdentity, reading: &mut TextReading) -> Option<bool> {
@@ -1222,6 +1299,15 @@ impl<T: TextSource + ?Sized> ReadSource for WithTexts<'_, T> {
 
   fn text(&self, identity: &ContentIdentity, offset: u64) -> Option<Cow<'_, [u8]>> {
     self.texts.text_at(identity, offset)
+  }
+
+  fn text_in<'a>(
+    &'a self,
+    identity: &ContentIdentity,
+    offset: u64,
+    cache: &'a mut crate::reads::WindowCache,
+  ) -> Option<Cow<'a, [u8]>> {
+    self.texts.text_in(identity, offset, cache)
   }
 }
 

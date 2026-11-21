@@ -68,7 +68,9 @@ fn daemon(shards: u16, tag: &str) -> (Daemon, String) {
 
 fn submitted(client: &mut Client, work: VolumeId) -> String {
   match client.submit(work) {
-    Ok(Submitted::Accepted(version)) => format!("accepted {version}"),
+    Ok(Submitted::Accepted(version) | Submitted::Identical(version)) => {
+      format!("accepted {version}")
+    }
     Ok(Submitted::Conflict(windows)) => format!("conflict {windows:?}"),
     Ok(Submitted::ApprovalRequired { identity, paths }) => {
       format!("approval of {identity:?} over {paths} paths required")
@@ -476,6 +478,7 @@ fn pipelined_round(client: &mut Client, green: VolumeId, round: u8) {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     },
     "based at {base}"
   );
@@ -578,6 +581,7 @@ const ACCEPTED_AT_TWO: ReplyBody = ReplyBody::Submitted {
   conflicts: Vec::new(),
   conflicts_elided: 0,
   verdict: 0,
+  identical: false,
 };
 
 /// A-247 "Exactly once". Do: submit a work off its green's shard with the owner's answer lost, so the green advanced
@@ -799,6 +803,7 @@ fn an_edit_behind_a_submit_waiting_on_its_owner_lands_after_the_verdict() {
       conflicts: Vec::new(),
       conflicts_elided: 0,
       verdict: 0,
+      identical: false,
     }
   );
   assert!(

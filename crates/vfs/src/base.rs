@@ -88,6 +88,8 @@ enum Since {
 
 /// Format: a directory's own two links (`.` and its name); each subdirectory adds one (POSIX).
 const ROOT_LINKS: u32 = 2;
+/// Unit: nanoseconds in a second, for telling a change time with a sub-second part ([`Overlay::unprovable`]).
+const NS_PER_SECOND: i64 = 1_000_000_000;
 
 /// How an overlay volume is created: the root directory handle the caller opened, the host's
 /// facts about it, and the large-file class boundary.
@@ -1447,7 +1449,7 @@ impl Overlay<'_> {
       // references, and the name serves the disk's file as a new inode on its next lookup. Until 2026-09-30 every inode
       // was refreshed in place onto the new file, so an opener read bytes it never opened; until A-151 (2026-10-22) one
       // this process did not count open still was, so a handle opened before a takeover read the outsider's file.
-      if self.names_another_file(store, no, fp) || (restored && self.unprovable(no, fp)) {
+      if self.names_another_file(store, no, fp) || (restored && self.unprovable(store, no, fp)) {
         self.release_detached(no);
         gone.push(name);
         continue;
@@ -1550,15 +1552,25 @@ impl Overlay<'_> {
   }
 
   /// Whether an entry a recovery restored cannot be proven the file its inode was made from (A-151): it holds no
-  /// descriptor and the filesystem records no birth time (`fp`'s is zero), so a number reused since the inode was made
-  /// cannot be ruled out.
-  fn unprovable(&self, no: InodeNo, fp: Fingerprint) -> bool {
+  /// descriptor, the filesystem records no birth time (`fp`'s is zero), and the disk's change time is not the one the
+  /// inode recorded, so a number reused since the inode was made cannot be ruled out.
+  ///
+  /// The change time proves it otherwise (w-realtools, 2026-11-20): the kernel stamps a file's change time when the
+  /// file is made and at every change to it, so a file made at a freed number after the inode recorded its file carries
+  /// a later one. Only a stamp with a sub-second part counts: a filesystem that keeps whole seconds could make the
+  /// reused file within the same second. Renumbering a file nothing changed broke real tools: a compiler that read a
+  /// header before a daemon restart and again after it saw two files, so `#pragma once` included it twice.
+  fn unprovable(&self, store: &Store, no: InodeNo, fp: Fingerprint) -> bool {
     fp.birth_ns == 0
       && !self
         .vol
         .base
         .as_ref()
         .is_some_and(|plane| plane.descriptors.contains_key(&no))
+      && !self.vol.inode(store, no).is_ok_and(|inode| {
+        fp.ctime_ns.rem_euclid(NS_PER_SECOND) != 0
+          && (inode.attrs.ctime, inode.attrs.size) == (fp.ctime_ns, fp.size)
+      })
   }
 
   /// The descriptor of an inode that left its name (A-151): kept while a handle holds the inode open, since the opener

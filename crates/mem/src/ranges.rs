@@ -46,7 +46,7 @@ impl UnitSet {
   }
 
   /// The bytes the recorded units cover: what an idle purge's walk leaves resident and free when it ends
-  /// (`ChunkArena::purge_keeping`).
+  /// (`ChunkArena::purge`).
   pub(crate) fn recorded_bytes(&self) -> usize {
     self.recorded.saturating_mul(self.unit)
   }

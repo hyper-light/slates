@@ -20,8 +20,8 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge,
-  NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
+  GrantState, IdentityRecord, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NameAliasRecord, NfsCallRecord, NfsClientRecord, NfsDelegationRecord, NfsLockRecord,
   NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal, SEAL_KEY_RECORD_BYTES,
   SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
   VolumeId, VolumeRecord,
@@ -200,6 +200,8 @@ pub struct PartitionSnapshot {
   /// a repository's or a green's (A-636 part 2b-2; appended), so a recovery mints the family ids the live partition
   /// would.
   pub family_counter: u64,
+  /// The version-control credentials revoked here (A-764; appended), by id: each never enrolled again.
+  pub credential_tombstones: Vec<[u8; 32]>,
 }
 
 /// A green adopted by its takeover successor from the successor's own holder ledger of it (§4.16 owner-loss recovery;
@@ -316,6 +318,10 @@ pub struct Partition {
   identities: BTreeMap<Vec<u8>, IdentityRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
+  /// The landings presented and awaiting a grant (§4.15 `AwaitingGrant`), by the volume they land and their id
+  /// (A-773): what the session log shows, so its read costs the landings waiting, never the partition's landing
+  /// history. Kept by `apply` beside `landings` and rebuilt from them at a restore; bounded by `landings`.
+  awaiting_grant: BTreeSet<(VolumeId, u64)>,
   /// The audit records retained, oldest first: at most `caps.audit_records` (A-265).
   audit: std::collections::VecDeque<AuditRecord>,
   /// The audit records dropped oldest first past the bound (A-265), snapshotted with the window.
@@ -484,6 +490,7 @@ impl Partition {
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
+      awaiting_grant: BTreeSet::new(),
       audit: std::collections::VecDeque::new(),
       audit_dropped: 0,
       green_chains: BTreeMap::new(),
@@ -1412,6 +1419,27 @@ impl Partition {
     self.landings.get(&id)
   }
 
+  /// The landings awaiting a grant from `from` (a volume and, within it, a landing id), in that order (A-773): a seek
+  /// into the waiting set, so a page costs the lines it carries.
+  pub fn awaiting_grant_from(
+    &self,
+    from: std::ops::Bound<(VolumeId, u64)>,
+  ) -> impl Iterator<Item = &LandingRecord> + '_ {
+    self
+      .awaiting_grant
+      .range((from, std::ops::Bound::Unbounded))
+      .filter_map(|(_, id)| self.landings.get(id))
+  }
+
+  /// Keeps `awaiting_grant` equal to the landings whose state is `AwaitingGrant`.
+  fn note_awaiting(&mut self, volume: VolumeId, id: u64, state: LandingState) {
+    if state == LandingState::AwaitingGrant {
+      self.awaiting_grant.insert((volume, id));
+    } else {
+      self.awaiting_grant.remove(&(volume, id));
+    }
+  }
+
   /// The highest landing id the partition holds, or `None` when it holds none — asked once at boot, so
   /// a fresh counter never re-mints a recovered landing's id (the records are durable and the guard
   /// refuses a duplicate).
@@ -1562,31 +1590,9 @@ impl Partition {
   pub fn check(&self, op: &Op, now_ns: u64) -> Result<(), DbError> {
     match op {
       Op::VolumeCreated { record } => self.check_volume_created(record),
-      Op::VolumeDestroyed { id } => {
-        self.volume(*id).ok_or(DbError::NotFound)?;
-        // A green live members of its lineage were made from keeps the version each was made at (A-575).
-        let members = self.repositories.branched_from(*id);
-        if members > 0 {
-          return Err(DbError::BranchedFrom { members });
-        }
-        self
-          .tombstone_sequence(*id)
-          .map(|_| ())
-          .ok_or(DbError::Capacity {
-            table: "tombstone sequence",
-          })
-      }
+      Op::VolumeDestroyed { id } => self.check_volume_destroyed(*id),
       // A moved volume leaves only as a whole record (A-291): no attachment of it may be left behind to name it.
-      Op::VolumeReleased { id } => {
-        self.volume(*id).ok_or(DbError::NotFound)?;
-        let attachments = self.attachments_of(*id).len();
-        if attachments > 0 {
-          return Err(DbError::Attached {
-            attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
-          });
-        }
-        Ok(())
-      }
+      Op::VolumeReleased { id } => self.check_volume_released(*id),
       // A captured base names a snapshot this partition holds (A-291).
       Op::BaseCaptured { volume, snapshot } => {
         self.snapshot(*volume, *snapshot).ok_or(DbError::NotFound)?;
@@ -1594,11 +1600,7 @@ impl Partition {
       }
       // A carried capture names a volume here, and its mark one of that volume's snapshots (A-503).
       Op::CaptureCarried { volume, mark, .. } | Op::CaptureAdopted { volume, mark, .. } => {
-        self.volume(*volume).ok_or(DbError::NotFound)?;
-        if let Some(mark) = mark {
-          self.snapshot(*volume, *mark).ok_or(DbError::NotFound)?;
-        }
-        Ok(())
+        self.check_capture(*volume, *mark)
       }
       // A repository's record and namespace keep §4.17.1's rules (A-515): `crate::repository`.
       Op::RepositoryCreated { .. }
@@ -1652,37 +1654,13 @@ impl Partition {
       | Op::ReviewCommentOutdated { .. }
       | Op::ReviewApproved { .. }
       | Op::ReviewApprovalStaled { .. }
-      | Op::ReviewClosed { .. } => {
-        self
-          .reviews
-          .check(op, |id| self.repositories.repository(id).is_some())?;
-        let (released, added) = self.reviews.charge(op);
-        self.merge_bytes_fit(released, added)
-      }
+      | Op::ReviewClosed { .. } => self.check_review(op),
       // A version-control credential (A-625 part 3): `crate::credentials`; its bytes fit the table byte budget, and the
       // refusal names the table the human was adding to.
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
-        self.credentials.check(op)?;
-        let (released, added) = self.credentials.charge(op);
-        self
-          .merge_bytes_fit(released, added)
-          .map_err(|_| DbError::Capacity {
-            table: "credentials",
-          })
-      }
-      Op::TombstoneAdopted { tombstone } => {
-        if self.volume(tombstone.volume).is_some()
-          || self.tombstones.contains_key(&tombstone.volume)
-        {
-          return Err(DbError::AlreadyExists {
-            existing: tombstone.volume.bytes,
-          });
-        }
-        if self.volume_slots_used() >= self.caps.volumes {
-          return Err(DbError::Capacity { table: "volumes" });
-        }
-        Ok(())
-      }
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => self.check_credential(op),
+      Op::TombstoneAdopted { tombstone } => self.check_tombstone_adopted(tombstone.volume),
       Op::TombstoneRetired { id } => self.tombstones.get(id).map(|_| ()).ok_or(DbError::NotFound),
       Op::VolumeStateChanged { id, .. }
       | Op::VolumeResized { id, .. }
@@ -1695,18 +1673,7 @@ impl Partition {
       | Op::VolumeSignersSet { id, .. }
       | Op::VolumeRelinquished { id }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::SnapshotTaken { record } => {
-        self.volume(record.volume).ok_or(DbError::NotFound)?;
-        if self.snapshot(record.volume, record.id).is_some() {
-          return Err(DbError::AlreadyExists {
-            existing: record.volume.bytes,
-          });
-        }
-        if self.snapshot_index.len() >= self.caps.snapshots {
-          return Err(DbError::Capacity { table: "snapshots" });
-        }
-        Ok(())
-      }
+      Op::SnapshotTaken { record } => self.check_snapshot_taken(record),
       Op::SnapshotPlaced { volume, id, .. }
       | Op::SnapshotIdentified { volume, id, .. }
       | Op::SnapshotDestroyed { volume, id } => self
@@ -1719,21 +1686,7 @@ impl Partition {
       }
       Op::LeaseTaken { volume, lease } => self.check_lease(*volume, lease, now_ns),
       Op::LeaseReleased { volume } => self.volume(*volume).map(|_| ()).ok_or(DbError::NotFound),
-      Op::AttachmentAdded { record } => {
-        self.volume(record.volume).ok_or(DbError::NotFound)?;
-        self.check_mount_dependency(record)?;
-        if self.attachment(record.id).is_some() {
-          return Err(DbError::AlreadyExists {
-            existing: record.volume.bytes,
-          });
-        }
-        if self.attachment_index.len() >= self.caps.attachments {
-          return Err(DbError::Capacity {
-            table: "attachments",
-          });
-        }
-        Ok(())
-      }
+      Op::AttachmentAdded { record } => self.check_attachment_added(record),
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentMountSeen { id, .. } => {
@@ -1802,23 +1755,7 @@ impl Partition {
       | Op::AttachmentExpired { .. } => self.check_alias_or_term(op),
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
-      Op::SealKeySet { record } => {
-        let fits = match record.owner {
-          SealKeyOwner::Recipient => (1..=SEAL_RECIPIENT_RECORD_MAX).contains(&record.record.len()),
-          _ => record.record.len() == SEAL_KEY_RECORD_BYTES,
-        };
-        if !fits {
-          Err(DbError::SealKeyMalformed {
-            len: record.record.len(),
-          })
-        } else if self.seal_keys.contains_key(&record.owner) {
-          Err(DbError::AlreadyExists {
-            existing: record.id,
-          })
-        } else {
-          Ok(())
-        }
-      }
+      Op::SealKeySet { record } => self.check_seal_key_set(record),
       Op::SealKeyDestroyed { owner } => {
         if self.seal_keys.contains_key(owner) {
           Ok(())
@@ -1873,6 +1810,8 @@ impl Partition {
         Ok(())
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
+      // Only a landing still awaiting its grant is superseded, and only by another landing this partition holds.
+      Op::LandingSuperseded { id, by } => self.check_landing_superseded(*id, *by),
       // The audit is never refused (A-265): its records are the history of what happened, kept or counted as dropped.
       Op::AuditAppended { .. }
       | Op::AuditOwed { .. }
@@ -1982,6 +1921,144 @@ impl Partition {
   /// The check of a volume's creation, and of a green's by its adoption (A-333): the id and the name free here (a name
   /// this partition holds for another partition's volume is that volume's, A-236, confirmed or not), no tombstone owed
   /// under the id, and room in the volumes table.
+  /// [`Self::check`] of a tombstone adopted for `volume`: no volume or tombstone of that id here already, and a volume
+  /// slot left for it.
+  fn check_tombstone_adopted(&self, volume: VolumeId) -> Result<(), DbError> {
+    if self.volume(volume).is_some() || self.tombstones.contains_key(&volume) {
+      return Err(DbError::AlreadyExists {
+        existing: volume.bytes,
+      });
+    }
+    if self.volume_slots_used() >= self.caps.volumes {
+      return Err(DbError::Capacity { table: "volumes" });
+    }
+    Ok(())
+  }
+
+  /// [`Self::check`] of a capture carried or adopted: its volume held here, and its mark one of that volume's snapshots
+  /// (A-503).
+  fn check_capture(
+    &self,
+    volume: VolumeId,
+    mark: Option<crate::catalog::SnapshotId>,
+  ) -> Result<(), DbError> {
+    self.volume(volume).ok_or(DbError::NotFound)?;
+    if let Some(mark) = mark {
+      self.snapshot(volume, mark).ok_or(DbError::NotFound)?;
+    }
+    Ok(())
+  }
+
+  /// [`Self::check`] of a review op: the review's rules, on a repository held here, and its bytes within the merge
+  /// budget.
+  fn check_review(&self, op: &Op) -> Result<(), DbError> {
+    self
+      .reviews
+      .check(op, |id| self.repositories.repository(id).is_some())?;
+    let (released, added) = self.reviews.charge(op);
+    self.merge_bytes_fit(released, added)
+  }
+
+  /// [`Self::check`] of a credential op: the credentials' rules, and its bytes within the merge budget, refused as the
+  /// credentials table's capacity past it.
+  fn check_credential(&self, op: &Op) -> Result<(), DbError> {
+    self.credentials.check(op)?;
+    let (released, added) = self.credentials.charge(op);
+    self
+      .merge_bytes_fit(released, added)
+      .map_err(|_| DbError::Capacity {
+        table: "credentials",
+      })
+  }
+
+  /// [`Self::check`] of a snapshot taken: its volume held, no snapshot of that id on it already, and a snapshot slot
+  /// left.
+  fn check_snapshot_taken(&self, record: &SnapshotRecord) -> Result<(), DbError> {
+    self.volume(record.volume).ok_or(DbError::NotFound)?;
+    if self.snapshot(record.volume, record.id).is_some() {
+      return Err(DbError::AlreadyExists {
+        existing: record.volume.bytes,
+      });
+    }
+    if self.snapshot_index.len() >= self.caps.snapshots {
+      return Err(DbError::Capacity { table: "snapshots" });
+    }
+    Ok(())
+  }
+
+  /// [`Self::check`] of an attachment added: its volume held, its mount's dependency kept, no attachment of that id
+  /// already, and an attachment slot left.
+  fn check_attachment_added(&self, record: &AttachmentRecord) -> Result<(), DbError> {
+    self.volume(record.volume).ok_or(DbError::NotFound)?;
+    self.check_mount_dependency(record)?;
+    if self.attachment(record.id).is_some() {
+      return Err(DbError::AlreadyExists {
+        existing: record.volume.bytes,
+      });
+    }
+    if self.attachment_index.len() >= self.caps.attachments {
+      return Err(DbError::Capacity {
+        table: "attachments",
+      });
+    }
+    Ok(())
+  }
+
+  /// [`Self::check`] of a seal key set: its record the length its owner's kind takes, and no key of that owner already.
+  fn check_seal_key_set(&self, record: &SealKeyRecord) -> Result<(), DbError> {
+    let fits = match record.owner {
+      SealKeyOwner::Recipient => (1..=SEAL_RECIPIENT_RECORD_MAX).contains(&record.record.len()),
+      _ => record.record.len() == SEAL_KEY_RECORD_BYTES,
+    };
+    if !fits {
+      Err(DbError::SealKeyMalformed {
+        len: record.record.len(),
+      })
+    } else if self.seal_keys.contains_key(&record.owner) {
+      Err(DbError::AlreadyExists {
+        existing: record.id,
+      })
+    } else {
+      Ok(())
+    }
+  }
+
+  /// [`Self::check`] of landing `id` superseded by `by`: both held, another, and `id` still awaiting its grant.
+  fn check_landing_superseded(&self, id: u64, by: u64) -> Result<(), DbError> {
+    match (self.landing(id), self.landing(by)) {
+      (Some(older), Some(_)) if older.state == LandingState::AwaitingGrant && id != by => Ok(()),
+      _ => Err(DbError::NotFound),
+    }
+  }
+
+  /// [`Self::check`] of a destroy: the volume held, no live member of its lineage made from it (a green keeps the
+  /// version each was made at, A-575), and a tombstone sequence left to give it.
+  fn check_volume_destroyed(&self, id: VolumeId) -> Result<(), DbError> {
+    self.volume(id).ok_or(DbError::NotFound)?;
+    let members = self.repositories.branched_from(id);
+    if members > 0 {
+      return Err(DbError::BranchedFrom { members });
+    }
+    self
+      .tombstone_sequence(id)
+      .map(|_| ())
+      .ok_or(DbError::Capacity {
+        table: "tombstone sequence",
+      })
+  }
+
+  /// [`Self::check`] of a release: the volume held, and no attachment of it left behind to name it (A-291).
+  fn check_volume_released(&self, id: VolumeId) -> Result<(), DbError> {
+    self.volume(id).ok_or(DbError::NotFound)?;
+    let attachments = self.attachments_of(id).len();
+    if attachments > 0 {
+      return Err(DbError::Attached {
+        attachments: u32::try_from(attachments).unwrap_or(u32::MAX),
+      });
+    }
+    Ok(())
+  }
+
   fn check_volume_created(&self, record: &crate::catalog::VolumeRecord) -> Result<(), DbError> {
     if let Some(existing) = self.volume(record.id) {
       return Err(DbError::AlreadyExists {
@@ -2253,7 +2330,9 @@ impl Partition {
           .saturating_add(added);
         Ok(())
       }
-      Op::CredentialEnrolled { .. } | Op::CredentialRevoked { .. } => {
+      Op::CredentialEnrolled { .. }
+      | Op::CredentialRevoked { .. }
+      | Op::CredentialTombstoned { .. } => {
         let (released, added) = self.credentials.charge(op);
         self.credentials.apply(op)?;
         self.green_chain_bytes = self
@@ -2551,6 +2630,7 @@ impl Partition {
       }
       Op::LandingRecorded { record } => {
         self.landings.insert(record.id, record.clone());
+        self.note_awaiting(record.volume, record.id, record.state);
         Ok(())
       }
       Op::LandingStateChanged {
@@ -2563,6 +2643,16 @@ impl Partition {
         landing.state = *state;
         landing.written = *written;
         landing.conflicts = *conflicts;
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, *state);
+        Ok(())
+      }
+      Op::LandingSuperseded { id, by } => {
+        let landing = self.landings.get_mut(id).ok_or(DbError::NotFound)?;
+        landing.state = LandingState::Superseded;
+        landing.superseded_by = Some(*by);
+        let volume = landing.volume;
+        self.note_awaiting(volume, *id, LandingState::Superseded);
         Ok(())
       }
       Op::AuditAppended { record } => {
@@ -2952,6 +3042,7 @@ impl Partition {
       atomic_records: self.repositories.atomic_held(),
       identities: self.identities.values().cloned().collect(),
       credentials: self.credentials.records().cloned().collect(),
+      credential_tombstones: self.credentials.tombstones().copied().collect(),
       work_logs: self
         .work_logs
         .iter()
@@ -3180,6 +3271,7 @@ impl Partition {
     }
     for l in &snapshot.landings {
       p.landings.insert(l.id, l.clone());
+      p.note_awaiting(l.volume, l.id, l.state);
     }
     p.audit = snapshot.audit.iter().cloned().collect();
     p.audit_dropped = snapshot.audit_dropped;
@@ -3225,7 +3317,10 @@ impl Partition {
     )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.reviews.bytes());
     // The version-control credentials, charged to the table byte budget as when each was enrolled (A-625 part 3).
-    p.credentials = crate::credentials::Credentials::restore(&snapshot.credentials)?;
+    p.credentials = crate::credentials::Credentials::restore(
+      &snapshot.credentials,
+      &snapshot.credential_tombstones,
+    )?;
     p.green_chain_bytes = p.green_chain_bytes.saturating_add(p.credentials.bytes());
     Ok(p)
   }

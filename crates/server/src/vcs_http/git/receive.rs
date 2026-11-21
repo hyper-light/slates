@@ -250,6 +250,22 @@ impl<L: ShardLender> Receive<L> {
             return Ok(false);
           }
           turn.yield_holding().await;
+          // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
+          if let Some(bytes) = push.take_homing() {
+            let (origin, shards) = lender
+              .lend(|state| (state.shard, state.shards.clone()))
+              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+            let homed = crate::vcs_store::homes::home_in_region(
+              origin,
+              &shards,
+              bytes,
+              crate::fleet::live_budget(),
+            )
+            .await;
+            lender
+              .lend(|state| push.homed(state, homed))
+              .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?;
+          }
         }
         #[cfg(unix)]
         Answering::Hook(call) => {

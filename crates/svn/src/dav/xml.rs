@@ -884,15 +884,20 @@ pub fn fuzzy_escape(text: &str) -> Cow<'_, str> {
 /// `bytes` in base64 as `svn_base64_encode_string2` writes them with line breaks: lines of 76 characters, each line,
 /// the last one too, ended by a line feed; nothing for nothing.
 pub fn base64_lines(bytes: &[u8]) -> String {
-  let (group_bytes, _) = BASE64_GROUP;
   let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+  push_base64_lines(&mut out, bytes);
+  out
+}
+
+/// [`base64_lines`] written into `out`, with no string of its own.
+pub(crate) fn push_base64_lines(out: &mut String, bytes: &[u8]) {
+  let (group_bytes, _) = BASE64_GROUP;
   for line in bytes.chunks(BASE64_BYTES_PER_LINE) {
     for group in line.chunks(group_bytes) {
-      push_base64_group(&mut out, group);
+      push_base64_group(out, group);
     }
     out.push('\n');
   }
-  out
 }
 
 /// Base64 with no line breaks over bytes that arrive a piece at a time, as `svn_base64_encode2` writes it into a stream

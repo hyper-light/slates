@@ -604,3 +604,36 @@ fn revoked_twice(state: &mut ShardState, id: [u8; 32]) {
     "an answer asks nothing"
   );
 }
+
+/// A-764 (a revoked credential never comes back). Do: apply a member's revocation of a key this node never held, then a
+/// member's enrollment of that key (what a member that missed the revocation offers when it rejoins). Expect the
+/// revocation held (the id kept revoked), the enrollment answered not held and the key never held here, the refusal
+/// counted.
+#[test]
+fn a764_a_member_never_brings_back_a_credential_revoked_here() {
+  use slates_cluster::credentials::CredentialMessage;
+  crate::daemon::audit_on_shard(|state| {
+    let blob = rsa_blob();
+    let id = ssh_key_id(&blob);
+    assert!(
+      super::apply_here(state, &CredentialMessage::Revoke { id }),
+      "a revocation of an id never held is held"
+    );
+    assert!(state.db.partition().credentials().revoked(&id));
+    let record = CredentialRecord {
+      id,
+      principal: proven(),
+      kind: CredentialKind::SshKey {
+        algorithm: "ssh-rsa".to_owned(),
+        blob,
+      },
+      expires_ns: None,
+    };
+    assert!(
+      !super::apply_here(state, &CredentialMessage::Enroll { record }),
+      "a revoked credential offered again"
+    );
+    assert_eq!(held(state, &id), None);
+    assert_eq!(counted(state, "credential.fleet.revoked_refused"), 1);
+  });
+}
