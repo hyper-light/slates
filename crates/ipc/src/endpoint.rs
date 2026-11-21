@@ -66,6 +66,10 @@ pub static G222_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 #[doc(hidden)]
 #[allow(clippy::disallowed_types)]
 pub static G222_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main): the client's reply spin yields its CPU each turn.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SPIN_YIELDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A request as the daemon end hands it to the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -747,7 +751,11 @@ impl ClientEnd {
       }
       let elapsed = elapsed_ns(started);
       if elapsed < spin_ns {
-        std::hint::spin_loop();
+        if G222_SPIN_YIELDS.load(Ordering::Relaxed) {
+          std::thread::yield_now();
+        } else {
+          std::hint::spin_loop();
+        }
         continue;
       }
       let look_timeout_ns = match self.before_park(ends, elapsed)? {

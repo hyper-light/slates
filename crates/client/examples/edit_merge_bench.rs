@@ -968,6 +968,9 @@ impl Drop for G222Dump {
 
 fn main() {
   let _g222 = G222Dump;
+  if std::env::var_os("G222_SPIN_YIELD").is_some() {
+    slates_ipc::endpoint::G222_SPIN_YIELDS.store(true, std::sync::atomic::Ordering::Relaxed);
+  }
   #[cfg(target_os = "macos")]
   if std::env::var_os("G222_CLIENT_QOS").is_some() {
     // SAFETY: diagnostic only (g222); this thread's own QoS class.
