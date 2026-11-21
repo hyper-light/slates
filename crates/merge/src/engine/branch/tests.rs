@@ -1227,3 +1227,82 @@ fn an_empty_member_joins_with_nothing_and_holds_what_it_writes() {
     (None, Some(b"root".to_vec()))
   );
 }
+
+/// A-805. Do: judge a fourth overwrite of a green and hold its verdict; preview it as a member of its own; then commit
+/// the verdict to the green from what its chain entry records (`apply_recorded`, as a server-made commit's step does).
+/// Expect: while the preview stands the green shows nothing of it (head 3, its file as before), and the preview reads as
+/// the green does once the verdict commits (the file, the identity, the changed paths in `(0, 1]` against the green's in
+/// `(3, 4]`); a preview of a verdict whose green moved since is refused `Moved`, nothing made; retired, the lineage holds
+/// what the green alone holds.
+#[test]
+fn a_held_verdict_previewed_reads_as_its_commit_while_its_green_shows_nothing_of_it() {
+  let mut origin = Origin::default();
+  origin.files.push(("a".to_owned(), b"0123".to_vec()));
+  let (mut lineage, root) = Lineage::new(Green::with_origin(origin));
+  overwrite_three_times(&mut lineage, root);
+  let inc = lineage
+    .with(root, |green| {
+      at_head(green, &[Edit::Overwrite(0, 0, b"9".to_vec())], 4)
+    })
+    .unwrap();
+  let judged = match lineage.with(root, |green| green.judge(&inc)).unwrap() {
+    super::super::Judgment::Accepted(judged) => judged,
+    _ => panic!("the overwrite is accepted"),
+  };
+  let applied = judged.applied().to_vec();
+  let before = lineage
+    .with(root, |green| {
+      (green.head(), green.content("a").map(<[u8]>::to_vec))
+    })
+    .unwrap();
+  let preview = lineage.preview(root, judged).unwrap();
+  let shown = lineage
+    .with(root, |green| {
+      (green.head(), green.content("a").map(<[u8]>::to_vec))
+    })
+    .unwrap();
+  assert_eq!(shown, before, "the green shows nothing of the held verdict");
+  let previewed = lineage
+    .with(preview, |green| {
+      (
+        green.content("a").map(<[u8]>::to_vec),
+        green.head_identity(),
+        green.changed_between(0, green.head()),
+      )
+    })
+    .unwrap();
+  let version = lineage
+    .with(root, |green| green.apply_recorded(&inc, &applied))
+    .unwrap();
+  assert_eq!(version, 4);
+  let committed = lineage
+    .with(root, |green| {
+      (
+        green.content("a").map(<[u8]>::to_vec),
+        green.head_identity(),
+        green.changed_between(3, 4),
+      )
+    })
+    .unwrap();
+  assert_eq!(previewed, committed, "the preview reads as the commit");
+  retire_whole(&mut lineage, preview);
+  let next = lineage
+    .with(root, |green| {
+      at_head(green, &[Edit::Overwrite(0, 0, b"8".to_vec())], 5)
+    })
+    .unwrap();
+  let stale = match lineage.with(root, |green| green.judge(&next)).unwrap() {
+    super::super::Judgment::Accepted(judged) => judged,
+    _ => panic!("the overwrite is accepted"),
+  };
+  let moved = lineage.with(root, |green| green.submit(&next)).unwrap();
+  assert_eq!(moved, Outcome::Accepted { version: 5 });
+  assert_eq!(
+    lineage.preview(root, stale),
+    Err(LineageRefused::Moved {
+      judged_at: 4,
+      head: 5
+    })
+  );
+  assert_eq!(lineage.len(), 1, "nothing made by the refused preview");
+}

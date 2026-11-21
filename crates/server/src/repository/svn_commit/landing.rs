@@ -25,8 +25,9 @@
 //! every text its history names ([`land_changeset`]): a `Payload` section of the texts' bytes, each whole, streamed from
 //! the content store a piece at a time (never one copy of them all); a `Texts` section naming each by its path, identity
 //! and length and its place in that payload (`slates_store::texts`, the format every tool shares), which the store
-//! indexes so it makes any of them again (`StoreHandle::text`); then the `Record`. One flush commits the three. A
-//! recovery reads a stored text the content store lacks back from there (`vcs_store::fetch_stored_texts`).
+//! indexes so it makes any of them again (`StoreHandle::text`); then the `Record`. One flush commits the three. Every
+//! reader reads a stored text a piece at a time back from there (C2 stage B part 2), and nothing keeps it in RAM once
+//! its revision stands.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
@@ -58,7 +59,7 @@ pub(crate) fn reference(sequence: u64) -> Vec<u8> {
 /// The sequence a register's reference names; none for bytes that are not one.
 pub(crate) fn sequence_of(bytes: &[u8]) -> Option<u64> {
   let rest = bytes.strip_prefix(MARK)?;
-  let digits: [u8; 8] = rest.try_into().ok()?;
+  let digits: [u8; size_of::<u64>()] = rest.try_into().ok()?;
   Some(u64::from_le_bytes(digits))
 }
 
@@ -135,6 +136,10 @@ pub(crate) async fn land_changeset(
   record: Vec<u8>,
   texts: &[LandedText],
 ) -> Result<(), Uncommitted> {
+  #[cfg(test)]
+  if REFUSE_LANDING.with(std::cell::Cell::get) {
+    return Err(Uncommitted::Unstored);
+  }
   if texts.is_empty() {
     return land(
       disk,
@@ -158,8 +163,43 @@ pub(crate) async fn land_changeset(
   landed
 }
 
+#[cfg(test)]
+thread_local! {
+  /// A test's store that refuses every changeset (as a full or failed disk does): [`land_changeset`] answers `Unstored`.
+  pub(crate) static REFUSE_LANDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Shape: the sections of a changeset that brings texts: its `Payload`, its `Texts` and its `Record`.
 const SECTIONS_WITH_TEXTS: u16 = 3;
+
+/// Every one of `texts` sent into `landing`'s `Payload` a content piece at a time, in order: the payload's identity,
+/// and each text's place in it.
+async fn sent_payload(
+  landing: &mut slates_store::owner::SlicedLanding,
+  texts: &[LandedText],
+) -> Result<([u8; 32], Vec<(u64, u64)>), Uncommitted> {
+  let mut hasher = blake3::Hasher::new();
+  let mut places = Vec::with_capacity(texts.len());
+  let mut at = 0u64;
+  for text in texts {
+    places.push((at, text.len));
+    let mut sent = 0u64;
+    while sent < text.len {
+      let piece = content_piece(text, sent).ok_or(Uncommitted::NotHeld)?;
+      if piece.is_empty() {
+        return Err(Uncommitted::NotHeld);
+      }
+      hasher.update(&piece);
+      sent = sent.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
+      landing
+        .part(piece)
+        .await
+        .map_err(|_| Uncommitted::Unstored)?;
+    }
+    at = at.saturating_add(text.len);
+  }
+  Ok((*hasher.finalize().as_bytes(), places))
+}
 
 /// [`land_changeset`]'s sliced landing.
 async fn land_sliced(
@@ -179,24 +219,7 @@ async fn land_sliced(
     .section(SectionKind::Payload, payload_len)
     .await
     .map_err(unstored)?;
-  let mut hasher = blake3::Hasher::new();
-  let mut places = Vec::with_capacity(texts.len());
-  let mut at = 0u64;
-  for text in texts {
-    places.push((at, text.len));
-    let mut sent = 0u64;
-    while sent < text.len {
-      let piece = content_piece(text, sent).ok_or(Uncommitted::NotHeld)?;
-      if piece.is_empty() {
-        return Err(Uncommitted::NotHeld);
-      }
-      hasher.update(&piece);
-      sent = sent.saturating_add(u64::try_from(piece.len()).unwrap_or(u64::MAX));
-      landing.part(piece).await.map_err(unstored)?;
-    }
-    at = at.saturating_add(text.len);
-  }
-  let payload = *hasher.finalize().as_bytes();
+  let (payload, places) = sent_payload(&mut landing, texts).await?;
   let entries: Vec<slates_store::texts::TextEntry> = texts
     .iter()
     .zip(places)

@@ -91,6 +91,59 @@ const SECTIONED_VERSION: u32 = 6;
 /// reference, never the changegroup: the log holds it once ([`write_push_reference`], [`reference_of`]).
 const REFERENCE_VERSION: u32 = 7;
 
+/// Format: the version of an import's segment record on the changeset log (A-767 C1 step 3; main's ruling of
+/// 2026-11-21 01:16): an [`IDENTITY_VERSION`] record of the revisions whose deltas lie in one segment of the import's
+/// changegroup (`crate::import::emit`), each log's group continuing the log where the segment before left it, the
+/// markers in the last segment alone. Its replay appends the rows as they are stored, by identity, with no text rebuilt,
+/// and is not held to an empty index nor checks each changeset's manifest: the run's segments replay in order into the
+/// repository's empty store, and the import checked every manifest before its entry named the run.
+const SEGMENT_VERSION: u32 = 8;
+/// Format: the version of an import's record in the repository's register once its history is on the changeset log
+/// (A-767 C1 step 3): the head, then the first and the last sequence of the run of segment changesets its import landed
+/// ([`write_run_reference`], [`run_of`]). The register holds this reference; the segments' records and payloads are
+/// the log's.
+const RUN_VERSION: u32 = 9;
+
+/// An import's run of segment changesets on the changeset log, as its register record names it ([`RUN_VERSION`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+  /// The room the import ran within.
+  pub room: u64,
+  /// The first segment's sequence.
+  pub first: u64,
+  /// The last segment's sequence.
+  pub last: u64,
+}
+
+/// The register's record of an import landed as the segment changesets `first` to `last` ([`RUN_VERSION`]).
+pub fn write_run_reference(room: u64, (first, last): (u64, u64)) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&RUN_VERSION.to_le_bytes());
+  out.push(Source::Import.byte());
+  out.extend_from_slice(&room.to_le_bytes());
+  out.extend_from_slice(&first.to_le_bytes());
+  out.extend_from_slice(&last.to_le_bytes());
+  out
+}
+
+/// The run a register record names, where it is an import's run reference ([`RUN_VERSION`]); `None` for any other
+/// record, a run whose last precedes its first, and a reference that does not read whole.
+pub fn run_of(bytes: &[u8]) -> Option<Run> {
+  let mut reader = Reader { rest: bytes };
+  let (version, source, room) = head(&mut reader).ok()?;
+  if version != RUN_VERSION || source != Source::Import {
+    return None;
+  }
+  let first = reader.long().ok()?;
+  let last = reader.long().ok()?;
+  (reader.rest.is_empty() && first <= last).then_some(Run {
+    room: room.left(),
+    first,
+    last,
+  })
+}
+
 /// A push's changeset on the changeset log, as its register record names it ([`REFERENCE_VERSION`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reference {
@@ -414,7 +467,7 @@ pub struct Writer {
   /// The logs, each its log's tag, a file log's path, and the number of the first revision the record holds of it: an
   /// import's, the changelog, the manifest log, then each file log in its path's order, each from its first; a push's,
   /// the logs it kept revisions in, each from its first kept.
-  logs: Vec<(u8, Vec<u8>, u32)>,
+  logs: Vec<(u8, Vec<u8>, u32, u32)>,
   /// The log being written, and its next revision.
   at: (usize, u32),
   /// The record so far.
@@ -424,14 +477,20 @@ pub struct Writer {
   /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`], an import's) or written whole (a
   /// push's, the tests' oracle).
   identities: bool,
+  /// Whether the record holds the index's markers (an import's whole record, or its last segment's).
+  markers: bool,
 }
+
+/// One log's revisions a record holds: its tag, a file log's path, the first revision and the one past the last
+/// (`u32::MAX`, the log's end as the index holds it when that part is written).
+type Logged = (u8, Vec<u8>, u32, u32);
 
 impl Writer {
   /// Starts the record of `index` (module docs): its head written, `room` the room the import ran within.
   pub fn begin(index: &HgIndex, store: &ContentStore, room: u64) -> Result<Writer, WriteRefused> {
     let mut logs = vec![
-      (CHANGELOG_TAG, Vec::new(), 0),
-      (MANIFEST_TAG, Vec::new(), 0),
+      (CHANGELOG_TAG, Vec::new(), 0, u32::MAX),
+      (MANIFEST_TAG, Vec::new(), 0, u32::MAX),
     ];
     logs
       .try_reserve(index.file_logs(store).count())
@@ -439,9 +498,29 @@ impl Writer {
     logs.extend(
       index
         .file_logs(store)
-        .map(|path| (FILE_TAG, path.to_vec(), 0)),
+        .map(|path| (FILE_TAG, path.to_vec(), 0, u32::MAX)),
     );
-    Writer::of(logs, (Source::Import, room), true)
+    Writer::of(logs, (Source::Import, room), (IDENTITY_VERSION, true))
+  }
+
+  /// Starts an import's segment record ([`SEGMENT_VERSION`]): `ranges` the revisions whose deltas lie in the segment,
+  /// each log's from its first to the one past its last, in the import's order; `markers` whether it is the last
+  /// segment, which holds the index's markers; `room` the room the import ran within.
+  pub fn begin_segment(
+    ranges: &[(Log<'_>, u32, u32)],
+    room: u64,
+    markers: bool,
+  ) -> Result<Writer, WriteRefused> {
+    let mut logs = Vec::new();
+    logs
+      .try_reserve(ranges.len())
+      .map_err(|_| WriteRefused::Allocation)?;
+    logs.extend(ranges.iter().map(|(log, first, end)| match log {
+      Log::Changelog => (CHANGELOG_TAG, Vec::new(), *first, *end),
+      Log::Manifest => (MANIFEST_TAG, Vec::new(), *first, *end),
+      Log::File(path) => (FILE_TAG, path.to_vec(), *first, *end),
+    }));
+    Writer::of(logs, (Source::Import, room), (SEGMENT_VERSION, markers))
   }
 
   /// Starts a push's record (A-680 part 2c, A-720) of the revisions it kept in `logs` (each a log and its first kept
@@ -456,36 +535,33 @@ impl Writer {
       .try_reserve(logs.len())
       .map_err(|_| WriteRefused::Allocation)?;
     kept.extend(logs.iter().map(|(log, first)| match log {
-      LogOf::Changelog => (CHANGELOG_TAG, Vec::new(), *first),
-      LogOf::Manifests => (MANIFEST_TAG, Vec::new(), *first),
-      LogOf::File(path) => (FILE_TAG, path.clone(), *first),
+      LogOf::Changelog => (CHANGELOG_TAG, Vec::new(), *first, u32::MAX),
+      LogOf::Manifests => (MANIFEST_TAG, Vec::new(), *first, u32::MAX),
+      LogOf::File(path) => (FILE_TAG, path.clone(), *first, u32::MAX),
     }));
-    Writer::of(kept, (Source::Push, room), false)
+    Writer::of(kept, (Source::Push, room), (VERSION, false))
   }
 
-  /// A writer of `logs` from `source`'s head.
+  /// A writer of `logs` from `source`'s head, of `version` (identities unless [`VERSION`]), with the index's markers
+  /// where `markers`.
   fn of(
-    logs: Vec<(u8, Vec<u8>, u32)>,
+    logs: Vec<Logged>,
     (source, room): (Source, u64),
-    identities: bool,
+    (version, markers): (u32, bool),
   ) -> Result<Writer, WriteRefused> {
     let mut out = Vec::new();
     out
       .try_reserve(HEAD_BYTES.saturating_add(LONG_BYTES))
       .map_err(|_| WriteRefused::Allocation)?;
-    let version = if identities {
-      IDENTITY_VERSION
-    } else {
-      VERSION
-    };
     write_head(&mut out, (version, source, room), to_u64(logs.len()));
-    let at = (0, logs.first().map_or(0, |(_, _, first)| *first));
+    let at = (0, logs.first().map_or(0, |(_, _, first, _)| *first));
     Ok(Writer {
       logs,
       at,
       out,
       done: false,
-      identities,
+      identities: version != VERSION,
+      markers,
     })
   }
 
@@ -495,20 +571,21 @@ impl Writer {
       return Ok(false);
     }
     let (at, rev) = self.at;
-    let Some((tag, path, first)) = self.logs.get(at) else {
+    let Some((tag, path, first, end)) = self.logs.get(at) else {
       let mut markers = Vec::new();
-      if self.imports() {
+      if self.markers {
         write_markers(&mut markers, index, store)
           .map_err(|number| WriteRefused::UnreadableMarker { number })?;
       } else {
-        // A push's record holds no markers (its obsmarkers are not taken yet): their count, none.
+        // A push's record holds no markers (its obsmarkers are not taken yet), nor an import's segment but its last:
+        // their count, none.
         markers.extend_from_slice(&0_u64.to_le_bytes());
       }
       self.put(&markers)?;
       self.done = true;
       return Ok(false);
     };
-    let first = *first;
+    let (first, end) = (*first, *end);
     let log = match *tag {
       CHANGELOG_TAG => Log::Changelog,
       MANIFEST_TAG => Log::Manifest,
@@ -519,7 +596,7 @@ impl Writer {
       MANIFEST_TAG => MANIFEST.to_vec(),
       _ => [DATA, path.as_slice()].concat(),
     };
-    let len = index.len(store, log);
+    let len = index.len(store, log).min(end);
     let mut part = Vec::new();
     if rev == first {
       write_group_head(&mut part, log, u64::from(len.saturating_sub(first)));
@@ -535,18 +612,13 @@ impl Writer {
     }
     if rev.saturating_add(1) >= len {
       let next = at.saturating_add(1);
-      self.at = (next, self.logs.get(next).map_or(0, |(_, _, first)| *first));
+      self.at = (
+        next,
+        self.logs.get(next).map_or(0, |(_, _, first, _)| *first),
+      );
     }
     self.put(&part)?;
     Ok(true)
-  }
-
-  /// Whether the record is an import's, whose markers it holds.
-  fn imports(&self) -> bool {
-    self
-      .out
-      .get(WORD_BYTES.saturating_mul(2))
-      .is_some_and(|source| *source == Source::Import.byte())
   }
 
   /// The record, once every part is written.
@@ -1266,6 +1338,8 @@ struct Revisions {
   formed: bool,
   /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`]).
   identities: bool,
+  /// Whether it is an import's segment ([`SEGMENT_VERSION`]): held to no empty index, no manifest checked.
+  segment: bool,
   /// The manifest replayed last and its text: the next one's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
 }
@@ -1289,6 +1363,31 @@ enum Kind {
   Revisions(Box<Revisions>),
   /// A push's changegroup as it arrived.
   Changegroup(Box<Retaken>),
+  /// A changeset's payload being framed, a chunk a step, before its intake begins ([`Replay::begin_sectioned`]).
+  Framing(Box<Framing>),
+}
+
+/// A changeset's changegroup being framed from its payload as far as its source holds it (`crate::framing`): the walk,
+/// what it has placed, and the room the push's intake ran within.
+struct Framing {
+  /// The walk.
+  walk: crate::framing::Framing,
+  /// What it has placed.
+  framed: crate::framing::Framed,
+  /// The room the push's intake ran within, each revision placed charged to it.
+  room: Admission,
+}
+
+/// Whether a changeset's replay has more to take ([`Replay::step_sectioned`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Progress {
+  /// More units follow.
+  More,
+  /// Every unit is taken: [`Replay::finish`] gives the fork.
+  Done,
+  /// The step needs these bytes of the payload, which its source does not hold: nothing was taken; put them in and
+  /// step again (`crate::framing::Window`).
+  Wanted(core::ops::Range<u64>),
 }
 
 /// A push's changegroup taken again through the intake (A-729 part 2).
@@ -1315,7 +1414,7 @@ impl Replay {
   ) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: bytes };
     let (version, source, room) = head(&mut reader)?;
-    if version == SECTIONED_VERSION || version == REFERENCE_VERSION {
+    if version == SECTIONED_VERSION || version == REFERENCE_VERSION || version == RUN_VERSION {
       // Its changegroup is the changeset's `Payload` section, not in these bytes: [`Replay::begin_sectioned`].
       return Err(Refused::Version { version });
     }
@@ -1334,16 +1433,12 @@ impl Replay {
   }
 
   /// Starts replaying a push landed on the changeset log (A-767 C4): `record` its `Record` section
-  /// ([`write_push_record`]), `payload` its `Payload` section, the changegroup as it arrived, taken again through the
-  /// live push's intake into a fork of `index`. Each [`Replay::step`] is then handed `payload`, read in place.
-  pub fn begin_sectioned(
-    record: &[u8],
-    payload: &[u8],
-    index: &mut HgIndex,
-    store: &mut ContentStore,
-  ) -> Result<Replay, Refused> {
+  /// ([`write_push_record`]), its changegroup the changeset's `Payload` section, read a piece at a time as the store
+  /// lends it (A-767 C1, R2: no payload held whole): framed a chunk a step, then taken again through the live push's
+  /// intake into a fork of the index ([`Replay::step_sectioned`]).
+  pub fn begin_sectioned(record: &[u8]) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: record };
-    let (version, source, mut room) = head(&mut reader)?;
+    let (version, source, room) = head(&mut reader)?;
     if version != SECTIONED_VERSION || source != Source::Push {
       return Err(Refused::Version { version });
     }
@@ -1354,21 +1449,69 @@ impl Replay {
     if !reader.rest.is_empty() {
       return Err(Refused::Trailing);
     }
-    let first = (
-      index.len(store, Log::Changelog),
-      index.len(store, Log::Manifest),
-    );
-    let intake =
-      Intake::begin((changegroup, payload), index, store, &mut room).map_err(Refused::Intake)?;
     Ok(Replay {
-      kind: Kind::Changegroup(Box::new(Retaken {
-        intake,
-        payload: 0..payload.len(),
+      kind: Kind::Framing(Box::new(Framing {
+        walk: crate::framing::Framing::new(changegroup, false),
+        framed: crate::framing::Framed::default(),
         room,
-        first,
-        done: false,
       })),
     })
+  }
+
+  /// Takes the next unit of a changeset's replay ([`Replay::begin_sectioned`]) from `payload`, its changegroup as far
+  /// as the source holds it: a chunk of its framing, then, once framed, its intake's units into a fork of `index`.
+  /// Refused, its owner gives the fork back ([`Replay::abandon`]).
+  pub fn step_sectioned<S: crate::framing::Source + ?Sized>(
+    &mut self,
+    payload: &S,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Progress, Refused> {
+    match &mut self.kind {
+      Kind::Framing(framing) => {
+        let Framing { walk, framed, room } = &mut **framing;
+        let mut sink = crate::framing::Collect {
+          framed,
+          admission: room,
+        };
+        match walk.step(payload, &mut sink) {
+          Ok(true) => Ok(Progress::More),
+          Ok(false) => {
+            let Framing { framed, room, .. } = *core::mem::replace(
+              framing,
+              Box::new(Framing {
+                walk: crate::framing::Framing::new(Version::V01, false),
+                framed: crate::framing::Framed::default(),
+                room: Admission::new(0),
+              }),
+            );
+            let first = (
+              index.len(store, Log::Changelog),
+              index.len(store, Log::Manifest),
+            );
+            let intake = Intake::begin_framed(framed, index, store).map_err(Refused::Intake)?;
+            self.kind = Kind::Changegroup(Box::new(Retaken {
+              intake,
+              payload: 0..0,
+              room,
+              first,
+              done: false,
+            }));
+            Ok(Progress::More)
+          }
+          Err(crate::framing::Halt::Wanted(wanted)) => Ok(Progress::Wanted(wanted.range)),
+          Err(crate::framing::Halt::Refused(refusal)) => {
+            Err(Refused::Intake(crate::push::intake::Refused::Unverified(
+              crate::push::verify::Unverified::Changegroup(refusal),
+            )))
+          }
+        }
+      }
+      Kind::Changegroup(retaken) => retaken.step_on(payload, store),
+      Kind::Revisions(_) => Err(Refused::Version {
+        version: SECTIONED_VERSION,
+      }),
+    }
   }
 
   /// Replays the next unit of `bytes`, the record [`Replay::begin`] was given, or the payload
@@ -1378,6 +1521,9 @@ impl Replay {
     match &mut self.kind {
       Kind::Revisions(revisions) => revisions.step(bytes, store),
       Kind::Changegroup(retaken) => retaken.step(bytes, store),
+      Kind::Framing(_) => Err(Refused::Version {
+        version: SECTIONED_VERSION,
+      }),
     }
   }
 
@@ -1386,6 +1532,7 @@ impl Replay {
     match self.kind {
       Kind::Revisions(revisions) => revisions.finish(index, store),
       Kind::Changegroup(retaken) => retaken.finish(index, store),
+      Kind::Framing(_) => Err(Refused::Truncated),
     }
   }
 
@@ -1394,6 +1541,8 @@ impl Replay {
     match self.kind {
       Kind::Revisions(revisions) => revisions.abandon(store),
       Kind::Changegroup(retaken) => retaken.intake.abandon(store),
+      // Framing makes no fork.
+      Kind::Framing(_) => Ok(()),
     }
   }
 }
@@ -1431,18 +1580,38 @@ impl Retaken {
     })
   }
 
-  /// Takes the next unit of the changegroup in `bytes`: whether more follow.
+  /// Takes the next unit of the changegroup in `bytes`, a record holding it whole: whether more follow.
   fn step(&mut self, bytes: &[u8], store: &mut ContentStore) -> Result<bool, Refused> {
-    if self.done {
-      return Ok(false);
-    }
     let payload = bytes.get(self.payload.clone()).ok_or(Refused::Truncated)?;
-    let stepped = self
+    match self.step_on(payload, store)? {
+      Progress::More => Ok(true),
+      Progress::Done => Ok(false),
+      // A record holds its changegroup whole: a want names bytes past its end.
+      Progress::Wanted(_) => Err(Refused::Truncated),
+    }
+  }
+
+  /// Takes the next unit of the changegroup, `payload` as far as its source holds it.
+  fn step_on<S: crate::framing::Source + ?Sized>(
+    &mut self,
+    payload: &S,
+    store: &mut ContentStore,
+  ) -> Result<Progress, Refused> {
+    if self.done {
+      return Ok(Progress::Done);
+    }
+    match self
       .intake
       .step(payload, store, &mut self.room)
-      .map_err(Refused::Intake)?;
-    self.done = stepped == Stepped::Done;
-    Ok(!self.done)
+      .map_err(Refused::Intake)?
+    {
+      Stepped::More => Ok(Progress::More),
+      Stepped::Done => {
+        self.done = true;
+        Ok(Progress::Done)
+      }
+      Stepped::Wanted(range) => Ok(Progress::Wanted(range)),
+    }
   }
 
   /// The fork in the index's place, what was replayed answered.
@@ -1493,7 +1662,8 @@ impl Revisions {
     index: &mut HgIndex,
     store: &mut ContentStore,
   ) -> Result<Revisions, Refused> {
-    if source == Source::Import && index.rows().rows() != 0 {
+    let segment = version == SEGMENT_VERSION;
+    if source == Source::Import && !segment && index.rows().rows() != 0 {
       return Err(Refused::NotEmpty);
     }
     let groups = reader.count(GROUP_MIN_BYTES)?;
@@ -1514,7 +1684,8 @@ impl Revisions {
       done: false,
       replayed: Replayed::default(),
       formed: version == DELTA_VERSION,
-      identities: version == IDENTITY_VERSION,
+      identities: version == IDENTITY_VERSION || segment,
+      segment,
       last: None,
     })
   }
@@ -1574,7 +1745,7 @@ impl Revisions {
       return self.group_head(reader, bytes);
     }
     let rev = self.check.unwrap_or(self.first);
-    if rev < self.fork.len(store, Log::Changelog) {
+    if !self.segment && rev < self.fork.len(store, Log::Changelog) {
       check_manifest(&self.fork, store, rev)?;
       self.check = Some(rev.saturating_add(1));
       return Ok(());
@@ -1822,6 +1993,8 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     IDENTITY_VERSION,
     SECTIONED_VERSION,
     REFERENCE_VERSION,
+    SEGMENT_VERSION,
+    RUN_VERSION,
   ]
   .contains(&version)
   {

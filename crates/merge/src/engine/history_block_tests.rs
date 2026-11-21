@@ -170,3 +170,353 @@ fn removed_then_folded(green: &mut Green, fourth: &[u8]) {
   assert_eq!(green.content_ref_at("f", 5).as_deref(), None);
   balanced(green);
 }
+
+/// A-803 (main 02:37, piece 3; w-fed-move's injection (b): the re-anchor walked every value of a changed path's history,
+/// so a path's k-th change cost O(k) while a reader pinned the floor). Do: create a 16 KiB file, then overwrite 8 bytes
+/// of it at a new offset in each of 300 versions, nothing folded. Expect: the last overwrite walks one value however
+/// long the history is (today: every value, 300); every version reads back exactly; the history owns only the bytes the
+/// overwrites replaced; the running totals equal their recount.
+#[test]
+fn a_length_preserving_change_walks_one_value_however_long_its_history() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 300;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first.clone()];
+  let mut walked_last = 0;
+  for version in 2..=VERSIONS + 1 {
+    let at = (version * 50) % (len - 8);
+    let bytes = [u8::try_from(version % 256).unwrap() ^ 0xa5; 8];
+    let before = green.history_reanchored_values();
+    let next = overwrite_long(&mut green, version, (at, &bytes), versions.last().unwrap());
+    walked_last = green.history_reanchored_values() - before;
+    versions.push(next);
+  }
+  assert_eq!(
+    walked_last, 1,
+    "the last overwrite walked {walked_last} values"
+  );
+  for (index, bytes) in versions.iter().enumerate() {
+    let version = u64::try_from(index).unwrap() + 1;
+    assert_eq!(
+      green.content_ref_at("f", version).as_deref(),
+      Some(bytes.as_slice()),
+      "version {version}"
+    );
+  }
+  assert_eq!(
+    green.history_owned_bytes(),
+    usize::try_from(VERSIONS).unwrap() * 8,
+    "only the overwritten bytes"
+  );
+  balanced(&green);
+}
+
+/// [`overwrite`] for a version past 255: the increment's identity carries the version's two low bytes.
+fn overwrite_long(
+  green: &mut Green,
+  version: u64,
+  (at, bytes): (u64, &[u8]),
+  previous: &[u8],
+) -> Vec<u8> {
+  let len = u64::try_from(bytes.len()).unwrap();
+  let mut inc = increment(0, version - 1, "f", &[(OpKind::Overwrite, at, len)], bytes);
+  inc.id[..8].copy_from_slice(&version.to_le_bytes());
+  let outcome = green.submit(&inc);
+  assert_eq!(outcome, Outcome::Accepted { version });
+  let mut next = previous.to_vec();
+  let from = usize::try_from(at).unwrap();
+  next[from..from + bytes.len()].copy_from_slice(bytes);
+  next
+}
+
+/// A generated step of [`the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints`]: a kind, a path,
+/// an offset share, a length and a fill byte.
+type Step = (u8, u8, u16, u8, u8);
+
+/// One twin of the oracle: a green, and whether it takes only the full re-anchor.
+struct Twin {
+  green: Green,
+  full: bool,
+}
+
+impl Twin {
+  /// `call` on the green, under the full re-anchor where this twin takes it alone.
+  fn run<R>(&mut self, call: impl FnOnce(&mut Green) -> R) -> R {
+    crate::history::FULL_REANCHOR_ONLY.with(|full| full.set(self.full));
+    let answer = call(&mut self.green);
+    crate::history::FULL_REANCHOR_ONLY.with(|full| full.set(false));
+    answer
+  }
+}
+
+/// The increment of `step` over the model's head file `bytes` at `path`, as version `version`; the file after it.
+fn step_increment(step: &Step, path: &str, version: u64, bytes: &[u8]) -> (Increment, Vec<u8>) {
+  let (kind, _, share, len, fill) = *step;
+  let file_len = bytes.len();
+  let at = if file_len == 0 {
+    0
+  } else {
+    usize::from(share) % (file_len + 1)
+  };
+  let len = usize::from(len % 24);
+  let mut next = bytes.to_vec();
+  let post = vec![fill; len];
+  if kind % 5 == 4 {
+    // A same-length replacement as an SDK edit composes it: a delete and an insert at one offset.
+    let len = len.min(file_len - at);
+    next[at..at + len].copy_from_slice(&post[..len]);
+    let ops = [
+      (OpKind::Delete, at as u64, len as u64),
+      (OpKind::Insert, at as u64, len as u64),
+    ];
+    let mut inc = increment(0, version - 1, path, &ops, &post[..len]);
+    inc.doc.ops[1].src = 0;
+    inc.id[..8].copy_from_slice(&version.to_le_bytes());
+    return (inc, next);
+  }
+  let (op, post): ((OpKind, u64, u64), Vec<u8>) = match kind % 4 {
+    // Overwrites most often, as agents' edits and the load harness's are.
+    0 | 1 => {
+      let len = len.min(file_len - at);
+      next[at..at + len].copy_from_slice(&post[..len]);
+      (
+        (OpKind::Overwrite, at as u64, len as u64),
+        post[..len].to_vec(),
+      )
+    }
+    2 => {
+      next.splice(at..at, post.iter().copied());
+      ((OpKind::Insert, at as u64, len as u64), post)
+    }
+    _ => {
+      let len = len.min(file_len - at);
+      next.drain(at..at + len);
+      ((OpKind::Delete, at as u64, len as u64), Vec::new())
+    }
+  };
+  let mut inc = increment(0, version - 1, path, &[op], &post);
+  inc.id[..8].copy_from_slice(&version.to_le_bytes());
+  (inc, next)
+}
+
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::prelude::ProptestConfig::default()))]
+
+  /// A-803's oracle (main 02:37, piece 3: "today's reanchor, on generated histories, through folds and checkpoints").
+  /// Do: create two files, then run generated histories of overwrites, inserts and deletes of either, folds of the
+  /// history and checkpoints restored, on a green taking the layered anchor and a twin taking only today's full
+  /// re-anchor. Expect: every outcome equal; after every step every file at every version the greens hold reads the
+  /// same in both and as the model's; both greens' running totals equal their recount.
+  #[test]
+  fn the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints(
+    steps in proptest::collection::vec(
+      (proptest::prelude::any::<u8>(), 0u8..2, proptest::prelude::any::<u16>(), proptest::prelude::any::<u8>(), proptest::prelude::any::<u8>()),
+      1..48,
+    ),
+  ) {
+    let paths = ["f", "g"];
+    let mut twins = [Twin { green: Green::new(), full: false }, Twin { green: Green::new(), full: true }];
+    let mut model: Vec<Vec<Vec<u8>>> = vec![vec![Vec::new(), Vec::new()]];
+    for (index, path) in paths.iter().enumerate() {
+      let version = u64::try_from(index).unwrap() + 1;
+      let bytes: Vec<u8> = (0..64u8).map(|n| n.wrapping_mul(7).wrapping_add(u8::try_from(index).unwrap())).collect();
+      let inc = increment(u8::try_from(version).unwrap(), version - 1, path, &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, 64)], &bytes);
+      for twin in &mut twins {
+        proptest::prop_assert_eq!(twin.run(|green| green.submit(&inc)), Outcome::Accepted { version });
+      }
+      let mut files = model.last().unwrap().clone();
+      files[index] = bytes;
+      model.push(files);
+    }
+    let mut floor = 0u64;
+    for step in &steps {
+      let head = twins[0].green.head();
+      match step.0 % 8 {
+        // A fold to a version at most a few behind the head.
+        6 => {
+          let to = head.saturating_sub(u64::from(step.2 % 4)).max(floor);
+          for twin in &mut twins {
+            twin.run(|green| green.fold_history_before(to));
+          }
+          floor = to;
+        }
+        // A checkpoint at the head, restored: the history starts again there.
+        7 => {
+          for twin in &mut twins {
+            let checkpoint = twin.green.checkpoint(head).unwrap();
+            twin.green = Green::restore(crate::origin::Origin::default(), &checkpoint);
+          }
+          floor = head;
+        }
+        _ => {
+          let which = usize::from(step.1);
+          let version = head + 1;
+          let files = model.last().unwrap().clone();
+          let (inc, next) = step_increment(step, paths[which], version, &files[which]);
+          let outcomes: Vec<Outcome> = twins.iter_mut().map(|twin| twin.run(|green| green.submit(&inc))).collect();
+          proptest::prop_assert_eq!(&outcomes[0], &outcomes[1]);
+          if matches!(outcomes[0], Outcome::Accepted { .. } | Outcome::Identical { .. }) {
+            let mut files = files;
+            files[which] = next;
+            model.push(files);
+          }
+        }
+      }
+      let head = twins[0].green.head();
+      proptest::prop_assert_eq!(head, twins[1].green.head());
+      for version in floor..=head {
+        let expected = &model[usize::try_from(version).unwrap()];
+        for (which, path) in paths.iter().enumerate() {
+          let layered = twins[0].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
+          let full = twins[1].green.content_ref_at(path, version).map(|bytes| bytes.into_owned());
+          proptest::prop_assert_eq!(&layered, &full, "{} at {}", path, version);
+          let want = (!expected[which].is_empty() || version > u64::try_from(which).unwrap())
+            .then(|| expected[which].clone());
+          proptest::prop_assert_eq!(&layered, &want, "{} at {} against the model", path, version);
+        }
+      }
+      for twin in &twins {
+        proptest::prop_assert_eq!(twin.green.retained_bytes().history, twin.green.history_bytes_recounted());
+      }
+    }
+    // Non-vacuity: the layered twin walked no more values than the full one (each walks one per change it takes).
+    proptest::prop_assert!(
+      twins[0].green.history_reanchored_values() <= twins[1].green.history_reanchored_values()
+    );
+  }
+}
+
+/// Submits a same-length replacement of `bytes` at `at`, composed as an SDK edit composes it (a delete and an insert at
+/// one offset), as version `version`; the file's new bytes.
+fn replace_long(
+  green: &mut Green,
+  version: u64,
+  (at, bytes): (u64, &[u8]),
+  previous: &[u8],
+) -> Vec<u8> {
+  let len = u64::try_from(bytes.len()).unwrap();
+  let mut inc = increment(
+    0,
+    version - 1,
+    "f",
+    &[(OpKind::Delete, at, len), (OpKind::Insert, at, len)],
+    bytes,
+  );
+  // The delete names no post-state bytes: the insert's are the increment's from its start.
+  inc.doc.ops[1].src = 0;
+  inc.id[..8].copy_from_slice(&version.to_le_bytes());
+  assert_eq!(green.submit(&inc), Outcome::Accepted { version });
+  let mut next = previous.to_vec();
+  let from = usize::try_from(at).unwrap();
+  next[from..from + bytes.len()].copy_from_slice(bytes);
+  next
+}
+
+/// A-809's leftover (b') (main 04:11, measured: an SDK edit's same-length replacement walked 5,100 values a change at a
+/// history of 5,000). Do: create a 16 KiB file, then replace 8 bytes of it in each of 300 versions as an SDK edit
+/// composes it, a delete and an insert at one offset. Expect: the last replacement walks one value; every version reads
+/// back; the history owns only the bytes replaced; the totals equal their recount.
+#[test]
+fn a_same_length_replacement_walks_one_value_however_long_its_history() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 300;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first.clone()];
+  let mut walked_last = 0;
+  for version in 2..=VERSIONS + 1 {
+    let at = (version * 50) % (len - 8);
+    let bytes = [u8::try_from(version % 256).unwrap() ^ 0x3c; 8];
+    let before = green.history_reanchored_values();
+    let next = replace_long(&mut green, version, (at, &bytes), versions.last().unwrap());
+    walked_last = green.history_reanchored_values() - before;
+    versions.push(next);
+  }
+  assert_eq!(
+    walked_last, 1,
+    "the last replacement walked {walked_last} values"
+  );
+  for (index, bytes) in versions.iter().enumerate() {
+    let version = u64::try_from(index).unwrap() + 1;
+    assert_eq!(
+      green.content_ref_at("f", version).as_deref(),
+      Some(bytes.as_slice()),
+      "version {version}"
+    );
+  }
+  assert_eq!(
+    green.history_owned_bytes(),
+    usize::try_from(VERSIONS).unwrap() * 8,
+    "only the replaced bytes"
+  );
+  balanced(&green);
+}
+
+/// A-809's leftover (a) (main 04:11, measured: a read of version 1 took 5.7 µs after 10 overwrites of one range and
+/// 191 µs after 10,000). Do: create a 16 KiB file, overwrite the same 64 bytes of it in each of 1,000 versions, then read
+/// version 1 whole. Expect: the read examines a layer or two at that offset, not one a version (the lowest numbered at
+/// or after its epoch gives every byte there), and reads back exactly; so does every 100th version.
+#[test]
+fn a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_overwritten() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 1_000;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first.clone()];
+  for version in 2..=VERSIONS + 1 {
+    let bytes = [u8::try_from(version % 256).unwrap(); 64];
+    let next = overwrite_long(
+      &mut green,
+      version,
+      (4096, &bytes),
+      versions.last().unwrap(),
+    );
+    versions.push(next);
+  }
+  let before = green.history_layers_examined();
+  assert_eq!(
+    green.content_ref_at("f", 1).as_deref(),
+    Some(first.as_slice())
+  );
+  let examined = green.history_layers_examined() - before;
+  assert!(
+    examined <= 2,
+    "reading version 1 examined {examined} layers"
+  );
+  for version in (1..=VERSIONS + 1).step_by(100) {
+    let index = usize::try_from(version - 1).unwrap();
+    assert_eq!(
+      green.content_ref_at("f", version).as_deref(),
+      Some(versions[index].as_slice()),
+      "version {version}"
+    );
+  }
+}

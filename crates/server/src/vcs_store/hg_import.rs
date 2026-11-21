@@ -595,6 +595,8 @@ fn place(
     return Err(Box::new((ImportFailed::NotEmpty, index)));
   }
   let empty = core::mem::replace(&mut store.index, index);
+  // An imported history is held outside the changeset store until imports land as changesets (C1 step 3).
+  store.unstored = true;
   let released = empty.release(content).is_ok();
   stores.index_changed(id);
   Ok(released)
@@ -618,6 +620,8 @@ pub(crate) fn place_imported(
         state.count(RELEASE_REFUSED, 1);
       }
       settle(state);
+      // An imported index is built whole: its runs merged a slice at a time (goal 93's pull).
+      super::index_upkeep::built(state, id);
       Ok(())
     }
     Err(refused) => {

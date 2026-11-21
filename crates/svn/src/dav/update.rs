@@ -74,6 +74,8 @@ enum Stop {
   Full,
   /// The writer refused a call.
   Refused,
+  /// The drive waits for a text's piece its repository reads asynchronously (C2 stage B part 2).
+  Waiting(crate::reads::Wanted),
 }
 
 /// The repository as an update-report's walk reads it, lent for one slice.
@@ -227,6 +229,7 @@ impl UpdateWalk {
           }
         }
         Next::Paused => {}
+        Next::Waiting(wanted) => break Stop::Waiting(wanted),
         Next::Ended => break Stop::Ended,
       }
       writer.take_written(&mut written);
@@ -253,6 +256,13 @@ impl UpdateWalk {
         self.begun = true;
         out.extend_from_slice(&written);
         ReportProgress::More
+      }
+      (Stop::Waiting(wanted), _) => {
+        writer.take_written(&mut written);
+        self.writer = Some(writer);
+        self.begun |= !written.is_empty();
+        out.extend_from_slice(&written);
+        ReportProgress::Waiting(wanted)
       }
       (Stop::Ended, None) => {
         writer.take_written(&mut written);

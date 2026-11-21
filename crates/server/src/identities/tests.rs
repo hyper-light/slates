@@ -15,7 +15,7 @@ use slates_wire::request::{RequestId, Seen};
 
 use super::{READ, Resumed, record, set_on_channel, with_session};
 use crate::state::{ClientSlot, ShardState};
-use crate::verbs::{Served, dispatch};
+use crate::verbs::Served;
 
 /// Shape: the client ids the session tests seat, on audit daemons that seat none of their own.
 const FIRST_SESSION: u32 = 41;

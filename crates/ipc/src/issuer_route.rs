@@ -222,7 +222,8 @@ impl IssuerRoute {
       });
     }
     with_patience(peer, patience)?;
-    let deadline = std::time::Instant::now() + patience;
+    let now = std::time::Instant::now();
+    let deadline = now.checked_add(patience).unwrap_or(now);
     let mut offered = [0u8; SECRET_BYTES];
     let mut read = 0usize;
     while read < SECRET_BYTES {
@@ -277,7 +278,8 @@ pub fn claim(
   )
   .map_err(|e| refused("socket", e))?;
   with_patience(&socket, patience)?;
-  let deadline = std::time::Instant::now() + patience;
+  let now = std::time::Instant::now();
+  let deadline = now.checked_add(patience).unwrap_or(now);
   rustix::net::connect(&socket, &address(name)?).map_err(|e| refused("connect issuer", e))?;
   let sent = uninterrupted(deadline, || {
     rustix::net::send(&socket, secret, SendFlags::NOSIGNAL)

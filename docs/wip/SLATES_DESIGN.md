@@ -12297,10 +12297,10 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
-> A stored text a later revision moves past is deltified (A-761's deltify job, main's ruling, form (A)): made a skip-delta
-> svndiff a window a slice (`vcs_store::svn_deltify`), landed as its own entry (`Record::Deltified`, the delta held by the
-> records as every other text is), then its store hold given back; a replay holds the texts still stored after its
-> whole log.
+> A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
+> part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
+> the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
+> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
@@ -57759,8 +57759,11 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > store is `crate::test_store` (main's ruling 1's helper). Part 2a (2026-11-21): a daemon without `--vcs-store`
 > refuses a git repository's creation, `Unsupported` naming the flag, as it refuses Mercurial's and Subversion's (one
 > rule for the three tools), and git's tests run on store-backed daemons through that helper; a rebuild on a node whose
-> store holds the changeset reads it from there, not from the region. Owed (part 2b): versions 2 and a sequence of 0
-> gone (a homing or landing that falls short refuses the push); the replay's pack read a piece at a time through
+> store holds the changeset reads it from there, not from the region. Part 2b piece 1 (2026-11-21): a client's push
+> writes version 5 alone, any shortfall of its homing or landing (or names changed since the homing) refusing it
+> `Unlanded` for its client's retry; an append that brings no object names none. Piece 2: an ask no edge takes refuses
+> the push as well, so a client's push never writes version 2. Owed: server-made commits (A-664) still write version 2
+> until they take the deferred submit's landing order (piece 3); the replay's pack read a piece at a time through
 > `StorePacks`.
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
@@ -57855,6 +57858,27 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `land_then_record` runs). Recovery applies only the sequences the register names (decision 2), as C4's replay already
 > did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
 > hg test on the helper. Git's create follows as its C item lands.
+
+> **Status (2026-11-21, C1: a changeset replayed from its payload a piece at a time; R2's replay half).** A replay
+> holds no payload whole. `slates_hg::framing` is the one walk of a changegroup's chunks (7.2's `changegroup.py`
+> order), over a `Source` that answers a range or `Wanted`: a slice never wants (a push's bundle, a whole decoding,
+> which counts in one walk and builds in a second, charged exactly between), and a `Window` holds a forward run its
+> driver fills. A step reads only from where it began and changes nothing on a want, so the driver lets go of what is
+> before the want and steps again. The intake reads each delta through it (`Stepped::Wanted`; a file group opens in
+> a step of its own, its path kept), and `record::Replay::begin_sectioned` / `step_sectioned` frame a changeset's
+> payload, then take it. The server fills the window from `StoreHandle::piece` (`vcs_store::fill_window`) for both
+> recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
+> fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
+
+> **Status (2026-11-21, C1 step 3, first part: an import written as a push's changegroup).** `slates_hg::import::emit`:
+> as the import walks a repository's revlogs (changelog, manifest log, each file log: a changegroup's order), it
+> writes each revision as its revlog stores it, the chunk against its delta parent (7.2's `deltaparent`: none for a
+> full snapshot, the base under generaldelta, else the revision before), a full snapshot as its text against the null
+> base, so nothing is diffed or rebuilt to write it. The stream is cut into segments of at least a bound, only between
+> chunks, each naming its texts (identity, length, delta parent's identity, place) as a push's `Texts` section does.
+> The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
+> (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
+> replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58866,6 +58890,485 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
   still re-sends the content. Next: the content placed ahead and stored once by identity, the record naming it rather
   than holding it, so the owner's durable step is small.
 
+### A-801 — A green owner's asks counted by kind and its answers timed by kind; the load harness reports the server nodes' merge counters (2026-11-21, w-fed-move, goal 86b; main's order 00:48 PST, the throughput walls; A-247, A-797)
+- **Why.** At 100,000 clients on one primary and two replicas the green's owner was asked 10,141,852 times (about a
+  hundred asks a client) and verdicts held at 153 a second, but no counter named which asks or where the owner's time
+  went, and the load harness printed only the client node's counters, while the owner's work is on the primary.
+- **Change.** `crates/server/src/work_home.rs`: every ask is counted by its kind beside the total
+  (`merge.work.asked_owner.<files|lengths|page|sizes|verdict|rebase|admit|name>`), and the owner times each answer by
+  kind (`merge.work.answered.<kind>`, `..._ns`). `crates/client/examples/load_bench.rs`: `--report-instances` prints
+  each named node's merge counters (`server_counter` rows); `crates/cli/tests/load_scale.rs` passes its three servers.
+- **Measured** (release, in-process daemon, this Mac Studio, 2026-11-21 ~01:00, the kernel's `kernel/` directory, 754
+  files, 1,000 clients, one round, `--per-connection 32 --hot-files 300`, oracle clean, 6,040 verdicts a second):
+  17,545 asks, 17.5 a client. By kind: lengths 7,736 (2.6 µs each to answer), files 3,173 (5.1 µs), verdict 2,458
+  (41.2 µs), rebase 2,256 (17.9 µs), admit 968 (1.6 µs), name 954 (5.6 µs). The owner spends about 185 ms answering
+  in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
+  and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
+  works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.
+
+### A-802 — A destroy asks its tenant's volume count, kept with the records, instead of collecting every volume of the partition; the load harness injects what grows at scale (2026-11-21, w-fed-move, goal 86b; main's order 01:41 PST; A-92's tenant erase)
+- **How it was found.** Main's order: inject into the 1,000-client stand-in, one at a time, the three things that only
+  grow at scale, and see which one's cost grows. The load harness gained the injections: `--idle-works M` (M works made
+  before the run and kept idle, pinning the floor), `--preload V` (V versions committed before the run, folded unless
+  idle works hold the floor), `--lagged-submit` (each idle work submits after the run, its base everything behind), and
+  the owner's per-kind counters printed after each phase (A-801). Release, in-process, this Mac Studio, the kernel's
+  `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32 --hot-files 300`, 2026-11-21:
+  - (a) bases behind: 1,000 idle works submitting from bases 10, 100 and 1,000 versions behind (up to about 2,700 by the
+    last of them): the verdict 28.5, 22.9 and 25.9 µs, submit p50 384, 332 and 334 µs. Flat.
+  - (b) history: 10^4 versions ahead, folded: verdict 63.4 µs, 3,713 verdicts/s; unfolded: 46.7 µs, 6,260/s; 10^5
+    unfolded: 89.5 µs, 5,217/s; the preload's own cost flat at 300 to 470 µs a version. The verdict grows about twice
+    over 10^5 versions; nothing else.
+  - (c) works pinning the floor: 10^3 idle works: verdict 41.5 µs, 6,513/s, cycle p99 150 ms; 10^4: verdict 84.0 µs,
+    lengths 6.9 µs (2.5 before), rebase 32.9 µs, 2,506/s, cycle p99 501 ms. Every kind of answer two to three times
+    slower: the one that grows. Sampled, the works' shards were in `erase_volume_keys` under `destroy_volume`:
+    `Art::collect` of the partition's volume records.
+- **Why.** A destroy erases its tenant's sealing key with its tenant's last volume (A-92), and to know whether it was
+  the last, it collected every volume record of the partition and scanned them: each work's destroy cost O(volumes
+  held), at the 100k rung up to 100,000 records a destroy.
+- **Change.** `crates/db/src/partition.rs`: `tenant_volumes`, each tenant's volume count, kept by `insert_volume` and
+  `remove_volume` (the only two ways a record comes and goes, a snapshot's restore included); `erase_volume_keys` asks
+  it.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-db --test model
+  a_destroys_cost_does_not_grow_with_the_partitions_other_volumes` (64 destroys beside 8,192 other volumes against
+  alone: 171.7 ms against 1.33 ms before, 129 times for 128 times the volumes; within 4 times after);
+  `a_tenants_key_is_erased_with_its_last_volume_on_the_partition` still passes; `cargo test -p slates-db` all pass.
+- **A/B by use** (same stand-in, 10^4 idle works): verdicts 2,506 to 5,956 a second, verdict 84.0 to 44.2 µs, rebase
+  32.9 to 20.3 µs, lengths 6.9 to 3.2 µs, cycle p99 501 to 212 ms; 10^3 idle works after: 5,697/s. Flat in M now. The
+  history's verdict growth (b) is the next candidate; main's rerun (r48) confirms on the topology.
+
+### A-722 amended — A push refused after its body is answered in git's words, never a cut connection (2026-11-21, w-git for UI goal 93; main's priority 01:31 PST and ruling 01:56 PST; found by use, w-interop)
+
+**Found.** A whole-history push of git/git (611 MB) over the HTTP edge failed 6 of 6, cut off at 57 to 63 s with
+curl's error 18 and no word of why. A diagnostic build on Studio-2 (base 94ff89fe5) logged the body read whole in
+2.8 s, the answer kept alive for 45 s, then the answer's step refused `PastAdmission` and the exchange failed `413`.
+The reply's `200` head had gone out before the body was read (A-722's `StatusMode::AtHead`, as `http-backend` writes
+its own), so the engine could only end the connection short.
+
+**Rule.** A push refused once its body was read whole (its checks, seal, decision, homing or landing, or the wait for
+its records at `f + 1`) is answered in git's words, and the reply ends cleanly:
+- under side-band-64k, on band 3, git's band for a fatal error after which the stream ends (`sideband.c`'s "remote
+  error");
+- without it, when a report was asked, as git reports a pack its unpacking refused: `unpack <words>`, each command
+  `ng <ref> <words>`, a flush (`slates_git::receive::write_refused_report`). The commands' names are kept for that
+  case alone, charged to the push's room, since the request moves on through the answer.
+
+The words are the SSH site's, now one module both edges write (`crate::git_push::words`). A refusal while the body is
+still read still cuts the connection, as git's own does when receive-pack dies while `http-backend` pipes it the body.
+Counted `vcs_http.git.push_refused_after_body`.
+
+**Test.** `vcs_http::git::receive::tests`: the site's exchange on a stored daemon's shard, its shard fenced for the
+one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, nothing answered, nothing counted). Green
+2 of 2.
+
+**Layer 2, measured, open.** The refusal itself was the pack's checks: one charge of 485,230,824 bytes asked with
+300,809,433 left, the connectivity walk's edge table (`receive::connect`, `begin_edges`, a `usize` for every tree
+entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
+are to work a slice at a time over the pack held once (GAPS).
+
+**Layer 2, piece 1: the connectivity check charges its objects, never its edges** (`slates_git::receive::connect`).
+- The first pass reads each pushed object once and judges its own edges out of the pack.
+- When no object is incomplete of its own, no tip can reach one, so every pushed tip is complete and the walk ends
+  there. That covers every push of a complete history, git/git's included, and needs no second read and no table but
+  one state per object.
+- Otherwise the worst state is carried back from each pushed tip, depth first. Each object is read once more as it is
+  opened, and each child's state is folded into the exit frame of the object that opened it. The stack holds the open
+  path and the children it waits on, charged as it grows: bounded by the history's depth times its widest object,
+  never by its edges.
+- Red: 322 objects and 16,449 edges within 8 bytes an object asked 134,176 bytes with 2,254 left. Green.
+- A-719's turn test now asks two turns an object (fsck and the first pass), since a complete push has no propagation.
+
+Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
+`crates/git/src/receive/tests/session.rs`.
+
+**Layer 2, piece 2: a decision step reckons its stage's room from counts** (`slates_git::store::Push::commit_parts`,
+`Repository::stage_room`, `crate::vcs_store::SealedPush::restage_turn`).
+- Found: with the checks fixed, git/git's push landed its changeset and then decided its 1,027 refs at about 0.5 ms a
+  step, unanswered after 1,200 s. A stack sample put 3,408 of 3,620 busy samples in a fold over the push's commits:
+  every decision step first asks whether the push's stage must be made again (A-722 part 4e), and that reckoned the
+  stage's room by a pass over every commit pushed, about 75,000.
+- Now the push keeps the parents its commits name as they arrive, and the room is two counts. A step with no stage due
+  reckons no room at all. Measured on the same push: about 30 µs a decision step.
+- The next wall, measured and owed (GAPS): creating a ref whose head descends from no green's head walks the whole
+  history it reaches for that green's reached set (A-614), so deciding many old tags is about refs times history.
+
+Also applied to: `crates/git/src/store/push.rs`, `crates/git/src/store/repository.rs`,
+`crates/server/src/vcs_store.rs`.
+
+Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
+`crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
+`crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
+
+### A-803 — The verdict's growth with history named: the re-anchor walks every value of a changed path (2026-11-21, w-fed-move, goal 86b; main's order 02:11 PST, injection (b); A-793, A-802)
+- **Why.** Injection (b) of A-802 (a long history ahead of the 1,000-client stand-in, held unfolded by one idle work)
+  doubled the owner's verdict over 10^5 versions. `2c32af2b5` (A-787 part 2, the re-anchor's remap indexed) was in
+  the build measured, so it is not that scan.
+- **Change.** Counters only: `merge.reanchor.values_walked` (the history values a submit's commit re-anchored,
+  `Green::history_reanchored_values`) and `merge.submit.secure` / `_ns` (the retention a submit secures before its
+  verdict, timed); the load harness prints them after each phase.
+- **Measured** (release, in-process, this Mac Studio, 2026-11-21 ~02:40, `kernel/` (754 files), 1,000 clients, one
+  round, `--per-connection 32 --hot-files 300 --idle-works 1`): preload 0, 10^4, 10^5 versions: judge 24.0, 31.7, 70.9
+  µs; values re-anchored a verdict 7.9, 30.2, 231.4; compose 57.1, 54.3, 50.3 µs; secure 1.0, 1.3, 1.0 µs; append
+  about 5 µs. The growing step is the re-anchor (about 0.2 µs a value walked): a change rewrites every value of its
+  path's history (A-793), so a path's k-th change costs O(k) while a reader pins the floor.
+- **At the 100k rung** a path's history is short (about 31,000 accepts of four edits over 42,000 hot files, a few
+  values a path), so this is not that rung's wall; it is the wall of a long-lived hot file. The fix's design (an
+  indirection so a length-preserving change moves only the pieces it overwrote) is with main before it is built.
+
+### A-804 — A server-made commit is answered only after its changeset landed and its version and register entry committed together (2026-11-21, w-rewrite-ops; main 01:52 PST, the deferred-submit hook; main's landing order of inbox/w-svn-from-main-c2-made.md; C2, A-664, A-252)
+Applied in the same change to: `crates/server/src/made_commit.rs` (new: the hook), `crates/server/src/verbs.rs`
+(`AcceptedParts`, `commit_accepted`, the turn taken in `submit`, `owner_judge` and the node's owner verb, `park_on_turn`),
+`crates/server/src/vcs_store/svn_made.rs` (`make_deferred`, module docs), `crates/server/src/repository/svn_commit.rs`
+(`land_made` takes its caller's commit, `MadeEntry`), `crates/server/src/state.rs`, GAPS (C2).
+- **Why.** A version a work submitted to a Subversion repository's green was durable and answered in the submit's step;
+  its revision was landed and named by the register later, by a task. So the client was answered before its revision
+  stood, and a `kill -9` between the two left the version with no revision (every later `svn commit` refused, the green
+  past its records' youngest revision) or, retried, made it twice.
+- **What.** Main's order: check, the store lands, the register commits naming the sequence, the answer. A recorded
+  submit to such a green takes the repository's landing turn before its verdict, or parks until a task holding the turn
+  runs it again (bounded by the shard's client seats, as a whole build's parked submits are). The verdict applies in
+  memory; nothing of the accept is durable in the submit's step. The made task makes the revision, lands it on the store
+  at the register's next sequence, then commits in one transaction the version's chain entry and what goes with it, the
+  register's entry naming the sequence, the local work's settle and the request's completion, and answers on the
+  request's route. A store's refusal gives the accept up: the green is made again from its durable chain and the request
+  is answered `Overloaded`, unrecorded, so its retry runs. A check that refuses the revision commits the version alone,
+  counted `UNMADE`, as before.
+- **A crash.** Before the step's commit the register names no new sequence and no version is durable, so recovery
+  restores the state before; the changeset at the unnamed sequence is the retry's landing place, which replaces it, so
+  the retry lands once.
+- **Red, then green.** `repository::svn_commit::tests`: the submit's own step answered with the green's durable head at 1
+  before the landing (now nothing answered, head 0, then answered with head 1 and the register at two entries); after a
+  kill between the landing and the commit the version stood with no revision (now head 0, revision 0, unanswered; the
+  retry lands revision 1 once); a submit meeting a held turn ran at once (now it waits and lands when the turn is given
+  back).
+- **Owed** (GAPS C2): the verdict computed pure and committed by position after the land, so reads never see the version
+  before it is durable; a bare dispatch's submit; Mercurial's made changeset; git adopts the hook (w-git).
+
+### A-805 — A server-made commit's verdict is held with its landing and shown to no reader before its one commit (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 1; the landing order's "never expose a revision that was never committed"; A-804, A-635, A-658)
+Applied in the same change to: `crates/merge/src/engine/branch.rs` (`Lineage::preview`, `LineageRefused::Moved`),
+`crates/server/src/greens.rs` (`Greens::preview`, `with_preview`, `retire_preview`), `crates/server/src/verbs.rs`
+(`verdict_of`'s held verdict, `held_outcome`, `apply_accepted`), `crates/server/src/made_commit.rs`,
+`crates/server/src/vcs_store/svn_made.rs` (`revision_held`, `revision_from`), `crates/server/src/repository/svn_commit/landing.rs`
+(a test's refusing store), GAPS (C2).
+- **Why.** A-804 applied the verdict to the green in the submit's step and committed it after the landing, so a read
+  during the landing saw a version that a crash or a refused landing then took back.
+- **What.** With the repository's landing turn held, the verdict is judged and held (`Green::judge`,
+  `judge_computed`), nothing applied. The revision is read from a preview: a branch of the green's lineage at its head
+  (O(1), A-534) with the held verdict committed into it as its version 1, which reads as the green will once the verdict
+  commits; it is retired in the submit's step. At the one commit the verdict is applied to the green as its chain entry
+  records it (`Green::apply_recorded`, what a recovery replays), refused where the green moved since, then the durable
+  parts follow in the same step. A refused landing leaves the green as it was: the secured retention is credited back.
+- **Red, then green.** `repository::svn_commit::tests`: a read of the green in the submit's step saw head 1 and the
+  work's bytes (now head 0, no file, then head 1 with the bytes once committed); a refused landing had been seen in the
+  submit's step (now nothing, and its retry lands once). `engine::branch::tests`: a held verdict's preview reads as its
+  commit (file, identity, changed paths) while its green shows nothing, and a preview of a moved green is refused.
+- **Cost.** The preview's branch is O(1) and its release is the version's own nodes; the mapped files are made twice
+  (owed, GAPS C2 (d)).
+
+### A-806 — A rebase answers each changed file as parts over the head, and a work holds and logs those parts: a work's log is what it wrote (2026-11-21, w-fed-move, goal 86b; main's order 02:37 PST, the 300 MB work log; CLAUDE.md §2 item 8; A-207, A-790)
+- **Why.** At 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its
+  partition's merge budget (A-797's diagnosis line). Named at small scale with a new peak
+  (`merge.work.log_peak_bytes`, `_entries`, the largest work log a partition has held): 1,000 clients, release,
+  in-process, over `kernel/` 752,530 bytes in 7 entries, over `drivers/gpu/drm/amd/include/asic_reg` (512 headers of
+  about 1 MB) 35,249,811 bytes in 8 entries, for 64-byte edits. A rebase answered each file a work still changed
+  whole (`RebaseAnswer::Rebased.changed`), the work held it whole (`WorkFiles::from_changed`), and its restatement
+  (A-207) logged it whole: one small edit of a large file cost the file in memory and in the partition's merge budget,
+  again at every rebase.
+- **Change.** `crates/server/src/work_files.rs`: `HeldParts` (a held file's origin, pieces, written bytes and
+  length) with `WorkFiles::from_parts` / `parts`, and `parts_over_base`: a rebased file as parts over the head's same
+  path, its common prefix and suffix base pieces and, for a same-length file, the equal runs worth a piece kept as
+  base pieces too, compared a page at a time (`equal_run`, `equal_tail`). `RebaseAnswer::Rebased.changed` carries
+  parts (made in `rebase_answer`, kept through `apply_replacement`); `crates/server/src/work_log.rs`: a restatement's
+  own file is its parts (`LoggedParts`), and replay rebuilds the work from them over its base.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --test work_edit_cow
+  a_rebased_works_log_holds_what_it_wrote_not_the_file` (a 64-byte write into a 1 MiB file, rebased: the work's log
+  1,048,635 bytes before, within 64 + 1,024 after, reading back its write). The parts oracle
+  `a_rebased_files_parts_read_back_as_the_file` (generated overwrites, inserts and deletes: read back exactly, never more
+  written than the file, nothing written for an unchanged file) and
+  `an_overwrite_of_a_large_file_is_its_written_bytes_over_the_base`. `work_cow`, `mounted_work_cow`, `merge_load`,
+  `green_post_state`, `verdict_pages`, `works_off_owner`, the fleet's rebase/check/merge tests, `--lib work_home
+  work_log work_files verbs::tests` pass. `daemon`'s `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`
+  fails on main without this change (it expects a green's landing refused; A-774 part 3, `f401f798c`, made a green
+  landable): reported to main.
+- **A/B by use** (same stand-in): the largest work log over `kernel/` 752,530 to 2,036 bytes, over `asic_reg`
+  35,249,811 to 1,957 bytes (2,124 and 2,434 in two more runs); oracle failures 0. Verdicts a second on `asic_reg`
+  were not comparable on the shared machine at the time (1,138 before; 1,703 and 134 after, load average 8, swap
+  96 of 97 GB).
+
+### A-807 — Mercurial's made changesets take the deferred-submit hook (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 2: "one hook, three tools"; A-731, A-804, A-805)
+Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the repository's tool chosen per green),
+`crates/server/src/vcs_store/hg_made.rs` (`make_deferred`, `made_step`; module docs), GAPS (C2 (c)).
+- **What.** A recorded submit to a Mercurial repository's green takes the repository's landing turn before its verdict
+  (or parks for it, as a Subversion one does), its verdict is held (A-805), and a task holding the turn makes one step:
+  the verdict applied, the version's durable parts, the changeset made of the version and its register entry, the
+  work's settle and the completion, then the answer. A bare dispatch keeps the step it had.
+- **Red, then green.** `vcs_store::hg_made::tests`: the submit's own step answered with the green's durable and engine
+  heads at 1 and the made changeset the line's head (now unanswered, heads 0, no changeset, then all of them after the
+  one step); a submit meeting a held turn ran at once (now it waits and commits once the turn is given back).
+- **Owed** (GAPS C2): the made changeset's record lands in the register's entry, not first on the node's store as a
+  push's does (a made reference and its replay, with w-hg), and a client's push takes no landing turn.
+
+### A-808 — An edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched (2026-11-21, w-fed-move, goal 86b; main's order 03:16 PST: owner asks per client grow with scale; A-247, A-801)
+- **How it was found.** Owner asks per client were 17.5 at 1,000 clients and about 101 at the 100k rung. Contention
+  injected into the 1,000-client stand-in (release, in-process, `kernel/`, one round, `--per-connection 32`), the
+  hot set narrowed: 300, 100, 30, 10 hot files gave 17.5, 23.1, 38.7, 69.4 asks a client; rebases 2.3, 3.9, 9.7, 22.2
+  a client. Counted by the verb that asked (`merge.work.base_ask.<verb>.<files|lengths>`): at 300 hot files edits
+  asked 7.9 lengths a client, at 10 hot files 18.1, and rebases asked 1.6 then 15.0 files a client. An edit asked its
+  file's length whenever the work did not hold the file, though the work keeps each touched path's base entry (A-247:
+  `WorkState::entries`, always at its current base), which names that length; and a rebase gave entries only for the
+  paths its restated journal named, so a path whose change became the head's (a conflict resolved by taking the head's
+  bytes) lost its entry.
+- **Change.** `crates/server/src/work_files.rs`: `Base` carries the work's kept entries, and `Base::len` reads a length
+  there when neither the green nor the verb's fetch has it (`entry_len`); `crates/server/src/work_home.rs`: an edit of
+  a path whose entry the work keeps asks nothing (counted `merge.work.length_from_entry`), and base asks are counted by
+  the verb that asked them; `crates/server/src/verbs.rs` `rebase_answer`: the entries of every path the increment
+  touched, beside those its journal names.
+- **Tests** (macOS arm64, Mac Studio, local). Red first, `slates-server --test works_off_owner
+  an_edit_after_a_rebase_reads_its_files_length_from_the_kept_entry` (a work off its green's shard, its change to `f`
+  made identical to the head, rebased, then editing `f` again: one length asked before, none after, counted from the
+  entry, both writes read back). `works_off_owner` (17), `merge_load`, `work_cow`, `work_edit_cow`, `green_post_state`,
+  `verdict_pages`, the fleet's holder/rebase/work tests (49) and `--lib work_home work_files work_log verbs::tests`
+  pass.
+- **A/B by use** (same stand-in): at 300 hot files asks 17.5 to 14.1 a client (lengths 7.7 to 4.8); at 10 hot files
+  69.4 to 48.5 (lengths 18.1 to 4.7): the length asks now flat in contention, the first edits' alone. Oracle failures 0;
+  at 10 hot files 4 clients starved past the harness's 64 resolutions a round (1 in each run before, that contention's
+  own). Open: a rebase still asks files (13.8 a client at 10 hot files), for the paths its journal names that the work
+  no longer holds (a change identical to the head), whose base bytes its next composition reads.
+
+### A-809 — A length-preserving change takes its path's anchor through a layer and walks one value (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 3; fixes A-803 by w-fed-move's option 1; A-793, A-787 part 2)
+Applied in the same change to:
+- `crates/merge/src/history.rs`: `Layers`, `Layer`, `Piece::epoch`, `overlay`, `flatten`, `Chunks::resolve_into` and
+  `prune`, and the module docs' "A layered anchor".
+- `crates/merge/src/engine/history_block_tests.rs`: the red test and the oracle.
+- GAPS (A-803) and BENCHMARKS.
+
+- **Why.** A change re-anchored every value of its path's history on the new block (A-793). A path's k-th change cost
+  O(k) while a reader pinned the floor: at 10^5 versions, 228 values walked a verdict and judge 65 µs.
+- **What happens on an overwrite.** A change that only overwrites bytes inside the file, changes some, and keeps some
+  takes the layered path:
+  1. The bytes it overwrote, as they were, are copied into one owned chunk as the anchor's next numbered layer.
+  2. The layer is indexed by offset.
+  3. The anchor chunk names the new block, and the old block is let go.
+  4. The superseded latest value reads the anchor at that layer's number.
+  No other value is walked, so the cost is O(log + the bytes overwritten).
+- **Reading.** A piece at epoch e reads the anchor overlaid by its layers numbered e or later, the lowest covering a
+  byte giving it. A value that becomes history reads its anchor at the anchor's next layer number, so swapping the
+  anchor's block changes only what history reads through layers.
+- **Other changes.** An insert, delete, truncate or extend first resolves the layers into concrete runs, then
+  re-anchors in full as before. So does a change that keeps nothing or changes nothing.
+- **Bounded.** A layer numbered below the least epoch read is dropped, so a fold frees what it no longer reads.
+- **Owned bytes.** The history owns only the overwritten bytes, as A-793's cut did, now even where another holder keeps
+  the old block: the full path keeps such a block whole.
+- **Evidence.**
+  - Red: `a_length_preserving_change_walks_one_value_however_long_its_history`, the 300th overwrite of a 16 KiB file
+    walked 300 values, now 1.
+  - Oracle: `the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints`. Generated overwrites,
+    inserts, deletes, folds and checkpoints run against a twin taking only the full re-anchor; every version reads
+    equal to it and to the model, and the totals stay balanced.
+  - A/B: w-fed-move's `--preload` at 0, 10^4 and 10^5, release, three interleaved rounds (BENCHMARKS). At 10^5, judge
+    65.4 to 22.5 µs, values 228 to 1.6 a verdict, verdicts/s 4,851–5,178 to 5,684–5,961; oracle failures 0 in all 18
+    runs.
+- **Cost moved to reads.** An earlier value's read resolves its anchor's layers (GAPS A-803 (a)).
+
+### A-811 — An SDK edit's same-length replacement takes the layered anchor, and a read takes one layer a start (2026-11-21, w-rewrite-ops; main 04:11 PST: A-809's leftovers measured; A-809)
+Applied in the same change to:
+- `crates/merge/src/history.rs`: `overwritten`'s replacements, `replaced_here`, `Layers::candidates`, `start_longest`,
+  and the examined counter.
+- `crates/merge/src/engine.rs`: `Green::history_layers_examined`.
+- `crates/merge/src/engine/history_block_tests.rs`: two reds, and replacements in the oracle.
+- `crates/merge/examples/history_layers_bench.rs` (new), GAPS (A-803), BENCHMARKS.
+
+What changed:
+- **An SDK edit's same-length replacement.** An SDK composes it as a delete and an insert of one length at one offset.
+  That is an overwrite there, so it takes the layered anchor; the new block is checked byte for byte as any overwrite's
+  is. It had walked every value of its path: 12.6 ms a change at a history of 5,000, against 10.4 µs now.
+- **A read through layers.** A read takes each start offset's layers from its epoch in number order, only while one
+  reaches further than those before. A byte at a start is the lowest-numbered layer covering it, so a range overwritten
+  m times at one offset is read through one layer: 191 µs at m = 10^4 before, 5.9 µs now.
+- **Measured and left open (GAPS):** an insert or a delete still re-anchors in full (17.5 ms a change at a history of
+  5,000 when overwrites and inserts alternate). The fix is layers that carry an offset shift.
+
+
+### A-614 amended — A create or a rewrite is admitted with no walk, its sets derived on first read (2026-11-21, w-git for UI goal 93; main's ruling (A), 03:52 PST; found by use: git/git's whole-history push)
+
+**Found.** With layer 2's pieces 1 and 2 in, git/git's whole-history push (611 MB, 1,027 refs, mostly tags at old
+commits) landed its changeset and then decided its commands for over 350 s, unfinished, at about 30 µs a step (Studio-2,
+release, 8baa1cf16). A create walked everything its head reached that no green's head did. An old tag's head descends
+from no green's head, so each tag walked its whole history for its green's reached set: refs times history. Stock git
+walks a push once and asks reachability only when something is read.
+
+**Rule.** A move is admitted with no walk unless it is a fast-forward over sets already known:
+- A create or a rewrite records `Followed::Remade`, its base only the green whose head is its own head, found by that
+  head's row with no walk. Its version has no value.
+- A fast-forward over a version with no value records `Followed::Grown` after the descent that decides it is one, and
+  has no value either.
+- A fast-forward over known sets still walks what it brings (its new objects) and keeps its value.
+- A head neither pushed nor indexed is still refused at admission.
+
+A version with no value has as its sets the closure of its head, derived on first read (`slates_git::store::Deriving`):
+- Sliced: a unit is an object of a walk or a commit of the search back, under the step budget.
+- A version first derives the versions it follows from.
+- A create or rewrite with no recorded base searches back by generation to the nearest commit a known version peels to.
+  It takes that version's reached set less its own tags as its base, and walks only beyond it.
+- `Repository::deriving_due` derives every unknown version, the oldest heads first, so a run of tags walks its history
+  about once in total.
+- Derived values are content, charged as puts are and held by a memo, which forks copy. The memo can be let go whole
+  (`forget_derived`). It is never recorded or replayed.
+
+What changes where:
+- **Policy** judges what a move brings by git's two-colour `new ^old` walk, with no reached set.
+- **The server** derives before a fetch holds its generation, and before any encoding turn (`vcs_store::git_derive`).
+- **Replay** walks nothing.
+- **Fresh objects of a create** are attributed to the push's first move in the landing map. Upload then offers that
+  move's fragment and encodes the rest loose: correct, maybe slower (GAPS).
+
+**Paced** (r52: a clone of git/git's branches took 465 s, its 8 derivations 3,024,021 turns of a few units each, each
+paying the shard's lend, its settle and a yield). The server's derivation turn goes on while nobody else waits on the
+shard, to the step's ceiling, as A-783 paces a push's build (`vcs_store::git_derive`).
+`git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects`: red 2,404 turns
+for one version of a 600-commit line; green at most 8.
+
+**Tests** (main's conditions):
+1. The map-model oracle (`store::tests::oracle`) has tags (annotated and lightweight, at old commits) and a replay. Every
+   derived set equals the model's closures before and after the replay, and the replay walks nothing.
+2. `t_a614a_tags_at_old_commits_derive_each_from_the_one_before_a_unit_a_turn`: sliced, a base found for each tag, and
+   fewer objects walked than twice the line's.
+3. `vcs_store::tests::t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn` now holds a replay to no walk.
+
+Also applied to: `crates/git/src/store/{repository,admitting,deriving,protect,reach,mod}.rs`, the git store's tests,
+`crates/server/src/vcs_store.rs`, `crates/server/src/vcs_store/{git_derive,git_encode,upload,tests}.rs`,
+`docs/wip/GAPS.md`.
+
+### A-238 amended — A push makes the chains room before its append, a green a turn (2026-11-21, w-git for UI goal 93; main's order 04:58 PST; found by use: git/git's whole-history push)
+
+**Found.** git/git's whole-history push had its daemon killed by the watchdog, in two runs: "shard 10 is spinning:
+1,142 ms of CPU without a step" (and 1,095 ms, 1,124 ms). Stack samples in one-second windows up to the kill put 748 of
+762 samples in one append (`repository::push::admit`). Its entry met `green_chains` at its cap, so it checkpointed every
+member green of the repository (A-753), about a thousand, in the append's one step, each folding its identity whole
+(`Green::head_identity`).
+
+**Rule.** A push's judge makes the room before the append (`git_push`'s `ServerJudge::room_turn`, after the command's
+work is built):
+- Where the chains have less room than the built work's entry can take (`Preparing::entry_bound`, as a Subversion
+  commit sizes its own), it checkpoints one member green a turn, counted `git_push.room_checkpointed`, until there is
+  room or every member is done.
+- The append's own A-238 guard stays as the guard. A green it still checkpoints in its step is counted
+  `repository.push.append_checkpointed`.
+- Each checkpoint's own fold is w-engine's to run in turns (`fold_identity_step`, landing).
+
+**Test.** `git_push::tests::t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step`: 16 creates,
+each its own 64-file tree, against a 64 KiB chain budget. Red at 30e89672f: every create ok, 73 greens checkpointed
+inside appends. Green: none inside an append, and the room made in the turns.
+
+Also applied to: `crates/server/src/git_push.rs`, `crates/server/src/git_push/hooks.rs`,
+`crates/server/src/repository/push.rs`, `crates/git/src/receive/works.rs`, `docs/wip/GAPS.md`.
+
+### A-812 — A created ref's green owes its push and is made when first reached, through one door (2026-11-21, w-rewrite-ops; main 05:16 PST, P2's engine half, w-git's request; A-647's derived data, A-618, A-664's whole build, A-752)
+Applied in the same change to:
+- `crates/merge/src/push.rs`: `DeferredPush` and its record ("GDEF"); `Building` over a `?Sized` `PushObjects`.
+- `crates/merge/src/engine.rs`: `Green::defer`, `is_materialized`, `deferred`, `materializing`, `materialize`, the
+  owed tail; a checkpoint and a fold of an owing green are nothing.
+- `crates/server/src/green_ready.rs` (new).
+- `crates/server/src/greens.rs`: `get` and `get_mut` lend no owing green; `lend`, `lend_mut`, `is_owing`, `defer`,
+  `owing_reached`.
+- `crates/server/src/repository/push.rs`: `BranchChange::CreateDeferred`.
+- `crates/server/src/verbs.rs`: the door in `run_recorded` and `owner_judge`, `ParkedKind::Request`, and a replay of a
+  GDEF record.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects`, which w-git fills for git.
+
+- **Why.** A git create composed its ref's whole tree at the push. git/git's history push makes 1,027 greens of a
+  4,876-file tree each, and could not land.
+- **What.**
+  - A created green owes its push: a `DeferredPush` (name, base version, base tree, tree, head, room), recorded as its
+    version 1 by a record of its own kind, not the built work.
+  - It is made when first reached. Today's `push::Building` runs over the tool's `PushObjects`, a unit a turn under half
+    the shard's step quantum, and `Green::materialize` commits the work as the owed version. So the made green is the
+    eager create's by construction: one builder over one input.
+  - Every request reaches a green's content through one door, `crate::green_ready::green_ready`. A recorded request on
+    an owing green, or on a work over one, parks and runs again whole once the green is made; so does an owner's step of
+    a submit. A request with no route answers `Overloaded`, unrecorded.
+  - `Greens::get` and `get_mut` lend no owing green, counted by `owing_reached`, so nothing reads one around the door,
+    and a checkpoint or a fold of one does nothing.
+  - A replay meeting a GDEF record defers the green. Entries after it wait in the engine's tail and apply once it is
+    made, so a recovery builds nothing.
+  - Main's memory-sizing rule: a materialized green nobody has written to (its chain is the push's record alone, no
+    checkpoint, no work over it) is dropped back to owing when more than one per client seat are kept, least recently
+    read first. Counted: `merge.green.materialized`, `merge.green.dematerialized`.
+- **Evidence.**
+  - `push::tests::a_green_that_owes_a_push_materializes_to_the_eager_create`. Over generated push histories with folds,
+    a green deferred then materialized over turns, and one replayed from records, read as the eager green: head,
+    identity, files and changed paths at every version, retention, checkpoint.
+  - `a_version_recorded_after_an_owed_push_is_applied_once_it_is_materialized` (the tail).
+  - `a_deferred_push_record_refuses_every_damaged_form` (every cut, every flipped byte, a trailing byte).
+  - `repository::push::tests::a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create`. The owing
+    green lends nothing, its durable head is 1 and its entry the push's record, smaller than the eager entry; its
+    checkpoint is nothing; a recorded request parks, then is answered once the green is made; it then reads as the
+    eager green; and its replay owes version 1 again.
+  - `an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again_when_read`: three materializations
+    and two drops at a bound of one.
+- **Owed** (GAPS, P2):
+  - git's objects (w-git's half);
+  - a deferred version's merge record to holders at f > 0;
+  - the signature verdict of a version replayed into an owing green's tail;
+  - the materialized content's retention charge before the build (it is settled after).
+
+### A-813 — An owed version goes to holders, its materialization is secured before it commits, and its tail keeps its signatures (2026-11-21, w-rewrite-ops; main 05:51 PST: A-812's robustness gaps; R8, A-321, A-16)
+Applied in the same change to:
+- `crates/merge/src/engine.rs`: `Green::reached`, and the owed signatures.
+- `crates/server/src/merge_service.rs`: `apply_inputs`, `REPLICA_OWES`, an owed version's inputs and identity.
+- `crates/server/src/merge_origin.rs` and `crates/server/src/green_adopt.rs`: replica versions by `reached`.
+- `crates/server/src/repository/push.rs`: an owed version's record enqueued.
+- `crates/server/src/green_ready.rs`: retention secured before the commit.
+- `crates/server/src/verbs.rs`: a replayed owed version's identity is its base's.
+- GAPS (A-812).
+
+What changed:
+- **Holders at f > 0 (R8: one code path).** An owed version's merge record is enqueued as any version's.
+  - Its inputs are the push's record, and its identity is the owing green's, its base's.
+  - A holder applies inputs through one function, `apply_inputs`, used by both the record's recomputation and the ledger
+    rebuild. A push's record makes the replica owe the same push.
+  - Replica versions are counted by `Green::reached`: the owed version and its tail, or the head when nothing is owed.
+    So a takeover adopts at the version the replica stands for, and the successor's door makes the green.
+  - An increment after an owed version meets a replica that still owes and is refused `merge.replica.owes` (GAPS A-812
+    (b), open).
+- **Retention.** Once the build is done and before `materialize` commits, the work's history and change index are
+  secured through the submit's own `secure_retention`. Past the room, the parked requests are answered
+  `BudgetExceeded`, typed with the bytes available; the green keeps owing (`merge.green.materialize_over_room`).
+- **Tail signatures (A-321).** A verdict recorded for a version an owing green stands for (up to `reached`) is kept, and
+  recorded once materialization applies the version.
+- **Evidence.**
+  - `a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green`: the shipped inputs are the push's
+    record; the replica owes version 1 at the record's identity; a later increment is refused while it owes; made, the
+    adopted replica reads as the eager green.
+  - `a_materialization_past_the_greens_retention_room_is_refused_before_it_commits`.
+  - `a_signature_recorded_on_a_version_in_the_owed_tail_is_kept` (red: the verdict was refused while owing).
+
+### A-814 — An import's revisions advance in RAM and commit as one entry: the green's side of C2 stage C (2026-11-21, w-rewrite-ops; main 04:11 and 06:11 PST; A-805's "computed pure, applied in one commit" over many revisions; A-767 C2)
+Applied in the same change to:
+- `crates/server/src/import_batch.rs` (new).
+- `crates/server/src/repository/push.rs`: `append_versions`.
+- `crates/server/src/greens.rs`: `preview_at_head`, `with_preview_mut`.
+- GAPS (C2 stage C; A-813's f > 0 limit with main's ruling).
+
+- **Why.** A Subversion import landed each revision as its own changeset: git-2000's 2,001 landings took 24.5 s
+  against 8.2 s before the store, one `F_FULLFSYNC` each. One landing an import needs the green, and the records, to
+  advance through the import in RAM without chain entries, then commit in one transaction.
+- **What.**
+  - `ImportBatch::begin` makes a scratch member of the green's lineage at its head, O(1) (`Lineage::branch`).
+  - Each revision's work is built against the scratch member (`with_engine`) and judged and committed into it
+    (`stage`). Each work is numbered as the green's (based at its head and each revision after), and the scratch member
+    reads its base in its own numbering, so the chain entries are the real ones a holder recomputes.
+  - `commit` makes one log record: every version's chain entry (with the head identity where the record goes to
+    holders), plus the register's parts, i.e. the import's one changeset's reference, which is w-svn's. It secures the
+    batch's summed retention first and judges the entry by the register's guard. Then it applies each version as its
+    entry records it (`Green::apply_recorded`), enqueues each merge record, and retires the scratch member.
+  - `abandon`, a refused commit, or a crash before the record leaves the green and its chain as they were: the green
+    was never touched.
+- **Evidence.** Three revisions over a first version:
+  - one register entry where one by one took three;
+  - the greens read alike (head, files, identity, durable head);
+  - a replay before the commit reaches the version before the batch, and after it the batch's last;
+  - abandoned or refused `Forbidden`, the green is as it was, and an off-head work is refused `NotAtHead`.
+- **Owed:** w-svn's records side and the import driver; the batch's caller bounds it (one changeset's revisions).
 ### A-815 — A version's increment held once in its owner shard's content store, its chain entry naming it (chain entry format 6) (2026-11-21, w-shared, lane (A); main's rulings 00:52 and 00:58 PST, "(A), by reference"; §4.16 "Commit", §4.8, §2.7; A-257, A-621, A-697, A-714, A-767)
 - **Why.** The lane's liveness (A-697's holder route at 32 MiB and above): the owner's one durable step copied the
   increment into its chain entry and the entry into the partition's log, 2.3 to 6.9 s of one shard's step in a debug

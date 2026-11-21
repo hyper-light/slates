@@ -308,7 +308,7 @@ fn a_paths_composition_costs_about_root_ops_an_op_not_its_pieces() {
     }
   }
   let examined = slates_merge::derive::compose_examined(1_000_000, &scattered);
-  let root = (scattered.len() as f64).sqrt() as u64;
+  let root = u64::try_from(scattered.len()).unwrap().isqrt();
   assert!(
     examined <= 12 * root * scattered.len() as u64,
     "scattered ops examined {examined} for {} ops (root {root})",

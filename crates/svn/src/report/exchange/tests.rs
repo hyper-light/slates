@@ -114,6 +114,9 @@ fn replay(
       Ok(Turn::Took { consumed }) => {
         held.drain(..consumed);
       }
+      Ok(Turn::Waiting(wanted)) => {
+        panic!("the fixture holds every text, yet the exchange waited for {wanted:?}")
+      }
       Ok(Turn::Wrote) => {
         wrote += 1;
         if let Some((_, answer)) = plan.early_after.take_if(|(after, _)| *after == wrote) {
@@ -580,6 +583,7 @@ fn turns_of(fixture: &Fixture, recorded: Recorded, budget: Budget) -> Vec<Writte
       Turn::NeedMore { .. } => panic!("{}: waits past its client's answer", recorded.name),
       Turn::Took { consumed } => drop(input.drain(..consumed)),
       Turn::Wrote => {}
+      Turn::Waiting(wanted) => panic!("{}: waited for {wanted:?}", recorded.name),
       Turn::Answered { .. } => return turns,
     }
   }

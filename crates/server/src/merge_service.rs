@@ -370,6 +370,7 @@ pub(crate) fn with_work_base<R>(
     green: lent.as_deref(),
     fetched: state.work_home.fetched.as_ref(),
     version: work.base_version,
+    entries: Some(&work.entries),
   })
 }
 
@@ -1474,7 +1475,7 @@ pub(crate) fn status_merge_volume(
     state,
     &rights_of(&record, principal),
   )));
-  Some(ReplyBody::Status {
+  let mut reply = ReplyBody::Status {
     report: Box::new(slates_ipc::protocol::StatusReport {
       transports,
       id: volume,
@@ -1491,8 +1492,7 @@ pub(crate) fn status_merge_volume(
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
-      // A green has no host mount of its own to bind (§4.16: a green is served through pinned
-      // attachments, the record form).
+      // Filled below, in the room the report leaves, as a plain volume's are.
       mounts: Vec::new(),
       mounts_elided: 0,
       drifted_elided: 0,
@@ -1507,7 +1507,15 @@ pub(crate) fn status_merge_volume(
       // reported rather than a zero it was not measured to be.
       loss: slates_ipc::protocol::LossReport::default(),
     }),
-  })
+  };
+  // A mounted work's host mounts, as any volume's (A-774 C1): Windows' unmount finds its drive among the volumes'
+  // reported mounts, so a work that reported none could not be unmounted (jupiter r3, 2026-11-21).
+  let room = crate::verbs::reply_room(&reply);
+  if let ReplyBody::Status { report } = &mut reply {
+    (report.mounts, report.mounts_elided) =
+      crate::verbs::mounts_of(state, id, room.min(crate::verbs::MOUNTS_REPORT_BYTES));
+  }
+  Some(reply)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2102,6 +2110,9 @@ pub struct PendingMergeRecord {
 pub(crate) const SUBMIT_JUDGE: (&str, &str) = ("merge.submit.judge", "merge.submit.judge_ns");
 /// See [`SUBMIT_JUDGE`]: the version's increment and verdict appended to the green's chain.
 pub(crate) const SUBMIT_APPEND: (&str, &str) = ("merge.submit.append", "merge.submit.append_ns");
+/// See [`SUBMIT_JUDGE`]: the retention a submit secures before its verdict, the settle's fold and the reservation's
+/// charge (A-803's measure).
+pub(crate) const SUBMIT_SECURE: (&str, &str) = ("merge.submit.secure", "merge.submit.secure_ns");
 /// See [`SUBMIT_JUDGE`]: from the version's enqueue to its record placed at the quorum, its inputs shipped first.
 pub(crate) const SUBMIT_PLACE: (&str, &str) = ("merge.submit.place", "merge.submit.place_ns");
 /// See [`SUBMIT_JUDGE`]: the versions placed, and the input shipments they took in all.
@@ -2171,8 +2182,8 @@ impl MergeShardState {
   /// named an archive no holder ever held, and waited `INPUTS_UNHELD` for good
   /// (`docs/bugs/2026-09-16-merge-record-names-inputs-by-the-tree-only-identity.md`).
   /// Format: the archive's 32-byte manifest identity (`Archive::manifest_identity`). The owner names it in the version's
-  /// chain entry as it holds the increment ([`hold_increment`], from the manifest it holds); the tests hold the rule here.
-  #[cfg(test)]
+  /// chain entry as it holds the increment ([`hold_increment`], from the manifest it holds); a deferred push's record
+  /// (P2), the chain's own bytes, is named by it here.
   fn inputs_identity(bytes: &[u8], page: u32) -> [u8; 32] {
     Self::inputs_archive(bytes, 0, page).manifest_identity()
   }
@@ -2242,6 +2253,22 @@ pub(crate) fn inputs_held_by(
   }
 }
 
+/// A version's merge record as its owner ships it to holders, for a test (P2): its inputs' bytes and the head identity
+/// it carries, read as `enqueue_record` reads them.
+#[cfg(test)]
+pub(crate) fn shipped_for_test(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  version: u64,
+) -> Option<(Vec<u8>, [u8; 32])> {
+  let inputs = match version_inputs(state, green, version)? {
+    VersionInputs::Held(held) => increment_of(state, green, &held)?.into_owned(),
+    VersionInputs::Record(bytes) => bytes.to_vec(),
+  };
+  let identity = state.greens.lend_mut(&green)?.head_identity();
+  Some((inputs, identity))
+}
+
 /// Where version `version` of `green` holds its inputs (chain entry format 6): the increment its chain entry names, which
 /// this shard's content store holds under the green's object ([`hold_increment`]). None for version 0 (its origin is
 /// made a share at a time, `crate::merge_origin`), a folded version or an adopted one.
@@ -2249,7 +2276,7 @@ pub(crate) fn version_inputs(
   state: &ShardState,
   green: DbVolumeId,
   version: u64,
-) -> Option<slates_merge::chain_entry::Inputs> {
+) -> Option<VersionInputs<'_>> {
   if version == 0 {
     // Version 0's inputs, a green's origin, are made a share at a time and kept until placed (`crate::merge_origin`,
     // A-286); a scratch green's version 0 has none.
@@ -2262,8 +2289,33 @@ pub(crate) fn version_inputs(
   let held = state.db.partition().green_floor(green);
   let index = usize::try_from(version.checked_sub(held)?.checked_sub(1)?).ok()?;
   let entry = state.db.partition().green_chain(green).get(index)?;
+  // A deferred push's version (P2): its record is the inputs, which a holder defers its replica by.
+  if slates_merge::push::DeferredPush::is_record(entry) {
+    return Some(VersionInputs::Record(entry));
+  }
   // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
-  slates_merge::chain_entry::inputs(entry).ok()
+  slates_merge::chain_entry::inputs(entry)
+    .ok()
+    .map(VersionInputs::Held)
+}
+
+/// Where a version's inputs are ([`version_inputs`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VersionInputs<'a> {
+  /// A chain entry's increment, which the content store holds (chain entry format 6).
+  Held(slates_merge::chain_entry::Inputs),
+  /// A deferred push's record (P2), the chain's own bytes.
+  Record(&'a [u8]),
+}
+
+impl VersionInputs<'_> {
+  /// The identity the version's merge record names its inputs by.
+  fn identity(&self, page: u32) -> [u8; 32] {
+    match self {
+      VersionInputs::Held(inputs) => inputs.identity,
+      VersionInputs::Record(bytes) => MergeShardState::inputs_identity(bytes, page),
+    }
+  }
 }
 
 /// Format: a version's increment held in its owner shard's content store as the version's inputs before its verdict
@@ -2447,9 +2499,11 @@ pub(crate) fn enqueue_record(
     (increment, base, evidence, completion),
     work,
     |state| {
+      // Lent whether or not it owes a push (P2): an owed version's record carries the base's identity, which a holder's
+      // replica owing the same push holds.
       state
         .greens
-        .get_mut(&green)
+        .lend_mut(&green)
         .map(|mut engine| engine.head_identity())
         .unwrap_or_default()
     },
@@ -2577,7 +2631,8 @@ fn enqueue_record_with(
     crate::merge_origin::make_origin_inputs(state, green, value);
     return;
   }
-  value.inputs = version_inputs(state, green, version).map(|inputs| inputs.identity);
+  let page = archive_page(state);
+  value.inputs = version_inputs(state, green, version).map(|inputs| inputs.identity(page));
   insert_pending(state, object, value, work);
 }
 
@@ -3082,7 +3137,12 @@ fn cut_shipments(
       ))
       .map(|(manifest, inputs)| InputsSource::Lent {
         manifest,
-        held: HeldChunks::of(state, object, inputs.identity),
+        held: match inputs {
+          VersionInputs::Held(inputs) => {
+            LentChunks::Held(HeldChunks::of(state, object, inputs.identity))
+          }
+          VersionInputs::Record(bytes) => LentChunks::Bytes(bytes),
+        },
       })
   };
   groups
@@ -3126,13 +3186,19 @@ fn make_inputs_manifest(state: &mut ShardState, object: ObjectId, version: u64) 
   if made {
     return;
   }
-  let Some(manifest) =
-    version_inputs(state, DbVolumeId { bytes: object.0 }, version).and_then(|inputs| {
-      state
-        .held_content
-        .held_manifest(state.store.content.arena(), object, &inputs.identity)
-    })
-  else {
+  let page = archive_page(state);
+  let Some(manifest) = version_inputs(state, DbVolumeId { bytes: object.0 }, version).and_then(
+    |inputs| match inputs {
+      VersionInputs::Held(inputs) => {
+        state
+          .held_content
+          .held_manifest(state.store.content.arena(), object, &inputs.identity)
+      }
+      VersionInputs::Record(bytes) => {
+        Some(crate::merge_origin::inputs_manifest_archive(bytes, 0, page))
+      }
+    },
+  ) else {
     return;
   };
   if let Some(pending) = state
@@ -3152,13 +3218,20 @@ fn make_inputs_manifest(state: &mut ShardState, object: ObjectId, version: u64) 
 enum InputsSource<'a> {
   /// An archive holding its chunks.
   Whole(&'a Archive),
-  /// An archive's manifest, its chunks lent from the content store.
+  /// An archive's manifest, its chunks lent.
   Lent {
     /// The archive without its chunks.
     manifest: &'a Archive,
-    /// Where its chunks are held.
-    held: HeldChunks<'a>,
+    /// Where its chunks are.
+    held: LentChunks<'a>,
   },
+}
+
+/// Where a lent source's chunks are: the content store's blocks (a chain entry's increment, format 6), or ranges of the
+/// chain's own bytes (a deferred push's record, P2).
+enum LentChunks<'a> {
+  Held(HeldChunks<'a>),
+  Bytes(&'a [u8]),
 }
 
 /// A version's inputs as the owner's content store holds them (chain entry format 6): each raw chunk lent from its block.
@@ -3220,10 +3293,19 @@ impl InputsSource<'_> {
       InputsSource::Whole(archive) => chunk_requests(archive, object, version, batch),
       InputsSource::Lent { manifest, held } => {
         let identity = manifest.manifest_identity();
+        let extents = inputs_extents(manifest);
         batch
           .iter()
           .filter_map(|chunk| {
-            let raw = held.piece(chunk)?;
+            let raw = match held {
+              LentChunks::Held(held) => held.piece(chunk)?,
+              LentChunks::Bytes(bytes) => {
+                let extent = extents.iter().find(|extent| extent.chunk == *chunk)?;
+                let start = usize::try_from(extent.offset).ok()?;
+                let end = start.checked_add(usize::try_from(extent.len).ok()?)?;
+                bytes.get(start..end)?
+              }
+            };
             Some(raw_chunk_request((object, version), &identity, chunk, raw))
           })
           .collect()
@@ -4081,7 +4163,7 @@ fn record_standing(
   sender: HostId,
 ) -> Option<RecordStanding> {
   let next = match state.merge.replicas.get(&object) {
-    Some(replica) => Some(replica.head().saturating_add(1)),
+    Some(replica) => Some(replica.reached().saturating_add(1)),
     // No replica of a green whose records this holder accepted: a warm restart keeps the records and the inputs it held
     // (AUD-29-59), not the engine, which is rebuilt from them a slice at a time (A-313). Before, every later record was
     // refused out of order here, for good.
@@ -4363,21 +4445,18 @@ fn recompute(
     let Some(bytes) = inputs else {
       return Err(INPUTS_UNHELD);
     };
-    let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
     let mut replica = state.merge.replicas.remove(&object).ok_or(OUT_OF_ORDER)?;
     let started = slates_machine::clock::monotonic_ns();
-    let outcome = replica.submit(&increment);
+    let applied = apply_inputs(&mut replica, bytes, value.version);
     count_phase(
       state,
       SUBMIT_RECOMPUTE,
       slates_machine::clock::monotonic_ns().saturating_sub(started),
     );
-    match outcome {
-      // An identical increment is accepted too (A-782): its version commits nothing new.
-      Outcome::Accepted { version } | Outcome::Identical { version }
-        if version == value.version => {}
-      // The owner accepted it; a holder that computes anything else has diverged.
-      _ => return Err(RECOMPUTE_MISMATCH),
+    if let Err(reason) = applied {
+      // Given back as it was: a later record or an adoption meets it again.
+      state.merge.replicas.insert(object, replica);
+      return Err(reason);
     }
     replica
   };
@@ -4410,6 +4489,42 @@ fn recompute(
   Ok(())
 }
 
+/// Counter: a record of a version after an owed one met a replica that still owes it (P2): refused, counted, the record
+/// left for a later attempt (GAPS A-812, a holder's replica is not made from its tool's objects yet).
+pub(crate) const REPLICA_OWES: &str = "merge.replica.owes";
+
+/// Applies a version's inputs to a holder's `replica` as exactly `version` (§4.16 "Apply on holders"): an increment
+/// judged afresh and accepted as that version; or a deferred push's record (P2, `DeferredPush`), the replica then owing
+/// it as its owner's green does, its head identity its base's, as the owner's record carries. A replica that owes a push
+/// cannot judge an increment after it: refused [`REPLICA_OWES`]. Anything else has diverged.
+pub(crate) fn apply_inputs(
+  replica: &mut Green,
+  bytes: &[u8],
+  version: u64,
+) -> Result<(), &'static str> {
+  if slates_merge::push::DeferredPush::is_record(bytes) {
+    let push = slates_merge::push::DeferredPush::decode(bytes).ok_or(INPUTS_UNDECODABLE)?;
+    return match replica.defer(push) {
+      Some(owed) if owed == version => Ok(()),
+      _ => Err(RECOMPUTE_MISMATCH),
+    };
+  }
+  if !replica.is_materialized() {
+    return Err(REPLICA_OWES);
+  }
+  let increment = Increment::decode(bytes).map_err(|_| INPUTS_UNDECODABLE)?;
+  match replica.submit(&increment) {
+    // An identical increment is accepted too (A-782): its version commits nothing new.
+    Outcome::Accepted { version: made } | Outcome::Identical { version: made }
+      if made == version =>
+    {
+      Ok(())
+    }
+    // The owner accepted it; a holder that computes anything else has diverged.
+    _ => Err(RECOMPUTE_MISMATCH),
+  }
+}
+
 /// Folds a holder's `replica` of a green below `floor`, the version below which its owner's engine had folded the
 /// green's histories when it made the record this holder now holds (§4.16 "delta retention before folding", A-385): the
 /// replica then keeps no more of the green's history than its owner does. A floor at or below the replica's own fold
@@ -4427,7 +4542,7 @@ pub(crate) fn fold_replica(state: &mut ShardState, replica: &mut Green, floor: u
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {
-    version: state.merge.replicas.get(&object).map(Green::head),
+    version: state.merge.replicas.get(&object).map(Green::reached),
     refused: state.merge.refused.contains(&object),
   }
 }
@@ -5176,7 +5291,7 @@ mod tests {
             let lent = ShipInputs::cut(
               &InputsSource::Lent {
                 manifest: &manifest,
-                held: HeldChunks::of(state, object, held.inputs.identity),
+                held: LentChunks::Held(HeldChunks::of(state, object, held.inputs.identity)),
               },
               (object, 4),
               lacking,

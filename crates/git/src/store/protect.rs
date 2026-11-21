@@ -42,7 +42,7 @@ use std::collections::{BTreeSet, BinaryHeap};
 
 use slates_vcs::ContentStore;
 
-use super::{Chain, Positions, Repository, StoreRefused};
+use super::{Chain, Repository, StoreRefused};
 use crate::Admission;
 use crate::object_name::ObjectId;
 use crate::objects::commit::Commit;
@@ -170,8 +170,11 @@ impl Repository {
   }
 
   /// The commits moving `green` to `to` brings to it, each handed to `judge` with its parents until one answers (module
-  /// docs): newest generation first, ties by the greater id, each once, stopping at the commits the green's current
-  /// head reaches.
+  /// docs): newest generation first, ties by the greater id, each once, never one the green's current head reaches.
+  /// Decided as git's `rev-list <to> ^<head>` decides it, with no reached set (A-614 amended: a green's sets may be
+  /// derived only on first read): the head's commits are painted back by generation number as the new head's are
+  /// walked, an equal generation's paint first, so a commit the head reaches is painted before it could be judged; the
+  /// walk ends once no commit of the new head's is left, so it costs the commits between the two heads.
   fn judge_brought<T>(
     &self,
     store: &ContentStore,
@@ -183,11 +186,36 @@ impl Repository {
     let Some(start) = self.peel(store, push, to)? else {
       return Ok(None);
     };
-    let reached = self.current_reached(store, green)?;
-    let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-    let mut heap = BinaryHeap::from([(self.generation(store, push, &start)?, start)]);
-    while let Some((_, id)) = heap.pop() {
-      if !seen.insert(id) || self.reached_by(store, reached.as_ref(), &id) {
+    let old = match self
+      .current_head(green)
+      .and_then(|head| self.id_at(store, head))
+    {
+      Some(head) => self.peel(store, push, head)?,
+      None => None,
+    };
+    // Each entry a commit, its generation number and whether it is the old head's paint; an equal generation's paint
+    // pops first, since `true` orders after `false`.
+    let mut heap: BinaryHeap<(u64, ObjectId, bool)> = BinaryHeap::new();
+    heap.push((self.generation(store, push, &start)?, start, false));
+    let mut brought_left = 1usize;
+    if let Some(old) = old {
+      heap.push((self.generation(store, push, &old)?, old, true));
+    }
+    let (mut judged, mut painted): (BTreeSet<ObjectId>, BTreeSet<ObjectId>) = Default::default();
+    while brought_left > 0 {
+      let Some((_, id, paint)) = heap.pop() else {
+        break;
+      };
+      if paint {
+        if painted.insert(id) {
+          for parent in self.parents(store, push, &id)? {
+            heap.push((self.generation(store, push, &parent)?, parent, true));
+          }
+        }
+        continue;
+      }
+      brought_left = brought_left.saturating_sub(1);
+      if painted.contains(&id) || !judged.insert(id) {
         continue;
       }
       let parents = self.parents(store, push, &id)?;
@@ -196,19 +224,11 @@ impl Repository {
         return Ok(Some(found));
       }
       for parent in parents {
-        heap.push((self.generation(store, push, &parent)?, parent));
+        heap.push((self.generation(store, push, &parent)?, parent, false));
+        brought_left = brought_left.saturating_add(1);
       }
     }
     Ok(None)
-  }
-
-  /// Whether `id` is an indexed object `reached` holds.
-  fn reached_by(&self, store: &ContentStore, reached: Option<&Positions>, id: &ObjectId) -> bool {
-    reached.is_some_and(|reached| {
-      self
-        .object(store, id)
-        .is_some_and(|row| reached.contains(row.position))
-    })
   }
 
   /// Why the commit `id` is not one a key `signers` trusts signed, or none where one did (module docs).

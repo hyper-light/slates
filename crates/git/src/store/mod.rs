@@ -100,6 +100,7 @@ pub use positions::Positions;
 pub use push::{Entries, HeldAt, HeldObject, Incoming, Push, PushRefused, StoredAt, stored_bytes};
 pub use repository::abbrev::Abbrev;
 pub use repository::admitting::Admitting;
+pub use repository::deriving::{Derived, Deriving};
 pub use repository::graph::{GraphFault, NamedRef, StoreGraph};
 pub use repository::protect::{Change, CommitSigners, Unsigned, UnsignedCommit};
 pub use repository::reach::{ReachRefused, ReachSets, Sets};

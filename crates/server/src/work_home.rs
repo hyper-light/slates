@@ -164,8 +164,8 @@ pub(crate) enum RebaseAnswer {
   Rebased {
     /// The green's head the work is now based on.
     version: u64,
-    /// The files that still differ from the head.
-    changed: BTreeMap<String, Option<Vec<u8>>>,
+    /// The files that still differ from the head, each as its parts over the head (A-806), `None` for a removal.
+    changed: BTreeMap<String, Option<crate::work_files::HeldParts>>,
     /// The operations restated over the head.
     journal: Vec<VolumeOp>,
     /// The base entries at the head of every path the restated journal names, for a work that composes its own
@@ -456,7 +456,9 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   let fetched = home.fetched.is_some();
   let file_if_unheld = |path: &str| {
     let key = canonical_path(path);
-    (!fetched && !w.files.holds(key)).then(|| Need::Lengths(vec![key.to_owned()]))
+    // A length the work's kept entry of the path names (its base's, A-247) is read there, not asked (A-808).
+    (!fetched && !w.files.holds(key) && !w.entries.contains_key(key))
+      .then(|| Need::Lengths(vec![key.to_owned()]))
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
@@ -823,6 +825,7 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
   let kept = crate::refining::kept(
     state,
@@ -883,6 +886,7 @@ fn sealed_with_edit(
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
   let old_len = sealed.files.len(base, key).ok()?;
   let inserted = u64::try_from(bytes.len()).ok()?;
@@ -931,6 +935,13 @@ pub(crate) fn gate(
     if matches!(need, Some(Need::Verdict { .. })) {
       let composed_ns = slates_machine::clock::monotonic_ns().saturating_sub(started);
       crate::merge_service::count_phase(state, SUBMIT_COMPOSE, composed_ns);
+    }
+    // A base read's ask, by the verb that asked it (A-808's measure: which verb re-asks under contention).
+    if let Some(Need::Files(_) | Need::Lengths(_)) = &need {
+      state.count(base_ask_by(&body, need.as_ref()), 1);
+    }
+    if need.is_none() && length_from_entry(state, work, &body) {
+      state.count(LENGTH_FROM_ENTRY, 1);
     }
     need
   } else {
@@ -1337,6 +1348,86 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
+/// Format: an edit whose file's base length the work's kept entry named, asked of no one (A-808), the non-vacuity count
+/// of the read from the entry.
+pub(crate) const LENGTH_FROM_ENTRY: &str = "merge.work.length_from_entry";
+
+/// Whether `body` is an edit of a file the work does not hold whose base length its kept entry names (A-808).
+fn length_from_entry(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> bool {
+  let (RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. }) = body else {
+    return false;
+  };
+  let key = canonical_path(path);
+  state.work_home.fetched.is_none()
+    && state
+      .works
+      .get(&work)
+      .is_some_and(|w| !w.files.holds(key) && w.entries.contains_key(key))
+}
+
+/// The counter a base read's ask (files or lengths) is counted under by the verb that asked it (A-808).
+fn base_ask_by(body: &RequestBody, need: Option<&Need>) -> &'static str {
+  let files = matches!(need, Some(Need::Files(_)));
+  match body {
+    RequestBody::Edit { .. } | RequestBody::EditStaged { .. } => {
+      if files {
+        "merge.work.base_ask.edit.files"
+      } else {
+        "merge.work.base_ask.edit.lengths"
+      }
+    }
+    RequestBody::Rebase { .. } => {
+      if files {
+        "merge.work.base_ask.rebase.files"
+      } else {
+        "merge.work.base_ask.rebase.lengths"
+      }
+    }
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::SubmitHeld { .. }
+    | RequestBody::SubmitApproved { .. }
+    | RequestBody::EditSubmit { .. }
+    | RequestBody::EditSubmitHeld { .. } => {
+      if files {
+        "merge.work.base_ask.submit.files"
+      } else {
+        "merge.work.base_ask.submit.lengths"
+      }
+    }
+    RequestBody::Declare { .. } => {
+      if files {
+        "merge.work.base_ask.declare.files"
+      } else {
+        "merge.work.base_ask.declare.lengths"
+      }
+    }
+    _ => {
+      if files {
+        "merge.work.base_ask.other.files"
+      } else {
+        "merge.work.base_ask.other.lengths"
+      }
+    }
+  }
+}
+
+/// The counter an ask of the owner is counted under by its kind, beside [`ASKED_THE_OWNER`]'s total (A-801's
+/// measure: 10,141,852 asks for 100,000 clients over the Linux kernel, about a hundred a client, named no mechanism).
+fn asked_kind(need: &Need) -> &'static str {
+  match need {
+    Need::Files(_) => "merge.work.asked_owner.files",
+    Need::Lengths(_) => "merge.work.asked_owner.lengths",
+    Need::Page { .. } => "merge.work.asked_owner.page",
+    Need::Sizes => "merge.work.asked_owner.sizes",
+    Need::Verdict { .. } => "merge.work.asked_owner.verdict",
+    Need::Rebase { .. } => "merge.work.asked_owner.rebase",
+    Need::Admit { .. } => "merge.work.asked_owner.admit",
+    Need::ReserveName { .. } => "merge.work.asked_owner.name",
+    Need::Route | Need::Refine(_) => "merge.work.asked_owner.other",
+  }
+}
+
 /// Counts where a verdict's or a rebase's sealed work was composed: on the work's shard, or by the green's owner.
 fn count_composed(state: &mut ShardState, need: &Need) {
   if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = need {
@@ -1441,6 +1532,7 @@ fn start_ask(
     request: id.word(),
     through_work: true,
   };
+  let asked_kind = asked_kind(&need);
   let outbox = state.work_home.outboxes.entry(owner).or_default();
   outbox.waiting.push_back(AskItem {
     queue,
@@ -1459,6 +1551,7 @@ fn start_ask(
   }
   let out = outbox.out;
   state.count(ASKED_THE_OWNER, 1);
+  state.count(asked_kind, 1);
   if full {
     return true;
   }
@@ -2249,8 +2342,43 @@ fn staged(state: &ShardState, item: &AskItem) -> bool {
   }
 }
 
-/// One ask answered on the owner's shard.
+/// One ask answered on the owner's shard, its time counted by its kind (`merge.work.answered.<kind>` and `..._ns`, A-801's
+/// measure of where the green's shard spends its time).
 fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let kind = answered_kind(&item.need);
+  let started = slates_machine::clock::monotonic_ns();
+  let outcome = answer_ask(state, item);
+  let spent = slates_machine::clock::monotonic_ns().saturating_sub(started);
+  crate::merge_service::count_phase(state, kind, spent);
+  outcome
+}
+
+/// The counters an answered ask is timed under by its kind: its count and its nanoseconds.
+fn answered_kind(need: &Need) -> (&'static str, &'static str) {
+  match need {
+    Need::Files(_) => ("merge.work.answered.files", "merge.work.answered.files_ns"),
+    Need::Lengths(_) => (
+      "merge.work.answered.lengths",
+      "merge.work.answered.lengths_ns",
+    ),
+    Need::Page { .. } => ("merge.work.answered.page", "merge.work.answered.page_ns"),
+    Need::Sizes => ("merge.work.answered.sizes", "merge.work.answered.sizes_ns"),
+    Need::Verdict { .. } => (
+      "merge.work.answered.verdict",
+      "merge.work.answered.verdict_ns",
+    ),
+    Need::Rebase { .. } => (
+      "merge.work.answered.rebase",
+      "merge.work.answered.rebase_ns",
+    ),
+    Need::Admit { .. } => ("merge.work.answered.admit", "merge.work.answered.admit_ns"),
+    Need::ReserveName { .. } => ("merge.work.answered.name", "merge.work.answered.name_ns"),
+    Need::Route | Need::Refine(_) => ("merge.work.answered.other", "merge.work.answered.other_ns"),
+  }
+}
+
+/// [`answer_on_owner`]'s answer.
+fn answer_ask(state: &mut ShardState, item: AskItem) -> Outcome {
   let AskItem {
     need,
     green,

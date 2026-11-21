@@ -242,6 +242,15 @@ pub struct Preparing {
 }
 
 impl Preparing {
+  /// The largest chain entry its work can take (`slates_merge::chain_entry::entry_bound`), once built; none before:
+  /// what its judge makes the chains room for before the append, a green a turn (A-238, off the append's step).
+  pub fn entry_bound(&self) -> Option<usize> {
+    match &self.done {
+      Some(Ok(built)) => Some(slates_merge::chain_entry::entry_bound(&built.increment)),
+      _ => None,
+    }
+  }
+
   /// Its build's longest unit so far, nanoseconds on its owner's clock (A-752).
   pub fn longest_unit_ns(&self) -> u64 {
     self.building.pace().longest_unit_ns()
