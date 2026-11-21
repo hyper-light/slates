@@ -560,27 +560,6 @@ fn svn_seen(
   )
 }
 
-/// Waits until `daemon`'s deltify job has kept `count` superseded texts as deltas, each landed as a changeset and named
-/// by the register (`vcs_store::svn_deltify`): a revision changing a file hands the job its old text, and its landing
-/// runs as a task of its own.
-fn deltified(daemon: &Daemon, count: u64) {
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-  while crate::daemon::observe_first(daemon, |state| {
-    state
-      .refusals
-      .get(crate::vcs_store::svn_deltify::DELTIFIED)
-      .copied()
-      .unwrap_or(0)
-  }) < count
-  {
-    assert!(
-      std::time::Instant::now() < deadline,
-      "the deltify job never landed"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(5));
-  }
-}
-
 /// The text `bytes` as a session reads it from the recovered repository (by its identity), and `/trunk/a.txt` as the
 /// green holds it.
 fn read_back(
@@ -604,15 +583,59 @@ fn read_back(
   })
 }
 
+/// Revision 1's changeset carries the text it put (C2 stage B): its payload `alpha\n`, the `Texts` entry naming it there,
+/// then its record.
+fn carries_its_text(
+  log: &ChangesetLog<hyper_block::file::DeviceFile>,
+  located: &slates_store::log::Located,
+) {
+  let sections = log.sections(located).unwrap();
+  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
+  assert_eq!(
+    kinds,
+    vec![
+      SectionKind::Payload,
+      SectionKind::Texts,
+      SectionKind::Record
+    ]
+  );
+  let read = |section: &slates_store::log::Section| {
+    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
+    log.read_at(&mut bytes, section.offset).unwrap();
+    bytes
+  };
+  let payload = read(&sections[0]);
+  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
+  assert_eq!(payload, b"alpha\n");
+  let entry = &entries[0];
+  assert_eq!(
+    (
+      entries.len(),
+      entry.path.as_slice(),
+      entry.text,
+      entry.len,
+      entry.base
+    ),
+    (
+      1,
+      b"/trunk/a.txt".as_slice(),
+      *blake3::hash(b"alpha\n").as_bytes(),
+      6,
+      None
+    )
+  );
+  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+}
+
 /// C2's arbiter (main's ruling of 2026-11-20 20:30, item 4: "the state before the kill must equal the state recovered
 /// from the store"). Do: on a daemon holding a store, create a Subversion repository, land revision 1 (`/trunk` and a
-/// file), a revision's properties set whole, and revision 2 changing the file, whose old text the deltify job keeps as
-/// a delta; stop the daemon (a stop publishes nothing, so what survives is what was made durable) and the store's
-/// owner; start both again over the same segment and store. Expect: the recovered repository equal to the one before
-/// the stop (records whole, youngest 2, the green at version 2), with nothing refused; its register five references
-/// naming sequences 0 to 4 (the creation, the two revisions, the properties and the deltified text), no record's bytes;
-/// the store's log holding those five changesets, revision 1's carrying its text (C2 stage B: its payload, the `Texts`
-/// entry naming it there, then its record); and the file read back at revision 2.
+/// file), a revision's properties set whole, and revision 2 changing the file; stop the daemon (a stop publishes
+/// nothing, so what survives is what was made durable) and the store's owner; start both again over the same segment
+/// and store. Expect: the recovered repository equal to the one before the stop (records whole, youngest 2, the green
+/// at version 2), with nothing refused; its register four references naming sequences 0 to 3 (the creation, the two
+/// revisions and the properties), no record's bytes; the store's log holding those four changesets, revision 1's
+/// carrying its text (C2 stage B: its payload, the `Texts` entry naming it there, then its record); and the file read
+/// back at revision 2.
 #[test]
 fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
   let instance = format!("vcs-store-svn-arbiter-{}", std::process::id());
@@ -660,11 +683,10 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
     ),
     Ok(2)
   );
-  deltified(&daemon, 1);
   let before = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
   assert_eq!(before.1, Some(2));
   assert_eq!(before.2, Some(2));
-  assert_eq!(before.3, vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
+  assert_eq!(before.3, vec![Some(0), Some(1), Some(2), Some(3)]);
   daemon.stop();
   store.restart_owner();
 
@@ -693,45 +715,8 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
     .copied()
     .collect();
   let sequences: Vec<u64> = ours.iter().map(|located| located.header.sequence).collect();
-  assert_eq!(sequences, vec![0, 1, 2, 3, 4]);
-  // Revision 1's changeset carries the text it put (C2 stage B): its payload, the `Texts` entry naming it there, then
-  // its record.
-  let sections = log.sections(&ours[1]).unwrap();
-  let kinds: Vec<SectionKind> = sections.iter().map(|section| section.kind).collect();
-  assert_eq!(
-    kinds,
-    vec![
-      SectionKind::Payload,
-      SectionKind::Texts,
-      SectionKind::Record
-    ]
-  );
-  let read = |section: &slates_store::log::Section| {
-    let mut bytes = vec![0u8; usize::try_from(section.len).unwrap()];
-    log.read_at(&mut bytes, section.offset).unwrap();
-    bytes
-  };
-  let payload = read(&sections[0]);
-  let entries = slates_store::texts::decode(&read(&sections[1])).unwrap();
-  assert_eq!(payload, b"alpha\n");
-  let entry = &entries[0];
-  assert_eq!(
-    (
-      entries.len(),
-      entry.path.as_slice(),
-      entry.text,
-      entry.len,
-      entry.base
-    ),
-    (
-      1,
-      b"/trunk/a.txt".as_slice(),
-      *blake3::hash(b"alpha\n").as_bytes(),
-      6,
-      None
-    )
-  );
-  assert_eq!(entry.place.payload, *blake3::hash(&payload).as_bytes());
+  assert_eq!(sequences, vec![0, 1, 2, 3]);
+  carries_its_text(&log, &ours[1]);
 }
 
 /// C2's crash between the store's landing and the register's commit (main's rulings of 2026-11-20 20:30 item 5 and
@@ -740,9 +725,8 @@ fn a_restarted_daemon_recovers_subversion_from_the_store_as_it_stood() {
 /// 2's changeset on the store at the next sequence, as a landing does, and stop the daemon before any register entry
 /// names it (the crash); start the daemon and the store again; then commit revision 2 again, as the unanswered client
 /// retries it. Expect: the recovered repository as it stood before the landing (youngest 1, its register naming
-/// sequences 0 and 1 alone); the retry answered revision 2, committed once (youngest 2, the register naming 0 to 2, and
-/// 3 the deltify job's keeping revision 1's text as a delta); and a second restart recovering that, revision 2's text
-/// the retry's.
+/// sequences 0 and 1 alone); the retry answered revision 2, committed once (youngest 2, the register naming 0 to 2);
+/// and a second restart recovering that, revision 2's text the retry's.
 #[test]
 fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands_once() {
   let instance = format!("vcs-store-svn-crash-{}", std::process::id());
@@ -795,10 +779,9 @@ fn a_changeset_landed_and_never_named_is_dropped_at_recovery_and_its_retry_lands
     ),
     Ok(2)
   );
-  deltified(&daemon, 1);
   let retried = crate::daemon::observe_first(&daemon, move |state| svn_seen(state, repository));
   assert_eq!(retried.1, Some(2));
-  assert_eq!(retried.3, vec![Some(0), Some(1), Some(2), Some(3)]);
+  assert_eq!(retried.3, vec![Some(0), Some(1), Some(2)]);
   daemon.stop();
   store.restart_owner();
 

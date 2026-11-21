@@ -214,6 +214,20 @@ pub struct Streamed {
   answering: session::Producing,
 }
 
+impl crate::render::StoreWants for Streamed {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    self.answering.wants()
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    self.answering.give_rows(rows);
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    self.answering.give_chunks(chunks);
+  }
+}
+
 impl Streamed {
   /// The answer's media type: the reply's `Content-Type`.
   pub fn media_type(&self) -> &'static [u8] {

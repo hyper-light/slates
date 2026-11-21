@@ -113,6 +113,22 @@ pub fn write_report_end(received: &Received, out: &mut impl Out) -> Result<(), R
   write_line(Packet::Flush, out)
 }
 
+/// Writes the report of a push refused whole after its pack was read, to a client that asked for a report but not
+/// side-band-64k (under side-band, band 3 carries the refusal, the stream ending after it): `unpack <why>`, then
+/// `ng <ref> <why>` for each of the commands `names`, in the order sent, then a flush, as git reports a pack its
+/// unpacking refused (`receive-pack.c`'s `report`). Refused for a line past a pkt-line's room.
+pub fn write_refused_report(
+  names: &[Vec<u8>],
+  why: &[u8],
+  out: &mut impl Out,
+) -> Result<(), Refusal> {
+  write_text(&[UNPACK, why], out)?;
+  for name in names {
+    write_text(&[NG_REF, name, b" ", why], out)?;
+  }
+  write_line(Packet::Flush, out)
+}
+
 /// Writes a hook's `words` as git relays them while the hook runs (`copy_to_sideband`): on band 2,
 /// in the pieces git reads them in, when the client `requested` side-band-64k; nothing otherwise,
 /// as git's words then go to its own standard error, which no client of a server reads (A-665

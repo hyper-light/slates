@@ -162,6 +162,14 @@ impl SvnStores for ServedRecords {
     .flatten()
   }
 
+  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+    super::svn_texts::fetch_piece(id, wanted).await
+  }
+
+  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
+    let _ = crate::state::with_state(|state| super::svn_texts::let_go(state, wanted));
+  }
+
   async fn land(
     &mut self,
     id: RepositoryId,
@@ -244,10 +252,12 @@ pub(crate) fn with_view<T>(
       None => state.vcs_stores.subversion_records(id)?,
     };
     let engine = green.and_then(|green| state.greens.get(&green));
+    // Every reader of a view can wait for a stored text's piece read through the node's store (C2 stage B part 2).
     let texts = HeadTexts {
       green: engine.as_deref(),
       store: state.vcs_stores.content(),
       records,
+      pieces: Some(&state.vcs_stores.svn_pieces),
     };
     let view = WithTexts {
       records,
@@ -411,6 +421,14 @@ impl crate::vcs_ssh::svn::SvnStores for TunnelRecords {
   }
 
   type Turn = svn_commit::landing::Turn;
+
+  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+    super::svn_texts::fetch_piece(id, wanted).await
+  }
+
+  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
+    let _ = crate::state::with_state(|state| super::svn_texts::let_go(state, wanted));
+  }
 
   async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn> {
     svn_commit::landing::turn(id).await

@@ -16450,6 +16450,62 @@ const LIVE_ROUND: (&str, &str) = ("fleet.live.hop.round", "fleet.live.hop.round_
 /// Format: a holder's count of entries served and their nanoseconds, arrival to answer.
 const LIVE_HOLDER_HOP: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holder_ns");
 
+/// Each hop timed once a timed `round`, the hops' nanoseconds adding up to the rounds' exactly, and each hop's
+/// `percentiles` ordered within its own time.
+fn hops_add_up_to_the_round(
+  hops: &[(u64, u64)],
+  round: (u64, u64),
+  percentiles: &[(u64, u64, u64)],
+) {
+  for (index, (timed, _)) in hops.iter().enumerate() {
+    assert_eq!(
+      *timed, round.0,
+      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
+    );
+  }
+  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
+  assert_eq!(
+    summed, round.1,
+    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  );
+  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(hops) {
+    assert!(
+      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
+      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
+    );
+  }
+}
+
+/// Each live hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time,
+/// read from the owner's status report, where they are published.
+fn hop_percentiles(client: &mut Client) -> Vec<(u64, u64, u64)> {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
+    panic!("the owner reported its status");
+  };
+  let figure = |name: String| -> u64 {
+    report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|row| row.kind == name)
+      .map(|row| row.count)
+      .max()
+      .unwrap_or(0)
+  };
+  LIVE_HOPS
+    .iter()
+    .map(|(timed, _)| {
+      (
+        figure(format!("{timed}.p50_ns")),
+        figure(format!("{timed}.p999_ns")),
+        figure(format!("{timed}.max_ns")),
+      )
+    })
+    .collect()
+}
+
 /// §4.10 "Live shipping" (A-200's owed breakdown, A-396): do write a live-shipped volume over and over from one client,
 /// each write sent once the last was answered. Expect every write answered at durability, its round timed on the owner hop
 /// by hop (the build, the hop to the control shard, the lane, the exchange, the hop back), each hop counted once a timed
@@ -16504,33 +16560,7 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.0),
     count(&daemons[0], LIVE_ROUND.1),
   );
-  // Each hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time.
-  // Read from the owner's status report, where they are published.
-  let ReplyBody::DaemonStatus { report } =
-    client.call(&RequestBody::DaemonStatus { memory: false })
-  else {
-    panic!("the owner reported its status");
-  };
-  let figure = |name: String| -> u64 {
-    report
-      .shards
-      .iter()
-      .flat_map(|shard| shard.refusals.iter())
-      .filter(|row| row.kind == name)
-      .map(|row| row.count)
-      .max()
-      .unwrap_or(0)
-  };
-  let percentiles: Vec<(u64, u64, u64)> = LIVE_HOPS
-    .iter()
-    .map(|(timed, _)| {
-      (
-        figure(format!("{timed}.p50_ns")),
-        figure(format!("{timed}.p999_ns")),
-        figure(format!("{timed}.max_ns")),
-      )
-    })
-    .collect();
+  let percentiles = hop_percentiles(&mut client);
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
@@ -16546,23 +16576,7 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     "every write of the loop is answered at durability: {replies:?}"
   );
   assert!(round.0 > 0, "rounds were timed: {round:?}");
-  for (index, (timed, _)) in hops.iter().enumerate() {
-    assert_eq!(
-      *timed, round.0,
-      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
-    );
-  }
-  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
-  assert_eq!(
-    summed, round.1,
-    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
-  );
-  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(&hops) {
-    assert!(
-      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
-      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
-    );
-  }
+  hops_add_up_to_the_round(&hops, round, &percentiles);
   assert!(
     percentiles.iter().any(|(p50, _, _)| *p50 > 0),
     "the hops' medians were recorded: {percentiles:?}"

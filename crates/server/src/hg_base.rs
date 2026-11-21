@@ -415,7 +415,7 @@ pub(crate) mod tests {
   /// Shape: the history 7.2 stored under its file index (`crates/hg/fixtures/import/make-import-fixtures.sh`): names
   /// under every rule of its encoding (a reserved name, a trailing space and period, `.i` and `.d` directories) and a
   /// hashed path eight directories deep.
-  const FILE_INDEX: Files = repository!(
+  pub(crate) const FILE_INDEX: Files = repository!(
     "import/fileindex",
     ["requires" => "import/fileindex-hg-requires.txt"],
     [

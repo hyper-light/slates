@@ -15865,6 +15865,43 @@ the same draws in one process.
 - Found on this history and fixed first (c5d746f8b): a text that comes back (A, B, A) made a chain loop when its row
   was replaced; a `T` row is now its first landing's.
 
+## Mercurial's one-changeset pull against `hg serve`: 4.2 s to 0.24 s (the index's runs merged, a pull made from what it sends) (goal 93 perf; main's order of 2026-11-21 00:22; 2026-11-21)
+
+**What changed.** A profile of a one-changeset pull of Mercurial's whole history (24.95 s at load 15 to 31, release main
+948711996) found two steps that scale with the history: every index lookup walked every run, since the learned merge
+had no caller (155 runs after the import, a lookup visiting 123 at p50, 11.8 µs; 2 runs, 0.6 µs after one merge;
+`crates/hg/examples/index_runs.rs`), and a pull whose client holds the history walked every manifest and file row for
+their links (7.2's `fastpathlinkrev`). Fixed in 94ff89fe5 (the merge made a table at a time and kept up on the owner
+shard, `vcs_store::index_upkeep`; the link walk only for a clone of every head) and f0ca841c7 (git's index on the same
+upkeep).
+
+**Command.** `KEEP_LOGS=DIR SERVERS="stock slates" SLATES=BIN SLATES_FILL=import crates/cli/bench/hg_scale.sh
+~/.cache/w-interop/bin/hg ~/.cache/w-perf/hg-src WORK 3 1800`, the harness starting slates with `--vcs-store` (7189ce280;
+release build of 7189ce280: 94ff89fe5 and that harness line), stock Mercurial 7.2, interleaved stock then slates each
+run, Mercurial's own repository (57,036 changesets, 307 tags). adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores),
+2026-11-21 02:00 to 02:43 PST, load 14 at the start, 5.6 to 7.8 at the end (shared). Studio-1, which main named for
+timing, was offline in kiln; the big Studio's slow link carries no part of a loopback run. Logs:
+`~/.cache/w-perf/prof/hg-ab-20261121T100112/` on the Studio. Every slates clone verified (`hg verify`) and its changesets
+and tags identical to the source.
+
+| Step (seconds) | `hg serve` runs 1 / 2 / 3 | best | slates runs 1 / 2 / 3 | best |
+|---|---|---|---|---|
+| one-changeset pull | 0.189 / 0.192 / 0.271 | 0.189 | 0.303 / 0.301 / 0.243 | **0.243** |
+| one-changeset push | 0.200 / 0.221 / 0.177 | 0.177 | 0.672 / 0.872 / 0.651 | 0.651 |
+| `clone -U` | 9.244 / 12.222 / 7.729 | 7.729 | 53.445 / 56.637 / 53.928 | 53.445 |
+| `clone -U --stream` (this build's stream: every text whole) | 0.495 / 0.570 / 0.840 | 0.495 | 335.3 / 352.2 / 337.6 | 335.3 |
+| filled (stock: push; slates: import) | 13.0 / 15.9 / 12.4 | 12.4 | 142.4 / 141.6 / 144.8 | 141.6 |
+
+What it says:
+- **The pull: 4.2 s (w-interop, 907c246ac) and 24.95 s (948711996, loaded) to 0.243 s best**, 1.3 times `hg serve`'s
+  0.189 s. Ten times faster than `hg serve` in wall time is not reachable for a one-changeset pull: stock hg's own client
+  (its Python start, discovery's round trips, writing the changeset) is most of `hg serve`'s 0.19 s, so the bar is the
+  server's own share, measured next by the daemon's time a request.
+- **The stream** in this build still sends every text whole (335 s, worse than the 46.8 s measured an hour before at
+  load 4; owed an explanation with the fixed stream's A/B). Its fix (c870c8f80: each revision its stored delta, read in
+  place) serves a repository whose revisions the store keeps, so its A/B fills slates by a push, next.
+- **`clone -U` is 6.9 times slower** (53 against 7.7 s; 24 against 16.4 s in w-interop's run): w-hg's clone item, sent.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
@@ -17210,3 +17247,96 @@ the control shard (8-9), the reply (6) and the hop back (4).
   svnsync now mirrors it in 270.7 s, a quarter. The server's replay of a revision is 2.4 to 2.8 ms of it (in-process,
   above), so most of the 135 ms a revision is outside the server's drive (the client's commit into FSFS, the round
   trips). Over HTTP the mirror cannot run until the DAV site serves `replay-report` (recorded in GAPS, not built).
+
+## A path's history re-anchored in O((n + k) log k): 80,000 ops judged in 90 ms, was 22.5 s (A-787 part 2's red; 2026-11-21)
+
+A refined re-indent puts tens of thousands of content ops on one path. The engine's judge re-anchors that path's history
+(`history::reanchor`), and two of its steps scanned a list per piece:
+- `Value::remapped` scanned every kept run;
+- `cut_superseded_blocks` scanned the union of runs.
+Both are now binary searches, and `remapped` falls back to the scan when runs overlap, so its result is the scan's
+(property test `the_indexed_remap_is_the_scans`). `green_post_state`, which had ended with exit 4 when the shard's
+watchdog saw a 3.5 s step in a debug build, passes 8 of 8 in 5.2 s.
+
+Measure: `Green::submit` of one increment re-indenting every line of one file (`lines` lines, two ops a line after
+refinement), timed once each, debug build, this Mac (macOS arm64), 2026-11-21 ~00:35 PST, by a scratch test in
+`crates/merge/src/refine/tests.rs` (not committed).
+
+| ops | before (main 73cd23c63) | after (2c32af2b5) |
+|---|---|---|
+| 10,000 | 0.40 s | 11 ms |
+| 20,000 | 1.43 s | 23 ms |
+| 40,000 | 5.64 s | 44 ms |
+| 80,000 | 22.5 s | 90 ms |
+
+Before, each doubling of ops quadrupled the time; after, it doubles. The first step alone (the remap index) gave 50 ms /
+195 ms / 775 ms / 3.22 s, still quadratic, until the union's binary search removed the second scan.
+
+## A length-preserving change walks one value, whatever its path's history: the verdict flat over 10^5 versions (A-809, fixing A-803; 2026-11-21)
+
+w-rewrite-ops, main's order of 02:37 PST (piece 3). A-803 (w-fed-move) named the verdict's growth with history: the
+re-anchor walked every value of a changed path. A-809 gives a path's anchor numbered layers: an overwrite copies the
+bytes it overwrote as a layer and walks one value (`crates/merge/src/history.rs`, "A layered anchor").
+
+- **Command:** `load_bench --tree ~/.cache/w-fed-move-linux/kernel --clients 1000 --rounds 1 --per-connection 32
+  --hot-files 300 --idle-works 1 --preload N`. Release, in-process, over `kernel/` of torvalds v7.4-rc4 (754 files).
+- **Builds:** before is origin/main abd5e7b2 (`git archive`); after is the same plus A-809 (5acf9132b).
+- **Hardware:** adas-mac-studio (Apple M3 Ultra, 96 GiB). 2026-11-21 03:44–03:47 PST, load average 2.3–3.9.
+- **Rounds:** before and after interleaved, three rounds, all runs shown.
+- **Measured:** the run phase, i.e. the owner's counters after the run less after the preload. Judge µs is
+  `merge.submit.judge_ns / merge.submit.judge`; values per verdict is `merge.reanchor.values_walked / merge.submit.judge`.
+- Every run: oracle failures 0, exit 0.
+
+| preload | side | judge µs (r1, r2, r3) | values walked a verdict | verdicts/s |
+|---|---|---|---|---|
+| 0 | before | 22.9, 22.3, 22.2 | 7.8, 7.8, 7.8 | 6,057, 6,352, 6,011 |
+| 0 | after | 21.5, 20.1, 20.2 | 1.6, 1.6, 1.6 | 5,644, 6,382, 5,990 |
+| 10^4 | before | 28.3, 27.5, 27.5 | 29.9, 30.2, 29.9 | 6,191, 5,855, 5,570 |
+| 10^4 | after | 22.1, 21.7, 20.7 | 1.6, 1.6, 1.6 | 5,539, 5,826, 5,995 |
+| 10^5 | before | 66.4, 64.7, 65.2 | 227.6, 227.4, 227.9 | 4,854, 4,851, 5,178 |
+| 10^5 | after | 22.3, 23.1, 22.1 | 1.6, 1.7, 1.6 | 5,684, 5,784, 5,961 |
+
+- **Judge:** grew 2.9 times over 10^5 versions before (22.5 to 65.4 µs, the means); after it stays at 20.6 to 22.5 µs.
+- **Values walked:** went from 7.8 to 228 a verdict before; after it is 1.6 whatever the history. The 1.6 is a
+  verdict's paths that change length (fully re-anchored, as before) mixed with overwrites (one value each).
+- **Verdicts/s:** at 10^5, before is 4,851–5,178 and after is 5,684–5,961. Elsewhere the runs overlap.
+- **The preload's own cost** (each tenth of 10^5 versions, `inject preload`) is flat on both sides: before 292–300 µs a
+  version, after 291–295 µs. Its versions spread over many files, so no one path's history grows there; the growth is
+  the verdicts' over the hot paths.
+- **Unit:** `a_length_preserving_change_walks_one_value_however_long_its_history`. The 300th overwrite of a 16 KiB file
+  walked 300 values before and walks 1 now.
+- **Logs:** `~/.cache/w-rewrite-ops-ab-logs/run-<round>-<preload>-<side>.log` on adas-mac-studio. They are scratch and
+  are deleted after this record.
+
+## A-809's leftovers measured: a read through layers, an SDK replacement, an insert (A-811; 2026-11-21)
+
+w-rewrite-ops, main's order of 04:11.
+
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench`.
+- **File:** one 16 KiB file, 64-byte edits, nothing folded (every version is history, as when a reader pins the floor).
+- **Rounds:** fastest of 5 rounds a point; each (b) point is the mean of 200 changes made after the history reaches its
+  length.
+- **Host:** adas-mac-studio (Apple M3 Ultra, 96 GiB), 04:09–04:23 PST.
+- **Builds:** before is main fd031603d, at load 1.7–2.8; after is the same plus A-811's two fixes, at load 2.6–4.0.
+
+| measure | point | before | after |
+|---|---|---|---|
+| (a) read of version 1 after m overwrites of one range | m = 10 | 5,750 ns | 3,917 ns |
+| | m = 100 | 15,708 ns | 3,292 ns |
+| | m = 1,000 | 37,125 ns | 1,709 ns |
+| | m = 10,000 | 190,750 ns | 5,875 ns |
+| (b') SDK replacement (delete + insert at one offset), a change | history 100 | 400,363 ns, 200.5 values | 3,087 ns, 1.0 |
+| | history 1,000 | 2,332,840 ns, 1,100.5 values | 4,270 ns, 1.0 |
+| | history 5,000 | 12,628,782 ns, 5,100.5 values | 10,398 ns, 1.0 |
+| (b) overwrite and insert alternating, a change | history 100 | 528,950 ns, 101 values | 524,655 ns, 101 |
+| | history 1,000 | 3,589,284 ns, 551 values | 3,599,576 ns, 551 |
+| | history 5,000 | 17,477,883 ns, 2,551 values | 17,526,648 ns, 2,551 |
+| overwrites alone, a change | history 100 | 2,568 ns, 1 value | 2,578 ns, 1 |
+| | history 1,000 | 3,607 ns, 1 value | 3,708 ns, 1 |
+| | history 5,000 | 9,034 ns, 1 value | 9,140 ns, 1 |
+
+- **(a) and (b'):** fixed (GAPS A-803's leftovers).
+- **(b):** open. An insert re-anchors in full, A-793's cost.
+- **The last rows:** a change that walks one value still grows sublinearly with the history. That cost is elsewhere in
+  the submit and is not chased.
+

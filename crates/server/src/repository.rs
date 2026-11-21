@@ -532,7 +532,7 @@ fn land_then_record(
     (repository, minted),
   ) {
     Ok(changeset) => changeset,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   let principal = principal.clone();
   let asked = (name.to_owned(), default_branch.to_owned());
@@ -593,7 +593,7 @@ fn creation_changeset(
     Vec<slates_store::owner::Part>,
     Vec<u8>,
   ),
-  ReplyBody,
+  Box<ReplyBody>,
 > {
   let judged = admits(
     state,
@@ -611,7 +611,7 @@ fn creation_changeset(
     },
   );
   if let Err(refusal) = judged {
-    return Err(refused(refusal));
+    return Err(Box::new(refused(refusal)));
   }
   // The repository's number and its root's, so nothing minted while the landing runs takes either.
   let reserved = minted.unwrap_or(DbVolumeId {
@@ -644,7 +644,7 @@ fn creation_changeset(
   let svn_created = match tool {
     VcsTool::Subversion => match svn_created(state, repository) {
       Ok(created) => created,
-      Err(refusal) => return Err(refused(refusal)),
+      Err(refusal) => return Err(Box::new(refused(refusal))),
     },
     VcsTool::Git | VcsTool::Mercurial => Vec::new(),
   };
@@ -711,7 +711,7 @@ pub(crate) fn create_blocking(
   let (header, parts, svn_created) = match creation_changeset(state, (&disk, principal), asked, ids)
   {
     Ok(changeset) => changeset,
-    Err(reply) => return reply,
+    Err(reply) => return *reply,
   };
   let landed = crate::test_store::land_blocking(disk, header, parts);
   recorded_after_landing(

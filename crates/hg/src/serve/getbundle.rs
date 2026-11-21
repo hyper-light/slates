@@ -31,11 +31,14 @@
 //!
 //! **Made a slice at a time** (A-745; §4.17.1 "A fetch's answer"). [`Answering`] writes the answer in steps, each given
 //! the served view and a room of its own: the stream's head, then the changegroup a unit a step ([`Walk`]), then the
-//! parts after it. A fetch that leaves no served changeset neither sent nor held, over a view that serves every
-//! changeset (a clone of every head, the large case), is walked by its links, 7.2's own fast path (`fastpathlinkrev`):
-//! the missing changesets as ranges, the manifest log in its order and then the file logs from row to row, each
-//! revision whose log links it to a missing changeset, so nothing grows with the repository but the walk's place. Any
-//! other fetch (a pull of some heads, a view that hides changesets) takes the slow path below, bounded by what it sends.
+//! parts after it. A clone of every head (the client holding nothing, over a view that serves every changeset: the large
+//! case) is walked by its links, 7.2's own fast path (`fastpathlinkrev`): the missing changesets as ranges, the manifest
+//! log in its order and then the file logs from row to row, each revision whose log links it to a missing changeset, so
+//! nothing grows with the repository but the walk's place, and every row it visits is sent. Any other fetch (a pull,
+//! whose client holds the history before it; a pull of some heads; a view that hides changesets) takes the slow path
+//! below, bounded by what it sends. 7.2 walks a pull of every head by its links too, visiting every row to send a few:
+//! a one-changeset pull of Mercurial's history took 4.2 s here that way (goal 93 perf), so slates takes the slow path,
+//! which may resend a manifest the client holds (an empty changeset's, reused), which its `addgroup` drops.
 //!
 //! **Texts lent** (A-680). The store lends each text in place where it holds it in one piece and copies it otherwise,
 //! the copy charged to the request's admission before it is made ([`Store`]). Each missing changeset's text is lent
@@ -580,20 +583,16 @@ fn frame_after(parts: &[Built], first: u32, admission: &mut Admission) -> Result
   Ok(out)
 }
 
-/// Whether a fetch of `outgoing` is walked by its links ([`Walk::begin`]): the view serves every changeset, and every
-/// one it serves is sent or descends to a common revision, which a bit each of the view, let go after, tells.
-fn by_links(
-  store: &impl Store,
-  outgoing: &Outgoing,
-  admission: &mut Admission,
-) -> Result<bool, Refusal> {
-  if !store.serves_every_changeset() {
-    return Ok(false);
-  }
-  let held = common_ancestors(store, &outgoing.common, admission)?;
-  let held_count = (0..store.count()).filter(|rev| held.contains(*rev)).count();
-  let covered = to_u64(held_count).saturating_add(outgoing.missing.len());
-  Ok(covered == u64::from(store.count()))
+/// Whether a fetch of `outgoing` is walked by its links ([`Walk::begin`]): a clone of every head, the client holding
+/// nothing (no common revision) and the view serving every changeset, so every changeset is missing and every manifest
+/// and file revision is sent: the walk visits what it sends. Any fetch whose client holds something is made from the
+/// changesets it lacks ([`named_changegroup`]), so a pull of one changeset costs what it sends, never a walk of every
+/// row of the history for its links (goal 93 perf: a one-changeset pull of Mercurial's history took 4.2 s by the
+/// walk). Decided from the fetch's own counts, nothing walked.
+fn by_links(store: &impl Store, outgoing: &Outgoing) -> bool {
+  outgoing.common.is_empty()
+    && store.serves_every_changeset()
+    && outgoing.missing.len() == u64::from(store.count())
 }
 
 /// The changegroup of `outgoing` in `version`, its payload whole: [`Walk`]'s steps at once.
@@ -649,9 +648,9 @@ pub struct Walk {
 }
 
 impl Walk {
-  /// A walk of the changegroup of `outgoing` in `version`, at its start: by the links where the fetch leaves no served
-  /// changeset neither sent nor held and the view serves every changeset (7.2's `fastpathlinkrev`, which it takes for
-  /// a fetch of every head), else by the changesets that name each revision, made whole within `admission`.
+  /// A walk of the changegroup of `outgoing` in `version`, at its start: by the links for a clone of every head
+  /// ([`by_links`]: the client holds nothing, so every row is sent), else by the changesets that name each revision,
+  /// made whole within `admission`.
   pub fn begin(
     store: &impl Store,
     outgoing: &Outgoing,
@@ -664,7 +663,7 @@ impl Walk {
       at: Some(At::Changelog(0)),
       named: None,
     };
-    if !by_links(store, outgoing, admission)? {
+    if !by_links(store, outgoing) {
       walk.named = Some(named_changegroup(store, outgoing, version, admission)?);
       walk.at = None;
     }

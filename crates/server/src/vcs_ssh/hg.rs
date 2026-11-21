@@ -82,6 +82,8 @@ pub(crate) struct HgCommand<S: HgStores> {
   warning: Vec<u8>,
   /// Input that arrived after the session ended, which it dropped: given back to the window at the next step.
   dropped: usize,
+  /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
+  costs: crate::vcs_store::hg_view::TurnCosts,
 }
 
 impl<S: HgStores> HgCommand<S> {
@@ -108,6 +110,7 @@ impl<S: HgStores> HgCommand<S> {
       stdio: Stdio::new(window),
       warning,
       dropped: 0,
+      costs: crate::vcs_store::hg_view::TurnCosts::ZERO,
     }
   }
 }
@@ -139,6 +142,71 @@ fn hidden_refused(principal: &Principal) -> Vec<u8> {
   words.extend_from_slice(format!("{principal:?}").as_bytes());
   words.push(b'\n');
   words
+}
+
+/// A request's step: its answer admitted the room a fetch's turn is (A-745 rule 2), as over HTTP (a `lookup` reads each
+/// head's manifest for its `.hgtags`, past the edge's room in hg's own history; the input stays bounded by the
+/// channel's window). A stream begun is held in this same turn, with no wait between, so every later turn reads what
+/// this one read.
+fn answered_step<S: HgStores>(
+  stores: &mut S,
+  (repository, room): (RepositoryId, u64),
+  stdio: &mut Stdio,
+  generation: &mut Option<S::Hold>,
+) -> Result<Progress, Refused> {
+  let answer_room = stores
+    .fetch_turn(repository)
+    .map_or(room, |(turn_room, _)| turn_room);
+  let mut admission = Admission::new(answer_room);
+  let progress = stores
+    .lend(repository, &mut admission, |store, left| {
+      stdio.step(store, left.left())
+    })
+    .ok_or_else(unheld)?;
+  if stdio.streaming() {
+    let mut held = Admission::new(room);
+    *generation = Some(stores.hold(repository, &mut held).ok_or_else(unheld)?);
+  }
+  Ok(progress)
+}
+
+/// A stream's turn (A-745, §4.17.1 "A fetch's answer"): what its next step asks of the node's changeset store answered
+/// first; then a `getbundle`'s answer made a turn at a time, the view lent for the turn, each slice within the shard's
+/// room, the turn paced (A-783, [`crate::vcs_store::hg_view::paced_turn`]) and ending once a room's worth waits to be
+/// sent or the store is asked.
+async fn streamed_turn<S: HgStores>(
+  stores: &mut S,
+  (generation, repository, room): (&S::Hold, RepositoryId, u64),
+  stdio: &mut Stdio,
+  costs: &mut crate::vcs_store::hg_view::TurnCosts,
+) -> Result<Progress, Refused> {
+  if let Some(wants) = stdio.store_wants()
+    && !crate::vcs_store::hg_view::answer_store_wants(wants, repository).await
+  {
+    return Err(unheld());
+  }
+  let (turn_room, quantum) = stores.fetch_turn(repository).unwrap_or((room, 0));
+  let mut admission = Admission::new(turn_room);
+  let start = slates_rt::futures::now_ns();
+  let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
+  let mut paced = crate::vcs_store::hg_view::paced_turn(quantum, start);
+  let turned = stores
+    .lend_held(generation, &mut admission, |store, _| {
+      loop {
+        if !paced.more(crate::vcs_store::hg_view::ANSWER_STEP, costs) {
+          break Progress::Streamed { more: true };
+        }
+        match stdio.stream(store, turn_room) {
+          Progress::Streamed { more: true }
+            if stdio.stdout().len() < bound && stdio.store_wants().is_none() => {}
+          other => break other,
+        }
+      }
+    })
+    .ok_or_else(unheld);
+  paced.close(slates_rt::futures::now_ns(), costs);
+  crate::vcs_store::hg_view::turn_taken();
+  turned
 }
 
 /// The words a session ends with when its store is no longer held here: the site's not-served words (its step 3).
@@ -181,6 +249,7 @@ impl<S: HgStores> Command for HgCommand<S> {
       room,
       stdio,
       dropped,
+      costs,
       ..
     } = self;
     if let Some(push_room) = stores.push_room(*repository) {
@@ -189,43 +258,9 @@ impl<S: HgStores> Command for HgCommand<S> {
     let progress = if stdio.taking_push() {
       stdio.step_push()
     } else if let (true, Some(generation)) = (stdio.streaming(), generation.as_ref()) {
-      // A-745 (§4.17.1 "A fetch's answer"): a `getbundle`'s answer made a turn at a time, the view lent for the turn,
-      // each slice within the shard's room, the turn ending at its quantum or once a room's worth waits to be sent.
-      let (turn_room, quantum) = stores.fetch_turn(*repository).unwrap_or((*room, 0));
-      let mut admission = Admission::new(turn_room);
-      let start = slates_rt::futures::now_ns();
-      let bound = usize::try_from(turn_room).unwrap_or(usize::MAX);
-      stores
-        .lend_held(generation, &mut admission, |store, _| {
-          loop {
-            match stdio.stream(store, turn_room) {
-              Progress::Streamed { more: true }
-                if slates_rt::futures::now_ns().saturating_sub(start) < quantum
-                  && stdio.stdout().len() < bound => {}
-              other => break other,
-            }
-          }
-        })
-        .ok_or_else(unheld)?
+      streamed_turn(stores, (generation, *repository, *room), stdio, costs).await?
     } else {
-      // A request's answer is admitted the room a fetch's turn is (A-745 rule 2), as over HTTP: a `lookup` reads each
-      // head's manifest for its `.hgtags`, past the edge's room in hg's own history. The input stays bounded by the
-      // channel's window.
-      let answer_room = stores
-        .fetch_turn(*repository)
-        .map_or(*room, |(turn_room, _)| turn_room);
-      let mut admission = Admission::new(answer_room);
-      let progress = stores
-        .lend(*repository, &mut admission, |store, left| {
-          stdio.step(store, left.left())
-        })
-        .ok_or_else(unheld)?;
-      if stdio.streaming() {
-        // Taken in the turn the answer began, with no wait between, so every later turn reads what this one read.
-        let mut held = Admission::new(*room);
-        *generation = Some(stores.hold(*repository, &mut held).ok_or_else(unheld)?);
-      }
-      progress
+      answered_step(stores, (*repository, *room), stdio, generation)?
     };
     if !stdio.streaming() {
       *generation = None;

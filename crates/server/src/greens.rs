@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 use slates_db::catalog::{RepositoryId, VolumeId};
-use slates_merge::engine::{Green, Lent, Lineage, LineageGreen, LineageRefused, Release};
+use slates_merge::engine::{Green, Judged, Lent, Lineage, LineageGreen, LineageRefused, Release};
 
 /// The shard's green engines (module docs).
 #[derive(Default)]
@@ -38,10 +38,21 @@ pub struct Greens {
   lineages: BTreeMap<RepositoryId, RefCell<Lineage>>,
   /// Lends refused because the member's lineage was lent already, or had a member taken out (module docs).
   busy: Cell<u64>,
+  /// Lends refused because the green owes a push (P2, `crate::green_ready`): the reach around the choke point, counted.
+  owing_reached: Cell<u64>,
   /// Retired members' releases still owed, oldest first (module docs, "A retire is sliced").
   pending: VecDeque<(RepositoryId, Release)>,
   /// Whether this shard's release task is running.
   releasing: bool,
+}
+
+/// A held verdict previewed as a member of its green's lineage ([`Greens::preview`]).
+#[must_use = "a preview holds its lineage's nodes until it is retired"]
+pub struct Preview {
+  /// The lineage.
+  repository: RepositoryId,
+  /// The preview's handle there.
+  handle: LineageGreen,
 }
 
 /// What one unit of the queued releases did ([`Greens::release_unit`]).
@@ -104,8 +115,51 @@ impl DerefMut for GreenMut<'_> {
 }
 
 impl Greens {
-  /// `id`'s engine, lent: `None` when there is none, or when its lineage is lent already (counted).
+  /// `id`'s engine, lent: `None` when there is none, when its lineage is lent already (counted), or when it owes a push
+  /// and holds no content yet (P2; counted): every reader reaches a green's content through `crate::green_ready`, which
+  /// materializes it first, so nothing reads around it. [`Greens::lend`] lends one that owes, for the materializer.
   pub fn get(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
+    let lent = self.lend(id)?;
+    if lent.is_materialized() {
+      return Some(lent);
+    }
+    self
+      .owing_reached
+      .set(self.owing_reached.get().saturating_add(1));
+    None
+  }
+
+  /// `id`'s engine, lent for a write: as [`Greens::get`], `None` for a green that owes a push (counted).
+  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+    let owing = self.lend(id).is_some_and(|lent| !lent.is_materialized());
+    if owing {
+      self
+        .owing_reached
+        .set(self.owing_reached.get().saturating_add(1));
+      return None;
+    }
+    self.lend_mut(id)
+  }
+
+  /// Makes `id`'s green owe `push` (P2, `Green::defer`): the version it owes, or none (no such green, or one that cannot
+  /// owe it).
+  pub fn defer(&mut self, id: &VolumeId, push: slates_merge::push::DeferredPush) -> Option<u64> {
+    self.lend_mut(id)?.defer(push)
+  }
+
+  /// Whether `id`'s green owes a push (P2): held, and not materialized.
+  pub fn is_owing(&self, id: &VolumeId) -> bool {
+    self.lend(id).is_some_and(|lent| !lent.is_materialized())
+  }
+
+  /// Reaches refused because the green owed a push ([`Greens::get`]): zero in a build where every reader goes through
+  /// `crate::green_ready`.
+  pub fn owing_reached(&self) -> u64 {
+    self.owing_reached.get()
+  }
+
+  /// `id`'s engine, lent whether or not it owes a push: the materializer's, a replay's and a create's lend alone (P2).
+  pub fn lend(&self, id: &VolumeId) -> Option<GreenRef<'_>> {
     if let Some(green) = self.alone.get(id) {
       return Some(GreenRef::Alone(green));
     }
@@ -121,9 +175,9 @@ impl Greens {
     lent.map(|lent| GreenRef::Member(Box::new(lent)))
   }
 
-  /// `id`'s engine, lent for a write: `None` when there is none, or when a member of its lineage is taken out
-  /// (counted).
-  pub fn get_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
+  /// `id`'s engine, lent for a write whether or not it owes a push: the materializer's, a replay's and a create's (P2).
+  /// `None` when there is none, or when a member of its lineage is taken out (counted).
+  pub fn lend_mut(&mut self, id: &VolumeId) -> Option<GreenMut<'_>> {
     if let Some(green) = self.alone.get_mut(id) {
       return Some(GreenMut::Alone(green));
     }
@@ -234,6 +288,74 @@ impl Greens {
     let handle = lineage.get_mut().branch(source, version)?;
     self.members.insert(id, (repository, handle));
     Ok(())
+  }
+
+  /// The held verdict `judged` of member `id`'s green previewed as a member of its lineage of its own (A-805,
+  /// `Lineage::preview`): what a reader that must see the version before it commits reads ([`Greens::with_preview`]),
+  /// while `id`'s engine shows nothing of it. Retire it with [`Greens::retire_preview`] in the same step. Refused as the
+  /// lineage refuses it; `Stale` for a green standing alone.
+  pub fn preview(&mut self, id: &VolumeId, judged: Judged) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let handle = lineage.get_mut().preview(source, judged)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine.
+  pub fn with_preview<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, |green| call(green))
+  }
+
+  /// A scratch member of member `id`'s lineage at its head, O(1) (`Lineage::branch`): what an import's batch advances its
+  /// revisions in (C2 stage C, A-814), the green showing nothing of them until the batch commits. Retire it with
+  /// [`Greens::retire_preview`]. Refused as the lineage refuses a branch; `Stale` for a green standing alone.
+  pub fn preview_at_head(&mut self, id: &VolumeId) -> Result<Preview, LineageRefused> {
+    let (repository, source) = *self.members.get(id).ok_or(LineageRefused::Stale)?;
+    let lineage = self
+      .lineages
+      .get_mut(&repository)
+      .ok_or(LineageRefused::Stale)?;
+    let head = lineage.get_mut().with(source, |green| green.head())?;
+    let handle = lineage.get_mut().branch(source, head)?;
+    Ok(Preview { repository, handle })
+  }
+
+  /// Runs `call` on `preview`'s engine, for a write.
+  pub fn with_preview_mut<R>(
+    &mut self,
+    preview: &Preview,
+    call: impl FnOnce(&mut Green) -> R,
+  ) -> Result<R, LineageRefused> {
+    let lineage = self
+      .lineages
+      .get_mut(&preview.repository)
+      .ok_or(LineageRefused::Stale)?;
+    lineage.get_mut().with(preview.handle, call)
+  }
+
+  /// Retires `preview`, its holds given back at once: a preview at its green's head shares every node but the ones its
+  /// one version copied, so its release is that version's paths, never the tree.
+  pub fn retire_preview(&mut self, preview: Preview) {
+    let Some(lineage) = self.lineages.get_mut(&preview.repository) else {
+      return;
+    };
+    if let Ok(mut release) = lineage.get_mut().retire(preview.handle) {
+      while self
+        .release_step(preview.repository, &mut release)
+        .is_ok_and(|more| more)
+      {}
+    }
   }
 
   /// Retires member `id` from its lineage: its engine is gone at once, and what it held comes back as a [`Release`] to

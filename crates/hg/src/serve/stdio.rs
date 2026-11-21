@@ -273,6 +273,15 @@ impl Stdio {
     }
   }
 
+  /// What the stream's next step needs of the changeset store, if anything (a `stream_out`'s,
+  /// [`crate::render::Streaming::wants`]).
+  pub fn store_wants(&mut self) -> Option<&mut dyn crate::render::StoreWants> {
+    match self.answering.as_mut() {
+      Some(answering) if crate::render::StoreWants::wants(answering).is_some() => Some(answering),
+      _ => None,
+    }
+  }
+
   /// Whether a `getbundle`'s answer is being made (A-745): [`Stdio::stream`] makes its next slice.
   pub fn streaming(&self) -> bool {
     self.answering.is_some()

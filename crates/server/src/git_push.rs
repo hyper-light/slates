@@ -137,6 +137,7 @@ mod hooks;
 pub(crate) mod intake;
 #[cfg(test)]
 pub(crate) mod tests;
+pub(crate) mod words;
 
 #[cfg(unix)]
 pub(crate) use hooks::{HookAnswer, HookCall};
@@ -224,7 +225,16 @@ pub(crate) struct ReceivePack<P = Unpresented> {
   quarantine: Option<GitPush>,
   /// The store's refusal of an object the pack brought, which answers every command.
   unadmitted: Option<GitRefused>,
+  /// The commands' names, kept once the request is read for a client that asked a report but not side-band-64k, and
+  /// charged to the push's room: what a refusal after the push's body answers each command with
+  /// ([`ReceivePack::refused_report`]), since the request itself moves on through the answer. None under side-band,
+  /// whose refusal is band 3's words alone.
+  refusal_names: Option<Vec<Vec<u8>>>,
 }
+
+/// Counter: a member green checkpointed in a push's turn before its append, making the chains room for the append's
+/// entry, a green a turn (A-238 moved off the append's step). Format: a counter name.
+pub(crate) const ROOM_CHECKPOINTED: &str = "git_push.room_checkpointed";
 
 /// The shard's clock as the store's and the checks' passes read it: the runtime's monotonic
 /// nanoseconds (§4.3).
@@ -311,6 +321,9 @@ struct DecidingPush {
   restaging: Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time over the turns before its verdict (A-752).
   preparing: Option<slates_git::receive::works::Preparing>,
+  /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
+  /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
+  making_room: Option<Vec<DbVolumeId>>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
   homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
@@ -327,9 +340,8 @@ struct DecidingPush {
 /// them on the node's store as one changeset (`Names` and `Payload`, the bytes the homing gave back moved in), its
 /// sequence taken now; landed, the record is written as version 5 naming the contents and the sequence. A push that
 /// brings no object the repository lacks homes nothing and names none. Any shortfall (a homing short, a pack not held, no
-/// store, a refused landing) refuses the push ([`PushFailed::Unlanded`], C5 part 2b), never a record naming its objects
-/// inline. A driver that never takes an ask (a test's synchronous one) leaves the record version 2, the one such path
-/// left (GAPS).
+/// store, a refused landing, an ask no edge took by the turn after) refuses the push ([`PushFailed::Unlanded`], C5 part
+/// 2b), never a record naming its objects inline.
 #[derive(Debug)]
 enum Homing {
   /// Not yet asked.
@@ -497,6 +509,7 @@ impl<P> ReceivePack<P> {
       _decoding: crate::vcs_share::place::Decoding::begin(state.shard),
       quarantine: GitPush::begin(&state.vcs_stores, repository),
       unadmitted: None,
+      refusal_names: None,
       #[cfg(unix)]
       presenter,
       #[cfg(not(unix))]
@@ -518,7 +531,49 @@ impl<P> ReceivePack<P> {
     });
     let bytes_in = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     charge_step(state, self.repository, began, bytes_in);
-    read
+    let read = read?;
+    self.keep_refusal_names()?;
+    Ok(read)
+  }
+
+  /// Keeps the commands' names for a refusal's report (`refusal_names`) once the request is read, charged to the push's
+  /// room, for a client that asked a report but not side-band-64k; nothing otherwise, or once kept.
+  fn keep_refusal_names(&mut self) -> Result<(), PushFailed> {
+    if self.refusal_names.is_some() {
+      return Ok(());
+    }
+    let Some(request) = self.session.request() else {
+      return Ok(());
+    };
+    let requested = &request.requested;
+    if requested.side_band_64k || !(requested.report_status || requested.report_status_v2) {
+      return Ok(());
+    }
+    let bytes = request.commands.iter().fold(0u64, |total, command| {
+      total.saturating_add(u64::try_from(command.name.len()).unwrap_or(u64::MAX))
+    });
+    self
+      .admission
+      .charge(bytes)
+      .map_err(|past| PushFailed::Exchange(receive::Refusal::PastAdmission(past)))?;
+    self.refusal_names = Some(
+      request
+        .commands
+        .iter()
+        .map(|command| command.name.clone())
+        .collect(),
+    );
+    Ok(())
+  }
+
+  /// The report of a push refused after its body was read, `why`, for a client that asked a report but not
+  /// side-band-64k: `unpack <why>` and each command `ng` with it (`slates_git::receive::write_refused_report`); none
+  /// for any other client, or before the request was read.
+  pub(crate) fn refused_report(&self, why: &str) -> Option<Vec<u8>> {
+    let names = self.refusal_names.as_ref()?;
+    let mut report = Vec::new();
+    receive::write_refused_report(names, why.as_bytes(), &mut report).ok()?;
+    Some(report)
   }
 
   /// The client's bytes have ended: whether the push is now read whole. A request cut short ends the
@@ -529,7 +584,9 @@ impl<P> ReceivePack<P> {
       session.end_into(site, admission)
     });
     charge_step(state, self.repository, began, 0);
-    ended
+    let ended = ended?;
+    self.keep_refusal_names()?;
+    Ok(ended)
   }
 
   /// Runs `call` of the session over the push's intake site, read only over the repository's index
@@ -746,6 +803,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
+      making_room: None,
       homing: Homing::Due,
       #[cfg(unix)]
       then: None,
@@ -775,6 +833,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        making_room,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -787,6 +846,7 @@ impl<P> ReceivePack<P> {
         admitting,
         restaging,
         preparing,
+        making_room,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -832,12 +892,14 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::Asked(bytes, (identity, count));
         Ok(false)
       }
-      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the content is given back
-      // and the record is version 2, never a decision waiting for a homing nobody runs.
+      // Asked and not taken by the turn after: no edge carries it (a driver that never asks), so the content is given
+      // back and the push refused (C5 part 2b), never a decision waiting for a homing nobody runs, nor a record naming
+      // its objects inline.
       Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _), _) => {
         crate::vcs_store::release_names(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
-        Ok(true)
+        decision.sealed.release_homed(state);
+        Err(PushFailed::Unlanded)
       }
       // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge;
       // a push whose pack is not held is refused (C5 part 2b).
@@ -856,10 +918,11 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::LandAsked(landing);
         Ok(false)
       }
-      // A changeset no edge took: no edge lands it, so the record names none (sequence 0), as a daemon with no store's.
+      // A changeset no edge took: no edge lands it, so the push is refused (C5 part 2b).
       Homing::LandAsked(_) => {
         crate::vcs_store::homes::count_untaken(state);
-        Ok(true)
+        decision.sealed.release_homed(state);
+        Err(PushFailed::Unlanded)
       }
       Homing::Unlanded => {
         decision.sealed.release_homed(state);
@@ -1794,6 +1857,8 @@ struct ServerJudge<'j> {
   restaging: &'j mut Option<slates_git::store::Staging>,
   /// The command under way's work, built a unit at a time before its verdict (A-752).
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
+  /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
+  making_room: &'j mut Option<Vec<DbVolumeId>>,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -1824,6 +1889,7 @@ impl Judge for ServerJudge<'_> {
       .push
       .admission_turn(self.state, (green, command.new), (self.admitting, ns))
       && self.build_turn(command, pushed, began)
+      && self.room_turn()
   }
 
   fn judge(&mut self, command: &Command, pushed: &Pushed<'_>) -> Result<Entry, Declined> {
@@ -1861,6 +1927,50 @@ impl Judge for ServerJudge<'_> {
 }
 
 impl ServerJudge<'_> {
+  /// A turn of making the chains room for the command under way's entry before its append (A-238, moved off the
+  /// append's step: git/git's whole-history push had an append meet `green_chains` at its cap and checkpoint the
+  /// repository's every member green in its one step, about a thousand folds, 1,142 ms, and the watchdog killed the
+  /// daemon): where the chains have less room than its built work's entry can take (`entry_bound`, as a Subversion
+  /// commit sizes its own, `svn_commit`), one member green checkpointed, counted [`ROOM_CHECKPOINTED`], and another turn
+  /// due; ready once there is room, or once every member is checkpointed (the append's guard then judges the entry,
+  /// `repository::push`'s A-238, which finds nothing left to fold).
+  fn room_turn(&mut self) -> bool {
+    let Some(bound) = self
+      .preparing
+      .as_ref()
+      .and_then(slates_git::receive::works::Preparing::entry_bound)
+    else {
+      *self.making_room = None;
+      return true;
+    };
+    if self.state.db.partition().green_chain_room() >= bound {
+      *self.making_room = None;
+      return true;
+    }
+    let repository = self.record.id;
+    let members = self.making_room.get_or_insert_with(|| {
+      self
+        .state
+        .db
+        .partition()
+        .repositories()
+        .members_of(repository)
+        .map(|member| member.green)
+        .collect()
+    });
+    let Some(green) = members.pop() else {
+      *self.making_room = None;
+      return true;
+    };
+    self.state.count(ROOM_CHECKPOINTED, 1);
+    crate::merge_service::checkpoint_green_when(
+      self.state,
+      green,
+      crate::merge_service::Doubling::Now,
+    );
+    false
+  }
+
   /// The policy's verdict on `command` (module docs, "Answering", item 3): A-644's store answers how the change moves
   /// its ref and so the right it needs, and A-622's check point judges that right and, where a rule imposes one, the
   /// requirements on what the change brings (A-644 part 2's `StoreBrings`: a linear history, signed commits); a

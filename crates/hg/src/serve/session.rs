@@ -301,6 +301,27 @@ impl Producing {
   }
 }
 
+impl crate::render::StoreWants for Producing {
+  fn wants(&self) -> Option<&crate::render::Want> {
+    match self {
+      Producing::Revlogs(streaming) => streaming.wants(),
+      Producing::Bundle(_) => None,
+    }
+  }
+
+  fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
+    if let Producing::Revlogs(streaming) = self {
+      streaming.give_rows(rows);
+    }
+  }
+
+  fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
+    if let Producing::Revlogs(streaming) = self {
+      streaming.give_chunks(chunks);
+    }
+  }
+}
+
 /// Serves the request at the front of `input` as [`serve`] does, but a `getbundle` whose answer begins, or a
 /// `stream_out` whose revlogs are served, is handed back in `answering` to be made a slice at a time (A-745), nothing of
 /// it written yet.
@@ -479,7 +500,8 @@ pub(crate) fn dispatch(
   }
   if command == b"stream_out" {
     let mut stream = Vec::new();
-    return match stream::stream_out(store, admission, &mut stream) {
+    // A whole answer cannot wait for the changeset store: its stream is not served (`1\n`); the edges stream it.
+    return match stream::stream_out(store, &mut crate::render::NotKept, admission, &mut stream) {
       Ok(()) => (Answer::Legacy(stream), None),
       Err(refusal) => {
         let refused = Refused::Serve(refusal);

@@ -1233,7 +1233,10 @@ fn both_packings(
   };
   let ours = changegroup(&served, &outgoing, Version::V03, &mut room()).unwrap();
   let ours = picked(&Changegroup::decode(&ours, Version::V03, &mut room()).unwrap());
-  let every = held.len() + missing.len() == usize::try_from(count).unwrap();
+  // 7.2's link-revision fast path where the client holds nothing (a clone of every head, the rows all sent), its slow
+  // path otherwise: slates takes the slow path for a pull 7.2 would walk by links, so a pull costs what it sends (goal
+  // 93 perf); the slow path may resend a manifest the client holds, which its `addgroup` drops.
+  let every = held.is_empty() && missing.len() == usize::try_from(count).unwrap();
   let oracle = if every {
     fast_packed(&served, &missing)
   } else {
@@ -1582,8 +1585,8 @@ proptest! {
   /// taking a side's revision unlisted, empty changesets reusing their parent's manifest, each manifest's delta stored
   /// against a parent or whole) and pack the changesets missing between generated heads and common revisions. Expect
   /// every manifest as 7.2's packer, stated literally, sends it, and every file revision the client lacks too, with its
-  /// link, in its log's order: its link-revision fast path where the fetch leaves no changeset neither sent nor held,
-  /// its slow path otherwise.
+  /// link, in its log's order: its link-revision fast path for a clone of every head (the client holding nothing), its
+  /// slow path otherwise (slates' choice for a pull, which 7.2 walks by links: goal 93 perf).
   #[test]
   fn the_changegroup_carries_what_mercurials_packer_carries(
     history in history(),
@@ -1700,4 +1703,37 @@ fn an_answer_is_made_a_slice_at_a_time_each_slice_within_its_own_room() {
   let (out, steps) = sliced(slice_room).unwrap();
   assert!(steps > 2, "{steps} steps");
   assert_eq!(out, whole);
+}
+
+/// Goal 93 perf (main's order of 2026-11-21 00:22: a one-changeset pull that scales with the history). A fetch whose
+/// client holds every served changeset but the newest is made from what it sends, not by walking every manifest and
+/// file revision of the history for their links (7.2's link walk serves a clone of every head, whose rows are what it
+/// sends). Do: pull the newest of twenty changesets, the client holding the nineteen before it; count the walk's steps.
+/// Expect: the walk made from the missing changeset (one step), and its changegroup the oracle's.
+#[test]
+fn a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history() {
+  let parents: Vec<[Option<Rev>; 2]> = (0..20u32).map(|rev| [rev.checked_sub(1), None]).collect();
+  let history = shaped(&parents);
+  let edits: Vec<Edit> = (0..20u8).map(|at| (vec![(at % 2, at)], 0)).collect();
+  let (served, stored) = filled(history, &edits);
+  let held = ancestors(&served.history, &[18]);
+  let missing: Vec<Rev> = vec![19];
+  let oracle = packed(&served, &stored, &missing, &held);
+  let outgoing = Outgoing {
+    heads: vec![19],
+    common: vec![18],
+    missing: missing.iter().map(|rev| *rev..rev + 1).collect(),
+  };
+  let mut walk = super::Walk::begin(&served, &outgoing, Version::V03, &mut room()).unwrap();
+  let mut out = Vec::new();
+  let mut steps = 1usize;
+  while walk.step(&served, &mut room(), &mut out).unwrap() {
+    steps = steps.saturating_add(1);
+  }
+  let ours = picked(&Changegroup::decode(&out, Version::V03, &mut room()).unwrap());
+  assert_eq!(steps, 1, "one step, not a walk of every row");
+  assert_eq!(
+    lacking(ours, &served, &held),
+    lacking(oracle, &served, &held)
+  );
 }
