@@ -493,11 +493,13 @@
 > - A/B (BENCHMARKS, "A length-preserving change walks one value"): at 10^5 versions, judge 65.4 to 22.5 µs and values
 >   228 to 1.6 a verdict.
 >
-> Left, measured, not worked:
+> Left, found by A-809's design and NOT measured (corrected 2026-11-21; this line said "measured" in error):
 > - (a) A read of an earlier value resolves its anchor's layers. That is O(log + the layers over each piece), so a hot
->   range overwritten m times since a reader's version costs it m candidates.
+>   range overwritten m times since a reader's version costs it m candidates. To measure: a rebase or old-version read's
+>   time against m.
 > - (b) A path whose changes alternate overwrites and inserts flattens its layers at each insert. That is O(its history)
->   per insert, as every change cost before.
+>   per insert, as every change cost before. To measure: `--preload` with inserts mixed in (the harness writes overwrites
+>   only).
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
