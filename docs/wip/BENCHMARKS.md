@@ -15910,6 +15910,108 @@ work's files, a2415c930). After: the slot an overlay over the green's pinned ver
 
 Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.
 
+
+## R9's loaded p99 on macOS: where it goes, and the immediate poll A/B (A-786; R9; 2026-11-20, w-provision-gate)
+
+**Machine and load.** This MacBook: Apple M4 Max, 14 CPUs (10 P + 4 E), 36 GB, macOS 26. Release builds,
+`provision_bench`, 9 shards (derived). The host's own load was 4 to 54 from other agents' builds through the day, so "quiet"
+below is the machine as it was, not a quiesced one. "Loaded" adds `PROVISION_BENCH_LOAD=2`: 28 busy processes at default
+priority (two a logical CPU), started after the daemon's boot. Each figure is the median of the bench's three runs, and
+the arms ran interleaved round by round. Diagnostic code (hop stamps, harvest counters, the arms' switches) lived only in
+the scratch tree, and the arms' binaries were compared by MD5 before running.
+
+**Red on main (base 37c84db43; host load 36-38).** Quiet 1-client spinning p50/p99/p999
+88.5 µs / 616 µs / 1.92 ms; parked p99 683 µs. Loaded: spinning 85.0 µs / 1.62 ms / 13.4 ms; parked p99 939 µs. Bound
+616 + (939 - 683) = 873 µs: FAIL.
+
+**Whose time.** A-559's stamps split each create: the creates at or past the loaded p99 spent 1.1 to 1.7 ms in the
+daemon at the median and 14 to 28 µs in the client (all of them parked their client). Stamps at each hop of a
+forwarded create, at the tail median (loaded): pickup by the client's shard 16-64 µs, the forward to the owner 7-13 µs,
+the owner's create 13-30 µs, the reply's task back on the client's shard 6-21 µs, from that task to the shard's serve task
+**0.77-1.37 ms** (quiet: 15 µs at the median, every create), the write into the client's ring 1 µs.
+
+**Why.** `Shard::run` harvests the driver with a zero-timeout wait whenever it has been busy a step quantum, and that ran
+between the two tasks. On macOS that wait is `kevent` with a zero timespec, which sleeps 12-15 µs with an involuntary
+switch (A-218). Counted in one 3-run form: quiet, 0 of 79,591 harvests over 100 µs (max 89 µs); loaded, 2,695 of 59,622
+(max 9.1 ms).
+
+**The A/B (loaded, three interleaved rounds, host load 41-54).** Arms: main; `immediate` (every zero-timeout wait on the
+queue is `kevent64` with `KEVENT_FLAG_IMMEDIATE`, the registrations and the kick moved to `kevent64` with it); and
+`immediate, no hold` (the same, with the closed-loop hold at 0).
+
+| arm | p50 µs | p99 ms | p999 ms | CPU, thousandths of a core |
+|---|---|---|---|---|
+| main | 114.8 / 82.3 / 77.8 | 1.04 / 0.49 / 0.91 | 2.74 / 2.26 / 7.78 | 773-1,167 / 2-1,017 / 656-811 |
+| immediate | 80.7 / 57.9 / 85.8 | 0.43 / 0.54 / 0.73 | 12.1 / 10.6 / 12.0 | 2,084-4,918 / 2,176-2,388 / 1,717-2,488 |
+| immediate, no hold | 29.6 / 68.3 / 58.9 | 0.17 / 0.38 / 0.27 | 0.30 / 11.3 / 6.65 | 1,358-3,093 / 1,270-3,518 / 1,202-2,458 |
+
+Slow harvests (over 100 µs) fell from 1,410-5,832 a form on main to 3-19 with the immediate poll. An earlier round of the
+same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against 0.67 / 0.46 / 0.74 ms, p999 13-18 against
+26-36 ms.
+
+**Measured and rejected:**
+- `immediate` with a `sched_yield` in each idle-spin turn. Quiet, it gave the best p50 (35 µs) at 0.1-0.9 cores. Loaded,
+  every p99 was 10.1 ms: each yield gave a spinner macOS's whole 10 ms quantum.
+- Zero-timeout polls of two forms on one queue (`IMMEDIATE` for the busy harvest, a zero timespec for the spin's turn, to
+  keep the spin's nap). 3 of 3 runs hung at the first create, every shard parked in `kevent64` and the client waiting: a
+  kick was lost. Not chased.
+
+**Reading.** The immediate poll removes the hop's millisecond tail. Alone, it makes A-387 keep holds, since turns now cost
+0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
+next piece; the immediate poll lands with it, not before.
+
+## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
+  three `slates anchor --fleet` processes at f = 1 over loopback UDP with their HTTPS version-control edges, formed and
+  bootstrapped; on a node not the bootstrap's, one push of git/git cut at v1.0.0 (3,434,551 bytes, 12,232 objects, about
+  500 KB of names), then ten at once, each to its own repository, over TLS, each timed from its connection to its whole
+  answer; then that node's homing counters. Studio-2 (14 cores), shared with other agents: load 10 to 16, so a build's
+  own rounds spread by up to 15 s; read the medians and the counters, never one round.
+- **Found first:** six of eleven version-3 homings fell short (`homes.homed_short`), their records version 2: the region
+  half of a homing took the record sessions on the repository's owner shard, where none is. Fixed in 3406df928 (the
+  region half runs on the control shard and waits for a lent session); after it, eleven of eleven `homed_in_region` in
+  every round below.
+- **v2 against v3** (v2 = f95edf68e, v3 = the switch on with 3406df928's fix), ten rounds:
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 2.847 | 2.376 | 5.523 | 6.787 | 8.345 | 7.902 |
+| 2 | 1.733 | 2.036 | 4.582 | 6.119 | 7.445 | 7.216 |
+| 3 | 1.719 | 2.044 | 4.910 | 5.849 | 6.862 | 6.554 |
+| 4 | 1.672 | 2.314 | 4.894 | 6.084 | 7.040 | 6.637 |
+| 5 | 1.732 | 2.082 | 4.829 | 8.733 | 6.483 | 9.971 |
+| 6 | 3.615 | 2.500 | 6.296 | 5.869 | 8.188 | 6.871 |
+| 7 | 1.952 | 2.426 | 4.312 | 7.409 | 6.631 | 8.573 |
+| 8 | 1.737 | 3.828 | 6.709 | 6.761 | 9.421 | 8.564 |
+| 9 | 4.217 | 2.278 | 10.972 | 5.646 | 15.167 | 6.045 |
+| 10 | 5.281 | 2.195 | 11.364 | 8.447 | 12.430 | 10.010 |
+
+- **Coalescing homings** (a per-member queue on the control shard, one `PutMany` a batch, the member publishing once
+  for the batch: branch `agents/w-balance-coalesce`, 962c37a07, never on main), a second ten rounds with each homing
+  timed inside (`homes.homing_local_ns`, `homes.homing_region_ns`, landed):
+
+| round | v2 10, p50 | v3 10, p50 | v3 coalesced 10, p50 | v2 1 push | v3 1 push | v3 coalesced 1 push |
+|---|---|---|---|---|---|---|
+| 1 | 9.193 | 12.633 | 13.815 | 4.588 | 4.161 | 5.935 |
+| 2 | 5.563 | 7.306 | 26.068 | 2.314 | 3.078 | 5.259 |
+| 3 | 6.670 | 15.004 | 18.836 | 2.946 | 5.626 | 4.031 |
+| 4 | 5.531 | 11.372 | 11.631 | 1.869 | 3.523 | 4.637 |
+| 5 | 20.257 | 7.777 | 11.360 | 2.431 | 4.363 | 2.886 |
+| 6 | 6.321 | 10.022 | 10.994 | 2.938 | 2.691 | 3.313 |
+| 7 | 5.054 | 5.329 | 6.109 | 2.319 | 2.052 | 2.327 |
+| 8 | 5.041 | 5.810 | 7.321 | 1.960 | 1.996 | 2.653 |
+| 9 | 4.363 | 6.453 | 5.774 | 1.738 | 2.321 | 2.168 |
+| 10 | 5.758 | 8.333 | 7.084 | 4.436 | 2.666 | 2.647 |
+
+- **What it says.** Medians, ten at once p50: 5.66 s (v2), 8.06 s (v3), 11.18 s (v3 coalesced), at load 10.5 to 11 with
+  v2's own rounds from 4.4 to 20.3 s. Each homing measured inside takes about 10 to 16 ms (11 a round: the local halves
+  16 to 66 ms, the region halves 71 to 174 ms a round), so the homing is not where a version-3 push's added time, if it
+  is real under this noise, goes; and the coalescer carried one item an exchange (14 exchanges for 14 items in most
+  rounds): the homings of concurrent pushes arrive spread over their checks and seldom overlap, so there is nothing to
+  coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
+  next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
+  the candidates), measured on a quiet host before anything is changed.
 ## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
 
 `crates/server/tests/mounted_work_cow.rs presenting`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a

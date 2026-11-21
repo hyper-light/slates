@@ -2770,7 +2770,7 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
     (None, None)
   } else {
     let admitted = HELD_CONNECTIONS
-      .fetch_update(
+      .try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |held| (held < bound).then_some(held.saturating_add(1)),

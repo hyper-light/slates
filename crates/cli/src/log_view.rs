@@ -7,7 +7,7 @@
 //! `--json` is the same view as one object whose keys and shapes are stable (`needs_you`, `greens`, `awaiting_grant`),
 //! so a harness reads the decision list without scraping text.
 
-use slates_client::{LogWork, NeedsYou, SessionLog, VolumeId, WorkMark};
+use slates_client::{NeedsYou, SessionLog, VolumeId, WorkMark};
 
 use crate::format::volume_id_text;
 
@@ -51,6 +51,43 @@ fn mark_text(mark: &WorkMark) -> String {
   }
 }
 
+/// One item that needs the human, as its text line.
+fn need_line(need: &NeedsYou) -> String {
+  match need {
+    NeedsYou::Collided {
+      name,
+      path,
+      windows,
+      behind,
+      ..
+    } => format!(
+      "  ! {name}: collided at {path} ({windows} window{}); its green moved {behind} version{} past it",
+      if *windows == 1 { "" } else { "s" },
+      if *behind == 1 { "" } else { "s" }
+    ),
+    NeedsYou::AwaitingApproval {
+      name,
+      identity,
+      paths,
+      ..
+    } => format!(
+      "  ! {name}: merge held for approval: increment {} ({paths} path{})",
+      manifest_text(identity),
+      if *paths == 1 { "" } else { "s" }
+    ),
+    NeedsYou::AwaitingGrant {
+      landing,
+      volume,
+      target,
+      manifest,
+    } => format!(
+      "  ! landing {landing} of {} into {target} awaits a grant: slates grant {landing} {}",
+      volume_id_text(*volume),
+      manifest_text(manifest)
+    ),
+  }
+}
+
 /// The view as text lines.
 pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   let mut lines = Vec::new();
@@ -60,39 +97,7 @@ pub(crate) fn text_lines(log: &SessionLog) -> Vec<String> {
   } else {
     lines.push(format!("needs you ({}):", needs.len()));
     for need in &needs {
-      lines.push(match need {
-        NeedsYou::Collided {
-          name,
-          path,
-          windows,
-          behind,
-          ..
-        } => format!(
-          "  ! {name}: collided at {path} ({windows} window{}); its green moved {behind} version{} past it",
-          if *windows == 1 { "" } else { "s" },
-          if *behind == 1 { "" } else { "s" }
-        ),
-        NeedsYou::AwaitingApproval {
-          name,
-          identity,
-          paths,
-          ..
-        } => format!(
-          "  ! {name}: merge held for approval: increment {} ({paths} path{})",
-          manifest_text(identity),
-          if *paths == 1 { "" } else { "s" }
-        ),
-        NeedsYou::AwaitingGrant {
-          landing,
-          volume,
-          target,
-          manifest,
-        } => format!(
-          "  ! landing {landing} of {} into {target} awaits a grant: slates grant {landing} {}",
-          volume_id_text(*volume),
-          manifest_text(manifest)
-        ),
-      });
+      lines.push(need_line(need));
     }
   }
   for green in greens_of(log) {
@@ -135,6 +140,7 @@ mod tests {
   use slates_ipc::protocol::MergeWindow;
 
   use super::*;
+  use slates_client::LogWork;
 
   fn id(n: u8) -> VolumeId {
     VolumeId { bytes: [n; 16] }

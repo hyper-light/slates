@@ -58,13 +58,16 @@ pub(crate) type MountedPins = std::collections::BTreeMap<DbVolumeId, MountPin>;
 
 /// The tree identity of `pin`: its fingerprints' device, telling one mount's base from another's.
 fn identity(pin: MountPin) -> u64 {
-  let mut word = [0u8; 8];
+  // Format: a `u64`'s little-endian bytes: the green's id folded into eight.
+  let mut word = [0u8; size_of::<u64>()];
+  let width = word.len();
   for (at, byte) in pin.green.bytes.iter().enumerate() {
-    if let Some(slot) = word.get_mut(at % 8) {
+    if let Some(slot) = word.get_mut(at.checked_rem(width).unwrap_or(0)) {
       *slot ^= *byte;
     }
   }
-  u64::from_le_bytes(word) ^ pin.version.rotate_left(32)
+  // Shape: the version turned half a word, so it mixes into the folded id's other half.
+  u64::from_le_bytes(word) ^ pin.version.rotate_left(u64::BITS / 2)
 }
 
 /// The slot of mounted work `id`, made on its first mount (the module doc): `true` when the work has one now, `false`
