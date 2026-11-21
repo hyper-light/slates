@@ -16458,6 +16458,7 @@ timed 64 MiB requests after a warm-up, 40 in all; a 6 s `/usr/bin/sample` of the
 |---|---|---|---|---|---|---|---|
 | main `55038e0` (before) | 3.70 | 874 / 1,066.5 / 1,131 | 61.9–65.5 ms | 604 | 798 | 344 | 189 / 197 |
 | `e39f4ae` (after: frames encoded in place, packets sealed in one reused buffer) | 3.05 to 2.96 | 961 / 1,103 / 1,217 | 58.9–62.5 ms | 491 | 852 | 356 | 224 / 237 |
+| `6f9261a` (then: stream data carried as spans of the sender's bytes until acknowledged) | 3.33 to 3.14 | 927 / 1,092 / 1,206 | 59.3–63.2 ms | 433 | 811 | 382 | 247 / 233 |
 
 What it means:
 - The lane does about 1.1 GB/s on loopback, one direction, one session, on a quiet Mac.
@@ -16465,8 +16466,12 @@ What it means:
 - The step removed a clone of every reliable frame (a stream frame's 9 KB) into each packet, and the allocation of
   each packet's payload and datagram: `memmove` fell 19% (604 to 491 samples), `realloc` and `RawVec::reserve` left
   the top of the profile. The median moved 3.4% and the minimum 10%. MEMORY SIZING bans the copies whatever they cost.
-- What remains per packet: the send stream's bytes copied into each frame, and on the receiver the decrypt, the frame
-  decode's copy and the reassembly. Then the syscalls (`sendto` and `recvfrom`, one per datagram), and AES-GCM.
+- The second step removed the copy of each stream frame's bytes out of its sender: a packet in flight now names its
+  stream data as a span (stream, offset, length), encoded from the sender's buffer when the packet is built and again
+  if it is resent. `memmove` fell 12% more (491 to 433, 28% from 604). Goodput is level with the first step (median
+  1,103 to 1,092 MB/s, inside run-to-run noise): the copy was banned, not slow.
+- What the profile names now, in order: `sendto` (one syscall a datagram), `recvfrom` (likewise), AES-GCM, and the
+  receiver's copies (the frame decode's and the reassembly's) inside `memmove`.
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not

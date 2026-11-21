@@ -58730,3 +58730,30 @@ the tests' decoding of it), `crates/transport/src/endpoint.rs` (`seal_in_place`,
   encoded bytes are what they assert on.
 - **Owed (the next step):** frames kept as references into the send stream's bytes until acknowledged (no copy into a
   frame at all), and the receiver's copies (the frame decode's, the reassembly's).
+
+### §4.8 amended — A packet in flight names its stream data as a span of the sender's bytes, encoded from there, never copied into a frame (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput, its second step; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's sending and loss recovery), GAPS (the sweep's lane line),
+BENCHMARKS (the bulk row's third row), `crates/transport/src/stream.rs` (`StreamSpan`, `StreamSender::next_span`,
+`StreamSender::bytes`; `next_frame` now the tests' copying view of it), `crates/transport/src/conn.rs` (`Carried`, the
+tracker's in-flight records, `Acked`, `Lost`, `copy_oldest`, `drop_copied`, `forget_stream`, `tracked_bytes`),
+`crates/transport/src/connection.rs` (`poll_transmit_into`'s encoding, `encode_carried`, the retransmission queue and
+its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget_send_stream`),
+`crates/transport/src/session.rs` (`encode_stream_frame`, the one stream-frame encoding).
+- **What was there.** Each stream frame copied its bytes out of its sender when framed, and the copy was held until
+  the frame was acknowledged: in the packet's in-flight record, in the retransmission queue after a loss, in a probe's
+  copy, and split by copying again when a smaller path MTU cut a resend.
+- **Change.** A sent item is a `Carried`: a frame held whole (a control frame, a reset, a blocked report), or a span of
+  a send stream's bytes (`StreamSpan`: stream, offset, length, end). A span is encoded straight from its sender's
+  buffer each time its packet is built (`encode_carried`, `encode_stream_frame`, byte for byte the held frame's
+  encoding). The sender keeps every byte until its connection forgets the stream, after the last byte is acknowledged;
+  forgetting drops the stream's spans from flight and from the retransmission queue, so an owed span's bytes are always
+  there. A span that finds no stream (a probe's copy of data acknowledged since) writes nothing. A resend split for a
+  smaller path MTU names two ranges of the same bytes.
+- **Measured** (BENCHMARKS, Studio-1, quiet): `memmove` samples 491 to 433 (604 before the first step); goodput level,
+  median 1,092 MB/s.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test: lib 148 of 148 and admission,
+  amplification, exchanges, handshake_levels, key_update, receive_refusal, session and stateless_reset. The connection
+  tests read every packet as the bytes `poll_transmit_into` wrote, resends and split resends included, so a span's
+  encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
+- **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
+  one `sendto` and one `recvfrom` a datagram.

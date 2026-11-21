@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::congestion::{AckEvent, Controller, LossEvent};
 use crate::conn::{
-  AckGenerator, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, ack_runs, tracked_bytes,
+  AckGenerator, Carried, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, ack_runs, tracked_bytes,
 };
 use crate::flow::FlowController;
 use crate::pacer::Pacer;
@@ -268,8 +268,8 @@ pub struct Connection {
   streams: StreamSpace,
   /// Connection-wide in-flight packet tracking and loss detection (packet numbers are per-connection).
   sent: SentTracker,
-  /// Frames freed by loss detection or a probe, awaiting retransmission.
-  retransmit: VecDeque<Frame>,
+  /// Frames freed by loss detection or a probe, awaiting retransmission: stream data as spans of its sender's bytes.
+  retransmit: VecDeque<Carried>,
   /// The receive reassemblers, keyed by stream id (created when a stream's first frame arrives).
   recv_streams: BTreeMap<u64, StreamAssembler>,
   /// Receive streams a stream frame reached since the reader last took them ([`Connection::take_readable`]): the
@@ -521,7 +521,7 @@ impl Connection {
     let pn = self.sent.next_pn()?;
     self.sent.on_sent(
       pn,
-      vec![Frame::Ping],
+      vec![Carried::Frame(Frame::Ping)],
       now,
       u64::try_from(size).unwrap_or(u64::MAX),
     );
@@ -693,7 +693,7 @@ impl Connection {
     let ack_largest = self.push_acknowledgement(&mut unreliable, &mut packing, budget);
     let carries_ack = !unreliable.is_empty();
     let acknowledgements = unreliable.len();
-    let mut reliable: Vec<Frame> = Vec::new();
+    let mut reliable: Vec<Carried> = Vec::new();
     self.take_control(&mut reliable, &mut packing, budget);
     let stop = match self.pacing_hold(now, budget, probe) {
       Some(release) => FreshStop::Pacer(release),
@@ -712,7 +712,13 @@ impl Connection {
     };
     if let Some(pn) = packet_number {
       let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
-      for frame in acknowledgement.iter().chain(&reliable).chain(credit) {
+      for frame in acknowledgement {
+        frame.encode_into(out);
+      }
+      for carried in &reliable {
+        self.encode_carried(carried, out);
+      }
+      for frame in credit {
         frame.encode_into(out);
       }
       if !reliable.is_empty() {
@@ -727,6 +733,24 @@ impl Connection {
     unreliable.clear();
     self.unreliable = unreliable;
     packet_number
+  }
+
+  /// Appends `carried`'s bytes to `out`: a held frame's encoding, or a stream frame encoded straight from its sender's
+  /// buffer. A span whose stream was forgotten (its every byte acknowledged, or the stream abandoned) is owed nothing
+  /// and writes nothing: its packet goes out smaller than its budget, and its loss or acknowledgement finds no stream.
+  fn encode_carried(&self, carried: &Carried, out: &mut Vec<u8>) {
+    match carried {
+      Carried::Frame(frame) => frame.encode_into(out),
+      Carried::Span(span) => {
+        if let Some(data) = self
+          .send_streams
+          .get(&span.stream_id)
+          .and_then(|sender| sender.bytes(span.offset, span.len))
+        {
+          crate::session::encode_stream_frame(out, (span.stream_id, span.offset, span.fin), data);
+        }
+      }
+    }
   }
 
   /// [`Connection::poll_transmit_into`]'s packet as its frames, decoded back from the bytes it wrote: how this module's
@@ -773,7 +797,7 @@ impl Connection {
   }
 
   /// Moves queued stream control frames into the packet while they fit.
-  fn take_control(&mut self, reliable: &mut Vec<Frame>, packing: &mut Packing, budget: u64) {
+  fn take_control(&mut self, reliable: &mut Vec<Carried>, packing: &mut Packing, budget: u64) {
     while let Some(front) = self.control.front() {
       let bytes = front.encoded_len() as u64;
       if packing.used.saturating_add(bytes) > budget {
@@ -781,7 +805,7 @@ impl Connection {
       }
       if let Some(frame) = self.control.pop_front() {
         packing.used = packing.used.saturating_add(bytes);
-        reliable.push(frame);
+        reliable.push(Carried::Frame(frame));
       }
     }
   }
@@ -811,7 +835,7 @@ impl Connection {
     &mut self,
     budget: u64,
     probe: bool,
-    reliable: &mut Vec<Frame>,
+    reliable: &mut Vec<Carried>,
     packing: &mut Packing,
   ) -> Option<FreshStop> {
     loop {
@@ -855,35 +879,26 @@ impl Connection {
     else {
       return;
     };
-    let Some(Frame::Stream {
-      stream_id,
-      offset,
-      fin,
-      data,
-    }) = self.retransmit.front()
-    else {
+    let Some(Carried::Span(span)) = self.retransmit.front().cloned() else {
       return;
     };
-    if data.len() <= head_len {
+    let head_len = u64::try_from(head_len).unwrap_or(u64::MAX);
+    if span.len <= head_len {
       return;
     }
-    let (stream_id, offset, fin) = (*stream_id, *offset, *fin);
-    let (Some(head_bytes), Some(tail_bytes)) = (data.get(..head_len), data.get(head_len..)) else {
-      return;
-    };
-    let tail_offset = offset.saturating_add(u64::try_from(head_len).unwrap_or(u64::MAX));
-    let head = Frame::Stream {
-      stream_id,
-      offset,
+    // A span is split by naming two ranges of the same bytes: nothing is copied.
+    let tail_offset = span.offset.saturating_add(head_len);
+    let stream_id = span.stream_id;
+    let head = Carried::Span(crate::stream::StreamSpan {
+      len: head_len,
       fin: false,
-      data: head_bytes.to_vec(),
-    };
-    let tail = Frame::Stream {
-      stream_id,
+      ..span
+    });
+    let tail = Carried::Span(crate::stream::StreamSpan {
       offset: tail_offset,
-      fin,
-      data: tail_bytes.to_vec(),
-    };
+      len: span.len.saturating_sub(head_len),
+      ..span
+    });
     self.retransmit.pop_front();
     self.retransmit.push_front(tail);
     self.retransmit.push_front(head);
@@ -898,7 +913,7 @@ impl Connection {
     &mut self,
     budget: u64,
     probe: bool,
-    reliable: &mut Vec<Frame>,
+    reliable: &mut Vec<Carried>,
     packing: &mut Packing,
   ) -> FreshStop {
     loop {
@@ -959,7 +974,7 @@ impl Connection {
     &mut self,
     now: u64,
     pn: u64,
-    reliable: Vec<Frame>,
+    reliable: Vec<Carried>,
     probe: bool,
     ack_largest: Option<u64>,
     size: u64,
@@ -969,13 +984,11 @@ impl Connection {
     }
     self.asked_since.get_or_insert(now);
     let bytes: u64 = reliable.iter().map(tracked_bytes).sum();
-    for frame in &reliable {
-      if let Frame::Stream {
-        stream_id, offset, ..
-      } = frame
-        && self.send_streams.contains_key(stream_id)
+    for carried in &reliable {
+      if let Some((stream_id, offset)) = carried.stream_offset()
+        && self.send_streams.contains_key(&stream_id)
       {
-        self.unacked.entry(*stream_id).or_default().insert(*offset);
+        self.unacked.entry(stream_id).or_default().insert(offset);
       }
     }
     if probe {
@@ -1105,7 +1118,7 @@ impl Connection {
   /// of the best scheduler in every scenario, against round-robin's 4.8×, and a weighted (deficit
   /// round-robin) scheduler that starved the control and metadata classes outright. The losers were
   /// deleted.
-  fn next_fresh_frame(&mut self, data_room: u64) -> Result<Frame, FreshStop> {
+  fn next_fresh_frame(&mut self, data_room: u64) -> Result<Carried, FreshStop> {
     let mut held_by_credit = false;
     for class in Priority::ALL {
       let cap = data_room.min(self.class_credit(class));
@@ -1173,19 +1186,20 @@ impl Connection {
 
   /// The next frame of `stream_id`, if the peer's stream credit covers it and it has data within its
   /// flow-control credit.
-  fn frame_of(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Frame> {
+  fn frame_of(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Carried> {
     if !self.streams.sendable(stream_id) {
       return None;
     }
     self
       .send_streams
       .get_mut(&stream_id)
-      .and_then(|sender| sender.next_frame(stream_id, max_frame_len))
+      .and_then(|sender| sender.next_span(stream_id, max_frame_len))
+      .map(Carried::Span)
   }
 
   /// Round-robin within one class: the first ready stream after the one served last, wrapping, frames;
   /// one that cannot frame within `max_frame_len` is passed over. Each ready stream is tried at most once.
-  fn round_robin_class(&mut self, class: Priority, max_frame_len: usize) -> Option<Frame> {
+  fn round_robin_class(&mut self, class: Priority, max_frame_len: usize) -> Option<Carried> {
     let mut after = *self.served.get(class);
     for _ in 0..self.ready.get(class).len() {
       let ready = self.ready.get(class);
@@ -1568,7 +1582,9 @@ impl Connection {
       }
       true
     });
-    lost.frames.retain(|frame| !matches!(frame, Frame::Ping));
+    lost
+      .frames
+      .retain(|frame| !matches!(frame, Carried::Frame(Frame::Ping)));
     if fell {
       self
         .controller
@@ -1608,14 +1624,17 @@ impl Connection {
 
   /// Whether a lost frame still needs resending: a stream frame whose range another copy already had
   /// acknowledged, or whose stream was forgotten, does not; every other frame does.
-  fn still_owed(&self, frame: &Frame) -> bool {
-    match frame {
-      Frame::Stream {
-        stream_id, offset, ..
-      } => self
+  fn still_owed(&self, carried: &Carried) -> bool {
+    if let Some((stream_id, offset)) = carried.stream_offset() {
+      return self
         .unacked
-        .get(stream_id)
-        .is_some_and(|offsets| offsets.contains(offset)),
+        .get(&stream_id)
+        .is_some_and(|offsets| offsets.contains(&offset));
+    }
+    let Carried::Frame(frame) = carried else {
+      return true;
+    };
+    match frame {
       // A reset another copy already had acknowledged is not resent.
       Frame::ResetStream { stream_id, .. } => self.resets_owed.contains(stream_id),
       // Nor is a reset token another copy already had acknowledged.
@@ -1638,37 +1657,37 @@ impl Connection {
 
   /// Marks the stream ranges `frames` carried acknowledged, and releases every send stream that is now
   /// drained with nothing unacknowledged: its exchange's data has been delivered.
-  fn mark_acknowledged(&mut self, frames: &[Frame]) {
+  fn mark_acknowledged(&mut self, frames: &[Carried]) {
     let mut touched = Vec::new();
-    for frame in frames {
-      match frame {
-        Frame::ResetStream { stream_id, .. } => {
-          self.resets_owed.remove(stream_id);
+    for carried in frames {
+      if let Carried::Frame(frame) = carried {
+        match frame {
+          Frame::ResetStream { stream_id, .. } => {
+            self.resets_owed.remove(stream_id);
+          }
+          Frame::ResetToken { .. } => self.reset_token_owed = false,
+          // A blocked report the peer has acknowledged while this end is still blocked at the same limit is
+          // re-armed: its answering credit may have been lost, so the next poll reports again (at most once
+          // per round trip) until the credit rises.
+          Frame::DataBlocked { limit } if self.blocked_sent == Some(*limit) => {
+            self.blocked_sent = None
+          }
+          Frame::StreamsBlocked { limit } if self.streams_blocked_sent == Some(*limit) => {
+            self.streams_blocked_sent = None
+          }
+          Frame::StreamDataBlocked { stream_id, limit }
+            if self.stream_blocked_sent.get(stream_id) == Some(limit) =>
+          {
+            self.stream_blocked_sent.remove(stream_id);
+          }
+          _ => {}
         }
-        Frame::ResetToken { .. } => self.reset_token_owed = false,
-        // A blocked report the peer has acknowledged while this end is still blocked at the same limit is
-        // re-armed: its answering credit may have been lost, so the next poll reports again (at most once
-        // per round trip) until the credit rises.
-        Frame::DataBlocked { limit } if self.blocked_sent == Some(*limit) => {
-          self.blocked_sent = None
-        }
-        Frame::StreamsBlocked { limit } if self.streams_blocked_sent == Some(*limit) => {
-          self.streams_blocked_sent = None
-        }
-        Frame::StreamDataBlocked { stream_id, limit }
-          if self.stream_blocked_sent.get(stream_id) == Some(limit) =>
-        {
-          self.stream_blocked_sent.remove(stream_id);
-        }
-        _ => {}
       }
-      if let Frame::Stream {
-        stream_id, offset, ..
-      } = frame
-        && let Some(offsets) = self.unacked.get_mut(stream_id)
+      if let Some((stream_id, offset)) = carried.stream_offset()
+        && let Some(offsets) = self.unacked.get_mut(&stream_id)
       {
-        offsets.remove(offset);
-        touched.push(*stream_id);
+        offsets.remove(&offset);
+        touched.push(stream_id);
       }
     }
     for stream_id in touched {
@@ -1978,9 +1997,11 @@ impl Connection {
     self.send_streams.remove(&stream_id);
     self.unacked.remove(&stream_id);
     self.stream_blocked_sent.remove(&stream_id);
-    self
-      .retransmit
-      .retain(|frame| !matches!(frame, Frame::Stream { stream_id: id, .. } if *id == stream_id));
+    self.retransmit.retain(|carried| {
+      carried
+        .stream_offset()
+        .is_none_or(|(id, _)| id != stream_id)
+    });
     let dropped = self.sent.forget_stream(stream_id);
     self.in_flight = self.in_flight.saturating_sub(dropped);
     self.connection_sent = self.connection_sent.saturating_sub(dropped);
@@ -2123,7 +2144,7 @@ impl Connection {
   }
 
   /// Queues frames for retransmission, counting them.
-  fn queue_retransmit(&mut self, frames: Vec<Frame>) {
+  fn queue_retransmit(&mut self, frames: Vec<Carried>) {
     self.retransmitted = self.retransmitted.saturating_add(frames.len() as u64);
     self.retransmit.extend(frames);
   }
