@@ -28,3 +28,18 @@ the rebase asks means fewer rebase rounds, which is either a protocol change or 
 
 Your goal says "the next largest kind". 1 cuts that kind by changing the client, 3 cuts a smaller kind in the server.
 Tell me which.
+
+## Update: option 1 withdrawn; the real cut is a protocol decision
+A-796's ResolveMerge is refused as stale unless the green is still at the checked head. At 10 hot files the head moves
+on almost every ask, so option 1 would add a check ask per attempt and still loop. Withdrawn.
+
+The one cut to rebase rounds would be a rebase that **takes the head on its conflicting windows** in one ask: retire the
+work's operations the verdict names in conflict, rebase the rest onto the current head, all at once. That is what the
+harness's client does by hand (read the head, write it over the windows, rebase), but atomic. It is the client's
+explicit choice, like `git rebase -X theirs`, so it is no inferred merge (CLAUDE.md §2 item 11). It would take the rebase
+asks from 19.8 to about 4.6 a client at 10 hot files (one per conflict), with no ReadHead round.
+
+It is a new verb, or a flag on Rebase, across ipc, client, server and engine. I won't add protocol without your ruling.
+- If yes: I build it red-first with the merge oracle (the same final bytes as the harness's manual loop when the head
+  holds still), then the A/B at 300/100/30/10 hot files.
+- If no: I take option 3 (the shard-level length cache, a server-only cut of the third-largest kind).
