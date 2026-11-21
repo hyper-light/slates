@@ -58705,3 +58705,55 @@ Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound),
   31,223, verdicts 125 to 153 a second, oracle failures 0. The next bound: 64,072 accepted submits, 4,169 edits and 536
   rebases refused `BudgetExceeded`; a first-occurrence line now logs what the green's retention holds when its cap
   refuses a reservation with room left.
+
+### §4.8 amended — A session's packets are encoded in place and sealed in one reused buffer: no frame cloned, nothing allocated a packet (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's sending), GAPS (the sweep's lane line), BENCHMARKS (the bulk
+row's before and after), `crates/transport/src/connection.rs` (`Connection::poll_transmit_into`; `poll_transmit` now
+the tests' decoding of it), `crates/transport/src/endpoint.rs` (`seal_in_place`, `Endpoint::send_buffer`,
+`flush_packets`; `protect_packet` the rare packets' and tests' wrapper), `crates/transport/src/session.rs`
+(`Frame::encode_into` crate-visible).
+- **What was there.** Each packet's frames were gathered into a list of their own: the acknowledgement, then a clone of
+  every reliable frame (a stream frame's whole payload, about 9 KB at the 9,209-byte path MTU), then the credit. The
+  originals went to the sent packet's record. `protect_packet` then encoded the list into a new payload, sealed it, and
+  copied it into a new datagram. Per packet: a 9 KB clone, an encode, a copy and four allocations.
+- **Change.** `Connection::poll_transmit_into` encodes the packet's frames straight into its caller's buffer, the
+  reliable ones from where they are held before they move into the sent record, never cloned. The acknowledgement and
+  credit frames go through a list the connection keeps between packets. The endpoint frames every 1-RTT packet in one
+  buffer it keeps, with room left for the longest short header, and `seal_in_place` writes the header just before the
+  frames once the packet number's length is known. It seals the payload in place, appends the tag and applies header
+  protection there, and the datagram is sent from that buffer. The buffer grows once to the session's largest datagram.
+- **Measured** (BENCHMARKS, the bulk row, Studio-1): `memmove` samples 604 to 491; goodput median 1,066.5 to 1,103 MB/s,
+  min 874 to 961.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test: lib 148 of 148, admission 3,
+  amplification 2, exchanges 8, handshake_levels 4, key_update 1, receive_refusal 3, session 25, stateless_reset 7. The
+  connection's tests read each packet through `poll_transmit`, which decodes what `poll_transmit_into` wrote, so the
+  encoded bytes are what they assert on.
+- **Owed (the next step):** frames kept as references into the send stream's bytes until acknowledged (no copy into a
+  frame at all), and the receiver's copies (the frame decode's, the reassembly's).
+
+### §4.8 amended — A packet in flight names its stream data as a span of the sender's bytes, encoded from there, never copied into a frame (2026-11-20, w-shared for UI goal 93; main's ruling on the lane's throughput, its second step; MEMORY SIZING)
+Applied in the same change to: §4.8 (the session plane's sending and loss recovery), GAPS (the sweep's lane line),
+BENCHMARKS (the bulk row's third row), `crates/transport/src/stream.rs` (`StreamSpan`, `StreamSender::next_span`,
+`StreamSender::bytes`; `next_frame` now the tests' copying view of it), `crates/transport/src/conn.rs` (`Carried`, the
+tracker's in-flight records, `Acked`, `Lost`, `copy_oldest`, `drop_copied`, `forget_stream`, `tracked_bytes`),
+`crates/transport/src/connection.rs` (`poll_transmit_into`'s encoding, `encode_carried`, the retransmission queue and
+its split, `frame_of`, `record_sent`, `still_owed`, `mark_acknowledged`, `forget_send_stream`),
+`crates/transport/src/session.rs` (`encode_stream_frame`, the one stream-frame encoding).
+- **What was there.** Each stream frame copied its bytes out of its sender when framed, and the copy was held until
+  the frame was acknowledged: in the packet's in-flight record, in the retransmission queue after a loss, in a probe's
+  copy, and split by copying again when a smaller path MTU cut a resend.
+- **Change.** A sent item is a `Carried`: a frame held whole (a control frame, a reset, a blocked report), or a span of
+  a send stream's bytes (`StreamSpan`: stream, offset, length, end). A span is encoded straight from its sender's
+  buffer each time its packet is built (`encode_carried`, `encode_stream_frame`, byte for byte the held frame's
+  encoding). The sender keeps every byte until its connection forgets the stream, after the last byte is acknowledged;
+  forgetting drops the stream's spans from flight and from the retransmission queue, so an owed span's bytes are always
+  there. A span that finds no stream (a probe's copy of data acknowledged since) writes nothing. A resend split for a
+  smaller path MTU names two ranges of the same bytes.
+- **Measured** (BENCHMARKS, Studio-1, quiet): `memmove` samples 491 to 433 (604 before the first step); goodput level,
+  median 1,092 MB/s.
+- **Tests** (macOS arm64, local). `slates-transport`, every lib and integration test: lib 148 of 148 and admission,
+  amplification, exchanges, handshake_levels, key_update, receive_refusal, session and stateless_reset. The connection
+  tests read every packet as the bytes `poll_transmit_into` wrote, resends and split resends included, so a span's
+  encoding is what they assert on. The tracker's own tests carry held frames (`Carried::Frame`), a case it keeps.
+- **Owed.** The receiver's copies (the frame decode's into each `Stream` frame, the reassembly's), and the profile's top:
+  one `sendto` and one `recvfrom` a datagram.
