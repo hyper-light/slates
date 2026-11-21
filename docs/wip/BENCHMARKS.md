@@ -17143,3 +17143,28 @@ both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
   in one step: at load 8 to 14 (r8) the daemon restarted within it and the client's transaction was gone. Owed (GAPS):
   the green's apply a slice at a time (w-engine's 1b) and the chain naming the text by identity rather than carrying
   it (P7's finding, the register's), each of them outside the Subversion path.
+
+## A path's history re-anchored in O((n + k) log k): 80,000 ops judged in 90 ms, was 22.5 s (A-787 part 2's red; 2026-11-21)
+
+A refined re-indent puts tens of thousands of content ops on one path. The engine's judge re-anchors that path's history
+(`history::reanchor`), and two of its steps scanned a list per piece:
+- `Value::remapped` scanned every kept run;
+- `cut_superseded_blocks` scanned the union of runs.
+Both are now binary searches, and `remapped` falls back to the scan when runs overlap, so its result is the scan's
+(property test `the_indexed_remap_is_the_scans`). `green_post_state`, which had ended with exit 4 when the shard's
+watchdog saw a 3.5 s step in a debug build, passes 8 of 8 in 5.2 s.
+
+Measure: `Green::submit` of one increment re-indenting every line of one file (`lines` lines, two ops a line after
+refinement), timed once each, debug build, this Mac (macOS arm64), 2026-11-21 ~00:35 PST, by a scratch test in
+`crates/merge/src/refine/tests.rs` (not committed).
+
+| ops | before (main 73cd23c63) | after (2c32af2b5) |
+|---|---|---|
+| 10,000 | 0.40 s | 11 ms |
+| 20,000 | 1.43 s | 23 ms |
+| 40,000 | 5.64 s | 44 ms |
+| 80,000 | 22.5 s | 90 ms |
+
+Before, each doubling of ops quadrupled the time; after, it doubles. The first step alone (the remap index) gave 50 ms /
+195 ms / 775 ms / 3.22 s, still quadratic, until the union's binary search removed the second scan.
+
