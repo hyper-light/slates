@@ -1624,6 +1624,80 @@ pub(crate) async fn homed_drive(
   }
 }
 
+/// C5 part 2b (main's ruling of 2026-11-21 00:50: a homing that falls short refuses the push, never a record naming its
+/// objects inline). Do: on a store-backed shard, push stock git's `create`, driving its answer as an edge does but
+/// handing its names' homing back fallen short (no region home answered). Expect: the push refused `Unlanded`, and the
+/// repository's register holding no record. Red before part 2b: answered `ok`, its record version 2.
+#[test]
+fn t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "short");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      let outcome = short_homing_drive(repository, &request).await;
+      let records = crate::state::with_state(|state| {
+        crate::vcs_store::tests::records(state, repository).len()
+      });
+      let _ = sent.send((outcome, records));
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (outcome, records) = got.recv().expect("the push ended");
+  assert_eq!(outcome, Err("Unlanded".to_owned()));
+  assert_eq!(records, Some(0), "nothing of the push in the register");
+}
+
+/// [`homed_drive`] whose first homing is handed back fallen short, as when no region home answers: the answer's
+/// refusal (its kind), or `Ok` with the report's reasons.
+async fn short_homing_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<u8>, String> {
+  use crate::state::with_state;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state")?
+  .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.input(state, request))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.end(state))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  let mut answer = Vec::new();
+  loop {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state")?
+      .map_err(|failed| format!("{failed:?}"))?;
+    match step {
+      Answering::Answered(_) => return Ok(answer),
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        if let Some(crate::git_push::Carry::Home(bytes)) = push.take_homing() {
+          let fallen = crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
+            outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
+            bytes,
+          });
+          with_state(|state| push.homed(state, fallen)).ok_or("no state")?;
+        }
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => return Err(format!("no hook runs here: {step:?}")),
+    }
+  }
+}
+
 /// A pack of `objects`, each whole, as stock git writes one.
 fn pack_of_objects(objects: &[(slates_git::object_name::Kind, Vec<u8>)]) -> Vec<u8> {
   use slates_git::entry::{self, Header, Representation};
@@ -1817,7 +1891,6 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "homed");
     let requests: Vec<Vec<u8>> = chain()
       .into_iter()
@@ -1958,7 +2031,6 @@ fn pushed_v3_at(
 ) -> (RepositoryId, slates_vcs::ContentId, u16) {
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, name);
     let request = chain()
       .into_iter()
@@ -2027,7 +2099,6 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
 #[test]
 fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
   crate::test_store::audit_on_stored_shard("git-push", |state| {
-    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "untaken");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let records = crate::vcs_store::tests::records(state, repository);
@@ -2043,6 +2114,5 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
         .copied(),
       Some(1)
     );
-    crate::vcs_store::write_version_4_for_test(false);
   });
 }

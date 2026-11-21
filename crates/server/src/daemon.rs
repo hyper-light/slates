@@ -7805,7 +7805,6 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "barrier");
         let request = crate::git_push::tests::chain()
           .into_iter()
@@ -7922,7 +7921,6 @@ mod tests {
     let (sent, got) = std::sync::mpsc::channel();
     first
       .observe(shard, move |state| {
-        crate::vcs_store::write_version_4_for_test(true);
         let repository = crate::git_push::tests::git_repository(state, "landed");
         let request = crate::git_push::tests::chain()
           .into_iter()

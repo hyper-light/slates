@@ -491,6 +491,9 @@ pub(crate) enum GitRefused {
   Store(StoreRefused),
   /// The allocator refused a record's room, or its length is past what an address can hold.
   Allocation,
+  /// A push's names and pack were homed and landed, but they are no longer what its record would name (another push
+  /// committed one of its objects since): the push is refused, for its client's retry, never written inline (C5 part 2b).
+  Unlanded,
 }
 
 /// A record not written, in a push's terms: an object whose bytes the content store does not hold whole is one the
@@ -1440,26 +1443,8 @@ pub(crate) struct SealedPush {
   landed: u64,
 }
 
-/// Whether a git push's record is written as version 4, its names and its pack homed in the region first (A-724 piece
-/// 8c; A-722's record v4; main's rulings of 2026-11-20). On since the takeover test (`crates/cli/tests/v3_takeover.rs`)
-/// passed with version 3: every acknowledged push on the successor, its names read from their region homes. A unit test turns it on for its own
-/// thread ([`write_version_4_for_test`]); off there by default, so a unit test's push answers with no publication.
-pub(crate) fn write_version_4() -> bool {
-  #[cfg(test)]
-  {
-    WRITE_VERSION_4_FOR_TEST.with(std::cell::Cell::get)
-  }
-  #[cfg(not(test))]
-  {
-    true
-  }
 }
 
-#[cfg(test)]
-std::thread_local! {
-  /// [`write_version_4`] as a test on this thread asks.
-  static WRITE_VERSION_4_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
 /// 8c), lent the room the shard can admit for the step and settled after: its identity; none where refused.
@@ -1505,11 +1490,6 @@ pub(crate) fn release_names(state: &mut ShardState, identity: &slates_vcs::Conte
   settle(state);
 }
 
-/// Turns [`write_version_4`] on or off for the calling thread (a test's shard).
-#[cfg(test)]
-pub(crate) fn write_version_4_for_test(on: bool) {
-  WRITE_VERSION_4_FOR_TEST.with(|cell| cell.set(on));
-}
 
 impl SealedPush {
   /// The rows of the names the record would write now (A-724 piece 8c): each object the repository lacks, as
@@ -1573,27 +1553,32 @@ impl SealedPush {
   }
 
   /// The record the entry holds (`RepositoryEntry::objects`): the moves now admitted and the objects not yet committed,
-  /// written now, as the append commits ([`record_of`]).
+  /// written now, as the append commits (C5 part 2b). An append that brings no object the repository lacks names none,
+  /// version 5. One whose names and pack its edge homed and landed names them and its changeset, version 5, while they
+  /// are still the names it would write (another push may have committed one of its objects since: refused, for the
+  /// client's retry, never written inline). One nobody homed (a server-made commit, A-664, until it takes the deferred
+  /// submit's landing order; a push whose driver never carried its homing, a test's synchronous one) is written whole,
+  /// version 2 ([`record_of`]): the one register-held path left (GAPS, C5 part 2b).
   pub(crate) fn record(&self, stores: &VcsStores) -> Result<Vec<u8>, GitRefused> {
     let (content, store) = stores.git_ref(self.repository).ok_or(GitRefused::NoStore)?;
-    // Version 4 only while the names it would write are the ones homed (A-724 piece 8c) and its pack is the one homed
-    // (A-722's record v4): another push may have committed one of its objects since, and then the names are written
-    // inline, version 2, which is always whole. The homed contents are then held by no record and freed by the next
-    // restart's `release_unheld`.
-    if let (Some((identity, count)), Some(packed)) = (self.named, self.packed)
-      && self.push.stored_pack() == Some(packed)
-      && let Ok((bytes, now)) = self.names_now(stores)
-      && now == count
-      && slates_vcs::ContentId::of(&bytes) == identity
-    {
-      let _ = content;
-      return RecordWriter::finish_packed(
-        (self.push.deepest(), &self.keyed),
-        (identity, count),
-        packed,
-        self.landed,
-      )
-      .map_err(unwritten);
+    let (bytes, now) = self.names_now(stores)?;
+    let moves = (self.push.deepest(), self.keyed.as_slice());
+    if now == 0 {
+      return RecordWriter::finish_packed(moves, None, None, 0).map_err(unwritten);
+    }
+    if let Some((identity, count)) = self.named {
+      return match self.packed {
+        Some(packed)
+          if self.push.stored_pack() == Some(packed)
+            && now == count
+            && slates_vcs::ContentId::of(&bytes) == identity
+            && self.landed > 0 =>
+        {
+          RecordWriter::finish_packed(moves, Some((identity, count)), Some(packed), self.landed)
+            .map_err(unwritten)
+        }
+        _ => Err(GitRefused::Unlanded),
+      };
     }
     record_of(
       content,
