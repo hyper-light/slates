@@ -3704,11 +3704,15 @@ async fn image_build_task(id: slates_db::catalog::VolumeId) {
 /// One turn of `id`'s [`ImageBuild`]: its next pieces sealed until the seal turns' share of the quantum has passed, each
 /// sized to what is left of it ([`piece_bytes`], a page at least); once every piece is sealed, the image made at its head
 /// ([`install_image`]). Dropped, the image still owed, when the volume was superseded, owes a whole record, its keys are
-/// refused, or its head moved since the capture (counted `fleet.live.image_stale`).
+/// refused, or the retained tail no longer reaches past the head it was captured at (counted `fleet.live.image_stale`):
+/// until 2026-11-20 any head moved since the capture dropped it, so under a stream of writes no image was ever made.
 fn advance_image_build(state: &mut ShardState, id: slates_db::catalog::VolumeId) -> Advance {
   let current = state.live.shipping.get(&id.bytes).and_then(|live| {
     let build = live.image_build.as_ref()?;
-    Some(live.fenced.is_none() && !live.owes_whole && live.shipper.head() == Some(build.head))
+    // The capture serves while the tail still reaches past it: a holder installed there takes the entries after it.
+    let usable =
+      live.shipper.head() == Some(build.head) || live.shipper.retains_after(build.head.position);
+    Some(live.fenced.is_none() && !live.owes_whole && usable)
   });
   match current {
     None => return Advance::Done,
@@ -3857,7 +3861,8 @@ fn refresh_image(state: &mut ShardState, id: slates_db::catalog::VolumeId) {
 }
 
 /// Makes `image` (sealed under `anchors`' keys, `None` in the clear) the volume's install image at the shipper's head, or
-/// at `at` when it was captured there ([`advance_image_build`]), which the head must still be.
+/// at `at` when it was captured there ([`advance_image_build`]), which must be the head or a head the retained tail still
+/// reaches past.
 fn install_image(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
@@ -3868,13 +3873,14 @@ fn install_image(
   let Some(live) = state.live.shipping.get_mut(&id.bytes) else {
     return;
   };
-  let Some(head) = live.shipper.head() else {
+  let Some(head) = at.or_else(|| live.shipper.head()) else {
     return;
   };
-  if at.is_some_and(|at| at != head) {
+  // At the head, or behind it while the tail reaches past it (`Shipper::mark_checkpoint`): else not made.
+  live.shipper.mark_checkpoint(head);
+  if live.shipper.checkpoint() != Some(head) {
     return;
   }
-  live.shipper.mark_checkpoint(head);
   live.shipper.set_bounds(Bounds::of_whole(image.len()));
   // The image is the whole state now, held here; the shipper keeps no entry for it.
   live.shipper.keep(None);
