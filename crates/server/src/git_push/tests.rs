@@ -436,7 +436,7 @@ pub(crate) fn pushed_from_the_fixtures(
 /// one record in the register a push.
 #[test]
 fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_tree() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "fixtures");
     let mut after = "";
     for (scenario, next) in chain() {
@@ -503,7 +503,7 @@ fn assert_a_configured_hook_refuses(
 /// then the delete applied, one record more.
 #[test]
 fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refuses_typed() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "policy");
     pushed_from_the_fixtures(state, repository, &["create", "update", "copy"]);
     let held = records(state, repository);
@@ -600,7 +600,7 @@ fn assert_first_line_names(received: &Received, what: &[u8]) {
 /// more; the fourth applying both as one entry, one record more, `again` holding the second commit's text.
 #[test]
 fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "atomic");
     pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
     let held = records(state, repository);
@@ -677,7 +677,7 @@ fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId,
 /// holding the second commit's text. Before that push, the store made again from the log advertises `topic` too.
 #[test]
 fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "bindings");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let branch = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
@@ -758,7 +758,7 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
 /// before.
 #[test]
 fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "thin-replayed");
     pushed_from_the_fixtures(state, repository, &["create", "update"]);
     let before = super::advertised_refs(state, repository);
@@ -808,7 +808,7 @@ fn update_with_its_delta_first() -> Vec<u8> {
 /// the change: the replay refused as diverged, the second push's ref lost.
 #[test]
 fn t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "thin-first");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let received = pushed(state, repository, &update_with_its_delta_first());
@@ -843,7 +843,8 @@ const CREATES: usize = 24;
 /// holds its commit.
 #[test]
 fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
-  let refused = crate::daemon::audit_on_shard_configured(
+  let refused = crate::test_store::audit_on_stored_shard_configured(
+    "git-push",
     |state| {
       let repository = git_repository(state, "chains");
       let pack = pack_of(scenario!("create").request);
@@ -884,7 +885,7 @@ const INTERLEAVED: usize = 12;
 #[cfg(unix)]
 #[test]
 fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
-  let (outcomes, restaged) = crate::daemon::audit_on_shard(|state| {
+  let (outcomes, restaged) = crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "overtaken");
     let pack = pack_of(scenario!("create").request);
     let mut pushes: Vec<Option<ReceivePack>> = (0..INTERLEAVED)
@@ -1149,7 +1150,7 @@ fn hooked_repository(
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let hook = script(
     HookPointName::GitPreReceive,
     "pre-receive",
@@ -1178,7 +1179,7 @@ fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothin
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let pre = script(
     HookPointName::GitPreReceive,
     "pre-receive",
@@ -1268,7 +1269,7 @@ fn assert_report_between_the_hooks(answer: &[u8]) {
 #[cfg(unix)]
 #[test]
 fn t_a665_an_update_hook_refuses_its_own_command_alone() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let hook = script(
     HookPointName::GitUpdate,
     "update",
@@ -1373,7 +1374,7 @@ pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
 /// created.
 #[test]
 fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "large");
     let (_, mut push) = started(state, repository);
     let (request, blob) = large_create(LARGE);
@@ -1413,7 +1414,7 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
 /// principal named for all of them; the idle repository has no row.
 #[test]
 fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let pushed_to = git_repository(state, "pushed");
     let idle = git_repository(state, "idle");
     let mut sent = 0u64;
@@ -1469,7 +1470,7 @@ const BRANCHES: usize = 40;
 #[cfg(unix)]
 #[test]
 fn t_a719_a_push_is_decided_a_command_a_step() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "many");
     let (_, mut push) = started(state, repository);
     let names: Vec<Vec<u8>> = (0..BRANCHES)
@@ -1514,7 +1515,7 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
 /// its deltas (no input step resolved them), and its answer, made over turns, is the one git's own server gave.
 #[test]
 fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "deferred");
     let mut chained = chain().into_iter();
     let (create, _) = chained.next().unwrap();
@@ -1551,7 +1552,7 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
 /// the live store holds no content the records would not, and the rebuilt none fewer.
 #[test]
 fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "again");
     pushed_from_the_fixtures(state, repository, &["create", "update"]);
     let main = state
@@ -1756,7 +1757,7 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 /// budget (`push.build.past_budget` 0).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
   let (first, objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
@@ -1813,7 +1814,7 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
-  let daemon = crate::daemon::audit_daemon_of(1);
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
     crate::vcs_store::write_version_4_for_test(true);
@@ -1870,15 +1871,16 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   );
 }
 
-/// A-724 piece 8c (main's ruling (ii): a replay reads a version-3 record's names locally, else from their region homes).
-/// Do: on a node of four shards, with version 3 on, push stock git's `create` on a shard that is not its names' home
-/// (pushed again on another where the first was); drop the names from that owner's content store, so only their home
-/// shard holds them for the region; make the store again from the log, a task on the owner waiting for the rebuild's
-/// end. Expect: the rebuild reads the names from their home before the record's replay (counted fetched), and the store
-/// made again is the live one. Every wait is on its event, none on a fixed time: a loaded machine is the norm.
+/// A-724 piece 8c and A-767 C5 (a replay reads a record's names locally, else from the node's changeset store; a node
+/// whose store lacks the changeset reads them from their region homes). Do: on a store-backed node of four shards, with
+/// the homing on, push stock git's `create` on a shard that is not its names' home (pushed again on another where the
+/// first was); drop the names from that owner's content store; make the store again from the log, a task on the owner
+/// waiting for the rebuild's end. Expect: the rebuild reads the record's changeset back from the node's store before its
+/// replay (counted read), and the store made again is the live one. Every wait is on its event, none on a fixed time: a
+/// loaded machine is the norm.
 #[test]
-fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
-  let daemon = crate::daemon::audit_daemon_of(4);
+fn t_a767_c5_a_rebuild_reads_a_records_names_back_from_the_nodes_store() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(4);
   let (first, identity, home) = pushed_v3_at(&daemon, 0, "fetched");
   let (partition, repository) =
     match crate::daemon::observe_at(&daemon, 0, |state| state.shard) == home {
@@ -1897,7 +1899,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       .expect("main");
     let before = state
       .refusals
-      .get(crate::vcs_store::NAMES_FETCHED)
+      .get(crate::vcs_store::CHANGESET_READ)
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, repository);
@@ -1916,7 +1918,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       let fetched = crate::state::with_state(|state| {
         state
           .refusals
-          .get(crate::vcs_store::NAMES_FETCHED)
+          .get(crate::vcs_store::CHANGESET_READ)
           .copied()
           .unwrap_or(0)
       })
@@ -1931,7 +1933,10 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
     home, owner_shard,
     "the names' home is the owner shard: the case reads nothing from the region"
   );
-  assert!(fetched, "the names were not read from their region home");
+  assert!(
+    fetched,
+    "the names were not read back from the node's store"
+  );
   let (whole, compared) = std::sync::mpsc::channel();
   crate::daemon::observe_at(&daemon, partition, move |state| {
     crate::vcs_store::tests::assert_made_again_whole(
@@ -1990,7 +1995,7 @@ fn pushed_v3_at(
 /// record (`LoggedChange::Objects`), the same bytes the repository's register keeps.
 #[test]
 fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "shipped");
     let _ = state.db.take_state_log_records();
     pushed_from_the_fixtures(state, repository, &["create"]);
@@ -2021,7 +2026,7 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
 /// the untaken homing counted.
 #[test]
 fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "untaken");
     pushed_from_the_fixtures(state, repository, &["create"]);
