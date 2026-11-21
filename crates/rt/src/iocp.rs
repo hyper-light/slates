@@ -197,9 +197,9 @@ impl IocpDriver {
       None => INFINITE,
       Some(0) => 0,
       Some(ns) => match self.deadline.as_ref().map(|d| d.arm(self.port, ns)) {
-        Some(Armed::Armed) => INFINITE,
-        Some(Armed::Fired) => 0,
-        Some(Armed::Busy) | None => whole_ms(ns),
+        Some(Arm::Running) => INFINITE,
+        Some(Arm::Fired) => 0,
+        Some(Arm::Busy) | None => whole_ms(ns),
       },
     };
     let mut count: u32 = 0;
@@ -277,9 +277,9 @@ struct Deadline {
 }
 
 /// What arming the deadline did.
-enum Armed {
+enum Arm {
   /// The timer runs and its packet posts to the port when it fires: wait untimed.
-  Armed,
+  Running,
   /// The timer had fired by the time its packet was bound, so no packet comes: harvest without waiting.
   Fired,
   /// The packet couldn't be re-armed this time (its last binding was firing as it was cancelled): wait in whole
@@ -337,13 +337,13 @@ impl Deadline {
 
   /// Arms the timer for `ns` from now, its packet bound to `port` under [`DEADLINE_KEY`]. A binding a past wait left
   /// (one a completion ended before its timer fired) is cancelled first, a packet it posted taken back with it.
-  fn arm(&self, port: HANDLE, ns: u64) -> Armed {
+  fn arm(&self, port: HANDLE, ns: u64) -> Arm {
     /// Format: nanoseconds per 100 ns tick, a waitable timer's unit.
     const NANOS_PER_TICK: u64 = 100;
     // SAFETY: the packet is this deadline's own and open.
     match unsafe { (self.cancel)(self.packet, REMOVE_POSTED) } {
       STATUS_SUCCESS | STATUS_CANCELLED => {}
-      _ => return Armed::Busy,
+      _ => return Arm::Busy,
     }
     // A relative due time is negative; rounded up, so the timer never fires before the deadline.
     let due = i64::try_from(ns.div_ceil(NANOS_PER_TICK))
@@ -351,7 +351,7 @@ impl Deadline {
       .min(SOONEST_DUE);
     // SAFETY: the timer is this deadline's own and open; `due` outlives the call; no completion routine.
     if unsafe { SetWaitableTimer(self.timer, &raw const due, 0, None, std::ptr::null(), 0) } == 0 {
-      return Armed::Busy;
+      return Arm::Busy;
     }
     let mut fired: u8 = 0;
     // SAFETY: the packet, the port and the timer are open; the key is a tag the wait reads back, never dereferenced;
@@ -369,9 +369,9 @@ impl Deadline {
       )
     };
     match (bound, fired) {
-      (STATUS_SUCCESS, 0) => Armed::Armed,
-      (STATUS_SUCCESS, _) => Armed::Fired,
-      _ => Armed::Busy,
+      (STATUS_SUCCESS, 0) => Arm::Running,
+      (STATUS_SUCCESS, _) => Arm::Fired,
+      _ => Arm::Busy,
     }
   }
 }
@@ -598,9 +598,9 @@ mod tests {
     eprintln!(
       "armed: {}",
       match armed {
-        Armed::Armed => "armed",
-        Armed::Fired => "fired",
-        Armed::Busy => "busy",
+        Arm::Running => "running",
+        Arm::Fired => "fired",
+        Arm::Busy => "busy",
       }
     );
     // SAFETY: an all-zero OVERLAPPED_ENTRY is a valid, empty record.
@@ -614,7 +614,7 @@ mod tests {
     let taken = usize::try_from(count).unwrap();
     let keys: Vec<usize> = entries.iter().take(taken).map(|e| e.lpCompletionKey).collect();
     eprintln!("dequeued ok={ok} count={count} keys={keys:?} took={took:?}");
-    assert!(matches!(armed, Armed::Armed), "the deadline didn't arm");
+    assert!(matches!(armed, Arm::Running), "the deadline didn't arm");
     assert!(keys.contains(&DEADLINE_KEY), "no deadline packet came: {keys:?}");
     assert!(took.as_nanos() < 1_000_000, "the deadline's packet took {took:?}");
   }
