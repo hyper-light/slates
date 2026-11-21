@@ -7227,3 +7227,26 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   end hung up unexpectedly"). If the release sweep shows clients waiting that long after a kill, that is a finding for
   w-git (how long the edge holds a dead daemon's connection).
 - Who gets failures: each red goes to its server's owner as a minimal test (w-git, w-hg, w-svn), copied to raft-chaos.
+
+## 2026-11-21, w-forming: goal 93 concurrency rounds, Mercurial and Subversion (main's piece, 10:43; corrected 10:48)
+- Test: `crates/cli/tests/vcs_concurrency.rs` (lands with this entry's commit; see inbox/main-from-w-forming-93.md).
+- Platform: macOS arm64 with stock Mercurial 7.2 (`SLATES_TEST_HG="uvx --quiet --python 3.12 --from mercurial==7.2 hg"`, as
+  the Mac Studio runs it) and stock Subversion 1.15 (svn, svnserve, svnadmin, svnrdump on the PATH); Linux as well where
+  both are installed. No dataset: each repository is made by the test. Release build.
+- Commands (all N, every scenario, each run against stock `hg serve` / `svnserve` first as the control):
+  `SLATES_CONC_N='2 10 50' cargo test --release -p slates-cli --test vcs_concurrency -- --ignored concurrent_stock_hg --nocapture`
+  `SLATES_CONC_N='2 10 50' cargo test --release -p slates-cli --test vcs_concurrency -- --ignored concurrent_stock_svn --nocapture`
+  (`SLATES_CONC_SCENARIOS` narrows: hg `same-head branches bookmarks`, svn `same-file paths`.)
+- Red looks like: the assertion's lines, each `N=<n> slates: <scenario>: ...` (e.g. "same-head: 2 of 10 pushes accepted,
+  one expected", "a refusal not in stock's words", "branches: ... missing [b3]", "bookmarks: wrong or missing [k7]",
+  "verify false", "history: revisions [...] gapless false", "dump, load or verify failed"). A line naming the control
+  (`hg serve (the control)` / `svnserve (the control)`) is the test's own expectation being wrong for stock, not a slates
+  red. The `CONC` lines print what each side did for the round's record. Each slates red goes to its owner (w-hg, w-svn).
+- Stopped under the correction (never started): w-forming's own round (kiln r4) and A-827's release A/B (kiln r3). The
+  A/B's command: `bash .git/w-forming-ab/p4.sh` from w-forming's clone, i.e. `cargo test --release -p slates-server --lib
+  bench_a_whole_publications_longest_turn -- --ignored --nocapture` (311 inodes, 9 interleaved rounds; debug gave one-turn
+  598-849 us vs the held capture's longest turn 36-66 us); P4 closes on its release numbers. C3's nemesis replay
+  (pre-restart kiln r19, out of reach): `SLATES_TEST_CLI=1 SLATES_CHAOS_SEED=<seed> cargo test -p slates-cli --test
+  live_chaos a_seeded_nemesis_of_single_faults_keeps_every_register_invariant` for seeds 1256052866610850298
+  5939796479076166087 10263252121351842258 17757241901296347647 8389754676365715562, plus fresh draws; red =
+  `live_chaos.rs:2465` or `:6704` panics (GAPS b8070b0ab).
