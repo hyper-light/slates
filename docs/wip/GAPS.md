@@ -175,8 +175,11 @@
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
 > made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
 > accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
-> a consistent snapshot while a push lands; the stream clone's chunks as stored deltas (store side done locally: `H`
-> rows per entry, `I` rows by node).
+> a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
+> the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
+> the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
+> whole; a log the store does not keep (an imported repository's, until w-hg's C1 step 3) serves no stream (`1\n`,
+> which stock `hg clone --stream` takes as "operation forbidden by server").
 >
 > **A-767, the derived per-path read form (2026-11-20, w-perf; A-645).** BUILT: the `Texts` section's one format and
 > edit form, the `T`/`H` rows at landing and replay, `Store::text_at`/`text_row`/`path_texts` and the owner's requests
@@ -300,8 +303,13 @@
 > at 94ff89fe5 by a diagnostic build: the pack's checks (`unbegun/checking`) asked 485,230,824 bytes in one charge with
 > 300,809,433 left. The charge is the connectivity walk's edge table (`receive::connect`'s `begin_edges`: a `usize` an
 > edge, every tree entry of the whole pack, about 60.6 M for git/git), sized by the pack's history rather than by the
-> slice in flight (A-719). Owed: the checks a slice at a time over the pack held once, charging only the slice; red, the
-> 611 MB push refused today and landing within its room; an A/B against stock git (10.77 s).
+> slice in flight (A-719). Piece 1 BUILT (2026-11-21): the walk charges a state an object and no edge table. When no
+> object is incomplete of its own, every pushed tip is complete and the walk ends after its first pass. Otherwise it
+> carries the worst state back from each tip depth first, a frame an object, its stack charged as it grows. Red:
+> `receive::tests::the_connectivity_check_charges_its_objects_never_its_edges` (322 objects, 16,449 edges, 8 B an
+> object) asked 134,176 B with 2,254 left at df349a9fe; green. Owed: what else the answer holds for the whole pack
+> (the next wall the 611 MB push meets, measured); red, that push landing within its room; an A/B against stock git
+> (10.77 s).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -431,6 +439,11 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
+> re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
+> judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
+> the 100k rung's wall (a few values a path there). Open: the fix's design, with main.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three

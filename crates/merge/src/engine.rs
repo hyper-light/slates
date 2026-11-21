@@ -977,6 +977,8 @@ pub struct Green {
   /// The changes whose path's history was re-anchored on the file's new block, the earlier blocks let go, and the bytes
   /// copied out of them (A-793, `crate::history::reanchor`).
   history_reanchored: (u64, u64, u64),
+  /// The history values re-anchors walked in all (A-803's measure: a change re-anchors every value its path holds).
+  history_reanchored_values: u64,
   /// The bytes every content history value's piece list costs, a running total.
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
@@ -3375,7 +3377,11 @@ impl Green {
       latest_list: (latest_before, latest_after),
       blocks_cut,
       bytes_cut,
+      values,
     } = anchored;
+    self.history_reanchored_values = self
+      .history_reanchored_values
+      .saturating_add(u64::try_from(values).unwrap_or(u64::MAX));
     self.history_lists = self
       .history_lists
       .saturating_sub(lists_before)
@@ -3398,6 +3404,11 @@ impl Green {
   /// copied out of them (A-793's non-vacuity counters, `crate::history::reanchor`).
   pub fn history_reanchored(&self) -> (u64, u64, u64) {
     self.history_reanchored
+  }
+
+  /// The history values re-anchors walked in all (A-803): divided by the re-anchored changes, the values a change walks.
+  pub fn history_reanchored_values(&self) -> u64 {
+    self.history_reanchored_values
   }
 
   /// Marks `path`'s latest content value superseded as a change lands, the file map having let its block go

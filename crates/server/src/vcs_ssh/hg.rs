@@ -189,6 +189,12 @@ impl<S: HgStores> Command for HgCommand<S> {
     let progress = if stdio.taking_push() {
       stdio.step_push()
     } else if let (true, Some(generation)) = (stdio.streaming(), generation.as_ref()) {
+      // What the stream's next step asks of the node's changeset store, answered before its turn.
+      if let Some(wants) = stdio.store_wants()
+        && !crate::vcs_store::hg_view::answer_store_wants(wants, *repository).await
+      {
+        return Err(unheld());
+      }
       // A-745 (§4.17.1 "A fetch's answer"): a `getbundle`'s answer made a turn at a time, the view lent for the turn,
       // each slice within the shard's room, the turn ending at its quantum or once a room's worth waits to be sent.
       let (turn_room, quantum) = stores.fetch_turn(*repository).unwrap_or((*room, 0));
@@ -201,7 +207,8 @@ impl<S: HgStores> Command for HgCommand<S> {
             match stdio.stream(store, turn_room) {
               Progress::Streamed { more: true }
                 if slates_rt::futures::now_ns().saturating_sub(start) < quantum
-                  && stdio.stdout().len() < bound => {}
+                  && stdio.stdout().len() < bound
+                  && stdio.store_wants().is_none() => {}
               other => break other,
             }
           }

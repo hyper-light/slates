@@ -58965,7 +58965,37 @@ one lend that ends the body. Red 2 of 2 at 94ff89fe5 (the body's end failed, not
 entry in the pack). That table is sized by the pack's history, not by the slice in flight, against A-719. The checks
 are to work a slice at a time over the pack held once (GAPS).
 
+**Layer 2, piece 1: the connectivity check charges its objects, never its edges** (`slates_git::receive::connect`).
+- The first pass reads each pushed object once and judges its own edges out of the pack.
+- When no object is incomplete of its own, no tip can reach one, so every pushed tip is complete and the walk ends
+  there. That covers every push of a complete history, git/git's included, and needs no second read and no table but
+  one state per object.
+- Otherwise the worst state is carried back from each pushed tip, depth first. Each object is read once more as it is
+  opened, and each child's state is folded into the exit frame of the object that opened it. The stack holds the open
+  path and the children it waits on, charged as it grows: bounded by the history's depth times its widest object,
+  never by its edges.
+- Red: 322 objects and 16,449 edges within 8 bytes an object asked 134,176 bytes with 2,254 left. Green.
+- A-719's turn test now asks two turns an object (fsck and the first pass), since a complete push has no propagation.
+
+Also applied to: `crates/git/src/receive/connect.rs`, `crates/git/src/receive/tests/mod.rs`,
+`crates/git/src/receive/tests/session.rs`.
+
 Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `crates/server/src/git_push.rs`,
 `crates/server/src/git_push/words.rs`, `crates/server/src/vcs_ssh/receive.rs`, `crates/git/src/receive/report.rs`,
 `crates/git/src/receive/session.rs`, `crates/git/src/receive/mod.rs`, `docs/wip/GAPS.md`.
 
+### A-803 — The verdict's growth with history named: the re-anchor walks every value of a changed path (2026-11-21, w-fed-move, goal 86b; main's order 02:11 PST, injection (b); A-793, A-802)
+- **Why.** Injection (b) of A-802 (a long history ahead of the 1,000-client stand-in, held unfolded by one idle work)
+  doubled the owner's verdict over 10^5 versions. `2c32af2b5` (A-787 part 2, the re-anchor's remap indexed) was in
+  the build measured, so it is not that scan.
+- **Change.** Counters only: `merge.reanchor.values_walked` (the history values a submit's commit re-anchored,
+  `Green::history_reanchored_values`) and `merge.submit.secure` / `_ns` (the retention a submit secures before its
+  verdict, timed); the load harness prints them after each phase.
+- **Measured** (release, in-process, this Mac Studio, 2026-11-21 ~02:40, `kernel/` (754 files), 1,000 clients, one
+  round, `--per-connection 32 --hot-files 300 --idle-works 1`): preload 0, 10^4, 10^5 versions: judge 24.0, 31.7, 70.9
+  µs; values re-anchored a verdict 7.9, 30.2, 231.4; compose 57.1, 54.3, 50.3 µs; secure 1.0, 1.3, 1.0 µs; append
+  about 5 µs. The growing step is the re-anchor (about 0.2 µs a value walked): a change rewrites every value of its
+  path's history (A-793), so a path's k-th change costs O(k) while a reader pins the floor.
+- **At the 100k rung** a path's history is short (about 31,000 accepts of four edits over 42,000 hot files, a few
+  values a path), so this is not that rung's wall; it is the wall of a long-lived hot file. The fix's design (an
+  indirection so a length-preserving change moves only the pieces it overwrote) is with main before it is built.
