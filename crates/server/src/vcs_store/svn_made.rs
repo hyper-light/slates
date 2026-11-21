@@ -20,8 +20,9 @@
 //! **Landed as an import's is** (`svn_commit::land_made`; C2 of Ada's close list), **answered after both** (the
 //! deferred-submit hook, `crate::made_commit`; main's landing order): a recorded submit takes the repository's landing
 //! turn before its verdict (or parks until it is free), so no client's commit lands between the version and its
-//! revision; a task holding it makes the revision ([`make_deferred`]), checks it, lands it on the node's changeset
-//! store, then commits the version and the register's entry naming the sequence in one step and answers. A crash
+//! revision; the verdict is held, never applied before the commit (A-805): the revision is read from a preview of it
+//! ([`make_deferred`]), and a task holding the turn checks it, lands it on the node's changeset store, then applies the
+//! verdict and commits the version and the register's entry naming the sequence in one step and answers. A crash
 //! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request ([`make`])
 //! commits its version in its own step and the task lands the revision after it (GAPS).
 //!
@@ -62,8 +63,9 @@ use crate::state::ShardState;
 
 #[cfg(test)]
 thread_local! {
-  /// A test's kill of a server-made commit's landing task before it commits (as a `kill -9` leaves the register): the
-  /// task ends there, nothing after it run.
+  /// A test's kill of a server-made commit's landing task after its changeset landed and before its step commits (as a
+  /// `kill -9` there leaves the register): the task ends there, nothing after it run. It fires once, clearing itself, so
+  /// a test waits for it to read false.
   pub(crate) static KILL_BEFORE_MADE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -203,43 +205,88 @@ async fn made_landing(
   });
 }
 
-/// Makes the revision of the version `pending` accepted, of a Subversion repository's green, and commits the two in one
-/// step once the revision has landed (`crate::made_commit`, main's landing order): a task holding the repository's
-/// landing turn, which the submit took before its verdict ([`made_commit_landing`]).
+/// Makes the revision of the version `pending` holds, of a Subversion repository's green, from its verdict `judged`,
+/// held and not applied (A-805, `crate::made_commit`): read from a preview of the verdict (`Greens::preview`) in this
+/// step, so the green shows nothing of it; then a task holding the repository's landing turn, which the submit took
+/// before its verdict, lands it and commits the version and the revision in one step ([`made_commit_landing`]).
 pub(crate) fn make_deferred(
   state: &mut ShardState,
   (repository, turn): (RepositoryId, Turn),
   pending: Pending,
-  copies: Vec<MadeCopy>,
+  (copies, judged): (Vec<MadeCopy>, slates_merge::engine::Judged),
 ) {
+  let (green, version) = pending.version();
+  let made = revision_held(
+    state,
+    (repository, green),
+    version,
+    (pending.authorship(), &copies),
+    judged,
+  );
   let request = pending.request();
-  let task = made_commit_landing((repository, turn), pending, copies);
+  let task = made_commit_landing((repository, turn), pending, made);
   if slates_rt::futures::spawn(task)
     .and_then(slates_rt::futures::detach)
     .is_err()
   {
-    // The task could not start (the shard's arena full): nothing of the accept is durable, so it is given up, its
-    // retry run again.
+    // The task could not start (the shard's arena full): nothing of the accept is applied or durable, so it is given
+    // up, its retry run again.
     unmade(state, &Unmade::Unrun);
-    crate::made_commit::abandon(state, request);
+    crate::made_commit::abandon(state, (request, green));
   }
 }
 
-/// [`make_deferred`]'s task: the revision made of the pending version, landed on the store, then committed with the
-/// version (`made_commit::commit`); a check that refused the revision commits the version alone (counted [`UNMADE`]),
-/// and a store that refused it gives the accept up (`made_commit::abandon`).
+/// The revision of `green`'s `version` from the verdict `judged` held for it, made after the records' youngest through a
+/// preview retired in this step; none where it is made already.
+fn revision_held(
+  state: &mut ShardState,
+  (repository, green): (RepositoryId, DbVolumeId),
+  version: u64,
+  (authorship, copies): (&Authorship, &[MadeCopy]),
+  judged: slates_merge::engine::Judged,
+) -> Result<Option<Revision>, Unmade> {
+  let youngest = state
+    .vcs_stores
+    .subversion_records(repository)
+    .map_or(u64::MAX, SvnRecords::youngest);
+  if youngest >= version {
+    return Ok(None);
+  }
+  if youngest.checked_add(1) != Some(version) {
+    return Err(Unmade::NotNext);
+  }
+  let now = AprTime(state.clock.wall_ns().div_euclid(NANOS_PER_MICRO));
+  let preview = state
+    .greens
+    .preview(&green, judged)
+    .map_err(|_| Unmade::NotNext)?;
+  let made = match state.vcs_stores.subversion_records(repository) {
+    Some(records) => state
+      .greens
+      .with_preview(&preview, |engine| {
+        revision_from(
+          (engine, (0, 1)),
+          records,
+          (youngest, version),
+          (authorship, now, copies),
+        )
+      })
+      .unwrap_or(Err(Unmade::NotNext)),
+    None => Err(Unmade::NotNext),
+  };
+  state.greens.retire_preview(preview);
+  made.map(Some)
+}
+
+/// [`make_deferred`]'s task: the revision `made` landed on the store, then committed with the version
+/// (`made_commit::commit`); a revision not made (counted [`UNMADE`]), or one the check refused, commits the version
+/// alone, and a store that refused it gives the accept up (`made_commit::abandon`).
 async fn made_commit_landing(
   (repository, turn): (RepositoryId, Turn),
   pending: Pending,
-  copies: Vec<MadeCopy>,
+  made: Result<Option<Revision>, Unmade>,
 ) {
-  let (green, version) = pending.version();
-  let authorship = pending.authorship().clone();
-  let Some(made) = crate::state::with_state(|state| {
-    revision_made(state, (repository, green), version, (&authorship, &copies))
-  }) else {
-    return;
-  };
+  let (green, _) = pending.version();
   let revision = match made {
     Ok(Some(revision)) => revision,
     // Made already, or not made: the version commits alone, the turn held until it has.
@@ -262,7 +309,7 @@ async fn made_commit_landing(
     move |_| Ok(revision),
     |state, entry| {
       #[cfg(test)]
-      if KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+      if KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false)) {
         killed.set(true);
         return Ok(None);
       }
@@ -277,23 +324,21 @@ async fn made_commit_landing(
     // A test's kill between the landing and the commit: nothing after it runs, as after a `kill -9`.
     return;
   }
-  let _ = crate::state::with_state(move |state| {
-    match landed {
-      Some(Ok(Some(Ok(_)))) => state.count(MADE, 1),
-      Some(Ok(Some(Err(refused)))) => unmade(state, &Unmade::Step(refused)),
-      Some(Ok(None)) | None => {}
-      Some(Err(refused)) => {
-        let Some(pending) = waiting.take() else {
-          return;
-        };
-        match refused {
-          // The store refused the changeset: nothing of the accept is durable.
-          Uncommitted::Unstored => crate::made_commit::abandon(state, pending.request()),
-          // The check refused the revision: the version stands alone, as one no revision was made of.
-          refused => {
-            unmade(state, &Unmade::Step(refused));
-            let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
-          }
+  let _ = crate::state::with_state(move |state| match landed {
+    Some(Ok(Some(Ok(_)))) => state.count(MADE, 1),
+    Some(Ok(Some(Err(refused)))) => unmade(state, &Unmade::Step(refused)),
+    Some(Ok(None)) | None => {}
+    Some(Err(refused)) => {
+      let Some(pending) = waiting.take() else {
+        return;
+      };
+      match refused {
+        // The store refused the changeset: nothing of the accept is applied or durable.
+        Uncommitted::Unstored => crate::made_commit::abandon(state, (pending.request(), green)),
+        // The check refused the revision: the version stands alone, as one no revision was made of.
+        refused => {
+          unmade(state, &Unmade::Step(refused));
+          let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
         }
       }
     }
@@ -351,29 +396,46 @@ fn revision_of(
     .vcs_stores
     .subversion_records(repository)
     .ok_or(Unmade::NotNext)?;
-  if engine.head() != version {
+  revision_from(
+    (&engine, (youngest, version)),
+    records,
+    (youngest, version),
+    (authorship, now, copies),
+  )
+}
+
+/// The revision made after the records' `youngest` as `version`, read from `engine`, whose versions `(from, to]` hold
+/// the version's change: the green itself (`from` the youngest, `to` the version), or a preview of a verdict held with
+/// its landing (`from` 0, `to` 1; A-805, `Greens::preview`).
+fn revision_from(
+  (engine, (from, to)): (&Green, (u64, u64)),
+  records: &SvnRecords,
+  (youngest, version): (u64, u64),
+  (authorship, now, copies): (&Authorship, AprTime, &[MadeCopy]),
+) -> Result<Revision, Unmade> {
+  if engine.head() != to {
     return Err(Unmade::NotNext);
   }
   let mut rows = BTreeMap::new();
   let mut contents = BTreeMap::new();
   let index = records.index();
-  for path in engine.changed_between(youngest, version) {
+  for path in engine.changed_between(from, to) {
     let at = svn_path(&path);
     if let Some(copy) = copies.iter().find(|copy| copy.to == at) {
-      let after = after(&engine, records, &path)?;
+      let after = after(engine, records, &path)?;
       let row = copy_row(index, youngest, copy, after, &mut contents)?;
       rows.insert(at, row);
       continue;
     }
     let beneath = copy_beneath(copies, &at);
-    if beneath.is_none() && engine.copied_after(&path, youngest) {
+    if beneath.is_none() && engine.copied_after(&path, from) {
       return Err(Unmade::Copy);
     }
     let before = match &beneath {
       Some((source, revision)) => before(index, source, *revision)?,
       None => before(index, &at, youngest)?,
     };
-    let after = after(&engine, records, &path)?;
+    let after = after(engine, records, &path)?;
     if engine.symlink(&path).is_some() {
       // A symbolic link's `svn:special` list, brought with the revision as any list a row names.
       contents.insert(special().1, SPECIAL_LIST.to_vec());

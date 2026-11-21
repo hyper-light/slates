@@ -239,6 +239,14 @@ pub(crate) async fn land_work(
       }
     }
   }
+  // A stored text a row names that the content store let go is brought back whole for the green's increment.
+  let brought = match bring_stored(repository, &work.record.changes).await? {
+    Ok(brought) => brought,
+    Err(refused) => {
+      let _ = crate::state::with_state(|state| release_stored(state, storing));
+      return Some(Err(refused));
+    }
+  };
   // The texts this commit put land in its changeset (C2 stage B): the store holds every text its history names, so no
   // entry names a text that is durable only in the shard's image, and a recovery reads one the content store lacks back
   // from there (`vcs_store::fetch_stored_texts`). The texts the records already held landed with the changeset that
@@ -253,7 +261,7 @@ pub(crate) async fn land_work(
       release_stored(state, storing);
     }
   };
-  landed(
+  let landed = landed(
     (repository, carried),
     |state| {
       let now = AprTime::from_wall_ns(slates_vfs::clock::Clock::wall_ns(&mut state.clock));
@@ -275,7 +283,45 @@ pub(crate) async fn land_work(
     },
     give_back,
   )
-  .await
+  .await;
+  let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+  landed
+}
+
+/// Brings back into the content store, whole, every text `changes` name that repository `repository`'s records keep
+/// stored and the content store lacks (C2 stage B part 2 (b)): the green's increment reads each whole in the commit's
+/// step (`Building::text_bytes`), a row naming one a copy or a revert. Each brought holds one count, which the caller
+/// gives back once the commit's step ran ([`release_texts`]). None where the shard's state is gone; refused `Unstored`
+/// where the node's store could not give one whole, and what was brought given back.
+async fn bring_stored(
+  repository: RepositoryId,
+  changes: &[ChangedPath],
+) -> Option<Result<Vec<ContentIdentity>, Uncommitted>> {
+  let wanted: Vec<(ContentIdentity, u64)> = crate::state::with_state(|state| {
+    let records = state.vcs_stores.subversion_records(repository);
+    let content = state.vcs_stores.content();
+    let mut wanted: Vec<(ContentIdentity, u64)> = Vec::new();
+    for text in changes.iter().filter_map(|change| change.text) {
+      let lacking = records.is_some_and(|records| records.stored_len(&text.identity).is_some())
+        && !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(text.identity)))
+        && !wanted
+          .iter()
+          .any(|(identity, _)| *identity == text.identity);
+      if lacking {
+        wanted.push((text.identity, text.size));
+      }
+    }
+    wanted
+  })?;
+  let mut brought = Vec::with_capacity(wanted.len());
+  for (identity, len) in wanted {
+    if !crate::vcs_store::svn_texts::bring_whole(repository, identity, len).await {
+      let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+      return Some(Err(Uncommitted::Unstored));
+    }
+    brought.push(identity);
+  }
+  Some(Ok(brought))
 }
 
 /// Lands one changeset of repository `repository` (module docs of [`landing`]): its landing turn awaited; `prepare`d
@@ -363,7 +409,12 @@ pub(crate) async fn land_revision(
   revision: Revision,
   judged: Option<(&CommitLocks, AprTime)>,
 ) -> Option<Result<Committed, Uncommitted>> {
-  landed(
+  // A stored text a row names that the content store let go is brought back whole for the green's increment.
+  let brought = match bring_stored(repository, &revision.record.changes).await? {
+    Ok(brought) => brought,
+    Err(refused) => return Some(Err(refused)),
+  };
+  let landed = landed(
     (repository, Vec::new()),
     |state| prepare_revision(state, repository, revision, judged),
     |state, reference, prepared| {
@@ -371,7 +422,9 @@ pub(crate) async fn land_revision(
     },
     |_| {},
   )
-  .await
+  .await;
+  let _ = crate::state::with_state(|state| release_texts(state, None, &brought));
+  landed
 }
 
 /// A revision checked for its landing ([`prepare_revision`]): the check, the work identity of its record, the room
