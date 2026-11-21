@@ -262,3 +262,6 @@ part closed between 07:20 and 16:00.
   every new inbox file each check. kiln mail to main can sit "waiting" behind a stuck admission, so never rely on it alone.
 - On the MacBook, a cross-session message to `slates-5b` also reaches main at once.
 - Main reaches you the same three ways. When kiln mail from main is stuck, it arrives as a goal or a session message.
+- A-NUMBERS (2026-11-21): claim an A-number by adding its row to amendments.tsv and pushing that claim BEFORE writing the
+  number in a commit, doc or test. If the push is refused, fetch, and if the number was taken meanwhile, take the next
+  free one. Three collisions in one morning (A-815, A-821, A-822) cost renumbering commits.
