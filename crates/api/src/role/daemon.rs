@@ -347,21 +347,45 @@ fn start_store(
   Ok((owner, views))
 }
 
-/// The store's sizing from this daemon's derivations (A-767; Ada's memory-sizing ruling: from the work, never the
-/// machine): its engine's memory the shard's reserve, its disk what the store's file system has free, its extent the
-/// content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its fanout SplinterDB's.
+/// The store's sizing from the work, never the machine (A-767; Ada's memory-sizing ruling). Its engine's memtable is one
+/// trunk node's worth, `fanout` extents: what one flush turns into one bundle; the engine learns it upward from the rows
+/// it holds (owed, GAPS), so a 128 GiB machine and a laptop start the same. Its disk is what the store's file system
+/// has free, its extent the content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its
+/// fanout SplinterDB's. Until 2026-11-20 the memtable was the shard's reserve, sized from the machine, which on a 128 GiB
+/// Mac passed the engine's 4 GiB bound and refused every landing (w-hg, by use).
 fn store_sizing(config: &DaemonConfig, disk: u64) -> slates_store::store::Sizing {
   let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
     8,
     "SplinterDB's target fanout, as mantle runs its engine until its E-step measures F on this hardware",
     ["engine-structure.md §4"]
   );
+  let extent_bytes = slates_vfs::content::chunk_bytes(config.page).get();
   slates_store::store::Sizing {
-    memory: usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX),
+    memory: extent_bytes.saturating_mul(fanout.get()),
     disk,
-    extent_bytes: u64::try_from(slates_vfs::content::chunk_bytes(config.page).get())
-      .unwrap_or(u64::MAX),
+    extent_bytes: u64::try_from(extent_bytes).unwrap_or(u64::MAX),
     fanout: fanout.get(),
+  }
+}
+
+#[cfg(test)]
+mod store_sizing_tests {
+  /// A-767, w-hg's finding. Do: size the store for this machine's own daemon configuration. Expect: its memtable is one
+  /// trunk node's worth (fanout extents), whatever the machine's memory, far inside the engine's 4 GiB bound.
+  #[test]
+  fn the_store_is_sized_from_its_work_not_the_machine() {
+    let profile = super::measure(true).unwrap();
+    let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
+    let sizing = super::store_sizing(&config, 1 << 30);
+    assert_eq!(
+      sizing.memory as u64,
+      sizing.extent_bytes * sizing.fanout as u64
+    );
+    assert!(
+      sizing.memory < (4usize << 30),
+      "{} bytes of memtable",
+      sizing.memory
+    );
   }
 }
 

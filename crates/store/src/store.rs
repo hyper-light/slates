@@ -208,27 +208,7 @@ impl Store {
     let mut buffer = Vec::new();
     let log = ChangesetLog::recover(log_file, applied, |file, located| {
       if replayed.is_ok() {
-        replayed = put_changeset(&mut rows, located, &mut value).and_then(|()| {
-          for section in sections_in(file, located)? {
-            if section.kind == SectionKind::Payload {
-              let identity = identity_of_range(file, section.offset, section.len, &mut buffer)?;
-              put_content(&mut rows, &identity, section.offset, section.len)?;
-            }
-            if section.kind == SectionKind::Texts {
-              buffer.clear();
-              buffer.resize(
-                usize::try_from(section.len)
-                  .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
-                0,
-              );
-              file
-                .read_exact_at(&mut buffer, section.offset)
-                .map_err(LogError::from)?;
-              crate::texts::put_rows(&mut rows, &located.header, &buffer)?;
-            }
-          }
-          Ok(())
-        });
+        replayed = put_rows_from_log(&mut rows, file, located, (&mut value, &mut buffer));
       }
     })?;
     replayed?;
@@ -251,9 +231,17 @@ impl Store {
     Ok(self.log.begin(header)?)
   }
 
-  /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable.
+  /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable. Its sections
+  /// are read back from the log, as a recovery's replay reads them, so a changeset landed a slice at a time gets every row
+  /// `land` puts (`C`, `P` for each payload, `T`/`H` from its `Texts`; w-perf's finding).
   pub fn applied(&mut self, located: &Located) -> Result<(), StoreError> {
-    put_changeset(&mut self.rows, located, &mut self.value)
+    let mut buffer = Vec::new();
+    put_rows_from_log(
+      &mut self.rows,
+      self.log.file(),
+      located,
+      (&mut self.value, &mut buffer),
+    )
   }
 
   /// Lands a changeset whose sections are `sections`, each bytes the caller holds or a content staged in `staging`
@@ -497,6 +485,37 @@ fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   put(&mut key, AFTER_TAG, &repository.to_be_bytes());
   put(&mut key, K_SEQUENCE, &sequence.to_be_bytes());
   key
+}
+
+/// Puts every row of the committed record `located`, its sections read back from `file`: the `C` row, a `P` row for each
+/// payload (its identity hashed from the log), the `T`/`H` rows of its `Texts`. One function for a recovery's replay and
+/// for [`Store::applied`], so a record is indexed the same whichever way it landed.
+fn put_rows_from_log<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  file: &F,
+  located: &Located,
+  (value, buffer): (&mut Vec<u8>, &mut Vec<u8>),
+) -> Result<(), StoreError> {
+  put_changeset(rows, located, value)?;
+  for section in sections_in(file, located)? {
+    if section.kind == SectionKind::Payload {
+      let identity = identity_of_range(file, section.offset, section.len, buffer)?;
+      put_content(rows, &identity, section.offset, section.len)?;
+    }
+    if section.kind == SectionKind::Texts {
+      buffer.clear();
+      buffer.resize(
+        usize::try_from(section.len)
+          .map_err(|_| StoreError::Sizing("a texts section past memory"))?,
+        0,
+      );
+      file
+        .read_exact_at(buffer, section.offset)
+        .map_err(LogError::from)?;
+      crate::texts::put_rows(rows, &located.header, buffer)?;
+    }
+  }
+  Ok(())
 }
 
 /// Puts the changeset row of the committed record `located`.

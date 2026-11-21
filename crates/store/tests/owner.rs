@@ -24,7 +24,8 @@ fn scratch(name: &str) -> PathBuf {
   dir.canonicalize().unwrap()
 }
 
-/// Shape: a test's store: 8 MiB of memory, 1 GiB of disk, 128 KiB extents, fanout 8.
+/// Shape: a test's store as the daemon sizes it (`slates_api`'s `store_sizing`): a memtable of one trunk node, eight
+/// 64 KiB extents (512 KiB), 1 GiB of disk.
 fn start(dir: &Path) -> StoreOwner {
   let grant = StoreGrant {
     repository: 1,
@@ -32,9 +33,9 @@ fn start(dir: &Path) -> StoreOwner {
     issued_ns: 0,
   };
   let sizing = Sizing {
-    memory: 8 << 20,
+    memory: 512 << 10,
     disk: 1 << 30,
-    extent_bytes: 128 << 10,
+    extent_bytes: 64 << 10,
     fanout: 8,
   };
   StoreOwner::start(StoreRoot::open(dir, &grant).unwrap(), sizing, 16).unwrap()
