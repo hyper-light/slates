@@ -13,3 +13,31 @@
   as content and named by identity and length; the record is 141 bytes; the landing step went from 27.3 to 13.2 ms. Its
   shape is A-767's payload section (inbox/w-store-from-w-git-v4-payload-2026-11-20.md). What's left is C5 with w-store:
   the git record and pack land through `slates_store::Store::land`.
+
+## C5, git onto the changeset store: part 1 LANDED (2026-11-21 ~00:45 PST)
+- **Commit:** origin/main 0e7120bdd (the merge carrying C5; branch agents/w-git-c5, deleted).
+- **Test run:** kiln r13 on the big Studio over ecbeed926 (base origin/main e1f246ca8), with `needs` and
+  `timeout_s`. The final merge with main touched none of C5's files (verbs, work_home, work_log only), so no rerun.
+- **What it does:** a stock git push (the fixtures' `create`) lands as one changeset on the node's store: `Names` and
+  `Payload`, the homed pack's bytes moved in with no further copy, at sequence 1 after the creation's 0, before the
+  register's entry. The record, version 5 (it replaces 4), names the sequence. A daemon stopped with nothing more
+  published, as kill -9 leaves it, and restarted recovers the repository by reading that changeset back from the
+  store: one changeset read, no replay refused, `main` at the pushed commit, its next landing at 2.
+- **Red test:** `daemon::tests::t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store`.
+  It failed with nothing landed (`landed: Some(0)`) until the landing was asked in the turn before the edge takes it.
+- **Results:** green alone (3/3 C5 tests) and in the focused set (211 passed): the C5 tests, t_a727b (now version 5),
+  `vcs_store::`, `git_push::`, `repository::store_tests` (w-svn's helper), `store_packs`, `vcs_http::git`, `vcs_ssh::`.
+- **Six failures that are not C5's:** `vcs_store::commits::tests::t_a664_live_a_submit_waits_parked_for_its_greens_whole_build`,
+  `t_a664_p3_made_commits_name_the_one_before_and_are_made_again_from_the_log`, and four in `vcs_store::paths::tests`
+  (`t_a664_p3_every_version...`, `..._a_store_made_again...`, `..._holders_a_successors_rebuilt...`,
+  `..._a_branchs_first_version...`). Each refuses the green's submit `Overloaded { shard }`. The three I checked fail the
+  same way on origin/main e5baf401c without C5 (kiln r3). Whose are they?
+- **The r5 hang:** it was C5's restart test blocked in `StoreOwner::stop` (a store handle outlived both daemons). It did
+  not recur after merging 931e52ed6 (A-798's lost wake), alone or in the focused set, so no stack went to w-provision-gate.
+  The two samples are kept on the big Studio at ~/.cache/w-git-diag/hang-59097.txt and hang-38760.txt.
+- **C5 part 2, next:**
+  - git's creation refused on a store-less daemon, naming `--vcs-store`: the git leg of w-hg's
+    `a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag`;
+  - versions 2 and sequence 0 removed;
+  - git's tests moved onto `test_store`;
+  - the replay's pack read a piece at a time through `StorePacks`.
