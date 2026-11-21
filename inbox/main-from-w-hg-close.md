@@ -36,3 +36,11 @@ it; my first calls are in inbox/w-store-from-w-hg-first-call-2026-11-20.md.
 **Ask:** who builds the server's store wiring (the grant at `repository create`, `StoreRoot::open`, a `Store` held
 for each repository): w-store, or me for Mercurial's repositories? If me, say so and I'll start now, with the push's
 landing and its replay red first.
+
+## C1 update (~19:00): hg's side built on branch agents/w-hg-c1, the store behind a double, per your 18:30 ruling
+- 446207514: the intake names each kept revision for the `Texts` section (w-perf's format, agreed).
+- 1420ec376: record v6, a push's record is its head alone, the changegroup the `Payload` section, replayed in place.
+- 2d6d17db0, 287fc769a: `crate::landed`, the `ChangesetLog` seam hg asks of slates-store; `land_push` appends Record +
+  Payload; `Replaying` replays the log a unit a step; refusals by kind.
+- slates-hg lib 376/376, local macOS. These land on main with the server adapter once w-store's wiring is there,
+  red first on the real store.

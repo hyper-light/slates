@@ -57,3 +57,16 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
   (systemd-oomd on a 16 GB runner). LANDED kiln e763e394f (merge-base confirmed, base e763e394f): Linux lanes stop
   oomd, 16 GiB swap, CARGO_BUILD_JOBS=2. Validated 0 diagnostics.
 - Still watching 44841298533's macos-latest / windows-11-arm / ubuntu-latest slates and w-k90-win's windows-slates.
+
+## ~19:00 PST (03:00Z)
+- GREEN macOS arm64: GitHub run 44841298533 (kiln 4aa0ee778, contains 08f1a434's vendor/slates pin), job 136653837819
+  `macos-latest (Slates build and tests)`: build 39 min, `--lib workspace::slates` 73 min, `--test vendored --test
+  slates_roles` 24 min, all success.
+- windows-11-arm job 136653837913: build OK, lib Slates tests OK, `vendored`/`slates_roles` FAILED exit 101 (no readable
+  detail). LANDED kiln eb7194f00 (merge-base confirmed, base eb7194f00): slates job Report step annotates failed tests.
+  Repro started: kiln run r145 (needs windows: jupiter, own target ~/.cache/w-k90-pin-2-target) `--test vendored --test
+  slates_roles`; queued (jupiter link down).
+- ubuntu-latest/ubuntu-24.04-arm on 4aa0ee778 red (before e763e394f's memory fix).
+- Clippy red on Windows/Linux (all clippy legs): crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` is a
+  disallowed method (A-520 piece 5, w-k90-containers'). For main / lint keeper.
+- Poller bebez30pl stopped at its 2 h limit.

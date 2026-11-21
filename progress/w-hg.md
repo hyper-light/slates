@@ -155,3 +155,16 @@
 - WAITING: r42 (the restart and clone measurement, queued on adacachy; also in run-requests.md); main's ruling on
   item 6(b); w-store's piece 3, before hg moves onto the changeset store (the C item, with R2's red test: an import's
   committed content against the .hg's bytes).
+- 2026-11-20 ~19:00, C1 (main's 18:30 ruling: hg's side against the seam, the store behind a double; land on main
+  once w-store's wiring is there). Branch agents/w-hg-c1 (worktree ~/slates-work/w-hg-c1), each red/oracle-tested,
+  slates-hg lib 376/376:
+  - 446207514: the intake names each kept revision for the Texts section (path, node, text BLAKE3 and length, base
+    identity, place in the payload).
+  - 1420ec376: record v6, a push's record is its head alone, the changegroup the Payload section, replayed in place
+    (Replay::begin_sectioned).
+  - 2d6d17db0 + 287fc769a: crate::landed, the ChangesetLog seam, land_push (Record + Payload), Replaying a unit a
+    step; refusals by kind (Missing, Record, Unreleased).
+  - Next on C1: the server adapter (slates_store::Store as ChangesetLog) and hg_push::land / recovery onto it, once
+    w-store's wiring lands; the Texts section once w-perf's encoder lands.
+- R2: r43 placed itself on this MacBook (load 116) and was stopped (no measurement here). r42 is still queued on
+  adacachy.
