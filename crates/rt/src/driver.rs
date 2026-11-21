@@ -554,7 +554,9 @@ mod tests {
     let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     let mut out = Vec::new();
-    driver.wait(Some(SUB_MILLISECOND_WAIT_NS), &mut out).unwrap();
+    driver
+      .wait(Some(SUB_MILLISECOND_WAIT_NS), &mut out)
+      .unwrap();
     // SAFETY: the calling thread's own pseudo-handle.
     let level = unsafe { GetThreadPriority(GetCurrentThread()) };
     // SAFETY: as above; the thread put back for whatever runs on it next.
