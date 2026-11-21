@@ -77,8 +77,12 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
 /// Diagnostic only (g222): the client's spin for a reply, `G222_CLIENT_SPIN_NS` or the goal bound.
-fn g222_spin_ns() -> u64 {
-  std::env::var("G222_CLIENT_SPIN_NS").ok().and_then(|v| v.parse().ok()).unwrap_or(SPIN_NS)
+fn g222_spin() -> Option<u64> {
+  match std::env::var("G222_CLIENT_SPIN_NS").ok().as_deref() {
+    Some("default") => None,
+    Some(v) => Some(v.parse().unwrap_or(SPIN_NS)),
+    None => Some(SPIN_NS),
+  }
 }
 
 /// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
@@ -221,7 +225,7 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    client.spin_for(Some(g222_spin_ns()));
+    client.spin_for(g222_spin());
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -795,7 +799,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(Some(g222_spin_ns()));
+  client.spin_for(g222_spin());
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
