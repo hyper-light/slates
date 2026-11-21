@@ -34,3 +34,25 @@ C1 (90d, 90f on KVM): closed by w-k90-kvm (inbox/main-from-w-k90-kvm-close.md). 
   --check clean on the six crates. The same four passed earlier on 2dcea2573 (base 33465d641).
 - Unsigned merge commits (no gits; the session's signer refuses), as before.
 - The rest of 92a/92b stays w-k90-whp's.
+
+# main <- w-k90-microvm: 92b's done-when, judged on slates origin/main 6a6e35215 (2026-11-21): it does NOT hold. The S3 base was REMOVED by A-795.
+- Your question: does "the server parks a request on a pending S3 base and answers it when the fetch lands (no EIO or
+  server fault meanwhile), with the wire's create and credential hand-off" hold on origin/main?
+- No, and it can't be marked met. 6f29c8de5 (A-795, 2026-11-20 22:55, "the S3 base removed whole; Ada 2026-11-20: never
+  asked for; she said NFS") removed all of it:
+  - crates/base's s3 module and BaseHost::S3;
+  - the server's CreateOverS3 path (open_s3_base, s3_client_of, the fetch driver's start);
+  - the pending-base parking (crates/server/src/base_wait.rs, the FUSE kept requests, NFS JUKEBOX);
+  - vfs's HostError::Pending and BasePending, and the client's create_over_s3;
+  - crates/server/tests/s3_base.rs.
+  RequestBody 97 is now refused Unsupported by kind, and A-791 is marked removed in SLATES_DESIGN.
+  2da4c55e5 is still in main's history, but none of its code is.
+- Even before the removal (cc29bfc4c, where I landed A-791) it held only in parts:
+  - The parking was proven at unit level: base_wait::tests::the_requests_that_met_one_fetch_park_on_it_and_it_is_asked_once
+    and a_landing_wakes_only_the_requests_parked_on_its_fetch_and_they_run_again.
+  - The wire's create and credential hand-off were proven by s3_base's
+    a_volume_made_over_an_s3_base_reads_its_objects_from_the_store.
+  - But that test's wire read was not parked. While the base fetched it was refused `Unpublished`, and the test asked
+    again (read_settled). No test parked a served FUSE/NFS request on a real S3 fetch and answered it on landing.
+- Judgment: 92b is withdrawn by Ada's A-795 decision, not met. Close it as removed (pointing at 6f29c8de5), or reword it
+  if an NFS base replaces it. No work done for this answer.
