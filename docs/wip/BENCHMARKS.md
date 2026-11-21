@@ -17749,3 +17749,41 @@ know that a file is unchanged since a cached answer without asking. Not built. W
 rejected the same day, what remains of the owner asks after A-817 is one ask a verb that needs the green: each rebase,
 each verdict, each work's first edit of a file, and a creation's admission and name.
 
+
+## The status memory report's residency: sweep what can hold pages, the report's kinds first (g226, 2026-11-21)
+
+w-sizing's option (a), main's order of 2026-11-20 23:50 (landed 27517bd04). A status asking for the memory report read
+the arenas 0 MiB resident after a 256 MiB burst on macOS (w-sizing's report on 599603559), since the residency sweep
+walked each shard's whole slice. Debug test binaries (the test is the measurement; no release run), 2 shards, RAM only.
+
+Command: `cargo test -p slates-server --test daemon a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas -- --nocapture`
+(256 files of 1 MiB through the SDK, then a memory status every hundredth of a liveness budget until the arenas read
+measured, bound ten liveness budgets).
+
+| Machine | Tree | Arenas after the burst | Looks | Time to measured |
+|---|---|---|---|---|
+| Mac Studio (Studio-4), macOS arm64 | origin/main 40c3f8d1e, one status | resident 0, measured false | 1 | never in that status |
+| Mac Studio (Studio-4), macOS arm64 | 40c3f8d1e, looking again | 286,785,536 (the regions whole, freed pages too) | 20 | 1.15 s |
+| Mac Studio (Studio-4), macOS arm64 | the fix, 3 runs | 268,435,456 of 268,435,456 | 2, 2, 2 | 86, 86, 76 ms |
+| adacachy, Linux x86_64 (load 45) | the fix | kiln r8 in flight at landing (compiling) | | |
+| jupiter, Windows x86_64 | the fix | with w-lint (run-requests 2026-11-21T01:10Z) | | |
+
+What the sweep walks a shard on the test daemon (`content_range.<range>.bytes`): write log 1,276,423,222, image slots
+12,884,901,888, delta log 6,442,450,944, DAX table 98,320, segment log 1,610,612,736, segment snapshots 6,442,450,944,
+rings 278,528; and of the arena only its held runs (268,435,456 on the burst's shard, where the region is 4 GiB). The
+write log and journal are whole because a fresh daemon cannot know them unwritten until its first give-back (GAPS).
+
+Step clock, measured-and-rejected: the shard's clock (`slates_machine::clock::monotonic_ns`, whole microseconds on
+macOS) for timing the sweep's steps. `cargo test -p slates-server --lib content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+on Studio-4, debug audit daemon:
+
+| Steps timed by | Whole sweep | Steps | Pages a step | Stepped | Longest true step | Steps over 100 us |
+|---|---|---|---|---|---|---|
+| the shard's clock | about 2 s | 70,909 | — | 1.24 s (fine clock) | 15.5 ms | 3,290 |
+| the step clock (`Instant`) | 13.9 s | 604,981 | 5.8 | 2.71 s | within budget (`past_budget` 0) | — |
+
+Budget a step about 1.6 us (half the debug daemon's live step quantum). The shard's clock read most steps as 0 ns, so
+each next step grew to a vector page's batch and ran milliseconds unseen; it is rejected for the step clock. The
+measured step: fixed 709-792 ns, 600-1,600 ns a page at a few pages (noise-dominated), so the floor buys about a page;
+the honest sweep's rate, about 280 K pages a second, is set by the runtime's look for work between idle slices (GAPS).
+The memory report's kinds pass 67 ms after arming in the same run.
