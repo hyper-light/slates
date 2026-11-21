@@ -338,3 +338,9 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
 ## 2026-11-20 ~18:55 PST: main's ruling on A-658 3c: (A) not built; (B) stays on my list, sequenced after w-store's
   A-767 server wiring lands. GAPS line landed (main 548e99440). NOW: robustness, family three (kiln r6) and exit 4
   (kiln r9). Then 3c (B) once the store wiring is on main, then the lane and the A/B.
+
+## 2026-11-20 ~19:20 PST: family three widened and hardened before landing (agents/w-shared-sweep-3 731331eef, merged
+  with main): the unmount helper's exit (`reap`) is watched too; a refused watch is a typed refusal
+  (MountError::ExitUnwatched; unmount counted refused), with no tick fallback (banned second path). bridge-fuse suites
+  green locally except a pre-existing flaky handshake count (1 of 4 on a loaded Mac; GAPS line added). Linux green+red =
+  kiln r11. Exit 4 = kiln r9 (queued).
