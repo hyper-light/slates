@@ -1411,8 +1411,9 @@ fn completed(state: &ShardState, origin: u64, id: slates_wire::request::RequestI
 /// commit, the answer). Do: submit a work to a Subversion repository's green as a client's recorded request; read its
 /// completion, the records' youngest revision and the green's durable head in the verb's own step; then wait for the
 /// revision. Expect: in the verb's step nothing is answered and nothing durable (the revision not landed); once it
-/// landed, the request answered, the green's durable head 1 and the register naming the creation and the revision.
-/// Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
+/// landed, the request answered, the green's durable head 1, the register naming the creation and the revision, and the
+/// made revision's text named stored by the records, none of it in RAM (its changeset carries it, C2 stage B part 2 (b)
+/// P4b). Until the deferred-submit hook, the verb answered and made the version durable before the revision landed.
 #[test]
 fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed() {
   stored(|| async move {
@@ -1450,6 +1451,18 @@ fn a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed(
         logged(state, svn).len(),
       )
     });
+    let alpha = identity(b"alpha\n");
+    let kept_as = on(|state| {
+      state
+        .vcs_stores
+        .subversion_records(svn)
+        .map(|records| (records.stored_len(&alpha), records.text(&alpha).is_some()))
+    });
+    assert_eq!(
+      kept_as,
+      Some((Some(6), false)),
+      "the made text is not stored alone"
+    );
     assert_eq!(
       in_the_verb,
       (false, 0, 0),
