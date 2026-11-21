@@ -69,4 +69,7 @@ POLICY_READ: briefs/common.md + briefs/w-k90-close.md + relaunch-2026-11-19.md. 
   reconnect (see below).
 
 ## For main to delete
-- adacachy ~/.cache/w-k90-close/kiln2 (partial SSH clone, 84K) and ~/.cache/w-k90-close/wt (broken half-checkout; `git -C ~/.cache/w-k90-close/kiln3 worktree remove` needs --force)
+(kiln said "not connected to the kiln server" for every run from this session at ~21:40 PST, so these stay:)
+- adacachy: /home/adalundhe/.cache/w-k90-close (my clone kiln3 + worktrees wt/wt2 + target + images + logs; ~50+ GB)
+- adacachy docker images: k90-close-agent:live, k90-close-kicbase:tls, k90-close-kicbase:base
+- adacachy: the `tls` kernel module stays loaded (harmless; `sudo modprobe -r tls` if wanted)
