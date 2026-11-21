@@ -76,6 +76,11 @@ const GOAL_REQUIRED_NS: u64 = 1_000_000;
 /// thinking (the paced form of 2026-11-06, A-226; goal 84b's quiet-Mac run).
 static PAUSE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
 
+/// Diagnostic only (g222): the client's spin for a reply, `G222_CLIENT_SPIN_NS` or the goal bound.
+fn g222_spin_ns() -> u64 {
+  std::env::var("G222_CLIENT_SPIN_NS").ok().and_then(|v| v.parse().ok()).unwrap_or(SPIN_NS)
+}
+
 /// Shape: how long the client spins for a reply before it parks: past the goal, so a reply inside
 /// the goal is taken without a wake (the provisioning bench's spinning form, AC-2.1).
 const SPIN_NS: u64 = GOAL_REQUIRED_NS;
@@ -216,7 +221,7 @@ impl Fixture {
   /// chain or the shard's budget cannot hold the seed): a measured answer, printed in the shape's place.
   fn new(instance: &str, tag: &str, files: usize) -> Result<Fixture, String> {
     let mut client = connect(instance);
-    client.spin_for(Some(SPIN_NS));
+    client.spin_for(Some(g222_spin_ns()));
     let green = client.create_green(&format!("{tag}-green"), false).unwrap();
     let (seed, _) = client.create_work(green, &format!("{tag}-seed")).unwrap();
     let mut model = BTreeMap::new();
@@ -790,7 +795,7 @@ fn print_growth(run: usize, key: &str, samples: &[u64]) {
 /// Every selected growth form, its runs, its rows and its goal lines.
 fn growth_sweep(instance: &str, selection: &Selection) {
   let mut client = connect(instance);
-  client.spin_for(Some(SPIN_NS));
+  client.spin_for(Some(g222_spin_ns()));
   for form in selection.growth.iter().copied() {
     let mut rows: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for index in 0..RUNS {
