@@ -64,10 +64,15 @@ pub async fn ship(
   sessions: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Shipped {
-  let exchanged = exchange((stream, message), sessions, budget, |host, reply| {
-    let _ = shipper.on_reply(host, decode_reply(reply));
-    until.is_some_and(|until| shipper.durable().is_some_and(|durable| durable >= until))
-  })
+  let exchanged = exchange(
+    (stream, message.to_vec()),
+    sessions,
+    budget,
+    |host, reply| {
+      let _ = shipper.on_reply(host, decode_reply(reply));
+      until.is_some_and(|until| shipper.durable().is_some_and(|durable| durable >= until))
+    },
+  )
   .await;
   Shipped {
     reusable: exchanged.reusable,
@@ -100,7 +105,7 @@ pub struct Exchanged {
 /// [`Shipper`] lives on another shard than its sessions (the daemon: the volume's shard appends, the control shard
 /// sends): it decides from the raw replies, and the owner folds them where its shipper is.
 pub async fn exchange(
-  (stream, message): (u64, &[u8]),
+  (stream, message): (u64, Vec<u8>),
   sessions: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
   mut enough: impl FnMut(HostId, &[u8]) -> bool,
@@ -123,11 +128,20 @@ pub async fn exchange(
   let (tx, rx) = reply_channel();
   let deadline_ns = budget.max_deadline_ns();
   let mut refused = Vec::new();
-  for (host, endpoint) in sessions {
+  // The message moves to the last holder and is copied for each before it, so a lone holder's exchange (a live lane's)
+  // copies nothing: the stream takes the bytes whole (`request_within`). Until 2026-11-21 every holder's task copied
+  // it here (g228, 85a).
+  let mut message = message;
+  let last = sessions.len().saturating_sub(1);
+  for (at, (host, endpoint)) in sessions.into_iter().enumerate() {
     let tx = tx.clone();
-    let bytes = message.to_vec();
+    let bytes = if at == last {
+      std::mem::take(&mut message)
+    } else {
+      message.clone()
+    };
     let spawned = spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, priority, &bytes, deadline_ns).await;
+      let (reply, endpoint) = request_within(endpoint, stream, priority, bytes, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     // A refused spawn drops that holder's session with its future; the others still decide, and the holder is reported

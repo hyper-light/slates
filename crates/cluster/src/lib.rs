@@ -538,24 +538,27 @@ impl Stragglers {
 /// is the collection loop's own bound — its full progress-extended span
 /// ([`CommitBudget::max_deadline_ns`]) — so a reply that arrives while the loop is still extending is not
 /// cut off early. Shared by the record and content dispatch here and the daemon's configuration plane (the
-/// council's Raft over its own stream), so the timed, session-preserving request discipline is one.
+/// council's Raft over its own stream), so the timed, session-preserving request discipline is one. The request is
+/// taken whole as the stream's send buffer (`Endpoint::begin_owned`): each holder's task owns its bytes already.
 pub async fn request_within(
   mut endpoint: Endpoint,
   stream_id: u64,
   priority: Priority,
-  request: &[u8],
+  request: Vec<u8>,
   deadline_ns: u64,
 ) -> (TimedReply, Endpoint) {
   let sent_ns = now_ns();
   let before = endpoint.last_exchange();
   // A delivered reply is preferred over the deadline when both are ready; a deadline that cannot be armed
   // (off a shard) fails the exchange like a transport error, never as a timeout (AUD-29-39).
-  let reply =
-    slates_rt::futures::within(deadline_ns, endpoint.request(stream_id, priority, request))
-      .await
-      .ok()
-      .flatten()
-      .and_then(Result::ok);
+  let reply = slates_rt::futures::within(
+    deadline_ns,
+    endpoint.request_owned(stream_id, priority, request),
+  )
+  .await
+  .ok()
+  .flatten()
+  .and_then(Result::ok);
   if reply.is_none() {
     // The deadline won: the `request` future was dropped mid-exchange. Abandon the exchange so its
     // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
@@ -770,7 +773,7 @@ pub async fn broadcast(
     let tx = tx.clone();
     if let Ok(task) = spawn_child(async move {
       let (reply, endpoint) =
-        request_within(endpoint, stream, priority, &request, deadline_ns).await;
+        request_within(endpoint, stream, priority, request, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     }) {
       tasks.push(task);
@@ -1010,7 +1013,7 @@ pub async fn commit_record_sent_as(
       // straggler that never replies still returns its session rather than having it dropped when this task
       // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
       let (reply, endpoint) =
-        request_within(endpoint, stream, Priority::Control, &bytes, deadline_ns).await;
+        request_within(endpoint, stream, Priority::Control, bytes, deadline_ns).await;
       tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -1298,7 +1301,7 @@ pub async fn promote_ledger_record(
         endpoint,
         LEDGER_PROMOTE_STREAM,
         Priority::Control,
-        &bytes,
+        bytes,
         deadline_ns,
       )
       .await;

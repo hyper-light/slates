@@ -2532,7 +2532,7 @@ fn dispatch_round(
     let reply_tx = tx.clone();
     let spawned = spawn_child(async move {
       let (reply, endpoint) =
-        request_within(endpoint, stream, Priority::Bulk, &bytes, deadline_ns).await;
+        request_within(endpoint, stream, Priority::Bulk, bytes, deadline_ns).await;
       reply_tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {

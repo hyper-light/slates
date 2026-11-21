@@ -11224,7 +11224,7 @@ async fn send_pair(member: HostId, request: &[u8], budget: CommitBudget) -> Opti
     endpoint,
     PAIR_KEY_STREAM,
     Priority::Metadata,
-    request,
+    request.to_vec(),
     budget.max_deadline_ns(),
   )
   .await;
@@ -11483,7 +11483,7 @@ pub(crate) async fn request_peer(
     endpoint,
     stream,
     Priority::Metadata,
-    request,
+    request.to_vec(),
     budget.max_deadline_ns(),
   )
   .await;

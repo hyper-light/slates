@@ -4969,7 +4969,7 @@ async fn ship_lane(
     let _ = state::with_state(|s| hold_for_exchange(s, holder));
     let sent_ns = slates_machine::clock::monotonic_ns();
     let exchanged =
-      slates_cluster::live::exchange((send.stream, &send.bytes), sessions, exchange, |_, _| true)
+      slates_cluster::live::exchange((send.stream, send.bytes), sessions, exchange, |_, _| true)
         .await;
     let answered_ns = slates_machine::clock::monotonic_ns();
     let stamps = LaneStamps {
@@ -6969,7 +6969,7 @@ pub(crate) async fn ask_admissions(
   });
   let request = admit.encode();
   let exchanged = slates_cluster::live::exchange(
-    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    (slates_cluster::live::LIVE_STATE_STREAM, request),
     sessions,
     crate::fleet::live_budget(),
     |_, _| false,
@@ -7213,7 +7213,7 @@ pub(crate) async fn ask_reports(
     crate::fleet::take_sessions("fleet.lent_to.live_takeover", |host| others.contains(&host));
   let request = slates_db::live::Report { object, epoch }.encode();
   let exchanged = slates_cluster::live::exchange(
-    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    (slates_cluster::live::LIVE_STATE_STREAM, request),
     sessions,
     budget,
     |_, _| false,
@@ -7690,7 +7690,7 @@ async fn fetch_log(
   let budget = exchange_budget(usize::try_from(bytes).unwrap_or(usize::MAX), &session);
   let request = slates_db::live::Fetch { object, epoch }.encode();
   let exchanged = slates_cluster::live::exchange(
-    (slates_cluster::live::LIVE_STATE_STREAM, &request),
+    (slates_cluster::live::LIVE_STATE_STREAM, request),
     session,
     budget,
     |_, _| false,

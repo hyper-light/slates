@@ -1898,12 +1898,26 @@ impl Endpoint {
   /// — a record commit is never queued behind a content put on the same session, in the packet schedule,
   /// the connection credit or the stream credit: an exchange binds to a stream only while the peer's stream
   /// credit leaves a slot for each more urgent class, and waits unsequenced until then, so a more urgent
-  /// exchange begun later binds first. A limit's worth waiting unbound is refused typed.
+  /// exchange begun later binds first. A limit's worth waiting unbound is refused typed. The request is copied once,
+  /// into the stream's send buffer; a caller that owns its bytes hands them over whole with
+  /// [`begin_owned`](Endpoint::begin_owned).
   pub fn begin(
     &mut self,
     kind: u64,
     priority: Priority,
     request: &[u8],
+  ) -> Result<u64, EndpointError> {
+    self.begin_owned(kind, priority, request.to_vec())
+  }
+
+  /// [`begin`](Endpoint::begin) with the request taken as the stream's send buffer, never copied whole. Until
+  /// 2026-11-21 a request was copied twice here (into the queue, then into the stream), and a live entry, encoded once
+  /// a holder and copied again by its exchange, four times a holder on a live write's path (g228, 85a).
+  pub fn begin_owned(
+    &mut self,
+    kind: u64,
+    priority: Priority,
+    request: Vec<u8>,
   ) -> Result<u64, EndpointError> {
     // The wait is bounded by the stream limit, less a slot per more urgent class: bulk exchanges filling
     // the queue never refuse a control exchange begun after them.
@@ -1932,7 +1946,7 @@ impl Endpoint {
       exchange,
       kind,
       priority,
-      request: request.to_vec(),
+      request,
     });
     self.bind_queued()?;
     Ok(exchange)
@@ -1957,7 +1971,7 @@ impl Endpoint {
       };
       let stream = self
         .conn
-        .open_exchange(queued.kind, queued.priority, &queued.request)
+        .open_exchange(queued.kind, queued.priority, queued.request)
         .map_err(EndpointError::Stream)?;
       self.by_stream.insert(stream, queued.exchange);
       if let Some(exchange) = self.exchanges.get_mut(&queued.exchange) {
@@ -2057,7 +2071,17 @@ impl Endpoint {
     priority: Priority,
     request: &[u8],
   ) -> Result<Vec<u8>, EndpointError> {
-    let id = self.begin(kind, priority, request)?;
+    self.request_owned(kind, priority, request.to_vec()).await
+  }
+
+  /// [`request`](Endpoint::request) with the request taken whole ([`begin_owned`](Endpoint::begin_owned)).
+  pub async fn request_owned(
+    &mut self,
+    kind: u64,
+    priority: Priority,
+    request: Vec<u8>,
+  ) -> Result<Vec<u8>, EndpointError> {
+    let id = self.begin_owned(kind, priority, request)?;
     loop {
       if let Some(reply) = self.take_reply(id) {
         self.flush()?;

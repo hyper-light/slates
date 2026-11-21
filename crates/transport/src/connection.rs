@@ -561,15 +561,17 @@ impl Connection {
   /// (finished), and returns its id; the peer's reply arrives on the same id. The stream waits unsent
   /// while the peer's stream credit does not cover it, and a limit's worth waiting is a typed refusal
   /// (`crate::streams`). The send side starts with the initial window of credit (both ends derive the
-  /// same window, R8); more is granted only as the peer's `MaxStreamData` for it arrives.
+  /// same window, R8); more is granted only as the peer's `MaxStreamData` for it arrives. `data` is taken as the
+  /// stream's send buffer, never copied whole, as a reply's is ([`Connection::reply`]): a live entry once copied here a
+  /// fourth time a holder (g228, 85a).
   pub fn open_exchange(
     &mut self,
     kind: u64,
     priority: Priority,
-    data: &[u8],
+    data: Vec<u8>,
   ) -> Result<u64, StreamRefusal> {
     let stream_id = self.streams.open_local(kind, priority)?;
-    self.install_sender(stream_id, data.to_vec());
+    self.install_sender(stream_id, data);
     Ok(stream_id)
   }
 
@@ -2427,7 +2429,7 @@ mod tests {
   /// Opens a stream carrying `content` on `sender` and returns its id.
   fn open(sender: &mut Connection, content: &[u8]) -> u64 {
     sender
-      .open_exchange(KIND, Priority::Metadata, content)
+      .open_exchange(KIND, Priority::Metadata, content.to_vec())
       .expect("the stream credit covers the test's streams")
   }
 
@@ -2952,7 +2954,7 @@ mod tests {
     let mut sender = fixed_window(FRAME_CAP);
     for seed in [4, 5] {
       let bulk = stream_content(seed, usize::try_from(2 * window).unwrap());
-      sender.open_exchange(KIND, Priority::Bulk, &bulk).unwrap();
+      sender.open_exchange(KIND, Priority::Bulk, bulk).unwrap();
     }
     let now = send_until(&mut sender, 1_000, |sender, _| sender.stops.credit > 0);
     assert!(sender.stops.credit > 0, "the bulk class stopped on credit");
@@ -2961,7 +2963,7 @@ mod tests {
       "the bulk class had the whole window"
     );
     let ping = sender
-      .open_exchange(KIND, Priority::Control, &stream_content(6, 8))
+      .open_exchange(KIND, Priority::Control, stream_content(6, 8))
       .unwrap();
     let carries_ping = |frames: &[Frame]| {
       frames
@@ -2999,7 +3001,7 @@ mod tests {
       );
       for seed in 0..idle {
         sender
-          .open_exchange(KIND, Priority::Bulk, &stream_content(seed, 8))
+          .open_exchange(KIND, Priority::Bulk, stream_content(seed, 8))
           .unwrap();
       }
       let now = send_until(&mut sender, 1_000, |sender, _| {
@@ -3018,7 +3020,7 @@ mod tests {
         sender.in_flight
       );
       let bulk = sender
-        .open_exchange(KIND, Priority::Bulk, &stream_content(99, 64 * FRAME_DATA))
+        .open_exchange(KIND, Priority::Bulk, stream_content(99, 64 * FRAME_DATA))
         .unwrap();
       let before = sender.stops.examined;
       let mut frames = 0u64;

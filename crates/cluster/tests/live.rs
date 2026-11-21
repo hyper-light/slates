@@ -425,7 +425,7 @@ fn a_lane_that_ends_with_a_holder_unanswered_gets_every_session_back() {
         let (back_tx, back_rx) = channel();
         let lane = slates_rt::futures::spawn(async move {
           let exchanged = slates_cluster::live::exchange(
-            (LIVE_ENTRY_STREAM, &bytes),
+            (LIVE_ENTRY_STREAM, bytes),
             sessions,
             CommitBudget::hard(DEADLINE_NS, POLL_NS),
             |_, _| true,

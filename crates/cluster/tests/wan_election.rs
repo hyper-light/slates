@@ -318,8 +318,14 @@ async fn probe_peer(owner: HostId, peer: HostId, endpoint: Endpoint) {
         .unwrap_or(initial)
         .max(HEARTBEAT_NS)
     });
-    let (reply, returned) =
-      request_within(endpoint, PROBE_KIND, Priority::Control, b"ping", deadline).await;
+    let (reply, returned) = request_within(
+      endpoint,
+      PROBE_KIND,
+      Priority::Control,
+      b"ping".to_vec(),
+      deadline,
+    )
+    .await;
     endpoint = returned;
     if let Some(round_trip_ns) = reply.round_trip_ns {
       with_node(owner, |n| {
