@@ -15,3 +15,7 @@ Disk: deleted my clone ~/slates-work/g226-live-shipped-volume (1.1 GB) and ~/.ca
 69 MB fanout clone, ~/.cache/g226-fanout. Studio-4 is at 16 GiB free.
 
 Ready for a goal-93 piece.
+
+Update 12:00 PST: Linux r8 ended green on b5220bd92 (adacachy). The arenas read 268,435,456 of 268,435,456 on the 2nd
+look in 35 ms. The content_ranges (4), held_runs and journal oracle tests all pass. The BENCHMARKS row landed as
+a5e5ce50. Still with w-lint: the macOS rerun on merged main and Windows.

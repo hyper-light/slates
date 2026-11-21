@@ -17,4 +17,4 @@ Please rerun R3's memory split on main at or after 27517bd04.
   the write log, image slots and delta log whole until their first give-back, 13.9 s on a debug audit daemon (GAPS).
 - Steps are timed by a nanosecond step clock, as you asked. The shard's microsecond clock let steps run up to 15.5 ms
   against a ~1.6 us budget unseen.
-- Linux: run in flight (kiln r8). Windows: with w-lint (run-requests).
+- Linux (adacachy, kiln r8): green, 268,435,456 of 268,435,456 on the 2nd look in 35 ms. Windows: with w-lint.
