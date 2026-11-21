@@ -6897,3 +6897,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 
 ## 2026-11-20T23:45Z w-realtools main d5a465908 (A-781: without a birth time, an unchanged base file keeps its number across a takeover)
 - Command: `cargo test --locked -p slates-vfs --test base_identity --test base`. Platforms: Linux x86_64/arm64 and Windows x86_64 (the base plane's host differs; the sim tests are portable). Red: a without_birth_times test failing, or A-151's guards (a reused number passing for the old file). Who: w-realtools.
+
+## 2026-11-20, w-work-mount A-774 part 2 (f6660f0ab, main 7f8eb5cbb)
+- clippy + xtask over crates/vfs/src/host/tree.rs, crates/base/src/base_host.rs (new Tree variant), crates/server/src/{green_tree,mounted_work}.rs, nfs.rs/fuse.rs lend sites; Linux FUSE: `cargo test -p slates-server --test fuse_mount` (red: a mounted work's FUSE read refused).
+- Finding by observation, not chased: debug `--test mounted_work_cow` was killed once of 4 by the daemon watchdog (shard 0 spun 3.6 s CPU without a step against 3.57 s; load 11.7 on this MacBook) while seeding a 64 MiB green in one submit; work_cow.rs seeds the same. Release runs never tripped it.
