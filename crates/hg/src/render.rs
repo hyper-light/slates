@@ -59,6 +59,7 @@ const UNCOMPRESSED: u8 = b'u';
 /// so a stream sends what follows the hunk, the text, as the revlog's full snapshot: a revlog chunk whose base is its
 /// own revision is the text itself, and the hunk sent with it failed stock 7.2's clone ("integrity check failed on
 /// 00changelog:0", found by `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`).
+/// Format: three big-endian 32-bit words.
 const TRIVIAL_HUNK_BYTES: u64 = 12;
 /// Format: the obsstore's name in a refusal of a marker the index cannot give back.
 const OBSSTORE: &[u8] = b"obsstore";
@@ -836,10 +837,11 @@ fn text_after_trivial_hunk(delta: &[u8]) -> Option<&[u8]> {
   let header = usize::try_from(TRIVIAL_HUNK_BYTES).ok()?;
   let (hunk, text) = (delta.get(..header)?, delta.get(header..)?);
   let words: Vec<u32> = hunk
-    .chunks_exact(4)
-    .map(|word| <[u8; 4]>::try_from(word).map(u32::from_be_bytes))
-    .collect::<Result<_, _>>()
-    .ok()?;
+    .as_chunks::<{ size_of::<u32>() }>()
+    .0
+    .iter()
+    .map(|word| u32::from_be_bytes(*word))
+    .collect();
   let length = u32::try_from(text.len()).ok()?;
   (words == [0, 0, length]).then_some(text)
 }

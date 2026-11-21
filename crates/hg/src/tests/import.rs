@@ -1444,6 +1444,39 @@ impl Clock for StandingClock {
   }
 }
 
+/// `segments` more than one, every one but the last at least `bound` bytes, and every text each names within it.
+fn segments_hold_their_texts(name: &str, segments: &[crate::import::emit::Segment], bound: usize) {
+  assert!(segments.len() > 1, "{name}: {} segments", segments.len());
+  for (at, segment) in segments.iter().enumerate() {
+    if at + 1 < segments.len() {
+      assert!(segment.payload.len() >= bound, "{name}: segment {at} short");
+    }
+    for kept in &segment.texts {
+      assert!(kept.place.end <= u64::try_from(segment.payload.len()).unwrap());
+    }
+  }
+}
+
+/// The changegroup `whole` taken through a push's intake into an empty index in `store`, a step at a time: the fork
+/// and what it brought.
+fn taken_whole(
+  whole: &[u8],
+  store: &mut ContentStore,
+) -> (crate::index::HgIndex, crate::push::intake::Intaken) {
+  use crate::import::emit;
+  use crate::push::intake::{Intake, Stepped};
+  let mut empty = crate::index::HgIndex::new();
+  let mut intake = Intake::begin((emit::VERSION, whole), &mut empty, store, &mut room()).unwrap();
+  loop {
+    match intake.step(whole, store, &mut room()).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+    }
+  }
+  intake.finish().ok().unwrap()
+}
+
 /// A-767 C1 step 3 (the import as the changegroup a push of it would bring, `crate::import::emit`). Do: import each of
 /// the five stores 7.2 wrote, writing its history in segments of at least 512 bytes; concatenate the segments and take
 /// them through the push's intake into an empty index. Expect the intake's index the import's row for row; every
@@ -1451,8 +1484,6 @@ impl Clock for StandingClock {
 /// segments.
 #[test]
 fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
-  use crate::import::emit;
-  use crate::push::intake::{Intake, Stepped};
   const BOUND: usize = 512;
   for name in REPOSITORIES {
     let mut repository = repository(name);
@@ -1474,40 +1505,14 @@ fn an_import_writes_the_changegroup_a_push_of_its_history_brings() {
     }
     let emitted = started.emitted();
     let mut imported = started.into_imported().unwrap();
-    assert!(segments.len() > 1, "{name}: {} segments", segments.len());
-    for (at, segment) in segments.iter().enumerate() {
-      if at + 1 < segments.len() {
-        assert!(segment.payload.len() >= BOUND, "{name}: segment {at} short");
-      }
-      for kept in &segment.texts {
-        assert!(kept.place.end <= u64::try_from(segment.payload.len()).unwrap());
-      }
-    }
+    segments_hold_their_texts(name, &segments, BOUND);
     let whole: Vec<u8> = segments
       .iter()
       .flat_map(|segment| segment.payload.clone())
       .collect();
     assert_eq!(u64::try_from(whole.len()).unwrap(), emitted, "{name}");
     let mut taken_store = self::store();
-    let mut empty = crate::index::HgIndex::new();
-    let mut intake = Intake::begin(
-      (emit::VERSION, &whole),
-      &mut empty,
-      &mut taken_store,
-      &mut room(),
-    )
-    .unwrap();
-    loop {
-      match intake
-        .step(whole.as_slice(), &mut taken_store, &mut room())
-        .unwrap()
-      {
-        Stepped::More => {}
-        Stepped::Done => break,
-        Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
-      }
-    }
-    let (mut fork, intaken) = intake.finish().ok().unwrap();
+    let (mut fork, intaken) = taken_whole(&whole, &mut taken_store);
     let texts: usize = segments.iter().map(|segment| segment.texts.len()).sum();
     assert_eq!(u64::try_from(texts).unwrap(), intaken.kept, "{name}");
     let taken: Rows = fork
