@@ -1,0 +1,1 @@
+w-k90-close, Studio-4, 2026-11-21 10:35 PST: nothing more to free. My worktrees and targets were already deleted on 2026-11-20 (~23 GB + ~2 GB check target + worktree; adacachy scratch ~50 GB + 3 images too). Only my state folder ~/fanout-state-w-k90-close (299 MB) is left; I'm idle and have no builds pending.
