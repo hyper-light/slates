@@ -139,3 +139,43 @@ pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64) {
     row[2].store(ended, Relaxed);
   }
 }
+
+/// Diagnostic only (g222, never main): asks the calling thread for the EEVDF slice `G222_SLICE_NS` (A-224's
+/// `sched_runtime` for a `SCHED_OTHER` thread, its policy and nice kept, no privilege), and counts the answer.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code, clippy::all, clippy::pedantic, clippy::restriction, clippy::disallowed_methods)]
+pub(crate) fn g222_slice() {
+  #[repr(C)]
+  #[derive(Clone, Copy, Default)]
+  struct SchedAttr {
+    size: u32,
+    policy: u32,
+    flags: u64,
+    nice: i32,
+    priority: u32,
+    runtime: u64,
+    deadline: u64,
+    period: u64,
+    util_min: u32,
+    util_max: u32,
+  }
+  let Some(slice) = std::env::var("G222_SLICE_NS").ok().and_then(|v| v.parse::<u64>().ok()) else {
+    return;
+  };
+  let mut attr = SchedAttr::default();
+  let size = std::mem::size_of::<SchedAttr>() as u32;
+  // SAFETY: diagnostic; pid 0 is the calling thread, `attr` is a repr(C) sched_attr of `size` bytes.
+  let got = unsafe { libc::syscall(libc::SYS_sched_getattr, 0, &raw mut attr, size, 0) };
+  if got != 0 {
+    eprintln!("g222 slice: sched_getattr refused: {}", std::io::Error::last_os_error());
+    return;
+  }
+  attr.size = size;
+  attr.policy = 0;
+  attr.runtime = slice;
+  // SAFETY: as above; the kernel reads `size` bytes.
+  let set = unsafe { libc::syscall(libc::SYS_sched_setattr, 0, &raw const attr, 0) };
+  if set != 0 {
+    eprintln!("g222 slice: sched_setattr({slice}) refused: {}", std::io::Error::last_os_error());
+  }
+}

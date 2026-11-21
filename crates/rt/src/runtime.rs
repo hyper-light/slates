@@ -416,6 +416,8 @@ fn run_worker(
       libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
     }
   }
+  #[cfg(target_os = "linux")]
+  crate::g222_slice();
   let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
   let ctx = match ShardContext::build(seed) {
     Ok(ctx) => ctx,
