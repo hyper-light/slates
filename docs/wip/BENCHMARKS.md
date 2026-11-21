@@ -17629,3 +17629,37 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
   branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
   a version, A-803 (c).
+
+## 2026-11-21 — A resolution judged at the head as it is (main's ruling of 10:33 PST): measured and rejected (w-fed-move, goal 86b)
+
+The idea (main ruled it as one verb): A-796's `ResolveMerge` judged against the current head, not refused
+`StaleMergeView` when the head had moved since the check. Its discards are retired and the rest rebased onto the
+current head in the same step, refused only by a conflict on windows it did not discard. The load harness resolved each
+conflict with `CheckMerge` then `ResolveMerge` (the declaration's operations on the windows discarded, the round's own
+slots written again), against its read-and-rebase loop.
+- **Built.** The owner's `merge_answer` without the stamp-head refusal; A-796's test red first (a moved head refused,
+  then rebased there); and a generated oracle in `crates/server/tests/merge_check.rs` (slot sets of the work, of rivals
+  before the check and after it). The oracle was accepted exactly when no kept slot was touched after the check, then
+  the head's file with the work's slots; otherwise a conflict naming only those slots. 24 histories passed. The harness
+  gained `--resolve`.
+- **Kept as:** `~/slates-work/w-fed-move-resolve-at-head-rejected.patch` (w-fed-move's machine).
+- **A/B.** Release, in-process, the kernel's `kernel/` (754 files), 1,000 clients, one round, `--per-connection 32`;
+  each pair back to back, main 67fa7f75a, this Mac Studio under other agents' load. Oracle failures were 0 in all eight runs.
+
+| hot files | resolve | asks a client | rebase-kind asks | verdict asks | verdicts/s | rebase conflicts |
+|---|---|---|---|---|---|---|
+| 300 | read+rebase | 11.2 | 2.1 | 2.4 | 3,264 | 754 |
+| 300 | check+resolve | 11.9 | 2.9 | 2.2 | 3,656 | 199 |
+| 100 | read+rebase | 13.0 | 3.6 | 2.7 | 2,271 | 1,822 |
+| 100 | check+resolve | 13.3 | 3.9 | 2.6 | 3,342 | 284 |
+| 30 | read+rebase | 19.3 | 8.7 | 3.8 | 2,168 | 5,850 |
+| 30 | check+resolve | 17.9 | 7.2 | 4.0 | 2,084 | 529 |
+| 10 | read+rebase | 31.8 | 20.1 | 5.1 | 1,260 | 16,035 |
+| 10 | check+resolve | 26.8 | 13.2 | 7.0 | 3,607 | 584 |
+
+- **Why rejected.** Main's bar was 19.8 to about 4.6 rebase asks a client at 10 hot files; it measured 20.1 to 13.2.
+  A resolution costs two asks (the check and the resolve), and the submit after it conflicts more often (6.0 against
+  4.2 a client at 10 hot files), since the head moves on while the client re-submits. At 300 and 100 hot files, where a
+  plain rebase usually succeeds, it cost more asks (11.2 to 11.9, 13.0 to 13.3). The verdicts-a-second column was
+  measured on a shared, loaded machine and is not read as a result.
+
