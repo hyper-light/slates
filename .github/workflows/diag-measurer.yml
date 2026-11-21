@@ -1,6 +1,6 @@
 name: diag-measurer
 
-# g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
+# g222's Linux split: the diagnostic arm (2c8f89de6 + g222's ring stamps, diag-g222-hops-base) loaded under A-224's lane, landing->taken vs taken->reply per request. Was: g222's bisect of ~10 us on a quiet lone submit since A-400 (f2081a3c8..a5233e228), quiet only. Was: g222's lone-client A/B (the supervisor's condition 3, 2026-11-20): does A-400 (a work on its client's shard) undo W1's
 # single-client regression at three shards? Four arms, each built from its own source extract, rotated each round,
 # loaded then quiet: 8dff8fcad (before W1), 379dfe750 (W1 and A-296, just before A-400), f2081a3c8 (A-400 landed),
 # a5233e228 (main now). Loaded on Linux = the supervisor's controlled load (A-224's lane). A diagnostics lane run only
@@ -12,8 +12,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  ARMS: "2fb7d49b337854f1e64e2bda0827d6593371d205 e4f2aeaf70a580b52a55865d0858b42899ccdd05 549fecefa17fe075d68057929e28aae5ac4aab81 c9100be042c499ad0148622beb5dd8100bb768a1 5fd097b10c58fc86709d267a5404c0986c36b935 2963b7ad2c452773af9e4578faf26f11eac93924 38f74a7960dda62d48f17c6ed7e4e1e735a1b810 be175cd9d06509ad68699df2e107208f9032b620 524542460f2f3c68ea4628828817f63f6d39356e 23eb15b498905ffb9d9d7697a83ad0b85894381f a5233e228978b8e60ccc0306c54b440564596807"
+  ARMS: "6e65db464c39d56e3fcd73bc55045bdb44e658be"
   ROUNDS: "3"
+  G222_SPLIT: "1"
 
 jobs:
   edit-merge-ab:
@@ -77,7 +78,7 @@ jobs:
             fi
             # Does the newer daemon run inside 256 MB? One short loaded accept under the cap decides; else CPUs only.
             if [ "$(cat "$W/constraint")" = systemd ] && timeout 300 systemd-run --user --scope -q -p MemoryMax=256M -p AllowedCPUs=0-1 \
-                 "$W/bin-a5233e228/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
+                 "$W/bin-6e65db464/edit_merge_bench" --loaded-only --spinners-per-core 2 --files 10 --form accept </dev/null > "$W/logs/probe.log" 2>&1; then
               echo "cap: AllowedCPUs=0-1 MemoryMax=256M" | tee "$W/capnote"
             else
               echo "cap: AllowedCPUs=0-1 only (the 256 MB probe failed: $(tail -2 "$W/logs/probe.log" | tr '\n' ' '))" | tee "$W/capnote"
@@ -103,6 +104,24 @@ jobs:
           chmod +x "$W/loaded.sh"
           set +e
           order() { case $1 in 1) echo $ARMS;; 2) echo $ARMS | awk '{for(i=NF;i>0;i--) printf "%s ", $i}';; *) echo $ARMS | awk '{h=int(NF/2); for(i=h+1;i<=NF;i++) printf "%s ", $i; for(i=1;i<=h;i++) printf "%s ", $i}';; esac; }
+          for round in $(seq 1 "$ROUNDS"); do
+            for arm in $ARMS; do
+              s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; [ -x "$B" ] || continue; L="$W/logs/loaded-$s-r$round.log"
+              echo "== loaded round $round arm $s $(date -u +%FT%TZ) load: $(load) $(cat "$W/capnote")" | tee "$L"
+              MEM="-p MemoryMax=256M"; [ -f "$W/nomem" ] && MEM=""
+              G222_DIAG="$W/logs/loaded-$s-r$round.tsv" timeout 1200 systemd-run --user --scope -q $MEM -p AllowedCPUs=0-1 "$W/loaded.sh" "$B" "$W" </dev/null >> "$L" 2>&1
+              echo "exit $?" >> "$L"; grep -E "ratchet-info.*f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+              python3 - "$W/logs/loaded-$s-r$round.tsv.ring" <<'PY' || true
+          import sys
+          q=[];s=[]
+          for l in open(sys.argv[1]).read().splitlines()[1:]:
+              a,b=l.split('\t'); q.append(int(a)); s.append(int(b))
+          q.sort(); s.sort()
+          pc=lambda a,p: a[min(len(a)-1,int(len(a)*p))]/1000
+          print('split n',len(q),'queued p50/p99/p999/max us',pc(q,.5),pc(q,.99),pc(q,.999),q[-1]/1000,'served p50/p99/p999 us',pc(s,.5),pc(s,.99),pc(s,.999))
+          PY
+            done
+          done
           for round in $(seq 1 "$ROUNDS"); do
             for arm in $(order $round); do
               s="${arm:0:9}"; B="$W/bin-$s/edit_merge_bench$EXE"; L="$W/logs/quiet-$s-r$round.log"
