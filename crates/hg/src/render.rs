@@ -350,6 +350,12 @@ pub enum Want {
     /// The places.
     places: Vec<StoredPlace>,
   },
+  /// These full texts, each by its identity, made by the store from its chain (A-767 C1 step 1b: a pull's file revision
+  /// whose stored base the client may lack, sent whole against the null base).
+  Texts {
+    /// Each text's identity.
+    texts: Vec<[u8; 32]>,
+  },
 }
 
 /// What answers a stream's wants at once (a whole answer, [`crate::serve::stream::stream_out`]; a test).
@@ -370,6 +376,8 @@ pub trait StoreWants {
   fn give_rows(&mut self, rows: Vec<Vec<Option<StoredRevision>>>);
   /// The chunks a [`Want::Chunks`] asked for.
   fn give_chunks(&mut self, chunks: Vec<Vec<u8>>);
+  /// The texts a [`Want::Texts`] asked for, in order; an answer that never asks for texts (a stream's) takes none.
+  fn give_texts(&mut self, _texts: Vec<Vec<u8>>) {}
 }
 
 impl StoreWants for Streaming {
@@ -423,6 +431,8 @@ pub fn answer_want(
       let chunks = source.chunks(&places).ok_or(Refused::TooLong)?;
       streaming.give_chunks(chunks);
     }
+    // A stream sends each revision as the store keeps it, never a text made whole.
+    Want::Texts { .. } => return Err(Refused::TooLong),
   }
   Ok(true)
 }

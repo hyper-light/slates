@@ -153,6 +153,11 @@ pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 /// batch of rows or of chunks. Format: a counter name in the status report.
 pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
 
+/// Counter: the file revisions a pull sent whole against the null base, each a text the store made from its chain since
+/// its stored base was neither on the client nor sent earlier in the answer (A-767 C1 step 1b, main's ruling of
+/// 2026-11-21 08:45; `slates_hg::serve::getbundle::Pull`). Format: a counter name in the status report.
+pub(crate) const PULL_WHOLE_TEXTS: &str = "vcs_store.hg_pull_whole_texts";
+
 /// Counter: the nanoseconds a fetch's streamed answer waited on the changeset store's answers, summed over its asks
 /// ([`STORE_ASKS`]). Format: a counter name in the status report.
 pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
@@ -239,6 +244,15 @@ pub(crate) async fn answer_store_wants(
         wants.give_chunks(chunks);
       }
       (Want::Chunks { .. }, None) => return false,
+      (Want::Texts { texts }, Some(disk)) => {
+        let Some(made) = texts_made(&disk, repository, &texts).await else {
+          return false;
+        };
+        let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+        let _ = crate::state::with_state(|state| state.count(PULL_WHOLE_TEXTS, whole));
+        wants.give_texts(made);
+      }
+      (Want::Texts { .. }, None) => return false,
     }
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
     let _ = crate::state::with_state(|state| {
@@ -247,6 +261,31 @@ pub(crate) async fn answer_store_wants(
     });
   }
   true
+}
+
+/// The full texts `texts` (each by its identity) of `repository`, made by the store's owner from their chains and read
+/// a piece at a time to their end (`StoreHandle::text`, empty at a text's end; A-767 C1 step 1b, a pull's revision sent
+/// whole); none where the store keeps no such text.
+pub(crate) async fn texts_made(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  texts: &[[u8; 32]],
+) -> Option<Vec<Vec<u8>>> {
+  let mut made = Vec::new();
+  made.try_reserve_exact(texts.len()).ok()?;
+  for identity in texts {
+    let mut text = Vec::new();
+    loop {
+      let at = u64::try_from(text.len()).ok()?;
+      let piece = disk.text(repository, *identity, at).await.ok()??;
+      if piece.is_empty() {
+        break;
+      }
+      text.extend_from_slice(&piece);
+    }
+    made.push(text);
+  }
+  Some(made)
 }
 
 /// [`held`], for the tests.

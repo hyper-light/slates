@@ -2895,10 +2895,26 @@
 >   - hg_interop `stock_hg_clone_stream_streams_a_pushed_repository_and_an_imported_one`: a plain `hg clone` asks the
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
-> - OPEN, 1b: a pull (`named_changegroup`, built whole when it begins) still reads file texts from the content store.
->   It becomes the same step-at-a-time walk, its stored deltas sent where their base is on the client or sent earlier
->   (main's condition), with a count of revisions sent whole. Then the other synchronous readers (lookup's `.hgtags`,
->   the push intake's base text), then step 2.
+> - 1b, BUILT below.
+> **C1 step 1b, a pull's file revisions through the changeset store (2026-11-21, w-hg; main's ruling of 08:45 with its
+> condition on pulls). BUILT.**
+> - A pull (any fetch the links do not walk) still makes its changelog and manifests whole when it begins
+>   (`named_changegroup`); its file section is now `serve::getbundle::Pull`, taken a step at a time from the node's
+>   changeset store through the same `StoreWants`: the rows of a batch of planned revisions and of their parents, then
+>   their stored edits, then any whole texts, one at a time (the new `Want::Texts`, `give_texts`; the daemon reads the
+>   store's `text` a piece at a time to its end, `hg_view::texts_made`).
+> - A revision's stored delta is sent where its base is on the client or sent earlier in this answer, decided from the
+>   common set: the base text is an earlier revision of its group, or a parent whose changeset the client holds. Else
+>   its whole text, made by the store from its chain, is sent against null and counted (`Walk::whole_sent`, beside
+>   `stored_sent`).
+> - Held by `getbundle::tests::a_pull_sends_a_stored_delta_against_a_parent_the_client_holds` (sent against its held
+>   p1, rebuilt equal, none whole), `a_pull_sends_whole_and_counts_a_revision_whose_stored_base_the_client_lacks` (the
+>   stored base a sibling's: sent whole, counted 1), and `a_pull_of_one_changeset_is_made_from_what_it_sends_not_the_whole_history`
+>   (a step a unit sent).
+>   The daemon counts each whole text a pull is given, `vcs_store.hg_pull_whole_texts`.
+> - OPEN: the bytes of a one-changeset pull of a large file against stock's (main's condition), measured below when
+>   recorded. Then the other synchronous readers (lookup's
+>   `.hgtags`, the push intake's base text), then step 2.
 > **C1, made changesets on the changeset store (2026-11-21, w-hg; main's ruling of 09:00: one hook, one path).
 > CLOSED.**
 > - A changeset the server makes of a submitted version lands on the node's store as a push's does. The made

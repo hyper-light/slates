@@ -97,13 +97,18 @@ pub trait Store: Repository {
   /// The repository's obsolescence markers, in any order.
   fn markers(&self) -> impl Iterator<Item = Marker<'_>>;
 
-  /// The parents' nodes and the flags of the file revision at `path` whose node is `node`, from its log's row, with no
-  /// text read (A-767 C1: a clone sends each file revision as the changeset store keeps it); none where the log lacks
-  /// it. By default read through [`Store::file`].
-  fn file_entry(&self, path: &[u8], node: &Node) -> Option<([Node; 2], u16)> {
+  /// The file revision at `path` whose node is `node` as its log's row holds it, with no text read ([`FileEntry`];
+  /// A-767 C1: a fetch sends each file revision as the changeset store keeps it); none where the log lacks it. By
+  /// default read through [`Store::file`].
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<FileEntry> {
     let mut room = Admission::new(u64::MAX);
     let logged = self.file(path, node, &mut room).ok()??;
-    Some((logged.parents, logged.flags))
+    Some(FileEntry {
+      position: logged.position,
+      parents: logged.parents,
+      link: logged.link,
+      flags: logged.flags,
+    })
   }
 
   /// What a whole answer, which cannot wait between its steps, reads of the changeset store where its walk asks it
@@ -154,6 +159,20 @@ pub trait Store: Repository {
   }
 }
 
+/// A file revision as its log's row holds it ([`Store::file_entry`]): its position in its log, its parents' nodes, the
+/// node of the changeset its log links it to, and its flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileEntry {
+  /// Its position in its log.
+  pub position: u64,
+  /// Its parents' nodes.
+  pub parents: [Node; 2],
+  /// The node of the changeset its log links it to.
+  pub link: Node,
+  /// Its flags.
+  pub flags: u16,
+}
+
 /// What the changeset store gives back for a walk's want ([`crate::render::Want`]): a log's rows in turn, or the
 /// chunks at the places asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +181,8 @@ pub enum Given {
   Rows(Vec<Vec<Option<crate::render::StoredRevision>>>),
   /// The bytes at each place asked, in order.
   Chunks(Vec<Vec<u8>>),
+  /// Each full text asked, in order.
+  Texts(Vec<Vec<u8>>),
 }
 
 /// A manifest revision as the store keeps it, a delta ([`Store::manifest_delta`]): its base's position in the log, its
@@ -654,6 +675,25 @@ pub fn changegroup(
   Ok(out)
 }
 
+/// The changegroup of `outgoing` in `version` made by the changesets that name each revision ([`named_changegroup`]),
+/// whatever the fetch, its payload whole: the two walks' oracle.
+#[cfg(test)]
+pub(crate) fn named_changegroup_whole(
+  store: &impl Store,
+  outgoing: &Outgoing,
+  version: Version,
+  admission: &mut Admission,
+) -> Result<Vec<u8>, Refusal> {
+  let mut walk = Walk::begun(store, outgoing, version, admission, false)?;
+  let mut out = Vec::new();
+  while walk.step(store, admission, &mut out)? {
+    if walk.wants().is_some() {
+      return Err(unanswered());
+    }
+  }
+  Ok(out)
+}
+
 /// The refusal of a whole answer whose walk asks the changeset store between steps, which only an edge answering a step
 /// at a time can ask ([`Store::stored_now`]).
 fn unanswered() -> Refusal {
@@ -701,6 +741,8 @@ pub struct Walk {
   named: Option<Vec<u8>>,
   /// The file revisions read from the changeset store ahead of their steps ([`Ahead`]).
   files: Files,
+  /// A pull's file section, once its changelog and manifests are written ([`Pull`]).
+  pull: Option<Pull>,
 }
 
 /// The file section's reads of the changeset store (A-767 C1 step 1; main's ruling of 2026-11-21 08:45): each file
@@ -780,15 +822,37 @@ impl Walk {
     version: Version,
     admission: &mut Admission,
   ) -> Result<Walk, Refusal> {
+    Walk::begun(
+      store,
+      outgoing,
+      version,
+      admission,
+      by_links(store, outgoing),
+    )
+  }
+
+  /// A walk of the changegroup of `outgoing` in `version` at its start, by the links if `linked`, else by the
+  /// changesets that name each revision ([`named_changegroup`]), its changelog and manifests made whole within
+  /// `admission`.
+  fn begun(
+    store: &impl Store,
+    outgoing: &Outgoing,
+    version: Version,
+    admission: &mut Admission,
+    linked: bool,
+  ) -> Result<Walk, Refusal> {
     let mut walk = Walk {
       missing: outgoing.missing.clone(),
       version,
       at: Some(At::Changelog(0)),
       named: None,
       files: Files::default(),
+      pull: None,
     };
-    if !by_links(store, outgoing) {
-      walk.named = Some(named_changegroup(store, outgoing, version, admission)?);
+    if !linked {
+      let (written, pull) = named_changegroup(store, outgoing, version, admission)?;
+      walk.named = Some(written);
+      walk.pull = Some(pull);
       walk.at = None;
     }
     Ok(walk)
@@ -803,7 +867,24 @@ impl Walk {
   ) -> Result<bool, Refusal> {
     if let Some(named) = self.named.take() {
       out.extend_from_slice(&named);
-      return Ok(false);
+      return Ok(self.pull.is_some());
+    }
+    if let Some(pull) = &mut self.pull {
+      if pull.ended {
+        return Ok(false);
+      }
+      loop {
+        while let Some(want) = pull.want.clone() {
+          let Some(given) = store.stored_now(&want) else {
+            return Ok(true);
+          };
+          pull.give(given);
+        }
+        let more = pull.step(store, self.version, room, out)?;
+        if pull.want.is_none() {
+          return Ok(more);
+        }
+      }
     }
     loop {
       // A want the store answers at once (a whole answer's, [`Store::stored_now`]) is given here and the unit taken
@@ -834,14 +915,22 @@ impl Walk {
     }
   }
 
-  /// What the next step asks of the changeset store, if anything ([`Files`]): given back by [`Walk::give`] before it.
+  /// What the next step asks of the changeset store, if anything ([`Files`], [`Pull`]): given back by [`Walk::give`]
+  /// before it.
   pub fn wants(&self) -> Option<&crate::render::Want> {
-    self.files.want.as_ref()
+    match &self.pull {
+      Some(pull) => pull.want.as_ref(),
+      None => self.files.want.as_ref(),
+    }
   }
 
   /// The changeset store's answer to [`Walk::wants`]: rows ask the chunks of as many of their revisions as the room the
   /// asking step was given holds, at once.
   pub fn give(&mut self, given: Given) {
+    if let Some(pull) = &mut self.pull {
+      pull.give(given);
+      return;
+    }
     let files = &mut self.files;
     let room = files.room;
     files.want = None;
@@ -878,12 +967,23 @@ impl Walk {
           ahead.chunk = Some(chunk);
         }
       }
+      // A clone walked by its links sends every base before its delta: it asks no whole text.
+      Given::Texts(_) => files.unkept = true,
     }
+  }
+
+  /// The file revisions a pull sent whole against the null base, its stored base not on the client nor sent before it
+  /// (main's ruling of 2026-11-21 08:45, counted).
+  pub fn whole_sent(&self) -> u64 {
+    self.pull.as_ref().map_or(0, |pull| pull.whole)
   }
 
   /// The file revisions this walk sent as the changeset store keeps them.
   pub fn stored_sent(&self) -> u64 {
-    self.files.stored
+    self
+      .files
+      .stored
+      .saturating_add(self.pull.as_ref().map_or(0, |pull| pull.stored))
   }
 
   /// The missing changeset at or after `from`, or the changelog group's end.
@@ -1033,9 +1133,10 @@ impl Walk {
       return Ok(Some(here));
     };
     let chunk = chunk.unwrap_or_default();
-    let (parents, flags) = store.file_entry(&found, &node).ok_or(Refusal::Store {
-      what: "a file revision",
-    })?;
+    let FileEntry { parents, flags, .. } =
+      store.file_entry(&found, &node).ok_or(Refusal::Store {
+        what: "a file revision",
+      })?;
     if open.as_deref() != Some(found.as_slice()) {
       if open.is_some() {
         changegroup::put_end(out);
@@ -1152,6 +1253,383 @@ impl Walk {
   }
 }
 
+/// A pull's file section (A-767 C1 step 1b; main's ruling of 2026-11-21 08:45, with its condition on pulls): each file
+/// revision the client lacks, its logs in their paths' order and each in its own, read from the node's changeset store
+/// a batch at a time, never a whole text from the content store. First the rows of a batch and of its revisions'
+/// parents; then for each revision its stored edit where the edit's base is on the client (a parent whose changeset the
+/// common set holds) or sent earlier in its group, else its whole text, made by the store from its chain, sent against
+/// the null base and counted; then their bytes, asked as the store keeps them; then each sent.
+#[derive(Debug)]
+pub(crate) struct Pull {
+  /// Each file log's path and the revisions it sends, in order.
+  plan: Vec<(Vec<u8>, Vec<PlannedRevision>)>,
+  /// The changesets the client holds: the common heads and their ancestors.
+  held: RevSet,
+  /// The group and the revision in it next.
+  at: (usize, usize),
+  /// Whether the group being sent has its name written.
+  open: bool,
+  /// The group's texts sent, by identity: the node each was sent as.
+  sent: BTreeMap<[u8; 32], Node>,
+  /// What the next step asks of the store.
+  want: Option<crate::render::Want>,
+  /// The revisions read ahead, from `at` on, in the plan's order.
+  batch: std::collections::VecDeque<Batched>,
+  /// The rows given, by path and node: the batch's revisions' and their parents'.
+  rows: BTreeMap<(Vec<u8>, Node), crate::render::StoredRevision>,
+  /// The rows asked, each log's path and nodes, in order.
+  rows_asked: Vec<(Vec<u8>, Vec<Node>)>,
+  /// The batch's revisions whose bytes are asked, in the order asked.
+  data_asked: Vec<usize>,
+  /// The revisions sent as the store keeps them.
+  stored: u64,
+  /// The revisions sent whole against the null base.
+  whole: u64,
+  /// Whether the file section's end is written.
+  ended: bool,
+  /// Whether the store gave fewer rows or bytes than were asked: refused at the next step.
+  short: bool,
+}
+
+/// A pull's file revision read ahead: where it is in the plan, how it is sent once decided, and its bytes once given.
+#[derive(Debug)]
+struct Batched {
+  /// Its group and its index in it.
+  at: (usize, usize),
+  /// How it is sent.
+  send: Option<Sending>,
+  /// Its stored edit or whole, or its whole text, once given.
+  data: Option<Vec<u8>>,
+}
+
+/// How a pull sends a file revision.
+#[derive(Clone, Debug)]
+enum Sending {
+  /// As the store keeps it, against `base` (the null node for a stored whole).
+  Stored {
+    /// The node its edit is against.
+    base: Node,
+    /// Where its edit or whole lies.
+    place: crate::render::StoredPlace,
+  },
+  /// Its whole text, made by the store, against the null base.
+  Whole {
+    /// The text's identity.
+    text: [u8; 32],
+  },
+}
+
+impl Pull {
+  /// A pull's file section over `plan`, the client holding `held`.
+  fn new(plan: Vec<(Vec<u8>, Vec<PlannedRevision>)>, held: RevSet) -> Pull {
+    Pull {
+      plan,
+      held,
+      at: (0, 0),
+      open: false,
+      sent: BTreeMap::new(),
+      want: None,
+      batch: std::collections::VecDeque::new(),
+      rows: BTreeMap::new(),
+      rows_asked: Vec::new(),
+      data_asked: Vec::new(),
+      stored: 0,
+      whole: 0,
+      ended: false,
+      short: false,
+    }
+  }
+
+  /// The store's answer to the pull's want.
+  fn give(&mut self, given: Given) {
+    self.want = None;
+    match given {
+      Given::Rows(rows) => {
+        let asked = core::mem::take(&mut self.rows_asked);
+        self.short |= rows.len() != asked.len();
+        for ((path, nodes), rows) in asked.into_iter().zip(rows) {
+          self.short |= rows.len() != nodes.len();
+          for (node, row) in nodes.into_iter().zip(rows) {
+            if let Some(row) = row {
+              self.rows.insert((path.clone(), node), row);
+            }
+          }
+        }
+      }
+      Given::Chunks(data) | Given::Texts(data) => {
+        let asked = core::mem::take(&mut self.data_asked);
+        self.short |= data.len() != asked.len();
+        for (at, data) in asked.into_iter().zip(data) {
+          if let Some(batched) = self.batch.get_mut(at) {
+            batched.data = Some(data);
+          }
+        }
+      }
+    }
+  }
+
+  /// Takes the pull's next unit (module docs of [`Pull`]): whether more follow.
+  fn step(
+    &mut self,
+    store: &impl Store,
+    version: Version,
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<bool, Refusal> {
+    if self.short {
+      return Err(Refusal::Store {
+        what: "a file revision the changeset store gave short",
+      });
+    }
+    let (group, index) = self.at;
+    let Some((path, revisions)) = self.plan.get(group) else {
+      if self.open {
+        changegroup::put_end(out);
+      }
+      changegroup::put_end(out);
+      self.ended = true;
+      return Ok(false);
+    };
+    let path = path.clone();
+    let Some(planned) = revisions.get(index).copied() else {
+      if self.open {
+        changegroup::put_end(out);
+      }
+      self.open = false;
+      self.sent.clear();
+      self.at = (group.saturating_add(1), 0);
+      return Ok(true);
+    };
+    if self.batch.front().map(|batched| batched.at) != Some((group, index)) {
+      self.batch.clear();
+      self.rows.clear();
+      self.ask_rows(room.left());
+      return Ok(true);
+    }
+    if self.batch.iter().any(|batched| batched.send.is_none()) {
+      self.decide(store)?;
+    }
+    if self
+      .batch
+      .front()
+      .is_some_and(|batched| batched.data.is_none())
+    {
+      self.ask_data(room.left());
+      return Ok(true);
+    }
+    let Some(Batched {
+      send: Some(send),
+      data: Some(data),
+      ..
+    }) = self.batch.pop_front()
+    else {
+      return Err(Refusal::Store {
+        what: "a file revision",
+      });
+    };
+    let text = self
+      .rows
+      .get(&(path.clone(), planned.node))
+      .map(|row| row.text)
+      .ok_or(Refusal::Store {
+        what: "a file revision the changeset store keeps no row of",
+      })?;
+    if !self.open {
+      changegroup::put_name(&path, out).map_err(|_| unencodable("a path"))?;
+      self.open = true;
+    }
+    room.charge(to_u64(data.len()))?;
+    let (base, whole) = match send {
+      Sending::Stored { base, .. } => (base, false),
+      Sending::Whole { .. } => (NULL_NODE, true),
+    };
+    let revision = Revision {
+      node: planned.node,
+      p1: planned.entry.parents[0],
+      p2: planned.entry.parents[1],
+      base,
+      link: planned.link,
+      flags: if version == Version::V02 {
+        0
+      } else {
+        planned.entry.flags
+      },
+      info: None,
+      protocol_flags: 0,
+      data: &data,
+      sidedata: None,
+    };
+    let written = if whole {
+      changegroup::put_revision_whole(&revision, version, out)
+    } else {
+      changegroup::put_revision(&revision, version, out)
+    };
+    written.map_err(|_| unencodable("a revision"))?;
+    if whole {
+      self.whole = self.whole.saturating_add(1);
+    } else {
+      self.stored = self.stored.saturating_add(1);
+    }
+    self.sent.insert(text, planned.node);
+    self.at = (group, index.saturating_add(1));
+    Ok(true)
+  }
+
+  /// Asks the rows of as many planned revisions from `at` on as `room` holds (one at least), and their parents'.
+  fn ask_rows(&mut self, room: u64) {
+    let most = usize::try_from(room / to_u64(core::mem::size_of::<Batched>()).max(1))
+      .unwrap_or(usize::MAX)
+      .max(1);
+    let (mut group, mut index) = self.at;
+    let mut asked: Vec<(Vec<u8>, Vec<Node>)> = Vec::new();
+    while self.batch.len() < most {
+      let Some((path, revisions)) = self.plan.get(group) else {
+        break;
+      };
+      let Some(planned) = revisions.get(index) else {
+        group = group.saturating_add(1);
+        index = 0;
+        continue;
+      };
+      let nodes = core::iter::once(planned.node).chain(
+        planned
+          .entry
+          .parents
+          .into_iter()
+          .filter(|parent| *parent != NULL_NODE),
+      );
+      match asked.last_mut() {
+        Some((last, wanted)) if last == path => wanted.extend(nodes),
+        _ => asked.push((path.clone(), nodes.collect())),
+      }
+      self.batch.push_back(Batched {
+        at: (group, index),
+        send: None,
+        data: None,
+      });
+      index = index.saturating_add(1);
+    }
+    self.rows_asked = asked.clone();
+    self.want = Some(crate::render::Want::Rows { logs: asked });
+  }
+
+  /// Decides how each undecided revision of the batch is sent (module docs of [`Pull`]); refused where the store keeps
+  /// no row of one.
+  fn decide(&mut self, store: &impl Store) -> Result<(), Refusal> {
+    let current = self.at.0;
+    for at in 0..self.batch.len() {
+      let Some((group, index)) = self
+        .batch
+        .get(at)
+        .filter(|batched| batched.send.is_none())
+        .map(|batched| batched.at)
+      else {
+        continue;
+      };
+      let (path, revisions) = self.plan.get(group).ok_or(Refusal::Store {
+        what: "a file revision",
+      })?;
+      let planned = revisions.get(index).copied().ok_or(Refusal::Store {
+        what: "a file revision",
+      })?;
+      let row = self
+        .rows
+        .get(&(path.clone(), planned.node))
+        .cloned()
+        .ok_or(Refusal::Store {
+          what: "a file revision the changeset store keeps no row of",
+        })?;
+      let send = match row.base {
+        None => Sending::Stored {
+          base: NULL_NODE,
+          place: row.place.clone(),
+        },
+        Some(base) => {
+          let sent = (group == current)
+            .then(|| self.sent.get(&base).copied())
+            .flatten();
+          let earlier = revisions
+            .get(..index)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find(|earlier| {
+              self
+                .rows
+                .get(&(path.clone(), earlier.node))
+                .is_some_and(|row| row.text == base)
+            })
+            .map(|earlier| earlier.node);
+          let held_parent = planned.entry.parents.into_iter().find(|parent| {
+            *parent != NULL_NODE
+              && self
+                .rows
+                .get(&(path.clone(), *parent))
+                .is_some_and(|row| row.text == base)
+              && store
+                .file_entry(path, parent)
+                .and_then(|entry| store.rev(&entry.link))
+                .is_some_and(|rev| self.held.contains(rev))
+          });
+          match sent.or(earlier).or(held_parent) {
+            Some(base) => Sending::Stored {
+              base,
+              place: row.place.clone(),
+            },
+            None => Sending::Whole { text: row.text },
+          }
+        }
+      };
+      if let Some(batched) = self.batch.get_mut(at) {
+        batched.send = Some(send);
+      }
+    }
+    Ok(())
+  }
+
+  /// Asks the bytes of the batch's decided revisions lacking theirs: the stored edits and wholes first, as many as
+  /// `room`'s bytes hold (one at least), then the whole texts.
+  fn ask_data(&mut self, room: u64) {
+    let mut places = Vec::new();
+    let mut asked = Vec::new();
+    let mut bytes = 0_u64;
+    for (at, batched) in self.batch.iter().enumerate() {
+      if batched.data.is_some() {
+        continue;
+      }
+      if let Some(Sending::Stored { place, .. }) = &batched.send {
+        if !places.is_empty() && bytes.saturating_add(place.len) > room {
+          break;
+        }
+        bytes = bytes.saturating_add(place.len);
+        places.push(place.clone());
+        asked.push(at);
+      }
+    }
+    if !places.is_empty() {
+      self.data_asked = asked;
+      self.want = Some(crate::render::Want::Chunks { places });
+      return;
+    }
+    // A whole text's length is not in its row, so one is asked at a time: what is held is the text sent next.
+    let front_whole = self.batch.iter().enumerate().find_map(|(at, batched)| {
+      match (&batched.data, &batched.send) {
+        (None, Some(Sending::Whole { text })) => Some((at, *text)),
+        _ => None,
+      }
+    });
+    let mut texts = Vec::new();
+    if let Some((at, text)) = front_whole {
+      texts.push(text);
+      asked.push(at);
+    }
+    if !texts.is_empty() {
+      self.data_asked = asked;
+      self.want = Some(crate::render::Want::Texts { texts });
+    }
+  }
+}
+
 /// What one revision of the changegroup carries before its delta is written.
 struct Entry<'s> {
   /// Its node and parents.
@@ -1177,15 +1655,16 @@ pub(crate) fn named_changegroup(
   outgoing: &Outgoing,
   version: Version,
   admission: &mut Admission,
-) -> Result<Vec<u8>, Refusal> {
+) -> Result<(Vec<u8>, Pull), Refusal> {
   let held = common_ancestors(store, &outgoing.common, admission)?;
   let missing: Vec<Rev> = outgoing.missing.iter().collect();
   admission.charge_items::<Rev>(missing.len())?;
   let changelog = changelog_entries(store, &missing, admission)?;
   let (manifests, files) = named_revisions(store, &changelog, &held, admission)?;
-  let mut groups: Vec<(&[u8], Vec<Entry<'_>>)> = Vec::with_capacity(files.len());
-  groups.extend(files);
-  encode_changegroup(version, &changelog, &manifests, &groups, admission)
+  let mut written = encode_changegroup(version, &changelog, &manifests, &[], admission)?;
+  // The file list's end, which the pull's file section writes once its groups are sent.
+  written.truncate(written.len().saturating_sub(changegroup::LENGTH_LEN));
+  Ok((written, Pull::new(files, held)))
 }
 
 /// The missing changesets' entries, oldest first, each linked to itself and holding its text, lent once.
@@ -1227,8 +1706,20 @@ fn read_changeset(text: &[u8]) -> Result<(Node, &[u8]), Refusal> {
   Ok((manifest, changeset.files))
 }
 
-/// The manifests a changegroup carries and its file groups by path, each path read from a changeset's text.
-type Named<'t, 's> = (Vec<Entry<'s>>, BTreeMap<&'t [u8], Vec<Entry<'s>>>);
+/// The manifests a changegroup carries and its file groups by path, each path read from a changeset's text: each file
+/// revision by its node, its row's entry and the missing changeset this changegroup links it to.
+type Named<'s> = (Vec<Entry<'s>>, Vec<(Vec<u8>, Vec<PlannedRevision>)>);
+
+/// A file revision a pull sends: its node, its log's row, and the changeset this changegroup links it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedRevision {
+  /// The node.
+  node: Node,
+  /// Its log's row.
+  entry: FileEntry,
+  /// The changeset it is linked to in this changegroup.
+  link: Node,
+}
 
 /// A revision found for a group, with its position in its log: what orders the group.
 type Placed<'s> = (u64, Entry<'s>);
@@ -1242,10 +1733,10 @@ fn named_revisions<'t, 's>(
   changelog: &'t [Entry<'s>],
   held: &RevSet,
   admission: &mut Admission,
-) -> Result<Named<'t, 's>, Refusal> {
+) -> Result<Named<'s>, Refusal> {
   let mut manifests: Vec<Placed<'s>> = Vec::new();
   let mut seen_manifests: BTreeMap<Node, usize> = BTreeMap::new();
-  let mut files: BTreeMap<&'t [u8], Vec<Placed<'s>>> = BTreeMap::new();
+  let mut files: BTreeMap<&'t [u8], Vec<(u64, PlannedRevision)>> = BTreeMap::new();
   let mut seen_files = BTreeSet::new();
   for changeset in changelog {
     let link = changeset.node;
@@ -1275,17 +1766,19 @@ fn named_revisions<'t, 's>(
         continue;
       };
       if seen_files.insert((path, found.node)) {
-        let logged = store
-          .file(path, &found.node, admission)?
-          .ok_or(Refusal::Store {
-            what: "a file revision",
-          })?;
-        admission.charge_items::<(Placed<'_>, &[u8], Node)>(1)?;
-        if !client_holds(store, held, &logged) {
-          files
-            .entry(path)
-            .or_default()
-            .push((logged.position, entry(found.node, link, logged)));
+        let entry = store.file_entry(path, &found.node).ok_or(Refusal::Store {
+          what: "a file revision",
+        })?;
+        admission.charge_items::<(u64, PlannedRevision, &[u8], Node)>(1)?;
+        if !store.rev(&entry.link).is_some_and(|rev| held.contains(rev)) {
+          files.entry(path).or_default().push((
+            entry.position,
+            PlannedRevision {
+              node: found.node,
+              entry,
+              link,
+            },
+          ));
         }
       }
     }
@@ -1296,8 +1789,8 @@ fn named_revisions<'t, 's>(
     .map(|(path, mut revisions)| {
       revisions.sort_unstable_by_key(|(position, _)| *position);
       (
-        path,
-        revisions.into_iter().map(|(_, entry)| entry).collect(),
+        path.to_vec(),
+        revisions.into_iter().map(|(_, planned)| planned).collect(),
       )
     })
     .collect();
@@ -1305,13 +1798,6 @@ fn named_revisions<'t, 's>(
     manifests.into_iter().map(|(_, entry)| entry).collect(),
     files,
   ))
-}
-
-/// Whether the client holds a logged revision: its log's link is a changeset the common revisions descend from.
-fn client_holds(store: &impl Store, held: &RevSet, logged: &Logged<'_>) -> bool {
-  store
-    .rev(&logged.link)
-    .is_some_and(|rev| held.contains(rev))
 }
 
 /// A logged revision's entry, linked to `link`.

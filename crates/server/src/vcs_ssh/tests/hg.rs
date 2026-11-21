@@ -1540,6 +1540,7 @@ impl Store for Grown {
         slates_hg::delta::encode_full_text(&self.bytes, &mut chunk).ok()?;
         Given::Chunks(places.iter().map(|_| chunk.clone()).collect())
       }
+      Want::Texts { texts } => Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect()),
     })
   }
 

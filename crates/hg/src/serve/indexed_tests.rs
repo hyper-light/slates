@@ -320,7 +320,9 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -1266,7 +1268,7 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
     let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
     let by_links = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
     let named =
-      super::super::getbundle::named_changegroup(&view, &outgoing, Version::V03, &mut room())
+      super::super::getbundle::named_changegroup_whole(&view, &outgoing, Version::V03, &mut room())
         .unwrap();
     assert_eq!(carried(&by_links), carried(&named), "{name}");
     assert!(!carried(&by_links).is_empty(), "{name}");

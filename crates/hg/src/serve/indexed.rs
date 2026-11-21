@@ -273,6 +273,14 @@ impl<'a> Indexed<'a> {
         }
         Some(super::getbundle::Given::Chunks(chunks))
       }
+      Want::Texts { texts: asked } => {
+        let held = texts.borrow();
+        let mut made = Vec::new();
+        for identity in asked {
+          made.push(held.get(identity)?.clone());
+        }
+        Some(super::getbundle::Given::Texts(made))
+      }
     }
   }
 
@@ -515,18 +523,20 @@ impl Store for Indexed<'_> {
     None
   }
 
-  /// A file revision's parents and flags from its log's row, no text read (A-767 C1).
-  fn file_entry(&self, path: &[u8], node: &Node) -> Option<([Node; 2], u16)> {
+  /// A file revision as its log's row holds it, no text read (A-767 C1).
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<super::getbundle::FileEntry> {
     let log = Log::File(path);
     let rev = self.index.rev(self.store, log, node)?;
     let row = self
       .index
       .revision(self.store, log, rev)
       .filter(|row| row.node == *node)?;
-    Some((
-      [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
-      row.flags,
-    ))
+    Some(super::getbundle::FileEntry {
+      position: u64::from(rev),
+      parents: [self.log_node(log, row.p1)?, self.log_node(log, row.p2)?],
+      link: self.index.changeset(self.store, row.link)?.node,
+      flags: row.flags,
+    })
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {

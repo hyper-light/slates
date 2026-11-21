@@ -619,6 +619,11 @@ pub(crate) fn answer_wants_blocking(
                     .ok()
                     .map(slates_hg::serve::getbundle::Given::Chunks)
                 }
+                Want::Texts { texts } => {
+                  crate::vcs_store::hg_view::texts_made(&disk, repository, &texts)
+                    .await
+                    .map(slates_hg::serve::getbundle::Given::Texts)
+                }
               }
             })
             .ok()
@@ -631,6 +636,7 @@ pub(crate) fn answer_wants_blocking(
     match given {
       Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
       Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
+      Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
       None => return false,
     }
   }

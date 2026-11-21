@@ -181,6 +181,7 @@ pub(crate) trait HgStores {
       match given {
         Some(slates_hg::serve::getbundle::Given::Rows(rows)) => wants.give_rows(rows),
         Some(slates_hg::serve::getbundle::Given::Chunks(chunks)) => wants.give_chunks(chunks),
+        Some(slates_hg::serve::getbundle::Given::Texts(texts)) => wants.give_texts(texts),
         None => return false,
       }
     }

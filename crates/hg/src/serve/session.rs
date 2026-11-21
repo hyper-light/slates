@@ -322,6 +322,12 @@ impl crate::render::StoreWants for Producing {
       Producing::Bundle(answering) => answering.give(super::getbundle::Given::Chunks(chunks)),
     }
   }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    if let Producing::Bundle(answering) = self {
+      answering.give(super::getbundle::Given::Texts(texts));
+    }
+  }
 }
 
 /// Serves the request at the front of `input` as [`serve`] does, but a `getbundle` whose answer begins, or a
