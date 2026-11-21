@@ -1,3 +1,8 @@
+# 2026-11-21 (w-forming), 85b: C1 CLOSED 95adf9632, R2 CLOSED c922a41d1. P4: A-827 (reader's hold on a volume's
+# head; whole captures imaged + read in turns) LANDED 4a0cbd7b7; debug 311 inodes: one-turn 598-849 us -> held longest
+# turn 36-66 us; release A/B kiln r3 queued (.git/w-forming-ab/p4.sh). Acted on 01a1ff31's P4 ruling (a) -- asked new
+# main 01a1ff2e to confirm. C3: replay r19 queued; forwarding stall GAPS ae598c833. Main is now 01a1ff2e.
+
 # 2026-11-20 ~21:40 (w-forming), 85b C3: replay r16 (114153f4a) stalled 5/5 at live_chaos.rs:2465 after takeovers
 # (no_credit -> owed whole -> whole builds, held_back.whole). Cause mine (A-768: a capture counted 0 bytes in the
 # queue's credit). FIXED 8e4da57ae (red test; fleet a_live_ 11/11 -- the GAPS 'fails on main' finding was this,
