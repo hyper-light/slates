@@ -141,6 +141,14 @@ pub(crate) fn paced_turn(quantum_ns: u64, began: u64) -> slates_pace::Step {
 /// in the status report.
 pub(crate) const STREAM_TURNS: &str = "vcs_store.hg_stream_turns";
 
+/// Counter: the asks a fetch's streamed answer made of the node's changeset store ([`answer_store_wants`]), each a
+/// batch of rows or of chunks. Format: a counter name in the status report.
+pub(crate) const STORE_ASKS: &str = "vcs_store.hg_stream_store_asks";
+
+/// Counter: the nanoseconds a fetch's streamed answer waited on the changeset store's answers, summed over its asks
+/// ([`STORE_ASKS`]). Format: a counter name in the status report.
+pub(crate) const STORE_WAIT_NS: &str = "vcs_store.hg_stream_store_wait_ns";
+
 /// Counts one turn of a fetch's streamed answer ([`STREAM_TURNS`]) on the shard serving it; nothing off a shard.
 pub(crate) fn turn_taken() {
   let _ = crate::state::with_state(|state| state.count(STREAM_TURNS, 1));
@@ -164,6 +172,7 @@ pub(crate) async fn answer_store_wants(
   use slates_hg::render::{StoredPlace, StoredRevision, Want};
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
+    let asked_at = slates_rt::futures::now_ns();
     let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
     match (want, disk) {
       (Want::Rows { logs }, Some(disk)) => {
@@ -223,6 +232,11 @@ pub(crate) async fn answer_store_wants(
       }
       (Want::Chunks { .. }, None) => return false,
     }
+    let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
+    let _ = crate::state::with_state(|state| {
+      state.count(STORE_ASKS, 1);
+      state.count(STORE_WAIT_NS, waited);
+    });
   }
   true
 }

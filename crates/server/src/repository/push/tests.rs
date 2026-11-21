@@ -1171,6 +1171,73 @@ fn an_untouched_materialized_green_past_the_bound_is_dropped_back_and_made_again
   );
 }
 
+/// A holder's replica at version 0 given the owing green's shipped `inputs` (the push's record) and `identity`: its
+/// base's identity; it then owes version 1, stands for it with the record's identity, and refuses a later increment
+/// (made from `built`) while it owes, nothing applied. The replica.
+fn replica_owing_the_record(
+  (inputs, identity): (&[u8], [u8; 32]),
+  built: &slates_merge::engine::Increment,
+) -> slates_merge::engine::Green {
+  let mut replica = slates_merge::engine::Green::new();
+  assert_eq!(
+    identity,
+    replica.head_identity(),
+    "the owing green's identity is its base's"
+  );
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, inputs, 1),
+    Ok(())
+  );
+  assert!(!replica.is_materialized());
+  assert_eq!(replica.reached(), 1, "the replica stands for version 1");
+  assert_eq!(
+    replica.head_identity(),
+    identity,
+    "its identity is the record's"
+  );
+  let mut later = built.clone();
+  later.id = [9; 32];
+  later.base = 1;
+  assert_eq!(
+    crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
+    Err(crate::merge_service::REPLICA_OWES)
+  );
+  assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+  replica
+}
+
+/// An import batch over `batch_main` (at its first version) with three revisions staged a revision at a time: the
+/// green shows nothing of them, and a replay of its durable chain (a crash's recovery) reaches the first version alone.
+fn staged_batch(
+  state: &mut ShardState,
+  batch_main: DbVolumeId,
+  (trees, store): (&[ObjectKey], &Store),
+) -> crate::import_batch::ImportBatch {
+  let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
+  for n in 1..4u8 {
+    let index = usize::from(n);
+    let next = batch_work(
+      state,
+      &batch,
+      (trees[index - 1], trees[index], &[n]),
+      (store, n + 1),
+    );
+    assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
+  }
+  assert_eq!(
+    green_reads(state, batch_main).0,
+    1,
+    "the green shows nothing of a staged batch"
+  );
+  // A crash now recovers to before the batch: what a replay of the durable chain reaches.
+  assert_eq!(
+    crate::verbs::replay_green_for_test(state, batch_main),
+    Some((1, None)),
+    "nothing of it durable"
+  );
+  batch
+}
+
 /// P2 at f > 0 (main's order of 05:51, R8: laptop and fleet one code path). Do: push an eager create and an owed create
 /// of the same tree; take the merge record the owner ships holders for the owed version 1 (`enqueue_record`'s inputs and
 /// identity); apply it to a holder's replica of the green at version 0 as a holder does (`apply_inputs`, the record's
@@ -1224,31 +1291,7 @@ fn a_holders_replica_owes_the_same_push_and_a_takeover_makes_it_the_eager_green(
       slates_merge::push::DeferredPush::is_record(&inputs),
       "the push's record is the inputs"
     );
-    let mut replica = slates_merge::engine::Green::new();
-    assert_eq!(
-      identity,
-      replica.head_identity(),
-      "the owing green's identity is its base's"
-    );
-    assert_eq!(
-      crate::merge_service::apply_inputs(&mut replica, &inputs, 1),
-      Ok(())
-    );
-    assert!(!replica.is_materialized());
-    assert_eq!(replica.reached(), 1, "the replica stands for version 1");
-    assert_eq!(
-      replica.head_identity(),
-      identity,
-      "its identity is the record's"
-    );
-    let mut later = built.clone();
-    later.id = [9; 32];
-    later.base = 1;
-    assert_eq!(
-      crate::merge_service::apply_inputs(&mut replica, &later.encode(), 2),
-      Err(crate::merge_service::REPLICA_OWES)
-    );
-    assert_eq!(replica.reached(), 1, "nothing applied while it owes");
+    let mut replica = replica_owing_the_record((&inputs, identity), &built);
     let mut building = replica
       .materializing(slates_merge::pace::Pace::unbounded())
       .expect("it owes a push");
@@ -1402,11 +1445,11 @@ fn batch_work(
   built
 }
 
+/// A green as a test compares it: head, files, head identity, durable head.
+type GreenRead = (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64);
+
 /// Reads a green as a test compares it: head, files, head identity, durable head (its checkpoint and chain).
-fn green_reads(
-  state: &mut ShardState,
-  green: DbVolumeId,
-) -> (u64, Vec<(String, Vec<u8>)>, [u8; 32], u64) {
+fn green_reads(state: &mut ShardState, green: DbVolumeId) -> GreenRead {
   let durable = state.db.partition().green_head(green);
   let mut engine = state.greens.get_mut(&green).expect("the green");
   let files = engine
@@ -1476,28 +1519,7 @@ fn an_import_batch_commits_its_revisions_as_one_entry_and_reads_as_one_by_one() 
       )
       .expect("a revision, one entry");
     }
-    let mut batch = crate::import_batch::ImportBatch::begin(state, batch_main).expect("a batch");
-    for n in 1..4u8 {
-      let index = usize::from(n);
-      let next = batch_work(
-        state,
-        &batch,
-        (trees[index - 1], trees[index], &[n]),
-        (&store, n + 1),
-      );
-      assert_eq!(batch.stage(state, next), Ok(u64::from(n) + 1));
-    }
-    assert_eq!(
-      green_reads(state, batch_main).0,
-      1,
-      "the green shows nothing of a staged batch"
-    );
-    // A crash now recovers to before the batch: what a replay of the durable chain reaches.
-    assert_eq!(
-      crate::verbs::replay_green_for_test(state, batch_main),
-      Some((1, None)),
-      "nothing of it durable"
-    );
+    let batch = staged_batch(state, batch_main, (&trees, &store));
     let made = batch
       .commit(state, (&owner(), batched), reference(9))
       .expect("committed");
