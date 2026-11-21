@@ -88,6 +88,10 @@ impl HostFs for BaseHost {
     self.seam().fingerprint_dir(dir)
   }
 
+  fn identify_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    self.seam().identify_dir(dir)
+  }
+
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
     self.seam().list(dir)
   }

@@ -450,6 +450,11 @@ impl HostFs for Lens<'_> {
     self.note(answer)
   }
 
+  fn identify_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    let answer = self.host.identify_dir(dir);
+    self.note(answer)
+  }
+
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
     let answer = self.host.list(dir);
     self.note(answer)

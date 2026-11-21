@@ -216,6 +216,14 @@ pub trait HostFs {
   fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError>;
   /// The directory's own fingerprint, which changes when its entries do.
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError>;
+  /// The directory's identity, what a recovery holds a recorded directory to (`Fingerprint::same_object`: its device,
+  /// its number and its birth), in a fingerprint whose other fields may say nothing. A host that knows the identity
+  /// only with the whole fingerprint answers that ([`HostFs::fingerprint_dir`], the default); one whose identity needs
+  /// no fetch answers it without one (an S3 base's directory, whose listing may not have landed: A-791), so an image of
+  /// a volume over it never waits on its store.
+  fn identify_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    self.fingerprint_dir(dir)
+  }
   /// The directory's entries with their fingerprints, one bulk call.
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError>;
   /// Opens a subdirectory (never through a symlink).
