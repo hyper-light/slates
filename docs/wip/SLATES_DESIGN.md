@@ -57735,6 +57735,28 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
 > files: one changeset, sequence 0, its record and its row read back).
 >
+> **Status (2026-11-20, C5 part 1: a git push lands on the store; w-git, main's split of ~21:20 and rulings of ~21:05).**
+> A push's names and pack, once homed in the region at `f + 1` (A-724 piece 8c, A-722's record v4), land on the node's
+> store as one changeset before the register's entry: its `Names` section the names' rows, its `Payload` the pack, the
+> bytes `homes::home_in_region` hands back after homing them, moved into the landing (no further copy), at the
+> repository's next sequence, taken at the landing (`VcsStores::next_changeset`, shared with Mercurial's; the creation
+> is 0). The edge carries it off the shard's step as it carries the homing (`git_push::carry`, the one way the HTTP and
+> SSH edges and the tests' driver run it); landed, the record is written as version 5 (replacing 4): version 4's names
+> and pack by identity, then the changeset's sequence; refused, the push is refused whole (`PushFailed::Unlanded`),
+> nothing of it in the register. The record's pack identity is the plain BLAKE3 of the `Payload` (the content store's
+> identity rule: a put answers the BLAKE3 of the whole bytes, its List root node-local), which the store's `P` row keys,
+> so `piece` reads it as recorded. A recovery reads a version-5 record's changeset before replaying it (its `C` row,
+> its `Names` checked against the record's identity, its `Payload` under the record's pack identity and length), puts
+> what the content store lacks, and notes the sequence, so the next landing takes the last one the register names + 1
+> and a changeset landed past the register's head is overwritten, never replayed (main's ruling 2). Red test:
+> `daemon::tests::t_a767_c5_a_git_push_lands_as_one_changeset_and_a_restart_replays_it_from_the_store` (a store-backed
+> daemon over a retained segment; the push homed and landed; the daemon stopped with nothing more published; the
+> successor recovers from the store's changeset, `main` at the pushed commit, the next at 2; the log read back from its
+> files holds the creation and the push, `Names` and `Payload`, the payload the record's BLAKE3). The one shared test
+> store is `crate::test_store` (main's ruling 1's helper). Owed (C5 part 2): git's creation refused without
+> `--vcs-store`, versions 2 and a sequence of 0 gone, git's tests on the shared store; the replay's pack read a piece at
+> a time through `StorePacks`.
+
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
 > properties, UUID, deltified text) lands whole as one changeset, sequence the count the register names (creation 0),

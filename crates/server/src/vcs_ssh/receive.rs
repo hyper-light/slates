@@ -175,19 +175,14 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
     if self.checked {
       // The turn kept through the edge's yield is given back, then taken again behind the repository's other pushes.
       drop(self.turn.take());
-      // The push's names homed in the region before its record names them (A-724 piece 8c), off the shard's step.
-      if let Some(bytes) = push.take_homing() {
+      // The push's names and pack homed in the region, then landed on the node's store, before its record names them
+      // (A-724 piece 8c; A-767 C5), off the shard's step.
+      if let Some(asked) = push.take_homing() {
         let (origin, shards) = lent(&mut self.lender, |state| {
           (state.shard, state.shards.clone())
         })?;
-        let homed = crate::vcs_store::homes::home_in_region(
-          origin,
-          &shards,
-          bytes,
-          crate::fleet::live_budget(),
-        )
-        .await;
-        lent(&mut self.lender, |state| push.homed(state, homed))?;
+        let carried = crate::git_push::carry(origin, &shards, asked).await;
+        lent(&mut self.lender, |state| push.homed(state, carried))?;
         return Ok(Stepped {
           consumed: 0,
           next: Next::More,
@@ -315,6 +310,7 @@ fn refused(failed: PushFailed, name: &str) -> Refused {
     PushFailed::Policy(_) => format!("{name}: the repository's policy cannot be read"),
     PushFailed::Exchange(refusal) => exchange_words(&refusal),
     PushFailed::Unchecked => format!("{name}: the push was answered before it was read whole"),
+    PushFailed::Unlanded => format!("{name}: the node's store refused the push's changeset"),
   })
 }
 
