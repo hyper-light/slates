@@ -6880,6 +6880,35 @@ pub(crate) fn admit(
   require_locked: bool,
   base: Option<&str>,
 ) -> Result<Admitted, Box<ReplyBody>> {
+  let base = match base {
+    None => AdmitBase::Scratch,
+    Some(path) => AdmitBase::Path(path),
+  };
+  admit_over(state, principal, (size, names, require_locked), base)
+}
+
+/// What an admitted volume is made over: nothing (a scratch volume), a host directory, or a tree the shard holds, lent
+/// per request (a mounted work's green version, A-774; `slates_vfs::host::tree`), named by its identity.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmitBase<'a> {
+  /// A scratch volume.
+  Scratch,
+  /// An overlay over the host directory at this path.
+  Path(&'a str),
+  /// An overlay over a tree the shard holds, of this identity.
+  Tree {
+    /// The tree's identity: its fingerprints' device.
+    identity: u64,
+  },
+}
+
+/// [`admit`] over any [`AdmitBase`].
+pub(crate) fn admit_over(
+  state: &mut ShardState,
+  principal: &Principal,
+  (size, names, require_locked): (SizeClass, NamePolicy, bool),
+  base: AdmitBase<'_>,
+) -> Result<Admitted, Box<ReplyBody>> {
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
@@ -6971,8 +7000,32 @@ pub(crate) fn admit(
     }
   };
   let config = volume_config(state, names, quota);
-  let (mut volume, host) = match base {
-    None => match Volume::create(&mut state.store, config) {
+  let (mut volume, mut host) = match base {
+    AdmitBase::Tree { .. } => {
+      let probe = slates_vfs::host::tree::TreeHost::new(0, (0, 0));
+      let made = Volume::create_overlay(
+        &mut state.store,
+        config,
+        BaseConfig {
+          root: probe.root(),
+          facts: probe.tree_facts(),
+          large_class_bytes: state.config.large_class_bytes,
+        },
+      );
+      match made {
+        Ok(v) => (v, None),
+        Err(e) => {
+          return Err(Box::new(give_back(
+            state,
+            reservation,
+            version_credit,
+            metadata_credit,
+            refusal_of_vfs(&e),
+          )));
+        }
+      }
+    }
+    AdmitBase::Scratch => match Volume::create(&mut state.store, config) {
       Ok(v) => (v, None),
       Err(e) => {
         return Err(Box::new(give_back(
@@ -6984,7 +7037,7 @@ pub(crate) fn admit(
         )));
       }
     },
-    Some(path) => match open_base(state, path, config) {
+    AdmitBase::Path(path) => match open_base(state, path, config) {
       Ok(pair) => pair,
       Err(reply) => {
         return Err(Box::new(give_back(
@@ -7010,6 +7063,28 @@ pub(crate) fn admit(
       metadata_credit,
       refusal_of_vfs(&e),
     )));
+  }
+  // A tree's entries show the volume's own owner, so its user may write what it mounts (A-774).
+  if let AdmitBase::Tree { identity } = base {
+    let owner = volume
+      .root_inode(&state.store)
+      .and_then(|root| volume.stat(&state.store, root));
+    match owner {
+      Ok(attrs) => {
+        host = Some(BaseHost::Tree(Box::new(
+          slates_vfs::host::tree::TreeHost::new(identity, (attrs.uid, attrs.gid)),
+        )));
+      }
+      Err(e) => {
+        return Err(Box::new(give_back(
+          state,
+          reservation,
+          version_credit,
+          metadata_credit,
+          refusal_of_vfs(&e),
+        )));
+      }
+    }
   }
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
   // `next_no` enforces, to the same allowance already reserved against the version slab above.
@@ -8477,6 +8552,7 @@ fn create_work_here(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
   // Its catalog register, which names its green, is the route a resend of its submit takes after a takeover, and its
@@ -9719,6 +9795,24 @@ pub(crate) fn accepted_version(reply: &ReplyBody) -> Option<u64> {
   }
 }
 
+/// Notes on the work a submission an ask policy held for approval (A-785, the session log's mark), at the work's
+/// revision now; any other answer leaves the mark as it is, to stand or go stale with the revision.
+fn note_held(state: &mut ShardState, work_id: DbVolumeId, reply: &ReplyBody) {
+  let ReplyBody::MergeApprovalRequired {
+    identity, paths, ..
+  } = reply
+  else {
+    return;
+  };
+  if let Some(work) = state.works.get_mut(&work_id) {
+    work.held = Some(crate::state::HeldMerge {
+      identity: *identity,
+      paths: *paths,
+      revision: work.revision,
+    });
+  }
+}
+
 /// Whether a submit's reply says its accepted increment changed nothing (A-782).
 fn accepted_identical(reply: &ReplyBody) -> bool {
   matches!(
@@ -9895,6 +9989,7 @@ fn settle_submit(
   reply: ReplyBody,
 ) -> ReplyBody {
   let Some(version) = accepted_version(&reply) else {
+    note_held(state, work_id, &reply);
     return kept_conflict(state, work_id, reply);
   };
   // A retry's answer for a work already past that version has nothing left to settle. At that very version it resets
@@ -10177,6 +10272,16 @@ fn judge_submission(
         inc.evidence,
         (completion, Some(sealed.work)),
       );
+      // A verdict a holder computed came with its increment, which that holder holds as the version's inputs (A-697 (1)):
+      // its shipment carries none of them back. The work's id names that holder's member.
+      if sealed.computed.is_some() {
+        crate::merge_service::inputs_held_by(
+          state,
+          green_id,
+          version,
+          ObjectId(sealed.work.bytes).creator(),
+        );
+      }
       // True the retention charge up to what the commit retained (the secured surplus credited). A settle after an
       // accept only credits: nothing was retained beyond what was secured. The work's floor moves when it has settled
       // (`crate::work_home::tell_floor`), which folds the histories and may checkpoint the chain (W3).
@@ -18660,6 +18765,7 @@ fn install_rebuilt_work(
       entries: std::collections::BTreeMap::new(),
       verdict: None,
       accepted: None,
+      held: None,
     },
   );
 }

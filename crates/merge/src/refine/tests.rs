@@ -124,7 +124,7 @@ fn a_one_token_change_in_a_rewrite_is_one_token_range() {
   let mut refiner = Refiner::new();
   let (hunks, _) = refiner.refine(&base, &post);
   assert_eq!(hunks.len(), 1, "{hunks:?}");
-  let hunk = hunks[0];
+  let hunk = hunks.get(0).unwrap();
   assert_eq!(
     &base[ix(hunk.base_at)..ix(hunk.base_at + hunk.base_len)],
     b"compute"
@@ -425,4 +425,107 @@ fn a_reindent_of_every_line_is_anchored_and_touches_only_blanks() {
   );
   refiner.release();
   assert_eq!(refiner.scratch_bytes(), 0);
+}
+
+thread_local! {
+  /// The counting clock's reads: each read is one tick of time, so a turn's deadline is a count of asks.
+  static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+fn counting_clock() -> u64 {
+  NOW.with(|now| {
+    let at = now.get() + 1;
+    now.set(at);
+    at
+  })
+}
+
+/// A source-like file of `lines` lines, and the same file re-indented with one token changed in every hundredth line:
+/// a formatter's pass and a codemod's edits at once, the refinement's heaviest path (Myers runs out, then anchors).
+fn reformatted(lines: usize) -> (Vec<u8>, Vec<u8>) {
+  let base: String = (0..lines)
+    .map(|n| format!("  let value_{n} = compute({n}, other_{});\n", n % 97))
+    .collect();
+  let post: String = base
+    .split_inclusive('\n')
+    .enumerate()
+    .map(|(n, line)| {
+      let line = format!("  {line}");
+      if n % 100 == 0 {
+        line.replacen("compute", "measure", 1)
+      } else {
+        line
+      }
+    })
+    .collect();
+  (base.into_bytes(), post.into_bytes())
+}
+
+/// A-787 (§4.3's step budget; CLAUDE.md §3 "Bounded work everywhere"). Do: refine a 3 MiB whole-file replacement (every
+/// line re-indented, every hundredth line's call renamed) driven by a pace whose turns end after a few asks, a turn at a
+/// time. Expect: it spans many turns, no unit does more than a unit's work (three times `WORK_PER_TICK` at most: the
+/// last charge before an ask is at most a unit's work itself), and the document and plan equal the unpaced
+/// refinement's. Unsliced, the whole refinement was one unit.
+#[test]
+fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
+  let (base, post) = reformatted(72_000);
+  assert!(base.len() > 3 << 20, "{}", base.len());
+  let journal = vec![
+    VolumeOp::Truncate {
+      path: PATH.into(),
+      len: 0,
+    },
+    VolumeOp::Extend {
+      path: PATH.into(),
+      at: 0,
+      len: post.len() as u64,
+    },
+  ];
+  let (doc, plan) = compose_volume_planned(
+    &Base::of_files(vec![(PATH.into(), base.len() as u64)]),
+    &journal,
+  )
+  .unwrap();
+  let lend =
+    |path: &str| (path == PATH).then(|| (Cow::Borrowed(&base[..]), Cow::Borrowed(&post[..])));
+  // Unpaced: the reference.
+  let (mut whole, mut whole_plan) = (doc.clone(), plan.clone());
+  let unpaced = refine_rewrites(&mut whole, &mut whole_plan, &mut Refiner::new(), &mut |p| {
+    lend(p)
+  });
+  assert_eq!(unpaced.paths, 1);
+  // Paced: a turn ends a few asks in.
+  let (mut sliced, mut sliced_plan) = (doc.clone(), plan.clone());
+  let mut refiner = Refiner::new();
+  let mut files = |p: &str| lend(p);
+  let ticks = crate::pace::Ticks;
+  let pace = crate::pace::Pace::new(counting_clock);
+  let mut work = Box::pin(super::refine_rewrites_paced(
+    &mut sliced,
+    &mut sliced_plan,
+    &mut refiner,
+    (&mut files, &ticks),
+  ));
+  let mut turns = 0u64;
+  let done = loop {
+    turns += 1;
+    pace.turn(counting_clock() + 8);
+    if let core::task::Poll::Ready(done) = pace.drive(work.as_mut()) {
+      break done;
+    }
+  };
+  drop(work);
+  assert!(turns > 100, "turns {turns}");
+  assert!(
+    done.longest_unit_work <= 3 * super::WORK_PER_TICK,
+    "{done:?}"
+  );
+  // And absolutely, whatever the constant: no unit does a 64th of the file's work (unsliced, one unit did it all).
+  assert!(done.longest_unit_work < base.len() as u64 / 64, "{done:?}");
+  assert_eq!(
+    (done.paths, done.refined_bytes),
+    (unpaced.paths, unpaced.refined_bytes)
+  );
+  assert_eq!(sliced.ops, whole.ops);
+  assert_eq!(sliced_plan, whole_plan);
 }

@@ -335,3 +335,57 @@ impl Drop for Sleep {
     }
   }
 }
+
+/// Which of two futures finished first, with its output ([`race2`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Either<A, B> {
+  /// The first.
+  First(A),
+  /// The second.
+  Second(B),
+}
+
+/// The first of `a` and `b` to finish; the other is dropped. Polls `a` first. hyper-rt's `combine::race2` (A-767
+/// piece C2, for the vendored engine's wait on its pool or its store), pinned on this future's own frame with
+/// `std::pin::pin!`, so it needs neither a pin-projection crate nor an allocation.
+pub async fn race2<A: Future, B: Future>(a: A, b: B) -> Either<A::Output, B::Output> {
+  let mut a = std::pin::pin!(a);
+  let mut b = std::pin::pin!(b);
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(out) = a.as_mut().poll(cx) {
+      return Poll::Ready(Either::First(out));
+    }
+    if let Poll::Ready(out) = b.as_mut().poll(cx) {
+      return Poll::Ready(Either::Second(out));
+    }
+    Poll::Pending
+  })
+  .await
+}
+
+#[cfg(test)]
+mod race_tests {
+  use super::*;
+
+  /// Do: race a ready future against a pending one, both ways, and two ready ones. Expect: the ready one wins
+  /// whichever side it is on, and of two ready ones the first.
+  #[test]
+  fn the_first_ready_future_wins_and_the_first_breaks_a_tie() {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut first = std::pin::pin!(race2(std::future::ready(1), std::future::pending::<u8>()));
+    assert_eq!(first.as_mut().poll(&mut cx), Poll::Ready(Either::First(1)));
+    let mut second = std::pin::pin!(race2(std::future::pending::<u8>(), std::future::ready(2)));
+    assert_eq!(
+      second.as_mut().poll(&mut cx),
+      Poll::Ready(Either::Second(2))
+    );
+    let mut tie = std::pin::pin!(race2(std::future::ready(3), std::future::ready(4)));
+    assert_eq!(tie.as_mut().poll(&mut cx), Poll::Ready(Either::First(3)));
+    let mut neither = std::pin::pin!(race2(
+      std::future::pending::<u8>(),
+      std::future::pending::<u8>()
+    ));
+    assert_eq!(neither.as_mut().poll(&mut cx), Poll::Pending);
+  }
+}

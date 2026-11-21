@@ -45,7 +45,7 @@ use std::time::Instant;
 use slates_vfs::base::{BaseConfig, Landed};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::{
-  Barrier, HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs, OsCode,
+  Barrier, HostDir, HostError, HostFile, HostFs, HostKind, LandCapabilities, LandFs, OsCode,
 };
 use slates_vfs::inode::{Fingerprint, WindowsAttributes, Witness};
 use slates_vfs::volume::{Store, Volume};
@@ -527,8 +527,11 @@ impl CostSamples {
 }
 
 /// The landing in flight.
-struct Landing<'a, H: LandFs> {
+struct Landing<'a, 'b, H: LandFs> {
   host: &'a mut H,
+  /// The volume's base host where it is not the target's (a volume over a tree base, A-774 part 3): what its files are
+  /// read through; `None` reads them through `host`, the target's, which is an overlay's own base.
+  base: Option<&'a mut (dyn HostFs + 'b)>,
   request: &'a LandingRequest,
   /// The granted target that every entry's path is relative to.
   root: HostDir,
@@ -759,7 +762,7 @@ struct Written {
   window_ns: Option<u64>,
 }
 
-impl<H: LandFs> Landing<'_, H> {
+impl<H: LandFs> Landing<'_, '_, H> {
   fn hidden_name(&mut self) -> Box<str> {
     let n = self.hidden_counter;
     // Saturating, not wrapping: a hidden name is created exclusively, so a repeat is refused, never reused.
@@ -1897,10 +1900,14 @@ impl<H: LandFs> Landing<'_, H> {
     }
     let len = usize::try_from(remaining).unwrap_or(usize::MAX).min(window);
     let mut bytes = vec![0u8; len];
+    let reader: &mut dyn HostFs = match self.base.as_deref_mut() {
+      Some(base) => base,
+      None => self.host,
+    };
     let read = self
       .request
       .source
-      .read_at(vol, store, self.host, copy.inode, copy.next, &mut bytes)?;
+      .read_at(vol, store, reader, copy.inode, copy.next, &mut bytes)?;
     let Some(chunk) = bytes.get(..read).filter(|chunk| !chunk.is_empty()) else {
       return Err(WriteFailure::Volume(VfsError::Invalid));
     };
@@ -3606,6 +3613,26 @@ impl Beginning {
     })
   }
 
+  /// [`Beginning::new`] for a volume over a tree base landed into a directory that is not its base (A-774 part 3): its
+  /// whole tree is planned as created and judged by content ([`crate::manifest::PlanWalk::materializing`]), its files
+  /// read through the base host lent to each unit ([`Beginning::unit_over`], [`LandingRun::step_over`]), and its finish
+  /// leaves the volume as it was.
+  pub fn materializing(
+    vol: &Volume,
+    target: &LandingTarget,
+    request: &LandingRequest,
+  ) -> Result<Beginning, LandingRefusal> {
+    let began = Instant::now();
+    let walk = crate::manifest::PlanWalk::materializing(vol, request.source)
+      .map_err(LandingRefusal::Volume)?;
+    Ok(Beginning {
+      target: target.clone(),
+      request: request.clone(),
+      began,
+      stage: BeginStage::Plan(walk),
+    })
+  }
+
   /// [`Beginning::new`] for a clone of a captured base (§4.15 `capture_base`, A-291's landing): its manifest is the
   /// change of `request.source` since the capture `base` (a snapshot's tree in the same store, pinned while the clone
   /// lives; or, for a clone a move brought here, what the move carried of the capture and the clone's mark, A-503),
@@ -3638,10 +3665,27 @@ impl Beginning {
     grants: &mut Grants,
     audit: &mut Audit,
   ) -> Result<Option<Planned>, LandingRefusal> {
+    self.unit_over(host, None, vol, store, (grants, audit))
+  }
+
+  /// [`Beginning::unit`] with the volume's base host lent beside the target's, for a volume whose base is not the target
+  /// (A-774 part 3, [`Beginning::materializing`]): the plan reads the volume's files through `base`.
+  pub fn unit_over<H: LandFs>(
+    &mut self,
+    host: &mut H,
+    base: Option<&mut dyn HostFs>,
+    vol: &mut Volume,
+    store: &mut Store,
+    (grants, audit): (&mut Grants, &mut Audit),
+  ) -> Result<Option<Planned>, LandingRefusal> {
     match std::mem::replace(&mut self.stage, BeginStage::Ended) {
       BeginStage::Plan(mut walk) => {
+        let reader: &mut dyn HostFs = match base {
+          Some(base) => base,
+          None => host,
+        };
         let Some(manifest) = walk
-          .unit(vol, store, host, &self.request.filter)
+          .unit(vol, store, reader, &self.request.filter)
           .map_err(LandingRefusal::Volume)?
         else {
           self.stage = BeginStage::Plan(walk);
@@ -3843,11 +3887,12 @@ impl Saved {
   }
 }
 
-impl<'a, H: LandFs> Landing<'a, H> {
+impl<'a, 'b, H: LandFs> Landing<'a, 'b, H> {
   /// The landing over its saved state, with its host and request lent for one slice.
   fn resume(host: &'a mut H, request: &'a LandingRequest, saved: Saved) -> Self {
     Self {
       host,
+      base: None,
       request,
       root: saved.root,
       dirs: saved.dirs,
@@ -4046,6 +4091,19 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     observer: &mut dyn Observer<H>,
     budget_ns: u64,
   ) -> Option<Result<LandingReport, LandingRefusal>> {
+    self.step_over(vol, store, (audit, observer), budget_ns, None)
+  }
+
+  /// [`LandingRun::step`] with the volume's base host lent beside the target's, for a volume whose base is not the target
+  /// (A-774 part 3): each file is read through `base`.
+  pub fn step_over(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    (audit, observer): (&mut Audit, &mut dyn Observer<H>),
+    budget_ns: u64,
+    mut base: Option<&mut (dyn HostFs + '_)>,
+  ) -> Option<Result<LandingReport, LandingRefusal>> {
     let began = Instant::now();
     let mut mark = began;
     self.last_step_ns = 0;
@@ -4053,7 +4111,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       if self.ready_to_finish() || self.advancing() || self.awaiting_barrier() {
         return None;
       }
-      let ended = self.unit(vol, store, audit, observer);
+      let ended = self.unit(vol, store, audit, observer, base.as_deref_mut());
       let now = Instant::now();
       self.last_unit_ns = nanos_between(mark, now);
       self.last_step_ns = nanos_between(began, now);
@@ -4159,7 +4217,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     let mut mark = began;
     self.last_step_ns = 0;
     loop {
-      let ended = self.unit(vol, store, audit, observer);
+      let ended = self.unit(vol, store, audit, observer, None);
       let now = Instant::now();
       self.last_unit_ns = nanos_between(mark, now);
       self.last_step_ns = nanos_between(began, now);
@@ -4267,6 +4325,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     store: &mut Store,
     audit: &mut Audit,
     observer: &mut dyn Observer<H>,
+    base: Option<&mut (dyn HostFs + '_)>,
   ) -> Option<Result<LandingReport, LandingRefusal>> {
     let LandingRun {
       host,
@@ -4288,6 +4347,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     };
     let state = saved.take()?;
     let mut landing = Landing::resume(host, request, state);
+    landing.base = base;
     let mut ended = None;
     let mut next_phase = None;
     match phase {
@@ -4444,7 +4504,7 @@ struct Finishing<'x> {
 /// ([`advance_step`]), not swept here, so a large landing's finish does no O(entries) work in any one unit; the advance
 /// and the report ([`finish_report`]) follow.
 fn begin_advance<H: LandFs>(
-  landing: &mut Landing<'_, H>,
+  landing: &mut Landing<'_, '_, H>,
   vol: &Volume,
   target: &LandingTarget,
   request: &LandingRequest,
@@ -4495,7 +4555,7 @@ fn begin_advance<H: LandFs>(
 /// its outcome takes it out of the overlay and its write reached the durability boundary; a rename also advances the
 /// whiteout at its origin.
 fn advance_step<H: LandFs>(
-  landing: &mut Landing<'_, H>,
+  landing: &mut Landing<'_, '_, H>,
   advance: &mut AdvanceState,
   reports: &[EntryReport],
   manifest: &Manifest,
@@ -4608,7 +4668,7 @@ fn advance_step<H: LandFs>(
 /// The landing's report, once its advance is done (A-133): the audit record, the counts and the overlay's state.
 /// The advance already ran ([`advance_step`]); this touches no disk.
 fn finish_report<H: LandFs>(
-  mut landing: Landing<'_, H>,
+  mut landing: Landing<'_, '_, H>,
   finishing: Finishing<'_>,
   advance: &AdvanceState,
 ) -> LandingReport {

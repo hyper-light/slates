@@ -984,17 +984,28 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
       store,
       volumes,
       attachments,
+      greens,
+      merge,
       ..
     } = &mut *s;
+    // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
+    let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
+    let green_tree = lent_green
+      .as_ref()
+      .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+    let mut tree_lens = None;
     let Ok(slot) = volumes.get_mut(handle) else {
       return Turned::Ended;
     };
     // The slot's base host is lent through a lens that notes the fetch a request met pending (A-555): such a request is
     // kept, not answered, until that fetch lands ([`keep`]).
-    let mut lens = slot
-      .host
-      .as_mut()
-      .map(|host| crate::base_wait::Lens::over(host));
+    let mut lens = slot.host.as_mut().map(|host| {
+      crate::base_wait::Lens::over(crate::mounted_work::lend(
+        host,
+        green_tree.as_ref(),
+        &mut tree_lens,
+      ))
+    });
     let dispatched = {
       let mut bridge = VolumeBridge::attached(
         mount.volume,
