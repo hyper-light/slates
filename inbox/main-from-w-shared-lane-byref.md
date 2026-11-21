@@ -103,3 +103,11 @@ landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's on
      (the content plane's hedged fetch), stored once on arrival; a retry asks only.
   3. Step 3's slicing of what remains on both control shards, `daemon.beat.late` the proof at 320 and 512 MiB.
 - Piece 1 is large; I'm starting on it now. Say so if you'd rather the push writers move in a piece of their own.
+
+## 01:41 PST: piece 1 (format 6) red confirmed; suites running
+- Red: kiln r20 (big Studio, load 7.4), base 544020bd2 with only the new test applied:
+  `an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill` FAILED at its first check ("the submit held
+  its increment in the owner's content store"). Green locally on the branch before I deleted my target (this MacBook,
+  8.2 s).
+- r16 (big Studio) running the branch's suites: merge 252 + integration all ok, cluster 248 ok so far.
+- Local target deleted per your 01:23 note (19 GB). Family three's Linux run (r22) can't start: adacachy refuses new runs.
