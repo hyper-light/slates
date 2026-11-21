@@ -188,14 +188,21 @@ impl<L: ShardLender> Exchange for Receive<L> {
       .lend(|state| push.end(state))
       .ok_or(Failed(Status::SERVICE_UNAVAILABLE))?
       .map_err(failed)?;
-    // A push under side-band-64k is answered here until its answer would have been silent for git's keepalive interval,
-    // then in the reply's turns with the keepalive between (the module doc); one without is answered here whole, as
-    // nothing can be written to it but its report. Either way a refusal before any reply still answers with a status.
+    // A push under side-band-64k is answered here until its answer would have been silent for git's keepalive interval
+    // since the exchange last wrote (its head, or a keepalive while its body was read), then in the reply's turns with
+    // the keepalive between (the module doc); one without is answered here whole, as nothing can be written to it but
+    // its report. Either way a refusal before any reply still answers with a status.
     let silent_until = self
       .push
       .side_band()
-      .then(|| slates_rt::futures::now_ns().saturating_add(self.keepalive_ns));
+      .then(|| self.last_written_ns.saturating_add(self.keepalive_ns));
     self.answering = !self.answer_until(gone, silent_until).await?;
+    // Not answered within the interval: its keepalive is due now, the reply's first run (R2: it was written only after
+    // the reply's own interval more, so the first byte after the body came two intervals in, 10 s, the client's patience
+    // in the edge tests, which failed 18 of 18 under load).
+    if self.answering && self.sent >= self.given.len() {
+      self.given.extend_from_slice(KEEPALIVE);
+    }
     Ok(())
   }
 
