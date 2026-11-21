@@ -8,12 +8,19 @@
 //!   happen, and then reads the same header by another path: it must see one header (one inode number), or the struct
 //!   the header defines is redefined;
 //! - `make -q` after each event: nothing untouched is out of date (modification times stable);
+//! - `cargo build` after each event: a no-op (its fingerprints key on the sources' modification times);
 //! - `git status --porcelain` after each event: no change shows (git's index keys on the inode number, both times and
-//!   the size, `core.checkStat`).
+//!   the size, `core.checkStat`);
+//! - and, behind the tools, every tracked file's inode number, modification time and change time compared as `stat`
+//!   reads them through the mount.
+//!
+//! The events: a snapshot of the volume and a daemon killed as a crash kills it, the anchor's next daemon taking the
+//! volume over (the first flow); memory pressure, the daemon's admission hold and the host's memory stall injected
+//! into an in-process daemon (the second).
 //!
 //! Gated: `SLATES_TEST_CLI=1` (a real anchor, its daemons and a kernel mount); macOS only for now (`mount_nfs`), the
-//! Linux FUSE and Windows WinFsp runs are main's (run-requests.md). It skips loudly where `mount_nfs`, `cc`, `make` or
-//! `git` is missing.
+//! Linux FUSE and Windows WinFsp runs are main's (run-requests.md). It skips loudly where `mount_nfs`, `cc`, `make`,
+//! `cargo` or `git` is missing.
 #![allow(
   clippy::unwrap_used,
   clippy::expect_used,
@@ -24,7 +31,9 @@
 )]
 #![cfg(target_os = "macos")]
 
+use std::collections::BTreeMap;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
@@ -37,6 +46,13 @@ const POLL: Duration = Duration::from_millis(20);
 /// Shape: consecutive answered verbs before the daemon counts as settled (the anchor may restart it once at
 /// startup, cli.rs `start_anchor_with_environment`).
 const STABLE_STREAK: u32 = 10;
+/// Shape: the quick profile's probe budget (milliseconds), as `slates anchor --quick` measures it (cli.rs).
+const QUICK_PROBE_MS: u64 = 5;
+/// Shape: the watchdog's looks waited out under the pressure: its beat is 100 ms (the daemon's start line), so a
+/// second of them.
+const PRESSURE_LOOKS: u32 = 10;
+/// See [`PRESSURE_LOOKS`].
+const LOOK: Duration = Duration::from_millis(100);
 /// Format: the header both includes name, by two paths.
 const HEADER: &str = "#pragma once\nstruct once { int x; };\n";
 
@@ -59,8 +75,12 @@ fn run(instance: &str, args: &[&str]) -> (i32, String, String) {
 }
 
 fn pause() {
+  pause_for(POLL);
+}
+
+fn pause_for(how_long: Duration) {
   #[allow(clippy::disallowed_methods)] // the test paces its polls
-  std::thread::sleep(POLL);
+  std::thread::sleep(how_long);
 }
 
 /// The anchor, killed and reaped on drop, so a failed assertion leaves no daemon behind.
@@ -207,7 +227,18 @@ fn make_base(base: &Path, gate: &Path) {
     "plain.o: plain.c inc/once.h\n\tcc -c plain.c -o plain.o\n",
   )
   .unwrap();
-  std::fs::write(base.join(".gitignore"), "*.o\n").unwrap();
+  std::fs::create_dir_all(base.join("krate/src")).unwrap();
+  std::fs::write(
+    base.join("krate/Cargo.toml"),
+    "[package]\nname = \"krate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+  )
+  .unwrap();
+  std::fs::write(
+    base.join("krate/src/lib.rs"),
+    "pub fn answer() -> u32 {\n  42\n}\n",
+  )
+  .unwrap();
+  std::fs::write(base.join(".gitignore"), "*.o\ntarget/\nCargo.lock\n").unwrap();
   for args in [
     &["init", "-q"][..],
     &["add", "-A"],
@@ -226,13 +257,82 @@ fn make_base(base: &Path, gate: &Path) {
   }
 }
 
-/// `make -q` and `git status --porcelain` over the mount: nothing out of date, nothing changed.
-fn nothing_moved(mount: &Path, after: &str) {
+/// `cargo build` of the fixture's crate over the mount, as a developer runs it: the parent `cargo test`'s target
+/// directory, build jobs and flags are not the crate's, so they are taken out of its environment (incremental on, the
+/// dev profile's default).
+fn cargo_build(mount: &Path) -> Output {
+  Command::new("cargo")
+    .args(["build", "--offline"])
+    .current_dir(mount.join("krate"))
+    .env_remove("CARGO_TARGET_DIR")
+    .env_remove("CARGO_INCREMENTAL")
+    .env_remove("CARGO_BUILD_JOBS")
+    .env_remove("RUSTFLAGS")
+    .env_remove("CARGO_ENCODED_RUSTFLAGS")
+    .output()
+    .unwrap()
+}
+
+/// The first build over the mount: make's object, cargo's crate, and git's index refreshed by a status.
+fn first_build(mount: &Path) {
+  let built = tool(mount, "make", &[]);
+  assert!(built.status.success(), "make: {}", text(&built));
+  let crate_built = cargo_build(mount);
+  assert!(
+    crate_built.status.success(),
+    "cargo build: {}",
+    text(&crate_built)
+  );
+  let refreshed = tool(mount, "git", &["status", "--porcelain"]);
+  assert!(
+    refreshed.status.success(),
+    "git status: {}",
+    text(&refreshed)
+  );
+}
+
+/// Every tracked file's inode number, modification time and change time (seconds and nanoseconds), as `stat` reads
+/// them through the mount.
+fn identities(mount: &Path) -> BTreeMap<String, (u64, i64, i64, i64, i64)> {
+  let listed = tool(mount, "git", &["ls-files"]);
+  assert!(listed.status.success(), "git ls-files: {}", text(&listed));
+  String::from_utf8_lossy(&listed.stdout)
+    .lines()
+    .map(|path| {
+      let meta = std::fs::metadata(mount.join(path)).unwrap();
+      (
+        path.to_owned(),
+        (
+          meta.ino(),
+          meta.mtime(),
+          meta.mtime_nsec(),
+          meta.ctime(),
+          meta.ctime_nsec(),
+        ),
+      )
+    })
+    .collect()
+}
+
+/// After `after`: every tracked file's identity as `before`, `make -q` up to date, `cargo build` a no-op and `git
+/// status --porcelain` empty.
+fn nothing_moved(mount: &Path, after: &str, before: &BTreeMap<String, (u64, i64, i64, i64, i64)>) {
+  assert_eq!(
+    &identities(mount),
+    before,
+    "after {after}, an untouched file's inode number or times moved"
+  );
   let made = tool(mount, "make", &["-q"]);
   assert!(
     made.status.success(),
     "after {after}, make would rebuild an untouched target: {}",
     text(&made)
+  );
+  let crate_built = cargo_build(mount);
+  assert!(
+    crate_built.status.success() && !text(&crate_built).contains("Compiling"),
+    "after {after}, cargo rebuilt an untouched crate: {}",
+    text(&crate_built)
   );
   let status = tool(mount, "git", &["status", "--porcelain"]);
   assert!(status.status.success(), "git status: {}", text(&status));
@@ -243,37 +343,27 @@ fn nothing_moved(mount: &Path, after: &str) {
   );
 }
 
-/// A compile, `make` and `git status` over a real kernel mount across a snapshot of the volume and a daemon's death
-/// (w-realtools; A-781). Do: mount an overlay over a git checkout; build `plain.o` with make and refresh git's index;
-/// start a compile of `main.c`, which includes `inc/once.h`, then blocks on a FIFO's include; take a snapshot and kill
-/// the daemon (the anchor starts the next); let the compile go on to `sub/../inc/once.h`. Expect the compile to succeed
-/// (one header: one inode number before and after), and after each event `make -q` up to date and `git status`
-/// clean (the inode number and both times of every untouched file unchanged).
-#[test]
-fn a_pragma_once_build_make_and_git_status_hold_across_a_snapshot_and_a_daemon_restart() {
+/// Whether the real-tools flows can run here; says why not on standard error.
+fn runnable() -> bool {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the real-tools flow: set SLATES_TEST_CLI=1 (a real kernel mount and daemon restarts)"
     );
-    return;
+    return false;
   }
-  for needed in ["mount_nfs", "cc", "make", "git", "mkfifo"] {
+  for needed in ["mount_nfs", "cc", "make", "cargo", "git", "mkfifo"] {
     if !on_path(needed) {
       eprintln!("skipping the real-tools flow: {needed} is not on this host");
-      return;
+      return false;
     }
   }
-  let root = fresh_dir("pragma");
-  let (base, mount_point, gate) = (root.join("base"), root.join("mnt"), root.join("gate.h"));
-  std::fs::create_dir_all(&mount_point).unwrap();
-  make_base(&base, &gate);
-  let made = tool(&root, "mkfifo", &[gate.to_str().unwrap()]);
-  assert!(made.status.success(), "mkfifo: {}", text(&made));
+  true
+}
 
-  let instance = format!("real-tools-{}", std::process::id());
-  let anchor = start_anchor(&instance);
+/// Creates the overlay volume over `base` through the CLI and mounts it at `mount_point`; its id and the mount's guard.
+fn mount_overlay(instance: &str, base: &Path, mount_point: &Path) -> (String, Mounted) {
   let (code, out, err) = run(
-    &instance,
+    instance,
     &[
       "volume",
       "create",
@@ -286,19 +376,35 @@ fn a_pragma_once_build_make_and_git_status_hold_across_a_snapshot_and_a_daemon_r
   );
   assert_eq!(code, 0, "create: {err}");
   let id = value_of(&out, "id");
-  let (code, _, err) = run(&instance, &["mount", &id, mount_point.to_str().unwrap()]);
+  let (code, _, err) = run(instance, &["mount", &id, mount_point.to_str().unwrap()]);
   assert_eq!(code, 0, "mount: {err}");
-  let mounted = Mounted(mount_point.clone());
+  (id, Mounted(mount_point.to_path_buf()))
+}
 
-  let built = tool(&mount_point, "make", &[]);
-  assert!(built.status.success(), "make: {}", text(&built));
-  let refreshed = tool(&mount_point, "git", &["status", "--porcelain"]);
-  assert!(
-    refreshed.status.success(),
-    "git status: {}",
-    text(&refreshed)
-  );
-  nothing_moved(&mount_point, "the first build");
+/// A compile, `make`, `cargo build` and `git status` over a real kernel mount across a snapshot of the volume and a daemon's death
+/// (w-realtools; A-781). Do: mount an overlay over a git checkout; build `plain.o` with make and refresh git's index;
+/// start a compile of `main.c`, which includes `inc/once.h`, then blocks on a FIFO's include; take a snapshot and kill
+/// the daemon (the anchor starts the next); let the compile go on to `sub/../inc/once.h`. Expect the compile to succeed
+/// (one header: one inode number before and after), and after each event every tracked file's inode number and times
+/// unchanged, `make -q` up to date, `cargo build` a no-op and `git status` clean.
+#[test]
+fn a_pragma_once_build_make_cargo_and_git_status_hold_across_a_snapshot_and_a_daemon_restart() {
+  if !runnable() {
+    return;
+  }
+  let root = fresh_dir("pragma");
+  let (base, mount_point, gate) = (root.join("base"), root.join("mnt"), root.join("gate.h"));
+  std::fs::create_dir_all(&mount_point).unwrap();
+  make_base(&base, &gate);
+  let made = tool(&root, "mkfifo", &[gate.to_str().unwrap()]);
+  assert!(made.status.success(), "mkfifo: {}", text(&made));
+
+  let instance = format!("real-tools-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (id, mounted) = mount_overlay(&instance, &base, &mount_point);
+  first_build(&mount_point);
+  let before = identities(&mount_point);
+  nothing_moved(&mount_point, "the first build", &before);
 
   let compile = Command::new("cc")
     .args(["-fsyntax-only", "main.c"])
@@ -310,9 +416,9 @@ fn a_pragma_once_build_make_and_git_status_hold_across_a_snapshot_and_a_daemon_r
 
   let (code, _, err) = run(&instance, &["volume", "snapshot", &id]);
   assert_eq!(code, 0, "snapshot: {err}");
-  nothing_moved(&mount_point, "a snapshot");
+  nothing_moved(&mount_point, "a snapshot", &before);
   kill_the_daemon(&instance, &anchor);
-  nothing_moved(&mount_point, "a daemon restart");
+  nothing_moved(&mount_point, "a daemon restart", &before);
 
   // Opening the FIFO for writing lets the compile's include of it go on; closing it ends that include.
   std::fs::OpenOptions::new()
@@ -330,4 +436,68 @@ fn a_pragma_once_build_make_and_git_status_hold_across_a_snapshot_and_a_daemon_r
 
   drop(mounted);
   drop(anchor);
+}
+
+/// The same tools under memory pressure (w-realtools; §4.2 admission's pressure hold, A-336's memory stall). Do: start
+/// a daemon in this process (so the test can put pressure on it), mount an overlay over a git checkout through the CLI,
+/// build with make and cargo and refresh git's index; then hold the whole admittable memory and report a host memory
+/// stall, as a host short of memory makes the daemon see, wait out a few of the daemon's own sampling looks, and look
+/// again; release the pressure and look once more. Expect, under the pressure and after it, every tracked file's inode
+/// number and times unchanged, `make -q` up to date, `cargo build` a no-op and `git status` clean.
+#[test]
+fn make_cargo_and_git_status_hold_under_memory_pressure() {
+  if !runnable() {
+    return;
+  }
+  let root = fresh_dir("pressure");
+  let (base, mount_point, gate) = (root.join("base"), root.join("mnt"), root.join("gate.h"));
+  std::fs::create_dir_all(&mount_point).unwrap();
+  make_base(&base, &gate);
+
+  let instance = format!("real-tools-pressure-{}", std::process::id());
+  let profile =
+    slates_machine::MachineProfile::measure_patiently(&slates_machine::ProfileOptions {
+      budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
+      codecs: false,
+      core_matrix: false,
+    })
+    .unwrap();
+  let config = slates_server::DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = slates_server::Daemon::start(
+    &profile,
+    config,
+    slates_server::SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the test creates its local consensus group");
+  let (_, mounted) = mount_overlay(&instance, &base, &mount_point);
+  first_build(&mount_point);
+  let before = identities(&mount_point);
+  nothing_moved(&mount_point, "the first build", &before);
+
+  daemon
+    .inject_pressure_hold(u64::MAX)
+    .expect("the hold is installed on every shard");
+  assert!(
+    daemon.inject_memory_stall(Some(true)),
+    "the daemon's watchdog takes the stall"
+  );
+  // A few of the watchdog's looks, so what the daemon does under the stall has happened before the tools look.
+  for _ in 0..PRESSURE_LOOKS {
+    pause_for(LOOK);
+  }
+  nothing_moved(&mount_point, "memory pressure", &before);
+
+  daemon
+    .inject_pressure_hold(0)
+    .expect("the hold is released on every shard");
+  let _ = daemon.inject_memory_stall(None);
+  nothing_moved(&mount_point, "the pressure's release", &before);
+
+  drop(mounted);
+  daemon.stop();
 }
