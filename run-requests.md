@@ -7250,3 +7250,12 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   live_chaos a_seeded_nemesis_of_single_faults_keeps_every_register_invariant` for seeds 1256052866610850298
   5939796479076166087 10263252121351842258 17757241901296347647 8389754676365715562, plus fresh draws; red =
   `live_chaos.rs:2465` or `:6704` panics (GAPS b8070b0ab).
+
+## 2026-11-21 11:35 PST g226, the residency fix's focused rerun on merged main (main's call (a); landed 27517bd04)
+- macOS (w-lint's next round), on main at or after 27517bd04:
+  `cargo test --locked -p slates-server --test daemon a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas -- --nocapture`
+  Red: a compile error, the arenas not `measured` within ten liveness budgets, or `resident_bytes` below seven eighths
+  of 268,435,456 (the test prints the kind, the looks and the time). Green at b5220bd92 on Studio-4: 2 looks, 76-86 ms,
+  268,435,456 resident. A red goes back to g226.
+- The Windows request of 2026-11-21T01:10Z stands; run it at 27517bd04 too. Linux r8 (adacachy, b5220bd92) is still
+  building at load 45.
