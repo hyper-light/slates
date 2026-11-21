@@ -29,12 +29,12 @@ use slates_ipc::protocol::{
   Conformance, CopyCase, CredentialMaterial, DatabaseRefusal, DeleteWhileOpen, DriftKind,
   EditBytes, EntryKind, Established, GrantScope, GrantState, HookPointName, HostAnswer,
   HostPathReason, ImportFault, Intent, IpcNodeKind, KernelCache, LandingDegradation, LandingStage,
-  LogLine, MoveRefusal, NamePolicy, ObjectFormat, OwnMountUse, PlannedAction, PolicyEffect,
-  PolicyEntry, PolicyNames, PolicyRight, PolicySubject, PolicyWho, Principal, ReadAt,
+  LogLine, MergeView, MoveRefusal, NamePolicy, ObjectFormat, OwnMountUse, PlannedAction,
+  PolicyEffect, PolicyEntry, PolicyNames, PolicyRight, PolicySubject, PolicyWho, Principal, ReadAt,
   ReadWritePolicy, RecoveryCause, Refusal, ReplyBody, RequestBody, Residency, Scope,
   SignatureFault, SignerKey, SizeClass, SnapshotBoundary, TargetPathConstraint, TargetRefusal,
-  UnsupportedReason, VcsTool, Verification, VolumeRefusal, WatcherState, WorkMark, WorkOp,
-  WriteAct, WriteMode,
+  UnsupportedReason, VcsTool, Verification, VolumeRefusal, WatcherState, WorkChange, WorkMark,
+  WorkOp, WriteAct, WriteMode,
 };
 use slates_wire::Wire;
 
@@ -105,6 +105,8 @@ fn schemas() -> Vec<&'static str> {
     <WatcherState as Wire>::SCHEMA,
     <WorkMark as Wire>::SCHEMA,
     <WorkOp as Wire>::SCHEMA,
+    <WorkChange as Wire>::SCHEMA,
+    <MergeView as Wire>::SCHEMA,
     <WriteAct as Wire>::SCHEMA,
     <WriteMode as Wire>::SCHEMA,
   ]
