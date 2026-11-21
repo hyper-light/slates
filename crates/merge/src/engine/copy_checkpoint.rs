@@ -248,7 +248,10 @@ impl Green {
   pub(super) fn sum_at(&self, at: u64) -> Sum {
     let mut sum = self.identity.clone();
     for key in &self.identity_dirty {
-      let (out, into) = self.identity_moves(key, self.identity_version);
+      // Each key from the version its entry was taken at: a key folded alone since (A-579) and changed again sits in
+      // the sum at that version, not at `identity_version`.
+      let since = self.identity_since(key);
+      let (out, into) = self.identity_moves(key, since);
       for entry in &out {
         sum.remove(entry);
       }
