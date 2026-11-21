@@ -55,7 +55,7 @@ impl Pieces {
   }
 
   /// The piece of `identity` holding `offset`, from `offset` on; none where no reader fetched it.
-  fn at(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
+  pub(super) fn at(&self, identity: &ContentIdentity, offset: u64) -> Option<&[u8]> {
     let ((_, start), (bytes, _)) = self
       .0
       .range(..=(*identity, offset))
