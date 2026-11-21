@@ -999,12 +999,9 @@ pub struct Green {
   /// non-vacuity counters: a block named by the history instead of copied).
   history_named: (u64, u64),
   /// The changes whose path's history was re-anchored on the file's new block, the earlier blocks let go, and the bytes
-  /// copied out of them (A-793, `crate::history::reanchor`).
-  history_reanchored: (u64, u64, u64),
-  /// The history values re-anchors walked in all (A-803's measure: a change re-anchors every value its path holds).
-  history_reanchored_values: u64,
-  /// The bytes every content history value's piece list costs, a running total.
-  history_lists: usize,
+  /// The changes the content history took without naming the new block whole, the tree nodes they made, and the bytes
+  /// they stored of what they removed (A-818's non-vacuity counters, `crate::history::change`).
+  history_changes: (u64, u64, u64),
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
   /// them), a running total: what [`Green::history_bytes`] leaves out, as the current values were always left out.
   specials: Dim<SpecialNode>,
@@ -1198,10 +1195,11 @@ fn changed_at<K: Clone, V: Clone>(
     .collect()
 }
 
-/// What a path's latest content value counts among the current values ([`Green::history_bytes`] leaves them out): its
-/// bytes and its piece list.
+/// What a path's latest content value counts among the current values ([`Green::history_bytes`] leaves them out): the
+/// bytes of the file's block it shares, and the structure that describes it alone (A-818: its tree's nodes and its
+/// anchor's latest order, as its piece list was before).
 fn current_bytes(value: &crate::history::Value) -> usize {
-  value.own_len().saturating_add(value.list_bytes())
+  value.own_len().saturating_add(value.structure())
 }
 
 /// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
@@ -3390,7 +3388,6 @@ impl Green {
       .map_or(0, current_bytes);
     self.history_current = self.history_current.saturating_sub(previous);
     if let Some(value) = &value {
-      self.history_lists = self.history_lists.saturating_add(value.list_bytes());
       self.history_current = self.history_current.saturating_add(current_bytes(value));
     }
     self
@@ -3451,10 +3448,10 @@ impl Green {
     self.chunks.owned_bytes()
   }
 
-  /// The value that `ops` made of `path`'s latest content, the file now holding its new bytes: the new block named
-  /// whole, with the path's history re-anchored on it (`crate::history::reanchor`, A-793), so the earlier block is let
-  /// go and the history keeps only what the change overwrote or removed. The file's block named whole (A-728) with
-  /// nothing re-anchored for a path with no latest value, or one the ops keep nothing of.
+  /// The value that `ops` made of `path`'s latest content, the file now holding its new bytes: the change taken from the
+  /// latest value alone, its removed bytes stored and the new block its anchor's newest (`crate::history::change`,
+  /// A-818), so no earlier version is walked. The file's block named whole (A-728) for a path with no latest value, or
+  /// one the ops are no change of.
   fn content_value(&mut self, path: &str, ops: &[Op]) -> crate::history::Value {
     let Green {
       content_history,
@@ -3462,63 +3459,33 @@ impl Green {
       content,
       ..
     } = self;
-    let anchored = content
+    let changed = content
       .block_of(path)
-      .zip(content_history.get_mut(path))
-      .filter(|(_, history)| history.last().is_some_and(|(_, latest)| latest.is_some()))
-      .and_then(|(block, history)| {
-        let values = history
-          .iter_mut()
-          .filter_map(|(_, value)| value.as_mut())
-          .collect();
-        crate::history::reanchor(values, chunks, content.blocks_mut(), (block, ops))
+      .zip(
+        content_history
+          .get_mut(path)
+          .and_then(|history| history.last_mut())
+          .and_then(|(_, latest)| latest.as_mut()),
+      )
+      .and_then(|(block, latest)| {
+        crate::history::change(latest, chunks, content.blocks_mut(), (block, ops))
       });
-    let Some(anchored) = anchored else {
+    let Some(changed) = changed else {
       return self.named_value(path);
     };
-    let crate::history::Reanchored {
-      value,
-      lists: (lists_before, lists_after),
-      latest_list: (latest_before, latest_after),
-      blocks_cut,
-      bytes_cut,
-      values,
-    } = anchored;
-    self.history_reanchored_values = self
-      .history_reanchored_values
-      .saturating_add(u64::try_from(values).unwrap_or(u64::MAX));
-    self.history_lists = self
-      .history_lists
-      .saturating_sub(lists_before)
-      .saturating_add(lists_after);
-    // The superseded value is still counted current until `push_content` replaces it, by its list as it is now.
-    self.history_current = self
-      .history_current
-      .saturating_sub(latest_before)
-      .saturating_add(latest_after);
-    let (changes, cut, copied) = self.history_reanchored;
-    self.history_reanchored = (
+    let (changes, nodes, stored) = self.history_changes;
+    self.history_changes = (
       changes.saturating_add(1),
-      cut.saturating_add(blocks_cut),
-      copied.saturating_add(u64::try_from(bytes_cut).unwrap_or(u64::MAX)),
+      nodes.saturating_add(changed.nodes),
+      stored.saturating_add(u64::try_from(changed.stored).unwrap_or(u64::MAX)),
     );
-    value
+    changed.value
   }
 
-  /// The changes whose history was re-anchored on the file's new block, the earlier blocks that let go, and the bytes
-  /// copied out of them (A-793's non-vacuity counters, `crate::history::reanchor`).
-  pub fn history_reanchored(&self) -> (u64, u64, u64) {
-    self.history_reanchored
-  }
-
-  /// The anchor layers reads of earlier values have examined, in all (A-809): what a read through layers costs.
-  pub fn history_layers_examined(&self) -> u64 {
-    self.chunks.layers_examined()
-  }
-
-  /// The history values re-anchors walked in all (A-803): divided by the re-anchored changes, the values a change walks.
-  pub fn history_reanchored_values(&self) -> u64 {
-    self.history_reanchored_values
+  /// The changes the content history took without naming the new block whole, the tree nodes they made, and the bytes
+  /// they stored of what they removed (A-818's non-vacuity counters).
+  pub fn history_changes(&self) -> (u64, u64, u64) {
+    self.history_changes
   }
 
   /// Marks `path`'s latest content value superseded as a change lands, the file map having let its block go
@@ -3593,20 +3560,18 @@ impl Green {
   /// Releases one content history value: its list leaves the running total and its chunks their references.
   fn release_content(&mut self, value: Option<crate::history::Value>) {
     if let Some(value) = value {
-      self.history_lists = self.history_lists.saturating_sub(value.list_bytes());
       value.release(&mut self.chunks, self.content.blocks_mut());
     }
   }
 
   /// The bytes the content and IPC histories retain beyond the current values — every earlier value still held for
   /// reconstruction (`content_at`, `base_at`) — read off running totals so the service charges retention without
-  /// walking the histories: the content history's chunks and piece lists, less the current values they also hold,
-  /// and the IPC history's earlier nodes.
+  /// walking the histories: the content history's chunks, trees and indexes, less the current values' blocks they also
+  /// hold, and the IPC history's earlier nodes.
   fn history_bytes(&self) -> usize {
     self
       .chunks
       .bytes()
-      .saturating_add(self.history_lists)
       .saturating_sub(self.history_current)
       .saturating_add(self.special_history_bytes)
   }
@@ -6405,35 +6370,25 @@ impl Green {
   }
 
   /// The most the history gains when a change of `ops` content ops supersedes `path`'s latest content value (A-728 part
-  /// 4, the honest charge; A-793, the re-anchor), whatever the ops: the value's piece list, no longer current; at most
-  /// its own block, the current file's, which the history keeps whole (a whole replace, or a holder beyond the map and
-  /// the history keeps it) or cut to what the change removed; and the pieces the re-anchor may add to every value the
-  /// path's history holds, two for each gap the ops leave in the kept runs (`ops` and a trailing truncate's), each value
-  /// a new one at most. A path with no history, or holding a copy's value (A-586), is recorded whole at its change
-  /// (`seed_content`): its file's block and one piece, all of it kept, and that value is re-anchored too. A path with no
-  /// file and no value gains nothing.
+  /// 4, the honest charge; A-818): what the change can remove of the value, stored (at most the value: its own block,
+  /// the current file's, kept whole when the change removes it all), and the structure its parts make
+  /// (`crate::history::change_bound`), whatever the ops and however long the path's history. A path with no history, or
+  /// holding a copy's value (A-586), is recorded whole at its change (`seed_content`): its file's block, kept, and the
+  /// change's bound over it. A path with no file and no value gains nothing.
   fn superseded_bytes(&self, path: &str, ops: usize) -> usize {
-    let split = |values: usize| {
-      values
-        .saturating_mul(ops.saturating_add(1))
-        .saturating_mul(2)
-        .saturating_mul(crate::history::PIECE_BYTES)
-    };
     let history = self.content_history.get(path);
     let covered = self.covered_since(path, last_entry(history)).is_some();
     let Some(history) = history.filter(|_| !covered) else {
       return self.content.get(path).map_or(0, |bytes| {
-        crate::history::Value::whole_cost(bytes.len()).saturating_add(split(1))
+        bytes
+          .len()
+          .saturating_add(crate::history::change_bound(bytes.len(), ops))
       });
     };
-    let Some(latest) = history.last().and_then(|(_, value)| value.as_ref()) else {
-      return 0;
-    };
-    let values = history.iter().filter(|(_, value)| value.is_some()).count();
-    latest
-      .list_bytes()
-      .saturating_add(latest.len())
-      .saturating_add(split(values))
+    history
+      .last()
+      .and_then(|(_, value)| value.as_ref())
+      .map_or(0, |latest| crate::history::change_bound(latest.len(), ops))
   }
 
   /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
@@ -6482,7 +6437,6 @@ impl Green {
     self
       .chunks
       .referenced_bytes(values())
-      .saturating_add(values().map(crate::history::Value::list_bytes).sum())
       .saturating_sub(current)
       .saturating_add(self.special_history_recounted())
   }
@@ -6622,13 +6576,11 @@ impl Green {
     };
     let old = slot.replace(named);
     let new_cost = slot.as_ref().map_or(0, current_bytes);
-    let new_list = slot.as_ref().map_or(0, crate::history::Value::list_bytes);
     let old_cost = old.as_ref().map_or(0, current_bytes);
     self.history_current = self
       .history_current
       .saturating_sub(old_cost)
       .saturating_add(new_cost);
-    self.history_lists = self.history_lists.saturating_add(new_list);
     self.release_content(old);
   }
 

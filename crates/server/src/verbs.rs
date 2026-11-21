@@ -10466,9 +10466,10 @@ const WORK_LOG_PEAK_BYTES: &str = "merge.work.log_peak_bytes";
 /// See [`WORK_LOG_PEAK_BYTES`].
 const WORK_LOG_PEAK_ENTRIES: &str = "merge.work.log_peak_entries";
 
-/// Format: the history values a submit's commit re-anchored (A-803's measure), summed: over `merge.submit.judge`, what a
-/// verdict walks of its paths' histories.
-const REANCHOR_VALUES_WALKED: &str = "merge.reanchor.values_walked";
+/// Format: the version-tree nodes a submit's commit made in the content history (A-818), summed: over
+/// `merge.submit.judge`, what a verdict makes of its paths' histories. Flat however long the history a reader pins, as
+/// a change walks no earlier version; A-803's `merge.reanchor.values_walked` grew with it.
+const HISTORY_NODES_MADE: &str = "merge.history.nodes_made";
 
 /// Secures `secured` bytes of `green_id`'s retention for the merge: folds what the retention budget allows first, leaving
 /// that room (never a live reader's version), then secures it, the first refusal reported. The bytes available where
@@ -10508,7 +10509,7 @@ fn report_first_retention_cap_refusal(
   slates_machine::log_line!(
     "slates-server: retention refused at the green's cap (first occurrence): shard={} secured={secured} \
      available={available} charged={} cap={} head={} folded_below={} floor={} {retained:?} owned={} named={:?} \
-     reanchored={:?}",
+     changes={:?}",
     state.shard,
     state.green_retention.get(&green).copied().unwrap_or(0),
     crate::merge_service::rejected_cache_budget(state),
@@ -10517,7 +10518,7 @@ fn report_first_retention_cap_refusal(
     crate::merge_service::reachable_floor(state, green),
     engine.history_owned_bytes(),
     engine.history_blocks_named(),
-    engine.history_reanchored(),
+    engine.history_changes(),
   );
 }
 
@@ -10707,10 +10708,10 @@ fn judged_submission(
       }
     };
   drop(increment_bytes);
-  let walked_before = state
+  let made_before = state
     .greens
     .get(&green_id)
-    .map_or(0, |engine| engine.history_reanchored_values());
+    .map_or(0, |engine| engine.history_changes().1);
   let verdict_start = state.clock.monotonic_ns();
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
   let hold = crate::made_commit::holds(state, green_id);
@@ -10745,12 +10746,12 @@ fn judged_submission(
     crate::merge_service::SUBMIT_JUDGE,
     verdict_end.saturating_sub(verdict_start),
   );
-  let walked = state
+  let made = state
     .greens
     .get(&green_id)
-    .map_or(0, |engine| engine.history_reanchored_values())
-    .saturating_sub(walked_before);
-  state.count(REANCHOR_VALUES_WALKED, walked);
+    .map_or(0, |engine| engine.history_changes().1)
+    .saturating_sub(made_before);
+  state.count(HISTORY_NODES_MADE, made);
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }

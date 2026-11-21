@@ -207,6 +207,8 @@ impl Blocks {
   }
 
   /// How many hold `block`: map nodes, the identity table and the content history (zero for a block that is gone).
+  /// Read by the reference history alone (`crate::history_reference`, test-only).
+  #[cfg(test)]
   pub(crate) fn holders(&self, block: Block) -> u64 {
     match self.slots.get(block.0) {
       Some(Some((_, holders))) => *holders,

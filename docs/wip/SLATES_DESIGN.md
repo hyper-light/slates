@@ -59799,3 +59799,40 @@ Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the c
   in GAPS.
 - **Cost owed.** One more publication per accepted version (before its append); the release bench (A/B at 64, 128,
   256, 320 and 512 MiB) measures it with the lane.
+
+### A-818 piece 2b — The engine switch: a path's history is persistent trees of byte identities, the re-anchor deleted (2026-11-21, w-rewrite-ops; main's go of 10:35 and its order to build 2b on a branch and land on the A/B)
+
+- **What changed.** `crates/merge/src/history.rs` is replaced, not layered.
+  - A value is a tree of identity runs (piece 1) over an anchor a path chain, whose `BytePlaces` (piece 2a) says
+    where each identity's bytes are. A change (`history::change`) takes the latest value alone. The engine's
+    `segments` give its parts. The ranges it removed are stored once (a range that is the whole file keeps the
+    superseded block itself). The new version is the latest's tree rebuilt.
+  - Deleted: the re-anchor walk (A-793), the layered anchor (A-809, A-811), compaction at re-anchor, the
+    `FULL_REANCHOR_ONLY` switch and `history_layers_examined`. No mode switch remains.
+  - What a change stored is retired once the earliest live value of its anchor is past it. An anchor goes with its
+    last value.
+  - Charges:
+    - The history's bytes are its chunks, the trees' live nodes and the anchors' indexes (`Chunks::bytes`).
+    - The latest value's own structure (its tree's nodes and its anchor's latest order) counts as current, as its
+      piece list did.
+    - Nodes are packed (48 bytes a tree node, 40 an order node, 32 an index entry). The many-files retention bound of
+      `tests/engine.rs` (64 bytes written plus 144 a version an edit) holds unchanged.
+    - Admission's bound (`history::change_bound`) is what a change can remove plus its parts' derived structure. It no
+      longer grows with the values a path holds.
+- **Counters.**
+  - `Green::history_changes` (changes taken, nodes made, bytes stored) replaces `history_reanchored` and
+    `history_reanchored_values`.
+  - The server's `merge.history.nodes_made` replaces `merge.reanchor.values_walked`. It is flat however long the
+    history.
+- **Oracle.** Today's history is kept verbatim as `crate::history_reference` (test-only).
+  `history::tests::every_version_reads_as_todays_reanchored_history` runs generated histories through both, with a
+  fold. Every version and range read must be equal, and equal to `apply`. The owned bytes never pass what was
+  removed. The running total must equal its recount, and nothing may be left after release. A wrong copy offset fails
+  it.
+  - Engine level: `the_history_reads_as_the_model_through_folds_and_checkpoints`, and the bounded-change tests in
+    place of the walked-one-value tests.
+- **A/B (main's condition: it lands only if writes win and reads and memory don't lose).** `history_layers_bench` now
+  prints every round at m = 10/100/1k/10k: reads of version 1, the three streams' change cost with history bytes a
+  version, and many paths changed once each. It uses only APIs both sides have, so it runs on main and on the branch.
+  The `leaf_chunks_bench` example prints option (i)'s rows. If old reads lose because today compacted fragments at
+  write time, the fix is a bounded compaction in this piece, measured in the same A/B (main's 10:35 note).

@@ -44,9 +44,6 @@
 //! typed refusal, [`Refusal::Missing`], and counted ([`PieceTrees::missing`]); an offset past a version's end is
 //! [`Refusal::OutOfRange`], and lengths add checked ([`Refusal::Overflow`]).
 
-// Its caller outside tests is the content history's engine switch (A-818 piece 2).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::cell::Cell;
 
 /// A node's place in the arena.
@@ -113,29 +110,81 @@ pub(crate) enum Refusal {
 
 /// One version of a file's content: a held root in the arena. Not `Clone`: [`PieceTrees::fork`] makes another hold,
 /// and [`PieceTrees::release`] gives one back.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Version {
   root: Tree,
 }
 
-/// One node: a run, its subtrees, and what the tree keeps of them.
+/// One node: a run, its subtrees, and what the tree keeps of them, packed (48 bytes: A-818's memory a version is held
+/// against the 24-byte piece it replaces, main's condition of 2026-11-21): links are slots as `u32`, [`NO_NODE`] for
+/// none, and a slot whose node has no holder is free.
 #[derive(Clone, Copy, Debug)]
 struct Node {
-  left: Tree,
-  run: Run,
-  right: Tree,
-  /// The longest path down from here, in nodes.
-  height: u32,
+  /// The run's offset in its source.
+  at: u64,
+  /// The run's length: never zero in a tree.
+  len: u64,
   /// The bytes in this subtree, its run's included.
   total: u64,
-  /// The versions and nodes that name this node.
+  left: u32,
+  right: u32,
+  /// The run's source.
+  source: u32,
+  /// The versions and nodes that name this node; zero for a free slot.
   holders: u32,
+  /// The nodes in this subtree, itself included.
+  count: u32,
+  /// The longest path down from here, in nodes.
+  height: u32,
+}
+
+/// Format: a link to no node.
+const NO_NODE: u32 = u32::MAX;
+
+/// A tree as a link.
+fn link(tree: Tree) -> u32 {
+  tree
+    .and_then(|slot| u32::try_from(slot).ok())
+    .unwrap_or(NO_NODE)
+}
+
+impl Node {
+  fn left(&self) -> Tree {
+    (self.left != NO_NODE).then(|| usize::try_from(self.left).unwrap_or(usize::MAX))
+  }
+
+  fn right(&self) -> Tree {
+    (self.right != NO_NODE).then(|| usize::try_from(self.right).unwrap_or(usize::MAX))
+  }
+
+  fn run(&self) -> Run {
+    Run {
+      source: usize::try_from(self.source).unwrap_or(usize::MAX),
+      at: self.at,
+      len: self.len,
+    }
+  }
+}
+
+/// Format: the bytes a node is charged: its slot in the arena.
+pub(crate) const NODE_BYTES: usize = size_of::<Node>();
+
+/// The most nodes [`PieceTrees::rebuild`] of `parts` parts over a version of at most `runs` runs can leave alive, without
+/// making it. Derived: an AVL tree of `n` nodes is at most 1.4405 log2(n + 2) high, under 1.5 times the bits of `n + 2`
+/// (`height`); a part is a slice (two splits) or one run, then a concatenation (a split of the last run and a join), and
+/// each split and join makes at most one node a level of the taller tree it walks, so a part leaves at most four times
+/// (`height` + 2) nodes it made.
+pub(crate) fn rebuild_bound(parts: usize, runs: u64) -> usize {
+  let bits = u64::BITS.saturating_sub(runs.saturating_add(2).leading_zeros());
+  let height =
+    usize::try_from(bits.saturating_add(bits / 2).saturating_add(1)).unwrap_or(usize::MAX);
+  parts.saturating_mul(height.saturating_add(2).saturating_mul(4))
 }
 
 /// The arena the versions made from one another share.
 #[derive(Debug, Default)]
 pub(crate) struct PieceTrees {
-  slots: Vec<Option<Node>>,
+  slots: Vec<Node>,
   /// Freed slots, reused before the arena grows.
   free: Vec<Slot>,
   /// Nodes copied because another holder named them (module docs, "Persistence by path copying").
@@ -148,16 +197,19 @@ pub(crate) struct PieceTrees {
 
 impl PieceTrees {
   /// Nodes copied because another holder named them: the non-vacuity counter of sharing.
+  #[cfg(test)]
   pub(crate) fn copied(&self) -> u64 {
     self.copied
   }
 
   /// Nodes reads visited.
+  #[cfg(test)]
   pub(crate) fn visited(&self) -> u64 {
     self.visited.get()
   }
 
   /// Links that named no node: zero in every correct use.
+  #[cfg(test)]
   pub(crate) fn missing(&self) -> u64 {
     self.missing.get()
   }
@@ -165,6 +217,21 @@ impl PieceTrees {
   /// The nodes alive in the arena.
   pub(crate) fn live(&self) -> usize {
     self.slots.len().saturating_sub(self.free.len())
+  }
+
+  /// The distinct nodes `roots` reach: the recount of what the versions hold.
+  pub(crate) fn reachable<'a>(&self, roots: impl Iterator<Item = &'a Version>) -> usize {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending: Vec<Slot> = roots.filter_map(|version| version.root).collect();
+    while let Some(slot) = pending.pop() {
+      if !seen.insert(slot) {
+        continue;
+      }
+      if let Ok(node) = self.node(slot) {
+        pending.extend(node.left().into_iter().chain(node.right()));
+      }
+    }
+    seen.len()
   }
 
   /// The empty version.
@@ -181,6 +248,7 @@ impl PieceTrees {
   }
 
   /// Another hold of `version`: O(1).
+  #[cfg(test)]
   pub(crate) fn fork(&mut self, version: &Version) -> Result<Version, Refusal> {
     self.retain(version.root)?;
     Ok(Version { root: version.root })
@@ -278,24 +346,24 @@ impl PieceTrees {
     };
     let node = *self.node(slot)?;
     self.visited.set(self.visited.get().saturating_add(1));
-    let left = self.total(node.left)?;
-    let run_end = left.saturating_add(node.run.len);
+    let left = self.total(node.left())?;
+    let run_end = left.saturating_add(node.len);
     if from < left {
-      self.read_tree(node.left, (from, end.min(left)), yield_run)?;
+      self.read_tree(node.left(), (from, end.min(left)), yield_run)?;
     }
     if from < run_end && end > left {
       let start = from.max(left).saturating_sub(left);
       let stop = end.min(run_end).saturating_sub(left);
       yield_run(Run {
-        source: node.run.source,
-        at: node.run.at.saturating_add(start),
+        source: node.run().source,
+        at: node.at.saturating_add(start),
         len: stop.saturating_sub(start),
       });
     }
     if end > run_end {
       let shift = |offset: u64| offset.saturating_sub(run_end);
       self.read_tree(
-        node.right,
+        node.right(),
         (shift(from.max(run_end)), shift(end)),
         yield_run,
       )?;
@@ -304,7 +372,7 @@ impl PieceTrees {
   }
 
   fn node(&self, slot: Slot) -> Result<&Node, Refusal> {
-    let node = self.slots.get(slot).and_then(Option::as_ref);
+    let node = self.slots.get(slot).filter(|node| node.holders > 0);
     if node.is_none() {
       self.missing.set(self.missing.get().saturating_add(1));
     }
@@ -312,7 +380,7 @@ impl PieceTrees {
   }
 
   fn node_mut(&mut self, slot: Slot) -> Result<&mut Node, Refusal> {
-    let node = self.slots.get_mut(slot).and_then(Option::as_mut);
+    let node = self.slots.get_mut(slot).filter(|node| node.holders > 0);
     if node.is_none() {
       self.missing.set(self.missing.get().saturating_add(1));
     }
@@ -347,7 +415,7 @@ impl PieceTrees {
       if node.holders > 0 {
         continue;
       }
-      let (left, right) = (node.left, node.right);
+      let (left, right) = (node.left(), node.right());
       self.free_slot(slot);
       pending.extend(left.into_iter().chain(right));
     }
@@ -355,7 +423,7 @@ impl PieceTrees {
 
   fn free_slot(&mut self, slot: Slot) {
     if let Some(place) = self.slots.get_mut(slot) {
-      *place = None;
+      place.holders = 0;
       self.free.push(slot);
     }
   }
@@ -371,22 +439,48 @@ impl PieceTrees {
       .checked_add(run.len)
       .and_then(|sum| sum.checked_add(self.total(right).ok()?))
       .ok_or(Refusal::Overflow)?;
+    let count = self
+      .count(left)?
+      .checked_add(self.count(right)?)
+      .and_then(|sum| sum.checked_add(1))
+      .ok_or(Refusal::Overflow)?;
     let node = Node {
-      left,
-      run,
-      right,
-      height,
+      at: run.at,
+      len: run.len,
       total,
+      left: link(left),
+      right: link(right),
+      source: u32::try_from(run.source).map_err(|_| Refusal::Overflow)?,
       holders: 1,
+      count,
+      height,
     };
     if let Some(slot) = self.free.pop()
       && let Some(place) = self.slots.get_mut(slot)
     {
-      *place = Some(node);
+      *place = node;
       return Ok(slot);
     }
-    self.slots.push(Some(node));
+    if u32::try_from(self.slots.len())
+      .ok()
+      .is_none_or(|slots| slots >= NO_NODE)
+    {
+      return Err(Refusal::Overflow);
+    }
+    self.slots.push(node);
     Ok(self.slots.len().saturating_sub(1))
+  }
+
+  /// The nodes in the subtree `tree`.
+  fn count(&self, tree: Tree) -> Result<u32, Refusal> {
+    tree.map_or(Ok(0), |slot| self.node(slot).map(|node| node.count))
+  }
+
+  /// The nodes `version`'s tree holds (shared with other versions or not): what it would cost alone.
+  pub(crate) fn nodes_in(&self, version: &Version) -> usize {
+    self
+      .count(version.root)
+      .map_or(0, |count| usize::try_from(count).unwrap_or(usize::MAX))
   }
 
   /// Opens the held node `slot` into its subtrees (each with a hold) and its run, spending the hold: a node only this
@@ -396,12 +490,12 @@ impl PieceTrees {
     if node.holders <= 1 {
       self.free_slot(slot);
     } else {
-      self.retain(node.left)?;
-      self.retain(node.right)?;
+      self.retain(node.left())?;
+      self.retain(node.right())?;
       self.node_mut(slot)?.holders = node.holders.saturating_sub(1);
       self.copied = self.copied.saturating_add(1);
     }
-    Ok((node.left, node.run, node.right))
+    Ok((node.left(), node.run(), node.right()))
   }
 
   /// A balanced tree of `runs` in order.
@@ -642,7 +736,9 @@ mod tests {
       for (step, (pick, raw)) in chain.iter().enumerate() {
         let base = usize::from(*pick) % versions.len();
         let parts = parts_over(models[base].len() as u64, raw, step + 1);
+        let live = trees.live();
         let made = trees.rebuild(&versions[base], &parts).unwrap();
+        prop_assert!(trees.live() - live <= rebuild_bound(parts.len(), models[base].len() as u64 + parts.len() as u64));
         models.push(rebuilt(&models[base], &parts));
         versions.push(made);
         for (version, model) in versions.iter().zip(&models) {

@@ -41,9 +41,6 @@
 //! **No panics.** Every slot is read with `get`; a link to no node and an identity no entry holds are
 //! [`Refusal::Missing`]; parts out of order are [`Refusal::Unordered`], which the caller answers as a whole replace.
 
-// Its caller outside tests is the content history's engine switch (A-818 piece 2b).
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::piece_tree::{Part, Refusal, Run};
@@ -79,11 +76,11 @@ pub(crate) enum Place {
 #[derive(Clone, Copy, Debug)]
 enum Entry {
   /// In the latest order, at this node (which holds the run's length).
-  Current(Slot),
+  Current(u32),
   /// Stored by the caller.
   Stored {
     /// The caller's chunk.
-    chunk: usize,
+    chunk: u32,
     /// The offset in it.
     at: u64,
     /// The run's length.
@@ -91,23 +88,66 @@ enum Entry {
   },
 }
 
-/// A node of the latest order: an identity run, its links and its subtree's length.
+/// A node of the latest order: an identity run, its links and its subtree's length, packed (40 bytes, as the tree's node
+/// is: links are slots as `u32`, [`NO_NODE`] for none, and a slot whose node has no length is free).
 #[derive(Clone, Copy, Debug)]
 struct OrderNode {
   identity: u64,
+  /// The run's length; zero for a free slot.
   len: u64,
   /// The bytes in this subtree, its own included.
   total: u64,
-  priority: u64,
-  parent: Option<Slot>,
-  left: Option<Slot>,
-  right: Option<Slot>,
+  priority: u32,
+  parent: u32,
+  left: u32,
+  right: u32,
+}
+
+/// Format: a link to no node.
+const NO_NODE: u32 = u32::MAX;
+
+/// A slot as a link.
+fn link(slot: Option<Slot>) -> u32 {
+  slot
+    .and_then(|slot| u32::try_from(slot).ok())
+    .unwrap_or(NO_NODE)
+}
+
+/// A link as a slot.
+fn slot_of(link: u32) -> Option<Slot> {
+  (link != NO_NODE).then(|| usize::try_from(link).unwrap_or(usize::MAX))
+}
+
+impl OrderNode {
+  fn parent(&self) -> Option<Slot> {
+    slot_of(self.parent)
+  }
+
+  fn left(&self) -> Option<Slot> {
+    slot_of(self.left)
+  }
+
+  fn right(&self) -> Option<Slot> {
+    slot_of(self.right)
+  }
+
+  fn set_parent(&mut self, slot: Option<Slot>) {
+    self.parent = link(slot);
+  }
+
+  fn set_left(&mut self, slot: Option<Slot>) {
+    self.left = link(slot);
+  }
+
+  fn set_right(&mut self, slot: Option<Slot>) {
+    self.right = link(slot);
+  }
 }
 
 /// The latest version's identity runs in file order (module docs, "The latest order").
 #[derive(Debug, Default)]
 struct Order {
-  slots: Vec<Option<OrderNode>>,
+  slots: Vec<OrderNode>,
   free: Vec<Slot>,
   root: Option<Slot>,
   /// Priorities minted: the counter SplitMix64 mixes.
@@ -128,7 +168,7 @@ impl Order {
     self
       .slots
       .get(slot)
-      .and_then(Option::as_ref)
+      .filter(|node| node.len > 0)
       .ok_or(Refusal::Missing)
   }
 
@@ -136,7 +176,7 @@ impl Order {
     self
       .slots
       .get_mut(slot)
-      .and_then(Option::as_mut)
+      .filter(|node| node.len > 0)
       .ok_or(Refusal::Missing)
   }
 
@@ -159,18 +199,19 @@ impl Order {
       identity,
       len,
       total: len,
-      priority: mix(self.minted),
-      parent: None,
-      left: None,
-      right: None,
+      // The mix's high half: a treap needs only distinct, well-spread priorities.
+      priority: u32::try_from(mix(self.minted) >> 32).unwrap_or(u32::MAX),
+      parent: NO_NODE,
+      left: NO_NODE,
+      right: NO_NODE,
     };
     if let Some(slot) = self.free.pop()
       && let Some(place) = self.slots.get_mut(slot)
     {
-      *place = Some(node);
+      *place = node;
       return slot;
     }
-    self.slots.push(Some(node));
+    self.slots.push(node);
     self.slots.len().saturating_sub(1)
   }
 
@@ -179,8 +220,8 @@ impl Order {
     let node = *self.node(slot)?;
     let total = node
       .len
-      .checked_add(self.total(node.left)?)
-      .and_then(|sum| sum.checked_add(self.total(node.right).ok()?))
+      .checked_add(self.total(node.left())?)
+      .and_then(|sum| sum.checked_add(self.total(node.right()).ok()?))
       .ok_or(Refusal::Overflow)?;
     self.node_mut(slot)?.total = total;
     Ok(())
@@ -191,7 +232,7 @@ impl Order {
     let mut at = slot;
     while let Some(slot) = at {
       self.update(slot)?;
-      at = self.node(slot)?.parent;
+      at = self.node(slot)?.parent();
     }
     Ok(())
   }
@@ -203,17 +244,17 @@ impl Order {
       return Ok(());
     };
     let node = self.node_mut(parent)?;
-    if node.left == Some(old) {
-      node.left = new;
+    if node.left() == Some(old) {
+      node.set_left(new);
     } else {
-      node.right = new;
+      node.set_right(new);
     }
     Ok(())
   }
 
   fn set_parent(&mut self, child: Option<Slot>, parent: Option<Slot>) -> Result<(), Refusal> {
     if let Some(child) = child {
-      self.node_mut(child)?.parent = parent;
+      self.node_mut(child)?.set_parent(parent);
     }
     Ok(())
   }
@@ -221,31 +262,31 @@ impl Order {
   /// Rotates `slot` above its parent, keeping the order.
   fn rotate_up(&mut self, slot: Slot) -> Result<(), Refusal> {
     let node = *self.node(slot)?;
-    let parent_slot = node.parent.ok_or(Refusal::Missing)?;
+    let parent_slot = node.parent().ok_or(Refusal::Missing)?;
     let parent = *self.node(parent_slot)?;
-    let moved = if parent.left == Some(slot) {
-      self.node_mut(parent_slot)?.left = node.right;
-      self.node_mut(slot)?.right = Some(parent_slot);
-      node.right
+    let moved = if parent.left() == Some(slot) {
+      self.node_mut(parent_slot)?.set_left(node.right());
+      self.node_mut(slot)?.set_right(Some(parent_slot));
+      node.right()
     } else {
-      self.node_mut(parent_slot)?.right = node.left;
-      self.node_mut(slot)?.left = Some(parent_slot);
-      node.left
+      self.node_mut(parent_slot)?.set_right(node.left());
+      self.node_mut(slot)?.set_left(Some(parent_slot));
+      node.left()
     };
     self.set_parent(moved, Some(parent_slot))?;
-    self.relink(parent.parent, parent_slot, Some(slot))?;
-    self.node_mut(slot)?.parent = parent.parent;
-    self.node_mut(parent_slot)?.parent = Some(slot);
+    self.relink(parent.parent(), parent_slot, Some(slot))?;
+    self.node_mut(slot)?.set_parent(parent.parent());
+    self.node_mut(parent_slot)?.set_parent(Some(slot));
     self.update(parent_slot)?;
     self.update(slot)
   }
 
   /// Rotates a new leaf up while its priority is above its parent's, then fixes the lengths above it.
   fn settle(&mut self, slot: Slot) -> Result<(), Refusal> {
-    self.fix_up(self.node(slot)?.parent)?;
+    self.fix_up(self.node(slot)?.parent())?;
     loop {
       let node = *self.node(slot)?;
-      let Some(parent) = node.parent else { break };
+      let Some(parent) = node.parent() else { break };
       if self.node(parent)?.priority >= node.priority {
         break;
       }
@@ -260,9 +301,9 @@ impl Order {
     let mut at = at;
     loop {
       let node = self.node(slot)?;
-      let left = self.total(node.left)?;
+      let left = self.total(node.left())?;
       if at < left {
-        slot = node.left.ok_or(Refusal::Missing)?;
+        slot = node.left().ok_or(Refusal::Missing)?;
         continue;
       }
       let past = at.saturating_sub(left);
@@ -270,20 +311,20 @@ impl Order {
         return Ok((slot, past));
       }
       at = past.saturating_sub(node.len);
-      slot = node.right.ok_or(Refusal::OutOfRange)?;
+      slot = node.right().ok_or(Refusal::OutOfRange)?;
     }
   }
 
   /// `slot`'s offset in the file: O(depth).
   fn rank(&self, slot: Slot) -> Result<u64, Refusal> {
     let mut node = *self.node(slot)?;
-    let mut rank = self.total(node.left)?;
+    let mut rank = self.total(node.left())?;
     let mut child = slot;
-    while let Some(parent_slot) = node.parent {
+    while let Some(parent_slot) = node.parent() {
       let parent = *self.node(parent_slot)?;
-      if parent.right == Some(child) {
+      if parent.right() == Some(child) {
         rank = rank
-          .saturating_add(self.total(parent.left)?)
+          .saturating_add(self.total(parent.left())?)
           .saturating_add(parent.len);
       }
       child = parent_slot;
@@ -295,7 +336,7 @@ impl Order {
   /// The leftmost node of the subtree `slot`.
   fn leftmost(&self, slot: Slot) -> Result<Slot, Refusal> {
     let mut slot = slot;
-    while let Some(left) = self.node(slot)?.left {
+    while let Some(left) = self.node(slot)?.left() {
       slot = left;
     }
     Ok(slot)
@@ -304,7 +345,7 @@ impl Order {
   /// The rightmost node of the subtree `slot`.
   fn rightmost(&self, slot: Slot) -> Result<Slot, Refusal> {
     let mut slot = slot;
-    while let Some(right) = self.node(slot)?.right {
+    while let Some(right) = self.node(slot)?.right() {
       slot = right;
     }
     Ok(slot)
@@ -312,17 +353,17 @@ impl Order {
 
   /// The node after `slot` in file order.
   fn successor(&self, slot: Slot) -> Result<Option<Slot>, Refusal> {
-    if let Some(right) = self.node(slot)?.right {
+    if let Some(right) = self.node(slot)?.right() {
       return self.leftmost(right).map(Some);
     }
     let mut child = slot;
-    let mut parent = self.node(slot)?.parent;
+    let mut parent = self.node(slot)?.parent();
     while let Some(up) = parent {
-      if self.node(up)?.left == Some(child) {
+      if self.node(up)?.left() == Some(child) {
         return Ok(Some(up));
       }
       child = up;
-      parent = self.node(up)?.parent;
+      parent = self.node(up)?.parent();
     }
     Ok(None)
   }
@@ -343,17 +384,17 @@ impl Order {
         }
         Some(root) => (self.rightmost(root)?, false),
       },
-      Some(before) => match self.node(before)?.left {
+      Some(before) => match self.node(before)?.left() {
         None => (before, true),
         Some(left) => (self.rightmost(left)?, false),
       },
     };
     if on_left {
-      self.node_mut(parent)?.left = Some(slot);
+      self.node_mut(parent)?.set_left(Some(slot));
     } else {
-      self.node_mut(parent)?.right = Some(slot);
+      self.node_mut(parent)?.set_right(Some(slot));
     }
-    self.node_mut(slot)?.parent = Some(parent);
+    self.node_mut(slot)?.set_parent(Some(parent));
     self.settle(slot)?;
     Ok(slot)
   }
@@ -366,15 +407,15 @@ impl Order {
       node.identity.saturating_add(offset),
       node.len.saturating_sub(offset),
     );
-    match node.right {
+    match node.right() {
       None => {
-        self.node_mut(slot)?.right = Some(rest);
-        self.node_mut(rest)?.parent = Some(slot);
+        self.node_mut(slot)?.set_right(Some(rest));
+        self.node_mut(rest)?.set_parent(Some(slot));
       }
       Some(right) => {
         let parent = self.leftmost(right)?;
-        self.node_mut(parent)?.left = Some(rest);
-        self.node_mut(rest)?.parent = Some(parent);
+        self.node_mut(parent)?.set_left(Some(rest));
+        self.node_mut(rest)?.set_parent(Some(parent));
       }
     }
     self.update(slot)?;
@@ -387,7 +428,7 @@ impl Order {
   fn delete(&mut self, slot: Slot) -> Result<(), Refusal> {
     loop {
       let node = *self.node(slot)?;
-      let child = match (node.left, node.right) {
+      let child = match (node.left(), node.right()) {
         (None, None) => break,
         (Some(one), None) | (None, Some(one)) => one,
         (Some(left), Some(right)) => {
@@ -400,10 +441,10 @@ impl Order {
       };
       self.rotate_up(child)?;
     }
-    let parent = self.node(slot)?.parent;
+    let parent = self.node(slot)?.parent();
     self.relink(parent, slot, None)?;
     if let Some(place) = self.slots.get_mut(slot) {
-      *place = None;
+      place.len = 0;
       self.free.push(slot);
     }
     self.fix_up(parent)
@@ -432,7 +473,7 @@ pub(crate) struct BytePlaces {
 /// Format: the bytes an index entry is charged: its key and value (module docs, "Bounded and charged").
 const ENTRY_BYTES: usize = size_of::<(u64, Entry)>();
 /// Format: the bytes a node of the latest order is charged.
-const NODE_BYTES: usize = size_of::<Option<OrderNode>>();
+const NODE_BYTES: usize = size_of::<OrderNode>();
 /// Format: the bytes a logged identity is charged.
 const LOGGED_BYTES: usize = size_of::<u64>();
 
@@ -448,7 +489,7 @@ impl BytePlaces {
     }
     let slot = places.order.alloc(0, len);
     places.order.root = Some(slot);
-    places.index.insert(0, Entry::Current(slot));
+    places.index.insert(0, Entry::Current(link(Some(slot))));
     let run = Run {
       source: IDENTITIES,
       at: 0,
@@ -467,12 +508,50 @@ impl BytePlaces {
       .saturating_add(self.logged.saturating_mul(LOGGED_BYTES))
   }
 
+  /// The bytes of what describes the latest version alone: its order's nodes and their entries. Counted as current, not
+  /// history, while the latest is the path's current file, as the current value's list always was.
+  pub(crate) fn current_bytes(&self) -> usize {
+    self
+      .order
+      .nodes()
+      .saturating_mul(NODE_BYTES)
+      .saturating_add(
+        self
+          .index
+          .len()
+          .saturating_sub(self.logged)
+          .saturating_mul(ENTRY_BYTES),
+      )
+  }
+
+  /// The chunks the retained changes stored.
+  pub(crate) fn stored_chunks(&self) -> impl Iterator<Item = usize> + '_ {
+    self
+      .log
+      .iter()
+      .flat_map(|stored| stored.chunks.iter().copied())
+  }
+
+  /// The most [`BytePlaces::change`] of `parts` parts can add to [`BytePlaces::bytes`], without making it. Derived: a part
+  /// cuts at most two nodes (at its ends) and inserts at most one, each with its entry; a removed range logs one
+  /// identity a node it removes and frees that node, which costs more than the identity, so its cuts bound it too.
+  pub(crate) fn change_bound(parts: usize) -> usize {
+    parts.saturating_mul(
+      ENTRY_BYTES
+        .saturating_add(NODE_BYTES)
+        .saturating_add(LOGGED_BYTES)
+        .saturating_mul(3),
+    )
+  }
+
   /// The index's entries.
+  #[cfg(test)]
   pub(crate) fn entries(&self) -> usize {
     self.index.len()
   }
 
   /// The latest version's length.
+  #[cfg(test)]
   pub(crate) fn len(&self) -> Result<u64, Refusal> {
     self.order.len()
   }
@@ -538,9 +617,10 @@ impl BytePlaces {
     if offset > 0 {
       let node = *self.order.node(slot)?;
       let rest = self.order.split(slot, offset)?;
-      self
-        .index
-        .insert(node.identity.saturating_add(offset), Entry::Current(rest));
+      self.index.insert(
+        node.identity.saturating_add(offset),
+        Entry::Current(link(Some(rest))),
+      );
     }
     Ok(())
   }
@@ -556,6 +636,7 @@ impl BytePlaces {
     self.cut(from)?;
     let (chunk, at) = store(from, end.saturating_sub(from))?;
     stored.chunks.push(chunk);
+    let chunk = u32::try_from(chunk).map_err(|_| Refusal::Overflow)?;
     let (mut slot, _) = self.order.find(from)?;
     let mut offset = 0u64;
     while offset < end.saturating_sub(from) {
@@ -599,7 +680,9 @@ impl BytePlaces {
             None
           };
           let slot = self.order.insert_before(before, identity, run.len)?;
-          self.index.insert(identity, Entry::Current(slot));
+          self
+            .index
+            .insert(identity, Entry::Current(link(Some(slot))));
           at = at.checked_add(run.len).ok_or(Refusal::Overflow)?;
           made.push(Part::Added(Run {
             source: IDENTITIES,
@@ -658,11 +741,15 @@ impl BytePlaces {
   fn place_of(&self, entry: Entry) -> Result<(u64, Place), Refusal> {
     match entry {
       Entry::Current(slot) => {
+        let slot = slot_of(slot).ok_or(Refusal::Missing)?;
         let len = self.order.node(slot)?.len;
         let at = self.order.rank(slot)?;
         Ok((len, Place::Current { at, len }))
       }
-      Entry::Stored { chunk, at, len } => Ok((len, Place::Stored { chunk, at, len })),
+      Entry::Stored { chunk, at, len } => {
+        let chunk = usize::try_from(chunk).map_err(|_| Refusal::Overflow)?;
+        Ok((len, Place::Stored { chunk, at, len }))
+      }
     }
   }
 
@@ -794,11 +881,13 @@ mod tests {
         let current = models.last().unwrap().clone();
         let parts = parts_over(current.len() as u64, raw);
         let next = applied(&current, &parts, &post);
+        let bytes_before = places.bytes();
         let made = places.change((step + 1) as u64, &parts, &mut |at, len| {
           chunks.push(current[at as usize..(at + len) as usize].to_vec());
           Ok((chunks.len() - 1, 0))
         }).unwrap();
         parts_made += parts.len();
+        prop_assert!(places.bytes() <= bytes_before + BytePlaces::change_bound(parts.len()));
         let version = trees.rebuild(versions.last().unwrap(), &made).unwrap();
         versions.push(version);
         models.push(next);

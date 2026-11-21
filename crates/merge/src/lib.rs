@@ -39,8 +39,12 @@ mod dims;
 pub mod engine;
 pub mod held;
 mod history;
+#[cfg(test)]
+mod history_reference;
 mod identity;
 pub mod increment;
+#[doc(hidden)]
+pub mod leaf_chunks_bench;
 pub mod map;
 pub mod named;
 pub mod ops_doc;
