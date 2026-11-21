@@ -328,3 +328,7 @@
   (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
   window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
   and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.
+- 2026-11-21 ~02:45 PST: B2 (a) COMPLETE on main: get-file-revs (560ebad9f), export (99ff3b8cb), deltify job
+  (d31502d48, base origin/main at merge). Every reader of a stored text reads one RAM does not hold through the store,
+  each held by a store test red without its wait. New finding (GAPS only): the svn://, svnserve -t and DAV loops have no
+  guard against a drive waiting again for the piece just fetched (the export and deltify jobs have one). Next: B2 (b).
