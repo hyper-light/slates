@@ -381,6 +381,17 @@ pub enum Outcome {
   },
 }
 
+/// Why [`Green::materialize`] refused a build, nothing applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmaterialized {
+  /// The green owes no push.
+  NothingOwed,
+  /// The work is not the owed push's: based elsewhere, or committing as another version.
+  OtherWork,
+  /// The work did not accept against the green's base.
+  NotAccepted,
+}
+
 /// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
 /// its effects kept until [`Green::commit_judged`] commits them as the version after the head it was judged at. A push
 /// judges each of its greens' works so, and commits them only once every one of them accepted: git's atomic push ("Either
@@ -954,6 +965,12 @@ pub struct HeadUnder {
 /// docs, A-534).
 #[derive(Debug, Default)]
 pub struct Green {
+  /// The push this green owes as its next version, not built yet (P2; [`Green::defer`]): its content is its base's until
+  /// [`Green::materialize`] commits the build. None for every green but a created ref's waiting to be first read.
+  owed: Option<crate::push::DeferredPush>,
+  /// The versions recorded after the owed one, met while it is owed (a replay of a chain that went on once the green was
+  /// materialized, then restarted): each applied, in order, once [`Green::materialize`] has committed the owed one.
+  owed_tail: Vec<(Increment, Vec<crate::chain_entry::Applied>)>,
   /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
   /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
   identity: crate::identity::SetHash,
@@ -2078,7 +2095,8 @@ impl Green {
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
-    if at > self.head() || at < self.folded_below || at < self.deltas_from {
+    // A green that owes a push has no content to fold into one (P2): nothing.
+    if self.owed.is_some() || at > self.head() || at < self.folded_below || at < self.deltas_from {
       return None;
     }
     let (copied, listed) = self.copied_at(at);
@@ -5464,6 +5482,63 @@ impl Green {
     indexed.saturating_add(copies)
   }
 
+  /// Makes this green owe `push` as its next version, its work not built (P2; [`crate::push::DeferredPush`]): what a
+  /// created ref's green starts as. Its content stays its base's, and it answers [`Green::is_materialized`] false until
+  /// [`Green::materialize`] commits the build. The version it owes, the one after its head; none, nothing changed, for a
+  /// push not based at the head or a green that owes one already.
+  pub fn defer(&mut self, push: crate::push::DeferredPush) -> Option<u64> {
+    if self.owed.is_some() || push.push().base_version != self.head() {
+      return None;
+    }
+    let version = push.version();
+    self.owed = Some(push);
+    Some(version)
+  }
+
+  /// Whether this green holds its content: false while it owes a push ([`Green::defer`]).
+  pub fn is_materialized(&self) -> bool {
+    self.owed.is_none()
+  }
+
+  /// The push this green owes, if any.
+  pub fn deferred(&self) -> Option<&crate::push::DeferredPush> {
+    self.owed.as_ref()
+  }
+
+  /// The build of the push this green owes, each turn under `pace`: drive it with [`crate::push::Building::advance`]
+  /// over this green and the push's objects, then give its work to [`Green::materialize`]. None when nothing is owed.
+  pub fn materializing(&self, pace: crate::pace::Pace) -> Option<crate::push::Building> {
+    self.owed.as_ref().map(|owed| owed.building(pace))
+  }
+
+  /// Commits `built`, the owed push's work, as the owed version, and clears the debt: the green is then the green the
+  /// eager create made, its version, files, histories, change index and identity alike, since the work is the same
+  /// builder's over the same objects. The versions recorded after it while it was owed are then applied in order
+  /// ([`Green::apply_recorded`]). The head it reaches. Refused, nothing applied, when nothing is owed, when `built` is
+  /// based elsewhere than the owed push, or when it does not commit as the owed version (a build of another push).
+  pub fn materialize(&mut self, built: &Increment) -> Result<u64, Unmaterialized> {
+    let owed = self.owed.as_ref().ok_or(Unmaterialized::NothingOwed)?;
+    let version = owed.version();
+    if built.base != owed.push().base_version || self.head().saturating_add(1) != version {
+      return Err(Unmaterialized::OtherWork);
+    }
+    let judgment = self.judge(built);
+    let Judgment::Accepted(held) = judgment else {
+      return Err(Unmaterialized::NotAccepted);
+    };
+    let (committed, _) = self.commit_held(held);
+    if committed != version {
+      return Err(Unmaterialized::OtherWork);
+    }
+    self.owed = None;
+    // The versions recorded after the owed one, in order, as a replay applies them.
+    let mut head = committed;
+    for (inc, applied) in std::mem::take(&mut self.owed_tail) {
+      head = self.apply_recorded(&inc, &applied);
+    }
+    Ok(head)
+  }
+
   /// Submits an increment: idempotent by identity, decides every dimension of its ops document, and
   /// commits a new version when all accept, or returns the conflict windows and changes nothing.
   /// An accepted increment's outcome is remembered for good (it is in the chain); a rejected one's
@@ -5978,6 +6053,14 @@ impl Green {
     inc: &Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
+    // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
+    // version it stands for is answered, so a replay goes on.
+    if let Some(owed) = &self.owed {
+      let at = u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX);
+      let version = owed.version().saturating_add(at).saturating_add(1);
+      self.owed_tail.push((inc.clone(), applied.to_vec()));
+      return version;
+    }
     // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
     // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
     if let Some(version) = self.accepted.get(&inc.id) {
@@ -6399,7 +6482,8 @@ impl Green {
   /// full copy per edit past what any reader needs. Returns the content and IPC metadata bytes released. Idempotent;
   /// a floor below the current one is a no-op.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
-    if floor <= self.folded_below {
+    // A green that owes a push has no history of the owed version to fold (P2): nothing.
+    if floor <= self.folded_below || self.owed.is_some() {
       return 0;
     }
     // The identity reads its keys' values at the version it was last brought to, so it is brought to the head

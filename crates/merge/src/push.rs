@@ -397,6 +397,182 @@ pub struct Building {
   stage: Stage,
 }
 
+/// A push a green owes as its next version, its work not built (P2, main's ruling of 2026-11-21 05:12; A-647's derived
+/// data): a created ref's green starts owing it, and [`Green::materializing`] builds it a unit a turn when the green is
+/// first reached, over the same [`PushObjects`] a push reads, then [`Green::materialize`] commits it. So the green
+/// materialized is the green the eager create made, by construction: one builder over one input. Held durably as a
+/// record of its own ([`DeferredPush::encode`]), not a chain entry's built work, so a create costs its push's names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeferredPush {
+  /// The push's name.
+  name: [u8; 32],
+  /// Its base version, the green's head when it was owed.
+  base_version: u64,
+  /// The base version's tree; none for a branch with nothing in it.
+  base_tree: Option<ObjectKey>,
+  /// The tree it pushes.
+  tree: ObjectKey,
+  /// The head it sets, in the tool's form.
+  head: Option<Vec<u8>>,
+  /// The room its build runs within.
+  room: u64,
+}
+
+/// Format: a deferred push record's magic, "GDEF" little-endian: a chain record of its own kind, never a chain entry's
+/// ("GCHN"), so a reader of either tells them apart at the first word.
+const DEFERRED_MAGIC: u32 = u32::from_le_bytes(*b"GDEF");
+/// Format: a deferred push record's version; a decoder refuses any other.
+const DEFERRED_VERSION: u32 = 1;
+/// Format: a deferred push record's digest, a BLAKE3 hash of what precedes it.
+const DEFERRED_DIGEST_BYTES: usize = 32;
+/// Format: the byte that marks an optional part present.
+const DEFERRED_PRESENT: u8 = 1;
+/// Format: the byte that marks an optional part absent.
+const DEFERRED_ABSENT: u8 = 0;
+
+impl DeferredPush {
+  /// The push `push` owed, its build within `room` bytes.
+  pub fn of(push: &Push<'_>, room: u64) -> DeferredPush {
+    DeferredPush {
+      name: push.name,
+      base_version: push.base_version,
+      base_tree: push.base_tree,
+      tree: push.tree,
+      head: push.head.map(<[u8]>::to_vec),
+      room,
+    }
+  }
+
+  /// The push owed.
+  pub fn push(&self) -> Push<'_> {
+    Push {
+      name: self.name,
+      base_version: self.base_version,
+      base_tree: self.base_tree,
+      tree: self.tree,
+      head: self.head.as_deref(),
+    }
+  }
+
+  /// The version it is owed as: the one after its base.
+  pub fn version(&self) -> u64 {
+    self.base_version.saturating_add(1)
+  }
+
+  /// Its build, each turn under `pace`.
+  pub fn building(&self, pace: Pace) -> Building {
+    Building::new(&self.push(), self.room, pace)
+  }
+
+  /// Its record: the magic, the version, the push and its room, and the digest of them.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&DEFERRED_MAGIC.to_le_bytes());
+    out.extend_from_slice(&DEFERRED_VERSION.to_le_bytes());
+    out.extend_from_slice(&self.name);
+    out.extend_from_slice(&self.base_version.to_le_bytes());
+    out.extend_from_slice(&self.room.to_le_bytes());
+    put_key(&mut out, Some(&self.tree));
+    put_key(&mut out, self.base_tree.as_ref());
+    match &self.head {
+      Some(head) => {
+        out.push(DEFERRED_PRESENT);
+        out.push(u8::try_from(head.len()).unwrap_or(u8::MAX));
+        out.extend_from_slice(head.get(..usize::from(u8::MAX)).unwrap_or(head));
+      }
+      None => out.push(DEFERRED_ABSENT),
+    }
+    let digest = *blake3::hash(&out).as_bytes();
+    out.extend_from_slice(&digest);
+    out
+  }
+
+  /// Whether `record` is a deferred push's record, by its magic alone.
+  pub fn is_record(record: &[u8]) -> bool {
+    record.get(..4) == Some(DEFERRED_MAGIC.to_le_bytes().as_slice())
+  }
+
+  /// The push a record holds; none for bytes that are not one whole and intact (another magic or version, a digest that
+  /// does not match, a part cut short or longer than its kind, bytes past the end).
+  pub fn decode(record: &[u8]) -> Option<DeferredPush> {
+    let body_len = record.len().checked_sub(DEFERRED_DIGEST_BYTES)?;
+    let (body, digest) = record.split_at_checked(body_len)?;
+    if blake3::hash(body).as_bytes().as_slice() != digest {
+      return None;
+    }
+    let mut reader = DeferredReader { bytes: body };
+    if reader.u32()? != DEFERRED_MAGIC || reader.u32()? != DEFERRED_VERSION {
+      return None;
+    }
+    let name = <[u8; 32]>::try_from(reader.take(32)?).ok()?;
+    let base_version = reader.u64()?;
+    let room = reader.u64()?;
+    let tree = reader.key()??;
+    let base_tree = reader.key()?;
+    let head = match reader.take(1)?.first()? {
+      &DEFERRED_PRESENT => {
+        let len = usize::from(*reader.take(1)?.first()?);
+        Some(reader.take(len)?.to_vec())
+      }
+      &DEFERRED_ABSENT => None,
+      _ => return None,
+    };
+    reader.bytes.is_empty().then_some(DeferredPush {
+      name,
+      base_version,
+      base_tree,
+      tree,
+      head,
+      room,
+    })
+  }
+}
+
+/// Appends an optional object key: a marker, then its length and bytes.
+fn put_key(out: &mut Vec<u8>, key: Option<&ObjectKey>) {
+  match key {
+    Some(key) => {
+      out.push(DEFERRED_PRESENT);
+      out.push(u8::try_from(key.as_bytes().len()).unwrap_or(u8::MAX));
+      out.extend_from_slice(key.as_bytes());
+    }
+    None => out.push(DEFERRED_ABSENT),
+  }
+}
+
+/// A reader over a deferred push's record: every take bounded by what is left, `None` past it.
+struct DeferredReader<'a> {
+  bytes: &'a [u8],
+}
+
+impl<'a> DeferredReader<'a> {
+  fn take(&mut self, len: usize) -> Option<&'a [u8]> {
+    let (taken, rest) = self.bytes.split_at_checked(len)?;
+    self.bytes = rest;
+    Some(taken)
+  }
+
+  fn u32(&mut self) -> Option<u32> {
+    Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+  }
+
+  fn u64(&mut self) -> Option<u64> {
+    Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+  }
+
+  /// An optional key: none when the record is cut short or names a key longer than [`LONGEST_ID`]; `Some(None)` absent.
+  fn key(&mut self) -> Option<Option<ObjectKey>> {
+    match *self.take(1)?.first()? {
+      DEFERRED_PRESENT => {
+        let len = usize::from(*self.take(1)?.first()?);
+        Some(Some(ObjectKey::new(self.take(len)?)?))
+      }
+      DEFERRED_ABSENT => Some(None),
+      _ => None,
+    }
+  }
+}
+
 /// A [`Push`] owned across turns.
 struct OwnedPush {
   name: [u8; 32],
