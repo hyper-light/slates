@@ -87,7 +87,11 @@
 >   slices behind the lane's 8 spinners on 4 vCPU. The shard count does not move them (run 44884432328: loaded accept
 >   p99 0.27-5.0 ms and p999 3.3-6.0 ms at 1, 2 and 4 shards). The macOS hop split (run 44888851325; BENCHMARKS "arm C"):
 >   the client's loaded round-trip p99 is 6.8-8.1 ms. The tail requests are replies written after the step that took
->   them (resumed or forwarded verbs), which the ring stamp does not cover yet. That hop is next. The busy path's
+>   them (resumed or forwarded verbs). **Take 2 (run 44934263888) named the hop:** with those replies stamped, every
+>   request joins, and 574-580 of each round's 580 loaded p99-tail requests are such deferred replies, almost all
+>   waiting in taken -> written (tail median 4.4-7.6 ms, against 0.9-2.7 ms queued and 3-15 µs for the client's own
+>   wake). Deferred taken -> written p99 is 5.8-8.1 ms loaded and 0.24-0.46 ms quiet; a sync reply's is 59-176 µs
+>   loaded. So the macOS loaded tail is the forward to the owner shard and back, not the client's wake. The busy path's
 >   zero-timeout kevent took at least 1 ms in 9-12% of its calls loaded (up to 4 ms; quiet 7-47 calls). The runner's
 >   kevent and ulock timeouts are late about 200 µs at the median, nanosleep 1.7-2.5 ms.
 > - Windows (CI, run 44857045148): no 1 ms band (queued p99 5–49 µs); accept p99 0.13–0.31 ms, conflict 0.11–0.29 ms;
