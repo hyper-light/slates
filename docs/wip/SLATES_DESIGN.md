@@ -2305,7 +2305,8 @@ threshold; racy window = the base filesystem's timestamp granularity (from a cit
 table keyed by the type `statfs` reports) plus the measured clock resolution; watcher coalescing
 window = measured p50 inter-arrival of event bursts; descriptor budget for large-class copy-ups =
 `RLIMIT_NOFILE` (or the Windows handle budget) minus the daemon's measured steady-state use,
-divided by the measured number of concurrently open large-class files.
+divided by the measured number of concurrently open large-class files; the daemon first raises its soft
+`RLIMIT_NOFILE` to min(hard limit, the platform's cap) at its start (A-837).
 
 **Worked example.** `cargo build` in a clone creates 190k files under `target/`: each create
 touches its directory (mostly current-epoch nodes, mutated in place after the first touch), the

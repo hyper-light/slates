@@ -838,6 +838,114 @@ pub fn descriptor_limit() -> Option<u64> {
   Some(WINDOWS_HANDLE_LIMIT)
 }
 
+/// What raising the descriptor limit at a daemon's start did (A-837), for the boot profile: the soft limit before, the
+/// hard limit and the platform's own cap it was raised toward, the soft limit after, and whether the kernel refused the
+/// raise. `None` is unlimited, or not read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorRaise {
+  /// The soft limit before.
+  pub before: Option<u64>,
+  /// The hard limit.
+  pub hard: Option<u64>,
+  /// The platform's cap on a process's descriptors (Linux `fs.nr_open`, macOS `kern.maxfilesperproc`).
+  pub cap: Option<u64>,
+  /// The soft limit after.
+  pub after: Option<u64>,
+  /// Whether the kernel refused the raise (the soft limit then stays where it was).
+  pub refused: bool,
+}
+
+/// The soft descriptor limit to set at a daemon's start (A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"),
+/// from the soft and hard limits and the platform's cap, each `None` where unlimited: the lower of the hard limit and the
+/// cap, and only when it raises the soft one; `None` (nothing to set) where the soft limit already reaches it or no
+/// finite target binds. A process may raise its soft limit to its hard one unprivileged, and the kernel refuses past
+/// its cap (Linux `fs.nr_open` even under an unlimited hard limit, macOS `kern.maxfilesperproc`), so the cap is a bound.
+/// Never lowers: a soft limit an operator set higher than this target is left alone.
+#[must_use]
+pub fn raised_descriptor_soft(
+  soft: Option<u64>,
+  hard: Option<u64>,
+  cap: Option<u64>,
+) -> Option<u64> {
+  let target = match (hard, cap) {
+    (Some(hard), Some(cap)) => hard.min(cap),
+    (Some(bound), None) | (None, Some(bound)) => bound,
+    (None, None) => return None,
+  };
+  soft.filter(|soft| *soft < target).map(|_| target)
+}
+
+/// Raises this process's soft descriptor limit as [`raised_descriptor_soft`] decides (A-837), keeping the hard one,
+/// and says what it did. Called once, at a daemon's start, before any shard opens a descriptor.
+#[cfg(unix)]
+#[must_use]
+pub fn raise_descriptor_limit() -> DescriptorRaise {
+  use rustix::process::{Resource, getrlimit, setrlimit};
+  let limit = getrlimit(Resource::Nofile);
+  let cap = descriptor_cap();
+  let (before, hard) = (limit.current, limit.maximum);
+  let Some(target) = raised_descriptor_soft(before, hard, cap) else {
+    return DescriptorRaise {
+      before,
+      hard,
+      cap,
+      after: before,
+      refused: false,
+    };
+  };
+  let raised = rustix::process::Rlimit {
+    current: Some(target),
+    maximum: hard,
+  };
+  let refused = setrlimit(Resource::Nofile, raised).is_err();
+  DescriptorRaise {
+    before,
+    hard,
+    cap,
+    after: getrlimit(Resource::Nofile).current,
+    refused,
+  }
+}
+
+/// The paired arm: Windows has no descriptor rlimit to raise; its handle table's ceiling is [`descriptor_limit`]'s.
+#[cfg(not(unix))]
+#[must_use]
+pub fn raise_descriptor_limit() -> DescriptorRaise {
+  let limit = descriptor_limit();
+  DescriptorRaise {
+    before: limit,
+    hard: limit,
+    cap: limit,
+    after: limit,
+    refused: false,
+  }
+}
+
+/// Linux's cap on a process's descriptors, `fs.nr_open`: `setrlimit` refuses a soft or hard limit past it, an unlimited
+/// hard limit included (`kernel/sys.c`, `do_prlimit`).
+#[cfg(target_os = "linux")]
+fn descriptor_cap() -> Option<u64> {
+  std::fs::read_to_string("/proc/sys/fs/nr_open")
+    .ok()?
+    .trim()
+    .parse::<u64>()
+    .ok()
+    .filter(|cap| *cap > 0)
+}
+
+/// macOS's cap on a process's descriptors, `kern.maxfilesperproc`: past it `setrlimit` refuses `EINVAL`, an unlimited
+/// hard limit included.
+#[cfg(target_os = "macos")]
+fn descriptor_cap() -> Option<u64> {
+  platform::sysctl_u64(c"kern.maxfilesperproc").filter(|cap| *cap > 0)
+}
+
+/// The paired arm for another Unix: no cap read, the hard limit alone binds.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn descriptor_cap() -> Option<u64> {
+  None
+}
+
 /// The most mappings this process may hold: Linux's `vm.max_map_count`, past which `mmap` refuses `ENOMEM` (65,530 by
 /// default). Read from the kernel rather than assumed, since a host may raise it. `None` off Linux, whose kernels set no
 /// such count (macOS and Windows bound a process's mappings by memory alone). The direct map's copies each hold a
@@ -1512,6 +1620,44 @@ mod platform {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-837 (the descriptor backstop: the daemon raises its soft limit at start). Do: decide the soft limit to set over
+  /// the shapes each platform presents (a soft limit under a finite hard one; the hard one past the platform's cap; an
+  /// unlimited hard limit with a cap, as Linux's `fs.nr_open` and macOS's `kern.maxfilesperproc` bind it; a soft limit
+  /// already at or past its target; an unlimited soft one; nothing finite at all). Expect: the lower of the hard limit and
+  /// the cap, only where it raises the soft one; never a lower soft limit; nothing where no finite target binds.
+  #[test]
+  fn a837_the_soft_descriptor_limit_is_raised_to_the_lower_of_hard_and_cap_and_never_lowered() {
+    // Linux under systemd's LimitNOFILE: soft 1,024, hard 524,288, fs.nr_open 1,048,576.
+    assert_eq!(
+      raised_descriptor_soft(Some(1_024), Some(524_288), Some(1_048_576)),
+      Some(524_288)
+    );
+    // macOS: soft 256, hard unlimited, kern.maxfilesperproc 245,760.
+    assert_eq!(
+      raised_descriptor_soft(Some(256), None, Some(245_760)),
+      Some(245_760)
+    );
+    // A hard limit past the cap: the cap.
+    assert_eq!(
+      raised_descriptor_soft(Some(256), Some(1 << 30), Some(61_440)),
+      Some(61_440)
+    );
+    // No cap read: the hard limit.
+    assert_eq!(
+      raised_descriptor_soft(Some(256), Some(4_096), None),
+      Some(4_096)
+    );
+    // Already at the target, or past it (an operator's higher soft limit): nothing to set, never lowered.
+    assert_eq!(raised_descriptor_soft(Some(4_096), Some(4_096), None), None);
+    assert_eq!(
+      raised_descriptor_soft(Some(1 << 20), Some(1 << 20), Some(1 << 16)),
+      None
+    );
+    // An unlimited soft limit, or nothing finite to raise toward: nothing to set.
+    assert_eq!(raised_descriptor_soft(None, Some(4_096), None), None);
+    assert_eq!(raised_descriptor_soft(Some(256), None, None), None);
+  }
 
   /// A cgroup limit file's text becomes a bound only when it is a plain byte count; `max`, an empty
   /// file and hostile text (signs, suffixes, spaces inside, a number past `u64`) are no bound at

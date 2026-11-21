@@ -21,6 +21,12 @@
 > close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
+> **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):
+> part 1 landed:** the daemon raises its soft `RLIMIT_NOFILE` at start to min(hard, the platform's cap: Linux
+> `fs.nr_open`, macOS `kern.maxfilesperproc`), never lowering it, Windows none; the boot profile's `descriptor_limit`
+> line names before, hard, cap and after (`a837_the_soft_descriptor_limit_is_raised_...`, a re-invoked child raised from
+> 64). **Open:** (2) the learned ceiling (the count at the first `EMFILE`/`ENFILE`, the lower of it and the rlimit); (3)
+> every host open, accept and memfd meeting exhaustion a typed refusal with a counter.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
