@@ -57972,6 +57972,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
 > fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
 
+> **Status (2026-11-20, the standing grant's `G` row).** `StoreRoot` keeps the grant it was opened under;
+> `Store::open` finds its `G` row (keyed by `grant_id`: the directory's device and inode, hashed) or puts it and
+> checkpoints the engine before anything lands, so the grant is recorded once and kept as first issued;
+> `StoreHandle::grant` is the id each landing's header names (the creation's since this change). Held by
+> `a_stores_standing_grant_is_recorded_once_and_found_after_a_crash` (`tests/store.rs`) and the creation test's
+> provenance check (`repository/store_tests.rs`). Owed: the audit position (a standing-grant audit kind) and revocation.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
