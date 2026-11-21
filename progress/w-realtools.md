@@ -48,3 +48,7 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   Open in GAPS: the WinFsp port of the flows; memory pressure from a host actually short of memory.
 - 17:40 PST: WinFsp port LANDED 9793d9218 (+ GAPS 3620554c6); macOS 4/4 in 44.71 s. Windows and Linux runs filed.
   Close list C1-C4 done. Branch agents/w-realtools deleted once landed.
+- 21:05 PST: close list done; nothing new is addressed to me. My Linux FUSE and Windows WinFsp run requests
+  (run-requests.md) haven't been run yet. Landed worktree removed. Kept: the clone ~/slates-work/w-realtools (to make a
+  worktree again if the first Windows build needs a fix), ~/.cache/w-realtools-target.noindex (4.7 GB), and
+  ~/.cache/w-realtools-clone on adas-macbook-pro-2. Studio-4's root-owned dead mount kiln-01a1f9e974cb... is still Ada's.
