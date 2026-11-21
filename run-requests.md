@@ -7007,3 +7007,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
   `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
 - 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.
+- w-shared, record plane (8f04c9130): RSS and time of one 64, 128, 256 and 320 MiB holder submit's placement, before
+  (c990989f7^) and after, release, on the big Studio (`SLATES_A697_BENCH_FRESH=1 SLATES_A697_BENCH_MIB=<n>
+  SLATES_A697_BENCH_RUNS=1 cargo test --release -p slates-server --test fleet bench_a697 -- --ignored --nocapture`).
+  Red would be the after's peak RSS or placement time growing with size squared, or a watchdog end (exit 4).

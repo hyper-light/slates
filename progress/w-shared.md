@@ -352,3 +352,6 @@ Queue (briefs/w-shared.md): 1. A-664 part 3's commit (g308) + follow-ons; 2. A-6
   disk=60g. kiln: "queued; link down 3, haven't answered 3, not macos 3, under strain 1 (the big Studio d1323898...)".
 NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and their whole archive on every shipment
   pass (size squared, one owner step each); building the fix with an RSS-bound test.
+
+## LANDED 2026-11-20 ~22:50 PST: record plane, inputs archived once = 8f04c9130 (main c990989f7). Exit 4 open until kiln r9
+  (queued) reports. Family three: kiln r11 started on adacachy (green running). Next: land sweep-3 on r11 green; read r9.
