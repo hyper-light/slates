@@ -1585,6 +1585,7 @@ impl ShardContext {
     let mut lost = false;
     let g222_began = slates_machine::clock::monotonic_ns();
     let mut g222_kicked = 2u64;
+    let mut g222_kick = (u64::MAX, u64::MAX);
     match self.entry {
       Some(entry) => {
         // A tracking shard counts its voluntary switches as the wait begins, so a kicked park can tell a
@@ -1606,6 +1607,15 @@ impl ShardContext {
           Parked::Waited(Some(woken)) => u64::from(woken.kicked_ns.is_some()),
           Parked::Waited(None) => 2,
         };
+        // When the kick came after the wait began, and how long the wake took after it.
+        if let Parked::Waited(Some(woken)) = parked
+          && let Some(kicked) = woken.kicked_ns
+        {
+          g222_kick = (
+            kicked.saturating_sub(woken.waiting_ns),
+            woken.returned_ns.saturating_sub(kicked),
+          );
+        }
         if let Parked::Waited(Some(woken)) = parked {
           self.note_wake(entry, woken, switches_before_wait);
         }
@@ -1616,6 +1626,7 @@ impl ShardContext {
       deadline_ns.map_or(u64::MAX, |d| d.saturating_sub(g222_began)),
       slates_machine::clock::monotonic_ns().saturating_sub(g222_began),
       g222_kicked,
+      g222_kick,
     );
     self.wait_ended();
     if lost {

@@ -58,6 +58,14 @@ const COMPLETION_NUDGE: [u8; 8] = 1u64.to_ne_bytes();
 #[doc(hidden)]
 #[allow(clippy::disallowed_types)]
 pub static G222_LAST_STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main): client sends, and those that rang a shard announced idle.
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_SENDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Diagnostic only (g222, never main).
+#[doc(hidden)]
+#[allow(clippy::disallowed_types)]
+pub static G222_RINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A request as the daemon end hands it to the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -665,6 +673,10 @@ impl ClientEnd {
     let announced = self.region.daemon_parked()?;
     let parked =
       crate::doorbell::after_publishing_idle_announced(|| announced.load(Ordering::Relaxed) != 0);
+    G222_SENDS.fetch_add(1, Ordering::Relaxed);
+    if parked {
+      G222_RINGS.fetch_add(1, Ordering::Relaxed);
+    }
     if parked {
       self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
       if let Some(bell) = &self.doorbell {

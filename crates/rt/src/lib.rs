@@ -113,14 +113,14 @@ pub fn g222_raise_qos() {
 pub mod g222_parks {
   use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
   pub const CAP: usize = 600_000;
-  pub static ROWS: [[AtomicU64; 3]; CAP] = [const { [const { AtomicU64::new(0) }; 3] }; CAP];
+  pub static ROWS: [[AtomicU64; 5]; CAP] = [const { [const { AtomicU64::new(0) }; 5] }; CAP];
   pub static N: AtomicUsize = AtomicUsize::new(0);
   pub fn dump(path: &str) {
     use std::io::Write;
     let n = N.load(Relaxed).min(CAP);
-    let mut out = String::from("timeout\twaited\tended\n");
+    let mut out = String::from("timeout\twaited\tended\tkick_after\twake_after\n");
     for row in ROWS.iter().take(n) {
-      out.push_str(&format!("{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed)));
+      out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed), row[2].load(Relaxed), row[3].load(Relaxed), row[4].load(Relaxed)));
     }
     if let Ok(mut f) = std::fs::File::create(path) {
       let _ = f.write_all(out.as_bytes());
@@ -130,13 +130,15 @@ pub mod g222_parks {
 }
 
 #[doc(hidden)]
-pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64) {
+pub(crate) fn g222_park(timeout: u64, waited: u64, ended: u64, kick: (u64, u64)) {
   use std::sync::atomic::Ordering::Relaxed;
   let n = g222_parks::N.fetch_add(1, Relaxed);
   if let Some(row) = g222_parks::ROWS.get(n) {
     row[0].store(timeout, Relaxed);
     row[1].store(waited, Relaxed);
     row[2].store(ended, Relaxed);
+    row[3].store(kick.0, Relaxed);
+    row[4].store(kick.1, Relaxed);
   }
 }
 

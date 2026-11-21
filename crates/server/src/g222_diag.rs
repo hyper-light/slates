@@ -88,7 +88,11 @@ pub fn ring(landed: u64, taken: u64, written: u64) {
 pub fn dump_ring(path: &str) {
   use std::io::Write;
   let n = RING_TAKEN.load(Relaxed).min(RING_CAP);
-  let mut out = String::from("queued\tserved\n");
+  let mut out = format!(
+    "# client sends {} rings {}\nqueued\tserved\n",
+    slates_ipc::endpoint::G222_SENDS.swap(0, Relaxed),
+    slates_ipc::endpoint::G222_RINGS.swap(0, Relaxed)
+  );
   for row in RING.iter().take(n) {
     out.push_str(&format!("{}\t{}\n", row[0].load(Relaxed), row[1].load(Relaxed)));
   }
