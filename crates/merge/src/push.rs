@@ -489,7 +489,7 @@ impl DeferredPush {
 
   /// Whether `record` is a deferred push's record, by its magic alone.
   pub fn is_record(record: &[u8]) -> bool {
-    record.get(..4) == Some(DEFERRED_MAGIC.to_le_bytes().as_slice())
+    record.get(..size_of::<u32>()) == Some(DEFERRED_MAGIC.to_le_bytes().as_slice())
   }
 
   /// The push a record holds; none for bytes that are not one whole and intact (another magic or version, a digest that
@@ -509,14 +509,7 @@ impl DeferredPush {
     let room = reader.u64()?;
     let tree = reader.key()??;
     let base_tree = reader.key()?;
-    let head = match reader.take(1)?.first()? {
-      &DEFERRED_PRESENT => {
-        let len = usize::from(*reader.take(1)?.first()?);
-        Some(reader.take(len)?.to_vec())
-      }
-      &DEFERRED_ABSENT => None,
-      _ => return None,
-    };
+    let head = reader.head()?;
     reader.bytes.is_empty().then_some(DeferredPush {
       name,
       base_version,
@@ -553,11 +546,28 @@ impl<'a> DeferredReader<'a> {
   }
 
   fn u32(&mut self) -> Option<u32> {
-    Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(
+      self.take(size_of::<u32>())?.try_into().ok()?,
+    ))
   }
 
   fn u64(&mut self) -> Option<u64> {
-    Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
+    Some(u64::from_le_bytes(
+      self.take(size_of::<u64>())?.try_into().ok()?,
+    ))
+  }
+
+  /// The optional head: its marker, then its length and bytes; none when the record is cut short or the marker is
+  /// neither; `Some(None)` absent.
+  fn head(&mut self) -> Option<Option<Vec<u8>>> {
+    match *self.take(1)?.first()? {
+      DEFERRED_PRESENT => {
+        let len = usize::from(*self.take(1)?.first()?);
+        Some(Some(self.take(len)?.to_vec()))
+      }
+      DEFERRED_ABSENT => Some(None),
+      _ => None,
+    }
   }
 
   /// An optional key: none when the record is cut short or names a key longer than [`LONGEST_ID`]; `Some(None)` absent.

@@ -894,6 +894,33 @@ fn completed_reply(
   }
 }
 
+/// The owed green's version 1 durable, its chain entry the push's record (not a work) and shorter than the eager
+/// green's.
+fn owed_is_its_record(state: &ShardState, (owed, eager): (DbVolumeId, DbVolumeId)) {
+  let partition = state.db.partition();
+  assert_eq!(partition.green_head(owed), 1, "the owed version is durable");
+  let owed_entry = partition
+    .green_chain(owed)
+    .first()
+    .cloned()
+    .expect("the owed entry");
+  let eager_entry = partition
+    .green_chain(eager)
+    .first()
+    .cloned()
+    .expect("the eager entry");
+  assert!(
+    slates_merge::push::DeferredPush::is_record(&owed_entry),
+    "the push's record, not a work"
+  );
+  assert!(
+    owed_entry.len() < eager_entry.len(),
+    "{} against {}",
+    owed_entry.len(),
+    eager_entry.len()
+  );
+}
+
 /// P2 (main's ruling of 2026-11-21 05:12; w-git's request): a created ref's green owes its push and is made when first
 /// reached. Do: push one change creating branch `eager` with its built work and one creating `owed` deferring the same
 /// tree (`BranchChange::CreateDeferred`); read `owed` around the door; fold and checkpoint it; then create a work over it
@@ -959,28 +986,7 @@ fn a_deferred_create_is_made_when_first_reached_and_reads_as_the_eager_create() 
       reached + 1,
       "the reach counted"
     );
-    let partition = state.db.partition();
-    assert_eq!(partition.green_head(owed), 1, "the owed version is durable");
-    let owed_entry = partition
-      .green_chain(owed)
-      .first()
-      .cloned()
-      .expect("the owed entry");
-    let eager_entry = partition
-      .green_chain(eager)
-      .first()
-      .cloned()
-      .expect("the eager entry");
-    assert!(
-      slates_merge::push::DeferredPush::is_record(&owed_entry),
-      "the push's record, not a work"
-    );
-    assert!(
-      owed_entry.len() < eager_entry.len(),
-      "{} against {}",
-      owed_entry.len(),
-      eager_entry.len()
-    );
+    owed_is_its_record(state, (owed, eager));
     crate::merge_service::checkpoint_green(state, owed);
     assert!(
       state.db.partition().green_checkpoint(owed).is_none(),

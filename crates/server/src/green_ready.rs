@@ -367,7 +367,7 @@ fn dematerialize(state: &mut ShardState, green: DbVolumeId) -> bool {
   let Some(slates_db::catalog::MemberOrigin::Branch { from, version }) = partition
     .repositories()
     .member(green)
-    .map(|member| member.origin.clone())
+    .map(|member| member.origin)
   else {
     return false;
   };

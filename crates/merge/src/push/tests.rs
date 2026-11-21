@@ -1582,18 +1582,20 @@ fn a_push_over_a_flat_tree_is_built_a_unit_at_a_time_over_many_turns() {
   assert!(turns > FILES as u64, "{turns} turns for {FILES} files");
 }
 
-/// What a green reads as, for P2's oracle: its head, its head identity, its files at every version, the paths each
-/// version changed, the history it retains, and its checkpoint at the head.
-fn reads_of(
-  green: &mut Green,
-) -> (
+/// A green's reads, as [`reads_of`] takes them: its head, its head identity, its files at every version, the paths
+/// each version changed, the history it retains, and its checkpoint at the head.
+type GreenReads = (
   u64,
   [u8; 32],
   Vec<Vec<(String, Vec<u8>)>>,
   Vec<Vec<String>>,
   usize,
   Option<Vec<u8>>,
-) {
+);
+
+/// What a green reads as, for P2's oracle: its head, its head identity, its files at every version, the paths each
+/// version changed, the history it retains, and its checkpoint at the head.
+fn reads_of(green: &mut Green) -> GreenReads {
   let head = green.head();
   let files = (0..=head)
     .map(|version| {
@@ -1646,6 +1648,65 @@ fn a_green_that_owes_a_push_materializes_to_the_eager_create() {
     .unwrap();
 }
 
+/// `push`'s record round-trips; `owing` defers it at `version`, reads its base meanwhile (no checkpoint, no fold), and
+/// materializes it, built in turns. The record.
+fn owing_took_the_record(
+  owing: &mut Green,
+  (push, version): (&Push<'_>, u64),
+  store: &Store,
+) -> Vec<u8> {
+  let record = DeferredPush::of(push, u64::MAX).encode();
+  let owed = DeferredPush::decode(&record).expect("the record decodes");
+  assert_eq!(
+    owed,
+    DeferredPush::of(push, u64::MAX),
+    "the record round-trips"
+  );
+  let before = reads_of(owing);
+  assert_eq!(owing.defer(owed.clone()), Some(version));
+  assert!(!owing.is_materialized());
+  assert!(
+    owing.checkpoint(owing.head()).is_none(),
+    "an owing green's checkpoint is nothing"
+  );
+  assert_eq!(
+    owing.fold_history_before(owing.head()),
+    0,
+    "an owing green's fold is nothing"
+  );
+  assert_eq!(owing.head(), before.0, "the owing green reads its base");
+  assert_eq!(
+    owing.files_at(before.0).len(),
+    before.2.last().unwrap().len()
+  );
+  let (made, _) = built_in_turns(&owing.deferred().unwrap().push(), owing, store, 3);
+  assert_eq!(owing.materialize(&made.unwrap().increment), Ok(version));
+  assert!(owing.is_materialized());
+  record
+}
+
+/// `replayed` defers the push its `record` holds at `version` and materializes it as a replay does, a pace's advances
+/// to the end; a second materialization owes nothing.
+fn replayed_from_record(replayed: &mut Green, record: &[u8], version: u64, store: &Store) {
+  assert_eq!(
+    replayed.defer(DeferredPush::decode(record).unwrap()),
+    Some(version)
+  );
+  let mut building = replayed
+    .materializing(crate::pace::Pace::unbounded())
+    .unwrap();
+  let made = loop {
+    if let Some(made) = building.advance(replayed, store) {
+      break made.unwrap();
+    }
+  };
+  assert_eq!(replayed.materialize(&made.increment), Ok(version));
+  assert_eq!(
+    replayed.materialize(&made.increment),
+    Err(crate::engine::Unmaterialized::NothingOwed)
+  );
+}
+
 /// One history of [`a_green_that_owes_a_push_materializes_to_the_eager_create`].
 fn owed_history(steps: &[Vec<Option<(u8, bool)>>]) {
   let mut store = Store::default();
@@ -1667,51 +1728,8 @@ fn owed_history(steps: &[Vec<Option<(u8, bool)>>]) {
       Outcome::Accepted { version }
     );
 
-    let record = DeferredPush::of(&push, u64::MAX).encode();
-    let owed = DeferredPush::decode(&record).expect("the record decodes");
-    assert_eq!(
-      owed,
-      DeferredPush::of(&push, u64::MAX),
-      "the record round-trips"
-    );
-    let before = reads_of(&mut owing);
-    assert_eq!(owing.defer(owed.clone()), Some(version));
-    assert!(!owing.is_materialized());
-    assert!(
-      owing.checkpoint(owing.head()).is_none(),
-      "an owing green's checkpoint is nothing"
-    );
-    assert_eq!(
-      owing.fold_history_before(owing.head()),
-      0,
-      "an owing green's fold is nothing"
-    );
-    assert_eq!(owing.head(), before.0, "the owing green reads its base");
-    assert_eq!(
-      owing.files_at(before.0).len(),
-      before.2.last().unwrap().len()
-    );
-    let (made, _) = built_in_turns(&owing.deferred().unwrap().push(), &owing, &store, 3);
-    assert_eq!(owing.materialize(&made.unwrap().increment), Ok(version));
-    assert!(owing.is_materialized());
-
-    assert_eq!(
-      replayed.defer(DeferredPush::decode(&record).unwrap()),
-      Some(version)
-    );
-    let mut building = replayed
-      .materializing(crate::pace::Pace::unbounded())
-      .unwrap();
-    let made = loop {
-      if let Some(made) = building.advance(&replayed, &store) {
-        break made.unwrap();
-      }
-    };
-    assert_eq!(replayed.materialize(&made.increment), Ok(version));
-    assert_eq!(
-      replayed.materialize(&made.increment),
-      Err(crate::engine::Unmaterialized::NothingOwed)
-    );
+    let record = owing_took_the_record(&mut owing, (&push, version), &store);
+    replayed_from_record(&mut replayed, &record, version, &store);
 
     if n % 3 == 2 {
       let floor = eager.head();
