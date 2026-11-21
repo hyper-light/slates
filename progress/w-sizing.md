@@ -126,7 +126,17 @@ Plan: a section per pool extent, closed when wholly free; the anchor holds each 
 - R2 macOS variance: NOT the pressure hold (injected readings, branch agents/w-sizing-r2hold ea004b541, both red:
   591 / 340 MiB kept; content object 0-2 MiB). Residual = process heap/buffers -> R3. GAPS corrected c131361d3.
   R2 CLOSED (close note). Branch agents/w-sizing-r2hold holds the two-test refactor (red; not landed).
-- Then R3 with w-hg + w-store.
+- w-lint pieces: recovery.rs sleeps -- already gone (A-777 removed that test); slates-server unsafe budget -- LANDED
+  d15a7fc45 (merge 39aa0995d): macOS open+retry one site, budget 10 (6 + macOS 1 + Windows 3). Replied
+  inbox/w-lint-from-w-sizing.md.
+- R3 NEXT: hg history push on the big Studio with `slates status --json` memory kinds (segment/content/arenas/regions/
+  heap) after the push and after 20 s idle, rev 39aa0995d: script ~/.cache/w-sizing-logs/hgmem.sh (+ hgmem-cmd.txt).
+  Blocked at 20:40: the big Studio had 5 GB free (needs ~6.2 GB at peak); it is the only runner with uvx and the
+  dataset (~/.cache/w-hg-mem/hg). w-hg/w-store have not answered inbox/w-hg-from-w-sizing-r3.md yet.
+- R3 measurement QUEUED as kiln r46 on d1323898 (main's order): `on` + mem refuses at once when memory is short, so the
+  run asks no memory and waits on the machine itself until 8 GiB is free (<= 2 h, then NO-ROOM), then pushes hg's
+  history at 39aa0995d and prints RSS + status memory kinds after the push and after 20 s idle. Kiln reports its end.
+- Branches: agents/w-sizing-r2win already deleted at landing; agents/w-sizing-r2hold (red experiment) deleted; none left.
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =

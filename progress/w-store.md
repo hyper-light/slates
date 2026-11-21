@@ -1,5 +1,11 @@
 # w-store progress (brief: briefs/w-store.md)
 
+## State (2026-11-20 ~21:30 PST)
+- LANDED 71db6d157: memtable held at 8/128 GiB profiles (slates-api store_sizing test; red 128 GiB Gone on the old
+  formula); owner's sliced landing (StoreHandle::begin -> SlicedLanding section/part/commit, drop abandons). slates-store
+  20/20. Told w-hg, w-perf, w-svn; close note appended. NEXT: C4 with w-hg (rerun its store test on main), C5 w-git,
+  C6 w-svn import over the sliced landing. GAPS owed: group commit (device flush rate), Windows store_root, grant audit.
+
 ## State (2026-11-20 ~19:30 PST) — CLOSE LIST (briefs/close-list.md): C2, C3, C4-C6
 - C2 landed in steps on origin/main: a9fd63be1 (slates_rt::sync, safe channel), 1b02c30b4 (retirement Reaper,
   RtError::Capacity, race2), ee0661c06 (vendor/mantle engine/chunk/disk/crc/codec @ mantle 87ab09e1; hyper-block issuer

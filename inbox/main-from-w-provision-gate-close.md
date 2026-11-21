@@ -28,3 +28,14 @@ spinning and parked).
 
 P2 (the loaded p99) is open: both candidates are measured, neither landed (loaded p999 2-10x worse, CPU 2-6x); BENCHMARKS
 "R9's loaded p99 on macOS, the candidates".
+
+# P2 CLOSED on data (2026-11-20 ~21:30 PST): main's nap kept, options 2 and 3 measured and rejected
+
+**Item:** P2, the loaded p99 (1.6 ms; the macOS zero-timeout kevent), fixed red first with g222. Main's 20:03 ruling: A/B
+option 3 against main on four conditions; land only if all four hold, else keep the nap and close on the record.
+**Commit on origin/main:** a38630375 (BENCHMARKS "R9's loaded p99 on macOS: options 2 and 3 measured and rejected", GAPS
+8a-r9-gate closed), on top of the measurements in 8edfb763e and 99c599ce5.
+**Measurement:** release, 3 interleaved rounds of 3 runs, all shown, macOS arm64 M4 Max, host load 2.7-21.7. Option 3
+failed all four: quiet CPU 5.7-10.0 vs 1.6-1.7 cores; loaded p999 10.1-12.7 vs 2.1-3.4 ms; loaded p99 better in 2 of 3
+rounds only; quiet p99 82 us in round 2. Option 2 failed alike. Branch agents/w-provision-gate-kqueue deleted.
+The gate's loaded bound stays red on macOS: R9 under load unmet there, no daemon lever found, recorded.

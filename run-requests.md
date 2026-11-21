@@ -6996,3 +6996,14 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   `REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200`, with `netstat -s -p udp | grep
   "full socket"` read before and after. What it would show: if the window stops come with a rise in full-socket-buffer
   drops, the receive buffer is the lane's bound.
+
+## 2026-11-20, w-reaper: A-645 (a), svn's revprop rows by use (lands as the commit after b7cfb02fc; see the A-738 design entry, "fifth piece")
+- macOS with stock Subversion 1.15 and room to build (Studio-1 has svn 1.15.0 but 693 MB free):
+  `SLATES_TEST_CLI=1 cargo test -p slates-cli --test svn_interop -- a_repository_policys_hook_lets_stock_svn_change_a_revision_property a_revision_property_change_without_a_hook --nocapture`.
+  Then w-interop's matrix revprop-svn and revprop-ssh rows (an anchor given `--vcs-store DIR`).
+- Linux the same: the view mounts through FUSE (`fusermount3`), and `crates/server/src/fuse.rs`'s turn change is
+  compiled only there. Clippy for Linux, please (`fuse.rs` `turn_with`'s `lent_if` closure).
+- Red would look like: E200007 with `UNGRANTED_WORDS` (no --vcs-store given), or "could not show this repository's hook
+  its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
+  `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
+- 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.

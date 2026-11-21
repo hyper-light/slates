@@ -1,3 +1,9 @@
+# RESUME HERE (2026-11-20 ~20:45 PST): CLOSE LIST DONE
+- C1 (goal 91) closed: inbox/main-from-w-fed-faults-close.md 7aa3c86; kiln 73712cc last. All six flows PASS on macOS;
+  killed/restarted/partitioned PASS on Linux; Linux link flows filed for main's lane (run-requests a89aeaa).
+- C2 (goal 85c) closed: slates c733506 (GAPS), live_chaos client-killed-mid-write PASSED macOS (9.3 s); inbox 7d202fd.
+- Nothing in flight; adacachy unit w-fed-faults-linux stopped.
+
 # RESUME HERE (2026-11-20 ~21:00Z, Mac Studio d1323898; supersedes everything below)
 - LANDED: kiln 30c5929 (A-580), e33c470 (A-708), 0edd8dc + e3e5d7b (A-734), ed8991d (A-750); slates a5140de
   (fleet.rs:4819), 51a061d (A-764: credentials are fleet state; red by use in w-balance's v3_takeover, 401 -> the

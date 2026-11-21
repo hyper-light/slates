@@ -111,3 +111,25 @@
 ## State found at start
 - On main already (g255): A-475 (dead clients by hang-up), A-522, A-536, A-554, A-570. Queue item 1 DONE on main.
 - reap_loop on main ran process_base_hints + delegation::drain and seal_idle_content at LIVENESS_BUDGET_NS.
+
+## 2026-11-20 ~21:30 PST: A-645 (a), svn's revprop rows (close-list item)
+- Landed: part 1 f532cdd54 (`vcs_store::svn_presenter`: the FSFS view laid into a volume of referenced files; texts
+  by identity through `ViewTexts` = HeadTexts; `fsfs::RevisionFile::pieces`; `WithTexts` answers no delta, so texts are
+  PLAIN). Part 2a 1c5b77fc1 (`StoreRoot::mount_point`; every view file is a referenced file, so the chunk store stays
+  empty and a read can run inside `vcs_store::lent_state`).
+- Left, part 2b/2c (the plan):
+  1. Config `vcs_view_root: Option<&'static StoreRoot>` (role/daemon.rs opens a second StoreRoot under the same grant
+     and leaks it). ShardState `root_mount` becomes `hook_views` (Presented(root) | Given(path) for the unit tests via
+     `record_root_mount` | none, refused typed "no standing grant").
+  2. `run_svn_hook`: REPOS = present-and-mount on the repository's owner shard (xshard). The view volume is made with
+     `verbs::create` under a name hashed to the owner shard (`.svn-view.<repo>.<n>`). The presenter advances, then the
+     mount: a child `slates --instance I mount --read-only NAME <store>/<repo>.svn`, spawned like hook_driver.
+  3. Serving: nfs.rs `with_export` and fuse.rs turns, for a view volume, run inside `lent_state` and lend
+     `ViewTexts` via a new `VolumeBridge::reading_referenced(seam)` (bridge-core read: `read_referenced`).
+  4. By-use red: `svn_interop::a_repository_policys_hook_lets_stock_svn_change_a_revision_property` with
+     `--vcs-store`; the hook runs `svnlook youngest $1`. Stock svn 1.15 only on Studio-1 (693 MB free).
+- A-748 Windows check: kiln r1 (needs windows) is building `vcs_edge_restart` in C:\Users\corph\w-reaper-win.
+- ~22:45 PST: part 2b/2c landed, 5c90dbcbe (in origin/main at e95c5009e). A configured hook's REPOS-PATH is the view
+  mounted at `<--vcs-store>/<repository>.svn`; the root-mount refusal is gone. Owed to main: the by-use run
+  (run-requests.md), Linux clippy of fuse.rs, and two GAPS items (the revprop refresh is linear; the view isn't
+  unmounted with its repository). w-interop told.

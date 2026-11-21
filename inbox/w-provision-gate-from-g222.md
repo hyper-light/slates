@@ -145,3 +145,21 @@ get a CPU for a millisecond. The ping-pong threads sleep between hand-offs and a
 My earlier "park at once" zeroed only the window; the holds still spun. Running now (diag-measurer-g222-10): no window
 **and** no hold (`G222_NO_SPIN`, `G222_NO_HOLD`) against main's, one binary, the floor each round. If the band empties,
 Linux's fix is the hold rule (yours, A-387) telling an oversubscribed machine not to spin — we should land it together.
+
+## 2026-11-20 21:35 PST — finding 8: Linux's band is none of: the epoll ms (fixed, on main), idle spin, holds, a 100 µs slice, pinning
+
+All on CI ubuntu-24.04-arm, A-224's lane (the bench reports 4 cores and starts 8 spinners and 3 shards: the user
+scope's `AllowedCPUs` is not enforced there, so the lane is 4 CPUs at two spinners each), one binary per run with the
+timerfd fix, env-switched, interleaved 3 rounds; "1 ms parks" = parks that waited 0.95–1.10 ms of ~100,000 a run.
+
+| run | arm | queued p99 µs | queued p999 µs | 1 ms parks a run |
+|---|---|---|---|---|
+| 44861831509 | main / no spin + no hold | 1,010–1,011 / 1,008 | 1,040–1,233 / 1,026–1,215 | 12,700–13,800 / 14,900–16,200 |
+| 44863105516 | main / slice 100 µs / slice + no spin | 1,010–1,011 / 1,005–1,009 / 1,001–1,003 | 1,026–1,197 / 1,019–1,026 / 1,008–1,024 | 13,000–15,000 / 12,100–12,900 / 14,000–16,200 |
+| 44865071559 | main / unpinned | 1,010–1,011 / 1,012–1,014 | 1,024–1,191 / 2,996–3,000 | 13,600–14,700 / 4,100–6,000 |
+
+- Unpinned shards cut the 1 ms parks threefold but make the queued p999 and the submit p99 worse (accept 5.2–11.0 ms).
+- The lane's own floor (ping-pong beside the bench, every run): p99 4.6–5.1 µs, p999 0.8–2.8 ms. So on this lane the
+  daemon's p99 can be < 1 ms by the floor, and the p999 floor is above 1 ms (0.8–2.8 ms).
+- Open: what holds a woken shard thread for one tick when a woken ping-pong thread runs at once. Next I'd stamp the
+  scheduler's own view (`/proc/self/task/*/schedstat` wait time per shard thread) around a band request.

@@ -50,3 +50,13 @@
 - Left in GAPS: one row's text is still deltified whole within its step.
 - C2 status: waiting on w-store's answer about how the server opens a repository's Store (inbox
   w-store-from-w-svn-stored-form-2026-11-20.md). Next: P6 svn:// update 5.6 s vs 2.7 s.
+
+## C2 svn onto the changeset store -- IN PROGRESS
+- Part 1 LANDED 00ff3b25c. A client's svn commit (land_work: svn://, svn+ssh, DAV) lands its revision as one
+  changeset through the shard's StoreHandle: sequence = revision, judged over the one before, Record section = the
+  revision's record. The client is answered once it is durable.
+- Test: a_subversion_commit_lands_as_a_changeset_in_the_store. Red first on the real store: the log recovered from its
+  files holds the creation and revision 1.
+- Replay from the store waits on w-store for a section read through the owner, and on your ruling with w-store on
+  whether recovery replays from the store or the register (inbox w-store-from-w-svn-replay-2026-11-20.md).
+- Next while waiting: green-made versions' changesets. Then an import as one changeset (its sequence rule asked).

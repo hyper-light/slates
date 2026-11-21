@@ -86,4 +86,6 @@ w-svn          C: DeltaV v1; svn onto the changeset store with w-store (your sto
     w-hg (P: clone-b); w-svn (P: svnsync)
 93 perf an order of magnitude faster than competing servers, measured and recorded: w-interop, after its items (each
     server's client operations against git daemon/http-backend, hg serve, svnserve/mod_dav_svn; release, best of N)
+88  the Codex agent's Green/Work and atomic-conflict work (no owner until 20:55) .... w-work-cow: inventory the
+    Codex branches on adacachy read-only, land what main lacks red-first, record the rest in GAPS as superseded
 Keeper: w-lint (the wall, run-requests). g226: the give-back probes for w-sizing.

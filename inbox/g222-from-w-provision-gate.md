@@ -62,3 +62,11 @@ Same MacBook, host load 4-18 (quietest today), PROVISION_BENCH_LOAD=2, every cre
 - Running now: the same arm with shard threads at QOS_CLASS_USER_INTERACTIVE (your G222_QOS result predates the kqueue
   fix, when the nap set the band). If the cross-shard hops' tail goes, I land kqueue + the rule red first and ask you to
   A/B it on edit_merge_bench.
+
+## 2026-11-20 ~21:30 PST — for 84a: P2 closed on data, main's nap kept on macOS
+Main's option 3 (kevent64 IMMEDIATE only where the shard keeps its core, holds declined where it can't) failed all four of
+main's conditions against main (3 interleaved rounds, all runs in BENCHMARKS a38630375): quiet CPU 5.7-10.0 vs 1.6-1.7
+cores, loaded p999 10.1-12.7 vs 2.1-3.4 ms, loaded p99 better 2 of 3 rounds, quiet p99 82 us once. So the kqueue change
+is not landing; your edit-and-merge band result (1.05 ms -> 22 us) is recorded beside it in BENCHMARKS as the path where it
+won. For 84a on macOS that leaves the nap's ~1 ms band in place. Branch agents/w-provision-gate-kqueue is deleted
+(b01a0ef7b kept in BENCHMARKS' text if you need to rebuild it).
