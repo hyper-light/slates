@@ -706,6 +706,24 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
     .copied()
     .unwrap_or(0);
   eprintln!("refinement: {turns} turns, past 1/2/4/16 quanta: {past:?}, longest {longest} us");
+  let submit_longest = counts
+    .get("merge.submit.longest_step_us")
+    .copied()
+    .unwrap_or(0);
+  let submit_past = counts
+    .get("merge.submit.steps_past_ceiling")
+    .copied()
+    .unwrap_or(0);
+  eprintln!("submit: longest step {submit_longest} us, steps past the ceiling {submit_past}");
+  // The submits' phases summed over the three submits, microseconds, for the record: where the step's time goes.
+  let phase = |name: &str| counts.get(name).copied().unwrap_or(0) / 1_000;
+  eprintln!(
+    "submit phases (us, summed): compose {}, secure {}, judge {}, append {}",
+    phase("merge.submit.compose_ns"),
+    phase("merge.submit.secure_ns"),
+    phase("merge.submit.judge_ns"),
+    phase("merge.submit.append_ns")
+  );
   drop(client);
   daemon.stop();
   assert!(
@@ -726,4 +744,23 @@ fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
     "the head is the re-indented file with the edit"
   );
   assert!(turns > 50, "the refinement ran over many turns: {turns}");
+  // The formatter's submit waited on its refinement, and the refinement job prepared its increment, its verdict and
+  // its encoding a bounded slice a turn, which the submit took (A-787 part 3): its step judges by position and commits.
+  // Its commit's history re-anchor (A-818's) and the chain's append still run in that step; the step's bound is held
+  // once A-818's engine switch lands (GAPS).
+  assert!(submit_longest > 0, "the submit's steps were measured");
+  let slices = counts
+    .get("merge.submit.prepare_slices")
+    .copied()
+    .unwrap_or(0);
+  let taken = counts
+    .get("merge.submit.prepared_taken")
+    .copied()
+    .unwrap_or(0);
+  eprintln!("prepare: {slices} slices, {taken} parts taken");
+  assert!(slices > 2, "the prepare was sliced: {slices}");
+  assert_eq!(
+    taken, 3,
+    "the increment, its encoding and its verdict taken"
+  );
 }
