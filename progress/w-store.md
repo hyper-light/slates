@@ -6,6 +6,10 @@
   back on slates_rt; ranges left out; block_on, spawn_detached, Reaper::shutdown, cell set_limit). Unit tests on
   slates_rt: engine 155/155, chunk 52/52, hyper-block 101/101, rt sync 11/11 + retirement 3/3 (macOS arm64,
   Adas-Mac-Studio-2; TMPDIR=~/.cache/w-store-tmp; own target ~/.cache/w-store-local-target.noindex).
+- 5cda65490 store RSS red test (tests/memory.rs): 192 MiB landed, RSS 6->71 MiB vs bound 142 (release), 7->73/143
+  (debug). C4-C6 now in the tools' hands: w-hg (agents/w-hg-c1, server adapter + hg_push::land onto vcs_disk), w-git
+  (C5 left with w-store), w-svn (its C2 waits on the wiring, now landed). My part: pair on each landing + RSS test.
+  GAPS owed: Windows store_root; StoreGrant durable audit record; server Sizing fanout measured; owner piece copies.
 - C4 groundwork: 2ab6c3717 --vcs-store; daemon holds StoreOwner, ShardState::vcs_disk per shard; store_root portable
   (Windows Unsupported). Notes sent to w-hg/w-git/w-svn. NEXT: pair on each tool's landing + RSS red test (C4 hg first).
 - C4 groundwork landed: 6ad443338 (w-lint literals fixed), baa28bfab (owner thread + StoreHandle). Replies sent:
