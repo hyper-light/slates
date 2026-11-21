@@ -226,23 +226,24 @@ fn counts(state: &ShardState) -> (u64, u64) {
 /// made and none refused. Red before the commit was made: `main` was listed at nothing.
 #[test]
 fn t_a664_p3_a_submitted_version_is_a_commit_a_clone_fetches() {
-  let (clone, made, dated) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "made");
-    let before = wall_seconds();
-    let ops = vec![
-      mkdir("/d"),
-      create("/d/a", b"alpha"),
-      create("/f", b"hello"),
-      executable("/d/a"),
-    ];
-    version(state, green, 1, ops);
-    let after = wall_seconds();
-    (
-      cloned(state, repository, "main"),
-      counts(state),
-      (before, after),
-    )
-  });
+  let (clone, made, dated) =
+    crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
+      let (repository, green) = git_repository(state, "made");
+      let before = wall_seconds();
+      let ops = vec![
+        mkdir("/d"),
+        create("/d/a", b"alpha"),
+        create("/f", b"hello"),
+        executable("/d/a"),
+      ];
+      version(state, green, 1, ops);
+      let after = wall_seconds();
+      (
+        cloned(state, repository, "main"),
+        counts(state),
+        (before, after),
+      )
+    });
   let expected = listing(&[
     ("d/a", Mode::Executable, b"alpha"),
     ("f", Mode::File, b"hello"),
@@ -369,18 +370,19 @@ fn t_a664_p3_a_branchs_first_made_commit_names_the_commit_it_was_made_at() {
 /// its tree holding both versions' files.
 #[test]
 fn t_a664_p3_a_commit_git_refuses_is_not_made_and_its_successor_holds_both() {
-  let (unmade, clone, made) = crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
-    let (repository, green) = git_repository(state, "refused");
-    version_saying(state, (green, 1), vec![create("/f", b"one")], "one\0two");
-    let key = green_key(to_db_volume(green));
-    let held = state
-      .vcs_stores
-      .git_ref(repository)
-      .map(|(_, git)| git.versions(key).len());
-    let unmade = (counts(state), held, records(state, repository).len());
-    version(state, green, 2, vec![create("/g", b"two")]);
-    (unmade, cloned(state, repository, "main"), counts(state))
-  });
+  let (unmade, clone, made) =
+    crate::test_store::audit_on_stored_shard("vcs_store-commits", |state| {
+      let (repository, green) = git_repository(state, "refused");
+      version_saying(state, (green, 1), vec![create("/f", b"one")], "one\0two");
+      let key = green_key(to_db_volume(green));
+      let held = state
+        .vcs_stores
+        .git_ref(repository)
+        .map(|(_, git)| git.versions(key).len());
+      let unmade = (counts(state), held, records(state, repository).len());
+      version(state, green, 2, vec![create("/g", b"two")]);
+      (unmade, cloned(state, repository, "main"), counts(state))
+    });
   assert_eq!(unmade, ((0, 1), Some(0), 1));
   assert_eq!(parents_of(&clone.text), Vec::<ObjectId>::new());
   let expected = listing(&[("f", Mode::File, b"one"), ("g", Mode::File, b"two")]);

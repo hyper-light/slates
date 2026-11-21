@@ -209,7 +209,12 @@ fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
 /// Starts node `node` as an anchor of the fleet in `manifest` with its HTTP edge on loopback and its changeset store in
 /// `store` (`--vcs-store`; C5: a daemon without one makes no git repository), and reads its lines until its daemon
 /// serves and its edge's port and issuer surface are named (echoing each to standard error).
-fn start_node(instance: &str, manifest: &str, node: &str, (held, store): (&HeldBlock, &str)) -> Node {
+fn start_node(
+  instance: &str,
+  manifest: &str,
+  node: &str,
+  (held, store): (&HeldBlock, &str),
+) -> Node {
   use std::os::fd::AsRawFd;
   let [probe, record] = held.sockets.as_slice() else {
     panic!("a node's block is its probe and record ports");

@@ -168,7 +168,8 @@ fn t_a724_a_repository_over_its_share_drops_fragments_only_where_rebuilding_cost
 /// snapshot and naming it; beside another, at most that, the slot divided between them.
 #[test]
 fn t_a724_a_repositorys_room_is_bounded_by_its_partitions_snapshot_slot() {
-  crate::test_store::audit_on_stored_shard_configured("vcs_share", 
+  crate::test_store::audit_on_stored_shard_configured(
+    "vcs_share",
     |state| {
       let toy = git_repository(state, "toy");
       let other = git_repository(state, "other");

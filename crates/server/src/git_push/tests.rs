@@ -843,7 +843,8 @@ const CREATES: usize = 24;
 /// holds its commit.
 #[test]
 fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
-  let refused = crate::test_store::audit_on_stored_shard_configured("git-push", 
+  let refused = crate::test_store::audit_on_stored_shard_configured(
+    "git-push",
     |state| {
       let repository = git_repository(state, "chains");
       let pack = pack_of(scenario!("create").request);
@@ -1932,7 +1933,10 @@ fn t_a767_c5_a_rebuild_reads_a_records_names_back_from_the_nodes_store() {
     home, owner_shard,
     "the names' home is the owner shard: the case reads nothing from the region"
   );
-  assert!(fetched, "the names were not read back from the node's store");
+  assert!(
+    fetched,
+    "the names were not read back from the node's store"
+  );
   let (whole, compared) = std::sync::mpsc::channel();
   crate::daemon::observe_at(&daemon, partition, move |state| {
     crate::vcs_store::tests::assert_made_again_whole(

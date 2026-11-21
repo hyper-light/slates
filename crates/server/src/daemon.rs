@@ -7166,8 +7166,8 @@ mod limits {
 
 #[cfg(test)]
 pub(crate) use tests::{
-  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_daemon_of_configured, audit_on_shard,
-  audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
+  audit_daemon, audit_daemon_configured, audit_daemon_of, audit_daemon_of_configured,
+  audit_on_shard, audit_on_shard_configured, hold_busy, observe_at, observe_first, test_profile,
 };
 
 #[cfg(test)]
