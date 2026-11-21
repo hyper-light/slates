@@ -34,7 +34,7 @@ use slates_vfs::base::{Diverged, Divergence};
 use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
-use slates_vfs::volume::{Store, Volume};
+use slates_vfs::volume::Volume;
 
 use crate::error::refusal_of_vfs;
 use crate::state::{ShardState, VolumeSlot};
@@ -43,10 +43,6 @@ use crate::state::{ShardState, VolumeSlot};
 /// for each byte it grows by (`crate::verbs::admit`), as the work it mounts is charged for what it holds; that budget
 /// is the mount's bound, as it is the work's, so a quota of its own would only refuse a write the work could make.
 const MOUNT_QUOTA_NONE: u64 = u64::MAX;
-/// Format: the permission bits a seeded directory takes (the green records none for a directory).
-const SEEDED_DIR_MODE: u32 = 0o755;
-/// Format: the permission bits a seeded file takes when the green records none.
-const SEEDED_FILE_MODE: u32 = 0o644;
 
 /// A mounted work's base: its green and the version the mount reads, kept readable while the mount lives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,47 +149,6 @@ pub(crate) fn source<'a>(
 ) -> Option<(crate::greens::GreenRef<'a>, u64)> {
   let pin = mounted.get(&volume)?;
   Some((greens.get(&pin.green)?, pin.version))
-}
-
-/// Creates `path` in `volume` with `bytes`, making its missing parent directories.
-fn seed_file(
-  volume: &mut Volume,
-  store: &mut Store,
-  path: &str,
-  bytes: &[u8],
-) -> Result<(), VfsError> {
-  let mut parts = path.split('/').filter(|part| !part.is_empty()).peekable();
-  let mut dir = directory(volume, store, "")?;
-  let mut walked = String::new();
-  while let Some(part) = parts.next() {
-    if parts.peek().is_none() {
-      let file = volume.create_file(store, dir, part, SEEDED_FILE_MODE)?;
-      volume.write(store, file, 0, bytes)?;
-      return Ok(());
-    }
-    if !walked.is_empty() {
-      walked.push('/');
-    }
-    walked.push_str(part);
-    dir = match directory(volume, store, &walked) {
-      Ok(found) => found,
-      Err(VfsError::NotFound) => volume.mkdir(store, dir, part, SEEDED_DIR_MODE)?,
-      Err(other) => return Err(other),
-    };
-  }
-  Err(VfsError::NotFound)
-}
-
-/// The directory at `path` in `volume`'s head.
-fn directory(
-  volume: &Volume,
-  store: &Store,
-  path: &str,
-) -> Result<slates_mem::Handle<slates_vfs::dir::DirNode>, VfsError> {
-  match volume.resolve(store, path)?.child {
-    Child::Dir(dir) => Ok(dir),
-    _ => Err(VfsError::NotDirectory),
-  }
 }
 
 /// The one splice that turns `old` into `new`: `(at, delete_len, insert)` with `insert` the range of `new` put at
@@ -457,11 +412,14 @@ fn declared(reply: ReplyBody) -> Result<(), Refusal> {
   }
 }
 
-/// The store-backed view of green `id`'s head, for a landing (§4.15 over §4.16, A-774 piece 3): a slot under the
-/// green's own id holding its head's files and symlinks, so the landing engine plans, presents and lands it as it
-/// does any volume's head, under the same grant (R10). Kept while the green's head stays where it was made, and made
-/// again once the head moves, so a presentation and the granted landing after it read one state. A named snapshot of a
-/// green is refused: a green's versions are its snapshots, and only its head lands.
+/// The store-backed view of green `id`'s head, for a landing (§4.15 over §4.16, A-774 parts 1 and 3): a slot under the
+/// green's own id, an overlay over the green at its head read where it lies (as a mount's, [`ensure_slot`]), its tree
+/// loaded (its directories listed, each entry an inode, no byte copied) so the landing's snapshot holds every entry. The
+/// landing plans its whole tree and reads each file from the green a window at a time
+/// (`slates_land::engine::Beginning::materializing`), under the grant any volume's landing takes (R10). Kept while the
+/// green's head stays where it was made, and made again once the head moves, so a presentation and the granted landing
+/// after it read one state. A named snapshot of a green is refused: only its head lands. Before part 3 the view was a
+/// scratch volume holding a copy of the head: presenting a 64 MiB green's landing added 72 MB resident.
 pub(crate) fn ensure_green_view(
   state: &mut ShardState,
   id: DbVolumeId,
@@ -487,66 +445,93 @@ pub(crate) fn ensure_green_view(
     return Ok(());
   }
   release(state, id);
-  let admitted = crate::verbs::admit(
+  let pin = MountPin {
+    green: id,
+    version: head,
+  };
+  let admitted = crate::verbs::admit_over(
     state,
     &record.owner,
-    SizeClass::Dynamic {
-      max: MOUNT_QUOTA_NONE,
+    (
+      SizeClass::Dynamic {
+        max: MOUNT_QUOTA_NONE,
+      },
+      NamePolicy::Exact,
+      false,
+    ),
+    crate::verbs::AdmitBase::Tree {
+      identity: identity(pin),
     },
-    NamePolicy::Exact,
-    false,
-    None,
   )
   .map_err(|reply| match *reply {
     ReplyBody::Refused { refusal } => refusal,
     _ => Refusal::NotFound,
   })?;
   let crate::verbs::Admitted {
-    mut volume,
+    volume,
     host,
     credits,
   } = admitted;
-  let seeded = {
-    let (greens, store) = (&state.greens, &mut state.store);
-    match greens.get(&id) {
-      Some(green) => seed_green(&green, store, &mut volume),
-      None => Err(VfsError::StaleHandle),
-    }
-  };
-  if let Err(e) = seeded {
-    crate::verbs::discard_admitted(
-      state,
-      crate::verbs::Admitted {
-        volume,
-        host,
-        credits,
-      },
-    );
-    return Err(refusal_of_vfs(&e));
-  }
   install(state, (id, record.name), volume, host, credits)?;
   state.merge.green_views.insert(id, head);
+  if let Err(e) = load_tree(state, id) {
+    release(state, id);
+    return Err(refusal_of_vfs(&e));
+  }
   Ok(())
 }
 
-/// Writes `green`'s head into `volume`: its files, then its symlinks.
-fn seed_green(
-  green: &slates_merge::engine::Green,
-  store: &mut Store,
-  volume: &mut Volume,
-) -> Result<(), VfsError> {
-  for (path, bytes) in green.files() {
-    seed_file(volume, store, &path, bytes)?;
-  }
-  for (path, target) in green.symlinks() {
-    let (parent, name) = match path.rsplit_once('/') {
-      Some((parent, name)) => (parent, name),
-      None => ("", path.as_str()),
-    };
-    let dir = directory(volume, store, parent)?;
-    volume.symlink(store, dir, name, target)?;
+/// Lists every directory of green view `id`'s tree through its base, so each entry is an inode of the view (no byte read).
+/// Proportional to the green's paths (owed: a unit at a time under the shard's slice).
+fn load_tree(state: &mut ShardState, id: DbVolumeId) -> Result<(), VfsError> {
+  let ShardState {
+    store,
+    volumes,
+    by_id,
+    greens,
+    merge,
+    ..
+  } = state;
+  let handle = *by_id.get(&id).ok_or(VfsError::StaleHandle)?;
+  let lent = view_source(greens, &merge.green_views, id);
+  let tree = lent
+    .as_ref()
+    .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+  let slot = volumes.get_mut(handle).map_err(|_| VfsError::StaleHandle)?;
+  let mut lens = None;
+  let Some(host) = slot.host.as_mut() else {
+    return Err(VfsError::StaleHandle);
+  };
+  let host = lend(host, tree.as_ref(), &mut lens);
+  let mut overlay = slot.volume.with_host(host);
+  let Child::Dir(root) = overlay.resolve(store, "")?.child else {
+    return Err(VfsError::NotDirectory);
+  };
+  let mut stack = vec![root];
+  while let Some(dir) = stack.pop() {
+    let names: Vec<String> = overlay
+      .readdir(store, dir)?
+      .into_iter()
+      .filter(|row| row.kind == slates_vfs::inode::Kind::Dir)
+      .map(|row| row.name.to_owned())
+      .collect();
+    for name in names {
+      if let Child::Dir(child) = overlay.lookup(store, dir, &name)?.child {
+        stack.push(child);
+      }
+    }
   }
   Ok(())
+}
+
+/// The green tree green view `id` reads: the green, lent from `greens`, at the head its view was made at.
+pub(crate) fn view_source<'a>(
+  greens: &'a crate::greens::Greens,
+  views: &GreenViews,
+  id: DbVolumeId,
+) -> Option<(crate::greens::GreenRef<'a>, u64)> {
+  let version = views.get(&id)?;
+  Some((greens.get(&id)?, *version))
 }
 
 /// Registers `volume` as the slot of merge volume `id` named `name`, or discards it with its credits.

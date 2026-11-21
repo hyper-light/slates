@@ -41,6 +41,9 @@ const LINK_PERMISSIONS: u32 = 0o777;
 /// Format: the one instant every entry of a tree shows: a fixed time, never zero (hosts report zero for "no birth time
 /// recorded", so a real stamp is never it); its value is the tree's, never compared with a clock's.
 const TREE_INSTANT_NS: i64 = 1_000_000_000;
+/// Format: the host clock's reading, one second past every entry's instant, so no entry is ever within a timestamp
+/// granularity of a reading (the racy rule, §4.5: a tree never changes, so nothing it shows is racy).
+const TREE_CLOCK_NS: i64 = 2_000_000_000;
 /// Format: the root directory's handle.
 const ROOT: HostDir = HostDir(1);
 
@@ -233,7 +236,7 @@ impl HostFs for TreeHost {
   }
 
   fn now_ns(&mut self) -> i64 {
-    TREE_INSTANT_NS
+    TREE_CLOCK_NS
   }
 }
 
@@ -331,6 +334,6 @@ impl HostFs for TreeLens<'_> {
   }
 
   fn now_ns(&mut self) -> i64 {
-    TREE_INSTANT_NS
+    TREE_CLOCK_NS
   }
 }
