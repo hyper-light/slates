@@ -26,3 +26,10 @@
   snapshot, the takeover and the injected pressure. The FIFO-held #pragma once compile and make stay Unix-only.
 - macOS re-run after the port: 4 passed in 44.71 s, adas-macbook-pro-2.local, base 9793d9218.
 - Windows and Linux runs are filed in run-requests.md. The Windows build is unverified, since I compile macOS only.
+## Brief lines closed on re-examination (2026-11-21 ~16:05 PST)
+- On origin/main: 1d14aa65 (the held #pragma once compile under clang, gcc and cc, as the brief's "clang and gcc
+  where present" asks), 69a06d89 (A-781's status line names the acceptance flows), 7acdf392 (every real-tools step
+  bounded at 300 s), and 7e1657ac7 (GAPS: the Studio NFS first-opendir stall, routed to g224).
+- Proof: adas-macbook-pro-2 (macOS arm64, debug, base 7acdf39, one run as main allowed): the pragma test passed in
+  29.32 s under clang, gcc and cc, fmt clean, nothing left mounted. On Studio-2 the same test fails in 305 s, naming
+  the stall (g224's bug).

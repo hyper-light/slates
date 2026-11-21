@@ -85,3 +85,7 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   agents/w-realtools-93 (1d14aa65, 69a06d89, 7acdf392) waits for one green run on a Mac where mounts work (asked main
   about adas-macbook-pro-2). r14 (the same test at 9793d9218 on Studio-2, to tell a regression from the host) is lost
   while Studio-2 doesn't answer; I check for and clean any mount it left.
+- 16:05 PST: LANDED 7acdf392 (+ 1d14aa65, 69a06d89) and GAPS 7e1657ac7; green on adas-macbook-pro-2 in 29.32 s.
+  Branch agents/w-realtools-93 deleted. Studio-2 checked clean (r14 left nothing). The Studio stall is g224's.
+  Nothing of my brief, close list or goal-93 piece is left open on my side; the Linux, Windows and jupiter runs are
+  main's (run-requests.md).
