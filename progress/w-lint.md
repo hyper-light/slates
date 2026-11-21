@@ -332,3 +332,8 @@
   svn_presenter (w-reaper). `xtask unsafe` refused "no room here now" twice; the rest waits for room.
 - Round 19 at 481d7abef: debug eprintlns removed from the hg replay; replay_sliced -> open_record; t_a729 split; svn
   examples handle Importing::Base; hg SEGMENT_VERSION Format; svn_commit PieceOf alias. give_up -> w-git.
+
+## 2026-11-21 ~10:50 round on 37c7a1691 (main's 10:35 word)
+- made_commit.rs give_up annotated as having no caller yet, naming w-git's C5 2b piece 3 (1cfbe14d9, main f917e1ce4);
+  one-line note to w-rewrite-ops (inbox/w-rewrite-ops-from-w-lint.md). Host clean but for w-hg's intake helper;
+  literals clean but for w-store's three; fmt, structural, unsafe, the six cross targets clean.
