@@ -335,3 +335,87 @@ pub(crate) fn create_on(
     std::thread::yield_now();
   }
 }
+
+/// Lands `parts` under `header` through `disk` and waits for the store's answer, for a test's synchronous history on a
+/// shard: the landing runs on a thread of its own with a runtime of its own, which parks until the store's owner
+/// answers (the shard's own thread cannot wait on a wake its runtime would deliver). Whether it landed.
+pub(crate) fn land_blocking(
+  disk: StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> bool {
+  std::thread::scope(|scope| {
+    scope
+      .spawn(move || {
+        waiting_runtime()
+          .block_on(async move { disk.land(header, parts).await.is_ok() })
+          .unwrap_or(false)
+      })
+      .join()
+      .unwrap_or(false)
+  })
+}
+
+/// Shape: one shard, a few tasks: [`land_blocking`]'s waiting thread's runtime.
+fn waiting_runtime() -> slates_rt::runtime::LocalRuntime {
+  slates_rt::runtime::LocalRuntime::new(&slates_rt::runtime::RuntimeConfig {
+    shards: 1,
+    tasks_per_shard: 8,
+    timers_per_shard: 8,
+    ring_entries: 64,
+    step_budget_ns: 1_000_000,
+    timer_tick_ns: 100_000,
+    batch: 8,
+    pin: false,
+    cores: Vec::new(),
+    page_bytes: 4096,
+    spin_ns: 0,
+    wake_tracking: None,
+  })
+  .expect("the waiting thread's runtime")
+}
+
+/// [`crate::daemon::audit_on_shard`] over a daemon holding a fresh [`TestStore`] named `name`: `history` runs on its
+/// shard; the daemon stops, dropping every handle, before the store goes (module docs).
+pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
+  name: &str,
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+) -> T {
+  let store = TestStore::start(name);
+  let handle = store.handle();
+  let answer = crate::daemon::audit_on_shard_configured(history, move |config| {
+    config.vcs_disk = Some(handle);
+  });
+  drop(store);
+  answer
+}
+
+/// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered
+/// once its changeset 0 is landed and it is recorded (`repository::create_blocking`, A-767 item 7): the verb's own
+/// creation answers by its reply route from a task, which a history holding the shard cannot wait for ([`created`] and
+/// [`create_on`] serve a history that runs as a task, or the test's thread). On a node with no store, and for any other
+/// request, the verb as a client's dispatch serves it.
+pub(crate) fn create(
+  state: &mut crate::state::ShardState,
+  principal: &slates_db::catalog::Principal,
+  request: slates_ipc::protocol::RequestBody,
+) -> slates_ipc::protocol::ReplyBody {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return crate::verbs::dispatch(state, 1, principal, request);
+  };
+  match request {
+    slates_ipc::protocol::RequestBody::CreateRepository {
+      name,
+      tool,
+      format,
+      default_branch,
+      green,
+    } => crate::repository::create_blocking(
+      state,
+      (disk, principal),
+      (&name, tool, format, &default_branch),
+      green,
+    ),
+    other => crate::verbs::dispatch(state, 1, principal, other),
+  }
+}

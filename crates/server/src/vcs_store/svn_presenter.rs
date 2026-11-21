@@ -24,6 +24,15 @@
 //! budget of node-revisions a call, writes their files, and then rewrites `db/current`, so a reader never sees a
 //! youngest revision whose file is missing. [`Presented::revision_properties_changed`] rewrites one revision's
 //! properties file after a revision property change.
+//!
+//! **A hook's first view.** A hook's `REPOS-PATH` waits for the view to be laid out and its properties refreshed, work
+//! that grows with the repository. So the hook's shard drives it as turns on the owner shard ([`view_turn`]), each at
+//! most the owner's step quantum and each answering how far the view got, and judges the wait on that progress: a turn
+//! that answers has moved the view on; a turn the owner does not answer within the liveness window of its own time, or
+//! one that answers having moved nothing, refuses the hook typed. No bound is set on the whole, whose length is the
+//! repository's. Until 2026-11-21 the whole first view had one liveness budget of the owner's time, so every repository
+//! past what a second lays out refused its hooks (w-interop's svn matrix, git/git's newest 2,000 revisions: "its owner
+//! shard did not answer in time").
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -39,11 +48,12 @@ use slates_vfs::volume::{Store, Volume};
 
 use super::svn_texts::{HeadTexts, SvnView};
 
-/// Format: the mode of every directory of the view: read and search for its user, nothing for others.
-const DIRECTORY_MODE: u32 = 0o700;
+/// Format: the mode of every directory of the view: read and search for all, written by none (the view is read-only;
+/// `svnadmin create`'s directories are `0755`).
+const DIRECTORY_MODE: u32 = 0o755;
 
-/// Format: the mode of every file of the view: read-only for its user, as FSFS keeps its revision files.
-const FILE_MODE: u32 = 0o400;
+/// Format: the mode of every file of the view: read-only for all, as FSFS keeps its revision files (`0444`).
+const FILE_MODE: u32 = 0o444;
 
 /// Format: why a configured hook is refused where no view can be shown (A-645 (a)): a hook is shown its repository as a
 /// view slates mounts in its store's granted directory, and this daemon was given none (`--vcs-store`). Answered with
@@ -128,6 +138,9 @@ impl Laid {
 pub(crate) struct Presented {
   view: View,
   written: Revision,
+  /// The bytes of the revision files written so far, the texts they name counted in them: the view's content, which
+  /// its volume's ceiling is derived from ([`Presented::size_for`]).
+  bytes: u64,
 }
 
 impl Presented {
@@ -221,18 +234,59 @@ impl Presented {
     let Some(youngest) = laid.shown.checked_sub(1) else {
       return Ok(laid.advance);
     };
-    for directory in fsfs::directories(youngest) {
+    let directories = fsfs::directories(youngest);
+    self.size_for(volume, &laid, &directories)?;
+    for directory in directories {
       directory_at(volume, store, root, &directory)?;
     }
     for (path, pieces) in laid.files {
       let (parent, name) = parent_of(volume, store, root, &path)?;
-      volume.create_referenced(store, parent, name, FILE_MODE, pieces, holds)?;
+      let made = volume.create_referenced(store, parent, name, FILE_MODE, pieces, holds)?;
+      owned_as_root(volume, store, root, made)?;
     }
     for (path, bytes) in &laid.small {
       put_file(volume, store, root, path, bytes)?;
     }
     self.written = laid.shown;
     Ok(laid.advance)
+  }
+
+  /// Sizes the view's volume to its own content before `laid` is written (main's ruling of 2026-11-20: never a ceiling of
+  /// its own, R3): its bytes the files it shows (every revision file's length, the texts it names counted in them, and
+  /// the small files'), at least what it holds; its inodes and entries those it holds and, at most, one more for each
+  /// directory and file `laid` makes. Until then the view was made with a ceiling of nothing and could hold no file
+  /// (`Volume(NoSpace)`, w-interop's matrix).
+  fn size_for(
+    &mut self,
+    volume: &mut Volume,
+    laid: &Laid,
+    directories: &[String],
+  ) -> Result<(), PresentRefusal> {
+    let files: u64 = laid
+      .files
+      .iter()
+      .map(|(_, pieces)| pieces.iter().map(Piece::len).sum::<u64>())
+      .sum();
+    let small = laid
+      .small
+      .iter()
+      .map(|(_, bytes)| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+      .fold(0u64, u64::saturating_add);
+    self.bytes = self.bytes.saturating_add(files);
+    let held = volume.accounting().referenced_bytes;
+    volume.resize(self.bytes.saturating_add(small).max(held))?;
+    let made = u64::try_from(
+      directories
+        .len()
+        .saturating_add(laid.files.len())
+        .saturating_add(laid.small.len()),
+    )
+    .unwrap_or(u64::MAX);
+    let (inodes, _) = volume.inode_usage();
+    volume.set_inode_allowance(inodes.saturating_add(made))?;
+    let (entries, _) = volume.entry_usage();
+    volume.set_entry_allowance(entries.saturating_add(made))?;
+    Ok(())
   }
 
   /// Rewrites revision `revision`'s properties file from the records, after a revision property change; nothing for a
@@ -269,7 +323,11 @@ fn directory_at(
   for name in path.split('/').filter(|name| !name.is_empty()) {
     at = match volume.lookup_no(store, at, name) {
       Ok(found) => found.inode,
-      Err(VfsError::NotFound) => volume.mkdir_no(store, at, name, DIRECTORY_MODE)?,
+      Err(VfsError::NotFound) => {
+        let made = volume.mkdir_no(store, at, name, DIRECTORY_MODE)?;
+        owned_as_root(volume, store, root, made)?;
+        made
+      }
       Err(refusal) => return Err(refusal.into()),
     };
   }
@@ -314,7 +372,21 @@ fn put_file(
   } else {
     vec![Piece::Made(bytes.into())]
   };
-  volume.create_referenced(store, parent, name, FILE_MODE, pieces, &mut NoHolds)?;
+  let made = volume.create_referenced(store, parent, name, FILE_MODE, pieces, &mut NoHolds)?;
+  owned_as_root(volume, store, root, made)
+}
+
+/// Gives `made` the owner of the view's root, `root`, the user its mount serves: the volume core makes every inode owned
+/// by uid 0, so a view's entries were unreadable to the hook it is mounted for (found by use: the macOS mount's `cat`
+/// of `db/current` waited, owner 0 and mode `0400`).
+fn owned_as_root(
+  volume: &mut Volume,
+  store: &mut Store,
+  root: InodeNo,
+  made: InodeNo,
+) -> Result<(), PresentRefusal> {
+  let owner = volume.stat(store, root)?;
+  volume.chown(store, made, owner.uid, owner.gid)?;
   Ok(())
 }
 
@@ -533,51 +605,91 @@ pub(crate) async fn repos_for_hook(
   let Some((origin, owner)) = place else {
     return Err(format!("{UNSHOWN_WORDS}: its owner shard did not answer"));
   };
+  let mut last = None;
+  let mut refreshed_from = 0;
+  loop {
+    let turn = crate::xshard::task_in_shard_time(
+      origin,
+      owner,
+      move || async move {
+        crate::state::with_state(|state| view_turn(state, id, refreshed_from))
+          .unwrap_or_else(|| Err("no shard".to_owned()))
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .unwrap_or_else(|| Err("its owner shard did not answer a turn of its view in time".to_owned()))
+    .map_err(|why| format!("{UNSHOWN_WORDS}: {why}"))?;
+    match turn {
+      ViewTurn::Shown => break,
+      ViewTurn::Refreshing(next) => refreshed_from = next,
+      ViewTurn::Laying(_) => {}
+    }
+    if last == Some(turn) {
+      return Err(format!(
+        "{UNSHOWN_WORDS}: a turn of its view moved nothing ({turn:?})"
+      ));
+    }
+    last = Some(turn);
+  }
+  let name_for_mount = name;
   crate::xshard::task_in_shard_time(
     origin,
     owner,
-    move || shown_at(root, id, name),
+    move || async move { mounted(root, id, &name_for_mount).await },
     crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await
   .unwrap_or_else(|| {
     Err(format!(
-      "{UNSHOWN_WORDS}: its owner shard did not answer in time"
+      "{UNSHOWN_WORDS}: its owner shard did not answer its view's mount in time"
     ))
   })
   .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// The repository's view, presented on this shard (its owner) a revision a turn and mounted in the store's granted
-/// directory `root`: where it is mounted (module docs).
-async fn shown_at(
-  root: &'static slates_land::store_root::StoreRoot,
+/// How far one turn of a hook's view ([`view_turn`]) took it: what the hook's shard judges its wait by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewTurn {
+  /// Laying the view out: this many revisions shown (`Presented::written`), more to show.
+  Laying(Revision),
+  /// Every revision shown; their properties files refreshed up to this revision, more to refresh.
+  Refreshing(Revision),
+  /// Shown and refreshed whole: ready to mount.
+  Shown,
+}
+
+/// One turn of a hook's view, on its owner shard: the view's volume made where there is none, then its next revisions
+/// laid out and written, then its properties files refreshed from `refreshed_from` on, a revision a slice, until the
+/// shard's step quantum is spent (`futures::step_budget_ns`, what any sliced work here runs to) or the view is whole. A
+/// turn always takes one slice, so every answer but a refusal moves the view on.
+fn view_turn(
+  state: &mut crate::state::ShardState,
   id: slates_db::catalog::RepositoryId,
-  name: String,
-) -> Result<std::path::PathBuf, String> {
-  let unshown = |why: String| format!("{UNSHOWN_WORDS}: {why}");
-  let on_shard = |why: &str| format!("{UNSHOWN_WORDS}: {why}");
-  crate::state::with_state(|state| slot_for(state, id))
-    .ok_or_else(|| on_shard("no shard"))?
-    .map_err(unshown)?;
-  loop {
-    let laid = crate::state::with_state(|state| present_slice(state, id))
-      .ok_or_else(|| on_shard("no shard"))?
-      .map_err(unshown)?;
-    if laid == Advance::Done {
-      break;
+  refreshed_from: Revision,
+) -> Result<ViewTurn, String> {
+  slot_for(state, id)?;
+  let quantum = slates_rt::futures::step_budget_ns().unwrap_or(state.config.runtime.step_budget_ns);
+  let began = slates_rt::futures::now_ns();
+  let spent = || slates_rt::futures::now_ns().saturating_sub(began) >= quantum;
+  while present_slice(state, id)? == Advance::More {
+    if spent() {
+      let written = state
+        .svn_views
+        .get(&id)
+        .map(|slot| slot.presented.written())
+        .ok_or("the view is gone")?;
+      return Ok(ViewTurn::Laying(written));
     }
-    slates_rt::futures::yield_now().await;
   }
-  let mut revision = 0;
-  while let Some(next) = crate::state::with_state(|state| refresh_slice(state, id, revision))
-    .ok_or_else(|| on_shard("no shard"))?
-    .map_err(unshown)?
-  {
+  let mut revision = refreshed_from;
+  while let Some(next) = refresh_slice(state, id, revision)? {
     revision = next;
-    slates_rt::futures::yield_now().await;
+    if spent() {
+      return Ok(ViewTurn::Refreshing(revision));
+    }
   }
-  mounted(root, id, &name).await
+  Ok(ViewTurn::Shown)
 }
 
 /// Makes the repository's view volume where this shard has none: a scratch volume owned by the repository's owner,
@@ -604,6 +716,8 @@ fn slot_for(
         && state.db.partition().volume_by_name(name).is_none()
     })
     .ok_or("no view volume name routes to the repository's shard")?;
+  // Dynamic, its ceiling nothing yet: each slice of the view sizes it to the view's own content before it writes
+  // (`Presented::write`), so its ceiling is never a number of its own (R3).
   let reply = crate::verbs::create(
     state,
     &owner,

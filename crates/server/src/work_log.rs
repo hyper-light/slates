@@ -198,6 +198,42 @@ pub(crate) enum WorkLogEntry {
   },
 }
 
+/// What a work's log holds, for a diagnosis line (A-797's, at a refused log): each entry's kind and bytes, a
+/// restatement's own files with their count, total and largest, an edit's path and length. A cold path, at a refusal.
+pub(crate) fn describe_log(entries: &[Vec<u8>]) -> String {
+  let mut out = String::new();
+  for entry in entries {
+    let part = match <WorkLogEntry as Wire>::from_bytes(entry) {
+      Ok(WorkLogEntry::Edit { path, bytes, .. }) => format!("edit {path} {} bytes", bytes.len()),
+      Ok(WorkLogEntry::Declared { .. }) => "declared".to_owned(),
+      Ok(WorkLogEntry::Restated {
+        base,
+        files,
+        journal,
+      }) => {
+        let sizes = files
+          .iter()
+          .map(|file| (file.bytes.as_ref().map_or(0, Vec::len), file.path.as_str()));
+        let total = sizes
+          .clone()
+          .map(|(len, _)| len)
+          .fold(0usize, usize::saturating_add);
+        let largest = sizes.max_by_key(|(len, _)| *len).unwrap_or((0, ""));
+        format!(
+          "restated at {base}: {} files, {total} bytes, the largest {} {} bytes; {} journal ops",
+          files.len(),
+          largest.1,
+          largest.0,
+          journal.len()
+        )
+      }
+      Err(_) => "undecodable".to_owned(),
+    };
+    out.push_str(&format!("[{} bytes: {part}] ", entry.len()));
+  }
+  out
+}
+
 /// Why a work's log could not be replayed: a refusal the recovery counts, leaving the work unbuilt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReplayError {

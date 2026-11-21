@@ -1,45 +1,12 @@
-//! The pack adapter over a real store's owner (A-767 C5). The store's directory is a real one beside the test binary,
-//! in the build output, never `/tmp` (R1).
-
-use std::path::PathBuf;
+//! The pack adapter over a real store's owner (A-767 C5), the one shared test store (`crate::test_store`).
 
 use slates_git::store::packed::PackSource;
-use slates_land::store_root::{StoreGrant, StoreRoot};
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 use slates_store::log::{Header, SectionKind, Tool};
-use slates_store::owner::StoreOwner;
-use slates_store::store::{PIECE_BYTES, Sizing};
+use slates_store::store::PIECE_BYTES;
 use slates_vcs::ContentId;
 
 use super::{PackFillRefused, StorePacks};
-
-#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
-fn store_directory(name: &str) -> PathBuf {
-  let binary = std::env::current_exe().unwrap();
-  let dir = binary
-    .parent()
-    .unwrap()
-    .join(format!("store-packs-{name}-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).unwrap();
-  dir.canonicalize().unwrap()
-}
-
-/// Shape: a store as the daemon sizes one (a memtable of one trunk node: eight 64 KiB extents), 1 GiB of disk.
-fn owner(dir: &std::path::Path) -> StoreOwner {
-  let grant = StoreGrant {
-    repository: 0,
-    target: StoreRoot::identify(dir).unwrap(),
-    issued_ns: 0,
-  };
-  let sizing = Sizing {
-    memory: 512 << 10,
-    disk: 1 << 30,
-    extent_bytes: 64 << 10,
-    fanout: 8,
-  };
-  StoreOwner::start(StoreRoot::open(dir, &grant).unwrap(), sizing, 16).unwrap()
-}
 
 /// Shape: one shard, a few tasks.
 fn runtime() -> LocalRuntime {
@@ -68,9 +35,8 @@ fn runtime() -> LocalRuntime {
 /// `PastBound`; the unknown pack refused `Missing`.
 #[test]
 fn a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time() {
-  let dir = store_directory("forward");
-  let owner = owner(&dir);
-  let handle = owner.handle();
+  let store = crate::test_store::TestStore::start("store-packs-forward");
+  let handle = store.handle();
   let pack: Vec<u8> = (0..300_000u32)
     .map(|at| (at.wrapping_mul(31) % 253) as u8)
     .collect();
@@ -145,7 +111,5 @@ fn a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time() {
     matches!(unknown, Err(PackFillRefused::Missing { at: 0 })),
     "{unknown:?}"
   );
-  owner.stop().unwrap();
-  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
-  let _ = std::fs::remove_dir_all(&dir);
+  drop(store);
 }

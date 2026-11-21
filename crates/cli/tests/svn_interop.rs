@@ -974,6 +974,207 @@ fn a_repository_policys_hook_lets_stock_svn_change_a_revision_property() {
   );
 }
 
+/// Sends one HTTP/1.1 request to the edge at `port` and reads its whole answer: `method` at `path`, a bearer `token`,
+/// the request's other `headers` and `body`; the answer's text.
+fn edge_request(
+  port: u16,
+  (method, path): (&str, &str),
+  token: &str,
+  headers: &[&str],
+  body: &[u8],
+) -> String {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut request = format!(
+    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nConnection: close\r\nContent-Length: {}\r\n",
+    body.len()
+  )
+  .into_bytes();
+  for header in headers {
+    request.extend_from_slice(header.as_bytes());
+    request.extend_from_slice(b"\r\n");
+  }
+  request.extend_from_slice(b"\r\n");
+  request.extend_from_slice(body);
+  stream.write_all(&request).unwrap();
+  let mut answer = Vec::new();
+  let _ = stream.read_to_end(&mut answer);
+  String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// A-645 (a), the view's mount by itself, on every Unix (Linux's FUSE mount, macOS's NFS mount), with no stock client:
+/// the DAV site runs start-commit at a commit's POST (A-733). Do: start an anchor with its HTTP edge and a store
+/// directory (`--vcs-store`); make a Subversion repository and a token; configure a start-commit hook that copies
+/// `$1/db/current` and `$1/format` (its `REPOS-PATH`'s FSFS files) to a file and refuses; POST `( create-txn )` to
+/// `!svn/me`; then unmount the view. Expect the hook to have read `0` and `5` (revision 0 the youngest, repository
+/// format 5) through the view mounted at `<store>/project.svn`, the commit refused by the hook, and the unmount to
+/// succeed. Red before A-645 (a): the hook was refused unrun, the file never written.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hooks_repos_path_is_the_repositorys_view_mounted_in_the_store_directory() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-view-{}", std::process::id());
+  let scratch = Scratch::new("svn-view");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "the view's mount") else {
+    return;
+  };
+  create_repository(&instance);
+  let (_, token) = minted_token(&instance, &issuer);
+  let read = format!("{}/view-read", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\ncat \"$1/db/current\" \"$1/format\" > \"{read}\"\nexit 1\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let seen = std::fs::read_to_string(&read).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert_eq!(
+    (seen.as_str(), unmounted.0),
+    ("0\n5\n", 0),
+    "answer: {answer}; unmount: {unmounted:?}"
+  );
+}
+
+/// Shape: the revisions of the repository a hook's first view is laid out for: git/git's newest 2,000 first-parent
+/// commits as a dump were the repository whose hooks the owner shard's one liveness budget refused (w-interop's svn
+/// matrix, release, Mac Studio, 2026-11-20: "its owner shard did not answer in time"), and a debug build lays each out
+/// slower than that release did.
+const MANY_REVISIONS: u64 = 2_000;
+
+/// Shape: the files of the one directory every revision of [`many_revisions_dump`] changes a file of: as many as
+/// git/git's tree holds at f7de81456940 (4,872), the dump the matrix met the refusal with. Every revision's file in an
+/// FSFS view carries the listing of each directory on a changed path, so each revision costs the view as much as this
+/// listing; a history of one file lays 2,000 revisions out inside a liveness budget even in a debug build (this test
+/// with one file passed on main a51023f57, 22.8 s).
+const MANY_REVISIONS_FILES: u64 = 4_872;
+
+/// A dump of `revisions` revisions under `trunk/`: the first adds [`MANY_REVISIONS_FILES`] files, each later one
+/// changes one of them: the history a hook's first view must lay out a revision at a time.
+fn many_revisions_dump(revisions: u64) -> Vec<u8> {
+  let props = |log: &str| format!("K 7\nsvn:log\nV {}\n{log}\nPROPS-END\n", log.len());
+  let file = |path: String, action: &str, body: &str| {
+    format!(
+      "Node-path: {path}\nNode-kind: file\nNode-action: {action}\nText-content-length: {0}\nContent-length: {0}\n\n\
+       {body}\n\n",
+      body.len()
+    )
+  };
+  let mut out = String::from(
+    "SVN-fs-dump-format-version: 2\n\nUUID: 00000000-0000-4000-8000-0000000064a6\n\nRevision-number: 0\n\
+     Prop-content-length: 10\nContent-length: 10\n\nPROPS-END\n\n",
+  );
+  for revision in 1..=revisions {
+    let log = props(&format!("r{revision}"));
+    out.push_str(&format!(
+      "Revision-number: {revision}\nProp-content-length: {0}\nContent-length: {0}\n\n{log}\n",
+      log.len()
+    ));
+    if revision == 1 {
+      out.push_str(
+        "Node-path: trunk\nNode-kind: dir\nNode-action: add\nProp-content-length: 10\nContent-length: 10\n\n\
+         PROPS-END\n\n",
+      );
+      for at in 0..MANY_REVISIONS_FILES {
+        out.push_str(&file(format!("trunk/f{at:05}"), "add", &format!("{at}\n")));
+      }
+    } else {
+      let at = revision % MANY_REVISIONS_FILES;
+      out.push_str(&file(
+        format!("trunk/f{at:05}"),
+        "change",
+        &format!("{at} r{revision}\n"),
+      ));
+    }
+  }
+  out.into_bytes()
+}
+
+/// A-645 (a), a hook's first view of a long history (w-interop's svn matrix, 2026-11-21). Do: start an anchor with its
+/// HTTP edge and a store directory; import a repository of [`MANY_REVISIONS`] revisions (`slates repository import`);
+/// configure a start-commit hook that copies `$1/db/current` (its `REPOS-PATH`'s youngest) to a file and refuses; POST
+/// `( create-txn )` to `!svn/me`, so the hook asks for the repository's first view; then unmount the view. Expect the
+/// hook to have read the youngest revision through the view and the unmount to succeed: the wait for the view is
+/// judged on its progress, however long its history. Red on main a51023f57: the first view had one liveness budget of
+/// the owner shard's time, so the hook was refused unrun ("its owner shard did not answer in time"), the file never
+/// written.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn a_hooks_first_view_of_a_long_history_is_waited_for_while_it_is_laid_out() {
+  use std::os::unix::fs::PermissionsExt;
+  let instance = format!("svn-long-view-{}", std::process::id());
+  let scratch = Scratch::new("svn-long-view");
+  let store = format!("{}/{STORE}", scratch.path);
+  made_directory(&store);
+  let (_anchor, lines, issuer) = start_anchor(
+    &instance,
+    &["--vcs-http", "127.0.0.1:0", "--vcs-store", &store],
+  );
+  let port = http_edge_port(&lines);
+  let Some(issuer) = issuer_or_skip(issuer, "a long history's first view") else {
+    return;
+  };
+  create_repository(&instance);
+  let dump = format!("{}/many.dump", scratch.path);
+  std::fs::write(&dump, many_revisions_dump(MANY_REVISIONS)).unwrap();
+  let imported = slates(&instance, &["repository", "import", REPOSITORY, &dump]);
+  assert_eq!(imported.0, 0, "import: {imported:?}");
+  let (_, token) = minted_token(&instance, &issuer);
+  let read = format!("{}/view-read", scratch.path);
+  let hook = format!("{}/start-commit", scratch.path);
+  std::fs::write(
+    &hook,
+    format!("#!/bin/sh\ncat \"$1/db/current\" > \"{read}\"\nexit 1\n"),
+  )
+  .unwrap();
+  std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+  let given = format!("start-commit={hook}");
+  let (code, out, err) = slates(
+    &instance,
+    &["repository", "policy", REPOSITORY, "--hook", &given],
+  );
+  assert_eq!(code, 0, "policy: {out}{err}");
+  let answer = edge_request(
+    port,
+    ("POST", &format!("/{REPOSITORY}/!svn/me")),
+    &token,
+    &["Content-Type: application/vnd.svn-skel"],
+    b"( create-txn )",
+  );
+  let seen = std::fs::read_to_string(&read).unwrap_or_default();
+  let view = format!("{store}/{REPOSITORY}.svn");
+  let unmounted = slates(&instance, &["unmount", &view]);
+  assert_eq!(
+    (seen.as_str(), unmounted.0),
+    (format!("{MANY_REVISIONS}\n").as_str(), 0),
+    "answer: {answer}; unmount: {unmounted:?}"
+  );
+}
+
 /// A-702 part 2 (`fs-wrap.c` `svn_repos_fs_change_rev_prop4`: a repository with no pre-revprop-change hook refuses every
 /// revision property change). Do: over the svn:// listener, with revision 1 committed and no hook configured, change
 /// its `svn:log` with stock `svn propset --revprop` (ra_svn's `change-rev-prop2`). Expect it refused in svnserve's words
