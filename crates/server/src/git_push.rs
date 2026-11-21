@@ -383,6 +383,13 @@ pub(crate) struct Landing {
   parts: Vec<slates_store::owner::Part>,
 }
 
+impl Landing {
+  /// The sequence the changeset lands at: what the record names once it is landed.
+  pub(crate) fn sequence(&self) -> u64 {
+    self.header.sequence
+  }
+}
+
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
 #[derive(Debug)]
 pub(crate) enum Carry {
@@ -1025,8 +1032,9 @@ pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
 
 /// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
 /// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
-/// landing side by side never share one. None where the daemon holds no store, or the repository no store here.
-fn landing_of(
+/// landing side by side never share one. None where the daemon holds no store, or the repository no store here. A git
+/// commit the server makes lands the same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
+pub(crate) fn landing_of(
   state: &mut ShardState,
   repository: RepositoryId,
   (names, pack): (Vec<u8>, Vec<u8>),
