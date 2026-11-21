@@ -7361,3 +7361,29 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - **Green:** the push exits 0, the daemon still serves, the clone holds both changesets, and no "is spinning" line in
   the daemon's log.
 - **Red:** `abort: error: bad HTTP status line: ''`, or the watchdog naming `hg_push::take` or `hg_push::unbundle`.
+
+- w-balance (2026-11-21, A-724 P4: a repository's turns weighed by use; main's ruling "land if it wins, else record it
+  rejected"): the A/B on branch agents/w-balance-turn-weights (one commit 928df7d1b, merged with main; focused tests
+  `vcs_share::turns` 3/3 and `receive` on the merge). Two release builds, each from its own `git archive` into its own
+  target dir (memory: a shared target mixes arms): A = the branch's merge base with main, B = the branch tip. Then, from
+  the repository root's crates/cli/bench, three rounds, the arms alternating:
+    python3 -u multi_repo_load.py <slates A|B> <git/git bare clone> v0.99 v1.0.0 v1.5.0 --steps 100 --per-repository-cap 3
+  Platform: Linux x86_64 or a Studio with about 8 GiB free past the run's estimate (the harness refuses a step that does
+  not fit and says so). Read per round: each class's p99 and its "starvation ...x its fair share", the busiest
+  repository's span and its shard-mates' lines, "busiest shards by step time", the one-push repositories' served/span/
+  queued p99. B wins if the busiest repository's span and the large class's fair-share ratio fall in every round and the
+  small class's p99 does not rise past A's spread. Red (a regression): a class over its fair share where A held it, or
+  a refused step or a dead daemon. Run 31's numbers (A, cap 3, Studio-2): r1 spanned 41.30 s, shard 4 ran 23.19 s, class
+  2 1.31x fair, class 0 1.74x, class 1 1.89x. Send the result to w-balance (lands or records rejected).
+
+- w-balance (2026-11-21, goals 89a/86a "1,000 clients under 1 ms", main's ruling (c) of 2026-11-20): load_bench at
+  1,000 clients, current main against main before A-400 (57ff29e53, the parent of 496533e52), release, quiet box
+  (24+ idle cores), interleaved, three rounds, order alternating by round:
+    load_bench --tree <linux v7.4-rc1 (6628e7d4c)>/fs --clients 1000 --hot-files 800 --per-connection 32 --rounds 20
+      --reply-patience 60 --think-us Z      (Z = 50000 and 20000)
+  The same harness in both arms (perf's handoff, agents/perf-handoff-g257): copy main's
+  crates/client/examples/load_bench.rs into the pre-A-400 tree before its build; if it does not compile there, say so and
+  run each arm's own. Keep every run's `bound`, `offered`, `noise` and `latency_server` rows; check the arms' verdicts a
+  second match. Met for 89a: a 1,000-client level reads `met yes` at 10^3 verdicts a second or more. If not met, the
+  piece main ruled next is (a): a work whose client sits on its green's owner shard placed on another shard so the owner
+  runs verdicts alone; send it back to w-balance with the rows and I build (a) red first.
