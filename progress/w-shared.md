@@ -1,5 +1,11 @@
 # w-shared -- UI goal 93's shared pieces of §4.17.1 (supervisor "slates-7a")
 
+## 14:23 PST: goal status reviewed (inbox close note). OPEN: the lane's proof (320/512 MiB 10/10). Branch
+  agents/w-shared-slice 0deb19aea, worktree ~/slates-work/w-shared-slice: (1) no re-encode/re-hash at the owner
+  (ec245f32e), (2) the fetched increment moved to the owner shard a chunk a call (0deb19aea). kiln r2: holder tests +
+  A/B 256/320/512 x5 vs 1a35ab091. Next cuts: the verb's gather+decode, append's publish, place (each measured), then
+  datagram batching on the content plane, then the 10 x 5 proof. BLOCKED: A-658 3c (A-767 holders' changesets).
+
 ## 14:00 PST: LANDED A-826 (3b) main 156007dff, family three c5051eb51. ACTIVE: owner-side slicing of the holder route
   (performance; near misses 454-883 ms on the control shard at 512 MiB). First cut agents/w-shared-slice ec245f32e: a
   holder's submit not re-encoded/re-hashed at the owner (SealedWork.held). kiln r1 (new numbering): holder tests + A/B
