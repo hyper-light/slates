@@ -97,7 +97,14 @@
   section per extent needed (only close returns commit) -- needs anchor-held per-extent handles; ask main whether R2
   includes Windows. Measurement for the close: r30 (hg history push, before 47dc24b72 vs after 92f7a756b, RSS + status
   split + system free after the anchor's SIGKILL) queued.
-- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md).
+- R2 measured by use, r35 (big Studio, release, hg history push; before 47dc24b72 / after 92f7a756b): RSS after push
+  6,198-6,200 MiB both arms, unchanged at 20 s idle; after SIGKILL system free: after-arm 5,569 -> 11,951 MiB, before-arm
+  stays 732 (leak; 2 names unlinked by the script). R2 status written to inbox/main-from-w-sizing-close.md (macOS +
+  Linux closed; Windows section-per-extent: asked main whether it is inside R2).
+- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md). Remaining 6.2 GB after an hg
+  history push is held content (w-hg 4,495.5 MiB content store) + register + heap; status split came back empty in r35
+  (g226 is fixing the status residency).
+- Worktree ~/slates-work/w-sizing-a789 (landed; removable). Scripts ~/.cache/w-sizing-logs (hgmem.sh, hgmem-cmd.txt).
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =
