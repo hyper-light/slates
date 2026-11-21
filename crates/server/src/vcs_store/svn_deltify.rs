@@ -10,7 +10,9 @@
 //! **What.** A landed revision hands the job the stored texts it moved past ([`after_revision`]; the records'
 //! `Repository::deltify_after` walks its rows alone), and a recovery hands it every one the records still keep stored
 //! ([`resume`]). For each, in order, oldest first: its delta is made a window a slice (the records' `DeltaWriter`, the
-//! window Subversion cuts, each target piece read from the content store beside its base's piece read from the records),
+//! window Subversion cuts, each target piece read from the content store beside its base's piece read from the records;
+//! a piece the content store does not hold is read through the node's changeset store, the job's task fetching it
+//! between slices and the window's target read so far kept across the wait, C2 stage B part 2),
 //! then landed as one changeset on the node's store and committed by an entry of the register naming it
 //! (`Record::Deltified`, through the step for a record that moves no version, `repository::svn_commit::land_record`,
 //! C2), and only then is the store's hold on the whole text given back.
@@ -56,8 +58,32 @@ struct Job {
   owner: Principal,
   /// The texts waiting, oldest first.
   queue: VecDeque<Deltifiable>,
-  /// The text being made, its delta so far, and the target bytes its windows made.
-  making: Option<(Deltifiable, DeltaWriter, u64)>,
+  /// The text being made.
+  making: Option<Making>,
+}
+
+/// A text being made: its delta so far, the target bytes its windows made, and the next window's target bytes read so
+/// far, kept across a wait for a piece the content store does not hold (C2 stage B part 2).
+#[derive(Debug)]
+struct Making {
+  /// The text.
+  candidate: Deltifiable,
+  /// Its delta so far.
+  writer: DeltaWriter,
+  /// The target bytes its windows made.
+  made: u64,
+  /// The next window's target bytes read so far.
+  partial: Vec<u8>,
+}
+
+/// What making a text's next window came to.
+enum Windowed {
+  /// The window made: the target bytes made after it.
+  Made(u64),
+  /// A piece of the text the content store does not hold, read through the node's store once fetched.
+  Waiting(slates_svn::reads::Wanted),
+  /// The text or its base cannot be read, or the writer refused.
+  Refused,
 }
 
 /// What one unit of a job did.
@@ -66,6 +92,8 @@ enum Unit {
   Went,
   /// A text's windows are all made: its record lands next, as the job's owner, then its whole bytes are given back.
   Land(Landing),
+  /// A piece of the text being made is waited for (C2 stage B part 2).
+  Waiting(slates_svn::reads::Wanted),
   /// The queue is empty: the job ends.
   Ended,
 }
@@ -79,6 +107,8 @@ pub(crate) enum Slice {
   More,
   /// A text's record lands before the next unit.
   Land(Landing),
+  /// A piece of the text being made is fetched through the node's store before the next unit (C2 stage B part 2).
+  Waiting(slates_svn::reads::Wanted),
   /// The job ended.
   Ended,
 }
@@ -120,7 +150,7 @@ fn hand(state: &mut ShardState, repository: RepositoryId, candidates: Vec<Deltif
         || job
           .making
           .as_ref()
-          .is_some_and(|(making, _, _)| making.text == candidate.text);
+          .is_some_and(|making| making.candidate.text == candidate.text);
       if !queued {
         job.queue.push_back(candidate);
       }
@@ -152,13 +182,34 @@ fn hand(state: &mut ShardState, repository: RepositoryId, candidates: Vec<Deltif
 /// Drives `repository`'s job a slice at a time, yielding between slices, until it ends; a text's record landed on the
 /// node's store and committed in the register (`svn_commit::land_record`, C2) before its whole bytes are given back.
 async fn drive(repository: RepositoryId) {
+  // The piece fetched for the text being made, held until the slice after the fetch has read it (C2 stage B part 2).
+  let mut fetched = None;
   loop {
     let sliced = crate::state::with_state_counted(|state| {
       let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
-      slice(state, repository, budget)
+      let sliced = slice(state, repository, budget);
+      if let Some(read) = fetched {
+        super::svn_texts::let_go(state, read);
+      }
+      // A text waiting again for the piece just fetched for it would wait for good: passed over.
+      match sliced {
+        Slice::Waiting(wanted) if fetched == Some(wanted) => {
+          pass_over(state, repository);
+          Slice::More
+        }
+        sliced => sliced,
+      }
     });
+    fetched = None;
     match sliced {
       Some(Slice::More) => slates_rt::futures::yield_now().await,
+      Some(Slice::Waiting(wanted)) => {
+        if super::svn_texts::fetch_piece(repository, wanted).await {
+          fetched = Some(wanted);
+        } else {
+          let _ = crate::state::with_state_counted(|state| pass_over(state, repository));
+        }
+      }
       Some(Slice::Land((record, text, owner))) => {
         let landed = crate::repository::svn_commit::land_record((&owner, repository), record).await;
         let _ = crate::state::with_state_counted(|state| landed_text(state, text, landed));
@@ -166,6 +217,14 @@ async fn drive(repository: RepositoryId) {
       Some(Slice::Ended) | None => return,
     }
   }
+}
+
+/// Passes over the text `repository`'s job is making, counted: a piece of it the node's store could not give.
+fn pass_over(state: &mut ShardState, repository: RepositoryId) {
+  if let Some(job) = state.vcs_stores.svn_deltifies.0.get_mut(&repository) {
+    job.making = None;
+  }
+  state.count(REFUSED, 1);
 }
 
 /// What a text's landing did: its whole bytes given back once its record stands, counted either way.
@@ -200,6 +259,7 @@ pub(crate) fn slice(state: &mut ShardState, repository: RepositoryId, budget_ns:
         return Slice::Ended;
       }
       Unit::Land(landing) => return Slice::Land(landing),
+      Unit::Waiting(wanted) => return Slice::Waiting(wanted),
       Unit::Went => {
         if slates_rt::futures::now_ns().saturating_sub(began) >= budget_ns {
           return Slice::More;
@@ -215,25 +275,40 @@ fn unit(state: &mut ShardState, repository: RepositoryId) -> Unit {
   let Some(job) = state.vcs_stores.svn_deltifies.0.get_mut(&repository) else {
     return Unit::Ended;
   };
-  let (candidate, mut writer, made) = match job.making.take() {
+  let mut making = match job.making.take() {
     Some(making) => making,
     None => match job.queue.pop_front() {
-      Some(candidate) => (candidate, DeltaWriter::new(), 0),
+      Some(candidate) => Making {
+        candidate,
+        writer: DeltaWriter::new(),
+        made: 0,
+        partial: Vec::new(),
+      },
       None => return Unit::Ended,
     },
   };
   let owner = job.owner.clone();
-  if made < candidate.len {
-    let Some(made) = window(state, repository, &candidate, (&mut writer, made)) else {
-      state.count(REFUSED, 1);
-      return Unit::Went;
+  if making.made < making.candidate.len {
+    let unit = match window(state, repository, &mut making) {
+      Windowed::Made(made) => {
+        state.count(WINDOWS, 1);
+        making.made = made;
+        Unit::Went
+      }
+      Windowed::Waiting(wanted) => Unit::Waiting(wanted),
+      Windowed::Refused => {
+        state.count(REFUSED, 1);
+        return Unit::Went;
+      }
     };
-    state.count(WINDOWS, 1);
     if let Some(job) = state.vcs_stores.svn_deltifies.0.get_mut(&repository) {
-      job.making = Some((candidate, writer, made));
+      job.making = Some(making);
     }
-    return Unit::Went;
+    return unit;
   }
+  let Making {
+    candidate, writer, ..
+  } = making;
   let record = Record::Deltified {
     text: candidate.text,
     base: candidate.base.map(|(base, _)| base),
@@ -242,20 +317,30 @@ fn unit(state: &mut ShardState, repository: RepositoryId) -> Unit {
   Unit::Land((record, candidate.text, owner))
 }
 
-/// Makes the next window of `candidate`'s delta: at most a window of its text from `made`, read from the content store,
-/// against the piece of its base beside it, read from the records (Subversion's windows: source piece *i* beside target
-/// piece *i*, an empty view at the source's end once it runs out). The target bytes made after it; none if the text or
-/// its base cannot be read, or the writer refuses.
-fn window(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  candidate: &Deltifiable,
-  (writer, made): (&mut DeltaWriter, u64),
-) -> Option<u64> {
+/// Makes the next window of the text `making`'s delta: at most a window of its text from what its windows made, read
+/// from the content store, or through the node's store where it does not hold it (C2 stage B part 2), against the piece
+/// of its base beside it, read from the records (Subversion's windows: source piece *i* beside target piece *i*, an
+/// empty view at the source's end once it runs out).
+fn window(state: &mut ShardState, repository: RepositoryId, making: &mut Making) -> Windowed {
   let room = DeltaWriter::window_room();
+  let Making {
+    candidate,
+    writer,
+    made,
+    partial,
+  } = making;
+  let (candidate, made) = (&*candidate, *made);
   let want = room.min(candidate.len.saturating_sub(made));
-  crate::vcs_store::within_budget(state, 0, |stores| {
-    let target = read_range(stores.content()?, candidate, made, want)?;
+  let read = crate::vcs_store::within_budget(state, 0, |stores| {
+    read_range(stores, candidate, made, (want, &mut *partial))
+  });
+  match read {
+    Some(Read::Whole) => {}
+    Some(Read::Waiting(wanted)) => return Windowed::Waiting(wanted),
+    None => return Windowed::Refused,
+  }
+  let target = std::mem::take(partial);
+  let made = crate::vcs_store::within_budget(state, 0, |stores| {
     let records = stores.subversion_records(repository)?;
     let (source, source_offset) = match candidate.base {
       Some((base, base_len)) if made < base_len => {
@@ -267,30 +352,48 @@ fn window(
     };
     writer.window(&source, source_offset, &target)?;
     made.checked_add(u64::try_from(target.len()).ok()?)
-  })
+  });
+  made.map_or(Windowed::Refused, Windowed::Made)
 }
 
-/// `want` bytes of the stored text `candidate` from `offset`, read a store window at a time (`ContentStore::run_at`).
+/// What a read of a window's target came to.
+enum Read {
+  /// The window's target bytes are all read.
+  Whole,
+  /// A piece neither the content store nor the fetched pieces hold, read through the node's store once fetched.
+  Waiting(slates_svn::reads::Wanted),
+}
+
+/// Reads `want` bytes of the stored text `candidate` from `offset` into `partial`, from where it stands: a store window
+/// at a time (`ContentStore::run_at`), else a piece fetched through the node's store; none where the bytes run out.
 fn read_range(
-  store: &slates_vcs::ContentStore,
+  stores: &super::VcsStores,
   candidate: &Deltifiable,
   offset: u64,
-  want: u64,
-) -> Option<Vec<u8>> {
+  (want, partial): (u64, &mut Vec<u8>),
+) -> Option<Read> {
   let id = slates_vcs::ContentId(candidate.text);
-  let mut out = Vec::with_capacity(usize::try_from(want).ok()?);
   let end = offset.checked_add(want)?;
-  let mut at = offset;
+  let mut at = offset.checked_add(u64::try_from(partial.len()).ok()?)?;
   while at < end {
-    let run = store.run_at(&id, candidate.len, at)?;
+    let held = stores
+      .content()
+      .and_then(|store| store.run_at(&id, candidate.len, at));
+    let Some(run) = held.or_else(|| stores.svn_pieces.at(&candidate.text, at).map(Into::into))
+    else {
+      return Some(Read::Waiting(slates_svn::reads::Wanted {
+        text: candidate.text,
+        offset: at,
+      }));
+    };
     let take = usize::try_from(end.saturating_sub(at)).ok()?.min(run.len());
     if take == 0 {
       return None;
     }
-    out.extend_from_slice(run.get(..take)?);
+    partial.extend_from_slice(run.get(..take)?);
     at = at.checked_add(u64::try_from(take).ok()?)?;
   }
-  Some(out)
+  Some(Read::Whole)
 }
 
 #[cfg(test)]
@@ -335,6 +438,86 @@ mod tests {
     crate::repository::svn_commit::land_work((&owner, repository), work, &texts)
       .await
       .is_some_and(|landed| landed.is_ok())
+  }
+
+  /// C2 stage B part 2 (the deltify job reads a stored text RAM does not hold through the node's changeset store, R6).
+  /// Do: commit a 250,000-byte text at `/a.txt`, let go the content store's hold on it, then commit a revision changing
+  /// it; let the job run. Expect: the first text kept as a delta by the records, read back byte for byte, made in three
+  /// windows with nothing refused, its bytes read through the store a piece at a time
+  /// (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after. Before, the job passed the
+  /// text over (`vcs_store.svn_deltify.refused`), leaving it stored whole.
+  #[test]
+  fn a_stored_text_the_content_store_let_go_is_deltified_through_the_store() {
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
+    let first = crate::test_store::noise(250_000);
+    let mut second = first.clone();
+    second[1_000] ^= 1;
+    second.extend_from_slice(b"tail");
+    let identity = *blake3::hash(&first).as_bytes();
+    let (sent, got) = std::sync::mpsc::channel();
+    let (one, two) = (first.clone(), second.clone());
+    crate::daemon::observe_first(&daemon, move |_state| {
+      let task = slates_rt::futures::spawn(async move {
+        let (repository, _) = crate::repository::svn_commit::tests::subversion("deltify").await;
+        let added = land(repository, 0, slates_svn::index::Action::Add, one).await;
+        // RAM lets the text go: only the node's store holds it now.
+        crate::state::with_state(|state| {
+          crate::vcs_store::within_budget(state, 0, |stores| {
+            if let Some(content) = stores.content_mut() {
+              let content_id = slates_vcs::ContentId(identity);
+              while content.contains(&content_id) {
+                if content.release(&content_id).is_err() {
+                  break;
+                }
+              }
+            }
+          });
+        });
+        let changed = land(repository, 1, slates_svn::index::Action::Modify, two).await;
+        let _ = sent.send((repository, added, changed));
+      })
+      .unwrap();
+      slates_rt::futures::detach(task).unwrap();
+    });
+    let (repository, added, changed) = got
+      .recv_timeout(std::time::Duration::from_secs(60))
+      .expect("both commits answered");
+    assert_eq!((added, changed), (true, true));
+    let counted = |name: &'static str| {
+      crate::daemon::observe_first(&daemon, move |state| {
+        state.refusals.get(name).copied().unwrap_or(0)
+      })
+    };
+    let waited = std::time::Instant::now();
+    while counted(DELTIFIED) + counted(REFUSED) == 0
+      && waited.elapsed() < std::time::Duration::from_secs(60)
+    {
+      std::thread::yield_now();
+    }
+    let counts = (counted(DELTIFIED), counted(WINDOWS), counted(REFUSED));
+    let fetched = counted(crate::vcs_store::svn_texts::PIECE_FETCHED);
+    let (kept, left) = crate::daemon::observe_first(&daemon, move |state| {
+      let records = state.vcs_stores.subversion_records(repository).unwrap();
+      (
+        (
+          records.stored_len(&identity),
+          records.text(&identity).map(std::borrow::Cow::into_owned),
+        ),
+        state.vcs_stores.svn_pieces_held(),
+      )
+    });
+    daemon.stop();
+    assert_eq!(
+      counts,
+      (1, 3, 0),
+      "one text deltified, a window of 100 KiB a unit"
+    );
+    assert!(
+      kept == (None, Some(first)),
+      "kept as a delta, read back whole"
+    );
+    assert!(fetched >= 1, "no piece read through the store");
+    assert_eq!(left, 0, "a fetched piece was kept");
   }
 
   /// Main's ruling on A-761 (the deltify job; w-perf's C1). Do: commit a 250,000-byte text at `/a.txt` (stored whole in
