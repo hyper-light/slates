@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 120
     env:
       # Shape: the arms, `name:commit` each, built and measured in turn; the rounds each arm runs.
-      ARMS: "between:ddfc331a0"
+      ARMS: "between:cd8ed9ca9"
       ROUNDS: "5"
       TESTS: "measure_what_live_shipping_adds_to_a_stable_nfs_write"
     steps:
@@ -65,6 +65,7 @@ jobs:
                 echo "== round $r arm $arm $t load $(cut -d' ' -f1-3 /proc/loadavg)"
                 SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 "$b" "$t" --exact --nocapture --test-threads=1 > ../run.log 2>&1; echo "exit $?"
                 python3 ../counters.py ../run.log
+                grep -m 12 "g228 reply" ../run.log || true
               done
             done
           done
