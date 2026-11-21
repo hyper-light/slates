@@ -461,6 +461,21 @@ fn reformatted(lines: usize) -> (Vec<u8>, Vec<u8>) {
   (base.into_bytes(), post.into_bytes())
 }
 
+/// `work` driven by a pace on the counting clock whose turns end a few asks in, a turn at a time, to its end: its
+/// answer and the turns it took.
+fn turns_to_done<F: core::future::Future>(work: F) -> (F::Output, u64) {
+  let pace = crate::pace::Pace::new(counting_clock);
+  let mut work = Box::pin(work);
+  let mut turns = 0u64;
+  loop {
+    turns += 1;
+    pace.turn(counting_clock() + 8);
+    if let core::task::Poll::Ready(done) = pace.drive(work.as_mut()) {
+      return (done, turns);
+    }
+  }
+}
+
 /// A-787 (§4.3's step budget; CLAUDE.md §3 "Bounded work everywhere"). Do: refine a 3 MiB whole-file replacement (every
 /// line re-indented, every hundredth line's call renamed) driven by a pace whose turns end after a few asks, a turn at a
 /// time. Expect: it spans many turns, no unit does more than a unit's work (a tick's work and one token's comparison at most: the
@@ -502,22 +517,12 @@ fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
   let mut refiner = Refiner::new();
   let mut files = |_: &str, p: &str| lend(p);
   let ticks = crate::pace::Ticks;
-  let pace = crate::pace::Pace::new(counting_clock);
-  let mut work = Box::pin(super::refine_rewrites_paced(
+  let (done, turns) = turns_to_done(super::refine_rewrites_paced(
     &mut sliced,
     &mut sliced_plan,
     &mut refiner,
     (&mut files, &ticks),
   ));
-  let mut turns = 0u64;
-  let done = loop {
-    turns += 1;
-    pace.turn(counting_clock() + 8);
-    if let core::task::Poll::Ready(done) = pace.drive(work.as_mut()) {
-      break done;
-    }
-  };
-  drop(work);
   assert!(turns > 100, "turns {turns}");
   // A unit: under a tick's work, then at most its last charge, one comparison of the longest token.
   assert!(
@@ -692,4 +697,16 @@ fn a_refined_rewrite_keeps_its_paths_other_operations() {
   assert!(matches!(outcome, Outcome::Accepted { .. }), "{outcome:?}");
   assert_eq!(green.content(PATH).unwrap(), post.as_bytes());
   assert_eq!(green.mode(PATH), Some(0o755));
+}
+
+/// The byte-class table is [`super::classify`] for every byte value: what the table answers, the rule answers.
+#[test]
+fn the_class_table_is_classify_for_every_byte() {
+  for byte in u8::MIN..=u8::MAX {
+    assert_eq!(
+      super::class(byte),
+      super::classify(byte),
+      "byte {byte:#04x}"
+    );
+  }
 }
