@@ -541,47 +541,18 @@ async fn stage_texts(
   Some(Ok((storing, carried)))
 }
 
-/// Takes out of `revision`'s contents every text its rows name that repository `repository`'s records do not hold, and
-/// names each in its stored texts by its length instead (C2 stage B part 2 (b)): the texts to land in its changeset. A
-/// text whose bytes a row also names as a property list stays among the contents, the records keeping a list whole.
+/// The texts of `revision` repository `repository`'s records do not hold, taken out and named stored
+/// (`Repository::take_texts`): the texts to land in its changeset.
 fn take_texts(
   state: &ShardState,
   repository: RepositoryId,
   revision: &mut Revision,
 ) -> BTreeMap<ContentIdentity, Vec<u8>> {
-  let Some(records) = state.vcs_stores.subversion_records(repository) else {
-    return BTreeMap::new();
-  };
-  let lists: std::collections::BTreeSet<ContentIdentity> = revision
-    .record
-    .changes
-    .iter()
-    .filter_map(|change| match change.properties {
-      Some(PropertyList::Held { identity, .. }) => Some(identity),
-      _ => None,
-    })
-    .collect();
-  let mut texts = BTreeMap::new();
-  for text in revision
-    .record
-    .changes
-    .iter()
-    .filter_map(|change| change.text)
-  {
-    if records.holds(&text.identity) || texts.contains_key(&text.identity) {
-      continue;
-    }
-    let bytes = if lists.contains(&text.identity) {
-      revision.contents.get(&text.identity).cloned()
-    } else {
-      revision.contents.remove(&text.identity)
-    };
-    if let Some(bytes) = bytes {
-      revision.stored.insert(text.identity, text.size);
-      texts.insert(text.identity, bytes);
-    }
-  }
-  texts
+  state
+    .vcs_stores
+    .subversion_records(repository)
+    .map(|records| records.take_texts(revision))
+    .unwrap_or_default()
 }
 
 /// A revision checked for its landing ([`prepare_revision`]): the check, the work identity of its record, the room

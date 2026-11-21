@@ -11,6 +11,7 @@ use crate::dump::{
 use crate::index::{ChangedPath, ContentIdentity, NodeKind, PropertyList};
 use crate::migration::{
   Exporter, Exporting, Importer, Importing, MigrationRefusal, Properties, Repository, Room,
+  Standalone,
 };
 use crate::svndiff::{Compression, Encoder, Version, Window};
 
@@ -43,19 +44,32 @@ pub(super) const CREATED_DATE: &[u8] = b"2026-11-19T00:00:00.000000Z";
 /// bytes of framing); before this piece, a call wrote a revision's 107 KB text whole.
 pub(super) const CALL_HEADROOM: usize = 4096;
 
-pub(super) fn created() -> Repository {
+pub(super) fn created() -> Standalone {
   created_within(ROOMY)
 }
 
-/// A repository as `CreateRepository` leaves one, within `room`.
-pub(super) fn created_within(room: Room) -> Repository {
+/// A repository as `CreateRepository` leaves one, within `room`, standing alone: its texts held apart, as a daemon's
+/// are on the node's store.
+pub(super) fn created_within(room: Room) -> Standalone {
+  let uuid = Uuid::parse(CREATED_UUID).expect("a UUID");
+  Standalone::new(Repository::new(uuid, CREATED_DATE, room).expect("a repository within its room"))
+}
+
+/// Records as `CreateRepository` leaves them, keeping their texts themselves (`KeptText`): for the tests of that
+/// keeping alone, which go with it (the KeptText move's third piece).
+pub(super) fn created_records() -> Repository {
+  created_records_within(ROOMY)
+}
+
+/// [`created_records`] within `room`.
+pub(super) fn created_records_within(room: Room) -> Repository {
   let uuid = Uuid::parse(CREATED_UUID).expect("a UUID");
   Repository::new(uuid, CREATED_DATE, room).expect("a repository within its room")
 }
 
 /// Imports `dump` into `repository`, its bytes arriving `piece` at a time.
 pub(super) fn import(
-  repository: &mut Repository,
+  repository: &mut Standalone,
   dump: &[u8],
   piece: usize,
 ) -> Result<(), MigrationRefusal> {
@@ -63,10 +77,11 @@ pub(super) fn import(
 }
 
 /// Imports `dump` into `repository` through `importer`, its bytes arriving `piece` at a time, each record it hands over
-/// committed through the records' own step (`Repository::commit_record`, A-652 part 3).
+/// committed through the records' own step (`Standalone::commit_record`, A-652 part 3), its texts held apart, each
+/// delta base the import asks for supplied from them.
 pub(super) fn import_with(
   importer: &mut Importer,
-  repository: &mut Repository,
+  repository: &mut Standalone,
   dump: &[u8],
   piece: usize,
 ) -> Result<(), MigrationRefusal> {
@@ -79,7 +94,7 @@ pub(super) fn import_with(
       held.extend_from_slice(&dump[next..end]);
       next = end;
     }
-    match importer.import(repository, &held, next == dump.len())? {
+    match repository.import(importer, &held, next == dump.len())? {
       Importing::Done => return Ok(()),
       Importing::NeedMore {
         consumed,
@@ -92,7 +107,7 @@ pub(super) fn import_with(
         held.drain(..consumed);
         repository.commit_record(*record)?;
       }
-      // The records hold every text they name: no base is kept elsewhere.
+      // `Standalone::import` supplies every base from the texts it holds.
       Importing::Base { .. } => return Err(MigrationRefusal::Corrupt),
     }
   }
@@ -100,7 +115,7 @@ pub(super) fn import_with(
 
 /// Imports the whole of `dump` into `repository` in one call.
 pub(super) fn import_whole(
-  repository: &mut Repository,
+  repository: &mut Standalone,
   dump: &[u8],
 ) -> Result<(), MigrationRefusal> {
   import(repository, dump, dump.len())
@@ -108,7 +123,7 @@ pub(super) fn import_whole(
 
 /// Exports revisions `first` to `last` of `repository` in format 2.
 pub(super) fn export(
-  repository: &Repository,
+  repository: &Standalone,
   first: u64,
   last: u64,
 ) -> Result<Vec<u8>, MigrationRefusal> {
@@ -117,24 +132,24 @@ pub(super) fn export(
 
 /// Exports revisions `first` to `last` of `repository` in `format`.
 pub(super) fn export_in(
-  repository: &Repository,
+  repository: &Standalone,
   first: u64,
   last: u64,
   format: Format,
 ) -> Result<Vec<u8>, MigrationRefusal> {
-  let mut exporter = Exporter::new(repository, first, last, format)?;
+  let mut exporter = Exporter::new(repository.records(), first, last, format)?;
   let mut out = Vec::new();
-  while exporter.export(repository, repository, &mut out)? != Exporting::Done {}
+  while exporter.export(repository.records(), repository, &mut out)? != Exporting::Done {}
   Ok(out)
 }
 
 /// Exports every revision of `repository` in format 2.
-pub(super) fn export_all(repository: &Repository) -> Result<Vec<u8>, MigrationRefusal> {
+pub(super) fn export_all(repository: &Standalone) -> Result<Vec<u8>, MigrationRefusal> {
   export(repository, 0, repository.youngest())
 }
 
 /// Exports every revision of `repository` in format 3, every text a delta.
-pub(super) fn export_deltas(repository: &Repository) -> Result<Vec<u8>, MigrationRefusal> {
+pub(super) fn export_deltas(repository: &Standalone) -> Result<Vec<u8>, MigrationRefusal> {
   export_in(repository, 0, repository.youngest(), Format::Three)
 }
 
@@ -162,7 +177,7 @@ pub(super) struct History {
 }
 
 /// `repository`'s history.
-pub(super) fn history(repository: &Repository) -> History {
+pub(super) fn history(repository: &Standalone) -> History {
   let mut revisions = Vec::new();
   let mut contents = BTreeMap::new();
   for revision in 0..=repository.youngest() {
