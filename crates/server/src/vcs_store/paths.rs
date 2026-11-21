@@ -195,6 +195,17 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
   }
 }
 
+/// P2's "derived on first read" (A-812, A-821): a git green just made through the door (`crate::green_ready`), owing
+/// its push until it was first reached, has its map of paths made of its head as a push's version has
+/// ([`advance_after_push`]): from its whole head in the whole build's slices where it holds no map before, else over
+/// the change. Nothing for a green of no git repository.
+pub(crate) fn derive_once_made(state: &mut ShardState, green: DbVolumeId) {
+  let Some(version) = state.greens.get(&green).map(|engine| engine.head()) else {
+    return;
+  };
+  advance_after_push(state, green, version);
+}
+
 /// [`advance`] for a version a push committed (A-664's live whole builds): a version whose map must be built from the
 /// whole head is built in slices by a task of the shard ([`whole_build`]), since a push carries its own commits and
 /// nothing of its answer needs the map; a step over the change runs here, as [`advance`]'s does. A push to a green whose
@@ -428,6 +439,19 @@ fn step(
     state.count(super::CHARGE_SHORT, 1);
   }
   Some(answer)
+}
+
+/// Lets go of every map and git trees `repository`'s greens keep (derived data, made again on a green's next step): for a
+/// test comparing what a successor holds of the repository's records alone, since a green that owes its push on replay
+/// derives its paths on first read (P2).
+#[cfg(test)]
+pub(crate) fn forget_maps_for_test(state: &mut ShardState, repository: RepositoryId) {
+  if let Some((content, git)) = state.vcs_stores.git(repository) {
+    for head in std::mem::take(&mut git.heads).into_values() {
+      let _ = release_head(content, &head);
+    }
+  }
+  super::settle(state);
 }
 
 /// The key of the green `green` was branched from and the version it was made at, for a branch.

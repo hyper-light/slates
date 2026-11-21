@@ -59649,6 +59649,14 @@ Applied in the same change to:
     record whichever base it has, so A-753's bound holds. The default branch, the base every create falls back to, is
     made first through the door.
   - A `CreateBranch` request made from a green that owes its push parks at the door like any request on such a green.
+  - Paths derived on first read: a git green the door has just made gets its map of paths made of its head, as a push's
+    version does (`paths::derive_once_made` over `advance_after_push`: the whole build's slices where it holds no map
+    before). A successor replays a created green owing its push again and holds no map of it until it is read
+    (`t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image` asserts both halves: the records' windows
+    back from the shard image, and the map back, the same version and tree, after the first read;
+    `t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart`: a pushed create's 1 MiB
+    object absent until `main` is read, whole by its identity once it is, on both daemons). A-727 a3b's object is now a
+    submitted version's, whose map is made with it and again by the replay.
 - **Evidence.**
   - `t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`: 1,500 files; the push takes at
     most its command's one turn (red on main: 14,273 quanta, the green holding the tree at once), the green owes,
