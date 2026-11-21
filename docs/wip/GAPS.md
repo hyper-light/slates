@@ -11,8 +11,9 @@
 > `crates/cli/tests/real_tools.rs` (a `#pragma once` compile held across the events, `make -q`, `cargo build` a no-op,
 > `git status` clean, every tracked file's inode number and times compared) across a snapshot, a SIGKILL takeover by
 > the anchor's next daemon and memory pressure (an injected hold and stall); green on adas-macbook-pro-2 (APFS).
-> Open: the same flows over Linux FUSE and Windows WinFsp (the test is macOS-only; run-requests.md), and memory
-> pressure from a host actually short of memory (the test injects it).
+> The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
+> and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
+> memory pressure from a host actually short of memory (the test injects it).
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
