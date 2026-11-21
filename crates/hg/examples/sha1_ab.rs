@@ -27,7 +27,10 @@ use sha1_checked::{Digest, Sha1};
 const PIECES: [usize; 2] = [240 * 1024, 8 * 1024];
 
 fn sha1dc(detect: bool, piece: &[u8]) -> [u8; 20] {
-  let mut state = Sha1::builder().detect_collision(detect).safe_hash(false).build();
+  let mut state = Sha1::builder()
+    .detect_collision(detect)
+    .safe_hash(false)
+    .build();
   Digest::update(&mut state, piece);
   let result = state.try_finalize();
   let mut out = [0; 20];
@@ -44,7 +47,9 @@ fn hardware(piece: &[u8]) -> [u8; 20] {
 
 fn main() {
   let arguments: Vec<String> = std::env::args().skip(1).collect();
-  let mib: usize = arguments.first().map_or(256, |value| value.parse().unwrap());
+  let mib: usize = arguments
+    .first()
+    .map_or(256, |value| value.parse().unwrap());
   let rounds: usize = arguments.get(1).map_or(5, |value| value.parse().unwrap());
   // Text-like bytes: manifest lines of a path, a NUL and forty hex digits, varied by a seeded generator.
   let mut corpus = Vec::with_capacity(mib << 20);
@@ -53,10 +58,21 @@ fn main() {
     seed ^= seed << 13;
     seed ^= seed >> 7;
     seed ^= seed << 17;
-    corpus.extend_from_slice(format!("mercurial/dir{}/file{}.py\0{:040x}\n", seed % 97, seed % 1013, seed).as_bytes());
+    corpus.extend_from_slice(
+      format!(
+        "mercurial/dir{}/file{}.py\0{:040x}\n",
+        seed % 97,
+        seed % 1013,
+        seed
+      )
+      .as_bytes(),
+    );
   }
   corpus.truncate(mib << 20);
-  println!("corpus {} MiB; rounds {rounds}; MB/s of each way, every round", mib);
+  println!(
+    "corpus {} MiB; rounds {rounds}; MB/s of each way, every round",
+    mib
+  );
   for piece_len in PIECES {
     let pieces: Vec<&[u8]> = corpus.chunks(piece_len).collect();
     let reference: Vec<[u8; 20]> = pieces.iter().map(|piece| sha1dc(true, piece)).collect();
