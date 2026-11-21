@@ -73,3 +73,9 @@ are wedged and need a person's cancel; every clippy leg is red on container.rs:3
 - Waiting: r19 on adacachy (the only Linux runner; "too few idle CPUs"): kiln tunnel test RED with the fix reversed,
   GREEN with it, + vendor.py check (this Mac has Python 3.9). Then land, then measure the runners' drops.
 - Finding for GAPS: kiln's topo.drops did not count Studio-4's 15:34:40Z drop; I measure drops from runners' logs.
+
+## ~09:45 PST 11-21: Studio-4 disk
+- ~/.cache/w-k90-pin-2-target.noindex was deleted whole at ~09:20 (Studio-4 was at 6.2 GB free); it is 160 MB now
+  (debug only, kiln-rt's clippy). Studio-4 is at 24 GB free: the rest isn't mine. I stopped my queued macOS e2e run (r18)
+  rather than rebuild kiln's lib tests here. I land the Linux piece as soon as r19's red/green passes; the target goes
+  whole once it lands.
