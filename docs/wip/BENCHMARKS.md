@@ -16447,8 +16447,26 @@ loaded to count. It showed two things to measure on a quiet machine:
   small datagrams.
 - At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
   lane on loopback.
-The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
-datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
+The UDP receive buffer was a suspect and is ruled out: over six 64 MiB transfers (about 5 s, load 22) the full-socket-
+buffer drops rose by 8, the rate an idle 20 s showed (32). The "~200 MB/s" was a loaded machine's figure.
+
+**On a quiet Mac, and the per-packet copies removed** (macOS arm64, Studio-1 `adas-mac-studio.local`, 14 cores, the
+command above with `REPLICATION_BENCH_BULK_MIB=64,64,64,64,64,64,64,64` and `replication_bench 20`: eight rows of five
+timed 64 MiB requests after a warm-up, 40 in all; a 6 s `/usr/bin/sample` of the process during them):
+
+| tree | load average | goodput min / median / max (MB/s) | 64 MiB wall p50 range | `memmove` samples | `sendto` | `recvfrom` | AES-GCM enc / dec |
+|---|---|---|---|---|---|---|---|
+| main `55038e0` (before) | 3.70 | 874 / 1,066.5 / 1,131 | 61.9–65.5 ms | 604 | 798 | 344 | 189 / 197 |
+| `e39f4ae` (after: frames encoded in place, packets sealed in one reused buffer) | 3.05 to 2.96 | 961 / 1,103 / 1,217 | 58.9–62.5 ms | 491 | 852 | 356 | 224 / 237 |
+
+What it means:
+- The lane does about 1.1 GB/s on loopback, one direction, one session, on a quiet Mac.
+- The stops are mostly "nothing queued" (about 8,000 of 7,300 packets' turns), with the window rarely the stop.
+- The step removed a clone of every reliable frame (a stream frame's 9 KB) into each packet, and the allocation of
+  each packet's payload and datagram: `memmove` fell 19% (604 to 491 samples), `realloc` and `RawVec::reserve` left
+  the top of the profile. The median moved 3.4% and the minimum 10%. MEMORY SIZING bans the copies whatever they cost.
+- What remains per packet: the send stream's bytes copied into each frame, and on the receiver the decrypt, the frame
+  decode's copy and the reassembly. Then the syscalls (`sendto` and `recvfrom`, one per datagram), and AES-GCM.
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not

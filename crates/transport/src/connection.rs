@@ -350,6 +350,10 @@ pub struct Connection {
   probe_copy_pending: bool,
   /// Why fresh sending stopped, counted ([`Connection::send_stops`]).
   stops: SendStops,
+  /// The unreliable frames of the packet being built ([`Connection::poll_transmit_into`]: its acknowledgement and its
+  /// credit), kept between packets so a packet allocates no list for them; empty between calls. Bounded by what one
+  /// packet's budget holds.
+  unreliable: Vec<Frame>,
   /// The stream credit last advertised for each receive stream: a stream whose credit moved since is
   /// advertised first. Held only for open receive streams (removed as each closes).
   credit_sent: BTreeMap<u64, u64>,
@@ -466,6 +470,7 @@ impl Connection {
       probe_copies: VecDeque::new(),
       probe_copy_pending: false,
       stops: SendStops::default(),
+      unreliable: Vec::new(),
       credit_sent: BTreeMap::new(),
       credit_cursor: 0,
       blocked_sent: None,
@@ -649,13 +654,24 @@ impl Connection {
     self.first_rtt_sample_at.get_or_insert(now);
   }
 
-  /// The next packet to send at `now`, as `(packet_number, frames)`, or `None` when there is nothing to
-  /// send right now. Fills the packet up to `packet_budget` stream bytes with several ack-eliciting frames
-  /// (RFC 9000 §12.2): queued retransmissions first, then fresh frames round-robin, while the congestion
-  /// window, the pacer and the connection credit allow — a probe the timeout owed may pass the window and
-  /// the pacer (RFC 9002 §6.2.4); then, if an acknowledgement is owed, the acknowledgement followed by the
-  /// current receive credit. An acknowledgement-only packet is neither paced nor window-limited.
-  pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
+  /// The next packet to send at `now`: its frames appended to `out` as the payload's bytes, and its packet number; or
+  /// `None` when there is nothing to send right now, `out` untouched. Fills the packet up to `packet_budget` stream
+  /// bytes with several ack-eliciting frames (RFC 9000 §12.2): queued retransmissions first, then fresh frames
+  /// round-robin, while the congestion window, the pacer and the connection credit allow — a probe the timeout owed may
+  /// pass the window and the pacer (RFC 9002 §6.2.4); then, if an acknowledgement is owed, the acknowledgement followed
+  /// by the current receive credit. An acknowledgement-only packet is neither paced nor window-limited.
+  ///
+  /// The reliable frames are encoded from where they are kept and then moved into the sent packet's record, never
+  /// cloned: before 2026-11-20 each was copied into the packet's own frame list (a stream frame's whole payload, about
+  /// 9 KB at a 9,209-byte path MTU, every packet), and that list and the encoded payload were allocated per packet
+  /// (MEMORY SIZING; main's ruling on the lane's throughput). Written in the order acknowledgement, reliable frames,
+  /// credit.
+  pub fn poll_transmit_into(
+    &mut self,
+    now: u64,
+    packet_budget: usize,
+    out: &mut Vec<u8>,
+  ) -> Option<u64> {
     // A spent packet-number space sends nothing, before any frame is taken from its queue (AUD-29-27).
     if self.sent.exhausted() {
       return None;
@@ -672,9 +688,11 @@ impl Connection {
     // The acknowledgement leads (sized to fit, with the connection credit), then stream control frames,
     // then retransmissions and fresh data, then as much stream credit as the room left holds — every frame
     // counted by its encoded length, so the packet never exceeds its budget (the datagram's floor).
-    let mut frames = Vec::new();
-    let ack_largest = self.push_acknowledgement(&mut frames, &mut packing, budget);
-    let carries_ack = !frames.is_empty();
+    let mut unreliable = std::mem::take(&mut self.unreliable);
+    unreliable.clear();
+    let ack_largest = self.push_acknowledgement(&mut unreliable, &mut packing, budget);
+    let carries_ack = !unreliable.is_empty();
+    let acknowledgements = unreliable.len();
     let mut reliable: Vec<Frame> = Vec::new();
     self.take_control(&mut reliable, &mut packing, budget);
     let stop = match self.pacing_hold(now, budget, probe) {
@@ -684,23 +702,42 @@ impl Connection {
         .unwrap_or_else(|| self.take_fresh(budget, probe, &mut reliable, &mut packing)),
     };
     self.note_stop(stop);
-    frames.extend(reliable.iter().cloned());
     if carries_ack || self.credit_moved() {
-      self.push_stream_credit(&mut frames, &mut packing, budget);
+      self.push_stream_credit(&mut unreliable, &mut packing, budget);
     }
-    if frames.is_empty() {
-      return None;
+    let packet_number = if unreliable.is_empty() && reliable.is_empty() {
+      None
+    } else {
+      self.sent.next_pn()
+    };
+    if let Some(pn) = packet_number {
+      let (acknowledgement, credit) = unreliable.split_at(acknowledgements.min(unreliable.len()));
+      for frame in acknowledgement.iter().chain(&reliable).chain(credit) {
+        frame.encode_into(out);
+      }
+      if !reliable.is_empty() {
+        // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
+        // packet number may encode shorter than its longest form).
+        let size = packing
+          .used
+          .saturating_add(crate::endpoint::PACKET_OVERHEAD_BYTES as u64);
+        self.record_sent(now, pn, reliable, probe, ack_largest, size);
+      }
     }
-    let pn = self.sent.next_pn()?;
-    if !reliable.is_empty() {
-      // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
-      // packet number may encode shorter than its longest form).
-      let size = packing
-        .used
-        .saturating_add(crate::endpoint::PACKET_OVERHEAD_BYTES as u64);
-      self.record_sent(now, pn, reliable, probe, ack_largest, size);
-    }
-    Some((pn, frames))
+    unreliable.clear();
+    self.unreliable = unreliable;
+    packet_number
+  }
+
+  /// [`Connection::poll_transmit_into`]'s packet as its frames, decoded back from the bytes it wrote: how this module's
+  /// tests read what a packet carries.
+  #[cfg(test)]
+  pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
+    let mut out = Vec::new();
+    let pn = self.poll_transmit_into(now, packet_budget, &mut out)?;
+    crate::session::decode_frames(&out)
+      .ok()
+      .map(|frames| (pn, frames))
   }
 
   /// With nothing in flight no probe timer runs, so a sender blocked by credit would wait forever if the

@@ -5261,7 +5261,7 @@
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
-> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
+> interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 1.1 GB/s on loopback on a quiet Mac, BENCHMARKS 2026-11-20; "200 MB/s" was a loaded machine's; each packet's frame clone and allocations removed, the stream bytes' copy into each frame and the receiver's copies owed); and the shared-green
 > bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a
 > shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
 > inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
