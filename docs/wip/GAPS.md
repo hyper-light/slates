@@ -33,7 +33,10 @@
 > but stays in RSS and vmmap's resident until the kernel wants it (a 64 MiB `shm_open` probe: footprint 64 -> 0 MiB,
 > RSS 64 -> 64). Correction (same day): those pages stay physically held (not reclaimed in 10 s under pressure), so RSS,
 > which `slates_machine::facts::resident_now` reads, is the honest holding and the footprint understates it.
-> **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> **A-789 BUILT (macOS; content as extents made on demand, piece 1):** each pool extent is an object of its own,
+> made ahead of need and given back whole at release: a 256 MiB burst's destroyed volume left 259 MiB in the content
+> object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
+> object, Windows' section per extent, a held extent's free pages. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**

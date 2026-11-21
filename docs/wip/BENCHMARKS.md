@@ -15809,6 +15809,24 @@ alone exhausts its budget.
   of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
   refiner's p99 save, at token grain, is about 14 ms for that file.
 
+## Content pool extents as objects of their own on macOS (A-789; main's ruling of 2026-11-20 15:20; 2026-11-20)
+- **Give-back, by use:** recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`, a one-shard
+  daemon over a held anchor, a 256 MiB burst into a volume of its own, then the volume destroyed. Measured as the
+  anchor's content object's pages in RAM (`mincore` through the anchor's view) plus the process's resident memory, on
+  adas-macbook-pro-2.local (macOS arm64; quiet). Before (961112d0e): 63 MiB, 1,621 MiB with the burst, 1,622 MiB 20 s
+  after the destroy (the object kept 259 MiB, the process 1,362 MiB). After (d0f3199f9): 420 MiB, 1,648 MiB, 123 MiB
+  (the object 0 MiB).
+- **Provisioning, interleaved A/B:** kiln run r26 on Adas-Mac-Studio.local (macOS arm64, 32 cores), release
+  `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), three rounds A then B,
+  each the median of three runs. The machine ran at load 44 to 79, so every figure is mostly scheduling, and neither arm
+  is near the 50 us floor:
+  - 1 client spinning, p50 (us): A 133.7, 114.4, 96.9; B 101.0, 115.5, 106.7.
+  - 1 client spinning, p99 (us): A 4,323.9, 1,260.8, 2,404.5; B 1,900.5, 861.5, 784.1.
+  - 8 clients spinning, p99 (us): A 3,661.3, 2,928.5, 3,952.5; B 817.4, 2,093.0, 3,664.4.
+  - 1 client parked, p99 (us): A 7,669.4, 5,544.9, 5,272.3; B 5,248.8, 8,701.8, 8,474.4.
+  No arm moved the histogram beyond the noise. A claim still opens and maps one object by name, as before; the extent
+  objects are made at the shard's start and at release. A rerun on a quiet machine is in the run requests.
+
 ## The idle prefault reserve against none (A-777; main's items 1-2 after A-765; 2026-11-20)
 - **The command and machine:** Adas-Mac-Studio.local (macOS arm64, 32 cores), kiln run r6, release, interleaved, three
   rounds: A = main 5518fb2bc (the reserve, A-765's decay), B = agents/w-sizing-noprefault (none).

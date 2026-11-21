@@ -186,7 +186,7 @@ impl ContentPool {
   ) -> ContentPool {
     let layout = config.shard_content_layout();
     let unit = config.pool_unit();
-    ContentPool {
+    let mut pool = ContentPool {
       segment,
       partition,
       partitions: config.geometry.partitions.max(1),
@@ -198,6 +198,35 @@ impl ContentPool {
       huge_pages: config.huge_pages,
       refused: 0,
       hold_open: false,
+    };
+    pool.make_own_extents();
+    pool
+  }
+
+  /// Makes this partition's slice's extent objects where extents are objects of their own (macOS: `make_extent`), so a
+  /// claim later only opens and maps one, never makes it on the provisioning path (main's condition (a), R9). An extent
+  /// a predecessor made is adopted as it is. One the OS refuses is counted, and made at its first claim instead.
+  fn make_own_extents(&mut self) {
+    let Some((content, _)) = &self.content else {
+      return;
+    };
+    for part in 0..self.parts.len() {
+      let Some(id) = u16::try_from(
+        usize::from(self.partition)
+          .saturating_mul(POOL_EXTENTS_PER_PARTITION)
+          .saturating_add(part),
+      )
+      .ok() else {
+        continue;
+      };
+      let (Some(extent), Some((_, (_, len)))) =
+        (slates_mem::extent_handoff(content, id), self.part(id))
+      else {
+        continue;
+      };
+      if slates_mem::make_extent(&extent, len).is_err() {
+        self.refused = self.refused.saturating_add(1);
+      }
     }
   }
 
@@ -248,6 +277,27 @@ impl ContentPool {
       .saturating_mul(self.stride)
       .saturating_add(self.arena_offset)
       .saturating_add(offset);
+    if let Some(extent) = self
+      .content
+      .as_ref()
+      .and_then(|(content, _)| slates_mem::extent_handoff(content, id))
+    {
+      // An extent of its own (macOS): made at its owner's start or at its last release; made here only if neither
+      // could (the OS refused it then).
+      // SAFETY: no other mapping in any process reaches the extent's object while this region lives: this partition
+      // holds its owner word (claimed by compare-and-swap, or held from the previous daemon, which has exited), and the
+      // object is unmapped before its word is released (`release`). The anchor never maps it.
+      let object = match unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) } {
+        Ok(object) => object,
+        Err(_) => {
+          slates_mem::make_extent(&extent, len).map_err(ServerError::Memory)?;
+          // SAFETY: as above.
+          unsafe { slates_mem::ExclusiveObject::open_range(&extent, 0, len) }
+            .map_err(ServerError::Memory)?
+        }
+      };
+      return Ok(Region::shared(object, self.page));
+    }
     match &self.content {
       Some((handoff, object_len)) if at.saturating_add(len) <= *object_len => {
         // SAFETY: no other mapping in any process reaches `[at, at + len)` while this region lives. The range is
@@ -320,6 +370,29 @@ impl ContentPool {
   }
 }
 
+impl ContentPool {
+  /// Gives a released extent's memory back to the system where it is an object of its own (macOS): its name removed,
+  /// so the object and every page in it go with the mapping just dropped, then made again, empty, for its next claim
+  /// (main's condition (a): never made on the provisioning path). Before, a released extent was only unmapped, and its
+  /// pages stayed in the anchor's one content object. A refusal is counted; the extent then keeps its pages.
+  fn give_back(&mut self, id: u16) {
+    let (Some(extent), Some((_, (_, len)))) = (
+      self
+        .content
+        .as_ref()
+        .and_then(|(content, _)| slates_mem::extent_handoff(content, id)),
+      self.part(id),
+    ) else {
+      return;
+    };
+    if slates_mem::unlink_handoff(&extent).is_err()
+      || slates_mem::make_extent(&extent, len).is_err()
+    {
+      self.refused = self.refused.saturating_add(1);
+    }
+  }
+}
+
 impl ExtentSource for ContentPool {
   fn claim(&mut self) -> Option<(u16, Region)> {
     for id in self.candidates() {
@@ -344,6 +417,7 @@ impl ExtentSource for ContentPool {
   fn release(&mut self, id: u16, region: Region) {
     // Unmapped first: the word may be claimed by another shard the moment it is released.
     drop(region);
+    self.give_back(id);
     if !matches!(
       self.segment.pool_release(usize::from(id), self.partition),
       Ok(true)
