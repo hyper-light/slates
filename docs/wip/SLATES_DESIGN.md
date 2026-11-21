@@ -57824,6 +57824,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
 > hg test on the helper. Git's create follows as its C item lands.
 
+> **Status (2026-11-21, C1: a changeset replayed from its payload a piece at a time; R2's replay half).** A replay
+> holds no payload whole. `slates_hg::framing` is the one walk of a changegroup's chunks (7.2's `changegroup.py`
+> order), over a `Source` that answers a range or `Wanted`: a slice never wants (a push's bundle, a whole decoding,
+> which counts in one walk and builds in a second, charged exactly between), and a `Window` holds a forward run its
+> driver fills. A step reads only from where it began and changes nothing on a want, so the driver lets go of what is
+> before the want and steps again. The intake reads each delta through it (`Stepped::Wanted`; a file group opens in
+> a step of its own, its path kept), and `record::Replay::begin_sectioned` / `step_sectioned` frame a changeset's
+> payload, then take it. The server fills the window from `StoreHandle::piece` (`vcs_store::fill_window`) for both
+> recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
+> fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with

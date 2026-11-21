@@ -175,10 +175,19 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
+> time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
+> `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
+> never wants. The intake reads its deltas through it (`Stepped::Wanted`), and `record::Replay::begin_sectioned` /
+> `step_sectioned` frame and take a changeset from its payload. The server's replay (`vcs_store::hg_piece_step`,
+> recovery's `replay_hg_referenced`, the rebuild's `replay_sliced`) fills a forward `Window` from `StoreHandle::piece`
+> on each want (`fill_window`); `payload_of` is gone. Red first:
+> `repository::hg_push::tests::a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload read
+> in 14 fills, the window at most 193,859 bytes (one 128 KiB delta, a 64 KiB piece and a header). Counters
+> `vcs_store.hg_replay_wants` and `vcs_store.hg_replay_window_most`.
 > Owed:
-> - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
->   reads;
-> - an import as changesets (R2's 5.73 GB peak, w-perf);
+> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main and w-store,
+>   inbox/main-from-w-hg-c1-import-design.md);
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
