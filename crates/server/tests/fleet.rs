@@ -16565,6 +16565,7 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   // publication's own turn, each step's nanoseconds within the build's.
   let build_steps: Vec<(u64, u64)> = [
     "fleet.live.hop.build.capture",
+    "fleet.live.hop.build.keys",
     "fleet.live.hop.build.seal",
     "fleet.live.hop.build.append",
     "fleet.live.hop.build.send",

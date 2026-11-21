@@ -4096,6 +4096,7 @@ fn sealed_payload(
     return Some((payload, None));
   }
   let (lineage, namer, segment) = body_keys(state, id)?;
+  mark_build(state, id, |marks, now| marks.keyed_ns = Some(now));
   let pieces = seal_body(&lineage, &namer, body, segment)?;
   let (sealing, anchors) = whole_sealing(state, id, whole)?;
   let mut payload = vec![kind, BODY_SEALED];
@@ -5399,7 +5400,10 @@ const HOP_BUILD_CAPTURE: (&str, &str) = (
   "fleet.live.hop.build.capture",
   "fleet.live.hop.build.capture_ns",
 );
-/// Of the build: the payload sealed under the volume's keys ([`sealed_payload`]).
+/// Of the build: the volume's sealing keys fetched ([`body_keys`]: its lineage key and namer, each unwrapped from its
+/// record).
+const HOP_BUILD_KEYS: (&str, &str) = ("fleet.live.hop.build.keys", "fleet.live.hop.build.keys_ns");
+/// Of the build: the payload sealed under the volume's keys ([`seal_body`]), once its keys are in hand.
 const HOP_BUILD_SEAL: (&str, &str) = ("fleet.live.hop.build.seal", "fleet.live.hop.build.seal_ns");
 /// Of the build: the entry appended to the shipper's log, its identity hashed ([`append_entry`]).
 const HOP_BUILD_APPEND: (&str, &str) = (
@@ -5416,6 +5420,8 @@ const HOP_BUILD_SEND: (&str, &str) = ("fleet.live.hop.build.send", "fleet.live.h
 struct BuildMarks {
   /// The capture read, its plain body in hand ([`publish_body`] entered).
   captured_ns: Option<u64>,
+  /// The volume's sealing keys in hand ([`body_keys`]: its lineage key and namer); unset for a clear body.
+  keyed_ns: Option<u64>,
   /// The payload sealed.
   sealed_ns: Option<u64>,
   /// The entry appended.
@@ -5527,9 +5533,15 @@ fn count_hops(state: &mut ShardState, volume: [u8; 16], stamps: Option<LaneStamp
       && sealed <= appended
       && appended <= stamps.made_ns;
     if ordered {
+      // A clear body has no keys to fetch: its seal is timed from the capture.
+      let keyed = marks
+        .keyed_ns
+        .filter(|keyed| captured <= *keyed && *keyed <= sealed)
+        .unwrap_or(captured);
       for (hop, ns) in [
         (HOP_BUILD_CAPTURE, captured.saturating_sub(published_ns)),
-        (HOP_BUILD_SEAL, sealed.saturating_sub(captured)),
+        (HOP_BUILD_KEYS, keyed.saturating_sub(captured)),
+        (HOP_BUILD_SEAL, sealed.saturating_sub(keyed)),
         (HOP_BUILD_APPEND, appended.saturating_sub(sealed)),
         (HOP_BUILD_SEND, stamps.made_ns.saturating_sub(appended)),
       ] {
