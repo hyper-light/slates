@@ -23,3 +23,19 @@
   normal before it runs; running, it shares round-robin with the load's normal-priority spinners (8 on 4 vCPU).
 - Next (diag-measurer-w-k90-win-84a-6, in flight): the shard kept one level up while it runs (no privilege; its own
   level within the process class), A/B against main's raise-for-the-wait, with stamps.
+
+## CLOSED: 84a met on Windows (2026-11-21 ~15:30 PST)
+- LANDED slates main 86b9442c6: f30126510 (A-834) -- a Windows shard stays one level above normal while it runs (A-361's
+  raise kept, not put back); fmt follow-up 0cbfaba80. With A-828 (0f409fc87, the timed wait's deadline).
+- Test, red then green on windows-latest and windows-11-arm (diag run 44948887874):
+  `driver::tests::a_windows_shard_stays_one_level_up_after_a_blocking_wait` red at the test alone (level 0 after the wait),
+  green with the change, with A-828's two tests; slates-rt clippy --all-targets -D warnings clean on both; unsafe budget
+  120/120; cargo fmt clean.
+- Numbers (same run; release, interleaved, 3 rounds a runner; BENCHMARKS "A Windows shard kept one level above normal"):
+  | runner, loaded | base (main 8fb2e33db) p999 accept / conflict | A-834 p999 accept / conflict | A-834 p99 |
+  |---|---|---|---|
+  | windows-latest | 32.0-48.5 / 31.9-84.9 ms | 579-699 / 305-410 µs | 174-230 µs |
+  | windows-11-arm | 4.2-31.8 / 19.8-27.3 ms | 640-665 / 304-335 µs | 217-319 µs |
+  p50 and quiet unchanged. A/B before it (run 44947142869, same binary): 0-4 requests a round over 10 ms against 6-20.
+- Mechanism (stamps, run 44945557697): the tail was a runnable shard losing a 31.6 ms quantum to normal-priority load,
+  queued (12-22 a round) or mid-service (16-22 a round); kept a level up it preempts the load. No privilege (R10).

@@ -135,3 +135,9 @@
 - Landing check: diag branch diag-measurer-w-k90-win-84a-3 (tests + slates-rt clippy, both runners); kiln/jupiter down.
 - Next: land 4b7f653ef; then per-wake stamps (g222's diag-g222-hops-base stamp module) on Windows for the p999 mechanism.
 - jupiter disk: was 0.7 GB free at 11:30; I deleted my kiln target (23 GB) -> 27 GB. Others fill it too.
+
+## 2026-11-21 ~15:30 PST: 84a Windows MET -- A-828 0f409fc87 + A-834 f30126510 (main 86b9442c6, fmt 0cbfaba80)
+- Loaded p99/p999 <1 ms on windows-latest and windows-11-arm, 3/3 rounds (diag run 44948887874). Close note appended to
+  inbox/main-from-w-k90-win-84a-windows.md. Goal c487e3280dce8759a63077de818cd843 -> goals_done.
+- For main to delete (my scratch): diag branches diag-measurer-w-k90-win-84a-1..7 and agents/w-k90-win-84a-wip,
+  agents/w-k90-win-84a-2 on slates origin (never main).
