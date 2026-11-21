@@ -19,6 +19,21 @@
 - After each landing send main (SendMessage to "main") a 3-line report and go straight on to the next piece in your
   queue. END when the queue is done or your context runs short (update your progress file first).
 
+## FOCUS: GOAL 93, THE VCS SERVERS (ADA 2026-11-21 ~10:40 PST; overrides every other priority in this file)
+Ada: "Goal 93 is where we need to focus our efforts now. Complete the servers, ensure correctness, then optimize."
+- Goal 93: slates serves git, Mercurial and Subversion as industrial-grade servers on its changeset architecture,
+  interop with stock clients proven, an order of magnitude faster than the stock servers.
+- Order, strictly: (1) COMPLETE: every verb and wire path a stock client uses works. (2) CORRECT: stock clients on
+  real repositories (git/git, the Linux tree, hg's own history, a large svn dump) get byte-identical results, and
+  every failure becomes a red test first. (3) Only then OPTIMIZE: A/B, release, all N, against the stock server.
+  Do not start a performance piece on 93 while a completeness or correctness failure on the same server is open.
+- If your current item is not goal 93: land what is green within about 30 minutes (or record an in-flight
+  measurement as one GAPS line), write inbox/main-from-<you>-free.md, and main gives you a goal-93 piece. CI runs
+  already going finish and are recorded; start no new non-93 runs.
+- Goal-93 owners keep their lists (close-list.md, "93 ..."), reordered C, then R, then P under this rule.
+- A failure found by use goes to the server's owner as a red test (inbox/<owner>-from-<you>-<topic>.md). It is fixed
+  by the owner, or by you if the owner says so in writing; never two agents in one file at once.
+
 ## FAST LANDING LOOP (ADA 2026-11-19 ~20:40 PST: "it should literally not take two hours to land a feature --
 ## implement, light unit testing, merge"). This OVERRIDES any heavier step above or in older briefs/progress files.
 Target: under 30 minutes per piece.
