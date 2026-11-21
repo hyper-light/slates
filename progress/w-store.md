@@ -1,5 +1,10 @@
 # w-store progress (brief: briefs/w-store.md)
 
+## State (2026-11-20 ~23:30 PST)
+- LANDED e4cfbd38d: creation in the one landing order (land seq 0, then record + completion, then answer; ids reserved
+  via ShardState::family_reserved_through). Red/green kill test; store_tests 3/3; repository:: 58/62 (the 4 known).
+  NEXT: AuditKind for the standing grant + revocation; then pairing C4-C6.
+
 ## State (2026-11-20 ~22:30 PST)
 - LANDED ad1d9e7a6: C5 store side, crates/server/src/vcs_store/store_packs.rs (StorePacks: async fill into a bounded
   LRU of store pieces, sync PackSource::piece lends; main's split, w-git builds git's side on it; shape posted

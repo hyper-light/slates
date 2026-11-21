@@ -72,3 +72,22 @@
   anything lands, and found as first issued after a crash. Every landing's header names its id
   (`StoreHandle::grant()`); the creation landing does now, and the tools were told. Tests: slates-store 21/21, server
   store_tests 2/2. Still owed: a standing-grant `AuditKind` with its audit position, and revocation.
+
+## 2026-11-20 ~23:30: a creation in the one landing order (e4cfbd38d)
+- Red first: `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once`
+  (server --lib, `repository/store_tests.rs`). A test-only fault ends the landing task between its two steps. Before
+  the fix, the repository was left in the register with no creation in the store.
+- Fix: `land_then_record`. It judges the `RepositoryCreated` guard (no apply) and reserves the repository's and root's
+  ids, then lands changeset 0. Only after that does one transaction record the repository, its root and the
+  completion, and the client is answered (the verb's acceptance is deferred until then). A kill in between leaves a
+  changeset no repository names, and the retry creates the repository once. Tests: `store_tests` 3/3.
+- **Your call:** id reservation was needed because ids were only peeked from the partition's family counter when the
+  verb ran. `ShardState::family_reserved_through` is a high-water mark; `fresh_family_id_at` now mints past it, so an
+  id that never got recorded becomes a gap and is never reused.
+- **Your call:** with a store, a create with no reply route (forwarded from another node) is refused `Unsupported`,
+  since it has nowhere to be answered after the landing. This is in GAPS as owed with the fleet half. Overrule if you
+  want something else.
+- There was no GAPS line for this finding, so I recorded it as CLOSED in the A-767 entry, with a design status line.
+- `repository::tests`: 58 pass and 4 fail. The 4 failures are the same ones (submit refused `Overloaded`) I reported on
+  clean main f9c113ae9, not from this change.
+- Sibling: svn_made's order is with w-svn (your note). w-hg's push already lands first on its branch.
