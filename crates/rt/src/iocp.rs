@@ -191,8 +191,7 @@ impl IocpDriver {
     const NANOS_PER_MILLI: u64 = 1_000_000;
     /// Format: INFINITE.
     const INFINITE: u32 = u32::MAX;
-    let whole_ms =
-      |ns: u64| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1);
+    let whole_ms = |ns: u64| u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1);
     let timeout_ms = match remaining_ns {
       None => INFINITE,
       Some(0) => 0,
@@ -301,9 +300,15 @@ impl Deadline {
       }
       let find = |name: &core::ffi::CStr| GetProcAddress(module, name.as_ptr().cast());
       (
-        std::mem::transmute::<FARPROC, Option<CreatePacket>>(find(c"NtCreateWaitCompletionPacket"))?,
-        std::mem::transmute::<FARPROC, Option<AssociatePacket>>(find(c"NtAssociateWaitCompletionPacket"))?,
-        std::mem::transmute::<FARPROC, Option<CancelPacket>>(find(c"NtCancelWaitCompletionPacket"))?,
+        std::mem::transmute::<FARPROC, Option<CreatePacket>>(find(
+          c"NtCreateWaitCompletionPacket",
+        ))?,
+        std::mem::transmute::<FARPROC, Option<AssociatePacket>>(find(
+          c"NtAssociateWaitCompletionPacket",
+        ))?,
+        std::mem::transmute::<FARPROC, Option<CancelPacket>>(find(
+          c"NtCancelWaitCompletionPacket",
+        ))?,
       )
     };
     // SAFETY: an unnamed timer with default security; the result is checked.
@@ -612,10 +617,20 @@ mod tests {
     };
     let took = started.elapsed();
     let taken = usize::try_from(count).unwrap();
-    let keys: Vec<usize> = entries.iter().take(taken).map(|e| e.lpCompletionKey).collect();
+    let keys: Vec<usize> = entries
+      .iter()
+      .take(taken)
+      .map(|e| e.lpCompletionKey)
+      .collect();
     eprintln!("dequeued ok={ok} count={count} keys={keys:?} took={took:?}");
     assert!(matches!(armed, Arm::Running), "the deadline didn't arm");
-    assert!(keys.contains(&DEADLINE_KEY), "no deadline packet came: {keys:?}");
-    assert!(took.as_nanos() < 1_000_000, "the deadline's packet took {took:?}");
+    assert!(
+      keys.contains(&DEADLINE_KEY),
+      "no deadline packet came: {keys:?}"
+    );
+    assert!(
+      took.as_nanos() < 1_000_000,
+      "the deadline's packet took {took:?}"
+    );
   }
 }
