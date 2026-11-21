@@ -1665,3 +1665,13 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - r4 (jupiter, the WinFsp C1 fix) is still building or running.
 - 2026-11-21 04:13 PST Quiet: every agent working, none waiting on main; no new landings since 04:06. r4 (jupiter, the WinFsp C1 fix) is still running; r48 is still queued. The MacBook disk is 53 GB.
 - 2026-11-21 04:18 PST RUN r4 (jupiter, live WinFsp): w-work-mount's C1 fix 705f4d7e5 is GREEN. a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save ok, 1 passed, 2.04 s. r3 had been red ("no slates volume is mounted at E:": a merge volume's status reported no mounts). w-work-mount lands it. The Linux FUSE leg (r2) is still queued for adacachy.
+- 2026-11-21 04:23 PST
+  - LANDED: 87721dbeb (w-work-mount, A-774 C1: a mounted work's status reports its host mounts, so Windows' unmount finds its drive). r3 red, r4 green on jupiter; C1's Windows side is done and the Linux FUSE run r2 is still queued.
+  - GOAL MET, the vendoring part of "kiln vendors slates" (w-k90-pin-2's goal 01a1facaf183, verified met in its stack): vendor/slates pinned at 8ce3d61523e1, kiln ci.yml green on five platforms:
+    - macOS arm64: 44851246181/136703754428;
+    - Linux x86-64: 44851246181/136703754443;
+    - Linux arm64: 44887857088/136804151244;
+    - Windows x86-64: 44887857088/136804151233;
+    - Windows arm64: 44887857088/136804151286.
+    Library API only (no slates CLI call). It was the goal's last open part, so the UI top-level needs Ada's mark; main's stack reads empty here.
+  - LEFT: kiln's clippy legs are red again on container.rs:301 (sent to w-k90-containers, who fixed it at 21:59). kiln's own CI lanes (ci.runs.local 01a1fa8f0de1, 01a1fa8fe409, 01a1fa8ff6d7, 01a1fa9006fe) are wedged and need a person's cancel: Ada.
