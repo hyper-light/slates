@@ -335,6 +335,17 @@
 > its_slice_allows` (31 units for 15 revisions before; fewer units than revisions after, the 1 ns slices' test still a
 > revision a unit). `revision_text` applies a chain into two swapped buffers (dc59ef2a1). Owed: the restart of hg's
 > history measured again, release, its slices and longest step (the Studios' network and adacachy's room permitting).
+> **Item 6, reading (a): a forced new head on a moved line, held to stock 7.2's `push -f` (2026-11-20, w-hg).**
+> PROVEN by use, no change needed. `crates/cli/tests/hg_interop.rs`
+> `stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both` runs over the HTTP edge with stock 7.2:
+> - A pushes, B clones, commits and pushes, which moves the line, then A commits on the old head;
+> - A's plain push is refused in 7.2's own words (`abort: push creates new remote head`, exit 255);
+> - `push --force` lands, as a line made (§4.17.3 decision 1);
+> - a fresh clone holds three changesets and both heads on `default`;
+> - B's pull brings A's head.
+> Passes on its first run (local macOS, 49 s with the HTTP round trip). Reading (b), the forced push judged as a work
+> and made over the moved head (the lock-free rebase, beyond stock), waits on main's ruling
+> (inbox/main-from-w-hg-2026-11-20-item6-question.md).
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
