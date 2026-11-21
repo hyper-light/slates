@@ -32,6 +32,10 @@ slates-machine = { workspace = true, features = ["codecs"] }
 # The proofs a grant, an enrollment, a revocation and a consensus recovery carry, the anchor's liveness budget the
 # client's deadlines derive from, and the daemon the daemon role runs (§2.6).
 slates-server = { workspace = true }
+# The version-control store the daemon role opens under the operator's `--vcs-store` grant (A-767): its directory's
+# root and grant (`slates-land`), its owner thread (`slates-store`).
+slates-land = { workspace = true }
+slates-store = { workspace = true }
 # The recovery budget the client's reconnect deadline and the anchor's restart policy derive from.
 slates-db = { workspace = true }
 # The anchor role's held NFS listener and fleet sockets, and its judgment of a starting daemon's runnable state.

@@ -115,8 +115,10 @@
 > hyper-raft `5e40eb9`; 2b: engine, chunk, disk, crc, codec vendored and ported onto `slates_rt` (main's ruling: no hyper-rt, no
 > `unsafe impl Send`/`Sync`), their unit tests green here; their files opened through `slates_land::store_root` under a
 > `StoreGrant` (C2 closed). Owed (performance): segmented store files over the granted root, measured against one file; the
-> engine's extent pages and fanout learned per device (cited now: 32, 8). C3 steps 1-2 built: the changeset log and the
-> store (landing, `C` rows, recovery).
+> engine's extent bytes and fanout are the caller's `Sizing` (from its machine profile; the server's derivation is
+> owed with C4). C3 closed; C4 groundwork built: the owner thread and
+> `--vcs-store` (the daemon holds the store; shards hold its handle). Owed: Windows' store directory (`store_root`
+> refuses `Unsupported` there); the store grant's durable audit record (logged only); each tool's landing onto it (C4-C6).
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
@@ -5490,10 +5492,15 @@
 > per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
 > red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
 > 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
-> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
-> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
-> The flow is on main since 2026-11-20 (`a_resumed_holders_catch_up_beside_a_busy_volume`, command in BENCHMARKS),
-> and its interleaved A/B against the pair reverted is in main's run-request queue.
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). The arm catch-up time is closed (g227,
+> 2026-11-20). On today's main the flow (`a_resumed_holders_catch_up_beside_a_busy_volume`) catches a holder up from
+> 20,000 behind (about 180 MiB) in 2.73, 3.86, 4.19 and 8.95 s on GitHub's arm runner and 3.43–4.47 s on x86, 0 or 1
+> installs. That is the old main's 2.2–2.4 s range again, not the 9.4–13.3 s the Nov 12 trees took. With the pair
+> reverted on the same trees, no run got through its 20,000 writes with the holder stopped inside 1,200 s (8 of 8 on
+> GitHub). On the Studio those writes took 344–1,134 s, against 18–43 s with the pair. The pair stays; BENCHMARKS
+> "The catch-up on today's main" has every run. Noted, not worked: each exchange to a lagging holder is capped at one congestion window
+> (`live_ship::take_batch`), so a catch-up moves about a window per round trip. That costs nothing measured now
+> that the arm gap is gone.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
@@ -9531,7 +9538,7 @@ them rather than renumbering or weakening the original gates.
 - D-O14 (opened 2026-09-04) FUSE passthrough for untouched base files — CLOSED 2026-09-04: not used; slates never requires `CAP_SYS_ADMIN` or root beyond the OS-provided brokers installed once (`fusermount3`/user namespaces, the FSKit extension, the WinFsp driver); the daemon copy path is the only base read path.
 - D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window until 2026-09-29; since A-43 the old entry moves aside and the new one in by renames that replace nothing, the name's absent window reported) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
 - D-O16 (opened 2026-09-04) Landing filters — DECIDED 2026-09-04: the confirmation surface offers suggestions the human toggles (ignore-file-aware); the agent's filter stays explicit; a toggle produces a new manifest hash (§4.15 step 2). Phase 5 builds it.
-- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict. The refinement runs off the verb, a slice a turn (A-787 parts 1 and 2, close item R3): longest turn 69-79 µs at 2 MiB and 133-157 µs at 8 MiB, against the whole refinement in the submit's step before. Found 2026-11-20, recorded, not worked (close order): (a) that tail follows the largest single buffer the job frees; deferring frees to an idle moment waits on A-783's primitive; (b) `pace::sort_by` (A-752) grows its runs by doubling, so one push copies every item before it in one step, and `OpsDoc::canonicalize_paced` sorts by it (the refinement no longer calls either); (c) an edit-and-submit of a work off its green's shard composes unrefined; (d) an edit-and-submit retried while parked behind a refinement or a whole build runs its edit again; (e) the rest of a submit (the seal's clone of the work's files, the composition, the post-state, the identity) is still one step that grows with the files. (f) Main's lint round 10 (35e4fd7de) reshaped refine.rs, and the result is 1.1-1.3 times slower a save than A-787 before it. Measured on adas-mac-studio-4 (M4 Max, release, load 3-4, interleaved): 12 MiB 234-236 ms against 181-184 ms, 1 MiB 19.6-20.0 against 15.7-16.0 ms. The likely cause is the byte-class table replaced by comparisons. A work off its green's shard refines too: it fetches the base bytes of the paths it replaced whole (C1, `whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits`). A file renamed over another is refined against the rename's source (C2). Found 2026-11-20, not worked (close order): the backup-then-recreate save (rename `f` to `f~`, create `f`, write it: vim's and Emacs's default with a backup) is refused by the deriver, `DeriveError::Unsupported("f")`, before any refinement, so such a save cannot be submitted at all (w-rewrite-ops, by a composition probe; GAPS §8f's rename onto a consumed base path).
+- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict. The refinement runs off the verb, a slice a turn (A-787 parts 1 and 2, close item R3): longest turn 69-79 µs at 2 MiB and 133-157 µs at 8 MiB, against the whole refinement in the submit's step before. Found 2026-11-20, recorded, not worked (close order): (a) that tail follows the largest single buffer the job frees; deferring frees to an idle moment waits on A-783's primitive; (b) `pace::sort_by` (A-752) grows its runs by doubling, so one push copies every item before it in one step, and `OpsDoc::canonicalize_paced` sorts by it (the refinement no longer calls either); (c) an edit-and-submit of a work off its green's shard composes unrefined; (d) an edit-and-submit retried while parked behind a refinement or a whole build runs its edit again; (e) the rest of a submit (the seal's clone of the work's files, the composition, the post-state, the identity) is still one step that grows with the files. (f) Main's lint round 10 (35e4fd7de) reshaped refine.rs, and the result is 1.1-1.3 times slower a save than A-787 before it. Measured on adas-mac-studio-4 (M4 Max, release, load 3-4, interleaved): 12 MiB 234-236 ms against 181-184 ms, 1 MiB 19.6-20.0 against 15.7-16.0 ms. The likely cause is the byte-class table replaced by comparisons. Fixed 2026-11-20 by 9f77462e4 (the table back, a literal `[Class; 256]` read through `.get`): on adas-mac-studio-2 (release, interleaved, six passes) the whole refinement is back at the pre-round-10 cost (12 MiB 184-191 ms against 187-190 ms; 1 MiB 15.7-16.0 against 16.0-16.3), and the sliced one keeps about 1.05 times it (12 MiB 199-204 against 187-194 ms), not chased. A work off its green's shard refines too: it fetches the base bytes of the paths it replaced whole (C1, `whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits`). A file renamed over another is refined against the rename's source (C2). Found 2026-11-20, not worked (close order): the backup-then-recreate save (rename `f` to `f~`, create `f`, write it: vim's and Emacs's default with a backup) is refused by the deriver, `DeriveError::Unsupported("f")`, before any refinement, so such a save cannot be submitted at all (w-rewrite-ops, by a composition probe; GAPS §8f's rename onto a consumed base path).
 - D-O18 (opened 2026-09-04) Merge proposer authority: slates departs from hecate's leader-fused proposer (one shared pointer group; partitioned execution) and uses a consensus-issued lease with an epoch check at commit; CLOSED 2026-09-04 by A-6: the owner is the distinguished proposer of its own registers under its host epoch, so no leader-versus-leaseholder split can exist; a resumed stale owner is refused at the first holder (model-checked as StaleNeverCommits and Continuity).
 
 ## 3. Undesigned (charter only)
@@ -10905,7 +10912,12 @@ the immediate poll with a time-horizon turn estimate, and the immediate poll wit
 spin's turn. Both meet R9's 50 µs floor quiet for the first time at nine shards (p99 28-43 and 38-40 µs against main's
 99-111) and cut the loaded p99 3-5x (0.25-0.46 ms against 1.06-1.34). Both make the loaded p999 worse (5.6-23.4 ms against
 2.1-2.5) and spend 2-6x main's quiet CPU (3.3-10 cores against 1.7). Neither lands under the data rule: P2 stays open.
-**Next:** the loaded p999's own hop (g222's ~1 ms timer band and the shards' priority under a true spin), with g222.
+**The p999's hop, named (2026-11-20 night):** g222's 1.00-1.02 ms band was the busy harvest's nap. The kqueue commit alone
+empties it on their path (queued p99 1.05-1.17 ms -> 22-23 µs), and on Linux the same band is the kernel tick. On
+provisioning the candidates' p999 sits in cross-shard hops to a shard that spins without sleeping, which macOS demotes
+and which then waits quanta for a core: 7-29 ms. QoS user-interactive does not move it (rejected; BENCHMARKS "Where the
+loaded p999 goes, per hop"). **Decision needed (main/Ada):** land the immediate poll for p99 3-5x better and R9's quiet
+floor (with the p999 4-5x worse and 4-6x the quiet CPU with holds), or keep main's nap.
 Earlier next step, now measured: A-387's turn estimate forgets by a count of turns, so with cheap turns a preemption is forgotten after
 2^shift turns, microseconds of spinning; the fix weighs turns by time, then lands with the immediate poll and its red test
 (`a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`, macOS judged by time). Found on the way, not chased:
@@ -23845,3 +23857,12 @@ owes a whole state, and each owed whole state is another 3 MiB build the writes 
 three runs of three on the merge 287055d5b: 41-42 MiB before the burst, 1,341-1,342 MiB after its volume was destroyed, for a
 256 MiB burst (bound: under a quarter of the burst). The same with the wait's original 250 ms sleep as with a yield, so
 the wait is not the cause. Not chased.
+
+### 2026-11-20: one submit of a 1 GiB or 100,000-file changeset holds its shard past the liveness window — open (w-work-cow's finding, not worked: Ada's close order)
+A seed work holding a whole 1 GiB green (1,000 files of 1 MiB) or a 32 MiB green of 100,000 files, submitted at once,
+spun shard 0 for 1,097 ms of CPU without a step against its 1,025 ms window; with no anchor the watchdog ended the
+daemon (exit 4: "shard 0 is spinning ... in task spawned at crates/server/src/identities.rs:243"). Release, Mac Studio
+32 cores, main 283d646b7, `tests/work_cow.rs` with `SLATES_WORK_COW_FILES=1000 SLATES_WORK_COW_FILE_BYTES=1073741`
+before its seed was split. An initial clone or import is one changeset (the storage ruling), so its submit and
+landing need slicing under the shard's step budget. P2's grid seeds in parts of at most 16 MiB and 5,000 files.
+

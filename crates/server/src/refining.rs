@@ -54,6 +54,9 @@ pub(crate) const REFINE_PAST_QUANTUM: [&str; 4] = [
 pub(crate) const REFINE_LONGEST_TURN_US: &str = "merge.refine.longest_turn_us";
 /// Shape: the multiples of the quantum [`REFINE_PAST_QUANTUM`] counts turns past.
 const PAST_MULTIPLES: [u64; 4] = [1, 2, 4, 16];
+
+/// A job's turns, and of them those past each of [`PAST_MULTIPLES`] of the shard's step quantum.
+type TurnCounts = (u64, [u64; PAST_MULTIPLES.len()]);
 /// Format: a refinement job that gave up (its work, green or bytes gone): its verbs compose unrefined.
 pub(crate) const REFINE_GAVE_UP: &str = "merge.refine.gave_up";
 /// Format: a verb parked behind its work's refinement.
@@ -341,7 +344,7 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
         post: Vec::new(),
       })
       .collect();
-    let mut turns = (0u64, [0u64; 4]);
+    let mut turns = (0u64, [0u64; PAST_MULTIPLES.len()]);
     let mut longest = 0u64;
     // The copies, a slice a turn.
     for index in 0..copies.len() {
@@ -436,7 +439,7 @@ fn job(work: DbVolumeId, green: DbVolumeId, owed: Owed) -> Job {
 
 /// Counts a job turn begun at `began`: `turns` the turns and those past each multiple of the shard's whole step quantum,
 /// `longest` the longest, nanoseconds.
-fn turn(turns: &mut (u64, [u64; 4]), longest: &mut u64, began: u64) {
+fn turn(turns: &mut TurnCounts, longest: &mut u64, began: u64) {
   let took = slates_rt::futures::now_ns().saturating_sub(began);
   let quantum = crate::state::with_state(|s| s.config.step_quantum_ns()).unwrap_or(u64::MAX);
   turns.0 = turns.0.saturating_add(1);
@@ -452,7 +455,7 @@ fn finish(
   state: &mut ShardState,
   work: DbVolumeId,
   (key, refined): (Key, Option<(OpsDoc, PostStatePlan)>),
-  (turns, longest): ((u64, [u64; 4]), u64),
+  (turns, longest): (TurnCounts, u64),
 ) {
   if refined.is_none() {
     state.count(REFINE_GAVE_UP, 1);
@@ -462,7 +465,10 @@ fn finish(
     state.count(name, count);
   }
   // The job's longest turn, microseconds: summed over jobs, so a run of one job reads its own.
-  state.count(REFINE_LONGEST_TURN_US, longest / 1_000);
+  state.count(
+    REFINE_LONGEST_TURN_US,
+    longest / crate::daemon::NANOS_PER_MICRO,
+  );
   state.refining.longest_turn_ns = state.refining.longest_turn_ns.max(longest);
   if state.refining.running.get(&work) == Some(&key) {
     state.refining.running.remove(&work);

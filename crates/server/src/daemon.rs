@@ -4562,7 +4562,7 @@ async fn start_shard(
 }
 
 /// Format: nanoseconds in a microsecond, for the boot log's slice times.
-const NANOS_PER_MICRO: u64 = 1_000;
+pub(crate) const NANOS_PER_MICRO: u64 = 1_000;
 
 /// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
 /// shard), for its duration. Only the boot tests set one.
@@ -5114,6 +5114,7 @@ async fn init_shard(
     making_volumes: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
     fenced_greens: std::collections::BTreeMap::new(),
+    vcs_disk: config.vcs_disk.clone(),
     vcs_stores: crate::vcs_store::VcsStores::with_windows(Box::new(
       crate::vcs_store::arena_windows::ChunkWindows::new(config.page),
     )),

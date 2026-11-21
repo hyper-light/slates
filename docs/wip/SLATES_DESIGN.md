@@ -11855,6 +11855,9 @@ the shard cannot admit waits, counted `merge.inputs_over_budget`, as one whose i
 > (the base's ranges and the bytes written), so 8 works each overwriting one byte of a 64 MiB file add 32 KiB, not
 > 201 MB (`crates/server/tests/work_edit_cow.rs`); off the green's shard an edit asks the owner for the file's length
 > alone. The A/B is in BENCHMARKS.
+> **The brief's grid (2026-11-20, w-work-cow P2, BENCHMARKS).** Over 1 MiB to 1 GiB greens of 1,000 to 100,000 files and
+> 1 to 100 works, a work requested, reading one file and editing it adds 1.6 to 5.6 KB of live heap, flat in both; with a
+> copy of the green per work put back, 1.5 MB to 1.25 GB. Release, Mac Studio, 135 runs, before and after interleaved.
 
 > **Status (2026-11-18, A-513: a work replayed through its green's owner is found again after a lost answer).** At
 > recovery a work whose green lives on another partition is replayed through the green's owner, every ask in its
@@ -57737,6 +57740,58 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > 64 KiB piece) once landed; `Store::changesets(repository, from)` reads the `C` rows. Tests: `slates-store` 7/7 unit
 > and 4/4 integration, the seam's own: a 300,001-byte pack read the same staged (borrowed), landed (RAM 0 after its
 > release) and recovered with and without a checkpoint.
+>
+> **Status (2026-11-20, piece C3 step 4: the A/B's derived per-path arm, decided).** Main's bar: changesets plus a derived
+> per-path form must meet the per-file arm's old read (91 µs p50) and clone file section (0.27 s). Arm C of
+> `crates/hg/examples/changeset_ab.rs` (BENCHMARKS, "Mercurial's history as changesets with a derived per-file form"):
+> over Mercurial's history at zstd 1, N=3 on Adas-Mac-Studio-2, old reads p50 73 to 74 µs and the clone's file section
+> 0.06 s, against the per-file arm's 77 to 79 µs and 0.19 to 0.20 s and the changesets alone's 814 to 833 µs and 2.02 s;
+> the derived form costs 2.2 s once for the whole history and 25.7 MiB beside the changesets' 28.5 MiB (stock: 77.6
+> MiB). **Decided:** the changeset log is the truth (item 1); a per-file form derived from it serves reads and clones,
+> kept by identity as A-645's derived data, evictable and recomputed from the log; a landing extends it with only its
+> own files' runs. Agreed in substance by w-hg (an edit against a named base; a `Texts` section) and w-git (v4's payload
+> homed by identity; normalization behind the same names) and w-svn (its svndiff already the normalized edit; revision-
+> property changes their own changesets).
+>
+> **Status (2026-11-20, C4 groundwork: the store's owner).** `owner.rs`: one thread a node runs holding its `Store`
+> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first), reached from shards by a
+> cloneable `StoreHandle` over a bounded `slates_rt::sync` channel: `land` (sections' `Vec`s moved in, answered once
+> durable), `piece`, `changesets`, each answer on a one-value channel the task awaits; a full queue is refused `Busy`.
+> The commit's `F_FULLFSYNC` and the engine's device waits never run on a shard. Test: `--test owner` 1/1 (a shard's
+> task lands two changesets, lists them, reads a 200,000-byte payload back by identity; a new owner after the stop
+> reads the same). Owed with C4: the daemon holding the owner (the node's `StoreGrant` at enrollment, the store's
+> directory in its configuration, `Sizing` from its machine profile).
+>
+> **Status (2026-11-20, C4 groundwork: the daemon holds the store).** `slates daemon --vcs-store DIR` (and the anchor,
+> which passes it to each daemon it starts): the daemon identifies the directory, issues the node's `StoreGrant` (the
+> operator's naming of it is the grant, on R10's CLI surface; logged with its device and inode), opens the root
+> through `slates_land::store_root`, sizes the store from its own derivations (memory the shard's reserve, disk the
+> directory's free space by `fstatvfs`, extent the content plane's chunk, fanout SplinterDB's under `derived!` until
+> the engine's E-step measures it), starts the owner and puts its handle in `DaemonConfig::vcs_disk`, which every
+> `ShardState` clones (`ShardState::vcs_disk`); `serve` stops the owner after the daemon, so its checkpoint is written.
+> Without the flag nothing changes. Windows: `store_root` refuses `Unsupported` there until its handle-relative
+> counterpart is written (GAPS), so the crates build on every target. Test: `slates-api role` the flag parsed and
+> passed on (1/1, with the role's 38/38).
+>
+> **Status (2026-11-20, the store's RSS red test, C4-C6's store side).** `crates/store/tests/memory.rs`, a process of
+> its own: three 64 MiB payloads landed through the owner from a shard's task and one read back whole a piece at a
+> time; resident memory after is held to the baseline plus two of the change in flight (its bytes and one decode
+> window, item 8's k = 2) plus the engine's budget. Measured (macOS arm64, Adas-Mac-Studio-2): baseline 6 to 7 MiB,
+> after 71 to 73 MiB, bound 142 to 143 MiB, 192 MiB landed (release and debug). History held in RAM, as before A-767,
+> passes the bound by the landings alone. Each tool's own red test (its intake's memory) is owed with w-hg, w-git,
+> w-svn.
+>
+> **Status (2026-11-20, main's ruling: the server's store wiring, a repository's creation landed).** `repository create`
+> on a daemon holding the store lands the repository's creation into it (A-767 item 7: the history begins with the
+> grant's record): one changeset, sequence 0, whose `Record` names the repository, its default branch, tool and format,
+> under the node's store grant; the request is answered once the creation is durable in the store too (the verb defers
+> its acceptance, AUD-11, and the landing task records its completion and answers), refused `Overloaded` when the store
+> refuses; without a store nothing changes. The store's header and `C` keys carry slates' 128-bit repository id (A-515)
+> since this change. Shape kept from A-767, against the ruling's "a Store for each repository on its owner shard": one
+> store a node on its owner thread, each shard a handle, so the commit's `F_FULLFSYNC` never runs on a shard and every
+> repository's landings on the device share one flush (item 2). Red test: `repository::store_tests` 1/1 (a git
+> repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
+> files: one changeset, sequence 0, its record and its row read back).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
