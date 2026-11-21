@@ -1,0 +1,89 @@
+runner 4 cores, 15 GiB, load 1.68 0.52 0.18 1/264 2299
+arm split = a40c07faa
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 8m 13s
+[1m[92m  Executable[0m tests/live_fleet.rs (../t-split/release/deps/live_fleet-92667df8231c08ad)
+split /home/runner/work/slates/arm-split/../t-split/release/deps/live_fleet-92667df8231c08ad
+arm cache = 4949613ae
+[1m[92m    Finished[0m `release` profile [optimized] target(s) in 8m 11s
+[1m[92m  Executable[0m tests/live_fleet.rs (../t-cache/release/deps/live_fleet-92667df8231c08ad)
+cache /home/runner/work/slates/arm-cache/../t-cache/release/deps/live_fleet-92667df8231c08ad
+== round 1 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.35 2.60 2.11
+exit 0
+  live  p50 155.6 p99 441.5 p999 1805.4 max 3108.5 us
+  added at p50 124.7 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(300.0), Some(290.0)), (Some(780.0), Some(380.0)), (Some(360.0), Some(360.0))]; plain statuses asked during the stream 0
+  the owner: build 57.9, to_control 13.0, lane 1.5, exchange 66.2, to_owner 4.4, round 143.0, reply 61.4, | p50/p99 build 28.7/65.5, to_control 11.3/30.7, lane 1.4/4.1, exchange 61.4/147.5, exchange.borrow 0.5/0.8, exchange.round_trip 57.3/294.9, exchange.collect 7.2/22.5, exchange.settle 0.4/0.6, to_owner 3.8/18.4, round 106.5/262.1, reply 12.3/24.6, hold.declined=1, hold.answer=2051, hold.exchange=3874, hold.dispatches=1995
+  candidate 0: holder 13.5, | p50/p99 holder 8.2/163.8, hold.entries=1849
+  candidate 2: holder 12.5, | p50/p99 holder 9.2/122.9, hold.entries=1668
+== round 1 arm cache measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.40 2.59 2.11
+exit 0
+  live  p50 143.6 p99 371.2 p999 2988.8 max 6334.5 us
+  added at p50 113.3 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(290.0), Some(300.0)), (Some(710.0), Some(330.0)), (Some(280.0), Some(280.0))]; plain statuses asked during the stream 0
+  the owner: build 66.5, to_control 9.8, lane 1.8, exchange 67.5, to_owner 4.7, round 150.3, reply 54.7, | p50/p99 build 26.6/65.5, to_control 9.2/28.7, lane 1.7/4.6, exchange 61.4/114.7, exchange.borrow 0.5/0.8, exchange.round_trip 57.3/147.5, exchange.collect 5.6/18.4, exchange.settle 0.4/0.7, to_owner 4.6/18.4, round 98.3/196.6, reply 6.1/10.2, hold.declined=6, hold.answer=2052, hold.exchange=3342, hold.dispatches=2201
+  candidate 0: holder 14.7, | p50/p99 holder 9.2/53.2, hold.entries=1723
+  candidate 2: holder 11.3, | p50/p99 holder 8.2/53.2, hold.declined=8, hold.entries=1196
+== round 2 arm cache measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.40 2.59 2.11
+exit 0
+  live  p50 144.7 p99 596.9 p999 1007.9 max 1086.5 us
+  added at p50 114.0 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(740.0), Some(350.0)), (Some(330.0), Some(330.0)), (Some(290.0), Some(280.0))]; plain statuses asked during the stream 0
+  the owner: build 66.2, to_control 10.0, lane 1.7, exchange 63.0, to_owner 4.4, round 145.3, reply 54.9, | p50/p99 build 26.6/65.5, to_control 9.2/28.7, lane 1.5/4.6, exchange 61.4/114.7, exchange.borrow 0.5/0.9, exchange.round_trip 57.3/213.0, exchange.collect 6.1/22.5, exchange.settle 0.4/0.6, to_owner 4.6/18.4, round 106.5/196.6, reply 5.6/16.4, hold.declined=6, hold.answer=2053, hold.exchange=3783, hold.dispatches=2054
+  candidate 1: holder 12.0, | p50/p99 holder 9.2/122.9, hold.entries=1577
+  candidate 2: holder 15.3, | p50/p99 holder 9.2/131.1, hold.declined=3, hold.entries=1826
+== round 2 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.40 2.59 2.11
+exit 0
+  live  p50 152.5 p99 518.9 p999 2178.6 max 3457.0 us
+  added at p50 121.0 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(300.0), Some(310.0)), (Some(310.0), Some(310.0)), (Some(740.0), Some(340.0))]; plain statuses asked during the stream 0
+  the owner: build 63.0, to_control 12.5, lane 1.8, exchange 62.0, to_owner 5.0, round 144.3, reply 61.0, | p50/p99 build 28.7/65.5, to_control 12.3/30.7, lane 1.7/4.1, exchange 57.3/122.9, exchange.borrow 0.5/0.9, exchange.round_trip 53.2/163.8, exchange.collect 6.1/22.5, exchange.settle 0.4/0.9, to_owner 4.6/20.5, round 106.5/213.0, reply 12.3/24.6, hold.declined=3, hold.answer=2051, hold.exchange=3515, hold.dispatches=1970
+  candidate 0: holder 11.5, | p50/p99 holder 9.2/53.2, hold.entries=1314
+  candidate 1: holder 13.9, | p50/p99 holder 9.2/90.1, hold.declined=2, hold.entries=1903
+== round 3 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.37 2.56 2.10
+exit 0
+  live  p50 151.5 p99 571.7 p999 2101.3 max 2587.6 us
+  added at p50 120.9 us;
+  cpu ms (process, control shard) in node order, owner 1: stream [(Some(240.0), Some(250.0)), (Some(790.0), Some(360.0)), (Some(320.0), Some(340.0))]; plain statuses asked during the stream 0
+  the owner: build 65.4, to_control 12.7, lane 1.4, exchange 68.2, to_owner 3.8, round 151.5, reply 60.8, | p50/p99 build 28.7/65.5, to_control 11.3/30.7, lane 1.3/4.6, exchange 61.4/180.2, exchange.borrow 0.5/0.8, exchange.round_trip 57.3/262.1, exchange.collect 6.1/22.5, exchange.settle 0.4/0.7, to_owner 3.6/14.3, round 106.5/262.1, reply 12.3/22.5, hold.declined=12, hold.answer=2051, hold.exchange=3468, hold.dispatches=1938
+  candidate 0: holder 14.4, | p50/p99 holder 9.2/180.2, hold.entries=1383
+  candidate 2: holder 14.6, | p50/p99 holder 9.2/81.9, hold.declined=5, hold.entries=1846
+== round 3 arm cache measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.37 2.56 2.10
+exit 0
+  live  p50 143.8 p99 488.6 p999 1494.3 max 2828.4 us
+  added at p50 113.3 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(720.0), Some(340.0)), (Some(300.0), Some(280.0)), (Some(280.0), Some(290.0))]; plain statuses asked during the stream 0
+  the owner: build 68.7, to_control 9.7, lane 1.7, exchange 63.5, to_owner 4.4, round 148.0, reply 55.0, | p50/p99 build 26.6/65.5, to_control 9.2/28.7, lane 1.4/5.1, exchange 61.4/131.1, exchange.borrow 0.5/1.0, exchange.round_trip 57.3/147.5, exchange.collect 5.6/22.5, exchange.settle 0.4/0.8, to_owner 4.1/14.3, round 106.5/196.6, reply 6.1/14.3, hold.declined=10, hold.answer=2051, hold.exchange=3399, hold.dispatches=2099
+  candidate 1: holder 10.7, | p50/p99 holder 9.2/53.2, hold.entries=1254
+  candidate 2: holder 14.0, | p50/p99 holder 9.2/45.1, hold.declined=1, hold.entries=1770
+== round 4 arm cache measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.66 2.60 2.12
+exit 0
+  live  p50 140.3 p99 414.3 p999 2835.7 max 3528.2 us
+  added at p50 107.5 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(740.0), Some(340.0)), (Some(290.0), Some(290.0)), (Some(280.0), Some(280.0))]; plain statuses asked during the stream 0
+  the owner: build 67.5, to_control 10.3, lane 1.7, exchange 65.5, to_owner 4.5, round 149.6, reply 54.5, | p50/p99 build 26.6/61.4, to_control 8.2/28.7, lane 1.5/5.1, exchange 57.3/122.9, exchange.borrow 0.5/1.0, exchange.round_trip 57.3/213.0, exchange.collect 6.1/22.5, exchange.settle 0.4/0.7, to_owner 3.8/20.5, round 98.3/229.4, reply 5.6/13.3, hold.answer=2052, hold.exchange=3527, hold.dispatches=1966
+  candidate 1: holder 11.8, | p50/p99 holder 8.2/163.8, hold.entries=1390
+  candidate 2: holder 14.6, | p50/p99 holder 9.2/81.9, hold.entries=1873
+== round 4 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.66 2.60 2.12
+exit 0
+  live  p50 163.4 p99 373.8 p999 1332.1 max 2999.1 us
+  added at p50 134.7 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(790.0), Some(380.0)), (Some(350.0), Some(360.0)), (Some(320.0), Some(310.0))]; plain statuses asked during the stream 0
+  the owner: build 77.6, to_control 13.9, lane 2.0, exchange 61.5, to_owner 4.5, round 159.4, reply 63.1, | p50/p99 build 30.7/73.7, to_control 13.3/32.8, lane 1.7/5.1, exchange 61.4/106.5, exchange.borrow 0.5/0.9, exchange.round_trip 57.3/196.6, exchange.collect 6.1/20.5, exchange.settle 0.4/1.4, to_owner 4.6/15.4, round 114.7/180.2, reply 13.3/30.7, hold.answer=2054, hold.exchange=3771, hold.dispatches=2178
+  candidate 1: holder 11.5, | p50/p99 holder 8.2/147.5, hold.entries=1568
+  candidate 2: holder 13.6, | p50/p99 holder 9.2/114.7, hold.declined=2, hold.entries=1744
+== round 5 arm split measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.66 2.60 2.12
+exit 0
+  live  p50 159.8 p99 376.7 p999 829.3 max 2642.0 us
+  added at p50 128.4 us;
+  cpu ms (process, control shard) in node order, owner 2: stream [(Some(350.0), Some(350.0)), (Some(240.0), Some(250.0)), (Some(760.0), Some(370.0))]; plain statuses asked during the stream 0
+  the owner: build 59.6, to_control 12.8, lane 1.6, exchange 62.8, to_owner 4.9, round 141.8, reply 62.5, | p50/p99 build 30.7/65.5, to_control 12.3/30.7, lane 1.5/4.1, exchange 57.3/122.9, exchange.borrow 0.5/0.8, exchange.round_trip 57.3/147.5, exchange.collect 6.1/20.5, exchange.settle 0.4/1.0, to_owner 4.6/20.5, round 106.5/213.0, reply 13.3/26.6, hold.declined=1, hold.answer=2051, hold.exchange=3462, hold.dispatches=2023
+  candidate 0: holder 16.5, | p50/p99 holder 10.2/53.2, hold.declined=1, hold.entries=1745
+  candidate 1: holder 14.1, | p50/p99 holder 9.2/122.9, hold.declined=8, hold.entries=1424
+== round 5 arm cache measure_what_live_shipping_adds_to_a_stable_nfs_write load 1.66 2.60 2.12
+exit 0
+  live  p50 144.3 p99 427.6 p999 1797.4 max 3427.2 us
+  added at p50 113.4 us;
+  cpu ms (process, control shard) in node order, owner 0: stream [(Some(720.0), Some(340.0)), (Some(280.0), Some(280.0)), (Some(280.0), Some(280.0))]; plain statuses asked during the stream 0
+  the owner: build 67.8, to_control 9.8, lane 2.2, exchange 62.4, to_owner 4.6, round 146.9, reply 54.7, | p50/p99 build 26.6/61.4, to_control 9.2/30.7, lane 2.0/5.6, exchange 57.3/122.9, exchange.borrow 0.6/1.2, exchange.round_trip 57.3/163.8, exchange.collect 6.1/20.5, exchange.settle 0.4/0.6, to_owner 4.6/16.4, round 106.5/196.6, reply 6.1/13.3, hold.declined=3, hold.answer=2052, hold.exchange=3370, hold.dispatches=2106
+  candidate 1: holder 11.9, | p50/p99 holder 8.2/131.1, hold.declined=1, hold.entries=1205
+  candidate 2: holder 14.2, | p50/p99 holder 9.2/81.9, hold.declined=2, hold.entries=1787
