@@ -94,3 +94,12 @@
   was given" to "no answer to initialize": `kiln reach mcp` bailed on Windows in reach/cli.rs ("reach needs a Unix
   machine for now") -> fixed (3a1fde52d, branch agents/w-k90-win-mcp3).
 - r42 (jupiter): e2e bare_metal then clippy on mcp3. Then land (one commit: loopback + cli + allows + ci report + docs).
+
+## 2026-11-20 ~16:30 PST: CLOSE ORDER -- my list: C1 goal 90e (slates_e2e bare_metal on Windows)
+- LANDED kiln main 4af73427b (base 648c57184, is-ancestor confirmed): reach::loopback (Windows runner harnesses get kiln's
+  MCP over 127.0.0.1 by per-session token), kiln reach mcp runs on Windows, container.rs:299 wait allowed (kind c),
+  Windows lane Report failures-first, docs reach.md §9 / agents.md. Tests: reach::loopback 4/4 macOS + Windows (r37).
+- Trimmed: deleted ~/.cache/w-k90-win-local-target.noindex (main's ask, Studio-2 disk).
+- r2 (jupiter, main 4af73427b+): SLATES_E2E=1 slates_e2e bare_metal, then Windows clippy. Watching. Also GitHub ci.yml
+  run on 4af73427b's descendants: `windows (Slates tests)` job.
+- For main to delete: ~/fanout-state-w-k90-win (half clone), ~/kiln-work/w-k90-win-kiln (broken blobless clone).
