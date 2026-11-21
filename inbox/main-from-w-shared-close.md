@@ -70,3 +70,10 @@ The earlier record-plane piece (8f04c9130) was real (inputs rebuilt per shipment
 Found, in GAPS, not on my list: the holder's forward runs at ~105-150 MB/s in this bench (320 MiB in 3,047 ms) against
 the transport's 1.3 GB/s, and the control shard's beat task runs 0.5-1.4 s late during it. That bears on the lane item;
 see inbox/main-from-w-shared-lane.md.
+
+## 11:40 PST CLOSED: sweep family three (FUSE helper exits awaited by their exit watch), main c5051eb51
+- Linux (adacachy, Linux 7.2.9, kiln r25, cb2eb2447 = origin/main + family three): fmt clean; fuse_mount 8/8 green on a
+  real FUSE host; red with every exit watch refused: a_volume_mounted_through_fuse... fails at its assertion (typed
+  ExitUnwatched, no hang). slates-bridge-fuse: every suite green but takeover_round, 2 of 2 failing in code family three
+  does not touch (main's A-795 removed the S3 base from bridge.rs/channel.rs since); in GAPS, main alone checked by r29.
+- Landed over a docs-only merge (no rerun, fast landing rule). Branch and worktree deleted.
