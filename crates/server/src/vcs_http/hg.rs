@@ -496,6 +496,8 @@ pub(crate) struct HgExchange<S: HgStores> {
   /// Whether a push's body ran past its room: its bytes let go as they arrive, and the push refused in Mercurial's
   /// words once the body has ended (A-711).
   past_room: bool,
+  /// A streamed answer's measured step cost, across its turns (A-783's paced turn).
+  costs: crate::vcs_store::hg_view::TurnCosts,
 }
 
 impl<S: HgStores> HgExchange<S> {
@@ -544,6 +546,7 @@ impl<S: HgStores> HgExchange<S> {
       generation: None,
       request_room: room,
       past_room: false,
+      costs: crate::vcs_store::hg_view::TurnCosts::ZERO,
     })
   }
 }
@@ -666,8 +669,10 @@ impl<S: HgStores> Exchange for HgExchange<S> {
 
 impl<S: HgStores> HgExchange<S> {
   /// One turn of a streamed answer (A-745, §4.17.1 "A fetch's answer"): the repository's view lent for the turn alone,
-  /// steps taken within the room the lender names until its quantum is spent or the answer ends; a step past the turn's
-  /// room after others ends the turn, and is taken again by the next within a room of its own. Whether more follow.
+  /// steps taken within the room the lender names, paced (A-783, [`crate::vcs_store::hg_view::paced_turn`]): to the
+  /// quantum while someone waits on the shard, on to its ceiling while no one does, or until the answer ends or asks the
+  /// changeset store; a step past the turn's room after others ends the turn, and is taken again by the next within a
+  /// room of its own. Whether more follow.
   fn turn(&mut self, streamed: &mut hg_http::Streamed, out: &mut Vec<u8>) -> Result<bool, Failed> {
     let id = self.repository.id;
     let (room, quantum) = self.stores.fetch_turn(id).unwrap_or((self.request_room, 0));
@@ -677,19 +682,22 @@ impl<S: HgStores> HgExchange<S> {
       .generation
       .as_ref()
       .ok_or(Failed(Status::INTERNAL_SERVER_ERROR))?;
+    let costs = &mut self.costs;
+    let mut paced = crate::vcs_store::hg_view::paced_turn(quantum, start);
     let turned = self
       .stores
       .lend_held(generation, &mut admission, |store, room| {
         let mut taken = false;
         loop {
+          if !paced.more(crate::vcs_store::hg_view::ANSWER_STEP, costs) {
+            break Ok(true);
+          }
           match streamed.step(store, room, out) {
             // A step that asks the changeset store ends the turn: the store answers before the next one.
             Ok(true) if slates_hg::render::StoreWants::wants(&*streamed).is_some() => {
               break Ok(true);
             }
-            Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {
-              taken = true
-            }
+            Ok(true) => taken = true,
             Ok(more) => break Ok(more),
             Err(slates_hg::serve::session::Refused::Serve(
               slates_hg::serve::Refusal::PastAdmission(_),
@@ -700,6 +708,8 @@ impl<S: HgStores> HgExchange<S> {
           }
         }
       });
+    paced.close(slates_rt::futures::now_ns(), costs);
+    crate::vcs_store::hg_view::turn_taken();
     match turned {
       Some(Ok(more)) => Ok(more),
       Some(Err(_)) => Err(Failed(Status::INTERNAL_SERVER_ERROR)),

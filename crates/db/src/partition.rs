@@ -2950,8 +2950,13 @@ impl Partition {
     self.carried.remove(&id);
     // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
     self.repositories.green_removed(id);
-    // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
-    // a volume that no longer exists), returning its bytes to the chain budget.
+    self.reclaim_chains_of(id);
+    Ok(())
+  }
+
+  /// A destroyed volume's merge records reclaimed with it, their bytes returned to the chain budget: a green's chain,
+  /// origin and checkpoint (its increments can never be replayed for a volume that no longer exists), and a work's log.
+  fn reclaim_chains_of(&mut self, id: VolumeId) {
     if let Some(chain) = self.green_chains.remove(&id) {
       let bytes: usize = chain.iter().map(Vec::len).sum();
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(bytes);
@@ -2964,12 +2969,10 @@ impl Partition {
     if let Some((_, checkpoint)) = self.green_checkpoints.remove(&id) {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(checkpoint.len());
     }
-    // A destroyed work's log can never be replayed either.
     let log = self.work_log_bytes(id);
     if self.work_logs.remove(&id).is_some() {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(log);
     }
-    Ok(())
   }
 
   fn insert_snapshot(&mut self, record: SnapshotRecord) -> Result<(), DbError> {

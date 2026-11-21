@@ -49,6 +49,10 @@ pub(super) mod staging;
 /// A move admitted a unit at a time (A-722 part 4c), a child of this module so it walks the rows and chains kept here.
 #[path = "admitting.rs"]
 pub(super) mod admitting;
+/// A version's sets derived on first read (A-614 amended, main's ruling (A) of 2026-11-21), a child of this module so it
+/// walks the rows and chains kept here.
+#[path = "deriving.rs"]
+pub(super) mod deriving;
 
 /// Shape: what one version's record costs the budget beside its set's runs. Derived from the type.
 const VERSION_BYTES: usize = size_of::<Version>();
@@ -104,6 +108,14 @@ pub enum StoreRefused {
   },
   /// A version's sets, its value of the reach sets (A-647, [`super::ReachSets`]), do not read as the type's.
   SetsUnreadable {
+    /// The green.
+    green: u64,
+    /// The version.
+    version: u64,
+  },
+  /// A version admitted with no walk (A-614 amended, main's ruling (A) of 2026-11-21) whose sets are not derived yet:
+  /// its reader derives them first ([`Repository::deriving`]), a slice at a time, and asks again.
+  Deferred {
     /// The green.
     green: u64,
     /// The version.
@@ -182,6 +194,11 @@ pub struct StoreCounters {
   pub remade: u64,
   /// Of those, the ones that started from another green's set.
   pub bases_found: u64,
+  /// Moves admitted with no walk, their versions' sets the closure of their heads, derived on first read (A-614
+  /// amended, main's ruling (A)).
+  pub deferred: u64,
+  /// Versions whose sets a reader derived ([`Repository::derive_turn`]), each once while its memo is kept.
+  pub derived: u64,
   /// Bytes the versions' values added to the content store as their commits put them: what the store held new, never
   /// what it held already and was held once more by (A-647 part 4).
   pub value_bytes: u64,
@@ -215,8 +232,10 @@ pub struct Found {
 struct Version {
   head: Option<u64>,
   /// Its value of [`super::ReachSets`] (A-647 part 3), held once by the record: the set its head reaches and D(k), what
-  /// it brought, which the store reads from it and keeps nowhere else.
-  value: ContentId,
+  /// it brought, which the store reads from it. None for a version admitted with no walk (A-614 amended, main's ruling
+  /// (A) of 2026-11-21): its sets are the closure of its head, derived on first read and kept in the memo
+  /// ([`Repository::deriving`]).
+  value: Option<ContentId>,
   /// Its D(k) encoded, once the owner asked (A-614 part 2).
   fragments: Option<Fragments>,
   /// How its reached set followed, kept so its derivation (A-647 part 2, [`reach`]) reads only its parents' values.
@@ -361,15 +380,16 @@ struct StagedAt {
 /// How a move's reached set follows from its green's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Reach {
-  /// A fast-forward: the set grows by what the version brought.
+  /// A fast-forward over a version whose sets are known: the set grows by what the walk found the version brought.
   Grown,
-  /// A create or a rewrite: the set made again, a base set (the reached set of `from`, a green and its version, when one
-  /// was found) and what a walk found beyond it.
-  Remade {
-    base: Positions,
-    beyond: Members,
-    from: Option<(u64, usize)>,
-  },
+  /// A fast-forward over a version admitted with no walk: none now either, its sets derived on first read (A-614
+  /// amended).
+  GrownUnwalked,
+  /// A create or a rewrite, admitted with no walk (A-614 amended, main's ruling (A) of 2026-11-21: a create walked
+  /// everything its head reached that no green's head did, so git/git's whole history, its 1,027 refs mostly tags at old
+  /// commits, was decided in time about refs times history): its set the closure of its head, derived on first read,
+  /// from `from` (a green and its version whose head is the move's own head, found with no walk) when one is.
+  Remade { from: Option<(u64, usize)> },
   /// A delete: nothing reached.
   Emptied,
 }
@@ -393,7 +413,7 @@ impl Move {
 
   /// Whether it is a fast-forward of its green.
   pub fn is_fast_forward(&self) -> bool {
-    self.reach == Reach::Grown
+    matches!(self.reach, Reach::Grown | Reach::GrownUnwalked)
   }
 
   /// The position of its green's head when it was admitted; none for a green with no head.
@@ -500,6 +520,20 @@ pub struct Repository {
   window: Window,
   levels: Levels,
   depth: Depth,
+  /// The sets derived for versions admitted with no walk (A-614 amended), each held once by the memo, and for each
+  /// commit a version whose sets are known peels to, that version: what a derivation searches back for its base. In a
+  /// cell because a derivation's reader holds the repository to read (a fork a fetch serves from); a cache of values
+  /// any tier derives alike, so it is never recorded and a restart starts it empty.
+  memo: RefCell<Memo>,
+}
+
+/// The derived sets a repository keeps ([`Repository::memo`]).
+#[derive(Clone, Debug, Default)]
+pub(super) struct Memo {
+  /// Each derived version's value, held once by the memo.
+  pub(super) values: BTreeMap<(u64, usize), ContentId>,
+  /// For each commit's position, a version whose head peels to it and whose sets are known (its value or the memo's).
+  pub(super) at: BTreeMap<u64, (u64, usize)>,
 }
 
 impl Repository {
@@ -522,6 +556,7 @@ impl Repository {
       window: Window::default(),
       levels: Levels::default(),
       depth: Depth::default(),
+      memo: RefCell::new(Memo::default()),
     }
   }
 
@@ -1054,12 +1089,6 @@ impl Repository {
     Ok(false)
   }
 
-  /// A green whose current head is the indexed commit `id`.
-  fn green_at(&self, store: &ContentStore, id: &ObjectId) -> Option<u64> {
-    let (row, _) = self.indexed(store, id)?;
-    self.heads.get(&row.position)?.iter().next().copied()
-  }
-
   /// Admits `green`'s move to `to` (`None` deletes the ref) before its verdict: what its version brings and how its
   /// reached set follows, read from the sealed `push` and the index (module docs).
   pub fn admit(
@@ -1139,18 +1168,19 @@ impl Repository {
     let (planned, heads) = self.plan(store, moves, (base, &positions))?;
     let before = store.used();
     let values = put_values(store, &planned)?;
+    let put: Vec<ContentId> = values.iter().flatten().copied().collect();
     let added = store.used().saturating_sub(before);
     let chains = self.chains_with(planned, &values);
     let total = footprint(&self.chains, &chains, &heads);
     let more = total.saturating_sub(self.charged);
     if let Err(refused) = store.charge(more) {
-      give_back(store, &values)?;
+      give_back(store, &put)?;
       return Err(refused.into());
     }
     let landing_cost = bytes(landed.len().saturating_add(kinds.len()), LANDING_BYTES);
     if let Err(refused) = store.charge(landing_cost) {
       store.discharge(more)?;
-      give_back(store, &values)?;
+      give_back(store, &put)?;
       return Err(refused.into());
     }
     // A stage that gives no position writes no row: its fork is given back, never adopted.
@@ -1173,7 +1203,7 @@ impl Repository {
     };
     if let Err(refused) = inserted {
       store.discharge(more.saturating_add(landing_cost))?;
-      give_back(store, &values)?;
+      give_back(store, &put)?;
       return Err(refused);
     }
     self.landings.extend(landed);
@@ -1198,7 +1228,7 @@ impl Repository {
     store.discharge(self.charged.saturating_sub(total))?;
     self.charged = total;
     self.count(|counters| counters.value_bytes = counters.value_bytes.saturating_add(added));
-    let versions = moves
+    let versions: Vec<u64> = moves
       .iter()
       .map(|movement| {
         chains.get(&movement.green).map_or(0, |chain| {
@@ -1211,6 +1241,18 @@ impl Repository {
     self.chains.extend(chains);
     self.heads = heads;
     self.next_position = next;
+    // Each version committed with its value is a base a later derivation may search back to (`deriving`).
+    for (movement, version) in moves.iter().zip(&versions) {
+      let version = usize::try_from(*version).unwrap_or(usize::MAX);
+      let valued = self
+        .chains
+        .get(&movement.green())
+        .and_then(|chain| chain.versions.get(version))
+        .is_some_and(|record| record.value.is_some());
+      if valued {
+        self.note_known(store, (movement.green(), version));
+      }
+    }
     self.count(|counters| counters.positions = counters.positions.saturating_add(given));
     self.depth.seen(push.deepest());
     push.release_holds(store)?;
@@ -1260,14 +1302,10 @@ impl Repository {
       push.len(),
       object_row.saturating_add(position_row).saturating_mul(2),
     );
-    let commits = push.commits().values().fold(0_u64, |total, arrived| {
-      let part = arrived
-        .parents
-        .len()
-        .saturating_mul(size_of::<u64>())
-        .saturating_add(rows::COMMIT_PART_BYTES);
-      total.saturating_add(bytes(1, part.saturating_mul(2)))
-    });
+    // A commit's part and its parents, each doubled, summed from the push's counts: no pass over its commits.
+    let (commits, parents) = push.commit_parts();
+    let commits = bytes(commits, rows::COMMIT_PART_BYTES.saturating_mul(2))
+      .saturating_add(bytes(parents, size_of::<u64>().saturating_mul(2)));
     objects
       .saturating_add(commits)
       .saturating_add(self.index.fork_room())
@@ -1434,18 +1472,21 @@ impl Repository {
     let mut planned = Vec::with_capacity(moves.len());
     let mut heads = self.heads.clone();
     for movement in moves {
-      let brought = self.members_positions(store, &movement.brought, (base, positions))?;
-      let reached = match &movement.reach {
-        Reach::Grown => self
-          .current_reached(store, movement.green)?
-          .unwrap_or_default()
-          .union(&brought),
-        Reach::Remade {
-          base: reached_base,
-          beyond,
-          ..
-        } => reached_base.union(&self.members_positions(store, beyond, (base, positions))?),
-        Reach::Emptied => Positions::new(),
+      // A fast-forward over sets known when it was admitted grows them now; one whose green's sets went unknown since (a
+      // memo let go) is left for its first reader, as one admitted so; a create, a rewrite and a fast-forward over sets
+      // never walked are left for theirs (A-614 amended).
+      let sets = match &movement.reach {
+        Reach::Grown => match self.current_reached(store, movement.green) {
+          Ok(reached) => {
+            let brought = self.members_positions(store, &movement.brought, (base, positions))?;
+            let reached = reached.unwrap_or_default().union(&brought);
+            Some(Sets { reached, brought })
+          }
+          Err(StoreRefused::Deferred { .. }) => None,
+          Err(refused) => return Err(refused),
+        },
+        Reach::GrownUnwalked | Reach::Remade { .. } => None,
+        Reach::Emptied => Some(Sets::default()),
       };
       let head = movement
         .to
@@ -1456,14 +1497,19 @@ impl Repository {
         green: movement.green,
         head,
         followed: followed(&movement.reach),
-        sets: Sets { reached, brought },
+        sets,
       });
     }
     Ok((planned, heads))
   }
 
-  /// The chains the planned versions make, on copies: each version with its value, `values`' in order.
-  fn chains_with(&self, planned: Vec<Planned>, values: &[ContentId]) -> BTreeMap<u64, Chain> {
+  /// The chains the planned versions make, on copies: each version with its value, `values`' in order (none for one left
+  /// for its first reader).
+  fn chains_with(
+    &self,
+    planned: Vec<Planned>,
+    values: &[Option<ContentId>],
+  ) -> BTreeMap<u64, Chain> {
     let mut chains: BTreeMap<u64, Chain> = BTreeMap::new();
     for (planned, value) in planned.into_iter().zip(values) {
       let mut chain = self.chains.get(&planned.green).cloned().unwrap_or_default();
@@ -1528,13 +1574,38 @@ impl Repository {
     Ok(self.sets(store, green, version)?.reached)
   }
 
-  /// `green`'s version `version`'s two sets, read from its value.
-  fn sets(&self, store: &ContentStore, green: u64, version: usize) -> Result<Sets, StoreRefused> {
-    let record = self.version_record(green, version)?;
-    Sets::read(store, &record.value).ok_or(StoreRefused::SetsUnreadable {
+  /// `green`'s version `version`'s two sets, read from its value or, for one admitted with no walk, from the memo;
+  /// refused [`StoreRefused::Deferred`] while they are not derived ([`Self::deriving`]).
+  pub(super) fn sets(
+    &self,
+    store: &ContentStore,
+    green: u64,
+    version: usize,
+  ) -> Result<Sets, StoreRefused> {
+    let value = self
+      .value_of(green, version)?
+      .ok_or(StoreRefused::Deferred {
+        green,
+        version: to_u64(version),
+      })?;
+    Sets::read(store, &value).ok_or(StoreRefused::SetsUnreadable {
       green,
       version: to_u64(version),
     })
+  }
+
+  /// `green`'s version `version`'s value: its record's, else the memo's; none while it is not derived.
+  pub(super) fn value_of(
+    &self,
+    green: u64,
+    version: usize,
+  ) -> Result<Option<ContentId>, StoreRefused> {
+    let record = self.version_record(green, version)?;
+    Ok(
+      record
+        .value
+        .or_else(|| self.memo.borrow().values.get(&(green, version)).copied()),
+    )
   }
 
   /// The set `green`'s newest version's head reaches, read from its value; `None` for a green with no version.
@@ -1649,8 +1720,9 @@ impl Repository {
         chain
           .kept()
           .map(|kept| kept.content)
-          .chain(chain.versions.iter().map(|version| version.value))
+          .chain(chain.versions.iter().filter_map(|version| version.value))
       })
+      .chain(self.memo.borrow().values.values().copied())
       .collect();
     if let Err(refused) = hold_all(store, &named) {
       let _ = index.release(store);
@@ -1674,6 +1746,7 @@ impl Repository {
       window: self.window.clone(),
       levels: self.levels.clone(),
       depth: self.depth,
+      memo: RefCell::new(self.memo.borrow().clone()),
     })
   }
 
@@ -1708,7 +1781,8 @@ impl Repository {
     let values: Vec<ContentId> = self
       .chains
       .values()
-      .flat_map(|chain| chain.versions.iter().map(|version| version.value))
+      .flat_map(|chain| chain.versions.iter().filter_map(|version| version.value))
+      .chain(self.memo.borrow().values.values().copied())
       .collect();
     first = first.and(give_back(store, &values));
     first.and(
@@ -1720,27 +1794,31 @@ impl Repository {
 }
 
 /// A move's version as its commit plans it: its green, its head's position, how its reached set followed, and its sets,
-/// which become its value once the commit puts them.
+/// which become its value once the commit puts them; none for a version left for its first reader (A-614 amended).
 struct Planned {
   green: u64,
   head: Option<u64>,
   followed: Followed,
-  sets: Sets,
+  sets: Option<Sets>,
 }
 
-/// Puts each planned version's sets as its value (A-647 part 3), held once for its record, in order; refused, every
-/// value put is given back.
+/// Puts each planned version's sets as its value (A-647 part 3), held once for its record, in order, none for a version
+/// left for its first reader; refused, every value put is given back.
 fn put_values(
   store: &mut ContentStore,
   planned: &[Planned],
-) -> Result<Vec<ContentId>, StoreRefused> {
+) -> Result<Vec<Option<ContentId>>, StoreRefused> {
   let shape = reach::shape_of(store.window())?;
   let mut values = Vec::with_capacity(planned.len());
   for version in planned {
-    match version.sets.put(store, shape) {
-      Ok(value) => values.push(value),
+    let Some(sets) = &version.sets else {
+      values.push(None);
+      continue;
+    };
+    match sets.put(store, shape) {
+      Ok(value) => values.push(Some(value)),
       Err(refused) => {
-        give_back(store, &values)?;
+        give_back(store, &values.iter().flatten().copied().collect::<Vec<_>>())?;
         return Err(refused.into());
       }
     }
@@ -1773,8 +1851,8 @@ fn give_back(store: &mut ContentStore, values: &[ContentId]) -> Result<(), Store
 /// What a version records of its move's [`Reach`].
 fn followed(reach: &Reach) -> Followed {
   match reach {
-    Reach::Grown => Followed::Grown,
-    Reach::Remade { from, .. } => Followed::Remade { base: *from },
+    Reach::Grown | Reach::GrownUnwalked => Followed::Grown,
+    Reach::Remade { from } => Followed::Remade { base: *from },
     Reach::Emptied => Followed::Emptied,
   }
 }
@@ -2295,8 +2373,9 @@ impl Repository {
     self.next_position
   }
 
-  /// Every green with a chain, in order (A-665: the hook's view weighs each one's base pack).
-  pub(super) fn greens(&self) -> impl Iterator<Item = u64> + '_ {
+  /// Every green with a chain, in order (A-665: the hook's view weighs each one's base pack; a reader deriving every
+  /// version's sets, A-614 amended).
+  pub fn greens(&self) -> impl Iterator<Item = u64> + '_ {
     self.chains.keys().copied()
   }
 

@@ -456,7 +456,9 @@ fn need_of(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> Option<N
   let fetched = home.fetched.is_some();
   let file_if_unheld = |path: &str| {
     let key = canonical_path(path);
-    (!fetched && !w.files.holds(key)).then(|| Need::Lengths(vec![key.to_owned()]))
+    // A length the work's kept entry of the path names (its base's, A-247) is read there, not asked (A-808).
+    (!fetched && !w.files.holds(key) && !w.entries.contains_key(key))
+      .then(|| Need::Lengths(vec![key.to_owned()]))
   };
   match body {
     RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. } => file_if_unheld(path),
@@ -823,6 +825,7 @@ fn composed(state: &ShardState, mut sealed: SealedWork, evidence: Vec<[u8; 32]>)
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
   let kept = crate::refining::kept(
     state,
@@ -883,6 +886,7 @@ fn sealed_with_edit(
     green: None,
     fetched: state.work_home.fetched.as_ref(),
     version: sealed.base_version,
+    entries: state.works.get(&sealed.work).map(|w| &w.entries),
   };
   let old_len = sealed.files.len(base, key).ok()?;
   let inserted = u64::try_from(bytes.len()).ok()?;
@@ -931,6 +935,13 @@ pub(crate) fn gate(
     if matches!(need, Some(Need::Verdict { .. })) {
       let composed_ns = slates_machine::clock::monotonic_ns().saturating_sub(started);
       crate::merge_service::count_phase(state, SUBMIT_COMPOSE, composed_ns);
+    }
+    // A base read's ask, by the verb that asked it (A-808's measure: which verb re-asks under contention).
+    if let Some(Need::Files(_) | Need::Lengths(_)) = &need {
+      state.count(base_ask_by(&body, need.as_ref()), 1);
+    }
+    if need.is_none() && length_from_entry(state, work, &body) {
+      state.count(LENGTH_FROM_ENTRY, 1);
     }
     need
   } else {
@@ -1335,6 +1346,70 @@ fn batch_bound(state: &ShardState) -> usize {
   usize::try_from(state.config.region.slots)
     .unwrap_or(1)
     .max(1)
+}
+
+/// Format: an edit whose file's base length the work's kept entry named, asked of no one (A-808), the non-vacuity count
+/// of the read from the entry.
+pub(crate) const LENGTH_FROM_ENTRY: &str = "merge.work.length_from_entry";
+
+/// Whether `body` is an edit of a file the work does not hold whose base length its kept entry names (A-808).
+fn length_from_entry(state: &ShardState, work: DbVolumeId, body: &RequestBody) -> bool {
+  let (RequestBody::Edit { path, .. } | RequestBody::EditStaged { path, .. }) = body else {
+    return false;
+  };
+  let key = canonical_path(path);
+  state.work_home.fetched.is_none()
+    && state
+      .works
+      .get(&work)
+      .is_some_and(|w| !w.files.holds(key) && w.entries.contains_key(key))
+}
+
+/// The counter a base read's ask (files or lengths) is counted under by the verb that asked it (A-808).
+fn base_ask_by(body: &RequestBody, need: Option<&Need>) -> &'static str {
+  let files = matches!(need, Some(Need::Files(_)));
+  match body {
+    RequestBody::Edit { .. } | RequestBody::EditStaged { .. } => {
+      if files {
+        "merge.work.base_ask.edit.files"
+      } else {
+        "merge.work.base_ask.edit.lengths"
+      }
+    }
+    RequestBody::Rebase { .. } => {
+      if files {
+        "merge.work.base_ask.rebase.files"
+      } else {
+        "merge.work.base_ask.rebase.lengths"
+      }
+    }
+    RequestBody::Submit { .. }
+    | RequestBody::SubmitSigned { .. }
+    | RequestBody::SubmitHeld { .. }
+    | RequestBody::SubmitApproved { .. }
+    | RequestBody::EditSubmit { .. }
+    | RequestBody::EditSubmitHeld { .. } => {
+      if files {
+        "merge.work.base_ask.submit.files"
+      } else {
+        "merge.work.base_ask.submit.lengths"
+      }
+    }
+    RequestBody::Declare { .. } => {
+      if files {
+        "merge.work.base_ask.declare.files"
+      } else {
+        "merge.work.base_ask.declare.lengths"
+      }
+    }
+    _ => {
+      if files {
+        "merge.work.base_ask.other.files"
+      } else {
+        "merge.work.base_ask.other.lengths"
+      }
+    }
+  }
 }
 
 /// The counter an ask of the owner is counted under by its kind, beside [`ASKED_THE_OWNER`]'s total (A-801's

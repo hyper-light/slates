@@ -87,11 +87,15 @@ pub mod head;
 mod held_copy;
 // A held NFS connection's send ledger and the judgment its adoption takes (A-550): kept on Linux alone; elsewhere its
 // pure parts are compiled and held by every host's tests, and only its no-op seams are called.
+mod green_ready;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod held_send;
 pub mod histogram;
 mod identities;
 mod image;
+#[cfg_attr(not(test), allow(dead_code))]
+// Its caller outside tests is svn's import driver (w-svn, C2 stage C).
+mod import_batch;
 pub mod landing;
 mod landing_entries;
 pub mod lease;

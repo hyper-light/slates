@@ -104,6 +104,7 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
+    stored_logs: true,
   }
 }
 
@@ -449,6 +450,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
+    stored_logs: true,
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -759,6 +761,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
+    stored_logs: true,
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -1015,6 +1018,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
+    stored_logs: true,
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1085,8 +1089,10 @@ fn streamed(answer: &[u8]) -> Streamed {
   (status, sent)
 }
 
-/// A changeset store as a stream asks it, over an imported index: every revision kept whole, its place its text's own
-/// identity, so the stream's bytes are the whole rendering's (`render::revlogs`).
+/// A changeset store as a stream asks it, over an imported index: every revision kept whole, as a push's changegroup
+/// holds a delta against the null base (7.2's `mdiff.trivialdiffheader`: one hunk replacing nothing at 0, then the
+/// text), its place that hunk under its text's own identity, so the stream's bytes are the whole rendering's
+/// (`render::revlogs`).
 struct WholeTexts<'s> {
   index: &'s crate::index::HgIndex,
   store: &'s slates_vcs::ContentStore,
@@ -1095,6 +1101,26 @@ struct WholeTexts<'s> {
 
 impl crate::render::StoredSource for WholeTexts<'_> {
   fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    logs
+      .iter()
+      .map(|(log, nodes)| self.log_rows(log, nodes))
+      .collect()
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    places
+      .iter()
+      .map(|place| trivial_hunk(self.texts.get(&place.payload)?))
+      .collect()
+  }
+}
+
+impl WholeTexts<'_> {
+  /// One log's rows ([`crate::render::StoredSource::rows`]).
+  fn log_rows(
     &mut self,
     log: &[u8],
     nodes: &[Node],
@@ -1111,7 +1137,7 @@ impl crate::render::StoredSource for WholeTexts<'_> {
       let mut text = Vec::new();
       crate::import::record::write_text(&mut text, self.store, &kept);
       let identity = *blake3::hash(&text).as_bytes();
-      let len = u64::try_from(text.len()).ok()?;
+      let len = u64::try_from(trivial_hunk(&text)?.len()).ok()?;
       self.texts.insert(identity, text);
       rows.push(Some(crate::render::StoredRevision {
         text: identity,
@@ -1125,13 +1151,21 @@ impl crate::render::StoredSource for WholeTexts<'_> {
     }
     Some(rows)
   }
+}
 
-  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
-    places
-      .iter()
-      .map(|place| self.texts.get(&place.payload).cloned())
-      .collect()
+/// `text` as a changegroup holds a delta against the null base: one hunk replacing bytes 0 to 0 with it (7.2's
+/// `mdiff.trivialdiffheader`, three big-endian words), then the text; an empty text as no hunk at all, an empty delta
+/// (read from 7.2's `hg debugbundle --all` of a commit adding an empty file: its delta's length 0).
+fn trivial_hunk(text: &[u8]) -> Option<Vec<u8>> {
+  if text.is_empty() {
+    return Some(Vec::new());
   }
+  let mut hunk = Vec::with_capacity(text.len().saturating_add(12));
+  for field in [0, 0, u32::try_from(text.len()).ok()?] {
+    hunk.extend_from_slice(&field.to_be_bytes());
+  }
+  hunk.extend_from_slice(text);
+  Some(hunk)
 }
 
 /// The whole-text store of `index`.
@@ -1363,10 +1397,37 @@ struct Deltas<'s> {
 impl crate::render::StoredSource for Deltas<'_> {
   fn rows(
     &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    logs
+      .iter()
+      .map(|(log, nodes)| self.log_rows(log, nodes))
+      .collect()
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    places
+      .iter()
+      .map(|place| {
+        self
+          .edits
+          .get(&place.payload)
+          .cloned()
+          .or_else(|| trivial_hunk(self.whole.texts.get(&place.payload)?))
+      })
+      .collect()
+  }
+}
+
+impl Deltas<'_> {
+  /// One log's rows ([`crate::render::StoredSource::rows`]): after its first, each revision kept as an edit against the
+  /// one before it.
+  fn log_rows(
+    &mut self,
     log: &[u8],
     nodes: &[Node],
   ) -> Option<Vec<Option<crate::render::StoredRevision>>> {
-    let wholes = self.whole.rows(log, nodes)?;
+    let wholes = self.whole.log_rows(log, nodes)?;
     let mut rows = Vec::with_capacity(wholes.len());
     let mut before: Option<([u8; 32], Vec<u8>)> = None;
     for row in wholes {
@@ -1411,19 +1472,6 @@ impl crate::render::StoredSource for Deltas<'_> {
       rows.push(Some(stored));
     }
     Some(rows)
-  }
-
-  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
-    places
-      .iter()
-      .map(|place| {
-        self
-          .edits
-          .get(&place.payload)
-          .or_else(|| self.whole.texts.get(&place.payload))
-          .cloned()
-      })
-      .collect()
   }
 }
 
@@ -1503,3 +1551,121 @@ fn a_stream_sends_each_revision_as_the_store_keeps_it_within_its_delta_bytes() {
     }
   }
 }
+
+/// A changeset store that counts what a stream asks of it, answering through `inner`.
+struct Counted<S> {
+  inner: S,
+  rows: usize,
+  chunks: usize,
+}
+
+impl<S: crate::render::StoredSource> crate::render::StoredSource for Counted<S> {
+  fn rows(
+    &mut self,
+    logs: &[(Vec<u8>, Vec<Node>)],
+  ) -> Option<Vec<Vec<Option<crate::render::StoredRevision>>>> {
+    self.rows += 1;
+    self.inner.rows(logs)
+  }
+
+  fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
+    self.chunks += 1;
+    self.inner.chunks(places)
+  }
+}
+
+/// Shape: the file logs of [`a_stream_asks_the_store_by_the_room_not_by_the_log`]'s repository, many beside its three
+/// other logs, so an ask a log stands out.
+const MANY_LOGS: u64 = 64;
+
+/// Goal 93 perf (main's order of 2026-11-21 05:06: the stream clone ~37x slower than stock; r20 on 94c1696bb, hg-src:
+/// the serving shard idle half the stream, waiting on one store ask a log, both passes, about 12,000 of them, each a turn
+/// with its view made afresh). Do: build a repository of one changeset and [`MANY_LOGS`] file logs of one revision
+/// each; stream it whole, in a room that holds it, from a store that counts its asks. Expect the store asked for rows
+/// once a pass (the count, then the writing) and for chunks once, whatever the logs; and the same bytes as the stream
+/// made a step at a time in a room that holds one log's rows or one chunk (which asks more).
+#[test]
+fn a_stream_asks_the_store_by_the_room_not_by_the_log() {
+  use super::super::stream::stream_out;
+  let mut built = build(
+    &[Made {
+      parents: [None, None],
+      root: None,
+      marker: None,
+      bookmark: false,
+    }],
+    false,
+  );
+  for at in 0..MANY_LOGS {
+    let path = format!("file-{at:03}").into_bytes();
+    let text = format!("text of file {at}\n").into_bytes();
+    let revision = NewRevision {
+      node: node::compute(&NULL_NODE, &NULL_NODE, &text).unwrap(),
+      p1: NULL_NODE,
+      p2: NULL_NODE,
+      link: built.nodes[0],
+      flags: 0,
+      len: u64::try_from(text.len()).unwrap(),
+      bytes: built.store.put(&text).unwrap(),
+      block: None,
+    };
+    built
+      .index
+      .append_revisions(&mut built.store, Log::File(&path), &[revision])
+      .unwrap();
+  }
+  let view = view_of(&built, true);
+  let mut counted = Counted {
+    inner: whole_texts(&built.index, &built.store),
+    rows: 0,
+    chunks: 0,
+  };
+  let mut answer = Vec::new();
+  stream_out(&view, &mut counted, &mut room(), &mut answer).unwrap();
+  let (status, sent) = streamed(&answer);
+  assert_eq!(status, b"0");
+  // The same stream a step at a time in a small room, its batches a log or a chunk each: the same bytes.
+  let mut streaming = crate::render::Streaming::default();
+  let mut small = Counted {
+    inner: whole_texts(&built.index, &built.store),
+    rows: 0,
+    chunks: 0,
+  };
+  let mut stepped = Vec::new();
+  loop {
+    crate::render::answer_want(&mut streaming, &mut small).unwrap();
+    if !streaming
+      .step(
+        &built.index,
+        &built.store,
+        &mut Admission::new(SMALL_ROOM),
+        &mut stepped,
+      )
+      .unwrap()
+    {
+      break;
+    }
+  }
+  assert_eq!(stepped, answer, "the stream asked a log at a time");
+  assert!(
+    small.rows > counted.rows,
+    "a small room asked {} times",
+    small.rows
+  );
+  assert_eq!(
+    (
+      sent
+        .iter()
+        .filter(|(name, _)| name.ends_with(b".i"))
+        .count(),
+      counted.rows,
+      counted.chunks
+    ),
+    // The file logs and the changelog: `build`'s changesets name no manifest, so no manifest log is written.
+    (usize::try_from(MANY_LOGS).unwrap() + 1, 2, 1),
+    "(index files, row asks, chunk asks)"
+  );
+}
+
+/// Shape: a step's room small enough that a batch holds one log's rows or one chunk, large enough for an entry.
+const SMALL_ROOM: u64 = 1 << 8;

@@ -532,6 +532,7 @@ pub(crate) fn replay(
           green,
           fetched: None,
           version,
+          entries: None,
         };
         let old_len = files.len(base, &path)?;
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -550,6 +551,7 @@ pub(crate) fn replay(
             green,
             fetched: None,
             version,
+            entries: None,
           },
           op.op()?,
         )?;
@@ -576,6 +578,7 @@ mod tests {
       green: None,
       fetched: None,
       version: 0,
+      entries: None,
     }
   }
 

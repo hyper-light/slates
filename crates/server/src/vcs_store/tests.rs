@@ -2132,9 +2132,10 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
         let newest = git.repository.versions(key).checked_sub(1)?;
         git.repository.head(content, key, newest)
       });
-    (turns > objects.len(), kept, left, head == Some(commit))
+    (turns, kept, left, head == Some(commit))
   });
-  assert_eq!(seen, (true, 1, 0, true));
+  // A create is admitted with no walk (A-614 amended), in one turn; its sets are its first reader's to derive.
+  assert_eq!(seen, (1, 1, 0, true));
 }
 
 /// A-752 part 3 (main's order of 2026-11-20: a push changing every file of a 1,500-file head stepped its map in its
@@ -2242,11 +2243,12 @@ fn walked(state: &ShardState, id: RepositoryId) -> u64 {
 }
 
 /// A-722 part 4g (main's report of 2026-11-20: after a restart, a daemon recovering a repository pushed git/git's v2.0.0
-/// spun past the watchdog's window and was killed again, a crash loop). Do: push one commit of [`MANY_FILES`] files;
-/// make the store again from the log, each turn held to no time at all, reading after each turn how many objects the
-/// store's walks visited. Expect: the record replayed; the move's admission walking every object the push brought, and
-/// no turn walking more than one of them. Red before the change: the replay's end admitted the move whole, its walk in
-/// one turn.
+/// spun past the watchdog's window and was killed again, a crash loop); A-614 amended (main's ruling (A) of 2026-11-21,
+/// its condition 3: a replay walks nothing, so a restart's cost stays flat in history). Do: push one commit of
+/// [`MANY_FILES`] files; make the store again from the log, each turn held to no time at all, reading after each turn
+/// how many objects the store's walks visited. Expect: the record replayed, and no object walked at all, by any turn:
+/// the create is admitted with no walk, its sets its first reader's to derive. Red before A-614's amendment: the move's
+/// admission walked every object the push brought, an object a turn (and before part 4g, the whole walk in one turn).
 #[test]
 fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
   let (most, total, objects) = crate::test_store::audit_on_stored_shard("vcs", |state| {
@@ -2272,11 +2274,8 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
     }
     (most, before.saturating_sub(begun), objects.len())
   });
-  assert!(
-    total >= u64::try_from(objects).unwrap(),
-    "walked {total} of {objects}"
-  );
-  assert_eq!(most, 1, "the most objects one turn walked");
+  assert!(objects > 0);
+  assert_eq!((total, most), (0, 0), "a replay walks nothing");
 }
 
 /// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past

@@ -3030,6 +3030,17 @@ fn run_recorded(
   if let Some(refusal) = crate::live_ship::refuse_over_bound(state, &body) {
     return Some(refusal);
   }
+  // The one door to a green's content (P2, `crate::green_ready`): a request on a green that owes a push, or on a work
+  // over one, starts its materialization and parks until it is made; nothing of it runs before.
+  if let Some(green) = crate::green_ready::owing_green_of(state, &body)
+    && crate::green_ready::green_ready(state, green)
+      == crate::green_ready::GreenReady::Materializing
+  {
+    state.current_request = Some((origin, id));
+    let parked = crate::green_ready::park_request(state, green, (client_id, principal, body));
+    state.current_request = None;
+    return parked;
+  }
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -9013,6 +9024,7 @@ fn edit(
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_edit(
       (&mut w.files, &mut w.journal),
@@ -9249,6 +9261,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
       green: lent.as_deref(),
       fetched: home.fetched.as_ref(),
       version: w.base_version,
+      entries: Some(&w.entries),
     };
     crate::work_log::apply_declare((&mut w.files, &mut w.journal), base, volume_op)
   };
@@ -9422,6 +9435,7 @@ fn build_increment(
     green: Some(&*engine),
     fetched: None,
     version: base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(state, sealed.work, (base_version, sealed.journal.len()));
   let inc = compose_increment(
@@ -10346,7 +10360,11 @@ const REANCHOR_VALUES_WALKED: &str = "merge.reanchor.values_walked";
 /// Secures `secured` bytes of `green_id`'s retention for the merge: folds what the retention budget allows first, leaving
 /// that room (never a live reader's version), then secures it, the first refusal reported. The bytes available where
 /// it cannot.
-fn secure_retention(state: &mut ShardState, green_id: DbVolumeId, secured: u64) -> Result<(), u64> {
+pub(crate) fn secure_retention(
+  state: &mut ShardState,
+  green_id: DbVolumeId,
+  secured: u64,
+) -> Result<(), u64> {
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
   crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
@@ -10594,7 +10612,7 @@ fn judge_submission(
         increment_bytes,
         increment: inc,
         applied,
-        verification: signed.verification.clone(),
+        verification: signed.verification,
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
@@ -11178,6 +11196,7 @@ pub(crate) fn compose_on_replica(
     green: Some(replica),
     fetched: None,
     version: sealed.base_version,
+    entries: None,
   };
   let kept = crate::refining::kept(
     state,
@@ -11348,6 +11367,12 @@ fn canonical_declaration(
     .collect()
 }
 
+/// A work's changed files (each its held parts, none: removed) and its journal of ops.
+type ChangedWork = (
+  std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
+  Vec<VolumeOp>,
+);
+
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
 /// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
@@ -11355,24 +11380,16 @@ fn canonical_declaration(
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
-  (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
+  (changed, mut journal): ChangedWork,
   replacement: &[slates_ipc::protocol::WorkChange],
-) -> Result<
-  (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
-  Refusal,
-> {
+) -> Result<ChangedWork, Refusal> {
   use slates_ipc::protocol::WorkChange;
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
     fetched: None,
     version: head,
+    entries: None,
   };
   let unknown = || Refusal::UnknownBase {
     green: VolumeId::default(),
@@ -11435,12 +11452,21 @@ fn rebase_answer(
       changed,
       journal,
     } => {
-      // A work that composed its own increment composes its next one too: it is given the entries it will need.
+      // A work that composed its own increment composes its next one too: it is given the entries it will need, of the
+      // paths its restated journal names and of every path its increment touched, so an edit of a path whose change
+      // became the head's reads its length from the entry, not the owner (A-808).
       let entries = if composes {
         journal
           .iter()
           .flat_map(VolumeOp::names)
           .flatten()
+          .chain(
+            inc
+              .doc
+              .ops
+              .iter()
+              .filter_map(|op| inc.doc.paths.path(op.path)),
+          )
           .map(|path| (path.to_owned(), engine.path_base(version, path)))
           .collect()
       } else {
@@ -11934,6 +11960,27 @@ pub(crate) fn owner_judge(
       .err()
       .map(refused);
   }
+  // The one door to a green's content (P2, `crate::green_ready`): a green that owes a push is made first, the step
+  // parked on it.
+  if crate::green_ready::green_ready(state, sealed.green)
+    == crate::green_ready::GreenReady::Materializing
+  {
+    let green = sealed.green;
+    let parked = ParkedSubmit {
+      origin,
+      id,
+      route: Some(back),
+      kind: ParkedKind::Owner {
+        sealed: Box::new(sealed),
+        evidence,
+        policy,
+      },
+      parked_ns: state.clock.monotonic_ns(),
+    };
+    return crate::green_ready::park(state, green, parked)
+      .err()
+      .map(refused);
+  }
   // A Subversion repository's green: the repository's landing turn before the verdict, or the step waits for it,
   // parked (`crate::made_commit`, main's landing order).
   if let crate::made_commit::Taken::Busy(repository) =
@@ -12005,6 +12052,44 @@ impl ParkedSubmit {
   }
 }
 
+/// The recorded request `body` of seat `client_id`, by `principal`, parked on a green's materialization (P2,
+/// `crate::green_ready::park_request`), answered on `route` when it runs again.
+pub(crate) fn parked_request(
+  (origin, id): (u64, RequestId),
+  route: Option<crate::merge_service::ReplyRoute>,
+  (client_id, principal, body): (u32, Principal, RequestBody),
+  state: &mut ShardState,
+) -> ParkedSubmit {
+  ParkedSubmit {
+    origin,
+    id,
+    route,
+    kind: ParkedKind::Request {
+      client_id,
+      principal,
+      body: Box::new(body),
+    },
+    parked_ns: state.clock.monotonic_ns(),
+  }
+}
+
+/// Answers a parked request `refusal`, unrecorded, so its retry runs again (P2: its green's materialization refused).
+/// Whether the answer was handed on.
+pub(crate) fn answer_refused(
+  state: &mut ShardState,
+  parked: ParkedSubmit,
+  refusal: Refusal,
+) -> bool {
+  let ParkedSubmit {
+    origin, id, route, ..
+  } = parked;
+  let handed = route.is_some_and(|route| answered_on(route, (origin, id), refused(refusal)));
+  if !handed {
+    state.count(crate::green_ready::PARK_REFUSED, 1);
+  }
+  handed
+}
+
 /// Answers a parked submit that waited past its bound `Overloaded`, unrecorded, so its retry runs (as a forward that
 /// never started is answered); nothing of it ran. Whether the answer was handed on.
 pub(crate) fn answer_overdue(state: &ShardState, parked: ParkedSubmit) -> bool {
@@ -12042,6 +12127,16 @@ enum ParkedKind {
     authorship: slates_ipc::protocol::Authorship,
     /// Its approval.
     approval: Approval,
+  },
+  /// A recorded request whose green owes a push, parked on its materialization (P2, `crate::green_ready`): run again
+  /// whole, through `run_recorded`, once the green holds its content.
+  Request {
+    /// The client's seat.
+    client_id: u32,
+    /// Who asked.
+    principal: Principal,
+    /// The request (boxed: it is most of a parked request's size).
+    body: Box<RequestBody>,
   },
   /// A rebase asked on the green's shard, parked behind its work's refinement (A-787 part 2).
   LocalRebase {
@@ -12191,6 +12286,16 @@ pub(crate) fn resume_all(state: &mut ShardState, parked: Vec<ParkedSubmit>) {
       }
       ParkedKind::LocalRebase { principal, work } => {
         resumed_rebase(state, (origin, id), route, &principal, work)
+      }
+      ParkedKind::Request {
+        client_id,
+        principal,
+        body,
+      } => {
+        state.reply_route = route;
+        let reply = run_recorded(state, origin, id, client_id, &principal, *body);
+        state.reply_route = None;
+        reply
       }
     };
     if let (Some(reply), Some(route)) = (reply, route)
@@ -14127,7 +14232,7 @@ fn bind_mount(
 /// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
 /// (A-267, 2026-11-18): a long name can leave less than this.
 /// Derived: `BULK_CHUNK_BYTES` (4096) / 4.
-const MOUNTS_REPORT_BYTES: usize = 1024;
+pub(crate) const MOUNTS_REPORT_BYTES: usize = 1024;
 
 /// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
 const RETIRED_WHOLE_READ: &str =
@@ -14143,7 +14248,7 @@ pub(crate) const WATCHER_MERGE: &str = "merge";
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
 /// attachment whose form is a chosen path, as many as `budget` bytes carry (in id order), and the
 /// count of those it did not.
-fn mounts_of(
+pub(crate) fn mounts_of(
   state: &ShardState,
   volume: DbVolumeId,
   budget: usize,
@@ -19184,6 +19289,21 @@ fn settle_installed(
 /// naming why (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the
 /// replay and installed the shorter one, and a submit's outcome was not checked at all. In one call: a refused
 /// publication's remake ([`remake_green`]) and the tests run it; a recovery runs [`replay_green_sliced`].
+/// [`replay_green`] for a test: green `id` replayed from its durable chain into a fresh engine, as a recovery replays
+/// it: the replayed engine's head, and the version it owes where it owes a push (P2).
+#[cfg(test)]
+pub(crate) fn replay_green_for_test(
+  state: &ShardState,
+  id: DbVolumeId,
+) -> Option<(u64, Option<u64>)> {
+  let replayed = replay_green(state, id).ok()?;
+  let owed = replayed
+    .0
+    .deferred()
+    .map(slates_merge::push::DeferredPush::version);
+  Some((replayed.0.head(), owed))
+}
+
 fn replay_green(
   state: &ShardState,
   id: DbVolumeId,
@@ -19448,6 +19568,32 @@ fn replay_chain_entry(
       let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
         return Ok(true);
       };
+      // A deferred create's version is its push's record (P2): the green owes it again, and is materialized when it is
+      // first reached (`crate::green_ready`); nothing is built here.
+      if slates_merge::push::DeferredPush::is_record(bytes) {
+        let push = slates_merge::push::DeferredPush::decode(bytes)
+          .ok_or(GreenFence::EntryCorrupt { version })?;
+        let name = push.push().name;
+        let base = push.push().base_version;
+        if green.defer(push) != Some(version) {
+          return Err(GreenFence::WrongVersion {
+            version,
+            accepted: green.head(),
+          });
+        }
+        // The owed version's identity is its base's, as its owner's record carried it to holders.
+        let identity = green.head_identity();
+        replayed.push(crate::merge_service::ReplayedVersion {
+          version,
+          increment: name,
+          base,
+          evidence: Vec::new(),
+          identity,
+          completion: None,
+        });
+        *next = next.saturating_add(1);
+        return Ok(false);
+      }
       Box::new(
         slates_merge::chain_entry::decode(bytes)
           .map_err(|_| GreenFence::EntryCorrupt { version })?,
@@ -19483,12 +19629,20 @@ fn replay_chain_entry(
   if let Some(signature) = entry.signature {
     green.record_signature(version, signature);
   }
-  let identity = green.head_identity();
+  // A green that owes a push took the entry into its tail (P2): its identity is its base's until it is materialized, so
+  // the recorded one is kept unchecked, and checked when the tail applies.
+  let owing = !green.is_materialized();
+  let identity = if owing {
+    entry.identity.unwrap_or([0; 32])
+  } else {
+    green.head_identity()
+  };
   let at_checkpoint = head_check.and_then(|(at, recorded)| (at == version).then_some(recorded));
-  if entry
-    .identity
-    .or(at_checkpoint)
-    .is_some_and(|recorded| recorded != identity)
+  if !owing
+    && entry
+      .identity
+      .or(at_checkpoint)
+      .is_some_and(|recorded| recorded != identity)
   {
     return Err(GreenFence::IdentityDiverged { version });
   }

@@ -17222,3 +17222,72 @@ refinement), timed once each, debug build, this Mac (macOS arm64), 2026-11-21 ~0
 
 Before, each doubling of ops quadrupled the time; after, it doubles. The first step alone (the remap index) gave 50 ms /
 195 ms / 775 ms / 3.22 s, still quadratic, until the union's binary search removed the second scan.
+
+## A length-preserving change walks one value, whatever its path's history: the verdict flat over 10^5 versions (A-809, fixing A-803; 2026-11-21)
+
+w-rewrite-ops, main's order of 02:37 PST (piece 3). A-803 (w-fed-move) named the verdict's growth with history: the
+re-anchor walked every value of a changed path. A-809 gives a path's anchor numbered layers: an overwrite copies the
+bytes it overwrote as a layer and walks one value (`crates/merge/src/history.rs`, "A layered anchor").
+
+- **Command:** `load_bench --tree ~/.cache/w-fed-move-linux/kernel --clients 1000 --rounds 1 --per-connection 32
+  --hot-files 300 --idle-works 1 --preload N`. Release, in-process, over `kernel/` of torvalds v7.4-rc4 (754 files).
+- **Builds:** before is origin/main abd5e7b2 (`git archive`); after is the same plus A-809 (5acf9132b).
+- **Hardware:** adas-mac-studio (Apple M3 Ultra, 96 GiB). 2026-11-21 03:44–03:47 PST, load average 2.3–3.9.
+- **Rounds:** before and after interleaved, three rounds, all runs shown.
+- **Measured:** the run phase, i.e. the owner's counters after the run less after the preload. Judge µs is
+  `merge.submit.judge_ns / merge.submit.judge`; values per verdict is `merge.reanchor.values_walked / merge.submit.judge`.
+- Every run: oracle failures 0, exit 0.
+
+| preload | side | judge µs (r1, r2, r3) | values walked a verdict | verdicts/s |
+|---|---|---|---|---|
+| 0 | before | 22.9, 22.3, 22.2 | 7.8, 7.8, 7.8 | 6,057, 6,352, 6,011 |
+| 0 | after | 21.5, 20.1, 20.2 | 1.6, 1.6, 1.6 | 5,644, 6,382, 5,990 |
+| 10^4 | before | 28.3, 27.5, 27.5 | 29.9, 30.2, 29.9 | 6,191, 5,855, 5,570 |
+| 10^4 | after | 22.1, 21.7, 20.7 | 1.6, 1.6, 1.6 | 5,539, 5,826, 5,995 |
+| 10^5 | before | 66.4, 64.7, 65.2 | 227.6, 227.4, 227.9 | 4,854, 4,851, 5,178 |
+| 10^5 | after | 22.3, 23.1, 22.1 | 1.6, 1.7, 1.6 | 5,684, 5,784, 5,961 |
+
+- **Judge:** grew 2.9 times over 10^5 versions before (22.5 to 65.4 µs, the means); after it stays at 20.6 to 22.5 µs.
+- **Values walked:** went from 7.8 to 228 a verdict before; after it is 1.6 whatever the history. The 1.6 is a
+  verdict's paths that change length (fully re-anchored, as before) mixed with overwrites (one value each).
+- **Verdicts/s:** at 10^5, before is 4,851–5,178 and after is 5,684–5,961. Elsewhere the runs overlap.
+- **The preload's own cost** (each tenth of 10^5 versions, `inject preload`) is flat on both sides: before 292–300 µs a
+  version, after 291–295 µs. Its versions spread over many files, so no one path's history grows there; the growth is
+  the verdicts' over the hot paths.
+- **Unit:** `a_length_preserving_change_walks_one_value_however_long_its_history`. The 300th overwrite of a 16 KiB file
+  walked 300 values before and walks 1 now.
+- **Logs:** `~/.cache/w-rewrite-ops-ab-logs/run-<round>-<preload>-<side>.log` on adas-mac-studio. They are scratch and
+  are deleted after this record.
+
+## A-809's leftovers measured: a read through layers, an SDK replacement, an insert (A-811; 2026-11-21)
+
+w-rewrite-ops, main's order of 04:11.
+
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench`.
+- **File:** one 16 KiB file, 64-byte edits, nothing folded (every version is history, as when a reader pins the floor).
+- **Rounds:** fastest of 5 rounds a point; each (b) point is the mean of 200 changes made after the history reaches its
+  length.
+- **Host:** adas-mac-studio (Apple M3 Ultra, 96 GiB), 04:09–04:23 PST.
+- **Builds:** before is main fd031603d, at load 1.7–2.8; after is the same plus A-811's two fixes, at load 2.6–4.0.
+
+| measure | point | before | after |
+|---|---|---|---|
+| (a) read of version 1 after m overwrites of one range | m = 10 | 5,750 ns | 3,917 ns |
+| | m = 100 | 15,708 ns | 3,292 ns |
+| | m = 1,000 | 37,125 ns | 1,709 ns |
+| | m = 10,000 | 190,750 ns | 5,875 ns |
+| (b') SDK replacement (delete + insert at one offset), a change | history 100 | 400,363 ns, 200.5 values | 3,087 ns, 1.0 |
+| | history 1,000 | 2,332,840 ns, 1,100.5 values | 4,270 ns, 1.0 |
+| | history 5,000 | 12,628,782 ns, 5,100.5 values | 10,398 ns, 1.0 |
+| (b) overwrite and insert alternating, a change | history 100 | 528,950 ns, 101 values | 524,655 ns, 101 |
+| | history 1,000 | 3,589,284 ns, 551 values | 3,599,576 ns, 551 |
+| | history 5,000 | 17,477,883 ns, 2,551 values | 17,526,648 ns, 2,551 |
+| overwrites alone, a change | history 100 | 2,568 ns, 1 value | 2,578 ns, 1 |
+| | history 1,000 | 3,607 ns, 1 value | 3,708 ns, 1 |
+| | history 5,000 | 9,034 ns, 1 value | 9,140 ns, 1 |
+
+- **(a) and (b'):** fixed (GAPS A-803's leftovers).
+- **(b):** open. An insert re-anchors in full, A-793's cost.
+- **The last rows:** a change that walks one value still grows sublinearly with the history. That cost is elsewhere in
+  the submit and is not chased.
+
