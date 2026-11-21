@@ -59468,3 +59468,34 @@ Applied in the same change to:
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
 
+### A-817 — A work asks for a file's base bytes only for a whole-file replacement whose declared base length is the file's; the identical-op drop measured and rejected (2026-11-21, w-fed-move, goal 86b; main's rulings 03:16 and 03:46 PST; A-787, A-808, D-27)
+- **How it was found.** After A-808, rebases and submits still asked the green's owner for files: 17.2 a client at 10
+  hot files in the 1,000-client stand-in (release, in-process, `kernel/`, one round). Main ruled that a rebase drop the
+  journal operations its change made identical to the head (git's skip of an already-applied commit), on two
+  conditions, and expected about 13.8 fewer asks a client. Counted why `base_missing` wanted each path
+  (`merge.work.base_missing.<unentried|unheld|replaced_whole>`): every one was replaced whole (76.3 paths a client at 10
+  hot files), none for a missing entry or an unheld file. `refine::whole_replacement` takes a lone overwrite at offset 0
+  as a whole-file replacement whatever the file's length, and the load harness's first slot is at offset 0, so every
+  work that wrote it asked its green's owner for the file's bytes at each rebase and submit, to refine a replacement
+  the refinement then keeps as declared (it refines only one whose base length is the file's).
+- **Change.** `crates/merge/src/refine.rs`: `whole_replaced_lengths` (each replacement's base path and the base length
+  its operations replace). `crates/server/src/work_home.rs` `base_missing`: a replaced path is asked for only when the
+  work's kept entry names that length for it, or names none. Nothing the refinement does changes: the bytes it no longer
+  gets are those it never used.
+- **Tests** (macOS arm64, Mac Studio, local). Red first, `slates-server --test works_off_owner
+  an_overwrite_at_the_start_of_a_longer_file_asks_no_base_bytes` (a 64-byte overwrite at offset 0 of a 1,024-byte file,
+  submitted from a work off its green's shard: one file asked before, none after; accepted, reading back). The
+  `works_off_owner` suite (18), `-p slates-merge --lib` (259) and its test targets, `green_post_state`, `mounted_work`,
+  `mounted_work_cow`, `merge_load`, `work_cow`, `work_edit_cow`, `verdict_pages`, `session_log` and the lib's work and
+  refine tests pass.
+- **A/B by use** (same stand-in): file asks 3.0, 4.5, 8.2, 17.2 a client at 300, 100, 30, 10 hot files to none; asks a
+  client 14.1, 17.6, 27.5, 49.2 to 11.1, 12.9, 19.1, 30.0 (69.4 before A-808 at 10 hot files); oracle failures 0 in
+  every run. What remains grows only with the rebases themselves (18.4 a client at 10 hot files, one ask a rebase).
+- **Measured and rejected: the identical-operation drop.** Built to main's ruling (`increment::drop_identical` after the
+  engine's rebase, its oracle on generated histories: outcomes and heads equal with and without the drop but for git's
+  case; a deterministic case: a work whose overwrite another wrote first). By use it fired 0.00, 0.00, 0.01 and 0.03
+  times a client at 300, 100, 30 and 10 hot files and left the rebases' file asks where they were (14.2 a client at 10
+  hot files): the engine's restatement already leaves out an operation whose effect became the head's, so the journal
+  reaching the drop holds nothing to drop, and the deterministic case passed only vacuously (an empty journal). Not
+  landed (CLAUDE.md §5: a dead-even A/B does not land); the patch is kept outside the tree
+  (`~/slates-work/w-fed-move-a817-rejected-drop.patch`, w-fed-move's machine) and its rule is not in the rebase section.

@@ -17047,6 +17047,70 @@ is the invocation's median of 3 runs. µs unless marked.
 - So the client's spin was Linux arm64's band; Linux x86_64's and macOS's loaded tails have other holds (macOS: the
   busy path's kevent nap, whose fix w-provision-gate measured and rejected on the provisioning path, a38630375).
 
+## The client's reply wait, arm C: measured and rejected, B (A-799) stays (85a; g222's last step, recorded by w-provision-gate; 2026-11-21)
+
+**The run.** GitHub run 44884335146 (branch `diag-measurer-g222-20`, "g222 A/B/C of the client reply wait on every
+platform"), all five jobs passed.
+
+**The arms:**
+- **A:** d799eff4b, the red gate.
+- **B:** 89e37868f, A-799 as landed: park at once.
+- **C:** 8d4d33618 (`agents/g222-loaded-p99-p999-reply-wait-c`). The client spins only while its spins catch the reply,
+  with a budget of twice the measured spun reply, and probes every 2^shift parks.
+
+Loaded is the f10 loaded mix. Three rounds per arm, interleaved. Each cell is p50/p99/p999 in µs, one triple per round
+and every round shown, as main extracted them from the run's log.
+
+| runner | form | A (red gate) | B (A-799) | C |
+|---|---|---|---|---|
+| macos-latest | accept_f10_loaded | 5134/11264/12155 · 2596/8164/10105 · 1741/7961/9974 | 3567/8391/11938 · 2459/9039/12135 · 1288/8370/12079 | 507/8371/11574 · 4068/8895/12103 · 466/8396/12226 |
+| macos-latest | conflict_f10_loaded | 4100/8590/11877 · 3916/8226/8821 · 3538/7788/12019 | 370/8127/10073 · 2453/8503/12305 · 4106/8273/12063 | 831/8202/11625 · 3644/8226/12187 · 1889/8423/11983 |
+| macos-latest | accept_f1000_quiet | 352/731/1163 · 415/1211/3394 · 418/1756/3385 | 367/784/2527 · 381/1234/2965 · 347/802/1052 | 302/602/824 · 311/592/734 · 277/624/814 |
+| macos-latest | accept_f10_quiet | 372/682/1734 · 459/3728/6472 · 389/1278/3194 | 365/977/2191 · 381/814/1259 · 471/902/1825 | 275/422/518 · 289/490/704 · 456/1526/9467 |
+| macos-latest | conflict_f1000_quiet | 323/727/1281 · 394/1154/2069 · 438/2275/4441 | 296/703/1850 · 319/720/1388 · 364/877/1719 | 262/449/595 · 273/578/780 · 335/925/1358 |
+| macos-latest | conflict_f10_quiet | 333/678/1095 · 391/1364/2410 · 355/1064/2975 | 310/913/1368 · 326/890/2338 · 369/856/1695 | 279/626/871 · 271/472/573 · 291/803/1591 |
+| ubuntu-24.04-arm | accept_f10_loaded | 422/1934/3357 · 396/1868/2926 · 393/2841/4204 | 239/939/4747 · 232/1072/3994 · 235/3989/5190 | 235/334/3994 · 236/3990/4879 · 236/342/372 |
+| ubuntu-24.04-arm | conflict_f10_loaded | 339/4000/6000 · 369/1793/3155 · 333/3996/6000 | 196/730/3001 · 193/896/1967 · 197/308/2479 | 193/333/1958 · 192/3998/5024 · 193/303/1823 |
+| ubuntu-24.04-arm | accept_f1000_quiet | 93/130/189 · 95/135/201 · 100/135/173 | 98/133/214 · 103/140/165 · 97/133/148 | 94/139/184 · 101/140/208 · 95/135/181 |
+| ubuntu-24.04-arm | accept_f10_quiet | 82/131/149 · 82/131/175 · 95/137/157 | 97/140/149 · 105/146/153 · 96/137/145 | 85/123/144 · 87/128/407 · 78/129/145 |
+| ubuntu-24.04-arm | conflict_f1000_quiet | 67/111/137 · 69/113/167 · 79/111/138 | 78/117/129 · 79/117/138 · 76/113/155 | 74/112/129 · 77/119/132 · 73/113/206 |
+| ubuntu-24.04-arm | conflict_f10_quiet | 67/106/130 · 70/111/134 · 75/111/143 | 73/113/150 · 79/123/167 · 72/115/127 | 64/103/139 · 65/103/132 · 65/104/136 |
+| ubuntu-latest | accept_f10_loaded | 244/3994/6044 · 349/5863/6285 · 69/7997/21023 | 115/2954/4075 · 137/3139/5886 · 98/2943/3896 | 96/2960/3996 · 273/5744/6256 · 265/5931/6268 |
+| ubuntu-latest | conflict_f10_loaded | 236/5599/6883 · 353/6388/6608 · 68/14650/19020 | 82/1967/3094 · 84/5150/6092 · 84/4015/6049 | 89/4001/5988 · 253/5996/6313 · 238/6070/6444 |
+| ubuntu-latest | accept_f1000_quiet | 70/130/172 · 107/143/152 · 72/125/171 | 79/107/140 · 82/141/175 · 96/142/170 | 82/109/173 · 71/143/172 · 85/136/149 |
+| ubuntu-latest | accept_f10_quiet | 69/109/141 · 106/139/155 · 69/95/112 | 80/133/150 · 110/164/203 · 81/145/162 | 91/130/150 · 70/123/134 · 70/134/143 |
+| ubuntu-latest | conflict_f1000_quiet | 89/115/130 · 61/120/134 · 88/118/129 | 69/125/136 · 72/122/136 · 70/125/137 | 70/99/110 · 70/94/109 · 70/107/139 |
+| ubuntu-latest | conflict_f10_quiet | 72/107/119 · 87/112/123 · 57/89/109 | 66/123/137 · 98/133/148 · 68/94/107 | 78/99/107 · 79/103/119 · 80/103/110 |
+| windows-11-arm | accept_f10_loaded | 85/336/39414 · 97/283/396 · 78/327/43700 | 102/184/32096 · 99/158/276 · 98/165/239 | 94/249/40417 · 85/181/50737 · 96/179/12124 |
+| windows-11-arm | conflict_f10_loaded | 64/314/32027 · 60/317/334 · 61/305/17874 | 76/127/478 · 78/130/262 · 75/131/4149 | 71/171/20219 · 68/175/27675 · 68/235/18272 |
+| windows-11-arm | accept_f1000_quiet | 106/149/225 · 108/149/177 · 106/145/245 | 109/157/272 · 109/152/189 · 111/154/222 | 93/142/219 · 110/158/226 · 91/133/174 |
+| windows-11-arm | accept_f10_quiet | 115/173/283 · 114/173/274 · 115/168/222 | 120/173/283 · 120/176/239 · 119/178/212 | 111/165/282 · 100/157/225 · 116/172/232 |
+| windows-11-arm | conflict_f1000_quiet | 92/132/186 · 90/133/155 · 93/139/196 | 93/141/191 · 94/142/195 · 95/145/185 | 82/139/181 · 91/136/172 · 82/132/170 |
+| windows-11-arm | conflict_f10_quiet | 94/141/184 · 91/144/181 · 89/139/179 | 91/139/203 · 93/141/184 · 92/142/171 | 77/128/189 · 80/131/234 · 78/122/151 |
+| windows-latest | accept_f10_loaded | 117/332/53886 · 118/309/55931 · 116/358/52073 | 159/279/32018 · 156/231/32273 · 155/284/33414 | 139/332/47967 · 140/298/55643 · 141/348/48702 |
+| windows-latest | conflict_f10_loaded | 88/293/564 · 90/299/43631 · 89/359/45585 | 129/204/740 · 128/210/569 · 127/218/12431 | 113/292/41931 · 114/291/39599 · 118/368/37216 |
+| windows-latest | accept_f1000_quiet | 111/193/308 · 115/211/376 · 108/177/302 | 130/204/313 · 131/226/335 · 127/191/279 | 129/216/280 · 132/213/271 · 129/212/293 |
+| windows-latest | accept_f10_quiet | 117/187/235 · 118/199/229 · 113/179/230 | 132/216/320 · 137/200/305 · 131/194/289 | 117/199/238 · 116/186/252 · 115/191/244 |
+| windows-latest | conflict_f1000_quiet | 99/189/283 · 100/188/230 · 97/176/271 | 114/191/272 · 115/200/264 · 112/181/262 | 113/186/257 · 116/195/276 · 113/173/215 |
+| windows-latest | conflict_f10_quiet | 97/187/316 · 98/180/291 · 96/170/229 | 110/174/240 · 111/179/241 · 108/167/211 | 96/159/223 · 96/169/220 · 96/157/214 |
+
+**Reading (main's verdict): C does not hold on every platform, so it does not land; B (A-799) stays.**
+- **Loaded, 85a's target:**
+  - macOS: C is no better than B (p99 about 8.4 ms in both).
+  - ubuntu-24.04-arm: C is no better than B either (better in 2 rounds, about 4 ms in the third, as B).
+  - ubuntu-latest: C is worse (accept p99 5.7-5.9 ms in 2 of 3 rounds against B's 2.9-3.1).
+  - Both Windows runners: C is far worse (conflict p999 20-42 ms against B's 0.3-12 ms, accept p999 12-56 ms against
+    B's 0.2-33).
+- **Quiet:** C helps only macOS (accept_f1000 p50 277-311 against 347-381 µs, p99 592-624 against 784-1,234). It is
+  even elsewhere.
+- **The macOS hop split** (run 44888851325, `diag-measurer-g222-22`). Its log could not be read here (no `gh` on this
+  machine), so g222's note stands for it (progress/g222.md, its quiet smoke run on Studio-4):
+  - The client's p99 tail is its own wake: from the reply written to the client seeing it, median 97 µs, two parks a
+    reply.
+  - The nap's harvests take 8-16 µs.
+  - The runtime's waits (the shard's kevent, the client's ulock) are late only 54 µs at the median and 63-75 µs at p99
+    under launchd. Only nanosleep is late (1.60 ms at the median), and nothing on the request path sleeps.
+
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** As "Subversion on the changeset store" above (adas-macbook-pro-2.local, release, load 15
