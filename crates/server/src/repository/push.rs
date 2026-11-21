@@ -88,6 +88,16 @@ pub(crate) enum BranchChange {
     /// The push it owes, based at the new green's version 0.
     push: slates_merge::push::DeferredPush,
   },
+  /// Green `green`, a member, owes `push` as its next version instead of moving by a built work (P2): the update a
+  /// [`BranchChange::CreateDeferred`] is for a green already named, recorded and replayed as its version the same way.
+  /// git's unborn default branch takes it (its first version over the empty green it is named by at version 0): git/git's
+  /// master, 4,876 files, was built whole in one step.
+  UpdateDeferred {
+    /// The green.
+    green: DbVolumeId,
+    /// The push it owes, based at its head.
+    push: slates_merge::push::DeferredPush,
+  },
   /// Branch `name` leaves the namespace and its green is kept (§4.17.1 item 5), unless the green moved past `version`,
   /// the version whose head the client said it saw.
   Delete {
@@ -227,6 +237,24 @@ pub(crate) enum AppendRefused {
 /// every correct use, since a push runs in one step of the owner shard. Format: a counter name in the status report.
 pub(crate) const PUSH_COMMIT_REFUSED: &str = "repository.push.commit_refused";
 
+/// Counter: an update a push deferred, its green owing the push rather than moved by a built work (P2,
+/// [`BranchChange::UpdateDeferred`]): git's unborn default branch's first version. Format: a counter name in the status
+/// report.
+pub(crate) const UPDATES_DEFERRED: &str = "repository.push.updates_deferred";
+
+/// The green a step leaves owing a push, and the push: a deferred create's new green, or a deferred update's (P2).
+fn owed(step: &Step) -> Option<(DbVolumeId, &slates_merge::push::DeferredPush)> {
+  match step {
+    Step::Create {
+      record,
+      deferred: Some(push),
+      ..
+    } => Some((record.id, push)),
+    Step::Defer { green, push } => Some((*green, push)),
+    _ => None,
+  }
+}
+
 /// One change, planned: what it does to which green.
 enum Step {
   /// `green` moves by `work`.
@@ -248,6 +276,12 @@ enum Step {
     green: DbVolumeId,
     version: u64,
   },
+  /// `green` owes `push` as its next version (P2, [`BranchChange::UpdateDeferred`]): deferred once the entry is judged,
+  /// never before, so a refused entry leaves the green as it was.
+  Defer {
+    green: DbVolumeId,
+    push: slates_merge::push::DeferredPush,
+  },
 }
 
 impl Step {
@@ -256,7 +290,7 @@ impl Step {
     match self {
       Step::Update { green, work } => Some((*green, work)),
       Step::Create { record, work, .. } => work.as_ref().map(|work| (record.id, work)),
-      Step::Delete { .. } => None,
+      Step::Delete { .. } | Step::Defer { .. } => None,
     }
   }
 }
@@ -367,9 +401,25 @@ pub(crate) fn append_versions(
     repository,
     ..RepositoryEntry::default()
   };
+  // Each revision's increment held in the content store, where its chain entry names it (chain entry format 6), before
+  // anything is recorded; what was held is given back if the entry is refused.
+  let mut increments = Vec::with_capacity(staged.len());
   for (index, step) in staged.iter().enumerate() {
+    let version = at(index);
+    let held =
+      match crate::merge_service::hold_increment(state, green, version, &step.increment.encode()) {
+        Ok(held) => held,
+        Err(refusal) => {
+          for held in increments {
+            crate::merge_service::release_refused_increment(state, green, held);
+          }
+          let _ = crate::merge_service::settle_green_retention(state, green);
+          return Err(AppendRefused::Entry(refusal));
+        }
+      };
+    increments.push(held);
     let bytes = slates_merge::chain_entry::encode(
-      &step.increment.encode(),
+      held.inputs,
       &step.increment,
       &step.applied,
       None,
@@ -378,7 +428,7 @@ pub(crate) fn append_versions(
     );
     entry.versions.push(GreenVersion {
       green,
-      version: at(index),
+      version,
       entry: bytes,
     });
   }
@@ -387,8 +437,12 @@ pub(crate) fn append_versions(
   entry.state = parts.state;
   entry.objects = parts.objects;
   let admitted = admit(state, &[], &entry, &[])
+    .and_then(|()| crate::verbs::publish_held_increments(state).map_err(AppendRefused::Entry))
     .and_then(|()| record_all(state, vec![Op::RepositoryAdvanced { entry }]));
   if let Err(refused) = admitted {
+    for held in increments {
+      crate::merge_service::release_refused_increment(state, green, held);
+    }
     let _ = crate::merge_service::settle_green_retention(state, green);
     return Err(refused);
   }
@@ -563,9 +617,12 @@ fn push_holding(
   // that moves greens alone waits on none of them (A-636 part 2b).
   let moves_state = !parts.names.is_empty()
     || !parts.state.is_empty()
-    || changes
-      .iter()
-      .any(|change| !matches!(change, BranchChange::Update { .. }));
+    || changes.iter().any(|change| {
+      !matches!(
+        change,
+        BranchChange::Update { .. } | BranchChange::UpdateDeferred { .. }
+      )
+    });
   if moves_state {
     crate::state_log::admit(state).map_err(AppendRefused::Repository)?;
   }
@@ -654,6 +711,9 @@ fn plan(
         }
         planned
       }
+      BranchChange::UpdateDeferred { green, push } => {
+        plan_update_deferred(state, record.id, (green, push), &mut greens)
+      }
       BranchChange::Delete { name, version } => {
         plan_delete(state, record.id, (name, version), (&mut names, &mut greens))
       }
@@ -698,6 +758,31 @@ fn plan_update(
   }
   gates(state, green, &work)?;
   Ok(Step::Update { green, work })
+}
+
+/// A deferred update's rules (P2): an update's, a member changed once whose engine is here and not fenced, and a push
+/// based at the green's head that it does not owe already. No gate is judged now: nothing merges until the push is built,
+/// when its green is first reached (`crate::green_ready`).
+fn plan_update_deferred(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (green, push): (DbVolumeId, slates_merge::push::DeferredPush),
+  greens: &mut BTreeSet<DbVolumeId>,
+) -> Result<Step, ChangeRefusal> {
+  if !is_member(state, repository, green) {
+    return Err(ChangeRefusal::Refused(Refusal::NotFound));
+  }
+  if !greens.insert(green) {
+    return Err(ChangeRefusal::Twice);
+  }
+  let based = state
+    .greens
+    .get(&green)
+    .is_some_and(|engine| engine.head() == push.push().base_version);
+  if state.fenced_greens.contains_key(&green) || !based {
+    return Err(ChangeRefusal::Refused(Refusal::ContentUnavailable));
+  }
+  Ok(Step::Defer { green, push })
 }
 
 /// The gates every merge into `green` passes (§4.16; A-285, A-321): a write policy that lets merges happen without an
@@ -982,13 +1067,24 @@ fn apply_planned(
   (entry, made): (RepositoryEntry, Vec<VolumeRecord>),
   held: &mut Held,
 ) -> Result<Appended, AppendRefused> {
-  let committed = commit(state, steps, verdicts)?;
-  let entry = recorded_entry(state, entry, steps, &committed);
+  let increments = hold_increments(state, steps, &verdicts)?;
+  let committed = match commit(state, steps, verdicts) {
+    Ok(committed) => committed,
+    Err(refused) => {
+      release_increments(state, steps, increments);
+      return Err(refused);
+    }
+  };
+  let entry = recorded_entry(state, entry, steps, &committed, &increments);
   let mut ops: Vec<Op> = made
     .into_iter()
     .map(|record| Op::VolumeCreated { record })
     .collect();
   ops.push(Op::RepositoryAdvanced { entry });
+  if let Err(refusal) = crate::verbs::publish_held_increments(state) {
+    release_increments(state, steps, increments);
+    return Err(AppendRefused::Entry(refusal));
+  }
   record_all(state, ops)?;
   // Recorded: the new greens are the repository's now, and nothing is given back.
   held.made.clear();
@@ -1180,26 +1276,27 @@ fn entry(
         },
       }),
       Step::Update { .. } => {}
+      // The register's guard holds the green at its push's base, as a delete's holds the version the client saw.
+      Step::Defer { green, push } => entry.checks.push(RepositoryCheck::Head {
+        green: *green,
+        version: push.push().base_version,
+      }),
     }
   }
   for (step, verdict) in steps.iter().zip(verdicts) {
     if let (Some((green, work)), Some(Verdict::Held(judged))) = (step.work(), verdict) {
-      let bound = slates_merge::chain_entry::entry_bound(work.encoded_len(), work);
+      let bound = slates_merge::chain_entry::entry_bound(work);
       entry.versions.push(GreenVersion {
         green,
         version: judged.at().saturating_add(1),
         entry: vec![0; bound],
       });
     }
-    // A deferred create's version 1 is its push's record (P2): judged by the register at the record's own length.
-    if let Step::Create {
-      record,
-      deferred: Some(push),
-      ..
-    } = step
-    {
+    // A deferred create's version 1, and a deferred update's next version, is its push's record (P2): judged by the
+    // register at the record's own length.
+    if let Some((green, push)) = owed(step) {
       entry.versions.push(GreenVersion {
-        green: record.id,
+        green,
         version: push.version(),
         entry: vec![0; push.encode().len()],
       });
@@ -1290,6 +1387,14 @@ fn commit(
         return Err(AppendRefused::Entry(Refusal::ContentUnavailable));
       }
     }
+    // A deferred update's green still at its push's base, owing nothing: confirmed before anything commits.
+    if let Step::Defer { green, push } = step {
+      let head = state.greens.get(green).map(|engine| engine.head());
+      if head != Some(push.push().base_version) {
+        state.count(PUSH_COMMIT_REFUSED, 1);
+        return Err(AppendRefused::Entry(Refusal::ContentUnavailable));
+      }
+    }
   }
   let mut committed = Vec::new();
   for (step, verdict) in steps.iter().zip(verdicts) {
@@ -1309,25 +1414,82 @@ fn commit(
         }
       }
       (_, Some(Verdict::Before(version))) => Some((version, Vec::new(), true)),
-      _ => None,
+      // The deferred update's green owes its push from here (P2), its content its head's until first reached.
+      _ => match step {
+        Step::Defer { green, push } => match state.greens.defer(green, push.clone()) {
+          Some(version) => {
+            state.count(UPDATES_DEFERRED, 1);
+            Some((version, Vec::new(), false))
+          }
+          None => {
+            state.count(PUSH_COMMIT_REFUSED, 1);
+            None
+          }
+        },
+        _ => None,
+      },
     };
     committed.push(made);
   }
   Ok(committed)
 }
 
-/// The entry with each version's real chain entry: the increment, what its verdict resolved it to, and, where the
-/// version's record goes to holders, the head's identity for a replay to compare (as `verbs::record_accepted` records
-/// a submit's).
+/// Each held verdict's increment held in the content store, where its chain entry names it (chain entry format 6, as
+/// `verbs::submit` holds a submit's), before any verdict commits: refused typed at the shard's room with what it held
+/// given back. In the order of the steps, none for a step with no held verdict.
+fn hold_increments(
+  state: &mut ShardState,
+  steps: &[Step],
+  verdicts: &[Option<Verdict>],
+) -> Result<Vec<Option<crate::merge_service::HeldIncrement>>, AppendRefused> {
+  let mut increments = Vec::new();
+  for (step, verdict) in steps.iter().zip(verdicts) {
+    let held = match (step.work(), verdict) {
+      (Some((green, work)), Some(Verdict::Held(judged))) => {
+        let version = judged.at().saturating_add(1);
+        match crate::merge_service::hold_increment(state, green, version, &work.encode()) {
+          Ok(held) => Some(held),
+          Err(refusal) => {
+            release_increments(state, steps, increments);
+            return Err(AppendRefused::Entry(refusal));
+          }
+        }
+      }
+      _ => None,
+    };
+    increments.push(held);
+  }
+  Ok(increments)
+}
+
+/// Gives back what [`hold_increments`] stored, for a push that records nothing.
+fn release_increments(
+  state: &mut ShardState,
+  steps: &[Step],
+  increments: Vec<Option<crate::merge_service::HeldIncrement>>,
+) {
+  for (step, held) in steps.iter().zip(increments) {
+    if let (Some((green, _)), Some(held)) = (step.work(), held) {
+      crate::merge_service::release_refused_increment(state, green, held);
+    }
+  }
+}
+
+/// The entry with each version's real chain entry: the increment by where the content store holds it, what its verdict
+/// resolved it to, and, where the version's record goes to holders, the head's identity for a replay to compare (as
+/// `verbs::record_accepted` records a submit's).
 fn recorded_entry(
   state: &mut ShardState,
   mut entry: RepositoryEntry,
   steps: &[Step],
   committed: &Committed,
+  increments: &[Option<crate::merge_service::HeldIncrement>],
 ) -> RepositoryEntry {
   let mut versions = Vec::new();
-  for (step, made) in steps.iter().zip(committed) {
-    let (Some((green, work)), Some((version, applied, false))) = (step.work(), made) else {
+  for ((step, made), held) in steps.iter().zip(committed).zip(increments) {
+    let (Some((green, work)), Some((version, applied, false)), Some(held)) =
+      (step.work(), made, held)
+    else {
       continue;
     };
     let identity = crate::merge_service::record_goes_to_holders(state, green)
@@ -1338,28 +1500,20 @@ fn recorded_entry(
           .map(|mut engine| engine.head_identity())
       })
       .flatten();
-    let bytes =
-      slates_merge::chain_entry::encode(&work.encode(), work, applied, None, identity, None);
+    let bytes = slates_merge::chain_entry::encode(held.inputs, work, applied, None, identity, None);
     versions.push(GreenVersion {
       green,
       version: *version,
       entry: bytes,
     });
   }
-  // Each deferred create's version 1: its push's record, never a built work (P2).
-  for step in steps {
-    if let Step::Create {
-      record,
-      deferred: Some(push),
-      ..
-    } = step
-    {
-      versions.push(GreenVersion {
-        green: record.id,
-        version: push.version(),
-        entry: push.encode(),
-      });
-    }
+  // Each deferred create's version 1 and deferred update's next version: its push's record, never a built work (P2).
+  for (green, push) in steps.iter().filter_map(owed) {
+    versions.push(GreenVersion {
+      green,
+      version: push.version(),
+      entry: push.encode(),
+    });
   }
   entry.versions = versions;
   entry
@@ -1417,21 +1571,17 @@ fn after(state: &mut ShardState, steps: &[Step], committed: &Committed, held: &m
         (None, None),
       );
     }
-    // A deferred create's version 1 goes to holders as any version does (P2, R8): its push's record is its inputs, which
-    // a holder defers its replica by, so a takeover adopts a green that owes the same push.
-    if let Step::Create {
-      record,
-      deferred: Some(push),
-      ..
-    } = step
-    {
-      let owed = push.push();
+    // A deferred create's version 1 and a deferred update's next version go to holders as any version does (P2, R8):
+    // its push's record is its inputs, which a holder defers its replica by, so a takeover adopts a green that owes the
+    // same push.
+    if let Some((green, push)) = owed(step) {
+      let pushed = push.push();
       crate::merge_service::enqueue_record(
         state,
-        record.id,
+        green,
         push.version(),
-        owed.name,
-        owed.base_version,
+        pushed.name,
+        pushed.base_version,
         Vec::new(),
         (None, None),
       );
@@ -1489,6 +1639,11 @@ fn answer_committed(steps: &[Step], committed: &Committed, recorded: bool) -> Ap
         ),
       },
       Step::Delete { green, .. } => BranchAppended::Deleted { green: *green },
+      Step::Defer { green, push } => BranchAppended::Moved {
+        green: *green,
+        version: push.version(),
+        before: false,
+      },
     })
     .collect();
   Appended { changes, recorded }

@@ -10,7 +10,8 @@
 //! quantum of a microsecond would end one at nearly every unit, each yield costing more than the unit it ended (state B:
 //! +13.8% of CPU over the unsliced build, 2026-11-08). No slice outlasts [`SLICE_CEILING_NS`], whatever the yields cost.
 //! The clock is read after every unit, so a slice overruns by its last unit at most. The units are recovery's own: the catalog's
-//! replay, each record rebuilt in the order recovery always took them, a green's origin walk one directory at a time,
+//! snapshot, then its log a record a unit (A-228 continued: the whole replay was one unit, 963 ms of CPU on a loaded
+//! host, and the watchdog killed a restarted daemon in it), each record rebuilt in the order recovery always took them, a green's origin walk one directory at a time,
 //! its chain one entry at a time, and each work's log replay. Only where a poll ends moves: no unit is reordered or
 //! split, and nothing else on the shard runs until the start ends, since the shard runs it alone.
 //!

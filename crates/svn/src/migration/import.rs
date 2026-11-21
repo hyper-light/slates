@@ -59,6 +59,15 @@ pub enum Importing {
     /// The record to commit.
     record: Box<Record>,
   },
+  /// A delta text opened on a base the repository names but keeps elsewhere (C2 stage B part 2 (b): a text stored on a
+  /// node's changeset store, which the records name by identity and length alone): the caller hands its bytes whole to
+  /// [`Importer::supply_base`], then drops the first `consumed` bytes and calls again.
+  Base {
+    /// The bytes, from the start of the buffer, the import is done with.
+    consumed: usize,
+    /// The base text's identity.
+    text: ContentIdentity,
+  },
   /// The stream ended, and every record it made was handed to the caller.
   Done,
 }
@@ -101,6 +110,12 @@ pub struct Importer {
   loading: Option<Revision>,
   /// Whether the stream has ended and every record it made been handed over.
   done: bool,
+  /// The base of the delta text just opened, which the repository keeps elsewhere: asked of the caller before the import
+  /// reads on ([`Importing::Base`]).
+  wanted_base: Option<ContentIdentity>,
+  /// Whether the stream may still name revisions the repository holds: true until the first revision it makes, so a
+  /// stream resumes a cut-short import only from its start, never by revisions out of order.
+  resumable: bool,
 }
 
 /// A revision being read: its number, its properties and its transaction (none for revision 0).
@@ -112,6 +127,9 @@ struct OpenRevision {
   properties: Properties,
   /// Its transaction; revision 0 makes none (`new_revision_record`).
   transaction: Option<Transaction>,
+  /// Whether the repository holds it already: an import resumed after a refusal (C2 stage C) reads it through without
+  /// making anything, its revision properties held to the repository's.
+  skipped: bool,
 }
 
 /// A node record being read: the path its sections change.
@@ -164,6 +182,9 @@ struct OpenText {
   expected: (Option<Md5>, Option<Sha1>),
   /// The text made so far.
   bytes: Vec<u8>,
+  /// A delta's base the repository keeps elsewhere, as its caller supplied it ([`Importing::Base`]); none where the
+  /// transaction or the repository holds the base, read from there a window at a time.
+  base: Option<Vec<u8>>,
 }
 
 impl Importer {
@@ -180,7 +201,34 @@ impl Importer {
       pending: None,
       loading: None,
       done: false,
+      wanted_base: None,
+      resumable: true,
     }
+  }
+
+  /// Hands the import the base `bytes` of the open delta text it asked for ([`Importing::Base`]), charged as the text's
+  /// own bytes are.
+  ///
+  /// # Errors
+  /// [`MigrationRefusal::Corrupt`] where no open text asked for `text`, or `bytes` are not its identity's; the room's
+  /// refusal past it.
+  pub fn supply_base(
+    &mut self,
+    repository: &Repository,
+    text: &ContentIdentity,
+    bytes: Vec<u8>,
+  ) -> Result<(), MigrationRefusal> {
+    let asked = matches!(
+      self.text.as_ref().map(|open| open.form),
+      Some(TextForm::Delta { base: Some(base) }) if base == *text
+    );
+    if !asked || *blake3::hash(&bytes).as_bytes() != *text {
+      return Err(MigrationRefusal::Corrupt);
+    }
+    self.charge(repository, bytes.len())?;
+    let open = self.text.as_mut().ok_or(MigrationRefusal::Corrupt)?;
+    open.base = Some(bytes);
+    Ok(())
   }
 
   /// The bytes the import holds outside the repository: the open revision's properties, section and text, and what its
@@ -261,6 +309,12 @@ impl Importer {
           if let Some(record) = made {
             return Ok(commit(offset, record));
           }
+          if let Some(text) = self.wanted_base.take() {
+            return Ok(Importing::Base {
+              consumed: offset,
+              text,
+            });
+          }
         }
         Read::NeedMore { consumed, needed } => {
           let consumed = offset
@@ -287,6 +341,17 @@ impl Importer {
     event: Event<'_>,
   ) -> Result<Option<Record>, MigrationRefusal> {
     let unmade = |done: Result<(), MigrationRefusal>| done.map(|()| None);
+    // A revision the repository holds already is read through: its nodes, their sections and texts make nothing.
+    let skipping = self.revision.as_ref().is_some_and(|open| open.skipped);
+    if skipping {
+      match event {
+        Event::Node(_) | Event::Text(_) | Event::Window(_) | Event::TextEnd | Event::Delta(_) => {
+          return Ok(None);
+        }
+        Event::Property(_) | Event::PropertiesEnd if self.properties.is_none() => return Ok(None),
+        _ => {}
+      }
+    }
     match event {
       Event::Format(_) | Event::Delta(_) => Ok(None),
       Event::Uuid(uuid) => uuid_record(repository, uuid),
@@ -332,13 +397,16 @@ impl Importer {
     let youngest = repository.youngest();
     let expected = youngest.checked_add(1).ok_or(MigrationRefusal::Corrupt)?;
     let continues = number == expected || (number == 0 && youngest == 0);
-    if !continues {
+    // A revision the repository holds already: the stream resumes an import a refusal cut short (C2 stage C, a batch
+    // is atomic), read through as long as each such revision's properties are the repository's.
+    let skipped = !continues && number <= youngest && self.resumable;
+    if !continues && !skipped {
       return Err(MigrationRefusal::OutOfSequence {
         expected,
         found: number,
       });
     }
-    let transaction = if number == 0 {
+    let transaction = if number == 0 || skipped {
       None
     } else {
       Some(repository.begin()?)
@@ -347,6 +415,7 @@ impl Importer {
       number,
       properties: Properties::new(),
       transaction,
+      skipped,
     });
     if properties {
       self.properties = Some(OpenProperties {
@@ -370,6 +439,18 @@ impl Importer {
       return Ok(None);
     };
     self.in_flight = 0;
+    if open.skipped {
+      // Held already: the same revision as the repository's, by its properties, or a stream that does not resume it.
+      if repository.revision_properties(open.number) != Some(&open.properties) {
+        return Err(MigrationRefusal::OutOfSequence {
+          expected: repository.youngest().saturating_add(1),
+          found: open.number,
+        });
+      }
+      self.resumable = open.number < repository.youngest();
+      return Ok(None);
+    }
+    self.resumable = false;
     match open.transaction {
       None => Ok(Some(Record::RevisionProperties {
         revision: open.number,
@@ -414,7 +495,17 @@ impl Importer {
       });
     }
     if let Some(section) = header.text {
-      self.text = Some(open_text(&path, facts, section)?);
+      let open = open_text(&path, facts, section)?;
+      // A base the records name but keep elsewhere is asked of the caller before a window reads it.
+      if let TextForm::Delta {
+        base: Some(identity),
+      } = open.form
+        && transaction.content(repository, &identity).is_none()
+        && repository.stored_len(&identity).is_some()
+      {
+        self.wanted_base = Some(identity);
+      }
+      self.text = Some(open);
     }
     self.node = Some(OpenNode { path });
     Ok(())
@@ -484,14 +575,18 @@ impl Importer {
       .as_ref()
       .and_then(|revision| revision.transaction.as_ref())
       .ok_or(MigrationRefusal::Corrupt)?;
-    let base: std::borrow::Cow<'_, [u8]> = match open.form {
-      TextForm::Delta {
-        base: Some(identity),
-      } => transaction
+    let base: std::borrow::Cow<'_, [u8]> = match (open.form, open.base.as_deref()) {
+      (TextForm::Delta { base: Some(_) }, Some(supplied)) => std::borrow::Cow::Borrowed(supplied),
+      (
+        TextForm::Delta {
+          base: Some(identity),
+        },
+        None,
+      ) => transaction
         .content(repository, &identity)
         .ok_or(MigrationRefusal::Corrupt)?,
-      TextForm::Delta { base: None } => std::borrow::Cow::Borrowed(&[]),
-      TextForm::Whole => return Err(MigrationRefusal::Corrupt),
+      (TextForm::Delta { base: None }, _) => std::borrow::Cow::Borrowed(&[]),
+      (TextForm::Whole, _) => return Err(MigrationRefusal::Corrupt),
     };
     let view = source_view(&base, window.source_offset, window.source_len)
       .ok_or(MigrationRefusal::Delta(SvndiffError::SourceShort))?;
@@ -726,6 +821,7 @@ fn open_text(path: &str, facts: Facts, section: TextSection) -> Result<OpenText,
     form,
     expected: (section.md5, section.sha1),
     bytes: Vec::new(),
+    base: None,
   })
 }
 

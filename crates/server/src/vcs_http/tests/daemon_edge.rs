@@ -920,6 +920,50 @@ fn a_long_pushs_answer_is_kept_alive_with_gits_keepalive_until_its_report() {
   );
 }
 
+/// A-722's keepalive on the fetch (main's goal-93 piece, 2026-11-21: a fetch's answer wrote nothing from its
+/// `packfile` section's head until its pack's first packet while the pack's objects were chosen over many turns; git's
+/// upload-pack writes `0005\1` while `pack-objects` is silent, git 2.50.1's `create_pack_file`). Do: start a daemon
+/// whose keepalive interval is none; push a history of [`KEPT_ALIVE_HISTORY`] commits; fetch its last commit at
+/// protocol v2 with `done`, as `git clone` asks. Expect: `200`; the `packfile` section's first packet git's keepalive
+/// (an empty band-1 packet), and the section's pack whole after the keepalives, every object pushed.
+/// Shape: how much of each of a fetch's first packets [`a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`]
+/// compares and shows: past a section's name and a keepalive, short of a pack's whole packet.
+const OPENING_SHOWN: usize = 16;
+
+#[test]
+fn a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen() {
+  let (identity, certificate) = identity();
+  let (daemon, _) = daemon_configured(Some(identity), |config| config.git_keepalive_ns = 0);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  let name = name_on_the_repositorys_partition();
+  create(&daemon, &name);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let edge = (port, &certificate);
+  let (request, last) = long_history(KEPT_ALIVE_HISTORY);
+  let created = pushed(edge, &name, &request);
+  let fetched = uploaded(edge, &name, &fetch_of(last));
+  daemon.stop();
+  assert_eq!(created.0, 200, "{}", String::from_utf8_lossy(&created.1));
+  assert_eq!(fetched.0, 200);
+  let (lines, _) = packets_from(&fetched.1, 0);
+  let opening: Vec<&[u8]> = lines
+    .iter()
+    .take(2)
+    .map(|line| {
+      line
+        .get(..line.len().min(OPENING_SHOWN))
+        .unwrap_or_default()
+    })
+    .collect();
+  assert_eq!(opening, [b"packfile\n".as_slice(), [1].as_slice()]);
+  let (_, commands_end) = packets_from(&request, 0);
+  let pushed_pack = request.get(commands_end..).expect("the push's pack");
+  assert_eq!(
+    ids_in(&fetched_pack(&fetched.1)).len(),
+    ids_in(pushed_pack).len()
+  );
+}
+
 /// A-713 (found by use, 2026-11-20: with git/git cut at v1.0.0, 2,930 commits in a 3.4 MB pack, the push landed and every
 /// clone, over HTTP and SSH, was refused `upload-pack: the request needs more room than the server admits`). Do: start a
 /// two-shard daemon whose edge serves loopback TLS, each request admitted one ring region; push a line of
@@ -1131,7 +1175,10 @@ fn create_hg_from_states(daemon: &Daemon, name: &str) {
       "the import did not end: {ended:?}"
     );
     // A done import waits to land (A-687); landed, its index is the store's and the store is lent again.
-    assert_eq!(crate::vcs_store::hg_import::land(state, id), Ok(()));
+    assert_eq!(
+      crate::vcs_store::hg_import::land_imported(state, id),
+      Ok(())
+    );
   });
 }
 

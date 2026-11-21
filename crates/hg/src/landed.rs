@@ -155,6 +155,24 @@ impl Replaying {
         self.under_way = Some((sequence, replay));
         Ok(Stepped::More)
       }
+      // A test's log keeps no store: the fork's own texts stand in for it.
+      #[cfg(test)]
+      Ok(Progress::Store) => {
+        replay.answer_from_fork(store);
+        self.under_way = Some((sequence, replay));
+        Ok(Stepped::More)
+      }
+      // This seam lends sections and answers no store want: a base landed before is read only by a replay that waits.
+      #[cfg(not(test))]
+      Ok(Progress::Store) => Err(given_back(
+        sequence,
+        replay,
+        store,
+        Refused::Record {
+          sequence,
+          refused: RecordRefused::StoreWanted,
+        },
+      )),
       // The log lends a section whole: a want names bytes past its end.
       Ok(Progress::Wanted(_)) => Err(given_back(
         sequence,

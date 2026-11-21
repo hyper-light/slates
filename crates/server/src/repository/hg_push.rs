@@ -163,6 +163,9 @@ const UNLANDED: &[u8] = b"the push could not be landed on the repository's chang
 
 /// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
 pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
+/// Counter: the slices a push's intake took (A-783's paced turn): a slice that yielded at its first quantum took one
+/// step, so a push of hg-src's history was a slice a revision. Format: a counter name in the status report.
+pub(crate) const INTAKE_SLICES: &str = "hg_push.intake_slices";
 /// Counter: pushes the changeset log refused, answered `UNLANDED`: nothing of them is in the register.
 pub(crate) const PUSH_UNLANDED: &str = "hg_push.unlanded";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
@@ -1413,10 +1416,29 @@ pub(crate) fn changeset_of(
   repository: RepositoryId,
   forked: &mut Forked,
 ) -> Option<Changeset> {
+  changeset_landing(state, repository, forked, None)
+}
+
+/// [`changeset_of`] for a changeset the server made of `green`'s `version` (`made`, a green's key and the version;
+/// A-767 C1, `vcs_store::hg_made`): its record and reference name the made green and version, so a replay puts the made
+/// node back, and it lands as a push's does otherwise.
+pub(crate) fn changeset_landing(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+  made: Option<(u64, u64)>,
+) -> Option<Changeset> {
   let disk = state.vcs_disk.clone()?;
   let sequence = state.vcs_stores.next_changeset(repository)?;
   let (version, payload) = &mut forked.changegroup;
-  let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
+  let reference = match made {
+    Some(made) => record::write_made_reference(forked.room, (*version, payload), sequence, made),
+    None => record::write_push_reference(forked.room, (*version, payload), sequence),
+  };
+  let section_record = match made {
+    Some(made) => record::write_made_record(forked.room, *version, made),
+    None => record::write_push_record(forked.room, *version),
+  };
   // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
   // A-767; fa5fd0023): its place is in this changeset's payload, named by the same identity the reference names.
   let payload_identity = *blake3::hash(payload).as_bytes();
@@ -1448,10 +1470,7 @@ pub(crate) fn changeset_of(
     sections: 0,
   };
   let parts = vec![
-    (
-      slates_store::log::SectionKind::Record,
-      record::write_push_record(forked.room, *version),
-    ),
+    (slates_store::log::SectionKind::Record, section_record),
     (
       slates_store::log::SectionKind::Payload,
       core::mem::take(payload),
@@ -1666,8 +1685,8 @@ async fn rebase_sliced(
           .flatten()
           .map(Ok);
       }
-      // A re-base reads the fork's rows, never the changegroup's bytes.
-      Ok(Stepped::Wanted(_)) => {
+      // A re-base reads the fork's rows, never the changegroup's bytes nor the store.
+      Ok(Stepped::Wanted(_) | Stepped::Store) => {
         return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
@@ -1706,6 +1725,8 @@ pub(crate) struct Taking {
   room: u64,
   /// The generation of the index it forked.
   generation: u64,
+  /// An intake step's measured cost, across its slices (A-783's paced turn).
+  costs: vcs_store::TurnCosts,
 }
 
 impl Taking {
@@ -1720,18 +1741,27 @@ impl Taking {
     let intake = self.intake.as_mut()?;
     let (_, payload) = self.changegroup.as_ref()?;
     let quantum = vcs_store::hg_import::quantum_of(state);
-    let start = slates_rt::futures::now_ns();
-    vcs_store::within_budget(state, lend, |stores| {
+    // A-783: steps to the quantum while someone waits on the shard, on to its ceiling while no one does; a slice that
+    // yielded at its first quantum (2.2 us on an M4 Max) was one step, a turn a revision for hg-src's ~230,000.
+    let mut paced = vcs_store::paced_turn(quantum, slates_rt::futures::now_ns());
+    let costs = &mut self.costs;
+    let sliced = vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       Some(loop {
+        if !paced.more(vcs_store::ANSWER_STEP, costs) {
+          break Ok(Stepped::More);
+        }
         match intake.step(payload.as_slice(), content, room) {
-          Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          Ok(Stepped::More) => {}
           // A push's changegroup arrived whole: a want names bytes past its end, a truncation.
           Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
           other => break other,
         }
       })
-    })
+    });
+    paced.close(slates_rt::futures::now_ns(), costs);
+    state.count(INTAKE_SLICES, 1);
+    sliced
   }
 
   /// The fork once every unit is taken.
@@ -1805,6 +1835,7 @@ fn begin_intake(
           changegroup: Some(changegroup),
           room: before,
           generation,
+          costs: vcs_store::TurnCosts::ZERO,
         }),
         Err(refused) => Err(intake_refused(&refused)),
       },
@@ -1831,12 +1862,41 @@ async fn take_sliced(
     let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
-      Ok(Stepped::Done) => return taking.finish().map(Ok),
+      Ok(Stepped::Done) => {
+        let forked = taking.finish()?;
+        let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
+        return Some(Ok(forked));
+      }
+      // A file delta's base landed before the push, read from the node's changeset store between slices (A-767 C1).
+      Ok(Stepped::Store) => {
+        let intake = taking.intake.as_mut()?;
+        if !vcs_store::hg_view::answer_store_wants(intake, repository).await {
+          return None;
+        }
+      }
       // The slice answers a whole changegroup's want as its truncation; none reaches here.
       Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => return Some(Err(intake_outcome(&refused))),
     }
   }
+}
+
+/// Counter: a push's file delta bases found in its cache of its own texts (A-767 C1, main's ruling (b2)). Format: a
+/// counter name in the status report.
+pub(crate) const BASE_HITS: &str = "vcs.hg.push_base_hits";
+/// Counter: a push's file revisions rebuilt from its own deltas to make a base its cache did not hold ((b1)). Format: a
+/// counter name in the status report.
+pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
+/// Counter: a push's file delta bases read from the node's changeset store: revisions landed before it. Format: a
+/// counter name in the status report.
+pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
+
+/// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
+/// [`BASE_STORE_READS`]).
+fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
+  state.count(BASE_HITS, intaken.base_hits);
+  state.count(BASE_REBUILDS, intaken.base_rebuilds);
+  state.count(BASE_STORE_READS, intaken.base_store_reads);
 }
 
 /// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
@@ -1858,8 +1918,8 @@ fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
 }
 
 /// `changegroup` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's
-/// state.
-#[cfg(test)]
+/// state: the tests', and a changeset the server made (`vcs_store::hg_made`), one version's change, taken in its task's
+/// step.
 pub(crate) fn take_whole(
   state: &mut ShardState,
   repository: RepositoryId,
@@ -1875,6 +1935,12 @@ pub(crate) fn take_whole(
     match taking.slice(state, lend, room) {
       Some(Ok(Stepped::More)) => {}
       Some(Ok(Stepped::Done)) => return taking.finish().map(Ok),
+      Some(Ok(Stepped::Store)) => {
+        if !stored_now(state, repository, &mut taking) {
+          taking.abandon_in(state);
+          return None;
+        }
+      }
       Some(Ok(Stepped::Wanted(range))) => {
         let refused = match taking.changegroup.as_ref() {
           Some((_, payload)) => whole_wanted(payload, range),
@@ -1893,6 +1959,24 @@ pub(crate) fn take_whole(
       }
     }
   }
+}
+
+/// Answers the intake's want of the node's changeset store at once, for a caller that holds the shard's state and so
+/// cannot wait between steps: a test's, from the store on a thread of its own (`test_store::answer_wants_blocking`).
+/// Whether it was answered.
+#[cfg(test)]
+fn stored_now(state: &mut ShardState, repository: RepositoryId, taking: &mut Taking) -> bool {
+  let (Some(disk), Some(intake)) = (state.vcs_disk.clone(), taking.intake.as_mut()) else {
+    return false;
+  };
+  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
+}
+
+/// The intake's want of the store, met by a caller that cannot wait between steps: a made changeset's, which sends
+/// every revision whole (`slates_hg::push::made::changegroup`), so never asks; unanswered.
+#[cfg(not(test))]
+fn stored_now(_state: &mut ShardState, _repository: RepositoryId, _taking: &mut Taking) -> bool {
+  false
 }
 
 /// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
@@ -1917,7 +2001,7 @@ pub(crate) fn land_in(
         match rebasing.slice(state)? {
           Ok(Stepped::More) => {}
           Ok(Stepped::Done) => break,
-          Ok(Stepped::Wanted(_)) => {
+          Ok(Stepped::Wanted(_) | Stepped::Store) => {
             return Some(PushOutcome::refused(&abort(REBASE_WANTED.to_vec())));
           }
           Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),

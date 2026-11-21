@@ -68,11 +68,13 @@
 //!
 //! **A create** is made at the version of the member whose head its first parent is, where it can still be branched
 //! from (the default branch's first, then the members as they joined), else at the default branch's newest version
-//! (A-654 part 1), and appended as A-635's new branch made at that version, its work moving it to the pushed tree.
-//! While the default branch is unborn, a create is built over an empty green and made from the default branch's green,
-//! which must be empty at its version 0: the default branch itself is moved by the work, any other ref is a new branch
-//! made at that empty version. A default branch that holds files no git commit names refuses it, typed: its commit is
-//! A-664's.
+//! (A-654 part 1), and appended as A-635's new branch made at that version, owing the push that moves it to the pushed
+//! tree (P2, A-823: `BranchChange::CreateDeferred`, made when first reached through `crate::green_ready`). While the
+//! default branch is unborn, a create's push is over an empty green, made from the default branch's green, which must be
+//! empty at its version 0: the default branch itself owes the push as its next version (`BranchChange::UpdateDeferred`),
+//! any other ref is a new branch made at that empty version. A default branch that holds files no git commit names
+//! refuses it, typed: its commit is A-664's. A command reaches greens only through the door: one that owes its push is
+//! made first, the command waiting a turn at a time.
 //!
 //! **A push's name** (A-618: two submits of one push carry one name, and every work's identity begins with it) is
 //! hashed from its repository and its commands, so a push sent again makes the same works, and A-635 answers each the
@@ -117,7 +119,6 @@ use slates_git::store::hook_view::Quantum;
 use slates_git::store::learn::Clock;
 use slates_git::store::views::{IndexedObjects, PushedObjects};
 use slates_ipc::protocol::{DatabaseRefusal, Refusal};
-use slates_merge::Increment;
 use slates_vcs::ContentStore;
 use slates_vcs::Work;
 
@@ -324,6 +325,8 @@ struct DecidingPush {
   /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
   /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
   making_room: Option<Vec<DbVolumeId>>,
+  /// The green owing its push that the command under way waits at the door for (P2, [`ServerJudge::door`]).
+  door: Option<DbVolumeId>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
   homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
@@ -378,6 +381,13 @@ pub(crate) struct Landing {
   header: slates_store::log::Header,
   /// Its `Names` and its `Payload`.
   parts: Vec<slates_store::owner::Part>,
+}
+
+impl Landing {
+  /// The sequence the changeset lands at: what the record names once it is landed.
+  pub(crate) fn sequence(&self) -> u64 {
+    self.header.sequence
+  }
 }
 
 /// What a push asks its edge to carry off the shard's step ([`ReceivePack::take_homing`]).
@@ -804,6 +814,7 @@ impl<P> ReceivePack<P> {
       restaging: None,
       preparing: None,
       making_room: None,
+      door: None,
       homing: Homing::Due,
       #[cfg(unix)]
       then: None,
@@ -834,6 +845,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         making_room,
+        door,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -847,6 +859,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         making_room,
+        door,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1019,8 +1032,9 @@ pub(crate) const PUSH_UNLANDED: &str = "git_push.unlanded";
 
 /// Repository `repository`'s push's changeset as the edge lands it (A-767 C5): `Names` the names' rows and `Payload` the
 /// pack, both the bytes their homing gave back, moved in; its sequence the repository's next, taken now so two pushes
-/// landing side by side never share one. None where the daemon holds no store, or the repository no store here.
-fn landing_of(
+/// landing side by side never share one. None where the daemon holds no store, or the repository no store here. A git
+/// commit the server makes lands the same way (`vcs_store::commits::make_deferred`, C5 2b piece 3).
+pub(crate) fn landing_of(
   state: &mut ShardState,
   repository: RepositoryId,
   (names, pack): (Vec<u8>, Vec<u8>),
@@ -1775,6 +1789,9 @@ pub(crate) struct PushTurns {
   pub(crate) longest_opening_ns: u64,
   /// The quanta turns took past their first because no one waited (A-783): the non-vacuity count of the extension.
   pub(crate) more_quanta: u64,
+  /// The units the turns ran (A-752: a build works a unit at a time, at least one a file it changes, whatever the
+  /// quantum the shard keeps).
+  pub(crate) units: u64,
   /// The turns that yielded to someone waiting at a quantum's end (A-783).
   pub(crate) yielded: u64,
 }
@@ -1832,14 +1849,16 @@ impl PushTurns {
     self.more_quanta = self
       .more_quanta
       .saturating_add(report.quanta.saturating_sub(1));
+    self.units = self.units.saturating_add(report.units);
     if report.stop == Some(slates_pace::Stop::Waiting) {
       self.yielded = self.yielded.saturating_add(1);
     }
   }
 
   /// Its status rows.
-  pub(crate) fn rows(&self) -> [(&'static str, u64); 7] {
+  pub(crate) fn rows(&self) -> [(&'static str, u64); 8] {
     [
+      ("push.build.units", self.units),
       ("push.build.more_quanta", self.more_quanta),
       ("push.build.yielded", self.yielded),
       ("push.build.turns", self.turns),
@@ -1873,6 +1892,8 @@ struct ServerJudge<'j> {
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
+  /// The green owing its push that the command under way waits at the door for (P2).
+  door: &'j mut Option<DbVolumeId>,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -1888,7 +1909,16 @@ impl Judge for ServerJudge<'_> {
       return false;
     }
     if command.is_delete() {
-      return true;
+      // A delete builds nothing; it reads only its own green, made first if it owes its push (P2's door).
+      return match bound(self.state, self.record.id, &command.name)
+        .filter(|green| self.state.greens.is_owing(green))
+      {
+        Some(green) => self.door(green),
+        None => {
+          *self.door = None;
+          true
+        }
+      };
     }
     let repository = self.record.id;
     let green = {
@@ -2050,11 +2080,27 @@ impl ServerJudge<'_> {
         record,
         store,
         indexed: &indexed,
+        owing: std::cell::Cell::new(None),
       };
       Verdicts::new(&greens, &indexed, &objects, *name, room)
         .prepared(preparing.take())
         .judge(command, pushed)
     })
+  }
+
+  /// P2's door for the command under way, at `green`, which owes its push: whether the command may go on to its verdict.
+  /// The first time, the green's materialization starts (`crate::green_ready`) and the command waits a turn at a time
+  /// while it runs. Once a build it waited for ended without making the green (refused past its room, counted there),
+  /// the command goes on, and its verdict, which lends no owing green, declines it in git's words: never a wait that
+  /// starts the build again every turn.
+  fn door(&mut self, green: DbVolumeId) -> bool {
+    if *self.door == Some(green) && !crate::green_ready::is_building(self.state, green) {
+      *self.door = None;
+      return true;
+    }
+    *self.door = Some(green);
+    crate::green_ready::green_ready(self.state, green);
+    false
   }
 
   /// A turn of `command`'s work build (A-752), begun at `began` on the shard's clock: units until half the step quantum
@@ -2080,9 +2126,9 @@ impl ServerJudge<'_> {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
       hash_bytes: state.config.archive_slice_bytes_within(quantum).max(1),
     };
-    let built = with_room(state, |state| {
+    let (built, owing) = with_room(state, |state| {
       let Some(store) = state.vcs_stores.git_ref(record.id) else {
-        return Ok::<bool, Declined>(true);
+        return Ok::<_, Declined>((true, None));
       };
       let (content, git) = store;
       let room = state.store.admittable();
@@ -2093,6 +2139,7 @@ impl ServerJudge<'_> {
         record,
         store,
         indexed: &indexed,
+        owing: std::cell::Cell::new(None),
       };
       let built = Verdicts::new(&greens, &indexed, &objects, *name, room).prepare(
         command,
@@ -2101,9 +2148,15 @@ impl ServerJudge<'_> {
         (began, env),
         slices,
       );
-      Ok(built)
+      Ok((built, greens.owing.get()))
     })
-    .unwrap_or(true);
+    .unwrap_or((true, None));
+    // A green the command reached that owes its push is made first, through the door, and the command waits for it a
+    // turn at a time (P2): its verdict reads it. A turn that only found it builds nothing and is not counted.
+    if let Some(green) = owing {
+      return self.door(green);
+    }
+    *self.door = None;
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
@@ -2157,16 +2210,9 @@ impl ServerJudge<'_> {
         };
         Ok((change, (Target::Green(green), None)))
       }
-      Entry::Create {
-        name,
-        from,
-        increment,
-      } => created(
-        state,
-        self.record,
-        (&name, from, increment),
-        (command.new, at),
-      ),
+      Entry::Create { name, from, push } => {
+        created(state, self.record, (&name, from, push), (command.new, at))
+      }
     }
   }
 
@@ -2213,7 +2259,7 @@ fn at_position(
 fn created(
   state: &ShardState,
   record: &RepositoryRecord,
-  (name, from, work): (&[u8], Option<(u64, u64)>, Increment),
+  (name, from, push): (&[u8], Option<(u64, u64)>, slates_merge::push::DeferredPush),
   (new, at): (ObjectId, usize),
 ) -> Result<Planned, Unappended> {
   let namespace = namespace_of(name)
@@ -2228,17 +2274,19 @@ fn created(
       let empty = empty_default(state, record).ok_or_else(|| refused_at(at, NO_EMPTY_DEFAULT))?;
       let repositories = state.db.partition().repositories();
       if repositories.branch(record.id, &namespace) == Some(empty) {
-        let change = BranchChange::Update { green: empty, work };
+        // The unborn default's first version owes the push too (P2): the green named already, so an update that defers.
+        let change = BranchChange::UpdateDeferred { green: empty, push };
         return Ok((change, (Target::Green(empty), Some(new))));
       }
       (empty, 0)
     }
   };
-  let change = BranchChange::Create {
+  // The created green owes its push, its content derived when first reached (P2, `crate::green_ready`).
+  let change = BranchChange::CreateDeferred {
     name: namespace.clone(),
     from,
     version,
-    work: Some(work),
+    push,
   };
   Ok((change, (Target::Created(namespace), Some(new))))
 }
@@ -2328,6 +2376,9 @@ struct ShardGreens<'s, 'v> {
   store: (&'s ContentStore, &'s GitStore),
   /// The repository's index as the push reads it (A-638): where an annotated tag's bytes are read.
   indexed: &'v IndexedObjects<'s>,
+  /// The first green the push reached that owes its push (P2): lent as none, so the push waits at the door for it
+  /// (`crate::green_ready`) rather than judge without it.
+  owing: std::cell::Cell<Option<DbVolumeId>>,
 }
 
 impl works::Greens for ShardGreens<'_, '_> {
@@ -2369,6 +2420,9 @@ impl ShardGreens<'_, '_> {
   /// Runs `with` over `green` lent for one call as the push reads it: its key, its log's position and its engine.
   fn lent<T>(&self, green: DbVolumeId, with: impl FnOnce(GreenRead<'_>) -> T) -> Option<T> {
     let position = self.state.db.partition().green_head(green);
+    if self.state.greens.is_owing(&green) && self.owing.get().is_none() {
+      self.owing.set(Some(green));
+    }
     let engine = self.state.greens.get(&green)?;
     Some(with(GreenRead {
       id: green_key(green),
@@ -2410,17 +2464,21 @@ impl ShardGreens<'_, '_> {
 
   /// The green a create whose first parent is `parent` is made from, and its version (module docs, "A create"): the
   /// newest of the store's versions of a member whose head is `parent`, where a branch can still be made at it, the
-  /// default branch's first, then the members as they joined.
+  /// default branch's first, then the members as they joined. A member other than the default branch that owes its
+  /// push is passed over (P2): a create made from it would make it at the push, as git/git's refs at commits other refs
+  /// hold would make most of them; the create owes its own push from the next base instead, its chain entry the push's
+  /// record either way. The default branch, the base every create falls back to, is made first through the door.
   fn holding(&self, parent: &ObjectId) -> Option<(DbVolumeId, Version)> {
     let (content, git) = self.store;
     let repositories = self.state.db.partition().repositories();
+    let default = self.default_green();
     let members = repositories
       .members_of(self.record.id)
       .map(|member| member.green);
-    self
-      .default_green()
+    default
       .into_iter()
       .chain(members)
+      .filter(|green| Some(*green) == default || !self.state.greens.is_owing(green))
       .find_map(|green| {
         let (number, tree) = git.version_of(content, green_key(green), parent)?;
         self.branchable(green, Version { number, tree })
@@ -2440,6 +2498,10 @@ impl ShardGreens<'_, '_> {
 
   /// `version` of `green`, where a branch can still be made at it (`repository::branch_version`).
   fn branchable(&self, green: DbVolumeId, version: Version) -> Option<(DbVolumeId, Version)> {
+    // A green owing its push is reached here too (P2's door): whether it can be branched at reads its engine.
+    if self.state.greens.is_owing(&green) && self.owing.get().is_none() {
+      self.owing.set(Some(green));
+    }
     crate::repository::branch_version(self.state, green, Some(version.number)).ok()?;
     Some((green, version))
   }

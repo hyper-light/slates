@@ -442,12 +442,7 @@ fn serve(
       } => {
         let found: Result<Vec<Vec<_>>, StoreError> = logs
           .iter()
-          .map(|(path, tool_ids)| {
-            tool_ids
-              .iter()
-              .map(|tool_id| store.text_by_tool(repository, path, tool_id))
-              .collect()
-          })
+          .map(|(path, tool_ids)| store.texts_by_tools(repository, path, tool_ids))
           .collect();
         let _ = answer.try_send(found);
       }

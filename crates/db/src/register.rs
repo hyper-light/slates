@@ -537,11 +537,15 @@ impl Placement {
 
 /// The number of distinct hosts of `cohort` in `acks`: dedups the host ids and drops any outside `cohort`.
 fn distinct_acks_within(cohort: &[HostId], acks: &[HostId]) -> usize {
+  // A host counted once, at its first acknowledgement: nothing allocated (a cohort and its acknowledgements are a
+  // handful of hosts; 85a, g228, the live path asked this on every durability poll).
   acks
     .iter()
-    .filter(|host| cohort.contains(host))
-    .collect::<std::collections::BTreeSet<&HostId>>()
-    .len()
+    .enumerate()
+    .filter(|(at, host)| {
+      cohort.contains(host) && !acks.get(..*at).is_some_and(|before| before.contains(host))
+    })
+    .count()
 }
 
 /// The candidate holders for `object`: the owner plus the co-holders of the one **copyset** the object

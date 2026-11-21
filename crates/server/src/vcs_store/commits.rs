@@ -117,65 +117,76 @@ type Object = (Kind, ObjectId, Vec<u8>);
 /// The commit's text as git signs it: its message, and its identity's name and email, with its date in seconds.
 type Authored<'a> = (&'a str, &'a str, &'a str, u64);
 
-/// Makes, records and admits git's commit of `green`'s `version`, which a submit carrying `authorship` just committed on
-/// the owner (module docs); nothing for a green of no git repository, or a version whose commit the store holds already
-/// (a submit sent again, which the engine answered from its idempotent accept). Counted, made or not.
+/// Makes git's commit of `green`'s `version`, which a submit carrying `authorship` just committed on the owner outside
+/// a recorded request (module docs): its date the owner's instant now, its making a job of the shard's queue
+/// ([`MadeAfter`]) that lands it on the node's store and records it (C5 part 2b piece 3: every record names its
+/// changeset); nothing for a green of no git repository, or a version whose commit the store holds already (a submit
+/// sent again, which the engine answered from its idempotent accept). Counted, made or not.
 pub(crate) fn make(
   state: &mut ShardState,
   green: DbVolumeId,
   version: u64,
   authorship: &Authorship,
 ) {
-  match made(state, green, version, authorship) {
-    Ok(true) => state.count(MADE, 1),
-    Ok(false) => {}
+  let Some(repository) = super::paths::git_repository_of(state, green) else {
+    return;
+  };
+  if made_already(&state.vcs_stores, repository, green_key(green), version) {
+    return;
+  }
+  match authored_now(state, authorship) {
+    Ok(authored) => enqueue(
+      state,
+      MadeJob {
+        repository,
+        green,
+        version,
+        authored,
+      },
+    ),
     Err(_) => state.count(UNMADE, 1),
   }
 }
 
-/// [`make`]'s steps: whether a commit was made.
-fn made(
-  state: &mut ShardState,
-  green: DbVolumeId,
-  version: u64,
-  authorship: &Authorship,
-) -> Result<bool, Unmade> {
-  let Some(repository) = super::paths::git_repository_of(state, green) else {
-    return Ok(false);
-  };
-  let key = green_key(green);
-  if made_already(&state.vcs_stores, repository, key, version) {
-    return Ok(false);
+/// A made commit's text as git signs it, owned: its message, its identity's name and email, and its date in seconds.
+#[derive(Clone, Debug)]
+struct OwnedAuthored {
+  /// The message.
+  message: String,
+  /// The identity's name.
+  name: String,
+  /// The identity's email.
+  email: String,
+  /// The date, in whole seconds of the owner's wall clock.
+  seconds: u64,
+}
+
+impl OwnedAuthored {
+  /// Borrowed as the commit's maker takes it.
+  fn borrowed(&self) -> Authored<'_> {
+    (
+      self.message.as_str(),
+      self.name.as_str(),
+      self.email.as_str(),
+      self.seconds,
+    )
   }
+}
+
+/// `authorship` dated at the owner's instant now, read once: the commit's bytes carry it, so a replay reads no clock.
+fn authored_now(state: &mut ShardState, authorship: &Authorship) -> Result<OwnedAuthored, Unmade> {
   let message = authorship.message.as_deref().ok_or(Unmade::Authorship)?;
   let identity = authorship
     .identities
     .git
     .as_ref()
     .ok_or(Unmade::Authorship)?;
-  // The commit's date is the owner's instant, read once; the commit's bytes carry it, so a replay reads no clock.
-  let seconds = u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0);
-  let authored = (
-    message,
-    identity.name.as_str(),
-    identity.email.as_str(),
-    seconds,
-  );
-  made_authored(state, (repository, green, version), authored)?;
-  Ok(true)
-}
-
-/// The commit of `green`'s `version` made over its kept trees as `authored`, its parent the commit before, recorded and
-/// admitted: [`made`]'s and [`made_owed`]'s last steps.
-fn made_authored(
-  state: &mut ShardState,
-  (repository, green, version): (RepositoryId, DbVolumeId, u64),
-  authored: Authored<'_>,
-) -> Result<(), Unmade> {
-  let key = green_key(green);
-  let parent = parent_of(state, repository, green);
-  let objects = commit_objects(state, repository, (key, version), authored, parent)?;
-  admitted(state, repository, (key, version), objects)
+  Ok(OwnedAuthored {
+    message: message.to_owned(),
+    name: identity.name.clone(),
+    email: identity.email.clone(),
+    seconds: u64::try_from(state.clock.wall_ns().div_euclid(NANOS_PER_SECOND)).unwrap_or(0),
+  })
 }
 
 /// The status count of the commits owed by submits whose maps are built whole after them (A-664's live whole builds,
@@ -193,6 +204,11 @@ pub(crate) fn after_submit(
   version: u64,
   authorship: &Authorship,
 ) {
+  // A made commit's one step (C5 2b piece 3, [`make_deferred`]): the map was stepped and the commit landed before it,
+  // and the step's own commit records it.
+  if crate::made_commit::committing(state) {
+    return;
+  }
   let whole = super::paths::git_repository_of(state, green)
     .filter(|repository| super::paths::needs_whole(state, (*repository, green), version));
   let Some(repository) = whole else {
@@ -259,7 +275,8 @@ fn staged(
 }
 
 /// Makes the commit owed of `green` (`super::owed`), its map kept at the owed version, from what was staged and never the
-/// clock, in a transaction of its own; counted. Nothing where none is owed, or the map is of another version.
+/// clock: a job of the shard's queue ([`MadeAfter`]), taken before the submits parked behind the build run again, so
+/// each names it as its parent; counted. Nothing where none is owed.
 pub(crate) fn make_owed(state: &mut ShardState, green: DbVolumeId) {
   let Some(repository) = super::paths::git_repository_of(state, green) else {
     return;
@@ -272,23 +289,21 @@ pub(crate) fn make_owed(state: &mut ShardState, green: DbVolumeId) {
   else {
     return;
   };
-  state.db.begin();
-  let authored = (
-    owed.message.as_str(),
-    owed.name.as_str(),
-    owed.email.as_str(),
-    owed.seconds,
+  let authored = OwnedAuthored {
+    message: owed.message,
+    name: owed.name,
+    email: owed.email,
+    seconds: owed.seconds,
+  };
+  enqueue(
+    state,
+    MadeJob {
+      repository,
+      green,
+      version: owed.version,
+      authored,
+    },
   );
-  let made = made_authored(state, (repository, green, owed.version), authored);
-  match (made, state.db.commit(&mut state.segment)) {
-    (Ok(()), Ok(_)) => state.count(MADE, 1),
-    (Ok(()), Err(_)) => {
-      // The store is ahead of a log that refused the entry: made again from the log, where the commit is owed still.
-      super::rebuild(state, repository);
-      state.count(UNMADE, 1);
-    }
-    (Err(_), _) => state.count(UNMADE, 1),
-  }
 }
 
 /// The status count of the branches `CreateBranch` made whose ref the store could not record (A-743): zero in every
@@ -597,6 +612,17 @@ fn recorded(
       vec![(key, version, Some(commit))],
     )
     .map_err(Unmade::Store)?;
+  record_and_commit(state, repository, sealed)
+}
+
+/// [`recorded`]'s last steps, its move admitted already: the record written into an entry of the register (version 5
+/// where the push's names and pack were homed and landed, C5), judged by the register's guard, the store committed, then
+/// the entry appended in the running transaction.
+fn record_and_commit(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  sealed: &mut SealedPush,
+) -> Result<(), Unmade> {
   let objects = sealed
     .record(super::Lent::new(&mut state.store, &mut state.vcs_stores).stores)
     .map_err(Unmade::Store)?;
@@ -620,4 +646,534 @@ fn recorded(
     return Err(Unmade::Entry(refusal_of_db(&error)));
   }
   Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+  /// A test's kill of a git made commit's task after its changeset landed and before its step commits (as a `kill -9`
+  /// there leaves the register): the task ends there, nothing after it run. It fires once, clearing itself, so a test
+  /// waits for it to read false.
+  pub(crate) static KILL_BEFORE_MADE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The status count of git commits the server made under the deferred-submit hook (C5 2b piece 3, [`make_deferred`]):
+/// landed on the node's store as one changeset and recorded with their version in one step. The path's non-vacuity
+/// count.
+pub(crate) const MADE_LANDED: &str = "vcs_commits.made_landed";
+
+/// Makes git's commit of the version `pending` holds, its verdict `judged` held and not applied (C5 2b piece 3, A-816,
+/// `crate::made_commit`): a preview of the verdict kept across turns, then a task holding the repository's landing turn
+/// steps the version's map over it a turn at a time, makes the commit's objects and seals them as a push, homes its
+/// names and pack in the region and lands them on the node's store as one changeset, then in one step applies the
+/// verdict and commits the version with the record naming that changeset (version 5), then answers. Nothing of the
+/// accept is durable or seen before that step.
+pub(crate) fn make_deferred(
+  state: &mut ShardState,
+  turn: crate::repository::svn_commit::landing::Turn,
+  mut pending: crate::made_commit::Pending,
+  judged: slates_merge::engine::Judged,
+) {
+  let (green, _) = pending.version();
+  if !crate::made_commit::hold_preview(state, &mut pending, judged) {
+    // No preview (the lineage busy): nothing of the accept is applied or durable.
+    state.count(UNMADE, 1);
+    turn.give_back(state);
+    crate::made_commit::give_up(state, pending);
+    return;
+  }
+  let request = pending.request();
+  if slates_rt::futures::spawn(made_landing(turn, pending))
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    // The task could not start (the shard's arena full): nothing of the accept is applied or durable.
+    state.count(UNMADE, 1);
+    crate::made_commit::abandon(state, (request, green));
+  }
+}
+
+/// Where a made commit stands before its one step ([`made_before_step`]).
+enum Before {
+  /// Its changeset landed: the sealed push, its record version 5 once written.
+  Landed(Box<SealedPush>),
+  /// Its commit not made (counted [`UNMADE`]): the version stands alone, as a version no commit was made of does
+  /// (module docs).
+  Unmade,
+  /// Its changeset refused by the node's store or the region: nothing of the accept may be durable.
+  Unlanded,
+  /// The shard's state is gone (the daemon stopping).
+  Gone,
+}
+
+/// [`make_deferred`]'s task: the commit made and landed before its step, then the step (`made_commit::commit`), the
+/// turn given back after.
+async fn made_landing(
+  turn: crate::repository::svn_commit::landing::Turn,
+  mut pending: crate::made_commit::Pending,
+) {
+  let (green, version) = pending.version();
+  let before = made_before_step(&mut pending).await;
+  #[cfg(test)]
+  if matches!(before, Before::Landed(_)) && KILL_BEFORE_MADE_COMMIT.with(|kill| kill.replace(false))
+  {
+    // A test's kill between the landing and the commit: nothing after it runs, as after a `kill -9`.
+    return;
+  }
+  let _ = crate::state::with_state(move |state| {
+    match before {
+      Before::Landed(mut sealed) => {
+        let repository = sealed.repository();
+        match crate::made_commit::commit(state, pending, |state| {
+          record_and_commit(state, repository, &mut sealed)
+        }) {
+          Some(Ok(())) => {
+            state.count(MADE, 1);
+            state.count(MADE_LANDED, 1);
+          }
+          Some(Err(_)) => {
+            sealed.release_homed(state);
+            state.count(UNMADE, 1);
+          }
+          // The green moved meanwhile: nothing of the accept committed.
+          None => {
+            sealed.release_homed(state);
+            super::paths::forget_preview_head(state, green, version);
+          }
+        }
+        // Committed, the push holds nothing and this gives back nothing; refused, it gives back what it held.
+        sealed.abandon(state);
+      }
+      Before::Unmade => {
+        state.count(UNMADE, 1);
+        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Unmade>(()));
+      }
+      Before::Unlanded | Before::Gone => {
+        super::paths::forget_preview_head(state, green, version);
+        crate::made_commit::give_up(state, pending);
+      }
+    }
+    turn.give_back(state);
+  });
+}
+
+/// The made commit before its step: the version's map stepped over the held verdict's preview a turn at a time, the
+/// commit's objects made and sealed as a push with its move admitted, then homed and landed.
+async fn made_before_step(pending: &mut crate::made_commit::Pending) -> Before {
+  let mut head_first = false;
+  loop {
+    match crate::state::with_state(|state| map_turn(state, pending, &mut head_first)) {
+      None => return Before::Gone,
+      Some(Ok(true)) => break,
+      Some(Ok(false)) => slates_rt::futures::yield_now().await,
+      Some(Err(_)) => return Before::Unmade,
+    }
+  }
+  let mut sealed = match crate::state::with_state(|state| sealed_made(state, pending)) {
+    None => return Before::Gone,
+    Some(Err(_)) => return Before::Unmade,
+    Some(Ok(sealed)) => sealed,
+  };
+  if home_and_land(&mut sealed).await.is_some() {
+    return Before::Landed(Box::new(sealed));
+  }
+  let _ = crate::state::with_state(move |state| {
+    sealed.release_homed(state);
+    sealed.abandon(state);
+  });
+  Before::Unlanded
+}
+
+/// One turn of the version's map over the held verdict's preview (`super::paths::over_preview_step`): whether it is kept.
+/// A head before with no map has its map built first, in the whole build's slices, once (`head_first`); a second need of
+/// it, or a step refused, leaves the commit unmade.
+fn map_turn(
+  state: &mut ShardState,
+  pending: &mut crate::made_commit::Pending,
+  head_first: &mut bool,
+) -> Result<bool, Unmade> {
+  let (green, version) = pending.version();
+  if super::paths::whole_build::building(state, green) {
+    return Ok(false);
+  }
+  let over =
+    super::paths::over_preview(state, green, version).ok_or(Unmade::Store(GitRefused::NoStore))?;
+  let stepped = crate::made_commit::with_held_preview_and_stores(state, pending, |engine, lent| {
+    use super::paths::OverPreviewStep;
+    let step = super::paths::over_preview_step(engine, lent.1, &over)?;
+    Some(match step {
+      OverPreviewStep::Kept => (step, true, true),
+      OverPreviewStep::Change | OverPreviewStep::Whole => {
+        let whole = step == OverPreviewStep::Whole;
+        let (kept, charged) = super::paths::step_over_preview(engine, lent, &over, whole);
+        (step, kept, charged)
+      }
+      OverPreviewStep::HeadFirst => (step, false, true),
+    })
+  })
+  .flatten()
+  .ok_or(Unmade::NoTrees)?;
+  let (step, kept, charged) = stepped;
+  if !charged {
+    state.count(super::CHARGE_SHORT, 1);
+  }
+  match step {
+    super::paths::OverPreviewStep::HeadFirst if !*head_first => {
+      *head_first = true;
+      super::paths::whole_build::start(state, over.repository, green, version.saturating_sub(1));
+      Ok(false)
+    }
+    _ if kept => Ok(true),
+    _ => Err(Unmade::NoTrees),
+  }
+}
+
+/// The made commit's objects over the version's kept map and trees (module docs), the submit's authorship dated now:
+/// [`sealed_of`] for the version `pending` holds.
+fn sealed_made(
+  state: &mut ShardState,
+  pending: &crate::made_commit::Pending,
+) -> Result<SealedPush, Unmade> {
+  let (green, version) = pending.version();
+  let repository =
+    super::paths::git_repository_of(state, green).ok_or(Unmade::Store(GitRefused::NoStore))?;
+  let authored = authored_now(state, pending.authorship())?;
+  sealed_of(state, (repository, green, version), &authored)
+}
+
+/// The commit of `green`'s `version` made over its kept map and trees as `authored`, its parent the commit before
+/// (module docs), its objects admitted to a push of their own as a pack, sealed, and its move to the commit at the
+/// version admitted: what its record and changeset are written from.
+fn sealed_of(
+  state: &mut ShardState,
+  (repository, green, version): (RepositoryId, DbVolumeId, u64),
+  authored: &OwnedAuthored,
+) -> Result<SealedPush, Unmade> {
+  let key = green_key(green);
+  let parent = parent_of(state, repository, green);
+  let (objects, commit) = commit_objects(
+    state,
+    repository,
+    (key, version),
+    authored.borrowed(),
+    parent,
+  )?;
+  let mut push =
+    GitPush::begin(&state.vcs_stores, repository).ok_or(Unmade::Store(GitRefused::NoStore))?;
+  let arriving: Vec<Incoming<'_>> = objects
+    .iter()
+    .map(|(kind, id, bytes)| Incoming {
+      kind: *kind,
+      claimed: Some(*id),
+      content: bytes,
+      depth: 0,
+    })
+    .collect();
+  if let Err(refused) = push.admit_all(state, &arriving) {
+    push.abandon(state);
+    return Err(Unmade::Store(refused));
+  }
+  let mut sealed = push.seal(state).map_err(Unmade::Store)?;
+  if let Err(refused) = sealed.admit(
+    (&mut state.store, &mut state.vcs_stores),
+    vec![(key, version, Some(commit))],
+  ) {
+    sealed.abandon(state);
+    return Err(Unmade::Store(refused));
+  }
+  Ok(sealed)
+}
+
+/// Where a made commit's homing stands between its carries (C5 part 2b, as a client's push's edge carries it): its names
+/// carried to their homes, then its pack, then its changeset to the node's store.
+enum Homing {
+  /// The names asked homed, by their identity and count.
+  Names((slates_vcs::ContentId, u64)),
+  /// The pack asked homed, by its identity and length, with the names' rows the names' homing gave back.
+  Pack(Vec<u8>, (slates_vcs::ContentId, u64)),
+  /// The changeset asked landed, at its sequence.
+  Land(u64),
+}
+
+/// A carry asked of the made commit's carrier, and where its homing then stands.
+type Ask = (crate::git_push::Carry, Homing);
+
+/// The made commit's first ask: its names put as one content and asked homed. None where it brings no object or its
+/// names were not put.
+fn first_ask(state: &mut ShardState, sealed: &SealedPush) -> Option<Ask> {
+  let names = {
+    let lent = super::Lent::new(&mut state.store, &mut state.vcs_stores);
+    sealed.names_now(lent.stores).ok()
+  };
+  let (bytes, count) = names.filter(|(_, count)| *count > 0)?;
+  let identity = super::put_names(state, &bytes)?;
+  Some((
+    crate::git_push::Carry::Home(bytes),
+    Homing::Names((identity, count)),
+  ))
+}
+
+/// What follows `carried`, the carrier's answer to the ask `homing` stands at: the next ask, `Some(None)` once the
+/// changeset landed (the push then names it), or None where any of it fell short (the caller gives back what it holds).
+fn next_ask(
+  state: &mut ShardState,
+  sealed: &mut SealedPush,
+  homing: Homing,
+  carried: crate::git_push::Carried,
+) -> Option<Option<Ask>> {
+  use crate::git_push::{Carried, Carry};
+  match (homing, carried) {
+    (Homing::Names((identity, count)), Carried::Homed(homed)) => {
+      if homed.outcome.as_ref().ok() != Some(&identity) {
+        super::release_names(state, &identity);
+        return None;
+      }
+      sealed.homed_as((identity, count));
+      let (bytes, packed) = sealed.pack_to_home()?;
+      if !super::hold_for_record(state, &packed.0) {
+        return None;
+      }
+      Some(Some((
+        Carry::Home(bytes),
+        Homing::Pack(homed.bytes, packed),
+      )))
+    }
+    (Homing::Pack(names, packed), Carried::Homed(homed)) => {
+      if homed.outcome.as_ref().ok() != Some(&packed.0) {
+        super::release_names(state, &packed.0);
+        return None;
+      }
+      sealed.pack_homed_as(packed);
+      let landing = crate::git_push::landing_of(state, sealed.repository(), (names, homed.bytes))?;
+      let sequence = landing.sequence();
+      Some(Some((
+        Carry::Land(Box::new(landing)),
+        Homing::Land(sequence),
+      )))
+    }
+    (Homing::Land(sequence), Carried::Landed(landed)) => {
+      let ok = landed.is_ok();
+      state.count(
+        if ok {
+          crate::git_push::PUSH_LANDED
+        } else {
+          crate::git_push::PUSH_UNLANDED
+        },
+        1,
+      );
+      ok.then(|| {
+        sealed.landed_as(sequence);
+        None
+      })
+    }
+    _ => None,
+  }
+}
+
+/// Homes `sealed`'s names and then its pack in the region, and lands them on the node's store as one changeset, through
+/// the edges' own carry (`crate::git_push::carry`, C5 part 2b): the push then names the changeset. None where any of it
+/// fell short; the caller gives back what it holds.
+async fn home_and_land(sealed: &mut SealedPush) -> Option<()> {
+  let (origin, shards, mut ask) = crate::state::with_state(|state| {
+    let ask = first_ask(state, sealed)?;
+    Some((state.shard, state.shards.clone(), ask))
+  })
+  .flatten()?;
+  loop {
+    let (carry, homing) = ask;
+    let carried = crate::git_push::carry(origin, &shards, carry).await;
+    match crate::state::with_state(|state| next_ask(state, sealed, homing, carried)).flatten()? {
+      Some(next) => ask = next,
+      None => return Some(()),
+    }
+  }
+}
+
+/// [`home_and_land`] carried as a test's synchronous driver carries a push (`git_push::tests::carried_blocking`).
+#[cfg(test)]
+pub(crate) fn home_and_land_blocking(
+  state: &mut ShardState,
+  sealed: &mut SealedPush,
+) -> Option<()> {
+  let mut ask = first_ask(state, sealed)?;
+  loop {
+    let (carry, homing) = ask;
+    let carried = crate::git_push::tests::carried_blocking(state, carry);
+    match next_ask(state, sealed, homing, carried)? {
+      Some(next) => ask = next,
+      None => return Some(()),
+    }
+  }
+}
+
+/// A git commit the server makes of a version already committed (a submit outside a recorded request, or a commit owed
+/// past a whole build, A-664): its repository, green, version and authorship, dated when the version committed, and the
+/// repository's landing turn where it was free then.
+struct MadeJob {
+  /// The repository.
+  repository: RepositoryId,
+  /// The green.
+  green: DbVolumeId,
+  /// The version.
+  version: u64,
+  /// Its text as git signs it.
+  authored: OwnedAuthored,
+}
+
+/// The shard's made commits of committed versions, made a job at a time by one task ([`drive_made_after`]), in the order
+/// their versions committed: each landed on the node's store, then recorded in a transaction of its own (C5 part 2b
+/// piece 3: no record carries its objects). Bounded by the shard's client seats, as parked submits are; past it a
+/// version stands with no commit made, counted [`UNMADE`], its successor's commit holding its files.
+#[derive(Default)]
+pub(crate) struct MadeAfter {
+  /// The jobs, oldest first, each with the landing turn it took where it was free when it came.
+  jobs: std::collections::VecDeque<(
+    MadeJob,
+    Option<crate::repository::svn_commit::landing::Turn>,
+  )>,
+  /// Whether a task drives them.
+  driving: bool,
+}
+
+impl Drop for MadeAfter {
+  /// The stores holding the queue are being let go with the shard's state, the landing gates its turns came from with
+  /// them: a turn still queued is forgotten, never handed back, since handing it back reaches for that state while it
+  /// is dropped (a thread-local's drop that reaches itself aborts the process).
+  fn drop(&mut self) {
+    for (_, turn) in self.jobs.drain(..) {
+      std::mem::forget(turn);
+    }
+  }
+}
+
+impl std::fmt::Debug for MadeAfter {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("MadeAfter")
+      .field("jobs", &self.jobs.len())
+      .field("driving", &self.driving)
+      .finish()
+  }
+}
+
+/// Queues `job`, its repository's landing turn taken now where it is free (so a recorded submit run after it in this
+/// step lands after it), and starts the task that drives the queue where none runs.
+fn enqueue(state: &mut ShardState, job: MadeJob) {
+  let bound = state
+    .config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1));
+  if state.vcs_stores.made_after.jobs.len() >= bound {
+    state.count(UNMADE, 1);
+    return;
+  }
+  let turn = crate::repository::svn_commit::landing::Turn::take_now(state, job.repository);
+  state.vcs_stores.made_after.jobs.push_back((job, turn));
+  if state.vcs_stores.made_after.driving {
+    return;
+  }
+  state.vcs_stores.made_after.driving = slates_rt::futures::spawn(drive_made_after())
+    .and_then(slates_rt::futures::detach)
+    .is_ok();
+}
+
+/// [`MadeAfter`]'s task: each job in turn, its repository's landing turn awaited where it took none, until none is left.
+async fn drive_made_after() {
+  loop {
+    let next = crate::state::with_state(|state| {
+      let next = state.vcs_stores.made_after.jobs.pop_front();
+      if next.is_none() {
+        state.vcs_stores.made_after.driving = false;
+      }
+      next
+    })
+    .flatten();
+    let Some((job, turn)) = next else {
+      return;
+    };
+    let turn = match turn {
+      Some(turn) => Some(turn),
+      None => crate::repository::svn_commit::landing::turn(job.repository).await,
+    };
+    made_after(job).await;
+    if let Some(turn) = turn {
+      let _ = crate::state::with_state(move |state| turn.give_back(state));
+    }
+  }
+}
+
+/// One job of [`MadeAfter`]: the commit sealed, homed and landed, then recorded.
+async fn made_after(job: MadeJob) {
+  let sealed = crate::state::with_state(|state| {
+    sealed_of(
+      state,
+      (job.repository, job.green, job.version),
+      &job.authored,
+    )
+  });
+  let mut sealed = match sealed {
+    Some(Ok(sealed)) => sealed,
+    Some(Err(_)) => {
+      let _ = crate::state::with_state(|state| state.count(UNMADE, 1));
+      return;
+    }
+    None => return,
+  };
+  if home_and_land(&mut sealed).await.is_none() {
+    let _ = crate::state::with_state(move |state| {
+      sealed.release_homed(state);
+      sealed.abandon(state);
+      state.count(UNMADE, 1);
+    });
+    return;
+  }
+  let repository = job.repository;
+  let _ = crate::state::with_state(move |state| recorded_after(state, repository, sealed));
+}
+
+/// A landed made commit of a committed version recorded in a transaction of its own (module docs, "Guard then apply");
+/// counted. A store whose entry the log then refuses is made again from the log.
+fn recorded_after(state: &mut ShardState, repository: RepositoryId, mut sealed: SealedPush) {
+  state.db.begin();
+  let made = record_and_commit(state, repository, &mut sealed);
+  match (made, state.db.commit(&mut state.segment)) {
+    (Ok(()), Ok(_)) => state.count(MADE, 1),
+    (Ok(()), Err(_)) => {
+      // The store is ahead of a log that refused the entry: made again from the log.
+      super::rebuild(state, repository);
+      state.count(UNMADE, 1);
+    }
+    (Err(_), _) => {
+      sealed.release_homed(state);
+      state.count(UNMADE, 1);
+    }
+  }
+  // Committed, the push holds nothing and this gives back nothing; refused, it gives back what it held.
+  sealed.abandon(state);
+}
+
+/// Every queued job of [`MadeAfter`] made now, as its task would, its carries through a test's synchronous driver
+/// ([`home_and_land_blocking`]): for a test that holds the shard, so the task cannot run until it returns.
+#[cfg(test)]
+pub(crate) fn made_after_now(state: &mut ShardState) {
+  while let Some((job, turn)) = state.vcs_stores.made_after.jobs.pop_front() {
+    match sealed_of(
+      state,
+      (job.repository, job.green, job.version),
+      &job.authored,
+    ) {
+      Ok(mut sealed) => {
+        if home_and_land_blocking(state, &mut sealed).is_some() {
+          recorded_after(state, job.repository, sealed);
+        } else {
+          sealed.release_homed(state);
+          sealed.abandon(state);
+          state.count(UNMADE, 1);
+        }
+      }
+      Err(_) => state.count(UNMADE, 1),
+    }
+    if let Some(turn) = turn {
+      turn.give_back(state);
+    }
+  }
 }

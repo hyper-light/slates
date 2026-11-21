@@ -283,14 +283,6 @@ impl Repository for Probed {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Probed {
@@ -310,13 +302,12 @@ impl Store for Probed {
     Ok(None)
   }
 
-  fn file(
+  fn file_entry(
     &self,
     _path: &[u8],
     _node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
-    Ok(None)
+  ) -> Option<slates_hg::serve::getbundle::FileEntry> {
+    None
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
@@ -1488,17 +1479,58 @@ impl Repository for Grown {
   ) -> Result<Option<Node>, slates_hg::serve::Refusal> {
     Ok(None)
   }
-
-  fn tags_text(
-    &self,
-    _node: &Node,
-    _admission: &mut slates_hg::Admission,
-  ) -> Result<Vec<u8>, slates_hg::serve::Refusal> {
-    Err(slates_hg::serve::Refusal::Store { what: "tags" })
-  }
 }
 
 impl Store for Grown {
+  /// The test's changeset store answered at once (A-767 C1): each file revision kept as its whole (every file holds
+  /// [`Grown::bytes`]), its identity the plain BLAKE3 of the bytes, its chunk the bytes (a whole kept raw).
+  fn stored_now(
+    &self,
+    want: &slates_hg::render::Want,
+  ) -> Option<slates_hg::serve::getbundle::Given> {
+    use slates_hg::render::{StoredPlace, StoredRevision, Want};
+    use slates_hg::serve::getbundle::Given;
+    let identity = *blake3::hash(&self.bytes).as_bytes();
+    let len = u64::try_from(self.bytes.len()).ok()?;
+    Some(match want {
+      Want::Rows { logs } => Given::Rows(
+        logs
+          .iter()
+          .map(|(path, nodes)| {
+            nodes
+              .iter()
+              .map(|node| {
+                self
+                  .files
+                  .iter()
+                  .any(|(held, file)| held == path && file == node)
+                  .then_some(StoredRevision {
+                    text: identity,
+                    base: None,
+                    place: StoredPlace {
+                      payload: identity,
+                      offset: 0,
+                      len,
+                    },
+                  })
+              })
+              .collect()
+          })
+          .collect(),
+      ),
+      // A stored whole is its raw text (the store's contract, A-767 C1).
+      Want::Chunks { places } => Given::Chunks(places.iter().map(|_| self.bytes.clone()).collect()),
+      Want::Texts { texts, most } => {
+        let total = (self.bytes.len() as u64).saturating_mul(texts.len() as u64);
+        if total > *most {
+          Given::TextsPast
+        } else {
+          Given::Texts(texts.iter().map(|_| self.bytes.clone()).collect())
+        }
+      }
+    })
+  }
+
   fn changeset_text(
     &self,
     rev: Rev,
@@ -1533,23 +1565,17 @@ impl Store for Grown {
     }))
   }
 
-  fn file(
-    &self,
-    path: &[u8],
-    node: &Node,
-    _room: &mut slates_hg::Admission,
-  ) -> Result<Option<Logged<'_>>, slates_hg::PastAdmission> {
+  fn file_entry(&self, path: &[u8], node: &Node) -> Option<slates_hg::serve::getbundle::FileEntry> {
     let at = self
       .files
       .iter()
-      .position(|(held, file)| held == path && file == node);
-    Ok(at.map(|at| Logged {
+      .position(|(held, file)| held == path && file == node)?;
+    Some(slates_hg::serve::getbundle::FileEntry {
       position: 0,
       parents: [NULL_NODE, NULL_NODE],
       link: self.changesets[at],
       flags: 0,
-      text: Cow::Borrowed(self.bytes.as_slice()),
-    }))
+    })
   }
 
   fn markers(&self) -> impl Iterator<Item = Marker<'_>> {
