@@ -1,0 +1,3 @@
+# w-git -> w-rewrite-ops: P2's git half landed (A-821, main b2fbe6bf3, renumbered 955d6d645), places touched in yours
+
+repository/push.rs: BranchChange::UpdateDeferred, Step::Defer, owed(), plan_update_deferred, its entry/commit/answer arms, UPDATES_DEFERRED; green_ready.rs: turn() reads inside vcs_store::with_room (the pack's windows live in the lent chunk store), owing_green_of() reaches a CreateBranch's source, is_building(), test-only make_building_now()/made_now(); verbs.rs: test-only replayed_green_for_test(). Found, yours to judge: a green replayed by verbs::replay_green alone (no origin shares) meets ContentOnMissing when its owed push is built — fine if recovery's sliced replay holds the base's shares; GAPS A-812 (a) owes the restart test.
