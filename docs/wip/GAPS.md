@@ -1196,7 +1196,12 @@
 > prototype file from the index's trial, read by stock `svnlook -t` as `-r` reads the committed revision. P3's
 > referenced file BUILT (2026-11-20, main's ruling 2): `slates_vfs::referenced`, a read-only file of content-store
 > identities read through the store's seam (zero bytes copied over a view of 64 texts), held by its volume until
-> released, `EROFS` to every change; the server's seam over `ContentStore`. Owed: P3 (the presenter under
+> released, `EROFS` to every change; the server's seam over `ContentStore`. A-645 (a) BUILT (2026-11-20): a hook's
+> REPOS-PATH is its repository's view, presented on the owner shard and mounted read-only under the store's standing
+> grant (`<--vcs-store>/<repository>.svn`); a daemon with no store directory refuses a configured hook typed. Owed: the
+> by-use run with stock svn 1.15 (run-requests.md); a revision property change's own signal, since each hook refreshes
+> every revision's properties file now (linear in the history, a revision a turn); the view unmounted with its
+> repository. Owed before: P3 (the presenter under
 > SLATES_ROOT, after A-727 a2), P4, the root mount's publication; until P3, REPOS stays `/<name>`.
 > **A-671 (2026-11-19, g296; the matcher's home):** git's `wildmatch` (A-597) is `slates_vcs::wildmatch` now, moved
 > whole from `crates/server` with its tests, behaviour unchanged, so slates-git, which builds on slates-vcs and not on

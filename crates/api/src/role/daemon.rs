@@ -238,6 +238,8 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
     .as_deref()
     .map(|dir| start_store(std::path::Path::new(dir), &config))
     .transpose()?;
+  config.vcs_view_root = store.as_ref().map(|(_, views)| *views);
+  let store = store.map(|(owner, _)| owner);
   config.vcs_disk = store.as_ref().map(slates_store::owner::StoreOwner::handle);
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
@@ -306,7 +308,13 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
 fn start_store(
   dir: &std::path::Path,
   config: &DaemonConfig,
-) -> Result<slates_store::owner::StoreOwner, Failure> {
+) -> Result<
+  (
+    slates_store::owner::StoreOwner,
+    &'static slates_land::store_root::StoreRoot,
+  ),
+  Failure,
+> {
   use slates_land::store_root::{StoreGrant, StoreRoot};
   let target = StoreRoot::identify(dir).map_err(|e| failed("vcs store directory", e))?;
   let grant = StoreGrant {
@@ -321,6 +329,11 @@ fn start_store(
     grant.target.inode
   );
   let root = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  // The same grant opened once more for the views slates presents in the directory (A-645 (a): a Subversion
+  // repository's FSFS view, mounted read-only there for its hooks), held for the process's life: one handle per daemon
+  // start, which a restart opens again.
+  let views = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  let views: &'static StoreRoot = Box::leak(Box::new(views));
   let disk = root
     .free_bytes()
     .map_err(|e| failed("vcs store free space", e))?;
@@ -329,7 +342,9 @@ fn start_store(
   let waiting = config
     .clients_per_shard
     .saturating_mul(usize::from(config.runtime.shards).max(1));
-  slates_store::owner::StoreOwner::start(root, sizing, waiting).map_err(|e| failed("vcs store", e))
+  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+    .map_err(|e| failed("vcs store", e))?;
+  Ok((owner, views))
 }
 
 /// The store's sizing from this daemon's derivations (A-767; Ada's memory-sizing ruling: from the work, never the

@@ -486,7 +486,8 @@ fn assert_a_configured_hook_refuses(
   assert_eq!(reasons(&received), [ROOT_UNPUBLISHED]);
   assert_first_line_names(&received, b"pre-receive");
   assert_eq!(records(state, repository), held);
-  state.root_mount = Some(std::path::PathBuf::from("/slates-root"));
+  state.hook_views =
+    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from("/slates-root"));
   let received = pushed(state, repository, delete);
   assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
   assert_first_line_names(&received, b"pre-receive");

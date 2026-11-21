@@ -678,13 +678,13 @@ fn a_start_commit_hook_that_refuses_refuses_the_commit_in_svnserves_words() {
   assert_eq!(latest, "( success ( ( ) 0: ) ) ( success ( 0 ) ) ");
 }
 
-/// A-645 P3 (main's ruling 1). Do: configure a start-commit hook that records that it ran and accepts, publish no root
-/// mount, and send the recorded commit. Expect: the commit refused at `open-root`, typed, in words naming why (the
-/// daemon's root mount is not yet published, so it has nowhere to show the hook its repository); the hook never run;
-/// the youngest revision still 0. Before A-645 P3 the hook ran with REPOS `/<name>`, a path that holds nothing.
+/// A-645 P3 (main's ruling 1) and (a). Do: configure a start-commit hook that records that it ran and accepts, give the
+/// daemon no store directory (no standing grant to show a hook its repository under), and send the recorded commit.
+/// Expect: the commit refused at `open-root`, typed, in words naming why; the hook never run; the youngest revision
+/// still 0. Before A-645 P3 the hook ran with REPOS `/<name>`, a path that holds nothing.
 #[cfg(unix)]
 #[test]
-fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
+fn a_hook_with_no_standing_grant_to_show_its_repository_is_refused_typed() {
   let dir = crate::git_hooks::tests::ScratchDir::new();
   let at = dir.path.display().to_string();
   let accepting = hook_script(&dir.path, "start-commit", &format!("echo ran > {at}/ran"));
@@ -698,7 +698,7 @@ fn a_hook_before_the_root_mount_is_published_is_refused_typed() {
   });
   assert!(
     committed.contains(&super::UNSUPPORTED_FEATURE.to_string())
-      && committed.contains(super::ROOT_UNPUBLISHED_WORDS),
+      && committed.contains(crate::vcs_store::svn_presenter::UNGRANTED_WORDS),
     "{committed}"
   );
   assert!(!dir.path.join("ran").exists(), "the hook ran");

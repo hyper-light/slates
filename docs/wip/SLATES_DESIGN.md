@@ -56522,10 +56522,34 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   makes the view's mount point inside the store's granted directory (`mkdirat` relative to its handle, for the user
   alone, made durable; a file or symlink at the name refused `ENOTDIR`), held by
   `a_mount_point_is_made_in_the_granted_directory_and_nowhere_else`.
-- **Owed.** A-645 (a) parts 2 and 3: the view's volume made and kept current by the daemon, mounted read-only under the
-  store's standing grant (`<--vcs-store>/<repository>.svn`) through each platform's mount, its path the hook's
-  REPOS-PATH (the "root mount not yet published" refusal goes), and the by-use red (stock svn's revprop change through
-  a real anchor). Then P4, and the presenter's call of `hold_owed_references` after a recovery.
+- **Part 3, its fifth piece (2026-11-20, A-645 (a) parts 2b and 2c, main's ruling of 20:00): a hook is handed its
+  repository's view, mounted under the store's standing grant.** Where the daemon is given a store directory
+  (`--vcs-store`, A-767's standing grant), the daemon role opens it once more for views (`DaemonConfig::vcs_view_root`),
+  and every shard's `ShardState::hook_views` is `HookViews::Granted`. A configured Subversion hook's `REPOS-PATH` is
+  then `svn_presenter::repos_for_hook`, run on the repository's owner shard (`xshard::task_in_shard_time`):
+  - the view volume made once, a scratch volume owned by the repository's owner, named `.svn-view.<repository>.<n>`
+    with `n` the first number whose name routes to the owner shard (`verbs::owner_of_name`), so the view's reads run where
+    the records are;
+  - laid out a revision a turn (`present_slice`, inside `vcs_store::lent_state`, so a text the content store keeps is
+    held), then each revision's properties file refreshed a revision a turn (`refresh_slice`), since a revision property
+    change may have changed them;
+  - mounted read-only, once, at `<store>/<repository>.svn` (`StoreRoot::mount_point`) by the daemon's own `slates
+    --instance I mount <view volume> <point> --read-only`, run as a helper of the shard (`hook_driver::run_helper`, its
+    exit awaited through `ExitWatch`, bounded by the failover delay, killed with its group past it), so each platform
+    mounts it as any client's mount does (§4.6: Linux FUSE through `fusermount3`, macOS NFS `mount(2)`).
+  The bridges read a view volume's texts through `VolumeBridge::reading_referenced` (bridge-core, new): the daemon's NFS
+  export (`nfs::with_export`) and FUSE turn (`fuse::turn_with`) serve a view volume's request inside `lent_state`, the
+  view's `ViewTexts` lent to the bridge. A daemon with no store directory refuses a configured hook typed
+  (`svn_presenter::UNGRANTED_WORDS`, `SVN_ERR_UNSUPPORTED_FEATURE`; git's push `no standing grant to show a hook its
+  view`); the unpublished root mount and `ShardState::root_mount` are gone, and `Daemon::record_root_mount` is the
+  in-process hook tests' stand-in (`HookViews::Given`). Held by `slates-server --lib` vcs_svn, git_push, vcs_ssh's svn,
+  vcs_http's svn and daemon edge, svn_hooks, hook_driver and the presenter (67 of 67, macOS arm64), and owed to a host
+  with stock Subversion 1.15 and room to build: `svn_interop::a_repository_policys_hook_lets_stock_svn_change_a_revision_property`
+  (the anchor given `--vcs-store`, the hook running `svnlook youngest $REPOS`; red on main before: E200007). Windows:
+  the store directory is `Unsupported` there and no hook runs, so a configured hook stays refused typed.
+- **Owed.** The by-use run above (in run-requests.md); a per-change signal for revision properties instead of the
+  refresh of every revision's file at each hook (GAPS); the view's mount ended with the repository; P4; and the
+  presenter's call of `hold_owed_references` after a recovery.
 - **Applied in the same change to** GAPS (A-661's hook entry), amendments.tsv.
 
 ### A-664 live whole builds, a parked submit's wait bounded — Answered `Overloaded` once it waits past the node's failover delay (2026-11-20, w-shared for UI goal 93; main's ruling)

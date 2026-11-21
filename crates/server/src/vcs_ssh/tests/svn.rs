@@ -528,8 +528,8 @@ const TEST_ROOT: &str = "/slates-root";
 impl SvnStores for Lends {
   type Green<'a> = View;
 
-  fn root_mount(&self) -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(TEST_ROOT))
+  fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews {
+    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from(TEST_ROOT))
   }
 
   fn holds(&self, id: RepositoryId) -> bool {

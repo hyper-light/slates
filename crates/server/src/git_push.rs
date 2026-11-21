@@ -159,8 +159,8 @@ const REFS: &str = "refs/";
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
 /// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
-/// this daemon has published no root mount to show the hook its view beneath (A-645 P3, main's ruling 1).
-pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"root mount not yet published";
+/// this daemon holds no standing grant to show the hook its view under (A-645 (a): `--vcs-store`).
+pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"no standing grant to show a hook its view";
 
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
 /// shard's budget, or an object the store refused).
@@ -591,7 +591,7 @@ impl<P> ReceivePack<P> {
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
-      let answering = self.declined(&mut Declining::hook(hook, state.root_mount.is_some()), out)?;
+      let answering = self.declined(&mut Declining::hook(hook, state.hook_views.shows()), out)?;
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
@@ -1445,7 +1445,7 @@ impl Declining {
   fn hook(hook: &HookConfig, root_published: bool) -> Declining {
     if !root_published {
       let why = format!(
-        "the repository's {} hook cannot run here: this daemon's root mount is not yet published",
+        "the repository's {} hook cannot run here: this daemon holds no standing grant to show it its view (--vcs-store)",
         hook.name
       );
       return Declining {
