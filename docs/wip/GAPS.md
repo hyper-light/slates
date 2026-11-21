@@ -62,7 +62,13 @@
 > **A-789 BUILT (macOS; content as extents made on demand, piece 1):** each pool extent is an object of its own,
 > made ahead of need and given back whole at release: a 256 MiB burst's destroyed volume left 259 MiB in the content
 > object and 1,362 MiB resident before, 0 and 123 MiB after. Open: the arena's address-space range in the content
-> object, Windows' section per extent, a held extent's free pages. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> object, a held extent's free pages. **Windows' section per extent written (A-789, main 18:40):** the anchor holds
+> each extent's section across a restart (`WHAT_CONTENT_EXTENT`); its build and tests are owed to w-lint on jupiter
+> (run-requests; red: commit kept after a destroyed volume's burst). **Open (R2, found 2026-11-20 19:45):** the macOS give-back
+> depends on the machine: recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone` passed on a quiet
+> adas-macbook-pro-2 (1,648 -> 123 MiB) but kept 1,366 MiB there later and 335-336 MiB on the big Studio at 5,433 free
+> pages, at A-789's own commit too. Likely the idle release's keep (commitments + headroom + the pressure hold) keeping
+> the burst's free extents, whose free pages macOS only marks reusable. > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**

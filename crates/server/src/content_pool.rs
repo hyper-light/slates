@@ -136,6 +136,11 @@ pub(crate) fn hold_toward(
 /// The parts of an arena range of `len` bytes, `(offset, len)` relative to the range: its length cut on `unit` into
 /// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. At most one part per bit
 /// of `len / unit`.
+/// The parts of one slice's arena range in `config`'s layout ([`arena_parts`]).
+pub(crate) fn parts_of(config: &DaemonConfig) -> Vec<(usize, usize)> {
+  arena_parts(config.shard_content_layout().arena.1, config.pool_unit())
+}
+
 pub(crate) fn arena_parts(len: usize, unit: usize) -> Vec<(usize, usize)> {
   let unit = unit.max(1);
   let mut units = len.checked_div(unit).unwrap_or(0);
@@ -277,6 +282,23 @@ impl ContentPool {
       .saturating_mul(self.stride)
       .saturating_add(self.arena_offset)
       .saturating_add(offset);
+    // An extent of its own on Windows (A-789): its section made ahead of the claim and held by the anchor, duplicated
+    // here and mapped committed whole.
+    #[cfg(windows)]
+    if crate::content_extents::installed() {
+      let section = crate::content_extents::section(id).ok_or(ServerError::Memory(
+        slates_mem::MemError::OsRefused {
+          call: "content extent section",
+          code: None,
+        },
+      ))?;
+      // SAFETY: no other view in any process reaches the extent's section while this region lives: this partition holds
+      // its owner word, the section is unmapped before the word is released (`release`), and the anchor that holds a
+      // duplicate never maps it.
+      let object = unsafe { slates_mem::ExclusiveObject::from_section(section, len) }
+        .map_err(ServerError::Memory)?;
+      return Ok(Region::shared(object, self.page));
+    }
     if let Some(extent) = self
       .content
       .as_ref()
@@ -376,6 +398,22 @@ impl ContentPool {
   /// (main's condition (a): never made on the provisioning path). Before, a released extent was only unmapped, and its
   /// pages stayed in the anchor's one content object. A refusal is counted; the extent then keeps its pages.
   fn give_back(&mut self, id: u16) {
+    // Windows (A-789): this process's handle closes now, and a task has the anchor let its duplicate go, which closes the
+    // section and returns its commit, then makes the extent again and has it held. Until then the extent is not ready.
+    #[cfg(windows)]
+    if crate::content_extents::installed() {
+      drop(crate::content_extents::take(id));
+      let Some((_, (_, len))) = self.part(id) else {
+        return;
+      };
+      if slates_rt::futures::spawn(crate::content_extents::remake(id, len))
+        .and_then(slates_rt::futures::detach)
+        .is_err()
+      {
+        self.refused = self.refused.saturating_add(1);
+      }
+      return;
+    }
     let (Some(extent), Some((_, (_, len)))) = (
       self
         .content
@@ -396,6 +434,12 @@ impl ContentPool {
 impl ExtentSource for ContentPool {
   fn claim(&mut self) -> Option<(u16, Region)> {
     for id in self.candidates() {
+      // An extent whose section is not made, or not yet held by the anchor, is passed over (A-789, Windows): data never
+      // lands where a daemon's death would lose it.
+      #[cfg(windows)]
+      if crate::content_extents::installed() && !crate::content_extents::ready(id) {
+        continue;
+      }
       match self.segment.pool_claim(usize::from(id), self.partition) {
         Ok(true) => return self.hand_out(id),
         Ok(false) => {}

@@ -57938,8 +57938,18 @@ objects, A-778), the tests (`a_bursts_extents_go_back_to_the_system_once_its_vol
 `a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name`, the killed anchor's extents), BENCHMARKS,
 GAPS.
 
-Status: built 2026-11-20, macOS. Linux keeps one memfd with holes punched and Windows needs a section per extent (g226's
-measurements, BENCHMARKS "Content give-back per platform").
+Status: built 2026-11-20, macOS; Windows written the same day (main's ruling of 18:40), its build and tests owed to
+w-lint on jupiter (run-requests). Linux keeps one memfd with holes punched (g226: the anchor's punch frees the pages
+with a peer still mapping them; BENCHMARKS "Content give-back per platform").
+- Windows: each extent is a reserved, unnamed section of its own (`slates_mem::make_extent_section`), since only
+  closing a section returns its commit (g226: decommitting a view is refused, error 87). The anchor holds a duplicate
+  of each under a new hold kind, `WHAT_CONTENT_EXTENT` (one handle, the extent's id as its record), bounded in a class of
+  its own (`HoldBounds::extents`, `DaemonConfig::held_extent_bound`, partitions × 64). The daemon keeps one table of
+  section handles for the process (`crate::content_extents`, atomic words written only by the holder of an extent's
+  owner word), made at its start before any claim and held by each shard's start; a claim takes only a made and held
+  extent and maps a duplicate committed whole; a release closes the table's handle and has the anchor let its duplicate
+  go, which closes the section, then makes and holds the extent again. A successor places the extents the handoff
+  table hands back before any shard claims.
 - Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
   back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
   volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).

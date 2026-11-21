@@ -15,7 +15,8 @@
 //! reading plus the budget, given to waits that take a span, so it lasted the daemon's whole uptime and more.
 
 use slates_anchor::handles::{
-  self, HandleMessage, MESSAGE_BYTES, WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC, WHAT_WINFSP_MOUNT,
+  self, HandleMessage, MESSAGE_BYTES, WHAT_CONTENT_EXTENT, WHAT_SHARDS_DAX, WHAT_SHARDS_RESYNC,
+  WHAT_WINFSP_MOUNT,
 };
 use slates_rt::futures;
 use slates_rt::pipe::{PipeEnd, PipeRead, PipeWrite};
@@ -205,6 +206,8 @@ pub(crate) struct Handed {
   pub(crate) resync_ends: Vec<HandedResync>,
   /// The held Shards streams' DAX sections (A-448).
   pub(crate) copies: Vec<HandedCopy>,
+  /// The held content pool extents (A-789): placed in the process's extent table before any shard claims.
+  pub(crate) extents: Vec<crate::content_extents::HandedExtent>,
   pub(crate) channel: Option<OwnedHandle>,
 }
 
@@ -215,7 +218,8 @@ pub(crate) struct Handed {
 pub(crate) fn adopt(config: &crate::config::DaemonConfig) -> Handed {
   let bound = config
     .held_device_bound()
-    .saturating_add(config.held_dax_bound());
+    .saturating_add(config.held_dax_bound())
+    .saturating_add(config.held_extent_bound());
   let mut handed = Handed::default();
   let Ok(value) = std::env::var(handles::ENV_HANDLES) else {
     return handed;
@@ -235,6 +239,10 @@ pub(crate) fn adopt(config: &crate::config::DaemonConfig) -> Handed {
     }
   };
   for entry in entries {
+    // A content pool extent's section (A-789): kept for the process's extent table.
+    if adopt_extent(&entry, &mut handed) {
+      continue;
+    }
     // A Shards stream's resync end (A-433) or DAX section (A-448), one handle: kept for the shard that owns its
     // attachment, which serves the stream again and takes its sections back, or lets them go. One this process cannot
     // own keeps its id as a refused entry with no handle, so the control shard releases the anchor's copy; its value is
@@ -298,6 +306,36 @@ pub(crate) fn adopt(config: &crate::config::DaemonConfig) -> Handed {
     });
   }
   handed
+}
+
+/// Takes held content pool extent `entry` (A-789), one handle, its record its id, into `handed`'s extents: whether the
+/// entry was one. One this process cannot own, or whose record names no extent, keeps its id as a refused entry with no
+/// handle, so the control shard releases the anchor's copy.
+fn adopt_extent(entry: &handles::HandedEntry, handed: &mut Handed) -> bool {
+  let [value] = entry.values.as_slice() else {
+    return false;
+  };
+  if entry.what != WHAT_CONTENT_EXTENT {
+    return false;
+  }
+  match (
+    adopted(*value),
+    crate::content_extents::id_of(&entry.record),
+  ) {
+    (Ok(section), Some(id)) => handed
+      .extents
+      .push(crate::content_extents::HandedExtent { id, section }),
+    _ => {
+      slates_machine::log_line!("slates-server: held content extent {:x} refused", entry.id);
+      handed.mounts.push(HandedMount {
+        attachment: entry.id,
+        handles: Vec::new(),
+        record: entry.record.clone(),
+        adoptable: false,
+      });
+    }
+  }
+  true
 }
 
 /// The channel's value and the entries of the handoff table `pointer` names (A-460): the inherited section and the
@@ -455,6 +493,24 @@ pub(crate) async fn hold_section(id: u64, value: u64, record: Vec<u8>) -> Result
 /// Lets a Shards stream's DAX section go (A-448): one attempt, as a mount's release; idempotent at the anchor, so a
 /// release of a section it never took is answered the same.
 pub(crate) async fn release_section(id: u64) -> Result<(), HoldRefusal> {
+  exchange(HandleMessage::Release { id }).await
+}
+
+/// Holds content pool extent `id`'s section, `value` in this daemon's table, with `record` its extent id (A-789):
+/// answered once the anchor has duplicated the section out of this process, within the same budget a mount's hold has.
+pub(crate) async fn hold_extent(id: u64, value: u64, record: Vec<u8>) -> Result<(), HoldRefusal> {
+  exchange(HandleMessage::Hold {
+    id,
+    what: WHAT_CONTENT_EXTENT,
+    values: vec![value],
+    record,
+  })
+  .await
+}
+
+/// Lets a content pool extent's section go (A-789): the anchor closes its duplicate, and once this process's handle is
+/// closed too the section closes and its commit returns. Idempotent at the anchor, as a section's release is.
+pub(crate) async fn release_extent(id: u64) -> Result<(), HoldRefusal> {
   exchange(HandleMessage::Release { id }).await
 }
 

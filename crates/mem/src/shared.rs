@@ -146,6 +146,16 @@ pub fn make_extent(handoff: &Handoff, len: usize) -> Result<(), MemError> {
   rustix::fs::ftruncate(&fd, want.unsigned_abs()).map_err(|e| refused("ftruncate", e))
 }
 
+/// Makes a Windows content extent (A-789's Windows shape, main's ruling of 2026-11-20 18:40): a reserved, unnamed section
+/// of `len` bytes, nothing mapped and nothing committed. It lives while a handle to it does, so the anchor holds a
+/// duplicate across a daemon restart and the extent's commit goes back when the last handle closes: g226 measured on
+/// jupiter that decommitting a shared section's view is refused (error 87) and that only closing the section returned
+/// its commit (BENCHMARKS "Content give-back per platform").
+#[cfg(windows)]
+pub fn make_extent_section(len: usize) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+  platform::make_section(len)
+}
+
 /// [`make_extent`] where extents are ranges of the content object: nothing to make.
 #[cfg(not(target_os = "macos"))]
 pub fn make_extent(_handoff: &Handoff, _len: usize) -> Result<(), MemError> {
@@ -404,6 +414,23 @@ impl ExclusiveObject {
   /// (AUD-29-09).
   pub unsafe fn new(object: SharedObject) -> ExclusiveObject {
     ExclusiveObject(object, 0)
+  }
+
+  /// The Windows section `handle` names, `len` bytes, mapped and committed whole, as storage no one else reaches: a
+  /// content extent of its own ([`make_extent_section`]).
+  ///
+  /// # Safety
+  ///
+  /// As for [`ExclusiveObject::new`]: while this value lives, no other view in any process reaches the section's bytes.
+  /// The anchor that holds a duplicate of the handle never maps it.
+  #[cfg(windows)]
+  pub unsafe fn from_section(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+  ) -> Result<ExclusiveObject, MemError> {
+    let words = Words::new().layout(len)?;
+    let inner = platform::from_section(handle, len)?;
+    Ok(ExclusiveObject(SharedObject { inner, len, words }, 0))
   }
 
   /// The bytes `[offset, offset + len)` of the object `handoff` names, mapped on their own, as storage no
@@ -1703,6 +1730,45 @@ mod platform {
 
   pub(super) fn create_sparse_unnamed(len: usize) -> Result<Inner, MemError> {
     create_section(None, len, PAGE_READWRITE | SEC_RESERVE)
+  }
+
+  /// A reserved, unnamed section of `len` bytes and nothing mapped: a content extent made ahead of its claim (A-789's
+  /// Windows shape). It charges no commit until a view commits its pages, and it lives as long as a handle to it does.
+  pub(super) fn make_section(len: usize) -> Result<std::os::windows::io::OwnedHandle, MemError> {
+    use std::os::windows::io::FromRawHandle;
+    let size = u64::try_from(len).map_err(|_| MemError::OsRefused {
+      call: "CreateFileMappingW",
+      code: None,
+    })?;
+    let high = u32::try_from(size >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(size & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    // SAFETY: an unnamed pagefile-backed section; no pointer is passed but the null name and attributes.
+    let handle = unsafe {
+      CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        std::ptr::null(),
+        PAGE_READWRITE | SEC_RESERVE,
+        high,
+        low,
+        std::ptr::null(),
+      )
+    };
+    if handle.is_null() {
+      return Err(os("CreateFileMappingW"));
+    }
+    // SAFETY: `handle` is the section just created, owned by nothing else in this process.
+    Ok(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+  }
+
+  /// The section `handle` names, `len` bytes, mapped and committed whole, as [`open_range`] commits a range: an
+  /// exclusive range is reached by reference, so it cannot commit page by page.
+  pub(super) fn from_section(
+    handle: std::os::windows::io::OwnedHandle,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    let inner = from_held_handle(handle, len)?;
+    Commits::new(len)?.commit(&inner, 0, len)?;
+    Ok(inner)
   }
 
   fn create_section(
