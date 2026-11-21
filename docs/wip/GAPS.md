@@ -1,5 +1,22 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Open (84a, g222, 2026-11-20): where a loaded edit and merge's tail waits — a 1 ms band on macOS and on Linux.**
+> A diagnostic (branches `diag-g222-hops*`, never main) stamped every request from its landing in the ring (A-559) to
+> its shard taking it and to its reply: under two spinners a CPU the daemon's part is the queue, not the service
+> (served p99 61–104 µs), and 1.0–1.3% of requests wait exactly 1.00–1.02 ms (queued p99 1,006–1,169 µs).
+> - **macOS:** the busy path's zero-timeout `kevent` nap (w-provision-gate, A-786 part 2, `b01a0ef7b`). On the
+>   edit-and-merge path it empties the band (1,362–1,543 of 52,050 → 0–2) and takes queued p99 to 22–23 µs, conflict
+>   p99 10.2–10.7 → 0.22–0.46 ms, accept p99 10.4–10.8 → 0.80–2.6 ms (M4 Max Studio, interleaved). Lands with
+>   w-provision-gate's hold rule. Shard, doorbell-thread and client QoS (`USER_INTERACTIVE`) each moved nothing.
+> - **Linux** (CI ubuntu-24.04-arm, A-224's lane): the same band (queued p99 1,007–1,010 µs, p999 1,021–1,091) with no
+>   nap; parking at once instead of spinning halves the medians (accept 189–206 → 86–100 µs) and leaves the band and
+>   the ms tails. It is the kernel's 1 ms tick on a two-CPU lane at the shard's own weight; no unprivileged raise
+>   exists (R10), and A-224's short slice was rejected. Owed: the Linux bound's question to main.
+> - **The client's share:** `edit_merge_bench`'s client spins for its reply at default priority beside the load, so
+>   accept's p99/p999 beyond the daemon's part (macOS 0.8–2.6 / 7–9 ms with the nap fixed) is the harness's own
+>   thread waiting for a CPU.
+> - Windows: not measured since A-400. Inbox: `inbox/w-provision-gate-from-g222.md` (findings 1–6).
+>
 > **KILN ON A LOADED KVM HOST (w-k90-kvm, 2026-11-20; kiln goal 90d/90f, closed at kiln c0f576eb3; findings recorded,
 > not worked, per the close order).** Seen on adacachy (load 60-85, io some avg10 ~10%) in kiln's `slates_e2e microvm::`
 > drive: (1) an agent's act asked while its runner's link to the server is down is refused at once (`reach/node.rs`
