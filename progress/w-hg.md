@@ -225,3 +225,30 @@
     - 1b: the pull path (named_changegroup, built whole and synchronous today) rebuilt as a stepwise walk with wants.
     - Then lookup's .hgtags, the intake's base text, made changesets.
     - Then step 2, after w-perf's intake change lands.
+- 09:00 main approved: made changesets onto the store FIRST, then 1a (the clone walk), then 1b (the pull).
+  Conditions:
+  - ONE HOOK: made_commit (A-804/A-805, Lineage::preview), the one svn_made uses. Ask w-rewrite-ops if it lacks
+    anything.
+  - ONE PATH: the server-built changegroup lands through the push's changeset path (Record v6, Payload, Texts, v7
+    reference). In the same series, remove the v3 made record (record::write_made, the DELTA_VERSION reader/writer, the
+    `formed` code), hg_made::recorded, and HgStore::unstored, with no fallback.
+  - Red: a repository with a made changeset is refused by the store rule today. Green: it clones and pulls through
+    the store, stock 7.2 verifies clean, and a restart replays it.
+  PLAN:
+  - M1 (slates-hg):
+    - record: `write_made_record(room, version, (green, ver))`, a SECTIONED head with Source::Made. head() lets
+      SECTIONED/REFERENCE take Push|Made.
+    - begin_sectioned keeps the made (green, ver); Retaken finish sets Replayed.made = (green, ver, the first new
+      changeset's node).
+    - Reference gains `made: Option<(u64, u64)>` (write_made_reference; reference_of; record() picks the made record).
+    - `push::made` encodes a Verified as a cg3 changegroup (put_revision_whole per revision; groups changelog,
+      manifests, empty tree list, files).
+  - M2 (server):
+    - made_commit::defer passes `judged` to hg_made::make_deferred.
+    - hg_made builds the Verified from a preview (svn_made::revision_held's pattern; changeset_of takes the engine), and
+      the bare make() spawns a task as svn_made::make does.
+    - The task: encode the cg, take it through the push intake into a fork (hg_push's begin_intake/take path),
+      hg_push::changeset_of with the made record, `disk.land` awaited, then made_commit::commit with landed_on_disk,
+      the register entry (v7 made reference), the fork placed, and the made map set.
+    - The recovery/rebuild replay of v7 already goes through the pieces; replayed_hg sets `made`.
+    - Tests poll for the made changeset (async now).
