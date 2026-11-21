@@ -300,3 +300,9 @@
   w-hg (push intake_tests intake): both still red on the host. w-store: 3 store literals.
 - Windows run requests: r12 (the once-only resubmission, by needs "windows", each step capped) never started: jupiter's
   runner restarted while it was "starting". Not resubmitted again; main to say when jupiter is steady.
+
+## 2026-11-21 round 15 at c8b77f817 (landed 7db3bdba6)
+- merge history.rs overlay (554482004, A-803; 11/10, every target) -> unchanged_outside; history_block_tests
+  int_plus_one. merge lib 253 pass. Host, fmt, structural, unsafe, six cross targets clean otherwise.
+- Still with owners: git receive tests wide_connectivity (w-git), hg push intake_tests intake (w-hg), store's 3
+  literals (w-store). Windows requests waiting on main's word about jupiter (r12 lost to its restart).
