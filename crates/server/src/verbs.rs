@@ -8833,12 +8833,12 @@ fn edit(
   // it now holds (copied from the base when it had not changed it), less what the splice deletes, and the journal's ops.
   // The base is read while its green is lent (`crate::greens`), and what comes out of it is owned.
   let read = crate::merge_service::with_work_base(state, w, |base| {
-    w.files.get(base, path).map(|old| {
+    w.files.len(base, path).map(|old_len| {
       let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      let ops = crate::work_log::edit_ops(path, old.as_deref(), (at, delete_len, inserted));
-      let (spliced, removed) =
-        w.files
-          .splice_delta(path, old.as_deref(), (at, delete_len, bytes.len()));
+      let ops = crate::work_log::edit_ops(path, old_len, (at, delete_len, inserted));
+      let (spliced, removed) = w
+        .files
+        .splice_delta(path, old_len, (at, delete_len, bytes.len()));
       (ops, spliced, removed)
     })
   });
@@ -9143,19 +9143,26 @@ fn assemble_post_state(
       continue;
     };
     let encoded_node;
-    let file_bytes;
-    // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
-    let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
-      // The submit read the base already (`build_increment` refuses a work whose green is gone).
-      let Some(file) = files.get(base, path).ok().flatten() else {
+    if is_file_content(op.kind) {
+      // The file's bytes this op contributes, copied out of that range alone (a held file's pieces, never the whole
+      // file); a range the file does not wholly hold contributes nothing, as before. The submit read the base already
+      // (`build_increment` refuses a work whose green is gone).
+      let (Some(at), Ok(dst), Ok(len)) = (
+        plan.get(&op.src),
+        usize::try_from(op.src),
+        usize::try_from(op.len),
+      ) else {
         continue;
       };
-      let Some(at) = plan.get(&op.src) else {
-        continue;
-      };
-      file_bytes = file;
-      (&file_bytes, *at)
-    } else if op.kind == OpKind::Mknod {
+      if let Some(into) = post.get_mut(dst..dst.saturating_add(len))
+        && files.copy_range(base, path, *at, into).ok().flatten() != Some(len)
+      {
+        into.fill(0);
+      }
+      continue;
+    }
+    // The bytes this op contributes, and the offset into them: an xattr's value or a node.
+    let (source, source_at): (&[u8], u64) = if op.kind == OpKind::Mknod {
       let Some(node) = journal.iter().rev().find_map(|entry| match entry {
         VolumeOp::Mknod {
           path: declared,
@@ -10668,6 +10675,7 @@ fn settle_rebase(
     } => (version, changed, journal, entries),
     crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
   };
+  let restated = crate::work_log::WorkLogEntry::restated(version, &changed, &journal);
   let changed = crate::work_files::WorkFiles::from_changed(changed);
   let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
     entries
@@ -10675,10 +10683,7 @@ fn settle_rebase(
       .map(|(path, base)| crate::work_charge::base_footprint(path, base))
       .fold(0, u64::saturating_add),
   );
-  let op = restatement(
-    work_id,
-    &crate::work_log::WorkLogEntry::restated(version, &changed, &journal),
-  );
+  let op = restatement(work_id, &restated);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.partition().check(&op, now) {
     return refused(refusal_of_db(&e));
@@ -10929,6 +10934,31 @@ pub(crate) fn owner_files(
       .map(std::borrow::Cow::into_owned);
     fetched.files.insert(path.clone(), file);
     // With the path's base entries, so the work composes its increment itself (A-247).
+    fetched
+      .entries
+      .insert(path.clone(), engine.path_base(version, path));
+  }
+  fetched
+}
+
+/// The base's lengths of `paths`, with their base entries, for an edit or a declaration on a work's shard (A-247):
+/// never their bytes, since a work's first edit of a file holds the base's ranges as pieces (`crate::work_files`).
+pub(crate) fn owner_lengths(
+  state: &ShardState,
+  green: DbVolumeId,
+  version: u64,
+  paths: &[String],
+) -> crate::work_files::FetchedBase {
+  let mut fetched = crate::work_files::FetchedBase::default();
+  let Some(engine) = base_engine(state, green) else {
+    fetched.gone = true;
+    return fetched;
+  };
+  for path in paths {
+    let len = engine
+      .content_len_at(path, version)
+      .map(|len| u64::try_from(len).unwrap_or(u64::MAX));
+    fetched.lengths.insert(path.clone(), len);
     fetched
       .entries
       .insert(path.clone(), engine.path_base(version, path));

@@ -87,7 +87,7 @@ pub(crate) fn ensure_slot(state: &mut ShardState, id: DbVolumeId) -> bool {
   };
   // A work with declared changes of its own would show its green's version without them (owed: write them into the
   // overlay); one whose green is elsewhere has no green here to read.
-  if work.files.changed_entries().next().is_some() || state.greens.get(&work.green).is_none() {
+  if !work.files.is_empty() || state.greens.get(&work.green).is_none() {
     state.count(MOUNT_SLOT_REFUSED, 1);
     return false;
   }
