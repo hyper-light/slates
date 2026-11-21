@@ -16406,12 +16406,70 @@ const LIVE_ROUND: (&str, &str) = ("fleet.live.hop.round", "fleet.live.hop.round_
 /// Format: a holder's count of entries served and their nanoseconds, arrival to answer.
 const LIVE_HOLDER_HOP: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holder_ns");
 
+/// Each hop timed once a timed `round`, the hops' nanoseconds adding up to the rounds' exactly, and each hop's
+/// `percentiles` ordered within its own time.
+fn hops_add_up_to_the_round(
+  hops: &[(u64, u64)],
+  round: (u64, u64),
+  percentiles: &[(u64, u64, u64)],
+) {
+  for (index, (timed, _)) in hops.iter().enumerate() {
+    assert_eq!(
+      *timed, round.0,
+      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
+    );
+  }
+  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
+  assert_eq!(
+    summed, round.1,
+    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  );
+  for ((p50, p999, max), (_, ns)) in percentiles.iter().zip(hops) {
+    assert!(
+      *p50 <= *p999 && *p999 <= *max && *max <= *ns,
+      "each hop's percentiles are ordered within its own time: {percentiles:?}, sums {hops:?}"
+    );
+  }
+}
+
+/// Each live hop's per-write percentiles beside its sums (g228): (p50, p999, max) in nanoseconds, a hop at a time,
+/// read from the owner's status report, where they are published.
+fn hop_percentiles(client: &mut Client) -> Vec<(u64, u64, u64)> {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
+    panic!("the owner reported its status");
+  };
+  let figure = |name: String| -> u64 {
+    report
+      .shards
+      .iter()
+      .flat_map(|shard| shard.refusals.iter())
+      .filter(|row| row.kind == name)
+      .map(|row| row.count)
+      .max()
+      .unwrap_or(0)
+  };
+  LIVE_HOPS
+    .iter()
+    .map(|(timed, _)| {
+      (
+        figure(format!("{timed}.p50_ns")),
+        figure(format!("{timed}.p999_ns")),
+        figure(format!("{timed}.max_ns")),
+      )
+    })
+    .collect()
+}
+
 /// §4.10 "Live shipping" (A-200's owed breakdown, A-396): do write a live-shipped volume over and over from one client,
 /// each write sent once the last was answered. Expect every write answered at durability, its round timed on the owner hop
 /// by hop (the build, the hop to the control shard, the lane, the exchange, the hop back), each hop counted once a timed
 /// round, and the hops' nanoseconds adding up to the rounds' exactly: each is the difference of consecutive stamps on the
 /// host's one monotonic clock, so a hop measured across shards is as sound as one within a shard. And a holder's serve
 /// timed too. These are the counters a run of the contract command reads the round's hops apart by.
+/// Each hop also publishes its per-write p50, p999 and maximum (g228: a hop's sum alone is a mean, which one long write
+/// skewed by 49 us a write), ordered and within the hop's own time.
 #[test]
 fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
   let _serial = serialize_fleet_tests();
@@ -16458,6 +16516,7 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     count(&daemons[0], LIVE_ROUND.0),
     count(&daemons[0], LIVE_ROUND.1),
   );
+  let percentiles = hop_percentiles(&mut client);
   let holders: Vec<u64> = [&daemons[1], &daemons[2]]
     .iter()
     .map(|holder| count(holder, LIVE_HOLDER_HOP.0))
@@ -16473,16 +16532,10 @@ fn a_live_writes_round_is_counted_hop_by_hop_and_the_hops_add_up_to_it() {
     "every write of the loop is answered at durability: {replies:?}"
   );
   assert!(round.0 > 0, "rounds were timed: {round:?}");
-  for (index, (timed, _)) in hops.iter().enumerate() {
-    assert_eq!(
-      *timed, round.0,
-      "hop {index} is timed once a timed round: {hops:?}, round {round:?}"
-    );
-  }
-  let summed = hops.iter().map(|(_, ns)| *ns).sum::<u64>();
-  assert_eq!(
-    summed, round.1,
-    "the hops' nanoseconds add up to the rounds': {hops:?}, round {round:?}"
+  hops_add_up_to_the_round(&hops, round, &percentiles);
+  assert!(
+    percentiles.iter().any(|(p50, _, _)| *p50 > 0),
+    "the hops' medians were recorded: {percentiles:?}"
   );
   assert!(
     holders.iter().any(|served| *served > 0),
@@ -22563,9 +22616,20 @@ const BENCH_EDIT_BYTES: usize = 3800;
 
 /// The phase counters the A-697 bench reads (`merge_service::SUBMIT_JUDGE` and its siblings, `work_home::SUBMIT_COMPOSE`
 /// and its): each pair's count and its sum.
-const BENCH_PHASES: [(&str, &str, &str); 9] = [
+const BENCH_PHASES: [(&str, &str, &str); 12] = [
   ("compose", "merge.submit.compose", "merge.submit.compose_ns"),
   ("compute", "merge.submit.compute", "merge.submit.compute_ns"),
+  (
+    "build",
+    "merge.submit.forward_build",
+    "merge.submit.forward_build_ns",
+  ),
+  (
+    "owner_step",
+    "merge.submit.owner_step",
+    "merge.submit.owner_step_ns",
+  ),
+  ("beat_late", "daemon.beat.late", "daemon.beat.late_ns"),
   ("forward", "merge.submit.forward", "merge.submit.forward_ns"),
   ("judge", "merge.submit.judge", "merge.submit.judge_ns"),
   ("append", "merge.submit.append", "merge.submit.append_ns"),
@@ -22837,6 +22901,75 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
     "each forward woken by the session's return: {before:?} then {after:?}"
   );
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
+/// Main's ruling on the lane (2026-11-20, A-697's release bench refused 320 MiB holder submits about half the time): a
+/// holder's submit is not refused by a bound that does not grow with its increment while the increment is still
+/// crossing. Do: in a two-node `f = 1` fleet, A's green replicated by B, B's work writes an 8 MiB file; B's failover
+/// delay, the bound its forward was held to, injected at 300 ms (a debug build's forward takes longer); B submits. Expect: answered `Submitted` at version 2,
+/// the forward and the owner's step timed (both counters moved). Before, the forward was refused `Overloaded` at the
+/// bound, its bytes still moving, and a retry sent them all again into the same bound.
+#[test]
+fn a_holders_submit_still_crossing_is_not_refused_by_a_size_independent_bound() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "crossing-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let work = bench_work(&mut holder, green, "crossing-work", 8 << 20);
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let (forwards_before, owner_steps_before) = (
+    count("merge.submit.forward"),
+    count("merge.submit.owner_step"),
+  );
+  daemon_b.inject_failover(Some(300_000_000)).unwrap();
+  let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
+  daemon_b.inject_failover(None).unwrap();
+  let counted = bench_counters([&daemon_a, &daemon_b]);
+  let given_up: Vec<(&&str, &u64)> = counted
+    .iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.forward.given_up")
+        || name.starts_with("fleet.forward.batch_given_up")
+        || name.starts_with("merge.acceptance")
+        || name.contains("overloaded")
+        || name.contains("Overloaded")
+    })
+    .collect();
+  eprintln!("give-ups and acceptance: {given_up:?}");
+  let (forwards, owner_steps) = (
+    count("merge.submit.forward") - forwards_before,
+    count("merge.submit.owner_step") - owner_steps_before,
+  );
+  eprintln!(
+    "forward {} ms, owner step {} ms (decode {} judge {} append {}), build {} ms, settle {} ms",
+    count("merge.submit.forward_ns") / 1_000_000,
+    count("merge.submit.owner_step_ns") / 1_000_000,
+    count("merge.submit.owner_decode_ns") / 1_000_000,
+    count("merge.submit.judge_ns") / 1_000_000,
+    count("merge.submit.append_ns") / 1_000_000,
+    count("merge.submit.forward_build_ns") / 1_000_000,
+    count("merge.submit.settle_ns") / 1_000_000
+  );
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  assert!(
+    forwards >= 1 && owner_steps >= 1,
+    "the forward and the owner's step were timed: {forwards}, {owner_steps}"
+  );
 }
 
 /// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of

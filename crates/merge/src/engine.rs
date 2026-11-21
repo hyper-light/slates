@@ -381,6 +381,17 @@ pub enum Outcome {
   },
 }
 
+/// Why [`Green::materialize`] refused a build, nothing applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmaterialized {
+  /// The green owes no push.
+  NothingOwed,
+  /// The work is not the owed push's: based elsewhere, or committing as another version.
+  OtherWork,
+  /// The work did not accept against the green's base.
+  NotAccepted,
+}
+
 /// A verdict reached and held, not yet committed (A-635; §4.17.1 "A push is a work"): an increment this green accepted,
 /// its effects kept until [`Green::commit_judged`] commits them as the version after the head it was judged at. A push
 /// judges each of its greens' works so, and commits them only once every one of them accepted: git's atomic push ("Either
@@ -954,6 +965,15 @@ pub struct HeadUnder {
 /// docs, A-534).
 #[derive(Debug, Default)]
 pub struct Green {
+  /// The push this green owes as its next version, not built yet (P2; [`Green::defer`]): its content is its base's until
+  /// [`Green::materialize`] commits the build. None for every green but a created ref's waiting to be first read.
+  owed: Option<crate::push::DeferredPush>,
+  /// The versions recorded after the owed one, met while it is owed (a replay of a chain that went on once the green was
+  /// materialized, then restarted): each applied, in order, once [`Green::materialize`] has committed the owed one.
+  owed_tail: Vec<(Increment, Vec<crate::chain_entry::Applied>)>,
+  /// The signature verdicts recorded for versions this green stands for while it owes a push (the owed one and its
+  /// tail's, a replay's provenance, A-321): recorded once [`Green::materialize`] has applied them.
+  owed_signatures: BTreeMap<u64, crate::chain_entry::Signature>,
   /// The set hash of every entry at `identity_version` (`crate::identity`, A-202): brought to the head only when
   /// the identity is read ([`Green::head_identity`]), by the keys in `identity_dirty`.
   identity: crate::identity::SetHash,
@@ -981,6 +1001,8 @@ pub struct Green {
   /// The changes whose path's history was re-anchored on the file's new block, the earlier blocks let go, and the bytes
   /// copied out of them (A-793, `crate::history::reanchor`).
   history_reanchored: (u64, u64, u64),
+  /// The history values re-anchors walked in all (A-803's measure: a change re-anchors every value its path holds).
+  history_reanchored_values: u64,
   /// The bytes every content history value's piece list costs, a running total.
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
@@ -1641,6 +1663,9 @@ struct Resolved {
   copies: BTreeMap<String, copy::CopySpec>,
   /// The operations on paths in the copies' trees, judged against the copied trees (`copy`, its module docs).
   copied: Option<Box<Resolved>>,
+  /// The paths a resolution's replacement brings into being at the head (A-796, AC-6.13): the work's kept metadata on
+  /// them is judged as for a path the increment itself establishes, since the replacement establishes it.
+  resolution_establishes: BTreeSet<String>,
 }
 
 impl Resolved {
@@ -1701,6 +1726,7 @@ impl Resolved {
       || self.mkdirs.contains(path)
       || self.renames.contains_key(path)
       || self.specials.contains_key(path)
+      || self.resolution_establishes.contains(path)
   }
 
   /// Notes a copy to `dst` (A-586); a second copy onto one destination in one increment is no copy anyone can mean, so
@@ -2076,7 +2102,8 @@ impl Green {
   /// values are no longer reconstructible). With the origin it restores ([`Green::restore`]) a green that answers as
   /// this one does for every version from `at` on.
   pub fn checkpoint(&self, at: u64) -> Option<crate::checkpoint::Checkpoint> {
-    if at > self.head() || at < self.folded_below || at < self.deltas_from {
+    // A green that owes a push has no content to fold into one (P2): nothing.
+    if self.owed.is_some() || at > self.head() || at < self.folded_below || at < self.deltas_from {
       return None;
     }
     let (copied, listed) = self.copied_at(at);
@@ -2581,20 +2608,73 @@ impl Green {
         })
         .map(|(dst, _)| dst.clone()),
     );
-    // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534).
+    // Every link at either end: by the one history rule a link unchanged since version 0 has no history (A-534). A link
+    // changes with its target where the target was a special node by the target's change, as the index records it
+    // (`record_changes` asks `was_special` as the version commits): a target that becomes special only after the span
+    // read through the link as before within it, since a link resolves one level.
     let aliases: Vec<String> =
       union_keys(self.hardlinks.keys(), self.hardlink_history.keys().cloned()).collect();
     for alias in aliases {
       let targets = [self.hardlink_at(&alias, from), self.hardlink_at(&alias, to)];
-      if targets
-        .iter()
-        .flatten()
-        .any(|target| self.was_special(target) && changed.contains(target))
-      {
+      if targets.iter().flatten().any(|target| {
+        changed.contains(target)
+          && self
+            .last_change_in(target, from, to)
+            .is_some_and(|version| self.special_by(target, version))
+      }) {
         changed.insert(alias);
       }
     }
     changed.into_iter().collect()
+  }
+
+  /// The model's: the last version in `(from, to]` at which any dimension of `path` changed, read off its histories.
+  #[cfg(feature = "test-model")]
+  fn last_change_in(&self, path: &str, from: u64, to: u64) -> Option<u64> {
+    fn last<T>(history: Option<&Vec<(u64, T)>>, from: u64, to: u64) -> Option<u64> {
+      history?
+        .iter()
+        .map(|(version, _)| *version)
+        .filter(|version| *version > from && *version <= to)
+        .max()
+    }
+    let xattrs = self
+      .xattr_history
+      .iter()
+      .filter(|((at, _), _)| at == path)
+      .filter_map(|(_, history)| last(Some(history), from, to))
+      .max();
+    let copies = self.copies.get(path).and_then(|records| {
+      records
+        .iter()
+        .map(|record| record.version)
+        .filter(|version| *version > from && *version <= to)
+        .max()
+    });
+    [
+      last(self.content_history.get(path), from, to),
+      last(self.special_history.get(path), from, to),
+      last(self.dir_history.get(path), from, to),
+      last(self.mode_history.get(path), from, to),
+      last(self.symlink_history.get(path), from, to),
+      last(self.hardlink_history.get(path), from, to),
+      xattrs,
+      copies,
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+  }
+
+  /// The model's: whether `path` was a special node by `version`, as [`Green::was_special`] answered when `version`
+  /// committed: its special history holds an entry at or before it, or, with none, it holds a special node since the
+  /// origin.
+  #[cfg(feature = "test-model")]
+  fn special_by(&self, path: &str, version: u64) -> bool {
+    match self.special_history.get(path) {
+      Some(history) => history.iter().any(|(at, _)| *at <= version),
+      None => self.specials.contains_key(path),
+    }
   }
 
   /// What the green holds at its head under `dir` (A-792): every file, directory, symlink and special node whose
@@ -3402,7 +3482,11 @@ impl Green {
       latest_list: (latest_before, latest_after),
       blocks_cut,
       bytes_cut,
+      values,
     } = anchored;
+    self.history_reanchored_values = self
+      .history_reanchored_values
+      .saturating_add(u64::try_from(values).unwrap_or(u64::MAX));
     self.history_lists = self
       .history_lists
       .saturating_sub(lists_before)
@@ -3425,6 +3509,16 @@ impl Green {
   /// copied out of them (A-793's non-vacuity counters, `crate::history::reanchor`).
   pub fn history_reanchored(&self) -> (u64, u64, u64) {
     self.history_reanchored
+  }
+
+  /// The anchor layers reads of earlier values have examined, in all (A-809): what a read through layers costs.
+  pub fn history_layers_examined(&self) -> u64 {
+    self.chunks.layers_examined()
+  }
+
+  /// The history values re-anchors walked in all (A-803): divided by the re-anchored changes, the values a change walks.
+  pub fn history_reanchored_values(&self) -> u64 {
+    self.history_reanchored_values
   }
 
   /// Marks `path`'s latest content value superseded as a change lands, the file map having let its block go
@@ -5422,6 +5516,79 @@ impl Green {
     indexed.saturating_add(copies)
   }
 
+  /// Makes this green owe `push` as its next version, its work not built (P2; [`crate::push::DeferredPush`]): what a
+  /// created ref's green starts as. Its content stays its base's, and it answers [`Green::is_materialized`] false until
+  /// [`Green::materialize`] commits the build. The version it owes, the one after its head; none, nothing changed, for a
+  /// push not based at the head or a green that owes one already.
+  pub fn defer(&mut self, push: crate::push::DeferredPush) -> Option<u64> {
+    if self.owed.is_some() || push.push().base_version != self.head() {
+      return None;
+    }
+    let version = push.version();
+    self.owed = Some(push);
+    Some(version)
+  }
+
+  /// The version this green has reached: its head, or while it owes a push the owed version and every version recorded
+  /// after it ([`Green::defer`], the owed tail). What a holder's replica and a takeover count it at (P2): the version a
+  /// green that owes stands for, not its base.
+  pub fn reached(&self) -> u64 {
+    match &self.owed {
+      Some(owed) => owed
+        .version()
+        .saturating_add(u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX)),
+      None => self.head(),
+    }
+  }
+
+  /// Whether this green holds its content: false while it owes a push ([`Green::defer`]).
+  pub fn is_materialized(&self) -> bool {
+    self.owed.is_none()
+  }
+
+  /// The push this green owes, if any.
+  pub fn deferred(&self) -> Option<&crate::push::DeferredPush> {
+    self.owed.as_ref()
+  }
+
+  /// The build of the push this green owes, each turn under `pace`: drive it with [`crate::push::Building::advance`]
+  /// over this green and the push's objects, then give its work to [`Green::materialize`]. None when nothing is owed.
+  pub fn materializing(&self, pace: crate::pace::Pace) -> Option<crate::push::Building> {
+    self.owed.as_ref().map(|owed| owed.building(pace))
+  }
+
+  /// Commits `built`, the owed push's work, as the owed version, and clears the debt: the green is then the green the
+  /// eager create made, its version, files, histories, change index and identity alike, since the work is the same
+  /// builder's over the same objects. The versions recorded after it while it was owed are then applied in order
+  /// ([`Green::apply_recorded`]). The head it reaches. Refused, nothing applied, when nothing is owed, when `built` is
+  /// based elsewhere than the owed push, or when it does not commit as the owed version (a build of another push).
+  pub fn materialize(&mut self, built: &Increment) -> Result<u64, Unmaterialized> {
+    let owed = self.owed.as_ref().ok_or(Unmaterialized::NothingOwed)?;
+    let version = owed.version();
+    if built.base != owed.push().base_version || self.head().saturating_add(1) != version {
+      return Err(Unmaterialized::OtherWork);
+    }
+    let judgment = self.judge(built);
+    let Judgment::Accepted(held) = judgment else {
+      return Err(Unmaterialized::NotAccepted);
+    };
+    let (committed, _) = self.commit_held(held);
+    if committed != version {
+      return Err(Unmaterialized::OtherWork);
+    }
+    self.owed = None;
+    // The versions recorded after the owed one, in order, as a replay applies them.
+    let mut head = committed;
+    for (inc, applied) in std::mem::take(&mut self.owed_tail) {
+      head = self.apply_recorded(&inc, &applied);
+    }
+    // The verdicts recorded while it owed, on the versions now applied.
+    for (version, signature) in std::mem::take(&mut self.owed_signatures) {
+      self.record_signature(version, signature);
+    }
+    Ok(head)
+  }
+
   /// Submits an increment: idempotent by identity, decides every dimension of its ops document, and
   /// commits a new version when all accept, or returns the conflict windows and changes nothing.
   /// An accepted increment's outcome is remembered for good (it is in the chain); a rejected one's
@@ -5936,6 +6103,14 @@ impl Green {
     inc: &Increment,
     applied: &[crate::chain_entry::Applied],
   ) -> u64 {
+    // A green that owes a push takes a later recorded version in order, to apply once it is materialized (P2): the
+    // version it stands for is answered, so a replay goes on.
+    if let Some(owed) = &self.owed {
+      let at = u64::try_from(self.owed_tail.len()).unwrap_or(u64::MAX);
+      let version = owed.version().saturating_add(at).saturating_add(1);
+      self.owed_tail.push((inc.clone(), applied.to_vec()));
+      return version;
+    }
     // An increment already accepted is answered its version and commits nothing, as a submit would: a chain holding one
     // increment twice is corrupt, and its caller sees the version differ from the one the entry was recorded as.
     if let Some(version) = self.accepted.get(&inc.id) {
@@ -5965,6 +6140,11 @@ impl Green {
     version: u64,
     signature: crate::chain_entry::Signature,
   ) -> bool {
+    // A version a green that owes a push stands for (P2): kept until it is made, never lost (an audit fact).
+    if self.owed.is_some() && version > self.head() && version <= self.reached() {
+      self.owed_signatures.insert(version, signature);
+      return true;
+    }
     if version == 0 || version > self.head() {
       return false;
     }
@@ -6357,7 +6537,8 @@ impl Green {
   /// full copy per edit past what any reader needs. Returns the content and IPC metadata bytes released. Idempotent;
   /// a floor below the current one is a no-op.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
-    if floor <= self.folded_below {
+    // A green that owes a push has no history of the owed version to fold (P2): nothing.
+    if floor <= self.folded_below || self.owed.is_some() {
       return 0;
     }
     // The identity reads its keys' values at the version it was last brought to, so it is brought to the head
@@ -6477,6 +6658,14 @@ impl Green {
   /// versions it maps through and the work (A-658), so any copy of the green that holds them answers it as the owner
   /// does, and a copy that has not reached the work's base answers [`Rebased::BaseAhead`].
   pub fn rebase(&self, inc: &Increment) -> Rebased {
+    self.rebase_establishing(inc, BTreeSet::new())
+  }
+
+  /// [`Green::rebase`] for a resolution (A-796, AC-6.13): `established` names the paths the resolution's replacement
+  /// brings into being at the head, so the work's kept mode and attribute changes on them are judged as on a path the
+  /// work establishes (a file the head removed, written anew by the replacement), never as a change to the removed one.
+  /// Nothing else of the verdict changes; with no path named it is the rebase.
+  pub fn rebase_establishing(&self, inc: &Increment, established: BTreeSet<String>) -> Rebased {
     if inc.base < self.deltas_from {
       return Rebased::BaseUnavailable {
         base: inc.base,
@@ -6497,7 +6686,8 @@ impl Green {
         identity: run.identity,
       };
     }
-    let resolved = Green::resolve(inc);
+    let mut resolved = Green::resolve(inc);
+    resolved.resolution_establishes = established;
     if let Some((path, case)) = self.copy_refusal(&resolved) {
       return Rebased::CopyRefused { path, case };
     }

@@ -7,18 +7,18 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use slates_db::catalog::{Principal, RepositoryId, VolumeId as DbVolumeId};
-use slates_ipc::protocol::{DUMP_FILE, ObjectFormat, Refusal, ReplyBody, RequestBody, VcsTool};
+use slates_ipc::protocol::{DUMP_FILE, ObjectFormat, Refusal, ReplyBody, VcsTool};
 use slates_svn::commit::record::Record;
 use slates_svn::dump::Format;
 use slates_wire::request::RequestId;
 
 use super::{ExportJob, WALKS_DIFFERED, export_dump};
 use crate::merge_service::ReplyRoute;
+use crate::repository::svn_commit::tests::{on, stored};
 use crate::state::ShardState;
 use crate::vcs_store::svn_import::tests::{
   FULL, FULL_LAST, PART1, PART2, imported, owner, subversion,
 };
-use crate::verbs::dispatch;
 
 /// Shape: the first revision of `part2.dump` (`make-fixtures.sh` dumps `--incremental -r 4:13` into it).
 const PART2_FIRST: u64 = 4;
@@ -45,10 +45,10 @@ fn stranger() -> Principal {
 }
 
 /// A Subversion repository `name` holding `full.dump`'s history, imported in its two parts: its id and its green.
-fn holding_the_full_history(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let (id, green) = subversion(state, name);
+async fn holding_the_full_history(name: &str) -> (RepositoryId, DbVolumeId) {
+  let (id, green) = subversion(name).await;
   for part in [PART1, PART2] {
-    let (loaded, _) = imported(state, id, part);
+    let (loaded, _) = imported(id, part).await;
     assert!(loaded.is_ok(), "{loaded:?}");
   }
   (id, green)
@@ -111,9 +111,15 @@ fn dump_of(state: &ShardState, name: &str) -> Option<Vec<u8>> {
 /// own: red when both took one fresh id at their walks' end, the second refused `AlreadyExists` at its record.
 #[test]
 fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  crate::test_store::run_on_first(
+    &daemon,
+    || async move {
+      holding_the_full_history("svn").await;
+    },
+    TASK_WAIT,
+  );
   let asked = crate::daemon::observe_first(&daemon, |state| {
-    holding_the_full_history(state, "svn");
     routed(state, 1);
     let whole = ask(state, (&owner(), "svn"), ((0, FULL_LAST), false), "whole");
     routed(state, 2);
@@ -156,6 +162,64 @@ fn t_a652_a_range_exports_into_a_new_volume_as_svnadmin_dump_wrote_it() {
   );
 }
 
+/// C2 stage B part 2 (the export reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose repository `stored` has a revision 1 adding `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), ask for revisions 0 to 1 in each format, each into a volume of
+/// its own. Expect both held, then within the wait both published, format 2's dump file carrying the text whole and
+/// format 3's its first and last KiB (its svndiff windows: noise, which none compresses), read through
+/// the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after.
+/// Before, the export's first read of the text refused it `Corrupt`, and nothing was published.
+#[test]
+fn an_export_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, _) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "stored", &bytes);
+  let asked = crate::daemon::observe_first(&daemon, |state| {
+    routed(state, 1);
+    let two = ask(state, (&owner(), "stored"), ((0, 1), false), "two");
+    routed(state, 2);
+    let three = ask(state, (&owner(), "stored"), ((0, 1), true), "three");
+    [two, three]
+  });
+  let held = (ReplyBody::Acknowledged, true);
+  assert_eq!(asked, [held.clone(), held]);
+  let began = Instant::now();
+  let made = loop {
+    let made = crate::daemon::observe_first(&daemon, |state| {
+      [dump_of(state, "two"), dump_of(state, "three")]
+    });
+    if made.iter().all(Option::is_some) || began.elapsed() > TASK_WAIT {
+      break made;
+    }
+  };
+  let (counted, fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      counters(state),
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let carries = |dump: &Option<Vec<u8>>, run: &[u8]| {
+    dump
+      .as_ref()
+      .is_some_and(|dump| dump.windows(run.len()).any(|window| window == run))
+  };
+  let [two, three] = &made;
+  let lengths = (two.as_ref().map(Vec::len), three.as_ref().map(Vec::len));
+  assert!(carries(two, &bytes), "format 2; {lengths:?}; {counted:?}");
+  assert!(
+    carries(three, &bytes[..1024]) && carries(three, &bytes[bytes.len() - 1024..]),
+    "format 3; {lengths:?}; {counted:?}"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
 /// The shard's counters a failed export test names: the export's, the image tasks' and the replies'.
 fn counters(state: &mut ShardState) -> Vec<String> {
   state
@@ -176,27 +240,29 @@ fn counters(state: &mut ShardState) -> Vec<String> {
 /// byte.
 #[test]
 fn t_a652_the_export_is_published_with_its_completion() {
-  crate::daemon::audit_on_shard(|state| {
-    let (id, _) = holding_the_full_history(state, "svn");
-    let mut job = job_of(id, ((0, 3), Format::Two), "published");
-    let walked = measured(state, &mut job).and_then(|()| written(state, &mut job).map(drop));
-    assert_eq!(walked, Ok(()));
-    let request = (ORIGIN, RequestId::from_word(1));
-    let (reply, _) = crate::image::complete(state, request, |s| match job.publish(s) {
-      Ok(reply) => reply,
-      Err(refusal) => {
-        job.release(s);
-        crate::verbs::refused(refusal)
-      }
-    });
-    let length = u64::try_from(PART1.len()).unwrap_or(u64::MAX);
-    let exported =
-      matches!(reply, ReplyBody::DumpExported { dump_bytes, .. } if dump_bytes == length);
-    assert!(exported, "{reply:?}");
-    assert!(
-      dump_of(state, "published").as_deref() == Some(PART1),
-      "part1.dump"
-    );
+  stored(|| async move {
+    let (id, _) = holding_the_full_history("svn").await;
+    on(|state| {
+      let mut job = job_of(id, ((0, 3), Format::Two), "published");
+      let walked = measured(state, &mut job).and_then(|()| written(state, &mut job).map(drop));
+      assert_eq!(walked, Ok(()));
+      let request = (ORIGIN, RequestId::from_word(1));
+      let (reply, _) = crate::image::complete(state, request, |s| match job.publish(s) {
+        Ok(reply) => reply,
+        Err(refusal) => {
+          job.release(s);
+          crate::verbs::refused(refusal)
+        }
+      });
+      let length = u64::try_from(PART1.len()).unwrap_or(u64::MAX);
+      let exported =
+        matches!(reply, ReplyBody::DumpExported { dump_bytes, .. } if dump_bytes == length);
+      assert!(exported, "{reply:?}");
+      assert!(
+        dump_of(state, "published").as_deref() == Some(PART1),
+        "part1.dump"
+      );
+    })
   });
 }
 
@@ -252,16 +318,18 @@ fn job_of(
 #[test]
 fn t_a652_the_jobs_two_walks_write_the_range_as_svnadmin_dump_wrote_it() {
   const DELTAS: &[u8] = include_bytes!("../../../../svn/fixtures/dump/deltas.dump");
-  crate::daemon::audit_on_shard(|state| {
-    let (id, _) = holding_the_full_history(state, "svn");
-    let mut part = job_of(id, ((0, 3), Format::Two), "part");
-    let made = measured(state, &mut part).and_then(|()| written(state, &mut part));
-    part.release(state);
-    assert!(made.as_deref() == Ok(PART1), "part1.dump");
-    let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
-    let made = measured(state, &mut deltas).and_then(|()| written(state, &mut deltas));
-    deltas.release(state);
-    assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
+  stored(|| async move {
+    let (id, _) = holding_the_full_history("svn").await;
+    on(|state| {
+      let mut part = job_of(id, ((0, 3), Format::Two), "part");
+      let made = measured(state, &mut part).and_then(|()| written(state, &mut part));
+      part.release(state);
+      assert!(made.as_deref() == Ok(PART1), "part1.dump");
+      let mut deltas = job_of(id, ((0, FULL_LAST), Format::Three), "deltas");
+      let made = measured(state, &mut deltas).and_then(|()| written(state, &mut deltas));
+      deltas.release(state);
+      assert!(made.as_deref() == Ok(DELTAS), "deltas.dump");
+    })
   });
 }
 
@@ -270,43 +338,28 @@ fn t_a652_the_jobs_two_walks_write_the_range_as_svnadmin_dump_wrote_it() {
 /// write refused `Unpublished`, counted once, and nothing kept: the job's volume given back.
 #[test]
 fn t_a652_a_second_walk_that_differs_from_the_first_is_refused() {
-  crate::daemon::audit_on_shard(|state| {
-    let (id, _) = holding_the_full_history(state, "svn");
+  stored(|| async move {
+    let (id, _) = holding_the_full_history("svn").await;
     let mut job = job_of(id, ((0, 3), Format::Two), "changed");
-    assert_eq!(measured(state, &mut job), Ok(()));
+    assert_eq!(on(|state| measured(state, &mut job)), Ok(()));
     let properties = BTreeMap::from([(b"svn:log".to_vec(), b"changed meanwhile".to_vec())]);
     let changed = Record::RevisionProperties {
       revision: 0,
       properties,
     };
-    let set = crate::repository::svn_commit::record(state, (&owner(), id), changed);
-    assert_eq!(set, Ok(()));
-    let refused = written(state, &mut job);
-    job.release(state);
-    assert!(
-      matches!(refused, Err(Refusal::Unpublished { .. })),
-      "{refused:?}"
-    );
-    let counted = state.refusals.get(WALKS_DIFFERED).copied();
-    assert_eq!((counted, job.admitted.is_none()), (Some(1), true));
+    let set = crate::repository::svn_commit::land_record((&owner(), id), changed).await;
+    assert_eq!(set, Some(Ok(())));
+    on(|state| {
+      let refused = written(state, &mut job);
+      job.release(state);
+      assert!(
+        matches!(refused, Err(Refusal::Unpublished { .. })),
+        "{refused:?}"
+      );
+      let counted = state.refusals.get(WALKS_DIFFERED).copied();
+      assert_eq!((counted, job.admitted.is_none()), (Some(1), true));
+    })
   });
-}
-
-/// Creates a git repository `name` on the shard.
-fn git(state: &mut ShardState, name: &str) {
-  let reply = dispatch(
-    state,
-    1,
-    &owner(),
-    RequestBody::CreateRepository {
-      name: name.to_owned(),
-      tool: VcsTool::Git,
-      format: ObjectFormat::Sha1,
-      default_branch: "main".to_owned(),
-      green: None,
-    },
-  );
-  assert!(matches!(reply, ReplyBody::GreenCreated { .. }), "{reply:?}");
 }
 
 /// A-652 part 3 (refused by kind before anything is made). Do: ask for an export of a repository nobody made, of the
@@ -316,55 +369,58 @@ fn git(state: &mut ShardState, name: &str) {
 /// `AlreadyExists` naming the green, and `Unsupported`; none deferred.
 #[test]
 fn t_a652_an_export_is_refused_by_kind_before_anything_is_made() {
-  crate::daemon::audit_on_shard(|state| {
-    let (_, green) = holding_the_full_history(state, "svn");
-    git(state, "git");
-    let own = owner();
-    let bad = |reason: &str| Refusal::BadRequest {
-      reason: reason.to_owned(),
-    };
-    let cases = [
-      (
-        ask(state, (&own, "none"), ((0, 1), false), "a"),
-        Refusal::NotFound,
-      ),
-      (
-        ask(state, (&stranger(), "svn"), ((0, 1), false), "a"),
-        crate::verbs::reply_refusal(crate::verbs::forbidden("export_dump")),
-      ),
-      (
-        ask(state, (&own, "git"), ((0, 1), false), "a"),
-        Refusal::Unsupported {
-          feature: "a dump of a repository of another tool than Subversion".to_owned(),
-        },
-      ),
-      (
-        ask(state, (&own, "svn"), ((3, 2), false), "a"),
-        bad("Start revision 3 is greater than end revision 2"),
-      ),
-      (
-        ask(state, (&own, "svn"), ((0, 14), false), "a"),
-        bad("End revision 14 is invalid (youngest revision is 13)"),
-      ),
-    ];
-    for ((reply, deferred), wanted) in cases {
-      assert_eq!((reply, deferred), (crate::verbs::refused(wanted), false));
-    }
-    let taken = state
-      .db
-      .partition()
-      .volume(green)
-      .map(|volume| volume.name.clone())
-      .expect("the green's record");
-    let existing = crate::verbs::to_wire_volume(green);
-    let held = ask(state, (&own, "svn"), ((0, 1), false), &taken);
-    let wanted = crate::verbs::refused(Refusal::AlreadyExists { existing });
-    assert_eq!(held, (wanted, false));
-    let unrecorded = ask(state, (&own, "svn"), ((0, 1), false), "fresh");
-    let outside = match &unrecorded.0 {
-      ReplyBody::Refused { refusal } => matches!(refusal, Refusal::Unsupported { .. }),
-      _ => false,
-    };
-    assert!(outside && !unrecorded.1, "{unrecorded:?}");
+  stored(|| async move {
+    let (_, green) = holding_the_full_history("svn").await;
+    // A git repository made through a client's request, as every creation on a store-backed daemon is (A-767 item 7).
+    crate::test_store::created(&owner(), ("git", VcsTool::Git, ObjectFormat::Sha1, "main")).await;
+    on(|state| {
+      let own = owner();
+      let bad = |reason: &str| Refusal::BadRequest {
+        reason: reason.to_owned(),
+      };
+      let cases = [
+        (
+          ask(state, (&own, "none"), ((0, 1), false), "a"),
+          Refusal::NotFound,
+        ),
+        (
+          ask(state, (&stranger(), "svn"), ((0, 1), false), "a"),
+          crate::verbs::reply_refusal(crate::verbs::forbidden("export_dump")),
+        ),
+        (
+          ask(state, (&own, "git"), ((0, 1), false), "a"),
+          Refusal::Unsupported {
+            feature: "a dump of a repository of another tool than Subversion".to_owned(),
+          },
+        ),
+        (
+          ask(state, (&own, "svn"), ((3, 2), false), "a"),
+          bad("Start revision 3 is greater than end revision 2"),
+        ),
+        (
+          ask(state, (&own, "svn"), ((0, 14), false), "a"),
+          bad("End revision 14 is invalid (youngest revision is 13)"),
+        ),
+      ];
+      for ((reply, deferred), wanted) in cases {
+        assert_eq!((reply, deferred), (crate::verbs::refused(wanted), false));
+      }
+      let taken = state
+        .db
+        .partition()
+        .volume(green)
+        .map(|volume| volume.name.clone())
+        .expect("the green's record");
+      let existing = crate::verbs::to_wire_volume(green);
+      let held = ask(state, (&own, "svn"), ((0, 1), false), &taken);
+      let wanted = crate::verbs::refused(Refusal::AlreadyExists { existing });
+      assert_eq!(held, (wanted, false));
+      let unrecorded = ask(state, (&own, "svn"), ((0, 1), false), "fresh");
+      let outside = match &unrecorded.0 {
+        ReplyBody::Refused { refusal } => matches!(refusal, Refusal::Unsupported { .. }),
+        _ => false,
+      };
+      assert!(outside && !unrecorded.1, "{unrecorded:?}");
+    })
   });
 }

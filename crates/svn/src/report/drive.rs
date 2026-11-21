@@ -67,7 +67,7 @@ use crate::index::{
   Revision, Text,
 };
 use crate::lock::{AprTime, LockTable};
-use crate::reads::Repository;
+use crate::reads::{Repository, Wanted};
 use crate::svndiff::{
   Compression, Encoder, Instruction, Made, Version, WINDOW_LIMIT, Window, WindowMaking,
 };
@@ -280,6 +280,28 @@ impl From<IndexRefusal> for DriveFailure {
   }
 }
 
+/// Why a step of a drive stopped short (C2 stage B part 2): a refusal, which ends the drive, or a text's piece its
+/// source reads asynchronously ([`Repository::fetchable`]), which the drive waits for, keeping everything it made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Halt {
+  /// The refusal.
+  Failed(DriveFailure),
+  /// The piece waited for.
+  Waiting(Wanted),
+}
+
+impl From<DriveFailure> for Halt {
+  fn from(failure: DriveFailure) -> Self {
+    Self::Failed(failure)
+  }
+}
+
+impl From<IndexRefusal> for Halt {
+  fn from(refusal: IndexRefusal) -> Self {
+    Self::Failed(DriveFailure::of_index(&refusal))
+  }
+}
+
 /// What [`Drive::next`] made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Next<'a> {
@@ -287,6 +309,9 @@ pub enum Next<'a> {
   Call(Call<'a>),
   /// The steps given were spent before a call was ready: call again.
   Paused,
+  /// A text's piece the repository reads asynchronously is waited for (C2 stage B part 2): fetched and made readable to
+  /// the repository, the drive is called again and reads on from there.
+  Waiting(Wanted),
   /// The drive has ended: closed, or aborted with [`Drive::failure`].
   Ended,
 }
@@ -765,8 +790,10 @@ impl Drive {
         return Next::Paused;
       };
       left = rest;
-      if let Err(failure) = self.step(sources) {
-        self.fail(failure);
+      match self.step(sources) {
+        Ok(()) => {}
+        Err(Halt::Failed(failure)) => self.fail(failure),
+        Err(Halt::Waiting(wanted)) => return Next::Waiting(wanted),
       }
     }
     self.current = self.pending.pop_front();
@@ -790,9 +817,9 @@ impl Drive {
   }
 
   /// One step of the walk.
-  fn step<R: Repository + ?Sized>(&mut self, sources: &Sources<'_, R>) -> Result<(), DriveFailure> {
+  fn step<R: Repository + ?Sized>(&mut self, sources: &Sources<'_, R>) -> Result<(), Halt> {
     match self.frames.pop() {
-      None if !self.started => self.start(sources),
+      None if !self.started => Ok(self.start(sources)?),
       None => {
         self.pending.push_back(Owned::CloseEdit);
         self.ended = true;
@@ -802,7 +829,7 @@ impl Drive {
         self.pending.push_back(Owned::CloseDirectory);
         Ok(())
       }
-      Some(Frame::Directory(directory)) => self.step_directory(*directory, sources),
+      Some(Frame::Directory(directory)) => Ok(self.step_directory(*directory, sources)?),
       Some(Frame::File(file)) => self.step_file(*file, sources),
     }
   }
@@ -1337,7 +1364,7 @@ impl Drive {
     &mut self,
     mut file: FileFrame,
     sources: &Sources<'_, R>,
-  ) -> Result<(), DriveFailure> {
+  ) -> Result<(), Halt> {
     match file.phase {
       FilePhase::Properties => {
         let token = file.lock_token.as_deref();
@@ -1351,7 +1378,15 @@ impl Drive {
         file.phase = FilePhase::Text;
       }
       FilePhase::Text => self.text(&mut file, sources)?,
-      FilePhase::Windows => self.window(&mut file, sources)?,
+      FilePhase::Windows => {
+        if let Err(halt) = self.window(&mut file, sources) {
+          // A wait keeps the file where it was: its window's work is back in `file.window`.
+          if matches!(halt, Halt::Waiting(_)) {
+            self.frames.push(Frame::File(Box::new(file)));
+          }
+          return Err(halt);
+        }
+      }
       FilePhase::End => {
         self.pending.push_back(Owned::TextDeltaEnd);
         file.phase = FilePhase::Close;
@@ -1399,7 +1434,7 @@ impl Drive {
     &mut self,
     file: &mut FileFrame,
     sources: &Sources<'_, R>,
-  ) -> Result<(), DriveFailure> {
+  ) -> Result<(), Halt> {
     let Some(text) = file.target.text.filter(|text| file.sent < text.size) else {
       file.phase = FilePhase::End;
       return Ok(());
@@ -1793,28 +1828,41 @@ pub(crate) fn window_unit<R: Repository + ?Sized>(
   delta: Delta<'_>,
   (encoding, repository): ((Version, Compression), &R),
   sink: &mut dyn FnMut(usize, usize, Vec<u8>),
-) -> Result<(), DriveFailure> {
+) -> Result<(), Halt> {
   let mut work = match work_held.take() {
     Some(work) => work,
     None => Box::new(begun_window(*delta.sent, delta.source, &delta.text)?),
   };
-  let units = if work.target.len() < work.target_len {
+  let read = if work.target.len() < work.target_len {
     let piece = (*delta.sent, work.target_len);
-    read_piece(
+    Some(read_piece(
       repository,
       &delta.text,
       piece,
       (&mut work.target, &mut work.target_cache),
-    )?
+    ))
   } else if work.source.len() < work.source_len {
     let source = delta.source.ok_or_else(DriveFailure::corrupt)?;
     let piece = (work.view, work.source_len);
-    read_piece(
+    Some(read_piece(
       repository,
       &source,
       piece,
       (&mut work.source, &mut work.source_cache),
-    )?
+    ))
+  } else {
+    None
+  };
+  let units = if let Some(read) = read {
+    match read {
+      Ok(units) => units,
+      // A wait keeps the window's work, the pieces read so far among it, for the step that reads on.
+      Err(halt @ Halt::Waiting(_)) => {
+        *work_held = Some(work);
+        return Err(halt);
+      }
+      Err(halt) => return Err(halt),
+    }
   } else if work.making.as_ref().and_then(WindowMaking::made).is_none() {
     make_window(&mut work, encoding)?
   } else {
@@ -1949,15 +1997,24 @@ fn read_piece<R: Repository + ?Sized>(
   text: &Text,
   (offset, want): (u64, usize),
   (piece, cache): (&mut Vec<u8>, &mut crate::reads::WindowCache),
-) -> Result<usize, DriveFailure> {
+) -> Result<usize, Halt> {
   let at = u64::try_from(piece.len())
     .ok()
     .and_then(|read| offset.checked_add(read))
     .ok_or_else(DriveFailure::corrupt)?;
-  let run = repository
+  let Some(run) = repository
     .text_in(&text.identity, at, cache)
     .filter(|run| !run.is_empty())
-    .ok_or_else(DriveFailure::corrupt)?;
+  else {
+    // A piece the repository reads asynchronously is waited for; any other text it lacks is corrupt.
+    if repository.fetchable(&text.identity, at) {
+      return Err(Halt::Waiting(Wanted {
+        text: text.identity,
+        offset: at,
+      }));
+    }
+    return Err(Halt::Failed(DriveFailure::corrupt()));
+  };
   let take = run
     .len()
     .min(want.saturating_sub(piece.len()))

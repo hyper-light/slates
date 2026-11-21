@@ -312,6 +312,7 @@ pub(crate) fn server(scenario: &Scenario) -> Server {
     push.abandon(&mut store).unwrap();
   } else {
     repository.commit(&mut store, &mut push, &moves).unwrap();
+    crate::served::derive_all(&repository, &mut store);
   }
   Server {
     repository,

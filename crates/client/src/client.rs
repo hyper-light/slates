@@ -110,6 +110,20 @@ pub enum Rebased {
   Conflict(Vec<MergeWindow>),
 }
 
+/// A merge check (§4.16, A-796): what it judged, every conflict window of the verdict a submit would get now (none when
+/// it would be accepted), and the work's canonical declaration by index, the indices a resolution's `discard` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeCheck {
+  /// What the check judged: a read or a resolution naming it is refused `StaleMergeView` once it no longer holds.
+  pub stamp: slates_ipc::protocol::MergeStamp,
+  /// Every conflict window.
+  pub conflicts: Vec<MergeWindow>,
+  /// The canonical declaration as far as the daemon's reply held it.
+  pub declaration: Vec<slates_ipc::protocol::MergeOp>,
+  /// Operations of the declaration past what the reply held.
+  pub declaration_elided: u32,
+}
+
 /// A snapshot's disk image, built (§4.6, A-160).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageBuilt {
@@ -3827,29 +3841,6 @@ impl Client {
     }
   }
 
-  /// Creates a volume laid over the objects of the S3 base `base` (A-555), its fetches signed with `credential`, which
-  /// the daemon holds in RAM and never records. `spec`'s `base` is not read: the S3 base is the volume's base.
-  pub fn create_over_s3(
-    &mut self,
-    spec: &CreateSpec,
-    base: &slates_ipc::protocol::S3BaseSpec,
-    credential: &slates_ipc::protocol::S3Credential,
-  ) -> Result<VolumeId, ClientError> {
-    match self.call(&RequestBody::CreateOverS3 {
-      name: spec.name.clone(),
-      size: spec.size,
-      names: spec.names,
-      require_locked: spec.require_locked,
-      base: base.clone(),
-      credential: credential.clone(),
-    })? {
-      ReplyBody::Created { id } => Ok(id),
-      _ => Err(ClientError::UnexpectedReply {
-        verb: "create over S3",
-      }),
-    }
-  }
-
   /// Takes a snapshot; its id.
   pub fn snapshot(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
     self.snapshot_with_coverage(volume).map(|(id, _)| id)
@@ -4684,6 +4675,125 @@ impl Client {
   pub fn rebase(&mut self, work: VolumeId) -> Result<Rebased, ClientError> {
     let reply = self.call(&RequestBody::Rebase { work })?;
     self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
+  }
+
+  /// Checks a work's pending declarations against its green's head and publishes nothing (§4.16, A-796): the verdict a
+  /// submit would get now, every window read (A-267), the canonical declaration, and the stamp a read or a resolution
+  /// names. The work's base, journal and files and the green are unchanged.
+  pub fn check_merge(&mut self, work: VolumeId) -> Result<MergeCheck, ClientError> {
+    let ReplyBody::MergeChecked {
+      stamp,
+      mut conflicts,
+      conflicts_elided,
+      verdict,
+      declaration,
+      declaration_elided,
+    } = resolved(self.call(&RequestBody::CheckMerge { work })?)?
+    else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "check_merge",
+      });
+    };
+    let mut from = u32::try_from(conflicts.len()).unwrap_or(u32::MAX);
+    let mut left = conflicts_elided;
+    while left > 0 {
+      let ReplyBody::Conflicts { windows, next } =
+        resolved(self.call(&RequestBody::Conflicts {
+          work,
+          verdict,
+          from,
+        })?)?
+      else {
+        return Err(ClientError::UnexpectedReply {
+          verb: "check_merge",
+        });
+      };
+      let read = u32::try_from(windows.len()).unwrap_or(u32::MAX);
+      if read == 0 && next.is_some() {
+        // A page that makes no progress short of the end would loop forever.
+        return Err(ClientError::UnexpectedReply {
+          verb: "check_merge",
+        });
+      }
+      conflicts.extend(windows);
+      left = left.saturating_sub(read);
+      match next {
+        Some(at) => from = at,
+        None => break,
+      }
+    }
+    Ok(MergeCheck {
+      stamp,
+      conflicts,
+      declaration,
+      declaration_elided,
+    })
+  }
+
+  /// Reads a file of one view a merge check named (A-796), every page of it: the work as it stood when checked, or the
+  /// green at the head the check judged. Refused `StaleMergeView` once the work changed or the head is not the stamp's.
+  pub fn read_merge_check(
+    &mut self,
+    stamp: slates_ipc::protocol::MergeStamp,
+    view: slates_ipc::protocol::MergeView,
+    path: &str,
+  ) -> Result<Vec<u8>, ClientError> {
+    if view == slates_ipc::protocol::MergeView::Green {
+      return self.read(
+        stamp.green,
+        path,
+        ReadAt::Version {
+          version: stamp.head,
+        },
+      );
+    }
+    let mut bytes = Vec::new();
+    loop {
+      let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let ReplyBody::ReadPage {
+        bytes: page, total, ..
+      } = resolved(self.call(&RequestBody::ReadMergeCheck {
+        stamp,
+        path: path.to_owned(),
+        offset,
+        max: u64::MAX,
+      })?)?
+      else {
+        return Err(ClientError::UnexpectedReply {
+          verb: "read_merge_check",
+        });
+      };
+      let done = offset.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX)) >= total;
+      if page.is_empty() && !done {
+        return Err(ClientError::UnexpectedReply {
+          verb: "read_merge_check",
+        });
+      }
+      bytes.extend_from_slice(&page);
+      if done {
+        return Ok(bytes);
+      }
+    }
+  }
+
+  /// Resolves a checked conflict (A-796): retires the canonical operations `discard` names (strictly increasing), rebases
+  /// the rest onto the stamp's head and applies `replacement` there, restating the work at the head. Refused
+  /// `StaleMergeView` with nothing changed when the head or the work moved since the check; a conflict when what is kept
+  /// still overlaps the head, every window read.
+  pub fn resolve_merge(
+    &mut self,
+    stamp: slates_ipc::protocol::MergeStamp,
+    discard: &[u64],
+    replacement: Vec<slates_ipc::protocol::WorkChange>,
+  ) -> Result<Rebased, ClientError> {
+    let reply = self.call(&RequestBody::ResolveMerge {
+      stamp,
+      discard: discard.to_vec(),
+      replacement,
+    })?;
+    self
+      .verdict_of(stamp.work, VerdictKind::Rebase, reply)?
+      .rebased()
   }
 
   /// Clones a snapshot into a new volume; the clone's id.

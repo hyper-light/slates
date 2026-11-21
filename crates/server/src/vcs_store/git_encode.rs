@@ -98,6 +98,11 @@ pub(crate) enum Turned {
 
 /// One turn of repository `id`'s encoding (the module doc), within the shard's quantum on its clock.
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Turned {
+  // A-614 amended: a version's D(k), which its fragments are encoded from, derived first where it is not known, so an
+  // encoding turned by any path (a fetch's wait, the task behind it) never meets a version left for its first reader.
+  if super::git_derive::turn(state, id) == super::git_derive::Turned::More {
+    return Turned::More;
+  }
   let began = slates_rt::futures::now_ns();
   let (turned, kept) = turn_uncounted(state, id);
   // A-724 piece 4: the turn's time and, once a version's fragments are kept, their bytes, on the repository's usage row,

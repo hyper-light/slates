@@ -73,6 +73,8 @@ pub struct MergeBudgetHeld {
   pub work_log_bytes: usize,
   /// The largest one log's bytes.
   pub largest_work_log: usize,
+  /// The work whose log that is.
+  pub largest_work: Option<VolumeId>,
   /// Their logs' entries.
   pub work_log_entries: usize,
 }
@@ -301,6 +303,11 @@ pub struct Partition {
   caps: PartitionCaps,
   volumes: Slab<VolumeRecord>,
   by_id: Art<Handle<VolumeRecord>>,
+  /// How many volumes of each tenant the partition holds (A-802): what a destroy asks before it erases the tenant's
+  /// sealing key, kept with every volume record added and removed (`insert_volume`, `remove_volume`, the only two), so
+  /// derived again on a snapshot's restore. Bounded by the volumes. Before, a destroy collected every volume record to
+  /// ask, so its cost grew with the partition.
+  tenant_volumes: BTreeMap<u64, usize>,
   by_name: Art<Handle<VolumeRecord>>,
   snapshots: Slab<SnapshotRecord>,
   snapshot_index: Art<Handle<SnapshotRecord>>,
@@ -409,6 +416,9 @@ pub struct Partition {
   /// acknowledged edit survives a daemon restart. Counted in `green_chain_bytes` against the same cap; a work's
   /// restatement (an accepted submit, a rebase) replaces its log, and its destroy reclaims it.
   work_logs: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// The largest work log held since start, bytes and entries ([`Partition::work_log_peak`]). A measure, not state:
+  /// not snapshotted.
+  work_log_peak: (usize, usize),
   /// Each green's origin held as a reference to its base snapshot (A-217): a few dozen bytes a green, whatever its
   /// tree, where `green_origins` held the whole tree's bytes. Removed with the green.
   green_origin_refs: BTreeMap<VolumeId, OriginRef>,
@@ -477,6 +487,8 @@ impl Partition {
       caps,
       volumes: Slab::new(caps.segment_slots, caps.volumes),
       by_id: Art::new(),
+      tenant_volumes: BTreeMap::new(),
+      work_log_peak: (0, 0),
       by_name: Art::new(),
       snapshots: Slab::new(caps.segment_slots, caps.snapshots),
       snapshot_index: Art::new(),
@@ -648,6 +660,11 @@ impl Partition {
         .map(bytes)
         .fold(0, usize::saturating_add),
       largest_work_log: self.work_logs.values().map(bytes).max().unwrap_or(0),
+      largest_work: self
+        .work_logs
+        .iter()
+        .max_by_key(|(_, log)| bytes(log))
+        .map(|(work, _)| *work),
       work_log_entries: self
         .work_logs
         .values()
@@ -890,10 +907,7 @@ impl Partition {
     self.seal_keys.remove(&SealKeyOwner::Lineage { volume: id });
     self.seal_keys.remove(&SealKeyOwner::Naming { volume: id });
     if let Some(account) = tenant
-      && !self
-        .volumes()
-        .iter()
-        .any(|volume| volume.owner.tenant() == account)
+      && !self.tenant_volumes.contains_key(&account)
     {
       self.seal_keys.remove(&SealKeyOwner::Tenant { account });
     }
@@ -2769,6 +2783,7 @@ impl Partition {
       Op::WorkLogged { work, entry } => {
         self.green_chain_bytes = self.green_chain_bytes.saturating_add(entry.len());
         self.work_logs.entry(*work).or_default().push(entry.clone());
+        self.note_work_log(*work);
         Ok(())
       }
       Op::WorkRestated { work, entry } => {
@@ -2778,6 +2793,7 @@ impl Partition {
           .saturating_sub(released)
           .saturating_add(entry.len());
         self.work_logs.insert(*work, vec![entry.clone()]);
+        self.note_work_log(*work);
         Ok(())
       }
       Op::GreenCheckpointed {
@@ -2789,6 +2805,21 @@ impl Partition {
         Ok(())
       }
     }
+  }
+
+  /// Notes `work`'s log as it stands after an entry, if it is the largest this partition has held (A-806's measure).
+  fn note_work_log(&mut self, work: VolumeId) {
+    let bytes = self.work_log_bytes(work);
+    if bytes > self.work_log_peak.0 {
+      let entries = self.work_logs.get(&work).map_or(0, Vec::len);
+      self.work_log_peak = (bytes, entries);
+    }
+  }
+
+  /// The largest work log this partition has held since it started, its bytes and its entries then (A-806's measure: a
+  /// work log that grows with one work's history is unbounded growth).
+  pub fn work_log_peak(&self) -> (usize, usize) {
+    self.work_log_peak
   }
 
   /// The bytes a work's log holds now.
@@ -2864,8 +2895,11 @@ impl Partition {
     let id = record.id;
     let name = record.name.clone();
     let lease = record.lease.clone();
+    let tenant = record.owner.tenant();
     let h = self.volumes.insert(record)?;
     self.by_id.insert(&id.bytes, h);
+    let held = self.tenant_volumes.entry(tenant).or_insert(0);
+    *held = held.saturating_add(1);
     self.by_name.insert(name.as_bytes(), h);
     if let Some(lease) = lease {
       self.index_lease(id, &lease)?;
@@ -2887,6 +2921,13 @@ impl Partition {
     let h = self.by_id.remove(&id.bytes).ok_or(DbError::NotFound)?;
     let record = self.volumes.remove(h)?;
     self.by_name.remove(record.name.as_bytes());
+    let tenant = record.owner.tenant();
+    match self.tenant_volumes.get_mut(&tenant) {
+      Some(held) if *held > 1 => *held = held.saturating_sub(1),
+      _ => {
+        self.tenant_volumes.remove(&tenant);
+      }
+    }
     if let Some(lease) = &record.lease {
       self.leases_by_holder.remove(&lease.holder.key());
     }
@@ -2909,8 +2950,13 @@ impl Partition {
     self.carried.remove(&id);
     // A destroyed green leaves the namespace that bound it (§4.17.1, A-515).
     self.repositories.green_removed(id);
-    // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
-    // a volume that no longer exists), returning its bytes to the chain budget.
+    self.reclaim_chains_of(id);
+    Ok(())
+  }
+
+  /// A destroyed volume's merge records reclaimed with it, their bytes returned to the chain budget: a green's chain,
+  /// origin and checkpoint (its increments can never be replayed for a volume that no longer exists), and a work's log.
+  fn reclaim_chains_of(&mut self, id: VolumeId) {
     if let Some(chain) = self.green_chains.remove(&id) {
       let bytes: usize = chain.iter().map(Vec::len).sum();
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(bytes);
@@ -2923,12 +2969,10 @@ impl Partition {
     if let Some((_, checkpoint)) = self.green_checkpoints.remove(&id) {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(checkpoint.len());
     }
-    // A destroyed work's log can never be replayed either.
     let log = self.work_log_bytes(id);
     if self.work_logs.remove(&id).is_some() {
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(log);
     }
-    Ok(())
   }
 
   fn insert_snapshot(&mut self, record: SnapshotRecord) -> Result<(), DbError> {

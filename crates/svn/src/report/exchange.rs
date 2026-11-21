@@ -200,6 +200,9 @@ pub enum Turn {
   /// The output grew by its room, or the drive's steps were spent: write the output, then call
   /// again with the same input.
   Wrote,
+  /// The drive waits for a text's piece its repository reads asynchronously (C2 stage B part 2): write the output,
+  /// fetch the piece and make it readable to the repository, then call again with the same input.
+  Waiting(crate::reads::Wanted),
   /// The command is answered whole, `consumed` bytes of the input taken: the connection reads its
   /// next command.
   Answered {
@@ -432,6 +435,10 @@ impl Exchange {
         Next::Paused => {
           self.phase = Phase::Driving(drive, writer);
           return Ok(Turn::Wrote);
+        }
+        Next::Waiting(wanted) => {
+          self.phase = Phase::Driving(drive, writer);
+          return Ok(Turn::Waiting(wanted));
         }
         Next::Ended => return Err(Refused::Editor(EditorRefused::OutOfOrder)),
       };

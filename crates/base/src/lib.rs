@@ -16,9 +16,6 @@
 //!
 //! Evidence for the primitives: `research/disk-source-of-truth.md` §4 (verified per
 //! platform), and the timestamp-granularity table there for the racy rule.
-//!
-//! An overlay's base may instead be the objects under an S3 base's prefix ([`s3`], §4.15 "An S3 base"): a volume's slot
-//! holds either kind as one [`BaseHost`] (A-555).
 
 // The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
 // are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
@@ -31,7 +28,6 @@ pub mod base_host;
 #[cfg(unix)]
 pub mod hint_set;
 pub mod own_mounts;
-pub mod s3;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

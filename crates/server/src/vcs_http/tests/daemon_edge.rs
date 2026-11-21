@@ -80,21 +80,45 @@ fn identity() -> (EdgeIdentity, CertificateDer<'static>) {
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`.
-fn daemon(identity: EdgeIdentity) -> Daemon {
+fn daemon(identity: EdgeIdentity) -> crate::test_store::StoredDaemon {
   daemon_named(Some(identity)).0
 }
 
 /// A daemon of [`SHARDS`] shards whose configuration asks for an edge on loopback presenting `identity`, or serving
 /// cleartext without one, and its instance's name, which its edge's realm names (`slates <instance>`).
-fn daemon_named(identity: Option<EdgeIdentity>) -> (Daemon, String) {
+fn daemon_named(identity: Option<EdgeIdentity>) -> (crate::test_store::StoredDaemon, String) {
   daemon_configured(identity, |_| {})
 }
 
-/// [`daemon_named`], its configuration changed by `configure` before it starts.
+/// [`daemon_named`], its configuration changed by `configure` before it starts. Every daemon here holds a changeset
+/// store (`crate::test_store`): a repository's history lands there, and a daemon without one makes no repository of any
+/// tool (C1, C2, C5).
 fn daemon_configured(
   identity: Option<EdgeIdentity>,
   configure: impl FnOnce(&mut crate::DaemonConfig),
-) -> (Daemon, String) {
+) -> (crate::test_store::StoredDaemon, String) {
+  let (profile, config, instance) = edge_config(identity, configure);
+  let daemon = crate::test_store::StoredDaemon::start(
+    "vcs-http",
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: instance.clone(),
+    },
+  )
+  .expect("the daemon starts");
+  daemon
+    .bootstrap(true)
+    .expect("the daemon creates its initial group");
+  (daemon, instance)
+}
+
+/// The profile, configuration and instance name of a daemon of [`SHARDS`] shards serving the edge on loopback presenting
+/// `identity`, or cleartext without one, its configuration changed by `configure`.
+fn edge_config(
+  identity: Option<EdgeIdentity>,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> (slates_machine::MachineProfile, crate::DaemonConfig, String) {
   static NEXT: AtomicU32 = AtomicU32::new(0);
   let profile = crate::daemon::test_profile();
   let instance = format!(
@@ -108,18 +132,7 @@ fn daemon_configured(
     identity,
   });
   configure(&mut config);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: instance.clone(),
-    },
-  )
-  .expect("the daemon starts");
-  daemon
-    .bootstrap(true)
-    .expect("the daemon creates its initial group");
-  (daemon, instance)
+  (profile, config, instance)
 }
 
 /// A git repository's name that routes to [`REPOSITORY`]'s partition, not the listener's.
@@ -134,9 +147,8 @@ fn name_on_the_repositorys_partition() -> String {
 fn create(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1084,9 +1096,8 @@ fn hg_name_on_the_repositorys_partition() -> String {
 fn create_hg_from_states(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::verbs::dispatch(
+    let created = crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1222,9 +1233,8 @@ const HG_PUSH_FIELDS: &str = "Accept-Encoding: identity\r\nContent-Type: applica
 fn create_empty_hg(daemon: &Daemon, name: &str) {
   let name = name.to_owned();
   let created = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    crate::verbs::dispatch(
+    crate::test_store::create(
       state,
-      1,
       &owner(),
       RequestBody::CreateRepository {
         name: name.clone(),
@@ -1770,7 +1780,7 @@ fn stock_hg_reads_a_repositorys_capabilities_on_a_daemons_loopback_edge_by_basic
     );
     return;
   };
-  let (daemon, _) = daemon_named(None);
+  let daemon = daemon_named(None).0;
   let port = daemon.vcs_http_port().expect("the edge started");
   let name = hg_name_on_the_repositorys_partition();
   create_hg_from_states(&daemon, &name);
@@ -1806,21 +1816,11 @@ fn create_svn_hooked(
   daemon
     .record_root_mount(std::path::Path::new(crate::vcs_svn::tests::TEST_ROOT))
     .expect("the root mount recorded");
+  let asked = (name, VcsTool::Subversion, ObjectFormat::Revisions, "trunk");
+  crate::test_store::create_on(daemon, REPOSITORY, &owner(), asked);
   let name = name.to_owned();
-  let replies = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
-    let created = crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Revisions,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    );
-    let set = crate::verbs::dispatch(
+  let set = crate::daemon::observe_at(daemon, REPOSITORY, move |state| {
+    crate::verbs::dispatch(
       state,
       2,
       &owner(),
@@ -1839,14 +1839,9 @@ fn create_svn_hooked(
         hooks_env: Vec::new(),
         signers: Vec::new(),
       },
-    );
-    (created, set)
+    )
   });
-  assert!(
-    !matches!(replies.0, ReplyBody::Refused { .. }),
-    "{replies:?}"
-  );
-  assert_eq!(replies.1, ReplyBody::Acknowledged);
+  assert_eq!(set, ReplyBody::Acknowledged);
 }
 
 /// The name Subversion gives a hook at `point`.
@@ -2465,7 +2460,7 @@ fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
     );
     return;
   }
-  let (daemon, _) = daemon_named(None);
+  let daemon = daemon_named(None).0;
   let port = daemon.vcs_http_port().expect("the edge started");
   enroll(&daemon, OWNER_TOKEN, OWNER, None);
   let name = (0u32..)

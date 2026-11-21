@@ -39,10 +39,10 @@
 //!
 //! **Bounds.** One build a green, so the builds are bounded by the partition's greens; each holds the head's paths and
 //! the entries put so far, a version's files at most. The parked submits of a green are bounded by the shard's client
-//! credit (`clients_per_shard × slots`, the bound `crate::base_wait` keeps), every request that can be in flight; a
+//! credit (`clients_per_shard × slots`, the bound `crate::lease_wait` keeps), every request that can be in flight; a
 //! submit past it is refused `Overloaded`, counted ([`PARK_REFUSED`]), and a retry of a parked request joins its entry.
-//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held, the
-//! bound `crate::base_wait` keeps): at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
+//! A parked submit waits at most the node's failover delay (`ShardState::failover_ns`, the most a reply is held):
+//! at each slice one that has waited longer is answered `Overloaded`, unrecorded, so its
 //! retry runs, counted ([`OVERDUE`]).
 //!
 //! **Cancellation.** The build lives in the store's map, keyed by its green, and its task holds the key alone: a task

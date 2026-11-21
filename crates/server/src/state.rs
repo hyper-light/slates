@@ -98,8 +98,7 @@ pub struct VolumeSlot {
   pub name: String,
   /// The volume.
   pub volume: Volume,
-  /// The read-only host of the overlay's base, for an overlay: a host directory, or the objects under an S3 base's
-  /// prefix (A-555).
+  /// The read-only host of the overlay's base, for an overlay: a host directory, or a green's tree (A-774).
   pub host: Option<BaseHost>,
   /// The reservation, for a bounded volume.
   pub reservation: Option<slates_mem::budget::Reservation>,
@@ -401,10 +400,6 @@ pub struct ShardState {
   /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
   /// call so a file-state change it makes carries the compound's record in its own transaction.
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
-  /// The fetch the NFS call this shard is serving right now met pending, with the volume whose base names it (A-555):
-  /// set by the call's export when a host call of the call was answered pending, taken by the call's serve once it
-  /// returns, so the call parks on that fetch (`crate::base_wait`). `None` between calls.
-  pub(crate) nfs_pending_base: Option<(VolumeId, slates_vfs::host::FetchId)>,
   /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
   /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
   /// replies are sent. At most a turn's mutations per held connection on this shard.
@@ -892,13 +887,14 @@ pub struct ShardState {
   /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
   /// "Leases and reads"), bounded by the shard's client credit.
   pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
-  /// Requests parked until the S3 base fetch they met lands (`crate::base_wait`; §4.15 "An S3 base", A-555), bounded by
-  /// the shard's client credit.
-  pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
   /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
   pub(crate) refining: crate::refining::Refining,
+  /// The shard's server-made commits waiting on their landing (the deferred-submit hook, `crate::made_commit`).
+  pub(crate) made_commits: crate::made_commit::MadeCommits,
+  /// The shard's greens being made from the push they owe, and the requests parked on them (P2, `crate::green_ready`).
+  pub(crate) materializations: crate::green_ready::Materializations,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
@@ -1705,7 +1701,7 @@ pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
 /// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
-  let server = with_state(|s| {
+  let server = try_with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
     // away on another shard; it ends when this reply is written into the client's ring.
     let ring = s.forwarded_rings.remove(&request);
@@ -1734,11 +1730,73 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       ring,
     });
     s.server_task
-  })
-  .flatten();
+  });
+  let server = match server {
+    Ok(server) => server,
+    // A reply this thread could not hand to its shard (A-800): counted, never silent. Its callers deliver from a task
+    // or a reply's run, outside any borrow, so this names a caller that broke that rule.
+    Err(StateAccess::Borrowed) => {
+      bump_undelivered(|counts| counts.borrowed = counts.borrowed.saturating_add(1));
+      None
+    }
+    Err(_) => None,
+  };
   if let Some(task) = server {
     slates_rt::registry::wake(task.0);
   }
+}
+
+std::thread_local! {
+  /// Replies this shard thread could not hand on (A-800), per thread as [`LOST_STEPS`] is: a `deliver` while the state
+  /// was borrowed, a forwarded reply resent because its run met a borrowed state, and one no shard here could take.
+  static UNDELIVERED: std::cell::Cell<Undelivered> = const { std::cell::Cell::new(Undelivered { borrowed: 0, forward_resent: 0, forward_unservable: 0 }) };
+}
+
+/// See [`UNDELIVERED`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Undelivered {
+  borrowed: u64,
+  forward_resent: u64,
+  forward_unservable: u64,
+}
+
+fn bump_undelivered(change: impl FnOnce(&mut Undelivered)) {
+  UNDELIVERED.with(|cell| {
+    let mut counts = cell.get();
+    change(&mut counts);
+    cell.set(counts);
+  });
+}
+
+/// Format: a reply `deliver` could not hand to its shard, the state borrowed (A-800).
+pub(crate) const REPLY_UNDELIVERED_BORROWED: &str = "state.reply_undelivered_borrowed";
+/// Format: a forwarded reply resent home because its run met a borrowed state (A-800).
+pub(crate) const FORWARD_RESENT_BORROWED: &str = "fleet.forward.client.resent_borrowed";
+/// Format: a forwarded reply no shard here could take: no state on the thread, or a fenced shard (A-800).
+pub(crate) const FORWARD_UNSERVABLE: &str = "fleet.forward.client.unservable";
+
+/// The replies `deliver` could not hand on, the state borrowed, on this thread so far.
+pub(crate) fn undelivered_borrowed() -> u64 {
+  UNDELIVERED.with(std::cell::Cell::get).borrowed
+}
+
+/// The forwarded replies resent because their run met a borrowed state, and those no shard here could take, on this
+/// thread so far.
+pub(crate) fn forward_undelivered() -> (u64, u64) {
+  let counts = UNDELIVERED.with(std::cell::Cell::get);
+  (counts.forward_resent, counts.forward_unservable)
+}
+
+/// Counts a forwarded reply resent home because its run met a borrowed state.
+pub(crate) fn count_forward_resent_borrowed() {
+  bump_undelivered(|counts| counts.forward_resent = counts.forward_resent.saturating_add(1));
+}
+
+/// Counts a forwarded reply no shard here could take.
+pub(crate) fn count_forward_unservable() {
+  bump_undelivered(|counts| {
+    counts.forward_unservable = counts.forward_unservable.saturating_add(1)
+  });
 }
 
 /// A taken-over green awaiting materialization (§4.16 owner-loss recovery; `ShardState::pending_green_materializations`).

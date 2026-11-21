@@ -787,10 +787,67 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         }
       }
     }
+    Verb::CheckMerge { work } => merge_check_verb(client, *work, json)?,
+    Verb::ResolveMerge { resolution } => merge_resolve_verb(client, resolution, json)?,
     // Only the merge verbs above reach here.
     _ => {}
   }
   Ok(())
+}
+
+/// `check-merge`: the work's early-conflict check (A-796), as JSON or as lines: its stamp, its declaration's operations
+/// and the conflict windows.
+fn merge_check_verb(client: &mut Client, work: VolumeId, json: bool) -> Result<(), ClientError> {
+  let checked = client.check_merge(work)?;
+  if json {
+    slates_machine::out_line!("{}", slates_mcp::merge_check_json(&checked));
+  } else {
+    slates_machine::out_line!(
+      "checked: head {} base {} revision {}",
+      checked.stamp.head,
+      checked.stamp.base,
+      checked.stamp.revision
+    );
+    for (index, op) in checked.declaration.iter().enumerate() {
+      slates_machine::out_line!(
+        "op {index}: {} kind {} at {} len {}",
+        op.path,
+        op.kind,
+        op.at,
+        op.len
+      );
+    }
+    print_windows(&checked.conflicts);
+  }
+  Ok(())
+}
+
+/// `resolve-merge`: a resolution bound to a check (A-796), read from its JSON, as JSON or as a line.
+fn merge_resolve_verb(
+  client: &mut Client,
+  resolution: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let args: serde_json::Value =
+    serde_json::from_str(resolution).map_err(|error| bad_resolution(error.to_string()))?;
+  let (stamp, discard, replacement) = slates_mcp::resolve_args(&args).map_err(bad_resolution)?;
+  let outcome = client.resolve_merge(stamp, &discard, replacement)?;
+  if json {
+    slates_machine::out_line!("{}", rebase_json(&outcome));
+  } else {
+    match outcome {
+      Rebased::Rebased(version) => slates_machine::out_line!("resolved: {version}"),
+      Rebased::Conflict(windows) => print_windows(&windows),
+    }
+  }
+  Ok(())
+}
+
+/// A resolution's JSON the CLI could not read (A-796), refused as the daemon refuses a malformed request.
+fn bad_resolution(message: String) -> ClientError {
+  ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest {
+    reason: format!("invalid resolution: {message}"),
+  })
 }
 
 /// A submit outcome as JSON (the MCP schema — `slates_mcp::windows_json` for the conflicts): `accepted`
@@ -1642,6 +1699,8 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
+    | Verb::CheckMerge { .. }
+    | Verb::ResolveMerge { .. }
     | Verb::Advance { .. }
     | Verb::Read { .. } => serve_merge(client, verb, json)?,
     Verb::Write {

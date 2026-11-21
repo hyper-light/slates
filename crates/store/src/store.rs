@@ -205,6 +205,8 @@ pub struct Store {
   value: Vec<u8>,
   /// The standing grant its directory is written under, as first recorded.
   grant: GrantRow,
+  /// The log reads that answered places ([`Store::places_bytes`]): the counter its coalescing is held to.
+  place_reads: u64,
 }
 
 /// A standing grant as the store recorded it (its `G` row, A-767; R10's record of the human's grant): what a landing's
@@ -249,6 +251,7 @@ impl Store {
       log,
       rows,
       value,
+      place_reads: 0,
       grant: GrantRow {
         id: 0,
         issued_ns: 0,
@@ -263,6 +266,16 @@ impl Store {
   /// The standing grant the store's directory is written under, as first recorded (its `G` row).
   pub fn grant(&self) -> &GrantRow {
     &self.grant
+  }
+
+  /// The log reads that answered places so far ([`Store::places_bytes`]).
+  pub fn place_reads(&self) -> u64 {
+    self.place_reads
+  }
+
+  /// Counts one log read that answered places.
+  pub(crate) fn place_read(&mut self) {
+    self.place_reads = self.place_reads.saturating_add(1);
   }
 
   /// Finds the `G` row of the grant the directory was opened under, or puts it and checkpoints the engine so it is
@@ -583,7 +596,7 @@ fn engine_sizing(
       extent_pages,
       max_extents,
     },
-    sizing.memory,
+    memtable_bytes(sizing.memory),
     TrunkConfig {
       fanout: sizing.fanout,
       leaf_entries,
@@ -602,6 +615,13 @@ pub fn grant_id(device: u64, inode: u64) -> u64 {
   let mut id = [0u8; U64];
   id.copy_from_slice(hash.as_bytes().get(..U64).unwrap_or(&[0u8; U64]));
   u64::from_le_bytes(id)
+}
+
+/// The memtable's bytes from the memory lent, `memory`: at most what its arena's 32-bit offsets address (mantle's
+/// `BTreeMem::new` refuses a larger arena, "a memtable past 4 GiB"). Until 2026-11-20 the whole loan was the memtable,
+/// so a shard's reserve of tens of GiB (a Mac Studio's) refused every landing (A-645 (a)'s run found it).
+fn memtable_bytes(memory: usize) -> usize {
+  memory.min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
 }
 
 /// The changeset row's key.

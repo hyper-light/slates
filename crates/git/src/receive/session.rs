@@ -369,13 +369,20 @@ impl<'s, H: HiddenRefs> Session<'s, H> {
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read: what lets the edge
   /// send git's keepalive while the push is answered (A-722's keepalive, git's `receive.keepAlive`).
   pub fn side_band(&self) -> bool {
-    let request = match &self.state {
+    self
+      .request()
+      .is_some_and(|request| request.requested.side_band_64k)
+  }
+
+  /// The push's request, once it is read whole and until the push is checked and taken ([`Session::take_checked`]) or
+  /// refused.
+  pub fn request(&self) -> Option<&Request> {
+    match &self.state {
       State::Pack { request, .. } | State::Resolving { request, .. } => Some(request),
       State::Checking(checking) => Some(checking.request()),
       State::Checked(checked) => Some(&checked.request),
       State::Request(_) | State::Done => None,
-    };
-    request.is_some_and(|request| request.requested.side_band_64k)
+    }
   }
 
   /// Whether the pack's checks are still to make: its waiting deltas still resolving, or its checks under way.

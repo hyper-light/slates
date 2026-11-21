@@ -407,6 +407,9 @@ impl McpServer {
       "slates.merge.declare" => self.declare(&args),
       "slates.merge.submit" => self.submit(&args),
       "slates.merge.rebase" => self.rebase(&args),
+      "slates.merge.check" => self.check_merge(&args),
+      "slates.merge.read_check" => self.read_check(&args),
+      "slates.merge.resolve" => self.resolve_merge(&args),
       "slates.merge.versions" => self.versions(&args),
       "slates.merge.changed_since" => self.changed_since(&args),
       "slates.merge.advance" => self.advance(&args),
@@ -696,6 +699,58 @@ impl McpServer {
       "visited": answer.visited,
       "bytes_read": answer.bytes_read,
     }))
+  }
+
+  /// `slates.merge.check` (A-796): the check's stamp, windows and canonical declaration ([`merge_check_json`]).
+  fn check_merge(&mut self, args: &Value) -> Result<Value, McpError> {
+    let work = volume_arg(args, "work")?;
+    let checked = self.client.check_merge(work).map_err(refusal)?;
+    Ok(merge_check_json(&checked))
+  }
+
+  /// `slates.merge.read_check` (A-796): one file of the checked work or of the green at the checked head.
+  fn read_check(&mut self, args: &Value) -> Result<Value, McpError> {
+    let stamp = stamp_arg(args.get("stamp").unwrap_or(&Value::Null))?;
+    let view = match string_arg(args, "view")?.as_str() {
+      "work" => slates_client::MergeView::Work,
+      "green" => slates_client::MergeView::Green,
+      _ => {
+        return Err(McpError {
+          code: code::INVALID_PARAMS,
+          message: "view must be work or green".to_owned(),
+        });
+      }
+    };
+    let path = string_arg(args, "path")?;
+    let bytes = self
+      .client
+      .read_merge_check(stamp, view, &path)
+      .map_err(refusal)?;
+    Ok(json!({
+      "path": path,
+      "len": bytes.len(),
+      "text": String::from_utf8_lossy(&bytes),
+    }))
+  }
+
+  /// `slates.merge.resolve` (A-796): the resolution [`resolve_args`] reads, answered as a rebase is.
+  fn resolve_merge(&mut self, args: &Value) -> Result<Value, McpError> {
+    let (stamp, discard, replacement) = resolve_args(args).map_err(|message| McpError {
+      code: code::INVALID_PARAMS,
+      message,
+    })?;
+    Ok(
+      match self
+        .client
+        .resolve_merge(stamp, &discard, replacement)
+        .map_err(refusal)?
+      {
+        Rebased::Rebased(version) => json!({ "rebased": true, "version": version }),
+        Rebased::Conflict(windows) => {
+          json!({ "rebased": false, "conflicts": windows_json(&windows) })
+        }
+      },
+    )
   }
 
   fn rebase(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -1237,6 +1292,30 @@ fn tool_list() -> Vec<Value> {
       json!(["work"]),
     ),
     tool(
+      "slates.merge.check",
+      "Check a work against its green's head and publish nothing (A-796): the verdict a submit would get now, the \
+       stamp to keep (work, green, base, head, revision), the conflict windows and the canonical declaration by index. \
+       Neither the work nor the green changes.",
+      json!({ "work": string }),
+      json!(["work"]),
+    ),
+    tool(
+      "slates.merge.read_check",
+      "Read one file of a checked view (A-796): view \"work\" (the work as checked; refused once it changed) or \
+       \"green\" (the green at the stamp's head).",
+      json!({ "stamp": { "type": "object" }, "view": { "enum": ["work", "green"] }, "path": string }),
+      json!(["stamp", "view", "path"]),
+    ),
+    tool(
+      "slates.merge.resolve",
+      "Resolve a checked conflict (A-796): retire the canonical operations `discard` names (strictly increasing \
+       indices from the check's declaration), rebase the rest onto the stamp's head, and apply `replacement` there: \
+       edits {kind:\"edit\", path, at, delete_len, text} and declarations {kind:\"declare\", op}, in the head's \
+       coordinates. Changes the work only; submit separately. Refused when the head or the work moved since the check.",
+      json!({ "stamp": { "type": "object" }, "discard": { "type": "array", "items": { "type": "integer" } }, "replacement": { "type": "array" } }),
+      json!(["stamp", "discard", "replacement"]),
+    ),
+    tool(
       "slates.merge.versions",
       "The green's current head version.",
       json!({ "green": string }),
@@ -1476,6 +1555,93 @@ fn tool_error(failure: &McpError) -> Value {
     "structuredContent": { "error": { "code": failure.code, "message": failure.message } },
     "isError": true,
   })
+}
+
+/// A merge check's stamp as JSON (A-796): what a read or a resolution names it by.
+pub fn stamp_json(stamp: slates_client::MergeStamp) -> Value {
+  json!({
+    "work": id_hex(stamp.work),
+    "green": id_hex(stamp.green),
+    "base": stamp.base,
+    "head": stamp.head,
+    "revision": stamp.revision,
+  })
+}
+
+/// A merge check as JSON (A-796), the shape `slates.merge.check` and `slates check --json` answer: its stamp, every
+/// conflict window ([`windows_json`]), and the canonical declaration by index, with the count the daemon's reply left
+/// out.
+pub fn merge_check_json(checked: &slates_client::MergeCheck) -> Value {
+  let declaration: Vec<Value> = checked
+    .declaration
+    .iter()
+    .enumerate()
+    .map(|(index, op)| json!({ "index": index, "kind": op.kind, "path": op.path, "at": op.at, "len": op.len }))
+    .collect();
+  json!({
+    "stamp": stamp_json(checked.stamp),
+    "conflicts": windows_json(&checked.conflicts),
+    "declaration": declaration,
+    "declaration_elided": checked.declaration_elided,
+  })
+}
+
+/// A stamp read back from JSON ([`stamp_json`]'s shape).
+fn stamp_arg(args: &Value) -> Result<slates_client::MergeStamp, McpError> {
+  Ok(slates_client::MergeStamp {
+    work: volume_arg(args, "work")?,
+    green: volume_arg(args, "green")?,
+    base: u64_arg(args, "base")?,
+    head: u64_arg(args, "head")?,
+    revision: u64_arg(args, "revision")?,
+  })
+}
+
+/// A resolution's arguments read from JSON (A-796), as `slates.merge.resolve` and `slates resolve` take them: `stamp`
+/// ([`stamp_json`]'s shape), `discard` (canonical indices, strictly increasing) and `replacement` (each
+/// `{"kind": "edit", "path", "at", "delete_len", "text"}` or `{"kind": "declare", "op"}`, an op as `slates.merge.declare`
+/// takes it). The text of an invalid field.
+pub fn resolve_args(
+  args: &Value,
+) -> Result<
+  (
+    slates_client::MergeStamp,
+    Vec<u64>,
+    Vec<slates_client::WorkChange>,
+  ),
+  String,
+> {
+  let invalid = |e: McpError| e.message;
+  let stamp = stamp_arg(args.get("stamp").unwrap_or(&Value::Null)).map_err(invalid)?;
+  let discard = args
+    .get("discard")
+    .and_then(Value::as_array)
+    .ok_or("missing array argument: discard")?
+    .iter()
+    .map(|index| index.as_u64().ok_or("discard holds non-negative integers"))
+    .collect::<Result<Vec<u64>, &str>>()?;
+  if discard.windows(2).any(|pair| pair.first() >= pair.get(1)) {
+    return Err("discard indices must be strictly increasing".to_owned());
+  }
+  let replacement = args
+    .get("replacement")
+    .and_then(Value::as_array)
+    .ok_or("missing array argument: replacement")?
+    .iter()
+    .map(|change| match change.get("kind").and_then(Value::as_str) {
+      Some("edit") => Ok(slates_client::WorkChange::Edit {
+        path: string_arg(change, "path").map_err(invalid)?,
+        at: u64_arg(change, "at").map_err(invalid)?,
+        delete_len: u64_arg(change, "delete_len").map_err(invalid)?,
+        bytes: string_arg(change, "text").map_err(invalid)?.into_bytes(),
+      }),
+      Some("declare") => Ok(slates_client::WorkChange::Declare {
+        op: work_op_from(change.get("op").unwrap_or(&Value::Null)).map_err(invalid)?,
+      }),
+      _ => Err("a replacement's kind is edit or declare".to_owned()),
+    })
+    .collect::<Result<Vec<_>, String>>()?;
+  Ok((stamp, discard, replacement))
 }
 
 /// The conflict windows as JSON: the file, the byte range, and the conflict class.
