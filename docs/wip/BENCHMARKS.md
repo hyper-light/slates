@@ -16194,6 +16194,18 @@ Kept: A-787.
   about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
   carrying the pack (part A).
 
+## A push's record names its homed pack: 141 bytes, the landing step halved (A-722's record v4, part A; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic with record version 4 on and the
+  homing driven as the edge drives it, over git/git's v1.5.0 push; the landing step's phases timed (`push_planned`).
+
+| | record bytes | landing step | entry and record | store commit | apply |
+|---|---|---|---|---|---|
+| part B (92f7a756b) | about 11 MiB | 27.3 ms | 1.7 ms | 0.6 ms | 18.6 ms |
+| part A | 141 | 13.2 ms | 1.8 ms | 1.2 ms | 8.1 ms |
+
+- **What it says.** The entry's write is no longer O(the pack). The apply's 8.1 ms is the greens' commit and the work's
+  encode (w-engine's), and the entry-and-record's 1.8 ms the names checked against the homed ones; each is the next cut.
+
 
 ## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
 
@@ -16266,3 +16278,22 @@ the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 
 | 256 MiB | B | 4 | 2,856 B | 65,536 B | 234.458 µs | 436.792 µs |
 | 256 MiB | A | 5 | 268,445,792 B | 32,768 B | 13.308385 ms | 23.680417 ms |
 | 256 MiB | B | 5 | 2,832 B | 98,304 B | 347.718 µs | 755.375 µs |
+
+## The forward lane's bulk throughput: the instrument (2026-11-20, w-shared; A-697 item 4, main's sweep)
+
+`replication_bench`'s bulk row sends one request of N MiB on a warm session. The holder takes the request whole and
+answers nothing, so the row times one direction. For each sample it prints the goodput, the session's path MTU and
+congestion window, and why its sending stopped (`Endpoint::send_stops`: the packet budget, the window, the pacer,
+the credit, nothing to send). The command, release, best of the five timed samples after one warm-up:
+
+    cargo build --release -p slates-cluster --example replication_bench
+    REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200
+
+No numbers are recorded yet. The first run (macOS arm64, this MacBook, load average 74, base 5d29b9572) was too
+loaded to count. It showed two things to measure on a quiet machine:
+- The path MTU reached 9,209 bytes, at macOS's `net.inet.udp.maxdgram` of 9,216. So the lane is not bound by
+  small datagrams.
+- At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
+  lane on loopback.
+The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
+datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
