@@ -57747,7 +57747,17 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > MiB). **Decided:** the changeset log is the truth (item 1); a per-file form derived from it serves reads and clones,
 > kept by identity as A-645's derived data, evictable and recomputed from the log; a landing extends it with only its
 > own files' runs. Agreed in substance by w-hg (an edit against a named base; a `Texts` section) and w-git (v4's payload
-> homed by identity; normalization behind the same names); w-svn's reply not yet in.
+> homed by identity; normalization behind the same names) and w-svn (its svndiff already the normalized edit; revision-
+> property changes their own changesets).
+>
+> **Status (2026-11-20, C4 groundwork: the store's owner).** `owner.rs`: one thread a node runs holding its `Store`
+> (spawned with `spawn_waited`, joined by `StoreOwner::stop`, which checkpoints first), reached from shards by a
+> cloneable `StoreHandle` over a bounded `slates_rt::sync` channel: `land` (sections' `Vec`s moved in, answered once
+> durable), `piece`, `changesets`, each answer on a one-value channel the task awaits; a full queue is refused `Busy`.
+> The commit's `F_FULLFSYNC` and the engine's device waits never run on a shard. Test: `--test owner` 1/1 (a shard's
+> task lands two changesets, lists them, reads a 200,000-byte payload back by identity; a new owner after the stop
+> reads the same). Owed with C4: the daemon holding the owner (the node's `StoreGrant` at enrollment, the store's
+> directory in its configuration, `Sizing` from its machine profile).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

@@ -1980,6 +1980,7 @@ dependencies = [
  "mantle-crc",
  "mantle-engine",
  "slates-land",
+ "slates-rt",
 ]
 
 [[package]]
