@@ -25,8 +25,10 @@
 > part 1 landed:** the daemon raises its soft `RLIMIT_NOFILE` at start to min(hard, the platform's cap: Linux
 > `fs.nr_open`, macOS `kern.maxfilesperproc`), never lowering it, Windows none; the boot profile's `descriptor_limit`
 > line names before, hard, cap and after (`a837_the_soft_descriptor_limit_is_raised_...`, a re-invoked child raised from
-> 64). **Open:** (2) the learned ceiling (the count at the first `EMFILE`/`ENFILE`, the lower of it and the rlimit); (3)
-> every host open, accept and memfd meeting exhaustion a typed refusal with a counter.
+> 64). **Part 2 landed:** the learned ceiling (`slates_machine::descriptors`): the count held at the first `EMFILE`,
+> `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
+> `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
+> **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,

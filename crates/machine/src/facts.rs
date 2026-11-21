@@ -881,6 +881,8 @@ pub fn raised_descriptor_soft(
 #[must_use]
 pub fn raise_descriptor_limit() -> DescriptorRaise {
   use rustix::process::{Resource, getrlimit, setrlimit};
+  // Linux counts a learned ceiling through a spare descriptor held from here (A-837 part 2).
+  crate::descriptors::reserve_spare();
   let limit = getrlimit(Resource::Nofile);
   let cap = descriptor_cap();
   let (before, hard) = (limit.current, limit.maximum);
