@@ -986,6 +986,12 @@ pub struct Green {
   /// version its entry in `identity` was taken at: a key changed again since is moved from there, not from
   /// `identity_version`. Empty whenever `identity` is the set hash at `identity_version` whole.
   identity_folded: BTreeMap<IdentityKey, u64>,
+  /// The dirty file keys whose own entry was taken out of `identity` when a commit first changed them (A-579 (b),
+  /// [`Green::mark_dirty`]): the fold adds their entry at the head and gives back what a copy since gave them, and reads
+  /// no history for them. Always a subset of `identity_dirty`.
+  identity_out: BTreeSet<IdentityKey>,
+  /// The file keys whose entry was taken out at their first change ([`Green::identities_taken_at_change`]).
+  identities_taken_at_change: std::cell::Cell<u64>,
   /// The current files (persistent, [`crate::dims`]).
   content: Files,
   /// The texts held by content identity (A-716, [`crate::held`]): blocks of `content`'s arena, shared with the files
@@ -2317,12 +2323,16 @@ impl Green {
       let Some(key) = self.identity_dirty.pop_first() else {
         break;
       };
-      let since = self
-        .identity_folded
-        .get(&key)
-        .copied()
-        .unwrap_or(self.identity_version);
-      let (out, into) = self.identity_moves(&key, since);
+      let since = self.identity_since(&key);
+      let (out, into) = if self.identity_out.remove(&key) {
+        // Its own entry left the sum at its change (`mark_dirty`): what a copy since gave it, and its entry now.
+        (
+          self.copied_entries(&key, since),
+          self.identity_entries_at_head(&key),
+        )
+      } else {
+        self.identity_moves(&key, since)
+      };
       for entry in &out {
         self.identity.remove(entry);
       }
@@ -2335,8 +2345,61 @@ impl Green {
       return false;
     }
     self.identity_folded.clear();
+    self.identity_out.clear();
     self.identity_version = self.head();
     true
+  }
+
+  /// The version `key`'s entry in the identity's sum was taken at (A-579): the version it was folded at alone, if it was
+  /// since the identity was last whole, else the version the identity is whole at.
+  fn identity_since(&self, key: &IdentityKey) -> u64 {
+    self
+      .identity_folded
+      .get(key)
+      .copied()
+      .unwrap_or(self.identity_version)
+  }
+
+  /// Marks `key` changed by the commit under way (A-202, A-579 (b)). A file's key changed for the first time since its
+  /// entry was taken holds, until this change, the bytes it held then; on a green with no copy record (whose entries
+  /// a copy's entry may stand for, A-586) its entry is taken out of the sum now, from its current bytes, so the fold
+  /// adds its entry at the head and reads no history for it: one hash a changed file, not two and a reconstruction.
+  /// Every other key is only marked, its move made whole by the fold.
+  fn mark_dirty(&mut self, key: IdentityKey) {
+    if self.identity_dirty.contains(&key) {
+      return;
+    }
+    if let IdentityKey::File(path) = &key
+      && self.copies.is_empty()
+    {
+      if let Some(bytes) = self.content.get(path) {
+        self.identity.remove(&file_entry(path, bytes));
+      }
+      self.identity_out.insert(key.clone());
+      self
+        .identities_taken_at_change
+        .set(self.identities_taken_at_change.get().saturating_add(1));
+    }
+    self.identity_dirty.insert(key);
+  }
+
+  /// `key`'s own entries at the head (none where it is absent; a copy's are its records', none here).
+  fn identity_entries_at_head(&self, key: &IdentityKey) -> Vec<crate::identity::Entry> {
+    match key {
+      IdentityKey::File(path) => self
+        .content
+        .get(path)
+        .map(|bytes| file_entry(path, bytes))
+        .into_iter()
+        .collect(),
+      _ => self.entries_of(key, self.head()).1.into_iter().collect(),
+    }
+  }
+
+  /// The file keys whose entry was taken out of the identity at their first change (A-579 (b)): the non-vacuity count
+  /// of [`Green::mark_dirty`]'s taking.
+  pub fn identities_taken_at_change(&self) -> u64 {
+    self.identities_taken_at_change.get()
   }
 
   /// The keys changed since the identity was last brought to the head (A-579): what its next read folds.
@@ -5193,7 +5256,7 @@ impl Green {
   /// commit ([`Staged`]), and a copy, which `commit_copies` applied first.
   fn apply_effect(&mut self, effect: Effect, version: u64, staged: &mut Staged) {
     // Every key an effect touches is marked once; the identity is brought up to date only when it is read (A-202).
-    self.identity_dirty.insert(effect.identity_key());
+    self.mark_dirty(effect.identity_key());
     match effect {
       Effect::Special(path, node) => self.commit_special(path, node, version),
       Effect::RemoveSpecial(path) => self.remove_special(path, version),
@@ -5337,9 +5400,7 @@ impl Green {
   /// Removes the file at `path` at `version` (a staged removal, or a replaced tree's, A-626): its last value stays in
   /// the history for reconstruction, no longer a current value, so retained and charged (`history_bytes`).
   fn remove_file_now(&mut self, path: &str, version: u64) {
-    self
-      .identity_dirty
-      .insert(IdentityKey::File(path.to_owned()));
+    self.mark_dirty(IdentityKey::File(path.to_owned()));
     self.seed_content(path, version);
     self.content.remove(path);
     self.supersede_latest(path);
