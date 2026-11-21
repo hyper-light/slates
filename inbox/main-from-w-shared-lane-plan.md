@@ -61,3 +61,18 @@ MiB must pass 10 of 10. BENCHMARKS gets the tables.
   rather than holding a copy, the by-reference item GAPS already owes) and the slicing meet. I'm starting there: (i)
   the owner's step measured by part (decode, judge, append, record checksum) to pick what to slice first; (ii) the
   sliced or by-reference form of the biggest part; landing 3a with it once the red test passes 10 of 10.
+
+## Update ~03:40 PST: 3a landed (71e55b6c2, main ed3fbc616)
+The holder's forward is awaited to its end (`xshard::task_to_its_end`), bounded by its lane's progress rule; a
+request's acknowledged bytes count as its progress. Test: an 8 MiB holder submit with B's bound injected at 300 ms,
+answered 6 of 6 (debug, load ~25); red with the fixed deadline put back, 2 of 2 refused. At 32 MiB it is still flaky,
+for the reason measured above: the owner's step for the submit is one 2.3 to 6.9 s step (append 1.2 s, and the commit
+and publish of the record holding the whole increment about 1.1 s; decode 0, judge 5 ms), so the owner's shard reads
+no session and the holder's lane gives the forward up as silent.
+
+Next, the larger change, starting now: the owner's durable step made small by recording the increment by reference.
+The increment's bytes are stored once as content by identity (on arrival, chunk by chunk, each chunk hashed in its own
+turn), and the chain entry and its log record name the content instead of holding the bytes. This changes a durable
+format (the chain entry; the replay, a holder's recompute and `inputs_of` read the increment through it), so I'll write
+its design entry first, with the formats and the replay's path, in inbox/main-from-w-shared-lane-byref.md, and build it
+behind no switch (one path), red test first: the 32 MiB holder submit above passing 10 of 10.

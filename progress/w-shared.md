@@ -391,3 +391,6 @@ NOW (not idle): exit 4 in code. cut_shipments rebuilds the version's inputs and 
   OWNER's step is 4-7 s in one control-shard step (debug, 32 MiB) -> lane gives up silent. NEXT: measure the owner's
   step by part (decode / judge / append / record checksum), slice or by-reference the biggest; land 3a with it.
   Family three: kiln r14 (queued, adacachy). Plan + update: inbox/main-from-w-shared-lane-plan.md.
+
+## LANDED 2026-11-21 ~03:40 PST: lane 3a = 71e55b6c2 (main ed3fbc616). NEXT: by-reference increment (owner's durable
+  step small): design note inbox/main-from-w-shared-lane-byref.md first, then build; red = 32 MiB holder submit 10/10.
