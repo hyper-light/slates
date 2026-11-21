@@ -7387,3 +7387,37 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   second match. Met for 89a: a 1,000-client level reads `met yes` at 10^3 verdicts a second or more. If not met, the
   piece main ruled next is (a): a work whose client sits on its green's owner shard placed on another shard so the owner
   runs verdicts alone; send it back to w-balance with the rows and I build (a) red first.
+
+## 2026-11-21, w-k90-a520: svn correctness by use on every route (goal 93; extends w-reaper's entry above; landed 013c0f0b, origin/main cec41123)
+- **What's new:** `SLATES_SVN_USE_ROUTE=svn|http|http-v1|ssh` on `a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve`
+  (svn by default). The control stays stock `svnserve -t` over FSFS. The slates leg is served on the named route:
+  - `svn`: the svn:// listener;
+  - `http`: the HTTP edge, HTTPv2;
+  - `http-v1`: the same edge, its clients (svn, svnrdump, svnsync) told to speak HTTPv1 with
+    `SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2=1`;
+  - `ssh`: the SSH edge as svn+ssh with an enrolled ed25519 key (skips loudly without OpenSSH or ssh-keygen).
+- **Command** (release, repository root, stock svn 1.15 first on the PATH):
+  `PATH=/opt/homebrew/bin:$PATH SLATES_SVN_USE_ROUTE=<route> SLATES_SVN_USE_DUMP=<dump> cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture`
+  Once per route (4) for each dump (2): 8 runs. Every verb is the default; add `SLATES_SVN_USE_REVISIONS=N` to cut
+  git-2000 down if a round must be shorter.
+- **Datasets:**
+  - `reads.dump`: `dump()` of crates/svn/fixtures/reads/make-fixtures.py (11 revisions, 24,865 B);
+    `python3 -I -c 'import importlib.util as u,sys; s=u.spec_from_file_location("m","crates/svn/fixtures/reads/make-fixtures.py"); m=u.module_from_spec(s); s.loader.exec_module(m); open(sys.argv[1],"wb").write(m.dump())' reads.dump`
+  - `git-2000.dump`: `crates/cli/bench/git_to_svn_dump.py <bare clone of git/git> master 2000` (458,114,318 B, as BENCHMARKS);
+    also at adas-macbook-pro-2 ~/.cache/w-svn-gitgit/git-2000.dump.
+- **Platforms:**
+  - macOS arm64: the big Studio (adas-mac-studio.local-2), the only fleet machine with stock svn 1.15
+    (/opt/homebrew/bin).
+  - Linux x86_64: the test asks for the 1.15 line, and Debian bookworm ships 1.14. It skips loudly there
+    ("no stock Subversion 1.15") unless a 1.15 svn, svnadmin, svnserve, svnrdump and svnsync are on the PATH.
+- **Check first:** no `skipping` line in the output (a skip passes the test).
+- **Owed first, main's focused case (main runs it; a red goes back to w-k90-a520):** the big Studio
+  (adas-mac-studio.local-2, stock svn 1.15 in /opt/homebrew/bin), reads.dump, verbs `log,diff`, each route once:
+  `for r in svn http http-v1 ssh; do PATH=/opt/homebrew/bin:$PATH SLATES_SVN_USE_ROUTE=$r SLATES_SVN_USE_DUMP=$PWD/reads.dump SLATES_SVN_USE_VERBS=log,diff cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve --nocapture; done`
+  Green: four passes with no `skipping` line. Landed on compile and fmt alone (main's call (c), 14:19): the Studio
+  didn't answer runs (r44, r2, r3); merged tree 83511fad: fmt clean and `--no-run` built on adacachy (r9).
+- **Red looks like:** `differences:`, then one entry per verb and revision: its first differing line and three lines of
+  each side (stock, then `slates over <route>`). Also a panic naming a step (import, policy, credential key, a
+  daemon edge's port). Each red goes to w-svn as a minimal red test, `inbox/w-svn-from-<runner>-<topic>.md`. Known
+  by reading, from clients' A-681 entry above: `propset --revprop` over HTTPv2 may be refused (no PROPPATCH on
+  !svn/rev/N).
