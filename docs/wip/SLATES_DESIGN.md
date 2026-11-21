@@ -12303,7 +12303,7 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
 > part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
 > the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
-> deltify job is retired, and its record kind with it (A-818: a log holding one is refused typed). An import's
+> deltify job is retired, and its record kind with it (A-819: a log holding one is refused typed). An import's
 > revision lands its texts the same way since P4a (its changeset's Payload and Texts rows, its record naming them
 > stored), and an import's delta whose base is only on the store asks its caller for the base (`Importing::Base`).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
@@ -57781,7 +57781,7 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
 > no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). A revision's texts are named
 > stored, their bytes the changeset's Payload with Texts rows (C2 stage B part 2 (b)); the deltify record kind is
-> retired and a revision carrying its texts inline is refused at replay (A-818). Held by
+> retired and a revision carrying its texts inline is refused at replay (A-819). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
 > between land and commit). Stage B part 1: a client's commit lands its texts in its changeset (`Payload`, `Texts`,
 > `Record`), and a recovery reads a stored text the shard's image lacks back from the store. Owed: the texts read
@@ -59412,7 +59412,7 @@ Applied in the same change to:
   w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
   piece 3 over this interface.
 
-### A-818 — Subversion's RAM texts retired: the deltify record and inline texts refused at replay (2026-11-21, w-svn; main 09:20 PST; C2 stage B part 2 (b), A-761, A-767 C2)
+### A-819 — Subversion's RAM texts retired: the deltify record and inline texts refused at replay (2026-11-21, w-svn; main 09:20 PST; C2 stage B part 2 (b), A-761, A-767 C2)
 Applied in the same change to:
 - `crates/svn/src/commit/record.rs`: `Record::Deltified` removed; its kind byte (5) refused `RecordRefused::Retired(Retired::Deltified)`.
 - `crates/svn/src/migration/records.rs`: the deltify APIs removed (`supersede`, `deltify_candidates`, `deltify_after`,
