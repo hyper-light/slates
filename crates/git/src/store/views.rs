@@ -186,7 +186,14 @@ impl<'a> PushedObjects<'a> {
         row.len,
       ));
     }
-    let held = self.push.object(&id).ok_or(Unavailable::Missing)?;
+    let Some(held) = self.push.object(&id) else {
+      // Git holds the empty tree as present in every repository (`object_name::empty_tree`).
+      return if crate::object_name::empty_tree(format) == Some(id) {
+        Ok((Kind::Tree, At::EmptyTree, 0))
+      } else {
+        Err(Unavailable::Missing)
+      };
+    };
     let kind = kind_of(held.number).ok_or(Unavailable::Malformed)?;
     let at = match held.at {
       HeldAt::Stored(content) => At::Stored(content),
@@ -199,6 +206,7 @@ impl<'a> PushedObjects<'a> {
   /// where they lie in the push's pack (`Push::bytes`).
   fn bytes(&self, at: &At, len: u64) -> Result<Cow<'a, [u8]>, Unavailable> {
     let content = match at {
+      At::EmptyTree => return Ok(Cow::Borrowed(&[])),
       At::Stored(content) | At::Indexed(StoredAt::Whole(content)) => content,
       At::Indexed(stored) => {
         count(&self.counters, |counters| &mut counters.assembled);
@@ -246,6 +254,9 @@ enum At {
   Stored(ContentId),
   /// Where it lies in the push's pack, by its name.
   Pushed(ObjectId),
+  /// The empty tree, which git holds as present whether or not an object stores it (A-836: what a ref naming a blob
+  /// holds); no bytes.
+  EmptyTree,
 }
 
 impl receive::works::PushedBytes for PushedObjects<'_> {

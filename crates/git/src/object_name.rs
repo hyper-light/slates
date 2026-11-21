@@ -554,6 +554,13 @@ impl Out for Hasher {
   }
 }
 
+/// The empty tree's name in `format` (git's `the_hash_algo->empty_tree`): a tree git holds as present in every repository
+/// whether or not an object stores it (`object-file.c`'s `empty_tree`, `has_object` answering it). What a ref naming no
+/// tree (a blob) holds: no files (A-836).
+pub fn empty_tree(format: ObjectFormat) -> Option<ObjectId> {
+  name_of(format, Kind::Tree, &[]).ok()
+}
+
 /// The name of an object of `kind` whose whole content is `content`, in `format`.
 pub fn name_of(
   format: ObjectFormat,

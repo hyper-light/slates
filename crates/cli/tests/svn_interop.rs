@@ -29,6 +29,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -202,6 +203,9 @@ struct Svn {
   session: String,
   /// The options every command takes before its subcommand.
   options: Vec<String>,
+  /// The environment every command runs with beside `LC_ALL` (a route's own switches: HTTP v1's,
+  /// [`HTTP_V1_SWITCH`]); none for most routes.
+  env: Vec<(String, String)>,
 }
 
 impl Svn {
@@ -218,6 +222,7 @@ impl Svn {
       scratch: scratch.path.clone(),
       session: session.to_owned(),
       options,
+      env: Vec::new(),
     }
   }
 
@@ -233,6 +238,7 @@ impl Svn {
       .args(args)
       .current_dir(dir)
       .env("LC_ALL", "C")
+      .envs(self.env.iter().map(|(name, value)| (name, value)))
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
@@ -1953,12 +1959,27 @@ const USE_PATIENCE: Duration = Duration::from_secs(3600);
 /// their addresses.
 const USE_URL: &str = "<repository>";
 
+/// Format: the environment variable that makes stock `svn`'s HTTP client ignore HTTPv2 and speak HTTPv1 (Subversion's
+/// `libsvn_ra_serf`, `SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2`), which `SLATES_SVN_USE_ROUTE=http-v1` sets for its client.
+const HTTP_V1_SWITCH: &str = "SVN_I_LIKE_LATENCY_SO_IGNORE_HTTPV2";
+
 /// Runs stock `program` with `args` in `dir`, killed past [`USE_PATIENCE`]: its exit code and both outputs.
 fn tool(program: &str, dir: &str, args: &[&str]) -> (i32, String, String) {
+  tool_with(program, dir, args, &[])
+}
+
+/// [`tool`], with `env` beside `LC_ALL` (a route's switches, as its client's [`Svn::env`]).
+fn tool_with(
+  program: &str,
+  dir: &str,
+  args: &[&str],
+  env: &[(String, String)],
+) -> (i32, String, String) {
   let mut child = Command::new(program)
     .args(args)
     .current_dir(dir)
     .env("LC_ALL", "C")
+    .envs(env.iter().map(|(name, value)| (name, value)))
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -2338,7 +2359,7 @@ fn rdump_of(leg: &UseLeg, scratch: &str) -> String {
   let mut args = leg.svn.options.clone();
   args.extend(["dump".to_owned(), "-q".to_owned(), leg.url.clone()]);
   let args: Vec<&str> = args.iter().map(String::as_str).collect();
-  let (code, out, err) = tool("svnrdump", scratch, &args);
+  let (code, out, err) = tool_with("svnrdump", scratch, &args, &leg.svn.env);
   if code == 0 {
     out
   } else {
@@ -2361,7 +2382,7 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
     .chain(leg.svn.options.iter().cloned())
     .collect();
   let init: Vec<&str> = init.iter().map(String::as_str).collect();
-  let (code, out, err) = tool("svnsync", scratch, &init);
+  let (code, out, err) = tool_with("svnsync", scratch, &init, &leg.svn.env);
   if code != 0 {
     return format!("init exit {code}: {}{}", out, leg.plain(&err));
   }
@@ -2370,7 +2391,7 @@ fn mirror_dump_of(leg: &UseLeg, (scratch, root): (&str, &str)) -> String {
     .chain(leg.svn.options.iter().cloned())
     .collect();
   let sync: Vec<&str> = sync.iter().map(String::as_str).collect();
-  let (code, _, err) = tool("svnsync", scratch, &sync);
+  let (code, _, err) = tool_with("svnsync", scratch, &sync, &leg.svn.env);
   if code != 0 {
     return format!("sync exit {code}: {}", leg.plain(&err));
   }
@@ -2444,20 +2465,79 @@ fn use_writes_logged(leg: &UseLeg, scratch: &str, writes: &[&str]) -> String {
   format!("{said}\n{unstamped}")
 }
 
+/// Slates' leg of the correctness by use on `route` (svn, http, http-v1 or ssh), its daemon `instance` with its issuer
+/// surface and its printed `lines`; None (said) where route ssh has no ssh-keygen here.
+fn use_slates_leg(
+  route: &str,
+  scratch: &Scratch,
+  (instance, issuer): (&str, &[(String, String)]),
+  lines: &[String],
+) -> Option<UseLeg> {
+  Some(match route {
+    "svn" => {
+      let (id, token) = minted_token(instance, issuer);
+      UseLeg {
+        name: "slates over svn://",
+        svn: Svn::new(scratch, "slates", credentials(id, token)),
+        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(lines)),
+      }
+    }
+    "http" | "http-v1" => {
+      let (_, token) = minted_token(instance, issuer);
+      let mut svn = Svn::new(scratch, "slates", credentials(USER.to_owned(), token));
+      if route == "http-v1" {
+        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
+      }
+      UseLeg {
+        name: if route == "http" {
+          "slates over HTTPv2"
+        } else {
+          "slates over HTTPv1"
+        },
+        svn,
+        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(lines)),
+      }
+    }
+    _ => {
+      let Some((key, public)) = ssh_key(scratch) else {
+        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
+        return None;
+      };
+      let (code, out, err) = slates_as_issuer(instance, issuer, &["credential", "key", &public]);
+      assert_eq!(code, 0, "credential key: {out}{err}");
+      let port = port_after(lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+      let tunnel = format!(
+        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
+      );
+      UseLeg {
+        name: "slates over svn+ssh",
+        svn: Svn::new(
+          scratch,
+          "slates",
+          vec!["--config-option".to_owned(), tunnel],
+        ),
+        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
+      }
+    }
+  })
+}
+
 /// Goal 93's Subversion correctness by use (main's lane of 2026-11-21; ignored: main runs its rounds, CLAUDE.md §8).
 /// Do: load the dump `SLATES_SVN_USE_DUMP` names into a stock FSFS repository (`svnadmin load`) served by stock
 /// `svnserve -t`, cut to its first `SLATES_SVN_USE_REVISIONS` revisions where that is set (`svnadmin dump -r`), and
-/// import the same revisions into a slates repository (`slates repository import`) served by the daemon's svn://
-/// listener; then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
+/// import the same revisions into a slates repository (`slates repository import`) served on the route
+/// `SLATES_SVN_USE_ROUTE` names (`svn`, the default: the svn:// listener; `http`: the HTTP edge as HTTPv2; `http-v1`: the
+/// same, its client told to speak HTTPv1 ([`HTTP_V1_SWITCH`]); `ssh`: the SSH edge as svn+ssh, by an enrolled key); then run each verb `SLATES_SVN_USE_VERBS` names (default [`USE_VERBS`]) as stock `svn` 1.15 against both,
 /// reading verbs at [`USE_SAMPLES`] revisions spread over the history (`SLATES_SVN_USE_SAMPLES`), and the writing verbs
 /// (commit, copy, merge, propset of a revision property) as the same edits on both, then their logs. Expect every
 /// answer byte for byte alike once each server's URL is made plain ([`USE_URL`]; a written revision's author and date,
 /// which the servers stamp, left out): log -v, info, a checkout's files and properties, `update -r`, `switch`, blame,
 /// `diff -c`, revision properties, `svnrdump dump`, and an `svnsync` mirror's `svnadmin dump`. A failure names each verb,
 /// its revision and its first differing line. Skips loudly without stock Subversion 1.15 (`svn`, `svnadmin`,
-/// `svnserve`, `svnrdump`, `svnsync`), the dump, or an issuer surface.
+/// `svnserve`, `svnrdump`, `svnsync`), the dump, an issuer surface, or (route `ssh`) OpenSSH.
 #[test]
-#[ignore = "correctness by use, main's rounds: SLATES_SVN_USE_DUMP=git-2000.dump [SLATES_SVN_USE_REVISIONS=N] [SLATES_SVN_USE_VERBS=log,diff] cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture"]
+#[ignore = "correctness by use, main's rounds: SLATES_SVN_USE_DUMP=git-2000.dump [SLATES_SVN_USE_ROUTE=svn|http|http-v1|ssh] [SLATES_SVN_USE_REVISIONS=N] [SLATES_SVN_USE_VERBS=log,diff] cargo test --release -p slates-cli --test svn_interop -- --ignored a_dump_reads_and_writes_alike --nocapture"]
 fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
   let Ok(dump) = std::env::var("SLATES_SVN_USE_DUMP") else {
     eprintln!("skipping svn correctness by use: SLATES_SVN_USE_DUMP names no dump");
@@ -2489,17 +2569,26 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     ),
     url: format!("svn+{CONTROL_TUNNEL}://localhost/control"),
   };
-  // Slates: the same revisions imported, served by the svn:// listener.
+  // Slates: the same revisions imported, served on the route `SLATES_SVN_USE_ROUTE` names (svn:// by default).
+  let route = std::env::var("SLATES_SVN_USE_ROUTE").unwrap_or_else(|_| "svn".to_owned());
+  let edge = match route.as_str() {
+    "svn" => "--vcs-svn",
+    "http" | "http-v1" => "--vcs-http",
+    "ssh" => "--vcs-ssh",
+    other => panic!("SLATES_SVN_USE_ROUTE names no route: {other} (svn, http, http-v1 or ssh)"),
+  };
+  if route == "ssh" && !openssh() {
+    eprintln!("skipping svn correctness by use over svn+ssh: no OpenSSH here (ssh on the PATH)");
+    return;
+  }
   let instance = format!("svn-use-{}", std::process::id());
-  let (_anchor, lines, issuer) = start_anchor(&instance, &["--vcs-svn", "127.0.0.1:0"]);
-  let port = svn_listener_port(&lines);
+  let (_anchor, lines, issuer) = start_anchor(&instance, &[edge, "127.0.0.1:0"]);
   let Some(issuer) = issuer_or_skip(issuer, "svn correctness by use") else {
     return;
   };
   create_repository(&instance);
   let imported = slates(&instance, &["repository", "import", REPOSITORY, &cut]);
   assert_eq!(imported.0, 0, "import: {imported:?}");
-  let (id, token) = minted_token(&instance, &issuer);
   let allowing = format!("{}/allow-revprop-change", scratch.path);
   allowing_hook(&allowing);
   let given = format!("pre-revprop-change={allowing}");
@@ -2508,10 +2597,8 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     &["repository", "policy", REPOSITORY, "--hook", &given],
   );
   assert_eq!(policy.0, 0, "policy: {policy:?}");
-  let slates_leg = UseLeg {
-    name: "slates",
-    svn: Svn::new(&scratch, "slates", credentials(id, token)),
-    url: format!("svn://127.0.0.1:{port}/{REPOSITORY}"),
+  let Some(slates_leg) = use_slates_leg(&route, &scratch, (&instance, &issuer), &lines) else {
+    return;
   };
   let legs = [&control, &slates_leg];
   let youngest: u64 = control
