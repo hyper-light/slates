@@ -231,7 +231,7 @@ const STREAM_FIN: u8 = 0b0000_0001;
 
 impl Frame {
   /// Appends this frame's canonical bytes to `out`.
-  fn encode_into(&self, out: &mut Vec<u8>) {
+  pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
     match self {
       Frame::Stream {
         stream_id,
