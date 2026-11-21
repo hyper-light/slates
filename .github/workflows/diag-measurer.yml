@@ -1,0 +1,63 @@
+name: diag measurer
+# g222's macOS split (84a, main's step 4): main with B (A-799) and the busy path's zero-timeout kevent nap, stamped by
+# hop (diag-g222-hops-mac 2e30acc9a): per reply the client's send -> shard taken (queued), taken -> written (served),
+# written -> the client saw it (wake), with the client's parks; every shard park's timeout and lateness; the
+# zero-timeout harvests' durations; and the runner's timer lateness (nanosleep and kevent, 200 us) quiet and under the
+# loaded form, against the launchd timer finding. Loaded = the harness's spinners, two a core (-20's macOS form).
+# A diagnostics lane run only from `diag-measurer-*` branches (never main); every log is an artifact.
+
+on:
+  push:
+    branches: ["diag-measurer-*"]
+
+env:
+  CARGO_TERM_COLOR: never
+  ROUNDS: "3"
+
+jobs:
+  mac-split:
+    name: macOS split (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - name: Build
+        run: |
+          W="$RUNNER_TEMP/msr"; mkdir -p "$W/logs"
+          cargo build --release --locked -p slates-client --example edit_merge_bench > "$W/logs/build.log" 2>&1 || { tail -30 "$W/logs/build.log"; exit 1; }
+          cp target/release/examples/edit_merge_bench "$W/bench"; shasum -a 256 "$W/bench"
+          uname -a; sysctl -n hw.ncpu hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu 2>/dev/null; sw_vers; launchctl print system 2>/dev/null | grep -i -m3 timer || true
+      - name: Rounds, loaded then quiet, split by hop
+        run: |
+          W="$RUNNER_TEMP/msr"; B="$W/bench"; set +e +o pipefail
+          python3 .github/g222/timers.py idle
+          for round in $(seq 1 "$ROUNDS"); do
+            L="$W/logs/loaded-r$round.log"; echo "== loaded round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            ( sleep 60; python3 .github/g222/timers.py "loaded-r$round" ) > "$W/logs/timers-loaded-r$round.log" 2>&1 &
+            G222_DIAG="$W/logs/loaded-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1500 "$B" --loaded-only --spinners-per-core 2 --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; wait; cat "$W/logs/timers-loaded-r$round.log"
+            grep -E "f10_loaded_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+            python3 .github/g222/macsplit.py "$W/logs/loaded-r$round.tsv"
+            L="$W/logs/quiet-r$round.log"; echo "== quiet round $round $(date -u +%FT%TZ) load: $(uptime)" | tee "$L"
+            G222_DIAG="$W/logs/quiet-r$round.tsv" perl -e 'alarm shift; exec @ARGV' 1200 "$B" --quiet-only --files 10 --form accept --form conflict </dev/null >> "$L" 2>&1
+            echo "exit $?" >> "$L"; grep -E "f10_quiet_total_p(50|99|999)\b|exit" "$L" | cut -c1-200
+            python3 .github/g222/macsplit.py "$W/logs/quiet-r$round.tsv"
+          done
+          python3 .github/g222/timers.py idle-end
+      - name: Keep the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-split-logs
+          path: ${{ runner.temp }}/msr/logs
+          if-no-files-found: warn
