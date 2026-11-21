@@ -451,6 +451,26 @@ impl Taker {
     self.stage = stage;
   }
 
+  /// Names `log` among the intake's logs, once per log, charging its name.
+  fn note_logged(
+    &mut self,
+    log: Log<'_>,
+    store: &ContentStore,
+    admission: &mut Admission,
+  ) -> Result<(), Refused> {
+    if self.logged {
+      return Ok(());
+    }
+    let named = log_of(log);
+    admission.charge_items::<(LogOf, u32)>(1)?;
+    if let LogOf::File(path) = &named {
+      admission.charge(to_u64(path.len()))?;
+    }
+    self.intaken.logs.push((named, self.fork.len(store, log)));
+    self.logged = true;
+    Ok(())
+  }
+
   /// Takes one revision of `log` (module docs): passed over, or checked, rebuilt and kept.
   fn take(
     &mut self,
@@ -500,15 +520,7 @@ impl Taker {
       link: revision.link,
       text,
     };
-    if !self.logged {
-      let named = log_of(log);
-      admission.charge_items::<(LogOf, u32)>(1)?;
-      if let LogOf::File(path) = &named {
-        admission.charge(to_u64(path.len()))?;
-      }
-      self.intaken.logs.push((named, self.fork.len(store, log)));
-      self.logged = true;
-    }
+    self.note_logged(log, store, admission)?;
     let previous = self
       .last
       .as_ref()

@@ -4041,6 +4041,23 @@ impl Volume {
     self.state == VolumeState::Destroying
   }
 
+  /// What the volume's snapshots and a reader's hold kept, taken from them for destroy: their deadlists' objects.
+  fn kept_dead(&mut self) -> Vec<Dead> {
+    let mut queue = Vec::new();
+    let snapshots: Vec<SnapshotId> = self.snapshot_ids().collect();
+    for id in snapshots {
+      if let Ok(s) = self.snapshots.remove(snapshot_handle(id)) {
+        queue.extend(s.deadlist.items().iter().copied());
+      }
+    }
+    self.last_snapshot = None;
+    // What a reader's hold kept goes with the volume (A-827): no reader reads a volume being destroyed.
+    if let Some(mut hold) = self.hold.take() {
+      queue.extend(hold.deadlist.take());
+    }
+    queue
+  }
+
   /// Begins destroying the volume; the deadlists and the head's own objects are released in
   /// cooperative slices by [`Volume::destroy_step`].
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {
@@ -4070,18 +4087,7 @@ impl Volume {
     self.credit_retention(store, bytes, versions);
     // The volume's kept clean-file digests return their slots to the shard's digest budget (§4.15).
     self.release_digest_cache(store);
-    let mut queue = Vec::new();
-    let snapshots: Vec<SnapshotId> = self.snapshot_ids().collect();
-    for id in snapshots {
-      if let Ok(s) = self.snapshots.remove(snapshot_handle(id)) {
-        queue.extend(s.deadlist.items().iter().copied());
-      }
-    }
-    self.last_snapshot = None;
-    // What a reader's hold kept goes with the volume (A-827): no reader reads a volume being destroyed.
-    if let Some(mut hold) = self.hold.take() {
-      queue.extend(hold.deadlist.take());
-    }
+    let mut queue = self.kept_dead();
     // The head's own objects: every node, inode version and chunk it reaches.
     // A clone walks only what it made: nodes born after its origin's epoch.
     let since = self.origin_epoch;

@@ -778,6 +778,11 @@
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
 > its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> In flight, paused for goal 93 (2026-11-21): run 31 (cap 3, Studio-2, 9865bb832) found shard-mates took 4.5 s of the
+> busiest repository's 41.3 s span and its shard ran steps 23.2 s of it: its own three pushes of one agent shared one
+> turn. The fix (a turn an agent, spare turns taken; red first) is on branch agents/w-balance-turn-weights, 928df7d1b,
+> NOT on main: its A/B (run 31's shape, three rounds) never ran (adacachy at load 30+, fat-LTO builds timed out at 2-3 h;
+> thin-LTO builds planned). Cap 10 owed: needs about 13.4 GiB free.
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).
@@ -7507,6 +7512,12 @@
 >     mean of about 200 ms gives about 10³ verdicts a second at 1,000 clients (a round of about six requests a client),
 >     and about 20 ms gives about 10⁴. The run's own verdicts a second are the figure. The goal is met when a level at
 >     1,000 clients reads `met yes` at 10³ verdicts a second or more.
+>
+>     **89a, paused for goal 93 (2026-11-21, w-balance):** main's ruling: load_bench at 1,000 clients, main against main
+>     before A-400 (57ff29e53), release, quiet box, interleaved, best of N; if edit and merge are not under 1 ms, build a
+>     work whose client sits on its green's owner shard placed elsewhere, and A/B it. Not run: adacachy's fat-LTO builds
+>     timed out (3 h, load 29-31); next, thin-LTO builds once, the same harness in both arms (perf's handoff,
+>     agents/perf-handoff-g257).
 >
 >   The 10,000-client rung (same Studio, load 9.8 to 10.9, 313 connections) did not finish within its 30-minute bound.
 >   After 1,775 s about 2,170 of 10,000 clients were done and about 11,600 submits counted, with daemon RSS 17.6 GB.
@@ -24688,3 +24699,14 @@ forwards to the new owner were refused: `fleet.owner_location.route_dropped.refu
 reached it, and the flow failed at `live_chaos.rs:2465` ("the stream made a's log durable at 946, now 906"). The live log
 itself was whole on every node. Not worked by w-forming (Ada's close order); whether it reproduces on main after
 8e4da57ae is r19's replay.
+
+### 2026-11-21: Goal 85b, w-forming's two in-flight measurements (parked for goal 93)
+- **P4, A-827's release A/B (4a0cbd7b7):** the debug bench (Studio-4, 311 inodes, 9 interleaved rounds) gave the one-turn
+  image and encoding 598-849 us against the held capture's longest turn 36-66 us (first turn 6-10 us). The release rounds
+  are kiln run r3: `bash .git/w-forming-ab/p4.sh` (`cargo test --release -p slates-server --lib
+  bench_a_whole_publications_longest_turn -- --ignored --nocapture`); P4 closes on its numbers.
+- **C3, the chaos run:** recorded on c9c9554d8 (7/7 targeted flows, every invariant held; seeded nemesis 0/3 on progress,
+  no safety violation). The two causes in w-forming's code are fixed (bbdea3259, 8e4da57ae); the replay of seeds
+  1256052866610850298, 5939796479076166087, 10263252121351842258, 17757241901296347647, 8389754676365715562 and two fresh
+  draws is kiln run r19 (`SEEDS=... NEMESIS_RUNS=2 NEMESIS_ONLY=1 bash .git/w-forming-ab/c3.sh`). Seed
+  10263252121351842258's forwarding stall is the separate entry above.
