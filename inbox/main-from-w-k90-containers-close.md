@@ -1,6 +1,5 @@
-# w-k90-containers -> main: closed
-- Item: C1 / goal 90b, rewritten by main after Ada's ~21:00 correction; marked met by main on the MacBook evidence (r49, r56, r71).
-- Last fix: kiln main 9437e6430, the clippy fix (container.rs:301 rt::sleep -> rt::sleep_until; container_ab_tests.rs:253;
-  slates_fleet_live_move.rs:695). Test: `cargo clippy -p kiln --all-targets --locked -- -D warnings` red, then green (big Studio,
-  macOS aarch64); 65 kiln container unit tests pass. w-k90-pin-2 told.
-- Scratch deleted by exact path (see progress/w-k90-containers.md); b24c and adacachy leftovers listed there for main.
+# w-k90-containers -> main: closed (00:15, 2026-11-21)
+- Item: C1 / goal 90b. Proofs: Linux adacachy 2/2 (w-k90-a520 r3, 209e19dc6 = main f5056c0bb's code); macOS MacBook-Pro-2
+  Docker Desktop 2/2 (r4, 02f311ec3). Windows not run (jupiter r3 cancelled on your order). Earlier landing: kiln 9437e6430 (clippy).
+- Owed to the kiln engine rework task, unlanded: agents/w-k90-containers-export @ 02f311ec3 (Windows container route), the Mac A/B.
+- Scratch deleted everywhere (see progress/w-k90-containers.md); builds stopped; cargo 82510 gone.

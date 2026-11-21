@@ -229,3 +229,17 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
 ## For main to delete (I couldn't reach these): b24c (did not answer): ~/.cache/w-k90-containers-statepush, ~/.cache/wkc-state.bundle,
    ~/.cache/wkc-clippy.bundle (if there). adacachy (no room): any ~/.cache/w-k90-containers-*. This Studio: this state clone
    ~/fanout-state-w-k90-containers (in use until this push). MacBook images pulled for the A/B: rust:1.99.1-bookworm, node:24-bookworm.
+## 2026-11-21 ~00:15: goal re-set by the person at ~22:40; stopped again by main at 00:03 (Ada's 21:00 ruling)
+- Results: Linux adacachy PASSED (w-k90-a520's r3, kiln 209e19dc6 = main f5056c0bb's container code: container:: 2/2, 240.9 s).
+  macOS PASSED on MacBook-Pro-2, Docker Desktop 29.3.1 (my r4, kiln 02f311ec3: 2/2, 293 s; drift held Ask+Bypass; review,
+  person's landing by manifest (folder = agent's changes exactly, HEAD/index unchanged), end clean; 0 mounts/volumes/containers left).
+  No Studio could run it (Studio-3, the only Studio with Docker Desktop, wedged/unreachable; Studio-2 offline; this Studio colima only).
+  Windows NOT run: jupiter r3 cancelled by main's order while building.
+- OWED to the kiln engine rework task (NOT landed, per main): kiln branch agents/w-k90-containers-export @ 02f311ec3 -- the
+  Windows container route (seen_at: the container mounts/works at guest_path's /mnt/<drive>/...; uid 1000 on Windows, held::owner
+  bailing there; slates_e2e `mod container` cfg(any(unix, windows))). Unverified on Windows. Also owed: the bind-vs-export A/B on a
+  Mac (f5056c0bb's fixed harness); its release build reached 23 GB and stalled the big Studio (main stopped it). kiln has no GAPS file.
+## DELETED by exact path (00:15): big Studio ~/.cache/w-k90-containers-{target,target-ab,target-win,ship-exp,*.log}, ~/kiln-work/
+   w-k90-containers-kiln, /tmp/wkc-exp.*; MacBook ~/.cache/w-k90-containers-{e2e-exp,target}, ~/kiln-work/{w-k90-containers-kiln,
+   wkc-push}; jupiter ~/.cache/w-k90-containers-{target,win.log}, ~/kiln-work/w-k90-containers-win; adacachy ~/kiln-work/
+   w-k90-containers-lin, ~/.cache/w-k90-containers-{target,tmp,lin.log,live-build.log,live-test.log}. cargo 82510 had exited.
