@@ -97,35 +97,31 @@ fn turn_lent(state: &mut ShardState, id: RepositoryId, quantum_ns: u64) -> (Turn
   let mut deriving = deriving;
   let mut clock = ShardClock;
   let mut derived = 0u64;
-  let outcome = loop {
-    let quantum = Quantum {
-      clock: &mut clock,
-      ns: quantum_ns,
-    };
-    match repository.derive_turn(content, &mut deriving, quantum) {
-      Ok(Derived::More) => break Ok(Turned::More),
-      Ok(Derived::Sets {
-        green,
-        version,
-        sets,
-      }) => {
-        if let Err(refused) = repository.keep_derived(content, (green, version), &sets) {
-          break Err(refused);
-        }
+  let quantum = Quantum {
+    clock: &mut clock,
+    ns: quantum_ns,
+  };
+  let outcome = match repository.derive_turn(content, &mut deriving, quantum) {
+    Ok(Derived::More) => Ok(Turned::More),
+    Ok(Derived::Sets {
+      green,
+      version,
+      sets,
+    }) => match repository.keep_derived(content, (green, version), &sets) {
+      Err(refused) => Err(refused),
+      // A version kept ends the turn: its put was the turn's last unit.
+      Ok(_) => {
         derived = derived.saturating_add(1);
-        // A version kept ends the turn: its put was the turn's last unit.
-        break Ok(Turned::More);
+        Ok(Turned::More)
       }
-      // Done with the versions it queued; a push meanwhile may have left more, which the next turn queues.
-      Ok(Derived::Done) => {
-        break Ok(if repository.derivations_due() {
-          Turned::More
-        } else {
-          Turned::Idle
-        });
-      }
-      Err(refused) => break Err(refused),
-    }
+    },
+    // Done with the versions it queued; a push meanwhile may have left more, which the next turn queues.
+    Ok(Derived::Done) => Ok(if repository.derivations_due() {
+      Turned::More
+    } else {
+      Turned::Idle
+    }),
+    Err(refused) => Err(refused),
   };
   let answer = match outcome {
     Ok(Turned::More) => {

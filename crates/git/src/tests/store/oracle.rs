@@ -268,13 +268,16 @@ impl Model {
   }
 }
 
+/// A push committed: its objects, and its moves (each ref's position and where it moved to).
+pub(super) type CommittedPush = (Vec<Made>, Vec<(u64, Option<ObjectId>)>);
+
 /// The real side.
 pub(super) struct Real {
   pub(super) store: ContentStore,
   pub(super) repository: Repository,
   pub(super) clock: Ticks,
   /// Every push committed, in order: its objects and its moves, what a restart's replay commits again.
-  pub(super) pushes: Vec<(Vec<Made>, Vec<(u64, Option<ObjectId>)>)>,
+  pub(super) pushes: Vec<CommittedPush>,
 }
 
 impl Real {
