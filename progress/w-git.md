@@ -338,3 +338,11 @@
   main-from-w-git-layer2-decision.md), holding. Next on my side meanwhile: the checks' 16 s.
 - Diag kit on Studio-2: ~/.cache/w-git-diag/{cut,phase_cut,timeline2}_patch.py, push_repro.sh, slates-l2diag.
   Removed there: w-git-wt, w-git-wt2 (worktrees), w-git-target.noindex (8 GB).
+- 05:10 A-614 amended, (A), LANDED (40d961807 + docs 36883edbd, merge 30e89672f): creates, rewrites and fast-forwards
+  over sets never walked are admitted with no walk; sets derived on first read (store::Deriving, sliced, memoized, base
+  by search back); policy by git's two-colour walk; server derives before fetch and encode (vcs_store::git_derive);
+  replay walks nothing. git 587/587, server git set 188/188 on the merged tree.
+- NEXT (main 04:42): (2) the >1 s unit in the push decision (watchdog kills the daemon: shard 10 spinning 1,142 ms,
+  vcs_http.rs:1454): name it with a unit-length counter, red, slice it. r42 times each part of a decision step.
+  (3) path maps per created ref derived on first read (A-664/A-752), oracle + sliced/memoized + replay flat; red =
+  git/git push lands; then the A/B vs stock git. w-engine told (inbox/w-engine-from-w-git-path-maps.md).
