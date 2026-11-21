@@ -23,6 +23,11 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn open(dir: &Path) -> Store {
+  open_with(dir, 8 << 20)
+}
+
+/// Opens the store in `dir` lent `memory` bytes.
+fn open_with(dir: &Path, memory: usize) -> Store {
   let grant = StoreGrant {
     repository: 1,
     target: StoreRoot::identify(dir).unwrap(),
@@ -32,7 +37,7 @@ fn open(dir: &Path) -> Store {
   Store::open(
     root,
     Sizing {
-      memory: 8 << 20,
+      memory,
       disk: 1 << 30,
       extent_bytes: 128 << 10,
       fanout: 8,
@@ -235,5 +240,22 @@ fn a_staged_content_reads_the_same_in_flight_landed_and_recovered() {
   assert!(
     store.piece(&staging, &[7u8; 32], 3, 0).unwrap().is_none(),
     "an identity nothing holds"
+  );
+}
+
+/// A-767 item 7's sizing on a large machine (found by use, A-645 (a), 2026-11-20: every `repository create` with
+/// `--vcs-store` refused `Overloaded` on a Mac Studio, the store's engine answering "a memtable past 4 GiB" since a
+/// shard's reserve there is tens of GiB). Do: open a store lent 8 GiB of memory, past what a memtable's 32-bit offsets
+/// address; land a changeset; read it back. Expect the landing taken and its row read back: the memtable is bounded by
+/// what its offsets address, the rest of the loan unused by it.
+#[test]
+fn a_store_lent_more_memory_than_a_memtable_addresses_lands_and_reads() {
+  let dir = scratch("past-4-gib");
+  let mut store = open_with(&dir, 8 << 30);
+  let landed = land(&mut store, 9, 0, b"changeset");
+  let rows = store.changesets(9, 0, 10).unwrap();
+  assert_eq!(
+    rows.iter().map(|row| row.identity).collect::<Vec<_>>(),
+    [landed]
   );
 }

@@ -482,12 +482,19 @@ fn engine_sizing(
       extent_pages,
       max_extents,
     },
-    sizing.memory,
+    memtable_bytes(sizing.memory),
     TrunkConfig {
       fanout: sizing.fanout,
       leaf_entries,
     },
   ))
+}
+
+/// The memtable's bytes from the memory lent, `memory`: at most what its arena's 32-bit offsets address (mantle's
+/// `BTreeMem::new` refuses a larger arena, "a memtable past 4 GiB"). Until 2026-11-20 the whole loan was the memtable,
+/// so a shard's reserve of tens of GiB (a Mac Studio's) refused every landing (A-645 (a)'s run found it).
+fn memtable_bytes(memory: usize) -> usize {
+  memory.min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
 }
 
 /// The changeset row's key.
