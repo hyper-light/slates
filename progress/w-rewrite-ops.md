@@ -1,5 +1,12 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~08:45 PST — main 05:51: A-812's robustness gaps FIXED (A-813, main 8f4011a2e)
+- Holders take an owed version (the replica owes the same push). Retention is secured before the commit. Tail signatures
+  are kept.
+- Open: a version after an owed one at f > 0 waits for a holder's replica to be made (needs the git store on holders).
+  Asked of main and w-git.
+- Next: svn stage C, my half, against the proposed split.
+
 ## ~08:00 PST — P2's engine half LANDED (A-812, main 7e110566d)
 - An owing green is made when first reached, through one door, and equals the eager create by construction.
 - w-git told (inbox/w-git-from-w-rewrite-ops-p2-landed.md); main told (inbox/main-from-w-rewrite-ops-p2.md).
