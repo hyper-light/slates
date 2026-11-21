@@ -569,16 +569,15 @@ fn t_c2c_a_refused_import_names_what_landed_and_the_same_dump_resumes_after_it()
   });
 }
 
-/// Shape: the room a tight admission leaves the import of `full.dump`: past twice its largest revision's texts
-/// (revision 7's 106,750 bytes, whole in the content store and again in its increment: 214 KB) with what the import's
-/// records, green and content windows charge beside them, short of twice two such revisions (428 KB), so the batch lands
-/// before revision 8. 320 KiB left too little beside the texts when every test ran at once (`Budget { available: 61904 }`).
-const TIGHT_ROOM: u64 = 400 << 10;
+/// Shape: the admission a tight import of `full.dump` is held to: past twice its largest revision's texts (revision 7's
+/// 106,750 bytes, whole in the content store and again in its increment: 214 KB), short of twice two such revisions
+/// (428 KB), so the batch lands before revision 8.
+const TIGHT_ROOM: u64 = 320 << 10;
 
 /// C2 stage C, main's oracle of 2026-11-21 08:17 (the batch bounded by the import's admission) with conditions 1 and 2
 /// (a refusal names what landed; the same dump resumes, reading through what it holds). Do: import `full.dump` into one
-/// repository with the shard's room as it is; into another with only [`TIGHT_ROOM`] admittable (the rest withheld as
-/// the pressure hold withholds it, §4.2), first cut three bytes short, then whole. Expect: the roomy import one batch, no flush for admission; the
+/// repository with the shard's room as it is; into another with the import's admission held to [`TIGHT_ROOM`]
+/// (`svn_commit::staging::ADMISSION_CAP`, against what its batch holds), first cut three bytes short, then whole. Expect: the roomy import one batch, no flush for admission; the
 /// tight one's cut import refused naming revision 7 the last landed (its batch landed before revision 8 for
 /// admission, the batch after given up); its whole import resuming (revisions 0 to 7 read through, 8 to 13 committed);
 /// both histories `full.dump` byte for byte, at the same youngest revision.
@@ -598,12 +597,8 @@ fn t_c2c_imports_under_a_small_and_a_large_admission_end_alike_and_resume_after_
     assert_eq!(whole, Ok(FULL_LAST));
     assert_eq!(flushed(), 0, "a roomy import landed for admission");
     let (tight, _) = subversion("tight").await;
-    let held = on(|state| {
-      let held = state.store.budget.hold();
-      let withheld = state.store.admittable().saturating_sub(TIGHT_ROOM);
-      state.store.budget.set_hold(held.saturating_add(withheld));
-      held
-    });
+    let cap = &crate::repository::svn_commit::staging::ADMISSION_CAP;
+    cap.with(|cap| cap.set(Some(TIGHT_ROOM)));
     let cut = FULL.get(..FULL.len() - 3).expect("a shorter dump");
     let landed = match imported(tight, cut).await.0 {
       Err(LoadFailed::Refused {
@@ -620,7 +615,7 @@ fn t_c2c_imports_under_a_small_and_a_large_admission_end_alike_and_resume_after_
       .await
       .0
       .map(|loaded| (loaded.revisions, loaded.youngest));
-    on(|state| state.store.budget.set_hold(held));
+    cap.with(|cap| cap.set(None));
     assert_eq!(resumed, Ok((FULL_LAST - 7, FULL_LAST)));
     for repository in [roomy, tight] {
       assert!(

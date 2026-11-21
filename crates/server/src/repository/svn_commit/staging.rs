@@ -42,6 +42,15 @@ pub(crate) const FLUSHED_SECTIONS: &str = "repository.svn_import.flushed_section
 /// Counter: a batch landed at the import's end, or before a record that moves no version. Format: a counter name.
 pub(crate) const FLUSHED_END: &str = "repository.svn_import.flushed_end";
 
+#[cfg(test)]
+thread_local! {
+  /// A test's import admission (main's oracle of 2026-11-21 08:17): what the shard would admit the import, less what its
+  /// batch holds (its texts and its increments' post-state), where it is smaller than the shard's own. The shard's room
+  /// in a test process is shared by every test's daemon, so a tight room made by withholding capacity moved under the
+  /// import; this one does not. [`Staging::due_before`] reads it.
+  pub(crate) static ADMISSION_CAP: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// Why a batch lands now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Flush {
@@ -140,7 +149,18 @@ impl Staging {
       return Some(Flush::Sections);
     }
     let charge = brought(revision).saturating_mul(2);
-    (charge > state.store.admittable()).then_some(Flush::Admission)
+    let admittable = state.store.admittable();
+    #[cfg(test)]
+    let admittable = ADMISSION_CAP
+      .with(std::cell::Cell::get)
+      .map_or(admittable, |cap| {
+        let carried = self
+          .carried
+          .iter()
+          .fold(0u64, |total, text| total.saturating_add(text.len));
+        admittable.min(cap.saturating_sub(carried.saturating_add(self.held)))
+      });
+    (charge > admittable).then_some(Flush::Admission)
   }
 
   /// Stages `revision` (module docs): its texts put into the content store and named stored, its copies planned, then

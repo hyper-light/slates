@@ -97,6 +97,8 @@ pub(crate) struct Importing {
   staging: Option<Staging>,
   /// The stream ended with revisions staged: they land before the import ends ([`land_owed`]).
   flush_end: bool,
+  /// The import's holding was not admitted with revisions staged: they land before it reads on ([`land_owed`]).
+  flush_admission: bool,
 }
 
 impl std::fmt::Debug for Importing {
@@ -238,6 +240,7 @@ pub(crate) fn begin(
     base_owed: None,
     staging: None,
     flush_end: false,
+    flush_admission: false,
   };
   state.vcs_stores.svn_imports.insert(id, importing);
   state.count(STARTED, 1);
@@ -262,7 +265,11 @@ fn takes_import(state: &ShardState, id: RepositoryId) -> Result<(), LoadFailed> 
 pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Turned, LoadFailed>> {
   let mut importing = state.vcs_stores.svn_imports.remove(&id)?;
   // A record owed its landing first, or a base owed: the import reads on only from the records it made.
-  if importing.owed.is_some() || importing.base_owed.is_some() || importing.flush_end {
+  if importing.owed.is_some()
+    || importing.base_owed.is_some()
+    || importing.flush_end
+    || importing.flush_admission
+  {
     state.vcs_stores.svn_imports.insert(id, importing);
     return Some(Ok(Turned::More));
   }
@@ -275,7 +282,14 @@ pub(crate) fn turn(state: &mut ShardState, id: RepositoryId) -> Option<Result<Tu
       Ok(Unit::More) if slates_rt::futures::now_ns().saturating_sub(began) < spend => {}
       // A record handed over ends the turn: it lands before the import reads on ([`land_owed`]).
       Ok(Unit::More | Unit::Owed) => {
-        break charge_holding(state, &mut importing).map(|()| Turned::More);
+        let charged = charge_holding(state, &mut importing);
+        // A holding the shard cannot admit while revisions are staged lands them first (C2 stage C, bounded by the
+        // import's admission): the batch's charge goes with it, and the turn after charges what is left.
+        if charged.is_err() && importing.staging.is_some() {
+          importing.flush_admission = true;
+          break Ok(Turned::More);
+        }
+        break charged.map(|()| Turned::More);
       }
       Ok(Unit::Done) => break done(state, id, &importing).map(Turned::Done),
       Err(failed) => break Err(failed),
@@ -492,14 +506,19 @@ impl Importing {
 pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>> {
   let owed = crate::state::with_state(|state| {
     let importing = state.vcs_stores.svn_imports.get_mut(&id)?;
+    let flush = if core::mem::take(&mut importing.flush_admission) {
+      Some(Flush::Admission)
+    } else {
+      core::mem::take(&mut importing.flush_end).then_some(Flush::End)
+    };
     Some((
       importing.owed.take(),
-      core::mem::take(&mut importing.flush_end),
+      flush,
       importing.principal.clone(),
       importing.staging.take(),
     ))
   })??;
-  let (record, flush_end, principal, mut staging) = owed;
+  let (record, flush, principal, mut staging) = owed;
   let failed = |refusal: Uncommitted, revision: u64| match refusal {
     Uncommitted::Budget { available } => LoadFailed::Budget { available },
     refusal => LoadFailed::Uncommitted {
@@ -534,14 +553,14 @@ pub(crate) async fn land_owed(id: RepositoryId) -> Option<Result<(), LoadFailed>
         Err(refusal) => Err(failed(refusal, revision)),
       }
     }
-    // The stream's end: the revisions staged land before the import answers.
-    None if flush_end => match staging.take() {
-      Some(batch) => batch
-        .land(&principal, Flush::End)
+    // The stream's end, or a holding not admitted: the revisions staged land before the import answers or reads on.
+    None if flush.is_some() => match (staging.take(), flush) {
+      (Some(batch), Some(cause)) => batch
+        .land(&principal, cause)
         .await?
         .map(|_| false)
         .map_err(|refusal| failed(refusal, 0)),
-      None => Ok(false),
+      _ => Ok(false),
     },
     None => Ok(false),
   };
