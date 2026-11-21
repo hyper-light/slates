@@ -282,3 +282,20 @@ landing and its replay red first.
   - Red would be a tag lookup refused "a .hgtags text not read", or a stream or clone of a pushed repository failing
     verify.
 - **Next:** the intake's base text, waiting on w-perf's answer about intake.rs. Then step 2.
+
+## The push intake's file delta bases through the store, main's (b2): LANDED on origin/main 8f7d388d3 (2026-11-21)
+- **What it does:** a file delta whose base isn't the text kept last no longer reads the content store's whole text.
+  It is found in this order:
+  - the push's own cache (bounded by its room, let go per file group);
+  - otherwise rebuilt from the push's own deltas;
+  - otherwise read from the store between steps for a revision landed before the push (`Stepped::Store`).
+- **Drivers:** the push's sliced intake, and the recovery's and rebuild's piece replays (`answer_wants_over`, over the
+  disk alone).
+- **Counted:** `vcs.hg.push_base_hits` / `_rebuilds` / `_store_reads` and `vcs_store.hg_intake_base_asks`.
+- **Tests:** slates-hg 402/402 and server hg 71/71 on the merged tree. The new red is
+  `a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`.
+- **The b1/b2 A/B** is deferred under goal 93's order (performance last).
+- **Note:** the final push included a second merge of main, touching `hg_push.rs`. Its re-test is running now; if it
+  goes red I fix it at once.
+- **Next:** `push/tree.rs`, which needs your ruling (inbox/main-from-w-hg-tree-through-store.md). Meanwhile
+  `push/made.rs`, `push/verify.rs`, `Indexed::file`.
