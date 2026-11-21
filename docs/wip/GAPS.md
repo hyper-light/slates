@@ -493,13 +493,24 @@
 > - A/B (BENCHMARKS, "A length-preserving change walks one value"): at 10^5 versions, judge 65.4 to 22.5 µs and values
 >   228 to 1.6 a verdict.
 >
-> Left, found by A-809's design and NOT measured (corrected 2026-11-21; this line said "measured" in error):
-> - (a) A read of an earlier value resolves its anchor's layers. That is O(log + the layers over each piece), so a hot
->   range overwritten m times since a reader's version costs it m candidates. To measure: a rebase or old-version read's
->   time against m.
-> - (b) A path whose changes alternate overwrites and inserts flattens its layers at each insert. That is O(its history)
->   per insert, as every change cost before. To measure: `--preload` with inserts mixed in (the harness writes overwrites
->   only).
+> A-809's leftovers, MEASURED (2026-11-21, A-811; main's order of 04:11;
+> `crates/merge/examples/history_layers_bench.rs`, release, adas-mac-studio M3 Ultra, load 2.6–3.9):
+> - (a) A read of an earlier value through layers. Version 1 read after 10, 100, 1,000 and 10,000 overwrites of one
+>   range took 5.7, 15.7, 37.1 and 190.8 µs, since every layer over the range was examined. FIXED: a read takes each
+>   start offset's layers in number order only while they reach further, ending at the start's longest. Now 3.9, 3.3,
+>   1.7 and 5.9 µs. Red: `a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_overwritten`,
+>   1,000 layers examined, now at most 2 (`Green::history_layers_examined`).
+> - (b') Found while measuring: an SDK edit's same-length replacement (a delete and an insert at one offset) never took
+>   the layered path. It walked every value: 0.40, 2.33 and 12.63 ms a change at history 100, 1,000 and 5,000. FIXED:
+>   such a pair is an overwrite, checked byte for byte as any is. Now 3.1, 4.3 and 10.4 µs, one value. Red:
+>   `a_same_length_replacement_walks_one_value_however_long_its_history`, 300 values, now 1. The oracle generates such
+>   replacements now.
+> - (b) OPEN, measured: a path alternating overwrites and inserts re-anchors in full at each insert. That is A-793's
+>   cost, unchanged by A-809: 0.53, 3.6 and 17.5 ms a change at history 100, 1,000 and 5,000 (101, 551 and 2,551
+>   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. Its design
+>   is with main.
+> - Observed, not chased: overwrites and replacements that walk one value still take 2.6 to 9–10 µs a change over
+>   history 100 to 5,000. The growth is sublinear and comes from elsewhere in the submit.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three

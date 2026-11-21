@@ -17259,3 +17259,35 @@ bytes it overwrote as a layer and walks one value (`crates/merge/src/history.rs`
 - **Logs:** `~/.cache/w-rewrite-ops-ab-logs/run-<round>-<preload>-<side>.log` on adas-mac-studio. They are scratch and
   are deleted after this record.
 
+## A-809's leftovers measured: a read through layers, an SDK replacement, an insert (A-811; 2026-11-21)
+
+w-rewrite-ops, main's order of 04:11.
+
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench`.
+- **File:** one 16 KiB file, 64-byte edits, nothing folded (every version is history, as when a reader pins the floor).
+- **Rounds:** fastest of 5 rounds a point; each (b) point is the mean of 200 changes made after the history reaches its
+  length.
+- **Host:** adas-mac-studio (Apple M3 Ultra, 96 GiB), 04:09–04:23 PST.
+- **Builds:** before is main fd031603d, at load 1.7–2.8; after is the same plus A-811's two fixes, at load 2.6–4.0.
+
+| measure | point | before | after |
+|---|---|---|---|
+| (a) read of version 1 after m overwrites of one range | m = 10 | 5,750 ns | 3,917 ns |
+| | m = 100 | 15,708 ns | 3,292 ns |
+| | m = 1,000 | 37,125 ns | 1,709 ns |
+| | m = 10,000 | 190,750 ns | 5,875 ns |
+| (b') SDK replacement (delete + insert at one offset), a change | history 100 | 400,363 ns, 200.5 values | 3,087 ns, 1.0 |
+| | history 1,000 | 2,332,840 ns, 1,100.5 values | 4,270 ns, 1.0 |
+| | history 5,000 | 12,628,782 ns, 5,100.5 values | 10,398 ns, 1.0 |
+| (b) overwrite and insert alternating, a change | history 100 | 528,950 ns, 101 values | 524,655 ns, 101 |
+| | history 1,000 | 3,589,284 ns, 551 values | 3,599,576 ns, 551 |
+| | history 5,000 | 17,477,883 ns, 2,551 values | 17,526,648 ns, 2,551 |
+| overwrites alone, a change | history 100 | 2,568 ns, 1 value | 2,578 ns, 1 |
+| | history 1,000 | 3,607 ns, 1 value | 3,708 ns, 1 |
+| | history 5,000 | 9,034 ns, 1 value | 9,140 ns, 1 |
+
+- **(a) and (b'):** fixed (GAPS A-803's leftovers).
+- **(b):** open. An insert re-anchors in full, A-793's cost.
+- **The last rows:** a change that walks one value still grows sublinearly with the history. That cost is elsewhere in
+  the submit and is not chased.
+

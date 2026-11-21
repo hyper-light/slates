@@ -68,6 +68,9 @@
 //!   ([`Chunks::prune`]), so folding the values that read it frees it; an anchor freed frees its layers. A layer costs
 //!   its bytes (owned, as A-793's cut copied them) and its entries ([`LAYER_BYTES`], counted with the chunks, as a
 //!   value's list is).
+//! - *An SDK edit's replacement* (a delete and an insert of one length at one offset) is an overwrite there and takes
+//!   the layered path (A-811); a read takes each start's layers in number order only while they reach further, so a
+//!   range overwritten m times at one offset reads through one layer ([`Layers::candidates`], A-811).
 //! - *A block another holder keeps* (a branch's map, the identity table) is not named by a layer: the change copies
 //!   what it overwrote and lets its hold go, so the history holds the overwritten bytes whoever else holds the block
 //!   (the full re-anchor keeps such a block whole).
@@ -125,10 +128,55 @@ struct Layers {
   by_number: std::collections::BTreeMap<u32, Vec<usize>>,
   /// The longest layer held: a query for `[from, to)` scans the starts from `from` less this.
   longest: usize,
+  /// The longest layer at each start offset: a read takes a start's layers in number order only until one reaches it.
+  start_longest: std::collections::BTreeMap<usize, usize>,
   /// The next layer's number.
   next: u32,
   /// How many pieces name the anchor at each epoch below [`CURRENT`]: a layer numbered below the least is read by none.
   epochs: std::collections::BTreeMap<u32, usize>,
+}
+
+impl Layers {
+  /// The layers that may give a byte of `[start, end)` to a piece read at `epoch`, with how many were examined: each
+  /// start offset's layers from `epoch` on, in number order, kept only while each reaches further than those before it
+  /// (a byte at a start is given by the lowest-numbered layer there that covers it, so a layer no longer than an earlier
+  /// one gives nothing), a start's walk ending at its longest layer. A range overwritten m times at one offset is read
+  /// through one layer, not m (A-809's leftover (a)). O(the starts over the range × log).
+  fn candidates(
+    &self,
+    epoch: u32,
+    (start, end): (usize, usize),
+  ) -> (Vec<(u32, usize, Layer)>, u64) {
+    let mut found = Vec::new();
+    let mut examined = 0u64;
+    let mut cursor = start.saturating_sub(self.longest);
+    while let Some(at) = self
+      .by_start
+      .range((cursor, 0)..(end, 0))
+      .next()
+      .map(|((at, _), _)| *at)
+    {
+      let longest_here = self.start_longest.get(&at).copied().unwrap_or(usize::MAX);
+      let mut reached = 0usize;
+      for (&(_, number), layer) in self.by_start.range((at, epoch)..=(at, CURRENT)) {
+        examined = examined.saturating_add(1);
+        if layer.len > reached {
+          if at.saturating_add(layer.len) > start {
+            found.push((number, at, *layer));
+          }
+          reached = layer.len;
+        }
+        if reached >= longest_here {
+          break;
+        }
+      }
+      let Some(next) = at.checked_add(1) else {
+        break;
+      };
+      cursor = next;
+    }
+    (found, examined)
+  }
 }
 
 /// Format: the bytes one layer's entries cost (its record and its keys in both indexes), counted with the chunks.
@@ -192,9 +240,16 @@ pub(crate) struct Chunks {
   layers: std::collections::BTreeMap<usize, Layers>,
   /// The bytes the layers' entries cost ([`LAYER_BYTES`] each): retained, as a value's list is, never owned.
   entries: usize,
+  /// The layers reads have examined, in all: the non-vacuity counter of a read's cost through layers.
+  examined: std::cell::Cell<u64>,
 }
 
 impl Chunks {
+  /// The layers reads have examined, in all ([`Chunks::resolve_into`]).
+  pub(crate) fn layers_examined(&self) -> u64 {
+    self.examined.get()
+  }
+
   /// The bytes the live chunks hold, owned or named, and the layers' entries.
   pub(crate) fn bytes(&self) -> usize {
     self.bytes.saturating_add(self.entries)
@@ -368,10 +423,19 @@ impl Chunks {
         if let Some(layer) = layers.by_start.remove(&(start, number)) {
           gone.push(layer.chunk);
         }
+        if layers
+          .by_start
+          .range((start, 0)..=(start, CURRENT))
+          .next()
+          .is_none()
+        {
+          layers.start_longest.remove(&start);
+        }
       }
     }
     if layers.by_start.is_empty() {
       layers.longest = 0;
+      layers.start_longest.clear();
       if layers.epochs.is_empty() {
         layers.next = 0;
       }
@@ -410,15 +474,10 @@ impl Chunks {
     };
     let start = piece.at;
     let end = piece.at.saturating_add(piece.len);
-    let from = start.saturating_sub(layers.longest);
-    let mut found: Vec<(u32, usize, Layer)> = layers
-      .by_start
-      .range((from, 0)..(end, 0))
-      .filter(|((at, number), layer)| {
-        *number >= piece.epoch && at.saturating_add(layer.len) > start
-      })
-      .map(|((at, number), layer)| (*number, *at, *layer))
-      .collect();
+    let (mut found, examined) = layers.candidates(piece.epoch, (start, end));
+    self
+      .examined
+      .set(self.examined.get().saturating_add(examined));
     found.sort_unstable_by_key(|(number, _, _)| *number);
     let mut uncovered = vec![(start, end)];
     let mut painted: Vec<(usize, Piece)> = Vec::new();
@@ -1319,6 +1378,8 @@ fn overlay(
     );
     layers.by_number.entry(number).or_default().push(*start);
     layers.longest = layers.longest.max(layer_len);
+    let at_start = layers.start_longest.entry(*start).or_default();
+    *at_start = (*at_start).max(layer_len);
   }
   let layers = chunks.layers.entry(anchor).or_default();
   layers.next = number.saturating_add(1);
@@ -1360,12 +1421,16 @@ fn overlay(
   })
 }
 
-/// The byte ranges `ops` overwrite in a file of `len` bytes, in order and merged where they touch: `None` where an op
-/// is anything but an overwrite inside the file, where the ops are out of order, or where they write nothing.
+/// The byte ranges `ops` overwrite in a file of `len` bytes, in order and merged where they touch: an overwrite's, or a
+/// same-length replacement's (a delete and an insert of its length at its offset, as an SDK edit composes it). `None`
+/// where an op is anything else or lies past the file, where the ops are out of order, or where they write nothing.
 fn overwritten(ops: &[Op], len: usize) -> Option<Vec<(usize, usize)>> {
   let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(ops.len());
-  for op in ops {
-    if op.kind != OpKind::Overwrite {
+  let mut ops = ops.iter().peekable();
+  while let Some(op) = ops.next() {
+    if replaced_here(op, ops.peek().copied()) {
+      ops.next();
+    } else if op.kind != OpKind::Overwrite {
       return None;
     }
     let start = usize::try_from(op.at).ok()?;
@@ -1383,6 +1448,14 @@ fn overwritten(ops: &[Op], len: usize) -> Option<Vec<(usize, usize)>> {
     }
   }
   (!ranges.is_empty()).then_some(ranges)
+}
+
+/// Whether `op` and `next` are a same-length replacement at one offset, a delete and an insert of its length, as an SDK
+/// edit composes one ([`overwritten`]): an overwrite there, which the caller checks byte for byte against the new block.
+fn replaced_here(op: &Op, next: Option<&Op>) -> bool {
+  op.kind == OpKind::Delete
+    && next
+      .is_some_and(|next| next.kind == OpKind::Insert && next.at == op.at && next.len == op.len)
 }
 
 /// Every value of `values` whose pieces read an anchor through its layers rebuilt of concrete runs ([`Value::concrete`]),

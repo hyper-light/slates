@@ -3459,6 +3459,11 @@ impl Green {
     self.history_reanchored
   }
 
+  /// The anchor layers reads of earlier values have examined, in all (A-809): what a read through layers costs.
+  pub fn history_layers_examined(&self) -> u64 {
+    self.chunks.layers_examined()
+  }
+
   /// The history values re-anchors walked in all (A-803): divided by the re-anchored changes, the values a change walks.
   pub fn history_reanchored_values(&self) -> u64 {
     self.history_reanchored_values

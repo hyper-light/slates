@@ -271,6 +271,19 @@ fn step_increment(step: &Step, path: &str, version: u64, bytes: &[u8]) -> (Incre
   let len = usize::from(len % 24);
   let mut next = bytes.to_vec();
   let post = vec![fill; len];
+  if kind % 5 == 4 {
+    // A same-length replacement as an SDK edit composes it: a delete and an insert at one offset.
+    let len = len.min(file_len - at);
+    next[at..at + len].copy_from_slice(&post[..len]);
+    let ops = [
+      (OpKind::Delete, at as u64, len as u64),
+      (OpKind::Insert, at as u64, len as u64),
+    ];
+    let mut inc = increment(0, version - 1, path, &ops, &post[..len]);
+    inc.doc.ops[1].src = 0;
+    inc.id[..8].copy_from_slice(&version.to_le_bytes());
+    return (inc, next);
+  }
   let (op, post): ((OpKind, u64, u64), Vec<u8>) = match kind % 4 {
     // Overwrites most often, as agents' edits and the load harness's are.
     0 | 1 => {
@@ -379,6 +392,131 @@ proptest::proptest! {
     // Non-vacuity: the layered twin walked no more values than the full one (each walks one per change it takes).
     proptest::prop_assert!(
       twins[0].green.history_reanchored_values() <= twins[1].green.history_reanchored_values()
+    );
+  }
+}
+
+/// Submits a same-length replacement of `bytes` at `at`, composed as an SDK edit composes it (a delete and an insert at
+/// one offset), as version `version`; the file's new bytes.
+fn replace_long(
+  green: &mut Green,
+  version: u64,
+  (at, bytes): (u64, &[u8]),
+  previous: &[u8],
+) -> Vec<u8> {
+  let len = u64::try_from(bytes.len()).unwrap();
+  let mut inc = increment(
+    0,
+    version - 1,
+    "f",
+    &[(OpKind::Delete, at, len), (OpKind::Insert, at, len)],
+    bytes,
+  );
+  // The delete names no post-state bytes: the insert's are the increment's from its start.
+  inc.doc.ops[1].src = 0;
+  inc.id[..8].copy_from_slice(&version.to_le_bytes());
+  assert_eq!(green.submit(&inc), Outcome::Accepted { version });
+  let mut next = previous.to_vec();
+  let from = usize::try_from(at).unwrap();
+  next[from..from + bytes.len()].copy_from_slice(bytes);
+  next
+}
+
+/// A-809's leftover (b') (main 04:11, measured: an SDK edit's same-length replacement walked 5,100 values a change at a
+/// history of 5,000). Do: create a 16 KiB file, then replace 8 bytes of it in each of 300 versions as an SDK edit
+/// composes it, a delete and an insert at one offset. Expect: the last replacement walks one value; every version reads
+/// back; the history owns only the bytes replaced; the totals equal their recount.
+#[test]
+fn a_same_length_replacement_walks_one_value_however_long_its_history() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 300;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first.clone()];
+  let mut walked_last = 0;
+  for version in 2..=VERSIONS + 1 {
+    let at = (version * 50) % (len - 8);
+    let bytes = [u8::try_from(version % 256).unwrap() ^ 0x3c; 8];
+    let before = green.history_reanchored_values();
+    let next = replace_long(&mut green, version, (at, &bytes), versions.last().unwrap());
+    walked_last = green.history_reanchored_values() - before;
+    versions.push(next);
+  }
+  assert_eq!(
+    walked_last, 1,
+    "the last replacement walked {walked_last} values"
+  );
+  for (index, bytes) in versions.iter().enumerate() {
+    let version = u64::try_from(index).unwrap() + 1;
+    assert_eq!(
+      green.content_ref_at("f", version).as_deref(),
+      Some(bytes.as_slice()),
+      "version {version}"
+    );
+  }
+  assert_eq!(
+    green.history_owned_bytes(),
+    usize::try_from(VERSIONS).unwrap() * 8,
+    "only the replaced bytes"
+  );
+  balanced(&green);
+}
+
+/// A-809's leftover (a) (main 04:11, measured: a read of version 1 took 5.7 µs after 10 overwrites of one range and
+/// 191 µs after 10,000). Do: create a 16 KiB file, overwrite the same 64 bytes of it in each of 1,000 versions, then read
+/// version 1 whole. Expect: the read examines a layer or two at that offset, not one a version (the lowest numbered at
+/// or after its epoch gives every byte there), and reads back exactly; so does every 100th version.
+#[test]
+fn a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_overwritten() {
+  const LEN: usize = 16 * 1024;
+  const VERSIONS: u64 = 1_000;
+  let first: Vec<u8> = (0..LEN).map(|n| u8::try_from(n % 251).unwrap()).collect();
+  let mut green = Green::new();
+  let len = u64::try_from(LEN).unwrap();
+  let made = green.submit(&increment(
+    1,
+    0,
+    "f",
+    &[(OpKind::Create, 0, 0), (OpKind::Insert, 0, len)],
+    &first,
+  ));
+  assert_eq!(made, Outcome::Accepted { version: 1 });
+  let mut versions = vec![first.clone()];
+  for version in 2..=VERSIONS + 1 {
+    let bytes = [u8::try_from(version % 256).unwrap(); 64];
+    let next = overwrite_long(
+      &mut green,
+      version,
+      (4096, &bytes),
+      versions.last().unwrap(),
+    );
+    versions.push(next);
+  }
+  let before = green.history_layers_examined();
+  assert_eq!(
+    green.content_ref_at("f", 1).as_deref(),
+    Some(first.as_slice())
+  );
+  let examined = green.history_layers_examined() - before;
+  assert!(
+    examined <= 2,
+    "reading version 1 examined {examined} layers"
+  );
+  for version in (1..=VERSIONS + 1).step_by(100) {
+    let index = usize::try_from(version - 1).unwrap();
+    assert_eq!(
+      green.content_ref_at("f", version).as_deref(),
+      Some(versions[index].as_slice()),
+      "version {version}"
     );
   }
 }

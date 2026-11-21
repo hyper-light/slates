@@ -59168,3 +59168,22 @@ Applied in the same change to:
     65.4 to 22.5 µs, values 228 to 1.6 a verdict, verdicts/s 4,851–5,178 to 5,684–5,961; oracle failures 0 in all 18
     runs.
 - **Cost moved to reads.** An earlier value's read resolves its anchor's layers (GAPS A-803 (a)).
+
+### A-811 — An SDK edit's same-length replacement takes the layered anchor, and a read takes one layer a start (2026-11-21, w-rewrite-ops; main 04:11 PST: A-809's leftovers measured; A-809)
+Applied in the same change to:
+- `crates/merge/src/history.rs`: `overwritten`'s replacements, `replaced_here`, `Layers::candidates`, `start_longest`,
+  and the examined counter.
+- `crates/merge/src/engine.rs`: `Green::history_layers_examined`.
+- `crates/merge/src/engine/history_block_tests.rs`: two reds, and replacements in the oracle.
+- `crates/merge/examples/history_layers_bench.rs` (new), GAPS (A-803), BENCHMARKS.
+
+What changed:
+- **An SDK edit's same-length replacement.** An SDK composes it as a delete and an insert of one length at one offset.
+  That is an overwrite there, so it takes the layered anchor; the new block is checked byte for byte as any overwrite's
+  is. It had walked every value of its path: 12.6 ms a change at a history of 5,000, against 10.4 µs now.
+- **A read through layers.** A read takes each start offset's layers from its epoch in number order, only while one
+  reaches further than those before. A byte at a start is the lowest-numbered layer covering it, so a range overwritten
+  m times at one offset is read through one layer: 191 µs at m = 10^4 before, 5.9 µs now.
+- **Measured and left open (GAPS):** an insert or a delete still re-anchors in full (17.5 ms a change at a history of
+  5,000 when overwrites and inserts alternate). The fix is layers that carry an offset shift.
+
