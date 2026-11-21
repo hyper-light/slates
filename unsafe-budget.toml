@@ -767,6 +767,8 @@ slates-vcs = 0
 # slates-store (0): the store's changeset log and rows (A-767): records read and written by checked offsets and `get`
 #   through hyper_block's files and mantle's engine; no FFI of its own.
 slates-store = 0
+# slates-pace (0): the paced step's estimates and its probe (A-783): arithmetic on integers, no FFI, no maps.
+slates-pace = 0
 # slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
 #   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
 slates-ssh = 0
