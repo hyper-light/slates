@@ -10382,8 +10382,7 @@ fn judge_submission(
   else {
     return refused(Refusal::NotFound);
   };
-  let bound =
-    slates_merge::chain_entry::entry_bound(increment_bytes.len(), &inc).saturating_add(room);
+  let bound = slates_merge::chain_entry::entry_bound(&inc).saturating_add(room);
   let admission = Op::GreenAdvanced {
     green: green_id,
     increment: vec![0; bound],
@@ -10410,18 +10409,38 @@ fn judge_submission(
   if let Err(available) = secure_retention(state, green_id, secured) {
     return refused(Refusal::BudgetExceeded { available });
   }
+  // The increment is held in the shard's content store, where its chain entry names it (lane (A), chain entry format
+  // 6): before the verdict, so an accepted version is always recorded, and refused typed at the shard's room. A verdict
+  // that accepts nothing gives back what this hold stored.
+  let next = state.db.partition().green_head(green_id).saturating_add(1);
+  let held = match crate::merge_service::hold_increment(state, green_id, next, &increment_bytes) {
+    Ok(held) => held,
+    Err(refusal) => {
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
+      return refused(refusal);
+    }
+  };
   let verdict_start = state.clock.monotonic_ns();
   // A verdict a holder computed (A-697 part c) is taken by position; any other is judged here.
   let Some(judged) = verdict_of(state, green_id, sealed, &inc) else {
+    crate::merge_service::release_refused_increment(state, green_id, held);
     return refused(Refusal::NotFound);
   };
   let (outcome, applied) = match judged {
     Ok(judged) => judged,
     Err(reason) => {
+      crate::merge_service::release_refused_increment(state, green_id, held);
       let _ = crate::merge_service::settle_green_retention(state, green_id);
       return refused(Refusal::BadRequest { reason });
     }
   };
+  if !matches!(
+    &outcome,
+    slates_merge::engine::Outcome::Accepted { .. }
+      | slates_merge::engine::Outcome::Identical { .. }
+  ) {
+    crate::merge_service::release_refused_increment(state, green_id, held);
+  }
   if sealed.computed.is_some() {
     state.count(TAKEN_BY_POSITION, 1);
   }
@@ -10461,6 +10480,7 @@ fn judge_submission(
       let copies = crate::vcs_store::svn_made::copies_of(&inc);
       // The wait goes first, in this transaction, so a version is never durable without it (A-252).
       if let Err(e) = crate::merge_service::stage_awaiting(state, green_id, version) {
+        crate::merge_service::release_refused_increment(state, green_id, held);
         return refused(refusal_of_db(&e));
       }
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
@@ -10472,9 +10492,10 @@ fn judge_submission(
         state,
         (green_id, sealed.work),
         version,
-        (&increment_bytes, &inc),
+        (held.inputs, &inc),
         (applied.as_deref(), &signed.verification),
       ) {
+        crate::merge_service::release_refused_increment(state, green_id, held);
         return refused(refusal);
       }
       let appended = state.clock.monotonic_ns().saturating_sub(append_start);
@@ -10587,7 +10608,10 @@ fn record_accepted(
   state: &mut ShardState,
   (green, work): (DbVolumeId, DbVolumeId),
   version: u64,
-  (increment_bytes, increment): (&[u8], &slates_merge::engine::Increment),
+  (inputs, increment): (
+    slates_merge::chain_entry::Inputs,
+    &slates_merge::engine::Increment,
+  ),
   (applied, verification): (
     Option<&[slates_merge::chain_entry::Applied]>,
     &slates_ipc::protocol::Verification,
@@ -10605,7 +10629,7 @@ fn record_accepted(
     })
     .flatten();
   let entry = slates_merge::chain_entry::encode(
-    increment_bytes,
+    inputs,
     increment,
     applied.unwrap_or_default(),
     crate::merge_service::SubmitCompletion::of_current(state, work)
@@ -10618,6 +10642,9 @@ fn record_accepted(
     green,
     increment: entry,
   };
+  // The entry names content the store must hold across a kill: the append is durable in the segment when it returns, the
+  // hold only once a publication commits its image, so the hold is published first (lane (A), condition 1).
+  publish_held_increments(state)?;
   let now = state.clock.monotonic_ns();
   state
     .db
@@ -10632,6 +10659,24 @@ fn record_accepted(
     engine.record_signature(version, signature);
   }
   Ok(())
+}
+
+/// Publishes the shard when its content store changed since its last publication (chain entry format 6): what an entry
+/// about to be appended names must be in the committed image first, since the append is durable at once and a kill
+/// before the next publication would leave the entry naming content the restarted store lacks. A refused publication
+/// refuses the append, and a green whose engine committed the version it would have recorded is made again from its
+/// durable checkpoint and chain, as after any refused publication (A-721, [`remake_greens_ahead`]).
+pub(crate) fn publish_held_increments(state: &mut ShardState) -> Result<(), Refusal> {
+  // A shard with no content object keeps no image (a degraded build): nothing it holds survives it, so there is no
+  // order to keep.
+  let (start, end) = state.content_range;
+  if state.held_content.changed_pieces().is_empty() || state.content.is_none() || end <= start {
+    return Ok(());
+  }
+  publish_shard(state).map(|_| ()).map_err(|e| {
+    remake_greens_ahead(state);
+    refusal_of_vfs(&e)
+  })
 }
 
 fn chain_admits(
@@ -18151,6 +18196,13 @@ pub(crate) async fn rebuild_recovered(
   )
   .await;
   rebuilt.blocks_swept = sweep_claims(state, claims);
+  // An increment held for a version whose entry a kill kept from its append names nothing (chain entry format 6): it
+  // goes, as every held increment no entry names does.
+  let greens: Vec<DbVolumeId> = state.greens.keys().copied().collect();
+  for green in greens {
+    let floor = state.db.partition().green_floor(green);
+    crate::merge_service::release_unnamed_increments(state, green, floor, None);
+  }
   slices.unit_done().await;
   // The objects the anchor held are taken back first, at the handles their backings had and dormant through the
   // replay, since each already holds every write the dead daemon made, in order with the stores made through it: the
@@ -18679,7 +18731,23 @@ async fn rebuild_green_sliced(
   if load_steps > 0 {
     state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
   }
+  count_resolved(state, &replayed);
   install_green(state, record, replayed)
+}
+
+/// Counts the versions a replay applied, each with its increment read from the content store (chain entry format 6).
+fn count_resolved(
+  state: &mut ShardState,
+  replayed: &Result<ReplayedGreen, crate::merge_service::GreenFence>,
+) {
+  if let Ok((_, versions)) = replayed
+    && !versions.is_empty()
+  {
+    state.count(
+      crate::merge_service::CHAIN_INPUTS_RESOLVED,
+      u64::try_from(versions.len()).unwrap_or(u64::MAX),
+    );
+  }
 }
 
 /// A green's place in its lineage's join order (A-575): 0 for a green no lineage holds.
@@ -18712,6 +18780,7 @@ async fn rebuild_member_sliced(
     if load_steps > 0 {
       state.count(GREEN_ORIGIN_LOAD_STEPS, load_steps);
     }
+    count_resolved(state, &replayed);
     return install_member_root(state, record, member, replayed);
   };
   let Some(seeded) = begin_member_branch(state, record, (from, version)) else {
@@ -19187,8 +19256,14 @@ fn replay_chain_entry(
       let Some(bytes) = state.db.partition().green_chain(id).get(*next) else {
         return Ok(true);
       };
+      // The increment the entry names, from the content store it was held in before its entry was appended (chain entry
+      // format 6): one the store lacks fences the green, as a corrupt entry does.
+      let inputs = slates_merge::chain_entry::inputs(bytes)
+        .map_err(|_| GreenFence::EntryCorrupt { version })?;
+      let increment = crate::merge_service::increment_of(state, id, &inputs)
+        .ok_or(GreenFence::ContentMissing { version })?;
       Box::new(
-        slates_merge::chain_entry::decode(bytes)
+        slates_merge::chain_entry::decode(bytes, &increment)
           .map_err(|_| GreenFence::EntryCorrupt { version })?,
       )
     }

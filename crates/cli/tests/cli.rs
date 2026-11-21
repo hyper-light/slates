@@ -7213,8 +7213,59 @@ impl HeldMount {
   }
 }
 
+/// Lane (A) by reference, condition 1 (main's ruling of 2026-11-21 00:52 PST; chain entry format 6): a version's
+/// increment is held in its owner shard's content store, in the anchor-held segment beside the partition's log, and the
+/// version's chain entry names it there by its inputs identity. Do: on an anchored daemon, keep a second work at the
+/// green's version 0 (so its chain cannot fold), land a 64 KiB file as version 1, then `kill -9` the daemon and let the
+/// anchor restart it. Expect: the submit held the increment in the content store
+/// (`merge.inputs.held_by_owner`), the restarted daemon's recovery replayed version 1 with its increment read from that
+/// store (`merge.chain.inputs_resolved`), and the head reads the file's bytes. Failing first: the entry carried the
+/// increment's bytes, and neither count existed.
+#[cfg(unix)]
+#[test]
+fn an_owners_unfolded_version_is_read_from_its_content_store_after_a_kill() {
+  let instance = format!("cli-byref-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(&instance, &["green", "byref"]);
+  assert_eq!(code, 0, "{err}");
+  let green = value_of(&out, "id");
+  let (code, _, err) = run(&instance, &["work", &green, "byrefheld"]);
+  assert_eq!(code, 0, "the work that keeps version 0 reachable: {err}");
+  let (code, out, err) = run(&instance, &["work", &green, "byref1"]);
+  assert_eq!(code, 0, "{err}");
+  let work = value_of(&out, "id");
+  let body = "by-reference-".repeat(64 * 1024 / 13);
+  let (code, _, err) = run(&instance, &["edit", &work, "/f.txt", "0", "0", &body]);
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(&instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"accepted\":true"), "accepted: {out}");
+  let (code, status, err) = run(&instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    status.contains("\"merge.inputs.held_by_owner\""),
+    "the submit held its increment in the owner's content store: {status}"
+  );
+  let killed = kill_the_daemon(&instance);
+  let restarted = await_daemon(&instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves");
+  let (code, status, err) = run(&instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    status.contains("\"merge.chain.inputs_resolved\""),
+    "the recovery read version 1's increment from the content store: {status}"
+  );
+  let (code, read, err) = run(&instance, &["read", &green, "/f.txt"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    read == body,
+    "the head reads the version's file after the kill ({} bytes read)",
+    read.len()
+  );
+}
+
 /// `SIGKILL`s the instance's daemon; its pid.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn kill_the_daemon(instance: &str) -> u32 {
   let killed = daemon_pid(instance).expect("the daemon answers");
   let killed_it = Command::new("kill")
