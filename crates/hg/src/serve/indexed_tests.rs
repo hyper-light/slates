@@ -104,7 +104,6 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
-    stored_logs: true,
   }
 }
 
@@ -321,7 +320,9 @@ fn texts_of(
 #[test]
 fn a_clone_over_the_view_carries_its_changesets_each_text_lent_once_in_place() {
   let (imported, store) = imported("states");
-  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+  let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+    .unwrap()
+    .answering_from_its_texts();
   assert_eq!(
     view.lends(),
     Lends {
@@ -450,7 +451,6 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
-    stored_logs: true,
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -761,7 +761,6 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
-    stored_logs: true,
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -1018,7 +1017,6 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
-    stored_logs: true,
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1260,7 +1258,9 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
   let mut walked = 0;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }
@@ -1268,7 +1268,7 @@ fn a_full_clone_walked_by_its_links_carries_what_the_namers_name() {
     let outgoing = pull::outgoing(&view, b"", b"", &mut room()).unwrap();
     let by_links = changegroup(&view, &outgoing, Version::V03, &mut room()).unwrap();
     let named =
-      super::super::getbundle::named_changegroup(&view, &outgoing, Version::V03, &mut room())
+      super::super::getbundle::named_changegroup_whole(&view, &outgoing, Version::V03, &mut room())
         .unwrap();
     assert_eq!(carried(&by_links), carried(&named), "{name}");
     assert!(!carried(&by_links).is_empty(), "{name}");
@@ -1360,7 +1360,9 @@ fn a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta() {
   let mut deltas = 0usize;
   for name in ["amended-root", "divergent", "states"] {
     let (imported, store) = imported(name);
-    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room()).unwrap();
+    let view = Indexed::new(&imported.index, &store, state_of(&imported), &mut room())
+      .unwrap()
+      .answering_from_its_texts();
     if !view.serves_every_changeset() {
       continue;
     }

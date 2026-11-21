@@ -408,12 +408,6 @@ pub(crate) struct HgStore {
   /// (046628f88), then each push's, taken in turn on this shard ([`VcsStores::next_changeset`]) and read back from the
   /// register's references at recovery.
   pub(crate) landed: u64,
-  /// Whether its index holds revisions the changeset store does not keep: an import's, a made changeset's, or a push's
-  /// whose record holds its revisions inline (one landed before A-767 C4); w-hg's C1 steps 3 and after land imports as
-  /// changesets. Such a repository advertises no stream clone, since its stream sends each revision as the store keeps
-  /// it (`slates_hg::serve::indexed::State::stored_logs`; goal 93 perf). A push replayed from the changeset log keeps
-  /// its revisions in the store, so leaves it as it was.
-  pub(crate) unstored: bool,
 }
 
 /// A Subversion repository's store: its records, beside its one green (A-655 part 2b; module docs, "Subversion").
@@ -3062,11 +3056,9 @@ fn with_released(
 /// payload's pieces, [`hg_piece_step`]).
 #[derive(Clone, Copy)]
 enum HgSource<'a> {
-  /// A record the register holds whole.
+  /// A record the register holds whole, or an import's segment record read back from the changeset log (A-767 C1 step
+  /// 3).
   Record(&'a [u8]),
-  /// An import's segment record read back from the changeset log (A-767 C1 step 3): its revisions are the store's, so
-  /// replaying it leaves the repository stored.
-  Segment(&'a [u8]),
 }
 
 /// [`hg_record_step`] over the stores.
@@ -3077,7 +3069,7 @@ fn hg_step_in(
   replay: Option<slates_hg::import::record::Replay>,
   deadline_ns: u64,
 ) -> Result<HgStep, ReplayRefused> {
-  let (HgSource::Record(bytes) | HgSource::Segment(bytes)) = source;
+  let HgSource::Record(bytes) = source;
   let unheld = ReplayRefused::Git(GitRefused::NoStore);
   let content = stores.content.as_mut().ok_or(unheld.clone())?;
   let Some(RepositoryStore::Mercurial(store)) = stores.entries.get_mut(&id) else {
@@ -3097,9 +3089,6 @@ fn hg_step_in(
       let replayed = replay
         .finish(&mut store.index, content)
         .map_err(ReplayRefused::Mercurial)?;
-      if matches!(source, HgSource::Record(_)) {
-        store.unstored = true;
-      }
       replayed_hg(store, &replayed).map(|_| HgStep::Stepped(None))
     }
     Err(refused) => {
@@ -3147,7 +3136,6 @@ fn replay_hg(
 ) -> Result<u64, ReplayRefused> {
   let replayed = slates_hg::import::record::replay(bytes, &mut store.index, content)
     .map_err(ReplayRefused::Mercurial)?;
-  store.unstored = true;
   replayed_hg(store, &replayed)
 }
 
@@ -3557,7 +3545,7 @@ fn hg_segment_step(
     hg_step_in(
       lent.stores,
       id,
-      HgSource::Segment(bytes),
+      HgSource::Record(bytes),
       replay,
       deadline_ns,
     )
@@ -4454,14 +4442,23 @@ fn record_unit(
 
 /// Hands `read` the objects a green's owed push reads (P2, `crate::green_ready`): the store of the tool `repository` is
 /// in, as a push's work is built from it, handed over rather than returned so a view borrowing the shard's state
-/// outlives nothing. Git's view lands with w-git's half of P2 (`PushedObjects` over an empty push, which reads the
-/// repository's committed objects); until then none, and a green that owes a push answers its readers
-/// `ContentUnavailable`. Whether there were any.
+/// outlives nothing. For git, the push's own view over an empty push (`PushedObjects`), which reads every object from
+/// the repository's committed index once the push that brought them landed: the objects the eager create's build read
+/// from the same index and the push's quarantine. Its caller lends the stores room and the shard's chunk store first
+/// (`vcs_store::with_room`), as a push's build has them: the pack's windows are read from that chunk store, and its
+/// parses are admitted the lent room. None for another tool's repository, or a store not held here, whose owing green
+/// answers its readers `ContentUnavailable`. Whether there were any.
 pub(crate) fn with_owed_push_objects(
   state: &crate::state::ShardState,
   repository: Option<RepositoryId>,
   read: &mut dyn FnMut(&dyn slates_merge::push::PushObjects),
 ) -> bool {
-  let _ = (state, repository, read);
-  false
+  let Some((content, git)) = repository.and_then(|repository| state.vcs_stores.git_ref(repository))
+  else {
+    return false;
+  };
+  let empty = Push::new(git.repository.format());
+  let objects = slates_git::store::views::PushedObjects::new(&git.repository, content, &empty);
+  read(&objects);
+  true
 }

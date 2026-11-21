@@ -305,19 +305,27 @@ impl crate::render::StoreWants for Producing {
   fn wants(&self) -> Option<&crate::render::Want> {
     match self {
       Producing::Revlogs(streaming) => streaming.wants(),
-      Producing::Bundle(_) => None,
+      Producing::Bundle(answering) => answering.wants(),
     }
   }
 
   fn give_rows(&mut self, rows: Vec<Vec<Option<crate::render::StoredRevision>>>) {
-    if let Producing::Revlogs(streaming) = self {
-      streaming.give_rows(rows);
+    match self {
+      Producing::Revlogs(streaming) => streaming.give_rows(rows),
+      Producing::Bundle(answering) => answering.give(super::getbundle::Given::Rows(rows)),
     }
   }
 
   fn give_chunks(&mut self, chunks: Vec<Vec<u8>>) {
-    if let Producing::Revlogs(streaming) = self {
-      streaming.give_chunks(chunks);
+    match self {
+      Producing::Revlogs(streaming) => streaming.give_chunks(chunks),
+      Producing::Bundle(answering) => answering.give(super::getbundle::Given::Chunks(chunks)),
+    }
+  }
+
+  fn give_texts(&mut self, texts: Vec<Vec<u8>>) {
+    if let Producing::Bundle(answering) = self {
+      answering.give(super::getbundle::Given::Texts(texts));
     }
   }
 }

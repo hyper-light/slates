@@ -7977,6 +7977,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > Since 2026-11-21 (g228) each hop also keeps a bounded per-write histogram (`crate::histogram::DurationHistogram`)
 > and the status report publishes its `p50_ns`, `p99_ns`, `p999_ns` and `max_ns` beside the sums: a sum is a mean,
 > which each run's first held reply (the 100 ms record period) had skewed by 49 µs a write.
+> The exchange hop is split four ways (`fleet.live.hop.exchange.{borrow,round_trip,collect,settle}`; the round trip is
+> the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
+> cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
+> placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
+> placement (g228, 2026-11-21).
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -57898,6 +57903,24 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
 
+> **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
+> makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
+> a push's changeset (made record, `Payload`, `Texts`), named by a made reference in the register's entry, through the
+> one deferred-submit hook (A-804/A-805), made from a preview of the held verdict. The register-held made record (v3)
+> and `HgStore::unstored` are gone: every Mercurial history is on the store, so every repository streams, and step 1's
+> rule (a revision with no store row is refused) refuses nothing a repository holds.
+
+> **Status (2026-11-21, C1 step 1a: a clone's file revisions as the changeset store keeps them).** A clone of every
+> head sends each file revision from the node's changeset store, never from the content store's whole text: the walk
+> asks the rows of the revisions ahead, then their chunks, between turns (w-perf's `StoreWants`, one mechanism with the
+> stream), and sends each stored delta as it stands against the node its base was sent as, or its stored whole.
+
+> **Status (2026-11-21, C1 step 1b: a pull's file revisions as the changeset store keeps them).** A pull's file
+> section is taken a step at a time from the store too (`serve::getbundle::Pull`): a stored delta is sent where its
+> base is on the client (a parent whose changeset the common set holds) or was sent earlier in its group; otherwise the
+> revision's whole text, made by the store from its chain (`Want::Texts`), is sent against null and counted. Its
+> changelog and manifests are still made whole when it begins.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
@@ -59435,6 +59458,36 @@ Applied in the same change to:
   1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
   (slates-svn).
 
+### A-820 — A Subversion copy from an older revision is made from the head and set back from the records; a Subversion green keeps no version for copies (2026-11-21, w-svn; main 10:55 PST, P7's finding (1); A-586, A-626, §4.16 delta retention)
+Applied in the same change to:
+- `crates/server/src/repository/svn_commit/restore.rs` (new): the restore walk, `Restore`, `CopyPlan`, counted
+  `repository.svn_commit.restore_slices`.
+- `crates/server/src/repository/svn_commit.rs`: `Building::copy` from the head and the restores merged with the
+  revision's rows (`over_restore`, `restored`); `planned` (the landing turn taken, the copies planned and their texts
+  brought) for `land_work` and `land_revision`; `fold_to_readers` after each landing, counted
+  `repository.svn_commit.folded_bytes`; `landed` folded into `landed_with`.
+- `crates/server/src/vcs_store/svn_texts.rs`: `vcs_store.svn_texts.bytes_brought`.
+- `docs/wip/GAPS.md`: P7's finding (1).
+
+- **Why.** A copy from an older revision was the engine's `Copy` of the source at that version, which the engine
+  rebuilt from the history it kept (`CopyFix`). So a Subversion green kept every version a copy might name: 440 MB for
+  git-2000's 35 MB of history (P7). When a tight budget folded it, a copy was refused `CopyRefused VersionFolded`.
+  Since C2 stage B every text is readable through the records and the node's store.
+- **What.** The copy is made from the source at the head, then each path whose node at the head is not the copied
+  revision's is set back: removed, made, or given the revision's text and property list. The two trees are walked
+  together from the copy's root, and a subtree whose node-revision is equal in both is skipped whole (the index bubbles
+  changes up). So the work is the paths the source changed since, not its size. The walk runs a slice at a time under
+  the shard's step budget, holding the landing turn. Rows of the same revision that change a restored path merge into
+  it. A Subversion green then folds its history to its live readers' floor after every landing.
+- **Evidence.** `copies_oracle_a_copy_from_any_revision_is_its_source_as_it_stood_then`: 24 seeds, 14 generated
+  revisions each, with additions, edits, property sets, deletions, copies of any node from any earlier revision
+  (copies of copies among them) and copies changed in their own revision. After each revision the green has folded to
+  its head and equals the model's tree. It is red without the restores and red without the fold.
+  `a_copy_from_an_older_revision_commits_after_the_green_folded_its_history` was red before: `CopyRefused
+  VersionFolded`. `stock_svn_copies_a_directory_from_an_older_revision_over_svn_protocol` is stock svn 1.15 on the big
+  Studio. The A/B (main's condition 3) is `measure_copies_from_older_revisions`: the A side is 3bf21428b, the B side
+  this change.
+
 ### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
 
 - **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
@@ -59556,3 +59609,57 @@ Applied in the same change to:
 - **Open (GAPS).** An old version's read is O(fragments × depth). Today's re-anchor compacts a fragmented value at
   write time, so today an old read is O(pieces) with pieces bounded by the value's bytes. Main's A/B (piece 2c)
   decides whether the read loses; the run is requested in `run-requests.md`.
+
+### A-821 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
+Applied in the same change to:
+- `crates/git/src/receive/works.rs`: a create builds nothing; its entry carries the push it owes (`DeferredPush`),
+  based at the new green's version 0; a create's turn reaches the greens its verdict will read.
+- `crates/server/src/git_push.rs`: `created` answers `BranchChange::CreateDeferred`, or `BranchChange::UpdateDeferred`
+  for the unborn default branch; `ShardGreens` notes the first green it reached that owes its push; a command's build
+  turn, and a delete, wait at the door for it.
+- `crates/server/src/repository/push.rs`: `BranchChange::UpdateDeferred` (`Step::Defer`, `plan_update_deferred`),
+  counted `repository.push.updates_deferred`.
+- `crates/server/src/vcs_store.rs`: `with_owed_push_objects` answers git's objects (`PushedObjects` over an empty push).
+- `crates/server/src/green_ready.rs`: a materialization's turn reads with the stores lent room and the shard's chunk
+  store (`vcs_store::with_room`); the door reaches a `CreateBranch`'s source green; test-only `make_building_now` and
+  `made_now`.
+- GAPS (A-812).
+
+- **Why.** git/git's history push made 1,027 greens of a 4,876-file tree, each composed whole at the push, and its
+  unborn `master` built whole in one step: the push could not land (main's ruling, P2: a created ref's green is
+  unmaterialized, its paths derived on first read; uniform, no tag special case).
+- **What.**
+  - A git create's verdict names the push its green owes, `DeferredPush::of` the push the eager create built, rebased
+    to version 0, since the new green holds the version it is made at as its own version 0. The push's append makes
+    the green owing (A-812). The unborn default branch's first push is an update that defers
+    (`BranchChange::UpdateDeferred`): its green is already named, so its next version is the push's record, planned and
+    committed the way a deferred create's version 1 is, and replayed the same.
+  - A materialization reads git's objects from the repository's committed index through the push's own view. The pack's
+    windows live in the shard's chunk store, which a read reaches only while it is lent, so the door's turn reads with
+    the stores lent (found by the red: the build was refused `Object Malformed`, the pack read `Unread { at: 166 }`).
+  - A push reaches greens only through the door. `ShardGreens` lends no owing green and notes the first it met (its
+    `lent` and its branch check); the command's turn starts that green's materialization (`green_ready`) and waits a
+    turn at a time, not counted as a build turn, until it is made, then judges. A create's turn reaches the ref's own
+    green and the one it would be made at; a delete reaches its own. The wait is bounded: once a build the command
+    waited for ends without making the green (refused past its room), the command goes on and its verdict declines it
+    in git's words, never starting the build again each turn.
+  - A create is never made from a member other than the default branch that owes its push: it is passed over, and the
+    create owes its own push from the next base (A-654's order). Made from it, the create would make it at the push, as
+    git/git's refs at commits other refs hold would make most of them; a deferred create's chain entry is its push's
+    record whichever base it has, so A-753's bound holds. The default branch, the base every create falls back to, is
+    made first through the door.
+  - A `CreateBranch` request made from a green that owes its push parks at the door like any request on such a green.
+- **Evidence.**
+  - `t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`: 1,500 files; the push takes at
+    most its command's one turn (red on main: 14,273 quanta, the green holding the tree at once), the green owes,
+    `repository.push.updates_deferred` 1; reached, it is made once (`merge.green.materialized` 1) and holds every file.
+  - `t_p2_a_created_branch_and_tag_owe_one_push_across_a_replay_and_are_made_as_the_eager_create`: `refs/tags/v1` and
+    `copy` owe at version 0; a replay before and after the live green is made holds the same head and the same owed
+    push's record byte for byte; made, each holds the second commit's text at version 1.
+  - The A-654, A-743, A-753 and A-238 tests read created greens through the door and pass unchanged in what they
+    assert; A-238's creates are followed by updates, whose works now fill the chains.
+  - The suites' synchronous push drivers hold the shard, so they run its materializations between a push's turns
+    (`carry_blocking`), as their tasks would; A-238's test pushes a poll at a time on a daemon, since its 32 pushes and
+    their makes in one poll met the watchdog's 3.5 s window.
+- **Owed** (GAPS, A-812): a replayed owing green made over a restarted node's shares (the restart test); git/git's push
+  landing (the red) and the A/B against stock git's 10.77 s.

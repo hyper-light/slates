@@ -184,6 +184,7 @@ pub(crate) fn node_of(repo: &impl Repository, rev: Rev) -> Result<Node, Refusal>
 }
 
 /// A set of the served view's revisions, a bit each, its words charged before they are made.
+#[derive(Debug)]
 pub(crate) struct RevSet {
   /// The bits, `u64::BITS` revisions a word.
   words: Vec<u64>,
