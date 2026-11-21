@@ -778,7 +778,7 @@ impl Repository {
     id: &ObjectId,
     place: &Place,
   ) -> Result<Vec<(ObjectId, Kind)>, StoreRefused> {
-    let bytes = Repository::bytes_of(store, id, place)?;
+    let bytes = self.bytes_of(store, id, place)?;
     let malformed = StoreRefused::Malformed { id: *id };
     let tree =
       Tree::parse(&bytes, self.format, &mut Admission::new(store.room())).map_err(|_| malformed)?;
