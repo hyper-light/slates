@@ -1,5 +1,10 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~05:00 PST: A-817 LANDED 351c9e2a (base bytes only for true whole replacements)
+- Main's identical-op drop: built + oracle, fired 0.03/client, asks unchanged -> NOT landed (dead-even A/B); patch at
+  ~/slates-work/w-fed-move-a817-rejected-drop.patch. Real cause: offset-0 overwrite misclassified as whole replacement.
+- Asks/client at 10 hot files: 69.4 (start) -> 48.5 (A-808) -> 30.0 (A-817). Report: inbox/main-from-w-fed-move-drop.md.
+
 ## 2026-11-21 ~04:00 PST: stale role test FIXED (564cc74a); A-808 LANDED 10a0318d (lengths from the kept entry)
 - Contention is the asks knob (17.5 -> 69.4 a client from 300 to 10 hot files). Edits' length re-asks fixed: 69.4 ->
   48.5. Open: rebases' file asks (13.8 a client), asked main whether a rebase may drop ops identical to the head.
