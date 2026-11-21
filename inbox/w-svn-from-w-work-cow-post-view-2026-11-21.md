@@ -18,3 +18,9 @@ real commit, on generated histories:
 all equal. It passed on main as written, so nothing in the engine changed; with the verdict left uncommitted in the
 preview it fails at its first case. Commit 60733f959 (branch agents/w-work-cow-post-view); see progress/w-work-cow.md
 for where it landed.
+
+## Correction (later 2026-11-21): w-engine landed this first, with a fix. Mine is withdrawn.
+w-engine's 607e5e02a (A-816, then 20c2bc961) holds A-805's preview to its commit over the copy oracle's and the identity
+oracle's generated histories and through `Greens::preview`. It found and fixed a real difference mine missed: a
+preview did not name a renamed home's hard links as changed the way the commit does (`Green::special_seen_for`,
+`know_special`). Build on main as it stands. My oracle (60733f959) is not landed and won't be: it duplicates theirs.

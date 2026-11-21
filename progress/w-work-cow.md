@@ -123,6 +123,6 @@ main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red 
   verdicts, 131 with a copy, 96 cases, debug, Mac Studio. Mutant (verdict not committed into the preview): fails at case 1.
   engine::branch 10/10. Design A-805 has an "Oracle" bullet. No GAPS line tracked the ask.
 - Told w-svn: inbox/w-svn-from-w-work-cow-post-view-2026-11-21.md.
-- NOT LANDED YET: kiln's MCP tools have been gone since the restart, and this Studio has no other push route (SSH
-  publickey refused, HTTPS no credential). To land when kiln returns: 60733f959's merge onto main via studio-3, and this
-  state branch (also 6bec55c/e43f712's red record).
+- WITHDRAWN: while kiln was down w-engine landed the same oracle with a fix (607e5e02a, A-816; 20c2bc961): a preview
+  now names a renamed home's links as changed as its commit does, a case my generator never hit. Mine (60733f959,
+  agents/w-work-cow-post-view) duplicates it and is not landed. w-svn's note has a correction.
