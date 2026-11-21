@@ -440,6 +440,12 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-806 (2026-11-21, w-fed-move; goal 86b's 300 MB work log).** FIXED: a rebase answers each changed file as parts
+> over the head; the work holds and its restatement logs those parts, so a work's log is what it wrote. Largest log at
+> 1,000 clients over `asic_reg` 35,249,811 to 1,957 bytes. Found beside it: `daemon`'s
+> `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
+> A-774 part 3), reported to main.
+>
 > **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
 > re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
 > judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not

@@ -59028,3 +59028,33 @@ Applied in the same change to: `crates/server/src/made_commit.rs` (new: the hook
   back).
 - **Owed** (GAPS C2): the verdict computed pure and committed by position after the land, so reads never see the version
   before it is durable; a bare dispatch's submit; Mercurial's made changeset; git adopts the hook (w-git).
+
+### A-806 — A rebase answers each changed file as parts over the head, and a work holds and logs those parts: a work's log is what it wrote (2026-11-21, w-fed-move, goal 86b; main's order 02:37 PST, the 300 MB work log; CLAUDE.md §2 item 8; A-207, A-790)
+- **Why.** At 100,000 clients over the Linux kernel one work's log reached 300,898,443 bytes and filled its
+  partition's merge budget (A-797's diagnosis line). Named at small scale with a new peak
+  (`merge.work.log_peak_bytes`, `_entries`, the largest work log a partition has held): 1,000 clients, release,
+  in-process, over `kernel/` 752,530 bytes in 7 entries, over `drivers/gpu/drm/amd/include/asic_reg` (512 headers of
+  about 1 MB) 35,249,811 bytes in 8 entries, for 64-byte edits. A rebase answered each file a work still changed
+  whole (`RebaseAnswer::Rebased.changed`), the work held it whole (`WorkFiles::from_changed`), and its restatement
+  (A-207) logged it whole: one small edit of a large file cost the file in memory and in the partition's merge budget,
+  again at every rebase.
+- **Change.** `crates/server/src/work_files.rs`: `HeldParts` (a held file's origin, pieces, written bytes and
+  length) with `WorkFiles::from_parts` / `parts`, and `parts_over_base`: a rebased file as parts over the head's same
+  path, its common prefix and suffix base pieces and, for a same-length file, the equal runs worth a piece kept as
+  base pieces too, compared a page at a time (`equal_run`, `equal_tail`). `RebaseAnswer::Rebased.changed` carries
+  parts (made in `rebase_answer`, kept through `apply_replacement`); `crates/server/src/work_log.rs`: a restatement's
+  own file is its parts (`LoggedParts`), and replay rebuilds the work from them over its base.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `slates-server --test work_edit_cow
+  a_rebased_works_log_holds_what_it_wrote_not_the_file` (a 64-byte write into a 1 MiB file, rebased: the work's log
+  1,048,635 bytes before, within 64 + 1,024 after, reading back its write). The parts oracle
+  `a_rebased_files_parts_read_back_as_the_file` (generated overwrites, inserts and deletes: read back exactly, never more
+  written than the file, nothing written for an unchanged file) and
+  `an_overwrite_of_a_large_file_is_its_written_bytes_over_the_base`. `work_cow`, `mounted_work_cow`, `merge_load`,
+  `green_post_state`, `verdict_pages`, `works_off_owner`, the fleet's rebase/check/merge tests, `--lib work_home
+  work_log work_files verbs::tests` pass. `daemon`'s `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier`
+  fails on main without this change (it expects a green's landing refused; A-774 part 3, `f401f798c`, made a green
+  landable): reported to main.
+- **A/B by use** (same stand-in): the largest work log over `kernel/` 752,530 to 2,036 bytes, over `asic_reg`
+  35,249,811 to 1,957 bytes (2,124 and 2,434 in two more runs); oracle failures 0. Verdicts a second on `asic_reg`
+  were not comparable on the shared machine at the time (1,138 before; 1,703 and 134 after, load average 8, swap
+  96 of 97 GB).
