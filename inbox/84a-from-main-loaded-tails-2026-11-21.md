@@ -48,3 +48,17 @@ uncontended spinning p99 still under 50 µs (provision_bench). It stays open unt
   commit on origin/main and the numbers.
 - Report to main (agent 01a1ff311fc972a8a0f720e354891538). A finding that doesn't block 84a goes to GAPS and isn't
   worked.
+
+## Addendum: how each mechanism works (main, ~10:40 PST; check each against the source before relying on it)
+- **Linux:** a fair-class thread can ask for its own slice through `sched_setattr` with `SCHED_NORMAL` and
+  `sched_runtime`. It needs no privilege, and the kernel clamps the slice to 0.1-100 ms. A shorter slice gives an
+  earlier deadline, so a woken shard can preempt a spinner instead of waiting out its slice. To check: whether the CI
+  kernel's `RUN_TO_PARITY` holds off that preemption, and whether a park/unpark keeps the slice.
+- **macOS:** `thread_policy_set(THREAD_TIME_CONSTRAINT_POLICY)` needs no privilege. The kernel demotes a thread that
+  keeps running past its `computation`, so a thread that spins can't hold the policy: give it only to threads that park
+  (A-799's client wait, and the shards' parked path after b01a0ef7b's nap). Report any demotion you see.
+- **Windows:** a high-resolution waitable timer (`CreateWaitableTimerExW` with
+  `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) can wake a completion port with no thread blocked on it:
+  `NtCreateWaitCompletionPacket` and `NtAssociateWaitCompletionPacket` (ntdll, Windows 8+) post a completion when the
+  timer fires. Go's runtime has used exactly this since 1.23 for sub-ms timers on IOCP (runtime/netpoll_windows.go,
+  os_windows.go). Read that code first.
