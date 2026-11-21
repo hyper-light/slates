@@ -85,3 +85,21 @@ Started 2026-11-20 ~07:50 PST. Read: briefs/common.md, briefs/w-k90-kvm.md, prog
   (2) a session start sent just before a link drop can be lost; the server then marks it crashed ("the runner doesn't
       hold it"), and only a person's resume takes it up.
   (3) under I/O pressure (adacachy, io some avg10 ~10%) a runner's sqlite stores took 48-96 s to open.
+
+## 2026-11-20 ~21:30 PST onward: goal 92, the six Shards-owed items (main's ask; "vendor once": judged in kiln's tree)
+- 1 HOLDS: vendor/patches/shards/0002 == Shards D288 b9006561 (numstat, docs aside); KVM r42/r28, HVF 81174ac49.
+- 3 HOLDS: slates_e2e microvm::g266 + ::g90 on KVM (r51, r42 at c0f576eb3) and HVF (81174ac49).
+- 4 HOLDS: one Slates in kiln (vendor/slates); vendored Shards has no Slates dep; SLATES_REV only in Shards' .github.
+- 6 BUILT, red/green on macOS HVF (this Studio): commit 3ba7efe6c (merge 2666498ea on main 865d8bed5), vendor patch
+  0003 "a restored microVM is given its served shares' streams". Red: restore refused --slates-fs-fd; green 1/1.
+  Windows: vm-process cross-checks clean; shards crate's Windows (cli served_pipes) unchecked here (aws-lc C), owed on jupiter.
+  LANDING: push via adacachy run r3 (synced from ~/kiln-work/w-k90-kvm branch w-k90-kvm-item6). Two earlier tries failed
+  (kiln server timeouts; one pasted bundle corrupt).
+- 5 IN FLIGHT: PM M620 scratch branch agents/w-k90-kvm-m620 (e1b6b45bd tests only = red, c60ed4c9b + fix = green);
+  jupiter run r2 (openssl-backend shallow clone; schannel kept dropping). Then land as vendor patch 0004.
+- 2 TODO: port slates' ACL rules into Shards' fs server (draft module ~/kiln-work/w-k90-kvm-scripts/acl.rs):
+  negotiate FUSE_POSIX_ACL + DONT_MASK + SETXATTR_EXT; set ACL -> mode; show from mode; default ACL on create; umask.
+- Slips: r61's retry loop ran `rm -rf` on its own partial clone dir (green.part) on jupiter; my git grep/diff on main's
+  ~/.local/state/shards-audit.git likely lazily fetched objects into it (told main).
+- for main to delete (this Studio): ~/.cache/w-k90-kvm-shards-stray-target{,-2} (test artifacts moved out of vendor/shards),
+  ~/.cache/w-k90-kvm-shards-target.noindex, ~/.cache/w-k90-kvm-slates-target.noindex; jupiter ~/.cache/w-k90-kvm/{kiln.git,green.try1}.

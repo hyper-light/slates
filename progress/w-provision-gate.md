@@ -60,6 +60,9 @@
   land) and ~/slates-work/w-provision-gate-ci, the clone ~/slates-work/w-provision-gate, ~/.cache/w-provision-gate-*
   (arms, fix, targets).
 
+- ~22:00: per main, deleted my scratch on Studio-4 by exact path: ~/.cache/w-provision-gate-target.noindex (4.8 GiB),
+  -arms, -fix, the kqueue .rs copies, and the clone ~/slates-work/w-provision-gate. Nothing of mine left to delete there.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
