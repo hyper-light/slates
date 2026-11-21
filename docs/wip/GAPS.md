@@ -8498,6 +8498,19 @@
 > lands. Also open from the same runs: a sevenfold p50 split between two invocations on this Mac (edit 18.8 against
 > 2.5 µs). Record: `BENCHMARKS.md`, "The client's edit and merge latency".
 
+> **Open (85a, g228, 2026-11-20): a live write adds under 50 µs at the median and under 1 ms at p999 under load.**
+> macOS (32-core Studio, release, contract command, BENCHMARKS "What live shipping adds to a stable write, after A-396's
+> holds"): on b402afc7c 168-205 µs added at load 16-31 (p999 393-708 µs), 543-823 µs at load 33-75. A-396's holds are
+> declined on macOS and change nothing there; holds forced on are measured and rejected (+50 µs). Main regressed 4x at
+> the median since a48bcdc52: a status request armed A-744's memory sweep as a task ahead of every turn's ready work
+> (`mincore` the heaviest frame in every daemon). Fixed here in part: the sweep runs on the shard's idle time, spaced by
+> its own length, and the runtime harvests its driver between idle slices (median 1,217-1,939 against 2,614-3,096 µs,
+> p999 2.2-3.7 against 4.9-9.7 ms at load 11-15). **Open, blocking 85a:** a plain status request still arms a sweep of
+> tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
+> burst and delays the next message up to half a step quantum per idle slice. Proposed (main's decision): arm the
+> background sweep only for a request that asks for the memory report, and read the content object whole from the
+> kernel's per-mapping figures rather than a page walk. Linux not measured: adacachy's runs froze at load 80-89.
+
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
 > the daemon's 10 ms poll (10,125–10,194 µs at the median) over a 12 µs loopback round trip. Each reply now wakes its
