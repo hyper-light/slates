@@ -425,6 +425,15 @@
 > A-782 closed identical versus accepted (one typed
 > outcome, engine to every surface); A-785 names merges held for approval. A-779 closed the stale presentation: a newer one of the same volume into the same target
 > supersedes it (typed refusal, off the log), and the log lists only grantable presentations.
+>
+> **Recorded, not built (close rule; main 01a1ff31, 2026-11-21).** (1) A write of the head's own bytes with nothing
+> intervening answers `Accepted` (the engine applies a no-op effect; `crates/client/tests/merge_identity.rs`
+> `the_heads_own_bytes_accept_at_a_version_of_their_own`), though it changes nothing and so is `Identical` (main's
+> ruling). Proposed test: that case asserts `Submitted::Identical(4)` and `Green::changed_nothing_at(4) == Some(true)`;
+> red today with `Accepted(4)`. (2) A presentation whose client went away (AUD-29-07's abandon) leaves its record
+> `AwaitingGrant` until a newer presentation of the same volume and target supersedes it (A-779); proposed: an
+> `Abandoned` landing state written at the abandon, its grant refused by kind, with a test that drops the presenting
+> client and reads the record and a grant's refusal.
 
 > **§4.17 version-control servers: the shared mapping and the git server are designed; the repository record, greens
 > made at another green's version and the object store's core are built (2026-11-18, A-497, D-28, A-515; 2026-11-19,
