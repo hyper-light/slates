@@ -17589,6 +17589,45 @@ fn keep_unrecovered_mounts(state: &mut ShardState, record: &VolumeRecord) -> usi
   ended
 }
 
+/// A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127); refused and
+/// counted where it cannot be rebuilt.
+fn rebuild_mounted_slot(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  (images, claims): (
+    &std::collections::BTreeMap<[u8; 16], VolumeImage>,
+    Option<&slates_vfs::recover::Claims>,
+  ),
+  max_prefix: &mut u16,
+) {
+  let Some(pin) = crate::mounted_work::recovered_pin(state, record.id) else {
+    return;
+  };
+  if !images.contains_key(&record.id.bytes) {
+    return;
+  }
+  match rebuild_volume(
+    state,
+    record,
+    images.get(&record.id.bytes),
+    claims,
+    Some(pin),
+  ) {
+    Ok(prefix) => {
+      *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
+      state.merge.mounted.insert(record.id, pin);
+    }
+    Err(cause) => {
+      slates_machine::log_line!(
+        "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
+        state.partition,
+        record.name
+      );
+      state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
+    }
+  }
+}
+
 /// Rebuilds one recorded volume by its role; false when a plain volume could not be (refused and logged, never
 /// presented empty), which leaves it out of the reconciliation.
 async fn rebuild_record(
@@ -17632,31 +17671,7 @@ async fn rebuild_record(
     Role::Work { green, .. } => {
       rebuild_work(state, record, green);
       rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
-      // A mounted work's slot, from its image, with what its mount wrote and has not submitted (A-774, A-127).
-      if let Some(pin) = crate::mounted_work::recovered_pin(state, record.id)
-        && images.contains_key(&record.id.bytes)
-      {
-        match rebuild_volume(
-          state,
-          record,
-          images.get(&record.id.bytes),
-          claims,
-          Some(pin),
-        ) {
-          Ok(prefix) => {
-            *max_prefix = (*max_prefix).max(prefix.wrapping_add(1).max(1));
-            state.merge.mounted.insert(record.id, pin);
-          }
-          Err(cause) => {
-            slates_machine::log_line!(
-              "slates-server: partition {}: mounted work {} not rebuilt: {cause:?}",
-              state.partition,
-              record.name
-            );
-            state.count(crate::mounted_work::MOUNT_SLOT_REFUSED, 1);
-          }
-        }
-      }
+      rebuild_mounted_slot(state, record, (images, claims), max_prefix);
     }
     Role::Plain => {
       match rebuild_volume(state, record, images.get(&record.id.bytes), claims, None) {
