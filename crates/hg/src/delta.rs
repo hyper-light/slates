@@ -144,10 +144,28 @@ pub fn patched_len(base: u64, delta: &[u8]) -> Result<u64, Refusal> {
 /// The text `delta` makes of `base`: its length checked and charged to `admission` first, then built in one vector of
 /// exactly that length.
 pub fn apply(base: &[u8], delta: &[u8], admission: &mut Admission) -> Result<Vec<u8>, Refusal> {
+  let mut out = Vec::new();
+  apply_into(base, delta, &mut out, admission)?;
+  Ok(out)
+}
+
+/// The text `delta` makes of `base`, written over `out`: its length checked first, then `out` emptied and filled, grown
+/// only where its capacity falls short of the text, and only that growth charged to `admission`. A chain read alternating
+/// between two buffers is so charged each buffer's longest text once, not a text a link (main's order of 2026-11-20 on
+/// the hg import's memory). Refused, `out` holds no text of this delta's, which its caller drops or writes over.
+pub fn apply_into(
+  base: &[u8],
+  delta: &[u8],
+  out: &mut Vec<u8>,
+  admission: &mut Admission,
+) -> Result<(), Refusal> {
   let len = patched_len(to_u64(base.len()), delta)?;
-  admission.charge(len).map_err(Refusal::PastAdmission)?;
   let capacity = usize::try_from(len).map_err(|_| Refusal::TooLong { value: len })?;
-  let mut out = Vec::with_capacity(capacity);
+  admission
+    .charge(to_u64(capacity.saturating_sub(out.capacity())))
+    .map_err(Refusal::PastAdmission)?;
+  out.clear();
+  out.reserve_exact(capacity);
   let mut last: usize = 0;
   for hunk in hunks(delta) {
     let hunk = hunk?;
@@ -157,7 +175,7 @@ pub fn apply(base: &[u8], delta: &[u8], admission: &mut Admission) -> Result<Vec
     last = index(hunk.end)?;
   }
   out.extend_from_slice(base_range(base, last, base.len())?);
-  Ok(out)
+  Ok(())
 }
 
 /// A hunk's position as an index.

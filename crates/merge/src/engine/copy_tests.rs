@@ -168,7 +168,7 @@ impl Work {
 fn accept(green: &mut Green, work: &Work, id: u64) -> u64 {
   let base = green.head();
   match green.submit(&work.at(id, base)) {
-    Outcome::Accepted { version } => version,
+    Outcome::Accepted { version } | Outcome::Identical { version } => version,
     other => panic!("increment {id} was not accepted: {other:?}"),
   }
 }
@@ -211,6 +211,7 @@ fn windows(outcome: &Outcome) -> Option<Vec<(String, MergeConflictClass)>> {
         .collect(),
     ),
     Outcome::Accepted { .. }
+    | Outcome::Identical { .. }
     | Outcome::BaseUnavailable { .. }
     | Outcome::CopyRefused { .. }
     | Outcome::ContentUnread { .. } => None,
@@ -1164,7 +1165,10 @@ fn submit_recorded(
   let increment = work.at(id, green.head());
   let (outcome, applied) = green.submit_resolved(&increment);
   assert!(
-    matches!(outcome, Outcome::Accepted { .. }),
+    matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ),
     "increment {id}: {outcome:?}"
   );
   (increment, applied.expect("an accepted version's effects"))
@@ -1320,7 +1324,10 @@ fn a_copy_from_a_folded_version_is_refused_typed() {
 fn accepted_effects(green: &mut Green, increment: &Increment) -> Vec<chain_entry::Applied> {
   let (outcome, applied) = green.submit_resolved(increment);
   assert!(
-    matches!(outcome, Outcome::Accepted { .. }),
+    matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    ),
     "not accepted: {outcome:?}"
   );
   applied.expect("an accepted version's effects")
@@ -1895,7 +1902,10 @@ impl Oracle {
     self.next += 1;
     let increment = work.at(self.next, self.green.head());
     let (outcome, applied) = self.green.submit_resolved(&increment);
-    let accepted = matches!(outcome, Outcome::Accepted { .. });
+    let accepted = matches!(
+      outcome,
+      Outcome::Accepted { .. } | Outcome::Identical { .. }
+    );
     prop_assert_eq!(accepted, expected.is_some(), "{:?}", outcome);
     if let (Some(applied), Some(landed)) = (applied, expected) {
       self.entries.push((increment, applied));

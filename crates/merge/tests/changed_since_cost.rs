@@ -118,7 +118,11 @@ fn changed_since_over_every_dimension_against_the_content_index() {
     id[..8].copy_from_slice(&submit.to_le_bytes());
     let outcome = green.submit(&build.with_id(id, green.head()));
     assert!(
-      matches!(outcome, slates_merge::engine::Outcome::Accepted { .. }),
+      matches!(
+        outcome,
+        slates_merge::engine::Outcome::Accepted { .. }
+          | slates_merge::engine::Outcome::Identical { .. }
+      ),
       "submit {submit}: {outcome:?}"
     );
   }

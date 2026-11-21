@@ -23,6 +23,7 @@ BOUND_VERBS = {
     "snapshot",
     "status",
     "drifted",
+    "session_log",
     "list",
     "resize",
     "destroy",
@@ -291,6 +292,26 @@ class SlatesSdkRoundTrip(unittest.TestCase):
                 client.submit(empty["id"])
             self.assertIn("CopyRefused", str(refused.exception))
             self.assertIn("source_empty", str(refused.exception))
+
+            # the session log (A-773), the shape `slates log --json` prints: two works over a fresh green edit one
+            # span differently; the second collides and is the one decision that needs a person.
+            watched = client.create_green("g-log")
+            first = client.create_work(watched, "w-log-first")
+            second = client.create_work(watched, "w-log-second")
+            client.edit(first["id"], "/f.txt", 0, 0, b"one")
+            client.edit(second["id"], "/f.txt", 0, 0, b"two")
+            self.assertTrue(client.submit(first["id"])["ok"])
+            self.assertFalse(client.submit(second["id"])["ok"])
+            log = client.session_log()
+            needs = [n for n in log["needs_you"] if n.get("work") == second["id"]]
+            self.assertEqual(len(needs), 1, log["needs_you"])
+            self.assertEqual(needs[0]["kind"], "collided")
+            self.assertEqual(needs[0]["path"], "f.txt")
+            shown = [g for g in log["greens"] if g["id"] == watched]
+            self.assertEqual(shown[0]["head"], 1)
+            marks = {w["id"]: w["mark"]["state"] for w in shown[0]["works"]}
+            self.assertEqual(marks[first["id"]], "accepted")
+            self.assertEqual(marks[second["id"]], "collided")
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:
