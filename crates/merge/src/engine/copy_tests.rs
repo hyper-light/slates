@@ -1902,6 +1902,11 @@ impl Model {
   }
 }
 
+/// A step a proptest case cannot go on from, as the case's failure.
+fn failed(error: impl std::fmt::Debug) -> TestCaseError {
+  TestCaseError::fail(format!("{error:?}"))
+}
+
 /// The green under test, the model it is held to, and what each accepted version applied.
 #[derive(Default)]
 struct Oracle {
@@ -1983,10 +1988,10 @@ impl Oracle {
     let (mut lineage, handle) = Lineage::new(std::mem::take(&mut self.green));
     let judgment = lineage
       .with(handle, |green| green.judge(increment))
-      .unwrap();
+      .map_err(failed)?;
     let viewed = match judgment {
       Judgment::Accepted(judged) => {
-        let fork = lineage.preview(handle, judged).unwrap();
+        let fork = lineage.preview(handle, judged).map_err(failed)?;
         let viewed = lineage
           .with(fork, |view| {
             let changed = view.changed_between(0, 1);
@@ -1997,14 +2002,14 @@ impl Oracle {
               .collect();
             (changed, reads)
           })
-          .unwrap();
-        let mut release = lineage.retire(fork).unwrap();
-        while !lineage.release_step(&mut release).unwrap() {}
+          .map_err(failed)?;
+        let mut release = lineage.retire(fork).map_err(failed)?;
+        while !lineage.release_step(&mut release).map_err(failed)? {}
         Some(viewed)
       }
       _ => None,
     };
-    self.green = lineage.take(handle).unwrap();
+    self.green = lineage.take(handle).map_err(failed)?;
     Ok(viewed)
   }
 
@@ -2551,7 +2556,7 @@ fn with_parents(paths: BTreeSet<String>) -> BTreeSet<String> {
   for path in &paths {
     let mut at = path.as_str();
     while let Some(cut) = at.rfind('/') {
-      at = &at[..cut];
+      at = at.get(..cut).unwrap_or_default();
       all.insert(at.to_owned());
     }
   }
