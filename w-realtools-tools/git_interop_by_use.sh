@@ -62,8 +62,9 @@ echo "slates: $("$SLATES" --version 2>&1 | head -1 | tr -d '\r'); git: $(git --v
 
 # The refs of a repository, one `<id> <name>` a line, sorted: what ls-remote says of a remote, show-ref of a local one.
 refs_remote() { bounded "${G[@]}" ls-remote "$1" | grep -v ' HEAD$' | grep -v $'\tHEAD$' | tr '\t' ' ' | sort; }
-refs_local() { git -C "$1" for-each-ref --format='%(objectname) %(refname)' | sort; }
-objects() { git -C "$1" rev-list --all --objects | cut -d' ' -f1 | sort -u; }
+# Branches and tags only: what the first push sends (a GitHub mirror also holds refs/pull/*, never pushed here).
+refs_local() { git -C "$1" for-each-ref --format='%(objectname) %(refname)' refs/heads refs/tags | sort; }
+objects() { git -C "$1" rev-list --branches --tags --objects | cut -d' ' -f1 | sort -u; }
 
 # Compares the slates repository NAME (at URL) with the bare source SRC: refs, objects, fsck of a bare clone.
 compare_whole() {
