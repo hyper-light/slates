@@ -77,3 +77,11 @@
 ## For main to delete
 - ~/slates-work/w-provision-gate (scratch clone, after part 2 lands)
 - ~/.cache/w-provision-gate-arms, ~/.cache/w-provision-gate-fix (scratch)
+- 2026-11-21 ~10:45 PST: 84a macOS (main's 10:20 ruling, inbox/84a-from-main-loaded-tails-2026-11-21.md). A/B of Mach's
+  THREAD_TIME_CONSTRAINT_POLICY on CI macos-latest, run 44934544995 (branch diag-measurer-w-provision-gate-tc). Arms:
+  B 008f618ec (main a9a2393b8 + edit_merge_bench's load-throughput line), TC 821457913 (+ the client's reply-wait
+  thread under the policy), TB 27e7a0873 (+ the shard threads). Terms: aperiodic, computation = constraint = the
+  measured window doubled until the kernel takes it (slates_machine::time_constraint::set_current_from; the kernel
+  refuses < its min RT quantum, 50 us here; unit test). Note: b01a0ef7b (named by main) is not on main and its branch is
+  gone, so the arms sit on main's nap. Local smoke (Studio-4, load 7, TB): loaded accept p99 225 us / p999 361 us, no
+  refusal. Worktrees: ~/slates-work/w-provision-gate-diag(2); clone ~/slates-work/w-provision-gate.
