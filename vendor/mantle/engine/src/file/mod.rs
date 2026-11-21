@@ -19,10 +19,10 @@ use hyper_block::block::BlockFile;
 use crate::error::Error;
 
 pub(crate) fn io_error(op: &'static str, e: &DiskError) -> Error {
-    Error::Io {
-        op,
-        detail: e.to_string(),
-    }
+  Error::Io {
+    op,
+    detail: e.to_string(),
+  }
 }
 
 /// The log's files are byte-addressed: RocksDB writes and reads WALs and MANIFESTs through the
@@ -31,12 +31,12 @@ pub(crate) fn io_error(op: &'static str, e: &DiskError) -> Error {
 /// legal. A direct-I/O file would need its padded tail cut on close, which `BlockFile` cannot
 /// do yet (docs/research/24 §2.2, the `Close` row), so one is refused.
 pub(crate) fn require_byte_addressed(file: &impl BlockFile) -> Result<(), Error> {
-    let align = file.alignment().get();
-    if align == 1 {
-        return Ok(());
-    }
-    Err(Error::Unsupported {
-        feature: "log file alignment above one byte (direct I/O)",
-        value: u64::try_from(align).unwrap_or(u64::MAX),
-    })
+  let align = file.alignment().get();
+  if align == 1 {
+    return Ok(());
+  }
+  Err(Error::Unsupported {
+    feature: "log file alignment above one byte (direct I/O)",
+    value: u64::try_from(align).unwrap_or(u64::MAX),
+  })
 }

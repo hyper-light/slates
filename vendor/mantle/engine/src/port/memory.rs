@@ -25,18 +25,18 @@
 /// The memory the machine could give this process now without writing anything out first; none
 /// without a reading.
 pub fn room_now() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        // A kernel that does not state its threshold holds back the dirty pages alone.
-        let vmstat = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
-        room_of(&meminfo, &status, &vmstat, crate::port::mmap::page_size())
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        slates_machine::facts::Facts::memory_available_now()
-    }
+  #[cfg(target_os = "linux")]
+  {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    // A kernel that does not state its threshold holds back the dirty pages alone.
+    let vmstat = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    room_of(&meminfo, &status, &vmstat, crate::port::mmap::page_size())
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    slates_machine::facts::Facts::memory_available_now()
+  }
 }
 
 /// The room in `meminfo` (`/proc/meminfo`'s text) for the process whose `/proc/self/status` text
@@ -46,89 +46,91 @@ pub fn room_now() -> Option<u64> {
 /// unreadable is none of that kind.
 #[cfg(any(target_os = "linux", test))]
 fn room_of(meminfo: &str, status: &str, vmstat: &str, page: usize) -> Option<u64> {
-    let available = kib(meminfo, "MemAvailable:")?;
-    let dirty = kib(meminfo, "Dirty:")
-        .unwrap_or(0)
-        .saturating_add(kib(meminfo, "Writeback:").unwrap_or(0));
-    let threshold = pages(vmstat, "nr_dirty_background_threshold", page).unwrap_or(0);
-    let held_back = dirty
-        .max(threshold)
-        .saturating_add(kib(status, "VmSwap:").unwrap_or(0));
-    Some(available.saturating_sub(held_back))
+  let available = kib(meminfo, "MemAvailable:")?;
+  let dirty = kib(meminfo, "Dirty:")
+    .unwrap_or(0)
+    .saturating_add(kib(meminfo, "Writeback:").unwrap_or(0));
+  let threshold = pages(vmstat, "nr_dirty_background_threshold", page).unwrap_or(0);
+  let held_back = dirty
+    .max(threshold)
+    .saturating_add(kib(status, "VmSwap:").unwrap_or(0));
+  Some(available.saturating_sub(held_back))
 }
 
 /// The bytes a `name kB` line of a proc file states, none when it is missing or unreadable.
 #[cfg(any(target_os = "linux", test))]
 fn kib(text: &str, name: &str) -> Option<u64> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(name))
-        .and_then(|rest| rest.trim().strip_suffix("kB"))
-        .and_then(|count| count.trim().parse::<u64>().ok())
-        .and_then(|count| count.checked_mul(1024))
+  text
+    .lines()
+    .find_map(|line| line.strip_prefix(name))
+    .and_then(|rest| rest.trim().strip_suffix("kB"))
+    .and_then(|count| count.trim().parse::<u64>().ok())
+    .and_then(|count| count.checked_mul(1024))
 }
 
 /// The bytes a `name count` line of `/proc/vmstat` states in pages of `page` bytes, none when it
 /// is missing or unreadable.
 #[cfg(any(target_os = "linux", test))]
 fn pages(text: &str, name: &str, page: usize) -> Option<u64> {
-    text.lines()
-        .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
-        .and_then(|count| count.trim().parse::<u64>().ok())
-        .and_then(|count| count.checked_mul(u64::try_from(page).ok()?))
+  text
+    .lines()
+    .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+    .and_then(|count| count.trim().parse::<u64>().ok())
+    .and_then(|count| count.checked_mul(u64::try_from(page).ok()?))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+  use super::*;
 
-    const MEMINFO: &str = "MemTotal:       98690668 kB\nMemFree:        74950608 kB\nMemAvailable:   80540128 kB\nCached:          6094500 kB\nDirty:            315480 kB\nWriteback:          1024 kB\nAnonPages:      15177928 kB\n";
-    const STATUS: &str = "Name:\tranges\nVmRSS:\t62100876 kB\nRssAnon:\t62096492 kB\nVmSwap:\t41459496 kB\nThreads:\t40\n";
-    /// The VM's thresholds (2026-10-23): 2,107,184 pages of 4 KiB in the background, past the
-    /// dirty pages above; `nr_dirty_threshold` is not the one held back.
-    const VMSTAT: &str = "nr_dirty 78870\nnr_writeback 256\nnr_dirty_threshold 4219520\nnr_dirty_background_threshold 2107184\n";
-    const PAGE: usize = 4096;
+  const MEMINFO: &str = "MemTotal:       98690668 kB\nMemFree:        74950608 kB\nMemAvailable:   80540128 kB\nCached:          6094500 kB\nDirty:            315480 kB\nWriteback:          1024 kB\nAnonPages:      15177928 kB\n";
+  const STATUS: &str = "Name:\tranges\nVmRSS:\t62100876 kB\nRssAnon:\t62096492 kB\nVmSwap:\t41459496 kB\nThreads:\t40\n";
+  /// The VM's thresholds (2026-10-23): 2,107,184 pages of 4 KiB in the background, past the
+  /// dirty pages above; `nr_dirty_threshold` is not the one held back.
+  const VMSTAT: &str = "nr_dirty 78870\nnr_writeback 256\nnr_dirty_threshold 4219520\nnr_dirty_background_threshold 2107184\n";
+  const PAGE: usize = 4096;
 
-    #[test]
-    fn the_room_is_the_estimate_less_the_background_threshold_and_the_process_s_swap() {
-        let room = room_of(MEMINFO, STATUS, VMSTAT, PAGE).unwrap();
-        assert_eq!(
-            room,
-            80_540_128 * 1024 - 2_107_184 * 4096 - 41_459_496 * 1024
-        );
-    }
+  #[test]
+  fn the_room_is_the_estimate_less_the_background_threshold_and_the_process_s_swap() {
+    let room = room_of(MEMINFO, STATUS, VMSTAT, PAGE).unwrap();
+    assert_eq!(
+      room,
+      80_540_128 * 1024 - 2_107_184 * 4096 - 41_459_496 * 1024
+    );
+  }
 
-    #[test]
-    fn dirty_pages_past_the_threshold_are_held_back_instead() {
-        let vmstat = "nr_dirty_background_threshold 16384\n";
-        let room = room_of(MEMINFO, STATUS, vmstat, PAGE).unwrap();
-        assert_eq!(room, (80_540_128 - 315_480 - 1_024 - 41_459_496) * 1024);
-    }
+  #[test]
+  fn dirty_pages_past_the_threshold_are_held_back_instead() {
+    let vmstat = "nr_dirty_background_threshold 16384\n";
+    let room = room_of(MEMINFO, STATUS, vmstat, PAGE).unwrap();
+    assert_eq!(room, (80_540_128 - 315_480 - 1_024 - 41_459_496) * 1024);
+  }
 
-    #[test]
-    fn a_count_missing_is_none_of_its_kind_and_no_estimate_is_no_reading() {
-        assert_eq!(
-            room_of(MEMINFO, "Name:\tranges\n", "", PAGE).unwrap(),
-            (80_540_128 - 315_480 - 1_024) * 1024
-        );
-        // A threshold line by another name, or unreadable, is no threshold.
-        assert_eq!(
-            room_of(MEMINFO, "", "nr_dirty_background_thresholds 9\n", PAGE).unwrap(),
-            (80_540_128 - 315_480 - 1_024) * 1024
-        );
-        assert_eq!(
-            room_of(MEMINFO, "", "nr_dirty_background_threshold x\n", PAGE).unwrap(),
-            (80_540_128 - 315_480 - 1_024) * 1024
-        );
-        assert_eq!(room_of("MemTotal: 1 kB\n", STATUS, VMSTAT, PAGE), None);
-        assert_eq!(
-            room_of("MemAvailable: 12x kB\n", STATUS, VMSTAT, PAGE),
-            None
-        );
-    }
+  #[test]
+  fn a_count_missing_is_none_of_its_kind_and_no_estimate_is_no_reading() {
+    assert_eq!(
+      room_of(MEMINFO, "Name:\tranges\n", "", PAGE).unwrap(),
+      (80_540_128 - 315_480 - 1_024) * 1024
+    );
+    // A threshold line by another name, or unreadable, is no threshold.
+    assert_eq!(
+      room_of(MEMINFO, "", "nr_dirty_background_thresholds 9\n", PAGE).unwrap(),
+      (80_540_128 - 315_480 - 1_024) * 1024
+    );
+    assert_eq!(
+      room_of(MEMINFO, "", "nr_dirty_background_threshold x\n", PAGE).unwrap(),
+      (80_540_128 - 315_480 - 1_024) * 1024
+    );
+    assert_eq!(room_of("MemTotal: 1 kB\n", STATUS, VMSTAT, PAGE), None);
+    assert_eq!(
+      room_of("MemAvailable: 12x kB\n", STATUS, VMSTAT, PAGE),
+      None
+    );
+  }
 
-    #[test]
-    fn a_process_swapped_past_the_estimate_has_no_room() {
-        let status = "VmSwap:\t90000000 kB\n";
-        assert_eq!(room_of(MEMINFO, status, VMSTAT, PAGE), Some(0));
-    }
+  #[test]
+  fn a_process_swapped_past_the_estimate_has_no_room() {
+    let status = "VmSwap:\t90000000 kB\n";
+    assert_eq!(room_of(MEMINFO, status, VMSTAT, PAGE), Some(0));
+  }
 }

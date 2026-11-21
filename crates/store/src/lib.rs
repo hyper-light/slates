@@ -14,3 +14,4 @@
 pub mod log;
 pub mod staging;
 pub mod store;
+pub mod texts;
