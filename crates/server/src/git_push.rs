@@ -956,7 +956,7 @@ fn landing_of(
     repository: u128::from_be_bytes(repository.bytes),
     sequence,
     judged_over: sequence.saturating_sub(1),
-    grant: 0,
+    grant: disk.grant(),
     work: 0,
     time_ns: slates_rt::futures::now_ns(),
     sections: 0,

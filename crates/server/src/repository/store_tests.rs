@@ -1,17 +1,14 @@
 //! A repository created through the daemon lands its creation into the node's version-control store, and the store
 //! recovers it (A-767 item 7; main's ruling of 2026-11-20: "red first: a repository created, landed into and recovered,
-//! read back through the store"). The store's directory is a real one beside the test binary in the build output, never
-//! `/tmp` (R1).
-
-use std::path::PathBuf;
+//! read back through the store"). The store is the one shared test store (`crate::test_store`).
 
 use slates_db::catalog::Principal;
 use slates_ipc::protocol::{ObjectFormat, ReplyBody, RequestBody, VcsTool};
-use slates_land::store_root::{StoreGrant, StoreRoot};
+use slates_land::store_root::StoreRoot;
 use slates_store::log::{ChangesetLog, SectionKind, Tool};
-use slates_store::owner::StoreOwner;
-use slates_store::store::{LOG_FILE, Sizing, Store};
+use slates_store::store::{LOG_FILE, Store};
 
+use crate::test_store::{TestStore, root, sizing};
 use crate::{Daemon, SegmentSource};
 
 /// Shape: the daemon's shards.
@@ -24,49 +21,18 @@ fn owner() -> Principal {
   }
 }
 
-/// A fresh directory beside the test binary, in the build output.
-fn store_directory(name: &str) -> PathBuf {
-  let binary = std::env::current_exe().unwrap();
-  let dir = binary
-    .parent()
-    .unwrap()
-    .join(format!("vcs-store-{name}-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir_all(&dir).unwrap();
-  dir.canonicalize().unwrap()
-}
-
-fn root(dir: &std::path::Path) -> StoreRoot {
-  let grant = StoreGrant {
-    repository: 0,
-    target: StoreRoot::identify(dir).unwrap(),
-    issued_ns: 0,
-  };
-  StoreRoot::open(dir, &grant).unwrap()
-}
-
-/// Shape: a test's store: 8 MiB of memory, 1 GiB of disk, 128 KiB extents, fanout 8.
-fn sizing() -> Sizing {
-  Sizing {
-    memory: 8 << 20,
-    disk: 1 << 30,
-    extent_bytes: 128 << 10,
-    fanout: 8,
-  }
-}
-
 /// A-767 item 7. Do: start a daemon holding a store, create a git repository through the verb, wait for its creation to
 /// land, stop the daemon and the store's owner, then open the store again from its files. Expect: the creation is one
 /// changeset of that repository, sequence 0, a git record naming the repository and its default branch, read back
 /// through the recovered store's rows and log.
 #[test]
 fn a_created_repository_is_landed_into_the_store_and_recovered() {
-  let dir = store_directory("create");
-  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let mut store = TestStore::start("create");
+  let dir = store.dir().to_path_buf();
   let profile = crate::daemon::test_profile();
   let instance = format!("vcs-store-create-{}", std::process::id());
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
-  config.vcs_disk = Some(store_owner.handle());
+  config.vcs_disk = Some(store.handle());
   let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
   daemon.bootstrap(true).unwrap();
   let name = "stored".to_owned();
@@ -116,7 +82,7 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
     std::thread::sleep(std::time::Duration::from_millis(5));
   }
   daemon.stop();
-  store_owner.stop().unwrap();
+  store.stop();
 
   // Recovered: the log read whole names one changeset, and the store's rows find it by its repository.
   let log_file = hyper_block::file::DeviceFile::adopt(
@@ -148,8 +114,8 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   let record = String::from_utf8(record).unwrap();
   assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
   drop(log);
-  let mut store = Store::open(root(&dir), sizing()).unwrap();
-  let rows = store.changesets(creation.header.repository, 0, 10).unwrap();
+  let mut reopened = Store::open(root(&dir), sizing()).unwrap();
+  let rows = reopened.changesets(creation.header.repository, 0, 10).unwrap();
   assert_eq!(rows.len(), 1);
   assert_eq!(rows[0].identity, creation.identity);
 }
@@ -162,12 +128,12 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
 /// revision's record as the register holds it: `/trunk` added. Before, a commit landed nothing into the store.
 #[test]
 fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
-  let dir = store_directory("svn-commit");
-  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let mut store = TestStore::start("svn-commit");
+  let dir = store.dir().to_path_buf();
   let profile = crate::daemon::test_profile();
   let instance = format!("vcs-store-svn-{}", std::process::id());
   let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
-  config.vcs_disk = Some(store_owner.handle());
+  config.vcs_disk = Some(store.handle());
   let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
   daemon.bootstrap(true).unwrap();
   let name = "stored-svn".to_owned();
@@ -233,7 +199,7 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
     .recv_timeout(std::time::Duration::from_secs(60))
     .expect("the landing answered");
   daemon.stop();
-  store_owner.stop().unwrap();
+  store.stop();
   assert_eq!(landed, Some(Ok(1)));
 
   let log_file = hyper_block::file::DeviceFile::adopt(
