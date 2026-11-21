@@ -1508,3 +1508,13 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-k90-win: kiln's CI lane frees at ~01:31; main dispatches from the MacBook if no run with f16212799 starts by 01:45.
   LANDED (w-hg): 8cb10f986 (step 0: hg refused without a store) and d571ffbca (replay a piece at a time: 790 KB read in 14 fills, peak 194 KB).
   NETWORK: the big Studio is now off kiln entirely (its 8 agents offline); Studio-2's agents are back.
+- 2026-11-21 01:13 PST
+  - The big Studio's agents are back on kiln; only w-k90-whp is offline (its Mac).
+  - DISK: the MacBook at 39 GB free. Active slates targets: w-svn 33 GB (trim asked at 00:33, queued behind a long turn), w-hg 7.3, w-git 4.6, w-shared 3.4, w-perf 2.0. Docker's remaining 60 GB of reclaimable volumes and the ~2 GB of slates-* images aren't worth it or aren't ours. Clean-aggressive waits for 30 GB.
+  - AUDIT: agents/w-shared-exit4-derive is a pre-squash leftover; its code is on main as c592a81f0. g222's arm C waits on its A/B; w-git's C5 2b piece 2 (1e0613233) is on test.
+- 2026-11-21 01:22 PST
+  - LANDED: 9d792682f (w-svn P7: svnsync from slates over svn:// mirrors git-2000 in 270.7 s, 135 ms a revision; w-interop measured 1,068 s before) and 0476b22ca (svn DAV: HTTPv2's revision resource answers PROPFIND, which stock svnsync init over the HTTP edge needs).
+  - DISK EMERGENCY, MacBook: 39 GB free at 01:13, 21 GB at 01:18, 19 GB at 01:22, with four agents building here (w-git, w-perf, w-shared, w-hg).
+    - clean-aggressive.sh freed 2 GB (stale kiln reach copies, an old bench target). Every big target was written in the last 2 h.
+    - w-svn (33 GB target) was interrupted with an urgent trim. w-hg, w-git, w-perf and w-shared are told to keep one profile and send cold builds to the Studios.
+    - Not ours, left alone: ~/.cache/kiln-move-stuck-target (24 GB, idle since 21:04; the script skips it, no fingerprint dir), kiln-send-route-target (27 GB) and kiln-opt-target (18 GB), all kiln sessions'. Ada's call.
