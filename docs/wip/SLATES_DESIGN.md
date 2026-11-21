@@ -57780,6 +57780,18 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > after 71 to 73 MiB, bound 142 to 143 MiB, 192 MiB landed (release and debug). History held in RAM, as before A-767,
 > passes the bound by the landings alone. Each tool's own red test (its intake's memory) is owed with w-hg, w-git,
 > w-svn.
+>
+> **Status (2026-11-20, main's ruling: the server's store wiring, a repository's creation landed).** `repository create`
+> on a daemon holding the store lands the repository's creation into it (A-767 item 7: the history begins with the
+> grant's record): one changeset, sequence 0, whose `Record` names the repository, its default branch, tool and format,
+> under the node's store grant; the request is answered once the creation is durable in the store too (the verb defers
+> its acceptance, AUD-11, and the landing task records its completion and answers), refused `Overloaded` when the store
+> refuses; without a store nothing changes. The store's header and `C` keys carry slates' 128-bit repository id (A-515)
+> since this change. Shape kept from A-767, against the ruling's "a Store for each repository on its owner shard": one
+> store a node on its owner thread, each shard a handle, so the commit's `F_FULLFSYNC` never runs on a shard and every
+> repository's landings on the device share one flush (item 2). Red test: `repository::store_tests` 1/1 (a git
+> repository created through the verb, its creation landed, the daemon and the owner stopped, the store reopened from its
+> files: one changeset, sequence 0, its record and its row read back).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the

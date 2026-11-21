@@ -41,7 +41,7 @@ enum Request {
     answer: Sender<Result<Option<Vec<u8>>, StoreError>>,
   },
   Changesets {
-    repository: u64,
+    repository: u128,
     from: u64,
     limit: usize,
     answer: Sender<Result<Vec<Changeset>, StoreError>>,
@@ -249,7 +249,7 @@ impl StoreHandle {
   /// The repository's landed changesets from `from` on, at most `limit` ([`Store::changesets`]).
   pub async fn changesets(
     &self,
-    repository: u64,
+    repository: u128,
     from: u64,
     limit: usize,
   ) -> Result<Vec<Changeset>, OwnerError> {

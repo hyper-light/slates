@@ -1922,6 +1922,7 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "blake3",
+ "hyper-block",
  "hyper-datagram",
  "hyper-seal",
  "libc",

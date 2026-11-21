@@ -14,7 +14,7 @@
 //! name a changeset the log lacks and lack none it holds.
 //!
 //! **Rows** (item 3), keyed so a repository's rows are one contiguous range: `C`, then the repository and the
-//! changeset's sequence (each a big-endian `u64`, so the order of the bytes is the order of the numbers), whose value
+//! changeset's sequence (big-endian, a `u128` and a `u64`, so the order of the bytes is the order of the numbers), whose value
 //! is the record's offset and length in the log, its identity, its tool byte and its work; and `P`, then a payload
 //! section's identity (BLAKE3 of its bytes), whose value is where those bytes are in the log and their length, so a
 //! landed content is read by identity as a staged one is ([`Store::piece`]). The other tables of item 3
@@ -48,6 +48,8 @@ const CHANGESETS: u8 = b'C';
 const CONTENTS: u8 = b'P';
 /// Format: a `u64` field's width.
 const U64: usize = size_of::<u64>();
+/// Format: a repository id's width (`u128`, A-515).
+const U128: usize = size_of::<u128>();
 /// Format: an identity's width (BLAKE3).
 const IDENTITY: usize = blake3::OUT_LEN;
 /// Format: a row key's first field, after its one-byte tag.
@@ -60,7 +62,7 @@ const CONTENT_VALUE_BYTES: usize = U64 + U64;
 /// until what it needs is whole), not a tuning of the reader.
 const PIECE_BYTES: usize = 1 << 16;
 /// Format: a changeset row key's sequence, after the tag and the repository.
-const K_SEQUENCE: usize = AFTER_TAG + U64;
+const K_SEQUENCE: usize = AFTER_TAG + U128;
 /// Format: a changeset row's key: the tag, the repository, the sequence.
 const KEY_BYTES: usize = K_SEQUENCE + U64;
 /// Format: a changeset row value's length, after the offset.
@@ -165,7 +167,7 @@ pub enum Contents<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Changeset {
   /// The repository.
-  pub repository: u64,
+  pub repository: u128,
   /// Its sequence.
   pub sequence: u64,
   /// The record's offset in the log.
@@ -347,7 +349,7 @@ impl Store {
   /// The repository's landed changesets from sequence `from` on, at most `limit`, in order.
   pub fn changesets(
     &mut self,
-    repository: u64,
+    repository: u128,
     from: u64,
     limit: usize,
   ) -> Result<Vec<Changeset>, StoreError> {
@@ -437,7 +439,7 @@ fn engine_sizing(
 }
 
 /// The changeset row's key.
-fn changeset_key(repository: u64, sequence: u64) -> [u8; KEY_BYTES] {
+fn changeset_key(repository: u128, sequence: u64) -> [u8; KEY_BYTES] {
   let mut key = [0u8; KEY_BYTES];
   put(&mut key, 0, &[CHANGESETS]);
   put(&mut key, AFTER_TAG, &repository.to_be_bytes());
@@ -522,7 +524,9 @@ fn decode_changeset(key: &[u8], value: &[u8]) -> Result<Changeset, StoreError> {
   };
   let le = |at: usize| u64_at(value, at).ok_or(StoreError::BadRow);
   Ok(Changeset {
-    repository: be(AFTER_TAG)?,
+    repository: field(key, AFTER_TAG)
+      .map(u128::from_be_bytes)
+      .ok_or(StoreError::BadRow)?,
     sequence: be(K_SEQUENCE)?,
     offset: le(0)?,
     len: le(V_LEN)?,
