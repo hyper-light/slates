@@ -58124,9 +58124,10 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
     - A refined document is built in canonical order and its post-state relaid through a map, with no sort:
       `pace::sort_by` grows its runs by doubling, and one push of that growth copied every op before it.
     - The output sits in fixed chunks freed one at a time.
-  - **Measured** (`a_large_rewrite_is_refined_over_many_turns_off_the_submit`, release, this Mac, load 6 to 16): a 2 MiB
-    re-indent refines over 31,632 to 49,214 turns, its longest 69 to 79 µs; at 8 MiB over 135,369 to 139,026 turns,
-    longest 133 to 157 µs. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
+  - **Measured** (`a_large_rewrite_is_refined_over_many_turns_off_the_submit`, release, three runs a size):
+    - adas-mac-studio-4 (M4 Max), load 3 to 4: a 2 MiB re-indent refines over 25,402 to 38,061 turns, its longest 54
+      to 69 µs; at 8 MiB over 134,477 to 154,504 turns, longest 109 to 311 µs.
+    - This Mac, load 6 to 16: 69 to 79 µs at 2 MiB, 133 to 157 µs at 8 MiB. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
     200 ms at 12 MiB. Turns past the whole quantum: 2 to 4%, past 16 quanta 0.03%. The quantum here is a few µs, the
     shard's measured wake.
   - **The remaining tail** follows the largest single buffer freed. Deferring those frees to an idle moment waits on
