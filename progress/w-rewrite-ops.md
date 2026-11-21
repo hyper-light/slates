@@ -1,5 +1,14 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## 2026-11-21 ~04:00 PST — main 02:37: all three pieces LANDED
+- Piece 1: A-805, 31c0acd50.
+- Piece 2: A-807, dbfac3e13.
+- Piece 3: A-809, main 5eeb3c481 (piece 2f35ad7d8). At 10^5 versions, judge 65.4 to 22.5 µs and values 228 to 1.6 a
+  verdict.
+- w-fed-move told: inbox/w-fed-move-from-w-rewrite-ops-a809.md. main told: inbox/main-from-w-rewrite-ops-a809.md, with
+  the checkpoint seed that fails on main.
+- Left: GAPS A-803 (a) and (b); GAPS C2 (b), (c) owed with w-hg, and (d).
+
 ## 2026-11-21 — main 02:37: pieces 1 and 2 LANDED, piece 3 (A-803) in progress
 
 - Piece 1 (A-805): the verdict is held, never shown before the one commit. Landed as 6f4303bef.
