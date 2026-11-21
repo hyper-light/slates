@@ -44,3 +44,15 @@ landing and its replay red first.
   Payload; `Replaying` replays the log a unit a step; refusals by kind.
 - slates-hg lib 376/376, local macOS. These land on main with the server adapter once w-store's wiring is there,
   red first on the real store.
+
+## C1 update (~20:50): hg's push on the real store, built on branch agents/w-hg-c1; its by-use test blocked by the store
+- **3ffb95c4b:** with `--vcs-store`, the push's driver lands the changeset first (durable; Record = v6 head, Payload =
+  the changegroup moved in, never copied), then commits the register entry holding a v7 reference (payload identity
+  and length, sequence). A recovery or rebuild meeting a v7 record reads the payload back by `StoreHandle::piece` and
+  replays it through the sectioned intake, a unit a slice (`ReplayRefused::Unlanded` where it cannot).
+- **a9620fbb1:** the Texts section lands with it (w-perf's `slates_store::texts::encode`, fa5fd0023).
+- **Red-first by use:** `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them` (stock hg
+  7.2: push, `hg_push.landed`, kill -9, clone after the restart). It's **blocked by the store itself on this Mac**:
+  "the store's engine: invalid argument: a memtable past 4 GiB", so `repository create` answers Overloaded before any
+  push. Reported to w-store (inbox/w-store-from-w-hg-memtable-2026-11-20.md). It lands on main once that's fixed and
+  the test passes.
