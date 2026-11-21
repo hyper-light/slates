@@ -75,3 +75,22 @@
 - **Red, then green:** the same six-way run (kiln r29, d9c014fa0, load 29 to 33): 18 of 18 passed, against 18 of 18
   failed before. `vcs_http::`, `git_push::` and `vcs_ssh::`: 168 passed. Format clean.
 - **Owed (GAPS):** the SSH edge's receive still carries its homing and landing inline, with no keepalive between.
+
+## C5 part 2b, piece 1: a client's push writes version 5 only: LANDED (2026-11-21 ~01:10 PST)
+- **Commit:** origin/main 3ce898533 (branch agents/w-git-c5b1, deleted).
+- **What changed:**
+  - The push's homing is always on; the test switch `write_version_4[_for_test]` is gone.
+  - Every shortfall refuses the push `PushFailed::Unlanded` (`GitRefused::Unlanded` at the append), for the client's
+    retry: a carried homing that falls short, a pack not held, no store, a refused landing, or names that changed
+    between the homing and the append.
+  - An append that brings no object writes version 5 naming none.
+- **Red, then green:** `t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing`. On main 970950081
+  it was red: answered `unpack ok` / `ok refs/heads/main` (r30). On the branch it is green (r32: 288 passed, format
+  clean). On the merged tree (426f6466c, which touched vcs_store.rs): 288 passed, 1 failed. The failure is
+  `git_push::tests::t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time` (`past_budget` 1). It is
+  load-sensitive: it passes 3 of 3 alone at load 22, and failed the same way under load before this piece (r18).
+  Please add it to the loaded-machine list.
+- **The one register-held path left, version 2, at `vcs_store::SealedPush::record`'s last arm (`record_of`):**
+  - server-made commits (A-664), until they take w-svn's deferred-submit landing order (piece 3);
+  - pushes whose driver never takes its homing ask: the tests' synchronous drivers `git_push::tests::answered` and
+    `pushed` (piece 2).

@@ -312,3 +312,6 @@
   green 18/18 at load 29-33). Next: C5 part 2b piece 1 (pushes v5 only; carried shortfalls refuse; names race
   refuses; moves-only v5; the v4 test switch removed; v2 left for made commits and sync test drivers' untaken asks),
   then 2b-2 (sync drivers async), then made commits onto w-svn's deferred-submit hook.
+- 2026-11-21 01:10 C5 2b piece 1 LANDED 3ce898533 (pushes v5 only; shortfalls Unlanded; switch gone). Next: piece 2,
+  the tests' synchronous push drivers (answered/pushed/pushed_from_the_fixtures and the in-test loops, ~30 sites)
+  made async on stored daemons, and an untaken homing ask refusing; piece 3 waits for w-svn's deferred-submit hook.
