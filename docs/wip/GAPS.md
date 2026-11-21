@@ -204,9 +204,10 @@
 > 5d7e05b81: 5.24/5.28/5.30 s against stock's 0.47/0.50/0.48 s, a later stream of the same daemon 10.69/10.71 s, its
 > store thread reading each chunk with its own lookup and `pread`; BUILT: a batch of places is read a run at a time
 > (`Store::places_bytes`: in order in one payload, the read within twice the bytes asked). OPEN: the bytes, 151.7 MB on the wire against stock's 77.9 MB (8452 files uncompressed
-> against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
-> the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
-> stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
+> against stream v2's 4282 compressed); the view made each turn (`Indexed::new`). CLOSED by w-hg's C1 (imports since
+> step 3, made changesets since the made-on-store piece): a repository whose history the store did not keep (an
+> import's, a made changeset's) advertised no stream (`State::stored_logs`, from `HgStore::unstored`, both removed),
+> so stock `hg clone --stream` cloned it plainly with its own
 > warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
 > server" (main's ruling 02:31; the stock-hg test above, and
 > `a_stream_clone_is_advertised_only_where_the_store_keeps_the_repositorys_logs`). Such a clone is a plain clone's speed.
@@ -2846,7 +2847,7 @@
 > a server-made revision (`land_made`, A-804's made commits) stages its texts the same way (`svn_commit::stage_texts`,
 > shared with `land_revision`); held by `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`
 > (its text named stored, none in RAM; red before: kept in RAM). Every new Subversion text now lands on the store and
-> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-818, main 09:20): the deltify record
+> nothing keeps one in RAM but the green's head and a hook view's pins. CLOSED (A-819, main 09:20): the deltify record
 > and APIs retired, a log holding one refused typed at decode and a revision with inline texts at replay
 > (`a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild`); `KeptText` stays for records
 > standing alone, which a daemon's no longer reach. Stage C,
@@ -2868,12 +2869,35 @@
 > waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's made changeset
 > takes the hook since A-807 (the turn first, the verdict held, the version and the changeset committed in one step
 > after it, then the answer; `a_mercurial_made_changeset_is_answered_only_after_its_one_step`,
-> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`), but its record is
-> still written in the register's entry, not landed on the node's store first, and a client's hg push takes no landing
-> turn, so a push in flight and a made changeset are not ordered by it (owed with w-hg: a made reference on the store
-> and its replay); git's adopts the hook (w-git, removing its version-2 path); (d)
+> `a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back`). Since A-767 C1 its
+> changeset lands on the node's store before the step, as a push's does (w-hg, below). A client's hg push still takes no
+> landing turn: one landed between a made changeset's making and its commit leaves the made fork stale, and the version
+> stands alone, counted `vcs.hg.changeset_unmade`. git's adopts the hook (w-git, removing its version-2 path); (d)
 > performance: the held verdict's mapped files are made twice (in the preview and at the commit). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C1, made changesets on the changeset store (2026-11-21, w-hg; main's ruling of 09:00: one hook, one path).
+> CLOSED.**
+> - A changeset the server makes of a submitted version lands on the node's store as a push's does. The made
+>   revisions' changegroup (`slates_hg::push::made::changegroup`) is taken through the push's intake into a fork, then
+>   landed with a made record (`write_made_record`: the green's key and version beside the push's head), `Payload`
+>   and `Texts`. The register's entry names it by reference (`write_made_reference`), and a replay puts the made node
+>   back.
+> - A recorded submit takes the shared deferred-submit hook (A-804/A-805/A-807): the changeset is made from a preview
+>   of the held verdict and landed by a task, then the version and the entry are committed in one step. A bare dispatch
+>   lands it from a task holding the turn.
+> - Removed, with no fallback:
+>   - the v3 made record (`record::write_made`, `DELTA_VERSION`, its `formed` reader, the revision's `base`);
+>   - `hg_made::recorded`;
+>   - `HgStore::unstored`, and the served view's `State::stored_logs` with it: every history is on the store, so every
+>     repository streams.
+> - Held by:
+>   - `push::made::tests::a_made_changesets_changegroup_takes_through_the_intake_to_what_it_keeps` (stock 7.2's three
+>     changesets, the intake's index `fork_with`'s row for row);
+>   - `a_made_changesets_record_replays_to_its_made_node`;
+>   - `hg_made::tests::t_a731_a_submitted_version_is_the_changeset_the_server_makes` (two made changesets named by
+>     reference on the store, the rebuild putting the made head back);
+>   - hg_interop 15/15 against stock hg 7.2 (the CLI's bookmark case submits through the hook).
+> - Next: C1 step 1, the served view's file texts through the store (1a, the clone walk; 1b, the pull).
 > **C2 stage C, the green's side BUILT (A-814, 2026-11-21, w-rewrite-ops; main's orders of 04:11 and 06:11; the
 > split in inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).** `crate::import_batch::ImportBatch` advances an import's
 > revisions in RAM and commits them as one entry, through a scratch member of the green's lineage, so the green shows

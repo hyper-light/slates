@@ -17464,3 +17464,30 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   whole fold killed a daemon on w-git's push); the Z = 20 ms p99 is a measured gap in GAPS, and the fold's work itself
   is the next cut.
 
+
+## Offset-shift layers for a path's history: writes win, old reads lose (A-803 (b); measured and REJECTED; 2026-11-21)
+
+- **Question.** A-803's leftover (b): an insert re-anchors its path's whole history (values walked per change grow with
+  history). Would layers that record each insert's shift, carried by a read, keep a change flat?
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench` (A-811's bench plus the line
+  `read_version_1_after_alternating`: version 1 read whole after m changes alternating an overwrite and an insert).
+- **Machine:** this Mac (w-rewrite-ops), load 79 falling to 53 while main's numbers ran (noisy; the shape is not).
+  Fastest of 5 rounds a point.
+
+| m (alternating changes) | 10 | 100 | 1,000 | 10,000 |
+|---|---|---|---|---|
+| main: read of version 1 | 0.33 µs | 1.4 µs | 4.4 µs | 10.9 µs |
+| shift layers, unbounded: read of version 1 | 2.9 µs | 0.17 ms | 4.3 ms | 58 ms |
+| shift layers, bounded at the file's length | 3.1 µs | 0.16 ms | 0.81 ms | 11.2 ms |
+| shift layers, bounded at s²: read of version 1 | 3.0 µs | 0.12 ms | 0.14 ms | 0.54 ms |
+
+| history (alternating stream), a change | 100 | 1,000 | 5,000 |
+|---|---|---|---|
+| main | 0.61 ms (101 values walked) | 4.2 ms (551) | 20.1 ms (2,551) |
+| shift layers, unbounded | 2.8 µs | 5.5 µs | 13.1 µs |
+| shift layers, bounded at s² | 0.39 ms | 3.3 ms | 14.1 ms |
+
+- **Verdict: REJECTED.** An old version's read carries its ranges through every later shift (quadratic in the shifts);
+  every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
+  branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
+  a version, A-803 (c).

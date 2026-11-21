@@ -73,9 +73,6 @@ const VERSION: u32 = 1;
 /// Format: the version of a push's record that holds its changegroup as it arrived (A-729 part 2): deltas, never texts.
 /// A replay refuses any version but these two.
 const CHANGEGROUP_VERSION: u32 = 2;
-/// Format: the version of a record of revisions each given whole or as the delta the index keeps it as (A-729 part 2,
-/// an import's): a form byte after a revision's flags, and a delta's base after it.
-const DELTA_VERSION: u32 = 3;
 /// Format: the version of an import's record that names each revision's content by identity and holds none of its bytes
 /// (A-729 part 2; main's ruling: since A-727 a3 the content a shard stores survives a restart in its image, recovered
 /// before the records, so a record names what the store holds, never a second copy in the log).
@@ -158,13 +155,19 @@ pub struct Reference {
   pub len: u64,
   /// The changeset's sequence in its repository.
   pub sequence: u64,
+  /// Where the changeset is one the server made (A-731): the green's key and the version it was made of.
+  pub made: Option<(u64, u64)>,
 }
 
 impl Reference {
   /// The record of the changeset this reference names, as the log's `Record` section holds it
-  /// ([`write_push_record`]): what [`Replay::begin_sectioned`] replays with the payload read back.
+  /// ([`write_push_record`], [`write_made_record`]): what [`Replay::begin_sectioned`] replays with the payload read
+  /// back.
   pub fn record(&self) -> Vec<u8> {
-    write_push_record(self.room, self.version)
+    match self.made {
+      Some(made) => write_made_record(self.room, self.version, made),
+      None => write_push_record(self.room, self.version),
+    }
   }
 }
 
@@ -175,11 +178,37 @@ pub fn write_push_reference(
   (version, changegroup): (Version, &[u8]),
   sequence: u64,
 ) -> Vec<u8> {
+  write_reference(Source::Push, room, (version, changegroup), sequence)
+}
+
+/// The register's record of a changeset the server made of `green`'s `version` (A-731), landed as changeset `sequence`
+/// whose changegroup is `changegroup`: [`write_push_reference`]'s form with the made source.
+pub fn write_made_reference(
+  room: u64,
+  (version, changegroup): (Version, &[u8]),
+  sequence: u64,
+  (green, made): (u64, u64),
+) -> Vec<u8> {
+  write_reference(
+    Source::Made {
+      green,
+      version: made,
+    },
+    room,
+    (version, changegroup),
+    sequence,
+  )
+}
+
+/// A changeset reference from `source` ([`REFERENCE_VERSION`]).
+fn write_reference(
+  source: Source,
+  room: u64,
+  (version, changegroup): (Version, &[u8]),
+  sequence: u64,
+) -> Vec<u8> {
   let mut out = Vec::new();
-  out.extend_from_slice(&MAGIC.to_le_bytes());
-  out.extend_from_slice(&REFERENCE_VERSION.to_le_bytes());
-  out.push(Source::Push.byte());
-  out.extend_from_slice(&room.to_le_bytes());
+  write_head_alone(&mut out, (REFERENCE_VERSION, source, room));
   out.extend_from_slice(version.name());
   out.extend_from_slice(blake3::hash(changegroup).as_bytes());
   out.extend_from_slice(&to_u64(changegroup.len()).to_le_bytes());
@@ -192,7 +221,12 @@ pub fn write_push_reference(
 pub fn reference_of(bytes: &[u8]) -> Option<Reference> {
   let mut reader = Reader { rest: bytes };
   let (version, source, room) = head(&mut reader).ok()?;
-  if version != REFERENCE_VERSION || source != Source::Push {
+  let made = match source {
+    Source::Push => None,
+    Source::Made { green, version } => Some((green, version)),
+    Source::Import => return None,
+  };
+  if version != REFERENCE_VERSION {
     return None;
   }
   let name = reader.take(CHANGEGROUP_NAME_BYTES).ok()?;
@@ -206,12 +240,9 @@ pub fn reference_of(bytes: &[u8]) -> Option<Reference> {
     payload,
     len,
     sequence,
+    made,
   })
 }
-/// Format: the form byte of a revision given whole.
-const TEXT_FORM: u8 = 0;
-/// Format: the form byte of a revision given as its delta, its base's node after the byte.
-const DELTA_FORM: u8 = 1;
 /// Format: the bytes of a changegroup version's name (`01` to `05`).
 const CHANGEGROUP_NAME_BYTES: usize = 2;
 
@@ -419,10 +450,8 @@ pub struct Revision<'t> {
   pub link: Node,
   /// 7.2's index flags.
   pub flags: u16,
-  /// The whole text; a revision given as a delta ([`DELTA_VERSION`]), its delta against `base`.
+  /// The whole text.
   pub text: &'t [u8],
-  /// A revision given as a delta: its base's node (A-729 part 2, a made changeset's manifest against its parent's).
-  pub base: Option<Node>,
 }
 
 /// One group of a push's record: a log, and its revisions in the order they were appended.
@@ -714,13 +743,12 @@ pub fn write_revisions(
   write_groups((VERSION, source, room), groups, markers)
 }
 
-/// [`write_revisions`] in `version`: [`DELTA_VERSION`] writes each revision's form, its base after a delta's.
+/// [`write_revisions`] in `version`.
 fn write_groups(
   (version, source, room): (u32, Source, u64),
   groups: &[Group<'_>],
   markers: &[&[u8]],
 ) -> Result<Vec<u8>, WriteRefused> {
-  let formed = version == DELTA_VERSION;
   let made = if matches!(source, Source::Made { .. }) {
     MADE_BYTES
   } else {
@@ -732,14 +760,8 @@ fn write_groups(
   for (log, revisions) in groups {
     len = len.saturating_add(group_head_len(*log));
     for revision in *revisions {
-      let form = match (formed, revision.base) {
-        (false, _) => 0,
-        (true, None) => TAG_BYTES,
-        (true, Some(_)) => TAG_BYTES.saturating_add(NODE_LEN),
-      };
       len = len
         .saturating_add(fixed_len(*log))
-        .saturating_add(to_u64(form))
         .saturating_add(to_u64(revision.text.len()));
     }
   }
@@ -757,7 +779,7 @@ fn write_groups(
   for (log, revisions) in groups {
     write_group_head(&mut out, *log, to_u64(revisions.len()));
     for revision in *revisions {
-      write_revision_head(&mut out, *log, revision, formed);
+      write_revision_head(&mut out, *log, revision);
       out.extend_from_slice(revision.text);
     }
   }
@@ -780,72 +802,7 @@ pub fn write_push(
   write_verified(verified, Source::Push, room)
 }
 
-/// A made changeset's record (A-731, [`Source::Made`]): the revisions the server made of `green`'s `version`, written as
-/// [`write_push`] writes a push's, the green's key and the version beside them.
-///
-/// Written in [`DELTA_VERSION`] (A-729 part 2): its manifest as its delta against `parent`, its first parent's text
-/// (`delta::encode_lines`), where it has one, so a made changeset's record holds the lines it changed, never the whole
-/// listing; every other revision whole.
-pub fn write_made(
-  verified: &crate::push::verify::Verified,
-  (green, version): (u64, u64),
-  parent: Option<&[u8]>,
-  room: u64,
-) -> Result<Vec<u8>, WriteRefused> {
-  let changesets = pushed(&verified.changesets, false);
-  let mut deltas: Vec<Vec<u8>> = Vec::new();
-  for (manifest, base) in verified
-    .manifests
-    .iter()
-    .zip(core::iter::once(parent).chain(core::iter::repeat(None)))
-  {
-    let mut delta = Vec::new();
-    if let Some(base) = base.filter(|_| manifest.p1 != NULL_NODE) {
-      crate::delta::encode_lines(base, &manifest.text, &mut delta)
-        .map_err(|_| WriteRefused::Allocation)?;
-    }
-    deltas.push(delta);
-  }
-  let manifests: Vec<Revision<'_>> = verified
-    .manifests
-    .iter()
-    .zip(&deltas)
-    .zip(core::iter::once(parent).chain(core::iter::repeat(None)))
-    .map(|((manifest, delta), base)| {
-      let delta_of = base.is_some() && manifest.p1 != NULL_NODE;
-      Revision {
-        node: manifest.node,
-        p1: manifest.p1,
-        p2: manifest.p2,
-        link: manifest.link,
-        flags: 0,
-        text: if delta_of { delta } else { &manifest.text },
-        base: delta_of.then_some(manifest.p1),
-      }
-    })
-    .collect();
-  let files: Vec<(Log<'_>, Vec<Revision<'_>>)> = verified
-    .files
-    .iter()
-    .map(|(path, arrived)| (Log::File(path), pushed(arrived, true)))
-    .collect();
-  let mut groups: Vec<Group<'_>> = vec![
-    (Log::Changelog, changesets.as_slice()),
-    (Log::Manifest, manifests.as_slice()),
-  ];
-  groups.extend(
-    files
-      .iter()
-      .map(|(log, revisions)| (*log, revisions.as_slice())),
-  );
-  write_groups(
-    (DELTA_VERSION, Source::Made { green, version }, room),
-    &groups,
-    &[],
-  )
-}
-
-/// [`write_push`] and [`write_made`]'s one writer.
+/// [`write_push`]'s writer.
 fn write_verified(
   verified: &crate::push::verify::Verified,
   source: Source,
@@ -969,6 +926,41 @@ pub fn write_push_record(room: u64, version: Version) -> Vec<u8> {
   out
 }
 
+/// A made changeset's record as the changeset log's `Record` section holds it ([`SECTIONED_VERSION`], A-767 C1: a made
+/// changeset lands as a push's does, main's ruling of 2026-11-21 09:00): [`write_push_record`]'s head with the made
+/// source, the green's key and the version it was made of, and the changegroup's version name; the changegroup the
+/// server built of it is the changeset's `Payload` section. Its replay puts the made node back
+/// ([`Replayed::made`]).
+pub fn write_made_record(room: u64, version: Version, (green, made): (u64, u64)) -> Vec<u8> {
+  let mut out = Vec::new();
+  write_head_alone(
+    &mut out,
+    (
+      SECTIONED_VERSION,
+      Source::Made {
+        green,
+        version: made,
+      },
+      room,
+    ),
+  );
+  out.extend_from_slice(version.name());
+  out
+}
+
+/// A record's head with no group count after it: the magic, the version, the source (a made changeset's green and
+/// version after its byte) and the room.
+fn write_head_alone(out: &mut Vec<u8>, (version, source, room): (u32, Source, u64)) {
+  out.extend_from_slice(&MAGIC.to_le_bytes());
+  out.extend_from_slice(&version.to_le_bytes());
+  out.push(source.byte());
+  if let Source::Made { green, version } = source {
+    out.extend_from_slice(&green.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+  }
+  out.extend_from_slice(&room.to_le_bytes());
+}
+
 /// A push's changegroup record written whole ([`ChangegroupWriter`]'s steps at once).
 pub fn write_changegroup(
   room: u64,
@@ -991,7 +983,6 @@ fn pushed(arrived: &[crate::push::verify::Arrived], linked: bool) -> Vec<Revisio
       link: if linked { revision.link } else { NULL_NODE },
       flags: 0,
       text: &revision.text,
-      base: None,
     })
     .collect()
 }
@@ -1041,7 +1032,7 @@ fn write_group_head(out: &mut Vec<u8>, log: Log<'_>, count: u64) {
 }
 
 /// Writes a revision's fixed part: node, parents, link (not a changeset's), flags and text length.
-fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>, formed: bool) {
+fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>) {
   out.extend_from_slice(&revision.node);
   out.extend_from_slice(&revision.p1);
   out.extend_from_slice(&revision.p2);
@@ -1049,15 +1040,6 @@ fn write_revision_head(out: &mut Vec<u8>, log: Log<'_>, revision: &Revision<'_>,
     out.extend_from_slice(&revision.link);
   }
   out.extend_from_slice(&revision.flags.to_le_bytes());
-  if formed {
-    match revision.base {
-      None => out.push(TEXT_FORM),
-      Some(base) => {
-        out.push(DELTA_FORM);
-        out.extend_from_slice(&base);
-      }
-    }
-  }
   out.extend_from_slice(&to_u64(revision.text.len()).to_le_bytes());
 }
 
@@ -1185,10 +1167,8 @@ struct Read<'a> {
   link: Node,
   /// 7.2's index flags.
   flags: u16,
-  /// The text; a revision given as a delta, its delta.
+  /// The text.
   text: &'a [u8],
-  /// A revision given as a delta: its base's node.
-  base: Option<Node>,
 }
 
 impl<'a> Reader<'a> {
@@ -1256,18 +1236,13 @@ impl<'a> Reader<'a> {
   }
 
   /// One revision: a changeset's when `linked` is false, else a manifest's or file revision's.
-  fn revision(&mut self, linked: bool, formed: bool) -> Result<Read<'a>, Refused> {
+  fn revision(&mut self, linked: bool) -> Result<Read<'a>, Refused> {
     let node = self.node()?;
     let p1 = self.node()?;
     let p2 = self.node()?;
     let link = if linked { self.node()? } else { NULL_NODE };
     let flags =
       <[u8; FLAGS_BYTES]>::try_from(self.take(FLAGS_BYTES)?).map_err(|_| Refused::Truncated)?;
-    let base = match formed.then(|| self.byte()).transpose()? {
-      None | Some(TEXT_FORM) => None,
-      Some(DELTA_FORM) => Some(self.node()?),
-      Some(tag) => return Err(Refused::Tag { tag }),
-    };
     let text = self.bytes()?;
     Ok(Read {
       node,
@@ -1276,7 +1251,6 @@ impl<'a> Reader<'a> {
       link,
       flags: u16::from_le_bytes(flags),
       text,
-      base,
     })
   }
 }
@@ -1314,8 +1288,6 @@ pub fn replay(
 /// and appended into the fork as [`replay`] keeps it), one new changeset's manifest held to the manifest log, or the
 /// markers and the record's end. Its place in the record is a byte offset, so it borrows nothing between steps.
 struct Revisions {
-  /// The record's source.
-  source: Source,
   /// The room the record was written within.
   room: Admission,
   /// The fork the record is replayed into.
@@ -1335,8 +1307,6 @@ struct Revisions {
   done: bool,
   /// What was replayed.
   replayed: Replayed,
-  /// Whether each revision names its form ([`DELTA_VERSION`]).
-  formed: bool,
   /// Whether each revision is named by its content's identity ([`IDENTITY_VERSION`]).
   identities: bool,
   /// Whether it is an import's segment ([`SEGMENT_VERSION`]): held to no empty index, no manifest checked.
@@ -1377,6 +1347,8 @@ struct Framing {
   framed: crate::framing::Framed,
   /// The room the push's intake ran within, each revision placed charged to it.
   room: Admission,
+  /// Where the changeset is one the server made: the green's key and the version.
+  made: Option<(u64, u64)>,
 }
 
 /// Whether a changeset's replay has more to take ([`Replay::step_sectioned`]).
@@ -1403,6 +1375,9 @@ struct Retaken {
   first: (u32, u32),
   /// Whether every unit is taken.
   done: bool,
+  /// Where the changeset is one the server made: the green's key and the version, which the replay puts back with its
+  /// node ([`Replayed::made`]).
+  made: Option<(u64, u64)>,
 }
 
 impl Replay {
@@ -1440,7 +1415,12 @@ impl Replay {
   pub fn begin_sectioned(record: &[u8]) -> Result<Replay, Refused> {
     let mut reader = Reader { rest: record };
     let (version, source, room) = head(&mut reader)?;
-    if version != SECTIONED_VERSION || source != Source::Push {
+    let made = match source {
+      Source::Push => None,
+      Source::Made { green, version } => Some((green, version)),
+      Source::Import => return Err(Refused::Version { version }),
+    };
+    if version != SECTIONED_VERSION {
       return Err(Refused::Version { version });
     }
     let name = reader.take(CHANGEGROUP_NAME_BYTES)?;
@@ -1455,6 +1435,7 @@ impl Replay {
         walk: crate::framing::Framing::new(changegroup, false),
         framed: crate::framing::Framed::default(),
         room,
+        made,
       })),
     })
   }
@@ -1470,7 +1451,9 @@ impl Replay {
   ) -> Result<Progress, Refused> {
     match &mut self.kind {
       Kind::Framing(framing) => {
-        let Framing { walk, framed, room } = &mut **framing;
+        let Framing {
+          walk, framed, room, ..
+        } = &mut **framing;
         let mut sink = crate::framing::Collect {
           framed,
           admission: room,
@@ -1478,12 +1461,15 @@ impl Replay {
         match walk.step(payload, &mut sink) {
           Ok(true) => Ok(Progress::More),
           Ok(false) => {
-            let Framing { framed, room, .. } = *core::mem::replace(
+            let Framing {
+              framed, room, made, ..
+            } = *core::mem::replace(
               framing,
               Box::new(Framing {
                 walk: crate::framing::Framing::new(Version::V01, false),
                 framed: crate::framing::Framed::default(),
                 room: Admission::new(0),
+                made: None,
               }),
             );
             let first = (
@@ -1497,6 +1483,7 @@ impl Replay {
               room,
               first,
               done: false,
+              made,
             }));
             Ok(Progress::More)
           }
@@ -1578,6 +1565,7 @@ impl Retaken {
       room,
       first,
       done: false,
+      made: None,
     })
   }
 
@@ -1641,6 +1629,16 @@ impl Retaken {
       .kept
       .saturating_sub(u64::from(changesets))
       .saturating_sub(u64::from(manifests));
+    let made = match self.made {
+      Some((green, version)) => {
+        let node = fork
+          .changeset(store, self.first.0)
+          .map(|row| row.node)
+          .ok_or(Refused::Truncated)?;
+        Some((green, version, node))
+      }
+      None => None,
+    };
     let replaced = core::mem::replace(index, fork);
     Ok(Replayed {
       changesets,
@@ -1649,7 +1647,7 @@ impl Retaken {
       file_revisions,
       markers: 0,
       whole: replaced.release(store).is_ok(),
-      made: None,
+      made,
     })
   }
 }
@@ -1674,7 +1672,6 @@ impl Revisions {
       .map_err(|refused| ImportRefused::<Infallible>::Index(refused.into()))?;
     let first = fork.len(store, Log::Changelog);
     Ok(Revisions {
-      source,
       room,
       fork,
       first,
@@ -1684,7 +1681,6 @@ impl Revisions {
       check: None,
       done: false,
       replayed: Replayed::default(),
-      formed: version == DELTA_VERSION,
       identities: version == IDENTITY_VERSION || segment,
       segment,
       last: None,
@@ -1752,14 +1748,6 @@ impl Revisions {
       return Ok(());
     }
     self.replayed.markers = replay_markers(reader, &mut self.fork, store)?;
-    if let Source::Made { green, version } = self.source {
-      let node = self
-        .fork
-        .changeset(store, self.first)
-        .map(|row| row.node)
-        .ok_or(Refused::Truncated)?;
-      self.replayed.made = Some((green, version, node));
-    }
     if !reader.rest.is_empty() {
       return Err(Refused::Trailing);
     }
@@ -1817,16 +1805,8 @@ impl Revisions {
       }
       return Ok(());
     }
-    let read = reader.revision(linked, self.formed)?;
-    if self.formed && linked {
-      self.formed_revision(store, (log, radix.as_slice()), (rev, &read))?;
-    } else if read.base.is_some() {
-      // A changeset is never written as a delta, nor any revision before the form byte.
-      return Err(Refused::Base {
-        revlog: radix.into_boxed_slice(),
-        rev,
-      });
-    } else if linked {
+    let read = reader.revision(linked)?;
+    if linked {
       replay_revision(&mut self.fork, store, (log, radix.as_slice()), (rev, &read))?;
     } else {
       replay_changeset(&mut self.fork, store, (rev, &read), self.room)?;
@@ -1870,7 +1850,6 @@ impl Revisions {
         link: NULL_NODE,
         flags,
         text: &text,
-        base: None,
       };
       return replay_changeset(&mut self.fork, store, (rev, &read), self.room);
     }
@@ -1902,52 +1881,6 @@ impl Revisions {
       .append_stored(store, log, &[(row, stored)])
       .map_err(ImportRefused::<Infallible>::Index)?;
     settle::<Infallible>(&mut self.fork, store, radix, rev, &numbers)?;
-    Ok(())
-  }
-
-  /// One manifest or file revision of a record that names forms, given whole or as its delta against the revision
-  /// replayed last or one the fork holds: rebuilt, then kept and appended as [`replay`] keeps it, its text held for the
-  /// next.
-  fn formed_revision(
-    &mut self,
-    store: &mut ContentStore,
-    (log, radix): (Log<'_>, &[u8]),
-    (rev, read): (u32, &Read<'_>),
-  ) -> Result<(), Refused> {
-    let text = match read.base {
-      None => read.text.to_vec(),
-      Some(base) => {
-        let unheld = || Refused::Base {
-          revlog: Box::from(radix),
-          rev,
-        };
-        let held;
-        let base_text: &[u8] = match &self.last {
-          Some((node, text)) if *node == base => text,
-          _ => {
-            let number = self.fork.rev(store, log, &base).ok_or_else(unheld)?;
-            held = self
-              .fork
-              .revision_text(store, log, number)
-              .ok_or_else(unheld)?;
-            &held
-          }
-        };
-        let mut room = self.room;
-        crate::delta::apply(base_text, read.text, &mut room).map_err(|refusal| Refused::Delta {
-          revlog: Box::from(radix),
-          rev,
-          refusal,
-        })?
-      }
-    };
-    let whole = Read {
-      text: &text,
-      base: None,
-      ..*read
-    };
-    replay_revision(&mut self.fork, store, (log, radix), (rev, &whole))?;
-    self.last = Some((read.node, text));
     Ok(())
   }
 
@@ -1990,7 +1923,6 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
   if ![
     VERSION,
     CHANGEGROUP_VERSION,
-    DELTA_VERSION,
     IDENTITY_VERSION,
     SECTIONED_VERSION,
     REFERENCE_VERSION,
@@ -2010,10 +1942,9 @@ fn head(reader: &mut Reader<'_>) -> Result<(u32, Source, Admission), Refused> {
     },
     tag => return Err(Refused::Tag { tag }),
   };
-  if (version == CHANGEGROUP_VERSION
-    || version == SECTIONED_VERSION
-    || version == REFERENCE_VERSION)
-    && source != Source::Push
+  let changeset_kind = matches!(source, Source::Push | Source::Made { .. });
+  if (version == CHANGEGROUP_VERSION && source != Source::Push)
+    || ((version == SECTIONED_VERSION || version == REFERENCE_VERSION) && !changeset_kind)
   {
     return Err(Refused::Tag { tag: source.byte() });
   }
