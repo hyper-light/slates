@@ -7006,3 +7006,4 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Red would look like: E200007 with `UNGRANTED_WORDS` (no --vcs-store given), or "could not show this repository's hook
   its repository: ..." naming the step (the view volume refused, the mount helper refused or past its bound); the hook's
   `svnlook youngest` writing nothing or not `1`; `slates unmount <store>/project.svn` failing.
+- 2026-11-20 w-fed-faults goal 91 (kiln main 73712cc): owed (main's Linux lane): Linux x86_64 `SLATES_FLEET_FAULTS=1` runs of slates_fleet_faults' w7_a708_a_runner_cut_off_..., w7_a708_a_slow_lossy_link_... and w7_a_move_whose_target_is_cut_off_midway_... (macOS PASSED; killed, restarted, partitioned PASSED on adacachy). Build once, run the test binary directly per flow: a second cargo test there rebuilt kiln for an hour.
