@@ -46,6 +46,9 @@
   rule. BLOCKER for main: the Studios' sync. To resume: rerun the same command by needs from
   ~/slates-work/w-provision-gate-ci, commit the ratchets.toml diff, write the C1 close note.
 
+- ~19:20: C1 CLOSED: baseline landed b45a114e3 (kiln r9, sync:false clone on the big Studio, per main 18:35); close
+  note inbox/main-from-w-provision-gate-close.md. Remote clone/target removed. Next: P2 (loaded p999 hop, with g222).
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh
