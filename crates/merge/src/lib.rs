@@ -45,6 +45,7 @@ pub mod named;
 pub mod ops_doc;
 pub mod origin;
 pub mod pace;
+mod piece_tree;
 pub mod ptrie;
 pub mod push;
 pub mod range;

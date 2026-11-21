@@ -62,6 +62,8 @@ fn imported(dump: &[u8]) -> Repository {
         held.drain(..consumed);
         needed = more.max(held.len() + 1);
       }
+      // A dump imported whole into fresh records names every base in it: none is asked for.
+      Importing::Base { .. } => panic!("a whole dump's import asked for a base"),
       Importing::Commit { consumed, record } => {
         held.drain(..consumed);
         repository.commit_record(*record).unwrap();

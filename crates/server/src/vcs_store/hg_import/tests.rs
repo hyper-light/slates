@@ -23,7 +23,7 @@ use crate::state::ShardState;
 use crate::verbs::dispatch;
 
 /// An index's rows, each its key and its body.
-type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+pub(crate) type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Shape: a content store's budget and an import's room for the one-call import the tests hold the shard's to, each the
 /// fixture's history many times over.

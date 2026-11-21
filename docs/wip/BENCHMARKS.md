@@ -17201,6 +17201,76 @@ about 30 µs of the Linux exchange is the daemon's own (the lane, the session's 
 receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
 both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
 
+**The exchange split, and a shard's placements cached (85a; g228; 2026-11-21).** The exchange is now timed apart
+(`fleet.live.hop.exchange.{borrow,round_trip,collect,settle}`: the session's borrow, its round trip as the session timed
+it, this side's tasks around it, the sessions' return). And `Configuration::place` (a fresh `Vec` and map per call, asked
+on every durability poll, every resolve and every lane's candidates) is answered from a per-shard cache keyed by
+everything `place` reads, bounded by the shard's placed heads (`crate::placement_cache`). Counted first: a 2 KiB live
+write cost its owner 250 allocator calls more than a plain write's 34; 134 after
+(`a_live_writes_allocations_on_its_owner_are_counted_against_a_plain_ones`, a per-thread counting allocator). Command:
+the contract command, release, each arm built from its commit, five rounds interleaved with the order alternating;
+ubuntu-latest, 4 cores, load 1.4-1.7 (diag-g228-live-12, run 44887905166). Microseconds; each cell added p50, live p50 /
+p999:
+
+| round | split (a40c07faa) | split + cache (4949613ae) |
+|---|---|---|
+| 1 | 124.7; 155.6 / 1,805.4 | 113.3; 143.6 / 2,988.8 |
+| 2 | 121.0; 152.5 / 2,178.6 | 114.0; 144.7 / 1,007.9 |
+| 3 | 120.9; 151.5 / 2,101.3 | 113.3; 143.8 / 1,494.3 |
+| 4 | 134.7; 163.4 / 1,332.1 | 107.5; 140.3 / 2,835.7 |
+| 5 | 128.4; 159.8 / 829.3 | 113.4; 144.3 / 1,797.4 |
+
+Per hop, p50 (bucket bounds), the same in every round of an arm: borrow 0.5, round trip 53.2-57.3, collect 5.6-7.2,
+settle 0.4 (both arms); the reply's wake 12.3-13.3 against 5.6-6.1 and the hop to the control shard 11.3-13.3 against
+8.2-9.2 (split against cache), the build 28.7-30.7 against 26.6.
+
+**Reading.** The cache takes 7-27 µs off the median added cost in every round (107.5-114.0 against 120.9-134.7): the
+durability polls and the lane's candidates no longer place. The live p999 exceeds 1 ms in both arms on this 4-core
+runner (4 of 5 rounds in each), so the p999 half of 85a is not judged here. Of the exchange, the session's borrow,
+return and this side's tasks are about 7 µs; the round trip, 57 µs of which a holder's serve is 8-15, is the rest.
+
+**The same A/B again, with the transport bench beside each round on the same runner** (diag-g228-live-13, run
+44888649901; ubuntu-latest, 4 cores, load 1.8-2.1; `replication_bench 1000 0`, release, built from the split arm, its
+"live ship" rows: `Shipper::append`, then the ship to two holders until durable, over real endpoints, no daemon):
+
+| round | transport, live ship 4 KiB p50 / p999 | split: added p50; live p50 / p999 | cache: added p50; live p50 / p999 |
+|---|---|---|---|
+| 1 | 60.6 / 78.8 | 157.0; 191.8 / 1,248.1 | 126.5; 164.2 / 1,400.3 |
+| 2 | 67.9 / 109.3 | 152.2; 187.3 / 2,271.2 | 129.1; 163.7 / 966.5 |
+| 3 | 69.2 / 127.4 | 162.8; 196.6 / 1,088.1 | 138.6; 173.6 / 1,578.6 |
+| 4 | 83.0 / 151.1 | 156.1; 190.7 / 1,293.5 | 130.1; 166.3 / 1,290.1 |
+| 5 | 69.5 / 103.8 | 154.6; 189.4 / 1,084.2 | 141.7; 175.8 / 942.3 |
+
+The daemon's exchange round trip was at most 65.5 µs at p50 (its bucket bound) in every round of both arms.
+
+**Reading.** The cache wins again in every round (126.5-141.7 against 152.2-162.8). And the exchange's round trip is the
+transport's own: the bare live ship takes 60.6-83.0 µs at p50 on the same runner, the daemon's round trip at most 65.5.
+The "about 30 µs of the daemon's own" above compared the Studio's transport bench (22.6-27.2 µs) with Linux's exchange,
+and was wrong: on this runner nothing of the daemon hides in the round trip, and its own share of the exchange is the
+7 µs of borrow, collect and settle. What 85a's Linux median holds beyond the transport is the build (26.6), the hop to
+the control shard (8-9), the reply (6) and the hop back (4).
+
+**The same A/B on macOS** (adas-mac-studio-2.local, Apple silicon, 14 cores, load 2.9-3.7; kiln r6, 2026-11-21 15:08 UTC;
+the contract command, release, CARGO_BUILD_JOBS=4, five rounds interleaved, order alternating). Microseconds; added p50;
+live p50 / p999:
+
+| round | split (a40c07faa) | split + cache (4949613ae) |
+|---|---|---|
+| 1 | 162.6; 188.2 / 290.1 | 156.9; 182.2 / 399.5 |
+| 2 | 167.2; 193.0 / 484.2 | 162.2; 188.2 / 328.2 |
+| 3 | 171.3; 197.1 / 355.4 | 157.0; 184.8 / 326.2 |
+| 4 | 165.2; 191.3 / 348.6 | 163.4; 189.3 / 335.7 |
+| 5 | 167.1; 192.5 / 325.1 | 162.5; 188.5 / 407.9 |
+
+Per hop, p50 (bucket bounds), both arms: build 18.4-22.5, exchange 98.3-106.5 of which round trip 73.7-81.9 and collect
+24.6-36.9, borrow and settle under 1; a holder's serve 8.2-9.2. No write over 50 ms in any round.
+
+**Reading.** The cache gains here too, in every round, by less (2-14 µs). The live p999 is under 1 ms in all ten rounds
+(290-484 µs), so on this machine 85a's p999 half holds and its median is 3.1-3.4x away. The exchange's collect, about
+30 µs at the median against Linux's 6, is the owner's control shard waking from its park for the answer (A-387 declines
+every hold on macOS: `hold.declined` about 7,700 a run); with the round trip's own two parked wakes, that is the macOS
+excess over Linux.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
@@ -17394,3 +17464,30 @@ left over the turns before its doubling deadline (310288b17). The fold: 0.33-0.4
   whole fold killed a daemon on w-git's push); the Z = 20 ms p99 is a measured gap in GAPS, and the fold's work itself
   is the next cut.
 
+
+## Offset-shift layers for a path's history: writes win, old reads lose (A-803 (b); measured and REJECTED; 2026-11-21)
+
+- **Question.** A-803's leftover (b): an insert re-anchors its path's whole history (values walked per change grow with
+  history). Would layers that record each insert's shift, carried by a read, keep a change flat?
+- **Command:** `cargo run --release -p slates-merge --example history_layers_bench` (A-811's bench plus the line
+  `read_version_1_after_alternating`: version 1 read whole after m changes alternating an overwrite and an insert).
+- **Machine:** this Mac (w-rewrite-ops), load 79 falling to 53 while main's numbers ran (noisy; the shape is not).
+  Fastest of 5 rounds a point.
+
+| m (alternating changes) | 10 | 100 | 1,000 | 10,000 |
+|---|---|---|---|---|
+| main: read of version 1 | 0.33 µs | 1.4 µs | 4.4 µs | 10.9 µs |
+| shift layers, unbounded: read of version 1 | 2.9 µs | 0.17 ms | 4.3 ms | 58 ms |
+| shift layers, bounded at the file's length | 3.1 µs | 0.16 ms | 0.81 ms | 11.2 ms |
+| shift layers, bounded at s²: read of version 1 | 3.0 µs | 0.12 ms | 0.14 ms | 0.54 ms |
+
+| history (alternating stream), a change | 100 | 1,000 | 5,000 |
+|---|---|---|---|
+| main | 0.61 ms (101 values walked) | 4.2 ms (551) | 20.1 ms (2,551) |
+| shift layers, unbounded | 2.8 µs | 5.5 µs | 13.1 µs |
+| shift layers, bounded at s² | 0.39 ms | 3.3 ms | 14.1 ms |
+
+- **Verdict: REJECTED.** An old version's read carries its ranges through every later shift (quadratic in the shifts);
+  every bound that makes the read cheap gives the write win back. The code and its red test are kept on the state
+  branch (`scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch`). Main's go (09:40 PST): a persistent piece tree
+  a version, A-803 (c).

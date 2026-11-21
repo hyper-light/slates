@@ -173,6 +173,8 @@ fn imported(path: &str) -> Repository {
         buffer.drain(..consumed);
         fill(&mut buffer, &mut ended);
       }
+      // A dump imported whole into fresh records names every base in it: none is asked for.
+      Importing::Base { .. } => panic!("a whole dump's import asked for a base"),
       Importing::Commit { consumed, record } => {
         buffer.drain(..consumed);
         repository.commit_record(*record).unwrap();

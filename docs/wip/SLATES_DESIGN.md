@@ -7977,6 +7977,11 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > Since 2026-11-21 (g228) each hop also keeps a bounded per-write histogram (`crate::histogram::DurationHistogram`)
 > and the status report publishes its `p50_ns`, `p99_ns`, `p999_ns` and `max_ns` beside the sums: a sum is a mean,
 > which each run's first held reply (the 100 ms record period) had skewed by 49 µs a write.
+> The exchange hop is split four ways (`fleet.live.hop.exchange.{borrow,round_trip,collect,settle}`; the round trip is
+> the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
+> cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
+> placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
+> placement (g228, 2026-11-21).
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -12303,7 +12308,7 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > A stored text a later revision moved past was deltified into the records' RAM (A-761's deltify job) until C2 stage B
 > part 2 (b), 2026-11-21: a committed text is its changeset's on the node's store, the content store lets it go once
 > the revision stands, no recovery reads it back, and every reader reads it a piece at a time through the store; the
-> deltify job is retired (`Record::Deltified` still replays until the records keep no text in RAM, GAPS). An import's
+> deltify job is retired, and its record kind with it (A-819: a log holding one is refused typed). An import's
 > revision lands its texts the same way since P4a (its changeset's Payload and Texts rows, its record naming them
 > stored), and an import's delta whose base is only on the store asks its caller for the base (`Importing::Base`).
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
@@ -57773,13 +57778,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
-> properties, UUID, deltified text) lands whole as one changeset, sequence the count the register names (creation 0),
+> properties, UUID) lands whole as one changeset, sequence the count the register names (creation 0),
 > and only then is committed at f+1 by a register entry holding a reference to it alone, with the green's version where
 > it moves one (`repository::svn_commit::landing`); one landing a repository at a time, from its check to its commit.
 > Recovery and rebuild read each named changeset back in sequence order and replay it through the live step; a changeset
 > landed past the register's last was never committed or answered, and is dropped, the client's retry landing it once.
 > A daemon without `--vcs-store` refuses to make a Subversion repository, typed (`Unsupported` naming `--vcs-store`):
-> no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). Held by
+> no default directory (R1, R10), no register-held second copy (CLAUDE.md §2 item 7). A revision's texts are named
+> stored, their bytes the changeset's Payload with Texts rows (C2 stage B part 2 (b)); the deltify record kind is
+> retired and a revision carrying its texts inline is refused at replay (A-819). Held by
 > `repository::store_tests` (the arbiter: the state recovered after a stop equals the state before; and the crash
 > between land and commit). Stage B part 1: a client's commit lands its texts in its changeset (`Payload`, `Texts`,
 > `Record`), and a recovery reads a stored text the shard's image lacks back from the store. Owed: the texts read
@@ -57895,6 +57902,13 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > the push's intake derives from the same changegroup on all five 7.2 formats (main's oracle of the two encodings).
 > An import refused midway leaves an unnamed run that recovery passes over, and the next landing takes the last named
 > sequence plus one (decision 2).
+
+> **Status (2026-11-21, C1: made changesets on the changeset store; main's ruling of 09:00).** A changeset the server
+> makes of a submitted version is a changegroup the server builds, taken through the push's own intake and landed as
+> a push's changeset (made record, `Payload`, `Texts`), named by a made reference in the register's entry, through the
+> one deferred-submit hook (A-804/A-805), made from a preview of the held verdict. The register-held made record (v3)
+> and `HgStore::unstored` are gone: every Mercurial history is on the store, so every repository streams, and step 1's
+> rule (a revision with no store row is refused) refuses nothing a repository holds.
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -59410,6 +59424,29 @@ Applied in the same change to:
   w-git's `t_c5b_p3_a_git_made_commit_is_answered_only_once_its_changeset_landed_and_committed`, green with their
   piece 3 over this interface.
 
+### A-819 — Subversion's RAM texts retired: the deltify record and inline texts refused at replay (2026-11-21, w-svn; main 09:20 PST; C2 stage B part 2 (b), A-761, A-767 C2)
+Applied in the same change to:
+- `crates/svn/src/commit/record.rs`: `Record::Deltified` removed; its kind byte (5) refused `RecordRefused::Retired(Retired::Deltified)`.
+- `crates/svn/src/migration/records.rs`: the deltify APIs removed (`supersede`, `deltify_candidates`, `deltify_after`,
+  `kept_range`, `check_deltified`, `Deltifiable`, `DeltaWriter`).
+- `crates/server/src/vcs_store.rs`: `ReplayRefused::SvnTextsInline`, checked by both revision replays.
+- `crates/server/src/repository/svn_commit.rs`: the deltified record's check and charge removed.
+- `docs/wip/GAPS.md`: C2's entry, the line left for main's call closed.
+
+- **Why.** Since C2 stage B part 2 (b) every new Subversion text is its changeset's on the node's store (P3 to P4b), so
+  the deltify record and texts carried inline in a revision's record served only logs written before. Keeping them to
+  replay such logs is the second path CLAUDE.md §2 item 7 bans, and the tree chose the same twice (w-git's C5 2b
+  removed version-2 records; w-hg's step 0 removed the register-held record path). slates has no deployed state for a
+  migration to protect.
+- **What.** A log's deltify record is refused typed at decode (`Retired::Deltified`); a revision record naming a text
+  inline and not stored is refused typed at replay (`SvnTextsInline`). The repository is left unrecovered with that
+  refusal, never a panic or a skip. The records' delta form (`KeptText`) stays for records standing alone (tests,
+  fixtures, an import before its caller lands it); a daemon's records reach it no more.
+- **Evidence.** `a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild` (three repositories
+  rebuilt from the node's store: whole, a hostile deltify record at changeset 2, revision 1's texts inline at changeset
+  1; red without the inline check: the third made again), and `a_retired_deltified_record_is_refused_typed_by_its_kind`
+  (slates-svn).
+
 ### A-579 — A checkpoint's identity fold in paced turns, ending within its doubling interval (2026-11-21, w-engine; goal 89b, "the server's own p99 under load"; main's order of ~05:00 to land it for robustness; §4.16, A-202, A-783)
 
 - **Found, with counters** (release `load_bench`, 1,000 clients, the big Studio; a scratch diagnostic build never
@@ -59442,6 +59479,35 @@ Applied in the same change to:
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
+
+
+### A-818 — A path's history as a persistent piece tree a version, piece 1: the pure module and its oracle (2026-11-21, w-rewrite-ops; main 09:40 PST, A-803 (c); A-793, A-809)
+
+- **Why.** A change that moves bytes re-anchors every earlier value of its path (A-793): 101 to 2,551 values walked a
+  change at 100 to 5,000 versions. Offset-shift layers made the change flat but an old read 58 ms at 10,000 changes
+  (A-803 (b), measured and rejected, BENCHMARKS).
+- **What (piece 1).** `crates/merge/src/piece_tree.rs`, a pure module:
+  - Each version is a join-based AVL tree of runs over an arena with holder counts (Blelloch, Ferizovic and Sun 2016).
+  - Path copying (Driscoll, Sarnak, Sleator and Tarjan 1989) makes every version persistent, sharing every subtree a
+    change did not touch.
+  - A change is `rebuild`: kept slices of the version before and added runs, the engine's `segments`, at
+    O(parts × log n).
+  - A read is O(log n + runs), whatever came after.
+  - The module doc gives what each source decided, and VS Code's piece tree as tier C.
+  - Its caller to come is the content history (piece 2: the engine switch, the re-anchor walk deleted in the same
+    series, no mode switch).
+- **Open for piece 2.** What a run names: an immutable chunk (VS Code's choice), or a byte identity located through
+  one index per path. The question is with main (`inbox/main-from-w-rewrite-ops-a818-anchor.md`).
+- **Evidence.**
+  - `every_version_reads_as_the_model_however_many_came_after`: a serial model, the AVL height bound, a read's visits
+    bounded, and nothing alive after release.
+  - `a_change_shares_every_subtree_it_did_not_touch`: copies are counted, with a few paths of new nodes a change, not
+    4,096.
+  - `history::tests::every_piece_tree_version_reads_as_the_reanchored_history`: main's oracle. Every version and range
+    is read through trees built from the engine's own `segments`, and equals the re-anchored value's and `apply`'s.
+  - Breaking path copying (always taking a node apart) or a run's cut offset fails the oracles.
+- **Applied in the same change to** `crates/merge/src/engine.rs` (`Segment` and `segments` crate-visible for the
+  oracle) and `crates/merge/src/lib.rs`.
 
 ### A-817 — A work asks for a file's base bytes only for a whole-file replacement whose declared base length is the file's; the identical-op drop measured and rejected (2026-11-21, w-fed-move, goal 86b; main's rulings 03:16 and 03:46 PST; A-787, A-808, D-27)
 - **How it was found.** After A-808, rebases and submits still asked the green's owner for files: 17.2 a client at 10
