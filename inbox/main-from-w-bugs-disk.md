@@ -1,0 +1,1 @@
+w-bugs disk 2026-11-21 10:35: freed 21 MB (my 4 stale ~/.cache/w-bugs-{ci,msg,src,upcase}); no build target of mine on Studio-4 (all builds on the big Studio via kiln since 16:35 yesterday); kept 4 unlanded worktrees (~170 MB each: P1 landing, start_shard, t_a752) and w-bugs-main's shared .git (862 MB); none landed, so none removed.
