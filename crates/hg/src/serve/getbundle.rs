@@ -102,6 +102,19 @@ pub trait Store: Repository {
   /// and then position (A-745): its path, its position, its node and its link; `None` past the last file log.
   fn file_linked_from(&self, from: (&[u8], u64)) -> Option<(Vec<u8>, u64, Linked)>;
 
+  /// The manifest log's revision at `position` as the store keeps it where that is a delta (A-729): its delta's base's
+  /// position, its parents' nodes, its flags and the delta, in Mercurial's form; `None` for a revision kept whole, or
+  /// by a store that keeps none. A clone sends it as it is where its base went before it in the same answer, so the
+  /// server rebuilds no text and the client diffs none (Ada's no-allocation rule; goal 93's clone). Lent as a text is,
+  /// a copy charged to `room`.
+  fn manifest_delta(
+    &self,
+    _position: u64,
+    _room: &mut Admission,
+  ) -> Result<Option<StoredDelta<'_>>, PastAdmission> {
+    Ok(None)
+  }
+
   /// Whether the manifest log holds `node` (A-745: a changeset sent is held to name a manifest the log holds).
   fn holds_manifest(&self, node: &Node) -> bool;
 
@@ -121,6 +134,10 @@ pub trait Store: Repository {
     None
   }
 }
+
+/// A manifest revision as the store keeps it, a delta ([`Store::manifest_delta`]): its base's position in the log, its
+/// parents' nodes, its flags and the delta's bytes.
+pub type StoredDelta<'s> = (u64, [Node; 2], u16, Cow<'s, [u8]>);
 
 /// A manifest or file revision as a fetch walks its log (A-745): its node, and the served revision of the changeset its
 /// log links it to, none where the view does not serve that changeset.
@@ -597,8 +614,9 @@ pub fn changegroup(
 enum At {
   /// The changelog's group, from this served revision.
   Changelog(Rev),
-  /// The manifest log, from this position.
-  Manifests(u64),
+  /// The manifest log, from this position; the position and node of the manifest this answer sent last, which a
+  /// manifest kept as a delta against it is sent as.
+  Manifests(u64, Option<(u64, Node)>),
   /// The file logs, from this path and position; the path whose group is open, its name written.
   Files {
     /// The path the walk resumes at.
@@ -670,7 +688,7 @@ impl Walk {
     };
     self.at = match at {
       At::Changelog(from) => self.changeset(store, from, room, out)?,
-      At::Manifests(position) => self.manifest(store, position, room, out)?,
+      At::Manifests(position, sent) => self.manifest(store, (position, sent), room, out)?,
       At::Files {
         path,
         position,
@@ -690,7 +708,7 @@ impl Walk {
   ) -> Result<Option<At>, Refusal> {
     let Some(rev) = self.missing.next_from(from) else {
       changegroup::put_end(out);
-      return Ok(Some(At::Manifests(0)));
+      return Ok(Some(At::Manifests(0, None)));
     };
     let node = node_of(store, rev)?;
     let [first, second] = parents_of(store, rev)?;
@@ -708,11 +726,12 @@ impl Walk {
     Ok(Some(At::Changelog(rev.saturating_add(1))))
   }
 
-  /// The manifest at `position` where a missing changeset links it, or the manifest group's end.
+  /// The manifest at `position` where a missing changeset links it, or the manifest group's end: sent as the delta the
+  /// store keeps where its base is `sent`, the manifest this answer sent last ([`Store::manifest_delta`]), else whole.
   fn manifest(
     &self,
     store: &impl Store,
-    position: u64,
+    (position, sent): (u64, Option<(u64, Node)>),
     room: &mut Admission,
     out: &mut Vec<u8>,
   ) -> Result<Option<At>, Refusal> {
@@ -727,21 +746,40 @@ impl Walk {
         open: None,
       }));
     };
-    let next = Some(At::Manifests(position.saturating_add(1)));
+    let following = position.saturating_add(1);
     let Some(link) = linked.link.filter(|link| self.missing.contains(*link)) else {
-      return Ok(next);
+      return Ok(Some(At::Manifests(following, sent)));
     };
-    let logged = store
-      .manifest(&linked.node, room)?
-      .ok_or_else(no_manifest)?;
     let link = node_of(store, link)?;
-    self.put(
-      (linked.node, logged.parents, link, logged.flags),
-      &logged.text,
-      room,
-      out,
-    )?;
-    Ok(next)
+    let stored = match sent {
+      Some((sent_position, sent_node)) => store
+        .manifest_delta(position, room)?
+        .filter(|(base, ..)| *base == sent_position)
+        .map(|(_, parents, flags, delta)| (sent_node, parents, flags, delta)),
+      None => None,
+    };
+    if let Some((base, parents, flags, delta)) = stored {
+      self.put_delta(
+        (linked.node, parents, link, flags),
+        (base, &delta),
+        room,
+        out,
+      )?;
+    } else {
+      let logged = store
+        .manifest(&linked.node, room)?
+        .ok_or_else(no_manifest)?;
+      self.put(
+        (linked.node, logged.parents, link, logged.flags),
+        &logged.text,
+        room,
+        out,
+      )?;
+    }
+    Ok(Some(At::Manifests(
+      following,
+      Some((position, linked.node)),
+    )))
   }
 
   /// The file revision at or after `from` where a missing changeset links it (its group's name first where it opens
@@ -790,6 +828,35 @@ impl Walk {
     Ok(Some(next(Some(found.clone()))))
   }
 
+  /// Appends one revision (its node, parents, link and flags) as the delta `data` against `base`, a revision sent
+  /// before it in this answer, its bytes charged to `room` before they are written.
+  fn put_delta(
+    &self,
+    (node, parents, link, flags): (Node, [Node; 2], Node, u16),
+    (base, data): (Node, &[u8]),
+    room: &mut Admission,
+    out: &mut Vec<u8>,
+  ) -> Result<(), Refusal> {
+    room.charge(to_u64(data.len()))?;
+    let revision = Revision {
+      node,
+      p1: parents[0],
+      p2: parents[1],
+      base,
+      link,
+      flags: if self.version == Version::V02 {
+        0
+      } else {
+        flags
+      },
+      info: None,
+      protocol_flags: 0,
+      data,
+      sidedata: None,
+    };
+    changegroup::put_revision(&revision, self.version, out).map_err(|_| unencodable("a revision"))
+  }
+
   /// Appends one revision (its node, parents, link and flags) as its full text against the null base, its bytes
   /// charged to `room` before they are written.
   fn put(
@@ -800,8 +867,6 @@ impl Walk {
     out: &mut Vec<u8>,
   ) -> Result<(), Refusal> {
     room.charge(to_u64(delta::HUNK_HEADER_LEN.saturating_add(text.len())))?;
-    let mut data = Vec::new();
-    delta::encode_full_text(text, &mut data).map_err(|_| unencodable("a full text"))?;
     let revision = Revision {
       node,
       p1: parents[0],
@@ -815,10 +880,11 @@ impl Walk {
       },
       info: None,
       protocol_flags: 0,
-      data: &data,
+      data: text,
       sidedata: None,
     };
-    changegroup::put_revision(&revision, self.version, out).map_err(|_| unencodable("a revision"))
+    changegroup::put_revision_whole(&revision, self.version, out)
+      .map_err(|_| unencodable("a revision"))
   }
 }
 

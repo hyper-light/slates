@@ -145,6 +145,9 @@ pub(crate) struct Started {
   pub(crate) daemon: Daemon,
   /// Its watch on its anchor.
   parent: ParentWatch,
+  /// The version-control store's owner, when the operator gave a store directory (A-767): stopped after the daemon,
+  /// so its last landings are in and its checkpoint is written.
+  store: Option<slates_store::owner::StoreOwner>,
 }
 
 /// Starts the daemon over the anchor's segment from the environment (or its own, run alone) and marks it serving.
@@ -229,6 +232,15 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
   // The svn:// listener, when the operator asked for one (`--vcs-svn`; §4.17.4 piece 7, A-656 part 2): cleartext as
   // ra_svn is, on a loopback address alone for a daemon that is no fleet node, which the flag's reading held it to.
   config.vcs_svn = options.vcs_svn;
+  // The version-control store (A-767), when the operator named its directory: the naming is the grant.
+  let store = options
+    .vcs_store
+    .as_deref()
+    .map(|dir| start_store(std::path::Path::new(dir), &config))
+    .transpose()?;
+  config.vcs_view_root = store.as_ref().map(|(_, views)| *views);
+  let store = store.map(|(owner, _)| owner);
+  config.vcs_disk = store.as_ref().map(slates_store::owner::StoreOwner::handle);
   for line in &config.derivations {
     slates_machine::log_line!("slates daemon: {line}");
   }
@@ -284,13 +296,153 @@ pub(crate) fn start(prefix: &[String], options: &ProcessOptions) -> Result<Start
       " alone"
     }
   );
-  Ok(Started { daemon, parent })
+  Ok(Started {
+    daemon,
+    parent,
+    store,
+  })
+}
+
+/// Opens the node's version-control store in `dir` under the standing grant the operator gave by naming it (`--vcs-store
+/// DIR`; A-767 item 7, R10's CLI surface), sized from this daemon's own derivations, and starts its owner thread.
+fn start_store(
+  dir: &std::path::Path,
+  config: &DaemonConfig,
+) -> Result<
+  (
+    slates_store::owner::StoreOwner,
+    &'static slates_land::store_root::StoreRoot,
+  ),
+  Failure,
+> {
+  use slates_land::store_root::{StoreGrant, StoreRoot};
+  let target = StoreRoot::identify(dir).map_err(|e| failed("vcs store directory", e))?;
+  let grant = StoreGrant {
+    repository: 0,
+    target,
+    issued_ns: slates_vfs::clock::Clock::monotonic_ns(&mut slates_vfs::clock::HostClock::new()),
+  };
+  slates_machine::log_line!(
+    "slates daemon: the version-control store at {} granted by the operator's --vcs-store (device {}, inode {})",
+    dir.display(),
+    grant.target.device,
+    grant.target.inode
+  );
+  let root = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  // The same grant opened once more for the views slates presents in the directory (A-645 (a): a Subversion
+  // repository's FSFS view, mounted read-only there for its hooks), held for the process's life: one handle per daemon
+  // start, which a restart opens again.
+  let views = StoreRoot::open(dir, &grant).map_err(|e| failed("vcs store directory", e))?;
+  let views: &'static StoreRoot = Box::leak(Box::new(views));
+  let disk = root
+    .free_bytes()
+    .map_err(|e| failed("vcs store free space", e))?;
+  let sizing = store_sizing(config, disk);
+  // A request a client seat may have waiting at once: every shard's seats.
+  let waiting = config
+    .clients_per_shard
+    .saturating_mul(usize::from(config.runtime.shards).max(1));
+  let owner = slates_store::owner::StoreOwner::start(root, sizing, waiting)
+    .map_err(|e| failed("vcs store", e))?;
+  Ok((owner, views))
+}
+
+/// The store's sizing from the work, never the machine (A-767; Ada's memory-sizing ruling). Its engine's memtable is one
+/// trunk node's worth, `fanout` extents: what one flush turns into one bundle; the engine learns it upward from the rows
+/// it holds (owed, GAPS), so a 128 GiB machine and a laptop start the same. Its disk is what the store's file system
+/// has free, its extent the content plane's chunk (the unit of copy-on-write, `slates_vfs::content::chunk_bytes`), its
+/// fanout SplinterDB's. Until 2026-11-20 the memtable was the shard's reserve, sized from the machine, which on a 128 GiB
+/// Mac passed the engine's 4 GiB bound and refused every landing (w-hg, by use).
+fn store_sizing(config: &DaemonConfig, disk: u64) -> slates_store::store::Sizing {
+  let fanout: slates_machine::Derived<usize> = slates_machine::derived!(
+    8,
+    "SplinterDB's target fanout, as mantle runs its engine until its E-step measures F on this hardware",
+    ["engine-structure.md §4"]
+  );
+  let extent_bytes = slates_vfs::content::chunk_bytes(config.page).get();
+  slates_store::store::Sizing {
+    memory: extent_bytes.saturating_mul(fanout.get()),
+    disk,
+    extent_bytes: u64::try_from(extent_bytes).unwrap_or(u64::MAX),
+    fanout: fanout.get(),
+  }
+}
+
+#[cfg(test)]
+mod store_sizing_tests {
+  #![allow(clippy::unwrap_used, clippy::disallowed_methods)]
+
+  use slates_store::log::{Header, SectionKind, Tool};
+
+  /// A fresh directory beside the test binary, in the build output (R1: never `/tmp`).
+  fn store_directory(name: &str) -> std::path::PathBuf {
+    let binary = std::env::current_exe().unwrap();
+    let dir = binary
+      .parent()
+      .unwrap()
+      .join(format!("vcs-sizing-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.canonicalize().unwrap()
+  }
+
+  /// A-767, w-hg's finding (a 128 GiB Mac refused every landing, "a memtable past 4 GiB"; main's order of 2026-11-20).
+  /// Do: for an 8 GiB and a 128 GiB machine, the profile's memory injected where the product reads it, derive the
+  /// daemon's configuration, start its store as `--vcs-store` does, land a changeset through a shard's handle and stop
+  /// the store. Expect: the engine opens, the landing is answered and the stop is clean at both extremes, and both
+  /// machines size the store alike: it is sized by its work (one trunk node of extents), never by the machine.
+  #[test]
+  fn the_store_lands_on_a_small_and_a_large_machine_alike() {
+    let measured = super::measure(true).unwrap();
+    let mut memories = Vec::new();
+    for (name, total) in [("8g", 8u64 << 30), ("128g", 128u64 << 30)] {
+      let mut profile = measured.clone();
+      profile.facts.memory.total = total;
+      profile.facts.memory.available = total / 2;
+      profile.facts.memory.limit = None;
+      let config = super::DaemonConfig::derive(&profile, "sizing", Some(2));
+      let dir = store_directory(name);
+      let (owner, _views) = super::start_store(&dir, &config).unwrap();
+      let handle = owner.handle();
+      let runtime = slates_rt::runtime::LocalRuntime::new(&config.runtime).unwrap();
+      let landed = runtime
+        .block_on(async move {
+          handle
+            .land(
+              Header {
+                tool: Tool::Mercurial,
+                repository: 7,
+                sequence: 0,
+                judged_over: 0,
+                grant: 1,
+                work: 0,
+                time_ns: 1,
+                sections: 0,
+              },
+              vec![(SectionKind::Record, b"clone".to_vec())],
+            )
+            .await
+        })
+        .unwrap();
+      assert!(landed.is_ok(), "{name}: {landed:?}");
+      drop(runtime);
+      let stopped = owner.stop();
+      assert!(stopped.is_ok(), "{name}: {stopped:?}");
+      memories.push(super::store_sizing(&config, 1 << 30).memory);
+      let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(memories[0], memories[1], "the store is sized by its work");
+  }
 }
 
 /// Serves a [`start`]ed daemon until a stop is requested, the anchor is gone or the control shard's watch ends, then
 /// stops it.
 pub(crate) fn serve(started: Started) -> Result<(), Failure> {
-  let Started { daemon, parent } = started;
+  let Started {
+    daemon,
+    parent,
+    store,
+  } = started;
   // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
   // stop request and these two at its own cadence and wakes this thread once one holds.
   let watch = parent;
@@ -306,11 +458,14 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
     }
   } else if !parent.anchor_alive() {
     slates_machine::log_line!("slates daemon: the anchor is gone; leaving");
-    release_the_anchors_objects();
+    release_the_anchors_objects(daemon.shards().len());
   } else {
     slates_machine::log_line!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
+  if let Some(owner) = store {
+    owner.stop().map_err(|e| failed("vcs store stop", e))?;
+  }
   Ok(())
 }
 
@@ -318,7 +473,12 @@ pub(crate) fn serve(started: Started) -> Result<(), Failure> {
 /// on macOS an object outlives every holder while its name exists, so a `SIGKILL`ed anchor left both in the kernel with
 /// every page the daemon had written (21 GB of the big Studio after four killed anchors, 2026-11-20). Done before the
 /// stop, so a daemon killed while it stops has already let them go; its own mappings keep the bytes until it exits.
-fn release_the_anchors_objects() {
+///
+/// The content pool's extents are objects of their own where the platform gives one back whole (macOS,
+/// `slates_mem::extent_handoff`), named from the content object's name and the extent's id: every id the layout can
+/// name, `partitions × POOL_EXTENTS_PER_PARTITION`, is released with it (a bounded count; a name never made is no
+/// refusal).
+fn release_the_anchors_objects(partitions: usize) {
   for variable in [
     slates_anchor::segment::ENV_HANDOFF,
     slates_anchor::segment::ENV_CONTENT,
@@ -330,6 +490,18 @@ fn release_the_anchors_objects() {
       Ok(descriptor) => slates_mem::Handoff::Descriptor(descriptor),
       Err(_) => slates_mem::Handoff::Name(value),
     };
+    if variable == slates_anchor::segment::ENV_CONTENT {
+      let ids = partitions.saturating_mul(slates_anchor::layout::POOL_EXTENTS_PER_PARTITION);
+      for id in (0..ids).filter_map(|id| u16::try_from(id).ok()) {
+        if let Some(extent) = slates_mem::extent_handoff(&handoff, id)
+          && let Err(refusal) = slates_mem::unlink_handoff(&extent)
+        {
+          slates_machine::log_line!(
+            "slates daemon: the anchor's content extent {id} was not released: {refusal}"
+          );
+        }
+      }
+    }
     if let Err(refusal) = slates_mem::unlink_handoff(&handoff) {
       slates_machine::log_line!(
         "slates daemon: the anchor's {variable} was not released: {refusal}"

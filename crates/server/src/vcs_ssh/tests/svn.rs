@@ -528,8 +528,8 @@ const TEST_ROOT: &str = "/slates-root";
 impl SvnStores for Lends {
   type Green<'a> = View;
 
-  fn root_mount(&self) -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(TEST_ROOT))
+  fn hook_views(&self) -> crate::vcs_store::svn_presenter::HookViews {
+    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from(TEST_ROOT))
   }
 
   fn holds(&self, id: RepositoryId) -> bool {
@@ -1355,4 +1355,88 @@ fn a_tunnel_runs_its_repositorys_commit_hooks_as_svnserve_t_runs_them() {
   let out = String::from_utf8_lossy(&answered.out).into_owned();
   assert!(out.contains("post said no"), "{out}");
   assert_eq!(youngest, 1);
+}
+
+/// Measurement, not a gate (main's order of 2026-11-20: svnsync over the matrix took 0.54 s a revision of
+/// git-2000.dump). Do: on a daemon's shard, create `repo` and import the dump `SLATES_SVN_REPLAY_DUMP` names; then,
+/// through the daemon's SSH site, hand `svnserve -t` the recorded tunnel handshake and one
+/// `replay-range ( 1 LAST 0 true )`, as `svnsync synchronize` asks (`SLATES_SVN_REPLAY_LAST`, 200 by default).
+/// Printed: the import's and the replay's wall time, the replay's bytes and its mean a revision.
+#[test]
+#[ignore = "measurement: needs SLATES_SVN_REPLAY_DUMP"]
+fn measure_svnsync_replay_range_over_the_tunnel() {
+  let path = std::env::var("SLATES_SVN_REPLAY_DUMP").expect("SLATES_SVN_REPLAY_DUMP");
+  let last: u64 = std::env::var("SLATES_SVN_REPLAY_LAST")
+    .ok()
+    .and_then(|last| last.parse().ok())
+    .unwrap_or(200);
+  let dump = std::fs::read(&path).expect("the dump");
+  let daemon = crate::daemon::audit_daemon();
+  let importing = std::time::Instant::now();
+  // The import a turn a call, as the server runs it: one call of all of it spins the shard past its watchdog window.
+  let id = crate::daemon::observe_first(&daemon, move |state| {
+    use crate::vcs_store::svn_import::tests::{DUMP, host_holding, owner, subversion};
+    let (id, _) = subversion(state, REPOSITORY);
+    let (host, root) = host_holding(&dump);
+    crate::vcs_store::svn_import::begin(state, (&owner(), id), (Box::new(host), root, DUMP))
+      .expect("the import begun");
+    id
+  });
+  loop {
+    let turned =
+      crate::daemon::observe_first(
+        &daemon,
+        move |state| match crate::vcs_store::svn_import::turn(state, id) {
+          Some(Ok(crate::vcs_store::svn_import::Turned::More)) => None,
+          other => Some(format!("{other:?}")),
+        },
+      );
+    if let Some(ended) = turned {
+      assert!(ended.starts_with("Some(Ok(Done"), "{ended}");
+      break;
+    }
+  }
+  let import = importing.elapsed();
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(format!("( replay-range ( 1 {last} 0 true ) ) ").as_bytes());
+  let (sent, outcome) = std::sync::mpsc::sync_channel(1);
+  let replaying = std::time::Instant::now();
+  crate::daemon::observe_first(&daemon, move |_state| {
+    let task = slates_rt::futures::spawn(async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      let owner = crate::vcs_store::svn_import::tests::owner();
+      let _ = sent.send(tunnel(&mut site, &owner, &[&client]));
+    })
+    .expect("the tunnel's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (answered, _) = outcome
+    .recv_timeout(std::time::Duration::from_secs(3600))
+    .expect("the tunnel ended");
+  let replay = replaying.elapsed();
+  let youngest = crate::daemon::observe_first(&daemon, move |state| {
+    state
+      .vcs_stores
+      .subversion_records(id)
+      .map(|records| records.youngest())
+  });
+  daemon.stop();
+  let finished = answered
+    .out
+    .windows(b"finish-replay".len())
+    .filter(|window| *window == b"finish-replay")
+    .count();
+  println!(
+    "MEASURE import_s {:.1} youngest {youngest:?} replay r1..r{last} wall_s {:.2} mean_ms {:.1} out_bytes {} \
+     finished {finished} err {}",
+    import.as_secs_f64(),
+    replay.as_secs_f64(),
+    replay.as_secs_f64() * 1e3 / last as f64,
+    answered.out.len(),
+    String::from_utf8_lossy(&answered.err)
+  );
 }

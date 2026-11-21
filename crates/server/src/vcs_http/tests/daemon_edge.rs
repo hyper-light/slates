@@ -2286,3 +2286,234 @@ fn a_shallow_clone_of_a_merge_heavy_history_is_deepened_over_the_daemons_edge() 
     "{answer}"
   );
 }
+
+/// A-766 part 2 (DeltaV v1, ra_serf 1.14's `open_root` without HTTPv2; `mod_dav_svn` 1.14.x `activity.c`, `version.c`,
+/// `mod_dav.c`). Do: on a daemon's HTTP edge, commit a file as a client without HTTPv2 does: MKACTIVITY of an activity;
+/// CHECKOUT of the VCC into it (`apply-to-version`); PROPPATCH of the working baseline the CHECKOUT named, setting
+/// `svn:log`; CHECKOUT of the root's version resource; PUT of `f.txt` under the working root that CHECKOUT named; MERGE
+/// of the activity; DELETE of the activity. Expect: `201` "Activity ... has been created."; `201` naming
+/// `!svn/wbl/ID/0`; `207`; `201` naming `!svn/wrk/ID/`; `201`; `200` naming revision 1; `204`; and revision 1 carrying
+/// the log message and the file. Before, the site refused every one of them.
+#[cfg(unix)]
+#[test]
+fn a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it() {
+  let (identity, certificate) = identity();
+  let daemon = daemon(identity);
+  let port = daemon.vcs_http_port().expect("the edge serves");
+  let edge = (port, &certificate);
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = svn_name_on_the_repositorys_partition();
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let activity = "4c1d2b8a-0f6e-4b52-9c7a-3d2e1f0a9b8c";
+  let made = dav(
+    edge,
+    ("MKACTIVITY", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let checkout_body = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:checkout xmlns:D=\"DAV:\"><D:activity-set><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:activity-set><D:apply-to-version/></D:checkout>"
+  );
+  let xml = ["Content-Type: text/xml"];
+  let baseline = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/vcc/default")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_baseline = field(&baseline.1, "Location").unwrap_or_default();
+  let logged = dav(
+    edge,
+    ("PROPPATCH", &working_baseline),
+    &xml,
+    b"<?xml version=\"1.0\" encoding=\"utf-8\"?><D:propertyupdate xmlns:D=\"DAV:\" \
+      xmlns:S=\"http://subversion.tigris.org/xmlns/svn/\"><D:set><D:prop><S:log>a v1 commit</S:log></D:prop>\
+      </D:set></D:propertyupdate>",
+  );
+  let root = dav(
+    edge,
+    ("CHECKOUT", &format!("/{name}/!svn/ver/0/")),
+    &xml,
+    checkout_body.as_bytes(),
+  );
+  let working_root = field(&root.1, "Location").unwrap_or_default();
+  let put = dav(
+    edge,
+    ("PUT", &format!("{}f.txt", working_root)),
+    &["Content-Type: application/vnd.svn-svndiff"],
+    &fulltext_delta(b"hello\n"),
+  );
+  let merge = format!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:merge xmlns:D=\"DAV:\"><D:source><D:href>/{name}/!svn/act/\
+     {activity}</D:href></D:source><D:no-auto-merge/><D:no-checkout/><D:prop><D:checked-in/><D:version-name/>\
+     </D:prop></D:merge>"
+  );
+  let merged = dav(edge, ("MERGE", &format!("/{name}")), &xml, merge.as_bytes());
+  let deleted = dav(
+    edge,
+    ("DELETE", &format!("/{name}/!svn/act/{activity}")),
+    &[],
+    b"",
+  );
+  let landed_name = name.clone();
+  let landed = crate::daemon::observe_at(&daemon, REPOSITORY, move |state| {
+    let id = state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(&landed_name)?
+      .id;
+    let records = state.vcs_stores.subversion_records(id)?;
+    let log = records
+      .revision_properties(1)?
+      .iter()
+      .find(|(name, _)| name.as_slice() == b"svn:log")
+      .map(|(_, value)| String::from_utf8_lossy(value).into_owned());
+    let file = records.index().node("/f.txt", 1).ok().flatten().is_some();
+    Some((records.youngest(), log, file))
+  });
+  daemon.stop();
+  assert_eq!(
+    (
+      (made.0, made.2.contains("has been created.")),
+      (
+        baseline.0,
+        working_baseline.ends_with(&format!("/!svn/wbl/{activity}/0"))
+      ),
+      logged.0,
+      (
+        root.0,
+        working_root.ends_with(&format!("/!svn/wrk/{activity}/"))
+      ),
+      put.0,
+      (
+        merged.0,
+        merged.2.contains("<D:version-name>1</D:version-name>")
+      ),
+      deleted.0,
+      landed,
+    ),
+    (
+      (201, true),
+      (201, true),
+      207,
+      (201, true),
+      201,
+      (200, true),
+      204,
+      Some((1, Some(String::from("a v1 commit")), true)),
+    ),
+    "MKACTIVITY {made:?}\nCHECKOUT {baseline:?}\nPROPPATCH {logged:?}\nCHECKOUT {root:?}\nPUT {put:?}\nMERGE {merged:?}"
+  );
+}
+
+/// Stock `svn` run with `arguments` in `directory`, as alice with the owner's token over Basic, its configuration in
+/// `config`: whether it succeeded, and what it printed.
+#[cfg(unix)]
+fn stock_svn(
+  config: &std::path::Path,
+  directory: &std::path::Path,
+  arguments: &[&str],
+) -> (bool, String) {
+  let config_dir = config.to_string_lossy().into_owned();
+  let output = std::process::Command::new("svn")
+    .current_dir(directory)
+    .args([
+      "--non-interactive",
+      "--no-auth-cache",
+      "--config-dir",
+      &config_dir,
+      "--config-option",
+      "servers:global:http-timeout=60",
+      "--username",
+      "alice",
+      "--password",
+      OWNER_TOKEN,
+    ])
+    .args(arguments)
+    .stdin(std::process::Stdio::null())
+    .output()
+    .expect("stock svn runs");
+  (
+    output.status.success(),
+    format!(
+      "{}{}",
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr)
+    ),
+  )
+}
+
+/// A-766 part 4 (DeltaV v1 by use): stock svn 1.7 and later speak v1 to a server whose OPTIONS has no HTTPv2 headers
+/// (ra_serf `options.c`: HTTPv2 only where `SVN-Me-Resource` is sent), as to `mod_dav_svn` with
+/// `SVNAdvertiseV2Protocol Off`. Do: start a daemon whose edge serves loopback cleartext; create a Subversion
+/// repository named with [`crate::vcs_http::svn::V1_ONLY_PREFIX`], whose OPTIONS withholds those headers in tests; run stock svn's
+/// `mkdir` of `/trunk`, `checkout` of it, `add` and `commit` of a file, and `log`. Expect: each succeeds, the log lists
+/// both commits' messages, and the edge made at least two DeltaV v1 activities (MKACTIVITY): the commits went over v1,
+/// not HTTPv2. Skips loudly without stock svn.
+#[cfg(unix)]
+#[test]
+fn stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge() {
+  let present = std::process::Command::new("svn")
+    .args(["--version", "--quiet"])
+    .output()
+    .is_ok_and(|output| output.status.success());
+  if !present {
+    eprintln!(
+      "SKIPPED stock_svn_commits_over_deltav_v1_on_a_daemons_loopback_edge: no `svn` on this host"
+    );
+    return;
+  }
+  let (daemon, _) = daemon_named(None);
+  let port = daemon.vcs_http_port().expect("the edge started");
+  enroll(&daemon, OWNER_TOKEN, OWNER, None);
+  let name = (0u32..)
+    .map(|serial| format!("{}{serial}", crate::vcs_http::svn::V1_ONLY_PREFIX))
+    .find(|name| usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS))) == REPOSITORY)
+    .expect("a name routes there");
+  create_svn_hooked(&daemon, &name, Vec::new());
+  let scratch = crate::git_hooks::tests::ScratchDir::new();
+  let config = scratch.path.join("config");
+  let url = format!("http://127.0.0.1:{port}/{name}");
+  let at = scratch.path.clone();
+  let mkdir = stock_svn(
+    &config,
+    &at,
+    &["mkdir", "-m", "the trunk over v1", &format!("{url}/trunk")],
+  );
+  let checkout = stock_svn(&config, &at, &["checkout", &format!("{url}/trunk"), "wc"]);
+  let wc = scratch.path.join("wc");
+  #[allow(clippy::disallowed_methods)]
+  // test code: a file in its own working copy, in its scratch directory
+  let written = std::fs::write(wc.join("a.txt"), b"hello over v1\n").is_ok();
+  let add = stock_svn(&config, &wc, &["add", "a.txt"]);
+  let commit = stock_svn(&config, &wc, &["commit", "-m", "a file over v1"]);
+  let log = stock_svn(&config, &at, &["log", &url]);
+  let activities = crate::daemon::observe_at(&daemon, REPOSITORY, |state| {
+    state
+      .refusals
+      .get(crate::vcs_http::svn::V1_ACTIVITIES)
+      .copied()
+      .unwrap_or(0)
+  });
+  daemon.stop();
+  for (step, (ran, output)) in [
+    ("mkdir", &mkdir),
+    ("checkout", &checkout),
+    ("add", &add),
+    ("commit", &commit),
+    ("log", &log),
+  ] {
+    eprintln!("svn {step} (success {ran}):\n{output}");
+  }
+  assert_eq!(
+    (
+      (mkdir.0, checkout.0, written, add.0, commit.0, log.0),
+      log.1.contains("the trunk over v1") && log.1.contains("a file over v1"),
+      activities >= 2,
+    ),
+    ((true, true, true, true, true, true), true, true),
+    "the edge made {activities} v1 activities"
+  );
+}

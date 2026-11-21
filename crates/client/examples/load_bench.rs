@@ -2374,6 +2374,18 @@ fn report_losses(client: &mut Client) {
   ] {
     println!("counter\t{name}\t{}", per_shard(name).sum::<u64>());
   }
+  // Every other merge counter this node moved, summed over its shards: where a work's submits waited (a replica
+  // behind, a settle or a replay awaiting it, an ask of the owner) shows here without a list to keep current.
+  let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+  for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+    if refusal.kind.starts_with("merge.") && !LOSS_COUNTERS.contains(&refusal.kind.as_str()) {
+      let total = moved.entry(refusal.kind.as_str()).or_default();
+      *total = total.saturating_add(refusal.count);
+    }
+  }
+  for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+    println!("merge_counter\t{name}\t{count}");
+  }
 }
 
 fn main() {

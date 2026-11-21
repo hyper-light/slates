@@ -29,6 +29,7 @@ path or git dependency on the shared repository: slates builds what it reviewed 
 | `hyper-datagram` | the sealed control-datagram plane | after slates' seal |
 | `hyper-block` | aligned direct I/O, the platform's full flush (`fdatasync`, `F_FULLFSYNC`, `FlushFileBuffers`), kept records, group commit's wait, the simulated power-loss file (`sim`) | mantle's `crates/disk` at `147f035` (`ORIGIN.md`) |
 | `hyper-log` | one log a device, group-committed, its frames, recovery and the stop-at-the-first-hole rule: the changeset log's substrate (A-767) | mantle's `crates/log` at `147f035` |
+| `hyper-measure` | a dev-dependency only: the allocation and page-fault counts some unit tests of `hyper-block` and the engine read | hyper-raft's measurement crate |
 | `hyper-sim` | the deterministic world `hyper-block`'s `sim` runs in (crash tests of the changeset log) | hyper-raft's simulator (docs/sim.md) |
 | `hyper-seal` | sealing at rest: the key hierarchy, STREAM, the ML-KEM-1024 recipient wrap, keyed names, keys in locked memory (A-92) | mantle's object seal, with focal's and slates' reviews (`docs/seal.md`) |
 
@@ -47,13 +48,20 @@ the final tree builds both crates, `sim` on, with no warning). One revision for 
 
 **Local changes** (each marked `slates:` in the source), to be proposed to hyper-raft's owner as a feature gate so the
 sources return to upstream's bytes:
-1. `hyper-block`'s device issuer (`src/issuer.rs`, `pub mod issuer;`), its panic containment (`src/unwind.rs`, used by
-   nothing else) and its `hyper-rt` dependency are left out:
-   slates runs one executor (CLAUDE.md §2 item 2, D-9), and the log uses only `block`, `buf`, `commit`, `file` and
-   `record`. Its three issuer tests stay upstream with the rest.
+1. `hyper-block`'s device issuer (`src/issuer.rs`) runs on slates' runtime: every `hyper_rt::` path in it is
+   `slates_rt::`'s, whose `sync` (the bounded channel, A-767 piece C2) carries hyper-rt's surface with no `unsafe`, and
+   the manifest depends on `slates-rt` in hyper-rt's place (main's ruling of 2026-11-20: no hyper-rt, no `unsafe impl
+   Send`/`Sync`; CLAUDE.md §2 item 2, D-9). Because the runtime under it changed, its unit tests run here (its
+   manifest lists their dev-dependencies): `TMPDIR=<a directory of your own> cargo test --manifest-path
+   vendor/hyper-raft/hyper-block/Cargo.toml --lib`, 101 of 101 on macOS arm64, Adas-Mac-Studio-2, 2026-11-20.
 2. `hyper-block`'s `threads::macos::thread_cpu` reads the kernel's thread CPU clock as given, without hyper-rt's
    restatement at the kernel's tick rate, which only a process Rosetta 2 translates needs; slates ships native arm64
    and x86_64 builds only. Its test times the spin by `std::time::Instant` (3 of 3 `threads` tests pass).
+3. `hyper-block`'s `DeviceFile::adopt` takes a file another crate opened (slates' `land`, relative to a store root its
+   standing grant names, `slates_land::store_root`), made direct after the open where asked and the platform can
+   (`F_NOCACHE` on macOS, `O_DIRECT` through `F_SETFL` on Linux) and buffered elsewhere, as `open` falls back; `open`
+   and `adopt` share the steps after the open (`finish`). So the store's files are never opened by path in a vendored
+   crate (A-767 C2; main's ruling: the engine's disk writes sit behind `land`'s write seam).
 
 A change slates needs in one of these crates is proposed to hyper-raft's owner, lands there once every consumer's suite
 passes, and reaches slates as a new snapshot in its own gated commit.

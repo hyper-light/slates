@@ -3630,7 +3630,7 @@ fn council_reports_over_the_wire(daemons: &[Daemon]) -> Vec<slates_ipc::protocol
     .iter()
     .map(|daemon| {
       let mut client = Client::connect(daemon.instance());
-      match client.call(&RequestBody::DaemonStatus) {
+      match client.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
         other => panic!("status answers on every node: {other:?}"),
       }
@@ -6494,6 +6494,8 @@ const MOVE_ADOPTED: &str = "fleet.move.adopted";
 const MOVE_ADOPTION_REPORTED: &str = "fleet.move.adoption_reported";
 /// Format: a move's old owner's count of the moves it began (`moves::MOVE_BEGUN`).
 const MOVE_BEGUN: &str = "fleet.move.begun";
+/// Counter: moves refused before any report (`crate::moves`'s own).
+const MOVE_REFUSED: &str = "fleet.move.refused";
 /// Format: a move's old owner's count of the copies it let go to the member the move named (`moves::MOVE_RELEASED`).
 const MOVE_RELEASED: &str = "fleet.move.released";
 
@@ -6856,6 +6858,71 @@ fn a_captured_clone_moved_twice_is_whole_on_each_new_owner_and_never_stale_on_an
     &landed_after_two_moves(),
     &described,
   );
+}
+
+/// Goal 91's live move, its first ask (A-291's bound; kiln's live move across two Macs, 2026-11-20): a move's first ask
+/// succeeds within the fleet's failover delay even when the head it hands over must first be carried and placed off its
+/// owner, which takes longer than that delay. Measured in kiln's lab, release, three runners on one Mac: the first ask
+/// refused `Unplaced` at 3,293 ms (bound 3,200 ms) with its capture not yet carried, the second at 3,187 ms with the head
+/// placed but not yet held off its owner, the third at 3,190 ms with the handoff begun at 142 ms, and the fourth reported
+/// at 120 ms, the work the refused asks began finished meanwhile. Three daemons at `f = 1`. Do: on a, overlay the
+/// captured tree, capture its base and clone it; write the agent's changes and about 780 KB more into the clone and detach;
+/// ask once to move it to b, then only follow the move while it answers `Moving`. Expect: `Moved`, never a refusal, and
+/// a's refusal counter unmoved.
+#[test]
+fn a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let members = three_members();
+  let base = captured_tree_dir();
+  let (answers, refused, failover, described) = {
+    let fleet: Vec<&Daemon> = members.daemons.iter().collect();
+    let mut client_a = Client::connect(&members.instances[0]);
+    let clone = captured_and_cloned(&mut client_a, &base.path, &["first-ask-workspace"])[0];
+    agents_changes(&mut client_a, clone);
+    let attachment = write_attachment(&mut client_a, clone);
+    // About 780 KB (the clone is bounded at 1 MiB) in files a ring's write takes whole (its payload cap is 4 KiB): content the handoff must place.
+    let window = vec![0x5a_u8; 3900];
+    for index in 0..200 {
+      let written = client_a.call(&RequestBody::FsWrite {
+        volume: clone,
+        attachment,
+        path: format!("/bulk-{index}"),
+        bytes: window.clone(),
+        mode: 0o644,
+      });
+      assert!(
+        matches!(written, ReplyBody::FsDone { .. }),
+        "bulk write {index}: {written:?}"
+      );
+    }
+    assert!(matches!(
+      client_a.call(&RequestBody::Detach { attachment }),
+      ReplyBody::Detached
+    ));
+    share_with_node(&mut client_a, clone, &members.daemons[1], ALL_RIGHTS);
+    let failover = members.daemons[0].failover_ns();
+    let to = members.hosts[1].0;
+    let mut answers: Vec<String> = Vec::new();
+    poll_until(&fleet, COUNCIL_RETIRE_DEADLINE, || {
+      let reply = client_a.call(&RequestBody::Move { volume: clone, to });
+      let settled = !matches!(reply, ReplyBody::Moving { .. });
+      let named = format!("{reply:?}");
+      if answers.last() != Some(&named) {
+        answers.push(named);
+      }
+      Ok(settled)
+    });
+    let refused = move_counter(&members.daemons[0], MOVE_REFUSED);
+    (answers, refused, failover, describe(&fleet))
+  };
+  for daemon in members.daemons {
+    daemon.stop();
+  }
+  assert!(
+    answers.last().is_some_and(|last| last.starts_with("Moved")),
+    "the first ask ended moved, not refused: {answers:?} (failover delay {failover:?}); {described}"
+  );
+  assert_eq!(refused, Ok(0), "a refused no ask of the move; {described}");
 }
 
 /// Goal 91's live move (kiln's K4 across runners): a captured clone moved to another node is found there by its name, as
@@ -7344,7 +7411,8 @@ fn share_with_node(
 /// `fleet` (A-237): as an operator who means to reach a volume from several nodes shares it with each. The owner's own
 /// node is told apart by the anchor its status reports.
 fn share_with_fleet(owner: &mut Client, volume: VolumeId, fleet: &[Daemon]) {
-  let ReplyBody::DaemonStatus { report } = owner.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } = owner.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the owner's node reported its status");
   };
   for node in fleet
@@ -9339,8 +9407,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   // the member dead (`route_dropped.owner_ineligible.dead`) though its own detector condemned no one (2026-10-08).
   let detectors: Vec<String> = daemons
     .iter()
-    .map(
-      |daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+    .map(|daemon| {
+      match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => format!(
           "{:?} (foreign: {}): {:?}",
           daemon.member_identity().ok(),
@@ -9348,8 +9416,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
           report.fleet.detector
         ),
         other => format!("status unavailable: {other:?}"),
-      },
-    )
+      }
+    })
     .collect();
   let routing = format!("{routing}; every node's detector {detectors:?}");
   trace_routing_views(&daemons, ObjectId(id.bytes));
@@ -10043,7 +10111,7 @@ fn the_harness_reads_a_paged_status_whole_across_an_acknowledgement() {
       ReplyBody::Listed { .. }
     ));
   }
-  let reply = client.call(&RequestBody::DaemonStatus);
+  let reply = client.call(&RequestBody::DaemonStatus { memory: false });
   daemon.stop();
   assert!(
     matches!(reply, ReplyBody::DaemonStatus { .. }),
@@ -10565,14 +10633,15 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // A's own detector, and what A holds about B: an A that never asked a relay (2026-10-10: requested 0, while B
   // refused about as many probes as A sent lease renewals) either never probed B or held B already condemned, and
   // these say which.
-  let detector_a = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => (
-      report.fleet.detector,
-      report.fleet.detector_pool,
-      report.fleet.detector_relays,
-    ),
-    _ => Default::default(),
-  };
+  let detector_a =
+    match Client::connect(a.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => (
+        report.fleet.detector,
+        report.fleet.detector_pool,
+        report.fleet.detector_relays,
+      ),
+      _ => Default::default(),
+    };
   let b_on_a = a.fleet_member_state(host_b);
 
   // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
@@ -10594,21 +10663,23 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // A's own detector at the end of the hold, and what A's fleet holds about B: a hold lost with every relay request
   // answered (2026-10-10: 17 asked, 17 credited, B gone after 12 periods, C's detector condemning nothing) says here
   // whether A's detector condemned B, on what evidence, or whether B left A's fleet by another path.
-  let detector_a_held = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => (
-      report.fleet.detector,
-      report.fleet.detector_pool,
-      report.fleet.detector_relays,
-    ),
-    _ => Default::default(),
-  };
+  let detector_a_held =
+    match Client::connect(a.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => (
+        report.fleet.detector,
+        report.fleet.detector_pool,
+        report.fleet.detector_relays,
+      ),
+      _ => Default::default(),
+    };
   let b_on_a_held = a.fleet_member_state(host_b);
   // C's detector as its status reports it: whether C condemned B by its own probes, and how that compares with the
   // theory's allowance (a count far above it is a detector misjudging a live peer; one within it is the load).
-  let detector_c = match Client::connect(c.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => report.fleet.detector,
-    _ => Vec::new(),
-  };
+  let detector_c =
+    match Client::connect(c.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
+      ReplyBody::DaemonStatus { report } => report.fleet.detector,
+      _ => Vec::new(),
+    };
   let counts_a = a.fleet_plane_counts().unwrap_or_default();
   let acked_on_a = counts_a.indirect_acked;
   let requested_by_a = counts_a.relays_asked;
@@ -10948,7 +11019,7 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     daemon_b.fleet_meshed()
   });
   let mut client = Client::connect(&instance_a);
-  let report = match client.call(&RequestBody::DaemonStatus) {
+  let report = match client.call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => report,
     other => panic!("status answers: {other:?}"),
   };
@@ -10998,7 +11069,7 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
   let observed: Vec<&Daemon> = daemons.iter().collect();
   let sessions_of = |daemon: &Daemon| {
     let mut client = Client::connect(daemon.instance());
-    match client.call(&RequestBody::DaemonStatus) {
+    match client.call(&RequestBody::DaemonStatus { memory: false }) {
       ReplyBody::DaemonStatus { report } => report.fleet.sessions,
       _ => Vec::new(),
     }
@@ -11027,11 +11098,12 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
   let last: Vec<_> = daemons.iter().map(sessions_of).collect();
   // The sessions peers dialed to each node, as its serve loops saw them: the connections whose sender is this node
   // when a peer's forwards and reads come back.
-  let served_of =
-    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
-      ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
-      _ => Vec::new(),
-    };
+  let served_of = |daemon: &Daemon| match Client::connect(daemon.instance())
+    .call(&RequestBody::DaemonStatus { memory: false })
+  {
+    ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
+    _ => Vec::new(),
+  };
   let served = poll_until(&observed, formation_deadline(), || {
     Ok(daemons.iter().all(|daemon| {
       served_of(daemon)
@@ -11097,13 +11169,14 @@ fn assert_detectors_measured(measured: bool, detectors: &[DetectorReading]) {
 /// polled for as the sessions are: one read right after formation found it unmeasured on a loaded Mac (2026-10-10,
 /// "the node's lateness is measured: 0"; 6 of 6 green when repeated).
 fn measured_detectors(daemons: &[Daemon], observed: &[&Daemon]) -> (bool, Vec<DetectorReading>) {
-  let detector_of =
-    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
-      ReplyBody::DaemonStatus { report } => {
-        Some((report.fleet.detector, report.fleet.detector_granularity_ns))
-      }
-      _ => None,
-    };
+  let detector_of = |daemon: &Daemon| match Client::connect(daemon.instance())
+    .call(&RequestBody::DaemonStatus { memory: false })
+  {
+    ReplyBody::DaemonStatus { report } => {
+      Some((report.fleet.detector, report.fleet.detector_granularity_ns))
+    }
+    _ => None,
+  };
   let measured = poll_until(observed, formation_deadline(), || {
     Ok(
       daemons
@@ -11198,14 +11271,14 @@ impl Client {
   }
 
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       // Acknowledged once before the first page, as `slates_client` does, and never between pages: any request but the
       // next page cancels the channel's capture (`status_on_channel`), so an acknowledgement that fell due mid-report
       // left the report refused (main's Windows arm64 lane, run 42528348387: `share_with_fleet` got `Refused` after
       // `DaemonStatus`, `Acknowledge`, `DaemonStatusNext`).
       self.acknowledge_if_due();
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect::<IpcError>(capacity, |request| {
+      return slates_ipc::status::collect::<IpcError>(capacity, *memory, |request| {
         self.sequence += 1;
         Ok(self.send_at(self.sequence, request))
       })
@@ -11923,7 +11996,7 @@ fn a_successors_failover_estimate_learns_the_takeover_it_completed() {
 /// The failover estimate the daemon `client` is connected to reports in its status (A-363), or `None` when it did not
 /// answer one.
 fn failover_through(client: &mut Client) -> Option<slates_ipc::protocol::FailoverReport> {
-  match client.call(&RequestBody::DaemonStatus) {
+  match client.call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => Some(report.fleet.failover),
     _ => None,
   }
@@ -12541,7 +12614,7 @@ fn f2_live_body(file: usize) -> Vec<u8> {
 /// The head of `volume`'s live log `daemon` holds as a candidate (its status's holding line), `None` while it shows none.
 fn held_live_head(daemon: &Daemon, volume: VolumeId) -> Option<u64> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return None;
   };
@@ -13070,7 +13143,9 @@ fn write_attachment(client: &mut Client, volume: VolumeId) -> u64 {
 /// `volume`'s entries in flight on its owner as the owner's status reports its live log (the head's position past the
 /// durable one), or `None` while the status shows no log for it.
 fn live_in_flight(client: &mut Client, volume: VolumeId) -> Option<u64> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -13099,7 +13174,9 @@ fn owned_live_line(
   client: &mut Client,
   volume: VolumeId,
 ) -> Option<(Option<u64>, Option<u64>, bool)> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -14238,7 +14315,9 @@ const CONTINUITY_FILES: usize = 6;
 /// The epoch and position of the head of `volume`'s live log on `client`'s node, as the owner it ships from (its own
 /// log, not a candidate's copy).
 fn owned_live_head(client: &mut Client, volume: VolumeId) -> Option<(u64, u64)> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -15680,7 +15759,7 @@ fn retakeable_volume(
 /// Every live line `daemon`'s status shows for `volume`: the log it ships, if any, and its copy as a candidate, if any.
 fn live_lines(daemon: &Daemon, volume: VolumeId) -> Vec<LiveReport> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return Vec::new();
   };
@@ -15940,7 +16019,7 @@ const INSTALLS_WALKED: &str = "fleet.config.installs_walked";
 /// not answer.
 fn held_record_count(daemon: &Daemon) -> Option<u64> {
   let ReplyBody::DaemonStatus { report } =
-    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus)
+    Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false })
   else {
     return None;
   };
@@ -16867,7 +16946,7 @@ fn heal_the_probe_plane(daemons: &[Daemon]) {
 
 /// This node's host epoch, from its status, through a client of `daemon`.
 fn host_epoch_of(daemon: &Daemon) -> Option<u64> {
-  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+  match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => Some(report.fleet.host_epoch),
     _ => None,
   }
@@ -19525,7 +19604,9 @@ struct RestartedSuccessor {
 /// `instance`'s own copy of `volume`'s log as a candidate, as its status reports it (`holding`).
 fn held_copy(instance: &str, volume: VolumeId) -> Option<LiveReport> {
   let mut client = Client::connect(instance);
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     return None;
   };
   report
@@ -20912,7 +20993,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
     usize::from(TWO_SHARDS),
   )));
   let listed = client.call(&RequestBody::List { after: None });
-  let status = client.call(&RequestBody::DaemonStatus);
+  let status = client.call(&RequestBody::DaemonStatus { memory: false });
   daemon_a.stop();
   daemon_b.stop();
 
@@ -21333,8 +21414,25 @@ fn assert_replicated_at_version_one(
   assert!(replicated, "B and C replicate the green at version 1");
 }
 
-/// The work B's client makes over `green`, named `holders-work`, admitted at base 1: its id.
-fn holders_work_at_base_one(holder: &mut Client, green: VolumeId) -> VolumeId {
+/// Waits until `holder` replicates `green` at `version` or later, within the placement deadline: a node serves works
+/// over a green another node owns once it replicates the green (A-697 part f, the rule "replicated here"); before,
+/// its creations are the owner's.
+fn await_replicated(holder: &Daemon, green: VolumeId, version: u64) {
+  let replicated = poll_until(&[holder], PLACEMENT_DEADLINE, || {
+    Ok(
+      holder
+        .merge_holder_state(green)?
+        .version
+        .is_some_and(|held| held >= version),
+    )
+  });
+  assert!(replicated, "the holder replicates the green at {version}");
+}
+
+/// The work B's client makes over `green`, named `holders-work`, admitted at base 1, once B replicates the green at 1:
+/// its id.
+fn holders_work_at_base_one(daemon_b: &Daemon, holder: &mut Client, green: VolumeId) -> VolumeId {
+  await_replicated(daemon_b, green, 1);
   let created = holder.call(&RequestBody::CreateWork {
     green,
     name: "holders-work".to_owned(),
@@ -21487,8 +21585,7 @@ fn head_bytes(
 
 /// A-697 part a, A-247 step two (a work over a green another node owns lives on the node that made it): in a two-node
 /// `f = 1` fleet, A owns a green at version 1 (`f` holding "hello"), shared with B's account, and another it shares with
-/// no one; B, which holds the green's replica, serves works over greens A owns (`Daemon::serve_works_on_holders`, the
-/// test hook until A-697's last piece). Do: a client on B creates a work over the shared green; reads `f` through it;
+/// no one; B, which replicates the green, serves works over it (A-697 part f, the rule "replicated here"). Do: a client on B creates a work over the shared green; reads `f` through it;
 /// edits it and reads it again; creates a second work under the same name; creates one over the unshared green.
 /// Expect: the work made on B, its id naming B as a volume B made does, admitted at base 1 with A's floor for it at 1;
 /// `f` byte for byte what A reads of its green, read on B from B's replica (its counter moved, and no forward of the
@@ -21502,7 +21599,7 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
   let mut owner = Client::connect(&instance_a);
   let unshared = version_one_beside_an_unshared_green(&mut owner, owners_work);
   let owners_bytes = head_bytes(&mut owner, green, "f");
-  daemon_b.serve_works_on_holders(true).unwrap();
+  await_replicated(&daemon_b, green, 1);
   let mut holder = Client::connect(daemon_b.instance());
   let bs_own = a_volume_of_b(&mut holder, "a-volume-of-b");
   let created = holder.call(&RequestBody::CreateWork {
@@ -21540,7 +21637,6 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
     green: unshared,
     name: "unshared-work".to_owned(),
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_the_work_is_named_by_b(work, bs_own, green);
   assert_eq!(base, 1, "admitted at the green's head");
   assert_eq!(floor, Ok(Some(1)), "A holds the work's base by its floor");
@@ -21553,7 +21649,7 @@ fn a_holder_makes_a_work_over_a_green_another_node_owns_and_reads_its_base_from_
 }
 
 /// A-697 part b, A-247 (a work's floor is held at its green's owner while the work reads it): in a two-node `f = 1`
-/// fleet, B serves works over greens A owns (the test hook), and makes a work over A's green at version 1. Do: a client on
+/// fleet, B, which replicates A's green, serves works over it (the rule "replicated here"), and makes a work over A's green at version 1. Do: a client on
 /// B asks `MoveWorkFloor` to drop the work's floor; a client on A asks it too; B destroys the work. Expect: A holds the
 /// work's floor at 1 after the creation; both clients refused `Unsupported` (a node's verb), the floor still 1; after
 /// the destroy, A drops the floor, told by B over the fleet (B's counter moved).
@@ -21564,9 +21660,8 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let admitted_floor = daemon_a.work_floor(green, work);
   let drop = RequestBody::MoveWorkFloor {
     green,
@@ -21592,7 +21687,6 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
     Ok(daemon_a.work_floor(green, work)?.is_none() && told(&daemon_b) > told_before)
   });
   let told_after = told(&daemon_b);
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_eq!(
     admitted_floor,
     Ok(Some(1)),
@@ -21608,7 +21702,7 @@ fn a_holders_work_gives_its_floor_back_to_its_greens_owner_when_it_is_destroyed(
 }
 
 /// A-697 part c, A-658 part 3b (a verdict computed anywhere, committed by position): in a two-node `f = 1` fleet, B
-/// serves works over greens A owns (the test hook), and makes a work over A's green at version 1 (`f` holding "hello").
+/// serves works over A's green, which it replicates (the rule "replicated here"), and makes a work over A's green at version 1 (`f` holding "hello").
 /// Do: the work edits `f` and submits; then a client of A reads the green, and B's client the work. Expect: answered
 /// `Submitted` at version 2, the verdict computed on B's replica (B's counter) and taken by position at A (A's counter),
 /// nothing judged at A from the work's journal; A's green reads "hello world"; B's work, now based on version 2, reads
@@ -21621,9 +21715,8 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let count = |daemon: &Daemon, name: &str| {
     daemon
       .refusals_on_every_shard()
@@ -21652,7 +21745,6 @@ fn a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_posi
       .work_floor(green, work)
       .map(|floor| floor == Some(2))
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
   assert!(
     matches!(
@@ -21702,9 +21794,129 @@ fn assert_answered_once_replicated<E: std::fmt::Debug>(
   );
 }
 
+/// `work` submitted by `holder` until answered within the placement deadline: the holder's routing learns the green's
+/// new owner within the takeover, and until then its ask is answered retryable, so the submit is resent. Whether it was
+/// answered, and the last reply.
+fn submit_until_answered(
+  holder: &mut Client,
+  survivors: &[&Daemon],
+  work: VolumeId,
+) -> (bool, Option<ReplyBody>) {
+  let mut submitted = None;
+  let answered = poll_until(survivors, PLACEMENT_DEADLINE, || {
+    let reply = holder
+      .try_call(&RequestBody::submit(work, Vec::new()), *DEADLINE_NS)
+      .unwrap_or_else(|e| refused_placeholder(&e));
+    let done = matches!(reply, ReplyBody::Submitted { .. });
+    submitted = Some(reply);
+    Ok(done)
+  });
+  (answered, submitted)
+}
+
+/// The submit answered at version 2.
+fn assert_submitted_at_two(submitted: Option<&ReplyBody>) {
+  assert!(
+    matches!(
+      submitted,
+      Some(ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      })
+    ),
+    "{submitted:?}"
+  );
+}
+
+/// A-697 part f (takeover; §4.8 "Promotion and takeover"): a holder's work goes on after its green's owner dies, its
+/// verdict taken by position at the green's successor. Do: three nodes at `f = 1`; on a, a green at version 1 (`f`
+/// holding "hello") shared with the fleet; the survivor that does not take the green over (the holder) makes a work
+/// over it, as its replica's holder, and inserts " world" into `f`; both survivors replicate version 1; a dies; once
+/// the successor has taken the green over, the holder submits its work. Expect: the work made on the holder (its id
+/// names the holder); the submit answered version 2, its verdict computed on the holder's replica and taken by position
+/// at the successor (both counters moved); the successor's green reads "hello world" at its head.
+#[test]
+fn a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut owner = Client::connect(daemons[0].instance());
+  let (green, owners_work) = green_with_work(&mut owner, "holder-takeover", &daemons);
+  commit_version(&mut owner, owners_work, (0, "hello"), 1);
+  drop(owner);
+  let successor_host = rendezvous_first(&[hosts[1], hosts[2]], ObjectId(green.bytes))
+    .expect("a survivor takes over the green");
+  // Indices among the survivors, once a is gone; the whole fleet's are one more.
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let holder_index = 1 - successor_index;
+  await_replicated(&daemons[1 + holder_index], green, 1);
+  let mut holder = Client::connect(daemons[1 + holder_index].instance());
+  let created = holder.call(&RequestBody::CreateWork {
+    green,
+    name: "holders-work".to_owned(),
+  });
+  let ReplyBody::WorkCreated { id: work, base: 1 } = created else {
+    panic!("the holder made the work at base 1: {created:?}");
+  };
+  edit_work(&mut holder, work, 5, " world");
+  let (both_at_one, unowned) = holders_before_owner_death_at(&daemons, green, 1);
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let taken_over = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 1)
+  });
+  let computed_before = count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap();
+  let taken_before =
+    count_on(&daemons[successor_index], "merge.verdict.taken_by_position").unwrap();
+  let (answered, submitted) = submit_until_answered(&mut holder, &survivors, work);
+  let computed =
+    count_on(&daemons[holder_index], "merge.work.computed_on_holder").unwrap() - computed_before;
+  let taken =
+    count_on(&daemons[successor_index], "merge.verdict.taken_by_position").unwrap() - taken_before;
+  let view = observe_taken_over_green(&daemons[successor_index], green);
+  drop(survivors);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(both_at_one, "both survivors replicated version 1");
+  assert!(unowned, "before the death neither survivor owned the green");
+  assert_eq!(
+    ObjectId(work.bytes).creator(),
+    hosts[1 + holder_index],
+    "the work was made on the holder"
+  );
+  assert!(taken_over, "the successor took the green over");
+  assert!(answered, "the holder's submit was answered: {submitted:?}");
+  assert_submitted_at_two(submitted.as_ref());
+  assert_committed_by_successor((computed, taken), &view);
+}
+
+/// The verdict computed on the holder's replica (`computed` moved) and taken by position at the successor (`taken`
+/// moved); the successor's green at version 2, reading "hello world".
+fn assert_committed_by_successor((computed, taken): (u64, u64), view: &TakenOverGreenView) {
+  assert!(
+    computed >= 1,
+    "the verdict was computed on the holder's replica"
+  );
+  assert!(taken >= 1, "the successor took the verdict by position");
+  assert_eq!(view.head, Ok(2), "{view:?}");
+  assert_eq!(view.at_head, Ok(b"hello world".to_vec()), "{view:?}");
+}
+
 /// A-697 part d (a holder's submit settles once its replica holds the version): in a three-node `f = 1` fleet (every
 /// node a holder, a quorum of two), A owns a green at version 1 (`f` holding "hello"), which B and C replicate; B serves
-/// works over greens A owns (the test hook) and makes one at base 1. Do: B withholds every merge record (A commits with
+/// works over A's green, which it replicates (the rule "replicated here"), and makes one at base 1. Do: B withholds every merge record (A commits with
 /// C alone); B's work edits `f` and submits; once B holds the owner's answer for a version its replica lacks, B takes
 /// records again. Expect: the submit answered `Submitted` at version 2 only after B's replica took version 2 (B's two
 /// counters, held and settled, each moved), and B's work then reads "hello world" on its new base.
@@ -21718,9 +21930,8 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
   at_version_one(&mut owner, owners_work);
   let all: Vec<&Daemon> = daemons.iter().collect();
   assert_replicated_at_version_one(&all, [daemon_b, daemon_c], green);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(daemon_b, &mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21767,7 +21978,6 @@ fn a_holders_submit_settles_once_its_replica_holds_the_version_the_owner_committ
     .merge_holder_state(green)
     .map(|state| state.version);
   let works_bytes = head_bytes(&mut holder, work, "f");
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert_eq!(withheld, Ok(()));
   assert_eq!(lifted, Ok(()));
   assert!(held, "B held the owner's answer for its replica");
@@ -21809,9 +22019,9 @@ fn assert_served_again_with_its_edit(
 
 /// A-697 part e, A-207 (a work comes back from its log after a restart), A-313 (a holder's replica is rebuilt from the
 /// records it holds): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a
-/// green at version 1 (`f` holding "hello") shared with B, and B, serving works over greens A owns (the test hook),
-/// makes a work over it and edits `f`. Do: restart B over its own segment (the hook is off while it recovers) and turn
-/// the hook on again; read `f` through the work until it is served; submit the work. Expect: the work served again with
+/// green at version 1 (`f` holding "hello") shared with B, and B, serving works over it as its replica's holder (the rule
+/// "replicated here"), makes a work over it and edits `f`. Do: restart B over its own segment; read `f` through the work
+/// until it is served; submit the work. Expect: the work served again with
 /// its edit, "hello world", replayed over B's replica of the green (B's counter moved), never refused for good; its
 /// submit answered version 2.
 #[test]
@@ -21889,9 +22099,8 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
     Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
   });
   assert!(replicated, "B replicates the green at version 1");
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemons[1], &mut holder, green);
   let edited = holder.call(&RequestBody::Edit {
     work,
     path: "f".to_owned(),
@@ -21913,7 +22122,6 @@ fn a_holders_work_comes_back_from_its_log_over_the_holders_replica_after_a_resta
       source(1),
     ),
   );
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
   let mut last: Result<Vec<u8>, Box<ReplyBody>> = Err(Box::new(ReplyBody::Acknowledged));
   let refs: Vec<&Daemon> = daemons.iter().collect();
@@ -21958,7 +22166,7 @@ fn assert_rebased_on_the_replica(
 
 /// A-697 (a holder's work rebased over the holder's replica; A-658: a rebase is a pure function of the versions it maps
 /// through): in a two-node `f = 1` fleet, A owns a green at version 1 (`f` holding "hello") shared with B, and B serves
-/// works over greens A owns (the test hook). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
+/// works over A's green, which it replicates (the rule "replicated here"). Do: B makes a work at base 1 and writes a new file `g`; A's own work changes
 /// `f` and submits, version 2; B's work rebases. Expect: answered `Rebased` at version 2, mapped on B's replica (B's
 /// counter moved); the work then reads `f` as version 2 holds it and keeps `g`; A's floor for the work rises to 2.
 #[test]
@@ -21986,9 +22194,8 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
   ));
   let first = owner.call(&RequestBody::submit(owners_work, Vec::new()));
   assert_eq!(version_of(&first), Some(1), "{first:?}");
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let wrote = edit(&mut holder, work, "g", 0, b"mine");
   assert!(matches!(
     edit(&mut owner, owners_work, "f", 5, b", there"),
@@ -22010,7 +22217,6 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
       .work_floor(green, work)
       .map(|floor| floor == Some(2))
   });
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(wrote, ReplyBody::Edited), "{wrote:?}");
   assert_eq!(version_of(&second), Some(2), "{second:?}");
   assert!(replica_at_two, "B's replica took version 2");
@@ -22018,8 +22224,8 @@ fn a_holders_work_rebases_over_the_holders_replica_and_its_floor_follows() {
 }
 
 /// A-697 (a copy a holder's work declares, composed over the holder's replica; A-626): in a two-node `f = 1` fleet, A
-/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over greens A owns (the test
-/// hook). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
+/// owns a green at version 1 (`f` holding "hello") shared with B, and B serves works over it as its replica's holder
+/// (the rule "replicated here"). Do: B's work declares a copy of `f` to `f2` and submits. Expect: answered `Submitted` at version 2, its
 /// increment composed on B's replica (B's counter moved), since a copy's source is the green's; A's green reads `f2` as
 /// "hello".
 #[test]
@@ -22029,9 +22235,8 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   let (green, owners_work) = green_and_work_on(&instance_a, &[&daemon_b]);
   let mut owner = Client::connect(&instance_a);
   at_version_one(&mut owner, owners_work);
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
-  let work = holders_work_at_base_one(&mut holder, green);
+  let work = holders_work_at_base_one(&daemon_b, &mut holder, green);
   let before = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap();
   let declared = holder.call(&RequestBody::Declare {
     work,
@@ -22045,7 +22250,6 @@ fn a_holders_work_submits_a_copy_composed_over_the_holders_replica() {
   let submitted = holder.call(&RequestBody::submit(work, Vec::new()));
   let composed_here = count_on(&daemon_b, "merge.work.composed_on_replica").unwrap() - before;
   let copied = head_bytes(&mut owner, green, "f2");
-  daemon_b.serve_works_on_holders(false).unwrap();
   assert!(matches!(declared, ReplyBody::Declared), "{declared:?}");
   assert!(
     matches!(
@@ -22137,7 +22341,7 @@ fn assert_released_and_made_again(
 
 /// A-697 part e2 (a holder creation a restart caught waiting for its admission releases the owner's floor before it is
 /// dropped): on a settled three-node fleet at `f = 1` whose nodes keep their state across a restart, A owns a green at
-/// version 1 shared with B, and B serves works over greens A owns (the test hook). Do: B loses the next admission its
+/// version 1 shared with B, and B serves works over it as its replica's holder (the rule "replicated here"). Do: B loses the next admission its
 /// owner answers, so a creation's answer is lost after A recorded the work's floor; restart B over its own segment; then
 /// create a work of the same name on B. Expect: the lost creation answered retryable and A holding a floor for a work
 /// whose id names B; after the restart A's floor for that work released (B's counter moved), never left holding the
@@ -22217,7 +22421,6 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
     Ok(daemons[1].merge_holder_state(green)?.version == Some(1))
   });
   assert!(replicated, "B replicates the green at version 1");
-  daemons[1].serve_works_on_holders(true).unwrap();
   lose_every_next_owner_answer(&daemons[1]);
   let floors_before = daemons[0].work_floors_of(green).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
@@ -22248,7 +22451,6 @@ fn a_holder_creation_a_restart_caught_releases_its_floor_at_the_owner() {
   let released_count = daemons[1]
     .refusals_on_every_shard()
     .map(|counts| counts.get("merge.work.admission_released").copied());
-  daemons[1].serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemons[1].instance());
   let made = holder.call(&RequestBody::CreateWork {
     green,
@@ -22325,6 +22527,7 @@ fn bench_green(owner: &mut Client, daemon_b: &Daemon, name: &str) -> VolumeId {
     ),
     "{first:?}"
   );
+  await_replicated(daemon_b, green, 1);
   green
 }
 
@@ -22358,7 +22561,7 @@ fn bench_work(client: &mut Client, green: VolumeId, name: &str, bytes: usize) ->
 
 /// A-697's measured breakdown (main's ruling of 2026-11-20: the by-reference forward is measured before and after,
 /// release, best of N with every N shown). Ignored: a benchmark, run by its recorded command, never by the suite. Do: in
-/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over greens A owns (the test hook), for
+/// a two-node `f = 1` fleet, A owning a green at version 1 and B serving works over it as its replica's holder (the rule "replicated here"), for
 /// each size in `SLATES_A697_BENCH_MIB` (comma-separated MiB, default 4) and `SLATES_A697_BENCH_RUNS` runs (default 3):
 /// a work on B (the holder) and one on A (local) each write a file of that size and submit. Prints, a line a submit, its
 /// wall time and every phase's count and milliseconds (both daemons' counters, the submit's own delta), and asserts
@@ -22381,7 +22584,6 @@ fn bench_a697_holder_and_local_submit_phases() {
   let fresh = std::env::var("SLATES_A697_BENCH_FRESH").is_ok_and(|fresh| fresh == "1");
   let mut owner = Client::connect(&instance_a);
   let shared = bench_green(&mut owner, &daemon_b, "bench-green");
-  daemon_b.serve_works_on_holders(true).unwrap();
   let mut holder = Client::connect(daemon_b.instance());
   for bytes in sizes {
     for run in 0..runs {
@@ -22429,7 +22631,6 @@ fn bench_a697_holder_and_local_submit_phases() {
       }
     }
   }
-  daemon_b.serve_works_on_holders(false).unwrap();
 }
 
 /// AUD-11, §4.9 (a forwarded write whose acceptance waits for its quorum commit is answered by the commit, not by a
@@ -22546,6 +22747,88 @@ fn a_forward_waiting_for_its_lent_session_is_woken_by_its_return() {
     "each forward woken by the session's return: {before:?} then {after:?}"
   );
   assert_eq!(after.1, before.1, "no wait elapsed unwoken");
+}
+
+/// A-697 (1) (a holder's increment crosses once: the inputs it composed are never shipped back to it; main's ruling of
+/// 2026-11-20 after A-697's release bench, which measured a holder version's inputs shipped back in three shipments).
+/// Do: in a two-node `f = 1` fleet, B serving works over A's green as its replica's holder, a work on B writes a file of 256
+/// KiB and submits; then a work on A does the same. Expect: both answered `Submitted`; B held its composed increment as
+/// the version's inputs and A was told so; no input chunk was shipped for B's version, while A's own version shipped
+/// its chunks to B (the control, so the count is not vacuous).
+#[test]
+fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "inputs-green");
+  let mut holder = Client::connect(daemon_b.instance());
+  let bytes = 256 * 1024;
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  let holders_work = bench_work(&mut holder, green, "inputs-holder", bytes);
+  let before = count("merge.inputs.chunks_shipped");
+  let held_before = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let holders = holder.call(&RequestBody::submit(holders_work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let holders_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let after_holders = count("merge.inputs.chunks_shipped");
+  let held_after = (
+    count("merge.inputs.held_at_compose"),
+    count("merge.inputs.held_by_composer"),
+  );
+  let owners_work = bench_work(&mut owner, green, "inputs-owner", bytes);
+  let owners = owner.call(&RequestBody::submit(owners_work, Vec::new()));
+  let owners_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 3)
+  });
+  let after_owners = count("merge.inputs.chunks_shipped");
+  assert!(
+    matches!(
+      holders,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{holders:?}"
+  );
+  assert!(
+    matches!(
+      owners,
+      ReplyBody::Submitted {
+        version: Some(3),
+        ..
+      }
+    ),
+    "{owners:?}"
+  );
+  assert!(
+    holders_placed && owners_placed,
+    "both versions placed at the quorum"
+  );
+  assert_eq!(
+    after_holders - before,
+    0,
+    "no input chunk shipped back to B for its own version"
+  );
+  assert_eq!(
+    (held_after.0 - held_before.0, held_after.1 - held_before.1),
+    (1, 1),
+    "B held its composed inputs, and A was told so"
+  );
+  assert!(
+    after_owners > after_holders,
+    "A's own version shipped its chunks to B: {after_holders} then {after_owners}"
+  );
 }
 
 /// §4.9 "Exactly-once", §4.16 "Commit" (AUD-11), found by fixtures' 1,000-client `f = 1` rung on 2026-11-06 (447
@@ -23672,7 +23955,7 @@ fn a_replacement_that_never_received_the_owners_pair_serves_the_live_volume_it_s
       let seated = daemon.council_voters()?.is_some_and(|voters| {
         voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
       });
-      let kept = match status.call(&RequestBody::DaemonStatus) {
+      let kept = match status.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
         _ => usize::MAX,
       };
@@ -23967,7 +24250,7 @@ fn a_replacement_that_never_received_the_owners_pair_opens_the_sealed_head_it_su
       let seated = daemon.council_voters()?.is_some_and(|voters| {
         voters.contains(&me) && voters.contains(&fresh) && !voters.contains(&old)
       });
-      let kept = match status.call(&RequestBody::DaemonStatus) {
+      let kept = match status.call(&RequestBody::DaemonStatus { memory: false }) {
         ReplyBody::DaemonStatus { report } => report.fleet.takeover.retirements.len(),
         _ => usize::MAX,
       };
@@ -28650,7 +28933,10 @@ fn a_green_given_up_while_its_inputs_holder_was_away_is_served_once_the_holder_i
     given_up && silenced.as_ref().is_ok_and(|silenced| *silenced > 0),
     "the successor gave the green up while the holder of its inputs was away ({silenced:?} answers withheld)"
   );
-  assert!(placed, "the successor placed the green at version 3 once the holder was heard again");
+  assert!(
+    placed,
+    "the successor placed the green at version 3 once the holder was heard again"
+  );
   assert!(
     judged.as_ref().is_ok_and(|judged| *judged >= 1),
     "the successor judged the green afresh ({judged:?})"
@@ -29302,7 +29588,9 @@ fn a_works_head_is_never_placed_so_a_takeover_cannot_bring_it_back_to_run_a_rese
 
 /// The sum over `client`'s daemon's shards of the counter `kind` (`slates status`'s per-shard counts).
 fn shard_count(client: &mut Client, kind: &str) -> u64 {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the daemon reported its status");
   };
   report
@@ -29569,7 +29857,9 @@ fn a_live_shipped_maps_sync_refused_at_the_held_reply_bound_wrote_nothing() {
 /// macOS, as the one test that asks it is.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn library_shard_count(client: &mut slates_client::Client, kind: &str) -> u64 {
-  let Ok(ReplyBody::DaemonStatus { report }) = client.call(&RequestBody::DaemonStatus) else {
+  let Ok(ReplyBody::DaemonStatus { report }) =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("the daemon reported its status");
   };
   report

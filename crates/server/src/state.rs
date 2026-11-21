@@ -783,6 +783,9 @@ pub struct ShardState {
   /// repository's tool store with its derived values, made with its record and made again by a recovery from its
   /// entries' objects. Bounded by the shard's memory budget, which every byte of it is charged to.
   pub(crate) vcs_stores: crate::vcs_store::VcsStores,
+  /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
+  /// handle to its owner thread, through which a repository's landings reach the changeset log.
+  pub vcs_disk: Option<slates_store::owner::StoreHandle>,
   /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
   /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's
@@ -792,11 +795,15 @@ pub struct ShardState {
   /// bounded by the hooks their policies configure. Unix alone, where hooks run.
   #[cfg(unix)]
   pub(crate) hook_times: crate::vcs_hooks::HookTimesTable,
-  /// The root mount this daemon published (§4.6, D-1; A-645 P3): the point the host shows every volume beneath, which a
-  /// hook is handed its repository's view beneath. The daemon's own record of the mount it made, written on every shard
-  /// when it publishes the mount, never a configured value that could drift from the mount (main's ruling of
-  /// 2026-11-20). None until then, and a configured hook is refused, typed, while it is none.
-  pub(crate) root_mount: Option<std::path::PathBuf>,
+  /// Where a hook is shown its repository (A-645 (a), `crate::vcs_store::svn_presenter::HookViews`): the store's
+  /// granted directory, where the repository's view is mounted for it, or none, when a configured hook is refused, typed.
+  pub(crate) hook_views: crate::vcs_store::svn_presenter::HookViews,
+  /// The Subversion repositories whose FSFS view this shard presents for their hooks (A-645 (a)), by repository: its
+  /// volume, its layout so far and where it is mounted. Bounded by the repositories this shard owns.
+  pub(crate) svn_views: std::collections::BTreeMap<
+    slates_db::catalog::RepositoryId,
+    crate::vcs_store::svn_presenter::ViewSlot,
+  >,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
@@ -885,6 +892,8 @@ pub struct ShardState {
   pub(crate) base_waits: crate::base_wait::BaseWaits,
   /// A shard's parked work verbs and the answer for the one now running (A-247; `crate::work_home`).
   pub(crate) work_home: crate::work_home::WorkHome,
+  /// The shard's refinements of works' whole-file rewrites, a slice a turn (A-787 part 2, `crate::refining`).
+  pub(crate) refining: crate::refining::Refining,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

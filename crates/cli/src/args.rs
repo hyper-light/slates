@@ -203,7 +203,11 @@ pub(crate) enum Verb {
   /// List.
   List,
   /// The daemon's status (`status` with no volume).
-  DaemonStatus,
+  DaemonStatus {
+    /// `--memory`: the memory report's residency read now, which only such a request costs the daemon (A-744; main's
+    /// ruling on g228's finding).
+    memory: bool,
+  },
   /// Explicitly create a consensus group bound to the daemon's current identity (§4.8, AUD-07).
   Bootstrap {
     /// Also create the root group, exactly once for a new fleet.
@@ -838,6 +842,7 @@ const VALUES: &[&str] = &[
   "--vcs-http",
   "--vcs-ssh",
   "--vcs-svn",
+  "--vcs-store",
   "--bounded",
   "--dynamic",
   "--base",
@@ -885,6 +890,7 @@ const SWITCHES: &[&str] = &[
   "--write",
   "--admin",
   "--drift",
+  "--memory",
   "--mirror",
   "--session",
   "--require-evidence",
@@ -2171,6 +2177,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
           "--vcs-http",
           "--vcs-ssh",
           "--vcs-svn",
+          "--vcs-store",
         ],
         switches: &["--quick"],
       })?;
@@ -2182,6 +2189,7 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
         vcs_http: vcs_address_of(&taken, "--vcs-http", fleet.is_some())?,
         vcs_ssh: vcs_ssh_of(&taken)?,
         vcs_svn: vcs_address_of(&taken, "--vcs-svn", fleet.is_some())?,
+        vcs_store: taken.value("--vcs-store").map(str::to_owned),
         fleet,
       };
       Ok(if words.first() == Some(&"anchor") {
@@ -2319,8 +2327,16 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       ))
     }
     ["status"] => {
-      taken.only(&NONE)?;
-      Ok(client(&taken, Verb::DaemonStatus))
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--memory"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::DaemonStatus {
+          memory: taken.switch("--memory"),
+        },
+      ))
     }
     ["bootstrap", "root"] => {
       taken.only(&NONE)?;
@@ -3062,6 +3078,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert_eq!(
@@ -3172,6 +3189,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     assert!(matches!(
@@ -3202,6 +3220,7 @@ mod tests {
         vcs_http: Some(loopback),
         vcs_ssh: None,
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3243,6 +3262,7 @@ mod tests {
         vcs_http: None,
         vcs_ssh: Some(loopback),
         vcs_svn: None,
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3282,6 +3302,7 @@ mod tests {
         vcs_http: Some(loopback(8080)),
         vcs_ssh: None,
         vcs_svn: Some(loopback(3690)),
+        vcs_store: None,
       }))
     );
     let anchor = parse(&args(
@@ -3944,7 +3965,15 @@ mod tests {
       Ok(Command::Client(ClientRequest {
         instance: "run".into(),
         json: false,
-        verb: Verb::DaemonStatus,
+        verb: Verb::DaemonStatus { memory: false },
+      }))
+    );
+    assert_eq!(
+      parse(&args("--instance run status --memory")),
+      Ok(Command::Client(ClientRequest {
+        instance: "run".into(),
+        json: false,
+        verb: Verb::DaemonStatus { memory: true },
       }))
     );
   }

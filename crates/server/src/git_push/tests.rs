@@ -486,7 +486,8 @@ fn assert_a_configured_hook_refuses(
   assert_eq!(reasons(&received), [ROOT_UNPUBLISHED]);
   assert_first_line_names(&received, b"pre-receive");
   assert_eq!(records(state, repository), held);
-  state.root_mount = Some(std::path::PathBuf::from("/slates-root"));
+  state.hook_views =
+    crate::vcs_store::svn_presenter::HookViews::Given(std::path::PathBuf::from("/slates-root"));
   let received = pushed(state, repository, delete);
   assert_eq!(reasons(&received), [HOOK_NOT_RUN]);
   assert_first_line_names(&received, b"pre-receive");
@@ -1748,10 +1749,12 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 }
 
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
-/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog). Do: create `main`
-/// at a flat tree of [`FLAT_FILES`] files, then push a commit changing every file, answering a step at a time. Expect:
-/// both `ok`; the work builds took more turns than the files they wrote (a unit at a time, before the verdicts), none
-/// past its budget by more than its longest unit and the scheduler's own overrun (`push.build.past_budget` 0).
+/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
+/// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
+/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
+/// build a unit at a time (more quanta than files), in a tenth as many turns as quanta or fewer (no one waited, so each
+/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
+/// budget (`push.build.past_budget` 0).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   let daemon = crate::daemon::audit_daemon();
@@ -1782,25 +1785,39 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   assert_eq!(reasons(&created), [b"ok"]);
   assert_eq!(reasons(&updated), [b"ok"]);
   let turns = after.turns - before.turns;
+  let quanta = (after.more_quanta - before.more_quanta) + turns;
+  // A unit at a time still: more quanta than files, each quantum asked once whether anyone waits.
   assert!(
-    turns > FLAT_FILES as u64,
-    "the update's work was built in {turns} turns for {FLAT_FILES} files"
+    quanta > FLAT_FILES as u64,
+    "the update's work took {quanta} quanta for {FLAT_FILES} files"
+  );
+  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  assert!(
+    turns * 10 < quanta,
+    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+  );
+  let ceiling = crate::daemon::HEARTBEAT_NS;
+  assert!(
+    after.longest_ns <= ceiling + after.longest_unit_ns + after.longest_opening_ns,
+    "a turn of {} ns past its {ceiling} ns ceiling",
+    after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
 }
 
-/// A-724 piece 8c (main's ruling of 2026-11-20 (ii): a record names its names only once they are durable at `f + 1` in
-/// the region). Do: with version 3 on for the shard, push stock git's `create` and `update`, driving each answer as an
-/// edge does (a turn, a yield, the names it asks to home homed in the region, the home publishing itself), then make
-/// the store again from the log. Expect: both pushes answered `ok`; each record that names objects version 3, naming
-/// them by the identity the region homed; and the store made again from those records equal to the live one. Every wait
+/// A-724 piece 8c and A-722's record v4 (main's rulings of 2026-11-20: a record names its names and its pack only once
+/// they are durable at `f + 1` in the region). Do: with version 4 on for the shard, push stock git's `create` and
+/// `update`, driving each answer as an edge does (a turn, a yield, the names and then the pack it asks to home homed in
+/// the region, the home publishing itself), then make the store again from the log. Expect: both pushes answered `ok`;
+/// each record that names objects version 4, naming its names and its pack by the identities the region homed; and
+/// the store made again from those records equal to the live one. Every wait
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let daemon = crate::daemon::audit_daemon_of(1);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "homed");
     let requests: Vec<Vec<u8>> = chain()
       .into_iter()
@@ -1849,7 +1866,7 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 3),
+    versions.iter().all(|version| *version == 4),
     "versions {versions:?}"
   );
 }
@@ -1937,7 +1954,7 @@ fn pushed_v3_at(
 ) -> (RepositoryId, slates_vcs::ContentId, u16) {
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, name);
     let request = chain()
       .into_iter()
@@ -2006,7 +2023,7 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
 #[test]
 fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
   crate::daemon::audit_on_shard(|state| {
-    crate::vcs_store::write_version_3_for_test(true);
+    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "untaken");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let records = crate::vcs_store::tests::records(state, repository);
@@ -2022,6 +2039,6 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
         .copied(),
       Some(1)
     );
-    crate::vcs_store::write_version_3_for_test(false);
+    crate::vcs_store::write_version_4_for_test(false);
   });
 }

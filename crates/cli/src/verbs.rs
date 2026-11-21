@@ -856,8 +856,8 @@ fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
 
 /// `status` (no volume): the daemon's status as text, or JSON (the MCP `daemon_json` schema), with
 /// every shard's telemetry ring drained (§4.14) — the same gather the MCP `slates.status` makes.
-fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError> {
-  let (report, telemetry) = slates_mcp::gather_daemon_status(client)?;
+fn emit_daemon_status(client: &mut Client, json: bool, memory: bool) -> Result<(), ClientError> {
+  let (report, telemetry) = slates_mcp::gather_daemon_status(client, memory)?;
   if json {
     slates_machine::out_line!("{}", slates_mcp::daemon_json(&report, &telemetry));
   } else {
@@ -1619,7 +1619,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       emit_create(client, &spec, json)?;
     }
     Verb::List => emit_list(client, json)?,
-    Verb::DaemonStatus => emit_daemon_status(client, json)?,
+    Verb::DaemonStatus { memory } => emit_daemon_status(client, json, *memory)?,
     Verb::PromoteRegion { region } => {
       client.promote_region(*region)?;
       emit_ok("region promoted", json);

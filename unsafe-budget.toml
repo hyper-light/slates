@@ -320,7 +320,18 @@ slates-machine = 97
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 83
+# 2026-11-20 (+1, g228, main's ruling on the status-armed residency sweep): `resident::mapping::query` on macOS, the
+# `mach_vm_region(mach_task_self_, ..., VM_REGION_TOP_INFO, ...)` call that reads a mapping's VM objects' resident pages
+# (libc binds neither the call nor the struct, and its `mach_task_self` is deprecated), one block with its `// SAFETY:`
+# line, so the anchor's objects whole cost O(mappings) where `mincore` walked tens of GiB.
+slates-mem = 87
+# 2026-11-20 (+3, A-789's Windows shape, main's ruling of 18:40: a content extent is a section of its own, closed when
+#   wholly free; compiled only for Windows; a `// SAFETY:` line directly above each):
+#   1. `shared.rs` Windows `make_section`: `CreateFileMappingW` of an unnamed `SEC_RESERVE` section (Win32 FFI, no safe
+#   wrapper);
+#   2. `make_section`: `OwnedHandle::from_raw_handle` of the section just created (unsafe by signature);
+#   3. `ExclusiveObject::from_section` (unsafe fn: its caller promises no other view reaches the section, as
+#   `ExclusiveObject::open_range` does).
 # 2026-11-20 (+1, A-744, a range's pages in RAM, main's ruling: every site named, `// SAFETY:` directly above):
 #   17. `resident.rs`, Unix `os::query`: `libc::mincore` over a page-aligned range into a vector of one byte a page (the
 #   kernel reads only the page table; rustix has no wrapper). Windows answers a typed refusal, no unsafe code.
@@ -556,7 +567,20 @@ slates-ipc = 147
 # 2026-11-20 (+1, A-748, `daemon.rs` `shared_listeners`, compiled only for Windows): the daemon takes unique ownership of
 #   the reading end of the anchor's shared-listener pipe, handed in its spawn's explicit handle list and named in its
 #   environment, read once; its inheritance flag is cleared at once (`slates_ipc::win_spawn::clear_inheritance`).
-slates-server = 6
+slates-server = 10
+# 2026-11-20 (+1, A-789's macOS shape, 362bd8c39, which landed it without raising the budget; w-lint's finding; a
+#   `// SAFETY:` line directly above): `content_pool.rs` `map`: `ExclusiveObject::open_range` of an extent's own object
+#   (unsafe fn: no other mapping reaches it while its owner word is held), one site, its retry after `make_extent` folded
+#   into the same loop.
+# 2026-11-20 (+3, A-789's Windows shape, main's ruling of 18:40; compiled only for Windows; a `// SAFETY:` line directly
+#   above each): the process's content extent table keeps each section's handle as a value in an atomic word, since a
+#   shard may claim another partition's extent and no lock may stand between them (D-7):
+#   1. `content_extents_windows.rs` `section`: `BorrowedHandle::borrow_raw` of the table's value, to duplicate it for a
+#   claimant (the value stays open: only the holder of the extent's owner word takes it out);
+#   2. `content_extents_windows.rs` `owned`: `OwnedHandle::from_raw_handle` of a value taken out of the table, to close
+#   it;
+#   3. `content_pool.rs` `map`: `ExclusiveObject::from_section` (unsafe fn: no other view reaches the extent while its
+#   owner word is held).
 slates-client = 0
 slates-api = 10
 slates-cli = 2
@@ -740,6 +764,9 @@ slates-svn = 0
 # slates-vcs (0): the version-control servers' object store (A-581, §4.17.1 shared piece 3): content by BLAKE3 identity in
 # an ordered map, tables read by checked offsets and `get`; no casts, no maps, no FFI.
 slates-vcs = 0
+# slates-store (0): the store's changeset log and rows (A-767): records read and written by checked offsets and `get`
+#   through hyper_block's files and mantle's engine; no FFI of its own.
+slates-store = 0
 # slates-ssh (0): SSH's transport (A-594, §4.17.2): the wire types read by checked offsets and `get`, the cryptography
 #   through aws-lc-rs's safe API (X25519, Ed25519, SHA-256, AES-256-GCM, OpenSSH's ChaCha20-Poly1305); no FFI of its own.
 slates-ssh = 0

@@ -159,8 +159,8 @@ const REFS: &str = "refs/";
 pub(crate) const HOOK_NOT_RUN: &[u8] = b"hook not run";
 
 /// Slates' words: the reason every command of a push is given while a git hook is configured for its repository and
-/// this daemon has published no root mount to show the hook its view beneath (A-645 P3, main's ruling 1).
-pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"root mount not yet published";
+/// this daemon holds no standing grant to show the hook its view under (A-645 (a): `--vcs-store`).
+pub(crate) const ROOT_UNPUBLISHED: &[u8] = b"no standing grant to show a hook its view";
 
 /// Slates' words: the reason every command of a push is given whose objects its repository's store did not admit (the
 /// shard's budget, or an object the store refused).
@@ -314,11 +314,12 @@ struct DecidingPush {
   then: Option<hooks::PushHooks>,
 }
 
-/// Where the homing of a push's names stands (A-724 piece 8c; main's ruling of 2026-11-20 (ii): content durable at
-/// `f + 1` in the region before the record that names it). While `crate::vcs_store::write_version_3`, the decision's
-/// first turn puts the names the record would carry as one content and asks the edge to home them
-/// ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge hands back the outcome
-/// ([`ReceivePack::homed`]); homed, the record is written as version 3, else as version 2.
+/// Where the homing of a push's names and pack stands (A-724 piece 8c; A-722's record v4; main's ruling of 2026-11-20
+/// (ii): content durable at `f + 1` in the region before the record that names it). While
+/// `crate::vcs_store::write_version_4`, the decision's first turn puts the names the record would carry as one content
+/// and asks the edge to home them ([`ReceivePack::take_homing`]); the decision waits, a turn at a time, until the edge
+/// hands back the outcome ([`ReceivePack::homed`]); then it asks the same of the pack its staging put in the store.
+/// Both homed, the record is written as version 4, naming each; else as version 2.
 #[derive(Debug)]
 enum Homing {
   /// Not yet asked.
@@ -327,6 +328,12 @@ enum Homing {
   Asked(Vec<u8>, (slates_vcs::ContentId, u64)),
   /// Taken by the edge, its outcome awaited.
   Waiting((slates_vcs::ContentId, u64)),
+  /// The names homed: the pack is asked next.
+  PackDue,
+  /// Asked: the pack's bytes, for the edge to take, its identity and length (held for the record).
+  PackAsked(Vec<u8>, (slates_vcs::ContentId, u64)),
+  /// The pack taken by the edge, its outcome awaited.
+  PackWaiting((slates_vcs::ContentId, u64)),
   /// Done, or never asked: the decision goes on.
   Done,
 }
@@ -584,7 +591,7 @@ impl<P> ReceivePack<P> {
     let checked = self.session.checked().ok_or(PushFailed::Unchecked)?;
     if let Some(hook) = git_hook(&record).filter(|_| !can_present) {
       self.give_back(state);
-      let answering = self.declined(&mut Declining::hook(hook, state.root_mount.is_some()), out)?;
+      let answering = self.declined(&mut Declining::hook(hook, state.hook_views.shows()), out)?;
       return Ok(Begun::Answering(Box::new(answering)));
     }
     let quarantine = (self.quarantine.take(), self.unadmitted.take());
@@ -657,10 +664,9 @@ impl<P> ReceivePack<P> {
   /// checked push taken from the session.
   fn deciding(
     &mut self,
-    (record, mut sealed, name): (RepositoryRecord, SealedPush, [u8; 32]),
+    (record, sealed, name): (RepositoryRecord, SealedPush, [u8; 32]),
     verdicts: HookVerdicts,
   ) -> Result<DecidingPush, PushFailed> {
-    sealed.give_back_in_turns();
     let checked = self.session.take_checked().ok_or(PushFailed::Unchecked)?;
     let deciding = Deciding::new(checked, &mut self.admission).map_err(PushFailed::Exchange)?;
     Ok(DecidingPush {
@@ -672,7 +678,7 @@ impl<P> ReceivePack<P> {
       admitting: None,
       restaging: None,
       preparing: None,
-      homing: if crate::vcs_store::write_version_3() {
+      homing: if crate::vcs_store::write_version_4() {
         Homing::Due
       } else {
         Homing::Done
@@ -726,13 +732,6 @@ impl<P> ReceivePack<P> {
       self.answer = AnswerState::Deciding(Box::new(decision));
       return Ok(None);
     }
-    // The holds the landing set aside are given back a turn at a time before the push is given back (A-722's landing
-    // step).
-    let ns = state.config.step_quantum_ns();
-    if !decision.sealed.give_back_turn(state, ns) {
-      self.answer = AnswerState::Deciding(Box::new(decision));
-      return Ok(None);
-    }
     decision.sealed.abandon(state);
     #[cfg(unix)]
     let then = decision.then;
@@ -768,14 +767,22 @@ impl<P> ReceivePack<P> {
           None => true,
         }
       }
-      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the names are given back
+      // Asked and not taken by the turn after: no edge homes it (a driver that never asks), so the content is given back
       // and the record is version 2, never a decision waiting for a homing nobody runs.
-      Homing::Asked(_, (identity, _)) => {
+      Homing::Asked(_, (identity, _)) | Homing::PackAsked(_, (identity, _)) => {
         crate::vcs_store::release_names(state, &identity);
         crate::vcs_store::homes::count_untaken(state);
         true
       }
-      waiting @ Homing::Waiting(_) => {
+      // The pack the staging put in the store, held once more for the record (A-722's record v4), and asked of the edge.
+      Homing::PackDue => match decision.sealed.pack_to_home() {
+        Some((bytes, packed)) if crate::vcs_store::hold_for_record(state, &packed.0) => {
+          decision.homing = Homing::PackAsked(bytes, packed);
+          false
+        }
+        _ => true,
+      },
+      waiting @ (Homing::Waiting(_) | Homing::PackWaiting(_)) => {
         decision.homing = waiting;
         false
       }
@@ -793,6 +800,10 @@ impl<P> ReceivePack<P> {
         decision.homing = Homing::Waiting(named);
         Some(bytes)
       }
+      Homing::PackAsked(bytes, packed) => {
+        decision.homing = Homing::PackWaiting(packed);
+        Some(bytes)
+      }
       other => {
         decision.homing = other;
         None
@@ -800,8 +811,9 @@ impl<P> ReceivePack<P> {
     }
   }
 
-  /// What the region answered of the names [`Self::take_homing`] gave: homed under their identity, the record is written
-  /// as version 3; else their hold is given back and the record is version 2.
+  /// What the region answered of the names or the pack [`Self::take_homing`] gave: the names homed under their identity,
+  /// the pack is asked next; the pack homed too, the record is written as version 4 naming both; else the content's
+  /// hold is given back and the record is version 2.
   pub(crate) fn homed(
     &mut self,
     state: &mut ShardState,
@@ -810,15 +822,24 @@ impl<P> ReceivePack<P> {
     let AnswerState::Deciding(decision) = &mut self.answer else {
       return;
     };
-    let Homing::Waiting((identity, count)) = core::mem::replace(&mut decision.homing, Homing::Done)
-    else {
-      return;
-    };
-    if homed.as_ref().is_ok_and(|homed| *homed == identity) {
-      decision.sealed.homed_as((identity, count));
-      return;
+    match core::mem::replace(&mut decision.homing, Homing::Done) {
+      Homing::Waiting((identity, count)) => {
+        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+          decision.sealed.homed_as((identity, count));
+          decision.homing = Homing::PackDue;
+          return;
+        }
+        crate::vcs_store::release_names(state, &identity);
+      }
+      Homing::PackWaiting((identity, len)) => {
+        if homed.as_ref().is_ok_and(|homed| *homed == identity) {
+          decision.sealed.pack_homed_as((identity, len));
+          return;
+        }
+        crate::vcs_store::release_names(state, &identity);
+      }
+      other => decision.homing = other,
     }
-    crate::vcs_store::release_names(state, &identity);
   }
 }
 
@@ -1424,7 +1445,7 @@ impl Declining {
   fn hook(hook: &HookConfig, root_published: bool) -> Declining {
     if !root_published {
       let why = format!(
-        "the repository's {} hook cannot run here: this daemon's root mount is not yet published",
+        "the repository's {} hook cannot run here: this daemon holds no standing grant to show it its view (--vcs-store)",
         hook.name
       );
       return Declining {
@@ -1548,6 +1569,23 @@ pub(crate) struct PushTurns {
   pub(crate) longest_unit_ns: u64,
   /// The longest opening of a turn, nanoseconds: what it did before its first unit (the admission's turn, the views).
   pub(crate) longest_opening_ns: u64,
+  /// The quanta turns took past their first because no one waited (A-783): the non-vacuity count of the extension.
+  pub(crate) more_quanta: u64,
+  /// The turns that yielded to someone waiting at a quantum's end (A-783).
+  pub(crate) yielded: u64,
+}
+
+/// A unit estimate's target relative error, parts per million (A-783, `slates_pace::Env::target_ppm`): the scheduler's
+/// own measured jitter over the quantum, at least one part, at most the whole.
+pub(crate) fn target_ppm(jitter_ns: u64, quantum_ns: u64) -> u64 {
+  u64::try_from(
+    u128::from(jitter_ns)
+      .saturating_mul(1_000_000)
+      .checked_div(u128::from(quantum_ns.max(1)))
+      .unwrap_or(0),
+  )
+  .unwrap_or(u64::MAX)
+  .clamp(1, 1_000_000)
 }
 
 impl PushTurns {
@@ -1566,9 +1604,24 @@ impl PushTurns {
     }
   }
 
+  /// What a turn's step did (A-783): the quanta it took past its first, and whether it yielded to someone waiting.
+  fn stepped(&mut self, report: Option<slates_pace::Report>) {
+    let Some(report) = report else {
+      return;
+    };
+    self.more_quanta = self
+      .more_quanta
+      .saturating_add(report.quanta.saturating_sub(1));
+    if report.stop == Some(slates_pace::Stop::Waiting) {
+      self.yielded = self.yielded.saturating_add(1);
+    }
+  }
+
   /// Its status rows.
-  pub(crate) fn rows(&self) -> [(&'static str, u64); 5] {
+  pub(crate) fn rows(&self) -> [(&'static str, u64); 7] {
     [
+      ("push.build.more_quanta", self.more_quanta),
+      ("push.build.yielded", self.yielded),
       ("push.build.turns", self.turns),
       ("push.build.past_budget", self.past_budget),
       ("push.build.longest_ns", self.longest_ns),
@@ -1751,8 +1804,16 @@ impl ServerJudge<'_> {
       ..
     } = self;
     let quantum = state.config.step_quantum_ns();
-    let budget = quantum / 2;
-    let deadline = began.saturating_add(budget);
+    // A-783: the turn yields at its quantum when someone waits on the shard, and goes on to the shard's ceiling (the
+    // watchdog's look) when no one does; a unit's estimate aims at the scheduler's own measured jitter over the
+    // quantum, its target relative error.
+    let env = slates_pace::Env {
+      clock: slates_rt::futures::now_ns,
+      waiting: slates_rt::futures::others_waiting,
+      quantum_ns: quantum,
+      ceiling_ns: slates_rt::futures::step_ceiling_ns().unwrap_or(quantum),
+      target_ppm: target_ppm(slates_rt::futures::scheduler_overrun_ns(), quantum),
+    };
     // A unit's bytes: the shard's copy and hash slices, derived from its measured memcpy and BLAKE3 rates (R3).
     let slices = slates_merge::pace::Slices {
       copy_bytes: state.config.copy_slice_bytes_within(quantum).max(1),
@@ -1776,7 +1837,7 @@ impl ServerJudge<'_> {
         command,
         pushed,
         preparing,
-        (slates_rt::futures::now_ns, began, deadline),
+        (began, env),
         slices,
       );
       Ok(built)
@@ -1786,17 +1847,22 @@ impl ServerJudge<'_> {
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
     // three and the units before its deadline, measured on one clock.
-    let (unit, opening, asked_at) = preparing.as_ref().map_or((0, 0, began), |prepared| {
-      (
-        prepared.longest_unit_ns(),
-        prepared.opening_ns(),
-        prepared.asked_at_ns(),
-      )
-    });
+    let (unit, opening, asked_at, step) =
+      preparing.as_ref().map_or((0, 0, began, None), |prepared| {
+        (
+          prepared.longest_unit_ns(),
+          prepared.opening_ns(),
+          prepared.asked_at_ns(),
+          prepared.step_report(),
+        )
+      });
     let tail = ended.saturating_sub(asked_at.max(began));
+    // Its budget: what its step was allowed (to the end of its last quantum, or its ceiling).
+    let budget = step.map_or(quantum, |report| report.allowed_ns.max(quantum));
     state
       .push_turns
       .counted(ended.saturating_sub(began), (budget, (opening, unit, tail)));
+    state.push_turns.stepped(step);
     built
   }
 

@@ -41,6 +41,8 @@ pub mod manifest;
 #[cfg(test)]
 mod manifest_vectors;
 pub mod source;
+// The version-control store's directory under its standing grant (A-767): the store's files, opened relative to it.
+pub mod store_root;
 // The store and volume configuration the unit tests land over, one fixture for every suite.
 #[cfg(test)]
 mod test_store;

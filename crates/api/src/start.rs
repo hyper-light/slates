@@ -131,6 +131,7 @@ impl StartSpec {
       vcs_http: self.vcs_http,
       vcs_ssh: self.vcs_ssh,
       vcs_svn: self.vcs_svn,
+      vcs_store: None,
     })
   }
 

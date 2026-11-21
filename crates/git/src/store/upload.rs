@@ -94,6 +94,7 @@ use super::deltas::{Search, SearchStep, delta_most};
 use super::fragment::{self, Encoder, FragmentRefused, Learning, Placed, Stored, ToEncode};
 use super::learn::{Clock, Exchange, Levels, Window};
 use super::positions::Positions;
+use super::push::StoredAt;
 use super::repository::{Kept, Repository, StoreRefused};
 use super::rows::ObjectRow;
 
@@ -299,6 +300,8 @@ struct Deflating {
 enum Deflated {
   /// A kept content.
   Content(ContentId),
+  /// An object read whole where it lies in its pack (A-722's record v4): its bytes, kept for its deflate's windows.
+  Read(Vec<u8>),
   /// A delta the stream made, and the admission's hold on what its search kept, given back after its last window.
   Made { delta: Vec<u8>, hold: Hold },
 }
@@ -309,7 +312,7 @@ struct Large {
   id: ObjectId,
   kind: Kind,
   len: u64,
-  content: ContentId,
+  stored: StoredAt,
   /// Where its entry begins in the pack.
   at: u64,
   /// Its delta chain's depth.
@@ -320,7 +323,7 @@ struct Large {
 /// each candidate's, each searched a window's bytes a unit; the smallest delta shorter than the object wins.
 struct Searching {
   /// The object.
-  target: (ObjectId, ObjectRow, ContentId),
+  target: (ObjectId, ObjectRow, StoredAt),
   /// The admission's hold on everything the search keeps.
   hold: Hold,
   /// The object's bytes read so far.
@@ -871,7 +874,7 @@ impl<A: Answered> Upload<A> {
   fn send_whole(
     &mut self,
     cx: &mut Context<'_>,
-    (id, row, content): (ObjectId, ObjectRow, ContentId),
+    (id, row, stored): (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     let mut written = Vec::new();
@@ -880,10 +883,23 @@ impl<A: Answered> Upload<A> {
       size: row.len,
     };
     entry::write(header, self.at, &mut written).map_err(entry_refused)?;
-    let first = cx
-      .store
-      .window_at(&content, row.len, 0)
-      .ok_or(StoreRefused::Unreadable { id })?;
+    let (first, from) = match stored {
+      StoredAt::Whole(content) => (
+        cx.store
+          .window_at(&content, row.len, 0)
+          .ok_or(StoreRefused::Unreadable { id })?,
+        Deflated::Content(content),
+      ),
+      StoredAt::InPack(_) => {
+        let bytes = cx
+          .repository
+          .read_stored(cx.store, &stored, row.len)
+          .ok_or(StoreRefused::Unreadable { id })?
+          .into_owned();
+        let first = bytes.get(..cx.store.window()).unwrap_or(&bytes).to_vec();
+        (Cow::Owned(first), Deflated::Read(bytes))
+      }
+    };
     let mut learning = Learning {
       window: &mut self.window,
       levels: &mut self.levels,
@@ -893,7 +909,7 @@ impl<A: Answered> Upload<A> {
     let level = fragment::level(row.kind, &first, &mut learning).map_err(StoreRefused::Encoding)?;
     self.emit(&written, out);
     Ok(Pending::Deflate(Deflating {
-      from: Deflated::Content(content),
+      from,
       len: row.len,
       next: 0,
       compress: Compress::new(Compression::new(level), true),
@@ -973,7 +989,9 @@ impl<A: Answered> Upload<A> {
         .store
         .window_at(content, deflating.len, deflating.next)
         .ok_or(StoreRefused::FragmentUnreadable)?,
-      Deflated::Made { delta, .. } => Cow::Borrowed(made_window(delta, window, deflating.next)?),
+      Deflated::Made { delta, .. } | Deflated::Read(delta) => {
+        Cow::Borrowed(made_window(delta, window, deflating.next)?)
+      }
     };
     let last = deflating.next.saturating_add(1) >= windows;
     let given = fragment::deflate_more(&mut deflating.compress, &bytes, last)
@@ -1082,18 +1100,19 @@ impl<A: Answered> Upload<A> {
       return Ok(Stage::Trailer);
     };
     self.entries = self.entries.saturating_add(1);
-    let (id, row, content) = cx.repository.stored_at(cx.store, position)?;
+    let (id, row, stored) = cx.repository.stored_at(cx.store, position)?;
     let next = Stage::Loose {
       from: position.saturating_add(1),
     };
     if row.len > to_u64(cx.store.window()) {
-      self.pending = Some(self.loose_large(cx, (id, row, content), out)?);
+      self.pending = Some(self.loose_large(cx, (id, row, stored), out)?);
       return Ok(next);
     }
     let bytes = cx
-      .store
-      .object_bytes(&content, row.len)
-      .ok_or(StoreRefused::Unreadable { id })?;
+      .repository
+      .read_stored(cx.store, &stored, row.len)
+      .ok_or(StoreRefused::Unreadable { id })?
+      .into_owned();
     let object = ToEncode {
       id,
       position,
@@ -1126,7 +1145,7 @@ impl<A: Answered> Upload<A> {
   fn loose_large(
     &mut self,
     cx: &mut Context<'_>,
-    target: (ObjectId, ObjectRow, ContentId),
+    target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     let candidates = self.candidates(target.1.kind, cx.exchange);
@@ -1150,7 +1169,7 @@ impl<A: Answered> Upload<A> {
   fn large_whole(
     &mut self,
     cx: &mut Context<'_>,
-    target: (ObjectId, ObjectRow, ContentId),
+    target: (ObjectId, ObjectRow, StoredAt),
     out: &mut impl Out,
   ) -> Result<Pending, StoreRefused> {
     self.counters.loose_whole = self.counters.loose_whole.saturating_add(1);
@@ -1158,7 +1177,7 @@ impl<A: Answered> Upload<A> {
       id: target.0,
       kind: target.1.kind,
       len: target.1.len,
-      content: target.2,
+      stored: target.2,
       at: self.at,
       depth: 0,
     };
@@ -1199,16 +1218,16 @@ impl<A: Answered> Upload<A> {
     mut searching: Box<Searching>,
     out: &mut impl Out,
   ) -> Result<Option<Pending>, StoreRefused> {
-    let (id, row, content) = &searching.target;
-    let target = (*id, row.len, *content);
-    if read_window(cx.store, target, &mut searching.target_bytes)? {
+    let (id, row, stored) = &searching.target;
+    let target = (*id, row.len, *stored);
+    if read_window(cx, target, &mut searching.target_bytes)? {
       return Ok(Some(Pending::Search(searching)));
     }
     let Some(candidate) = searching.candidates.get(searching.trying).copied() else {
       return self.searched(cx, *searching, out).map(Some);
     };
-    let base = (candidate.id, candidate.len, candidate.content);
-    let step = if read_window(cx.store, base, &mut searching.base_bytes)? {
+    let base = (candidate.id, candidate.len, candidate.stored);
+    let step = if read_window(cx, base, &mut searching.base_bytes)? {
       SearchStep::More
     } else {
       let Searching {
@@ -1272,7 +1291,7 @@ impl<A: Answered> Upload<A> {
       cx.admission.release(hold);
       return self.large_whole(cx, target, out);
     };
-    let (id, row, content) = target;
+    let (id, row, stored) = target;
     let representation = if self.answer.ofs_delta() {
       Representation::OfsDelta { base: base.at }
     } else {
@@ -1296,7 +1315,7 @@ impl<A: Answered> Upload<A> {
       id,
       kind: row.kind,
       len: row.len,
-      content,
+      stored,
       at: self.at,
       depth: base.depth.saturating_add(1),
     };
@@ -1338,7 +1357,7 @@ impl<A: Answered> Upload<A> {
 
 /// A search of `target` against `candidates`, with the admission's `hold` on what it keeps, nothing yet read.
 fn searching(
-  target: (ObjectId, ObjectRow, ContentId),
+  target: (ObjectId, ObjectRow, StoredAt),
   candidates: Vec<Large>,
   hold: Hold,
 ) -> Searching {
@@ -1381,15 +1400,28 @@ fn search_charge(target_len: u64, candidates: &[Large]) -> u64 {
 /// Reads the next window of the object `(id, len, content)` names into `bytes`, made with room for the whole object
 /// when the first is read: whether one was read, none once the object is whole.
 fn read_window(
-  store: &ContentStore,
-  (id, len, content): (ObjectId, u64, ContentId),
+  cx: &Context<'_>,
+  (id, len, stored): (ObjectId, u64, StoredAt),
   bytes: &mut Vec<u8>,
 ) -> Result<bool, StoreRefused> {
+  let store = cx.store;
   let read = to_u64(bytes.len());
   if read >= len {
     return Ok(false);
   }
   let unreadable = StoreRefused::Unreadable { id };
+  // An object read where it lies in its pack (A-722's record v4) is read whole at once, its chain resolved.
+  let content = match stored {
+    StoredAt::Whole(content) => content,
+    StoredAt::InPack(_) => {
+      *bytes = cx
+        .repository
+        .read_stored(store, &stored, len)
+        .ok_or(unreadable)?
+        .into_owned();
+      return Ok(true);
+    }
+  };
   if bytes.is_empty() {
     *bytes = Vec::with_capacity(usize::try_from(len).map_err(|_| unreadable)?);
   }

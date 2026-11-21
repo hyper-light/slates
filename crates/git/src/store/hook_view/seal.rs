@@ -32,7 +32,7 @@ use crate::{Admission, PastAdmission, to_u64};
 
 use super::ReadRefused;
 use super::stored::Adler32;
-use super::units::{Known, Part, Segment, Unit, content_range};
+use super::units::{Known, Part, Segment, Unit, stored_range};
 
 /// One turn of a seal's work: the owner's clock and the nanoseconds the turn may spend (§4.3's
 /// step budget, the owner's to derive); one unit of work is done whatever it is.
@@ -215,13 +215,13 @@ impl Sealing {
   pub(in crate::store) fn step_on(
     &mut self,
     unit: &Unit,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     quantum: Quantum<'_>,
   ) -> Result<bool, SealRefused> {
     let Quantum { clock, ns } = quantum;
     let begun = clock.now_ns();
     loop {
-      if self.unit_of_work(unit, store)? {
+      if self.unit_of_work(unit, (store, repository))? {
         return Ok(true);
       }
       if clock.now_ns().saturating_sub(begun) >= ns {
@@ -232,14 +232,18 @@ impl Sealing {
 
   /// One unit of work: a window of the pack hashed, or of an object's bytes taken into its
   /// Adler-32. Whether every byte before the trailer is hashed.
-  fn unit_of_work(&mut self, unit: &Unit, store: &ContentStore) -> Result<bool, SealRefused> {
+  fn unit_of_work(
+    &mut self,
+    unit: &Unit,
+    (store, repository): (&ContentStore, &Repository),
+  ) -> Result<bool, SealRefused> {
     match self.stage {
       Stage::Hashed => Ok(true),
       Stage::Adler { whole, at, sum } => {
-        self.take_adler(unit, store, (whole, at, sum))?;
+        self.take_adler(unit, (store, repository), (whole, at, sum))?;
         Ok(false)
       }
-      Stage::Pack { at } => self.pass(unit, store, at),
+      Stage::Pack { at } => self.pass(unit, (store, repository), at),
     }
   }
 
@@ -248,7 +252,7 @@ impl Sealing {
   fn take_adler(
     &mut self,
     unit: &Unit,
-    store: &ContentStore,
+    (store, repository): (&ContentStore, &Repository),
     (whole, at, mut sum): (usize, u64, Adler32),
   ) -> Result<(), SealRefused> {
     let object = unit
@@ -257,8 +261,14 @@ impl Sealing {
       .ok_or(SealRefused::Read(ReadRefused::Unreadable))?;
     let to = at.saturating_add(to_u64(store.window())).min(object.len);
     let mut bytes = Vec::new();
-    content_range(store, &object.content, object.len, (at, to), &mut bytes)
-      .map_err(SealRefused::Read)?;
+    stored_range(
+      (store, repository),
+      &object.stored,
+      object.len,
+      (at, to),
+      &mut bytes,
+    )
+    .map_err(SealRefused::Read)?;
     sum.update(&bytes);
     self.stage = if to >= object.len {
       self.adlers.push(sum.value());
@@ -271,7 +281,12 @@ impl Sealing {
 
   /// A window of the pack from `at` hashed, or the Adler-32 of the whole object whose entry begins
   /// there begun. Whether the pass has reached the trailer.
-  fn pass(&mut self, unit: &Unit, store: &ContentStore, at: u64) -> Result<bool, SealRefused> {
+  fn pass(
+    &mut self,
+    unit: &Unit,
+    (store, repository): (&ContentStore, &Repository),
+    at: u64,
+  ) -> Result<bool, SealRefused> {
     let trailer = unit.trailer_at();
     if at >= trailer {
       self.stage = Stage::Hashed;
@@ -300,7 +315,7 @@ impl Sealing {
       trailer: None,
     };
     unit
-      .fill(store, known, (at, to), &mut bytes)
+      .fill((store, repository), known, (at, to), &mut bytes)
       .map_err(SealRefused::Read)?;
     self.hasher.update(&bytes);
     if let Segment::Whole(_) = segment {

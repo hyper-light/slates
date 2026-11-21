@@ -328,6 +328,7 @@ fn named(record: &Record) -> String {
     Record::RevisionProperties { revision, .. } => format!("revision {revision}'s properties"),
     Record::Revision(revision) => format!("revision {}", revision.head + 1),
     Record::Locks(_) => "lock entries".to_owned(),
+    Record::Deltified { .. } => "a text deltified".to_owned(),
   }
 }
 

@@ -1270,6 +1270,7 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
 /// MEMORY SIZING (w-sizing; found by use on the big Studio, 2026-11-20: four anchors killed with `SIGKILL` held 21 GB
 /// with no process alive). Do: start an anchor, read its issuer surface for the names of its segment and its content
 /// object, `SIGKILL` the anchor and wait for its daemon to leave. Expect both names gone (`shm_open` answers `ENOENT`),
+/// and every content pool extent's too (objects of their own on macOS since the extents piece),
 /// so the objects and every page written into them go back to the system with their last holder. Before, nothing
 /// removed them: macOS keeps a shared-memory object while its name exists, and only the creator, the killed anchor,
 /// removed the name. Any name the test finds left is removed at the end, so a red run leaks nothing.
@@ -1308,13 +1309,200 @@ fn a_killed_anchors_segment_and_content_go_with_its_daemon() {
     progress.check(&instance, "the daemon's process ended");
     pause();
   }
-  let left: Vec<&String> = names.iter().filter(|name| present(name)).collect();
+  // The content pool's extents, objects of their own on macOS, named from the content object's name and their id: every
+  // id a layout of up to 64 partitions can name.
+  let content = exports
+    .iter()
+    .find(|(name, _)| name == slates_anchor::segment::ENV_CONTENT)
+    .map(|(_, value)| slates_mem::Handoff::Name(value.clone()))
+    .expect("the content object's name");
+  let extents: Vec<String> = (0..64 * slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
+    .filter_map(|id| u16::try_from(id).ok())
+    .filter_map(|id| match slates_mem::extent_handoff(&content, id) {
+      Some(slates_mem::Handoff::Name(name)) => Some(name),
+      _ => None,
+    })
+    .collect();
+  let left: Vec<&String> = names
+    .iter()
+    .chain(extents.iter())
+    .filter(|name| present(name))
+    .collect();
   for name in &left {
     let _ = rustix::shm::unlink(name.as_str());
   }
   assert!(
     left.is_empty(),
     "the killed anchor's objects outlived every holder: {left:?}"
+  );
+}
+
+/// The system's commit charge, bytes: what Windows has promised backing for (`GlobalMemoryStatusEx`: the page file's
+/// total less what is still available).
+#[cfg(windows)]
+fn commit_charge() -> u64 {
+  use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+  // SAFETY: an all-zero `MEMORYSTATUSEX` is a valid value for the call to fill; its length is set next.
+  let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+  status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).unwrap();
+  // SAFETY: `status` is a live, sized `MEMORYSTATUSEX` the call fills.
+  assert_ne!(unsafe { GlobalMemoryStatusEx(&raw mut status) }, 0);
+  status
+    .ullTotalPageFile
+    .saturating_sub(status.ullAvailPageFile)
+}
+
+/// The pid the instance's `status` names; absent while no daemon answers.
+#[cfg(windows)]
+fn status_pid(instance: &str) -> Option<u32> {
+  let (code, text, _) = run(instance, &["status", "--json"]);
+  if code != 0 {
+    return None;
+  }
+  text
+    .split("\"pid\":")
+    .nth(1)?
+    .trim_start()
+    .split(|character: char| !character.is_ascii_digit())
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// Terminates process `pid` and waits for it to have exited.
+#[cfg(windows)]
+fn terminate(pid: u32) {
+  use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+  use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+  use windows_sys::Win32::System::Threading::{
+    INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+    WaitForSingleObject,
+  };
+  // SAFETY: the pid came from the instance's status; only termination and its exit are asked for, nothing inherited.
+  let process = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+  assert!(!process.is_null(), "OpenProcess({pid})");
+  // SAFETY: the unique owned handle OpenProcess just returned.
+  let process = unsafe { OwnedHandle::from_raw_handle(process) };
+  // SAFETY: `process` stays owned for the call.
+  assert_ne!(unsafe { TerminateProcess(process.as_raw_handle(), 1) }, 0);
+  // SAFETY: `process` stays owned for the wait.
+  assert_eq!(
+    unsafe { WaitForSingleObject(process.as_raw_handle(), INFINITE) },
+    WAIT_OBJECT_0
+  );
+}
+
+/// A volume of `bounded` bytes made through the CLI and attached for writing: its id and the attachment.
+#[cfg(windows)]
+fn writable_volume(instance: &str, name: &str, bounded: &str) -> (String, String) {
+  let (code, out, err) = run(instance, &["volume", "create", name, "--bounded", bounded]);
+  assert_eq!(code, 0, "create {name}: {err}");
+  let id = value_of(&out, "id");
+  let (code, out, err) = run(instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "attach {name}: {err}");
+  (id, value_of(&out, "attachment"))
+}
+
+/// MEMORY SIZING, R2 on Windows (main's ruling of 2026-11-20 18:40: every platform gives a burst's memory back; A-789's
+/// Windows shape). Do: under a real anchor, read the system's commit charge, write a burst of N bytes into a volume of
+/// its own, destroy the volume, and wait. Expect the commit charge to come back to within a quarter of N of where it
+/// began. Before, each pool extent was a range of the anchor's one content section, committed whole when the daemon
+/// mapped it, and a section's commit comes back only when it closes (g226 on jupiter: decommitting a view is refused,
+/// error 87), so a freed extent kept its commit for the anchor's whole life. Now each extent is a section of its own,
+/// closed once wholly free.
+#[cfg(windows)]
+#[test]
+fn a_freed_content_extent_gives_its_commit_back_on_windows() {
+  /// Shape: the burst, far above the commit noise of a test's own processes.
+  const BURST: usize = 256 << 20;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the Windows extent commit flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-extent-commit-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let before = commit_charge();
+  let (id, attachment) = writable_volume(&instance, "burst", "512MiB");
+  let burst: Vec<u8> = (0..BURST)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "burst.bin"], &burst);
+  assert_eq!(code, 0, "write: {err}");
+  drop(burst);
+  let with_burst = commit_charge();
+  let (code, _, err) = run(&instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+  let (code, _, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(code, 0, "destroy: {err}");
+  let file = u64::try_from(BURST).unwrap();
+  let started = std::time::Instant::now();
+  let mut after = commit_charge();
+  while after.saturating_sub(before) * 4 >= file
+    && started.elapsed() < std::time::Duration::from_secs(60)
+  {
+    pause();
+    after = commit_charge();
+  }
+  drop(anchor);
+  eprintln!(
+    "a {} MiB burst: commit {} MiB before, {} MiB with it, {} MiB after its volume was destroyed",
+    BURST >> 20,
+    before >> 20,
+    with_burst >> 20,
+    after >> 20
+  );
+  assert!(
+    with_burst.saturating_sub(before) >= file / 2,
+    "the burst was committed: {} MiB before, {} MiB with it",
+    before >> 20,
+    with_burst >> 20
+  );
+  assert!(
+    after.saturating_sub(before) * 4 < file,
+    "the freed extents gave their commit back: {} MiB before, {} MiB after, for a {} MiB burst",
+    before >> 20,
+    after >> 20,
+    BURST >> 20
+  );
+}
+
+/// R2 on Windows, condition (d) of main's ruling: recovery adopts every extent after a daemon restart, across
+/// processes. Do: under a real anchor, write a file of several chunk windows into a volume, terminate the daemon, and
+/// wait for the anchor's successor to answer. Expect the file to read back byte for byte: its extents' sections were
+/// held by the anchor across the death and handed to the successor (A-789's hold kind `WHAT_CONTENT_EXTENT`).
+#[cfg(windows)]
+#[test]
+fn a_content_extent_outlives_a_killed_daemon_on_windows() {
+  /// Shape: the file, several chunk windows.
+  const FILE: usize = 16 << 20;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the Windows extent restart flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-extent-restart-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (id, attachment) = writable_volume(&instance, "kept", "64MiB");
+  let bytes: Vec<u8> = (0..FILE)
+    .map(|at| u8::try_from((at * 7 + at / 4096) % 251).unwrap())
+    .collect();
+  let (code, _, err) = run_with_stdin(&instance, &["write", &id, &attachment, "kept.bin"], &bytes);
+  assert_eq!(code, 0, "write: {err}");
+  let killed = status_pid(&instance).expect("the instance's daemon answers");
+  terminate(killed);
+  let started = std::time::Instant::now();
+  while status_pid(&instance).is_none_or(|pid| pid == killed) {
+    assert!(
+      started.elapsed() < std::time::Duration::from_secs(120),
+      "the anchor's successor answers"
+    );
+    pause();
+  }
+  let (code, read, err) = run_with_stdin(&instance, &["read", &id, "kept.bin"], b"");
+  drop(anchor);
+  assert_eq!(code, 0, "read after the restart: {err}");
+  assert!(
+    read == bytes,
+    "the file reads back byte for byte after the daemon's death"
   );
 }
 

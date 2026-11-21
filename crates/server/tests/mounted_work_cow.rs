@@ -57,14 +57,14 @@ fn named(key: &str, default: usize) -> usize {
     .map_or(default, |value| value.parse().unwrap())
 }
 
-fn daemon() -> (Daemon, String) {
+fn daemon(tag: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
-  let instance = format!("srv-mount-cow-{}", std::process::id());
+  let instance = format!("srv-mount-cow-{tag}-{}", std::process::id());
   let daemon = Daemon::start(
     &profile,
     DaemonConfig::derive(&profile, &instance, Some(1)),
     slates_server::SegmentSource::Create {
-      name: common::fixture_object("slates-seg", "mount-cow"),
+      name: common::fixture_object("slates-seg", &format!("mount-cow-{tag}")),
     },
   )
   .unwrap();
@@ -166,7 +166,7 @@ fn mounted_works_cost_their_divergence_not_the_green() {
   let files = named("SLATES_MOUNT_COW_FILES", FILES);
   let works = named("SLATES_MOUNT_COW_WORKS", WORKS);
   let green_bytes = files * FILE_BYTES;
-  let (daemon, instance) = daemon();
+  let (daemon, instance) = daemon("mounts");
   let mut client = connect(&instance);
   let small = populated_green(&mut client, "cow-small", SMALL_FILES);
   let large = populated_green(&mut client, "cow-large", files);
@@ -175,14 +175,16 @@ fn mounted_works_cost_their_divergence_not_the_green() {
   let _ = mounted_work(&daemon, &mut client, small, "cow-small-warm");
   let (_, mut stream, root) = mounted_work(&daemon, &mut client, large, "cow-large-warm");
   read_and_save(&mut stream, &root, &path(0));
-  let small_times: Vec<Duration> = (0..SMALL_WORKS)
-    .map(|index| mounted_work(&daemon, &mut client, small, &format!("cow-small-{index}")).0)
-    .collect();
-
   let before = resident();
+  let mut small_times = Vec::new();
   let mut large_times = Vec::new();
   let mut streams = Vec::new();
   for index in 0..works {
+    // A mount over the small green just before each of the first large ones, so both medians meet the same load (a
+    // debug run at load 16 timed them apart and failed the ratio once). Its own bytes are within the fixed term.
+    if index < SMALL_WORKS {
+      small_times.push(mounted_work(&daemon, &mut client, small, &format!("cow-small-{index}")).0);
+    }
     let (took, mut stream, root) =
       mounted_work(&daemon, &mut client, large, &format!("cow-large-{index}"));
     large_times.push(took);

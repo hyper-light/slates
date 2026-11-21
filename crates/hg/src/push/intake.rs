@@ -86,6 +86,45 @@ pub struct Intaken {
   /// Each log the push kept revisions in, in the order kept, and the number of its first: its kept revisions are the
   /// fork's from that number on, which its record is written from.
   pub logs: Vec<(LogOf, u32)>,
+  /// Each revision kept, as the changeset log's `Texts` section names it (A-767 C4; w-perf's format, agreed): written as
+  /// it is kept, since the intake has rebuilt and checked its text then and naming it later would rebuild every chain.
+  pub texts: Vec<KeptText>,
+}
+
+/// Format: the path a `Texts` entry gives the changelog's revisions: no tracked path holds a NUL (7.2's
+/// `checkfilename`), so it meets no file's (agreed with w-perf, 2026-11-20).
+pub const CHANGELOG_PATH: &[u8] = b"\0changelog";
+/// Format: the path a `Texts` entry gives the manifest log's revisions (see [`CHANGELOG_PATH`]).
+pub const MANIFEST_PATH: &[u8] = b"\0manifest";
+
+/// One revision the intake kept, as the changeset log's `Texts` section names it (A-767 C4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptText {
+  /// Its file's path, or [`CHANGELOG_PATH`] or [`MANIFEST_PATH`].
+  pub path: Vec<u8>,
+  /// Its node: Mercurial's tool id.
+  pub node: Node,
+  /// Its whole text's identity: the plain BLAKE3 of its bytes.
+  pub identity: [u8; 32],
+  /// Its whole text's length.
+  pub len: u64,
+  /// The identity of the text its payload delta rests on; none for a delta against the null base (a whole text).
+  pub base: Option<[u8; 32]>,
+  /// Where its delta lies in the payload (the changegroup as received).
+  pub place: Range<usize>,
+}
+
+impl Intaken {
+  /// What the kept texts were charged to the intake's admission, each as it was kept: the `Texts` section the landing
+  /// writes, held as the record is, O(revisions), apart from a step's working set.
+  pub fn texts_charged(&self) -> u64 {
+    let each = to_u64(core::mem::size_of::<KeptText>());
+    self.texts.iter().fold(0, |total, kept| {
+      total
+        .saturating_add(each)
+        .saturating_add(to_u64(kept.path.len()))
+    })
+  }
 }
 
 /// Whether there is more to take.
@@ -198,6 +237,19 @@ impl Frame {
   }
 
   /// The revision at `at` of `range`, its delta read from `payload`.
+  /// [`Frame::revision`] with where its delta lies in the payload (A-767 C4: the `Texts` section's place).
+  fn placed<'p>(
+    &self,
+    payload: &'p [u8],
+    range: &Range<usize>,
+    at: usize,
+  ) -> Option<(Revision<'p>, Range<usize>)> {
+    let revision = self.revision(payload, range, at)?;
+    let index = range.start.checked_add(at)?;
+    let place = self.revisions.get(index)?.data.clone();
+    Some((revision, place))
+  }
+
   fn revision<'p>(
     &self,
     payload: &'p [u8],
@@ -248,6 +300,8 @@ struct Taker {
   manifests: Vec<(Node, Node)>,
   /// The text kept last, and its node: the next revision's base where its delta names it.
   last: Option<(Node, Vec<u8>)>,
+  /// The identity of the text kept last, so the next revision's base is named without hashing it again.
+  last_identity: Option<(Node, [u8; 32])>,
   /// Whether the log being taken has kept a revision yet.
   logged: bool,
   /// What was brought.
@@ -274,6 +328,7 @@ impl Intake {
         manifest_of: Vec::new(),
         manifests: Vec::new(),
         last: None,
+        last_identity: None,
         logged: false,
         intaken: Intaken::default(),
       },
@@ -291,7 +346,7 @@ impl Intake {
     let Intake { frame, taker } = self;
     match taker.stage {
       Stage::Changelog(at) => {
-        let next = frame.revision(payload, &frame.changelog, at);
+        let next = frame.placed(payload, &frame.changelog, at);
         taker.take_or(
           next,
           Log::Changelog,
@@ -300,7 +355,7 @@ impl Intake {
         )
       }
       Stage::Manifests(at) => {
-        let next = frame.revision(payload, &frame.manifests, at);
+        let next = frame.placed(payload, &frame.manifests, at);
         let after = Stage::Files { file: 0, at: 0 };
         taker.take_or(next, Log::Manifest, (store, admission), after)
       }
@@ -331,16 +386,16 @@ impl Taker {
   /// Takes `next` of `log`, or moves to `after` where its group has no more.
   fn take_or(
     &mut self,
-    next: Option<Revision<'_>>,
+    next: Option<(Revision<'_>, Range<usize>)>,
     log: Log<'_>,
     (store, admission): (&mut ContentStore, &mut Admission),
     after: Stage,
   ) -> Result<Stepped, Refused> {
-    let Some(revision) = next else {
+    let Some((revision, place)) = next else {
       self.enter(after);
       return Ok(Stepped::More);
     };
-    self.take(log, &revision, store, admission)?;
+    self.take(log, (&revision, place), store, admission)?;
     self.stage = match self.stage {
       Stage::Changelog(at) => Stage::Changelog(at.saturating_add(1)),
       Stage::Manifests(at) => Stage::Manifests(at.saturating_add(1)),
@@ -366,14 +421,14 @@ impl Taker {
     if at == 0 {
       audit(path)?;
     }
-    let Some(revision) = frame.revision(payload, &revisions, at) else {
+    let Some((revision, place)) = frame.placed(payload, &revisions, at) else {
       self.enter(Stage::Files {
         file: file.saturating_add(1),
         at: 0,
       });
       return Ok(Stepped::More);
     };
-    self.take(Log::File(path), &revision, store, admission)?;
+    self.take(Log::File(path), (&revision, place), store, admission)?;
     self.stage = Stage::Files {
       file,
       at: at.saturating_add(1),
@@ -385,6 +440,7 @@ impl Taker {
   fn enter(&mut self, stage: Stage) {
     self.brought.clear();
     self.last = None;
+    self.last_identity = None;
     self.logged = false;
     self.stage = stage;
   }
@@ -393,7 +449,7 @@ impl Taker {
   fn take(
     &mut self,
     log: Log<'_>,
-    revision: &Revision<'_>,
+    (revision, place): (&Revision<'_>, Range<usize>),
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<(), Refused> {
@@ -411,12 +467,14 @@ impl Taker {
     }
     self.check_known(log, revision, store)?;
     let mut room = *admission;
-    let text = rebuilt(
-      self.base_text(log, revision, store),
-      revision,
-      log,
-      &mut room,
-    )?;
+    let base_text = self.base_text(log, revision, store);
+    let base = match (&base_text, &self.last_identity) {
+      _ if revision.base == NULL_NODE => None,
+      (_, Some((node, identity))) if *node == revision.base => Some(*identity),
+      (Some(text), _) => Some(*blake3::hash(text).as_bytes()),
+      (None, _) => None,
+    };
+    let text = rebuilt(base_text, revision, log, &mut room)?;
     node::check(&revision.node, &revision.p1, &revision.p2, &text).map_err(|fault| {
       Unverified::Node {
         log: log_of(log),
@@ -453,6 +511,23 @@ impl Taker {
       .intaken
       .bytes
       .saturating_add(to_u64(arrived.text.len()));
+    admission.charge_items::<KeptText>(1)?;
+    let path = match log {
+      Log::Changelog => CHANGELOG_PATH,
+      Log::Manifest => MANIFEST_PATH,
+      Log::File(path) => path,
+    };
+    admission.charge(to_u64(path.len()))?;
+    let identity = *blake3::hash(&arrived.text).as_bytes();
+    self.intaken.texts.push(KeptText {
+      path: path.to_vec(),
+      node: revision.node,
+      identity,
+      len: to_u64(arrived.text.len()),
+      base,
+      place,
+    });
+    self.last_identity = Some((revision.node, identity));
     self.last = Some((revision.node, arrived.text));
     Ok(())
   }
@@ -667,9 +742,12 @@ impl Rebase {
       Err(refused) => return Err(Box::new((Unindexed::Fork(refused), stale))),
     };
     let logs = intaken.logs.clone();
+    // The texts a push kept name its revisions' contents and their places in its payload, whatever index they are
+    // re-based onto, so they carry over as they are.
     let intaken = Intaken {
       held_changesets: intaken.held_changesets.clone(),
       passed_over: intaken.passed_over,
+      texts: intaken.texts.clone(),
       ..Intaken::default()
     };
     Ok(Rebase {

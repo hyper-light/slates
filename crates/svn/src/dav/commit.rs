@@ -223,6 +223,11 @@ pub struct DavCommit {
   /// Where its new texts go, a window at a time (§4.17.1 rule 1; [`TextSink`]): the caller's, handed back with the
   /// accepted work, dropped with a commit that ends otherwise.
   texts: Box<dyn TextSink>,
+  /// The DeltaV v1 activity it is, for a client without HTTPv2 (A-766 part 2, [`super::activity`]); none over HTTPv2.
+  activity: Option<String>,
+  /// The paths a DeltaV v1 client checked out, each with the revision of the version resource it checked out: what
+  /// HTTPv2 sends as `X-SVN-Version-Name`, the base a later request on the working resource is judged against.
+  checked_out: BTreeMap<String, Revision>,
 }
 
 /// A PUT whose delta is open: its file's token, its path, whether it adds the file, and the result checksum its
@@ -263,6 +268,63 @@ impl std::fmt::Debug for DavCommit {
 }
 
 impl DavCommit {
+  /// Names this transaction DeltaV v1's `activity` (MKACTIVITY, A-766 part 2): requests on the activity's working
+  /// resources find it by that name.
+  pub fn set_activity(&mut self, activity: &str) {
+    self.activity = Some(activity.to_owned());
+  }
+
+  /// The DeltaV v1 activity this transaction is, if it is one.
+  pub fn activity(&self) -> Option<&str> {
+    self.activity.as_deref()
+  }
+
+  /// Records a DeltaV v1 CHECKOUT of the version resource at `path` in `revision` (`version.c` `dav_svn__checkout`):
+  /// the base later requests on its working resource are judged against, as HTTPv2's `X-SVN-Version-Name`.
+  pub fn check_out(&mut self, path: &str, revision: Revision) {
+    self.checked_out.insert(path.to_owned(), revision);
+  }
+
+  /// The revision the version resource at `path` was checked out in, if it was.
+  pub fn checked_out(&self, path: &str) -> Option<Revision> {
+    self.checked_out.get(path).copied()
+  }
+
+  /// A DeltaV v1 PROPPATCH of the activity's working baseline (`!svn/wbl/ID/REV`; ra_serf's `open_root` sends the
+  /// commit's revision properties there): each property the body sets or removes applied to the transaction's
+  /// revision properties ([`DavCommit::change_revision_properties`]), answered as a node's PROPPATCH is.
+  pub fn proppatch_revision_properties(&mut self, (body, bounds): (&[u8], &Bounds)) -> HttpAnswer {
+    let changes = match property_changes(body, bounds) {
+      Ok(changes) => changes,
+      Err(_) => {
+        return error_answer(
+          HTTP_BAD_REQUEST,
+          true,
+          SVN_ERR_DAV_MALFORMED_DATA,
+          "The PROPPATCH body could not be read",
+        );
+      }
+    };
+    let set: Vec<(Vec<u8>, Vec<u8>)> = changes
+      .iter()
+      .filter_map(|(name, value)| Some((name.clone(), value.clone()?)))
+      .collect();
+    let removed: Vec<Vec<u8>> = changes
+      .iter()
+      .filter(|(_, value)| value.is_none())
+      .map(|(name, _)| name.clone())
+      .collect();
+    self.change_revision_properties(&set, &removed);
+    proppatched(&changes)
+  }
+
+  /// Sets or removes the transaction's revision properties a DeltaV v1 PROPPATCH of its working baseline names
+  /// (`deadprops.c` on a working baseline: `svn_repos_fs_change_txn_prop`): each of `set` its value, each of `removed`
+  /// gone; `svn:author` is the principal's and stays.
+  pub fn change_revision_properties(&mut self, set: &[(Vec<u8>, Vec<u8>)], removed: &[Vec<u8>]) {
+    self.drive.change_revision_properties(set, removed);
+  }
+
   /// Begins a transaction over `world` with `setup` (its revision properties from [`transaction_properties`]): the
   /// edit's root opened at the youngest, start-commit answered by `hooks`.
   ///
@@ -300,6 +362,8 @@ impl DavCommit {
       tokens: 0,
       over: false,
       putting: None,
+      activity: None,
+      checked_out: BTreeMap::new(),
     };
     let opened = commit.edit_until_hook(
       world,

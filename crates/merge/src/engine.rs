@@ -400,6 +400,48 @@ pub struct Judged {
   post_state: Vec<u8>,
   /// Its named runs' bytes, taken from the work ([`Green::judge_named`], A-760): a whole text's buffer becomes the file.
   read: Vec<Vec<u8>>,
+  /// Its files made so far, a slice a step before the commit ([`Green::make_step`], A-760).
+  making: Making,
+}
+
+/// A held verdict's files made a copy slice a step before its commit ([`Green::make_step`], A-760): the files a run
+/// makes whole, found at the first step; the next effect to look at; the file under way.
+#[derive(Default)]
+struct Making {
+  /// The files a run makes whole and their runs, once found.
+  wholes: Option<Vec<(usize, usize)>>,
+  /// The next effect to look at.
+  next: usize,
+  /// The file under way.
+  current: Option<FileMaking>,
+}
+
+/// One file under way ([`Making`]): its place among the effects, its bytes as pieces of its base and the post-state,
+/// how far they are copied, and the bytes so far (reserved at the file's length once).
+struct FileMaking {
+  place: usize,
+  segments: Vec<Segment>,
+  segment: usize,
+  offset: u64,
+  out: Vec<u8>,
+}
+
+/// A piece of a file being made: a range of its base, or of the work's post-state.
+#[derive(Clone, Copy)]
+enum Segment {
+  /// `len` bytes of the base from `start`.
+  Base { start: u64, len: u64 },
+  /// `len` bytes of the post-state from `src`.
+  Post { src: u64, len: u64 },
+}
+
+/// What one [`Green::make_step`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Made {
+  /// Whether every file is made, so the commit copies nothing.
+  pub done: bool,
+  /// The bytes this step copied: at most its slice.
+  pub copied: u64,
 }
 
 impl Judged {
@@ -889,6 +931,20 @@ impl OriginLoad {
   }
 }
 
+/// What a green holds at its head under one directory ([`Green::head_under`]): each dimension's paths there (the
+/// directory's own path among them where it holds one), a file with its length.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadUnder {
+  /// Every file at or under the directory, with its length.
+  pub files: Vec<(String, u64)>,
+  /// Every directory at or under it.
+  pub dirs: Vec<String>,
+  /// Every symlink at or under it.
+  pub symlinks: Vec<String>,
+  /// Every special node (FIFO, socket, device) at or under it.
+  pub specials: Vec<String>,
+}
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
 /// base version can be reconstructed for a lagging work. The content dimension's history is copy-on-write
@@ -918,10 +974,9 @@ pub struct Green {
   /// The content history values that name a file's block instead of copying its bytes, and those bytes (A-728's
   /// non-vacuity counters: a block named by the history instead of copied).
   history_named: (u64, u64),
-  /// The splices whose added runs name the file's new block (A-728 part 2), and those values' bytes.
-  history_spliced_named: (u64, usize),
-  /// The superseded values sealed by a copy of the runs they alone named, and the bytes copied (A-728 part 2).
-  history_sealed: (u64, u64),
+  /// The changes whose path's history was re-anchored on the file's new block, the earlier blocks let go, and the bytes
+  /// copied out of them (A-793, `crate::history::reanchor`).
+  history_reanchored: (u64, u64, u64),
   /// The bytes every content history value's piece list costs, a running total.
   history_lists: usize,
   /// The bytes of every path's latest content value and its piece list (the current files, as the history holds
@@ -1004,6 +1059,9 @@ pub struct Green {
   /// The mapped files made once their verdict accepted ([`Green::make_mapped`]): the non-vacuity counter of the deferral
   /// (a conflict makes none). A cell, since a rebase's restatement makes them without changing the green.
   mapped_files_made: std::cell::Cell<u64>,
+  /// The files held verdicts made a slice a step before their commits ([`Green::make_step`], A-760): the non-vacuity
+  /// count of the sliced making.
+  files_made_in_steps: std::cell::Cell<u64>,
   /// The change index (§4.16 `changed_since`, A-264): the paths each version changed in any dimension, each version's
   /// sorted and each path once, recorded as the version commits at the cost of its own changes, so what changed since a
   /// version is read in the changes since it and never the green's whole tree. A hard link is recorded at a version that
@@ -1463,6 +1521,45 @@ fn applied_len(base_len: u64, ops: &[Op]) -> u64 {
   out.saturating_add(base_len.saturating_sub(pos))
 }
 
+/// The pieces [`apply`] makes a base of `base_len` bytes into under `ops`, in order, without copying a byte (A-760,
+/// [`Green::make_step`]): ranges of the base and of the post-state.
+fn segments(base_len: u64, ops: &[Op]) -> Vec<Segment> {
+  let mut pieces = Vec::new();
+  let mut pos = 0u64;
+  for op in ops {
+    if op.at > pos {
+      let len = op.at.min(base_len).saturating_sub(pos.min(base_len));
+      if len > 0 {
+        pieces.push(Segment::Base { start: pos, len });
+      }
+      pos = op.at;
+    }
+    match op.kind {
+      OpKind::Delete => pos = pos.saturating_add(op.len),
+      OpKind::Truncate => pos = base_len,
+      OpKind::Overwrite => {
+        pieces.push(Segment::Post {
+          src: op.src,
+          len: op.len,
+        });
+        pos = pos.saturating_add(op.len);
+      }
+      OpKind::Insert | OpKind::Extend => pieces.push(Segment::Post {
+        src: op.src,
+        len: op.len,
+      }),
+      _ => {}
+    }
+  }
+  if pos < base_len {
+    pieces.push(Segment::Base {
+      start: pos,
+      len: base_len.saturating_sub(pos),
+    });
+  }
+  pieces
+}
+
 /// The named run `ops` make a base of `base_len` bytes into, whole and alone, by its place in `post`: one op adds
 /// exactly that run's bytes and the file is no longer than it, so nothing else of the base or the post-state is in it.
 fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<usize> {
@@ -1474,6 +1571,18 @@ fn sole_run(base_len: u64, ops: &[Op], post: &crate::named::Post<'_>) -> Option<
     return None;
   }
   post.whole_run(op.src, op.len)
+}
+
+/// Moves each of `wholes`' runs' buffers into its file (A-760, [`Green::whole_runs`]): last, once every other file is
+/// made, since a moved buffer shortens the post-state's address space under every later run.
+fn move_whole_runs(effects: &mut [Effect], read: &mut [Vec<u8>], wholes: &[(usize, usize)]) {
+  for &(place, run) in wholes {
+    if let (Some(Effect::SetContent(_, bytes @ None, ..)), Some(buffer)) =
+      (effects.get_mut(place), read.get_mut(run))
+    {
+      *bytes = Some(core::mem::take(buffer));
+    }
+  }
 }
 
 /// [`apply`], for the history's oracle (`crate::history`'s tests).
@@ -2457,6 +2566,70 @@ impl Green {
     changed.into_iter().collect()
   }
 
+  /// What the green holds at its head under `dir` (A-792): every file, directory, symlink and special node whose
+  /// path is `dir` or starts with `dir/` (every path for the root, `""`), each found by one descent of its map, so a
+  /// listing of one directory reads that directory's subtree rather than the whole green. [`Green::current_base`]
+  /// copies every path of every dimension, which a listing did per page: on the Linux kernel's 97,371 files that was
+  /// most of a primary's one busy core at 1,000 and 10,000 clients (goal 86b, 2026-11-20; 144 and 192 verdicts a
+  /// second).
+  pub fn head_under(&self, dir: &str) -> HeadUnder {
+    let prefix = if dir.is_empty() {
+      String::new()
+    } else {
+      format!("{dir}/")
+    };
+    let at_or_under = |path: &str| dir.is_empty() || path == dir || path.starts_with(&prefix);
+    let mut under = HeadUnder::default();
+    // `dir` itself is the prefix less its slash: a lookup of its own, then the walk under it.
+    let own = |held: bool| held.then(|| dir.to_owned());
+    under.files.extend(
+      own(!dir.is_empty() && self.content.contains_key(dir)).and_then(|path| {
+        self
+          .content
+          .get(&path)
+          .map(|bytes| (path, bytes.len() as u64))
+      }),
+    );
+    under.files.extend(
+      self
+        .content
+        .prefix(&prefix)
+        .filter(|(path, _)| at_or_under(path))
+        .map(|(path, bytes)| (path, bytes.len() as u64)),
+    );
+    under
+      .dirs
+      .extend(own(!dir.is_empty() && self.dirs.contains_key(dir)));
+    under.dirs.extend(
+      self
+        .dirs
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
+      .symlinks
+      .extend(own(!dir.is_empty() && self.symlinks.contains_key(dir)));
+    under.symlinks.extend(
+      self
+        .symlinks
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
+      .specials
+      .extend(own(!dir.is_empty() && self.specials.contains_key(dir)));
+    under.specials.extend(
+      self
+        .specials
+        .prefix(&prefix)
+        .map(|(path, _)| path)
+        .filter(|path| at_or_under(path)),
+    );
+    under
+  }
+
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
   /// content length, and the directories, modes, symlinks, hard links and xattrs — so an increment
   /// based on the head can be composed against what the green actually holds. (An *older* version's
@@ -2689,6 +2862,11 @@ impl Green {
   /// verdict defers, counted, so a test shows a conflict made none and an accept made each of its files once.
   pub fn mapped_files_made(&self) -> u64 {
     self.mapped_files_made.get()
+  }
+
+  /// The files held verdicts made a slice a step before their commits ([`Green::make_step`], A-760).
+  pub fn files_made_in_steps(&self) -> u64 {
+    self.files_made_in_steps.get()
   }
 
   /// The deltas the verdict's position mapping has consulted ([`Green::fast_path_hits`]'s companion): one per delta
@@ -3157,21 +3335,15 @@ impl Green {
     self.history_named
   }
 
-  /// The splices whose added runs named the file's new block instead of a copy, and those values' bytes; and the
-  /// superseded values sealed by copying out the runs they alone named, and the bytes copied (A-728 part 2's
-  /// non-vacuity counters).
-  pub fn history_splices_named(&self) -> ((u64, usize), (u64, u64)) {
-    (self.history_spliced_named, self.history_sealed)
-  }
-
   /// The bytes the content history owns, copied out of files (A-728: what a value stored whole no longer copies).
   pub fn history_owned_bytes(&self) -> usize {
     self.chunks.owned_bytes()
   }
 
-  /// The value that `ops` made of `path`'s latest content, the file now holding its new bytes
-  /// (`crate::history::Value::spliced`), or the file's block named whole (A-728) for a path with none, or one the
-  /// splice shares nothing with or stores whole.
+  /// The value that `ops` made of `path`'s latest content, the file now holding its new bytes: the new block named
+  /// whole, with the path's history re-anchored on it (`crate::history::reanchor`, A-793), so the earlier block is let
+  /// go and the history keeps only what the change overwrote or removed. The file's block named whole (A-728) with
+  /// nothing re-anchored for a path with no latest value, or one the ops keep nothing of.
   fn content_value(&mut self, path: &str, ops: &[Op]) -> crate::history::Value {
     let Green {
       content_history,
@@ -3179,59 +3351,65 @@ impl Green {
       content,
       ..
     } = self;
-    let block = content.block_of(path);
-    let spliced = content_history
-      .get(path)
-      .and_then(|history| history.last())
-      .and_then(|(_, value)| value.as_ref())
-      .zip(block)
-      .and_then(|(latest, block)| {
-        let blocks = content.blocks();
-        latest.spliced(chunks, (blocks, block), ops, blocks.bytes(block))
+    let anchored = content
+      .block_of(path)
+      .zip(content_history.get_mut(path))
+      .filter(|(_, history)| history.last().is_some_and(|(_, latest)| latest.is_some()))
+      .and_then(|(block, history)| {
+        let values = history
+          .iter_mut()
+          .filter_map(|(_, value)| value.as_mut())
+          .collect();
+        crate::history::reanchor(values, chunks, content.blocks_mut(), (block, ops))
       });
-    match (spliced, block) {
-      (Some((value, named)), Some(block)) => {
-        // The added runs are the file's block (A-728 part 2): the chunk naming it takes its holder.
-        if named {
-          content.blocks_mut().hold(block);
-          let (values, bytes) = self.history_spliced_named;
-          self.history_spliced_named =
-            (values.saturating_add(1), bytes.saturating_add(value.len()));
-        }
-        value
-      }
-      _ => self.named_value(path),
-    }
+    let Some(anchored) = anchored else {
+      return self.named_value(path);
+    };
+    let crate::history::Reanchored {
+      value,
+      lists: (lists_before, lists_after),
+      latest_list: (latest_before, latest_after),
+      blocks_cut,
+      bytes_cut,
+    } = anchored;
+    self.history_lists = self
+      .history_lists
+      .saturating_sub(lists_before)
+      .saturating_add(lists_after);
+    // The superseded value is still counted current until `push_content` replaces it, by its list as it is now.
+    self.history_current = self
+      .history_current
+      .saturating_sub(latest_before)
+      .saturating_add(latest_after);
+    let (changes, cut, copied) = self.history_reanchored;
+    self.history_reanchored = (
+      changes.saturating_add(1),
+      cut.saturating_add(blocks_cut),
+      copied.saturating_add(u64::try_from(bytes_cut).unwrap_or(u64::MAX)),
+    );
+    value
   }
 
-  /// Seals `path`'s latest content value as a change supersedes it, the file map having let its block go
-  /// (`crate::history::Value::seal`, A-728 part 2): the runs it alone names of a block nothing else holds are copied out
-  /// and the block let go, counted.
-  fn seal_latest(&mut self, path: &str) {
-    let Green {
-      content_history,
-      chunks,
-      content,
-      history_sealed,
-      ..
-    } = self;
-    let Some(latest) = content_history
+  /// The changes whose history was re-anchored on the file's new block, the earlier blocks that let go, and the bytes
+  /// copied out of them (A-793's non-vacuity counters, `crate::history::reanchor`).
+  pub fn history_reanchored(&self) -> (u64, u64, u64) {
+    self.history_reanchored
+  }
+
+  /// Marks `path`'s latest content value superseded as a change lands, the file map having let its block go
+  /// (`crate::history::Value::supersede`): its own block is history from here, whole or, once the change re-anchors the
+  /// path's history, cut to what the change removed (A-728 part 4, A-793).
+  fn supersede_latest(&mut self, path: &str) {
+    let Some(latest) = self
+      .content_history
       .get_mut(path)
       .and_then(|history| history.last_mut())
       .and_then(|(_, value)| value.as_mut())
     else {
       return;
     };
-    // Its own block stops being the current file's: from here it is history, whole or cut (A-728 part 4).
     self.history_current = self.history_current.saturating_sub(latest.own_len());
-    let copied = latest.seal(chunks, content.blocks_mut());
-    if copied > 0 {
-      let (values, bytes) = *history_sealed;
-      *history_sealed = (
-        values.saturating_add(1),
-        bytes.saturating_add(u64::try_from(copied).unwrap_or(u64::MAX)),
-      );
-    }
+    latest.supersede();
   }
 
   /// Whether `ops`, applied to `path` as it was at `base`, make exactly the head's file: the whole-file identity check
@@ -4676,8 +4854,16 @@ impl Green {
   /// file is the one the verdict would have made. Making it in the verdict built every clean path's new file before the
   /// verdict was known: 91 of 283 engine samples of W1's owner at 3,000 clients were that `apply` (perf, 2026-11-11), and
   /// 82% of those verdicts conflicted.
-  fn make_mapped(&self, effects: &mut [Effect], post_state: crate::named::Post<'_>) {
-    for effect in effects.iter_mut() {
+  fn make_mapped(
+    &self,
+    effects: &mut [Effect],
+    post_state: crate::named::Post<'_>,
+    skip: &[usize],
+  ) {
+    for (place, effect) in effects.iter_mut().enumerate() {
+      if skip.contains(&place) {
+        continue;
+      }
       if let Effect::SetContent(path, bytes @ None, ops, source) = effect {
         let made = match source {
           // A created file is its declared ops over nothing (made lazily, `Green::merge_create`).
@@ -4696,7 +4882,7 @@ impl Green {
 
   fn commit(&mut self, mut effects: Vec<Effect>, version: u64, post_state: crate::named::Post<'_>) {
     // First, before a copy or a node move changes the head: each mapped file from the head the verdict judged.
-    self.make_mapped(&mut effects, post_state);
+    self.make_mapped(&mut effects, post_state, &[]);
     let moves = self.node_moves(&effects);
     effects.extend(moves);
     // A copied tree's hard links name the copy's nodes, or nodes of their own (`Green::copy_link_effects`), read from the
@@ -5004,7 +5190,7 @@ impl Green {
       .insert(IdentityKey::File(path.to_owned()));
     self.seed_content(path, version);
     self.content.remove(path);
-    self.seal_latest(path);
+    self.supersede_latest(path);
     self.last_changed.insert(path.to_owned(), version);
     self.file_removed.insert(path.to_owned(), version);
     self.push_content(path.to_owned(), version, None);
@@ -5027,9 +5213,10 @@ impl Green {
     // gains is the bytes the new value added, its piece list, and whatever the old one held that the new one does not,
     // the retention charged to the running totals.
     self.seed_content(&path, version);
-    // The file first, so the value names its block (A-728); the value it supersedes sealed before it is spliced from.
+    // The file first, so the value names its block (A-728); the value it supersedes marked so before the path's history
+    // is re-anchored on that block (A-793).
     self.content.insert(&path, bytes);
-    self.seal_latest(&path);
+    self.supersede_latest(&path);
     let value = self.content_value(&path, &ops);
     self.last_changed.insert(path.clone(), version);
     self.push_content(path.clone(), version, Some(value));
@@ -5433,6 +5620,7 @@ impl Green {
           applied,
           post_state: inc.post_state.clone(),
           read: Vec::new(),
+          making: Making::default(),
         })
       }
       Err(windows) => {
@@ -5514,6 +5702,132 @@ impl Green {
     Ok(self.commit_held(judged))
   }
 
+  /// Makes `judged`'s files a copy slice of `slice_bytes` a step (A-760; at least a byte), so its commit copies none:
+  /// a file a work splices into, a large text's or any other, is made over as many steps as its bytes take, never in
+  /// the commit's one step. Every file but those a named run makes whole is made first, then each whole run's buffer is
+  /// moved into its file (no copy), as the commit does. Refused [`HeadMoved`] once the green has moved since the
+  /// verdict, as its commit is: the files are made from the head it was judged at.
+  pub fn make_step(&self, judged: &mut Judged, slice_bytes: u64) -> Result<Made, HeadMoved> {
+    let head = self.head();
+    if judged.at != head {
+      return Err(HeadMoved {
+        judged_at: judged.at,
+        head,
+      });
+    }
+    let budget = slice_bytes.max(1);
+    let mut copied = 0u64;
+    if judged.making.wholes.is_none() {
+      judged.making.wholes =
+        Some(self.whole_runs(&judged.effects, &judged.post_state, &judged.read));
+    }
+    while copied < budget {
+      if judged.making.current.is_none() {
+        judged.making.current = self.next_to_make(judged);
+      }
+      let Some(mut file) = judged.making.current.take() else {
+        let wholes = judged.making.wholes.clone().unwrap_or_default();
+        move_whole_runs(&mut judged.effects, &mut judged.read, &wholes);
+        return Ok(Made { done: true, copied });
+      };
+      copied =
+        copied.saturating_add(self.copy_some(judged, &mut file, budget.saturating_sub(copied)));
+      if file.segment < file.segments.len() {
+        judged.making.current = Some(file);
+      } else if let Some(Effect::SetContent(_, bytes @ None, ..)) =
+        judged.effects.get_mut(file.place)
+      {
+        *bytes = Some(file.out);
+        self
+          .files_made_in_steps
+          .set(self.files_made_in_steps.get().saturating_add(1));
+      }
+    }
+    Ok(Made {
+      done: false,
+      copied,
+    })
+  }
+
+  /// The next file of `judged` still to make, with its pieces: none once every one is made or is a whole run's.
+  fn next_to_make(&self, judged: &mut Judged) -> Option<FileMaking> {
+    let skip: Vec<usize> = judged
+      .making
+      .wholes
+      .as_deref()
+      .unwrap_or_default()
+      .iter()
+      .map(|(place, _)| *place)
+      .collect();
+    while let Some(effect) = judged.effects.get(judged.making.next) {
+      let place = judged.making.next;
+      judged.making.next = place.saturating_add(1);
+      if skip.contains(&place) {
+        continue;
+      }
+      let Effect::SetContent(path, None, ops, source) = effect else {
+        continue;
+      };
+      let (base_len, ops) = match source {
+        ContentSource::Created(declared) => (0, declared.as_slice()),
+        ContentSource::Mapped | ContentSource::Copied(..) => (
+          u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
+          ops.as_slice(),
+        ),
+      };
+      let length = usize::try_from(applied_len(base_len, ops)).unwrap_or(0);
+      return Some(FileMaking {
+        place,
+        segments: segments(base_len, ops),
+        segment: 0,
+        offset: 0,
+        out: Vec::with_capacity(length),
+      });
+    }
+    None
+  }
+
+  /// Copies at most `budget` bytes more of `file` from its base at the head and `judged`'s post-state: the bytes copied.
+  fn copy_some(&self, judged: &Judged, file: &mut FileMaking, budget: u64) -> u64 {
+    let base: &[u8] = match judged.effects.get(file.place) {
+      Some(Effect::SetContent(_, _, _, ContentSource::Created(_))) | None => &[],
+      Some(effect) => self.content.get(effect.path()).unwrap_or_default(),
+    };
+    let post = crate::named::Post::of(&judged.post_state, &judged.read);
+    let mut copied = 0u64;
+    while copied < budget {
+      let Some(segment) = file.segments.get(file.segment).copied() else {
+        break;
+      };
+      let (len, piece) = match segment {
+        Segment::Base { start, len } => (len, (true, start)),
+        Segment::Post { src, len } => (len, (false, src)),
+      };
+      let take = len
+        .saturating_sub(file.offset)
+        .min(budget.saturating_sub(copied));
+      let from = piece.1.saturating_add(file.offset);
+      if piece.0 {
+        let start = usize::try_from(from).unwrap_or(usize::MAX);
+        let end = usize::try_from(from.saturating_add(take))
+          .unwrap_or(usize::MAX)
+          .min(base.len());
+        file
+          .out
+          .extend_from_slice(base.get(start..end).unwrap_or_default());
+      } else {
+        file.out.extend_from_slice(&post.span(from, take));
+      }
+      copied = copied.saturating_add(take);
+      file.offset = file.offset.saturating_add(take);
+      if file.offset >= len {
+        file.segment = file.segment.saturating_add(1);
+        file.offset = 0;
+      }
+    }
+    copied
+  }
+
   /// Commits a verdict judged at the head: the version after it, and what the chain records of it.
   fn commit_held(&mut self, judged: Judged) -> (u64, Vec<crate::chain_entry::Applied>) {
     // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
@@ -5524,53 +5838,60 @@ impl Green {
       applied,
       post_state,
       read,
+      making,
       ..
     } = judged;
     let mut effects = effects;
     let mut read = read;
-    self.take_whole_runs(&mut effects, &post_state, &mut read);
+    // Every file but those a run makes whole is made first, while every run's buffer is in place: a run moved into its
+    // file leaves the post-state's later bytes where their ops address them only once nothing reads them any more. The
+    // files `make_step` made already are passed over.
+    let wholes = making
+      .wholes
+      .unwrap_or_else(|| self.whole_runs(&effects, &post_state, &read));
+    let skip: Vec<usize> = wholes.iter().map(|(place, _)| *place).collect();
+    self.make_mapped(
+      &mut effects,
+      crate::named::Post::of(&post_state, &read),
+      &skip,
+    );
+    move_whole_runs(&mut effects, &mut read, &wholes);
     self.commit(effects, version, crate::named::Post::of(&post_state, &read));
     self.accepted.insert(id, version);
     (version, applied)
   }
 
-  /// Makes each file whose bytes are exactly one named run's, and no other file's, of that run's buffer, moved (A-760):
-  /// a whole text becomes the green's file with no copy, so a landing holds the text once. Every other file is made
-  /// by [`Green::make_mapped`] as before.
-  fn take_whole_runs(&self, effects: &mut [Effect], inline: &[u8], read: &mut [Vec<u8>]) {
+  /// The files whose bytes are exactly one named run's, and no other file's (A-760), each with that run: a whole text
+  /// becomes the green's file with its buffer moved, no copy ([`move_whole_runs`]), so a landing holds the text once.
+  /// Every other file is made by [`Green::make_mapped`], before any buffer moves.
+  fn whole_runs(&self, effects: &[Effect], inline: &[u8], read: &[Vec<u8>]) -> Vec<(usize, usize)> {
     if read.is_empty() {
-      return;
+      return Vec::new();
     }
+    let post = crate::named::Post::of(inline, read);
     let mut wanted: Vec<(usize, usize)> = Vec::new();
-    {
-      let post = crate::named::Post::of(inline, read);
-      for (place, effect) in effects.iter().enumerate() {
-        let Effect::SetContent(path, None, ops, source) = effect else {
-          continue;
-        };
-        let (base_len, ops) = match source {
-          ContentSource::Created(declared) => (0, declared.as_slice()),
-          ContentSource::Mapped => (
-            u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
-            ops.as_slice(),
-          ),
-          ContentSource::Copied(..) => continue,
-        };
-        if let Some(run) = sole_run(base_len, ops, &post) {
-          wanted.push((place, run));
-        }
-      }
-    }
-    for &(place, run) in &wanted {
-      if wanted.iter().filter(|(_, other)| *other == run).count() != 1 {
+    for (place, effect) in effects.iter().enumerate() {
+      let Effect::SetContent(path, None, ops, source) = effect else {
         continue;
-      }
-      if let (Some(Effect::SetContent(_, bytes @ None, ..)), Some(buffer)) =
-        (effects.get_mut(place), read.get_mut(run))
-      {
-        *bytes = Some(core::mem::take(buffer));
+      };
+      let (base_len, ops) = match source {
+        ContentSource::Created(declared) => (0, declared.as_slice()),
+        ContentSource::Mapped => (
+          u64::try_from(self.content.get(path).unwrap_or_default().len()).unwrap_or(u64::MAX),
+          ops.as_slice(),
+        ),
+        ContentSource::Copied(..) => continue,
+      };
+      if let Some(run) = sole_run(base_len, ops, &post) {
+        wanted.push((place, run));
       }
     }
+    let alone: Vec<(usize, usize)> = wanted
+      .iter()
+      .copied()
+      .filter(|(_, run)| wanted.iter().filter(|(_, other)| other == run).count() == 1)
+      .collect();
+    alone
   }
 
   /// Commits an accepted version as its chain entry recorded it, the next version after the head (§4.16, §4.8 recovery;
@@ -5824,10 +6145,11 @@ impl Green {
   /// The most this increment can add to the retained history ([`Green::retention_charge`]), charged before the
   /// verdict (A-16): what the history would gain if every op were applied. Per path (W2: the history shares what a
   /// version kept, `crate::history`; A-728 part 4: it counts every block it keeps, and only the latest value's own block
-  /// is current):
+  /// is current; A-793: a change re-anchors the path's history on the new block):
   /// - a file changed in any way (edited, created over, renamed onto, removed, or renamed away) supersedes its latest
-  ///   value, which keeps its list and what it keeps of its own block ([`Green::superseded_bytes`]); the new value's own
-  ///   block and list are current, and its other runs name chunks the history holds already;
+  ///   value, which keeps its list and at most its own block, whole or cut, and every earlier value of the path may gain
+  ///   pieces where the change's ops split its runs ([`Green::superseded_bytes`]); the new value's own block and list
+  ///   are current;
   /// - an IPC node replaced or removed keeps the node.
   pub fn history_reservation(&self, inc: &Increment) -> usize {
     if self.accepted.contains_key(&inc.id) {
@@ -5856,11 +6178,12 @@ impl Green {
     let content: usize = edits
       .iter()
       .filter(|(path, _)| !replaced.contains(*path))
-      .map(|(path, _)| self.superseded_bytes(path))
-      .sum();
+      .map(|(path, ops)| self.superseded_bytes(path, ops.len()))
+      .fold(0usize, usize::saturating_add);
     let replaced = replaced.into_iter().fold(content, |total, path| {
+      let ops = edits.get(path).map_or(0, Vec::len);
       total
-        .saturating_add(self.superseded_bytes(path))
+        .saturating_add(self.superseded_bytes(path, ops))
         .saturating_add(if self.specials.contains_key(path) {
           SPECIAL_NODE_BYTES
         } else {
@@ -5870,33 +6193,36 @@ impl Green {
     replaced.saturating_add(self.replace_history_reservation(inc))
   }
 
-  /// What the history gains when a change supersedes `path`'s latest content value (A-728 part 4, the honest charge),
-  /// whatever the change's ops: the value's piece list, no longer current, and what it keeps of its own block, the
-  /// current file's ([`crate::history::Value::kept_when_superseded`]): the whole block when the value names all of it
-  /// or a holder beyond the map and the history keeps it (the identity table, a branch), else the runs it names. The
-  /// new value's own block and list are current, and its other runs name chunks the history holds already. A path with
-  /// no history, or holding a copy's value (A-586), is recorded whole at its change (`seed_content`): its file's block
-  /// and one piece, all of it kept. A path with no file and no value gains nothing.
-  fn superseded_bytes(&self, path: &str) -> usize {
+  /// The most the history gains when a change of `ops` content ops supersedes `path`'s latest content value (A-728 part
+  /// 4, the honest charge; A-793, the re-anchor), whatever the ops: the value's piece list, no longer current; at most
+  /// its own block, the current file's, which the history keeps whole (a whole replace, or a holder beyond the map and
+  /// the history keeps it) or cut to what the change removed; and the pieces the re-anchor may add to every value the
+  /// path's history holds, two for each gap the ops leave in the kept runs (`ops` and a trailing truncate's), each value
+  /// a new one at most. A path with no history, or holding a copy's value (A-586), is recorded whole at its change
+  /// (`seed_content`): its file's block and one piece, all of it kept, and that value is re-anchored too. A path with no
+  /// file and no value gains nothing.
+  fn superseded_bytes(&self, path: &str, ops: usize) -> usize {
+    let split = |values: usize| {
+      values
+        .saturating_mul(ops.saturating_add(1))
+        .saturating_mul(2)
+        .saturating_mul(crate::history::PIECE_BYTES)
+    };
     let history = self.content_history.get(path);
     let covered = self.covered_since(path, last_entry(history)).is_some();
     let Some(history) = history.filter(|_| !covered) else {
-      return self
-        .content
-        .get(path)
-        .map_or(0, |bytes| crate::history::Value::whole_cost(bytes.len()));
+      return self.content.get(path).map_or(0, |bytes| {
+        crate::history::Value::whole_cost(bytes.len()).saturating_add(split(1))
+      });
     };
     let Some(latest) = history.last().and_then(|(_, value)| value.as_ref()) else {
       return 0;
     };
-    // The map and the latest value each hold the current block; any other holder keeps it past the seal.
-    let others = self
-      .content
-      .block_of(path)
-      .is_some_and(|block| self.content.blocks().holders(block) > 2);
+    let values = history.iter().filter(|(_, value)| value.is_some()).count();
     latest
       .list_bytes()
-      .saturating_add(latest.kept_when_superseded(others))
+      .saturating_add(latest.len())
+      .saturating_add(split(values))
   }
 
   /// What the green charges as retention (AUD-16): the content and IPC histories' bytes and the
@@ -6193,7 +6519,7 @@ impl Green {
     post_state: crate::named::Post<'_>,
   ) -> Rebased {
     use crate::increment::VolumeOp;
-    self.make_mapped(&mut effects, post_state);
+    self.make_mapped(&mut effects, post_state, &[]);
     // The links the version's removals and replacements hand a node to, as the commit hands it on (A-669's rule).
     let heirs = self.heirs_of(&effects);
     let mut changed: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
@@ -6560,6 +6886,9 @@ mod restate_tests;
 
 #[cfg(test)]
 mod copy_restate_tests;
+
+#[cfg(test)]
+mod head_under_tests;
 
 #[cfg(test)]
 mod tests {

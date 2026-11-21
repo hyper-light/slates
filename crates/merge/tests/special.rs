@@ -350,8 +350,8 @@ fn fold_removed_ipc_history(green: &mut Green) {
   assert!(green.base_at(3).specials.is_empty());
 }
 
-/// AC-6.8 / AUD-16: a one-byte edit and a payload-free unlink retain old values; reserve those
-/// values before applying either operation, so a small request cannot escape memory admission.
+/// AC-6.8 / AUD-16, A-793: a one-byte edit and a payload-free unlink retain old values; reserve at least those values
+/// before applying either operation, so a small request cannot escape memory admission.
 #[test]
 fn short_edits_and_unlinks_reserve_the_values_they_supersede() {
   let origin = Origin {
@@ -392,7 +392,13 @@ fn assert_reserved_history_covers_apply(green: &mut Green, inc: &Increment) {
     added > inc.post_state.len(),
     "the incoming payload does not bound retention"
   );
-  assert_eq!(reserved, added);
+  // An upper bound taken before the verdict, which the settle after it trues up (A-16): since A-793 a change re-anchors
+  // its path's history on the new block, and how far it splits the earlier values' runs is known only once its ops are
+  // placed at the head, so the reservation covers the most it can add rather than equalling it.
+  assert!(
+    reserved >= added,
+    "{reserved} reserved for {added} retained: the reservation must cover what the history gained"
+  );
   assert_eq!(
     green.history_reservation(inc) + green.changes_reservation(inc),
     0,

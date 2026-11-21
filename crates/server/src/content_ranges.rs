@@ -79,8 +79,24 @@ pub(crate) struct Sweep {
   longest_ns: u64,
   /// The longest single step, nanoseconds: what an advance may pass its budget by at most.
   longest_step_ns: u64,
-  /// Whether a status request's sweep task is advancing the sweep in the background ([`arm`]): one at a time.
+  /// Whether a status request armed a sweep the shard's idle time is advancing ([`arm`]): one at a time.
   running: bool,
+  /// Slices of the sweep run on the shard's idle time ([`idle_slice`]): the background path's non-vacuity count.
+  idle_slices: u64,
+  /// When the armed sweep was armed, shard clock nanoseconds, and the sweeps completed then ([`arm`]): the armed sweep
+  /// is done once one more has completed, by an idle slice or a request's own advance.
+  armed: (u64, u64),
+  /// When the last armed sweep completed, and how long it took from its arming: the spacing [`arm`] keeps.
+  last: Option<(u64, u64)>,
+  /// Status requests that found the last sweep too recent to arm another ([`arm`]).
+  spaced: u64,
+  /// Sweeps armed ([`arm`]): only a request that asks for the memory report arms one.
+  armed_count: u64,
+  /// Steps the sweep has taken ([`advance`]), each a kernel call over a vector page of pages: none for a plain status.
+  steps: u64,
+  /// The anchor segment and content object whole, from the kernel's per-mapping figures (on the control shard), as the
+  /// last memory request read them ([`read_whole`]); by their place in [`RANGES`].
+  whole: [Option<Residency>; RANGES.len()],
 }
 
 /// One mapped range the sweep walks: a range of the content object, or a region of the arena.
@@ -99,10 +115,6 @@ enum Target {
     kind: slates_anchor::layout::RegionKind,
     len: usize,
   },
-  /// The anchor segment whole, `len` bytes.
-  SegmentWhole { len: usize },
-  /// The anchor content object whole, `len` bytes.
-  ContentWhole { len: usize },
   /// The ring region of client `client`, `len` bytes. A client gone between two advances is passed over.
   Client {
     client: slates_mem::Handle<crate::state::ClientSlot>,
@@ -117,8 +129,6 @@ impl Target {
       Target::Object { len, .. }
       | Target::Region { len, .. }
       | Target::Segment { len, .. }
-      | Target::SegmentWhole { len }
-      | Target::ContentWhole { len }
       | Target::Client { len, .. } => *len,
     }
   }
@@ -128,8 +138,6 @@ impl Target {
     match self {
       Target::Object { range, .. } | Target::Segment { range, .. } => *range,
       Target::Region { .. } => ARENA,
-      Target::SegmentWhole { .. } => SEGMENT_WHOLE,
-      Target::ContentWhole { .. } => CONTENT_WHOLE,
       Target::Client { .. } => CLIENT_REGIONS,
     }
   }
@@ -185,16 +193,8 @@ fn targets(state: &ShardState) -> Vec<Target> {
       targets.push(Target::Segment { range, kind, len });
     }
   }
-  // The daemon's own memory report (§4.14): the two anchor objects whole once, on the control shard, and each shard's
-  // clients' ring regions on their shard.
-  if crate::verbs::is_control_shard(state) {
-    targets.push(Target::SegmentWhole {
-      len: state.segment.len(),
-    });
-    if let Some(content) = state.content.as_ref() {
-      targets.push(Target::ContentWhole { len: content.len() });
-    }
-  }
+  // The daemon's own memory report (§4.14): each shard's clients' ring regions on their shard. The two anchor objects
+  // whole are read from the kernel's per-mapping figures, never walked ([`read_whole`]).
   for (client, slot) in state.clients.iter() {
     targets.push(Target::Client {
       client,
@@ -224,8 +224,6 @@ fn residency(
       .residency_of(offset, len)
       .ok(),
     Target::Segment { kind, .. } => state.segment.region_residency_of(*kind, offset, len).ok(),
-    Target::SegmentWhole { .. } => state.segment.residency_of(offset, len).ok(),
-    Target::ContentWhole { .. } => state.content.as_ref()?.residency(offset, len).ok(),
     Target::Client { client, .. } => state
       .clients
       .get(*client)
@@ -241,39 +239,73 @@ fn residency(
 /// Arms one sweep to completion in the background (§4.14, the daemon's memory report): a request's own advance walks
 /// half a step quantum, and the anchor segment and content object whole are tens of GiB, millions of pages, which a
 /// status request alone would take hundreds of requests to sweep (84 GiB unswept after 400 requests, a debug daemon on the
-/// Mac Studio, 2026-11-20). So a status request also spawns, unless one runs, a task that advances the sweep a step a
-/// turn of this shard ([`advance`]'s bound), yielding between, until one sweep completes; the next request reads it. An
-/// idle shard is woken for nothing else: the task is armed by a request and ends with its sweep. With no task to spawn
-/// the request's own advance still moves the sweep.
+/// Mac Studio, 2026-11-20). So a status request also hands the rest to the shard's idle time, unless a sweep is already
+/// armed: the shard's idle work ([`idle_slice`], `ShardContext::set_idle_work`) advances it a bounded step whenever the
+/// shard has nothing ready and its idle spin has run out, until one sweep completes; the next request reads it.
+///
+/// Never as a task: one that advanced the sweep a step a turn, yielding between, ran half a step quantum of `mincore`
+/// ahead of every turn's ready work for as long as a sweep lasted, seconds over tens of GiB, on every shard a status
+/// request reached. A stream of live writes begun after a status request paid it at every hop: on the 32-core Studio
+/// (load 4-75, 2026-11-20, BENCHMARKS) what live shipping added went from 543-823 µs to 1,312-4,111 µs at the median, its
+/// p999 from 5.6-11.4 ms to 25-198 ms, and every daemon burned 1.5-9.3 s of CPU over a 2,000-write stream against
+/// 0.26-0.93 s, `mincore` the heaviest frame in each (g228). On idle time a sweep takes nothing from ready work, and a
+/// busy shard's sweep waits for its idle moments while each request still moves it (`report`'s own advance).
+///
+/// Spaced by its own length: a sweep is armed no sooner after the last one completed than that one took. So the sweeps
+/// take at most half of a shard's time over any span however often status is asked (a poller asking every few
+/// milliseconds kept every shard sweeping), and what a request reads is at most two sweeps old. A request that finds the
+/// last sweep too recent is counted (`content_range.sweep.spaced`) and reads it. The shard has one idle-work slot and
+/// this is the daemon's only use of it since A-777 removed the arena reserve's refill.
 fn arm(state: &mut ShardState) {
   if state.content_sweep.running {
     return;
   }
-  state.content_sweep.running = true;
-  let spawned =
-    slates_rt::futures::spawn(sweep_to_completion()).and_then(slates_rt::futures::detach);
-  if spawned.is_err() {
-    state.content_sweep.running = false;
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  if state
+    .content_sweep
+    .last
+    .is_some_and(|(completed_ns, took_ns)| now < completed_ns.saturating_add(took_ns))
+  {
+    state.content_sweep.spaced = state.content_sweep.spaced.saturating_add(1);
+    return;
+  }
+  let registered =
+    slates_rt::registry::with_current(|context| context.set_idle_work(Box::new(idle_slice)));
+  if matches!(registered, Some(Ok(()))) {
+    state.content_sweep.running = true;
+    state.content_sweep.armed = (now, state.content_sweep.sweeps);
+    state.content_sweep.armed_count = state.content_sweep.armed_count.saturating_add(1);
   }
 }
 
-/// The task [`arm`] spawns: one [`advance`] a turn until a sweep completes, then the task ends.
-async fn sweep_to_completion() {
-  loop {
-    let completed = crate::state::with_state(|state| {
-      let before = state.content_sweep.sweeps;
-      advance(state);
-      let completed = state.content_sweep.sweeps != before;
-      if completed {
-        state.content_sweep.running = false;
-      }
-      completed
-    });
-    if completed != Some(false) {
-      return;
+/// One slice of an armed sweep on the shard's idle time ([`arm`]): one [`advance`], bounded by half the step quantum as
+/// the shard's idle work must be. Whether it did anything: `false` once the armed sweep has completed (or none is armed,
+/// or the state is out of reach), so the shard parks, and an idle shard pays one flag read before each park after that.
+fn idle_slice() -> bool {
+  crate::state::with_state(|state| {
+    if !state.content_sweep.running {
+      return false;
     }
-    slates_rt::futures::yield_now().await;
-  }
+    let advanced = !armed_sweep_done(state);
+    if advanced {
+      advance(state);
+      state.content_sweep.idle_slices = state.content_sweep.idle_slices.saturating_add(1);
+    }
+    if armed_sweep_done(state) {
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+      let sweep = &mut state.content_sweep;
+      sweep.running = false;
+      sweep.last = Some((now, now.saturating_sub(sweep.armed.0)));
+    }
+    advanced
+  })
+  .unwrap_or(false)
+}
+
+/// Whether the armed sweep has completed: one more sweep since it was armed, by an idle slice or a request's own advance
+/// ([`report`]), so a request that finishes it leaves the idle work nothing to begin again.
+fn armed_sweep_done(state: &ShardState) -> bool {
+  state.content_sweep.sweeps > state.content_sweep.armed.1
 }
 
 /// Advances the sweep for at most half the shard's step quantum (module docs, "Bounded"); at most one sweep completes.
@@ -314,6 +346,7 @@ fn advance(state: &mut ShardState) {
       .saturating_sub(offset)
       .min(pages.saturating_mul(page));
     let found = residency(state, target, (offset, len));
+    state.content_sweep.steps = state.content_sweep.steps.saturating_add(1);
     let after = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
     mark = after;
     let sweep = &mut state.content_sweep;
@@ -365,15 +398,21 @@ fn advance(state: &mut ShardState) {
   }
 }
 
-/// The shard's content-range figures for the status report (module docs): the sweep advanced, then the last completed
-/// sweep's figures, every one reported (zero too, so an absent `.modified` means the OS does not say), the arena's
-/// allocated bytes now, and the sweeps completed.
-pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
-  advance(state);
-  arm(state);
+/// The shard's content-range figures for the status report (module docs). A request that asks for the memory report
+/// (`memory`) advances the sweep, arms it to completion on idle time ([`arm`]) and reads the anchor's objects whole
+/// ([`read_whole`]); a plain one does no residency work at all and reports the last figures read (main's ruling on
+/// g228's finding: every plain status armed a sweep of tens of GiB on every shard, about a core a daemon for a second or
+/// more after a burst). Then every figure is reported (zero too, so an absent `.modified` means the OS does not say),
+/// the arena's allocated bytes now, and the sweeps completed.
+pub(crate) fn report(state: &mut ShardState, memory: bool) -> Vec<RefusalCount> {
+  if memory {
+    advance(state);
+    arm(state);
+    read_whole(state);
+  }
   let mut rows: Vec<(String, u64)> = Vec::new();
-  if let Some(done) = &state.content_sweep.done {
-    for (name, found) in RANGES.iter().zip(done) {
+  for (range, name) in RANGES.iter().enumerate() {
+    if let Some(found) = figure(&state.content_sweep, range) {
       rows.push((format!("{PREFIX}{name}.bytes"), found.bytes));
       rows.push((format!("{PREFIX}{name}.resident"), found.resident));
       if let Some(modified) = found.modified {
@@ -406,6 +445,16 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
     state.content_sweep.sweeps,
   ));
   rows.push((
+    format!("{PREFIX}sweep.idle_slices"),
+    state.content_sweep.idle_slices,
+  ));
+  rows.push((format!("{PREFIX}sweep.spaced"), state.content_sweep.spaced));
+  rows.push((
+    format!("{PREFIX}sweep.armed"),
+    state.content_sweep.armed_count,
+  ));
+  rows.push((format!("{PREFIX}sweep.steps"), state.content_sweep.steps));
+  rows.push((
     format!("{PREFIX}sweep.past_budget"),
     state.content_sweep.past_budget,
   ));
@@ -417,10 +466,65 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
   for (name, count) in state.push_turns.rows() {
     rows.push((name.to_owned(), count));
   }
+  // The runtime's own counters, the shard's since its start: steps, polls, polls past their allowance, the longest
+  // poll, and polls by length (A-783; `crates/cli/bench/pacing_ab.py` reads them before and after its pushes).
+  if let Some(counters) = slates_rt::registry::with_current(|context| context.counters()) {
+    for (name, count) in [
+      ("rt.steps", counters.steps),
+      ("rt.polls", counters.polls),
+      ("rt.long_steps", counters.long_steps),
+      ("rt.preempted_steps", counters.preempted_steps),
+      ("rt.unattributed_steps", counters.unattributed_steps),
+      ("rt.longest_step_ns", counters.longest_step_ns),
+      ("rt.waiting_asked", counters.waiting_asked),
+      ("rt.waiting_found", counters.waiting_found),
+    ] {
+      rows.push((name.to_owned(), count));
+    }
+    for (bucket, count) in counters.poll_log2.iter().enumerate() {
+      if *count > 0 {
+        rows.push((format!("rt.poll_log2.{bucket}"), *count));
+      }
+    }
+  }
   rows
     .into_iter()
     .map(|(kind, count)| RefusalCount { kind, count })
     .collect()
+}
+
+/// A range's last figures: the anchor's objects whole from their per-mapping read ([`read_whole`]), every other range
+/// from the last completed sweep.
+fn figure(sweep: &Sweep, range: usize) -> Option<Residency> {
+  if range == SEGMENT_WHOLE || range == CONTENT_WHOLE {
+    sweep.whole.get(range).copied().flatten()
+  } else {
+    sweep
+      .done
+      .as_ref()
+      .and_then(|done| done.get(range))
+      .copied()
+  }
+}
+
+/// Reads the anchor segment and content object whole from the kernel's per-mapping figures, on the control shard
+/// (`slates_mem::resident::of_mapping`; main's ruling): the cost of reading their mappings, where a page walk of tens of
+/// GiB took tens of milliseconds a sweep. A read the OS refuses leaves the last figures.
+fn read_whole(state: &mut ShardState) {
+  if !crate::verbs::is_control_shard(state) {
+    return;
+  }
+  let segment = state.segment.mapped_residency().ok();
+  let content = state
+    .content
+    .as_ref()
+    .and_then(|content| content.mapped_residency().ok());
+  let whole = &mut state.content_sweep.whole;
+  for (range, found) in [(SEGMENT_WHOLE, segment), (CONTENT_WHOLE, content)] {
+    if let (Some(found), Some(slot)) = (found, whole.get_mut(range)) {
+      *slot = Some(found);
+    }
+  }
 }
 
 /// This shard's part of the daemon's memory by kind (§4.14; A-232's gotcha): on the control shard the anchor segment and
@@ -428,9 +532,8 @@ pub(crate) fn report(state: &mut ShardState) -> Vec<RefusalCount> {
 /// and mappings are its live lengths now; its resident and written bytes are the last completed sweep's ([`advance`],
 /// which each status request moves), `measured` once one has completed. Called after [`report`], which advances it.
 pub(crate) fn memory(state: &ShardState) -> Vec<slates_ipc::protocol::MemoryKindReport> {
-  let done = state.content_sweep.done.as_ref();
   let kind = |name: &str, range: usize, (mappings, reserved): (u64, u64)| {
-    let found = done.and_then(|done| done.get(range)).copied();
+    let found = figure(&state.content_sweep, range);
     slates_ipc::protocol::MemoryKindReport {
       kind: name.to_owned(),
       mappings,
@@ -493,6 +596,61 @@ mod tests {
   /// a segment region one step whole: a debug shard spun 3.2 s in one poll (w-perf); with one report a poll but a fixed
   /// batch, every advance ran past its budget. (The runtime's `long_steps` is no measure here: the debug audit daemon's
   /// live quantum is 3.2 us, which no status report's own rows fit; 200 no-op observes counted 6, 200 reports 200.)
+  /// A-744, with g228's finding (a status request's sweep ran ahead of every turn's ready work for seconds). Do: on a
+  /// running daemon, ask the shard's report once, as a status request does, then only watch, with observations that
+  /// report nothing, until a sweep completes; then ask the report again at once. Expect: the sweep completes with no
+  /// further request, by slices of the shard's idle time (`idle_slices` moved, the background path's non-vacuity count),
+  /// and then stops (nothing left armed); and the request right after it arms no new sweep (`spaced` moved), since the
+  /// last completed less than its own length ago.
+  #[test]
+  // The watch leaves the shard idle between its looks, which is the condition under test: a look is a task on the shard.
+  #[allow(clippy::disallowed_methods)]
+  fn a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length() {
+    /// Shape: the watch's bound: a debug audit daemon's whole slice, swept on idle time, within ten liveness budgets.
+    const WATCH: std::time::Duration =
+      std::time::Duration::from_nanos(10 * crate::daemon::LIVENESS_BUDGET_NS);
+    /// Shape: the pause between two looks: a hundredth of a liveness budget, long against a shard's idle spin, so the
+    /// shard reaches its idle work between looks, as a daemon nobody asks does.
+    const LOOK: std::time::Duration =
+      std::time::Duration::from_nanos(crate::daemon::LIVENESS_BUDGET_NS / 100);
+    let daemon = crate::daemon::audit_daemon();
+    crate::daemon::observe_first(&daemon, |state| {
+      report(state, true);
+    });
+    let started = std::time::Instant::now();
+    let mut seen = (0, 0, true);
+    while started.elapsed() < WATCH {
+      seen = crate::daemon::observe_first(&daemon, |state| {
+        let sweep = &state.content_sweep;
+        (sweep.sweeps, sweep.idle_slices, sweep.running)
+      });
+      if seen.0 > 0 && !seen.2 {
+        break;
+      }
+      std::thread::sleep(LOOK);
+    }
+    let spaced = crate::daemon::observe_first(&daemon, |state| {
+      report(state, true);
+      (state.content_sweep.spaced, state.content_sweep.running)
+    });
+    daemon.stop();
+    let (sweeps, idle_slices, running) = seen;
+    assert!(
+      sweeps > 0,
+      "a sweep completed on the shard's idle time within {WATCH:?}: (sweeps, idle slices, armed) {seen:?}"
+    );
+    assert!(
+      idle_slices > 0,
+      "the sweep advanced in idle slices: {seen:?}"
+    );
+    assert!(!running, "the completed sweep left nothing armed: {seen:?}");
+    assert_eq!(
+      spaced,
+      (1, false),
+      "a request right after a sweep completed armed none: (spaced, running) {spaced:?}"
+    );
+  }
+
   #[test]
   fn a_sweep_completes_within_its_bound_and_holds_every_range_to_its_bytes() {
     let daemon = crate::daemon::audit_daemon();
@@ -515,7 +673,7 @@ mod tests {
     let mut sweeps = 0;
     while sweeps == 0 && asked < bound {
       sweeps = crate::daemon::observe_first(&daemon, |state| {
-        report(state);
+        report(state, true);
         state.content_sweep.sweeps
       });
       asked += 1;

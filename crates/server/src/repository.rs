@@ -395,12 +395,120 @@ pub(crate) fn create_repository(
   ) {
     Ok(root) => {
       install_root(state, repository, root, adopted.is_some());
-      ReplyBody::GreenCreated {
+      let created = ReplyBody::GreenCreated {
         id: to_wire_volume(root),
-      }
+      };
+      land_creation(
+        state,
+        repository,
+        (name, tool, format, default_branch),
+        created,
+      )
     }
     Err(refusal) => refused(refusal),
   }
+}
+
+/// Counter: creations landed into the node's version-control store (A-767).
+pub(crate) const CREATION_LANDED: &str = "repository.create.landed";
+/// Counter: creations the store refused (its owner busy or gone, or its write failed): the repository stands in its
+/// partition, and its store holds no creation for it.
+pub(crate) const CREATION_UNLANDED: &str = "repository.create.unlanded";
+/// Counter: creations whose landing task could not be spawned (the shard's arena full).
+pub(crate) const CREATION_UNRUN: &str = "repository.create.unrun";
+
+/// Lands a new repository's creation into the node's version-control store when the daemon has one (A-767 item 7, main's
+/// ruling of 2026-11-20): one changeset, sequence 0, whose record names the repository as the client asked for it, under
+/// the node's store grant. The repository's record is the partition's already; the request is answered once the
+/// creation is durable in the store too (the verb defers its acceptance, AUD-11, and the task records its completion),
+/// so a client told a repository exists finds its history begun. Without a store the reply is `created` at once. A
+/// request with no reply route (a verb dispatched by the shard itself) is answered at once and its landing counted.
+fn land_creation(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+  created: ReplyBody,
+) -> ReplyBody {
+  let Some(disk) = state.vcs_disk.clone() else {
+    return created;
+  };
+  let header = slates_store::log::Header {
+    tool: match tool {
+      VcsTool::Git => slates_store::log::Tool::Git,
+      VcsTool::Mercurial => slates_store::log::Tool::Mercurial,
+      VcsTool::Subversion => slates_store::log::Tool::Subversion,
+    },
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence: 0,
+    judged_over: 0,
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let record = creation_record(name, tool, format, default_branch);
+  let deferred = state.current_request.zip(state.reply_route);
+  let reply = created.clone();
+  let task = async move {
+    let landed = disk
+      .land(
+        header,
+        vec![(slates_store::log::SectionKind::Record, record)],
+      )
+      .await;
+    let answered = crate::state::with_state_counted(move |state| {
+      state.count(
+        if landed.is_ok() {
+          CREATION_LANDED
+        } else {
+          CREATION_UNLANDED
+        },
+        1,
+      );
+      let ((origin, id), route) = deferred?;
+      state.db.begin();
+      let reply = match landed {
+        Ok(_) => reply,
+        Err(_) => refused(Refusal::Overloaded { shard: state.shard }),
+      };
+      let reply = crate::verbs::record_completion(state, origin, id, reply);
+      let reply = match state.db.commit(&mut state.segment) {
+        Ok(_) => reply,
+        Err(error) => {
+          crate::verbs::reconcile_unpublished_effects(state);
+          refused(refusal_of_db(&error))
+        }
+      };
+      Some((route, reply, state.shard))
+    })
+    .flatten();
+    if let Some((route, reply, here)) = answered {
+      crate::told::deliver_to(route, reply, here);
+    }
+  };
+  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
+    Ok(()) if deferred.is_some() => {
+      state.reply_route = None;
+      state.acceptance_deferred = true;
+      ReplyBody::Acknowledged
+    }
+    Ok(()) => created,
+    Err(_) => {
+      state.count(CREATION_UNRUN, 1);
+      created
+    }
+  }
+}
+
+/// Format: a repository's creation record in its store (A-767): one line each of a marker, the name, the default
+/// branch, the tool and the object format, as the client asked for them.
+fn creation_record(
+  name: &str,
+  tool: VcsTool,
+  format: ObjectFormat,
+  default_branch: &str,
+) -> Vec<u8> {
+  format!("slates repository create\n{name}\n{default_branch}\n{tool:?}\n{format:?}\n").into_bytes()
 }
 
 /// A new repository's id (A-636 part 2b-2): of the adopted green's family, so the root joins it, or of a family of its
@@ -1182,6 +1290,10 @@ pub(crate) async fn run_releases() {
     }
   }
 }
+
+#[cfg(test)]
+#[path = "repository/store_tests.rs"]
+mod store_tests;
 
 #[cfg(test)]
 mod tests {

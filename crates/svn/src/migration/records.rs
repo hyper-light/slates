@@ -425,37 +425,51 @@ impl Repository {
   ) -> Result<u64, StepRefusal> {
     let mut saved = 0u64;
     for change in changes {
-      let Some(text) = change.text else {
-        continue;
-      };
-      if self.texts.contains_key(&text.identity) {
-        continue;
-      }
-      let Some(bytes) = fresh.get(&text.identity) else {
-        continue;
-      };
-      let bytes = bytes.clone();
-      let base = self.skip_base(&change.path, revision, &text.identity);
-      let base_bytes = match base {
-        Some(base) => self.text(&base).ok_or(StepRefusal::Corrupt)?.into_owned(),
-        None => Vec::new(),
-      };
-      let (delta, windows) = encode_delta(&base_bytes, &bytes).ok_or(StepRefusal::Corrupt)?;
-      saved = saved.saturating_add(
-        u64::try_from(bytes.len())
-          .unwrap_or(u64::MAX)
-          .saturating_sub(u64::try_from(delta.len()).unwrap_or(u64::MAX)),
-      );
-      self.texts.insert(
-        text.identity,
-        KeptText {
-          base,
-          delta,
-          windows,
-        },
-      );
+      saved = saved.saturating_add(self.keep_one_fresh(revision, change, &fresh)?);
     }
-    // The property lists the rows name, kept whole; a text's bytes are in its delta alone.
+    self.keep_lists(changes, fresh);
+    Ok(saved)
+  }
+
+  /// Keeps the text `change` names, if `fresh` brings it and the records do not hold it ([`Repository::keep_fresh`]'s
+  /// one row): a delta against its node's skip-delta predecessor's text. What its delta takes less than its bytes did.
+  fn keep_one_fresh(
+    &mut self,
+    revision: Revision,
+    change: &ChangedPath,
+    fresh: &BTreeMap<ContentIdentity, Vec<u8>>,
+  ) -> Result<u64, StepRefusal> {
+    let Some(text) = change.text else {
+      return Ok(0);
+    };
+    if self.texts.contains_key(&text.identity) {
+      return Ok(0);
+    }
+    let Some(bytes) = fresh.get(&text.identity) else {
+      return Ok(0);
+    };
+    let base = self.skip_base(&change.path, revision, &text.identity);
+    let base_bytes = match base {
+      Some(base) => self.text(&base).ok_or(StepRefusal::Corrupt)?.into_owned(),
+      None => Vec::new(),
+    };
+    let (delta, windows) = encode_delta(&base_bytes, bytes).ok_or(StepRefusal::Corrupt)?;
+    let saved = u64::try_from(bytes.len())
+      .unwrap_or(u64::MAX)
+      .saturating_sub(u64::try_from(delta.len()).unwrap_or(u64::MAX));
+    self.texts.insert(
+      text.identity,
+      KeptText {
+        base,
+        delta,
+        windows,
+      },
+    );
+    Ok(saved)
+  }
+
+  /// Keeps whole the property lists `changes` name that `fresh` brings; a text's bytes are in its delta alone.
+  fn keep_lists(&mut self, changes: &[ChangedPath], fresh: BTreeMap<ContentIdentity, Vec<u8>>) {
     let lists: BTreeSet<ContentIdentity> = changes
       .iter()
       .filter_map(|change| match change.properties {
@@ -468,7 +482,6 @@ impl Repository {
         self.contents.insert(identity, bytes);
       }
     }
-    Ok(saved)
   }
 
   /// The text of the skip-delta predecessor of the node at `path` in `revision` (FSFS's rule, `fs_fs.c`
@@ -480,6 +493,13 @@ impl Repository {
     revision: Revision,
     identity: &ContentIdentity,
   ) -> Option<ContentIdentity> {
+    let base = self.skip_target(path, revision)?;
+    (base != *identity && self.texts.contains_key(&base)).then_some(base)
+  }
+
+  /// The text of the skip-delta predecessor of the node at `path` in `revision`, wherever it is kept; none for a node
+  /// with no predecessor, or one with no text.
+  fn skip_target(&self, path: &str, revision: Revision) -> Option<ContentIdentity> {
     let node = self.index.node(path, revision).ok().flatten()?;
     let count = node.predecessor_count();
     let target = count & count.saturating_sub(1);
@@ -487,8 +507,7 @@ impl Repository {
     for _ in 0..count.saturating_sub(target) {
       at = self.index.node_revision(at.predecessor()?).ok()?;
     }
-    let base = at.text()?.identity;
-    (base != *identity && self.texts.contains_key(&base)).then_some(base)
+    Some(at.text()?.identity)
   }
 
   /// The properties a node's property list holds.
@@ -608,7 +627,188 @@ impl Repository {
       } => self.set_revision_properties(revision, properties),
       Record::Revision(revision) => self.commit(revision).map(drop),
       Record::Locks(entries) => self.apply_lock_entries(&entries),
+      Record::Deltified { text, base, delta } => self.keep_deltified(text, base, delta),
     }
+  }
+
+  /// The stored texts the deltify job may keep as deltas now (main's ruling on A-761; GAPS' A-727 (c)), oldest first:
+  /// each a text a commit stored in the content store whose path's node at the youngest revision holds another text (its
+  /// node moved past it), with the text it would be a delta against: its node's skip-delta predecessor's, when the
+  /// records keep that one (a delta or a list's bytes), none for a first version or a predecessor of the same text. A
+  /// text whose predecessor is itself still stored waits, so a chain is made oldest first; a later call names it. One
+  /// walk of the rows, each stored text named once, by the first row that names it.
+  pub fn deltify_candidates(&self) -> Vec<Deltifiable> {
+    let youngest = self.youngest();
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for revision in 1..=youngest {
+      let Ok(changes) = self.index.changes(revision) else {
+        continue;
+      };
+      for change in changes {
+        let Some(text) = change.text else { continue };
+        if !self.stored.contains_key(&text.identity) || !seen.insert(text.identity) {
+          continue;
+        }
+        if let Some(candidate) = self.deltifiable(&change.path, revision, text.identity) {
+          candidates.push(candidate);
+        }
+      }
+    }
+    candidates
+  }
+
+  /// The stored texts `revision` moved past ([`Repository::deltify_candidates`]'s rule, for one revision): each path it
+  /// changed whose node before it held a stored text another than the one it holds now. What a commit hands the
+  /// deltify job: the rows of one revision walked, not the history.
+  pub fn deltify_after(&self, revision: Revision) -> Vec<Deltifiable> {
+    let Some(before) = revision.checked_sub(1) else {
+      return Vec::new();
+    };
+    let Ok(changes) = self.index.changes(revision) else {
+      return Vec::new();
+    };
+    let mut candidates: Vec<Deltifiable> = Vec::new();
+    for change in changes {
+      let Some(prior) = self
+        .index
+        .node(&change.path, before)
+        .ok()
+        .flatten()
+        .and_then(|node| node.text())
+      else {
+        continue;
+      };
+      if !self.stored.contains_key(&prior.identity)
+        || candidates
+          .iter()
+          .any(|candidate| candidate.text == prior.identity)
+      {
+        continue;
+      }
+      if let Some(candidate) = self.deltifiable(&change.path, before, prior.identity) {
+        candidates.push(candidate);
+      }
+    }
+    candidates
+  }
+
+  /// The stored text `text`, held by the node at `path` in `revision`, as the deltify job would take it now: none while
+  /// the youngest revision's node at `path` still holds it, or while its skip-delta predecessor's text is itself still
+  /// stored (it waits, so a chain is made oldest first).
+  fn deltifiable(
+    &self,
+    path: &str,
+    revision: Revision,
+    text: ContentIdentity,
+  ) -> Option<Deltifiable> {
+    let len = self.stored.get(&text).copied()?;
+    let head = self
+      .index
+      .node(path, self.youngest())
+      .ok()
+      .flatten()
+      .and_then(|node| node.text())
+      .map(|head| head.identity);
+    if head == Some(text) {
+      return None;
+    }
+    let base = match self.skip_target(path, revision) {
+      Some(base) if base == text => None,
+      Some(base) if self.stored.contains_key(&base) => return None,
+      Some(base) => self.kept_len(&base).map(|base_len| (base, base_len)),
+      None => None,
+    };
+    Some(Deltifiable { text, len, base })
+  }
+
+  /// `len` bytes of the text the records keep under `identity` from `offset`, made window by window: the source view a
+  /// deltify job's window is made against. None for a text the records do not keep, or a range past it.
+  pub fn kept_range(&self, identity: &ContentIdentity, offset: u64, len: u64) -> Option<Vec<u8>> {
+    self.range_of(identity, offset, len, 0)
+  }
+
+  /// The length of a text the records keep (a delta or a list's bytes), none for one they do not.
+  fn kept_len(&self, identity: &ContentIdentity) -> Option<u64> {
+    match self.texts.get(identity) {
+      Some(kept) => Some(kept.len()),
+      None => self
+        .contents
+        .get(identity)
+        .and_then(|bytes| u64::try_from(bytes.len()).ok()),
+    }
+  }
+
+  /// The check of [`Record::Deltified`], which changes nothing: the bytes the records would hold more once `text` is
+  /// kept as `delta` against `base`, and the delta's windows. The text must be stored, its base one the records keep (or
+  /// none), the delta an svndiff making exactly the stored length, and the records within their room after it.
+  ///
+  /// # Errors
+  /// [`StepRefusal::Corrupt`] for a text not stored, a base not kept, or a delta that is not an svndiff making the text's
+  /// length; [`StepRefusal::Room`] past the room.
+  pub fn check_deltified(
+    &self,
+    text: &ContentIdentity,
+    base: Option<&ContentIdentity>,
+    delta: &[u8],
+  ) -> Result<u64, StepRefusal> {
+    self
+      .checked_deltified(text, base, delta)
+      .map(|(growth, _)| growth)
+  }
+
+  /// [`Repository::check_deltified`], with the delta's windows.
+  fn checked_deltified(
+    &self,
+    text: &ContentIdentity,
+    base: Option<&ContentIdentity>,
+    delta: &[u8],
+  ) -> Result<CheckedDelta, StepRefusal> {
+    let len = self.stored.get(text).copied().ok_or(StepRefusal::Corrupt)?;
+    if base.is_some_and(|base| self.kept_len(base).is_none()) {
+      return Err(StepRefusal::Corrupt);
+    }
+    let windows = windows_of(delta).ok_or(StepRefusal::Corrupt)?;
+    let made = windows
+      .last()
+      .map_or(0, |(start, made, _)| start.saturating_add(*made));
+    if made != len {
+      return Err(StepRefusal::Corrupt);
+    }
+    let growth = u64::try_from(delta.len()).unwrap_or(u64::MAX);
+    let held = self.held.saturating_add(growth);
+    if held > self.room.bytes {
+      return Err(StepRefusal::Room {
+        needed: held,
+        room: self.room.bytes,
+      });
+    }
+    Ok((growth, windows))
+  }
+
+  /// A stored text kept as `delta` against `base` from now on, its stored length dropped ([`Record::Deltified`]), once
+  /// [`Repository::check_deltified`] takes it.
+  ///
+  /// # Errors
+  /// [`Repository::check_deltified`]'s.
+  fn keep_deltified(
+    &mut self,
+    text: ContentIdentity,
+    base: Option<ContentIdentity>,
+    delta: Vec<u8>,
+  ) -> Result<(), StepRefusal> {
+    let (growth, windows) = self.checked_deltified(&text, base.as_ref(), &delta)?;
+    self.stored.remove(&text);
+    self.texts.insert(
+      text,
+      KeptText {
+        base,
+        delta,
+        windows,
+      },
+    );
+    self.held = self.held.saturating_add(growth);
+    Ok(())
   }
 
   /// A transaction on the youngest revision, named as FSFS names it: the base, a `-`, and the repository's count of
@@ -705,6 +905,22 @@ impl Repository {
       stored,
       lock_entries,
     } = checked;
+    let (revision, changes, held) = self.apply_rows(planned, &properties, &fresh, &lock_entries)?;
+    let saved = self.keep_fresh(revision, &changes, fresh)?;
+    self.finish_revision((stored, properties), (held, saved));
+    Ok(revision)
+  }
+
+  /// [`Repository::apply`]'s first part: the plan's revision still the next, its lock entries and the room checked
+  /// again, its rows appended to the index and its lock entries applied; its number, its rows, and what the records hold
+  /// with it before its texts' deltas save.
+  fn apply_rows(
+    &mut self,
+    planned: Planned,
+    properties: &Properties,
+    fresh: &BTreeMap<ContentIdentity, Vec<u8>>,
+    lock_entries: &[LockEntry],
+  ) -> Result<(Revision, Vec<ChangedPath>, u64), StepRefusal> {
     let youngest = self.youngest();
     if planned.revision() != youngest.checked_add(1).ok_or(StepRefusal::Corrupt)? {
       return Err(StepRefusal::OutOfDate {
@@ -714,27 +930,114 @@ impl Repository {
     }
     self
       .locks
-      .check_entries(&lock_entries)
+      .check_entries(lock_entries)
       .map_err(StepRefusal::Lock)?;
-    let held = self.grown(&properties, &fresh)?;
+    let held = self.grown(properties, fresh)?;
     // Checked just above against these very records, so neither refuses; a refusal would still be answered, typed.
     let revision = self.index.commit_planned(planned)?;
     self
       .locks
-      .apply_all(&lock_entries)
+      .apply_all(lock_entries)
       .map_err(StepRefusal::Lock)?;
     let changes = self
       .index
       .changes(revision)
       .map(<[ChangedPath]>::to_vec)
       .unwrap_or_default();
-    let saved = self.keep_fresh(revision, &changes, fresh)?;
+    Ok((revision, changes, held))
+  }
+
+  /// [`Repository::apply`]'s last part, once its texts are kept: its stored texts named, its properties kept, and what
+  /// the records hold, `held` less what the deltas `saved`.
+  fn finish_revision(
+    &mut self,
+    (stored, properties): (BTreeMap<ContentIdentity, u64>, Properties),
+    (held, saved): (u64, u64),
+  ) {
     for (identity, len) in stored {
       self.stored.entry(identity).or_insert(len);
     }
     self.revision_properties.push(properties);
     self.held = held.saturating_sub(saved);
-    Ok(revision)
+  }
+
+  /// A recorded revision's replay begun ([`RevisionReplay`]; R4: a recovery replayed a revision's record whole, its every
+  /// text deltified in one step): checked as [`Repository::commit_record`] checks it.
+  ///
+  /// # Errors
+  /// Every refusal of [`Repository::check`]'s.
+  pub fn replay_revision(&self, revision: RevisionToCommit) -> Result<RevisionReplay, StepRefusal> {
+    Ok(RevisionReplay {
+      stage: ReplayStage::Checked(Box::new(self.check(revision)?)),
+    })
+  }
+
+  /// One step of `replay` ([`RevisionReplay`]): its rows applied at its first step, then the texts of at most `most`
+  /// of its rows (one at least) kept each step, then its properties and stored texts; the revision once it is whole,
+  /// none while steps remain. Until then the records are mid-revision, which a recovery lends to no reader.
+  ///
+  /// # Errors
+  /// Every refusal of [`Repository::apply`]'s; [`StepRefusal::Corrupt`] for a replay already ended.
+  pub fn replay_step(
+    &mut self,
+    replay: &mut RevisionReplay,
+    most: usize,
+  ) -> Result<Option<Revision>, StepRefusal> {
+    match std::mem::replace(&mut replay.stage, ReplayStage::Ended) {
+      ReplayStage::Checked(checked) => {
+        let Checked {
+          planned,
+          properties,
+          fresh,
+          stored,
+          lock_entries,
+        } = *checked;
+        let (revision, changes, held) =
+          self.apply_rows(planned, &properties, &fresh, &lock_entries)?;
+        replay.stage = ReplayStage::Keeping(Box::new(Keeping {
+          revision,
+          changes,
+          at: 0,
+          fresh,
+          stored,
+          properties,
+          held,
+          saved: 0,
+        }));
+        Ok(None)
+      }
+      ReplayStage::Keeping(mut keeping) => {
+        let end = keeping
+          .at
+          .saturating_add(most.max(1))
+          .min(keeping.changes.len());
+        while keeping.at < end {
+          if let Some(change) = keeping.changes.get(keeping.at) {
+            let saved = self.keep_one_fresh(keeping.revision, change, &keeping.fresh)?;
+            keeping.saved = keeping.saved.saturating_add(saved);
+          }
+          keeping.at = keeping.at.saturating_add(1);
+        }
+        if keeping.at < keeping.changes.len() {
+          replay.stage = ReplayStage::Keeping(keeping);
+          return Ok(None);
+        }
+        let Keeping {
+          revision,
+          changes,
+          fresh,
+          stored,
+          properties,
+          held,
+          saved,
+          ..
+        } = *keeping;
+        self.keep_lists(&changes, fresh);
+        self.finish_revision((stored, properties), (held, saved));
+        Ok(Some(revision))
+      }
+      ReplayStage::Ended => Err(StepRefusal::Corrupt),
+    }
   }
 
   /// The commit step's check of a client's accepted work at the moment its owner commits it (A-655 part 2b), as FSFS
@@ -905,8 +1208,98 @@ impl KeptText {
 /// Derived: a `u64`'s 64 halvings, and the first version.
 const MAX_CHAIN: usize = 65;
 
+/// A delta checked against its text: the text's length and the delta's windows (target offset, target length,
+/// offset into the delta).
+type CheckedDelta = (u64, Vec<(u64, u64, usize)>);
+
 /// An encoded delta and its windows: each window's (offset into the target, target length, offset into the delta).
 type EncodedDelta = (Vec<u8>, Vec<(u64, u64, usize)>);
+
+/// A stored text the deltify job may keep as a delta ([`Repository::deltify_candidates`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deltifiable {
+  /// The text's identity.
+  pub text: ContentIdentity,
+  /// Its length, as stored.
+  pub len: u64,
+  /// The text its delta is against and that text's length; none for a delta against nothing.
+  pub base: Option<(ContentIdentity, u64)>,
+}
+
+/// An svndiff of version 2 made a window at a time ([`DeltaWriter::window`]), as the deltify job makes a stored text's
+/// delta a bounded step a turn: each window from a piece of the target and the piece of the source beside it, its
+/// sections LZ4 blocks where that is shorter, as [`encode_delta`] writes the records' other deltas.
+#[derive(Debug)]
+pub struct DeltaWriter {
+  /// The encoder.
+  encoder: svndiff::Encoder,
+  /// The delta so far.
+  out: Vec<u8>,
+}
+
+impl Default for DeltaWriter {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl DeltaWriter {
+  /// A delta with its header written.
+  pub fn new() -> Self {
+    let encoder = svndiff::Encoder::new(svndiff::Version::Two);
+    let out = encoder.header().to_vec();
+    Self { encoder, out }
+  }
+
+  /// The most target bytes one window makes, and the most source bytes it views: Subversion's window
+  /// (`SVN_DELTA_WINDOW_SIZE`), as the records' other deltas are cut.
+  pub fn window_room() -> u64 {
+    svndiff::WINDOW_LIMIT
+  }
+
+  /// The window that makes `target` (at most [`DeltaWriter::window_room`] bytes) from `source`, the source's bytes
+  /// from `source_offset`: the windows the deltifier makes of the two pieces, their views moved to where `source` lies
+  /// in the whole source. None if the deltifier or the encoder refuses, which it never does within the room.
+  pub fn window(&mut self, source: &[u8], source_offset: u64, target: &[u8]) -> Option<()> {
+    let room = std::num::NonZeroUsize::new(usize::try_from(svndiff::WINDOW_LIMIT).ok()?)?;
+    for mut window in svndiff::deltas(source, target, room).ok()? {
+      window.source_offset = window.source_offset.checked_add(source_offset)?;
+      self
+        .encoder
+        .window(&window, svndiff::Compression::Lz4, &mut self.out)
+        .ok()?;
+    }
+    Some(())
+  }
+
+  /// The delta's bytes.
+  pub fn finish(self) -> Vec<u8> {
+    self.out
+  }
+}
+
+/// Each window of `delta` (an svndiff): where its target bytes start in the text, how many it makes, and where its
+/// encoding starts in the delta; none for bytes that are not a whole svndiff.
+fn windows_of(delta: &[u8]) -> Option<Vec<(u64, u64, usize)>> {
+  let mut decoder = svndiff::Decoder::new();
+  let mut at = match decoder.decode(delta).ok()? {
+    svndiff::Decoded::Header { consumed, .. } => consumed,
+    _ => return None,
+  };
+  let mut windows = Vec::new();
+  let mut made = 0u64;
+  while at < delta.len() {
+    match decoder.decode(delta.get(at..)?).ok()? {
+      svndiff::Decoded::Window { window, consumed } => {
+        windows.push((made, window.target_len, at));
+        made = made.checked_add(window.target_len)?;
+        at = at.checked_add(consumed)?;
+      }
+      _ => return None,
+    }
+  }
+  Some(windows)
+}
 
 /// `target` as an svndiff of version 2 against `source`, each window's sections LZ4 blocks where that is shorter, as
 /// FSFS 1.10 and later write a representation; none if the encoder refuses a window it made, which it never does.
@@ -924,6 +1317,47 @@ fn encode_delta(source: &[u8], target: &[u8]) -> Option<EncodedDelta> {
       .ok()?;
   }
   Some((out, windows))
+}
+
+/// A recorded revision's replay a bounded step at a time ([`Repository::replay_revision`], [`Repository::replay_step`];
+/// R4 of Ada's close list: a recovery replayed a revision's record whole, every text it brought deltified in one step,
+/// so one large revision held its shard): where it stands.
+#[derive(Debug)]
+pub struct RevisionReplay {
+  /// Where it stands.
+  stage: ReplayStage,
+}
+
+/// Where a [`RevisionReplay`] stands.
+#[derive(Debug)]
+enum ReplayStage {
+  /// Checked; its rows not yet applied.
+  Checked(Box<Checked>),
+  /// Its rows applied; its texts being kept a step's worth at a time.
+  Keeping(Box<Keeping>),
+  /// Ended.
+  Ended,
+}
+
+/// A replayed revision's texts being kept ([`ReplayStage::Keeping`]).
+#[derive(Debug)]
+struct Keeping {
+  /// The revision.
+  revision: Revision,
+  /// Its rows.
+  changes: Vec<ChangedPath>,
+  /// How many of its rows' texts are kept.
+  at: usize,
+  /// The texts and property lists it brought.
+  fresh: BTreeMap<ContentIdentity, Vec<u8>>,
+  /// The texts its commit stored.
+  stored: BTreeMap<ContentIdentity, u64>,
+  /// Its revision properties.
+  properties: Properties,
+  /// What the records hold with it before its deltas save.
+  held: u64,
+  /// What its texts' deltas have saved so far.
+  saved: u64,
 }
 
 /// A revision the commit step checked against a repository ([`Repository::check`]): what [`Repository::apply`]

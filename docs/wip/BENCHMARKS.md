@@ -8830,6 +8830,56 @@ installs; diag-82's owner hooks found that tail (215,997 bytes at head 16,526). 
 diag-81 (`agents/live-durability-catchup-record`) was withdrawn on 2026-11-19: diag-84 supersedes it, and its "about
 100% of a CPU" reading had counted a window that began before the resume.
 
+### The catch-up on today's main: the pair against the pair reverted, interleaved (A-200; 2026-11-20, g227)
+
+**The question.** On the Nov 12 trees the pair caught a holder up slower than main did: 9.4–13.3 s on arm against
+2.2–2.4 s. Does that hold on today's main, and is the pair worth keeping?
+
+**The command.** `SLATES_TEST_CLI=1 SLATES_CATCH_UP_BACKLOG=20000 cargo test --release --locked -p slates-cli --test
+live_chaos -- --nocapture --test-threads=1 --exact a_resumed_holders_catch_up_beside_a_busy_volume`, run in ABBA order,
+4 runs each, a separate target directory each.
+
+**Trees.**
+- A: main with the flow fixed (ec1f2ab1, landed in b80f5699; d33d2a48 on GitHub, the same tree plus the diag workflow).
+- B: the same tree with the pair's three changes reverted (`agents/g227-catchup-baseline-2`, 837c3be2): `fold_reply`,
+  the per-entry retain bound, and `retains_after` without building.
+
+Both trees build the flow, but the scripts' up-front `cargo build --release --locked -p slates-cli --bin slates --tests`
+exited 101 on both GitHub runners for both trees. That build covers every test target, and some other target failed to
+build; the flow's own target built when it ran.
+
+**Machines.**
+- GitHub `ubuntu-24.04-arm` (aarch64) and `ubuntu-latest` (x86_64), 4 CPUs each, load about 2, 2026-11-20 23:20 UTC
+  (`diag-g227-catchup-2`; results on `diag-results/g227-catchup-2-{arm,x86}`).
+- Adas-Mac-Studio (Apple silicon, 32 CPUs), shared, load 9–49 (kiln, 2026-11-21 00:45 UTC).
+
+A Linux x86_64 leg on adacachy (load 72–77) did not finish its first release build in kiln's 4 hours, and gave no runs.
+
+| leg | A: catch-up, each run (s) | A: installs | B: each run |
+|---|---|---|---|
+| GitHub arm | 2.73 3.86 4.19 8.95 | 0 1 0 0 | timed out at 1,200 s, 4 of 4 |
+| GitHub x86 | 4.47 3.43 3.84 3.89 | 1 0 1 1 | timed out at 1,200 s, 4 of 4 |
+| Studio | 38.33 82.98 8.76 20.65 (load 10.7, 48.2, 29.0, 8.9) | 0 0 1 1 | 24.01 23.54 17.80 8.82 (load 14.4, 20.2, 15.5, 12.2); installs 1 2 1 2 |
+
+- **A's other figures.** Per MiB behind: 15.1–49.1 ms on GitHub arm, 19.1–25.2 ms on x86. The owner's two shards spent
+  442–1,247 CPU ticks over each catch-up (Linux).
+- **B's 20,000 writes with the holder stopped.** On GitHub they never finished inside 1,200 s, 8 of 8. On the Studio
+  they took 344, 1,134, 344 and 925 s, against A's 19.5, 42.9, 18.4 and 40.0 s.
+- **Neighbour volume during the catch-up, on the Studio.** A: 3,031–4,690 writes, p50 3.0–16.1 ms. B: 1,668–2,899
+  writes, p50 4.9–10.3 ms.
+
+**Reading.**
+- The arm gap of Nov 12 is gone on today's main. On GitHub's arm runner, A's best catch-up (2.73 s) sits in the old
+  main's 2.2–2.4 s range. Its median is about 4.0 s, under half the Nov 12 trees' 9.4–13.3 s.
+- Reverting the pair costs far more than any catch-up difference. Without the reply fold's fix, every reply of the
+  stopped holder clones its whole backlog, and once it resumes, the writes behind it crawl: 8 to 60 times A's time on
+  the Studio, and past 1,200 s on 4-CPU runners.
+- On the loaded Studio both trees' best catch-up is 8.8 s. A's two slowest runs were its two most loaded (48 and 11).
+- **Verdict:** the pair stays (already on main since 59ec7871). Reverting it is measured and rejected.
+- **Not pursued, recorded:** each exchange to a lagging holder is capped at one congestion window (`take_batch`), so a
+  catch-up runs at about a window a round trip. With the arm gap gone there is no measured cost to remove, so it is
+  noted here and in GAPS, not worked.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The
@@ -15327,6 +15377,28 @@ over-allocation left. w-hg's account: the import keeps every file revision whole
 115,479 file revisions are 4,296.9 MiB as whole texts; a push of the same history committed 4,495.5 MiB). Ada's
 changeset ruling (changesets the stored unit, per-file deltas derived) replaces that; its A/B is the next section.
 
+### Where import D's 5.7 GB is: the content store's whole texts, 91 % (R2's attribution; main's order of 15:35; 2026-11-20)
+Build: release main 1b63ab896, the same Studio and hg-src (`.hg` 87,836 KiB), one import on a fresh anchor (kiln
+r26, script `~/.cache/w-perf/bench/hgmem.sh`, logs `~/.cache/w-perf/prof/hgmem-20261121T011519/`). The daemon's RSS
+sampled by `ps` each second, its import counters beside it; `footprint` and `vmmap -summary` taken before the import and
+after its landing only. Rejected as instruments, each tried: `MallocStackLogging` (every step slowed past the daemon's 1 s
+liveness window: the anchor killed and restarted it about a hundred times, peak 633 MB, 2,172 s) and `heap` (it
+suspended the daemon for 211 s: 7 restarts). Neither number is the import's.
+
+| Phase (s from the import's start) | RSS |
+|---|---|
+| 0 to 54: the changelog and manifests read | 93 MB -> 967 MB |
+| 54 to 111 | flat, 967 MB -> 1,068 MB |
+| 122 to 311: the file logs, every revision put whole | 1,267 MB -> 5,583 MB |
+| 311 to the landing: the record written, landed | flat, 5,583 MB -> 5,630 MB |
+
+After the landing, `footprint` 5,589 MB (peak 5,648 MB): **shared memory 5.1 GB dirty** (the content store's chunk arena
+in the anchor's content object, A-727), `MALLOC_SMALL` 193 MB, `VM_ALLOCATE` 154 MB, the rest (text, stacks, page
+tables) about 130 MB. So 91 % of the peak is what the import keeps in the content store: Mercurial's 115,479 file
+revisions as whole texts, 4,296.9 MiB by w-hg's count, plus the arena's chunks around them; the heap is 6 %. The cut is
+what the store keeps, not a transient: the changeset as the stored unit with per-file reads derived (Ada's ruling; main's
+ruling of 15:40 for R2), which waits on w-store's slates-store (A-767 piece 3) and hg onto it (w-hg's close item).
+
 ### The lend's swap, release (A-727 slice a2)
 `vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
@@ -15556,6 +15628,44 @@ What it says:
 Owed: the full clone over the wire (changesets, manifests derived, files) and an import's RSS in the daemon, once
 the shape is built there. And N=3 an arm on a quiet machine.
 
+## Mercurial's history as changesets with a derived per-file form: arm C of the changeset A/B (A-767 C3; main's order of 2026-11-20: "changesets plus a derived per-path form ... must meet the per-file arm's 91 µs and 0.27 s, or beat them, before A-767 is built"; 2026-11-20)
+
+**What it is.** w-hg's `changeset_ab` (the section above) with a third arm. **C**: B's log, in changeset order, is the
+truth; from it a per-file log is derived (each file's revisions in revision order, read out of B's compressed segments
+through the same 64-segment decoded cache, then cut into 64 KiB segments and compressed again) and kept as derived data
+by identity (A-645), and every read runs on the derived form. All three arms hold Mercurial's own deltas (no diff at the
+server) and check every rebuilt text against its BLAKE3 identity.
+
+**Command.** `cargo build --release -p slates-hg --example changeset_ab` at the worktree of this entry's commit, then
+`/usr/bin/time -l changeset_ab <hg-src> <A|B|C> 2000`, rounds of A B C interleaved, N=3. Machine: Adas-Mac-Studio-2.local
+(Apple silicon, 14 cores, 36 GiB, macOS), 2026-11-20 18:42 to 19:09 PST, load average 1.9 to 3.5. Data: Mercurial's
+repository cloned from mercurial-scm.org (57,054 changesets, 4,243 paths, 114,732 file revisions, 94.0 MiB of
+deltas). adacachy, which main named for timing while the Studios' network is bad, could not clone the history from
+mercurial-scm.org (three "incomplete response" aborts), so these rows are this Mac's.
+
+| zstd 1, rounds 1 / 2 / 3 | Held | Old read µs p50 | p99 | Clone file section | Segment decodes |
+|---|---|---|---|---|---|
+| A per-file | 26.6 MiB | 77 / 77 / 79 | 2,646 / 2,617 / 2,681 | 0.19 / 0.19 / 0.20 s | 5,258 |
+| B changesets | 28.5 MiB | 833 / 814 / 829 | 12,345 / 12,184 / 12,323 | 2.02 / 2.02 / 2.02 s | 52,498 |
+| C changesets + derived per-file | 28.5 MiB truth + 25.7 MiB derived | 73 / 73 / 74 | 2,677 / 2,638 / 2,660 | 0.06 / 0.06 / 0.06 s | 1,505 |
+
+Deriving C's per-file form from B's log: 2.17 / 2.17 / 2.19 s for the whole history (2.03 to 2.05 s of it regrouping
+through 52,498 decodes of B's segments, the rest compressing). Other codecs, round 1: raw 0.09 s and 94.0 MiB derived,
+reads p50 15 µs, clone 0.01 s; LZ4 1.02 s and 35.2 MiB, 40 µs, 0.03 s; zstd 3 2.27 s and 24.3 MiB, 72 µs, 0.06 s; zstd 9
+2.92 s and 22.2 MiB, 71 µs, 0.06 s. Peak RSS (the example holds every arm's raw log at once, so it is the harness's, not
+a store's): A 593 to 615 MB, B 618 to 624 MB, C 966 to 1,017 MB.
+
+What it says:
+- **C meets the bar and beats it**: old reads p50 73 µs against the per-file arm's 77 here (91 in w-hg's run), a clone's
+  file section 0.06 s against 0.19 (0.27). Its clone decodes fewer segments than A because its derived log is laid out in
+  the clone's own order (sorted paths), where A's follows the fncache; C is no faster than A's layout would be in that
+  order, and needs no faster.
+- **The cost is a derivation and its bytes**: 2.2 s once for the whole history, and for each later changeset only its
+  own files' runs; 25.7 MiB of derived form beside the 28.5 MiB of changesets (54.2 MiB in all, against stock hg's 77.6
+  MiB store), evictable and recomputable since it is derived.
+- Decision for A-767: the changeset log is the truth; a per-file form derived from it, cached by identity, serves reads
+  and clones.
+
 ## Subversion's history held as changesets or as per-file deltas, counted: svn's arm of the changeset A/B (Ada's ruling of 2026-11-20 ~13:35; main's A/B order; UI goal 93; 2026-11-20)
 
 **What it is.** The same A/B as Mercurial's (the section above, w-hg's `changeset_ab`). Both arms hold exactly the
@@ -15719,6 +15829,42 @@ What it says:
 - Logs: `~/.cache/w-perf/ab/a722p3-20261120T232946/` on the Studio (`push-<arm>-<round>.log`,
   `scale-<arm>-<round>.log`).
 
+## The derived per-path read form on the changeset store: an old file revision in 85 µs at p50, read from its own chain alone (A-645 on A-767; main's order of 2026-11-20 18:30; UI goal 93; 2026-11-20)
+
+**What it is.** The changeset store's read side for a file's old versions (`slates_store::texts`, fa5fd0023 and
+c5d746f8b): each changeset's `Texts` section names every version it kept (identity, length, base, place in its
+payload); landing derives `T` rows (a text by identity to how it is made) and `H` rows (a path's history), and
+`Store::text_at` makes a version by walking its `T` rows to a whole and applying each edit read from its own changeset,
+so no changeset outside the chain is read. Main's bar: "an old file revision read without rebuilding any changeset it
+isn't in, within the per-file arm's 91 µs" (w-hg's arm A at zstd 1, p50; the section "Mercurial's history held as
+changesets or as per-file deltas" above).
+
+**Command.** `cargo run --locked --release -p slates-store --example per_path_read -- ~/.cache/w-perf/hg-src DIR 2000`
+at c5d746f8b (kiln r32), adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores, 96 GiB), 2026-11-20 20:13 to 20:31 PST, load
+11 to 14 (shared). Mercurial's own repository (4,242 paths, 114,696 file revisions, 94.0 MiB of revlog chunks) landed as
+54,728 changesets, one a changelog revision with the file revisions it introduced, each Mercurial's own chunk (a whole
+or its `mpatch` hunks against its recorded base; no diff made). Then 2,000 file revisions drawn as `changeset_ab` draws
+them (xorshift, seed 0x2026_1120), each read whole on a cold text cache, checked against its BLAKE3, three rounds over
+the same draws in one process.
+
+| Round | Old read µs p50 / p99 / max | Changesets opened p50 / p99 | Reads outside their chain |
+|---|---|---|---|
+| 1 (the log not yet in the page cache) | 234 / 20,334 / 90,598 | 41 / 851 | 0 |
+| 2 | 87 / 4,048 / 11,519 | 41 / 851 | 0 |
+| 3 | 85 / 4,067 / 9,083 | 41 / 851 | 0 |
+
+- **Within the bar once the log is cached** (85 and 87 µs against 91 µs), and the p99 beside arm A's (3,716 µs at zstd 1,
+  3,807 raw). Every read opened its own chain's changesets alone. The first round pays the log's first read from the
+  device (20 ms at p99).
+- **The chains are Mercurial's own**, up to 851 edits: a read applies each edit over the text before it. Shorter chains
+  (the store's own wholes at the chain bound) are the stored form's, w-hg's C1.
+- **Landing**: 978.7 s, 17.9 ms a changeset, one full flush (`F_FULLFSYNC`) each, as the store commits today; landings
+  sharing a flush are w-store's (A-767 item 2). The log 128.0 MiB (the chunks plus each changeset's `Texts` section and
+  framing), the rows file 132 KiB before a checkpoint. Peak RSS 1.06 GB is the example's (every chunk and identity held
+  to land and check), not the store's.
+- Found on this history and fixed first (c5d746f8b): a text that comes back (A, B, A) made a chain loop when its row
+  was replaced; a `T` row is now its first landing's.
+
 ## Record version 3 against version 2: a push's latency with its names homed first (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The builds:** v2 = f95edf68e (the switch off), v3 = 5ca050628 (the switch on, landed as 08fba4007), release, each built
@@ -15787,6 +15933,24 @@ alone exhausts its budget.
   of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
   refiner's p99 save, at token grain, is about 14 ms for that file.
 
+## Content pool extents as objects of their own on macOS (A-789; main's ruling of 2026-11-20 15:20; 2026-11-20)
+- **Give-back, by use:** recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`, a one-shard
+  daemon over a held anchor, a 256 MiB burst into a volume of its own, then the volume destroyed. Measured as the
+  anchor's content object's pages in RAM (`mincore` through the anchor's view) plus the process's resident memory, on
+  adas-macbook-pro-2.local (macOS arm64; quiet). Before (961112d0e): 63 MiB, 1,621 MiB with the burst, 1,622 MiB 20 s
+  after the destroy (the object kept 259 MiB, the process 1,362 MiB). After (d0f3199f9): 420 MiB, 1,648 MiB, 123 MiB
+  (the object 0 MiB).
+- **Provisioning, interleaved A/B:** kiln run r26 on Adas-Mac-Studio.local (macOS arm64, 32 cores), release
+  `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), three rounds A then B,
+  each the median of three runs. The machine ran at load 44 to 79, so every figure is mostly scheduling, and neither arm
+  is near the 50 us floor:
+  - 1 client spinning, p50 (us): A 133.7, 114.4, 96.9; B 101.0, 115.5, 106.7.
+  - 1 client spinning, p99 (us): A 4,323.9, 1,260.8, 2,404.5; B 1,900.5, 861.5, 784.1.
+  - 8 clients spinning, p99 (us): A 3,661.3, 2,928.5, 3,952.5; B 817.4, 2,093.0, 3,664.4.
+  - 1 client parked, p99 (us): A 7,669.4, 5,544.9, 5,272.3; B 5,248.8, 8,701.8, 8,474.4.
+  No arm moved the histogram beyond the noise. A claim still opens and maps one object by name, as before; the extent
+  objects are made at the shard's start and at release. A rerun on a quiet machine is in the run requests.
+
 ## The idle prefault reserve against none (A-777; main's items 1-2 after A-765; 2026-11-20)
 - **The command and machine:** Adas-Mac-Studio.local (macOS arm64, 32 cores), kiln run r6, release, interleaved, three
   rounds: A = main 5518fb2bc (the reserve, A-765's decay), B = agents/w-sizing-noprefault (none).
@@ -15845,6 +16009,16 @@ arm64), loaded (load average 55-73 from other agents' builds); runs interleaved.
 | the cache plus w-svn's owned run kept across a window's pieces | 1.97, 2.27, 7.82, 1.99, 1.78 | 1.78 | 0.89 ms | 30,488 |
 
 Measured and rejected: the owned-run change (dead even with the cache, the same windows made); the cache stays.
+
+Through the daemon (release, this Mac at load ~35-45, base a703 at 2bf76bbbb-era with the owned-run drive, equal to the
+cache by the table above): `SLATES_SVN_REPLAY_DUMP=git-2000.dump SLATES_SVN_REPLAY_LAST=300 /usr/bin/time -l
+target/release/deps/slates_server-* measure_svnsync_replay_range_over_the_tunnel --ignored --nocapture` imports the
+dump into a test daemon a turn a call, then hands `svnserve -t` over the daemon's SSH site the recorded tunnel
+handshake and one `replay-range ( 1 300 0 true )`, as `svnsync synchronize` asks. One run: the replay of r1..r300
+2.22 s, 7.4 ms a revision (27,339,304 bytes, 300 `finish-replay`s), against the matrix's 540 ms a revision before the
+cache: the server's one-step turns are not the gap. The import 62.3 s (131-485 s before SimHost lent its node,
+fc6ebd03c). The process's peak, 5.68 GB, holds the dump twice for the simulated host and is no daemon's figure: the
+2,511 MiB peak against the 447 MiB dump is measured next on a release daemon (A-772, GAPS).
 Peak RSS of the bench (import + replay): 591-597 MB against the 447 MiB dump. The remaining gap to the matrix's
 0.54 s a revision is the server's per turn: ~960 steps a revision at one step a turn (the quantum, ~3.7 us, is under
 one step), measured next through the daemon's SSH site (`measure_svnsync_replay_range_over_the_tunnel`).
@@ -15909,3 +16083,800 @@ work's files, a2415c930). After: the slot an overlay over the green's pinned ver
 | after | 0.75, 0.75, 0.72, 0.82, 0.79 | 0.53, 0.78, 0.69, 0.60, 0.71 | 0.32, 0.56, 0.46, 0.42, 6.91 |
 
 Bound the test holds: 8 x (256 KiB + one 64 KiB file) + 8 MiB = 11.0 MB. A mount's own bytes: 90-102 KB.
+
+
+## R9's loaded p99 on macOS: where it goes, and the immediate poll A/B (A-786; R9; 2026-11-20, w-provision-gate)
+
+**Machine and load.** This MacBook: Apple M4 Max, 14 CPUs (10 P + 4 E), 36 GB, macOS 26. Release builds,
+`provision_bench`, 9 shards (derived). The host's own load was 4 to 54 from other agents' builds through the day, so "quiet"
+below is the machine as it was, not a quiesced one. "Loaded" adds `PROVISION_BENCH_LOAD=2`: 28 busy processes at default
+priority (two a logical CPU), started after the daemon's boot. Each figure is the median of the bench's three runs, and
+the arms ran interleaved round by round. Diagnostic code (hop stamps, harvest counters, the arms' switches) lived only in
+the scratch tree, and the arms' binaries were compared by MD5 before running.
+
+**Red on main (base 37c84db43; host load 36-38).** Quiet 1-client spinning p50/p99/p999
+88.5 µs / 616 µs / 1.92 ms; parked p99 683 µs. Loaded: spinning 85.0 µs / 1.62 ms / 13.4 ms; parked p99 939 µs. Bound
+616 + (939 - 683) = 873 µs: FAIL.
+
+**Whose time.** A-559's stamps split each create: the creates at or past the loaded p99 spent 1.1 to 1.7 ms in the
+daemon at the median and 14 to 28 µs in the client (all of them parked their client). Stamps at each hop of a
+forwarded create, at the tail median (loaded): pickup by the client's shard 16-64 µs, the forward to the owner 7-13 µs,
+the owner's create 13-30 µs, the reply's task back on the client's shard 6-21 µs, from that task to the shard's serve task
+**0.77-1.37 ms** (quiet: 15 µs at the median, every create), the write into the client's ring 1 µs.
+
+**Why.** `Shard::run` harvests the driver with a zero-timeout wait whenever it has been busy a step quantum, and that ran
+between the two tasks. On macOS that wait is `kevent` with a zero timespec, which sleeps 12-15 µs with an involuntary
+switch (A-218). Counted in one 3-run form: quiet, 0 of 79,591 harvests over 100 µs (max 89 µs); loaded, 2,695 of 59,622
+(max 9.1 ms).
+
+**The A/B (loaded, three interleaved rounds, host load 41-54).** Arms: main; `immediate` (every zero-timeout wait on the
+queue is `kevent64` with `KEVENT_FLAG_IMMEDIATE`, the registrations and the kick moved to `kevent64` with it); and
+`immediate, no hold` (the same, with the closed-loop hold at 0).
+
+| arm | p50 µs | p99 ms | p999 ms | CPU, thousandths of a core |
+|---|---|---|---|---|
+| main | 114.8 / 82.3 / 77.8 | 1.04 / 0.49 / 0.91 | 2.74 / 2.26 / 7.78 | 773-1,167 / 2-1,017 / 656-811 |
+| immediate | 80.7 / 57.9 / 85.8 | 0.43 / 0.54 / 0.73 | 12.1 / 10.6 / 12.0 | 2,084-4,918 / 2,176-2,388 / 1,717-2,488 |
+| immediate, no hold | 29.6 / 68.3 / 58.9 | 0.17 / 0.38 / 0.27 | 0.30 / 11.3 / 6.65 | 1,358-3,093 / 1,270-3,518 / 1,202-2,458 |
+
+Slow harvests (over 100 µs) fell from 1,410-5,832 a form on main to 3-19 with the immediate poll. An earlier round of the
+same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against 0.67 / 0.46 / 0.74 ms, p999 13-18 against
+26-36 ms.
+
+**Measured and rejected:**
+- `immediate` with a `sched_yield` in each idle-spin turn. Quiet, it gave the best p50 (35 µs) at 0.1-0.9 cores. Loaded,
+  every p99 was 10.1 ms: each yield gave a spinner macOS's whole 10 ms quantum.
+- Zero-timeout polls of two forms on one queue (`IMMEDIATE` for the busy harvest, a zero timespec for the spin's turn, to
+  keep the spin's nap). 3 of 3 runs hung at the first create, every shard parked in `kevent64` and the client waiting: a
+  kick was lost. Not chased.
+
+**Reading.** The immediate poll removes the hop's millisecond tail. Alone, it makes A-387 keep holds, since turns now cost
+0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
+next piece; the immediate poll lands with it, not before.
+
+### R9's loaded p99 on macOS, the candidates (A-786; 2026-11-20 evening, w-provision-gate)
+
+Same MacBook, host load 10-26. `provision_bench` with `PROVISION_BENCH_LOAD=2` (quiet forms, then loaded ones), three
+rounds interleaved. Each cell is the median of the bench's three runs.
+
+The arms:
+- **main:** origin/main's runtime.
+- **time:** kqueue on `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait (`agents/w-provision-gate-kqueue`),
+  plus A-387's turn estimate with a memory of spinning time: each turn decays both sums by (H - T)/H, with H the longest
+  hold asked. It is unit-tested: after a 1 ms preemption and 1,000 polling turns, the old estimate read 400 ns.
+- **nap:** the immediate kqueue, A-387 unchanged, and on macOS an idle-spin turn that found nothing sleeps the OS's
+  shortest sleep (`sleep(1 ns)`, about 15 µs), the nap main's `kevent` took. The nap moves to the idle spin, so it never
+  sits between two tasks of a request.
+
+| arm | quiet p50 µs | quiet p99 µs | quiet p999 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|---|---|
+| main | 41.9 / 42.4 / 42.8 | 111 / 103 / 99 | 147 / 136 / 138 | 1.30 / 1.34 / 1.06 | 2.47 / 2.46 / 2.12 | 1.66-1.72 |
+| time | 16.7 / 14.0 / 15.2 | 36 / 28 / 43 | 65 / 51 / 103 | 0.44 / 0.32 / 0.25 | 10.3 / 5.6 / 6.0 | 7.3-10.0 |
+| nap | 19.2 / 18.2 / 18.5 | 40 / 39 / 38 | 55 / 50 / 48 | 0.33 / 0.33 / 0.46 | 16.1 / 10.1 / 23.4 | 3.3-4.2 |
+
+The loaded bound (the loaded spinning p99 against the loaded parked p99 and the quiet spinning p99): main fails 3 of 3,
+time and nap pass 6 of 6. An earlier round of time alone (host load 34-50) read loaded p99 2.00 -> 0.46 ms and loaded
+p999 13.0 -> 37.3 ms.
+
+**Measured, not landed.** Both arms meet R9's floor quiet at nine shards, which main never has, and cut the loaded p99
+3-5x. Both lose the loaded p999 and spend 2-6x the quiet CPU. Under the data rule neither lands. The loaded p999 is the
+open item; its hop is named below.
+
+### Where the loaded p999 goes, per hop, and the shards' QoS (A-786; 2026-11-20 night, w-provision-gate)
+
+Same MacBook. The host was quiet for once (load 4 to 18). `PROVISION_BENCH_LOAD=2`. Diagnostic hop stamps (never on main)
+split each create in the loaded p999 tail, three per run. Two rounds, interleaved.
+
+- **main:** the tail is the client's own wake after it parked (from the reply landing to its taking, 15 to 33 ms) and the
+  nap hop (from the reply's task to the serve task, 0.6 to 2.9 ms). Loaded p99 0.88 to 1.44 ms, p999 2.2 to 2.7 ms.
+- **immediate poll + time-horizon estimate:** the tail is almost all cross-shard hops. The forward to the owner's task
+  took 7 to 19 ms, and the owner's reply to its task on the client's shard 13 to 29 ms. The client wakes fast. A shard
+  that spins without ever sleeping looks CPU-bound to macOS, which demotes it; preempted beside the spinners, it waits
+  quanta for a core, and a kick cannot help because it is not parked. Loaded p99 0.26 to 0.55 ms, p999 10.6 to 12.2 ms.
+  Quiet: p99 41 to 89 µs, at 6.1 to 10.0 cores (holds keep all nine shards spinning for one client).
+- **The same, with shard threads at `QOS_CLASS_USER_INTERACTIVE`:** loaded p99 0.26 to 0.45 ms, p999 6.5 / 9.8 ms. The
+  tail is still the cross-shard hops (6 to 22 ms). **Measured and rejected,** the third time for a shard QoS class
+  (2026-10-07 twice, and g222's G222_QOS before the kqueue fix).
+
+| arm | quiet p99 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|
+| main | 96.7 / 89.3 | 0.88 / 1.06 | 2.42 / 2.24 | 1.66-1.70 |
+| immediate + time estimate | 89.2 / 48.1 | 0.43 / 0.26 | 11.2 / 10.6 | 6.1-10.0 |
+| the same, QoS user-interactive | 39.6 / 34.8 | 0.45 / 0.26 | 6.45 / 9.83 | 6.2-10.0 |
+
+**Reading.** On macOS beside two spinners a logical CPU, the nap is both the cause of the loaded p99 (it hands the core
+away between two tasks of a request) and what keeps a spinning shard at its priority. Removing it cuts the loaded p99 3 to
+5 times and loses the p999 4 to 5 times. No priority lever moved it. On g222's edit-and-merge path the immediate poll
+improved the p999 too (15 -> 7-9 ms, the client's spin there); on provisioning it does not. That makes it a trade-off for
+main and Ada, not a fix.
+
+## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
+
+- **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
+  three `slates anchor --fleet` processes at f = 1 over loopback UDP with their HTTPS version-control edges, formed and
+  bootstrapped; on a node not the bootstrap's, one push of git/git cut at v1.0.0 (3,434,551 bytes, 12,232 objects, about
+  500 KB of names), then ten at once, each to its own repository, over TLS, each timed from its connection to its whole
+  answer; then that node's homing counters. Studio-2 (14 cores), shared with other agents: load 10 to 16, so a build's
+  own rounds spread by up to 15 s; read the medians and the counters, never one round.
+- **Found first:** six of eleven version-3 homings fell short (`homes.homed_short`), their records version 2: the region
+  half of a homing took the record sessions on the repository's owner shard, where none is. Fixed in 3406df928 (the
+  region half runs on the control shard and waits for a lent session); after it, eleven of eleven `homed_in_region` in
+  every round below.
+- **v2 against v3** (v2 = f95edf68e, v3 = the switch on with 3406df928's fix), ten rounds:
+
+| round | v2 1 push | v3 1 push | v2 10, p50 | v3 10, p50 | v2 10, p99 | v3 10, p99 |
+|---|---|---|---|---|---|---|
+| 1 | 2.847 | 2.376 | 5.523 | 6.787 | 8.345 | 7.902 |
+| 2 | 1.733 | 2.036 | 4.582 | 6.119 | 7.445 | 7.216 |
+| 3 | 1.719 | 2.044 | 4.910 | 5.849 | 6.862 | 6.554 |
+| 4 | 1.672 | 2.314 | 4.894 | 6.084 | 7.040 | 6.637 |
+| 5 | 1.732 | 2.082 | 4.829 | 8.733 | 6.483 | 9.971 |
+| 6 | 3.615 | 2.500 | 6.296 | 5.869 | 8.188 | 6.871 |
+| 7 | 1.952 | 2.426 | 4.312 | 7.409 | 6.631 | 8.573 |
+| 8 | 1.737 | 3.828 | 6.709 | 6.761 | 9.421 | 8.564 |
+| 9 | 4.217 | 2.278 | 10.972 | 5.646 | 15.167 | 6.045 |
+| 10 | 5.281 | 2.195 | 11.364 | 8.447 | 12.430 | 10.010 |
+
+- **Coalescing homings** (a per-member queue on the control shard, one `PutMany` a batch, the member publishing once
+  for the batch: branch `agents/w-balance-coalesce`, 962c37a07, never on main), a second ten rounds with each homing
+  timed inside (`homes.homing_local_ns`, `homes.homing_region_ns`, landed):
+
+| round | v2 10, p50 | v3 10, p50 | v3 coalesced 10, p50 | v2 1 push | v3 1 push | v3 coalesced 1 push |
+|---|---|---|---|---|---|---|
+| 1 | 9.193 | 12.633 | 13.815 | 4.588 | 4.161 | 5.935 |
+| 2 | 5.563 | 7.306 | 26.068 | 2.314 | 3.078 | 5.259 |
+| 3 | 6.670 | 15.004 | 18.836 | 2.946 | 5.626 | 4.031 |
+| 4 | 5.531 | 11.372 | 11.631 | 1.869 | 3.523 | 4.637 |
+| 5 | 20.257 | 7.777 | 11.360 | 2.431 | 4.363 | 2.886 |
+| 6 | 6.321 | 10.022 | 10.994 | 2.938 | 2.691 | 3.313 |
+| 7 | 5.054 | 5.329 | 6.109 | 2.319 | 2.052 | 2.327 |
+| 8 | 5.041 | 5.810 | 7.321 | 1.960 | 1.996 | 2.653 |
+| 9 | 4.363 | 6.453 | 5.774 | 1.738 | 2.321 | 2.168 |
+| 10 | 5.758 | 8.333 | 7.084 | 4.436 | 2.666 | 2.647 |
+
+- **What it says.** Medians, ten at once p50: 5.66 s (v2), 8.06 s (v3), 11.18 s (v3 coalesced), at load 10.5 to 11 with
+  v2's own rounds from 4.4 to 20.3 s. Each homing measured inside takes about 10 to 16 ms (11 a round: the local halves
+  16 to 66 ms, the region halves 71 to 174 ms a round), so the homing is not where a version-3 push's added time, if it
+  is real under this noise, goes; and the coalescer carried one item an exchange (14 exchanges for 14 items in most
+  rounds): the homings of concurrent pushes arrive spread over their checks and seldom overlap, so there is nothing to
+  coalesce. Coalescing is rejected: its queue, its bound and its wire variants add complexity for no measured gain. Owed
+  next: where a version-3 push's added time goes at ten at once (its decision's homing turn and the edge's hand-off are
+  the candidates), measured on a quiet host before anything is changed.
+## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
+
+
+## A partial clone back under its time before A-722 part 3: no row read for a type or an unread size (main's order 1; w-perf's A/B; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2 (shared, load 33-36), release; w-perf's `git_scale.sh` on
+  git/git cut at v1.0.0 (2,930 commits, 12,233 objects), its steps (push, clone, incremental push and fetch, shallow,
+  partial), then ten `git clone --bare --filter=blob:none` against the same daemon, each timed and the daemon's CPU
+  (`ps -o time`) taken before and after. main ab760dc65 against the change (a2fb50583).
+
+| | daemon CPU a partial clone (ten) | wall (ten) |
+|---|---|---|
+| main | 740, 700, 740, 760, 730, 740, 750, 730, 740, 720 ms | 0.967, 0.958, 1.028, 1.044, 1.011, 1.019, 1.048, 1.051, 1.020, 0.978 s |
+| after | 260, 270, 290, 250, 340, 330, 320, 340, 360, 350 ms | 0.489, 0.510, 0.514, 0.500, 0.633, 0.581, 0.584, 0.580, 0.615, 0.595 s |
+
+- **What it says.** w-perf measured 0.62-0.72 s before part 3 and 0.93-1.04 s after; the walk now reads no row for a
+  type (its landing's runs) and none for a size `blob:none` does not use, so the partial clone is under its time before
+  part 3. The scale script's own interleaved rounds on the shared machine were too noisy to compare by wall time (a
+  full clone of either arm took 6.4 to 28 s), so the daemon's CPU is the comparison.
+`crates/server/tests/green_landing_cow.rs` (measured as `mounted_work_cow.rs presenting` before its move to a binary of its own), release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
+side, all shown. A 64 MiB green of 1,024 files of 64 KiB; its landing presented into a fresh directory, then granted and
+landed. Before: main 7f8eb5cbb (the landing view a scratch volume holding a copy of the head, a2415c930). After: the
+view an overlay over the green's head, planned whole and read through the tree host beside the writer.
+
+| side | presenting adds (MB) | the granted landing adds (MB) |
+|---|---|---|
+| before | 69.34, 69.35, 69.29, 69.21, 69.26 | 1.57, 1.77, 1.61, 1.70, 1.62 |
+| after | 1.74, 1.67, 1.82, 1.61, 1.51 | 1.08, 1.06, 1.05, 1.00, 2.80 |
+
+Bound the test holds: 16.8 MB (a fixed 8 MiB and 8 MiB of windows and entries).
+
+## A rewrite's refinement sliced under its owner's turns: longest step 10-99 µs up to 4 MiB, per save 1.15-1.5x (A-787; 2026-11-20)
+
+Command: `cargo run --release -p slates-merge --example rewrite_slices`, built at A-787 and at A-776 (561c655a3, the
+example's sliced half stubbed), each tree from `git archive`. Run interleaved, three runs a side, five rounds a case,
+on adas-mac-studio-2 (Apple M4 Max, 14 cores, macOS arm64), load 13 to 14, 16:30 PST. Cases: each source file of the
+merge crate re-indented with every hundredth line's first word changed, and the same at 1, 4 and 12 MiB generated.
+"whole" is the refinement in one call (best of five, ms). "longest unit" is `Pace::longest_unit_ns` driving the paced
+refinement on the real clock with 250 µs turns.
+
+| case | A-776 whole ms (3 runs) | A-787 whole ms (3 runs) | A-787 longest unit µs, each round (3 runs × 5) |
+|---|---|---|---|
+| engine.rs (304 KiB) | 13.84, 14.63, 14.26 | 20.80, 20.83, 21.05 | 30.8 31.1 32.0 30.6 31.0; 34.8 46.4 30.5 31.0 30.3; 30.9 30.9 30.9 32.9 31.4 |
+| verdict.rs (6 KiB) | 0.21, 0.21, 0.21 | 0.31, 0.31, 0.32 | 11.5 10.2 10.2 10.1 10.2; 10.7 10.1 10.0 19.5 14.8; 10.7 10.2 10.1 10.2 10.2 |
+| increment.rs (89 KiB) | 3.87, 4.11, 3.97 | 5.92, 5.82, 6.00 | 29.7 31.0 30.7 29.5 29.4; 32.4 31.9 34.7 31.4 31.3; 29.2 29.6 29.4 29.5 29.7 |
+| 1 MiB | 11.69, 12.53, 11.19 | 17.21, 17.43, 17.67 | 33.0 32.8 30.8 32.0 46.7; 32.0 31.7 37.5 32.0 31.1; 57.2 31.5 51.0 32.2 34.9 |
+| 4 MiB | 46.47, 51.80, 49.55 | 67.87, 67.28, 67.16 | 89.8 33.5 37.5 35.0 33.1; 38.8 36.0 75.4 43.8 99.2; 61.8 33.3 37.9 33.3 33.9 |
+| 12 MiB | 165.88, 182.10, 183.00 | 205.25, 202.21, 199.54 | 164.8 291.0 1814.2 2826.1 97.2; 47.1 43.9 42.3 41.4 40.3; 71.0 49.2 66.5 2522.1 43.2 |
+
+Under A-776 the longest step is the whole call: 14 ms at 304 KiB, 166 to 211 ms at 12 MiB. Under A-787 it stays tens
+of µs and does not grow with the file, apart from three 12 MiB rounds of 15 with one unit of 1.8 to 2.8 ms. Those are
+not explained yet: preemption at load 13 on 14 cores, or the release of a large buffer, both unmeasured. The paced
+refinement costs 1.45 to 1.5 times the one-call refinement on source files and at 1 MiB, 1.35 times at 4 MiB and 1.15
+times at 12 MiB. Its search makes the same steps (2,365,669 for `engine.rs` in both trees), so the cost is the meter's
+bookkeeping per comparison. The same A/B on this Mac at load 35 to 58 gave the same per-save ratios, with preemption
+outliers of up to 80 ms in the longest unit.
+
+Rejected, measured:
+- A heapsort in place for the anchors: 165 to 185 ms against 14 ms for a 1 MiB rewrite.
+- Restructuring the Myers rounds to await once per unit rather than per diagonal: no change (25.9 against 26.1 ms).
+- A hash table for the anchors: its rehash is one step that grows with the file.
+
+Kept: A-787.
+
+## The fragments' encoder, its level timed per object against chosen from measured rates: even on CPU, one output (main's ruling; A-718; 2026-11-20)
+
+- **The machine and builds.** adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores; placed by kiln, no `on`), release
+  builds of `crates/git/examples/encode_bench.rs` on two branches: A, agents/w-k90-ab-A (slates 8ebf8a1c6, the encoder's
+  zlib level and delta window learned from each sample and trial timed on the clock), B, agents/w-k90-ab-B (7c37b6fee,
+  chosen from the bytes they saved and `learn::Rates` measured once a process), each with `Repository::fragments_len`.
+  Dataset: git/git cut at v2.0.0 (`echo v2.0.0 | git pack-objects --revs --stdout`, 55,872,412 bytes; head
+  e156455ea491), its 2,301,445,716 bytes of objects pushed as one version and its fragments encoded once a process.
+- **The command.** `encode_bench <head> < v2.pack`, A then B, three rounds (kiln run r24; its script in the run). The
+  machine was not quiet: other agents' builds held its load at 22 to 58.
+
+| round | load at its start | A: ns a MiB in | A: fragments | B: ns a MiB in | B: fragments |
+|---|---|---|---|---|---|
+| 1 | 41 / 58 | 114,257,366 (250.8 s) | 1,918,502,639 B | 109,622,545 (240.6 s) | 1,918,502,639 B |
+| 2 | 56 / 55 | 111,023,658 (243.7 s) | 1,914,198,588 B | 64,824,161 (142.3 s) | 1,918,502,639 B |
+| 3 | 22 / 38 | 58,649,771 (128.7 s) | 1,918,502,639 B | 58,563,455 (128.5 s) | 1,918,502,639 B |
+
+- **What it says.** Best of three, the two are even on CPU (128.7 s against 128.5 s, 58.6 ms a MiB of objects; the
+  rest is the load), so the change is not one for speed: a dead-even A/B, kept for its correctness. B wrote the same
+  1,918,502,639 bytes in every round; A wrote 4,304,051 bytes fewer in round 2, its level a timed choice the load moved,
+  which is what main's ruling removed (one input, one output; A-745 rule 4's held answer now byte for byte). Both write
+  fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
+  to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
+  (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.
+
+## A push's objects landed where they lie in its pack: the store 22 times smaller (A-722's record v4, part B; main's pack-homing ruling; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic (one push driven by phase on a
+  daemon's shard, then its repository's store made again from the log, each replay turn 1 ms) over git/git's v1.5.0
+  (9.4 MiB of pack, 34,296 objects). Before: main 5c6327b8e (its run in "A push read where it lies in its pack while
+  it is judged" and the replay section's); after: the change.
+
+| | content after input | content peak | content after the landing | process peak RSS | replay: turns, content peak |
+|---|---|---|---|---|---|
+| before | 0.0 MiB | 310.3 MiB | 309.0 MiB | 781.8 MiB | 1,921, 309.0 MiB |
+| after | 0.0 MiB | 15.4 MiB | 14.1 MiB | 356.6 MiB | 1,468, 14.1 MiB |
+
+- **What it says.** A landed object is a place in its push's pack, held once as content (9.4 MiB), and its row; the
+  rest of the 14.1 MiB is the index's tables, the reach values and the landing map. The store's bytes a push are now
+  about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
+  carrying the pack (part A).
+
+## A push's record names its homed pack: 141 bytes, the landing step halved (A-722's record v4, part A; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic with record version 4 on and the
+  homing driven as the edge drives it, over git/git's v1.5.0 push; the landing step's phases timed (`push_planned`).
+
+| | record bytes | landing step | entry and record | store commit | apply |
+|---|---|---|---|---|---|
+| part B (92f7a756b) | about 11 MiB | 27.3 ms | 1.7 ms | 0.6 ms | 18.6 ms |
+| part A | 141 | 13.2 ms | 1.8 ms | 1.2 ms | 8.1 ms |
+
+- **What it says.** The entry's write is no longer O(the pack). The apply's 8.1 ms is the greens' commit and the work's
+  encode (w-engine's), and the entry-and-record's 1.8 ms the names checked against the homed ones; each is the next cut.
+
+
+## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
+
+**What it is.** A-226's paced form (2026-11-06, above: "The macOS paced tail was the recovery give-back") on the quietest
+Mac kiln gave: each sample meets parked shards, so each edit and submit pays the doorbell and a kicked shard's wake.
+Before A-226 its p99 samples held 17 to 31 ms between the doorbell's wake and the shard's read; A-226 removed the cause
+and the run on a quiet Mac was owed.
+
+**Command.** `edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept --form conflict`, release,
+built from main `f47668e74` with `--pause-ns` restored (this change), 3 invocations × 3 runs × 1,000 samples, run after
+the one-minute load fell below 3. Machine: adas-mac-studio.local (Apple M4 Max, 14 CPUs, macOS; 9 shards derived),
+2026-11-21 02:14 to 02:19 UTC, load 2.00 / 1.75 / 1.98 at each invocation's start and 2.58 after.
+
+| invocation | accept total p50 / p99 / max per run (µs) | conflict total p50 / p99 / max per run (µs) |
+|---|---|---|
+| 1 | 91 / 196 / 331; 99 / 200 / 307; 178 / 1,209 / 2,748 | 187 / 782 / 1,974; 190 / 859 / 2,353; 172 / 803 / 1,928 |
+| 2 | 329 / 1,644 / 2,939; 327 / 1,592 / 3,674; 329 / 1,429 / 10,202 | 179 / 646 / 1,466; 191 / 1,237 / 7,950; 185 / 942 / 2,609 |
+| 3 | 333 / 1,530 / 3,673; 336 / 1,527 / 3,525; 329 / 1,919 / 3,895 | 182 / 779 / 2,924; 188 / 849 / 2,854; 191 / 816 / 2,624 |
+
+- **No sample in 17–31 ms**: the largest of the 18,000 is 10.2 ms (one accept run); every other run's largest is 0.3
+  to 7.9 ms. Every sample answered as the model said.
+- What is left at the paced p99 (0.2 to 1.9 ms) is the kicked park's own wake on macOS, part of goal 84a's open
+  loaded and paced tail (GAPS), not the late wake this run was owed for.
+
+## A work's first edit as pieces over its base against a whole-file copy (A-790; main's dispatch of 2026-11-20 15:20; 2026-11-20)
+- **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents' builds
+  (load not quiesced; the A and B runs interleave, so drift hits both).
+- **Binaries.** Release `cargo test --locked --release -p slates-server --test work_edit_cow --no-run`. A: main
+  1de9e5e6f (a first edit copies the whole file into the work) with the same test file; B: A-790 on that main.
+- **Command.** `~/.cache/w-work-cow-ab-run/ab.sh`: for each file size, five rounds, each round A then B, every run a
+  fresh process (one daemon, one green holding one file, four works each requested and overwriting one byte at the
+  file's middle): `SLATES_WORK_EDIT_COW_FILE_BYTES=<size> SLATES_WORK_EDIT_COW_WORKS=4 <binary> --nocapture`.
+- **Measures.** Live heap a work: the allocator's bytes in use (`slates_mem::heap::stats().in_use`) added by the four
+  works, over four. Resident memory is shown too, and hides A's copies: macOS's allocator hands the seed's freed blocks
+  back to them, so A's resident grows by kilobytes while its live heap grows by the file per work. Time: request to the
+  edit's reply, per work.
+- **Result.** B holds 2.6 to 2.9 KB a work at every size (the work's record, journal and three pieces); A holds the
+  file (1,050,496 B, 16,787,328 B, 268,445,760 B a work). Best mean of five: 1 MiB A 261 us, B 113 us; 16 MiB A 455 us,
+  B 132 us; 256 MiB A 5.15 ms, B 173 us. B's time does not grow with the file; A's does. Kept: B.
+
+| file | binary | round | live heap a work | resident (4 works) | mean a first edit | slowest |
+|---|---|---|---|---|---|---|
+| 1 MiB | A | 1 | 1,050,496 B | 2,146,304 B | 318.593 µs | 464.458 µs |
+| 1 MiB | B | 1 | 2,672 B | 65,536 B | 237.604 µs | 277.916 µs |
+| 1 MiB | A | 2 | 1,050,496 B | 3,375,104 B | 398 µs | 557 µs |
+| 1 MiB | B | 2 | 2,672 B | 49,152 B | 112.635 µs | 134.792 µs |
+| 1 MiB | A | 3 | 1,050,496 B | 1,130,496 B | 267.76 µs | 289.917 µs |
+| 1 MiB | B | 3 | 2,672 B | 65,536 B | 141.948 µs | 225.458 µs |
+| 1 MiB | A | 4 | 1,050,496 B | 1,097,728 B | 261 µs | 414.875 µs |
+| 1 MiB | B | 4 | 2,672 B | 65,536 B | 152.072 µs | 201.875 µs |
+| 1 MiB | A | 5 | 1,050,496 B | 2,719,744 B | 262.583 µs | 297.041 µs |
+| 1 MiB | B | 5 | 2,672 B | 81,920 B | 225.385 µs | 396.458 µs |
+| 16 MiB | A | 1 | 16,787,328 B | 81,920 B | 455.052 µs | 481.334 µs |
+| 16 MiB | B | 1 | 2,608 B | 81,920 B | 132.27 µs | 190.625 µs |
+| 16 MiB | A | 2 | 16,787,328 B | 49,152 B | 473.728 µs | 551.333 µs |
+| 16 MiB | B | 2 | 2,656 B | 65,536 B | 279.218 µs | 427.291 µs |
+| 16 MiB | A | 3 | 16,787,328 B | 98,304 B | 560.916 µs | 718.833 µs |
+| 16 MiB | B | 3 | 2,608 B | 81,920 B | 248.354 µs | 317.708 µs |
+| 16 MiB | A | 4 | 16,787,336 B | 114,688 B | 548.26 µs | 657.375 µs |
+| 16 MiB | B | 4 | 2,624 B | 114,688 B | 229.593 µs | 327.75 µs |
+| 16 MiB | A | 5 | 16,787,328 B | 114,688 B | 483.198 µs | 538.292 µs |
+| 16 MiB | B | 5 | 2,656 B | 98,304 B | 236.541 µs | 325.208 µs |
+| 256 MiB | A | 1 | 268,445,760 B | 32,768 B | 6.769229 ms | 7.308125 ms |
+| 256 MiB | B | 1 | 2,868 B | 131,072 B | 173.406 µs | 225.708 µs |
+| 256 MiB | A | 2 | 268,445,776 B | 65,536 B | 5.148739 ms | 5.259292 ms |
+| 256 MiB | B | 2 | 2,784 B | 81,920 B | 182.437 µs | 236.458 µs |
+| 256 MiB | A | 3 | 268,445,760 B | 32,768 B | 5.17801 ms | 5.371792 ms |
+| 256 MiB | B | 3 | 2,864 B | 114,688 B | 181.073 µs | 261.709 µs |
+| 256 MiB | A | 4 | 268,445,760 B | 65,536 B | 15.27751 ms | 24.87775 ms |
+| 256 MiB | B | 4 | 2,856 B | 65,536 B | 234.458 µs | 436.792 µs |
+| 256 MiB | A | 5 | 268,445,792 B | 32,768 B | 13.308385 ms | 23.680417 ms |
+| 256 MiB | B | 5 | 2,832 B | 98,304 B | 347.718 µs | 755.375 µs |
+
+## The forward lane's bulk throughput: the instrument (2026-11-20, w-shared; A-697 item 4, main's sweep)
+
+`replication_bench`'s bulk row sends one request of N MiB on a warm session. The holder takes the request whole and
+answers nothing, so the row times one direction. For each sample it prints the goodput, the session's path MTU and
+congestion window, and why its sending stopped (`Endpoint::send_stops`: the packet budget, the window, the pacer,
+the credit, nothing to send). The command, release, best of the five timed samples after one warm-up:
+
+    cargo build --release -p slates-cluster --example replication_bench
+    REPLICATION_BENCH_BULK_MIB=4,64 target/release/examples/replication_bench 200
+
+No numbers are recorded yet. The first run (macOS arm64, this MacBook, load average 74, base 5d29b9572) was too
+loaded to count. It showed two things to measure on a quiet machine:
+- The path MTU reached 9,209 bytes, at macOS's `net.inet.udp.maxdgram` of 9,216. So the lane is not bound by
+  small datagrams.
+- At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
+  lane on loopback.
+The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
+datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
+
+## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
+- **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
+  quiesced; before and after interleave within each point, so drift hits both).
+- **Binaries.** Release `cargo test --locked --release -p slates-server --test work_cow --no-run` on main 283d646b7 with
+  this change's test (after), and the same tree with a copy of the green put back into each new work
+  (`create_work_here` seeding `WorkFiles::from_changed(green.files())`, 896233d1f's shape) (before).
+- **Command.** `~/.cache/w-work-cow-grid-run/grid.sh`: for green in 1 MiB, 32 MiB, 1 GiB; files in 1,000, 10,000,
+  100,000 (each file green/files bytes); works in 1, 10, 100; three rounds, each round after then before, every run a
+  fresh process: `SLATES_WORK_COW_FILES=<f> SLATES_WORK_COW_FILE_BYTES=<g/f> SLATES_WORK_COW_WORKS=<w> <binary>
+  --nocapture`. A run seeds the green in parts of at most 16 MiB and 5,000 files (one submit of the whole green stalls
+  its shard past the liveness window, GAPS), makes one warm work, then times each work from its request through reading
+  one existing file whole and editing one byte of it. Before runs only where works x green <= 2 GiB, to keep the shared
+  machine out of swap. 135 runs, none failed.
+- **Measure.** Live heap a work: the allocator's bytes in use (`slates_mem::heap::stats().in_use`) the N works added,
+  over N (resident memory hides copies made into freed blocks the allocator reuses, A-790's A/B).
+- **Result.** After: 1.6 to 5.6 KB a work at every point (0 B at three 1-work points, within the allocator's noise),
+  flat across 1 MiB to 1 GiB and 1 to 100 works: O(N x metadata), never N x G. Its time follows the one file read
+  (7.7 ms reading a 1 MiB file at 1 GiB in 1,000 files; 76 to 165 us where files are 10 KiB or less), not the green.
+  Before: the green per work (1.5 MB at 1 MiB in 1,000 files to 1.25 GB at 1 GiB in 100,000 files, the green plus its
+  files' overhead), its time growing with it (to 129 ms). Kept: after (main since A-247/A-534, its first edit A-790).
+
+| green | files | works | after: live heap a work (min of 3) | after: best mean | before: live heap a work | before: best mean |
+|---|---|---|---|---|---|---|
+| 1 MiB | 1,000 | 1 | 1,648 B | 112 us | 1,527,232 B | 326 us |
+| 1 MiB | 1,000 | 10 | 3,788 B | 80 us | 1,530,441 B | 293 us |
+| 1 MiB | 1,000 | 100 | 3,501 B | 79 us | 1,529,250 B | 280 us |
+| 1 MiB | 10,000 | 1 | 2,032 B | 85 us | 3,576,128 B | 1,020 us |
+| 1 MiB | 10,000 | 10 | 3,430 B | 80 us | 3,569,876 B | 980 us |
+| 1 MiB | 10,000 | 100 | 3,281 B | 76 us | 3,568,177 B | 958 us |
+| 1 MiB | 100,000 | 1 | 1,904 B | 80 us | 26,036,256 B | 8,290 us |
+| 1 MiB | 100,000 | 10 | 3,161 B | 92 us | 26,039,129 B | 8,876 us |
+| 1 MiB | 100,000 | 100 | 3,332 B | 89 us | 26,040,766 B | 8,744 us |
+| 32 MiB | 1,000 | 1 | 0 B | 294 us | 49,417,264 B | 1,484 us |
+| 32 MiB | 1,000 | 10 | 5,590 B | 332 us | 49,434,916 B | 3,377 us |
+| 32 MiB | 1,000 | 100 | 3,591 B | 325 us | not run (N x G > 2 GiB) | |
+| 32 MiB | 10,000 | 1 | 5,488 B | 82 us | 38,289,616 B | 4,633 us |
+| 32 MiB | 10,000 | 10 | 3,478 B | 80 us | 38,292,627 B | 4,427 us |
+| 32 MiB | 10,000 | 100 | 3,380 B | 80 us | not run (N x G > 2 GiB) | |
+| 32 MiB | 100,000 | 1 | 2,288 B | 98 us | 62,831,472 B | 11,837 us |
+| 32 MiB | 100,000 | 10 | 3,228 B | 81 us | 62,840,518 B | 11,989 us |
+| 32 MiB | 100,000 | 100 | 3,388 B | 80 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 1,000 | 1 | 0 B | 7,661 us | 1,082,667,584 B | 65,387 us |
+| 1 GiB | 1,000 | 10 | 4,537 B | 7,743 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 1,000 | 100 | 3,784 B | 7,886 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 10,000 | 1 | 0 B | 908 us | 1,149,444,064 B | 43,987 us |
+| 1 GiB | 10,000 | 10 | 0 B | 821 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 10,000 | 100 | 2,986 B | 877 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 100,000 | 1 | 13,216 B | 147 us | 1,253,254,176 B | 129,091 us |
+| 1 GiB | 100,000 | 10 | 3,952 B | 165 us | not run (N x G > 2 GiB) | |
+| 1 GiB | 100,000 | 100 | 3,441 B | 102 us | not run (N x G > 2 GiB) | |
+
+All runs:
+
+| side | green | files | works | round | live heap a work | resident (all works) | mean |
+|---|---|---|---|---|---|---|---|
+| after | 1 MiB | 1,000 | 1 | 1 | 1,648 B | 81,920 B | 112 us |
+| before | 1 MiB | 1,000 | 1 | 1 | 1,527,232 B | 1,589,248 B | 341 us |
+| after | 1 MiB | 1,000 | 1 | 2 | 1,648 B | 81,920 B | 116 us |
+| before | 1 MiB | 1,000 | 1 | 2 | 1,527,232 B | 1,654,784 B | 356 us |
+| after | 1 MiB | 1,000 | 1 | 3 | 1,648 B | 98,304 B | 113 us |
+| before | 1 MiB | 1,000 | 1 | 3 | 1,527,232 B | 1,589,248 B | 326 us |
+| after | 1 MiB | 1,000 | 10 | 1 | 3,788 B | 278,528 B | 84 us |
+| before | 1 MiB | 1,000 | 10 | 1 | 1,530,550 B | 15,384,576 B | 300 us |
+| after | 1 MiB | 1,000 | 10 | 2 | 3,788 B | 311,296 B | 80 us |
+| before | 1 MiB | 1,000 | 10 | 2 | 1,530,441 B | 15,384,576 B | 293 us |
+| after | 1 MiB | 1,000 | 10 | 3 | 3,788 B | 327,680 B | 89 us |
+| before | 1 MiB | 1,000 | 10 | 3 | 1,532,041 B | 15,515,648 B | 295 us |
+| after | 1 MiB | 1,000 | 100 | 1 | 3,501 B | 606,208 B | 82 us |
+| before | 1 MiB | 1,000 | 100 | 1 | 1,529,467 B | 162,054,144 B | 287 us |
+| after | 1 MiB | 1,000 | 100 | 2 | 3,502 B | 573,440 B | 79 us |
+| before | 1 MiB | 1,000 | 100 | 2 | 1,529,250 B | 161,808,384 B | 286 us |
+| after | 1 MiB | 1,000 | 100 | 3 | 3,502 B | 573,440 B | 80 us |
+| before | 1 MiB | 1,000 | 100 | 3 | 1,529,480 B | 162,086,912 B | 280 us |
+| after | 1 MiB | 10,000 | 1 | 1 | 2,080 B | 65,536 B | 85 us |
+| before | 1 MiB | 10,000 | 1 | 1 | 3,592,544 B | 3,604,480 B | 1,024 us |
+| after | 1 MiB | 10,000 | 1 | 2 | 2,032 B | 65,536 B | 108 us |
+| before | 1 MiB | 10,000 | 1 | 2 | 3,576,128 B | 3,784,704 B | 1,020 us |
+| after | 1 MiB | 10,000 | 1 | 3 | 2,048 B | 98,304 B | 109 us |
+| before | 1 MiB | 10,000 | 1 | 3 | 3,593,152 B | 3,473,408 B | 1,041 us |
+| after | 1 MiB | 10,000 | 10 | 1 | 3,478 B | 294,912 B | 80 us |
+| before | 1 MiB | 10,000 | 10 | 1 | 3,570,185 B | 35,815,424 B | 980 us |
+| after | 1 MiB | 10,000 | 10 | 2 | 3,430 B | 278,528 B | 89 us |
+| before | 1 MiB | 10,000 | 10 | 2 | 3,570,280 B | 35,815,424 B | 985 us |
+| after | 1 MiB | 10,000 | 10 | 3 | 3,430 B | 294,912 B | 85 us |
+| before | 1 MiB | 10,000 | 10 | 3 | 3,569,876 B | 35,799,040 B | 985 us |
+| after | 1 MiB | 10,000 | 100 | 1 | 3,653 B | 704,512 B | 80 us |
+| before | 1 MiB | 10,000 | 100 | 1 | 3,568,338 B | 365,740,032 B | 961 us |
+| after | 1 MiB | 10,000 | 100 | 2 | 3,417 B | 671,744 B | 78 us |
+| before | 1 MiB | 10,000 | 100 | 2 | 3,568,177 B | 365,690,880 B | 958 us |
+| after | 1 MiB | 10,000 | 100 | 3 | 3,281 B | 589,824 B | 76 us |
+| before | 1 MiB | 10,000 | 100 | 3 | 3,568,241 B | 366,772,224 B | 962 us |
+| after | 1 MiB | 100,000 | 1 | 1 | 18,368 B | 65,536 B | 83 us |
+| before | 1 MiB | 100,000 | 1 | 1 | 26,052,848 B | 26,968,064 B | 9,036 us |
+| after | 1 MiB | 100,000 | 1 | 2 | 18,368 B | 65,536 B | 80 us |
+| before | 1 MiB | 100,000 | 1 | 2 | 26,036,336 B | 31,588,352 B | 8,290 us |
+| after | 1 MiB | 100,000 | 1 | 3 | 1,904 B | 65,536 B | 92 us |
+| before | 1 MiB | 100,000 | 1 | 3 | 26,036,256 B | 30,556,160 B | 8,504 us |
+| after | 1 MiB | 100,000 | 10 | 1 | 3,168 B | 409,600 B | 97 us |
+| before | 1 MiB | 100,000 | 10 | 1 | 26,039,129 B | 268,173,312 B | 8,876 us |
+| after | 1 MiB | 100,000 | 10 | 2 | 3,161 B | 409,600 B | 113 us |
+| before | 1 MiB | 100,000 | 10 | 2 | 26,040,768 B | 268,582,912 B | 8,881 us |
+| after | 1 MiB | 100,000 | 10 | 3 | 3,161 B | 393,216 B | 92 us |
+| before | 1 MiB | 100,000 | 10 | 3 | 26,040,848 B | 269,795,328 B | 9,016 us |
+| after | 1 MiB | 100,000 | 100 | 1 | 3,332 B | 1,359,872 B | 89 us |
+| before | 1 MiB | 100,000 | 100 | 1 | 26,041,190 B | 2,697,543,680 B | 9,117 us |
+| after | 1 MiB | 100,000 | 100 | 2 | 3,385 B | 1,392,640 B | 99 us |
+| before | 1 MiB | 100,000 | 100 | 2 | 26,040,766 B | 2,694,856,704 B | 8,989 us |
+| after | 1 MiB | 100,000 | 100 | 3 | 3,478 B | 1,327,104 B | 90 us |
+| before | 1 MiB | 100,000 | 100 | 3 | 26,041,025 B | 2,970,632,192 B | 8,744 us |
+| after | 32 MiB | 1,000 | 1 | 1 | 0 B | 163,840 B | 360 us |
+| before | 32 MiB | 1,000 | 1 | 1 | 49,417,280 B | 24,788,992 B | 2,466 us |
+| after | 32 MiB | 1,000 | 1 | 2 | 0 B | 180,224 B | 294 us |
+| before | 32 MiB | 1,000 | 1 | 2 | 49,417,264 B | 24,133,632 B | 2,395 us |
+| after | 32 MiB | 1,000 | 1 | 3 | 0 B | 196,608 B | 327 us |
+| before | 32 MiB | 1,000 | 1 | 3 | 49,417,264 B | 409,600 B | 1,484 us |
+| after | 32 MiB | 1,000 | 10 | 1 | 5,590 B | 573,440 B | 332 us |
+| before | 32 MiB | 1,000 | 10 | 1 | 49,435,313 B | 470,974,464 B | 3,744 us |
+| after | 32 MiB | 1,000 | 10 | 2 | 5,608 B | 606,208 B | 354 us |
+| before | 32 MiB | 1,000 | 10 | 2 | 49,437,155 B | 434,110,464 B | 3,377 us |
+| after | 32 MiB | 1,000 | 10 | 3 | 5,640 B | 557,056 B | 360 us |
+| before | 32 MiB | 1,000 | 10 | 3 | 49,434,916 B | 471,990,272 B | 3,446 us |
+| after | 32 MiB | 1,000 | 100 | 1 | 4,014 B | 4,014,080 B | 325 us |
+| after | 32 MiB | 1,000 | 100 | 2 | 3,591 B | 3,948,544 B | 326 us |
+| after | 32 MiB | 1,000 | 100 | 3 | 3,973 B | 3,997,696 B | 328 us |
+| after | 32 MiB | 10,000 | 1 | 1 | 5,488 B | 65,536 B | 82 us |
+| before | 32 MiB | 10,000 | 1 | 1 | 38,305,616 B | 43,499,520 B | 4,633 us |
+| after | 32 MiB | 10,000 | 1 | 2 | 5,488 B | 81,920 B | 110 us |
+| before | 32 MiB | 10,000 | 1 | 2 | 38,289,920 B | 43,630,592 B | 4,796 us |
+| after | 32 MiB | 10,000 | 1 | 3 | 5,488 B | 65,536 B | 123 us |
+| before | 32 MiB | 10,000 | 1 | 3 | 38,289,616 B | 44,548,096 B | 4,655 us |
+| after | 32 MiB | 10,000 | 10 | 1 | 3,478 B | 327,680 B | 107 us |
+| before | 32 MiB | 10,000 | 10 | 1 | 38,292,627 B | 436,813,824 B | 4,478 us |
+| after | 32 MiB | 10,000 | 10 | 2 | 3,478 B | 344,064 B | 116 us |
+| before | 32 MiB | 10,000 | 10 | 2 | 38,292,684 B | 437,026,816 B | 4,427 us |
+| after | 32 MiB | 10,000 | 10 | 3 | 3,478 B | 344,064 B | 80 us |
+| before | 32 MiB | 10,000 | 10 | 3 | 38,292,630 B | 435,847,168 B | 4,480 us |
+| after | 32 MiB | 10,000 | 100 | 1 | 3,417 B | 983,040 B | 82 us |
+| after | 32 MiB | 10,000 | 100 | 2 | 3,380 B | 819,200 B | 80 us |
+| after | 32 MiB | 10,000 | 100 | 3 | 3,444 B | 966,656 B | 80 us |
+| after | 32 MiB | 100,000 | 1 | 1 | 2,288 B | 81,920 B | 100 us |
+| before | 32 MiB | 100,000 | 1 | 1 | 62,831,472 B | 63,127,552 B | 12,004 us |
+| after | 32 MiB | 100,000 | 1 | 2 | 2,288 B | 98,304 B | 103 us |
+| before | 32 MiB | 100,000 | 1 | 2 | 62,847,776 B | 66,535,424 B | 11,837 us |
+| after | 32 MiB | 100,000 | 1 | 3 | 2,288 B | 65,536 B | 98 us |
+| before | 32 MiB | 100,000 | 1 | 3 | 62,847,856 B | 64,356,352 B | 12,436 us |
+| after | 32 MiB | 100,000 | 10 | 1 | 3,292 B | 425,984 B | 81 us |
+| before | 32 MiB | 100,000 | 10 | 1 | 62,840,614 B | 648,167,424 B | 12,077 us |
+| after | 32 MiB | 100,000 | 10 | 2 | 3,228 B | 442,368 B | 85 us |
+| before | 32 MiB | 100,000 | 10 | 2 | 62,840,585 B | 645,005,312 B | 12,108 us |
+| after | 32 MiB | 100,000 | 10 | 3 | 3,228 B | 458,752 B | 82 us |
+| before | 32 MiB | 100,000 | 10 | 3 | 62,840,518 B | 647,380,992 B | 11,989 us |
+| after | 32 MiB | 100,000 | 100 | 1 | 3,635 B | 1,441,792 B | 82 us |
+| after | 32 MiB | 100,000 | 100 | 2 | 3,658 B | 1,458,176 B | 80 us |
+| after | 32 MiB | 100,000 | 100 | 3 | 3,388 B | 1,261,568 B | 80 us |
+| after | 1 GiB | 1,000 | 1 | 1 | 0 B | 1,179,648 B | 7,821 us |
+| before | 1 GiB | 1,000 | 1 | 1 | 1,082,667,584 B | 761,069,568 B | 69,066 us |
+| after | 1 GiB | 1,000 | 1 | 2 | 0 B | 1,130,496 B | 8,066 us |
+| before | 1 GiB | 1,000 | 1 | 2 | 1,082,667,584 B | 782,221,312 B | 65,387 us |
+| after | 1 GiB | 1,000 | 1 | 3 | 0 B | 1,130,496 B | 7,661 us |
+| before | 1 GiB | 1,000 | 1 | 3 | 1,082,667,616 B | 805,584,896 B | 65,645 us |
+| after | 1 GiB | 1,000 | 10 | 1 | 4,537 B | 11,075,584 B | 7,825 us |
+| after | 1 GiB | 1,000 | 10 | 2 | 4,537 B | 11,075,584 B | 7,743 us |
+| after | 1 GiB | 1,000 | 10 | 3 | 4,585 B | 11,042,816 B | 8,022 us |
+| after | 1 GiB | 1,000 | 100 | 1 | 3,949 B | 110,755,840 B | 7,886 us |
+| after | 1 GiB | 1,000 | 100 | 2 | 3,954 B | 111,902,720 B | 7,915 us |
+| after | 1 GiB | 1,000 | 100 | 3 | 3,784 B | 110,804,992 B | 8,095 us |
+| after | 1 GiB | 10,000 | 1 | 1 | 0 B | 163,840 B | 1,016 us |
+| before | 1 GiB | 10,000 | 1 | 1 | 1,149,444,064 B | 317,669,376 B | 43,987 us |
+| after | 1 GiB | 10,000 | 1 | 2 | 0 B | 147,456 B | 908 us |
+| before | 1 GiB | 10,000 | 1 | 2 | 1,149,444,096 B | 247,496,704 B | 44,246 us |
+| after | 1 GiB | 10,000 | 1 | 3 | 0 B | 212,992 B | 928 us |
+| before | 1 GiB | 10,000 | 1 | 3 | 1,149,452,352 B | 641,712,128 B | 58,413 us |
+| after | 1 GiB | 10,000 | 10 | 1 | 0 B | 1,196,032 B | 1,013 us |
+| after | 1 GiB | 10,000 | 10 | 2 | 0 B | 1,294,336 B | 997 us |
+| after | 1 GiB | 10,000 | 10 | 3 | 0 B | 1,327,104 B | 821 us |
+| after | 1 GiB | 10,000 | 100 | 1 | 3,084 B | 11,485,184 B | 877 us |
+| after | 1 GiB | 10,000 | 100 | 2 | 2,986 B | 11,780,096 B | 949 us |
+| after | 1 GiB | 10,000 | 100 | 3 | 3,050 B | 11,501,568 B | 886 us |
+| after | 1 GiB | 100,000 | 1 | 1 | 13,216 B | 81,920 B | 147 us |
+| before | 1 GiB | 100,000 | 1 | 1 | 1,253,270,656 B | 1,345,929,216 B | 130,068 us |
+| after | 1 GiB | 100,000 | 1 | 2 | 13,216 B | 65,536 B | 188 us |
+| before | 1 GiB | 100,000 | 1 | 2 | 1,253,254,272 B | 1,340,686,336 B | 129,091 us |
+| after | 1 GiB | 100,000 | 1 | 3 | 13,232 B | 65,536 B | 175 us |
+| before | 1 GiB | 100,000 | 1 | 3 | 1,253,254,176 B | 1,347,043,328 B | 153,341 us |
+| after | 1 GiB | 100,000 | 10 | 1 | 3,952 B | 311,296 B | 165 us |
+| after | 1 GiB | 100,000 | 10 | 2 | 3,952 B | 327,680 B | 204 us |
+| after | 1 GiB | 100,000 | 10 | 3 | 3,952 B | 311,296 B | 191 us |
+| after | 1 GiB | 100,000 | 100 | 1 | 3,565 B | 1,163,264 B | 102 us |
+| after | 1 GiB | 100,000 | 100 | 2 | 3,655 B | 2,310,144 B | 133 us |
+| after | 1 GiB | 100,000 | 100 | 3 | 3,441 B | 2,211,840 B | 130 us |
+
+## R9's loaded p99 on macOS: options 2 and 3 measured and rejected, main's nap kept (A-786, P2 closed; 2026-11-20 night, w-provision-gate)
+
+**The question (main, 20:03 PST).** Should the non-sleeping poll land? Option 3 lands it only where a shard keeps its
+core, and declines holds when it cannot. It lands only if all four hold against main:
+1. quiet CPU no higher than main's;
+2. loaded p999 no worse than main's;
+3. loaded p99 better;
+4. quiet p99 at or under R9's 50 µs in every round.
+
+Otherwise option 1 stands: main's nap.
+
+**The arms.** Both were built from one tree (origin/main 9070b9e35's merge), differing only in `crates/rt`:
+- **main:** origin/main's runtime.
+- **option 3:**
+  - `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait (the busy harvest never naps);
+  - a per-shard measure of whether it keeps its core while spinning (`core_kept`: each idle spin's wall time against
+    the thread's CPU time, decayed over the longest hold asked; it keeps its core while spinning through one window
+    loses less off the core than one wake);
+  - an idle turn that polls without sleeping while the shard keeps its core, and naps otherwise (macOS: `sleep(1 ns)`);
+  - holds declined while it does not keep its core.
+
+**Conditions.** `provision_bench` with `PROVISION_BENCH_LOAD=2`, release, on this MacBook (Apple M4 Max, 14 CPUs, 9
+shards), host load 2.7-21.7 (quiet for this machine). Three rounds interleaved, each the bench's three runs, all shown.
+
+| round, arm | quiet p50 µs | quiet p99 µs | quiet p999 µs | loaded p99 µs | loaded p999 ms | quiet CPU, thousandths of a core |
+|---|---|---|---|---|---|---|
+| 1 main | 43.3, 42.2, 42.1 | 143.7, 102.7, 112.5 | 481.9, 139.3, 142.7 | 334, 161, 1,507 | 2.54, 0.35, 2.12 | 1,677, 1,680, 1,698 |
+| 1 option 3 | 22.8, 20.1, 17.7 | 182.5, 46.6, 46.8 | 425.5, 79.3, 89.9 | 409, 463, 614 | 10.43, 2.16, 10.15 | 7,525, 8,575, 8,564 |
+| 2 main | 43.4, 42.1, 41.9 | 227.6, 92.3, 89.1 | 781.8, 134.3, 146.8 | 794, 1,273, 1,255 | 3.40, 2.43, 3.47 | 1,672, 1,667, 1,669 |
+| 2 option 3 | 19.6, 14.8, 15.6 | 204.4, 39.3, 82.3 | 509.0, 62.6, 129.6 | 474, 472, 695 | 11.22, 13.65, 4.52 | 5,729, 7,937, 7,764 |
+| 3 main | 42.8, 42.9, 42.8 | 102.4, 99.0, 101.2 | 225.6, 142.2, 129.9 | 413, 1,099, 1,349 | 4.20, 2.21, 2.25 | 1,662, 1,714, 1,642 |
+| 3 option 3 | 16.5, 15.0, 15.1 | 193.5, 36.1, 37.7 | 391.3, 76.8, 73.3 | 530, 736, 534 | 12.96, 10.92, 12.73 | 7,884, 9,957, 9,930 |
+
+**Verdict: option 3 fails all four.**
+1. Quiet CPU is 3.4-6.0 times main's. Per create it is about 120-170 core-µs against main's 70, so faster creates do
+   not explain it: the shards keep their cores quiet, so they true-spin and keep holds. A paced client (1 ms) costs the
+   same in both arms, 0.05-0.14 cores.
+2. The loaded p999 is 10.1-12.7 ms against main's 2.1-3.4 ms at the median.
+3. The loaded p99 is better in rounds 2 and 3 (0.47-0.53 against 1.10-1.25 ms) and worse in round 1 (0.46 against 0.33).
+4. The quiet p99 is 82.3 µs in round 2's median.
+
+**Option 2** (the immediate poll with the time-horizon turn estimate, landed nowhere) fails the same way: quiet 6.1-10.0
+cores and loaded p999 5.6-12.2 ms (the tables above, "the candidates" and "per hop").
+
+**Measured and rejected, both.** Main's nap stays. Kept here for whoever comes back to it:
+- the mechanism of the loaded p99: the busy harvest's nap between a forwarded reply's two tasks, 0.77-1.37 ms at the tail;
+- the mechanism of the candidates' p999: cross-shard hops to a shard that never sleeps and that macOS demoted, 7-29 ms;
+- that QoS user-interactive moves neither;
+- that on g222's edit-and-merge path the immediate poll alone emptied the 1 ms band (queued p99 1.05-1.17 ms -> 22-23
+  µs).
+
+The candidates' code is deleted with its branch (`agents/w-provision-gate-kqueue`, b01a0ef7b).
+## What live shipping adds to a stable write, after A-396's holds: macOS, and main's regression since b402afc7c (85a; g228; 2026-11-20)
+
+**Command (the contract):** `SLATES_TEST_CLI=1 SLATES_TEST_MEASURE=1 <live_fleet release test binary>
+measure_what_live_shipping --nocapture --test-threads=1`, each arm built with `cargo test --release -p slates-cli --test
+live_fleet --no-run` (CARGO_BUILD_JOBS=4, the Studio's load rule). The test, since this change, also reads each daemon's
+CPU over the stream, the 500 ms after it and the second after that (the process; on Linux the control shard's thread
+too), and prints each candidate's live counters (`fleet.live.hop.holder`). Arms interleaved round by round, the order
+rotated; every round shown. **Hardware:** adas-mac-studio.local-2, Apple silicon, 32 cores, macOS. Linux (adacachy) was
+not measured: its kiln runs were frozen by their cgroup at load 80-89 (`do_freezer_trap`) and timed out unbuilt.
+
+### A-396's owed A/B: the holds against none, and against holds forced on (base b402afc7c, load 31 -> 16)
+
+Microseconds: what live shipping adds at the median; the live write's p999.
+
+| round | holds (main) | no holds | forced (A-387's decline bypassed) |
+|---|---|---|---|
+| 1 | 234.2; 707.7 | 169.2; 434.4 | 297.7; 534.1 |
+| 2 | 177.3; 393.5 | 184.4; 416.4 | 223.9; 447.2 |
+| 3 | 179.9; 402.0 | 169.8; 447.7 | 236.6; 502.3 |
+| 4 | 182.8; 453.5 | 187.3; 491.9 | 224.4; 514.3 |
+| 5 | 167.7; 400.3 | 205.0; 423.0 | 294.2; 585.5 |
+
+An earlier five-round A/B of holds against none on the same base (load 32-34): holds 454.0-596.0 µs added (p999
+859.8-4,645.0), none 455.1-551.0 (886.5-1,721.2).
+
+**Reading.** On macOS every hold is declined by A-387's predicate (`fleet.live.hold.declined` about 7,900 a run), so the
+holds change nothing there, and the CPU after the stream is the same either way (10-60 ms a second a daemon, `ps`'s 10 ms
+grain): no idle spin. Forcing the holds on is **measured and rejected**: about 50 µs worse at the median and the owner's
+CPU over the stream 620 against 380 ms. The live p999 is under 1 ms at this load; the median is 3.4-4x the 50 µs goal.
+The owner's round splits (holds, round 5): exchange 100 µs, build 28, to the control shard 23, back to the owner 5, the
+lane 1; the reply's own wake from the fold 65 µs on top. A holder's serve of an entry is about 10 µs
+(`fleet.live.hop.holder`), so the exchange is the transport and the two control shards' wakes.
+
+**Measured and rejected: a fold that answers before its follow-on work** (2fbc20496, branch
+agents/g228-live-write-adds-holds-ab, not landed). The fold's appends and sends queued behind the replies it woke, to cut
+the reply's 65-116 µs wake: on main 56f33c6f6 at load 9-11 the reply's wake was 88 against 92 µs a write, and the added
+median 2,368-2,676 against 1,312-2,967 µs. The reply's wake is not the fold's tail.
+
+### Main regressed 4x at the median and 15-20x at p999 between b402afc7c and 56f33c6f6, holds or none (load 33 -> 75)
+
+| round | old (b402afc7c) | main56 (56f33c6f6) | noholds56 |
+|---|---|---|---|
+| 1 | 543.1; 6.3 ms; 0 | 2,518.4; 126.3 ms; 30 | 1,797.5; 105.9 ms; 30 |
+| 2 | 624.1; 11.4 ms; 0 | 4,101.1; 106.8 ms; 61 | 2,948.2; 95.5 ms; 33 |
+| 3 | 822.5; 6.2 ms; 0 | 549.4; 42.7 ms; 1 | 2,425.7; 152.3 ms; 49 |
+| 4 | 604.1; 6.5 ms; 0 | 2,639.4; 108.1 ms; 39 | 631.7; 24.8 ms; 0 |
+| 5 | 700.9; 5.6 ms; 0 | 3,984.3; 150.8 ms; 56 | 4,110.9; 198.3 ms; 73 |
+
+Each cell: added at the median (µs); live p999; live writes over 50 ms. Every daemon's CPU over the stream: old
+0.26-0.93 s, the new arms 1.5-9.3 s; in several new rounds every daemon burned 300-880 ms a second after the stream,
+holds or none. Bisected on main's first-parent line (three rounds a probe, load 49-74): good through #17 (6337049f6:
+572/338/645 and 652/594/551 µs added, no write over 50 ms), bad from #25 (03a62ad15: 562/2,092/1,046 µs, 0/34/12 writes
+over 50 ms; #33 779840fba: 568/1,672/2,305, 0/25/37). A probe at load 4-6 could not classify #19-#24 (1,029-2,970 µs,
+no write over 50 ms, no reference in that run), so the burner was found by sampling instead: `sample <daemon pid> 3`
+during the stream of main56, three rounds, every daemon's heaviest non-waiting frame `mincore` (538-1,309 samples in
+3 s), under `slates_mem::resident::of_range` (A-744's sweep). #18 is a48bcdc52, "a status request arms the A-744 sweep
+to completion a step a turn": the test's own status polls before the stream (`wait_settled`, the sessions) armed a sweep
+of tens of GiB of address space on every shard, which ran half a step quantum ahead of every turn's ready work for
+seconds.
+
+### The fix, measured: the sweep on the shard's idle time, spaced by its length, and the driver harvested between idle slices
+
+Same command and Studio. Each cell: added at the median (µs); live p999; writes over 50 ms; every daemon's CPU over the
+stream.
+
+| round | main (f9c113ae9) | sweep on idle time (68b597dd8), load 15-21 | main (f9c113ae9) | sweep + harvest (343b741e8), load 11-15 |
+|---|---|---|---|---|
+| 1 | 3,485.5; 13.1 ms; 0; 6.3-7.0 s | 353.7; 64.6 ms; 18; 3.3-4.1 s | 3,087.4; 7.8 ms; 0; 5.6-6.2 s | 1,701.8; 3.6 ms; 0; 4.2-4.5 s |
+| 2 | 440.9; 17.5 ms; 1; 4.7-5.1 s | 424.5; 64.0 ms; 12; 2.7-3.4 s | 3,095.8; 6.4 ms; 0; 6.3-6.6 s | 1,397.9; 2.7 ms; 0; 3.6-4.0 s |
+| 3 | 2,415.4; 15.7 ms; 0; 5.1-5.7 s | 392.5; 61.6 ms; 8; 3.1-3.6 s | 2,614.2; 9.7 ms; 0; 5.4-6.5 s | 1,939.2; 3.4 ms; 0; 4.4-4.6 s |
+| 4 | 3,684.6; 14.0 ms; 0; 6.6-7.3 s | 406.5; 84.2 ms; 25; 3.5-3.9 s | 2,654.0; 4.9 ms; 0; 5.6-6.2 s | 1,630.0; 3.7 ms; 0; 4.3-4.5 s |
+| 5 | 3,283.7; 31.1 ms; 0; 5.8-6.6 s | 410.0; 79.7 ms; 17; 3.1-4.0 s | 2,796.5; 5.4 ms; 0; 6.1-6.6 s | 1,216.5; 2.2 ms; 0; 2.4-2.7 s |
+
+**Reading.** On idle time alone the sweep stopped running ahead of ready work (the median 8x better), but the idle loop
+never asked the driver between slices, so a socket's readiness waited for the sweep to end: 8-25 writes over 50 ms a run
+(`crates/rt/tests/idle_work_io.rs`, red before: a TCP accept never served in 5 s beside endless idle work). With the
+driver harvested between slices: no write over 50 ms, p999 2.2-3.7 ms against main's 4.9-9.7, the median 1,217-1,939
+against 2,614-3,096 µs, CPU over the stream a third lower. **Still open (GAPS):** every daemon burns 440-600 ms in the
+500 ms after the stream and 630-1,100 ms in the second after that, the armed sweeps finishing on idle time (main finished
+them during the stream, at the writes' expense): a status request still costs every shard a sweep of tens of GiB of
+address space, and an idle slice still delays the next message by up to half a step quantum. The live write's 50 µs goal
+needs no sweep armed by a plain status request at all.
+
+## A status does residency work only when asked: a live write under a burst of plain statuses (main's ruling on g228's finding; A-744; 2026-11-20)
+
+**Command (the contract):** the live-shipping measurement as above, release, CARGO_BUILD_JOBS=4, and its sibling
+`measure_what_live_shipping_adds_under_a_burst_of_plain_statuses` (the same stream while a thread asks the owner a
+plain `slates status` again and again). **Arms:** main (a664be6f2, with 7ac3900ee's measurement file only) and asked
+(7ac3900ee). **Hardware:** adas-mac-studio.local-2, Apple silicon, 32 cores, macOS, load 9-11; five rounds interleaved.
+Each cell: added at the median (µs); live p999; every daemon's CPU over the stream; in the 1.5 s after it.
+
+| round | main, contract | asked, contract | main, status burst (statuses) | asked, status burst (statuses) |
+|---|---|---|---|---|
+| 1 | 2,220.4; 4.8 ms; 5.0-5.4 s; 0.6-1.2 s | 204.9; 441 µs; 0.11-0.44 s; 20-30 ms | 2,815.1; 5.7 ms (755) | 292.6; 1,450 µs (161) |
+| 2 | 1,940.5; 7.1 ms; 4.6-5.0 s; 1.5 s | 182.3; 402 µs; 0.12-0.40 s; 20-30 ms | 1,902.8; 5.4 ms (571) | 196.2; 713 µs (104) |
+| 3 | 1,681.8; 3.0 ms; 4.0-4.4 s; 1.4 s | 172.2; 343 µs; 0.09-0.35 s; 20 ms | 1,523.8; 3.1 ms (519) | 177.6; 638 µs (100) |
+| 4 | 1,353.0; 2.7 ms; 3.5-3.8 s; 1.4 s | 177.9; 368 µs; 0.08-0.36 s; 20 ms | 1,407.3; 3.1 ms (488) | 193.4; 650 µs (102) |
+| 5 | 1,465.3; 2.7 ms; 3.7-3.9 s; 1.5 s | 177.0; 445 µs; 0.10-0.37 s; 20-30 ms | 1,099.3; 2.4 ms (404) | 184.0; 2,713 µs (101) |
+
+**Reading.** Main's status-armed sweeps cost every live write about 1.1-2.8 ms at the median and 2.4-7.1 ms at p999,
+burst or none (the measurement's own status polls before the stream arm them), and every daemon about a core for 1.5 s
+after the stream. With residency only for a memory request: 172-205 µs added (9.5x), p999 342-445 µs, the daemons back
+at 10-30 ms of CPU a second when idle; under a status burst 178-293 µs, p999 under 1 ms in 4 of 5 rounds. The added
+median is back where b402afc7c stood before a48bcdc52 (168-205 µs at load 16-31). 85a's 50 µs median is still 3.4-4x
+away on this Mac: the round's exchange (about 100 µs, the transport and two control shards' wakes, A-387 declining
+macOS holds) and the held reply's wake (65-116 µs) are what remain (the round counted hop by hop above).
+
+## Paced work yields only when someone waits: a push's build in a twentieth of the turns, newcomers held (A-783; main's pacing call of 2026-11-20 15:35, condition (d); 2026-11-20)
+
+- **The builds:** A = main at 779840fba; B = the same tree with A-783 (`slates-pace`, the runtime's probe and ceiling,
+  the push build on them). Both carry the same measurement, the runtime's counters as status rows (`rt.steps`,
+  `rt.polls`, `rt.long_steps`, `rt.poll_log2.*`; landed with A-783), release, each in its own target directory.
+- **The command:** `crates/cli/bench/pacing_ab.py A_SLATES A_BENCH B_SLATES B_BENCH ~/.cache/g309-scale/src.git
+  'v1.0.0^{commit}' --rounds N --pushes 8 --load idle|both`: a fresh daemon a side a round, the sides alternating their
+  order each round; 8 pushes of git/git cut at v1.0.0 (12,232 objects, 3.4 MB) at once, each to its own repository;
+  meanwhile a newcomer, a ref advertisement of an idle repository, one after another, timed from its send to the
+  answer's first byte; the runtime's and the build's counters from `slates status` before and after; then
+  `provision_bench`'s single-client spinning p99 (R9's gated row, the bench stopped once it prints). `cores` adds as
+  many CPU burners as cores (`yes`).
+- **The machine:** the big Studio (Apple M3 Ultra, 32 cores, 96 GiB, macOS 26.4), shared with other agents' builds and
+  a live chaos run: load at each pass's start and end below. Every round shown.
+
+**Pass 1** (16:36–16:43 PST, load 5.5 at the start): B before the batch fix (below).
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms |
+|---|---|---|---|---|
+| idle 1 | 6.124 | 3.038 | 8.27 / 18.93 | 8.74 / 42.03 |
+| idle 2 | 5.236 | 2.940 | 4.30 / 11.19 | 6.75 / 37.40 |
+| idle 3 | 5.983 | 5.237 | 3.40 / 17.24 | 2.66 / 92.08 |
+| idle 4 | 6.280 | 6.060 | 3.13 / 12.02 | 2.47 / 92.29 |
+| idle 5 | 6.493 | 4.712 | 3.34 / 11.85 | 2.96 / 105.54 |
+| cores 1 | 18.642 | 4.170 | 6.57 / 52.58 | 8.77 / 62.40 |
+| cores 2 | 7.210 | 4.576 | 9.01 / 41.77 | 8.28 / 74.31 |
+| cores 3 | 16.692 | 12.579 | 21.62 / 130.10 | 22.09 / 147.94 |
+| cores 4 | 19.247 | 14.751 | 11.63 / 81.80 | 19.40 / 123.68 |
+| cores 5 | 13.849 | 13.071 | 25.06 / 108.79 | 10.70 / 125.51 |
+
+Walls fell, but B's newcomer max rose to about the ceiling (100 ms) idle, while its builds yielded 0 to 3 times a
+round in most rounds. **Found:** a shard's step takes a batch of ready tasks out of its queue and polls them in turn, so
+the tasks after the one running a paced turn were in neither the queue nor the control channel, and the probe never saw
+them. The daemon's log (a scratch diagnostic build, never landed) showed it: a newcomer's connection, moved to its
+repository's shard just as a build turn began there, was taken into that step's batch; the turn asked 4,263 times over
+80 ms and found no one; the newcomer was first polled 94 ms after its move was sent. Fixed in B (the probe counts the
+batch's tasks not yet polled; red first, `a_task_ready_in_the_same_batch_is_seen_waiting`).
+
+**Pass 2** (17:16–17:32, load 15.8 at the start, 41.8 at the end, the box's other work rising through it): B fixed.
+
+| round | A wall s | B wall s | A newcomer p99 / max ms | B newcomer p99 / max ms | B turns that yielded |
+|---|---|---|---|---|---|
+| idle 1 | 10.551 | 4.312 | 1.91 / 12.18 | 8.52 / 20.70 | 68 |
+| idle 2 | 5.542 | 6.810 | 48.91 / 111.29 | 105.80 / 144.65 | 55 |
+| idle 3 | 4.675 | 5.642 | 34.64 / 82.80 | 42.39 / 57.60 | 44 |
+| idle 4 | 4.270 | 4.070 | 46.34 / 70.70 | 40.16 / 49.04 | 37 |
+| idle 5 | 4.080 | 4.025 | 28.46 / 35.66 | 37.94 / 59.19 | 62 |
+| cores 1 | 8.465 | 11.266 | 80.60 / 126.49 | 74.50 / 127.22 | 12 |
+| cores 2 | 9.313 | 6.118 | 17.84 / 129.15 | 48.96 / 132.48 | 88 |
+| cores 3 | 8.215 | 4.495 | 20.05 / 70.52 | 26.16 / 63.63 | 110 |
+| cores 4 | 11.656 | 7.643 | 8.75 / 51.64 | 14.57 / 40.79 | 35 |
+| cores 5 | 6.992 | 6.234 | 27.22 / 62.13 | 25.07 / 64.32 | 75 |
+
+The host's own load dominates these rounds (A's newcomer p50 went from 0.78 to 5.5 ms between rounds 1 and 2): even
+at load, best wall 6.992 s (A) against 4.495 s (B); idle about even.
+
+**Pass 3** (17:34–17:39, load 11.5 at the start, 20.8 at the end): B fixed, idle, seven rounds, the build's own turns
+read too (`push.build.turns`, both sides).
+
+| round | A wall s | B wall s | A build turns | B build turns | A newcomer p99 / max ms | B newcomer p99 / max ms | A / B provision p99 µs |
+|---|---|---|---|---|---|---|---|
+| 1 | 7.864 | 7.195 | 370,207 | 89,140 | 2.81 / 12.52 | 3.07 / 15.11 | 197.9 / 173.5 |
+| 2 | 8.704 | 7.061 | 371,069 | 62,828 | 2.41 / 12.89 | 2.21 / 13.62 | 176.4 / 183.5 |
+| 3 | 9.869 | 6.011 | 371,480 | 22,643 | 2.29 / 13.12 | 2.53 / 11.51 | 173.0 / 188.1 |
+| 4 | 9.204 | 6.648 | 371,456 | 18,682 | 2.22 / 34.41 | 5.28 / 20.23 | 165.7 / 176.4 |
+| 5 | 8.888 | 8.056 | 371,345 | 128,776 | 2.51 / 29.34 | 1.99 / 12.70 | 173.0 / 172.3 |
+| 6 | 9.948 | 9.549 | 370,669 | 118,865 | 2.54 / 12.85 | 2.76 / 12.06 | 191.3 / 183.0 |
+| 7 | 10.766 | 12.255 | 370,951 | 369,786 | 2.80 / 14.27 | 2.10 / 15.74 | 200.8 / 265.2 |
+
+- **What it says.** The build's turns fall 3 to 20 times in six rounds of seven, and the wall with them: best 7.864 s
+  (A) against 6.011 s (B), median 9.204 against 7.195 s. Newcomers hold: p99 median 2.51 ms (A) against 2.53 ms (B), max
+  median 13.12 against 13.62 ms. Provisioning holds (R9's row, median 176.4 against 183.0 µs; both above the 50 µs
+  floor on this loaded host, A as much as B). Kept: B.
+- **Owed.** In round 7 every one of B's turns yielded at its first ask (369,778 of 369,786), so it gained nothing: some
+  task on those shards was ready at nearly every quantum. Which one, and whether it is a real waiter or a task that
+  yields for its own sake, is the next measure (GAPS, A-783). The longest-step column is the shard's since its start,
+  the boot's on both sides, so it is not in the tables; the poll histograms put p999 at 0.5 to 2 ms on both.
+- **Not this change's.** `provision_bench`'s 8-client form hung on both sides (pass 1 and its own timing run): one
+  client waits in `Client::round_trip` for a reply that never comes, every shard parked in `kevent`, the main thread
+  joining it (reported to main with both stacks).

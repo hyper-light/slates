@@ -338,9 +338,27 @@ fn listable(s: &ShardState, volume: VolumeId, capability: Option<MountCapability
 fn with_export<R>(
   s: &mut ShardState,
   volume: VolumeId,
-  (subject, groups, dialect): (Principal, Option<UnixGroups>, Dialect),
+  who: (Principal, Option<UnixGroups>, Dialect),
   rights: Rights,
   capability: MountCapability,
+  f: impl FnOnce(&mut Export<'_>) -> R,
+) -> Option<R> {
+  // A view volume's texts are read through the content store, its chunks lent for the request (A-645 (a)).
+  let view = crate::vcs_store::svn_presenter::view_of(&s.svn_views, volume);
+  let view_green =
+    view.and_then(|repository| crate::repository::svn_commit::green_of(s, repository).ok());
+  crate::vcs_store::svn_presenter::lent_if(s, view.is_some(), move |s| {
+    with_export_lent(s, volume, who, (rights, capability), (view, view_green), f)
+  })
+}
+
+/// [`with_export`] with the content store's chunks lent where `view` names the repository whose view `volume` is.
+fn with_export_lent<R>(
+  s: &mut ShardState,
+  volume: VolumeId,
+  (subject, groups, dialect): (Principal, Option<UnixGroups>, Dialect),
+  (rights, capability): (Rights, MountCapability),
+  (view, view_green): (Option<slates_db::catalog::RepositoryId>, Option<VolumeId>),
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   // A mounted work's slot, made again after a restart (A-774).
@@ -376,8 +394,17 @@ fn with_export<R>(
     nfs_pending_base,
     greens,
     merge,
+    vcs_stores,
     ..
   } = s;
+  let view_source =
+    crate::vcs_store::svn_presenter::view_source(vcs_stores, greens, view, view_green);
+  let view_texts = view_source
+    .as_ref()
+    .map(crate::vcs_store::svn_presenter::ViewSource::texts);
+  let view_seam = view_texts
+    .as_ref()
+    .map(crate::vcs_store::svn_presenter::ViewTexts);
   // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774).
   let lent_green = crate::mounted_work::source(greens, &merge.mounted, volume);
   let green_tree = lent_green
@@ -410,6 +437,9 @@ fn with_export<R>(
         )
       }
     };
+    if let Some(seam) = view_seam.as_ref() {
+      bridge = bridge.reading_referenced(seam);
+    }
     attachments.begin(admitted).ok()?;
     let mut scoped;
     let served: &mut dyn slates_bridge_core::Bridge = match scope {
@@ -2770,7 +2800,7 @@ fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
     (None, None)
   } else {
     let admitted = HELD_CONNECTIONS
-      .fetch_update(
+      .try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |held| (held < bound).then_some(held.saturating_add(1)),

@@ -31,7 +31,7 @@ pub mod file;
 mod gather;
 #[cfg(all(target_vendor = "apple", any(test, feature = "sim")))]
 pub mod image;
-// slates: `pub mod issuer;` is left out with hyper-rt (vendor/hyper-raft/README.md, "Local changes", 1).
+pub mod issuer;
 mod node;
 pub mod record;
 mod resident;
@@ -41,7 +41,7 @@ pub mod segmented;
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
 pub mod threads;
-// slates: `mod unwind;` (the issuer's panic containment) is left out with it (local change 1).
+mod unwind;
 
 /// What a device operation fails with.
 #[derive(Debug, thiserror::Error)]

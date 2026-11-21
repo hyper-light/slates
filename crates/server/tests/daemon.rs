@@ -59,9 +59,9 @@ impl Client {
 
   /// Sends `body` as the next request and waits for the reply.
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect::<IpcError>(capacity, |request| {
+      return slates_ipc::status::collect::<IpcError>(capacity, *memory, |request| {
         Ok(self.call_once(request))
       })
       .unwrap();
@@ -516,7 +516,9 @@ fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
 fn choosing_more_shards_does_not_multiply_the_hosts_capacity() {
   let (daemon, instance) = shard_selection_daemon("more", 6);
   let mut client = Client::connect(&instance);
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("observe the running daemon's capacity");
   };
   assert_eq!(report.shards.len(), 6);
@@ -556,7 +558,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   daemon.bootstrap(true).unwrap();
   let mut first = Client::connect(&instance);
   let mut other = Client::connect(&instance);
-  let initial = first.call_once(&RequestBody::DaemonStatus);
+  let initial = first.call_once(&RequestBody::DaemonStatus { memory: false });
   let cursor = status_cursor(&initial);
   assert_eq!(
     other.call_once(&cursor),
@@ -581,7 +583,7 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
     },
     "completion releases the capture"
   );
-  let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
+  let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus { memory: false }));
   assert!(matches!(
     first.call(&RequestBody::List { after: None }),
     ReplyBody::Listed { .. }
@@ -623,6 +625,7 @@ fn finish_status_capture(
   let mut pages_read = 0;
   let report = slates_ipc::status::collect::<IpcError>(
     slates_ipc::status::snapshot_capacity(first.end.region()),
+    false,
     |request| {
       pages_read += 1;
       Ok(initial.take().unwrap_or_else(|| first.call_once(request)))
@@ -751,7 +754,9 @@ const DESTROY_SPREAD: usize = 8;
 
 /// Each shard's live volumes and committed bytes, from the daemon's status.
 fn shard_holdings(client: &mut Client) -> Vec<(u64, u64)> {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("status");
   };
   report
@@ -801,6 +806,88 @@ fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
     std::thread::yield_now();
   }
   drop(daemon);
+}
+
+/// A-744 with main's ruling on g228's finding (2026-11-20): only a status request that asks for the memory report costs
+/// the daemon residency work. Before, every plain status armed a sweep of tens of GiB of address space on every shard,
+/// about a core a daemon for a second or more after a burst, and live writes paid for it at every hop. Do: on a
+/// two-shard daemon, ask a burst of plain statuses; read every shard's sweep counts from the last; then ask one status
+/// for the memory report. Expect: after the burst no shard armed a sweep or took a step of one (`content_range.sweep.armed`
+/// and `.steps` 0 on every shard), so no shard's slice holds work for it; the memory request arms a sweep and steps it
+/// on every shard (the counts' non-vacuity) and reports the anchor's objects measured.
+#[test]
+fn a_burst_of_plain_statuses_arms_no_residency_sweep_and_a_memory_status_does() {
+  /// Shape: the burst, many against the one request a sweep needs to be armed.
+  const BURST: usize = 50;
+  let (daemon, instance) = daemon("plain-status");
+  let mut client = Client::connect(&instance);
+  let mut last = None;
+  let status =
+    |client: &mut Client, memory: bool| match client.call(&RequestBody::DaemonStatus { memory }) {
+      ReplyBody::DaemonStatus { report } => *report,
+      other => panic!("a status: {other:?}"),
+    };
+  for _ in 0..BURST {
+    last = Some(status(&mut client, false));
+  }
+  let sweep = |report: &slates_ipc::protocol::DaemonReport, kind: &str| -> Vec<u64> {
+    report
+      .shards
+      .iter()
+      .map(|shard| {
+        shard
+          .refusals
+          .iter()
+          .filter(|refusal| refusal.kind == format!("content_range.sweep.{kind}"))
+          .map(|refusal| refusal.count)
+          .sum()
+      })
+      .collect()
+  };
+  let plain = last.unwrap();
+  let (armed, steps) = (sweep(&plain, "armed"), sweep(&plain, "steps"));
+  let memory = status(&mut client, true);
+  let (armed_after, steps_after) = (sweep(&memory, "armed"), sweep(&memory, "steps"));
+  let measured: Vec<(String, bool)> = memory
+    .memory
+    .iter()
+    .map(|kind| (kind.kind.clone(), kind.measured))
+    .collect();
+  drop(client);
+  drop(daemon);
+  eprintln!(
+    "after {BURST} plain statuses: armed {armed:?}, steps {steps:?}; after a memory status: armed {armed_after:?}, \
+     steps {steps_after:?}; measured {measured:?}"
+  );
+  assert_eq!(
+    armed.len(),
+    usize::from(TEST_SHARDS),
+    "every shard reported"
+  );
+  assert!(
+    armed.iter().all(|armed| *armed == 0),
+    "a plain status armed a sweep: {armed:?}"
+  );
+  assert!(
+    steps.iter().all(|steps| *steps == 0),
+    "a plain status stepped a sweep: {steps:?}"
+  );
+  assert!(
+    armed_after.iter().all(|armed| *armed == 1),
+    "the memory status armed one sweep a shard: {armed_after:?}"
+  );
+  assert!(
+    steps_after.iter().all(|steps| *steps > 0),
+    "the memory status stepped the sweep: {steps_after:?}"
+  );
+  for whole in ["segment", "content"] {
+    assert!(
+      measured
+        .iter()
+        .any(|(kind, measured)| kind == whole && *measured),
+      "the memory status read the anchor's {whole} whole: {measured:?}"
+    );
+  }
 }
 
 /// §4.7 "Shards poll rings while any client has activity within the measured idle window" (A-42): a shard
@@ -925,7 +1012,9 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
     panic!("a read is served while writes are refused");
   };
   assert!(volumes.is_empty(), "the refused create created nothing");
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     strict.stop();
     panic!("status is served while writes are refused");
   };
@@ -1368,7 +1457,9 @@ fn present_named(
 
 /// The landings the daemon holds awaiting a grant, over every shard (the status report).
 fn landings_awaiting(client: &mut Client) -> u64 {
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+  let ReplyBody::DaemonStatus { report } =
+    client.call(&RequestBody::DaemonStatus { memory: false })
+  else {
     panic!("status");
   };
   report
@@ -2451,7 +2542,9 @@ fn version_stats_scenario() {
   let (daemon, instance) = capped_daemon("version-stats", SMALL_VERSION_SLAB);
   let mut client = Client::connect(&instance);
   let stats = |client: &mut Client| -> (u64, u64) {
-    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    let ReplyBody::DaemonStatus { report } =
+      client.call(&RequestBody::DaemonStatus { memory: false })
+    else {
       panic!("daemon status");
     };
     let slots = report
@@ -3719,7 +3812,7 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   );
   // The refusal is the metadata ledger's: bytes and version slots are plainly roomy, the ledger is
   // committed up to its capacity.
-  let reply = client.call(&RequestBody::DaemonStatus);
+  let reply = client.call(&RequestBody::DaemonStatus { memory: false });
   let ReplyBody::DaemonStatus { report } = reply else {
     panic!("daemon status: {reply:?}");
   };
@@ -4506,7 +4599,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     first.call(&scratch("still-served")),
     ReplyBody::Created { .. }
   );
-  let refused_count = match first.call(&RequestBody::DaemonStatus) {
+  let refused_count = match first.call(&RequestBody::DaemonStatus { memory: false }) {
     ReplyBody::DaemonStatus { report } => Some(report.clients_refused),
     _ => None,
   };
@@ -4594,9 +4687,10 @@ const RETENTION_EDITS: u64 = 6;
 /// lagging work still names the old version the copies are kept for it (the fold floor is its base),
 /// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
 /// head, folds every copy away and credits the charge — so only the rejected-result cache remains
-/// charged. Non-vacuous: the history grew with the edits before the fold (the earlier file once, which the lagging work
-/// keeps, and what the edits wrote: under two copies for all of them, A-728 part 4's honest charge) and is zero after
-/// it, and every observation has `charged == history + rejected`.
+/// charged. Non-vacuous: the history grew with the edits before the fold (what the edits overwrote, which the lagging
+/// work's version still reads, and the pieces its versions name of the current file: well under one copy of the file,
+/// A-793; A-728 part 2 kept the earlier file whole) and is zero after it, and every observation has
+/// `charged == history + rejected`.
 #[test]
 fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
   let (daemon, instance) = daemon("merge-retention");
@@ -4613,13 +4707,17 @@ fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded
     submit_accepted(&mut client, writer, 2 + edit);
   }
   let retained = daemon.merge_retention(g).unwrap();
-  // The honest charge (A-728 part 4, main's ruling): the lagging work keeps the file as it was before the edits, once,
-  // which the history holds (its earlier block); the edits add what they wrote. Never a copy per edit (W2).
+  // The honest charge (A-728 part 4, main's ruling) of what the history holds (A-793): the bytes each edit overwrote,
+  // which the lagging work's version reads, and the pieces every version names of the current file's block, two more
+  // for each edit at most; never the earlier file whole (A-728 part 2), nor a copy per edit (W2).
   let file = RETENTION_FILE_BYTES as u64;
+  let pieces = (RETENTION_EDITS + 1) * (2 * RETENTION_EDITS + 1) * 3 * size_of::<usize>() as u64;
   assert!(
-    retained.history >= file && retained.history < 2 * file,
-    "the small edits retained the earlier file once for the lagging work and what they wrote, under two copies of \
-     the file for all of them (W2: a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
+    retained.history > 0
+      && retained.history <= RETENTION_EDITS * 4 + pieces
+      && retained.history < file,
+    "the small edits retained what they overwrote and their versions' pieces, under one copy of the file ({file} \
+     bytes; a whole copy per edit before 2026-11-07, {} bytes): {retained:?}",
     RETENTION_EDITS * file
   );
   assert_balanced(&retained, 0);
@@ -4715,7 +4813,9 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
     .collect();
   let mut seated = 0;
   for client in &mut clients {
-    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    let ReplyBody::DaemonStatus { report } =
+      client.call(&RequestBody::DaemonStatus { memory: false })
+    else {
       panic!("a seated client is served");
     };
     seated = report.shards.iter().map(|shard| shard.clients).sum::<u32>();

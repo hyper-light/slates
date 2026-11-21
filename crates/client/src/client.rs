@@ -495,6 +495,9 @@ pub struct Client {
   /// Replies dropped on arrival because nothing awaited them: a protocol-only acknowledgement's, or an
   /// abandoned operation's.
   unawaited_dropped: u64,
+  /// The stamp the daemon wrote with the last reply a synchronous call took (A-559; `slates_ipc::slot`, "The stamp"):
+  /// zero before any, or when the daemon wrote none.
+  reply_stamp: u32,
   /// The async path's bind of a reconnected channel (AUD-29-19): the attest's request word while it is in
   /// flight, its reply handled where replies are drained, so a reconnect never blocks an event loop on a
   /// round trip.
@@ -1555,6 +1558,7 @@ impl Client {
       verdict_chains: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
+      reply_stamp: 0,
       attest_in_flight: None,
       attest_refused: None,
       consumer: None,
@@ -1680,9 +1684,9 @@ impl Client {
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect(capacity, |request| self.call_plain(request));
+      return slates_ipc::status::collect(capacity, *memory, |request| self.call_plain(request));
     }
     self.call_plain(body)
   }
@@ -2468,6 +2472,7 @@ impl Client {
             self.buffer(reply.request, body, reply.stamp);
             continue;
           }
+          self.reply_stamp = reply.stamp;
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
         // The daemon's process ended with the reply unwritten. A daemon that stops answering is ended by its supervisor,
@@ -2815,6 +2820,13 @@ impl Client {
   /// `slates_ipc::slot`, "The stamp"): zero before any. Read right after a send, it is that send's.
   pub fn request_stamp(&self) -> u32 {
     self.end.request_stamp()
+  }
+
+  /// The stamp the daemon wrote with the last reply a synchronous call ([`Self::call`] and the verbs over it) took, as
+  /// it landed in the completion ring (A-559): zero before any. With [`Self::request_stamp`] it splits a call's latency
+  /// between the daemon and this client (`slates_machine::attribution`).
+  pub fn reply_stamp(&self) -> u32 {
+    self.reply_stamp
   }
 
   /// Spins for `spin_ns` taking `id`'s reply if it lands — the async fast path: most replies arrive
@@ -3812,6 +3824,29 @@ impl Client {
     })? {
       ReplyBody::Created { id } => Ok(id),
       _ => Err(ClientError::UnexpectedReply { verb: "create" }),
+    }
+  }
+
+  /// Creates a volume laid over the objects of the S3 base `base` (A-555), its fetches signed with `credential`, which
+  /// the daemon holds in RAM and never records. `spec`'s `base` is not read: the S3 base is the volume's base.
+  pub fn create_over_s3(
+    &mut self,
+    spec: &CreateSpec,
+    base: &slates_ipc::protocol::S3BaseSpec,
+    credential: &slates_ipc::protocol::S3Credential,
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateOverS3 {
+      name: spec.name.clone(),
+      size: spec.size,
+      names: spec.names,
+      require_locked: spec.require_locked,
+      base: base.clone(),
+      credential: credential.clone(),
+    })? {
+      ReplyBody::Created { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create over S3",
+      }),
     }
   }
 
@@ -4992,9 +5027,22 @@ impl Client {
     }
   }
 
-  /// The daemon's status (§4.14 `slates.status`).
+  /// The daemon's status (§4.14 `slates.status`): its counters and health signals, with no residency work asked of
+  /// it; the memory report's figures are the last a memory request read ([`Client::daemon_memory_status`]).
   pub fn daemon_status(&mut self) -> Result<DaemonReport, ClientError> {
-    match self.call(&RequestBody::DaemonStatus)? {
+    self.daemon_status_asking(false)
+  }
+
+  /// [`Client::daemon_status`] with the memory report read now: the anchor's objects whole from the kernel's per-mapping
+  /// figures, and each shard's ranges swept on its idle time (A-744; main's ruling on g228's finding). Only such a
+  /// request costs the daemon residency work.
+  pub fn daemon_memory_status(&mut self) -> Result<DaemonReport, ClientError> {
+    self.daemon_status_asking(true)
+  }
+
+  /// The daemon's status, the memory report's residency asked for or not.
+  fn daemon_status_asking(&mut self, memory: bool) -> Result<DaemonReport, ClientError> {
+    match self.call(&RequestBody::DaemonStatus { memory })? {
       ReplyBody::DaemonStatus { report } => Ok(*report),
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",

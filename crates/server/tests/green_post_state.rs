@@ -565,3 +565,165 @@ fn two_whole_file_rewrites_of_different_lines_merge_as_their_edits() {
     "the head holds both edits"
   );
 }
+
+/// Close item C2 (A-776, A-547). Do: on a one-shard daemon, make a green whose `a` holds 200 short functions and whose
+/// `b` holds a line; from one work, edit `a` near its end; from another, rewrite `a` whole with a line near its top
+/// changed and rename it over `b` (a tool writing a file and moving it into place); submit the edit, then the rename.
+/// Expect: both accepted, `b` holding both edits, `a` gone. The rename's carried content is refined against `a`'s base,
+/// so the edit, mapped through the move, meets no overlap; unrefined, it replaced `a` whole and conflicted.
+#[test]
+fn a_rewrite_renamed_over_another_file_merges_with_an_edit_of_its_source() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-rename-rewrite-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "rename-rewrite"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let base: String = (0..200)
+    .map(|n| format!("fn f{n}(a: u32) -> u32 {{\n    a + {n}\n}}\n"))
+    .collect();
+  let first = base.replacen("a + 3\n", "a * 3\n", 1);
+  let mut client = connect(&instance);
+  let green = client.create_green("rename-rewrite-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "rename-rewrite-seed").unwrap();
+  client.edit(seed, "a", 0, 0, base.as_bytes()).unwrap();
+  client.edit(seed, "b", 0, 0, b"fn old() {}\n").unwrap();
+  let seeded = client.submit(seed);
+  let (editor, _) = client.create_work(green, "rename-rewrite-edit").unwrap();
+  let (mover, _) = client.create_work(green, "rename-rewrite-move").unwrap();
+  let at = u64::try_from(base.find("a + 190\n").unwrap() + 2).unwrap();
+  client.edit(editor, "a", at, 1, b"-").unwrap();
+  let whole = u64::try_from(base.len()).unwrap();
+  client.edit(mover, "a", 0, whole, first.as_bytes()).unwrap();
+  client
+    .declare(
+      mover,
+      slates_ipc::protocol::WorkOp::Rename {
+        from: "a".to_owned(),
+        to: "b".to_owned(),
+      },
+    )
+    .unwrap();
+  let edited = client.submit(editor);
+  let moved = client.submit(mover);
+  let b = client.read(green, "b", ReadAt::Head);
+  let a = client.read(green, "a", ReadAt::Head);
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(edited, Ok(Submitted::Accepted(2))),
+    "edit: {edited:?}"
+  );
+  assert!(
+    matches!(moved, Ok(Submitted::Accepted(3))),
+    "rename: {moved:?}"
+  );
+  assert_eq!(
+    String::from_utf8(b.unwrap()).unwrap(),
+    first.replacen("a + 190\n", "a - 190\n", 1)
+  );
+  assert!(a.is_err(), "a was moved: {a:?}");
+}
+
+/// Close item R3 (A-787 part 2). Do: on a one-shard daemon, seed a green's `f` with 2 MiB of source lines; from one work,
+/// change one call in it by a declared edit; from another, re-indent every line of the file (a formatter's pass, saved
+/// whole); submit the edit, then the pass. Expect: both accepted, the head the re-indented file with the edit, and the
+/// refinement having run as a job of the shard over many turns (`merge.refine.turns`), never inside the verb. Until
+/// A-787 part 2 the submit refined the 2 MiB in its own step.
+#[test]
+fn a_large_rewrite_is_refined_over_many_turns_off_the_submit() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-refine-turns-{}", std::process::id());
+  let daemon = Daemon::start(
+    &profile,
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)),
+    slates_server::SegmentSource::Create {
+      name: common::fixture_object("slates-seg", "refine-turns"),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut base = String::new();
+  let mut n = 0usize;
+  while base.len() < 2 << 20 {
+    base.push_str(&format!(
+      "  let value_{n} = compute({n}, other_{});\n",
+      n % 97
+    ));
+    n += 1;
+  }
+  let reindent = |text: &str| -> String {
+    text
+      .split_inclusive('\n')
+      .map(|line| format!("  {line}"))
+      .collect()
+  };
+  let marker = "compute(1000, ";
+  let mut client = connect(&instance);
+  let green = client.create_green("refine-turns-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "refine-turns-seed").unwrap();
+  client.edit(seed, "f", 0, 0, base.as_bytes()).unwrap();
+  let seeded = client.submit(seed);
+  let (editor, _) = client.create_work(green, "refine-turns-edit").unwrap();
+  let (formatter, _) = client.create_work(green, "refine-turns-format").unwrap();
+  let at = u64::try_from(base.find(marker).unwrap()).unwrap();
+  client.edit(editor, "f", at, 7, b"measure").unwrap();
+  let whole = u64::try_from(base.len()).unwrap();
+  let formatted = reindent(&base);
+  client
+    .edit(formatter, "f", 0, whole, formatted.as_bytes())
+    .unwrap();
+  let edited = client.submit(editor);
+  let format = client.submit(formatter);
+  let head = client.read(green, "f", ReadAt::Head);
+  let counts = daemon.refusals_on_every_shard().unwrap();
+  let turns = counts.get("merge.refine.turns").copied().unwrap_or(0);
+  let past: Vec<u64> = [
+    "merge.refine.past_quantum",
+    "merge.refine.past_2_quanta",
+    "merge.refine.past_4_quanta",
+    "merge.refine.past_16_quanta",
+  ]
+  .iter()
+  .map(|name| counts.get(*name).copied().unwrap_or(0))
+  .collect();
+  // The measured figures, for the record: the job's turns, and those past 1, 2, 4 and 16 step quanta.
+  let longest = counts
+    .get("merge.refine.longest_turn_us")
+    .copied()
+    .unwrap_or(0);
+  eprintln!("refinement: {turns} turns, past 1/2/4/16 quanta: {past:?}, longest {longest} us");
+  drop(client);
+  daemon.stop();
+  assert!(
+    matches!(seeded, Ok(Submitted::Accepted(1))),
+    "seeded: {seeded:?}"
+  );
+  assert!(
+    matches!(edited, Ok(Submitted::Accepted(2))),
+    "edit: {edited:?}"
+  );
+  assert!(
+    matches!(format, Ok(Submitted::Accepted(3))),
+    "format: {format:?}"
+  );
+  let expected = reindent(&base.replacen("compute(1000, ", "measure(1000, ", 1));
+  assert!(
+    head.as_deref().ok() == Some(expected.as_bytes()),
+    "the head is the re-indented file with the edit"
+  );
+  assert!(turns > 50, "the refinement ran over many turns: {turns}");
+}

@@ -292,15 +292,20 @@ impl LoggedOp {
 }
 
 impl WorkLogEntry {
-  /// The restatement of a work at `base` holding `files` of its own, with `journal`.
-  pub(crate) fn restated(base: u64, files: &WorkFiles, journal: &[VolumeOp]) -> WorkLogEntry {
+  /// The restatement of a work at `base` holding `files` of its own (a rebase's changed files, each whole), with
+  /// `journal`.
+  pub(crate) fn restated(
+    base: u64,
+    files: &BTreeMap<String, Option<Vec<u8>>>,
+    journal: &[VolumeOp],
+  ) -> WorkLogEntry {
     WorkLogEntry::Restated {
       base,
       files: files
-        .changed_entries()
+        .iter()
         .map(|(path, bytes)| OwnFile {
-          path: path.to_owned(),
-          bytes: bytes.map(<[u8]>::to_vec),
+          path: path.clone(),
+          bytes: bytes.clone(),
         })
         .collect(),
       journal: journal.iter().map(LoggedOp::of).collect(),
@@ -312,12 +317,11 @@ impl WorkLogEntry {
 /// range, and the inserted bytes as an extend past the file's end or an insert within it.
 pub(crate) fn edit_ops(
   path: &str,
-  old: Option<&[u8]>,
+  old_len: Option<u64>,
   (at, delete_len, inserted): (u64, u64, u64),
 ) -> Vec<VolumeOp> {
-  let old_len = old.map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX));
   let mut ops = Vec::new();
-  if old.is_none() {
+  if old_len.is_none() {
     ops.push(VolumeOp::Create {
       path: path.to_owned(),
     });
@@ -330,7 +334,7 @@ pub(crate) fn edit_ops(
     });
   }
   if inserted > 0 {
-    ops.push(if at >= old_len {
+    ops.push(if at >= old_len.unwrap_or(0) {
       VolumeOp::Extend {
         path: path.to_owned(),
         at,
@@ -412,9 +416,9 @@ pub(crate) fn replay(
           fetched: None,
           version,
         };
-        let old = files.get(base, &path)?.map(std::borrow::Cow::into_owned);
+        let old_len = files.len(base, &path)?;
         let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let ops = edit_ops(&path, old.as_deref(), (at, delete_len, inserted));
+        let ops = edit_ops(&path, old_len, (at, delete_len, inserted));
         apply_edit(
           (&mut files, &mut journal),
           base,
@@ -449,6 +453,15 @@ mod tests {
   use super::*;
 
   /// One of every journal operation, so a round trip covers each variant.
+  /// No base: a work whose green is gone, which reads only what it holds whole.
+  fn no_base() -> Base<'static> {
+    Base {
+      green: None,
+      fetched: None,
+      version: 0,
+    }
+  }
+
   fn every_op() -> Vec<VolumeOp> {
     let node = SpecialNode {
       kind: slates_merge::special::SpecialKind::Fifo,
@@ -545,23 +558,22 @@ mod tests {
   /// it; expect the same entry, and the replay of it alone to give back the base, the files and the journal.
   #[test]
   fn a_restatement_round_trips_every_journal_operation() {
-    let files = WorkFiles::from_changed(
-      [
-        ("kept".to_owned(), Some(b"own bytes".to_vec())),
-        ("gone".to_owned(), None),
-      ]
-      .into_iter()
-      .collect(),
-    );
+    let own: BTreeMap<String, Option<Vec<u8>>> = [
+      ("kept".to_owned(), Some(b"own bytes".to_vec())),
+      ("gone".to_owned(), None),
+    ]
+    .into_iter()
+    .collect();
+    let files = WorkFiles::from_changed(own.clone());
     let journal = every_op();
-    let entry = WorkLogEntry::restated(9, &files, &journal);
+    let entry = WorkLogEntry::restated(9, &own, &journal);
     let bytes = entry.to_bytes();
     assert_eq!(WorkLogEntry::from_bytes(&bytes).unwrap(), entry);
     let (base, replayed_files, replayed_journal) = replay(None, 0, &[bytes]).unwrap();
     assert_eq!(base, 9);
     assert_eq!(
-      replayed_files.changed_entries().collect::<Vec<_>>(),
-      files.changed_entries().collect::<Vec<_>>()
+      replayed_files.changed_entries(no_base()).unwrap(),
+      files.changed_entries(no_base()).unwrap()
     );
     assert_eq!(replayed_journal, journal);
   }
@@ -570,12 +582,10 @@ mod tests {
   /// expect each refused `Undecodable` by the replay, never a panic or a partial work.
   #[test]
   fn a_truncated_or_overlong_entry_is_refused() {
-    let files = WorkFiles::from_changed(
-      [("kept".to_owned(), Some(b"own bytes".to_vec()))]
-        .into_iter()
-        .collect(),
-    );
-    let bytes = WorkLogEntry::restated(3, &files, &every_op()).to_bytes();
+    let own: BTreeMap<String, Option<Vec<u8>>> = [("kept".to_owned(), Some(b"own bytes".to_vec()))]
+      .into_iter()
+      .collect();
+    let bytes = WorkLogEntry::restated(3, &own, &every_op()).to_bytes();
     for cut in 0..bytes.len() {
       assert_eq!(
         replay(None, 0, &[bytes[..cut].to_vec()]).err(),

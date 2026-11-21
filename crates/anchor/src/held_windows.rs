@@ -39,8 +39,8 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::handles::{
-  HandedEntry, HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, Reason, WHAT_SHARDS_DAX,
-  decode, encode, encode_env, encode_handoff,
+  HandedEntry, HandleMessage, HandleRefusal, HoldBounds, MESSAGE_BYTES, Reason, decode, encode,
+  encode_env, encode_handoff,
 };
 
 /// This thread's last error code, read before any other call.
@@ -404,9 +404,9 @@ struct Entry {
 pub struct Held {
   entries: BTreeMap<u64, Entry>,
   bounds: HoldBounds,
-  /// How many of the entries are DAX sections, held against [`HoldBounds::sections`]; the rest are held against
-  /// [`HoldBounds::attachments`].
-  sections: usize,
+  /// How many of the entries are held in each bound class (`handles::class`): the attachments', the DAX sections'
+  /// ([`HoldBounds::sections`]) and the content extents' ([`HoldBounds::extents`], A-789).
+  held_in: [usize; 3],
   refused: u64,
 }
 
@@ -416,26 +416,28 @@ impl Held {
     Held {
       entries: BTreeMap::new(),
       bounds,
-      sections: 0,
+      held_in: [0; 3],
       refused: 0,
     }
   }
 
   /// How many entries are held against the same bound as entries of `what`.
   fn held_like(&self, what: u8) -> usize {
-    if what == WHAT_SHARDS_DAX {
-      self.sections
-    } else {
-      self.entries.len().saturating_sub(self.sections)
-    }
+    self
+      .held_in
+      .get(usize::from(crate::handles::class(what)))
+      .copied()
+      .unwrap_or(0)
   }
 
   /// Drops entry `id`, closing its handles, and gives its room back to its class.
   fn remove(&mut self, id: u64) {
     if let Some(entry) = self.entries.remove(&id)
-      && entry.what == WHAT_SHARDS_DAX
+      && let Some(held) = self
+        .held_in
+        .get_mut(usize::from(crate::handles::class(entry.what)))
     {
-      self.sections = self.sections.saturating_sub(1);
+      *held = held.saturating_sub(1);
     }
   }
 
@@ -550,8 +552,11 @@ impl Held {
         record,
       },
     );
-    if what == WHAT_SHARDS_DAX {
-      self.sections = self.sections.saturating_add(1);
+    if let Some(held) = self
+      .held_in
+      .get_mut(usize::from(crate::handles::class(what)))
+    {
+      *held = held.saturating_add(1);
     }
     HandleMessage::Held { id }
   }
@@ -748,6 +753,7 @@ mod tests {
     HoldBounds {
       attachments: count,
       sections: 0,
+      extents: 0,
     }
   }
 
@@ -978,6 +984,7 @@ mod tests {
     let mut held = Held::new(HoldBounds {
       attachments: 1,
       sections: 2,
+      extents: 0,
     });
     let section = one_event();
     let value = handle_value(section.as_raw_handle());

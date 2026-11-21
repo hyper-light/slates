@@ -600,6 +600,247 @@ fn stock_hg_clones_pulls_and_pushes_over_the_vcs_http_edge() {
   hg_round_trip(&hg, &scratch.path, &format!("{prefix}r"), &config);
 }
 
+/// §4.17.3 decision 1 (a client's `--force` makes a line; main's item 6, reading (a), held to stock 7.2's `push -f`). Do:
+/// over the HTTP edge, push a first changeset from copy A; clone it into B, commit and push there, so the line moves;
+/// commit in A on the old head and push without `--force`, then with it; clone the repository again into C and pull
+/// into B. Expect the plain push refused in 7.2's own words (`abort: push creates new remote head`, exit 255) with
+/// nothing landed; the forced one landed; C holding three changesets and two heads on `default`, A's and B's; and B's
+/// pull bringing A's head. Skips loudly without stock hg 7.2 ([`STOCK_HG`]) or an issuer surface ([`issuer_of`]).
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping stock hg's forced new head: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-force-{}", std::process::id());
+  let started = start_anchor(&instance, &["--vcs-http", "127.0.0.1:0"]);
+  let port = http_edge_port(&started.lines);
+  let Some(issuer) = issuer_of(&started, "stock hg's forced new head") else {
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let prefix = format!("http://127.0.0.1:{port}/");
+  let url = format!("{prefix}r");
+  let config: Vec<String> = [
+    format!("auth.slates.prefix={prefix}"),
+    format!("auth.slates.username={HG_USER}"),
+    format!("auth.slates.password={token}"),
+  ]
+  .into_iter()
+  .flat_map(|item| ["--config".to_owned(), item])
+  .collect();
+  let scratch = Scratch::new("hg-force");
+  let at = |name: &str| format!("{}/{name}", scratch.path);
+  let (a, b, c) = (at("a"), at("b"), at("c"));
+  hg_ok(&hg, &scratch.path, &["init", &a]);
+  std::fs::write(format!("{a}/file"), "first\n").unwrap();
+  hg_ok(&hg, &a, &["commit", "--addremove", "--message", "first"]);
+  hg_ok(&hg, &a, &with_config(&["push", &url], &config));
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", &url, &b], &config),
+  );
+  std::fs::write(format!("{b}/file"), "first\nfrom b\n").unwrap();
+  hg_ok(&hg, &b, &["commit", "--message", "from b"]);
+  hg_ok(&hg, &b, &with_config(&["push"], &config));
+  std::fs::write(format!("{a}/other"), "from a\n").unwrap();
+  hg_ok(&hg, &a, &["commit", "--addremove", "--message", "from a"]);
+  let (refused, out, err) = hg_in(&hg, &a, &with_config(&["push", &url], &config));
+  assert_eq!(refused, 255, "{out}{err}");
+  assert!(err.contains("abort: push creates new remote head"), "{err}");
+  hg_ok(&hg, &a, &with_config(&["push", "--force", &url], &config));
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", "-U", &url, &c], &config),
+  );
+  let heads: Vec<String> = hg_ok(&hg, &c, &["heads", "--template", "{branch} {node}\\n"])
+    .lines()
+    .map(str::to_owned)
+    .collect();
+  let a_tip = hg_nodes(&hg, &a).first().cloned().unwrap_or_default();
+  let b_tip = hg_nodes(&hg, &b).first().cloned().unwrap_or_default();
+  assert_eq!(hg_nodes(&hg, &c).len(), 3, "C holds every changeset");
+  let mut expected = vec![format!("default {a_tip}"), format!("default {b_tip}")];
+  let mut seen = heads.clone();
+  expected.sort();
+  seen.sort();
+  assert_eq!(seen, expected, "both heads on default: {heads:?}");
+  hg_ok(&hg, &b, &with_config(&["pull", &url], &config));
+  assert!(hg_nodes(&hg, &b).contains(&a_tip), "B pulled A's head");
+}
+
+/// The anchor's next lines (its standard error, as `lines` forwards them), read until `instance`'s daemon says it
+/// serves: the lines read.
+fn lines_until(lines: &std::sync::mpsc::Receiver<String>, instance: &str) -> Vec<String> {
+  let serving = format!("{SERVING_LINE}{instance} serving on ");
+  let mut read = Vec::new();
+  loop {
+    let line = lines
+      .recv_timeout(PATIENCE)
+      .expect("the restarted daemon served within the test's patience");
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    let served = line.starts_with(&serving);
+    read.push(line);
+    if served {
+      return read;
+    }
+  }
+}
+
+/// A-767 C4 (main's order of 19:50: hg's push onto the changeset store, red first on the real store). Do: start an
+/// anchor whose daemon holds a changeset store in a fresh directory beside the test binary (`--vcs-store`); push two
+/// changesets of stock hg 7.2 over the HTTP edge; read the push's landing count; kill the daemon (`SIGKILL`) and, once
+/// the anchor's restarted daemon serves, clone the repository afresh. Expect the push landed as a changeset on the
+/// store (`hg_push.landed` counted), and the clone after the restart holding both changesets: the recovery read the
+/// push's changegroup back from the store, the register holding only its reference. Skips loudly without stock hg 7.2
+/// ([`STOCK_HG`]) or an issuer surface.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::disallowed_methods)]
+fn stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them() {
+  let Some(hg) = stock_hg() else {
+    eprintln!(
+      "skipping the changeset store's hg push: no Mercurial 7.2 here (set {STOCK_HG} to the command that runs it)"
+    );
+    return;
+  };
+  let instance = format!("hg-store-{}", std::process::id());
+  let binary = std::env::current_exe().unwrap();
+  let store = binary
+    .parent()
+    .unwrap()
+    .join(format!("vcs-store-hg-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&store);
+  std::fs::create_dir_all(&store).unwrap();
+  let store = store.canonicalize().unwrap();
+  let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .args([
+      "--vcs-http",
+      "127.0.0.1:0",
+      "--vcs-store",
+      store.to_str().unwrap(),
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let stderr = child.stderr.take().unwrap();
+  let (send, lines) = std::sync::mpsc::channel();
+  let reader = std::thread::spawn(move || {
+    for line in std::io::BufReader::new(stderr)
+      .lines()
+      .map_while(Result::ok)
+    {
+      let _ = std::io::stderr().write_all(format!("{line}\n").as_bytes());
+      if send.send(line).is_err() {
+        break;
+      }
+    }
+  });
+  let _anchor = Anchor {
+    child,
+    drain: Some(reader),
+  };
+  let mut first = lines_until(&lines, &instance);
+  while PRINTS_ISSUER_SURFACE && !first.iter().any(|line| issuer_surface(line).is_some()) {
+    first.push(lines.recv_timeout(PATIENCE).unwrap());
+  }
+  let issuer = first.iter().find_map(|line| issuer_surface(line));
+  settle(&instance, _anchor.child.id());
+  let (code, out, err) = slates(&instance, &[], &["bootstrap", "root"]);
+  assert_eq!(code, 0, "bootstrap root: {out}{err}");
+  let Some(issuer) = issuer else {
+    eprintln!("skipping the changeset store's hg push: no issuer surface on this platform");
+    return;
+  };
+  create_hg_repository(&instance, "r");
+  let token = minted_token(&instance, &issuer);
+  let config_for = |port: u16| -> Vec<String> {
+    let prefix = format!("http://127.0.0.1:{port}/");
+    [
+      format!("auth.slates.prefix={prefix}"),
+      format!("auth.slates.username={HG_USER}"),
+      format!("auth.slates.password={token}"),
+    ]
+    .into_iter()
+    .flat_map(|item| ["--config".to_owned(), item])
+    .collect()
+  };
+  let port = http_edge_port(&first);
+  let scratch = Scratch::new("hg-store");
+  let local = format!("{}/local", scratch.path);
+  hg_ok(&hg, &scratch.path, &["init", &local]);
+  std::fs::write(format!("{local}/file"), "first\n").unwrap();
+  hg_ok(
+    &hg,
+    &local,
+    &["commit", "--addremove", "--message", "first"],
+  );
+  std::fs::write(format!("{local}/file"), "first\nsecond\n").unwrap();
+  hg_ok(&hg, &local, &["commit", "--message", "second"]);
+  let url = format!("http://127.0.0.1:{port}/r");
+  hg_ok(
+    &hg,
+    &local,
+    &with_config(&["push", &url], &config_for(port)),
+  );
+  let (code, status, err) = slates(&instance, &[], &["status", "--json"]);
+  assert_eq!(code, 0, "status: {err}");
+  assert!(
+    status.contains("\"hg_push.landed\""),
+    "the push did not land on the store: {status}"
+  );
+  let daemon = Command::new("pgrep")
+    .args(["-f", "--", &format!("--instance {instance} daemon")])
+    .output()
+    .unwrap();
+  let killed = String::from_utf8_lossy(&daemon.stdout)
+    .split_whitespace()
+    .next()
+    .expect("the daemon's pid")
+    .to_owned();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let restarted = lines_until(&lines, &instance);
+  let port = port_after(&restarted, VCS_HTTP_LINE).unwrap_or(port);
+  settle(&instance, _anchor.child.id());
+  let clone = format!("{}/clone", scratch.path);
+  let url = format!("http://127.0.0.1:{port}/r");
+  hg_ok(
+    &hg,
+    &scratch.path,
+    &with_config(&["clone", &url, &clone], &config_for(port)),
+  );
+  assert_eq!(
+    hg_nodes(&hg, &clone),
+    hg_nodes(&hg, &local),
+    "the restarted daemon replayed the push from the store"
+  );
+  let _ = std::fs::remove_dir_all(&store);
+}
+
 /// A-650 and A-679 (§4.17.3 "The wire surface": SSH version 1, slates' own SSH server reading `hg -R <repo> serve
 /// --stdio` in Mercurial's quoting). Do: start an anchor with its SSH edge on loopback (`--vcs-ssh 127.0.0.1:0`); make a
 /// Mercurial repository through the CLI ([`create_hg_repository`]); enroll a fresh key (`credential key`, the issuer's

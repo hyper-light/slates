@@ -1894,11 +1894,34 @@ impl Shipper {
 
   /// Records `head` as the last whole state made: the owner's whole state as of the entry at it (that entry itself when
   /// it is whole, or an image of the state it left, made beside the log), which an install sends to a holder off the
-  /// chain or behind the retained tail. Ignored unless it is the owner's head now.
+  /// chain or behind the retained tail. Taken when it is the owner's head now, or a head behind it on this chain (its
+  /// start, its checkpoint or a retained entry) that the retained tail still reaches past ([`Shipper::retains_after`]):
+  /// a holder installed there catches up by the entries after it, as one installed at the head does (A-428). Never one
+  /// behind the checkpoint it would replace. Before 2026-11-20 only the head was taken, so an install image sealed over
+  /// turns while writes went on was always behind it and dropped: 1,055 of 1,055 under the seeded nemesis, a candidate
+  /// behind the tail never installed (w-forming, Goal 85b).
   pub fn mark_checkpoint(&mut self, head: Head) {
-    if Some(head) == self.head {
+    if self
+      .checkpoint
+      .is_some_and(|checkpoint| checkpoint.position > head.position)
+    {
+      return;
+    }
+    if Some(head) == self.head || (self.behind_on_chain(&head) && self.retains_after(head.position))
+    {
       self.checkpoint = Some(head);
     }
+  }
+
+  /// Whether `head` is on this owner's chain behind its head: its start, its last checkpoint, or a retained entry.
+  fn behind_on_chain(&self, head: &Head) -> bool {
+    Some(*head) == self.start
+      || Some(*head) == self.checkpoint
+      || self
+        .retained
+        .iter()
+        .find(|entry| entry.position == head.position)
+        .is_some_and(|entry| entry.head() == *head)
   }
 
   /// The last whole state shipped ([`Shipper::mark_checkpoint`]).
