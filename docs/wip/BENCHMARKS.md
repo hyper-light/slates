@@ -8830,6 +8830,56 @@ installs; diag-82's owner hooks found that tail (215,997 bytes at head 16,526). 
 diag-81 (`agents/live-durability-catchup-record`) was withdrawn on 2026-11-19: diag-84 supersedes it, and its "about
 100% of a CPU" reading had counted a window that began before the resume.
 
+### The catch-up on today's main: the pair against the pair reverted, interleaved (A-200; 2026-11-20, g227)
+
+**The question.** On the Nov 12 trees the pair caught a holder up slower than main did: 9.4–13.3 s on arm against
+2.2–2.4 s. Does that hold on today's main, and is the pair worth keeping?
+
+**The command.** `SLATES_TEST_CLI=1 SLATES_CATCH_UP_BACKLOG=20000 cargo test --release --locked -p slates-cli --test
+live_chaos -- --nocapture --test-threads=1 --exact a_resumed_holders_catch_up_beside_a_busy_volume`, run in ABBA order,
+4 runs each, a separate target directory each.
+
+**Trees.**
+- A: main with the flow fixed (ec1f2ab1, landed in b80f5699; d33d2a48 on GitHub, the same tree plus the diag workflow).
+- B: the same tree with the pair's three changes reverted (`agents/g227-catchup-baseline-2`, 837c3be2): `fold_reply`,
+  the per-entry retain bound, and `retains_after` without building.
+
+Both trees build the flow, but the scripts' up-front `cargo build --release --locked -p slates-cli --bin slates --tests`
+exited 101 on both GitHub runners for both trees. That build covers every test target, and some other target failed to
+build; the flow's own target built when it ran.
+
+**Machines.**
+- GitHub `ubuntu-24.04-arm` (aarch64) and `ubuntu-latest` (x86_64), 4 CPUs each, load about 2, 2026-11-20 23:20 UTC
+  (`diag-g227-catchup-2`; results on `diag-results/g227-catchup-2-{arm,x86}`).
+- Adas-Mac-Studio (Apple silicon, 32 CPUs), shared, load 9–49 (kiln, 2026-11-21 00:45 UTC).
+
+A Linux x86_64 leg on adacachy (load 72–77) did not finish its first release build in kiln's 4 hours, and gave no runs.
+
+| leg | A: catch-up, each run (s) | A: installs | B: each run |
+|---|---|---|---|
+| GitHub arm | 2.73 3.86 4.19 8.95 | 0 1 0 0 | timed out at 1,200 s, 4 of 4 |
+| GitHub x86 | 4.47 3.43 3.84 3.89 | 1 0 1 1 | timed out at 1,200 s, 4 of 4 |
+| Studio | 38.33 82.98 8.76 20.65 (load 10.7, 48.2, 29.0, 8.9) | 0 0 1 1 | 24.01 23.54 17.80 8.82 (load 14.4, 20.2, 15.5, 12.2); installs 1 2 1 2 |
+
+- **A's other figures.** Per MiB behind: 15.1–49.1 ms on GitHub arm, 19.1–25.2 ms on x86. The owner's two shards spent
+  442–1,247 CPU ticks over each catch-up (Linux).
+- **B's 20,000 writes with the holder stopped.** On GitHub they never finished inside 1,200 s, 8 of 8. On the Studio
+  they took 344, 1,134, 344 and 925 s, against A's 19.5, 42.9, 18.4 and 40.0 s.
+- **Neighbour volume during the catch-up, on the Studio.** A: 3,031–4,690 writes, p50 3.0–16.1 ms. B: 1,668–2,899
+  writes, p50 4.9–10.3 ms.
+
+**Reading.**
+- The arm gap of Nov 12 is gone on today's main. On GitHub's arm runner, A's best catch-up (2.73 s) sits in the old
+  main's 2.2–2.4 s range. Its median is about 4.0 s, under half the Nov 12 trees' 9.4–13.3 s.
+- Reverting the pair costs far more than any catch-up difference. Without the reply fold's fix, every reply of the
+  stopped holder clones its whole backlog, and once it resumes, the writes behind it crawl: 8 to 60 times A's time on
+  the Studio, and past 1,200 s on 4-CPU runners.
+- On the loaded Studio both trees' best catch-up is 8.8 s. A's two slowest runs were its two most loaded (48 and 11).
+- **Verdict:** the pair stays (already on main since 59ec7871). Reverting it is measured and rejected.
+- **Not pursued, recorded:** each exchange to a lagging holder is capped at one congestion window (`take_batch`), so a
+  catch-up runs at about a window a round trip. With the arm gap gone there is no measured cost to remove, so it is
+  noted here and in GAPS, not worked.
+
 ## What a WinFsp mount and unmount wait for the Windows anchor (A-213; 2026-11-05)
 
 Each WinFsp mount sends the anchor a hold and each unmount a release, and waits for the answer (A-198, A-206). The

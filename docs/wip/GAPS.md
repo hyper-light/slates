@@ -5492,10 +5492,15 @@
 > per holder, no longer builds the entries either (`a_lagging_holders_reply_costs_its_owner_the_same_whatever_it_lacks`,
 > red first). Together, at 20,000 behind: 0 installs in 7 of 8 runs (main 1 to 5), the neighbour volume's worst write
 > 0.16–0.40 s (main 1.16–1.85 s); the catch-up itself slower, 3.95–6.09 s on x86 and 9.38–13.34 s on arm (main
-> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). Open: the arm catch-up time, and this flow on
-> today's main, whose byte bounds (`Bounds::of_whole`) the measured trees predate.
-> The flow is on main since 2026-11-20 (`a_resumed_holders_catch_up_beside_a_busy_volume`, command in BENCHMARKS),
-> and its interleaved A/B against the pair reverted is in main's run-request queue.
+> 2.81–3.40 and 2.17–2.44; BENCHMARKS "A resumed holder's catch-up"). The arm catch-up time is closed (g227,
+> 2026-11-20). On today's main the flow (`a_resumed_holders_catch_up_beside_a_busy_volume`) catches a holder up from
+> 20,000 behind (about 180 MiB) in 2.73, 3.86, 4.19 and 8.95 s on GitHub's arm runner and 3.43–4.47 s on x86, 0 or 1
+> installs. That is the old main's 2.2–2.4 s range again, not the 9.4–13.3 s the Nov 12 trees took. With the pair
+> reverted on the same trees, no run got through its 20,000 writes with the holder stopped inside 1,200 s (8 of 8 on
+> GitHub). On the Studio those writes took 344–1,134 s, against 18–43 s with the pair. The pair stays; BENCHMARKS
+> "The catch-up on today's main" has every run. Noted, not worked: each exchange to a lagging holder is capped at one congestion window
+> (`live_ship::take_batch`), so a catch-up moves about a window per round trip. That costs nothing measured now
+> that the arm gap is gone.
 
 > **Fixed (live-durability, 2026-11-09): a node replaced with fresh RAM was sent pairs wrapped to its destroyed
 > predecessor's key.** An owner kept each candidate's recipient public key by stable anchor alone, and a replacement
