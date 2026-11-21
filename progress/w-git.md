@@ -315,3 +315,46 @@
 - 2026-11-21 01:10 C5 2b piece 1 LANDED 3ce898533 (pushes v5 only; shortfalls Unlanded; switch gone). Next: piece 2,
   the tests' synchronous push drivers (answered/pushed/pushed_from_the_fixtures and the in-test loops, ~30 sites)
   made async on stored daemons, and an untaken homing ask refusing; piece 3 waits for w-svn's deferred-submit hook.
+- 2026-11-21 C5 2b piece 2 LANDED f5a14f6a8 (untaken asks refuse Unlanded; carry helpers; region holds apart in
+  replay). Piece 3 (made commits onto the deferred-submit hook, record_of/v2 removed) waits for the hook on main.
+- 2026-11-21 01:31 PRIORITY, the push cut-off (w-interop: git/git whole-history push over HTTP cut at ~60 s, curl 18).
+  Diagnosed by a DIAG build (Studio-2 ~/.cache/w-git-relwt, patches ~/.cache/w-git-diag/{cut,phase_cut}_patch.py,
+  binary slates-phasediag, repro push_repro.sh into ~/.cache/w-git-diag/pushrepro). The cause: an answer step refused
+  PastAdmission after the 200 head, so the edge aborted. Phase: the checks (`unbegun/checking`) asked 485,230,824 B
+  with 300,809,433 left; it is the connectivity walk's whole-pack edge table (slates_git receive::connect begin_edges).
+- 02:20 Layer 1 LANDED 379087733 (merge df349a9fe): refusals after the body go out as band 3 words / unpack+ng
+  report, the reply ends clean, counted; git_push::words shared with SSH. Red 2/2 at 94ff89fe5, green 2/2; focused
+  51/51 + git 49/49 on the merged tree. main and w-interop told (inbox *-push-cut*).
+- NEXT (main 01:56): layer 2 before C5 2b piece 3. The checks a slice at a time over the pack held once, charging
+  only the slice (no whole edge table); red = the 611 MB push refused today, then landing within its room; A/B vs
+  stock git (release, interleaved, all N). Merge w-shared format 6 piece 1 when it lands.
+- 02:40 Layer 2 piece 1 LANDED b295ea7b3 (merge b7d2ae37e): connectivity check charges per object, no edge table
+  (red asked 134,176 B / 2,254 left). The 611 MB push no longer refused; it lands its changeset.
+- 04:10 Layer 2 piece 2 LANDED 8baa1cf16 (merge 339f7e73d): stage_room from counts; restage_turn skips when nothing
+  due (decision step 0.5 ms -> ~30 us). Focused on merged tree: git store 115, receive 50, server 53.
+- Measured (Studio-2, git/git push): checks 16.0 s, seal 3.7 s, homing+landing 1.3 s, decision >350 s unfinished.
+  The decision wall: a create walks its whole history for its green's reached set (A-614), refs x history. Options
+  (A) lazy reached sets, (B') generation order + peeled-commit head map; asked main (inbox
+  main-from-w-git-layer2-decision.md), holding. Next on my side meanwhile: the checks' 16 s.
+- Diag kit on Studio-2: ~/.cache/w-git-diag/{cut,phase_cut,timeline2}_patch.py, push_repro.sh, slates-l2diag.
+  Removed there: w-git-wt, w-git-wt2 (worktrees), w-git-target.noindex (8 GB).
+- 05:10 A-614 amended, (A), LANDED (40d961807 + docs 36883edbd, merge 30e89672f): creates, rewrites and fast-forwards
+  over sets never walked are admitted with no walk; sets derived on first read (store::Deriving, sliced, memoized, base
+  by search back); policy by git's two-colour walk; server derives before fetch and encode (vcs_store::git_derive);
+  replay walks nothing. git 587/587, server git set 188/188 on the merged tree.
+- NEXT (main 04:42): (2) the >1 s unit in the push decision (watchdog kills the daemon: shard 10 spinning 1,142 ms,
+  vcs_http.rs:1454): name it with a unit-length counter, red, slice it. r42 times each part of a decision step.
+  (3) path maps per created ref derived on first read (A-664/A-752), oracle + sliced/memoized + replay flat; red =
+  git/git push lands; then the A/B vs stock git. w-engine told (inbox/w-engine-from-w-git-path-maps.md).
+- 06:20 A-238 amended LANDED 4f6242707: a push makes the chains room before its append, a green a turn (red: 73
+  append checkpoints -> 0). The >1 s unit was repository::push::admit folding ~1,000 member greens in one append
+  (r44's stack samples). Each fold whole until w-engine lands 507110661. NEXT: path maps derived on first read.
+- 07:10 r52 (branches only on ca444739c): push 72.5 s ok, mirror clone 465 s ok (fsck clean); derive turns 3.0 M,
+  encode units past budget 844 k.
+- 07:55 derivation pacing LANDED 2b2fc8d80 (A-783 pace; red 2,404 turns -> <= 8). Finding: t_a752 flakes under load
+  on main too (1/2 at load 12.8).
+- 06:30 wide_connectivity clippy fix LANDED ca444739c (w-lint told).
+- P2 (main 05:12): created refs' greens unmaterialized, paths derived on first read. Engine half: w-rewrite-ops
+  (interface agreed: PushObjects as source, DeferredPush, green_ready, Applied::Deferred). My git half waits for it.
+- NEXT while blocked on the engine half: C5 2b piece 3 (made commits onto the deferred-submit hook, A-804 landed
+  5a21c11dc; record_of/v2 removed in the same series), per w-rewrite-ops' made-hook note.

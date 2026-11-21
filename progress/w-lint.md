@@ -287,3 +287,34 @@
 - Windows run requests (main 20:05: w-sizing R2 at 20bef898c with its red-first at 20bef898c^, w-work-mount's WinFsp
   mounted-work test, w-realtools' real_tools over WinFsp): one combined run by needs "windows". r7 and r8 both ended
   "the kiln server did not answer in time" before any output came back; whether r8 runs on jupiter is unknown.
+
+## 2026-11-21 round 14 (89269ab1b .. c8b77f817): through the network outage
+- The Mac lost GitHub for hours (fetches died mid-pack, then no answer); the transport fix (encode_packet) waited and
+  landed as 89269ab1b once it came back. kiln's server also dropped; r10 (A-789 Windows checks, red-first, real_tools)
+  ran 5h21m with no output past its clippy stage and ended when jupiter's runner restarted: no results. Not resubmitted
+  yet (main's 21:58 rule: once only, after checking).
+- Landed: 4e32bd101 (db, vcs, store, merge, ipc, hg, svn literal), 5d555c7fa (server repository, svn landing,
+  test_store), 6995ff750 (server recovery, ssh hg, git receive, verbs, tests), c22f468e3 (cli merge verbs, load_bench,
+  merge_check, fleet). Tests run for each (listed in the commits).
+- Sent: w-provision-gate (rt spin_kick time-wait; since fixed upstream), w-git (receive tests wide_connectivity),
+  w-hg (push intake_tests intake): both still red on the host. w-store: 3 store literals.
+- Windows run requests: r12 (the once-only resubmission, by needs "windows", each step capped) never started: jupiter's
+  runner restarted while it was "starting". Not resubmitted again; main to say when jupiter is steady.
+
+## 2026-11-21 round 15 at c8b77f817 (landed 7db3bdba6)
+- merge history.rs overlay (554482004, A-803; 11/10, every target) -> unchanged_outside; history_block_tests
+  int_plus_one. merge lib 253 pass. Host, fmt, structural, unsafe, six cross targets clean otherwise.
+- Still with owners: git receive tests wide_connectivity (w-git), hg push intake_tests intake (w-hg), store's 3
+  literals (w-store). Windows requests waiting on main's word about jupiter (r12 lost to its restart).
+
+## 2026-11-21 round 16 at 30e89672f
+- server git_derive never_loop -> one match; merge history_layers_bench Stream alias (every target); git oracle
+  CommittedPush alias. server vcs_store:: 109 pass, examples and git lib tests build. Host, fmt, structural, unsafe, cross
+  clean otherwise. Still with owners: w-git (receive wide_connectivity, which also blocks git's lib tests), w-hg (intake
+  helper), w-store (3 literals). Windows requests held for main's word on jupiter.
+
+## 2026-11-21 round 17 at 7e110566d
+- merge push.rs (efe6d2763: deferred push records) on every target: decode split (DeferredReader::head), widths by
+  size_of; push tests GreenReads alias + owed_history split; server push test split, green_ready Copy clone. merge lib
+  258, server repository::push 7 pass. w-git's helper fixed upstream. Still with owners: w-hg (intake helper), w-store
+  (3 literals). Windows requests held for main's word on jupiter.

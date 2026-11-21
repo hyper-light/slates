@@ -101,3 +101,34 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - State per platform (GitHub ci.yml `slates` job): macOS arm64 GREEN (44841298533/136653837819), Linux x86-64 GREEN
   (44851246181/136703754443; again 44867288588/136745995680). Linux arm64: lld link fix 482bd01f8 awaiting a run.
   Windows arm64: CRLF fix 60c0b27c5 awaiting a run. Windows x86-64: w-k90-win (2 Unix-path tests in workspace::tests).
+
+## ~03:10 PST 11-21 (11:10Z)
+- Run 44887857088 (kiln a0d114abb: contains 08f1a434's pin, 482bd01f8 lld, 60c0b27c5 CRLF, w-k90-win's f16212799):
+  GREEN Windows x86-64 `windows (Slates tests)` 136804151233 (w-k90-win's job); GREEN Linux arm64 `ubuntu-24.04-arm
+  (Slates build and tests)` 136804151244 (lld link; build 37 min). ubuntu-latest lost its hosted runner (infra; Linux
+  x86-64 already green twice). windows-11-arm in lib tests; macos-latest still building.
+
+## ~04:25 PST 11-21: DONE
+- GREEN Windows arm64: run 44887857088 job 136804151286 (a0d114abb; vendored 11/11 with the CRLF fix).
+- Goal 01a1facaf183 marked met (goals_done) with: macOS arm64 44851246181/136703754428, Linux x86-64
+  44851246181/136703754443 (4f5e58c1b); Linux arm64 136804151244, Windows x86-64 136804151233, Windows arm64
+  136804151286 (44887857088, a0d114abb). Pin 8ce3d61523e1 in all. No CLI call. Reported to main (inbox).
+- For main to cancel (needs a person): kiln ci runs 01a1fa8f0de173e39b8af52219ffb700, 01a1fa8fe4097372b94f7337ff2b7fd3,
+  01a1fa8ff6d771bc90e709b705554f79, 01a1fa9006fe76bcbc4891519afba25e (wedged), and r145 (jupiter repro, unneeded now).
+- For main to delete: ~/kiln-work/w-k90-pin-2-kiln (scratch clone), ~/.cache/w-k90-pin-2-target.noindex,
+  ~/kiln-work/w-k90-pin-2-logs.
+
+## ~05:00 PST 11-21: C1 CLOSED (inbox/main-from-w-k90-pin-2-close.md). R2 (runner link closing) root cause found
+- adacachy enp9s0: 192.168.1.77/24 primary (static, not NetworkManager's: DHCP-only profile) + 192.168.1.90/24
+  secondary (DHCP). kiln quic_advertise 192.168.1.90:7071, bound 0.0.0.0:7071; LAN route src .77.
+- kiln's version probe from Studio-4 to .90:7071: answered 5/5 FROM .77 (scripts ~/kiln-work/w-k90-pin-2-scripts/vnprobe.py).
+- => direct QUIC answers come from the wrong address -> runners fall to the HTTP tunnel and its 5-min UDP check
+  (tunnel.rs udp_answers: from == to) never passes -> all LAN Macs stay tunnelled; Macs reach adacachy on 2.4 GHz Wi-Fi
+  (Studio-4 en1 ch9 -69 dBm, Ethernet unplugged; cec37f60 .84 logs "Host is down" every few min): each blip kills the
+  tunnel's TCP -> QUIC ends ~30-90 s later -> "agent disconnected reason=closed". 192.168.1.93's tunnel: opened every
+  ~16.3 min, its QUIC gone within ~1 min, tunnel closed idle 600 s later (f3f618's cycle).
+- Ruled out: load (server's 7071 socket 0 drops since start; 0.7% host-wide UDP drops are other sockets), ARP table
+  (109/1024), upgrades (1 of ~20 drops). Tunnel is Class::Background in overload.rs (noted, not the cause here).
+- Operational fix = a person on adacachy (drop .77 or route src .90). kiln fix = IP_PKTINFO in vendored hyper-rt +
+  hyper-transport (passes local_ip None at endpoint.rs:1037): asked main whether that's R2's fix.
+- Reported: inbox/main-from-w-k90-pin-2.md (~04:50).

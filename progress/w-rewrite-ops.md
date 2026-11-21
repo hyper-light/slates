@@ -1,5 +1,68 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~09:20 PST — svn stage C, the green's side, LANDED (A-814, main a0cdaf94f)
+- `ImportBatch` (a scratch member, staged works, one entry). w-svn has the seam and its side's list.
+- GAPS: A-813's f > 0 limit recorded with main's §4.16 ruling.
+- NOW: A-803 (b), offset-shift layers (red: values walked per insert). Then the one-value drift.
+
+## ~08:45 PST — main 05:51: A-812's robustness gaps FIXED (A-813, main 8f4011a2e)
+- Holders take an owed version (the replica owes the same push). Retention is secured before the commit. Tail signatures
+  are kept.
+- Open: a version after an owed one at f > 0 waits for a holder's replica to be made (needs the git store on holders).
+  Asked of main and w-git.
+- Next: svn stage C, my half, against the proposed split.
+
+## ~08:00 PST — P2's engine half LANDED (A-812, main 7e110566d)
+- An owing green is made when first reached, through one door, and equals the eager create by construction.
+- w-git told (inbox/w-git-from-w-rewrite-ops-p2-landed.md); main told (inbox/main-from-w-rewrite-ops-p2.md).
+- Owed: GAPS A-812 (a) to (e).
+
+## NEXT, in order (main 04:36 PST, 2026-11-21)
+1. **Stage C, the green's side.** It waits for w-svn's answer on the split (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md).
+   If w-svn hasn't answered within its next turn, I build my half against the proposed split: `ImportBatch` on a lineage
+   preview, one `apply_recorded` commit, and push taking N updates of one green.
+2. **A-809 leftover (b).** Layers that carry an offset shift, composing with overwrite layers, so an insert or delete
+   walks no earlier value. The oracle must cover them. Red: values walked per insert (2,551 at history 5,000 today).
+3. **The drift.** A one-value change still goes 2.6 to 9–10 µs over history 100 to 5,000 (A-811's bench). Chase it after
+   (b).
+
+## 2026-11-21 ~04:35 PST — main 04:11: leftovers measured, A-811 LANDED (main 55288d05b); stage C split proposed
+- (a) read through layers: 191 to 5.9 µs at m = 10^4. (b') SDK replace: 12.6 ms to 10.4 µs at history 5,000.
+- (b) insert re-anchor: measured open (17.5 ms at history 5,000); its design asked of main.
+- Stage C: split proposed to w-svn (inbox/w-svn-from-w-rewrite-ops-stage-c-split.md); waiting for the answer.
+
+## 2026-11-21 ~04:30 PST — main 04:02: the checkpoint failure FIXED (A-810, main d9bc5f00c)
+- The index's model asked specialness timelessly; the index was right; it was not the restore. Seeded red, named test,
+  0 failures in 25 runs. Bug record in docs/bugs.
+- A-803 (a) and (b) are not measured gaps (GAPS corrected, fd031603d); stopped there per main's condition.
+- Note: inbox/main-from-w-rewrite-ops-a810.md.
+
+## 2026-11-21 ~04:00 PST — main 02:37: all three pieces LANDED
+- Piece 1: A-805, 31c0acd50.
+- Piece 2: A-807, dbfac3e13.
+- Piece 3: A-809, main 5eeb3c481 (piece 2f35ad7d8). At 10^5 versions, judge 65.4 to 22.5 µs and values 228 to 1.6 a
+  verdict.
+- w-fed-move told: inbox/w-fed-move-from-w-rewrite-ops-a809.md. main told: inbox/main-from-w-rewrite-ops-a809.md, with
+  the checkpoint seed that fails on main.
+- Left: GAPS A-803 (a) and (b); GAPS C2 (b), (c) owed with w-hg, and (d).
+
+## 2026-11-21 — main 02:37: pieces 1 and 2 LANDED, piece 3 (A-803) in progress
+
+- Piece 1 (A-805): the verdict is held, never shown before the one commit. Landed as 6f4303bef.
+- Piece 2 (A-807): Mercurial's made changesets take the hook. Landed as c6f71e8e4.
+- Piece 3 (A-803): the re-anchor's per-path anchor indirection. Next; w-fed-move told.
+
+## 2026-11-21 — LANDED: the deferred-submit hook (A-804; piece 109348900, main 5a21c11dc)
+
+- Main's 01:52 piece. `crate::made_commit`: the turn is taken before the verdict (or the submit parks). The made task
+  lands the changeset, then commits the version, the register entry, the settle and the completion in one step, and
+  then answers. A kill between the land and the commit recovers to before, and the retry lands once.
+- Three tests in `repository/svn_commit/tests.rs`, red before and green now. Notes: inbox/w-svn-, w-git- and
+  main-from-w-rewrite-ops-made-hook.md.
+- Left (GAPS C2, A-804 owed): the pure verdict committed by position, the bare dispatch, hg_made, and git's adoption
+  (w-git).
+- The BENCHMARKS before/after table (ca9e40a7b) landed with it.
+
 ## 2026-11-20 ~19:10 PST — close list (Ada's CLOSE THE OPEN ITEMS order): C1, C2, R3 all CLOSED
 
 - C1 CLOSED: b8c16aad7 (main d4a5f9f43). A work off its green's shard fetches the base of files it replaced whole.

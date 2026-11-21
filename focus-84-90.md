@@ -1546,3 +1546,192 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - THE PUSH CUT-OFF, NAMED (w-git): about 65 s in, an answer step refuses the 611 MB push PastAdmission (its working set outgrew the room its shard admitted). The reply's head was already out, so the 413 can't be sent and the edge aborts: curl 18.
   - RULING: layer 1 now: every refusal after the head in git's own words, never an aborted connection. Layer 2 before C5 2b piece 3: the answer phases slice over the pack held once and charge only the slice (A-719, Ada's tens-of-thousands-of-large-pushes rule). Red: the 611 MB push lands within its room; A/B against stock git's 10.77 s.
   - DISK: the MacBook at 26 GB; w-svn's target regrew to 27 GB. It deletes incremental and builds with CARGO_INCREMENTAL=0.
+- 2026-11-21 02:03 PST
+  - w-engine is BACK (took the 89b ruling). Its fold now finishes in 0.9-1.6 s on a deadline-sized share. A/B against main:
+    - Z=50 ms: p99 under 1 ms for every kind, 5 of 5 rounds (main at most 2); SubmitAccepted p999 1.4-9.2 ms vs 64.7-89.5.
+    - Z=20 ms: SubmitAccepted p99 5.4-9.7 ms vs 2.5-4.5, WORSE; p999 better.
+  - RULING: (b): subtract a key's old entry at first change, half the hashing and no history reads, no format change. Measure again; (a) and (b) land together only if Z=20 p99 is no worse. (c), the format change, only if needed and inside w-shared's format 6 bump. Push through the MacBook (Studio-4 unreliable).
+  - LANDED: 302da8b45 (w-svn B2 (a): DAV GET reads a stored text's piece through the store). kiln CI: run 44887857088 on a0d114abb, carrying w-k90-win's w2/w7 fix, holds the lane; no dispatch needed.
+  - The MacBook disk back to 44 GB.
+- 2026-11-21 02:08 PST LANDED:
+  - 98a39ef1c (w-fed-move, A-802, goal 86b): a destroy asks its tenant's volume count instead of collecting every volume of the partition. With 10^4 idle works pinning the floor, 1,000 clients go from 2,506 to 5,956 verdicts/s; verdict 84 -> 44 us; cycle p99 501 -> 212 ms. Red first. Injection flags (--idle-works, --preload, --lagged-submit) added to the harness.
+  - 1946bd8ea (w-svn B2 (a): get-file-revs through the store).
+  The injection table: (a) bases behind is flat; (b) history grows the verdict 41 -> 90 us at 10^5; (c) idle works was the wall, fixed.
+  RULING: w-fed-move's (b) next, first re-measured on main after 2c32af2b5 (reanchor O((n+k) log k)), which may be the same scan.
+  The MacBook disk is 40 GB.
+- 2026-11-21 02:13 PST
+  - GOAL 92's SHARDS PART MET (w-k90-kvm), all six items in kiln's one vendored tree:
+    - (1) D288, the resync end: already works; real VMs on KVM and HVF.
+    - (2) a guest's POSIX ACLs: kiln 110f4115f, red then green in a macOS VM; jupiter 116/116.
+    - (3) a guest over a Slates stream: already works on KVM and HVF.
+    - (4) exactly one vendor/slates: already true.
+    - (5) M620 WHP DAX edges: kiln 64624e059; jupiter 2 of 6 red without it, 6 of 6 with.
+    - (6) shards restore keeps the share: kiln 3ba7efe6c, real-VM red then green.
+    - vendor.py check shards: 5 recorded changes, 0 differences. inbox/main-from-w-k90-kvm-close.md.
+    - Gaps kept on record: WHP tests refused side by side; item 6's Windows unit test can't compile without the vendored test data; the Windows compile used aws-lc's prebuilt objects.
+    - The UI part needs Ada's mark: main's goal stack still reads empty from this session.
+  - LANDED: 379087733 (w-git push cut-off layer 1: a push refused after its body is answered in git's words, never a cut connection; red 2/2). Layer 2, the charge, is named and next.
+  - The MacBook disk is 32 GB.
+- 2026-11-21 02:20 PST DISK: the MacBook fell to 20 GB free (w-git's r10 release build placed here: 3.5 -> 14 GB). Main ran clean-aggressive.sh per the under-30-GB rule. It deleted ~/.cache/kiln-send-route-target (26 GB, a kiln session's build output, last written 23:43, not in use; regenerable, the session rebuilds if it resumes) and w-k90-a520's finished reach copy. Free went 20 -> 60 GB. w-git puts release builds on a Studio from now on (needs disk=60g) and builds with CARGO_INCREMENTAL=0 (w-svn's target went 27 -> 6.4 GB that way). Studio-1's g221 and g223 show offline (network).
+- 2026-11-21 02:23 PST LANDED:
+  - b295ea7b3 and dc7c03c35 (w-git push layer 2, piece 1): receive's connectivity check charges its objects, never its edges; red asked 134,176 B with 2,254 left.
+  - b9ce328cb (w-svn B2 (a): export reads stored texts through the store).
+  - 24a8f7e5e (w-fed-move, A-803): the verdict's growth with history named as A-793's re-anchor: O(k) for a path's k-th change while a reader pins the floor. Judge 24 -> 71 us and values walked 7.9 -> 231 at 10^5 versions; not the 100k wall. Fix design to main first.
+  A-804 is claimed by w-rewrite-ops (the deferred-submit hook). The MacBook disk is 59 GB.
+- 2026-11-21 02:28 PST LANDED:
+  - 90e2a7666 (w-rewrite-ops, A-804, the deferred-submit hook): a server-made svn commit is answered only after its changeset landed and its version and entry committed together.
+  - ee96cfa26 (w-svn: C2 B2 (a) COMPLETE; the deltify job reads through the store).
+  - c870c8f80 (w-perf: the hg stream clone's chunks as stored deltas, no whole text made, red first). hg's one-changeset pull went 4.2 s -> 0.303 s in round 1 (hg serve 0.230 s).
+  RULING (w-perf): advertise the stream capability per repository, only where the store keeps the logs. Stock hg clone --stream against an imported repo now aborts "operation forbidden by server" instead of falling back. Red with stock 7.2, then the full A/B, and name what's left of the pull.
+  NOTED: w-svn's B2 (b) plan. (b.1) a commit's stored texts let go once landed; recovery stops reading them back. (b.2) the records' kept texts land as Payload deltas with Texts rows and keep only a window index; disk stays delta-sized, ~35 MB for git-2000. Storing wholes was rejected at 12x the disk.
+  The MacBook disk is 51 GB.
+- 2026-11-21 02:33 PST RULINGS:
+  - w-rewrite-ops (A-804 landed as 5a21c11dc): first close its own gap. The verdict applied in memory lets a read see a version before it's durable, a read of the uncommitted, so it's computed pure and applied in the one commit, with a red for a read during a held landing. Then hg's made changesets adopt the hook. Then A-803's fix.
+  - A-803 (the re-anchor's O(k) per change with a pinned floor): option (1), the per-path anchor indirection with an interval index, O(log + pieces touched), oracle against today's reanchor, A/B with --preload. Option (2) rejected (gives back A-793's memory saving). Built by w-rewrite-ops.
+  - w-fed-move stays on the 100k walls. While r48 waits it takes the 300 MB work log, unbounded growth: a counter-named mechanism, red, fix.
+  2c32af2b5 was already in w-fed-move's profiled build; the growth survives it.
+- 2026-11-21 02:38 PST LANDED: 2659cfe39 (w-perf: git's repository index is kept up as Mercurial's is, merged a table at a time once built whole, its lends reporting lookups; red: no merge without its arm). The compaction ruling now covers git as well as hg. No agent waiting on main. r48 still queued (no start notice). The MacBook disk is 46 GB.
+- 2026-11-21 02:43 PST
+  - LANDED:
+    - 772395004 (BENCHMARKS: hg's one-changeset pull 4.2 s -> 0.243 s best, hg serve 0.189 s, every run shown; still 1.29x stock).
+    - 5ddb0e3c3 (w-svn B2 (b) P1: a commit brings back a stored text the content store let go).
+  - RUN: w-work-mount's C1 WinFsp test can't reach jupiter from Studio-2 (10 kiln refusals), so main runs it from the MacBook as kiln r1 on jupiter: a fresh clone of agents/w-work-mount-win (0cbef8441), slates-server's build warnings counted, then a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save. The result goes to w-work-mount.
+- 2026-11-21 02:48 PST Quiet: no agent waiting on main; no new landings since 02:39. jupiter run r1 (w-work-mount's WinFsp test) is running; r48 is still queued. The MacBook disk is 39 GB; the owners were told earlier, and the cleanup runs again under 30.
+- 2026-11-21 02:53 PST LANDED: 34259b8eb (w-svn B2 (b) P2: a hook's view brings back a stored text the content store let go before it holds it). w-git waits on its own r14 (the push's decision phase sampled). No agent waiting on main. The MacBook disk is 35 GB.
+- 2026-11-21 02:59 PST DISK, the MacBook: 59 GB free at 02:22, 31 GB now, none of it slates' targets (only w-perf 4.6 GB and w-svn 5.4 GB are active). The growth:
+  - a Docker container elated_leakey (rust:1-bookworm, 33 min) building kiln and running w-k90-vendor's C1 Linux tests (workspace::slates, vendored, slates_roles) from a kiln work folder; its writable layer is 13.9 GB, freed when it exits;
+  - Docker images up 14 GB;
+  - ~/.local/share/kiln up 37 -> 53 GB (agent work folders);
+  - other sessions' new caches (kmf-local 6.4 GB, reliquary-rq03 2.3 GB, kiln-move-freeze 1.1 GB).
+  The clean-aggressive rule applies under 30 GB; kiln-opt-target (18 GB, unwritten since 23:09) qualifies then. No agent waiting on main.
+- 2026-11-21 03:03 PST
+  - LANDED: 6b555466b (w-perf: an index never merged, such as a repository filled by pushes alone, is merged once its lookups are reported, which times the rule's price; red: four runs, no merge). inserts_took stays owed in GAPS for w-hg's and w-git's intakes. The stream A/B restarted on the big Studio (r3).
+  - w-fed-move claimed an A-number for the work-log wall ("a work's log is what it wrote").
+  - DISK: the MacBook at 29 GB. clean-aggressive freed 0: kiln-opt-target has a file open, so it's in use and kept. The growth is Docker (the kiln-build container's 14 GB layer, freed on exit; images +14 GB) and kiln's agent folders. Ada's. Studio-1's g221 and g223 offline again.
+- 2026-11-21 03:08 PST
+  - LANDED: dc0adee77 (w-fed-move, the work-log wall: a rebase answers each changed file as parts over the head, and a work holds and logs those parts, so its log is what it wrote).
+  - Studio-2 is off kiln again (its 7 agents offline).
+  - DISK: the MacBook at 27 GB. The kiln-build container elated_leakey is still running at 42 min, its layer 14.2 GB, freed when it exits. Docker images are 60 GB (36.6 reclaimable, not ours). w-git's r18 is compiling on the MacBook, non-incremental.
+- 2026-11-21 03:13 PST
+  - LANDED:
+    - A-806 (w-fed-move, 4c404823 / dc0adee77): a work's log holds what it wrote. A rebase answers changed files as pieces over the head. Largest log 752,530 -> 2,036 bytes over kernel/, 35,249,811 -> 1,957 over asic_reg. Red first: a 64-byte write into 1 MiB logged 1,048,635 bytes before, under 1,088 after.
+    - 542e1242c (w-svn B2 (b) P3: the content store lets go a commit's texts once landed, recovery reads none back, the deltify job retired).
+    - w-git's r18 is green at 8baa1cf16 (layer 2's next piece), landing.
+  - STALE TEST on main: daemon's the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier still asserts a green's landing is refused, but A-774 part 3 (f401f798c) made greens landable. w-fed-move updates only that assertion to A-774's rule, or stops and reports a design conflict.
+  - NEXT for w-fed-move: owner asks per client grow ~6x with scale (17.5 at 1k, ~101 at 100k). Inject contention to find the kind that grows.
+  - DISK: the MacBook back to 42 GB. The kiln-build container is still running at 47 min, 14.3 GB.
+- 2026-11-21 03:18 PST LANDED: 564cc74af (w-fed-move: the stale role test judges a green's landing as any volume's, so it expects the missing target refused, not Unsupported: A-774 part 3's rule; stale since f401f798c). w-fed-faults acknowledged an old message late; its list stays closed. w-git's r22 (the git/git push on the 8baa1cf16 diagnostic) is running. The MacBook disk is 55 GB.
+- 2026-11-21 03:23 PST
+  - LANDED: dbfac3e13 (w-rewrite-ops, A-807: Mercurial's made changesets take the deferred-submit hook). Piece 1, the dirty read during a held landing, isn't visible on main; asked whether it's inside A-807, and if not it comes before A-803.
+  - RUN: main queued w-work-mount's Linux FUSE C1 test as kiln r2 (needs linux,mem=16g,disk=30g; adacachy under strain, so queued): a fresh clone of main, then fuse_mount's a_work_mounted_through_fuse_saves_and_its_submit_lands_the_save. A skip is not green. jupiter's r1 (the WinFsp test) hasn't reported yet.
+  - The MacBook disk is 53 GB.
+- 2026-11-21 03:28 PST LANDED: bf3606a54 (w-perf: hg serve streams only where the store keeps the logs, so stock hg clone --stream falls back instead of aborting; a null-base revision is streamed as its text). 89269ab1b (w-lint: the transport clippy fix, so the full lint round runs). w-work-mount waits on main's r1 (WinFsp, jupiter) and r2 (FUSE, Linux, queued). No agent waiting on main for a ruling. The MacBook disk is 53 GB.
+- 2026-11-21 03:33 PST
+  - LANDED: 8968640c0 (w-perf). The stream capability per repository is red/green with stock hg 7.2: the imported leg aborted "operation forbidden by server" before, and clones plainly with hg's warning after. A REAL BUG found and fixed in the same commit: a pushed repository's stream clone failed "integrity check failed on 00changelog:0", because a null-base revision carried its 12-byte push header. Test stand-ins had stored it without the header; they now model the real push.
+  - r3 (old tree, big Studio), all three rounds against stock hg:
+    - one-changeset pull: 0.181-0.216 vs 0.155-0.205 s (best 1.17x);
+    - clone -U: 17.2-17.7 vs 8.0-11.0 s (2.1x);
+    - first push: 113-128 vs 10.6-14.1 s (about 10x slower, the largest hg gap);
+    - the daemon ends at 5.9 GiB resident.
+  - NEXT for w-perf: the pull A/B with needs (no Studio-2 pin), then profile the push by phase and hand w-hg the named step, or fix it if it lies outside C1's files.
+- 2026-11-21 03:38 PST LANDED:
+  - b0405dcad (w-fed-move, goal 86b): an edit reads its file's base length from the work's kept entry, and a rebase gives the entries of every path the work touched. At 10 hot files, owner asks fell from 69.4 to 48.5 a client.
+  - 4e32bd101 (w-lint round 14 at 89269ab1b: db, vcs, store, merge, ipc and hg back under the wall; literals derived). Round 14's pieces went to w-provision-gate (a disallowed std::thread::sleep in its A-798 spin_kick test; nudged through kiln), w-git and w-hg.
+  - A-809 claimed by w-rewrite-ops (A-803's fix, the layered anchor). w-perf's pull A/B now runs off Studio-2; the push profile is next.
+- 2026-11-21 03:43 PST
+  - CONFIRMED: w-rewrite-ops' piece 1, the dirty read during a held landing, is on main as 31c0acd50 (A-805), before A-807; it is now on A-809 (A-803's layered anchor).
+  - LANDED: 5d555c7fa (w-lint round 14 part 2: repository creation's boxed refusal, the svn landing's payload, the store tests' scratch and splits).
+  - w-fed-move's asks table at 1,000 clients (hot files 300/100/30/10): asks per client 17.5 / 23.1 / 38.7 / 69.4 and rebases 2.3 / 3.9 / 9.7 / 22.2. Contention is the knob. A-808 fixed the length re-asks.
+  - RULING: a rebase drops a journal op whose result became identical to the head, as git rebase skips already-upstream commits (D-27's identical). Provenance stays: each is recorded identical, as in A-782. An oracle holds heads and per-op outcomes equal with and without the drop, apart from git's later-change case, stated in the design with an amendment entry. A/B expects ~13.8 fewer byte asks per client at 10 hot files.
+- 2026-11-21 03:48 PST
+  - LANDED: f25fa0438 (w-provision-gate: A-798's spin_kick holds its turn instead of sleeping, D-9). 7ff7b3316 (w-git layer 2 piece 2: a decision step reckons its stage's room from counts, 0.5 ms -> 30 us a step).
+  - RUN r1 (jupiter): the WinFsp test SKIPPED (SLATES_TEST_CLI and WINFSP_TEST_MOUNT unset), which isn't green. slates-server built with no slates warnings (only aws-lc's build-script notes), so 0cbef8441's import fix holds. WinFsp is installed on jupiter (winfsp-x64.dll present). Rerun as r3 with both variables set.
+  - RULING (w-git layer 2 decision wall: 1,027 refs, mostly old annotated tags, each walking its whole history, over 350 s): option (A), an amendment to A-614 under A-647's derived-data rule. A ref created at a commit that is no green's head records "the closure of H", derived on first read, so admission walks what's new once per push, as git does. (B') was rejected: new persistent derived index state for the same result. Conditions: an oracle (derived equals eager, before and after a restart), sliced and memoized derivation, recovery flat in history, and the 611 MB push landing as the green.
+- 2026-11-21 03:53 PST
+  - RUN r3 (jupiter, main as of 02:47 with WinFsp live): w-work-mount's C1 test is RED. a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save panicked at winfsp.rs:2539: "unmount: slates: no slates volume is mounted at E:", exit 4, 5.19 s. Sent to w-work-mount to fix red first; main runs its diagnostic commands on jupiter, since Studio-2's kiln can't.
+  - LANDED: 6995ff750 (w-lint round 14 part 3: recovery, ssh hg, git receive, verbs and two tests back under the wall). w-work-mount's import fix was already on main (7a9ace19f); its branch is deleted. w-git's (A) plan comes in pieces (inbox a35b80d).
+- 2026-11-21 03:58 PST
+  - LANDED:
+    - 5eeb3c481 (w-rewrite-ops, A-809, A-803's fix: the layered anchor). A length-preserving change walks one value: the 300th overwrite walked 300 values, now 1. At 10^5 preload, judge 65 -> 22 us and values per verdict 227 -> 1.6; verdicts/s 4,851-5,178 -> 5,684-5,961. Oracle against FULL_REANCHOR_ONLY clean in 18 runs.
+    - c22f468e3 (w-lint round 14 part 4).
+  - BUG FOUND (w-rewrite-ops), assigned to it: checkpoint.rs a_green_restored_from_its_checkpoint_answers_as_the_green_it_was fails 1 in 5-10. The change index after a restore drops a path (["e/f"] vs the model's ["a", "e/f"]), reproduced on pure origin/main. Seed into the seed file, then fix.
+  - RUNS: r4 on jupiter runs w-work-mount's C1 fix (agents/w-work-mount-c1, 705f4d7e5: a merge volume's status reports its mounts) under the live WinFsp test. r5 on Studio-4 runs slates-merge's clippy and full suite on main, w-rewrite-ops' request.
+- 2026-11-21 04:03 PST
+  - RUN r5 (Studio-4, main c8b77f817): slates-merge's full suite is green (lib 253/253, every target). Clippy had one error, the layered overlay's cognitive complexity at 11/10, which w-lint's round 15 had already fixed: 7db3bdba6 on main.
+  - r4 (jupiter, w-work-mount's C1 fix 705f4d7e5) is still running.
+- 2026-11-21 04:08 PST
+  - LANDED: 2bd701897 and d9bc5f00c (w-rewrite-ops, A-810). The checkpoint-restore failure was the change index's MODEL asking "ever special" instead of "special by its change"; the model now states the design's rule. fd031603d (GAPS: A-803's leftovers (a) and (b) were found by design, not measured).
+  - RULING: w-rewrite-ops measures (a) and (b) for about half an hour; the one that grows gets fixed, the one that's flat is closed as measured. Then svn's C2 stage C on the merge engine's side, split with w-svn: the import's revisions advance the green in RAM and commit in one transaction (A-804's mechanism extended); red: one landing per revision today.
+  - r4 (jupiter, the WinFsp C1 fix) is still building or running.
+- 2026-11-21 04:13 PST Quiet: every agent working, none waiting on main; no new landings since 04:06. r4 (jupiter, the WinFsp C1 fix) is still running; r48 is still queued. The MacBook disk is 53 GB.
+- 2026-11-21 04:18 PST RUN r4 (jupiter, live WinFsp): w-work-mount's C1 fix 705f4d7e5 is GREEN. a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save ok, 1 passed, 2.04 s. r3 had been red ("no slates volume is mounted at E:": a merge volume's status reported no mounts). w-work-mount lands it. The Linux FUSE leg (r2) is still queued for adacachy.
+- 2026-11-21 04:23 PST
+  - LANDED: 87721dbeb (w-work-mount, A-774 C1: a mounted work's status reports its host mounts, so Windows' unmount finds its drive). r3 red, r4 green on jupiter; C1's Windows side is done and the Linux FUSE run r2 is still queued.
+  - GOAL MET, the vendoring part of "kiln vendors slates" (w-k90-pin-2's goal 01a1facaf183, verified met in its stack): vendor/slates pinned at 8ce3d61523e1, kiln ci.yml green on five platforms:
+    - macOS arm64: 44851246181/136703754428;
+    - Linux x86-64: 44851246181/136703754443;
+    - Linux arm64: 44887857088/136804151244;
+    - Windows x86-64: 44887857088/136804151233;
+    - Windows arm64: 44887857088/136804151286.
+    Library API only (no slates CLI call). It was the goal's last open part, so the UI top-level needs Ada's mark; main's stack reads empty here.
+  - LEFT: kiln's clippy legs are red again on container.rs:301 (sent to w-k90-containers, who fixed it at 21:59). kiln's own CI lanes (ci.runs.local 01a1fa8f0de1, 01a1fa8fe409, 01a1fa8ff6d7, 01a1fa9006fe) are wedged and need a person's cancel: Ada.
+- 2026-11-21 04:28 PST
+  - w-git: (A)'s end-to-end proof r37 is running (git/git's 611 MB push). The checks' 16 s is mostly tree parsing: Tree::parse 2,905 busy samples, Checking::turn 1,020, inflate 505. Each tree is parsed twice (fsck and the connectivity pass), so parsing once is the next lever, after (A)'s A/B.
+  - w-k90-containers: kiln main's container.rs:301 no longer has the sleep (its 9437e6430 survived w-k90-a520's merge 209e19dc6). w-k90-pin-2's clippy note likely predates it; CI's exact clippy command is running on current kiln main to prove it.
+- 2026-11-21 04:33 PST
+  - LANDED:
+    - c1c6346e0 (w-rewrite-ops, A-811): (a) a read of version 1 after 10,000 overwrites went 190.8 -> 5.9 us; (b') an SDK same-length replacement at history 5,000 went 12.63 ms -> 10.4 us, one value walked.
+    - 275e3aeec (w-perf: an hg stream sends an empty text's empty delta as is, and an empty log inline).
+  - RULING (w-rewrite-ops): svn stage C first, the user-visible 3x regression. A-793's (b), alternating overwrites and inserts at 17.5 ms over 5,000, comes straight after, not left owed.
+  - ROOT CAUSE of tonight's link drops (w-k90-pin-2's R2): adacachy's enp9s0 holds a stray static 192.168.1.77/24 as PRIMARY beside kiln's 192.168.1.90/24. UDP replies leave from .77, so the tunnel's from == to check never passes, and every LAN Mac stays on one TCP tunnel over 2.4 GHz Wi-Fi.
+    - RULED: the fix is IP_PKTINFO, answering from the contacted address, in kiln's vendored hyper-rt and hyper-transport as a vendor patch. Red: a two-address host contacted on the secondary.
+    - Ada's stopgap: on adacachy, sudo ip addr del 192.168.1.77/24 dev enp9s0, unless something needs .77, or route the LAN with src .90.
+- 2026-11-21 04:38 PST
+  - LANDED: 94c1696bb (w-perf's second stream fix: an empty text). w-perf's pull A/B and push profile run together as r16.
+  - w-git (A) BUILT (40d961807): reached sets deferred, sliced and memoized; tag oracle plus replay; 587/587 and 188/188. The 611 MB push meets a THIRD wall: each created ref's green builds a whole path map from its tree (refs x tree size; 9,700 of 11,642 decision samples in compose_unit / whole_build::slice). Also a unit over 1 s (1,142 ms) at vcs_http.rs:1454 gets the daemon killed mid-push.
+  - RULINGS: (1) land (A) now, with GAPS entries for the path-map wall and Repository::commit's stage leak. (2) Name and slice the >1 s unit (robustness first). (3) Path maps derived on first read under A-647, like (A): oracle, sliced, memoized, replay flat; w-engine told. Red: the 611 MB push lands.
+- 2026-11-21 04:43 PST LANDED: 36883edbd (w-git's (A): A-614 amended; a create or rewrite is admitted with no walk, and reached sets are derived on first read). bea12a16c (GAPS: A-803's (b) queued after stage C, with the one-value drift's numbers). w-git is naming the >1 s unit: the whole-map build's last slice builds the map and trees whole, but the watchdog caught a step in the HTTP connection's task, so r42's per-part timing decides which. w-perf's r17 is waiting for placement; w-rewrite-ops waits on w-svn's stage C answer.
+- 2026-11-21 04:48 PST Quiet: w-git's (A) merged (30e89672f; build and tests green on the merged tree; scratch branch deleted) and w-git waits on r42's per-part timing for the >1 s unit. w-lint's round 16 runs on the fresh main. No agent waiting on main. The MacBook disk is 52 GB.
+- 2026-11-21 04:56 PST
+  - LANDED: 729c7c094 (w-lint round 16: a derive turn's one-pass loop, two type aliases).
+  - DISK, Studio-4 at 26 GB: main ran clean-aggressive there. It freed 27 GB, mostly g226's idle target (25 GB, unwritten for 2 h, regenerable), plus old reach copies: 53 GB free. The other Studios: Studio-2 124 GB, the big Studio 769 GB, Studio-1 62 GB.
+  - THE >1 s UNIT NAMED (w-git, r44): an append at green_chains capacity checkpoints ~1,000 member greens in one step (layer 1, w-git's: moved into the ready turns, one green a turn). Each checkpoint's identity fold also runs whole (layer 2, w-engine's 507110661).
+  - RULING CHANGED for w-engine: land the fold in turns now, for robustness, since the watchdog kills the daemon mid-push. The Z=20 p99 regression goes to GAPS as a measured gap, fixed straight after with (b). w-git builds layer 1 meanwhile.
+- 2026-11-21 04:58 PST Quiet: no new landings since 04:50. w-engine's kiln mail is still stuck (an 893-byte admitted message, depth 1, since ~23:00; harness restarted 03:14). The ruling to land the fold in turns is also in its inbox file. No other agent waiting on main. The MacBook disk is 54 GB.
+- 2026-11-21 05:03 PST w-perf: the hg stream clone works now but is ~37x slower than stock (r17). The push profile r18 is running: the push's first ~34 s has the slates daemon idle with flat memory, so the client side or the connection is suspect; check it against stock first. The stream's 37x is queued right after the push finding: phase-split, red, A/B with bytes on the wire. No landings since 04:50; w-engine's mail is still stuck.
+- 2026-11-21 05:08 PST
+  - LANDED:
+    - 7f411f580 (w-git layer 1, A-238 amended 4f6242707): a push makes the chains room before its append, a green a turn; red: 73 checkpoints inside appends, then none.
+    - ca444739c (w-git's connectivity test under the lint wall).
+  - RULING (w-git path maps): P2, uniform lazy derivation for any created ref, not P1's tag shortcut. P1 then P2 would be layering, and it leaves the wall for branch-heavy repositories. Tags get the 99% for free, never read to submit. Oracle and red as before.
+  - FINDING (w-perf, hg first push 98-103 s vs stock 9.7-10.2 s, 5.8 GiB resident): intake files_present ~57%, rebuilding whole manifests per changeset by chain walks; take ~41%, sha1dc ~26 s.
+  - RULING (w-hg, after C1 step 3, as robustness under the bounded-working-set rule): incremental decoded manifests, O(changed lines); node verification kept for integrity, hashed once from the held text; A/B sha1dc against hardware SHA-1. w-perf may build (1) in parallel if C1 doesn't touch those files.
+- 2026-11-21 05:13 PST w-git's P2 sized:
+  - Engine half: an unmaterialized green state; materialization sliced over a TreeSource; ONE choke point ShardState::green_ready -> Ready | Materializing for all 101 call sites; nothing to fold for an unmaterialized green.
+  - Git half: a deferred create, a TreeSource over the git store, replay, an oracle for branches and tags; red: the 611 MB push lands.
+  RULING: w-rewrite-ops takes the engine half BEFORE svn stage C (a push that can't land outranks a 3x slowdown), unless stage C is already near green. Added: an untouched green's materialized content may drop back and re-derive (MEMORY SIZING), with materializations and drops counted.
+- 2026-11-21 05:18 PST w-rewrite-ops took P2's engine half: interface sent to w-git, stage C to follow, w-svn told. No agent waiting on main; no landings since 05:04. w-engine's mail is still stuck. The MacBook disk is 55 GB.
+- 2026-11-21 05:23 PST LANDED: 3c4753671 (w-perf, the hg stream's ~37x: a stream asks the store by its room, never once a log). w-git answered w-rewrite-ops on P2's interface. No agent waiting on main. The MacBook disk is 54 GB.
+- 2026-11-21 05:28 PST Quiet: w-perf named the stream's step and landed its fix (3c4753671 / bbcf0f72f); the A/B follows. No agent waiting on main; w-engine's mail is still stuck. The MacBook disk is 54 GB.
+- 2026-11-21 05:33 PST Quiet. Landing audit: only agents/w-work-mount-c1 (96 min) is open, a leftover whose fix landed as 87721dbeb by cherry-pick (2 of 3 files equal main). Nothing unlanded. No agent waiting on main. The MacBook disk is 54 GB.
+- 2026-11-21 05:38 PST LANDED: fb02a03b5 (w-git: a derivation turn runs to the step's ceiling while nobody waits, A-783's pace; red 2,404 turns, green <= 8). w-git takes C5 2b piece 3 (made commits adopt the A-804 hook, version 2 removed) while P2's engine half (w-rewrite-ops) is built; t_a752's load flake noted. No agent waiting on main.
+- 2026-11-21 05:43 PST LANDED: efe6d2763 (w-rewrite-ops, A-812, P2's engine half): a created ref's green owes its push and is made when first reached, through one door. w-git's git half now lands on it; its red is git/git's 611 MB push landing. No agent waiting on main. The MacBook disk is 54 GB.
+- 2026-11-21 05:48 PST
+  - A-812 (P2's engine half) is on main as 7e110566d / efe6d2763. A created ref's green owes its push: version 1 is a small push record; it's made on first reach through one door with a counted miss; droppable when unwritten (bound: one per client seat); recovery builds nothing; the eager build is the oracle.
+  - GAPS listed: holders at f > 0 aren't sent the owed version's record; retention is settled after the build; tail signatures aren't kept; paths outside a request get the counted miss.
+  - RULING: w-rewrite-ops closes the robustness gaps first (f > 0 holders, red on the simulated f = 1 fleet with the owner killed; retention secured before the build; tail signatures), then stage C, building its half against the split. Main runs its requests as kiln r12 (Studio-1): clippy on merge and server, the server's push, git and green filters, merge lib.
+- 2026-11-21 05:53 PST RUN r12 (Studio-1, main 7e110566d), so far: the server lib's push, git, green and owing filters are green, 170 passed. Clippy found 2 errors in slates-merge on A-812's deferred-push record (cognitive complexity 11/10; a needless & pattern), already fixed by w-lint's round 17 (62eb2ed10). The merge lib is still running.
+- 2026-11-21 05:58 PST RUN r12 done: slates-merge lib 258/258 as well, so A-812's checks are all green, its two clippy findings already fixed by w-lint (62eb2ed10). Sent to w-rewrite-ops, which goes on with A-812's robustness gaps, then stage C. No agent waiting on main.
+- 2026-11-21 06:03 PST LANDED: 312fb407a (w-rewrite-ops, A-813: A-812's robustness gaps closed. An owed version goes to holders at f > 0, its materialization's retention is secured before it commits, and its tail keeps signatures). Next for w-rewrite-ops: svn stage C. No agent waiting on main. The MacBook disk is 54 GB.
+- 2026-11-21 06:08 PST
+  - LANDED: b2ab5f08e (w-perf: an hg fetch's turns are paced, A-783, so a stream is turns of bytes, not of steps; a 2,987-changeset test needs far fewer than 24,956 server turns).
+  - A-813's open f > 0 limit: a later version of an owed green can't place until a holder makes its own copy, which needs the repository's git objects there. RULED: yes, they must be on f+1 nodes (§4.16 / A-767, once per node), and a takeover must serve the repository. If the git store isn't replicated with its changesets, that's a fleet gap for w-store (stopped pending Ada) and w-git, in GAPS.
+  - w-rewrite-ops told to start stage C now, without waiting for a go when the order already names the piece.
+- 2026-11-21 06:13 PST w-perf on the hg stream:
+  - The first fix, batching store requests, didn't move the time: 15.8 s against stock's 0.44-0.50 s, 151.7 MB on the wire against 77.9 MB.
+  - The cause: one step per turn, about 460,000 turns. The second fix 5d7e05b81 / b2ab5f08e paces hg's turns with A-783's primitive: a local test went from 24,956 turns to 16, the server's busy time 2,221 -> 465 ms (debug); the stock-hg test caps the stream at 6 turns (31 with the old loop).
+  - r25 has the full-scale A/B.
+  - NOTED to w-perf: the 2x bytes on the wire (send chunks compressed as hg's wire expects, no recompression where stored compressed), and the pull and clone -U in r25's table, since the pacing covers them too.
+- 2026-11-21 06:18 PST w-perf: the stream's 2x bytes are because Fastest picks Uncompressed whenever the client offers it (hg 7.2 does); stock's chunks are compressed only because its revlogs are compressed on disk. The choice of per-chunk zlib (stock's format), zstd (needs the stream requirement) or none goes by the daemon's measured codec policy, decided on r25's timings. No ruling needed. No landings since 06:03; no agent waiting on main.
+- 2026-11-21 06:23 PST LANDED: 0e643f818 (w-rewrite-ops, A-814, svn C2 stage C, the green's side: an import's revisions advance in RAM and commit as one entry). w-svn's records side follows, with the crash oracle; then the A/B against 24.5 s for git-2000's import (8.2 s before the store). No agent waiting on main.
+- 2026-11-21 06:28 PST LANDED: 42c3778c3 (store: a batch of places is read a run at a time, not a pread a chunk). No agent waiting on main; w-engine's mail is still stuck. The MacBook disk is 54 GB.

@@ -324,3 +324,16 @@
   post-verdict view (main's routing), w-git builds git's made commits on the same hook. Worktree ~/slates-work/w-svn-c2
   at main 9d792682f, clean. Patches kept: ~/.cache/w-svn-b2a-wait.patch (B2 wait path), ~/.cache/w-svn-fold-attempt.patch
   (rejected fold).
+- 2026-11-21 ~02:10 PST: B2 (a) on main: drives (35786a9dd/b934f9e5b), ra_svn get-file (9061acd6c), DAV GET
+  (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
+  window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
+  and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.
+- 2026-11-21 ~02:45 PST: B2 (a) COMPLETE on main: get-file-revs (560ebad9f), export (99ff3b8cb), deltify job
+  (d31502d48, base origin/main at merge). Every reader of a stored text reads one RAM does not hold through the store,
+  each held by a store test red without its wait. New finding (GAPS only): the svn://, svnserve -t and DAV loops have no
+  guard against a drive waiting again for the piece just fetched (the export and deltify jobs have one). Next: B2 (b).
+- 2026-11-21 ~04:00 PST: B2 (b) P1 (197b5f2d7: a commit brings back an evicted stored text for its green increment),
+  P2 (34259b8eb: the hook view brings one back before holding it; GAPS: a view pins what it shows), P3 (abd5e7b2e: the
+  content store lets go a commit's texts once landed, recovery reads none back, deltify job retired) on main, each with
+  a store test red first. svn_made was done by A-804 (90e2a7666, not mine). Next: P4 (imports land texts as Payload,
+  records keep none in RAM). Target trim of leftovers was declined at the prompt; disk 26 GB free.

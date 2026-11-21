@@ -1,5 +1,28 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~04:00 PST: stale role test FIXED (564cc74a); A-808 LANDED 10a0318d (lengths from the kept entry)
+- Contention is the asks knob (17.5 -> 69.4 a client from 300 to 10 hot files). Edits' length re-asks fixed: 69.4 ->
+  48.5. Open: rebases' file asks (13.8 a client), asked main whether a rebase may drop ops identical to the head.
+- Report: inbox/main-from-w-fed-move-asks.md.
+
+## 2026-11-21 ~03:15 PST: A-806 LANDED slates main 4c404823 (the 300 MB work log: a work's log is what it wrote)
+- Peak counter merge.work.log_peak_bytes; rebases answer parts over the head; restatements log parts.
+- 1k over asic_reg: 35,249,811 -> 1,957 bytes. Report: inbox/main-from-w-fed-move-worklog.md.
+- (b)'s fix (anchor indirection) handed to w-rewrite-ops by main; my design note is its brief.
+- Sibling: daemon roles test stale since A-774 part 3 (reported, untouched).
+
+## 2026-11-21 ~02:50 PST: A-803 LANDED slates main 081542c5 ((b) named: the re-anchor walks every value)
+- Counters: merge.reanchor.values_walked, merge.submit.secure. Values per verdict 7.9 -> 231 over 10^5 versions,
+  judge 24 -> 71 µs, compose and secure flat. Not the 100k wall (a few values a path there).
+- Design options sent to main: inbox/main-from-w-fed-move-b-design.md (I recommend waiting for r48, then the anchor
+  indirection). Waiting on main's call and r48's rows.
+
+## 2026-11-21 ~02:30 PST: A-802 LANDED slates main fd0dd8eb (injections; the destroy's O(volumes) scan)
+- Harness injections: --idle-works M, --preload V, --lagged-submit; the owner's per-kind counters printed after each
+  phase. Results: (a) flat; (b) verdict about 2x at 10^5; (c) 10^4 idle works cut 6,513 to 2,506 verdicts/s, which
+  was a destroy collecting every volume record (erase_volume_keys) -> per-tenant count. A/B: 2,506 -> 5,956/s.
+- Next: (b) the verdict's growth with history (41 -> 90 us over 10^5 versions).
+
 ## 2026-11-21 ~01:40 PST: A-801 LANDED slates main 2d079c44 (throughput: name the mechanism first)
 - Owner asks counted by kind and answers timed by kind on the owner; the harness prints the server nodes' merge
   counters (`server_counter` rows; load_scale passes its servers).
