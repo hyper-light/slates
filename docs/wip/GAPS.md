@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Closed (main, 2026-11-21, A-832): a daemon kept one file descriptor per base file it had ever read, and never closed
+> it.** kiln's daemon on adacachy reached 1,048,575 of its 1,048,576 descriptors over ~/Projects/kiln (731 worktrees)
+> and refused every open (`EMFILE`); this MacBook's held 4,574 (3,995 regular files of ~/Projects/slates). Now an
+> untouched base file's descriptor lives only while a handle holds the inode open (`BasePlane::transient`, `deferred`,
+> `release_unopened` in crates/vfs/src/base.rs; `Volume::unpin_open`): a verb with no open closes what it opened when
+> its overlay borrow ends, and an open's descriptor closes at its last close. A later read reopens through the home and
+> proves the file the inode was made from (A-151). Witnessed large copies keep theirs (their witness reads through it).
+> Red on main: 500 reads left 506 handles open against 6; green: 6 (`reading_base_files_keeps_no_descriptor_after_the_reads`,
+> `an_open_base_file_keeps_its_descriptor_until_its_last_close`). Still open, owner w-provision-gate: a recovery over a
+> base of ~192k directories reopens them in one step and overruns the 1 s liveness window, so adacachy's restarted
+> daemon is killed every ~1 s and the anchor counts each restart as recovered. Witnessed descriptors are still bounded
+> only by the large-class copies a volume holds.
+
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
 > `a_restored_mount_tells_its_kernel_the_whole_takeover_set_in_slices_each_inode_once`; adacachy, Linux 7.2.9, kiln r25,
@@ -439,6 +452,10 @@
 > the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
 > held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
+> R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
+> fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
+> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused

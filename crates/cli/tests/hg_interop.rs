@@ -1832,6 +1832,7 @@ const LOOKUP_STORE_ASKS: &str = "vcs_store.hg_lookup_store_asks";
 /// repository; then `hg pull -r v1 -r tip` into another, which 7.2 sends as one `batch` of two lookups. Fails the test
 /// unless the first holds the tagged changeset alone and the second the whole history, each pull's lookup of `v1` read
 /// the tags from the changeset store, and the batch read them in one round as the lone lookup did. The tagged node.
+#[allow(clippy::disallowed_methods)] // test code: its own scratch directory
 fn tag_pulls(hg: &[String], scratch: &str, url: &str, config: &[String], instance: &str) -> String {
   let source = format!("{scratch}/tagged");
   hg_ok(hg, scratch, &["init", &source]);

@@ -722,6 +722,27 @@ impl Taker {
     Ok(())
   }
 
+  /// Whether revision `node` of `log` is passed over: brought already by this push, or held already by the fork (a
+  /// changeset held is charged and named among the held).
+  fn already_brought(
+    &mut self,
+    log: Log<'_>,
+    node: Node,
+    store: &ContentStore,
+    admission: &mut Admission,
+  ) -> Result<bool, Refused> {
+    let held = !self.brought.contains(&node) && self.fork.rev(store, log, &node).is_some();
+    if !self.brought.contains(&node) && !held {
+      return Ok(false);
+    }
+    self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
+    if held && log == Log::Changelog {
+      admission.charge_items::<Node>(1)?;
+      self.intaken.held_changesets.push(node);
+    }
+    Ok(true)
+  }
+
   /// Takes one revision of `log` (module docs): passed over, or checked, rebuilt and kept.
   fn take(
     &mut self,
@@ -730,16 +751,7 @@ impl Taker {
     given: Option<Vec<u8>>,
     (store, admission): (&mut ContentStore, &mut Admission),
   ) -> Result<(), Refused> {
-    if self.brought.contains(&revision.node) {
-      self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
-      return Ok(());
-    }
-    if self.fork.rev(store, log, &revision.node).is_some() {
-      self.intaken.passed_over = self.intaken.passed_over.saturating_add(1);
-      if log == Log::Changelog {
-        admission.charge_items::<Node>(1)?;
-        self.intaken.held_changesets.push(revision.node);
-      }
+    if self.already_brought(log, revision.node, store, admission)? {
       return Ok(());
     }
     self.check_known(log, revision, store)?;

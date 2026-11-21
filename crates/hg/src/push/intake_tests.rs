@@ -822,6 +822,9 @@ fn a_manifest_naming_a_file_revision_nobody_holds_is_refused() {
   );
 }
 
+/// A line of changesets' last changeset, manifest and each file revision's node with its text, for a push after it.
+type PushedLine = (Node, Node, Vec<(Node, Vec<u8>)>);
+
 /// One file `f` whose revisions are pushed as `deltas` name them (each its text and the revision it is a delta against,
 /// none for the null base), each in a changeset of its own on one line of changesets after `parent` (`after`: the
 /// changeset, manifest and file revisions before them, empty for a first push): the changegroup in version 03, and the
@@ -829,7 +832,7 @@ fn a_manifest_naming_a_file_revision_nobody_holds_is_refused() {
 fn file_push(
   texts: &[(&[u8], Option<usize>)],
   after: (Node, Node, &[(Node, Vec<u8>)]),
-) -> (Vec<u8>, (Node, Node, Vec<(Node, Vec<u8>)>)) {
+) -> (Vec<u8>, PushedLine) {
   use crate::changegroup::{self as cg, Revision, Version};
   use crate::{NULL_NODE, delta, node};
   let hex = |node: &Node| {

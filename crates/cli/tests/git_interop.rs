@@ -1106,7 +1106,7 @@ fn the_daemons_resident_memory_after_a_push_and_a_clone_follows_the_pack_not_the
   let warm_cost = warm.peak.saturating_sub(start.min(warm.cloned));
   let measured = round(REPOSITORY, HISTORY_COMMITS, real.as_ref());
   let bound = warm.cloned + 2 * measured.pack + warm_cost;
-  let mib = |bytes: u64| format!("{}.{}", bytes >> 20, (bytes % (1 << 20)) * 10 >> 20);
+  let mib = |bytes: u64| format!("{}.{}", bytes >> 20, ((bytes % (1 << 20)) * 10) >> 20);
   eprintln!(
     "resident MiB: start {}; the warm-up's pack {} bytes, peak {}, after {} (W {}); the pack N = {} bytes, peak {}, \
      after the push {}, after the clone {}; the bound {}",
@@ -1575,7 +1575,7 @@ fn whole_session(git: &Git, source: &str, url: &str) {
       "-q",
       "origin",
       &branch,
-      &format!("HEAD:refs/heads/slates-topic"),
+      "HEAD:refs/heads/slates-topic",
     ],
   );
   git.ok(&mirror, &["fetch", "-q", "--prune", "origin"]);

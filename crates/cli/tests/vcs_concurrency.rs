@@ -20,6 +20,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -186,8 +187,7 @@ fn refusal_line(out: &str, err: &str) -> String {
   err
     .lines()
     .chain(out.lines())
-    .filter(|line| line.starts_with("abort:") || line.starts_with("svn: E"))
-    .last()
+    .rfind(|line| line.starts_with("abort:") || line.starts_with("svn: E"))
     .unwrap_or("")
     .to_owned()
 }
@@ -517,130 +517,160 @@ fn hg_push_at_once(
   )
 }
 
+/// Same head: every clone commits on the one head and pushes at once; stock takes one, refusing the rest in its words. What failed goes to `failed`, what was seen to `seen`.
+fn hg_same_head(
+  hg: &Hg,
+  (base, url, n): (&str, &str, usize),
+  failed: &mut Vec<String>,
+  seen: &mut Vec<String>,
+) {
+  let copies = hg_clones(hg, base, url, n, "same");
+  for (i, copy) in copies.iter().enumerate() {
+    append(&format!("{copy}/file"), &format!("same {i}\n"));
+    hg.ok(copy, &["commit", "--message", &format!("same {i}")]);
+  }
+  let pushed = hg_push_at_once(hg, &copies, url, |_| Vec::new());
+  let accepted = pushed.iter().filter(|r| r.0 == 0).count();
+  let refusals: BTreeSet<String> = pushed
+    .iter()
+    .filter(|r| r.0 != 0)
+    .map(|r| refusal_line(&r.1, &r.2))
+    .collect();
+  let state = hg_state(hg, base, url, "same");
+  seen.push(format!(
+    "same-head: {accepted} of {n} accepted, refusals {refusals:?}, verify {}, {} heads, {} changesets",
+    state.verified,
+    state.heads.len(),
+    state.changesets
+  ));
+  if accepted != 1 {
+    failed.push(format!(
+      "same-head: {accepted} of {n} pushes accepted, one expected"
+    ));
+  }
+  for refusal in &refusals {
+    if !HG_HEAD_RACE_REFUSALS
+      .iter()
+      .any(|words| refusal.starts_with(words))
+    {
+      failed.push(format!(
+        "same-head: a refusal not in stock's words: {refusal:?}"
+      ));
+    }
+  }
+  if !state.verified || state.heads.len() != 1 || state.changesets != 1 + accepted {
+    failed.push(format!(
+      "same-head: verify {}, {} heads (one expected), {} changesets ({} expected)",
+      state.verified,
+      state.heads.len(),
+      state.changesets,
+      1 + accepted
+    ));
+  }
+}
+
+/// Branches: every clone commits on a branch of its own and pushes it at once; every branch lands. What failed goes to `failed`, what was seen to `seen`.
+fn hg_branches(
+  hg: &Hg,
+  (base, url, n): (&str, &str, usize),
+  failed: &mut Vec<String>,
+  seen: &mut Vec<String>,
+) {
+  let copies = hg_clones(hg, base, url, n, "branch");
+  for (i, copy) in copies.iter().enumerate() {
+    hg.ok(copy, &["branch", &format!("b{i}")]);
+    write(&format!("{copy}/b{i}"), &format!("branch {i}\n"));
+    hg.ok(
+      copy,
+      &["commit", "--addremove", "--message", &format!("branch {i}")],
+    );
+  }
+  let pushed = hg_push_at_once(hg, &copies, url, |_| vec!["--new-branch".to_owned()]);
+  let accepted = pushed.iter().filter(|r| r.0 == 0).count();
+  let state = hg_state(hg, base, url, "branch");
+  let landed: BTreeSet<String> = state
+    .heads
+    .iter()
+    .filter_map(|head| head.split(' ').next())
+    .map(str::to_owned)
+    .collect();
+  let missing: Vec<String> = (0..n)
+    .map(|i| format!("b{i}"))
+    .filter(|branch| !landed.contains(branch))
+    .collect();
+  let refusals: BTreeSet<String> = pushed
+    .iter()
+    .filter(|r| r.0 != 0)
+    .map(|r| refusal_line(&r.1, &r.2))
+    .collect();
+  seen.push(format!(
+    "branches: {accepted} of {n} accepted, refusals {refusals:?}, verify {}, missing {missing:?}",
+    state.verified
+  ));
+  if accepted != n || !missing.is_empty() || !state.verified {
+    failed.push(format!(
+      "branches: {accepted} of {n} accepted (all expected), missing {missing:?}, verify {}, refusals {refusals:?}",
+      state.verified
+    ));
+  }
+}
+
+/// Bookmarks: every clone commits on a branch of its own with a bookmark and pushes both at once; every bookmark names its node. What failed goes to `failed`, what was seen to `seen`.
+fn hg_bookmarks(
+  hg: &Hg,
+  (base, url, n): (&str, &str, usize),
+  failed: &mut Vec<String>,
+  seen: &mut Vec<String>,
+) {
+  let copies = hg_clones(hg, base, url, n, "mark");
+  let mut nodes = BTreeMap::new();
+  for (i, copy) in copies.iter().enumerate() {
+    hg.ok(copy, &["branch", &format!("m{i}")]);
+    write(&format!("{copy}/m{i}"), &format!("mark {i}\n"));
+    hg.ok(
+      copy,
+      &["commit", "--addremove", "--message", &format!("mark {i}")],
+    );
+    hg.ok(copy, &["bookmark", &format!("k{i}")]);
+    nodes.insert(
+      format!("k{i}"),
+      hg.ok(copy, &["log", "-r", ".", "--template", "{node}"]),
+    );
+  }
+  let pushed = hg_push_at_once(hg, &copies, url, |i| {
+    vec!["--new-branch".to_owned(), "-B".to_owned(), format!("k{i}")]
+  });
+  let accepted = pushed.iter().filter(|r| r.0 == 0).count();
+  let state = hg_state(hg, base, url, "mark");
+  let wrong: Vec<&String> = nodes
+    .iter()
+    .filter(|(name, node)| state.bookmarks.get(*name) != Some(*node))
+    .map(|(name, _)| name)
+    .collect();
+  seen.push(format!(
+    "bookmarks: {accepted} of {n} accepted, verify {}, wrong or missing {wrong:?}",
+    state.verified
+  ));
+  if accepted != n || !wrong.is_empty() || !state.verified {
+    failed.push(format!(
+      "bookmarks: {accepted} of {n} accepted (all expected), wrong or missing {wrong:?}, verify {}",
+      state.verified
+    ));
+  }
+}
+
 /// The Mercurial scenarios against the repository at `url`, its first changeset already pushed: a list of what failed
 /// (empty when every expectation held), and what was seen, for the report.
 fn hg_scenarios(hg: &Hg, base: &str, url: &str, n: usize) -> (Vec<String>, Vec<String>) {
   let (mut failed, mut seen) = (Vec::new(), Vec::new());
   if wanted("same-head") {
-    let copies = hg_clones(hg, base, url, n, "same");
-    for (i, copy) in copies.iter().enumerate() {
-      append(&format!("{copy}/file"), &format!("same {i}\n"));
-      hg.ok(copy, &["commit", "--message", &format!("same {i}")]);
-    }
-    let pushed = hg_push_at_once(hg, &copies, url, |_| Vec::new());
-    let accepted = pushed.iter().filter(|r| r.0 == 0).count();
-    let refusals: BTreeSet<String> = pushed
-      .iter()
-      .filter(|r| r.0 != 0)
-      .map(|r| refusal_line(&r.1, &r.2))
-      .collect();
-    let state = hg_state(hg, base, url, "same");
-    seen.push(format!(
-      "same-head: {accepted} of {n} accepted, refusals {refusals:?}, verify {}, {} heads, {} changesets",
-      state.verified,
-      state.heads.len(),
-      state.changesets
-    ));
-    if accepted != 1 {
-      failed.push(format!(
-        "same-head: {accepted} of {n} pushes accepted, one expected"
-      ));
-    }
-    for refusal in &refusals {
-      if !HG_HEAD_RACE_REFUSALS
-        .iter()
-        .any(|words| refusal.starts_with(words))
-      {
-        failed.push(format!(
-          "same-head: a refusal not in stock's words: {refusal:?}"
-        ));
-      }
-    }
-    if !state.verified || state.heads.len() != 1 || state.changesets != 1 + accepted {
-      failed.push(format!(
-        "same-head: verify {}, {} heads (one expected), {} changesets ({} expected)",
-        state.verified,
-        state.heads.len(),
-        state.changesets,
-        1 + accepted
-      ));
-    }
+    hg_same_head(hg, (base, url, n), &mut failed, &mut seen);
   }
   if wanted("branches") {
-    let copies = hg_clones(hg, base, url, n, "branch");
-    for (i, copy) in copies.iter().enumerate() {
-      hg.ok(copy, &["branch", &format!("b{i}")]);
-      write(&format!("{copy}/b{i}"), &format!("branch {i}\n"));
-      hg.ok(
-        copy,
-        &["commit", "--addremove", "--message", &format!("branch {i}")],
-      );
-    }
-    let pushed = hg_push_at_once(hg, &copies, url, |_| vec!["--new-branch".to_owned()]);
-    let accepted = pushed.iter().filter(|r| r.0 == 0).count();
-    let state = hg_state(hg, base, url, "branch");
-    let landed: BTreeSet<String> = state
-      .heads
-      .iter()
-      .filter_map(|head| head.split(' ').next())
-      .map(str::to_owned)
-      .collect();
-    let missing: Vec<String> = (0..n)
-      .map(|i| format!("b{i}"))
-      .filter(|branch| !landed.contains(branch))
-      .collect();
-    let refusals: BTreeSet<String> = pushed
-      .iter()
-      .filter(|r| r.0 != 0)
-      .map(|r| refusal_line(&r.1, &r.2))
-      .collect();
-    seen.push(format!(
-      "branches: {accepted} of {n} accepted, refusals {refusals:?}, verify {}, missing {missing:?}",
-      state.verified
-    ));
-    if accepted != n || !missing.is_empty() || !state.verified {
-      failed.push(format!(
-        "branches: {accepted} of {n} accepted (all expected), missing {missing:?}, verify {}, refusals {refusals:?}",
-        state.verified
-      ));
-    }
+    hg_branches(hg, (base, url, n), &mut failed, &mut seen);
   }
   if wanted("bookmarks") {
-    let copies = hg_clones(hg, base, url, n, "mark");
-    let mut nodes = BTreeMap::new();
-    for (i, copy) in copies.iter().enumerate() {
-      hg.ok(copy, &["branch", &format!("m{i}")]);
-      write(&format!("{copy}/m{i}"), &format!("mark {i}\n"));
-      hg.ok(
-        copy,
-        &["commit", "--addremove", "--message", &format!("mark {i}")],
-      );
-      hg.ok(copy, &["bookmark", &format!("k{i}")]);
-      nodes.insert(
-        format!("k{i}"),
-        hg.ok(copy, &["log", "-r", ".", "--template", "{node}"]),
-      );
-    }
-    let pushed = hg_push_at_once(hg, &copies, url, |i| {
-      vec!["--new-branch".to_owned(), "-B".to_owned(), format!("k{i}")]
-    });
-    let accepted = pushed.iter().filter(|r| r.0 == 0).count();
-    let state = hg_state(hg, base, url, "mark");
-    let wrong: Vec<&String> = nodes
-      .iter()
-      .filter(|(name, node)| state.bookmarks.get(*name) != Some(*node))
-      .map(|(name, _)| name)
-      .collect();
-    seen.push(format!(
-      "bookmarks: {accepted} of {n} accepted, verify {}, wrong or missing {wrong:?}",
-      state.verified
-    ));
-    if accepted != n || !wrong.is_empty() || !state.verified {
-      failed.push(format!(
-        "bookmarks: {accepted} of {n} accepted (all expected), wrong or missing {wrong:?}, verify {}",
-        state.verified
-      ));
-    }
+    hg_bookmarks(hg, (base, url, n), &mut failed, &mut seen);
   }
   (failed, seen)
 }
