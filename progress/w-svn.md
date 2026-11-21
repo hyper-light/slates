@@ -298,3 +298,12 @@
 - P6: measurement test (w-svn-next, uncommitted vcs_ssh/tests/svn.rs: RSS checkpoints + update/checkout) got
   "not whole" 524-byte answers for update; release run printing the answer in progress (bq3pv7luh). git-200.dump made
   (~/.cache/w-svn-gitgit) for faster runs; debug builds die to the watchdog in import.
+- C2 stage A built in ~/slates-work/w-svn-c2 (uncommitted at 22:40, testing): every svn record store-first
+  (svn_commit::landing: gate/turn, sequence = register object count, reference-only register entries), recovery and
+  rebuild read changesets back from the store (vcs_store svn_to_fetch/fetch_svn), svn creation refused without
+  --vcs-store, crate::test_store shared helper (TestStore guard, StoredDaemon, run_on_first), svn_commit/import/export
+  tests async on stored daemons, arbiter + crash tests in repository::store_tests. slates-server svn+store_tests
+  96/96, identities+vcs_store 37/37, barrier/deltify/svn_texts 3/3, cli --test cli a_repository_the_cli_creates 1/1.
+  svn_made: landed by a task holding the turn the submit took (main asked: inbox main-from-w-svn-c2-made).
+- P6 finding: the measurement's scripted update was wrong, not the server: abort-edit then E210004 "Successful edit
+  status returned too soon" (the script's report). Fix the script after C2.
