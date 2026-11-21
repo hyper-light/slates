@@ -1585,3 +1585,8 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   RULING (w-perf): advertise the stream capability per repository, only where the store keeps the logs. Stock hg clone --stream against an imported repo now aborts "operation forbidden by server" instead of falling back. Red with stock 7.2, then the full A/B, and name what's left of the pull.
   NOTED: w-svn's B2 (b) plan. (b.1) a commit's stored texts let go once landed; recovery stops reading them back. (b.2) the records' kept texts land as Payload deltas with Texts rows and keep only a window index; disk stays delta-sized, ~35 MB for git-2000. Storing wholes was rejected at 12x the disk.
   The MacBook disk is 51 GB.
+- 2026-11-21 02:33 PST RULINGS:
+  - w-rewrite-ops (A-804 landed as 5a21c11dc): first close its own gap. The verdict applied in memory lets a read see a version before it's durable, a read of the uncommitted, so it's computed pure and applied in the one commit, with a red for a read during a held landing. Then hg's made changesets adopt the hook. Then A-803's fix.
+  - A-803 (the re-anchor's O(k) per change with a pinned floor): option (1), the per-path anchor indirection with an interval index, O(log + pieces touched), oracle against today's reanchor, A/B with --preload. Option (2) rejected (gives back A-793's memory saving). Built by w-rewrite-ops.
+  - w-fed-move stays on the 100k walls. While r48 waits it takes the 300 MB work log, unbounded growth: a counter-named mechanism, red, fix.
+  2c32af2b5 was already in w-fed-move's profiled build; the growth survives it.
