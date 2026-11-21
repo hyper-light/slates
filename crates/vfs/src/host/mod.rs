@@ -157,6 +157,10 @@ pub enum HostError {
   /// deadlock avoided by, typed by its numbering (A-539): `EDEADLK`, or Windows' `ERROR_POSSIBLE_DEADLOCK`, a Win32 code
   /// that before A-539 rode in an errno's place.
   OwnMount(OsCode),
+  /// The process or the system has no descriptor (a Windows handle) left to open with (A-837): `EMFILE`, `ENFILE`;
+  /// Windows' `ERROR_TOO_MANY_OPEN_FILES`, `ERROR_NO_SYSTEM_RESOURCES`. Typed apart from `Unavailable`, since nothing is
+  /// wrong with the base: the open is refused, the shard keeps serving, and a retry after descriptors close may succeed.
+  DescriptorsExhausted(OsCode),
 }
 
 impl std::fmt::Display for HostError {
@@ -172,6 +176,7 @@ impl std::fmt::Display for HostError {
       Self::Unavailable(code) => write!(f, "host unavailable ({code})"),
       Self::Unprivileged(code) => write!(f, "a privilege this process does not hold ({code})"),
       Self::OwnMount(code) => write!(f, "on a mount this daemon serves ({code})"),
+      Self::DescriptorsExhausted(code) => write!(f, "no descriptor left to open with ({code})"),
     }
   }
 }
@@ -188,7 +193,8 @@ impl HostError {
       | Self::Unsupported(code)
       | Self::Unavailable(code)
       | Self::Unprivileged(code)
-      | Self::OwnMount(code) => Some(*code),
+      | Self::OwnMount(code)
+      | Self::DescriptorsExhausted(code) => Some(*code),
       Self::NotFound | Self::NotDirectory | Self::NotFile | Self::StaleHandle => None,
     }
   }

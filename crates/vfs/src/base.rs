@@ -586,6 +586,8 @@ pub(crate) fn unavailable_code(error: HostError) -> Option<crate::host::OsCode> 
     | HostError::Unavailable(code)
     | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => Some(code),
+    // The host's own code (A-837), never GONE_DIRECTORY: the directory may well be there.
+    HostError::DescriptorsExhausted(code) => Some(code),
     HostError::NotFound | HostError::NotDirectory | HostError::NotFile | HostError::StaleHandle => {
       Some(GONE_DIRECTORY)
     }
@@ -925,6 +927,8 @@ fn host_refusal(e: HostError) -> VfsError {
     | HostError::Unavailable(code)
     | HostError::Unprivileged(code)
     | HostError::OwnMount(code) => VfsError::BaseUnavailable(Some(code)),
+    // Typed apart (A-837): nothing is wrong with the base, the process is out of descriptors.
+    HostError::DescriptorsExhausted(code) => VfsError::DescriptorsExhausted(code),
   }
 }
 

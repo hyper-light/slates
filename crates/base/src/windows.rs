@@ -121,9 +121,11 @@ fn status_refusal(status: NTSTATUS) -> HostError {
 /// A Win32 error code as the host's refusal, typed as Win32's (A-527, A-539): no reader takes it for the errno of its
 /// number.
 fn code_refusal(code: u32) -> HostError {
-  // Handle exhaustion teaches the process its ceiling (A-837 part 2): the count held at the first one met.
+  // Handle exhaustion: typed (A-837 part 3), and it teaches the process its ceiling (part 2), the count held at the
+  // first one met.
   if slates_machine::descriptors::is_exhaustion_win32(code) {
     let _learned = slates_machine::descriptors::note_exhaustion();
+    return HostError::DescriptorsExhausted(slates_vfs::host::OsCode::Win32(code));
   }
   HostError::Unavailable(slates_vfs::host::OsCode::Win32(code))
 }

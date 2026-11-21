@@ -131,6 +131,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     // A read-only attachment's or a snapshot view's change, on the wire as the read-only volume it is.
     VfsError::ReadOnly => Refusal::ReadOnlyVolume,
     VfsError::BaseUnavailable(code) => base_unavailable(String::new(), *code),
+    VfsError::DescriptorsExhausted(code) => descriptors_exhausted(*code),
     VfsError::Memory(MemError::BudgetExceeded { available, .. }) => Refusal::BudgetExceeded {
       available: *available,
     },
@@ -329,6 +330,14 @@ pub fn target_of_host(e: &slates_vfs::host::HostError) -> TargetRefusal {
 
 /// A base directory unavailable at `path`, by the code its host named, in the variant of its numbering (A-539): an
 /// errno in `BaseUnavailable` (0 where the host named none), a Win32 code in `BaseUnavailableWin32`.
+/// The wire refusal for descriptor exhaustion (A-837): the host's code in the field of its numbering (A-539).
+pub fn descriptors_exhausted(code: slates_vfs::host::OsCode) -> Refusal {
+  match code {
+    slates_vfs::host::OsCode::Errno(errno) => Refusal::DescriptorsExhausted { errno, win32: 0 },
+    slates_vfs::host::OsCode::Win32(win32) => Refusal::DescriptorsExhausted { errno: 0, win32 },
+  }
+}
+
 pub fn base_unavailable(path: String, code: Option<slates_vfs::host::OsCode>) -> Refusal {
   match code {
     Some(slates_vfs::host::OsCode::Win32(code)) => Refusal::BaseUnavailableWin32 { path, code },

@@ -4808,6 +4808,16 @@ pub enum Refusal {
   /// A merge check's view no longer holds (A-796): the green's head moved past the stamp's, or the work changed since it
   /// was checked. Nothing was read or changed; check again. Appended.
   StaleMergeView,
+  /// The daemon or its host had no descriptor (a Windows handle) left to open what the verb needed (A-837): nothing is
+  /// wrong with what was asked for, and a retry after descriptors close may succeed. The code the host named, in the
+  /// field of its numbering (A-539), the other zero: an errno (`EMFILE`, `ENFILE`) or a Win32 code
+  /// (`ERROR_TOO_MANY_OPEN_FILES`, `ERROR_NO_SYSTEM_RESOURCES`). Appended.
+  DescriptorsExhausted {
+    /// The errno, or zero.
+    errno: i32,
+    /// The Win32 code, or zero.
+    win32: u32,
+  },
 }
 
 /// Why a copy was refused before any verdict ([`Refusal::CopyRefused`]): `slates_merge::engine::CopyRefusal` on the

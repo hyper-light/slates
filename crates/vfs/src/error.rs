@@ -64,6 +64,9 @@ pub enum VfsError {
   /// The base beneath an overlay entry cannot be served: the code the host named, typed by its numbering (A-539); none
   /// where the volume met no host to ask (none lent, or one away).
   BaseUnavailable(Option<crate::host::OsCode>),
+  /// A base entry could not be opened because the process or the system had no descriptor left (A-837): the code the
+  /// host named, typed by its numbering. Retryable once descriptors close; the shard keeps serving.
+  DescriptorsExhausted(crate::host::OsCode),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
   /// than return torn bytes; `status` lists the drift.
   BaseDrift,
@@ -189,6 +192,7 @@ impl VfsError {
       | Self::ReferenceUnresolved
       | Self::RecoveryVersion { .. } => "EIO",
       Self::NotOverlay => "ENODEV",
+      Self::DescriptorsExhausted(_) => "EMFILE",
       Self::DigestNotClean => "ENODATA",
       Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",
       Self::DigestCacheFull => "ENOSPC",

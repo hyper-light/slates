@@ -5221,6 +5221,8 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::InvalidName => "invalid_name",
     Refusal::PolicyMismatch => "policy_mismatch",
     Refusal::BaseUnavailable { .. } | Refusal::BaseUnavailableWin32 { .. } => "base_unavailable",
+    // A-837: the counter of opens refused for descriptor exhaustion.
+    Refusal::DescriptorsExhausted { .. } => "descriptors_exhausted",
     Refusal::DuplicateRequest => "duplicate_request",
     Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",
@@ -7887,6 +7889,10 @@ pub(crate) fn base_open_refusal(path: &str, error: slates_vfs::host::HostError) 
       path: path.to_owned(),
       used_as: slates_ipc::protocol::OwnMountUse::Base,
     },
+    // A-837: out of descriptors, typed apart; nothing is wrong with the base.
+    slates_vfs::host::HostError::DescriptorsExhausted(code) => {
+      crate::error::descriptors_exhausted(code)
+    }
     // The code in the variant of its numbering (A-539).
     other => crate::error::base_unavailable(path.to_owned(), other.code()),
   }

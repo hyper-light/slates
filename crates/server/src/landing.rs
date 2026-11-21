@@ -3287,7 +3287,8 @@ fn answer_of(error: HostError) -> HostAnswer {
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
     | HostError::Unprivileged(code)
-    | HostError::OwnMount(code) => match code {
+    | HostError::OwnMount(code)
+    | HostError::DescriptorsExhausted(code) => match code {
       slates_vfs::host::OsCode::Win32(code) => HostAnswer::Win32 { code },
       slates_vfs::host::OsCode::Errno(errno) => HostAnswer::Errno { errno },
     },

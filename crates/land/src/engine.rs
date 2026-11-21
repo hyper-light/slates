@@ -3338,7 +3338,8 @@ fn named_code(error: HostError) -> Option<OsCode> {
     | HostError::NoSpace(code)
     | HostError::Unsupported(code)
     | HostError::Unavailable(code)
-    | HostError::Unprivileged(code) => Some(code),
+    | HostError::Unprivileged(code)
+    | HostError::DescriptorsExhausted(code) => Some(code),
     HostError::NotFound
     | HostError::NotDirectory
     | HostError::NotFile

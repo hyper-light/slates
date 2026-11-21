@@ -703,6 +703,12 @@ pub enum HostFault {
   },
   /// An overlay's base could not be read now: its drift is unknown (§4.15 "Drift").
   BaseUnreadable,
+  /// The daemon or its host had no descriptor (a Windows handle) left to open what the verb needed (A-837); a retry
+  /// after descriptors close may succeed.
+  DescriptorsExhausted {
+    /// The code the host named, typed by its numbering (A-539).
+    code: OsCode,
+  },
   /// A target the verb needs cannot be used, typed (A-299; until 2026-11-18 the daemon's words): a landing's target
   /// directory (§4.15 step 4), a mount point, or the mount the daemon made there (§4.6).
   Target(TargetRefusal),
@@ -1013,6 +1019,16 @@ impl Error {
         path,
         code: Some(OsCode::Win32(code)),
       }),
+      // A-837: the field of the code's numbering is the nonzero one (A-539).
+      Refusal::DescriptorsExhausted { errno, win32 } => {
+        Error::Host(HostFault::DescriptorsExhausted {
+          code: if win32 != 0 {
+            OsCode::Win32(win32)
+          } else {
+            OsCode::Errno(errno)
+          },
+        })
+      }
       Refusal::Target { refusal } => Error::Host(HostFault::Target(refusal)),
       // No daemon of this build sends it (superseded by `Target`, A-299): a client and a daemon of different builds.
       Refusal::TargetUnavailable { reason } => {
@@ -1192,6 +1208,10 @@ impl fmt::Display for HostFault {
       Self::BaseUnreadable => {
         f.write_str("the overlay's base could not be read now, so its drift is unknown")
       }
+      Self::DescriptorsExhausted { code } => write!(
+        f,
+        "DescriptorsExhausted: the daemon had no descriptor left to open with ({code}); retry once some close"
+      ),
       Self::Target(refusal) => write!(f, "TargetUnavailable: {}", target_words(*refusal)),
       Self::Os { call, errno } => write!(f, "{call} failed: {}", errno_text(*errno)),
       Self::Memory(note) => write!(f, "the channel's shared memory refused: {note}"),
@@ -1925,6 +1945,9 @@ mod tests {
         code: Some(OsCode::Win32(2)),
       },
       HostFault::BaseUnreadable,
+      HostFault::DescriptorsExhausted {
+        code: OsCode::Errno(24),
+      },
       HostFault::Target(TargetRefusal::OwnedByAnother { owner: Some(501) }),
       HostFault::Os {
         call: "mmap",

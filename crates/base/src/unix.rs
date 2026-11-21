@@ -45,13 +45,13 @@ fn refusal(e: rustix::io::Errno) -> HostError {
     rustix::io::Errno::NOENT => HostError::NotFound,
     rustix::io::Errno::NOTDIR => HostError::NotDirectory,
     rustix::io::Errno::LOOP | rustix::io::Errno::ISDIR => HostError::NotFile,
-    other => {
-      // Descriptor exhaustion teaches the process its ceiling (A-837 part 2): the count held at the first one met.
-      if slates_machine::descriptors::is_exhaustion_errno(other.raw_os_error()) {
-        let _learned = slates_machine::descriptors::note_exhaustion();
-      }
-      HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error()))
+    // Descriptor exhaustion: typed (A-837 part 3), and it teaches the process its ceiling (part 2), the count held at
+    // the first one met.
+    other if slates_machine::descriptors::is_exhaustion_errno(other.raw_os_error()) => {
+      let _learned = slates_machine::descriptors::note_exhaustion();
+      HostError::DescriptorsExhausted(slates_vfs::host::OsCode::Errno(other.raw_os_error()))
     }
+    other => HostError::Unavailable(slates_vfs::host::OsCode::Errno(other.raw_os_error())),
   }
 }
 
