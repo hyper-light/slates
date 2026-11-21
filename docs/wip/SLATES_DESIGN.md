@@ -57869,6 +57869,16 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
 > fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
 
+> **Status (2026-11-21, C1 step 3, first part: an import written as a push's changegroup).** `slates_hg::import::emit`:
+> as the import walks a repository's revlogs (changelog, manifest log, each file log: a changegroup's order), it
+> writes each revision as its revlog stores it, the chunk against its delta parent (7.2's `deltaparent`: none for a
+> full snapshot, the base under generaldelta, else the revision before), a full snapshot as its text against the null
+> base, so nothing is diffed or rebuilt to write it. The stream is cut into segments of at least a bound, only between
+> chunks, each naming its texts (identity, length, delta parent's identity, place) as a push's `Texts` section does.
+> The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
+> (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
+> replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
