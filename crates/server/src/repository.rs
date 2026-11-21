@@ -2785,7 +2785,8 @@ mod tests {
     const FILES: usize = 400;
     /// Shape: the looks the test waits for the turns to end, each after a shard's step has run.
     const LOOKS: usize = 10_000;
-    let daemon = crate::daemon::audit_daemon();
+    // A git repository's history is kept on the node's changeset store: a store-backed audit daemon.
+    let (_store, daemon) = crate::test_store::audit_daemon_stored();
     let green = crate::daemon::observe_first(&daemon, |state| {
       // Someone waits: a task ready on this shard, polled only once this closure has returned.
       let waiting = slates_rt::futures::spawn(async {}).unwrap();
