@@ -787,10 +787,55 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         }
       }
     }
+    Verb::CheckMerge { work } => {
+      let checked = client.check_merge(*work)?;
+      if json {
+        slates_machine::out_line!("{}", slates_mcp::merge_check_json(&checked));
+      } else {
+        slates_machine::out_line!(
+          "checked: head {} base {} revision {}",
+          checked.stamp.head,
+          checked.stamp.base,
+          checked.stamp.revision
+        );
+        for (index, op) in checked.declaration.iter().enumerate() {
+          slates_machine::out_line!(
+            "op {index}: {} kind {} at {} len {}",
+            op.path,
+            op.kind,
+            op.at,
+            op.len
+          );
+        }
+        print_windows(&checked.conflicts);
+      }
+    }
+    Verb::ResolveMerge { resolution } => {
+      let args: serde_json::Value =
+        serde_json::from_str(resolution).map_err(|error| bad_resolution(error.to_string()))?;
+      let (stamp, discard, replacement) =
+        slates_mcp::resolve_args(&args).map_err(bad_resolution)?;
+      let outcome = client.resolve_merge(stamp, &discard, replacement)?;
+      if json {
+        slates_machine::out_line!("{}", rebase_json(&outcome));
+      } else {
+        match outcome {
+          Rebased::Rebased(version) => slates_machine::out_line!("resolved: {version}"),
+          Rebased::Conflict(windows) => print_windows(&windows),
+        }
+      }
+    }
     // Only the merge verbs above reach here.
     _ => {}
   }
   Ok(())
+}
+
+/// A resolution's JSON the CLI could not read (A-796), refused as the daemon refuses a malformed request.
+fn bad_resolution(message: String) -> ClientError {
+  ClientError::Refused(slates_ipc::protocol::Refusal::BadRequest {
+    reason: format!("invalid resolution: {message}"),
+  })
 }
 
 /// A submit outcome as JSON (the MCP schema — `slates_mcp::windows_json` for the conflicts): `accepted`
@@ -856,8 +901,8 @@ fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
 
 /// `status` (no volume): the daemon's status as text, or JSON (the MCP `daemon_json` schema), with
 /// every shard's telemetry ring drained (§4.14) — the same gather the MCP `slates.status` makes.
-fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError> {
-  let (report, telemetry) = slates_mcp::gather_daemon_status(client)?;
+fn emit_daemon_status(client: &mut Client, json: bool, memory: bool) -> Result<(), ClientError> {
+  let (report, telemetry) = slates_mcp::gather_daemon_status(client, memory)?;
   if json {
     slates_machine::out_line!("{}", slates_mcp::daemon_json(&report, &telemetry));
   } else {
@@ -1619,7 +1664,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       emit_create(client, &spec, json)?;
     }
     Verb::List => emit_list(client, json)?,
-    Verb::DaemonStatus => emit_daemon_status(client, json)?,
+    Verb::DaemonStatus { memory } => emit_daemon_status(client, json, *memory)?,
     Verb::PromoteRegion { region } => {
       client.promote_region(*region)?;
       emit_ok("region promoted", json);
@@ -1642,6 +1687,8 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Copy { .. }
     | Verb::Submit { .. }
     | Verb::Rebase { .. }
+    | Verb::CheckMerge { .. }
+    | Verb::ResolveMerge { .. }
     | Verb::Advance { .. }
     | Verb::Read { .. } => serve_merge(client, verb, json)?,
     Verb::Write {

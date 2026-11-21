@@ -110,6 +110,20 @@ pub enum Rebased {
   Conflict(Vec<MergeWindow>),
 }
 
+/// A merge check (§4.16, A-796): what it judged, every conflict window of the verdict a submit would get now (none when
+/// it would be accepted), and the work's canonical declaration by index, the indices a resolution's `discard` names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeCheck {
+  /// What the check judged: a read or a resolution naming it is refused `StaleMergeView` once it no longer holds.
+  pub stamp: slates_ipc::protocol::MergeStamp,
+  /// Every conflict window.
+  pub conflicts: Vec<MergeWindow>,
+  /// The canonical declaration as far as the daemon's reply held it.
+  pub declaration: Vec<slates_ipc::protocol::MergeOp>,
+  /// Operations of the declaration past what the reply held.
+  pub declaration_elided: u32,
+}
+
 /// A snapshot's disk image, built (§4.6, A-160).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageBuilt {
@@ -1684,9 +1698,9 @@ impl Client {
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
-    if matches!(body, RequestBody::DaemonStatus) {
+    if let RequestBody::DaemonStatus { memory } = body {
       let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
-      return slates_ipc::status::collect(capacity, |request| self.call_plain(request));
+      return slates_ipc::status::collect(capacity, *memory, |request| self.call_plain(request));
     }
     self.call_plain(body)
   }
@@ -4663,6 +4677,125 @@ impl Client {
     self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
   }
 
+  /// Checks a work's pending declarations against its green's head and publishes nothing (§4.16, A-796): the verdict a
+  /// submit would get now, every window read (A-267), the canonical declaration, and the stamp a read or a resolution
+  /// names. The work's base, journal and files and the green are unchanged.
+  pub fn check_merge(&mut self, work: VolumeId) -> Result<MergeCheck, ClientError> {
+    let ReplyBody::MergeChecked {
+      stamp,
+      mut conflicts,
+      conflicts_elided,
+      verdict,
+      declaration,
+      declaration_elided,
+    } = resolved(self.call(&RequestBody::CheckMerge { work })?)?
+    else {
+      return Err(ClientError::UnexpectedReply {
+        verb: "check_merge",
+      });
+    };
+    let mut from = u32::try_from(conflicts.len()).unwrap_or(u32::MAX);
+    let mut left = conflicts_elided;
+    while left > 0 {
+      let ReplyBody::Conflicts { windows, next } =
+        resolved(self.call(&RequestBody::Conflicts {
+          work,
+          verdict,
+          from,
+        })?)?
+      else {
+        return Err(ClientError::UnexpectedReply {
+          verb: "check_merge",
+        });
+      };
+      let read = u32::try_from(windows.len()).unwrap_or(u32::MAX);
+      if read == 0 && next.is_some() {
+        // A page that makes no progress short of the end would loop forever.
+        return Err(ClientError::UnexpectedReply {
+          verb: "check_merge",
+        });
+      }
+      conflicts.extend(windows);
+      left = left.saturating_sub(read);
+      match next {
+        Some(at) => from = at,
+        None => break,
+      }
+    }
+    Ok(MergeCheck {
+      stamp,
+      conflicts,
+      declaration,
+      declaration_elided,
+    })
+  }
+
+  /// Reads a file of one view a merge check named (A-796), every page of it: the work as it stood when checked, or the
+  /// green at the head the check judged. Refused `StaleMergeView` once the work changed or the head is not the stamp's.
+  pub fn read_merge_check(
+    &mut self,
+    stamp: slates_ipc::protocol::MergeStamp,
+    view: slates_ipc::protocol::MergeView,
+    path: &str,
+  ) -> Result<Vec<u8>, ClientError> {
+    if view == slates_ipc::protocol::MergeView::Green {
+      return self.read(
+        stamp.green,
+        path,
+        ReadAt::Version {
+          version: stamp.head,
+        },
+      );
+    }
+    let mut bytes = Vec::new();
+    loop {
+      let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let ReplyBody::ReadPage {
+        bytes: page, total, ..
+      } = resolved(self.call(&RequestBody::ReadMergeCheck {
+        stamp,
+        path: path.to_owned(),
+        offset,
+        max: u64::MAX,
+      })?)?
+      else {
+        return Err(ClientError::UnexpectedReply {
+          verb: "read_merge_check",
+        });
+      };
+      let done = offset.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX)) >= total;
+      if page.is_empty() && !done {
+        return Err(ClientError::UnexpectedReply {
+          verb: "read_merge_check",
+        });
+      }
+      bytes.extend_from_slice(&page);
+      if done {
+        return Ok(bytes);
+      }
+    }
+  }
+
+  /// Resolves a checked conflict (A-796): retires the canonical operations `discard` names (strictly increasing), rebases
+  /// the rest onto the stamp's head and applies `replacement` there, restating the work at the head. Refused
+  /// `StaleMergeView` with nothing changed when the head or the work moved since the check; a conflict when what is kept
+  /// still overlaps the head, every window read.
+  pub fn resolve_merge(
+    &mut self,
+    stamp: slates_ipc::protocol::MergeStamp,
+    discard: &[u64],
+    replacement: Vec<slates_ipc::protocol::WorkChange>,
+  ) -> Result<Rebased, ClientError> {
+    let reply = self.call(&RequestBody::ResolveMerge {
+      stamp,
+      discard: discard.to_vec(),
+      replacement,
+    })?;
+    self
+      .verdict_of(stamp.work, VerdictKind::Rebase, reply)?
+      .rebased()
+  }
+
   /// Clones a snapshot into a new volume; the clone's id.
   pub fn clone_snapshot(
     &mut self,
@@ -5004,9 +5137,22 @@ impl Client {
     }
   }
 
-  /// The daemon's status (§4.14 `slates.status`).
+  /// The daemon's status (§4.14 `slates.status`): its counters and health signals, with no residency work asked of
+  /// it; the memory report's figures are the last a memory request read ([`Client::daemon_memory_status`]).
   pub fn daemon_status(&mut self) -> Result<DaemonReport, ClientError> {
-    match self.call(&RequestBody::DaemonStatus)? {
+    self.daemon_status_asking(false)
+  }
+
+  /// [`Client::daemon_status`] with the memory report read now: the anchor's objects whole from the kernel's per-mapping
+  /// figures, and each shard's ranges swept on its idle time (A-744; main's ruling on g228's finding). Only such a
+  /// request costs the daemon residency work.
+  pub fn daemon_memory_status(&mut self) -> Result<DaemonReport, ClientError> {
+    self.daemon_status_asking(true)
+  }
+
+  /// The daemon's status, the memory report's residency asked for or not.
+  fn daemon_status_asking(&mut self, memory: bool) -> Result<DaemonReport, ClientError> {
+    match self.call(&RequestBody::DaemonStatus { memory })? {
       ReplyBody::DaemonStatus { report } => Ok(*report),
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",

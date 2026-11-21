@@ -117,6 +117,63 @@ impl HgStores for ServedViews {
   }
 }
 
+/// Answers what a stream's next step needs of the node's changeset store (goal 93 perf: each revision sent as the store
+/// keeps it), over the shard's handle, as a task: a log's rows by node (`StoreHandle::texts_by_tool`, the `I` rows) and
+/// a batch of chunks (`StoreHandle::places`, read in place). A daemon holding no store keeps no revision, so a rows'
+/// want is answered none and the stream is not served (`1\n`). Whether every want was answered; false where the store
+/// refused or was gone, which ends the answer.
+pub(crate) async fn answer_store_wants(
+  wants: &mut dyn slates_hg::render::StoreWants,
+  id: RepositoryId,
+) -> bool {
+  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  let repository = u128::from_be_bytes(id.bytes);
+  while let Some(want) = wants.wants().cloned() {
+    let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
+    match (want, disk) {
+      (Want::Rows { log, nodes }, Some(disk)) => {
+        let asked = nodes.iter().map(|node| node.to_vec()).collect();
+        let Ok(found) = disk.texts_by_tool(repository, log, asked).await else {
+          return false;
+        };
+        wants.give_rows(
+          found
+            .into_iter()
+            .map(|row| {
+              row.map(|(text, row)| StoredRevision {
+                text,
+                base: row.base,
+                place: StoredPlace {
+                  payload: row.place.payload,
+                  offset: row.place.offset,
+                  len: row.place.len,
+                },
+              })
+            })
+            .collect(),
+        );
+      }
+      (Want::Rows { nodes, .. }, None) => wants.give_rows(vec![None; nodes.len()]),
+      (Want::Chunks { places }, Some(disk)) => {
+        let asked = places
+          .iter()
+          .map(|place| slates_store::texts::Place {
+            payload: place.payload,
+            offset: place.offset,
+            len: place.len,
+          })
+          .collect();
+        let Ok(chunks) = disk.places(asked).await else {
+          return false;
+        };
+        wants.give_chunks(chunks);
+      }
+      (Want::Chunks { .. }, None) => return false,
+    }
+  }
+  true
+}
+
 /// [`held`], for the tests.
 #[cfg(test)]
 pub(crate) fn held_here(state: &ShardState, id: RepositoryId) -> bool {
@@ -136,6 +193,8 @@ pub(crate) struct Generation {
   roots: Vec<PhaseHead>,
   /// The register's bookmarks as they stood.
   bookmarks: BookmarkHeads,
+  /// Whether the changeset store kept every revision as it stood (`HgStore::unstored`).
+  stored_logs: bool,
 }
 
 impl Generation {
@@ -179,15 +238,21 @@ pub(crate) fn hold_in(
     return None;
   }
   let (roots, bookmarks) = register_of(state, id, room).ok()?;
-  let index = super::within_budget(state, 0, |stores| {
+  let (index, stored_logs) = super::within_budget(state, 0, |stores| {
     let (content, store) = stores.mercurial(id)?;
-    store.index.fork(content).ok()
+    let stored_logs = !store.unstored;
+    store
+      .index
+      .fork(content)
+      .ok()
+      .map(|index| (index, stored_logs))
   })?;
   Some(Generation {
     id,
     index: Some(index),
     roots,
     bookmarks,
+    stored_logs,
   })
 }
 
@@ -206,6 +271,7 @@ pub(crate) fn lend_held_in<R>(
       roots: &generation.roots,
       bookmarks: &generation.bookmarks,
       publishing: PUBLISHING,
+      stored_logs: generation.stored_logs,
     };
     let view = Indexed::new(index, content, read, room).ok()?;
     Some(step(&view, room))
@@ -234,12 +300,19 @@ fn lend_in<R>(
   if !held(state, id) {
     return None;
   }
+  let started = slates_rt::futures::now_ns();
   let made = super::lent_state(state, |state| {
     with_view(state, id, room, |view, _, room| step(view, room))
   });
   if made.is_none() {
     crate::fleet::count_refusal_in(state, UNMADE);
   }
+  // The lend's lookups over the store's own index, reported to its merge rule (`super::index_upkeep`).
+  super::index_upkeep::looked_up(
+    state,
+    id,
+    slates_rt::futures::now_ns().saturating_sub(started),
+  );
   made
 }
 
@@ -272,6 +345,7 @@ pub(crate) fn with_view<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
+    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   Some(step(&view, IndexHeld::new(&store.index, content), room))
@@ -293,6 +367,7 @@ pub(crate) fn with_view_over<R>(
     roots: &roots,
     bookmarks: &bookmarks,
     publishing: PUBLISHING,
+    stored_logs: !store.unstored,
   };
   let view = Indexed::new(&store.index, content, read, room).ok()?;
   let held = IndexHeld::new(over.unwrap_or(&store.index), content);

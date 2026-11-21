@@ -448,6 +448,9 @@ impl Drop for Anchor {
 /// ports), and its issuer surface's variables, where this platform names them ([`PRINTS_ISSUER_SURFACE`]).
 struct Started {
   anchor: Anchor,
+  /// The daemon's changeset store (`--vcs-store`), which a git repository needs (C5; main's ruling of 2026-11-20: a
+  /// daemon without one refuses to create one); declared after the anchor, so the daemon is gone before it is removed.
+  _store: Scratch,
   lines: Vec<String>,
   issuer: Option<Vec<(String, String)>>,
 }
@@ -484,6 +487,7 @@ fn value_of(text: &str, key: &str) -> String {
 /// its issuer surface ([`lines_until_served`]), waits until the daemon answers verbs steadily, and makes the root
 /// consensus group as a first start does (`slates bootstrap root`).
 fn start_anchor(instance: &str, edges: &[&str]) -> Started {
+  let store = Scratch::new("vcs-store");
   let mut child = Command::new(env!("CARGO_BIN_EXE_slates"))
     .args([
       "--instance",
@@ -494,6 +498,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
       SHARDS,
     ])
     .args(edges)
+    .args(["--vcs-store", &store.path])
     .stdout(Stdio::null())
     .stderr(Stdio::piped())
     .spawn()
@@ -509,6 +514,7 @@ fn start_anchor(instance: &str, edges: &[&str]) -> Started {
   assert_eq!(code, 0, "bootstrap root: {out}{err}");
   Started {
     anchor,
+    _store: store,
     lines,
     issuer,
   }
@@ -709,8 +715,9 @@ const MEMORY_KINDS: [&str; 5] = ["segment", "content", "arenas", "regions", "hea
 /// §4.14 and A-232's gotcha (the bug record of 2026-11-20, the anchor's kills of w-hg's daemon): the daemon reports its
 /// own memory by kind, read in process with nothing suspended, so no inspector need suspend it (`vmmap`, `heap`), which
 /// past the anchor's window gets it killed by design. Do: start an anchor with its HTTP edge on loopback; make
-/// repository [`REPOSITORY`] and a token; push stock git's first commit there while a thread asks `slates status --json`
-/// again and again until the push ends. Expect every answer to report `memory` with each of [`MEMORY_KINDS`] once, each
+/// repository [`REPOSITORY`] and a token; push stock git's first commit there while a thread asks `slates status --json
+/// --memory` (the request that asks for the memory report, main's ruling on g228's finding) again and again until the
+/// push ends. Expect every answer to report `memory` with each of [`MEMORY_KINDS`] once, each
 /// kind's resident bytes within its reserved bytes, the segment's, the content object's and the heap's reserved bytes
 /// above zero; the push to succeed; and the anchor never to have restarted the daemon (the same pid and `restarts` 0
 /// at the end). Skips loudly as the round trips do.
@@ -726,8 +733,8 @@ fn a_status_during_a_push_reports_the_daemons_memory_by_kind_while_the_anchor_ke
     return;
   };
   let status = |instance: &str| -> serde_json::Value {
-    let (code, out, err) = slates(instance, &[], &["status", "--json"]);
-    assert_eq!(code, 0, "status --json: {out}{err}");
+    let (code, out, err) = slates(instance, &[], &["status", "--json", "--memory"]);
+    assert_eq!(code, 0, "status --json --memory: {out}{err}");
     serde_json::from_str(&out).unwrap()
   };
   let before = status(&leg.instance);

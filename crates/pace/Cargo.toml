@@ -1,0 +1,14 @@
+[package]
+name = "slates-pace"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Paced work (§4.3): a step of cooperative units that yields at the quantum when someone waits, and goes on to a derived ceiling when no one does, each unit kind's cost estimated from its own measures; no runtime, its clock and its waiting probe given."
+
+[dependencies]
+
+[lints]
+workspace = true

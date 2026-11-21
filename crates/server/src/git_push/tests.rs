@@ -229,9 +229,8 @@ pub(crate) fn owner() -> Principal {
 
 /// Makes git repository `name`, SHA-1, its default branch `main`, on the shard: its id.
 pub(crate) fn git_repository(state: &mut ShardState, name: &str) -> RepositoryId {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -322,7 +321,7 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   loop {
     match push.answer_step(state, &mut answer).expect("answered") {
       Answering::Answered(received) => return (answer, *received),
-      Answering::Turned => {}
+      Answering::Turned => carry_blocking(state, push),
       #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
@@ -437,7 +436,7 @@ pub(crate) fn pushed_from_the_fixtures(
 /// one record in the register a push.
 #[test]
 fn t_a654_stock_gits_pushes_are_answered_as_git_answered_and_each_ref_holds_its_tree() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "fixtures");
     let mut after = "";
     for (scenario, next) in chain() {
@@ -504,7 +503,7 @@ fn assert_a_configured_hook_refuses(
 /// then the delete applied, one record more.
 #[test]
 fn t_a654_the_policy_hides_and_refuses_in_gits_words_and_a_configured_hook_refuses_typed() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "policy");
     pushed_from_the_fixtures(state, repository, &["create", "update", "copy"]);
     let held = records(state, repository);
@@ -601,7 +600,7 @@ fn assert_first_line_names(received: &Received, what: &[u8]) {
 /// more; the fourth applying both as one entry, one record more, `again` holding the second commit's text.
 #[test]
 fn t_a654_a_push_with_atomic_is_all_or_none_and_without_it_a_ref_at_a_time() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "atomic");
     pushed_from_the_fixtures(state, repository, &["create", "update", "tag", "copy"]);
     let held = records(state, repository);
@@ -678,7 +677,7 @@ fn atomic_applied_as_one_entry(state: &mut ShardState, repository: RepositoryId,
 /// holding the second commit's text. Before that push, the store made again from the log advertises `topic` too.
 #[test]
 fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_green() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "bindings");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let branch = |state: &mut ShardState, body: RequestBody| dispatch(state, 1, &owner(), body);
@@ -759,7 +758,7 @@ fn t_a743_a_branch_the_namespace_binds_is_a_ref_git_sees_and_pushes_move_its_gre
 /// before.
 #[test]
 fn t_a722_p4_a_thin_packs_record_is_replayed_in_turns_with_its_deltas_resolved() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "thin-replayed");
     pushed_from_the_fixtures(state, repository, &["create", "update"]);
     let before = super::advertised_refs(state, repository);
@@ -809,7 +808,7 @@ fn update_with_its_delta_first() -> Vec<u8> {
 /// the change: the replay refused as diverged, the second push's ref lost.
 #[test]
 fn t_a722_a_thin_packs_record_whose_delta_waits_first_is_replayed() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "thin-first");
     pushed_from_the_fixtures(state, repository, &["create"]);
     let received = pushed(state, repository, &update_with_its_delta_first());
@@ -844,7 +843,8 @@ const CREATES: usize = 24;
 /// holds its commit.
 #[test]
 fn t_a753_a_repository_takes_branch_creates_past_its_chain_budget() {
-  let refused = crate::daemon::audit_on_shard_configured(
+  let refused = crate::test_store::audit_on_stored_shard_configured(
+    "git-push",
     |state| {
       let repository = git_repository(state, "chains");
       let pack = pack_of(scenario!("create").request);
@@ -885,7 +885,7 @@ const INTERLEAVED: usize = 12;
 #[cfg(unix)]
 #[test]
 fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_append() {
-  let (outcomes, restaged) = crate::daemon::audit_on_shard(|state| {
+  let (outcomes, restaged) = crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "overtaken");
     let pack = pack_of(scenario!("create").request);
     let mut pushes: Vec<Option<ReceivePack>> = (0..INTERLEAVED)
@@ -912,6 +912,8 @@ fn t_a722_p4e_a_stage_a_landing_overtook_is_made_again_in_turns_before_its_appen
         {
           outcomes[at] = reasons(&received);
           *slot = None;
+        } else {
+          carry_blocking(state, push);
         }
       }
     }
@@ -1055,7 +1057,10 @@ async fn driven(
     went();
     match step {
       Answering::Answered(received) => break *received,
-      Answering::Turned => slates_rt::futures::yield_now().await,
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
       Answering::Hook(call) => {
         let ran = call.run(std::future::pending()).await;
         with_state(|state| push.hook_ran(state, ran, &mut answer))
@@ -1150,7 +1155,7 @@ fn hooked_repository(
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothing() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let hook = script(
     HookPointName::GitPreReceive,
     "pre-receive",
@@ -1179,7 +1184,7 @@ fn t_a665_a_push_whose_pre_receive_hook_refuses_gets_gits_words_and_moves_nothin
 #[cfg(unix)]
 #[test]
 fn t_a665_a_push_whose_hooks_accept_lands_and_post_receive_runs_after_the_update() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let pre = script(
     HookPointName::GitPreReceive,
     "pre-receive",
@@ -1269,7 +1274,7 @@ fn assert_report_between_the_hooks(answer: &[u8]) {
 #[cfg(unix)]
 #[test]
 fn t_a665_an_update_hook_refuses_its_own_command_alone() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let hook = script(
     HookPointName::GitUpdate,
     "update",
@@ -1374,7 +1379,7 @@ pub(crate) fn large_create(bytes: usize) -> (Vec<u8>, ObjectId) {
 /// created.
 #[test]
 fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "large");
     let (_, mut push) = started(state, repository);
     let (request, blob) = large_create(LARGE);
@@ -1399,7 +1404,7 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
     let received = loop {
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break *received,
-        Answering::Turned => {}
+        Answering::Turned => carry_blocking(state, &mut push),
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
@@ -1414,7 +1419,7 @@ fn t_a719_a_pushs_pack_is_read_into_its_quarantine_holding_none_of_its_bytes() {
 /// principal named for all of them; the idle repository has no row.
 #[test]
 fn t_a724_a_repositorys_pushes_are_counted_on_its_own_usage_row() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let pushed_to = git_repository(state, "pushed");
     let idle = git_repository(state, "idle");
     let mut sent = 0u64;
@@ -1470,7 +1475,7 @@ const BRANCHES: usize = 40;
 #[cfg(unix)]
 #[test]
 fn t_a719_a_push_is_decided_a_command_a_step() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "many");
     let (_, mut push) = started(state, repository);
     let names: Vec<Vec<u8>> = (0..BRANCHES)
@@ -1492,7 +1497,10 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
       let was_deciding = matches!(push.answer, super::AnswerState::Deciding(_));
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break *received,
-        Answering::Turned => deciding += usize::from(was_deciding),
+        Answering::Turned => {
+          deciding += usize::from(was_deciding);
+          carry_blocking(state, &mut push);
+        }
         #[cfg(unix)]
         Answering::Hook(_) => panic!("no hook is configured"),
       }
@@ -1515,7 +1523,7 @@ fn t_a719_a_push_is_decided_a_command_a_step() {
 /// its deltas (no input step resolved them), and its answer, made over turns, is the one git's own server gave.
 #[test]
 fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_step() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "deferred");
     let mut chained = chain().into_iter();
     let (create, _) = chained.next().unwrap();
@@ -1535,7 +1543,7 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
       turns += 1;
       match push.answer_step(state, &mut answer).expect("answered") {
         Answering::Answered(received) => break received,
-        Answering::Turned => {}
+        Answering::Turned => carry_blocking(state, &mut push),
         #[cfg(unix)]
         step @ Answering::Hook(_) => panic!("no hook runs here: {step:?}"),
       }
@@ -1552,7 +1560,7 @@ fn t_a724_a_pushs_waiting_deltas_resolve_in_its_answers_turns_never_in_an_input_
 /// the live store holds no content the records would not, and the rebuilt none fewer.
 #[test]
 fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "again");
     pushed_from_the_fixtures(state, repository, &["create", "update"]);
     let main = state
@@ -1567,6 +1575,49 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
       &[crate::vcs_store::green_key(main)],
     );
   });
+}
+
+/// The edge's carry as a test's synchronous driver stands in for it (C5 part 2b piece 2: a push whose homing no edge
+/// takes is refused): its names and pack kept for the region on this shard as their home keeps them
+/// (`crate::vcs_store::homes::keep_for_region`, the home's own step; a test's daemon is one node, and the crossing to
+/// other homes is held by the async drivers' tests, [`homed_drive`]), and its changeset landed on the node's store for
+/// real, from a thread of its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked
+/// nothing.
+pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
+  let Some(asked) = push.take_homing() else {
+    return;
+  };
+  let carried = match asked {
+    super::Carry::Home(bytes) => {
+      let outcome =
+        crate::vcs_store::homes::keep_for_region(state, &bytes).map(|(identity, _)| identity);
+      super::Carried::Homed(crate::vcs_store::homes::Homed { outcome, bytes })
+    }
+    super::Carry::Land(landing) => {
+      let super::Landing {
+        disk,
+        header,
+        parts,
+      } = *landing;
+      super::Carried::Landed(crate::test_store::land_answered_blocking(
+        disk, header, parts,
+      ))
+    }
+  };
+  push.homed(state, carried);
+}
+
+/// The edge's carry as a test's async driver runs it ([`super::carry`]): the homing or the landing the push asked,
+/// handed back. Refused only where the shard's state is not lent.
+pub(crate) async fn carry_awaited<P>(push: &mut ReceivePack<P>) -> Result<(), String> {
+  use crate::state::with_state;
+  if let Some(asked) = push.take_homing() {
+    let (origin, shards) =
+      with_state(|state| (state.shard, state.shards.clone())).ok_or("no state to carry")?;
+    let carried = super::carry(origin, &shards, asked).await;
+    with_state(|state| push.homed(state, carried)).ok_or("no state for the carried")?;
+  }
+  Ok(())
 }
 
 /// One push of `request` driven as an edge drives it (`crate::vcs_http::git::receive`): its answer a step at a time,
@@ -1602,20 +1653,93 @@ pub(crate) async fn homed_drive(
       Answering::Answered(received) => return Ok(*received),
       Answering::Turned => {
         slates_rt::futures::yield_now().await;
-        if let Some(bytes) = push.take_homing() {
+        if let Some(asked) = push.take_homing() {
           let (origin, shards) =
             with_state(|state| (state.shard, state.shards.clone())).ok_or("no state")?;
-          let homed = crate::vcs_store::homes::home_in_region(
-            origin,
-            &shards,
-            bytes,
-            crate::fleet::live_budget(),
-          )
-          .await;
-          if homed.is_err() {
-            return Err(format!("not homed: {homed:?}"));
+          let carried = crate::git_push::carry(origin, &shards, asked).await;
+          match &carried {
+            crate::git_push::Carried::Homed(homed) if homed.outcome.is_err() => {
+              return Err(format!("not homed: {:?}", homed.outcome));
+            }
+            crate::git_push::Carried::Landed(Err(refused)) => {
+              return Err(format!("not landed: {refused:?}"));
+            }
+            _ => {}
           }
-          with_state(|state| push.homed(state, homed)).ok_or("no state for the homing")?;
+          with_state(|state| push.homed(state, carried)).ok_or("no state for the homing")?;
+        }
+      }
+      #[cfg(unix)]
+      step @ Answering::Hook(_) => return Err(format!("no hook runs here: {step:?}")),
+    }
+  }
+}
+
+/// C5 part 2b (main's ruling of 2026-11-21 00:50: a homing that falls short refuses the push, never a record naming its
+/// objects inline). Do: on a store-backed shard, push stock git's `create`, driving its answer as an edge does but
+/// handing its names' homing back fallen short (no region home answered). Expect: the push refused `Unlanded`, and the
+/// repository's register holding no record. Red before part 2b: answered `ok`, its record version 2.
+#[test]
+fn t_a767_c5b_a_push_whose_homing_falls_short_is_refused_and_records_nothing() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
+  let (sent, got) = std::sync::mpsc::channel();
+  crate::daemon::observe_first(&daemon, move |state| {
+    let repository = git_repository(state, "short");
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let task = slates_rt::futures::spawn(async move {
+      let outcome = short_homing_drive(repository, &request).await;
+      let records =
+        crate::state::with_state(|state| crate::vcs_store::tests::records(state, repository).len());
+      let _ = sent.send((outcome, records));
+    })
+    .expect("the push's task");
+    slates_rt::futures::detach(task).expect("detached");
+  });
+  let (outcome, records) = got.recv().expect("the push ended");
+  assert_eq!(outcome, Err("Unlanded".to_owned()));
+  assert_eq!(records, Some(0), "nothing of the push in the register");
+}
+
+/// [`homed_drive`] whose first homing is handed back fallen short, as when no region home answers: the answer's
+/// refusal (its kind), or `Ok` with the report's reasons.
+async fn short_homing_drive(repository: RepositoryId, request: &[u8]) -> Result<Vec<u8>, String> {
+  use crate::state::with_state;
+  let mut push = with_state(|state| {
+    ReceivePack::start(
+      state,
+      (&owner(), repository),
+      false,
+      &mut Vec::new(),
+      Unpresented,
+    )
+  })
+  .ok_or("no state")?
+  .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.input(state, request))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  with_state(|state| push.end(state))
+    .ok_or("no state")?
+    .map_err(|failed| format!("{failed:?}"))?;
+  let mut answer = Vec::new();
+  loop {
+    let step = with_state(|state| push.answer_step(state, &mut answer))
+      .ok_or("no state")?
+      .map_err(|failed| format!("{failed:?}"))?;
+    match step {
+      Answering::Answered(_) => return Ok(answer),
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        if let Some(crate::git_push::Carry::Home(bytes)) = push.take_homing() {
+          let fallen = crate::git_push::Carried::Homed(crate::vcs_store::homes::Homed {
+            outcome: Err(crate::vcs_store::homes::HomeRefused::Unanswered),
+            bytes,
+          });
+          with_state(|state| push.homed(state, fallen)).ok_or("no state")?;
         }
       }
       #[cfg(unix)]
@@ -1740,7 +1864,10 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
     timed(began);
     match step {
       Answering::Answered(received) => break *received,
-      Answering::Turned => slates_rt::futures::yield_now().await,
+      Answering::Turned => {
+        slates_rt::futures::yield_now().await;
+        carry_awaited(&mut push).await?;
+      }
       #[cfg(unix)]
       Answering::Hook(_) => return Err("no hook is configured".to_owned()),
     }
@@ -1749,13 +1876,15 @@ async fn stepped(repository: RepositoryId, request: &[u8]) -> Stepped {
 }
 
 /// A-752 (main's order of 2026-11-20, w-git's measure: one command bringing 3,502 objects over a flat 3,500-file tree
-/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog). Do: create `main`
-/// at a flat tree of [`FLAT_FILES`] files, then push a commit changing every file, answering a step at a time. Expect:
-/// both `ok`; the work builds took more turns than the files they wrote (a unit at a time, before the verdicts), none
-/// past its budget by more than its longest unit and the scheduler's own overrun (`push.build.past_budget` 0).
+/// built its work in one step, 374 to 642 ms debug, so a monorepo's push would outlast the watchdog), with A-783's rule
+/// (a turn yields at its quantum when someone waits). Do: create `main` at a flat tree of [`FLAT_FILES`] files, then push
+/// a commit changing every file, answering a step at a time, no one else on the shard. Expect: both `ok`; the update's
+/// build a unit at a time (more quanta than files), in a tenth as many turns as quanta or fewer (no one waited, so each
+/// turn went on), none past its ceiling (the watchdog's look) by more than a unit and its opening, and none past its
+/// budget (`push.build.past_budget` 0).
 #[test]
 fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "flat"));
   let (first, objects) = flat_commit(FLAT_FILES, "first", None);
   let create = request(
@@ -1783,9 +1912,22 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
   assert_eq!(reasons(&created), [b"ok"]);
   assert_eq!(reasons(&updated), [b"ok"]);
   let turns = after.turns - before.turns;
+  let quanta = (after.more_quanta - before.more_quanta) + turns;
+  // A unit at a time still: more quanta than files, each quantum asked once whether anyone waits.
   assert!(
-    turns > FLAT_FILES as u64,
-    "the update's work was built in {turns} turns for {FLAT_FILES} files"
+    quanta > FLAT_FILES as u64,
+    "the update's work took {quanta} quanta for {FLAT_FILES} files"
+  );
+  // A-783: no one waited, so each turn went on to its ceiling: far fewer turns than quanta.
+  assert!(
+    turns * 10 < quanta,
+    "{turns} turns for {quanta} quanta: the turns did not go on while no one waited"
+  );
+  let ceiling = crate::daemon::HEARTBEAT_NS;
+  assert!(
+    after.longest_ns <= ceiling + after.longest_unit_ns + after.longest_opening_ns,
+    "a turn of {} ns past its {ceiling} ns ceiling",
+    after.longest_ns
   );
   assert_eq!(after.past_budget, 0, "{after:?}");
 }
@@ -1799,10 +1941,9 @@ fn t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time() {
 /// is on its event (an answer, a channel), none on a fixed time: a loaded machine is the norm.
 #[test]
 fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
-  let daemon = crate::daemon::audit_daemon_of(1);
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(1);
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_first(&daemon, move |state| {
-    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, "homed");
     let requests: Vec<Vec<u8>> = chain()
       .into_iter()
@@ -1851,20 +1992,21 @@ fn t_a724_a_pushs_record_names_its_names_once_they_are_homed_in_the_region() {
   let versions = sent.recv().expect("checked");
   assert!(!versions.is_empty(), "no record");
   assert!(
-    versions.iter().all(|version| *version == 4),
+    versions.iter().all(|version| *version == 5),
     "versions {versions:?}"
   );
 }
 
-/// A-724 piece 8c (main's ruling (ii): a replay reads a version-3 record's names locally, else from their region homes).
-/// Do: on a node of four shards, with version 3 on, push stock git's `create` on a shard that is not its names' home
-/// (pushed again on another where the first was); drop the names from that owner's content store, so only their home
-/// shard holds them for the region; make the store again from the log, a task on the owner waiting for the rebuild's
-/// end. Expect: the rebuild reads the names from their home before the record's replay (counted fetched), and the store
-/// made again is the live one. Every wait is on its event, none on a fixed time: a loaded machine is the norm.
+/// A-724 piece 8c and A-767 C5 (a replay reads a record's names locally, else from the node's changeset store; a node
+/// whose store lacks the changeset reads them from their region homes). Do: on a store-backed node of four shards, with
+/// the homing on, push stock git's `create` on a shard that is not its names' home (pushed again on another where the
+/// first was); drop the names from that owner's content store; make the store again from the log, a task on the owner
+/// waiting for the rebuild's end. Expect: the rebuild reads the record's changeset back from the node's store before its
+/// replay (counted read), and the store made again is the live one. Every wait is on its event, none on a fixed time: a
+/// loaded machine is the norm.
 #[test]
-fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
-  let daemon = crate::daemon::audit_daemon_of(4);
+fn t_a767_c5_a_rebuild_reads_a_records_names_back_from_the_nodes_store() {
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(4);
   let (first, identity, home) = pushed_v3_at(&daemon, 0, "fetched");
   let (partition, repository) =
     match crate::daemon::observe_at(&daemon, 0, |state| state.shard) == home {
@@ -1883,7 +2025,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       .expect("main");
     let before = state
       .refusals
-      .get(crate::vcs_store::NAMES_FETCHED)
+      .get(crate::vcs_store::CHANGESET_READ)
       .copied()
       .unwrap_or(0);
     crate::vcs_store::rebuild(state, repository);
@@ -1902,7 +2044,7 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
       let fetched = crate::state::with_state(|state| {
         state
           .refusals
-          .get(crate::vcs_store::NAMES_FETCHED)
+          .get(crate::vcs_store::CHANGESET_READ)
           .copied()
           .unwrap_or(0)
       })
@@ -1917,7 +2059,10 @@ fn t_a724_a_rebuild_reads_a_version_3_records_names_from_their_region_home() {
     home, owner_shard,
     "the names' home is the owner shard: the case reads nothing from the region"
   );
-  assert!(fetched, "the names were not read from their region home");
+  assert!(
+    fetched,
+    "the names were not read back from the node's store"
+  );
   let (whole, compared) = std::sync::mpsc::channel();
   crate::daemon::observe_at(&daemon, partition, move |state| {
     crate::vcs_store::tests::assert_made_again_whole(
@@ -1939,7 +2084,6 @@ fn pushed_v3_at(
 ) -> (RepositoryId, slates_vcs::ContentId, u16) {
   let (sent, got) = std::sync::mpsc::channel();
   crate::daemon::observe_at(daemon, partition, move |state| {
-    crate::vcs_store::write_version_4_for_test(true);
     let repository = git_repository(state, name);
     let request = chain()
       .into_iter()
@@ -1976,7 +2120,7 @@ fn pushed_v3_at(
 /// record (`LoggedChange::Objects`), the same bytes the repository's register keeps.
 #[test]
 fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "shipped");
     let _ = state.db.take_state_log_records();
     pushed_from_the_fixtures(state, repository, &["create"]);
@@ -2001,22 +2145,35 @@ fn t_a724_a_pushs_record_rides_its_repositorys_names_log() {
   });
 }
 
-/// A-724 piece 8c (a decision never waits for a homing nobody runs: found by the takeover test, where the HTTP edge had
-/// lost its homing in a refactor and a version-3 push hung). Do: with version 3 on, push stock git's `create` through a
-/// driver that never takes the homing its decision asks for (`pushed`). Expect: answered `ok`, its record version 2,
-/// the untaken homing counted.
+/// A-724 piece 8c and C5 part 2b piece 2 (a decision never waits for a homing nobody runs, found by the takeover test;
+/// and no record names a push's objects inline). Do: push stock git's `create` through a driver that never takes the
+/// homing its decision asks for. Expect: the push refused `Unlanded`, the untaken homing counted, and the repository's
+/// register holding no record. Red before piece 2: answered `ok`, its record version 2.
 #[test]
-fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
-  crate::daemon::audit_on_shard(|state| {
-    crate::vcs_store::write_version_4_for_test(true);
+fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
+  crate::test_store::audit_on_stored_shard("git-push", |state| {
     let repository = git_repository(state, "untaken");
-    pushed_from_the_fixtures(state, repository, &["create"]);
-    let records = crate::vcs_store::tests::records(state, repository);
-    let versions: Vec<u32> = records
-      .iter()
-      .map(|record| u32::from_le_bytes(record[4..8].try_into().unwrap()))
-      .collect();
-    assert_eq!(versions, vec![2]);
+    let request = chain()
+      .into_iter()
+      .next()
+      .map(|(scenario, _)| scenario.request.to_vec())
+      .expect("create");
+    let (_, mut push) = started(state, repository);
+    for piece in request.chunks(PIECE) {
+      push.input(state, piece).expect("taken");
+    }
+    push.end(state).expect("ended");
+    let mut answer = Vec::new();
+    let refused = loop {
+      match push.answer_step(state, &mut answer) {
+        Ok(Answering::Answered(_)) => break None,
+        Ok(Answering::Turned) => {}
+        #[cfg(unix)]
+        Ok(step @ Answering::Hook(_)) => panic!("no hook runs here: {step:?}"),
+        Err(failed) => break Some(format!("{failed:?}")),
+      }
+    };
+    assert_eq!(refused.as_deref(), Some("Unlanded"));
     assert_eq!(
       state
         .refusals
@@ -2024,6 +2181,10 @@ fn t_a724_a_push_whose_homing_no_edge_takes_answers_with_a_version_2_record() {
         .copied(),
       Some(1)
     );
-    crate::vcs_store::write_version_4_for_test(false);
+    assert_eq!(
+      records(state, repository),
+      0,
+      "nothing of the push in the register"
+    );
   });
 }

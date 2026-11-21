@@ -240,7 +240,8 @@ impl GitReplay {
       .into_iter()
       .chain(self.packed.map(|(identity, _)| identity));
     for identity in held.collect::<Vec<_>>() {
-      if content.holders(&identity) == 0
+      // The region's own hold (this shard its home) is not the record's (`super::replay_push`'s rule).
+      if content.holders(&identity) <= super::homes::region_holds_here(&identity)
         && let Err(refused) = content.hold(&identity)
       {
         return Err(ReplayRefused::Git(GitRefused::Object(

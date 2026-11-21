@@ -1048,6 +1048,27 @@ where
   async move { within(call?, deadline_ns).await }
 }
 
+/// Runs the future `start` makes as a task on `shard`, and awaits its result on this shard (`origin`) until the task
+/// ends: for a task that bounds itself, its every wait judged by its own progress, so a wall deadline here would only cut
+/// it short while it still progressed and drop its late result. A holder's forward is one (main's ruling on the lane,
+/// 2026-11-21): its lane gives it up once none of its own bytes have moved for a stall budget (`forward_lane::Stall`),
+/// and the replica's wait has its own bound (`work_home::hold_until_replica`); a fixed bound here refused a 320 MiB
+/// submit still crossing, whose retry sent it all again. `None` when the target's task arena refused the task. Labelled
+/// with the line that called this, as [`task_within`]'s is.
+#[track_caller]
+pub fn task_to_its_end<T, F>(
+  origin: u16,
+  shard: u16,
+  start: impl FnOnce() -> F + Send + 'static,
+) -> impl Future<Output = Option<T>>
+where
+  T: Send + 'static,
+  F: Future<Output = T> + 'static,
+{
+  let call = task_on(origin, shard, std::panic::Location::caller(), start);
+  async move { call?.await }
+}
+
 /// [`task_within`], awaited while the target is working, up to `budget_ns` of the target's own CPU time
 /// ([`within_shard_time`]).
 /// The task is labelled with the line that called this, as [`task_within`]'s is.
@@ -1301,6 +1322,76 @@ mod tests {
     taken
   }
 
+  /// A-800 (goal 86b's lost replies: the counters that place a lost one). Do: from one shard, carry a reply home to
+  /// another with `send_reply_home`, its end setting a flag. Expect: the end runs, the sender counts it handed
+  /// (`xshard.reply_home_handed`) and the client's shard counts it run (`xshard.reply_home_ran`), so a reply handed and
+  /// never run shows as the difference between the two at a 100,000-client run.
+  #[test]
+  // The test thread waits off-shard for the other shard to run the reply.
+  #[allow(clippy::disallowed_methods)]
+  fn a_reply_carried_home_is_counted_handed_where_sent_and_run_where_it_ran() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RAN: AtomicBool = AtomicBool::new(false);
+    RAN.store(false, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon_of(2);
+    let (handed_before, home) = crate::daemon::observe_first(&daemon, |state| {
+      let before = reply_home_counts().handed;
+      let home = state.shards.get(1).copied().unwrap_or(state.shard);
+      send_reply_home(home, || RAN.store(true, Ordering::Release));
+      (before, home)
+    });
+    let deadline = std::time::Instant::now() + MESSAGE_WAIT;
+    while !RAN.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+      std::thread::sleep(std::time::Duration::from_nanos(LOOK_EVERY_NS));
+    }
+    let handed = crate::daemon::observe_first(&daemon, |_| reply_home_counts().handed);
+    let ran = crate::daemon::observe_at(&daemon, 1, |_| reply_home_counts().ran);
+    daemon.stop();
+    assert!(
+      RAN.load(Ordering::Acquire),
+      "the reply's end ran on shard {home}"
+    );
+    assert_eq!(
+      (handed - handed_before, ran >= 1),
+      (1, true),
+      "handed {handed}, ran {ran}"
+    );
+  }
+
+  /// A-800 (goal 86b's lost replies; §4.3 "backpressure, never a drop", CLAUDE.md §2 item 9). Do: on a shard, while
+  /// its state is borrowed, drop unrun a reply task carried home to that shard (the drop runs the reply's end there, as
+  /// an admission refusal's drop does), whose end sets a flag. Expect: the reply's end runs on its shard once the
+  /// borrow is let go, resent home rather than lost, and the resend is counted (`xshard.reply_resent_borrowed`). Before,
+  /// the drop found the state borrowed and returned, so the reply was lost with nothing counted: at 100,000 clients the
+  /// client node answered 9,116,579 forwards on its control shard and delivered 9,113,196 home.
+  #[test]
+  // The test thread waits off-shard for the shard to run the resent reply.
+  #[allow(clippy::disallowed_methods)]
+  fn a_reply_dropped_unrun_while_its_shards_state_is_borrowed_is_resent_not_lost() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RAN: AtomicBool = AtomicBool::new(false);
+    RAN.store(false, Ordering::Release);
+    let daemon = crate::daemon::audit_daemon();
+    crate::daemon::observe_first(&daemon, |state| {
+      let at = state.shard;
+      drop(reply_task(at, || RAN.store(true, Ordering::Release)));
+    });
+    let deadline = std::time::Instant::now() + MESSAGE_WAIT;
+    while !RAN.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+      std::thread::sleep(std::time::Duration::from_nanos(LOOK_EVERY_NS));
+    }
+    let counted = crate::daemon::observe_first(&daemon, |_| reply_home_counts());
+    daemon.stop();
+    assert!(
+      RAN.load(Ordering::Acquire),
+      "the reply's end ran on its shard"
+    );
+    assert_eq!(
+      counted.resent_borrowed, 1,
+      "the resend was counted: {counted:?}"
+    );
+  }
+
   /// A reply handed home waits for room even while this shard's task arena is full (goal 238; §4.3, banned items 8 and
   /// 9). Do: on a shard, register a stand-in slot whose control channel holds one message and fill it; fill this
   /// shard's task arena with tasks that park by yielding; and hand a reply home to the stand-in with `hand_reply_home`,
@@ -1517,7 +1608,7 @@ mod tests {
       "the hand-off past the bound was refused to its sender: {past:?}"
     );
     let (refused, held) = crate::daemon::observe_first(&daemon, |state| {
-      let report = crate::verbs::shard_report(state);
+      let report = crate::verbs::shard_report(state, false);
       let refused: u64 = report
         .refusals
         .iter()
@@ -2084,12 +2175,40 @@ impl Drop for RunUnstarted {
     if DISCARDING_UNSENT.try_with(Cell::get).unwrap_or(true) || self.body.is_none() {
       return;
     }
-    if state::with_state(|s| s.shard) != Some(self.at) {
-      return;
+    match state::try_with_state(|s| s.shard) {
+      Ok(shard) if shard == self.at => {
+        state::with_state_counted(|s| s.count(REPLY_RUN_UNSTARTED, 1));
+        self.run();
+      }
+      // Its own shard, borrowed here (A-800): sent home again, to run once the borrow is let go. Before, the reply was
+      // lost with nothing counted.
+      Err(state::StateAccess::Borrowed) => {
+        let Some(body) = self.body.take() else {
+          return;
+        };
+        bump_reply_home(|counts| counts.resent_borrowed = counts.resent_borrowed.saturating_add(1));
+        if carry(
+          self.at,
+          Control::Spawn(Box::new(boxed_reply_task(self.at, body))),
+        )
+        .is_err()
+        {
+          bump_reply_home(|counts| counts.orphaned = counts.orphaned.saturating_add(1));
+        }
+      }
+      // Another shard's thread, a thread with no state, or a fenced shard: no shard can run it here.
+      _ => bump_reply_home(|counts| counts.orphaned = counts.orphaned.saturating_add(1)),
     }
-    state::with_state_counted(|s| s.count(REPLY_RUN_UNSTARTED, 1));
-    self.run();
   }
+}
+
+/// Adds to this thread's [`ReplyHome`] counts.
+fn bump_reply_home(change: impl FnOnce(&mut ReplyHome)) {
+  REPLY_HOME.with(|cell| {
+    let mut counts = cell.get();
+    change(&mut counts);
+    cell.set(counts);
+  });
 }
 
 /// Carries a reply home to `origin`, the client's shard, as [`send_back`] carries a result: `body` is the reply's
@@ -2098,22 +2217,64 @@ impl Drop for RunUnstarted {
 /// arena there. The sibling of [`AnswerUnstarted`] the supervisor ordered fixed with it (2026-11-07). A reply that
 /// could not be carried (its client's shard gone) is counted `xshard.reply_dropped`.
 pub fn send_reply_home(origin: u16, body: impl FnOnce() + Send + 'static) {
+  bump_reply_home(|counts| counts.handed = counts.handed.saturating_add(1));
   send_back(origin, reply_task(origin, body));
 }
 
 /// The task that runs `body`, a reply's synchronous end, on `origin`, or runs it there as it is dropped unrun
 /// ([`RunUnstarted`]).
 fn reply_task(origin: u16, body: impl FnOnce() + Send + 'static) -> SpawnRequest {
+  boxed_reply_task(origin, Box::new(body))
+}
+
+/// [`reply_task`] of a body already boxed (a resend, [`RunUnstarted`]'s drop).
+fn boxed_reply_task(origin: u16, body: Box<dyn FnOnce() + Send>) -> SpawnRequest {
   let mut guard = RunUnstarted {
     at: origin,
-    body: Some(Box::new(body)),
+    body: Some(body),
   };
   SpawnRequest::new(
     Box::pin(async move {
+      bump_reply_home(|counts| counts.ran = counts.ran.saturating_add(1));
       guard.run();
     }),
     None,
   )
+}
+
+/// Format: the status counters of [`ReplyHome`] (A-800): replies handed home, run there, resent because their shard's
+/// state was borrowed at their drop, and orphaned (dropped where no shard could run them).
+pub(crate) const REPLY_HOME_HANDED: &str = "xshard.reply_home_handed";
+/// See [`REPLY_HOME_HANDED`].
+pub(crate) const REPLY_HOME_RAN: &str = "xshard.reply_home_ran";
+/// See [`REPLY_HOME_HANDED`].
+pub(crate) const REPLY_RESENT_BORROWED: &str = "xshard.reply_resent_borrowed";
+/// See [`REPLY_HOME_HANDED`].
+pub(crate) const REPLY_ORPHANED: &str = "xshard.reply_orphaned";
+
+std::thread_local! {
+  /// The replies carried home on this shard thread, by what became of them (A-800, [`reply_home_counts`]). Per thread,
+  /// so each shard reports its own, and never through the shard's state, which the sites that count here cannot borrow.
+  static REPLY_HOME: Cell<ReplyHome> = const { Cell::new(ReplyHome { handed: 0, ran: 0, resent_borrowed: 0, orphaned: 0 }) };
+}
+
+/// The replies carried home on this shard thread, by what became of them (A-800): the counts the lost-reply hunt
+/// compares, so a reply that never ran is placed between the hand-off on the sending shard and the run on the client's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReplyHome {
+  /// Handed to the client's shard (sent at once or kept for room), counted on the sending shard.
+  pub handed: u64,
+  /// Run by their task on the client's shard.
+  pub ran: u64,
+  /// Dropped unrun on the client's shard while its state was borrowed, and resent home.
+  pub resent_borrowed: u64,
+  /// Dropped unrun where no shard could run them (another shard's thread, no state, a fenced shard): lost, counted.
+  pub orphaned: u64,
+}
+
+/// [`ReplyHome`] on this shard thread so far.
+pub fn reply_home_counts() -> ReplyHome {
+  REPLY_HOME.with(Cell::get)
 }
 
 /// Counter: a reply carried home whose task the client's shard refused at admission, run there by its drop instead

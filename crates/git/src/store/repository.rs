@@ -1260,14 +1260,10 @@ impl Repository {
       push.len(),
       object_row.saturating_add(position_row).saturating_mul(2),
     );
-    let commits = push.commits().values().fold(0_u64, |total, arrived| {
-      let part = arrived
-        .parents
-        .len()
-        .saturating_mul(size_of::<u64>())
-        .saturating_add(rows::COMMIT_PART_BYTES);
-      total.saturating_add(bytes(1, part.saturating_mul(2)))
-    });
+    // A commit's part and its parents, each doubled, summed from the push's counts: no pass over its commits.
+    let (commits, parents) = push.commit_parts();
+    let commits = bytes(commits, rows::COMMIT_PART_BYTES.saturating_mul(2))
+      .saturating_add(bytes(parents, size_of::<u64>().saturating_mul(2)));
     objects
       .saturating_add(commits)
       .saturating_add(self.index.fork_room())
@@ -1675,6 +1671,12 @@ impl Repository {
       levels: self.levels.clone(),
       depth: self.depth,
     })
+  }
+
+  /// The repository's shared index (its object and position rows), for its owner shard's upkeep: the merge of its runs,
+  /// timed against its lookups (goal 93 perf; the server's `vcs_store::index_upkeep`).
+  pub fn rows(&mut self) -> &mut Index {
+    &mut self.index
   }
 
   /// Where the repository stands (A-745 rule 4): the positions it has given and the versions its greens have, both only

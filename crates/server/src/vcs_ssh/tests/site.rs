@@ -592,7 +592,7 @@ fn a_record_proves_its_principal_for_its_own_key_while_live() {
 /// nobody holds the rest, and each refusal is counted once by its reason.
 #[test]
 fn the_production_lookup_proves_a_key_by_the_credential_record_from_any_shard() {
-  let daemon = crate::daemon::audit_daemon_of(SHARDS);
+  let (_store, daemon) = crate::test_store::audit_daemon_of_stored(SHARDS);
   let keys: Vec<(UserKey, Vec<u8>)> = (1..=5).map(ed25519).collect();
   let blob = |at: usize| {
     keys

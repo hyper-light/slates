@@ -12,9 +12,20 @@
 //! holds, moved into the request, so the owner writes them without a copy. The channel's capacity is the requests the
 //! daemon lets wait at once; past it a request is refused `Busy`, the push's own refusal.
 //!
+//! **A sliced landing** ([`StoreHandle::begin`], then [`SlicedLanding`]'s `section`, `part` and `commit`) lands a
+//! changeset too large to hold whole (an import, a large pack) one bounded part a request: each part is written where
+//! it belongs in the open record and let go, so the RAM it takes is a part, never the changeset; the record is visible
+//! only at its commit mark, as a whole landing's is. The owner serves reads meanwhile; another landing, whole or sliced,
+//! waits in the owner's own bounded queue (the request channel's capacity again, refused `Busy` past it) until the open
+//! one commits or is let go. A client that lets its [`SlicedLanding`] go uncommitted, or whose task is dropped,
+//! abandons it: the owner learns so from the landing's liveness channel, whose sender the client held, at the next
+//! request it serves (the drop sends one to wake it), and the log's end never moved, so the next record is written over
+//! the abandoned bytes and recovery never sees them (a record verifies only with its trailer).
+//!
 //! **Ending.** When every handle is gone the owner checkpoints the engine at the log's end (so a restart replays
 //! nothing) and its thread returns; [`StoreOwner::stop`] joins it.
 
+use std::collections::VecDeque;
 use std::fmt;
 
 use slates_land::store_root::StoreRoot;
@@ -24,7 +35,7 @@ use crate::log::Section;
 use crate::log::{Header, Located, SectionKind};
 use crate::staging::{Identity, Staging};
 use crate::store::{Changeset, Contents, PIECE_BYTES, Sizing, Store, StoreError};
-use crate::texts::{TextCache, TextRow};
+use crate::texts::{Place, TextCache, TextRow};
 
 /// A landed changeset's section as a replay reads it: its kind, where its bytes are in the log and their length, and
 /// the bytes themselves when they fit one read piece ([`PIECE_BYTES`]: a record, a small `Texts`); a longer section is
@@ -40,8 +51,33 @@ pub struct SectionAt {
 /// A section of a landing: its kind and its bytes, moved in.
 pub type Part = (SectionKind, Vec<u8>);
 
+/// The rows a texts-by-tool ask answers: each tool id's text identity and row, none where it has none.
+type TextsAnswer = Result<Vec<Option<(Identity, TextRow)>>, StoreError>;
+
 /// A request to the owner, with the channel its answer goes back on.
 enum Request {
+  Begin {
+    header: Header,
+    alive: ChannelReceiver<()>,
+    answer: Sender<Result<u64, StoreError>>,
+  },
+  Section {
+    landing: u64,
+    kind: SectionKind,
+    len: u64,
+    answer: Sender<Result<(), StoreError>>,
+  },
+  Part {
+    landing: u64,
+    bytes: Vec<u8>,
+    answer: Sender<Result<(), StoreError>>,
+  },
+  Commit {
+    landing: u64,
+    answer: Sender<Result<Located, StoreError>>,
+  },
+  /// A sliced landing was let go: wakes the owner to look at its liveness channel.
+  Dropped,
   Land {
     header: Header,
     parts: Vec<Part>,
@@ -86,6 +122,16 @@ enum Request {
     limit: usize,
     answer: Sender<Result<Vec<(u64, Identity)>, StoreError>>,
   },
+  TextsByTool {
+    repository: u128,
+    path: Vec<u8>,
+    tool_ids: Vec<Vec<u8>>,
+    answer: Sender<TextsAnswer>,
+  },
+  Places {
+    places: Vec<Place>,
+    answer: Sender<Result<Vec<Vec<u8>>, StoreError>>,
+  },
 }
 
 /// Why a request to the owner did not get its answer.
@@ -125,11 +171,36 @@ pub struct StoreOwner {
 #[derive(Debug, Clone)]
 pub struct StoreHandle {
   requests: Sender<Request>,
+  /// The id of the standing grant the store's directory was opened under ([`crate::store::grant_id`]): what a
+  /// landing's header names.
+  grant: u64,
 }
 
 impl fmt::Debug for Request {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Request::Begin { header, .. } => f
+        .debug_struct("Begin")
+        .field("header", header)
+        .finish_non_exhaustive(),
+      Request::Section {
+        landing, kind, len, ..
+      } => f
+        .debug_struct("Section")
+        .field("landing", landing)
+        .field("kind", kind)
+        .field("len", len)
+        .finish_non_exhaustive(),
+      Request::Part { landing, bytes, .. } => f
+        .debug_struct("Part")
+        .field("landing", landing)
+        .field("len", &bytes.len())
+        .finish_non_exhaustive(),
+      Request::Commit { landing, .. } => f
+        .debug_struct("Commit")
+        .field("landing", landing)
+        .finish_non_exhaustive(),
+      Request::Dropped => f.write_str("Dropped"),
       Request::Land { header, parts, .. } => f
         .debug_struct("Land")
         .field("header", header)
@@ -162,6 +233,19 @@ impl fmt::Debug for Request {
         .field("repository", repository)
         .field("from", from)
         .finish_non_exhaustive(),
+      Request::TextsByTool {
+        repository,
+        tool_ids,
+        ..
+      } => f
+        .debug_struct("TextsByTool")
+        .field("repository", repository)
+        .field("tool_ids", &tool_ids.len())
+        .finish_non_exhaustive(),
+      Request::Places { places, .. } => f
+        .debug_struct("Places")
+        .field("places", &places.len())
+        .finish_non_exhaustive(),
       Request::Read { offset, len, .. } => f
         .debug_struct("Read")
         .field("offset", offset)
@@ -182,15 +266,16 @@ impl StoreOwner {
   /// Opens the store in `root` on a thread of its own (the store recovers there before the first request is served),
   /// with room for `waiting` requests at once.
   pub fn start(root: StoreRoot, sizing: Sizing, waiting: usize) -> Result<Self, OwnerError> {
+    let grant = crate::store::grant_id(root.grant().target.device, root.grant().target.inode);
     let (requests, incoming) = sync::channel(waiting).map_err(|_| OwnerError::Busy)?;
     let thread = slates_rt::registry::spawn_waited(
       std::thread::Builder::new().name("slates-store".to_owned()),
-      move || serve(root, sizing, incoming),
+      move || serve(root, sizing, incoming, waiting),
     )
     .map_err(|_| OwnerError::Gone)?;
     Ok(Self {
       thread,
-      handle: StoreHandle { requests },
+      handle: StoreHandle { requests, grant },
     })
   }
 
@@ -215,6 +300,7 @@ fn serve(
   root: StoreRoot,
   sizing: Sizing,
   mut incoming: ChannelReceiver<Request>,
+  waiting: usize,
 ) -> Result<(), StoreError> {
   let mut store = Store::open(root, sizing)?;
   // The owner lands bytes the request carries; nothing is staged on its side.
@@ -222,8 +308,67 @@ fn serve(
   // The texts the owner made from their chains (A-645's derived per-path read form), kept across requests, so a clone
   // streaming a path's versions in order makes each from the one before; its bound learned from the chains it made.
   let mut texts = TextCache::new(0);
-  while let Ok(request) = incoming.blocking_recv() {
+  let mut landings = Landings {
+    open: None,
+    held: VecDeque::new(),
+    waiting,
+    next: 0,
+  };
+  loop {
+    landings.let_go_if_dropped(&mut store);
+    let request = match landings.next_held() {
+      Some(request) => request,
+      None => match incoming.blocking_recv() {
+        Ok(request) => request,
+        Err(_) => break,
+      },
+    };
+    landings.let_go_if_dropped(&mut store);
+    let Some(request) = landings.hold_while_open(request) else {
+      continue;
+    };
     match request {
+      Request::Begin {
+        header,
+        alive,
+        answer,
+      } => {
+        let _ = answer.try_send(landings.begin(&mut store, header, alive));
+      }
+      Request::Section {
+        landing,
+        kind,
+        len,
+        answer,
+      } => {
+        let step = landings
+          .check(landing)
+          .and_then(|()| store.landing_section(kind, len));
+        let _ = answer.try_send(landings.failed_lets_go(&mut store, step));
+      }
+      Request::Part {
+        landing,
+        bytes,
+        answer,
+      } => {
+        let step = landings.check(landing).and_then(|()| {
+          if bytes.len() > PIECE_BYTES {
+            return Err(StoreError::Sizing("a landing's part past one piece"));
+          }
+          store.landing_part(&bytes)
+        });
+        drop(bytes);
+        let _ = answer.try_send(landings.failed_lets_go(&mut store, step));
+      }
+      Request::Commit { landing, answer } => {
+        // A commit that fails lets the record go (`commit_open` took it); a stranger's commit touches nothing.
+        let committed = landings.check(landing).and_then(|()| {
+          landings.open = None;
+          store.commit_landing()
+        });
+        let _ = answer.try_send(committed);
+      }
+      Request::Dropped => {}
       Request::Land {
         header,
         parts,
@@ -292,6 +437,25 @@ fn serve(
       } => {
         let _ = answer.try_send(store.path_texts(repository, &path, from, limit));
       }
+      Request::TextsByTool {
+        repository,
+        path,
+        tool_ids,
+        answer,
+      } => {
+        let found: Result<Vec<_>, StoreError> = tool_ids
+          .iter()
+          .map(|tool_id| store.text_by_tool(repository, &path, tool_id))
+          .collect();
+        let _ = answer.try_send(found);
+      }
+      Request::Places { places, answer } => {
+        let read: Result<Vec<_>, StoreError> = places
+          .iter()
+          .map(|place| store.place_bytes(&staging, place))
+          .collect();
+        let _ = answer.try_send(read);
+      }
       Request::Read {
         offset,
         len,
@@ -301,7 +465,102 @@ fn serve(
       }
     }
   }
+  store.abandon_landing();
   store.checkpoint()
+}
+
+/// The owner's sliced landing, if one is open, and the landings held behind it.
+struct Landings {
+  /// The open landing: its number and the liveness channel whose sender its client holds.
+  open: Option<(u64, ChannelReceiver<()>)>,
+  /// Landings (whole or sliced) that arrived while one was open, in order.
+  held: VecDeque<Request>,
+  /// The most held at once: the request channel's own capacity, so the owner's queue is bounded as the channel is.
+  waiting: usize,
+  /// The next landing's number.
+  next: u64,
+}
+
+impl Landings {
+  /// Lets the open landing go when its client has let its liveness sender go.
+  fn let_go_if_dropped(&mut self, store: &mut Store) {
+    let dropped = match &mut self.open {
+      Some((_, alive)) => matches!(alive.try_recv(), Err(SyncError::Closed(()))),
+      None => false,
+    };
+    if dropped {
+      self.open = None;
+      store.abandon_landing();
+    }
+  }
+
+  /// The oldest held landing, once none is open.
+  fn next_held(&mut self) -> Option<Request> {
+    if self.open.is_some() {
+      return None;
+    }
+    self.held.pop_front()
+  }
+
+  /// `request`, to serve now; or `None` when it is a landing that must wait for the open one: held, or, when the
+  /// queue is full, answered [`StoreError::Held`] (its asker's [`OwnerError::Busy`]).
+  fn hold_while_open(&mut self, request: Request) -> Option<Request> {
+    if self.open.is_none() || !matches!(request, Request::Land { .. } | Request::Begin { .. }) {
+      return Some(request);
+    }
+    if self.held.len() < self.waiting {
+      self.held.push_back(request);
+      return None;
+    }
+    match request {
+      Request::Land { answer, .. } => {
+        let _ = answer.try_send(Err(StoreError::Held));
+      }
+      Request::Begin { answer, .. } => {
+        let _ = answer.try_send(Err(StoreError::Held));
+      }
+      _ => {}
+    }
+    None
+  }
+
+  /// Opens a sliced landing; its number.
+  fn begin(
+    &mut self,
+    store: &mut Store,
+    header: Header,
+    alive: ChannelReceiver<()>,
+  ) -> Result<u64, StoreError> {
+    store.open_landing(header)?;
+    let number = self.next;
+    self.next = self.next.wrapping_add(1);
+    self.open = Some((number, alive));
+    Ok(number)
+  }
+
+  /// Whether `landing` is the open one.
+  fn check(&self, landing: u64) -> Result<(), StoreError> {
+    match &self.open {
+      Some((number, _)) if *number == landing => Ok(()),
+      _ => Err(StoreError::NoLanding),
+    }
+  }
+
+  /// `step`, letting the open landing go when it failed on it (a section's bytes out of order, a write refused), so a
+  /// landing is committed whole or not at all.
+  fn failed_lets_go(
+    &mut self,
+    store: &mut Store,
+    step: Result<(), StoreError>,
+  ) -> Result<(), StoreError> {
+    if let Err(error) = &step
+      && !matches!(error, StoreError::NoLanding)
+    {
+      self.open = None;
+      store.abandon_landing();
+    }
+    step
+  }
 }
 
 /// `row`'s sections, each small one with its bytes.
@@ -322,6 +581,11 @@ fn sections_of(store: &Store, row: &Changeset) -> Result<Vec<SectionAt>, StoreEr
 }
 
 impl StoreHandle {
+  /// The id of the standing grant the store writes under: the `grant` every landing's header names (its `G` row).
+  pub fn grant(&self) -> u64 {
+    self.grant
+  }
+
   /// Sends `request` and waits for its answer on `answers`, as a task.
   async fn ask<T>(
     &self,
@@ -335,10 +599,33 @@ impl StoreHandle {
       Err(SyncError::NotOnShardThread(_)) => return Err(OwnerError::NotOnShard),
     }
     match answers.recv().await {
+      Ok(Err(StoreError::Held)) => Err(OwnerError::Busy),
       Ok(answer) => answer.map_err(OwnerError::Store),
       Err(SyncError::NotOnShardThread(())) => Err(OwnerError::NotOnShard),
       Err(_) => Err(OwnerError::Gone),
     }
+  }
+
+  /// Opens a sliced landing of `header` (whose section count names the sections to come); answered once its header is
+  /// written. Its sections and parts follow through the [`SlicedLanding`]; nothing is visible until its commit.
+  pub async fn begin(&self, header: Header) -> Result<SlicedLanding, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let (alive, watched) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let number = self
+      .ask(
+        Request::Begin {
+          header,
+          alive: watched,
+          answer,
+        },
+        answers,
+      )
+      .await?;
+    Ok(SlicedLanding {
+      handle: self.clone(),
+      number,
+      alive: Some(alive),
+    })
   }
 
   /// Lands a changeset whose sections are `parts` (their bytes moved in): appended, committed with one flush, its rows
@@ -444,6 +731,35 @@ impl StoreHandle {
       .await
   }
 
+  /// Each version of `path` in `repository` its tool names in `tool_ids` (Mercurial's nodes), in order, as it landed
+  /// ([`Store::text_by_tool`]), none for one no landed changeset named. A batch, so a stream asks once for a log's rows
+  /// (bounded by the log's length).
+  pub async fn texts_by_tool(
+    &self,
+    repository: u128,
+    path: Vec<u8>,
+    tool_ids: Vec<Vec<u8>>,
+  ) -> Result<Vec<Option<(Identity, TextRow)>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self
+      .ask(
+        Request::TextsByTool {
+          repository,
+          path,
+          tool_ids,
+          answer,
+        },
+        answers,
+      )
+      .await
+  }
+
+  /// The bytes at each of `places` ([`Store::place_bytes`]), in order: a stream's chunks, read in place.
+  pub async fn places(&self, places: Vec<Place>) -> Result<Vec<Vec<u8>>, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    self.ask(Request::Places { places, answer }, answers).await
+  }
+
   /// A path's history in `repository` from sequence `from` on, at most `limit` ([`Store::path_texts`]).
   pub async fn path_texts(
     &self,
@@ -486,5 +802,65 @@ impl StoreHandle {
         answers,
       )
       .await
+  }
+}
+
+/// A landing open on the owner, its steps sent one bounded part at a time (the module's "A sliced landing"). Let go
+/// uncommitted, it is abandoned: nothing of it is ever visible.
+#[derive(Debug)]
+pub struct SlicedLanding {
+  handle: StoreHandle,
+  number: u64,
+  /// The liveness sender the owner watches; taken at the commit, so only an uncommitted landing's drop wakes the owner.
+  alive: Option<Sender<()>>,
+}
+
+impl SlicedLanding {
+  /// Begins the next section, `len` bytes of `kind`.
+  pub async fn section(&mut self, kind: SectionKind, len: u64) -> Result<(), OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let request = Request::Section {
+      landing: self.number,
+      kind,
+      len,
+      answer,
+    };
+    self.handle.ask(request, answers).await
+  }
+
+  /// Writes the next `bytes` of the open section, at most one piece ([`PIECE_BYTES`]: the read's unit, so a landing in
+  /// flight holds no more than a piece a request); moved in and let go once written.
+  pub async fn part(&mut self, bytes: Vec<u8>) -> Result<(), OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let request = Request::Part {
+      landing: self.number,
+      bytes,
+      answer,
+    };
+    self.handle.ask(request, answers).await
+  }
+
+  /// Commits the landing (one flush) and applies its rows; answered once it is durable.
+  pub async fn commit(mut self) -> Result<Located, OwnerError> {
+    let (answer, answers) = sync::channel(1).map_err(|_| OwnerError::Busy)?;
+    let request = Request::Commit {
+      landing: self.number,
+      answer,
+    };
+    let committed = self.handle.ask(request, answers).await;
+    // Committed or refused, the owner let the record go: the drop has nothing to wake it for.
+    self.alive = None;
+    committed
+  }
+}
+
+impl Drop for SlicedLanding {
+  fn drop(&mut self) {
+    if let Some(alive) = self.alive.take() {
+      drop(alive);
+      // Wakes the owner to see the landing let go. Refused only when its queue is full, and then it has requests to
+      // serve, and looks at the landing before each.
+      let _ = self.handle.requests.try_send(Request::Dropped);
+    }
   }
 }

@@ -711,6 +711,10 @@ impl Held {
 pub(crate) struct LiveState {
   /// The live volumes this shard owns, by volume bytes.
   pub(crate) shipping: BTreeMap<[u8; 16], LiveVolume>,
+  /// Each timed hop's per-write durations ([`count_hop`]), by its count's name: its sums alone are means, which one long
+  /// write skews (each run's first held reply waited the 100 ms record period, 49 us a write averaged over 2,051;
+  /// g228, BENCHMARKS "85a's two named costs"). A fixed set, one histogram a hop, each of fixed size.
+  pub(crate) hop_times: BTreeMap<&'static str, crate::histogram::DurationHistogram>,
   /// What this node holds as a candidate, by object. Tracked (`crate::tracked`), so a publication carries only the
   /// copies reached since the last (A-270).
   pub(crate) held: crate::tracked::Tracked<ObjectId, Held>,
@@ -2515,6 +2519,18 @@ struct Capture {
   read_rate: (u64, u64),
 }
 
+impl Capture {
+  /// The bytes the body it makes will hold, about: its record and every span's run (a run within its file's size is no
+  /// longer).
+  fn body_bytes(&self) -> usize {
+    let runs: u64 = self.spans.iter().map(|span| span.len).sum();
+    self
+      .record
+      .len()
+      .saturating_add(usize::try_from(runs).unwrap_or(usize::MAX))
+  }
+}
+
 /// A file of a [`Capture`]: its number, its size when pinned, and its open extent's offset and copied bytes.
 struct CapturedFile {
   inode: u64,
@@ -3496,11 +3512,15 @@ fn queue_behind_build(
   let Some(build) = live.building.as_mut() else {
     return;
   };
-  // The build's size whether it is sealing (its plain body) or hashing (its sealed payload, A-757 part 2).
-  let building_bytes = build
-    .hashing
-    .as_ref()
-    .map_or(build.body.len(), |(payload, _)| payload.len());
+  // The build's size whether it is capturing (the body its record and runs will make, A-768), sealing (its plain body) or
+  // hashing (its sealed payload, A-757 part 2). A capture counted for nothing until 2026-11-20: a successor's log, its
+  // bounds still unset, refused its second delta behind its first whole capture, owed a whole state, and its writes
+  // waited behind whole build after whole build (the seeded nemesis, Goal 85b).
+  let building_bytes = match (&build.capture, &build.hashing) {
+    (Some(capture), _) => capture.body_bytes(),
+    (None, Some((payload, _))) => payload.len(),
+    (None, None) => build.body.len(),
+  };
   let credit = credit.max(building_bytes);
   if !whole && build.queued_bytes > 0 && build.queued_bytes.saturating_add(body.len()) > credit {
     refuse(state, id, "fleet.live.refused.no_credit");
@@ -5318,6 +5338,29 @@ const HOP_HOLDER: (&str, &str) = ("fleet.live.hop.holder", "fleet.live.hop.holde
 fn count_hop(state: &mut ShardState, (count, sum): (&'static str, &'static str), ns: u64) {
   state.count(count, 1);
   state.count(sum, ns);
+  state.live.hop_times.entry(count).or_default().record(ns);
+}
+
+/// Each timed hop's per-write percentiles for the shard's status report ([`count_hop`]): `<hop>.p50_ns`, `.p99_ns`,
+/// `.p999_ns` and `.max_ns`, each a histogram bucket's upper bound within an eighth above the exact value, the maximum
+/// exact.
+pub(crate) fn hop_rows(state: &ShardState) -> Vec<slates_ipc::protocol::RefusalCount> {
+  let mut rows = Vec::new();
+  for (hop, times) in &state.live.hop_times {
+    let quantiles = times.quantiles();
+    for (figure, value) in [
+      ("p50_ns", quantiles.p50_ns),
+      ("p99_ns", quantiles.p99_ns),
+      ("p999_ns", quantiles.p999_ns),
+      ("max_ns", quantiles.max_ns),
+    ] {
+      rows.push(slates_ipc::protocol::RefusalCount {
+        kind: format!("{hop}.{figure}"),
+        count: value,
+      });
+    }
+  }
+  rows
 }
 
 /// The round of `volume`'s newest entry, hop by hop, once an answer made it durable: its publication's arrival at the
@@ -9768,6 +9811,61 @@ mod tests {
     assert!(delta_turns >= 1, "the delta took turns of its own");
     assert_eq!(refused, 0, "nothing was refused");
     assert_eq!(pins, 0, "no pin outlived the capture");
+  }
+
+  /// Goal 85b C3 (the seeded nemesis, seeds 1256052866610850298, 10263252121351842258, 8389754676365715562 and
+  /// 17757241901296347647): the publications queued behind a whole capture in turns are held to the credit the capture's
+  /// body will take, as they are behind a sealing build. Do: on a live volume with no whole entry yet (the bounds a
+  /// successor's log starts with), write two 512 KiB files and publish at a quantum of zero (its whole state, captured
+  /// in turns), then write a page into the first file and publish, three times. Expect: the three deltas queued behind the capture, none refused
+  /// for credit. Before, a capture counted for nothing, the second delta was refused, the volume owed a whole state, and every write after a
+  /// takeover waited behind whole build after whole build past the fleet wait (`fleet.live.held_back.whole`).
+  #[test]
+  fn the_publications_behind_a_whole_capture_are_held_to_the_credit_its_body_takes() {
+    let measured = crate::daemon::audit_on_shard(|state| {
+      let id = live_volume_here(state, "capture-credit")?;
+      write_captured(state, id, "first", b"85b: the first file")?;
+      write_captured(state, id, "second", b"85b: the second file")?;
+      let local = state.fleet.configuration().owner;
+      let holders = [
+        HostId(local.0.wrapping_add(1)),
+        HostId(local.0.wrapping_add(2)),
+      ];
+      owe_first_whole(state, id, &holders);
+      // Its first publication, the whole state it owes, captured in turns at a quantum of zero.
+      state.seal_walk_quantum_ns = Some(0);
+      let _ = crate::verbs::publish_shard(state);
+      let capturing = state
+        .live
+        .shipping
+        .get(&id.bytes)
+        .and_then(|live| live.building.as_ref())
+        .is_some_and(|build| build.capture.is_some());
+      if !capturing {
+        return None;
+      }
+      for (at, fill) in [(0u64, 1u8), (65_536, 2), (131_072, 3)] {
+        let handle = *state.by_id.get(&id)?;
+        let ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).ok()?;
+        let root = slot.volume.root_inode(store).ok()?;
+        let file = slot.volume.lookup_no(store, root, "first").ok()?.inode;
+        slot.volume.write(store, file, at, &[fill; 4096]).ok()?;
+        let _ = crate::verbs::publish_shard(state);
+      }
+      let counted = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+      Some((
+        counted(LIVE_QUEUED),
+        counted("fleet.live.refused.no_credit"),
+      ))
+    });
+    let (queued, refused) = measured.expect("the scene was made");
+    println!("behind a whole capture: {queued} queued, {refused} refused for credit");
+    assert_eq!(
+      refused, 0,
+      "no delta behind the capture was refused for credit"
+    );
+    assert_eq!(queued, 3, "every delta queued behind the capture");
   }
 
   /// A-768: a whole capture read in turns reads the head it began on. Do: write two 512 KiB files to a live volume, take the

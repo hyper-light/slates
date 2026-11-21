@@ -96,6 +96,7 @@ impl BasePlane {
         Ok(Directory {
           inode: inode.0,
           source: listing.source.clone(),
+          // What a recovery holds the directory to (`same_object`).
           fingerprint: host
             .fingerprint_dir(listing.dir)
             .map_err(super::host_refusal)?,

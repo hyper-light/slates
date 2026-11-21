@@ -231,23 +231,14 @@ const STREAM_FIN: u8 = 0b0000_0001;
 
 impl Frame {
   /// Appends this frame's canonical bytes to `out`.
-  fn encode_into(&self, out: &mut Vec<u8>) {
+  pub(crate) fn encode_into(&self, out: &mut Vec<u8>) {
     match self {
       Frame::Stream {
         stream_id,
         offset,
         fin,
         data,
-      } => {
-        out.push(KIND_STREAM);
-        out.extend_from_slice(&stream_id.to_le_bytes());
-        out.extend_from_slice(&offset.to_le_bytes());
-        out.push(if *fin { STREAM_FIN } else { 0 });
-        // A frame is frame-cap-bounded, so the length fits a u32; the builder refuses an oversize
-        // frame first, so a saturating cast is only reachable by a bug.
-        out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
-        out.extend_from_slice(data);
-      }
+      } => encode_stream_frame(out, (*stream_id, *offset, *fin), data),
       Frame::Ack {
         largest,
         range,
@@ -313,6 +304,24 @@ impl Frame {
   }
 }
 
+/// Appends a `Stream` frame's canonical bytes for `data` at `offset` of `stream_id`, its end if `fin`, to `out`: the one
+/// encoding a held frame ([`Frame::Stream`]) and a span of a send stream's bytes (`crate::stream::StreamSpan`, encoded
+/// straight from the sender's buffer) share, so both are byte for byte the same on the wire.
+pub(crate) fn encode_stream_frame(
+  out: &mut Vec<u8>,
+  (stream_id, offset, fin): (u64, u64, bool),
+  data: &[u8],
+) {
+  out.push(KIND_STREAM);
+  out.extend_from_slice(&stream_id.to_le_bytes());
+  out.extend_from_slice(&offset.to_le_bytes());
+  out.push(if fin { STREAM_FIN } else { 0 });
+  // A frame is frame-cap-bounded, so the length fits a u32; the builder refuses an oversize frame first, so a saturating
+  // cast is only reachable by a bug.
+  out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+  out.extend_from_slice(data);
+}
+
 /// Encodes a packet payload's frame sequence to bytes.
 pub fn encode_frames(frames: &[Frame]) -> Vec<u8> {
   let mut out = Vec::new();
@@ -322,18 +331,115 @@ pub fn encode_frames(frames: &[Frame]) -> Vec<u8> {
   out
 }
 
+/// One frame as a packet's payload carries it, decoded in place ([`frame_refs`]): a stream frame's bytes lent from the
+/// payload, never copied out of it; every other frame decoded whole (they are words, and an acknowledgement's ranges).
+/// Or a held frame lent as it is ([`FrameRef::lend`]): how a caller holding frames already hands them on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameRef<'a> {
+  /// A stream frame, its bytes lent.
+  Stream {
+    /// The stream.
+    stream_id: u64,
+    /// The first byte's offset.
+    offset: u64,
+    /// Whether it ends the stream.
+    fin: bool,
+    /// The bytes.
+    data: &'a [u8],
+  },
+  /// Any other frame, decoded.
+  Owned(Frame),
+  /// Any other frame, held by the caller and lent.
+  Held(&'a Frame),
+}
+
+impl<'a> FrameRef<'a> {
+  /// `frame` lent: a stream frame's bytes as a lent stream frame, any other as itself.
+  pub fn lend(frame: &'a Frame) -> FrameRef<'a> {
+    match frame {
+      Frame::Stream {
+        stream_id,
+        offset,
+        fin,
+        data,
+      } => FrameRef::Stream {
+        stream_id: *stream_id,
+        offset: *offset,
+        fin: *fin,
+        data,
+      },
+      held => FrameRef::Held(held),
+    }
+  }
+
+  /// The frame held whole, stream bytes copied: what [`decode_frames`] gives.
+  pub fn into_owned(self) -> Frame {
+    match self {
+      FrameRef::Stream {
+        stream_id,
+        offset,
+        fin,
+        data,
+      } => Frame::Stream {
+        stream_id,
+        offset,
+        fin,
+        data: data.to_vec(),
+      },
+      FrameRef::Owned(frame) => frame,
+      FrameRef::Held(frame) => frame.clone(),
+    }
+  }
+}
+
+/// The frames of a packet's payload, each decoded as it is reached, a stream frame's bytes lent from `bytes`
+/// ([`FrameRef`]); a malformation ends it with its typed refusal. A receiver checks the whole payload first
+/// ([`validate_frames`]), so a packet is taken whole or refused whole, then walks it again to apply it, copying no
+/// stream byte (MEMORY SIZING; main's ruling on the lane, 2026-11-20).
+pub fn frame_refs(bytes: &[u8]) -> impl Iterator<Item = Result<FrameRef<'_>, SessionError>> {
+  let mut reader = Reader::new(bytes);
+  std::iter::from_fn(move || decode_one(&mut reader))
+}
+
+/// Whether `bytes` decode whole as a payload's frames: `Ok`, or the first frame's typed refusal ([`frame_refs`]).
+pub fn validate_frames(bytes: &[u8]) -> Result<(), SessionError> {
+  for frame in frame_refs(bytes) {
+    frame?;
+  }
+  Ok(())
+}
+
 /// Decodes a packet payload's frame sequence. Every length is bounds-checked before it is read (a
 /// wild stream length never allocates past the input), an unknown kind and a set reserved flag are
-/// typed refusals, and any malformation is a typed [`SessionError`], never a panic.
+/// typed refusals, and any malformation is a typed [`SessionError`], never a panic. Stream bytes are copied into each
+/// frame: a receiver applies a payload through [`frame_refs`] instead.
 pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
-  let mut reader = Reader::new(bytes);
-  let mut frames = Vec::new();
-  while !reader.is_empty() {
-    let kind = reader.u8().map_err(|_| SessionError::Truncated)?;
+  frame_refs(bytes)
+    .map(|frame| frame.map(FrameRef::into_owned))
+    .collect()
+}
+
+/// The next frame at `reader`, padding passed over; `None` at the payload's end.
+fn decode_one<'a>(reader: &mut Reader<'a>) -> Option<Result<FrameRef<'a>, SessionError>> {
+  loop {
+    if reader.is_empty() {
+      return None;
+    }
+    let kind = match reader.u8() {
+      Ok(kind) => kind,
+      Err(_) => return Some(Err(SessionError::Truncated)),
+    };
     // PADDING (RFC 9000 §19.1): a lone zero byte, consumed with no frame produced.
     if kind == KIND_PADDING {
       continue;
     }
+    return Some(decode_kind(reader, kind));
+  }
+}
+
+/// The frame of `kind` at `reader`, a stream frame's bytes lent from the payload.
+fn decode_kind<'a>(reader: &mut Reader<'a>, kind: u8) -> Result<FrameRef<'a>, SessionError> {
+  {
     let frame = match kind {
       KIND_STREAM => {
         let stream_id = reader.u64().map_err(|_| SessionError::Truncated)?;
@@ -343,16 +449,13 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
           return Err(SessionError::FlagsSet);
         }
         let len = reader.u32().map_err(|_| SessionError::Truncated)? as usize;
-        let data = reader
-          .bytes(len)
-          .map_err(|_| SessionError::Truncated)?
-          .to_vec();
-        Frame::Stream {
+        let data = reader.bytes(len).map_err(|_| SessionError::Truncated)?;
+        return Ok(FrameRef::Stream {
           stream_id,
           offset,
           fin: flags & STREAM_FIN != 0,
           data,
-        }
+        });
       }
       KIND_ACK => {
         let largest = reader.u64().map_err(|_| SessionError::Truncated)?;
@@ -410,9 +513,8 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
       },
       other => return Err(SessionError::UnknownFrame(other)),
     };
-    frames.push(frame);
+    Ok(FrameRef::Owned(frame))
   }
-  Ok(frames)
 }
 
 #[cfg(test)]

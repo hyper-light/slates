@@ -84,6 +84,8 @@ pub struct StoreRoot {
   dir: OwnedFd,
   path: PathBuf,
   target: TargetIdentity,
+  /// The standing grant it was opened under, recorded by the store at its open (A-767's `G` row, R10).
+  grant: StoreGrant,
 }
 
 /// Windows has no store directory yet: every call refuses [`StoreRootRefusal::Unsupported`] (its handle-relative
@@ -103,6 +105,11 @@ impl StoreRoot {
   /// The directory's identity.
   pub fn target(&self) -> &TargetIdentity {
     &self.target
+  }
+
+  /// The standing grant the directory was opened under.
+  pub fn grant(&self) -> &StoreGrant {
+    &self.grant
   }
 
   /// The path a store file is named under in messages.
@@ -150,7 +157,13 @@ impl StoreRoot {
       dir,
       path: path.to_path_buf(),
       target,
+      grant: grant.clone(),
     })
+  }
+
+  /// The standing grant the directory was opened under.
+  pub fn grant(&self) -> &StoreGrant {
+    &self.grant
   }
 
   /// The identity a standing grant for the directory at `path` binds (for the grant's issue, which the human
@@ -194,7 +207,7 @@ impl StoreRoot {
       op: "read the store's file system's free space",
       code: errno.raw_os_error(),
     })?;
-    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
   }
 
   /// Whether the file `name` exists in the directory (without following a symlink).

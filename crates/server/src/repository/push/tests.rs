@@ -132,9 +132,8 @@ fn work(
 
 /// Creates repository `name` (git, its default `main` a new empty green): its id and the root.
 fn repository(state: &mut ShardState, name: &str) -> (RepositoryId, DbVolumeId) {
-  let reply = dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -297,7 +296,7 @@ fn two_branches(state: &mut ShardState) -> (RepositoryId, [DbVolumeId; 2], Store
 /// included: names, heads, identities, chains, records, retention and engines as they were.
 #[test]
 fn a_push_moves_every_branch_or_none_of_them() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let two = store.put_tree(&[("f", b"two")]);
     let topical = store.put_tree(&[("g", b"topic")]);
@@ -426,7 +425,7 @@ fn assert_refused_whole(
 /// namespace and its green stays; `main` moves.
 #[test]
 fn a_push_creates_and_deletes_branches_in_the_same_step() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let featured = store.put_tree(&[("f", b"one"), ("h", b"new")]);
     let two = store.put_tree(&[("f", b"two")]);
@@ -532,7 +531,7 @@ fn assert_recorded_as_one(
 /// its verdict, gone again; nothing of either applied.
 #[test]
 fn every_refused_change_is_named_and_nothing_is_applied() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let lone = lone_green(state);
     let two = store.put_tree(&[("f", b"two")]);
@@ -666,7 +665,7 @@ fn assert_a_conflict_retires_the_branch_made_for_it(
 /// approver would approve; the stranger is refused `Forbidden` and the unknown repository `NotFound`.
 #[test]
 fn the_gates_and_the_entry_refuse_the_whole_push() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
     let (repo, [main, topic], mut store, one) = two_branches(state);
     let two = store.put_tree(&[("f", b"two")]);
     let moving = work(state, main, (1, Some(one)), (two, b"c2"), (&store, 12));
@@ -837,7 +836,7 @@ fn made_greens(pushed: &Appended) -> Vec<DbVolumeId> {
 /// the second branch's id was the first's, and the entry was refused `ContentUnavailable` naming it.
 #[test]
 fn t_a694_an_append_makes_each_new_branch_its_own_green() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("repository-push", |state| {
     let (repo, [main, _], _, _) = two_branches(state);
     let changes = vec![
       create("left", main, 1),

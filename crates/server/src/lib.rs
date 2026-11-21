@@ -29,9 +29,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-// A request that meets a pending S3 base waits for the fetch it met (§4.15 "An S3 base", A-555).
 mod base_hints;
-mod base_wait;
 mod carry;
 pub mod catalog;
 pub mod config;
@@ -101,6 +99,7 @@ mod lease_wait;
 mod lfs;
 mod live_hold;
 mod live_ship;
+mod made_commit;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
 mod merge_origin;
@@ -145,6 +144,8 @@ mod nfs_writeback;
 pub mod observe;
 mod owner_location;
 mod staging;
+#[cfg(test)]
+pub(crate) mod test_store;
 mod work_charge;
 pub mod work_files;
 mod work_log;

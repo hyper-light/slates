@@ -23,6 +23,7 @@ slates-http = { workspace = true }
 slates-vcs = { workspace = true }
 # The merge engine a push becomes a work in (§4.17.1 shared piece 4, A-618): the store reads a push's trees for it.
 slates-merge = { workspace = true }
+slates-pace = { workspace = true }
 
 [dev-dependencies]
 slates-test-seeds = { workspace = true }

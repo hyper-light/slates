@@ -135,6 +135,8 @@ pub(crate) fn lend_on<R>(
     state
       .vcs_usage
       .stepped(&id, Work::Fetch, (now.saturating_sub(began), 0), now);
+    // The step's lookups over the store's own index, reported to its merge rule (`super::index_upkeep`).
+    super::index_upkeep::looked_up(state, id, now.saturating_sub(began));
   }
   lent
 }

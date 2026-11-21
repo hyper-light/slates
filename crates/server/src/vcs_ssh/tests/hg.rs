@@ -1042,9 +1042,8 @@ fn owner() -> Principal {
 /// Makes Mercurial repository `name` on `state`'s shard holding what 7.2's server held before `ssh-push`: `base` and
 /// `second` landed draft, as a non-publishing push lands them, with bookmark `main` at `base`; its record.
 fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1085,7 +1084,7 @@ fn drafted_history(state: &mut ShardState, name: &str) -> RepositoryRecord {
   let terms = (false, HISTORY_PUSH, PUSH_ROOM);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared);
+  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"
@@ -1179,7 +1178,7 @@ fn push_capabilities(hello: &[u8]) -> (CapabilityValues, Option<Vec<u8>>) {
 /// consumed and exit 0; and `default`'s line at `third` afterwards.
 #[test]
 fn stock_7_2s_push_over_ssh_lands_through_the_daemons_lenders_as_7_2_answered_it() {
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let record =
     crate::daemon::observe_first(&daemon, |state| drafted_history(state, "pushed-over-ssh"));
   let id = record.id;
@@ -1233,9 +1232,8 @@ fn one_file_history(
   name: &str,
   bytes: &'static [u8],
 ) -> (RepositoryRecord, Node) {
-  let reply = crate::verbs::dispatch(
+  let reply = crate::test_store::create(
     state,
-    1,
     &owner(),
     RequestBody::CreateRepository {
       name: name.to_owned(),
@@ -1266,7 +1264,7 @@ fn one_file_history(
   let terms = (false, HISTORY_PUSH, u64::MAX);
   let prepared =
     hg_push::prepare_served(state, id, &unbundle, terms, &mut room).expect("the history prepared");
-  let landed = hg_push::land(state, (&owner(), id), prepared);
+  let landed = hg_push::land_stored(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"
@@ -1318,7 +1316,7 @@ fn a_mercurial_clone_larger_than_a_requests_room_is_answered_over_ssh() {
     })
     .collect();
   let large: &'static [u8] = Box::leak(large.into_boxed_slice());
-  let daemon = crate::daemon::audit_daemon();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
   let (record, head) = crate::daemon::observe_first(&daemon, move |state| {
     one_file_history(state, "cloned-over-ssh", large)
   });

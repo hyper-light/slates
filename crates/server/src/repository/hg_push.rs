@@ -158,6 +158,13 @@ const MOVED: &[u8] = b"the repository changed while this push was taken; push ag
 const UNREAD: &[u8] = b"the push's changesets could not be read back";
 /// Slates' words for a push whose record could not be written (A-680 part 2c).
 const UNRECORDED: &[u8] = b"the push's record could not be written";
+/// Format: slates' words for a push the node's changeset log refused (its owner busy or gone, or its write failed).
+const UNLANDED: &[u8] = b"the push could not be landed on the repository's changeset log";
+
+/// Counter: pushes landed as a changeset on the node's changeset log (A-767 C4).
+pub(crate) const PUSH_LANDED: &str = "hg_push.landed";
+/// Counter: pushes the changeset log refused, answered `UNLANDED`: nothing of them is in the register.
+pub(crate) const PUSH_UNLANDED: &str = "hg_push.unlanded";
 /// Slates' words for a push refused while a Mercurial hook is configured (module docs, "The hook gate"), before the
 /// hook's configured name and after it.
 const HOOK_NOT_RUN: &[u8] = b"the repository's ";
@@ -1202,8 +1209,6 @@ pub(crate) fn land(
     fork,
     intaken,
     record: written,
-    changegroup: (version, payload),
-    room,
     ..
   }) = forked
   else {
@@ -1217,19 +1222,13 @@ pub(crate) fn land(
   };
   // The push's record, the revisions it kept written from the fork in the order kept, within the room the landing runs
   // within (A-680 part 2c, A-720); a push that kept none records none.
-  let revisions = intaken.kept.saturating_add(intaken.passed_over);
-  let written = (!intaken.logs.is_empty()).then(|| match written {
-    Some(record) => Some(Ok(record)),
-    None => Some(record::write_changegroup(
-      room,
-      (version, &payload),
-      revisions,
-    )),
-  });
+  // A push that kept revisions carries the reference to its changeset on the node's store (`land_on_disk`); without one
+  // it is refused, never recorded in the register instead (main's ruling of 2026-11-20, decision 1).
+  let written = (!intaken.logs.is_empty()).then_some(written);
   let record = match written {
     None => None,
-    Some(Some(Ok(bytes))) => Some(bytes),
-    Some(_) => {
+    Some(Some(bytes)) => Some(bytes),
+    Some(None) => {
       return Landed {
         answer: Err(*abort(UNRECORDED.to_vec())),
         released: release_index(state, fork),
@@ -1335,19 +1334,31 @@ pub(crate) async fn unbundle(
   // Landed in one step against the index as it is then; a fork another push made stale meanwhile is re-based by node
   // (A-720 part 2b), a slice at a time, and the landing tried again.
   let mut forked = forked;
+  if let Some(taken) = forked.as_mut()
+    && let Err(outcome) = land_on_disk(repository, taken).await?
+  {
+    return Some(outcome);
+  }
+  landed_after_rebases(repository, (principal, bundle), &unbundle, forked, room).await
+}
+
+/// [`unbundle`]'s landing: `forked` recorded and landed in one step against the index as it is then; a fork another
+/// push made stale meanwhile re-based by node (A-720 part 2b), a slice at a time, and the landing tried again.
+async fn landed_after_rebases(
+  repository: RepositoryId,
+  (principal, bundle): (&Principal, &[u8]),
+  unbundle: &Unbundle,
+  mut forked: Option<Forked>,
+  room: &mut Admission,
+) -> Option<PushOutcome> {
   loop {
-    if let Some(taken) = forked.as_mut()
-      && let Err(outcome) = record_sliced(taken).await?
-    {
-      return Some(outcome);
-    }
     let tried = crate::state::with_state(|state| match forked.take() {
       Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
       fresh => Ok(landing(
         state,
         repository,
         (principal, bundle),
-        &unbundle,
+        unbundle,
         fresh,
         room,
       )),
@@ -1362,45 +1373,145 @@ pub(crate) async fn unbundle(
   }
 }
 
-/// Writes `forked`'s record a part at a time, a yield between slices (A-732's writer; written whole in the landing's one
-/// step, a large push's record held its shard past the watchdog's window): before its landing, so the landing appends
-/// it. Nothing to do where it is written or the push kept nothing; none when the store went away.
-async fn record_sliced(forked: &mut Forked) -> Option<Result<(), PushOutcome>> {
-  // A-740: a shard stuck in this step names it.
-  let _doing = slates_rt::futures::doing("hg_push::record");
+/// Lands a push's changegroup as one changeset on the node's changeset log, where the daemon holds one (A-767 C4; item
+/// 4: landed, durable, before the register's entry names it): its `Record` the push's head (record v6), its `Payload`
+/// the changegroup as it arrived, moved into the log's request, never copied. The register's entry then holds a
+/// reference (record v7: the payload's identity and length and the changeset's sequence), so the changegroup is held
+/// once, by the log. A crash after this and before the entry leaves a changeset no entry names, which a recovery
+/// replays nothing of. Without a log the record is written as before ([`record_sliced`]).
+async fn land_on_disk(
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Option<Result<(), PushOutcome>> {
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
     return Some(Ok(()));
   }
-  let unrecorded = || PushOutcome::refused(&abort(UNRECORDED.to_vec()));
-  let (version, payload) = &forked.changegroup;
-  let revisions = forked
-    .intaken
-    .kept
-    .saturating_add(forked.intaken.passed_over);
-  let Ok(mut writer) =
-    record::ChangegroupWriter::begin(forked.room, (*version, payload.len()), revisions)
-  else {
-    return Some(Err(unrecorded()));
+  let made = crate::state::with_state(|state| changeset_of(state, repository, forked))?;
+  let Some((disk, header, parts, reference)) = made else {
+    // No changeset store, no history (main's ruling of 2026-11-20, decision 1): a repository is never made on such a
+    // daemon, and nothing keeps a push's history in the register instead.
+    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
   };
-  loop {
-    let written = crate::state::with_state(|state| {
-      let quantum = vcs_store::hg_import::quantum_of(state);
-      let start = slates_rt::futures::now_ns();
-      loop {
-        match writer.step(payload) {
-          Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
-          other => break other,
-        }
-      }
-    });
-    match written? {
-      Ok(true) => slates_rt::futures::yield_now().await,
-      Ok(false) => break,
-      Err(_) => return Some(Err(unrecorded())),
-    }
+  let landed = disk.land(header, parts).await;
+  crate::state::with_state(|state| landed_on_disk(state, forked, landed.is_ok(), reference))
+}
+
+/// A push's changeset as the node's store lands it (A-767 C4): the store's handle, the header at the repository's next
+/// sequence, the sections (Record: the v6 head; Payload: the changegroup, moved out of `forked`, never copied; Texts:
+/// each kept revision's text, base and place), and the register's reference to it. None where the node holds no store
+/// or the repository has no Mercurial store here.
+pub(crate) type Changeset = (
+  slates_store::owner::StoreHandle,
+  slates_store::log::Header,
+  Vec<slates_store::owner::Part>,
+  Vec<u8>,
+);
+
+/// [`Changeset`] of `forked`'s push to `repository`, its sequence taken now ([`land_on_disk`]'s first half).
+pub(crate) fn changeset_of(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Option<Changeset> {
+  let disk = state.vcs_disk.clone()?;
+  let sequence = state.vcs_stores.next_changeset(repository)?;
+  let (version, payload) = &mut forked.changegroup;
+  let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
+  // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
+  // A-767; fa5fd0023): its place is in this changeset's payload, named by the same identity the reference names.
+  let payload_identity = *blake3::hash(payload).as_bytes();
+  let texts: Vec<slates_store::texts::TextEntry> = forked
+    .intaken
+    .texts
+    .iter()
+    .map(|kept| slates_store::texts::TextEntry {
+      path: kept.path.clone(),
+      tool_id: kept.node.to_vec(),
+      text: kept.identity,
+      len: kept.len,
+      base: kept.base,
+      place: slates_store::texts::Place {
+        payload: payload_identity,
+        offset: kept.place.start,
+        len: kept.place.end.saturating_sub(kept.place.start),
+      },
+    })
+    .collect();
+  let header = slates_store::log::Header {
+    tool: slates_store::log::Tool::Mercurial,
+    repository: u128::from_be_bytes(repository.bytes),
+    sequence,
+    judged_over: sequence.saturating_sub(1),
+    grant: 0,
+    work: 0,
+    time_ns: slates_rt::futures::now_ns(),
+    sections: 0,
+  };
+  let parts = vec![
+    (
+      slates_store::log::SectionKind::Record,
+      record::write_push_record(forked.room, *version),
+    ),
+    (
+      slates_store::log::SectionKind::Payload,
+      core::mem::take(payload),
+    ),
+    (
+      slates_store::log::SectionKind::Texts,
+      slates_store::texts::encode(&texts),
+    ),
+  ];
+  Some((disk, header, parts, reference))
+}
+
+/// [`land_on_disk`] for a test on a shard: `forked`'s changeset landed on the shard's store through [`changeset_of`]
+/// and the store's own `land`, waited for on a thread of its own (`crate::test_store::land_blocking`). A fork that
+/// brought no revision, or already names its changeset, lands nothing; a refused landing is the landing's refusal.
+#[cfg(test)]
+pub(crate) fn store_blocking(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Result<(), PushOutcome> {
+  if forked.record.is_some() || forked.intaken.logs.is_empty() {
+    return Ok(());
   }
-  forked.record = writer.finish();
-  Some(Ok(()))
+  let Some((disk, header, parts, reference)) = changeset_of(state, repository, forked) else {
+    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
+  };
+  let ok = crate::test_store::land_blocking(disk, header, parts);
+  landed_on_disk(state, forked, ok, reference)
+}
+
+/// [`land`] for a test on a shard (main's ruling of 2026-11-20: the one landing path, the store first): `prepared`'s
+/// push landed on the shard's store ([`store_blocking`]), then landed as the driver lands it; a refused store landing
+/// leaves the fork naming no changeset, which [`land`] refuses.
+#[cfg(test)]
+pub(crate) fn land_stored(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  mut prepared: Prepared,
+) -> Landed {
+  if let Some(forked) = prepared.forked.as_mut() {
+    let _ = store_blocking(state, repository, forked);
+  }
+  land(state, (principal, repository), prepared)
+}
+
+/// [`land_on_disk`]'s second half: the landing counted, and on success `reference` the push's record, so its entry
+/// names the changeset; a refused landing answered `UNLANDED`, nothing of it in the register.
+pub(crate) fn landed_on_disk(
+  state: &mut ShardState,
+  forked: &mut Forked,
+  ok: bool,
+  reference: Vec<u8>,
+) -> Result<(), PushOutcome> {
+  state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1);
+  if !ok {
+    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
+  }
+  forked.record = Some(reference);
+  Ok(())
 }
 
 /// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
@@ -1555,42 +1666,13 @@ async fn rebase_sliced(
           .flatten()
           .map(Ok);
       }
+      // A re-base reads the fork's rows, never the changegroup's bytes.
+      Ok(Stepped::Wanted(_)) => {
+        return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
+      }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
     }
   }
-}
-
-/// [`unbundle`] in one call, every slice at once: the driver's steps for a caller that holds the shard's state (the
-/// tests), never the daemon's path.
-#[cfg(test)]
-pub(crate) fn unbundle_in(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, heads, bundle): Pushing<'_>,
-  room: &mut Admission,
-) -> Option<PushOutcome> {
-  let fronted = vcs_store::lent_state(state, |state| {
-    front(state, repository, (heads, bundle), room)
-  });
-  let mut unbundle = match fronted? {
-    Ok(unbundle) => unbundle,
-    Err(outcome) => return Some(outcome),
-  };
-  let forked = match unbundle.take_changegroup() {
-    None => None,
-    Some(changegroup) => match take_whole(state, repository, changegroup, room)? {
-      Ok(forked) => Some(forked),
-      Err(refused) => return Some(PushOutcome::refused(&refused)),
-    },
-  };
-  landing(
-    state,
-    repository,
-    (principal, bundle),
-    &unbundle,
-    forked,
-    room,
-  )
 }
 
 /// Derived: the room each slice of a push's intake is lent from the arena's pool beyond what the shard could admit
@@ -1642,8 +1724,10 @@ impl Taking {
     vcs_store::within_budget(state, lend, |stores| {
       let content = stores.content_mut()?;
       Some(loop {
-        match intake.step(payload, content, room) {
+        match intake.step(payload.as_slice(), content, room) {
           Ok(Stepped::More) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
+          // A push's changegroup arrived whole: a want names bytes past its end, a truncation.
+          Ok(Stepped::Wanted(range)) => break Err(whole_wanted(payload, range)),
           other => break other,
         }
       })
@@ -1748,9 +1832,29 @@ async fn take_sliced(
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
       Ok(Stepped::Done) => return taking.finish().map(Ok),
+      // The slice answers a whole changegroup's want as its truncation; none reaches here.
+      Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => return Some(Err(intake_outcome(&refused))),
     }
   }
+}
+
+/// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
+const REBASE_WANTED: &[u8] = b"push refused: its re-base asked for bytes of its changegroup";
+
+/// The refusal of a whole changegroup's intake that wanted bytes `range` (`slates_hg::framing`): past its end, a
+/// truncation.
+fn whole_wanted(payload: &[u8], range: core::ops::Range<u64>) -> IntakeRefused {
+  IntakeRefused::Unverified(Unverified::Changegroup(
+    slates_hg::changegroup::Refusal::Truncated(slates_hg::Truncated {
+      what: "changegroup",
+      at: range.start,
+      needed: range.end.saturating_sub(range.start),
+      left: u64::try_from(payload.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(range.start),
+    }),
+  ))
 }
 
 /// `changegroup` taken into its fork every slice at once: [`take_sliced`]'s steps for a caller that holds the shard's
@@ -1771,6 +1875,14 @@ pub(crate) fn take_whole(
     match taking.slice(state, lend, room) {
       Some(Ok(Stepped::More)) => {}
       Some(Ok(Stepped::Done)) => return taking.finish().map(Ok),
+      Some(Ok(Stepped::Wanted(range))) => {
+        let refused = match taking.changegroup.as_ref() {
+          Some((_, payload)) => whole_wanted(payload, range),
+          None => whole_wanted(&[], range),
+        };
+        taking.abandon_in(state);
+        return Some(Err(intake_refused(&refused)));
+      }
       Some(Err(refused)) => {
         taking.abandon_in(state);
         return Some(Err(intake_refused(&refused)));
@@ -1784,8 +1896,8 @@ pub(crate) fn take_whole(
 }
 
 /// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
-/// re-based first, every row at once, then judged at landing and landed: the driver's steps for the tests, which land
-/// pushes side by side with no runtime.
+/// re-based first, every row at once, then its changeset landed on the store ([`store_blocking`]), then judged at
+/// landing and landed: the driver's steps for the tests, which land pushes side by side with no runtime.
 #[cfg(test)]
 pub(crate) fn land_in(
   state: &mut ShardState,
@@ -1805,6 +1917,9 @@ pub(crate) fn land_in(
         match rebasing.slice(state)? {
           Ok(Stepped::More) => {}
           Ok(Stepped::Done) => break,
+          Ok(Stepped::Wanted(_)) => {
+            return Some(PushOutcome::refused(&abort(REBASE_WANTED.to_vec())));
+          }
           Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),
         }
       }
@@ -1812,6 +1927,12 @@ pub(crate) fn land_in(
     }
     fresh => fresh,
   };
+  let mut forked = forked;
+  if let Some(fork) = forked.as_mut()
+    && let Err(outcome) = store_blocking(state, repository, fork)
+  {
+    return Some(outcome);
+  }
   landing(
     state,
     repository,

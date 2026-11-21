@@ -35,7 +35,7 @@
 //! itself, or once the edge's signal says the client has gone (`super::site::ClientGone`), which ends the tunnel as
 //! `svnserve` ends where its client leaves inside a command (E210002); Windows, with no hook driver, refuses a change at
 //! a configured point. The work the drive accepts lands through the owner's
-//! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::commit_work`, the one both ra_svn
+//! commit step ([`SvnStores::commit`]: A-655 part 2b's `repository::svn_commit::land_work`, the one both ra_svn
 //! transports call, A-698), and `close-edit` is answered with `commit-info` (the revision, its date and author) or with
 //! the step's refusal as its failure, after which the client's commands are dropped until its `abort-edit`.
 //!
@@ -161,7 +161,7 @@ pub(crate) trait SvnStores {
   /// Runs `step` over what repository `id`'s sessions are opened with; none when its store is not held here.
   fn opening<T>(&mut self, id: RepositoryId, step: impl FnOnce(&Opening<'_>) -> T) -> Option<T>;
   /// Lands `work`, which `principal`'s commit made on repository `id` and the connection accepted, through the owner's
-  /// commit step (`repository::svn_commit::commit_work` at the owner's instant, A-698): the revision it made, or why
+  /// commit step (`repository::svn_commit::land_work` at the owner's instant, A-698): the revision it made, or why
   /// not; none when its store is not held here.
   async fn commit(
     &mut self,
@@ -170,11 +170,28 @@ pub(crate) trait SvnStores {
     work: Work,
     texts: &dyn TextSink,
   ) -> Option<Result<Committed, svn_commit::Uncommitted>>;
-  /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step: a lock verb's
-  /// entries (`Record::Locks`, A-693 part 2) or a revision's properties whole (`Record::RevisionProperties`, A-702 part
-  /// 2); whether it landed; none when its store is not held here.
-  fn land_record(
+  /// A repository's landing turn (C2, `repository::svn_commit::landing::Turn`), held from a verb's judgment to its
+  /// record's landing.
+  type Turn;
+  /// Reads the text piece `wanted` of repository `id` through the node's changeset store, where the repository's
+  /// sources read it until [`SvnStores::let_go`] (C2 stage B part 2): whether it did; none to read where the sources
+  /// hold every text in memory (the default).
+  async fn fetch(&mut self, id: RepositoryId, wanted: slates_svn::reads::Wanted) -> bool {
+    let _ = (id, wanted);
+    false
+  }
+  /// Lets go a piece [`SvnStores::fetch`] read, once the call that waited for it has read it.
+  fn let_go(&mut self, wanted: slates_svn::reads::Wanted) {
+    let _ = wanted;
+  }
+  /// Repository `id`'s landing turn, once no other landing holds it; none when its store is not held here.
+  async fn turn(&mut self, id: RepositoryId) -> Option<Self::Turn>;
+  /// Lands `record`, which moves no version, by `principal` on repository `id` through the owner's step, holding its
+  /// landing `turn`: a lock verb's entries (`Record::Locks`, A-693 part 2) or a revision's properties whole
+  /// (`Record::RevisionProperties`, A-702 part 2); whether it landed; none when its store is not held here.
+  async fn land_record(
     &mut self,
+    turn: Self::Turn,
     id: RepositoryId,
     principal: &Principal,
     record: Record,
@@ -301,6 +318,9 @@ pub(crate) struct SvnCommand<R, V> {
   repositories: R,
   /// Where their stores are lent.
   stores: V,
+  /// The text piece a drive waited for and the session fetched (C2 stage B part 2), held until the next call has read
+  /// it.
+  fetched: Option<slates_svn::reads::Wanted>,
   /// The principal the client's key proved, which the repository's policy judges.
   principal: Principal,
   /// Its name, the tunnel's user.
@@ -337,6 +357,8 @@ enum Received {
   Took(usize),
   /// Output was written and nothing taken.
   Wrote,
+  /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2).
+  Waiting(slates_svn::reads::Wanted),
   /// The client answered the greeting with this URL.
   Opened {
     /// The URL.
@@ -390,6 +412,7 @@ impl Received {
         Received::Took(consumed)
       }
       Turn::Wrote => Received::Wrote,
+      Turn::Waiting(wanted) => Received::Waiting(wanted),
       Turn::Opened { open, consumed } => Received::Opened {
         url: open.url.to_vec(),
         consumed,
@@ -421,6 +444,7 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     Some(Self {
       repositories,
       stores,
+      fetched: None,
       principal: principal.clone(),
       user: crate::lfs::owner_name(principal).into_bytes(),
       connection,
@@ -442,9 +466,28 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     if let Some(status) = self.exit {
       return exited(status);
     }
-    let consumed = match self.received() {
+    let previous = self.fetched.take();
+    let received = self.received();
+    // The piece the last wait fetched was read by this call (C2 stage B part 2).
+    if let Some(wanted) = previous {
+      self.stores.let_go(wanted);
+    }
+    let consumed = match received {
       Received::NeedMore => return self.wait_or_end(),
       Received::Wrote => 0,
+      Received::Waiting(wanted) => {
+        let Some(id) = self.opened.as_ref().map(|record| record.id) else {
+          self.not_held();
+          return self.consumed(0);
+        };
+        // A piece the node's store cannot give ends the session: the drive would wait for it again.
+        if self.stores.fetch(id, wanted).await {
+          self.fetched = Some(wanted);
+        } else {
+          self.not_held();
+        }
+        0
+      }
       Received::Took(consumed) => consumed,
       Received::Opened { url, consumed } => {
         self.open(&url);
@@ -642,6 +685,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Some(verdicts) = pre_lock_hooks(site, &hooked, room, &call).await else {
       return self.client_left();
     };
+    // The landing turn, held from the judgment to the entries' landing (C2): no other landing moves the lock table
+    // between them.
+    let Some(turn) = self.stores.turn(id).await else {
+      return self.not_held();
+    };
     let undrawn = std::cell::Cell::new(false);
     let mut draw = || {
       let mut token = [0u8; slates_svn::lock::UUID_BYTES];
@@ -676,7 +724,8 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     } else {
       match self
         .stores
-        .land_record(id, &self.principal, Record::Locks(entries))
+        .land_record(turn, id, &self.principal, Record::Locks(entries))
+        .await
       {
         None => return self.not_held(),
         Some(landed) => landed.map_err(|refused| refused.failure()),
@@ -718,6 +767,10 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
     let Some(verdict) = revision_property_hook(site, &hooked, room, pre, call).await else {
       return self.client_left();
     };
+    // The landing turn, held from the judgment to the record's landing (C2): no other change lands in between.
+    let Some(turn) = self.stores.turn(id).await else {
+      return self.not_held();
+    };
     let judged = {
       let Self {
         connection,
@@ -736,7 +789,11 @@ impl<R: Repositories, V: SvnStores> SvnCommand<R, V> {
       Some(Ok(None)) => return,
       Some(Ok(Some(record))) => record,
     };
-    let landed = match self.stores.land_record(id, &self.principal, record) {
+    let landed = match self
+      .stores
+      .land_record(turn, id, &self.principal, record)
+      .await
+    {
       None => return self.not_held(),
       Some(landed) => landed.map_err(|refused| refused.failure()),
     };
