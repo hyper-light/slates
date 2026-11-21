@@ -1104,6 +1104,10 @@ pub struct Green {
   below_floor_last: BTreeMap<String, u64>,
   /// The hard links naming each target, the reverse of `hardlinks`: the links a special's change changes.
   links_to: Dim<BTreeSet<String>>,
+  /// On a preview (A-805, [`Lineage::preview`]): the paths of its verdict, and their links, that were IPC nodes or had a
+  /// special history in the green it was forked from, which a fork's empty histories cannot say ([`Green::was_special`]).
+  /// None on every other green.
+  special_seen: Option<BTreeSet<String>>,
   /// The bytes `changes` and `latest_change` hold, a running total counted in [`Green::history_bytes`], so the index
   /// folds under the same budget as the histories it indexes.
   changes_bytes: usize,
@@ -2505,7 +2509,30 @@ impl Green {
   /// Whether `path` is or ever was an IPC node: a special now, or one whose node has a history (A-534: by the one
   /// history rule a special unchanged since version 0 has none, so the history alone no longer says it).
   fn was_special(&self, path: &str) -> bool {
-    self.specials.contains_key(path) || self.special_history.contains_key(path)
+    self.specials.contains_key(path)
+      || self.special_history.contains_key(path)
+      || self
+        .special_seen
+        .as_ref()
+        .is_some_and(|seen| seen.contains(path))
+  }
+
+  /// Of `judged`'s paths and the links naming them, those that were special here ([`Green::was_special`]): what a preview
+  /// forked from this green must know of its history to record the verdict's changes as this green would (A-805).
+  pub(super) fn special_seen_for(&self, judged: &Judged) -> BTreeSet<String> {
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    for effect in &judged.effects {
+      let path = effect.path();
+      paths.insert(path.to_owned());
+      paths.extend(self.links_to.get(path).into_iter().flatten().cloned());
+    }
+    paths.retain(|path| self.was_special(path));
+    paths
+  }
+
+  /// Gives a preview what its source knew was special ([`Green::special_seen_for`]).
+  pub(super) fn know_special(&mut self, seen: BTreeSet<String>) {
+    self.special_seen = Some(seen);
   }
 
   /// [`Green::head_identity`] recounted from scratch over every current entry: the oracle the running set hash is

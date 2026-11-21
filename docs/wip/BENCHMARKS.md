@@ -17103,13 +17103,25 @@ and every round shown, as main extracted them from the run's log.
     B's 0.2-33).
 - **Quiet:** C helps only macOS (accept_f1000 p50 277-311 against 347-381 µs, p99 592-624 against 784-1,234). It is
   even elsewhere.
-- **The macOS hop split** (run 44888851325, `diag-measurer-g222-22`). Its log could not be read here (no `gh` on this
-  machine), so g222's note stands for it (progress/g222.md, its quiet smoke run on Studio-4):
-  - The client's p99 tail is its own wake: from the reply written to the client seeing it, median 97 µs, two parks a
-    reply.
-  - The nap's harvests take 8-16 µs.
-  - The runtime's waits (the shard's kevent, the client's ulock) are late only 54 µs at the median and 63-75 µs at p99
-    under launchd. Only nanosleep is late (1.60 ms at the median), and nothing on the request path sleeps.
+- **The macOS hop split** (run 44888851325, `diag-measurer-g222-22`, macos-latest, main with B, branch
+  `diag-g222-hops-mac` 2e30acc9a, never main; read by g222 2026-11-21). Three rounds, each loaded then quiet. The bench
+  itself measured loaded accept p99 8.2-13.8 ms and conflict 8.1-8.9 ms, the same as B's above. Per request (57,936 a
+  round):
+  - **The client's round trip, loaded:** p50 79-98 µs, p99 6.8-8.1 ms, p999 8.6-11.9 ms (quiet: 66-67 / 515-563 /
+    985-1,550 µs). Every request in the p99 tail parked, 3 parks at the median.
+  - **Which hop:** the ring's stamp covers only replies a shard writes in the step that took the request. That joined
+    3-4 of the 580 loaded tail requests, so the tail is replies written later (a resumed or forwarded verb), and the
+    split hasn't named their hop yet. Over the joined requests, loaded: queued (sent -> taken) p99 3.2-3.3 ms and p999
+    3.9 ms; served p99 136-190 µs; wake (written -> the client saw it) p99 256-335 µs and p999 2.8-2.9 ms. Quiet: all
+    three p99 86-102 µs.
+  - **The nap:** the busy path's zero-timeout kevent took at least 1 ms in 11,825-16,321 of 131,136-135,988 calls
+    loaded (9-12%), spread up to 4 ms (2-4 ms: 5,355-6,906). Quiet: 7-47. The queued p99 (3.2 ms) sits in that range.
+  - **Shard parks:** a timed park overran its timeout by p99 110-390 µs and p999 1.9-2.0 ms loaded, at least 1 ms in
+    59-75 of about 15,400. Quiet: never as much as 1 ms.
+  - **The runner's timers, 200 µs timeouts x 2,000** (the launchd finding): kevent and ulock are late 199-212 µs at the
+    median both idle and loaded, and loaded p999 0.7-2.2 ms (at most 18 of 2,000 at least 1 ms late). nanosleep is late
+    1.7-2.5 ms at the median (1,221-1,947 of 2,000 at least 1 ms late). On Studio-4 under kiln, kevent and ulock are
+    late 54 µs at the median, nanosleep 1.60 ms. Nothing on the request path sleeps.
 
 ## Where a Subversion import's memory is: git-2000 attributed by region (P7 of Ada's close list, A-772's daemon peak; 2026-11-21)
 
