@@ -92,9 +92,8 @@ fn pushed_fenced_after_body(name: &'static str, request: Vec<u8>) -> (bool, Vec<
       };
       let mut exchange: Receive<FencedOnce> = ReceiveServices::new(FencedOnce, u64::MAX)
         .start(&start)
-        .ok()
         .expect("the push starts");
-      exchange.body(&request).await.ok().expect("the body taken");
+      exchange.body(&request).await.expect("the body taken");
       REFUSALS_DUE.with(|due| due.set(1));
       let ended = exchange.body_end(ClientGone::never()).await.is_ok();
       let mut answer = Vec::new();

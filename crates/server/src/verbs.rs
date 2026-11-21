@@ -10597,7 +10597,7 @@ fn judge_submission(
         increment_bytes,
         increment: inc,
         applied,
-        verification: signed.verification.clone(),
+        verification: signed.verification,
         computed: sealed.computed.is_some(),
         authorship: policy.authorship.clone(),
       };
@@ -11352,6 +11352,12 @@ fn canonical_declaration(
     .collect()
 }
 
+/// A work's changed files (each its held parts, none: removed) and its journal of ops.
+type ChangedWork = (
+  std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
+  Vec<VolumeOp>,
+);
+
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
 /// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
@@ -11359,18 +11365,9 @@ fn canonical_declaration(
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
-  (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
+  (changed, mut journal): ChangedWork,
   replacement: &[slates_ipc::protocol::WorkChange],
-) -> Result<
-  (
-    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
-    Vec<VolumeOp>,
-  ),
-  Refusal,
-> {
+) -> Result<ChangedWork, Refusal> {
   use slates_ipc::protocol::WorkChange;
   let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
@@ -14141,7 +14138,7 @@ fn bind_mount(
 /// prefix and its path), not its path alone, and the mounts take no more than the room the rest of the report leaves
 /// (A-267, 2026-11-18): a long name can leave less than this.
 /// Derived: `BULK_CHUNK_BYTES` (4096) / 4.
-const MOUNTS_REPORT_BYTES: usize = 1024;
+pub(crate) const MOUNTS_REPORT_BYTES: usize = 1024;
 
 /// Format: what the retired whole-file `Read` is refused as (A-267): the verb, and the paged read that replaced it.
 const RETIRED_WHOLE_READ: &str =
@@ -14157,7 +14154,7 @@ pub(crate) const WATCHER_MERGE: &str = "merge";
 /// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
 /// attachment whose form is a chosen path, as many as `budget` bytes carry (in id order), and the
 /// count of those it did not.
-fn mounts_of(
+pub(crate) fn mounts_of(
   state: &ShardState,
   volume: DbVolumeId,
   budget: usize,

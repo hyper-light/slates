@@ -181,7 +181,10 @@
 > whole. A revision against the null base is sent as its text, the changegroup's trivial hunk not sent: sent with it,
 > stock 7.2's stream clone of a pushed repository failed "integrity check failed on 00changelog:0" (found by use,
 > `stock_hg_clone_stream_streams_a_pushed_repository_and_clones_an_imported_one_plainly`; the unit test's store had
-> kept such a revision bare). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
+> kept such a revision bare). An empty text comes with no hunk (an empty delta), sent as it is, and a log whose every
+> chunk is empty is sent inline, as 7.2 keeps it: at hg-src's scale the first refused the stream (an empty body, "unexpected
+> response from remote server: empty string", `mercurial/__init__.py`) and the second left two warnings in `hg verify`
+> (A/B r13 on 8968640c0; reproduced on hg's first 2987 changesets, which now stream and verify clean). OPEN until w-hg's C1 step 3 (imports landed as changesets): a repository whose history
 > the store does not keep (an import's, a made changeset's, a push recorded inline before A-767 C4) advertises no
 > stream (`State::stored_logs`, from `HgStore::unstored`), so stock `hg clone --stream` clones it plainly with its own
 > warning ("stream clone requested but server has them disabled"), where it had aborted "operation forbidden by
@@ -479,10 +482,49 @@
 > `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
 > A-774 part 3), reported to main.
 >
-> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
-> re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
-> judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
-> the 100k rung's wall (a few values a path there). Open: the fix's design, with main.
+> **A-810 (2026-11-21, w-rewrite-ops; main's order of 04:02). FIXED.** `crates/merge/tests/checkpoint.rs`'s restore test
+> failed about one run in five on main: `changed_between(0, 1)` named `["e/f"]` and its model `["a", "e/f"]`.
+> - It was not the restore. The index's model (A-264's oracle) asked whether a link's target was ever a special node,
+>   timelessly, while the index asks it as the version commits.
+> - A link whose target becomes special only after a span was modelled as changed within it, though it reads the same
+>   there (a link resolves one level).
+> - The model now asks it by the target's last change in the span.
+> - Red: the seed, now in `checkpoint.proptest-regressions`. Pinned by
+>   `a_link_changes_with_its_target_only_once_the_target_is_a_special_node`.
+> - After: 0 failures in 25 runs of the suite.
+> - Record: `docs/bugs/2026-11-21-the-change-index-model-asked-specialness-timelessly.md`.
+>
+> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, then FIXED by A-809 (w-rewrite-ops, main's order
+> of 02:37, w-fed-move's option 1). The verdict's growth with history was the re-anchor, which walked every value of a
+> changed path: 7.9 values a verdict with no preload, 231 with 10^5 versions; judge 24 to 71 µs; compose and secure
+> flat. Counted by `merge.reanchor.values_walked` and `merge.submit.secure`.
+>
+> A-809 gives a path's anchor numbered layers (`history.rs`, "A layered anchor"). An overwrite inside the file copies
+> what it overwrote as the anchor's next layer and walks one value; an insert or delete resolves the layers and
+> re-anchors in full, as before.
+> - Oracle: `the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints`.
+> - Red: `a_length_preserving_change_walks_one_value_however_long_its_history`, 300 values walked, now 1.
+> - A/B (BENCHMARKS, "A length-preserving change walks one value"): at 10^5 versions, judge 65.4 to 22.5 µs and values
+>   228 to 1.6 a verdict.
+>
+> A-809's leftovers, MEASURED (2026-11-21, A-811; main's order of 04:11;
+> `crates/merge/examples/history_layers_bench.rs`, release, adas-mac-studio M3 Ultra, load 2.6–3.9):
+> - (a) A read of an earlier value through layers. Version 1 read after 10, 100, 1,000 and 10,000 overwrites of one
+>   range took 5.7, 15.7, 37.1 and 190.8 µs, since every layer over the range was examined. FIXED: a read takes each
+>   start offset's layers in number order only while they reach further, ending at the start's longest. Now 3.9, 3.3,
+>   1.7 and 5.9 µs. Red: `a_read_of_an_early_version_examines_one_layer_a_range_however_often_it_was_overwritten`,
+>   1,000 layers examined, now at most 2 (`Green::history_layers_examined`).
+> - (b') Found while measuring: an SDK edit's same-length replacement (a delete and an insert at one offset) never took
+>   the layered path. It walked every value: 0.40, 2.33 and 12.63 ms a change at history 100, 1,000 and 5,000. FIXED:
+>   such a pair is an overwrite, checked byte for byte as any is. Now 3.1, 4.3 and 10.4 µs, one value. Red:
+>   `a_same_length_replacement_walks_one_value_however_long_its_history`, 300 values, now 1. The oracle generates such
+>   replacements now.
+> - (b) OPEN, measured: a path alternating overwrites and inserts re-anchors in full at each insert. That is A-793's
+>   cost, unchanged by A-809: 0.53, 3.6 and 17.5 ms a change at history 100, 1,000 and 5,000 (101, 551 and 2,551
+>   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. Its design
+>   is with main.
+> - Observed, not chased: overwrites and replacements that walk one value still take 2.6 to 9–10 µs a change over
+>   history 100 to 5,000. The growth is sublinear and comes from elsewhere in the submit.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three

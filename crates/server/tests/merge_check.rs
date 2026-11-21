@@ -104,8 +104,23 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   let mut said = Vec::new();
   let (green, head, second) = collided(client, instance, shards, "h");
   let base = head - 1;
+  let check = checked_conflicting(client, (green, head, base), second, &mut said);
+  views_named(client, &check, &mut said);
+  clean_checked(client, green, base, &mut said);
+  resolved_and_landed(client, (green, head, second), &check, &mut said);
+  let late = refused_once_moved(client, green, &mut said);
+  kept_conflict(client, green, late, &mut said);
+  said
+}
 
-  // A check of the conflicting work: the windows, the head and base it judged, nothing changed.
+/// A check of the conflicting work `second`: the windows, the head and base it judged, nothing changed, nothing
+/// published.
+fn checked_conflicting(
+  client: &mut Client,
+  (green, head, base): (VolumeId, u64, u64),
+  second: VolumeId,
+  said: &mut Vec<String>,
+) -> slates_client::MergeCheck {
   let check = client.check_merge(second).unwrap();
   said.push(format!(
     "check: head {} base {} conflicts {} declaration {}",
@@ -132,7 +147,11 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     "a check publishes nothing"
   );
 
-  // The views it names.
+  check
+}
+
+/// The views the check names: the green's and the work's.
+fn views_named(client: &mut Client, check: &slates_client::MergeCheck, said: &mut Vec<String>) {
   let theirs = client
     .read_merge_check(check.stamp, MergeView::Green, FILE)
     .unwrap();
@@ -146,8 +165,10 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   ));
   assert_eq!(theirs, b"aaaa XXXX cccc\n");
   assert_eq!(mine, b"aaaa YYYY cccc\n");
+}
 
-  // A clean work's check: no window, and its base stays where it was (a check is not a rebase).
+/// A clean work's check: no window, and its base stays where it was (a check is not a rebase).
+fn clean_checked(client: &mut Client, green: VolumeId, base: u64, said: &mut Vec<String>) {
   let (clean, _) = client.create_work(green, "h-clean").unwrap();
   client.edit(clean, "other", 0, 0, b"own\n").unwrap();
   let clean_check = client.check_merge(clean).unwrap();
@@ -157,9 +178,16 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     clean_check.stamp.base - base
   ));
   assert!(clean_check.conflicts.is_empty());
+}
 
-  // A resolution bound to the check: retire every operation of the work on the file, write the agent's own bytes at
-  // the head, then submit.
+/// A resolution bound to the check: every operation of the work on the file retired, the agent's own bytes written at
+/// the head, then submitted, and landed as the agent wrote it.
+fn resolved_and_landed(
+  client: &mut Client,
+  (green, head, second): (VolumeId, u64, VolumeId),
+  check: &slates_client::MergeCheck,
+  said: &mut Vec<String>,
+) {
   let discard: Vec<u64> = check
     .declaration
     .iter()
@@ -194,8 +222,11 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     b"aaaa ZZZZ cccc\n",
     "the resolution lands as the agent wrote it"
   );
+}
 
-  // A check whose head then moves: the resolution and the views are refused, and the work is unchanged.
+/// A check whose head then moves, then one whose work then changes: the resolution and the views refused, the work
+/// unchanged. The late work.
+fn refused_once_moved(client: &mut Client, green: VolumeId, said: &mut Vec<String>) -> VolumeId {
   let (late, _) = client.create_work(green, "h-late").unwrap();
   client.edit(late, FILE, AT, LEN, b"LLLL").unwrap();
   let late_check = client.check_merge(late).unwrap();
@@ -226,8 +257,12 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
   assert!(stale(changed));
   assert!(stale(read));
 
-  // A resolution that keeps the conflicting operation: another work writes the contested range first; the windows, and
-  // nothing changed.
+  late
+}
+
+/// A resolution that keeps the conflicting operation: another work writes the contested range first; the windows, and
+/// nothing changed.
+fn kept_conflict(client: &mut Client, green: VolumeId, late: VolumeId, said: &mut Vec<String>) {
   let (rival, _) = client.create_work(green, "h-rival").unwrap();
   client.edit(rival, FILE, AT, LEN, b"RRRR").unwrap();
   accepted(client, rival);
@@ -243,7 +278,6 @@ fn history(client: &mut Client, instance: &str, shards: u16) -> Vec<String> {
     client.read(late, FILE, ReadAt::Head).unwrap(),
     b"aaaa LLLL cccc\n"
   );
-  said
 }
 
 /// §4.16, A-796 (the Codex agent's early-conflict check and conditional resolution). Do: the history above on one

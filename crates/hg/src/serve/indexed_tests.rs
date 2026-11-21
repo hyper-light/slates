@@ -1141,8 +1141,12 @@ impl crate::render::StoredSource for WholeTexts<'_> {
 }
 
 /// `text` as a changegroup holds a delta against the null base: one hunk replacing bytes 0 to 0 with it (7.2's
-/// `mdiff.trivialdiffheader`, three big-endian words), then the text.
+/// `mdiff.trivialdiffheader`, three big-endian words), then the text; an empty text as no hunk at all, an empty delta
+/// (read from 7.2's `hg debugbundle --all` of a commit adding an empty file: its delta's length 0).
 fn trivial_hunk(text: &[u8]) -> Option<Vec<u8>> {
+  if text.is_empty() {
+    return Some(Vec::new());
+  }
   let mut hunk = Vec::with_capacity(text.len().saturating_add(12));
   for field in [0, 0, u32::try_from(text.len()).ok()?] {
     hunk.extend_from_slice(&field.to_be_bytes());
