@@ -5,9 +5,6 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 use slates_rt::futures;
 use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
 
@@ -34,8 +31,7 @@ fn config() -> RuntimeConfig {
 #[test]
 fn a_step_sees_a_ready_task_and_nothing_when_alone() {
   let runtime = LocalRuntime::new(&config()).unwrap();
-  let seen: Rc<Cell<(bool, bool, u64, u64)>> = Rc::new(Cell::new((true, false, 0, 0)));
-  let out = Rc::clone(&seen);
+  let (out, seen) = std::sync::mpsc::channel::<(bool, bool, u64, u64)>();
   runtime
     .spawn(async move {
       let alone = futures::others_waiting();
@@ -44,16 +40,18 @@ fn a_step_sees_a_ready_task_and_nothing_when_alone() {
       futures::detach(task).unwrap();
       let after = futures::others_waiting();
       futures::set_step_ceiling_ns(50_000_000);
-      out.set((
-        alone,
-        after,
-        default_ceiling,
-        futures::step_ceiling_ns().unwrap(),
-      ));
+      out
+        .send((
+          alone,
+          after,
+          default_ceiling,
+          futures::step_ceiling_ns().unwrap(),
+        ))
+        .unwrap();
     })
     .unwrap();
   runtime.run_until_idle();
-  let (alone, after, default_ceiling, set) = seen.get();
+  let (alone, after, default_ceiling, set) = seen.try_recv().unwrap();
   assert!(!alone, "a task alone saw someone waiting");
   assert!(after, "a ready task was not seen");
   assert_eq!(
@@ -85,7 +83,7 @@ fn spin(ns: u64, ask_ns: Option<u64>) {
 #[test]
 fn a_poll_that_asks_and_finds_no_one_is_no_long_step() {
   let runtime = LocalRuntime::new(&config()).unwrap();
-  let counts: Rc<Cell<(u64, u64, u64)>> = Rc::new(Cell::new((0, 0, 0)));
+  let (out, counts) = std::sync::mpsc::channel::<(u64, u64, u64)>();
   // Every poll past its allowance by the wall clock: the task's, the host's and the unattributed (§4.3).
   let long_steps = || {
     slates_rt::registry::with_current(|ctx| {
@@ -94,7 +92,6 @@ fn a_poll_that_asks_and_finds_no_one_is_no_long_step() {
     })
     .unwrap()
   };
-  let out = Rc::clone(&counts);
   runtime
     .spawn(async move {
       let quantum = futures::step_budget_ns().unwrap();
@@ -104,11 +101,11 @@ fn a_poll_that_asks_and_finds_no_one_is_no_long_step() {
       let after_asking = long_steps();
       spin(3 * quantum, None);
       futures::yield_now().await;
-      out.set((before, after_asking, long_steps()));
+      out.send((before, after_asking, long_steps())).unwrap();
     })
     .unwrap();
   runtime.run_until_idle();
-  let (before, after_asking, after_silent) = counts.get();
+  let (before, after_asking, after_silent) = counts.try_recv().unwrap();
   assert_eq!(
     after_asking, before,
     "a poll that asked and found no one was counted long"

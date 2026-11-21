@@ -315,6 +315,54 @@ fn a_run_moved_into_its_file_leaves_later_runs_where_they_were() {
   assert_eq!(green.content("b"), second.get(..5));
 }
 
+/// A green at version 1 holding `base` as the file `big`.
+fn green_holding_big(base: &[u8]) -> Green {
+  let mut green = Green::new();
+  let (doc, _) = compose_volume_planned(
+    &Base::of_files(Vec::new()),
+    &[
+      VolumeOp::Create {
+        path: "big".to_owned(),
+      },
+      VolumeOp::Extend {
+        path: "big".to_owned(),
+        at: 0,
+        len: base.len() as u64,
+      },
+    ],
+  )
+  .unwrap();
+  let seed = Increment {
+    id: [1; 32],
+    base: 0,
+    doc,
+    post_state: base.to_vec(),
+    evidence: Vec::new(),
+    named: Default::default(),
+  };
+  let super::Judgment::Accepted(seeded) = green.judge_named(&mut seed.clone()) else {
+    panic!("the seed was not accepted");
+  };
+  green.commit_judged(seeded).unwrap();
+  green
+}
+
+/// `judged`'s files made by `green` a `slice` a step to the end, no step copying more than its slice: the bytes copied
+/// and the steps taken.
+fn made_in_slices(green: &Green, judged: &mut super::Judged, slice: u64) -> (u64, u64) {
+  let mut copied = 0u64;
+  let mut steps = 0u64;
+  loop {
+    let made = green.make_step(judged, slice).unwrap();
+    assert!(made.copied <= slice, "a step copied {} bytes", made.copied);
+    copied += made.copied;
+    steps += 1;
+    if made.done {
+      return (copied, steps);
+    }
+  }
+}
+
 /// A-760's last piece (C1, 2026-11-20: "a partial splice of a run copies at the commit"). Do: a green holding a 1 MiB
 /// file; a work that overwrites 5 bytes in its middle from named run 0 and creates a file of the whole of named run 1;
 /// judge it with `judge_named`, make its files with `make_step` a 64 KiB slice a step, then commit. Expect: no step
@@ -328,33 +376,7 @@ fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
   let base: Vec<u8> = (0..FILE)
     .map(|at| u8::try_from(at % 251).unwrap())
     .collect();
-  let mut green = Green::new();
-  let (doc, _) = compose_volume_planned(
-    &Base::of_files(Vec::new()),
-    &[
-      VolumeOp::Create {
-        path: "big".to_owned(),
-      },
-      VolumeOp::Extend {
-        path: "big".to_owned(),
-        at: 0,
-        len: FILE as u64,
-      },
-    ],
-  )
-  .unwrap();
-  let seed = Increment {
-    id: [1; 32],
-    base: 0,
-    doc,
-    post_state: base.clone(),
-    evidence: Vec::new(),
-    named: Default::default(),
-  };
-  let super::Judgment::Accepted(seeded) = green.judge_named(&mut seed.clone()) else {
-    panic!("the seed was not accepted");
-  };
-  green.commit_judged(seeded).unwrap();
+  let mut green = green_holding_big(&base);
 
   let whole = b"a whole text, moved".to_vec();
   let splice = b"FIVE!".to_vec();
@@ -412,17 +434,7 @@ fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
     panic!("not accepted");
   };
   let (made_before, stepped_before) = (green.mapped_files_made(), green.files_made_in_steps());
-  let mut copied = 0u64;
-  let mut steps = 0u64;
-  loop {
-    let made = green.make_step(&mut judged, SLICE).unwrap();
-    assert!(made.copied <= SLICE, "a step copied {} bytes", made.copied);
-    copied += made.copied;
-    steps += 1;
-    if made.done {
-      break;
-    }
-  }
+  let (copied, steps) = made_in_slices(&green, &mut judged, SLICE);
   assert_eq!(copied, FILE as u64, "the spliced file copied once");
   assert!(steps >= FILE as u64 / SLICE, "{steps} steps");
   assert_eq!(green.commit_judged(judged).map(|(v, _)| v), Ok(2));
@@ -432,13 +444,23 @@ fn a_splice_into_a_large_file_is_made_a_slice_a_step_before_its_commit() {
     "the commit made a file"
   );
   assert_eq!(green.files_made_in_steps(), stepped_before + 1);
+  spliced_and_created(&green, (base, &splice), (&whole, whole_buffer));
+}
+
+/// `big` is `base` with `splice` in its middle, and `new` is `whole`, in the run's own buffer at `whole_buffer`.
+fn spliced_and_created(
+  green: &Green,
+  (base, splice): (Vec<u8>, &[u8]),
+  (whole, whole_buffer): (&[u8], *const u8),
+) {
+  let middle = base.len() / 2;
   let mut expected = base;
-  expected[FILE / 2..FILE / 2 + 5].copy_from_slice(&splice);
+  expected[middle..middle + splice.len()].copy_from_slice(splice);
   assert!(
     green.content("big") == Some(expected.as_slice()),
     "the spliced file differs"
   );
   let created = green.content("new").unwrap();
-  assert_eq!(created, whole.as_slice());
+  assert_eq!(created, whole);
   assert_eq!(created.as_ptr(), whole_buffer, "the whole run was copied");
 }

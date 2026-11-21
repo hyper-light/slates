@@ -386,17 +386,16 @@ fn the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it() {
   }
 }
 
-/// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
-/// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
-/// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
-/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
-#[test]
-fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
-  use std::collections::BTreeMap;
-  let part = stock();
-  let verified = verify(&part, &Nothing, &mut room()).unwrap();
-  let mut texts: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
-  let mut paths: BTreeMap<Node, Vec<u8>> = BTreeMap::new();
+/// Each verified revision's text and the path it is kept under (the changelog's and manifest log's NUL-led paths), by
+/// node.
+fn texts_and_paths(
+  verified: &Verified,
+) -> (
+  std::collections::BTreeMap<Node, Vec<u8>>,
+  std::collections::BTreeMap<Node, Vec<u8>>,
+) {
+  let mut texts = std::collections::BTreeMap::new();
+  let mut paths = std::collections::BTreeMap::new();
   for arrived in &verified.changesets {
     texts.insert(arrived.node, arrived.text.clone());
     paths.insert(arrived.node, super::CHANGELOG_PATH.to_vec());
@@ -411,9 +410,14 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
       paths.insert(arrived.node, path.clone());
     }
   }
-  let decoded =
-    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
-  let mut deltas: BTreeMap<Node, (Node, &[u8])> = BTreeMap::new();
+  (texts, paths)
+}
+
+/// Each revision of `decoded`'s groups: its delta's base and its data, by node.
+fn deltas_by_node<'d>(
+  decoded: &'d crate::changegroup::Changegroup<'_>,
+) -> std::collections::BTreeMap<Node, (Node, &'d [u8])> {
+  let mut deltas = std::collections::BTreeMap::new();
   for range in [&decoded.changelog, &decoded.manifests] {
     for revision in decoded.group(range) {
       deltas.insert(revision.node, (revision.base, revision.data));
@@ -424,6 +428,21 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
       deltas.insert(revision.node, (revision.base, revision.data));
     }
   }
+  deltas
+}
+
+/// A-767 C4 (the changeset log's `Texts` section, w-perf's format, agreed 2026-11-20). Do: take stock 7.2's bundle a
+/// step at a time and verify it whole. Expect one kept text per revision kept, each naming its node, the BLAKE3 and
+/// length of the text verification rebuilt for it, the identity of its delta's base text (none for a whole text), and
+/// the place in the payload holding exactly its delta; the changelog and manifest log under their NUL-led paths.
+#[test]
+fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
+  let part = stock();
+  let verified = verify(&part, &Nothing, &mut room()).unwrap();
+  let (texts, paths) = texts_and_paths(&verified);
+  let decoded =
+    crate::changegroup::Changegroup::decode(&part.payload, part.version, &mut room()).unwrap();
+  let deltas = deltas_by_node(&decoded);
   let mut store = store();
   let mut index = HgIndex::new();
   let (fork, intaken, _) = intake(&part, &mut index, &mut store, &mut room()).unwrap();
@@ -441,6 +460,33 @@ fn the_intake_names_each_kept_revisions_text_its_base_and_its_place() {
   for index in [fork, index] {
     index.release(&mut store).unwrap();
   }
+}
+
+/// The sectioned record `sectioned` refused by `Replay::begin` (its payload is not in it), and by kind cut short or with
+/// a byte after it.
+fn sectioned_refused(
+  sectioned: &[u8],
+  payload: &[u8],
+  empty: &mut HgIndex,
+  store: &mut ContentStore,
+) {
+  use crate::import::record::{self, Replay};
+  assert!(matches!(
+    Replay::begin(sectioned, empty, store),
+    Err(record::Refused::Version { version: 6 })
+  ));
+  for cut in 0..sectioned.len() {
+    assert!(
+      Replay::begin_sectioned(&sectioned[..cut], payload, empty, store).is_err(),
+      "cut at {cut}"
+    );
+  }
+  let mut trailing = sectioned.to_vec();
+  trailing.push(0);
+  assert!(matches!(
+    Replay::begin_sectioned(&trailing, payload, empty, store),
+    Err(record::Refused::Trailing)
+  ));
 }
 
 /// A-767 C4 (a push landed on the changeset log: its `Record` section and its `Payload` section, the changegroup held
@@ -472,22 +518,7 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
   assert_eq!(rows(&mut by_whole, &store), expected);
   let held = store.len();
   let mut empty = HgIndex::new();
-  assert!(matches!(
-    Replay::begin(&sectioned, &mut empty, &mut store),
-    Err(record::Refused::Version { version: 6 })
-  ));
-  for cut in 0..sectioned.len() {
-    assert!(
-      Replay::begin_sectioned(&sectioned[..cut], &part.payload, &mut empty, &mut store).is_err(),
-      "cut at {cut}"
-    );
-  }
-  let mut trailing = sectioned.clone();
-  trailing.push(0);
-  assert!(matches!(
-    Replay::begin_sectioned(&trailing, &part.payload, &mut empty, &mut store),
-    Err(record::Refused::Trailing)
-  ));
+  sectioned_refused(&sectioned, &part.payload, &mut empty, &mut store);
   assert_eq!(store.len(), held, "a refused replay held something");
   for index in [by_sections, by_whole, fork, index, empty] {
     index.release(&mut store).unwrap();

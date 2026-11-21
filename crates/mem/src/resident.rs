@@ -198,8 +198,12 @@ mod mapping {
     let mut address = u64::try_from(at).unwrap_or(u64::MAX);
     let mut seen: Vec<u32> = Vec::new();
     let mut pages = 0u64;
-    let words =
-      u32::try_from(std::mem::size_of::<TopInfo>() / std::mem::size_of::<u32>()).unwrap_or(0);
+    let words = u32::try_from(
+      std::mem::size_of::<TopInfo>()
+        .checked_div(std::mem::size_of::<u32>())
+        .unwrap_or(0),
+    )
+    .unwrap_or(0);
     while address < end {
       let (mut size, mut info, mut count, mut name) = (0u64, TopInfo::default(), words, 0);
       // SAFETY: every pointer is to a live local of the type the call writes (`info` is `vm_region_top_info_data_t`
