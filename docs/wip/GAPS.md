@@ -2308,6 +2308,11 @@
 > a stored text a store window a step, a green's held text a window's room a step; a call whose texts are not whole
 > writes nothing. Held by `an_export_rebuilds_a_long_delta_chain_a_window_a_call` (no call a quarter of the whole read)
 > and `a_stored_text_is_read_a_store_window_a_step`. Owed: format 3's window made in units (w-bugs' `WindowMaking`). Owed from them: the records' texts in the shared object store; an import resumed across a restart (the committed revisions are recovered; a
+> **R3, the svn hook tests' flake (2026-11-20, w-svn; Ada's close list):** `vcs_svn::tests` waited ten liveness windows
+> for an answer that runs hooks, and its reader returns part-way at a timeout; on a loaded Mac a hook's first run
+> outlasted that (1 in 3, w-perf; 22 s against 2.3 s), read as a wrong answer. The wait is now a hang's bound
+> (`HOOK_PATIENCE_NS`, sixty windows), and the unlock test holds its answer whole before its hooks' files. 8 of 8 runs
+> green after (load 11-17). Closed.
 > **A-780, the svn DAV site's PROPFIND written in place (2026-11-20, w-svn; Ada's MEMORY SIZING rule):** every
 > property's value and element is written into one reused buffer (`dav::site` `write_live`, `push_dead`, the value
 > writers), responses streamed into the body as described; allprop of a 32-file directory at depth 1 makes 445
