@@ -4589,6 +4589,7 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
       .chain(large_counts(state))
       .chain(content_ranges)
       .chain(crate::live_ship::hop_rows(state))
+      .chain(busy_harvest_rows())
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -27439,4 +27440,18 @@ mod resize_admission_tests {
     );
     assert_eq!(refused, 0, "no allowance was refused");
   }
+}
+
+/// This shard's busy harvests deferred because a harvest costs more than its quantum (`slates_rt::busy_harvest`), as
+/// the `rt.core.harvests_deferred` row: the longer interval's non-vacuity count. Left out at zero, as every count of the
+/// report is.
+fn busy_harvest_rows() -> Vec<RefusalCount> {
+  slates_rt::registry::with_current(|ctx| ctx.counters().harvests_deferred)
+    .filter(|deferred| *deferred > 0)
+    .map(|deferred| RefusalCount {
+      kind: "rt.core.harvests_deferred".to_owned(),
+      count: deferred,
+    })
+    .into_iter()
+    .collect()
 }
