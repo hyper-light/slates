@@ -206,8 +206,14 @@
 > in 14 fills, the window at most 193,859 bytes (one 128 KiB delta, a 64 KiB piece and a header). Counters
 > `vcs_store.hg_replay_wants` and `vcs_store.hg_replay_window_most`.
 > Owed:
-> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main and w-store,
->   inbox/main-from-w-hg-c1-import-design.md);
+> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main, inbox/main-from-w-hg-c1-import-design.md).
+>   BUILT, its first part: `slates_hg::import::emit` writes an import's history as the changegroup (03) a push of it
+>   would bring, each revision's chunk its revlog's own delta against its delta parent (`Outline::delta_parent`, 7.2's
+>   `deltaparent`), cut into segments of at least a bound only between chunks, each naming its texts as a push's
+>   `Texts` section does (`Import::emitting`, `take_segment`). Held by
+>   `import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`: for each of the five stores 7.2
+>   wrote, the segments concatenated and taken through the push's intake give the import's index row for row. Owed:
+>   the server landing each segment as a changeset and the import's entry naming the run, and the replay of a run;
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
