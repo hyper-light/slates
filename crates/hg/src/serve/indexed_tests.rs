@@ -104,6 +104,7 @@ fn state_of(imported: &Imported) -> State<'_> {
     roots: &imported.phase_roots,
     bookmarks: &imported.bookmarks,
     publishing: false,
+    stored_logs: true,
   }
 }
 
@@ -449,6 +450,7 @@ fn texts_longer_than_a_window_are_copied_within_the_room() {
     roots: &[],
     bookmarks: &[],
     publishing: true,
+    stored_logs: true,
   };
   let view = Indexed::new(&index, &store, no_state, &mut room()).unwrap();
   let short = view.changeset_text(0, &mut Admission::new(9_999));
@@ -759,6 +761,7 @@ fn view_of(built: &Built, publishing: bool) -> Indexed<'_> {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing,
+    stored_logs: true,
   };
   Indexed::new(&built.index, &built.store, state, &mut room()).unwrap()
 }
@@ -1015,6 +1018,7 @@ fn a_marker_the_store_cannot_read_refuses_the_view() {
     roots: &built.roots,
     bookmarks: &built.bookmarks,
     publishing: false,
+    stored_logs: true,
   };
   let refused = Indexed::new(&built.index, &built.store, state, &mut room()).err();
   assert_eq!(
@@ -1085,8 +1089,10 @@ fn streamed(answer: &[u8]) -> Streamed {
   (status, sent)
 }
 
-/// A changeset store as a stream asks it, over an imported index: every revision kept whole, its place its text's own
-/// identity, so the stream's bytes are the whole rendering's (`render::revlogs`).
+/// A changeset store as a stream asks it, over an imported index: every revision kept whole, as a push's changegroup
+/// holds a delta against the null base (7.2's `mdiff.trivialdiffheader`: one hunk replacing nothing at 0, then the
+/// text), its place that hunk under its text's own identity, so the stream's bytes are the whole rendering's
+/// (`render::revlogs`).
 struct WholeTexts<'s> {
   index: &'s crate::index::HgIndex,
   store: &'s slates_vcs::ContentStore,
@@ -1111,7 +1117,7 @@ impl crate::render::StoredSource for WholeTexts<'_> {
       let mut text = Vec::new();
       crate::import::record::write_text(&mut text, self.store, &kept);
       let identity = *blake3::hash(&text).as_bytes();
-      let len = u64::try_from(text.len()).ok()?;
+      let len = u64::try_from(trivial_hunk(&text)?.len()).ok()?;
       self.texts.insert(identity, text);
       rows.push(Some(crate::render::StoredRevision {
         text: identity,
@@ -1129,9 +1135,20 @@ impl crate::render::StoredSource for WholeTexts<'_> {
   fn chunks(&mut self, places: &[crate::render::StoredPlace]) -> Option<Vec<Vec<u8>>> {
     places
       .iter()
-      .map(|place| self.texts.get(&place.payload).cloned())
+      .map(|place| trivial_hunk(self.texts.get(&place.payload)?))
       .collect()
   }
+}
+
+/// `text` as a changegroup holds a delta against the null base: one hunk replacing bytes 0 to 0 with it (7.2's
+/// `mdiff.trivialdiffheader`, three big-endian words), then the text.
+fn trivial_hunk(text: &[u8]) -> Option<Vec<u8>> {
+  let mut hunk = Vec::with_capacity(text.len().saturating_add(12));
+  for field in [0, 0, u32::try_from(text.len()).ok()?] {
+    hunk.extend_from_slice(&field.to_be_bytes());
+  }
+  hunk.extend_from_slice(text);
+  Some(hunk)
 }
 
 /// The whole-text store of `index`.
@@ -1420,8 +1437,8 @@ impl crate::render::StoredSource for Deltas<'_> {
         self
           .edits
           .get(&place.payload)
-          .or_else(|| self.whole.texts.get(&place.payload))
           .cloned()
+          .or_else(|| trivial_hunk(self.whole.texts.get(&place.payload)?))
       })
       .collect()
   }
