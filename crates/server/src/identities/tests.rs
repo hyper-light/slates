@@ -191,7 +191,7 @@ fn answered_by_message(
 /// anything of the work.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_without_a_message_before_any_work_is_built() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     [
       ("git", VcsTool::Git),
       ("hg", VcsTool::Mercurial),
@@ -224,7 +224,7 @@ fn answered_by_identity(
 /// the principal's own name.
 #[test]
 fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let git = (mercurial_only("Ada"), git_only("Ada"));
     let mercurial = (git_only("Ada"), mercurial_only("Ada"));
     let svn = repository_work(state, "svn", VcsTool::Subversion);
@@ -248,7 +248,7 @@ fn t_a664_a_repositorys_green_refuses_a_submit_with_no_identity_in_its_tool() {
 /// identity. Expect: accepted at version 1.
 #[test]
 fn t_a664_a_plain_green_takes_a_submit_with_neither() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let work = plain_work(state);
     accepted_version(&ask(state, submit(work, None, ToolIdentities::default())))
   });
@@ -279,8 +279,9 @@ fn set_at_once(
 /// Do: set the owner's identities from an agent's own channel, with the launcher's proof. Expect: `Forbidden`.
 #[test]
 fn t_a664_an_agent_never_sets_identities_even_with_the_launchers_proof() {
-  let answer =
-    crate::daemon::audit_on_shard(|state| set_at_once(state, &agent(), both("Ada"), None));
+  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
+    set_at_once(state, &agent(), both("Ada"), None)
+  });
   assert!(
     matches!(answer, Some(Refusal::Forbidden { .. })),
     "{answer:?}"
@@ -291,8 +292,9 @@ fn t_a664_an_agent_never_sets_identities_even_with_the_launchers_proof() {
 /// secret made. Expect: `GrantIssuerUnverified`.
 #[test]
 fn t_a664_identities_set_without_the_launchers_proof_are_refused() {
-  let answer =
-    crate::daemon::audit_on_shard(|state| set_at_once(state, &owner(), both("Ada"), Some([0; 32])));
+  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
+    set_at_once(state, &owner(), both("Ada"), Some([0; 32]))
+  });
   assert_eq!(answer, Some(Refusal::GrantIssuerUnverified));
 }
 
@@ -305,8 +307,9 @@ fn refused_naming(answer: Option<&Refusal>, part: &str) -> bool {
 /// git name with a leading space, with the launcher's proof. Expect: `BadRequest` naming git's identity.
 #[test]
 fn t_a664_a_git_identity_git_would_change_is_refused() {
-  let answer =
-    crate::daemon::audit_on_shard(|state| set_at_once(state, &owner(), both(" Ada"), None));
+  let answer = crate::test_store::audit_on_stored_shard("vcs", |state| {
+    set_at_once(state, &owner(), both(" Ada"), None)
+  });
   assert!(
     refused_naming(answer.as_ref(), "git identity"),
     "{answer:?}"
@@ -319,7 +322,7 @@ fn t_a664_a_git_identity_git_would_change_is_refused() {
 /// proof. Expect: each `BadRequest` naming Mercurial's user, so no record holds a user Mercurial would refuse or change.
 #[test]
 fn t_a664_a_mercurial_user_mercurial_would_refuse_or_change_is_refused() {
-  let answers = crate::daemon::audit_on_shard(|state| {
+  let answers = crate::test_store::audit_on_stored_shard("vcs", |state| {
     [
       "Ada\n<ada@example.com>",
       "",
@@ -347,7 +350,7 @@ fn t_a664_a_mercurial_user_mercurial_would_refuse_or_change_is_refused() {
 /// `PolicyChanged { current: 1 }`, the record unchanged.
 #[test]
 fn t_a664_identities_are_recorded_as_the_version_after_the_one_read() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let first = record(state, owner(), both("Ada"), 0);
     let stale = record(state, owner(), both("Eve"), 0);
     let kept = state
@@ -569,7 +572,7 @@ fn t_a664_a_submit_waiting_for_its_sessions_read_is_refused_when_its_channel_is_
 /// session's kept none and refused `IdentityRequired`; the session still keeps none.
 #[test]
 fn t_a664_a_later_read_never_replaces_the_identities_a_session_keeps() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let work = repository_work(state, "agents", VcsTool::Git);
     let (seat, _client) = seat(state, FIRST_SESSION, owner());
     if let Ok(slot) = state.clients.get_mut(seat) {
@@ -640,7 +643,7 @@ fn returned_to(
 /// read counted; each owner's submit accepted at version 1, so neither returning submit built anything.
 #[test]
 fn t_a664_a_read_returning_to_a_seat_its_session_left_is_kept_by_no_one_and_runs_nothing() {
-  let answered = crate::daemon::audit_on_shard(|state| {
+  let answered = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (taken, _taken_region) = seat(state, SECOND_SESSION, agent());
     let (retiring, _retiring_region) = seat(state, FIRST_SESSION, owner());
     if let Ok(slot) = state.clients.get_mut(retiring) {

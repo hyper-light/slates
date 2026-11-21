@@ -370,6 +370,21 @@ fn adoptable(
   Ok(record.id)
 }
 
+/// Format: the refusal's words for a repository a daemon without a changeset store cannot keep (main's ruling of
+/// 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1).
+const NEEDS_A_STORE: &str = "a Mercurial repository's history is kept on the node's changeset store: start the daemon \
+                             with --vcs-store DIR";
+
+/// The refusal of a repository of `tool` on a daemon without a changeset store (A-767; main's ruling of 2026-11-20,
+/// decision 1): the store is the repository's history, and a register-held copy for a daemon without one would be a
+/// second path (CLAUDE.md §2 item 7). Typed `Unsupported`, naming `--vcs-store`. Mercurial's since C1; git's and
+/// Subversion's as their C items land.
+fn no_store_for(state: &ShardState, tool: VcsTool) -> Option<Refusal> {
+  (tool == VcsTool::Mercurial && state.vcs_disk.is_none()).then(|| Refusal::Unsupported {
+    feature: NEEDS_A_STORE.to_owned(),
+  })
+}
+
 /// `CreateRepository` (module docs): the repository, its root and the default branch's binding, then the root's engine
 /// in a new lineage. Answered `GreenCreated` with the root.
 pub(crate) fn create_repository(
@@ -378,6 +393,9 @@ pub(crate) fn create_repository(
   (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
   green: Option<VolumeId>,
 ) -> ReplyBody {
+  if let Some(refusal) = no_store_for(state, tool) {
+    return refused(refusal);
+  }
   let adopted = match green.map(|volume| adoptable(state, principal, volume)) {
     Some(Ok(id)) => Some(id),
     Some(Err(refusal)) => return refused(refusal),

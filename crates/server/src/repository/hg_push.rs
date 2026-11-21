@@ -1209,8 +1209,6 @@ pub(crate) fn land(
     fork,
     intaken,
     record: written,
-    changegroup: (version, payload),
-    room,
     ..
   }) = forked
   else {
@@ -1224,19 +1222,13 @@ pub(crate) fn land(
   };
   // The push's record, the revisions it kept written from the fork in the order kept, within the room the landing runs
   // within (A-680 part 2c, A-720); a push that kept none records none.
-  let revisions = intaken.kept.saturating_add(intaken.passed_over);
-  let written = (!intaken.logs.is_empty()).then(|| match written {
-    Some(record) => Some(Ok(record)),
-    None => Some(record::write_changegroup(
-      room,
-      (version, &payload),
-      revisions,
-    )),
-  });
+  // A push that kept revisions carries the reference to its changeset on the node's store (`land_on_disk`); without one
+  // it is refused, never recorded in the register instead (main's ruling of 2026-11-20, decision 1).
+  let written = (!intaken.logs.is_empty()).then_some(written);
   let record = match written {
     None => None,
-    Some(Some(Ok(bytes))) => Some(bytes),
-    Some(_) => {
+    Some(Some(bytes)) => Some(bytes),
+    Some(None) => {
       return Landed {
         answer: Err(*abort(UNRECORDED.to_vec())),
         released: release_index(state, fork),
@@ -1348,11 +1340,6 @@ pub(crate) async fn unbundle(
     return Some(outcome);
   }
   loop {
-    if let Some(taken) = forked.as_mut()
-      && let Err(outcome) = record_sliced(taken).await?
-    {
-      return Some(outcome);
-    }
     let tried = crate::state::with_state(|state| match forked.take() {
       Some(stale) if is_stale(state, repository, &stale) => Err(Box::new(stale)),
       fresh => Ok(landing(
@@ -1387,14 +1374,35 @@ async fn land_on_disk(
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
     return Some(Ok(()));
   }
-  let taken = crate::state::with_state(|state| {
-    let disk = state.vcs_disk.clone()?;
-    let sequence = state.vcs_stores.next_changeset(repository)?;
-    Some((disk, sequence))
-  })?;
-  let Some((disk, sequence)) = taken else {
-    return Some(Ok(()));
+  let made = crate::state::with_state(|state| changeset_of(state, repository, forked))?;
+  let Some((disk, header, parts, reference)) = made else {
+    // No changeset store, no history (main's ruling of 2026-11-20, decision 1): a repository is never made on such a
+    // daemon, and nothing keeps a push's history in the register instead.
+    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
   };
+  let landed = disk.land(header, parts).await;
+  crate::state::with_state(|state| landed_on_disk(state, forked, landed.is_ok(), reference))
+}
+
+/// A push's changeset as the node's store lands it (A-767 C4): the store's handle, the header at the repository's next
+/// sequence, the sections (Record: the v6 head; Payload: the changegroup, moved out of `forked`, never copied; Texts:
+/// each kept revision's text, base and place), and the register's reference to it. None where the node holds no store
+/// or the repository has no Mercurial store here.
+pub(crate) type Changeset = (
+  slates_store::owner::StoreHandle,
+  slates_store::log::Header,
+  Vec<slates_store::owner::Part>,
+  Vec<u8>,
+);
+
+/// [`Changeset`] of `forked`'s push to `repository`, its sequence taken now ([`land_on_disk`]'s first half).
+pub(crate) fn changeset_of(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Option<Changeset> {
+  let disk = state.vcs_disk.clone()?;
+  let sequence = state.vcs_stores.next_changeset(repository)?;
   let (version, payload) = &mut forked.changegroup;
   let reference = record::write_push_reference(forked.room, (*version, payload), sequence);
   // Each kept revision's text, base and place, for the derived per-path reads (w-perf's Texts section, A-645 on
@@ -1441,55 +1449,57 @@ async fn land_on_disk(
       slates_store::texts::encode(&texts),
     ),
   ];
-  let landed = disk.land(header, parts).await;
-  let ok = landed.is_ok();
-  crate::state::with_state(|state| state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1))?;
-  if !ok {
-    return Some(Err(PushOutcome::refused(&abort(UNLANDED.to_vec()))));
-  }
-  forked.record = Some(reference);
-  Some(Ok(()))
+  Some((disk, header, parts, reference))
 }
 
-/// Writes `forked`'s record a part at a time, a yield between slices (A-732's writer; written whole in the landing's one
-/// step, a large push's record held its shard past the watchdog's window): before its landing, so the landing appends
-/// it. Nothing to do where it is written or the push kept nothing; none when the store went away.
-async fn record_sliced(forked: &mut Forked) -> Option<Result<(), PushOutcome>> {
-  // A-740: a shard stuck in this step names it.
-  let _doing = slates_rt::futures::doing("hg_push::record");
+/// [`land_on_disk`] for a test on a shard: `forked`'s changeset landed on the shard's store through [`changeset_of`]
+/// and the store's own `land`, waited for on a thread of its own (`crate::test_store::land_blocking`). A fork that
+/// brought no revision, or already names its changeset, lands nothing; a refused landing is the landing's refusal.
+#[cfg(test)]
+pub(crate) fn store_blocking(
+  state: &mut ShardState,
+  repository: RepositoryId,
+  forked: &mut Forked,
+) -> Result<(), PushOutcome> {
   if forked.record.is_some() || forked.intaken.logs.is_empty() {
-    return Some(Ok(()));
+    return Ok(());
   }
-  let unrecorded = || PushOutcome::refused(&abort(UNRECORDED.to_vec()));
-  let (version, payload) = &forked.changegroup;
-  let revisions = forked
-    .intaken
-    .kept
-    .saturating_add(forked.intaken.passed_over);
-  let Ok(mut writer) =
-    record::ChangegroupWriter::begin(forked.room, (*version, payload.len()), revisions)
-  else {
-    return Some(Err(unrecorded()));
+  let Some((disk, header, parts, reference)) = changeset_of(state, repository, forked) else {
+    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
   };
-  loop {
-    let written = crate::state::with_state(|state| {
-      let quantum = vcs_store::hg_import::quantum_of(state);
-      let start = slates_rt::futures::now_ns();
-      loop {
-        match writer.step(payload) {
-          Ok(true) if slates_rt::futures::now_ns().saturating_sub(start) < quantum => {}
-          other => break other,
-        }
-      }
-    });
-    match written? {
-      Ok(true) => slates_rt::futures::yield_now().await,
-      Ok(false) => break,
-      Err(_) => return Some(Err(unrecorded())),
-    }
+  let ok = crate::test_store::land_blocking(disk, header, parts);
+  landed_on_disk(state, forked, ok, reference)
+}
+
+/// [`land`] for a test on a shard (main's ruling of 2026-11-20: the one landing path, the store first): `prepared`'s
+/// push landed on the shard's store ([`store_blocking`]), then landed as the driver lands it; a refused store landing
+/// leaves the fork naming no changeset, which [`land`] refuses.
+#[cfg(test)]
+pub(crate) fn land_stored(
+  state: &mut ShardState,
+  (principal, repository): (&Principal, RepositoryId),
+  mut prepared: Prepared,
+) -> Landed {
+  if let Some(forked) = prepared.forked.as_mut() {
+    let _ = store_blocking(state, repository, forked);
   }
-  forked.record = writer.finish();
-  Some(Ok(()))
+  land(state, (principal, repository), prepared)
+}
+
+/// [`land_on_disk`]'s second half: the landing counted, and on success `reference` the push's record, so its entry
+/// names the changeset; a refused landing answered `UNLANDED`, nothing of it in the register.
+pub(crate) fn landed_on_disk(
+  state: &mut ShardState,
+  forked: &mut Forked,
+  ok: bool,
+  reference: Vec<u8>,
+) -> Result<(), PushOutcome> {
+  state.count(if ok { PUSH_LANDED } else { PUSH_UNLANDED }, 1);
+  if !ok {
+    return Err(PushOutcome::refused(&abort(UNLANDED.to_vec())));
+  }
+  forked.record = Some(reference);
+  Ok(())
 }
 
 /// Whether `forked` was made from an index another push has replaced since (A-720 part 2b).
@@ -1647,39 +1657,6 @@ async fn rebase_sliced(
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
     }
   }
-}
-
-/// [`unbundle`] in one call, every slice at once: the driver's steps for a caller that holds the shard's state (the
-/// tests), never the daemon's path.
-#[cfg(test)]
-pub(crate) fn unbundle_in(
-  state: &mut ShardState,
-  repository: RepositoryId,
-  (principal, heads, bundle): Pushing<'_>,
-  room: &mut Admission,
-) -> Option<PushOutcome> {
-  let fronted = vcs_store::lent_state(state, |state| {
-    front(state, repository, (heads, bundle), room)
-  });
-  let mut unbundle = match fronted? {
-    Ok(unbundle) => unbundle,
-    Err(outcome) => return Some(outcome),
-  };
-  let forked = match unbundle.take_changegroup() {
-    None => None,
-    Some(changegroup) => match take_whole(state, repository, changegroup, room)? {
-      Ok(forked) => Some(forked),
-      Err(refused) => return Some(PushOutcome::refused(&refused)),
-    },
-  };
-  landing(
-    state,
-    repository,
-    (principal, bundle),
-    &unbundle,
-    forked,
-    room,
-  )
 }
 
 /// Derived: the room each slice of a push's intake is lent from the arena's pool beyond what the shard could admit
@@ -1873,8 +1850,8 @@ pub(crate) fn take_whole(
 }
 
 /// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
-/// re-based first, every row at once, then judged at landing and landed: the driver's steps for the tests, which land
-/// pushes side by side with no runtime.
+/// re-based first, every row at once, then its changeset landed on the store ([`store_blocking`]), then judged at
+/// landing and landed: the driver's steps for the tests, which land pushes side by side with no runtime.
 #[cfg(test)]
 pub(crate) fn land_in(
   state: &mut ShardState,
@@ -1901,6 +1878,12 @@ pub(crate) fn land_in(
     }
     fresh => fresh,
   };
+  let mut forked = forked;
+  if let Some(fork) = forked.as_mut()
+    && let Err(outcome) = store_blocking(state, repository, fork)
+  {
+    return Some(outcome);
+  }
   landing(
     state,
     repository,

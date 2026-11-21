@@ -14301,11 +14301,13 @@ fn start_anchor_with_vcs_http(
 
 /// A-685 (§4.17.1 "The repository and its greens"; §4.17.2 "Transports" item 1): `slates repository create` against
 /// a real anchor. Do: start an anchor whose daemon serves the version-control HTTP edge on loopback; create git
-/// repository `NAME` from the command line; create `NAME` again, for Mercurial; create one repository of each other
+/// repository `NAME` from the command line; create `NAME` again, for Subversion; create one repository of each other
 /// tool with its defaults, and one with `--json`; enroll an HTTP token for this account (`slates credential token`, the
 /// issuer's verb) and ask the edge, with it as a bearer token, for `NAME`'s receive-pack advertisement and for a name
 /// no repository has. Expect: the create answers the repository and its root green's id; the second create is refused
-/// `AlreadyExists` (exit 1), a name being taken whatever the tool; each tool's create answers with its defaults; the
+/// `AlreadyExists` (exit 1), a name being taken whatever the tool; each tool's create answers with its defaults, but
+/// Mercurial's, which this daemon without a changeset store refuses `Unsupported`, naming `--vcs-store` (main's ruling
+/// of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1); the
 /// edge answers `200` for the repository by its name and `404` for the unknown name. Where this platform publishes no
 /// issuer surface (Linux: a descriptor only the anchor's children hold) the token's leg is skipped, loudly; the creates
 /// run everywhere.
@@ -14353,19 +14355,33 @@ fn a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge() {
 /// `repository create NAME` again, for another tool than the first: refused `AlreadyExists`, exit 1 (a repository's
 /// name is unique whatever its tool, §4.17.1 item 1).
 fn the_name_is_taken_whatever_the_tool(instance: &str, name: &str) {
-  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "hg"]);
+  let (code, out, err) = run(instance, &["repository", "create", name, "--tool", "svn"]);
   assert_eq!(code, 1, "the name is taken: {out}{err}");
   assert!(err.contains("AlreadyExists"), "{err}");
 }
 
 /// A repository of each tool, with its defaults, and one created with `--json`: each answers (exit 0), the JSON one with
-/// its name and its root green's id.
+/// its name and its root green's id; Mercurial's, on this daemon without a changeset store, is refused `Unsupported`
+/// naming `--vcs-store` (exit 1), since its history is kept on the store alone.
 fn each_tool_creates_with_its_defaults(instance: &str) {
-  for (name, tool) in [("an-hg-one", "hg"), ("an-svn-one", "svn")] {
-    let (code, out, err) = run(instance, &["repository", "create", name, "--tool", tool]);
-    assert_eq!(code, 0, "{tool}'s create answers: {err}");
-    assert_eq!(value_of(&out, "repository"), name, "{out}");
-  }
+  let (code, out, err) = run(
+    instance,
+    &["repository", "create", "an-svn-one", "--tool", "svn"],
+  );
+  assert_eq!(code, 0, "svn's create answers: {err}");
+  assert_eq!(value_of(&out, "repository"), "an-svn-one", "{out}");
+  let (code, out, err) = run(
+    instance,
+    &["repository", "create", "an-hg-one", "--tool", "hg"],
+  );
+  assert_eq!(
+    code, 1,
+    "hg's create is refused without a store: {out}{err}"
+  );
+  assert!(
+    err.contains("Unsupported") && err.contains("--vcs-store"),
+    "the refusal names the flag: {err}"
+  );
   let (code, out, err) = run(
     instance,
     &[

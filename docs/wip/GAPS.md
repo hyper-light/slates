@@ -147,8 +147,15 @@
 > `write_push_reference` and `reference_of`.
 > Red first by use: `crates/cli/tests/hg_interop.rs`
 > `stock_hg_pushes_land_on_the_changeset_store_and_a_restarted_daemon_replays_them` (stock hg 7.2: two changesets
-> pushed and counted `hg_push.landed`, the daemon killed, a clone after the restart holding both). Without a store, a
-> push records as before (A-729 part 2's v2 record).
+> pushed and counted `hg_push.landed`, the daemon killed, a clone after the restart holding both).
+> **No store, no Mercurial (main's ruling of 2026-11-20, inbox w-svn-from-main-c2-rulings decision 1). CLOSED.** A
+> daemon without `--vcs-store` refuses `repository create --tool hg`, typed `Unsupported` naming `--vcs-store`
+> (`repository::no_store_for`; `crates/cli/tests/cli.rs` `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge`).
+> The register-held v2 record path is gone (`unbundle_in`'s whole-history record, `record_sliced`); a push with no
+> store reference is refused `UNRECORDED`. The hg tests run on store-backed daemons through the one shared helper,
+> `crates/server/src/test_store.rs` (`TestStore`: a real store beside the test binary, removed when dropped;
+> `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`), and `crates/cli/tests/hg_interop.rs`'s anchors
+> each hold a scratch store.
 > Owed:
 > - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
 >   reads;

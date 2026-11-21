@@ -1253,7 +1253,7 @@ pub(crate) fn repository(
 /// is held, none unrecovered, and nothing is charged.
 #[test]
 fn t_a662_each_tool_has_its_arm_made_with_its_record_and_freed_with_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (git, _) = repository(state, "git", VcsTool::Git);
     let (hg, _) = repository(state, "hg", VcsTool::Mercurial);
     let (svn, _) = repository(state, "svn", VcsTool::Subversion);
@@ -1333,7 +1333,7 @@ fn assert_bytes_that_are_no_record_are_refused(
 /// admit now, then `ContentUnavailable`, counted.
 #[test]
 fn t_a662_a_store_refusal_reads_as_the_budget_or_unavailable() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let budget = GitRefused::Store(StoreRefused::Content(ContentRefused::OverBudget {
       need: 10,
       room: 3,
@@ -1564,7 +1564,7 @@ pub(crate) fn assert_made_again_whole(
 /// made again equal whole, both records replayed and none refused.
 #[test]
 fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "split", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1597,7 +1597,7 @@ fn t_a662_a_push_appended_a_ref_at_a_time_is_made_again_from_its_records() {
 /// second's chain; the store made again equal whole, its learned depth the second's chain, both records replayed.
 #[test]
 fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "twice", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (objects, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1638,7 +1638,7 @@ fn t_a662_a_push_whose_objects_another_committed_first_records_none_of_them() {
 /// as version 2, its record holding every object the push brought, and the store's ref at the new head.
 #[test]
 fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "tree", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1698,7 +1698,7 @@ fn t_a662_a_refused_ref_leaves_the_push_whole_for_the_next() {
 /// and replayed both records; freeing gives every byte back.
 #[test]
 fn t_a662_a_pushs_objects_ride_its_entry_and_the_log_makes_the_same_store() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "kernel", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1780,7 +1780,7 @@ fn assert_recorded_and_charged(
 /// version 1 with the new head; the record naming that key.
 #[test]
 fn t_a662_a_created_branch_is_keyed_by_the_green_its_append_makes() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "made", VcsTool::Git);
     let files = [(b"README".to_vec(), b"one\n".to_vec())];
     let (first, one) = commit_of(&files, &[], FIRST_DATE);
@@ -1840,7 +1840,7 @@ fn kept_files(
 /// first version) and none refused.
 #[test]
 fn t_a664_p3_a_pushs_version_keeps_its_map_of_gits_files() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, green) = repository(state, "pushed", VcsTool::Git);
     let (a, a_bytes) = blob(b"alpha\n");
     let (b, b_bytes) = blob(b"beta\n");
@@ -1954,7 +1954,7 @@ fn pushed_many(state: &mut ShardState, name: &str, pushes: u64) -> (RepositoryId
 /// lent again and its green's map made again by its build. Red before the change: the store was made whole at once.
 #[test]
 fn t_a732_a_git_rebuild_lends_nothing_and_replays_a_record_a_turn() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = pushed_many(state, "sliced-rebuild", 5);
     let records = records(state, repository).len();
     super::rebuild(state, repository);
@@ -1989,7 +1989,7 @@ const MANY_FILES: usize = 64;
 /// Red before the change: the record was replayed whole in one turn.
 #[test]
 fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-objects", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2027,7 +2027,7 @@ fn t_a722_p4_a_many_object_pack_record_is_replayed_over_many_turns() {
 /// it. Expect: more turns than the push holds objects; the push landed, its green's head the commit.
 #[test]
 fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-sealed", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2077,7 +2077,7 @@ fn t_a722_p4_a_pushs_seal_takes_many_turns_and_lands() {
 /// admitted before it (none left kept) and landed it, the green's head the commit.
 #[test]
 fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "many-admitted", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2131,7 +2131,7 @@ fn t_a722_p4_a_move_admitted_over_many_turns_is_the_one_its_append_lands() {
 /// ones built from the whole head.
 #[test]
 fn t_a752_p3_a_pushs_map_step_runs_a_path_a_slice_and_equals_the_whole_build() {
-  let seen = crate::daemon::audit_on_shard(|state| {
+  let seen = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "change-build", VcsTool::Git);
     let files = |word: &str, count: usize| -> Vec<(Vec<u8>, Vec<u8>)> {
       (0..count)
@@ -2234,7 +2234,7 @@ fn walked(state: &ShardState, id: RepositoryId) -> u64 {
 /// one turn.
 #[test]
 fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
-  let (most, total, objects) = crate::daemon::audit_on_shard(|state| {
+  let (most, total, objects) = crate::test_store::audit_on_stored_shard("vcs", |state| {
     let (repository, root) = repository(state, "admitted-in-turns", VcsTool::Git);
     let files: Vec<(Vec<u8>, Vec<u8>)> = (0..MANY_FILES)
       .map(|n| {
@@ -2272,7 +2272,7 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
 /// their BLAKE3, which the record does not name), never accepted.
 #[test]
 fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("vcs", |state| {
     const LARGE: usize = 1 << 20;
     let repository = crate::git_push::tests::git_repository(state, "old-form");
     let (request, _) = crate::git_push::tests::large_create(LARGE);

@@ -192,7 +192,7 @@ fn check_settled(state: &ShardState, id: RepositoryId) {
 /// holds, and each turn, the import's start and end and its landing counted.
 #[test]
 fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_imports_it() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let (expected_rows, expected) = in_one_call(state, STATES);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
@@ -226,7 +226,7 @@ fn t_a675_a_directory_imports_into_its_store_a_turn_at_a_time_as_one_call_import
 /// Mercurial's own repository, is w-perf's run: no fixture here holds more than a page.)
 #[test]
 fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let mut clock = Ticking(0);
@@ -273,7 +273,7 @@ fn t_a720_an_import_is_bounded_by_its_shard_never_one_region() {
 /// units, at least one a revision of the record, and the store's rows after it the rows the landing left.
 #[test]
 fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let (turns, ended) = to_its_end(state, id);
@@ -311,7 +311,7 @@ fn t_a732_a_recovery_replays_an_import_record_a_revision_a_unit() {
 /// spent), the replay's units counted, and the rows the landing left.
 #[test]
 fn a_recovery_unit_replays_as_many_revisions_as_its_slice_allows() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
     let (_, ended) = to_its_end(state, id);
@@ -349,7 +349,7 @@ fn a_recovery_unit_replays_as_many_revisions_as_its_slice_allows() {
 /// given back), no import under way, and the refusal counted.
 #[test]
 fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let cut = STATES.iter().map(|&(path, bytes)| {
       let half = bytes.len() / 2;
@@ -386,7 +386,7 @@ fn t_a675_an_import_refused_midway_gives_back_everything_it_held() {
 /// store's rows unchanged.
 #[test]
 fn t_a675_an_import_takes_an_empty_mercurial_store_one_at_a_time() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let git = created(state, "git", VcsTool::Git);
     assert_eq!(
       begin(state, git, directory(STATES.iter().copied())),
@@ -436,7 +436,7 @@ fn assert_an_imported_store_takes_no_second_import(state: &mut ShardState) {
 /// freed, nothing charged and the shard's retention charge what it was before either import.
 #[test]
 fn t_a675_a_repository_freed_midway_gives_its_import_back() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let retained = state.store.budget.retained();
     assert_an_import_freed_midway_is_given_back(state);
     let whole = created(state, "whole", VcsTool::Mercurial);
@@ -478,7 +478,8 @@ fn assert_an_import_freed_midway_is_given_back(state: &mut ShardState) {
 /// clock.
 #[test]
 fn t_a675_the_shards_task_runs_an_import_to_its_end() {
-  let daemon = crate::daemon::audit_daemon();
+  let store = crate::test_store::TestStore::new("hg");
+  let daemon = crate::test_store::audit_daemon_stored(&store);
   let id = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
@@ -563,7 +564,7 @@ fn as_kept(roots: &[slates_hg::phases::PhaseHead]) -> Vec<(u8, Vec<u8>)> {
 /// counted landed, and no landing refused.
 #[test]
 fn t_a687_an_import_lands_its_record_phase_roots_and_bookmarks_in_one_entry() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let (_, expected) = in_one_call(state, STATES);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));
@@ -603,7 +604,7 @@ fn assert_landed_as_imported(state: &ShardState, id: RepositoryId, expected: &Im
 /// holds, as it was before the import.
 #[test]
 fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     let reply = dispatch(
       state,
@@ -648,7 +649,8 @@ fn t_a687_a_refused_landing_records_nothing_and_gives_back_everything() {
 /// holding the rows the landing left, the replay counted.
 #[test]
 fn t_a732_a_rebuild_replays_a_mercurial_store_a_step_a_turn() {
-  let daemon = crate::daemon::audit_daemon();
+  let store = crate::test_store::TestStore::new("hg");
+  let daemon = crate::test_store::audit_daemon_stored(&store);
   let (id, landed, during) = crate::daemon::observe_first(&daemon, |state| {
     let id = created(state, "hg", VcsTool::Mercurial);
     assert_eq!(begin(state, id, directory(STATES.iter().copied())), Ok(()));

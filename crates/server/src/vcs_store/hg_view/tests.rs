@@ -91,7 +91,7 @@ fn lent_count(state: &mut ShardState, id: RepositoryId, room: u64) -> Option<u32
 /// nothing past the room, counted as a view not made.
 #[test]
 fn t_a680_a_view_is_lent_from_the_store_or_not_at_all() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let hg = created(state, "hg", VcsTool::Mercurial);
     let git = created(state, "git", VcsTool::Git);
     let (host, directory) = laid_out(STATES.iter().copied());
@@ -137,7 +137,7 @@ fn bookmarks_of(state: &mut ShardState, id: RepositoryId) -> Vec<(Vec<u8>, slate
 /// bookmark at `one`'s node once created, gone once retired, and back at it once bound; `one` and `two` unmoved.
 #[test]
 fn a_branch_the_owner_creates_retires_and_binds_is_a_bookmark_by_the_same_name() {
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let hg = created(state, "hg", VcsTool::Mercurial);
     let (host, directory) = laid_out(STATES.iter().copied());
     assert_eq!(begin(state, hg, (Box::new(host), directory)), Ok(()));
@@ -216,7 +216,7 @@ fn pushed(
   let terms = (false, [7; 32], u64::MAX);
   let prepared = crate::repository::hg_push::prepare_served(state, id, &unbundle, terms, &mut room)
     .expect("the push prepared");
-  let landed = crate::repository::hg_push::land(state, (&owner(), id), prepared);
+  let landed = crate::repository::hg_push::land_stored(state, (&owner(), id), prepared);
   assert!(
     landed.answer.is_ok() && landed.released.is_ok(),
     "{landed:?}"
@@ -240,7 +240,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
       }
     }
   }
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let hg = created(state, "hg", VcsTool::Mercurial);
     let made = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),
@@ -309,7 +309,7 @@ fn a_clone_reads_the_generation_it_began_on_whatever_lands_or_is_rebuilt_meanwhi
 #[test]
 fn a_branch_from_a_name_follows_mercurials_lookup_bookmark_tag_then_branch() {
   use slates_ipc::protocol::Refusal;
-  crate::daemon::audit_on_shard(|state| {
+  crate::test_store::audit_on_stored_shard("hg", |state| {
     let hg = created(state, "hg", VcsTool::Mercurial);
     let first = crate::repository::hg_push::tests::history_of(&[
       ("base", "a", b"a\n", None, "default"),

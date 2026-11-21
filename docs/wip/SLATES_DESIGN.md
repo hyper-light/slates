@@ -57972,6 +57972,19 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
 > fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
 
+> **Status (2026-11-20, C4: no store, no Mercurial; main's ruling, inbox w-svn-from-main-c2-rulings decision 1).** A
+> daemon without `--vcs-store` refuses `repository create --tool hg`, typed `Unsupported` naming the flag
+> (`repository::no_store_for`): the store is a Mercurial repository's history, and a register-held copy beside it would
+> be a second path. The register-held v2 record path is removed (`unbundle_in`'s whole-history record and
+> `record_sliced` in `crates/server/src/repository/hg_push.rs`); a push's register entry is the store reference
+> (record v7) alone, and a landing with none is refused `UNRECORDED`. Tests run on store-backed daemons through one
+> shared helper, `crates/server/src/test_store.rs` (`TestStore`, a real store beside the test binary removed when
+> dropped; `audit_on_stored_shard`, `audit_daemon_stored`, `land_blocking`, which waits for the owner's answer on a
+> thread of its own since a shard's thread cannot wait on a wake its runtime would deliver). Recovery applies only the
+> sequences the register names (decision 2), as C4's replay already did. Held by `crates/cli/tests/cli.rs`
+> `a_repository_the_cli_creates_is_found_by_name_on_the_vcs_http_edge` (the refusal through the CLI) and every hg test
+> on the helper. Git's and Subversion's creates follow as their C items land.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
