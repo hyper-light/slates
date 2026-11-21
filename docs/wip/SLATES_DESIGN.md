@@ -57962,6 +57962,16 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > past it; a landing let go uncommitted is abandoned (its liveness channel's sender dropped, the owner woken), the log's
 > end never moved. Held by `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing` (`tests/owner.rs`).
 
+> **Status (2026-11-20, C5's store side: git's pack read from the store).** `crates/server/src/vcs_store/store_packs.rs`
+> (`StorePacks`): git's synchronous `PackSource::piece` over the store, which only its owner thread reads. An awaited
+> `fill(pack, len, offset, until)` fetches the store's pieces (`PIECE_BYTES`, aligned in the pack) covering a range
+> into a set bounded by the caller's derived `most`, least recently used let go first, a range past the bound refused
+> `PastBound`, an unknown pack `Missing`; `piece` lends from the set alone and answers `None` on a miss, the caller's
+> cue to await a fill and step again. One way to the bytes (R6). The pack is named by plain BLAKE3 of its `Payload`
+> section, the store's `P` key. Held by `a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time`
+> (300,000 bytes read forward through a three-piece bound: each piece fetched once, every miss one fill, a let-go piece
+> fetched again and then reused). git's push landing, recovery and replay on it are w-git's (main's split).
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
