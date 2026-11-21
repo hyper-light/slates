@@ -8,8 +8,11 @@
 //! **Segments.** The stream is cut into segments of at least `bound` bytes, only between chunks, so each revision's
 //! delta lies whole in one segment, and each segment names its revisions' texts as a push's `Texts` section does
 //! ([`KeptText`]: the text's identity and length, its delta parent's text identity, and where the delta lies in the
-//! segment). The segments concatenated in order are the changegroup. A caller lands each as one changeset as it is cut
-//! ([`Emitter::take`]), so what is held is one segment and the chunk that closes it.
+//! segment). The segments concatenated in order are the changegroup. Each carries its record (main's ruling of
+//! 2026-11-21 01:16): the index rows of the revisions whose deltas it holds, by identity
+//! (`crate::import::record::Writer::begin_segment`), so a recovery restores them with no text rebuilt; the import
+//! writes it once those rows are appended and cuts the segment then ([`Emitter::cut`]). A caller lands each as one
+//! changeset as it is cut ([`Emitter::take`]), so what is held is one segment and the chunk that closes it.
 //!
 //! **Bounds.** Besides the segment, the emitter keeps, for the log being read, each revision's node and text identity
 //! (52 bytes a revision, so a delta's parent is named without reading its entry again), charged to the walk's room as
@@ -33,6 +36,8 @@ pub struct Segment {
   pub payload: Vec<u8>,
   /// Each revision whose delta lies in it, places within `payload`.
   pub texts: Vec<KeptText>,
+  /// Its record: the index rows of those revisions, by identity, and the markers in the last segment.
+  pub record: Vec<u8>,
 }
 
 /// Why a revision could not be written.
@@ -42,6 +47,8 @@ pub enum EmitRefused {
   PastAdmission(crate::PastAdmission),
   /// A chunk the changegroup cannot carry (longer than a chunk's signed 32-bit length).
   Unencodable(changegroup::EncodeRefusal),
+  /// A segment's record could not be written.
+  Record(crate::import::record::WriteRefused),
   /// A delta whose parent the log has not read: a revlog naming a later revision.
   Parent {
     /// The revision.
@@ -94,6 +101,8 @@ pub struct Emitter {
   read: Vec<(Node, [u8; 32])>,
   /// Whether the file log being read has written its group's name.
   named: bool,
+  /// The revisions whose deltas the segment being written holds: each log's, from its first to the one past its last.
+  ranges: Vec<(Logged, u32, u32)>,
   /// The bytes of the segments cut so far.
   cut: u64,
 }
@@ -108,6 +117,7 @@ impl Emitter {
       ready: VecDeque::new(),
       read: Vec::new(),
       named: false,
+      ranges: Vec::new(),
       cut: 0,
     }
   }
@@ -181,10 +191,32 @@ impl Emitter {
       place: start.saturating_add(header)..end,
     });
     self.read.push((read.node, identity));
-    if self.segment.len() >= self.bound {
-      self.cut();
+    let logged = Logged::of(read.log);
+    match self.ranges.last_mut() {
+      Some((last, _, end)) if *last == logged => *end = read.rev.saturating_add(1),
+      _ => {
+        room.charge_items::<(Logged, u32, u32)>(1)?;
+        self
+          .ranges
+          .push((logged, read.rev, read.rev.saturating_add(1)));
+      }
     }
     Ok(())
+  }
+
+  /// Whether the segment being written has reached its bound: the import writes its record and cuts it
+  /// ([`Emitter::cut`]).
+  pub(crate) fn due(&self) -> bool {
+    self.segment.len() >= self.bound
+  }
+
+  /// The revisions whose deltas the segment being written holds, each log's range, in the import's order.
+  pub(crate) fn ranges(&self) -> Vec<(Log<'_>, u32, u32)> {
+    self
+      .ranges
+      .iter()
+      .map(|(logged, first, end)| (logged.log(), *first, *end))
+      .collect()
   }
 
   /// A group ended: the changelog's, the manifest log's (with version 03's empty tree list after it), or a file log's
@@ -205,12 +237,9 @@ impl Emitter {
     }
   }
 
-  /// The file list ended, and with it the stream: the last segment cut.
+  /// The file list ended, and with it the stream: the last segment's record and cut follow ([`Emitter::cut`]).
   pub(crate) fn finished(&mut self) {
     self.end();
-    if !self.segment.is_empty() {
-      self.cut();
-    }
   }
 
   /// The next segment cut, oldest first.
@@ -237,12 +266,45 @@ impl Emitter {
     changegroup::put_end(&mut self.segment);
   }
 
-  /// Cuts the segment being written.
-  fn cut(&mut self) {
+  /// Cuts the segment being written with its `record` (module docs).
+  pub(crate) fn cut(&mut self, record: Vec<u8>) {
     self.cut = self.cut.saturating_add(to_u64(self.segment.len()));
+    self.ranges.clear();
     self.ready.push_back(Segment {
       payload: core::mem::take(&mut self.segment),
       texts: core::mem::take(&mut self.texts),
+      record,
     });
+  }
+}
+
+/// A log a segment's range names, owned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Logged {
+  /// The changelog.
+  Changelog,
+  /// The manifest log.
+  Manifest,
+  /// A file log, by its path.
+  File(Vec<u8>),
+}
+
+impl Logged {
+  /// `log`, owned.
+  fn of(log: Log<'_>) -> Self {
+    match log {
+      Log::Changelog => Logged::Changelog,
+      Log::Manifest => Logged::Manifest,
+      Log::File(path) => Logged::File(path.to_vec()),
+    }
+  }
+
+  /// The log it names.
+  fn log(&self) -> Log<'_> {
+    match self {
+      Logged::Changelog => Log::Changelog,
+      Logged::Manifest => Log::Manifest,
+      Logged::File(path) => Log::File(path),
+    }
   }
 }
