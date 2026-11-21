@@ -257,12 +257,15 @@
 > landing, or names that changed between the homing and the append (another push committed one of its objects) refuse
 > it, `PushFailed::Unlanded` (`GitRefused::Unlanded` at the append), for the client's retry. An append that brings no
 > object names none (version 5, no names, no pack, sequence 0). The test switch `write_version_4[_for_test]` is gone.
-> The one register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody
-> homed, which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing
-> order, and a push whose driver never takes the homing it asks (the tests' synchronous drivers, `git_push::tests::
-> answered`/`pushed`; counted `HOMING_UNTAKEN`). Owed (w-git): piece 2, those drivers made async on stored daemons and an
-> untaken ask refusing; piece 3, made commits onto the deferred-submit hook, and `record_of` removed with them; the
-> replay reading the pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
+> Piece 2 BUILT (2026-11-21): an ask no edge takes by the turn after refuses the push too (counted `HOMING_UNTAKEN`), so
+> a client's push has no version-2 path at all; the tests' synchronous push drivers carry it through a stand-in edge
+> (`git_push::tests::carry_blocking`: the homing handed back under its own BLAKE3 on the one-node test daemon, the
+> changeset landed for real from a thread of its own), their async ones through the edge's own `carry`. The one
+> register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody homed,
+> which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing order, and
+> a store test sealing a push directly (`vcs_store::tests::push_through`, never through a driver). Owed (w-git): piece 3,
+> made commits onto the deferred-submit hook, and `record_of` removed with them; the replay reading the pack a piece at
+> a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
@@ -3499,6 +3502,17 @@
 > `inject_memory_stall` in server roles), so the wedge is judged a wedge on any host; the A-336 tests keep driving a
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
+
+> **Killed test daemons leave their macOS socket-route nodes behind, an unbounded set (2026-11-21; OPEN, w-bugs, after
+> its current three; found by main on the MacBook).** `$TMPDIR` (`/var/folders/.../T`) held 1,637 `slates-<hex>.sock`
+> files, the macOS socket route's nodes (`crates/ipc/src/route.rs`, A-161/A-173), new ones as recent as 01:28. The route
+> removes its node when the daemon stops, and replaces one a dead daemon left under the same instance name; but test
+> daemons take unique per-pid instance names and are often killed (SIGKILL tests, aborts), so their nodes are never
+> reused or removed. That breaks CLAUDE.md §4 (tests leave nothing behind) and §2 item 8 (no unbounded set): each node
+> is 0 bytes, but the set grows with every killed test daemon. Main deleted the 971 older than two days. Shapes: the test
+> harness removes its instance's node at its end, as `AnchorProcess`'s guard reaps the anchor; or the route sweeps the
+> unanswered `slates-*.sock` nodes of dead instances at bind, bounded and owner-only. Red first: a test that SIGKILLs a
+> daemon and asserts its node is gone once the harness ends.
 
 > **On a loaded Linux host, stock hg against the release daemon spun shard 0 past its window five times; four kills,
 > and a restarted daemon's own start spun into a fifth (2026-11-20; OPEN, w-hg; found by w-interop's Linux counts).**

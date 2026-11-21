@@ -2255,7 +2255,10 @@ fn replay_push(
     .flatten()
     .map(|(identity, _)| identity)
   {
-    if content.holders(&identity) == 0 {
+    // The region's own hold (this shard its home, restored with the image) is not the record's: the record's hold is
+    // taken again unless a fetch for this replay put the content, whose hold is the record's (a hold lost at every
+    // restart of a home before, found by `daemon::tests::t_a727_repository_windows_survive_a_warm_restart_in_the_shard_image`).
+    if content.holders(&identity) <= homes::region_holds_here(&identity) {
       content
         .hold(&identity)
         .map_err(|refused| ReplayRefused::Git(GitRefused::Object(PushRefused::Content(refused))))?;

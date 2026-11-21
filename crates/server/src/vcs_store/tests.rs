@@ -2281,20 +2281,29 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
 
 /// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past
 /// one window by this node's root of it, as records did before the rule, is refused, never read as the object. Do:
-/// push a create of `main` whose one file is 1 MiB; take the push's record and name the file by its root in place of
-/// its BLAKE3; replay the record so altered into the repository's store made again empty. Expect: the record as written
+/// seal a create of `main` whose one file is 512 KiB straight into the store (a record nobody homed, version 2, which
+/// names its objects inline: a server-made commit's form until C5 part 2b's piece 3; a client's push names them by its
+/// names' content's BLAKE3 since piece 1); take its record and name the file by its root in place of its BLAKE3; replay
+/// the record so altered into the repository's store made again empty. Expect: the record as written
 /// replays; the altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by
 /// their BLAKE3, which the record does not name), never accepted.
 #[test]
 fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
   crate::test_store::audit_on_stored_shard("vcs", |state| {
-    const LARGE: usize = 1 << 20;
-    let repository = crate::git_push::tests::git_repository(state, "old-form");
-    let (request, _) = crate::git_push::tests::large_create(LARGE);
-    crate::git_push::tests::pushed(state, repository, &request);
+    // Shape: a file past one window of the content store (its `assert_ne!` below holds it so), and within the room a
+    // wiring test's work is built in ([`ROOM`]).
+    const LARGE: usize = 1 << 19;
+    let (repository, green) = repository(state, "old-form", VcsTool::Git);
     let blob: Vec<u8> = (0..LARGE)
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
+    let (objects, head) = commit_of(&[(b"large".to_vec(), blob.clone())], &[], FIRST_DATE);
+    push_through(
+      state,
+      (repository, green),
+      &objects,
+      (None, head, tree_of(&objects)),
+    );
     let identity = ContentId::of(&blob);
     // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
     // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).
