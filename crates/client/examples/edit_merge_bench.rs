@@ -960,7 +960,9 @@ fn main() {
   })
   .expect("the machine profile measures");
   let instance = format!("edit-merge-bench-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, None);
+  // Diagnostic only (g222, never main): G222_SHARDS asks the daemon for that many shards.
+  let shards_asked: Option<u16> = std::env::var("G222_SHARDS").ok().and_then(|v| v.parse().ok());
+  let config = DaemonConfig::derive(&profile, &instance, shards_asked);
   let shards = config.runtime.shards;
   let daemon = Daemon::start(
     &profile,
