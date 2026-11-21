@@ -394,6 +394,12 @@ fn rung(bench: &str, green: &str, clients: &str, nodes: &[Node], kill: Option<(u
     .map(|node| node.instance.as_str())
     .collect();
   let extra = std::env::var("SLATES_LOADTEST_ARGS").unwrap_or_default();
+  // The servers' own merge counters are printed at the end too (A-801): the owner's time is on the primary.
+  let servers: Vec<&str> = nodes
+    .iter()
+    .take(SERVERS.len())
+    .map(|node| node.instance.as_str())
+    .collect();
   let started = Instant::now();
   let mut harness = Command::new(bench)
     .args([
@@ -403,6 +409,8 @@ fn rung(bench: &str, green: &str, clients: &str, nodes: &[Node], kill: Option<(u
       green,
       "--clients",
       clients,
+      "--report-instances",
+      &servers.join(","),
     ])
     .args(extra.split_whitespace())
     .stdout(Stdio::inherit())

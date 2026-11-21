@@ -1714,7 +1714,7 @@ pub(crate) const REPLY_UNDELIVERABLE: &str = "reply.undeliverable";
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
 /// ring and the server task woken; dropped and counted ([`REPLY_UNDELIVERABLE`]) when its client is gone.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
-  let server = with_state(|s| {
+  let server = try_with_state(|s| {
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
     // away on another shard; it ends when this reply is written into the client's ring.
     let ring = s.forwarded_rings.remove(&request);
@@ -1743,11 +1743,73 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       ring,
     });
     s.server_task
-  })
-  .flatten();
+  });
+  let server = match server {
+    Ok(server) => server,
+    // A reply this thread could not hand to its shard (A-800): counted, never silent. Its callers deliver from a task
+    // or a reply's run, outside any borrow, so this names a caller that broke that rule.
+    Err(StateAccess::Borrowed) => {
+      bump_undelivered(|counts| counts.borrowed = counts.borrowed.saturating_add(1));
+      None
+    }
+    Err(_) => None,
+  };
   if let Some(task) = server {
     slates_rt::registry::wake(task.0);
   }
+}
+
+std::thread_local! {
+  /// Replies this shard thread could not hand on (A-800), per thread as [`LOST_STEPS`] is: a `deliver` while the state
+  /// was borrowed, a forwarded reply resent because its run met a borrowed state, and one no shard here could take.
+  static UNDELIVERED: std::cell::Cell<Undelivered> = const { std::cell::Cell::new(Undelivered { borrowed: 0, forward_resent: 0, forward_unservable: 0 }) };
+}
+
+/// See [`UNDELIVERED`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Undelivered {
+  borrowed: u64,
+  forward_resent: u64,
+  forward_unservable: u64,
+}
+
+fn bump_undelivered(change: impl FnOnce(&mut Undelivered)) {
+  UNDELIVERED.with(|cell| {
+    let mut counts = cell.get();
+    change(&mut counts);
+    cell.set(counts);
+  });
+}
+
+/// Format: a reply `deliver` could not hand to its shard, the state borrowed (A-800).
+pub(crate) const REPLY_UNDELIVERED_BORROWED: &str = "state.reply_undelivered_borrowed";
+/// Format: a forwarded reply resent home because its run met a borrowed state (A-800).
+pub(crate) const FORWARD_RESENT_BORROWED: &str = "fleet.forward.client.resent_borrowed";
+/// Format: a forwarded reply no shard here could take: no state on the thread, or a fenced shard (A-800).
+pub(crate) const FORWARD_UNSERVABLE: &str = "fleet.forward.client.unservable";
+
+/// The replies `deliver` could not hand on, the state borrowed, on this thread so far.
+pub(crate) fn undelivered_borrowed() -> u64 {
+  UNDELIVERED.with(std::cell::Cell::get).borrowed
+}
+
+/// The forwarded replies resent because their run met a borrowed state, and those no shard here could take, on this
+/// thread so far.
+pub(crate) fn forward_undelivered() -> (u64, u64) {
+  let counts = UNDELIVERED.with(std::cell::Cell::get);
+  (counts.forward_resent, counts.forward_unservable)
+}
+
+/// Counts a forwarded reply resent home because its run met a borrowed state.
+pub(crate) fn count_forward_resent_borrowed() {
+  bump_undelivered(|counts| counts.forward_resent = counts.forward_resent.saturating_add(1));
+}
+
+/// Counts a forwarded reply no shard here could take.
+pub(crate) fn count_forward_unservable() {
+  bump_undelivered(|counts| {
+    counts.forward_unservable = counts.forward_unservable.saturating_add(1)
+  });
 }
 
 /// A taken-over green awaiting materialization (§4.16 owner-loss recovery; `ShardState::pending_green_materializations`).

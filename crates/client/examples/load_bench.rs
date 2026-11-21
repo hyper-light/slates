@@ -2327,7 +2327,7 @@ fn arg(name: &str) -> Option<String> {
 /// at the end of a run: `lost\t<counter>\t<count>`, all shards summed, a zero printed too. Since A-232 a client waits
 /// for a lost reply while its daemon lives, so a run's latencies alone do not show one (goal 238: about 4,200
 /// `xshard.reply_dropped` a run of the 3,000-client rung on main before the carrier).
-const LOSS_COUNTERS: [&str; 15] = [
+const LOSS_COUNTERS: [&str; 21] = [
   "xshard.reply_dropped",
   "xshard.keep_refused",
   "xshard.unstarted_unanswered",
@@ -2343,6 +2343,13 @@ const LOSS_COUNTERS: [&str; 15] = [
   "merge.work.park_full",
   "merge.work.pending_stuck",
   "merge.work.floor_not_sent",
+  // A-800: where a reply carried home can be lost, each counted apart (a resend is not a loss; an orphan is).
+  "xshard.reply_orphaned",
+  "xshard.reply_resent_borrowed",
+  "state.reply_undelivered_borrowed",
+  "fleet.forward.client.unservable",
+  "fleet.forward.client.resent_borrowed",
+  "fleet.forward.client.delivered_past_retention",
 ];
 
 /// Prints [`LOSS_COUNTERS`], the daemon's waits for room (`room\t<counter>\t<count>`: begun and ended summed over the
@@ -2371,6 +2378,14 @@ fn report_losses(client: &mut Client) {
   for name in [
     "merge.work.composed_on_work",
     "merge.work.composed_by_owner",
+    // A-800: a forwarded reply's hops on the client node, so a lost one is placed by the first count that falls behind.
+    "fleet.forward.client.to_control",
+    "fleet.forward.client.control_started",
+    "fleet.forward.client.resolved",
+    "xshard.reply_home_handed",
+    "xshard.reply_home_ran",
+    "xshard.reply_run_unstarted",
+    "fleet.forward.client.delivered_home",
   ] {
     println!("counter\t{name}\t{}", per_shard(name).sum::<u64>());
   }
@@ -2462,6 +2477,29 @@ fn main() {
     );
   }
   report_losses(&mut setup);
+  // The server nodes' own merge counters (A-801): where a green's owner spends its time is on the primary, which the
+  // client node's report above does not show. `--report-instances` names them (the load_scale test passes its servers).
+  for instance in arg("--report-instances")
+    .unwrap_or_default()
+    .split(',')
+    .filter(|name| !name.is_empty())
+  {
+    match connect(instance).and_then(|mut client| client.daemon_status()) {
+      Ok(report) => {
+        let mut moved = std::collections::BTreeMap::<&str, u64>::new();
+        for refusal in report.shards.iter().flat_map(|shard| shard.refusals.iter()) {
+          if refusal.kind.starts_with("merge.") || refusal.kind.starts_with("xshard.reply") {
+            let total = moved.entry(refusal.kind.as_str()).or_default();
+            *total = total.saturating_add(refusal.count);
+          }
+        }
+        for (name, count) in moved.into_iter().filter(|(_, count)| *count > 0) {
+          println!("server_counter\t{instance}\t{name}\t{count}");
+        }
+      }
+      Err(error) => println!("server_counter\t{instance}\tunreachable\t{error:?}"),
+    }
+  }
   drop(setup);
   if let Some(daemon) = daemon {
     daemon.stop();

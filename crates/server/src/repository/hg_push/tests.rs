@@ -648,6 +648,90 @@ fn a_landed_push_is_replayed_into_the_store_from_its_entry() {
   assert!(held);
 }
 
+/// Shape: each large file's length in [`LARGE`]: two of the store's 64 KiB pieces, so the payload spans many pieces
+/// while any one delta spans few.
+const LARGE_LEN: usize = 1 << 17;
+/// Six large files, each its own byte repeated.
+static LARGE: [[u8; LARGE_LEN]; 6] = [
+  [b'a'; LARGE_LEN],
+  [b'b'; LARGE_LEN],
+  [b'c'; LARGE_LEN],
+  [b'd'; LARGE_LEN],
+  [b'e'; LARGE_LEN],
+  [b'f'; LARGE_LEN],
+];
+
+/// A-767 C1 (the piece-reading intake; R2, a replay holding no payload whole). Do: on a running daemon holding a
+/// changeset store, push six changesets each adding a 128 KiB file (a payload of about 768 KiB, many store pieces);
+/// make the repository's store again from its log (the sliced `vcs_store::rebuild`) and read it once the task ends.
+/// Expect every changeset held again; the replay's window wanted the store's pieces more than once; and it never held
+/// the payload whole, at most one file's delta, a chunk's header and a piece. Red before: the payload was read back
+/// whole (`payload_of`), no want counted.
+#[test]
+fn a_landed_push_replays_from_its_payload_a_piece_at_a_time() {
+  let commits: Vec<Commit> = LARGE
+    .iter()
+    .zip(["one", "two", "three", "four", "five", "six"])
+    .enumerate()
+    .map(|(at, (bytes, name))| (name, name, bytes.as_slice(), at.checked_sub(1), "default"))
+    .collect();
+  let made = history_of(&commits);
+  let part = changegroup(&made, &[0, 1, 2, 3, 4, 5]);
+  let payload = u64::try_from(part.payload.len()).unwrap();
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let repository = crate::daemon::observe_first(&daemon, move |state| {
+    let mut hg = Hg::new(state, "pieces");
+    let unbundle = Unbundle {
+      parts: vec![taken(0, Asks::Changegroup(part))],
+    };
+    let answer = hg.push(state, &unbundle, &View::default());
+    assert!(answer.is_ok(), "{answer:?}");
+    crate::vcs_store::rebuild(state, hg.repository);
+    hg.repository
+  });
+  let began = std::time::Instant::now();
+  let rebuilding = loop {
+    let rebuilding = crate::daemon::observe_first(&daemon, move |state| {
+      state.vcs_stores.rebuilding(repository)
+    });
+    if !rebuilding || began.elapsed() > TASK_WAIT {
+      break rebuilding;
+    }
+  };
+  let (changesets, wants, most) = crate::daemon::observe_first(&daemon, move |state| {
+    let (content, store) = state.vcs_stores.mercurial_ref(repository).unwrap();
+    (
+      store.index.len(content, Log::Changelog),
+      state
+        .refusals
+        .get(crate::vcs_store::HG_REPLAY_WANTS)
+        .copied()
+        .unwrap_or(0),
+      state
+        .refusals
+        .get(crate::vcs_store::HG_REPLAY_WINDOW_MOST)
+        .copied()
+        .unwrap_or(0),
+    )
+  });
+  daemon.stop();
+  println!(
+    "A-767 C1 replay: a {payload}-byte payload read in {wants} fills, the window at most {most} bytes"
+  );
+  assert!(!rebuilding, "still rebuilding after {TASK_WAIT:?}");
+  assert_eq!(changesets, 6);
+  assert!(
+    wants > 1,
+    "the replay wanted the store's pieces {wants} times"
+  );
+  let piece = u64::try_from(slates_store::store::PIECE_BYTES).unwrap();
+  let bound = u64::try_from(LARGE_LEN).unwrap() + piece + 256;
+  assert!(
+    most > 0 && most <= bound && most < payload,
+    "the window held {most} at once, of a {payload}-byte payload"
+  );
+}
+
 fn assert_plain_landed(state: &ShardState, hg: &Hg, made: &[Made]) {
   assert_eq!(
     hex(&made[3].node),

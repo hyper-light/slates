@@ -10,9 +10,10 @@
 > `a_rebased_work_submits_as_it_would_have` passes. Same on origin/main 8cb10f986 (not caused by 6459374). The job's
 > turns do not count as the shard's steps, or a turn runs past its slice at debug speed.
 
-> **Open (w-fed-faults, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` fail on macOS arm64**
+> **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
-> larger than one ring region), on origin/main 8cb10f986 alike. Not looked into.
+> larger than one ring region) since 8cb10f986: they made a Mercurial repository on a daemon without a changeset store,
+> which C1 refuses. They start stored daemons (`stored_daemon_named`) and create through `crate::test_store::create`.
 
 > **Open (w-fed-faults, 2026-11-21): A-796's wire variants are appended but not published.** `CheckMerge`,
 > `ReadMergeCheck`, `ResolveMerge`, `MergeChecked`, `StaleMergeView` and the `MergeView` enum: `cargo test -p
@@ -194,10 +195,25 @@
 > test's synchronous shard history `audit_on_stored_shard`, `land_blocking` and `create` (a creation landed, then
 > recorded, in place: `repository::create_blocking` over `creation_changeset` and `recorded_after_landing`, the halves
 > `land_then_record` runs). `crates/cli/tests/hg_interop.rs`'s anchors each hold a scratch store.
+> **The piece-reading replay (A-767 C1; R2's replay half). CLOSED.** A changeset's payload is read back a piece at a
+> time as its replay wants it, never whole. `slates_hg::framing` is the one walk of a changegroup's chunks over a
+> `Source`, which answers a range or `Wanted`; a whole changegroup's decoding and the live push frame a slice, which
+> never wants. The intake reads its deltas through it (`Stepped::Wanted`), and `record::Replay::begin_sectioned` /
+> `step_sectioned` frame and take a changeset from its payload. The server's replay (`vcs_store::hg_piece_step`,
+> recovery's `replay_hg_referenced`, the rebuild's `replay_sliced`) fills a forward `Window` from `StoreHandle::piece`
+> on each want (`fill_window`); `payload_of` is gone. Red first:
+> `repository::hg_push::tests::a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload read
+> in 14 fills, the window at most 193,859 bytes (one 128 KiB delta, a 64 KiB piece and a header). Counters
+> `vcs_store.hg_replay_wants` and `vcs_store.hg_replay_window_most`.
 > Owed:
-> - the payload is read back whole at replay, as the live push holds it; a piece-reading intake goes with the derived
->   reads;
-> - an import as changesets (R2's 5.73 GB peak, w-perf);
+> - an import as changesets (R2's 5.73 GB peak, w-perf; design asked of main, inbox/main-from-w-hg-c1-import-design.md).
+>   BUILT, its first part: `slates_hg::import::emit` writes an import's history as the changegroup (03) a push of it
+>   would bring, each revision's chunk its revlog's own delta against its delta parent (`Outline::delta_parent`, 7.2's
+>   `deltaparent`), cut into segments of at least a bound only between chunks, each naming its texts as a push's
+>   `Texts` section does (`Import::emitting`, `take_segment`). Held by
+>   `import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`: for each of the five stores 7.2
+>   wrote, the segments concatenated and taken through the push's intake give the import's index row for row. Owed:
+>   the server landing each segment as a changeset and the import's entry naming the run, and the replay of a run;
 > - a clone's file revisions served from the Texts rows.
 > **A-767 (2026-11-20, w-store; Ada's storage and changeset rulings).** DESIGNED: one unit, the changeset; RAM holds
 > the change in flight and a learned cache; history an append-only changeset log on each holder's disk under the
@@ -232,10 +248,30 @@
 > before its replay (its row; its `Names` checked against the record's identity; its `Payload` found under the record's
 > pack identity), puts what the content store lacks, and notes the sequence, so the next landing takes the last one
 > named + 1 and a changeset landed past the register's head is overwritten (main's ruling). The one shared test store:
-> `crate::test_store`. Owed (w-git, C5 part 2): a daemon without `--vcs-store` refusing git's creation, typed; versions
-> 2 and 5's sequence 0 removed (no register-held history); git's tests onto the shared store; the replay reading the
-> pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its
-> own buffer and the content store's windows).
+> `crate::test_store`. C5 part 2a BUILT (2026-11-21, w-git): a daemon without `--vcs-store` refuses git's creation,
+> `Unsupported` naming `--vcs-store` (one rule for the three tools; `repository::tests::a_daemon_without_a_store_refuses_
+> mercurial_and_subversion_naming_the_flag` holds all three), and git's tests run on store-backed daemons through the
+> one helper (`test_store::audit_on_stored_shard[_configured]`, `audit_daemon_stored`, `audit_daemon_of_stored`,
+> `create`; the HTTP edge's every daemon a `StoredDaemon`). C5 part 2b piece 1 BUILT (2026-11-21, w-git, main's ruling of
+> 00:50): a client's push writes version 5 only. A homing that falls short, a pack not held, no store, a refused
+> landing, or names that changed between the homing and the append (another push committed one of its objects) refuse
+> it, `PushFailed::Unlanded` (`GitRefused::Unlanded` at the append), for the client's retry. An append that brings no
+> object names none (version 5, no names, no pack, sequence 0). The test switch `write_version_4[_for_test]` is gone.
+> The one register-held path left, version 2 (`vcs_store::SealedPush::record`'s last arm, `record_of`): a record nobody
+> homed, which is a server-made commit (A-664, `vcs_store::commits`) until it takes w-svn's deferred-submit landing
+> order, and a push whose driver never takes the homing it asks (the tests' synchronous drivers, `git_push::tests::
+> answered`/`pushed`; counted `HOMING_UNTAKEN`). Owed (w-git): piece 2, those drivers made async on stored daemons and an
+> untaken ask refusing; piece 3, made commits onto the deferred-submit hook, and `record_of` removed with them; the
+> replay reading the pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
+> buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
+> region homes, held by a test of its own (the rebuild test now reads the node's store).
+> R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
+> keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
+> appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
+> diagnostic's reply gaps 6.7-7.0 s). Now the keepalive is written once due, the silence measured from the last write;
+> the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
+> held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
+> Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
@@ -365,6 +401,18 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-801 (2026-11-21, w-fed-move; goal 86b's throughput).** BUILT: owner asks counted and answers timed by kind; the
+> load harness prints the server nodes' merge counters. At 1,000 clients in-process: 17.5 asks a client (lengths 44%,
+> files 18%, verdicts 14%, rebases 13%), the owner's answering 185 ms in all: not the wall at that scale. Open: the
+> 100k wall's mechanism, to be named by main's rerun (r48) from the primary's `server_counter` rows.
+>
+> **A-800 (2026-11-21, w-fed-move; goal 86b's lost replies).** BUILT: every place a reply carried home can be lost is
+> counted apart, and the silent ones now resend: a reply task dropped while its shard's state is borrowed, a forwarded
+> reply whose run meets a borrowed state (and one a retention refusal dropped after it was taken, now delivered), a
+> `deliver` that cannot borrow; handed and run are counted at each end of the hop. Open: which site lost the 3,383 at
+> 100k is for main's rerun to name (the counters print from the client node). Leading candidate, fixed since by A-798
+> (`931e52ed`): a lost kick left a reply's control message unseen on a parked shard; handed equal to run confirms it.
 >
 > **A-797 (2026-11-21, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: the green's
 > owner answers a batch of work asks within its step budget and hands the rest back (one batch had held its shard 1,055
@@ -2536,6 +2584,32 @@
 > the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
 > `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
+> **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
+> ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
+> revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
+> svnsync and client commits land a revision at a time either way and are not affected. Two shapes take it back, each
+> outside the Subversion path and not built on svn's reading: (a) the import as one changeset, the records and the
+> green advancing in RAM ahead of the register, one transaction at its end, a refusal rolling both back (the green's
+> side is the merge engine's, w-engine); (b) a cheaper barrier than F_FULLFSYNC where the store's durability allows it
+> (w-store's call; A-130 has the history).
+> **P7's memory findings (2026-11-21, w-svn; BENCHMARKS "Where a Subversion import's memory is" and "A Subversion
+> import on the real daemon"; main's order: after C2 stage B part 2, completion then robustness then performance).**
+> Owed, each measured on git-2000's import (437 MiB dump, 2,000 revisions): (1) the green charges 440 MB of retention
+> for a history the records keep in 35 MB (12x): its kept versions serve copies from older revisions (folding them was
+> measured and rejected, `CopyRefused VersionFolded`), so a copy's source must be read from the records first;
+> (2) 593 MB of live small allocations with no owner attributed; (3) ~1 GB of whole-text transients during the import
+> (a revision's whole texts, its record's encoding and the reader's buffer held at once) and 1.5 GB of freed large
+> blocks the test binary's allocator keeps (the daemon's own allocator gives them back; the real daemon peaks at
+> 1,570 MiB, half of it the segment, where the green's chain entries carry each revision's file bytes). C2 stage C holds
+> each whole text once and measures it.
+> **svnsync from slates over the HTTP edge (2026-11-21, w-svn; found by P7's `an_svnsync_measured` on the big Studio):**
+> stock `svnsync init` refused E200007 "The method 'PROPFIND' is not served here": HTTPv2's revision resource
+> (`!svn/rev/REV`, where ra_serf reads revision properties) was not served. Fixed: it is answered as the revision's
+> baseline is, under its own href (`a_revision_resource_answers_its_revisions_properties_as_its_baseline_does`). Owed,
+> not built (Ada's close order: findings recorded only): the DAV site serves no `replay-report` (at the session URL or
+> at `!svn/rev/REV`, which the site advertises with `replay-rev-resource`), so `svnsync synchronize` from slates over
+> HTTP cannot run; and DeltaV v1's revision properties (a PROPFIND of the VCC with a `Label`) answer the youngest's.
+> svnsync over svn:// mirrors git-2000 in 270.7 s (135 ms a revision; w-interop's 1,068 s before).
 > **R4, recovery replays a revision record a turn at a time (2026-11-20, w-svn; Ada's close list; found by w-git's sweep):**
 > a Subversion revision's record was replayed whole in one recovery or rebuild turn (`replay_svn` -> `commit_record`),
 > every text it brought deltified in one step, so one large revision held its shard. Now `RevisionReplay`
@@ -9781,7 +9855,7 @@ them rather than renumbering or weakening the original gates.
 - D-O14 (opened 2026-09-04) FUSE passthrough for untouched base files — CLOSED 2026-09-04: not used; slates never requires `CAP_SYS_ADMIN` or root beyond the OS-provided brokers installed once (`fusermount3`/user namespaces, the FSKit extension, the WinFsp driver); the daemon copy path is the only base read path.
 - D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window until 2026-09-29; since A-43 the old entry moves aside and the new one in by renames that replace nothing, the name's absent window reported) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
 - D-O16 (opened 2026-09-04) Landing filters — DECIDED 2026-09-04: the confirmation surface offers suggestions the human toggles (ignore-file-aware); the agent's filter stays explicit; a toggle produces a new manifest hash (§4.15 step 2). Phase 5 builds it.
-- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict. The refinement runs off the verb, a slice a turn (A-787 parts 1 and 2, close item R3): longest turn 69-79 µs at 2 MiB and 133-157 µs at 8 MiB, against the whole refinement in the submit's step before. Found 2026-11-20, recorded, not worked (close order): (a) that tail follows the largest single buffer the job frees; deferring frees to an idle moment waits on A-783's primitive; (b) `pace::sort_by` (A-752) grows its runs by doubling, so one push copies every item before it in one step, and `OpsDoc::canonicalize_paced` sorts by it (the refinement no longer calls either); (c) an edit-and-submit of a work off its green's shard composes unrefined; (d) an edit-and-submit retried while parked behind a refinement or a whole build runs its edit again; (e) the rest of a submit (the seal's clone of the work's files, the composition, the post-state, the identity) is still one step that grows with the files. (f) Main's lint round 10 (35e4fd7de) reshaped refine.rs, and the result is 1.1-1.3 times slower a save than A-787 before it. Measured on adas-mac-studio-4 (M4 Max, release, load 3-4, interleaved): 12 MiB 234-236 ms against 181-184 ms, 1 MiB 19.6-20.0 against 15.7-16.0 ms. The likely cause is the byte-class table replaced by comparisons. Fixed 2026-11-20 by 9f77462e4 (the table back, a literal `[Class; 256]` read through `.get`): on adas-mac-studio-2 (release, interleaved, six passes) the whole refinement is back at the pre-round-10 cost (12 MiB 184-191 ms against 187-190 ms; 1 MiB 15.7-16.0 against 16.0-16.3), and the sliced one keeps about 1.05 times it (12 MiB 199-204 against 187-194 ms), not chased. A work off its green's shard refines too: it fetches the base bytes of the paths it replaced whole (C1, `whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits`). A file renamed over another is refined against the rename's source (C2). Found 2026-11-20, not worked (close order): the backup-then-recreate save (rename `f` to `f~`, create `f`, write it: vim's and Emacs's default with a backup) is refused by the deriver, `DeriveError::Unsupported("f")`, before any refinement, so such a save cannot be submitted at all (w-rewrite-ops, by a composition probe; GAPS §8f's rename onto a consumed base path).
+- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict. The refinement runs off the verb, a slice a turn (A-787 parts 1 and 2, close item R3): longest turn 69-79 µs at 2 MiB and 133-157 µs at 8 MiB, against the whole refinement in the submit's step before. Found 2026-11-20, recorded, not worked (close order): (a) that tail follows the largest single buffer the job frees; deferring frees to an idle moment waits on A-783's primitive; (b) `pace::sort_by` (A-752) grows its runs by doubling, so one push copies every item before it in one step, and `OpsDoc::canonicalize_paced` sorts by it (the refinement no longer calls either); (c) an edit-and-submit of a work off its green's shard composes unrefined; (d) an edit-and-submit retried while parked behind a refinement or a whole build runs its edit again; (e) the rest of a submit (the seal's clone of the work's files, the composition, the post-state, the identity) is still one step that grows with the files. (f) Main's lint round 10 (35e4fd7de) reshaped refine.rs, and the result is 1.1-1.3 times slower a save than A-787 before it. Measured on adas-mac-studio-4 (M4 Max, release, load 3-4, interleaved): 12 MiB 234-236 ms against 181-184 ms, 1 MiB 19.6-20.0 against 15.7-16.0 ms. The likely cause is the byte-class table replaced by comparisons. Fixed 2026-11-20 by 9f77462e4 (the table back, a literal `[Class; 256]` read through `.get`): on adas-mac-studio-2 (release, interleaved, six passes) the whole refinement is back at the pre-round-10 cost (12 MiB 184-191 ms against 187-190 ms; 1 MiB 15.7-16.0 against 16.0-16.3), and the sliced one keeps about 1.05 times it (12 MiB 199-204 against 187-194 ms), not chased. A work off its green's shard refines too: it fetches the base bytes of the paths it replaced whole (C1, `whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits`). A file renamed over another is refined against the rename's source (C2). Found 2026-11-20, not worked (close order): the backup-then-recreate save (rename `f` to `f~`, create `f`, write it: vim's and Emacs's default with a backup) is refused by the deriver, `DeriveError::Unsupported("f")`, before any refinement, so such a save cannot be submitted at all (w-rewrite-ops, by a composition probe; GAPS §8f's rename onto a consumed base path). 2026-11-21: the re-anchor of a refined path's history was O(pieces x runs), which tripped the watchdog in a debug build on a 2 MiB rewrite (92,354 ops); now O((n + k) log k), 80,000 ops in 90 ms where it took 22.5 s (A-787 part 2 fix).
 - D-O18 (opened 2026-09-04) Merge proposer authority: slates departs from hecate's leader-fused proposer (one shared pointer group; partitioned execution) and uses a consensus-issued lease with an epoch check at commit; CLOSED 2026-09-04 by A-6: the owner is the distinguished proposer of its own registers under its host epoch, so no leader-versus-leaseholder split can exist; a resumed stale owner is refused at the first holder (model-checked as StaleNeverCommits and Continuity).
 
 ## 3. Undesigned (charter only)
@@ -24072,7 +24146,7 @@ experiment/*, codex/*), none on origin: 1,387 commits not on main (cc29bfc4c), 6
 (VFS, DAX, FUSE, catalog, reclaim, runtime) are outside this goal and untouched. None duplicates A-255, A-257 or A-263-A-267
 in what lands. Branch tips as of 2026-11-10:
 
-- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** Not ported: the Codex `rebase_with` refinement (a kept operation conflicting only on a path the replacement re-establishes answers the windows instead), which the agent meets by retiring those operations too. Its CLI and MCP surface landed with it: `slates check`/`slates resolve` and `slates.merge.check`/`read_check`/`resolve`, one JSON shape (`crates/mcp/tests/mcp.rs`).
+- **LANDED as A-796 (2026-11-20): `CheckMerge`, `ReadMergeCheck`, `ResolveMerge` over main's rebase, A-267's kept verdict reused; `tests/merge_check.rs`.** The Codex `rebase_with` rule landed too (`Green::rebase_establishing`, AC-6.13), and conflict-mutants' restart finding (a work's revision seeded from its log position; `merge_check.rs`). Its CLI and MCP surface landed with it: `slates check`/`slates resolve` and `slates.merge.check`/`read_check`/`resolve`, one JSON shape (`crates/mcp/tests/mcp.rs`).
   `work/slates-atomic-conflicts` 6420b7ee7, `work/slates-conflict-cli` 0d5ab5141, `work/slates-conflict-mutants` 65472f43a.
 - **superseded: A-257 (a green's chain records its verdict; recovery applies it), A-782 (one typed outcome).** Evidence: `green_checkpoint.rs` (0782fdb0c), `recovery.rs`.
   `work/slates-owned-merge-verdict` fd456c059, `work/slates-runtime-step-verdict` f5f26fe41, `work/slates-server-root-publication` 246b88842, `work/slates-verdict-counter-mutant` 246b88842, `work/slates-verdict-force-inline` f065ee4ad, `work/slates-verdict-inline-commit` 2bf699369, `work/slates-verdict-ordinary-path` 2bf699369.
