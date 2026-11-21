@@ -173,3 +173,14 @@
   4 GiB; reported to w-store). Lands on main when it passes.
 - ~21:20 LANDED 242f4a173: C1's push onto the changeset store (by-use test with stock hg 7.2 passes; suites green).
   NEXT: the import onto the store (rest of C1; R2's peak).
+- ~21:45 main's ruling (inbox/w-svn-from-main-c2-rulings.md, decision 1) applies to C1: no repository without
+  --vcs-store (a typed refusal naming it), no register-held history path for hg, and tests on store-backed daemons
+  through ONE shared helper (repository::store_tests' directory, made shared with a removal guard). Not small for hg:
+  every hg server test runs on a store-less shard through the sync push path (unbundle_in). Plan: the very next
+  commit after C1 lands. Recovery rule already matches decision 2 (next sequence = named + 1; unnamed changesets
+  dropped).
+- C1 remaining order:
+  1. file texts read through the store (T rows) instead of the content store;
+  2. the intake keeps no whole text with a store;
+  3. the import as changesets (R2).
+  Then the no-store path dropped.
