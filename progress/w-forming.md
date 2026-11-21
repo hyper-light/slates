@@ -1,3 +1,9 @@
+# STATUS 2026-11-20 evening (w-forming), main's 15:20 list: (1) flake LANDED c922a41d1 (poll_for_live_periods; the
+# test is A-351's, not mine); (2) greens LANDED 95adf9632; (3a) delta capture in turns LANDED c9e00c01b; (3b) image
+# slicing needs a CoW reader-epoch amendment -- asked main; (4) release A/B running on kiln (run r1, linux/amd64,
+# .git/w-forming-ab/ab.sh: before 51a061d36, after 9a0b9e877, N=5 interleaved). Finding sent: fleet
+# a_live_whole_entry_is_sealed_in_turns... fails on main at Studio-4 load (2/2). Deleted probe target + old land target.
+
 # STATUS 2026-11-20 end (w-forming): main's three items DONE. A-768 586cf5035 (sliced capture, pins), A-771 cb1b698f0
 # (rebuild payload + archive hashing in steps), A-775 035df1690 via 419557ac6 (base b831a2877): a taken-over volume
 # given up while its cohort members were away is judged afresh once one is heard at a later incarnation (anchor:
