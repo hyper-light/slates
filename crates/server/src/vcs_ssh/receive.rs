@@ -193,7 +193,7 @@ impl<S: ShardLender> Command for ReceiveCommand<S> {
           next: Next::More,
         });
       }
-      let turn = crate::vcs_share::turns::take(self.repository).await;
+      let turn = crate::vcs_share::turns::take(self.repository, self.principal.clone()).await;
       let (next, kept) = answer_step(
         &mut self.lender,
         push,

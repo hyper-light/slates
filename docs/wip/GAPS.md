@@ -252,7 +252,9 @@
 > The daemon's end at ten large pushes fixed: a pack's waiting deltas resolve a delta a unit in the answer's turns
 > (`unpack::Reader::resolve_turn`); per-repository push counters by phase in `slates status`. Owed: the small
 > repositories' wait was per-push turns (fixed: `vcs_share::turns`, a repository's pushes one turn a round); owed:
-> its by-use proof at cap 3 and 10, and weights learned from usage in place of one turn a repository.
+> its by-use proof at cap 3 (run 31: shard-mates explain 4.5 s of the busiest repository's 41.3 s, not its gap) and
+> weights learned from use in place of one turn a repository (done: a turn an agent, spare turns taken; run 32 A/B in
+> BENCHMARKS.md). Owed: cap 10 at real room (needs about 13.4 GiB free; the Studio had 8.7).
 > Acknowledged pushes lost at a takeover: fixed (push records ride the names log; a push answered once held at
 > f + 1; `crates/cli/tests/v3_takeover.rs`). Record version 3 on (names homed at f + 1, read from the region on a
 > takeover).

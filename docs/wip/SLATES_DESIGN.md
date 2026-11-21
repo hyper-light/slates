@@ -55329,6 +55329,18 @@ Applied in the same change to:
   `vcs_share::turns::tests::a_repositorys_pushes_share_one_turn_a_round_of_the_shard` (three pushes of one repository
   took 3 turns between the small one's, now at most 1). Tests: slates-server `vcs_share:: git_push:: vcs_http::git
   vcs_ssh::` 106 of 106. The cap-3 and cap-10 by-use proof follows in BENCHMARKS.md.
+- **A repository's turns weighed by use, and spare turns (piece 3c, 2026-11-20; main's order: weights learned from use,
+  never one turn a repository as a constant; run 31 first).** Run 31 (cap 3, the Studio, 9865bb832) asked whether busy
+  repositories sharing shards explain the remaining gap. They do not: the busiest repository (r1, three class-2 pushes)
+  spanned 41.30 s on shard 4, its shard-mates took 4.5 s of it (r8 2.91 s, r12 0.67 s, three one-push repositories about
+  0.3 s each), and shard 4 ran steps for 23.19 s of the 41.30 s. Its three pushes of one agent shared one turn, so the
+  shard ran one of r1's steps a round with nobody else waiting. `crate::vcs_share::turns` now weighs each repository by
+  what is under way: it holds as many turns at once as it has distinct principals among its pushes holding or waiting on
+  the shard (one agent's pushes one flow, three agents' three), the next turn going to a push whose principal holds
+  none; and a turn no other repository on the shard holds or waits for is spare, taken whatever the weight. Red first
+  (both failed under the old rule): `a_repositorys_pushes_by_several_agents_take_a_turn_an_agent_each_round`,
+  `a_repository_alone_on_its_shard_takes_a_turn_for_each_push`; the one-agent rule still holds
+  (`a_repositorys_pushes_share_one_turn_a_round_of_the_shard`). The A/B is in BENCHMARKS.md.
 - **Acknowledged pushes lost at a takeover, found and fixed (2026-11-20; main's order: top item, A-636's author gone).**
   `crates/cli/tests/v3_takeover.rs` (three `slates anchor --fleet` processes at f = 1, stock git over their HTTPS edges,
   the owner SIGKILLed with a push in flight) was red on version-2 records: the successor adopted and rebuilt the

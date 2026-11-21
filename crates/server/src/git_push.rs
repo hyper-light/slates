@@ -358,6 +358,11 @@ impl<P> ReceivePack<P> {
     self.repository
   }
 
+  /// Who pushes: the principal whose turns its steps take (`crate::vcs_share::turns`).
+  pub(crate) fn principal(&self) -> &Principal {
+    &self.principal
+  }
+
   /// Whether the client asked its answer multiplexed (`side-band-64k`), once its request is read.
   pub(crate) fn side_band(&self) -> bool {
     self.session.side_band()
