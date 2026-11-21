@@ -360,3 +360,113 @@ fn a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_it
   assert_eq!(rows.len(), 1, "the repository's creation, once");
   assert_eq!(rows[0].sequence, 0);
 }
+
+/// A-767 item 7 across a restart (main's order of 2026-11-20). Do: create a repository with the daemon killed between
+/// its creation's landing and its record; stop the daemon and the store's owner; start both again over the same anchor
+/// segment and store; create another repository. Expect: the new repository is recorded, and the store's rows give it
+/// exactly its own creation (sequence 0, its own name), never the killed one's orphaned changeset 0, whose id a
+/// restarted node mints again from the register's counter (asserted: the log holds two changesets 0 of that id). Green
+/// with no change: a `(repository, sequence)` row is the newest landing at it, and the register can only ever name the
+/// newest, since a record follows its landing and the counter passes the id once it is recorded.
+#[test]
+fn a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset() {
+  use slates_anchor::AnchorSegment;
+  let dir = store_directory("orphan");
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-orphan-{}", std::process::id());
+  let config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  let segment = AnchorSegment::create(&instance, &profile.facts.identity, config.geometry)
+    .unwrap()
+    .with_content(
+      &crate::daemon::content_name_of(&instance),
+      config.content_bytes(),
+    )
+    .unwrap();
+  let rendezvous = slates_ipc::HeldRendezvous::hold(&instance).unwrap();
+  let start = |owner: &StoreOwner| {
+    let (handoff, len) = segment.handoff().unwrap();
+    let mut config = config.clone();
+    config.vcs_disk = Some(owner.handle());
+    Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Handoff {
+        handoff,
+        len,
+        content: segment.content_handoff().unwrap(),
+        rendezvous: rendezvous.adoption(),
+      },
+    )
+    .unwrap()
+  };
+  let killed = "killed-first";
+  let partition = usize::from(crate::verbs::owner_of_name(killed, usize::from(SHARDS)));
+  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let daemon = start(&store_owner);
+  daemon.bootstrap(true).unwrap();
+  let first = crate::daemon::observe_at(&daemon, partition, move |state| {
+    super::KILL_BETWEEN_LANDING_AND_RECORD.with(|kill| kill.set(true));
+    routed_create(state, 1, (killed, VcsTool::Git, ObjectFormat::Sha1, "main"))
+  });
+  assert!(!matches!(first, ReplyBody::Refused { .. }), "{first:?}");
+  wait_for(&daemon, partition, super::CREATION_KILLED, 1);
+  daemon.stop();
+  store_owner.stop().unwrap();
+
+  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let daemon = start(&store_owner);
+  // The same partition, so the new id is minted from the same counter the killed creation's was.
+  let second = crate::daemon::observe_at(&daemon, partition, move |state| {
+    super::KILL_BETWEEN_LANDING_AND_RECORD.with(|kill| kill.set(false));
+    routed_create(
+      state,
+      2,
+      (killed, VcsTool::Git, ObjectFormat::Sha1, "trunk"),
+    )
+  });
+  assert!(!matches!(second, ReplyBody::Refused { .. }), "{second:?}");
+  wait_for(&daemon, partition, super::CREATION_LANDED, 1);
+  let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(killed)
+      .map(|record| record.id)
+  })
+  .expect("the second creation recorded");
+  daemon.stop();
+  store_owner.stop().unwrap();
+
+  // Non-vacuity: the restarted node minted the killed creation's id again, so the log holds two changesets 0 of it.
+  let log_file = hyper_block::file::DeviceFile::adopt(
+    root(&dir).open_file(LOG_FILE).unwrap(),
+    &dir.join(LOG_FILE),
+    hyper_block::file::CachingRequest::Buffered,
+    hyper_block::buf::Alignment::BYTE,
+  )
+  .unwrap();
+  let mut at_zero = 0;
+  let log = ChangesetLog::recover(log_file, 0, |_, located| {
+    if located.header.repository == u128::from_be_bytes(created.bytes)
+      && located.header.sequence == 0
+    {
+      at_zero += 1;
+    }
+  })
+  .unwrap();
+  drop(log);
+  assert_eq!(at_zero, 2, "the orphan and the new creation share the id");
+  let mut store = Store::open(root(&dir), sizing()).unwrap();
+  let rows = store
+    .changesets(u128::from_be_bytes(created.bytes), 0, 10)
+    .unwrap();
+  assert_eq!(rows.len(), 1, "one creation for the repository: {rows:?}");
+  let sections = store.sections(&rows[0]).unwrap();
+  let record = store.read(sections[0].offset, sections[0].len).unwrap();
+  let record = String::from_utf8(record).unwrap();
+  assert!(
+    record.contains("\ntrunk\n"),
+    "the repository's own creation, not the orphan's: {record}"
+  );
+}

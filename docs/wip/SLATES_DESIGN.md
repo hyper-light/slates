@@ -57985,7 +57985,12 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > whose creation never recorded is a gap), changeset 0 landed, then in one transaction the repository, its root and
 > its completion recorded, then the answer (deferred, AUD-11). A kill between the two leaves a changeset no repository
 > names, which recovery passes over, and the client's retry creates the repository afresh. Without a store the record
-> is made at once, as before; with one, a request with no reply route is refused `Unsupported` (the fleet half, owed).
+> is made at once, as before. Every creation has a reply route: repository verbs are served on the node the client
+> reached (A-575; never forwarded to another node), so a fleet answers one as a laptop does (R8). After a restart the
+> successor mints a killed creation's id again (the register's counter never passed it); the store's `(repository,
+> sequence)` row is the newest landing at it, which is the only one the register can ever name (a record follows its
+> landing, and the counter passes the id once recorded), so the new repository never meets the orphan
+> (`a_creation_after_a_restart_never_meets_a_killed_creations_orphaned_changeset`, which also asserts the log holds both).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
