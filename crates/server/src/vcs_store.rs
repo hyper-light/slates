@@ -1570,32 +1570,6 @@ impl SealedPush {
   }
 
   /// Gives back what a stage under way ([`SealedPush::restage_turn`]) holds: a push dropped mid-decision.
-  /// Has the push give back its pack's holds in turns once its objects land ([`SealedPush::give_back_turn`]), not in
-  /// the landing's step (A-722's landing step: 5.2 ms of git/git v1.5.0's). Its owner turns them before it abandons it.
-  pub(crate) fn give_back_in_turns(&mut self) {
-    self.push.give_back_in_turns();
-  }
-
-  /// One turn of giving back the holds the push set aside at its landing, for `ns` of the shard's clock and a unit at
-  /// least: whether none is left. A refusal is counted and ends the turns; the push's abandon gives back the rest.
-  pub(crate) fn give_back_turn(&mut self, state: &mut ShardState, ns: u64) -> bool {
-    let given = {
-      let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
-      let mut clock = crate::git_push::ShardClock;
-      let quantum = slates_git::store::hook_view::Quantum {
-        clock: &mut clock,
-        ns,
-      };
-      lent.stores.content.as_mut().map_or(Ok(true), |content| {
-        self.push.give_back_turn(content, quantum)
-      })
-    };
-    given.unwrap_or_else(|_| {
-      state.count(RELEASE_REFUSED, 1);
-      true
-    })
-  }
-
   pub(crate) fn abandon_staging(state: &mut ShardState, staging: slates_git::store::Staging) {
     let given = {
       let lent = Lent::new(&mut state.store, &mut state.vcs_stores);
@@ -1712,25 +1686,36 @@ impl GitPush {
     })
   }
 
-  /// Admits `objects`, in the order the push brought them, with the room their bytes take lent for the step. Refused at
-  /// the first object refused; the push keeps what it admitted before, for its caller to abandon.
+  /// Admits `objects`, handed whole (the server's own commits), in the order the push brought them: written first as a
+  /// pack of whole objects (`slates_git::pack::of_whole_placed`, as git's `pack-objects` writes an object it finds no
+  /// delta for), which the push holds as its own, each admitted where its entry lies there as a client's is (A-722's
+  /// record v4: every push's objects are a pack's, so its record is that pack and a replay makes the store the live
+  /// one made). Refused at the first object refused; the push keeps what it admitted before, for its caller to
+  /// abandon.
   pub(crate) fn admit_all(
     &mut self,
     state: &mut ShardState,
     objects: &[Incoming<'_>],
   ) -> Result<(), GitRefused> {
-    let bytes = objects
-      .iter()
-      .map(|incoming| u64::try_from(incoming.content.len()).unwrap_or(u64::MAX))
-      .fold(0, u64::saturating_add);
-    within_budget(state, bytes, |stores| {
+    let format = self.push.format();
+    let (pack, offsets) = slates_git::pack::of_whole_placed(
+      format,
+      objects
+        .iter()
+        .map(|incoming| (incoming.kind, incoming.content)),
+    )
+    .map_err(|_| GitRefused::Allocation)?;
+    let sent = u64::try_from(self.push.pack().len().saturating_add(pack.len())).unwrap_or(u64::MAX);
+    let base = u64::try_from(self.push.pack().len()).unwrap_or(u64::MAX);
+    self.keep_pack_to(sent, &pack);
+    within_budget(state, 0, |stores| {
       let (content, store) = stores.git(self.repository).ok_or(GitRefused::NoStore)?;
-      for incoming in objects {
+      for (incoming, offset) in objects.iter().zip(offsets) {
         admit_object(
           content,
           store,
           (&mut self.push, &mut self.record),
-          (*incoming, None),
+          (*incoming, Some(base.saturating_add(offset))),
         )?;
       }
       Ok(())
@@ -2277,6 +2262,9 @@ fn replay_pack(
       .finish_with(&bases, &mut admission)
       .map_err(ReplayRefused::Pack)?
   };
+  // Each object is held where it lies in the record's pack, as the live push held it (A-722's record v4: rows by pack
+  // place), so the store made again from the log is the live one.
+  push.extend_pack(record.pack);
   for object in &unpacked.objects {
     let incoming = Incoming {
       kind: object.kind,
@@ -2284,8 +2272,13 @@ fn replay_pack(
       content: &object.content,
       depth: object.chain.as_ref().map_or(0, |chain| chain.depth),
     };
-    admit_object(content, store, (&mut *push, &mut *remade), (incoming, None))
-      .map_err(ReplayRefused::Git)?;
+    admit_object(
+      content,
+      store,
+      (&mut *push, &mut *remade),
+      (incoming, Some(object.offset)),
+    )
+    .map_err(ReplayRefused::Git)?;
   }
   Ok(())
 }

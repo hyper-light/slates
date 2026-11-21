@@ -55983,6 +55983,41 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722's record v4, part B — rows by pack place: a landed object is where it lies in its push's pack (2026-11-20, w-git for UI goal 93; main's pack-homing ruling: content once, the store's bytes a push must not grow)
+- **Why.** A push's staging put every object new to the repository in the content store inflated (git/git's v1.5.0:
+  309 MiB for a 9.4 MiB pack), its row naming that copy. Main's ruling for record v4: the landed objects are places
+  in the one pack the push brought, not second copies.
+- **Change.**
+  - Staging's first step after the generations puts the push's pack in the content store as one content, a window a
+    unit (`Step::Packing`; `Push::set_stored_pack`).
+  - Each object's row names that pack and carries where its entry begins (`ObjectRow::offset`, the kind byte marked
+    `rows::IN_PACK`); the row holds the pack.
+  - The repository keeps each pack's length (`Repository`'s `packs`) and reads an indexed object through one read
+    (`Repository::read_stored`/`row_bytes`/`stored_of`): whole, or where it lies through `packed::read` (B1), its
+    chain from the objects read lately (held to the largest pack), a REF_DELTA's base followed through the index into
+    its own pack (`IndexBases`). A read is held to the longest object the packs hold (`largest`), not the store's lent
+    room: it allocates nothing in the store.
+  - Every reader goes through it: the index view a push's thin bases are read from, the pushed-objects view, the
+    walks, the fragments' encoder (an in-pack object read whole at its first window), the upload stream's loose and
+    large objects (`StoredAt` in place of a content; an in-pack object deflated from its bytes read whole), and the
+    hook view (its whole objects by `StoredAt`; its reads and seal handed the repository).
+  - A push's reads take its own pack and the store's packs by identity (`PushSource`), so a thin pack's REF_DELTA base
+    in a landed pack is read where it lies.
+  - Every push's objects are a pack's: the server's own commits are written as a pack of whole objects first
+    (`pack::of_whole_placed`) and admitted where they lie, so a record is always its push's pack and a replay makes the
+    store the live one made (the whole replay `replay_pack` places objects as the stepped one does).
+  - Gone, as no object is put inflated any more: `Push::put_placed`, the resolution-order putting (47dc24b72) and the
+    holds given back in turns after a landing (ccd07b58c): a landing gives back the push's one hold of its pack.
+- **Measured** (adas-mac-studio.local-2, release; B1's diagnostic over git/git's v1.5.0, 9.4 MiB of pack): the
+  content store after the push lands holds 14.1 MiB (309.0 MiB before: every object inflated), its peak 15.4 MiB
+  (310.3); the process's peak RSS 356.6 MiB (781.8); the store made again from the log in 1,468 turns, its content
+  at most 14.1 MiB. The longest step, 27.3 ms, is still the landing's entry apply (the record carrying the pack: part
+  A, the record v4 itself).
+- **Tests.** `slates-git` `store::tests::packed::a_landed_push_is_read_where_it_lies_in_its_stored_pack` (the captured
+  `create` push: every object read back from its stored pack; the store grew by 1,919 bytes for 11,076 bytes of
+  objects inflated, a 748-byte pack); `slates-git --lib` 582 passed; `slates-server --lib` 1,032 passed (one lease
+  deadline test failed once under the suite's load and passed three times alone).
+
 ### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
 - **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
   cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
