@@ -1660,6 +1660,62 @@ fn a_checkout_reads_a_text_ram_does_not_hold_through_the_store() {
   assert_eq!(left, 0, "a fetched piece was kept");
 }
 
+/// C2 stage B part 2 (`get-file-revs` reads a text RAM does not hold through the node's changeset store, R6). Do: on a
+/// daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// ([`crate::test_store::a_text_only_the_store_holds`]), ask `get-file-revs` of it from revision 1 to 1 through the
+/// daemon's `svnserve -t` site. Expect the answer whole, as `svnserve` ends it (the delta's empty string, `done`,
+/// `( success ( ) )`), the text's first and last KiB in its svndiff (noise, which no window compresses), read through
+/// the store a piece at a time (`vcs_store.svn_texts.piece_fetched` at least once), every fetched piece let go after.
+/// Before, the delta's first window ended the answer "Filesystem is corrupt".
+#[test]
+fn a_get_file_revs_reads_a_text_ram_does_not_hold_through_the_store() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon) =
+    crate::test_store::a_text_only_the_store_holds(&principal(OWNER), REPOSITORY, &bytes);
+  let handshake_end = MKDIR_CLIENT
+    .windows(b"( commit".len())
+    .position(|window| window == b"( commit")
+    .expect("the handshake's end");
+  let mut client = MKDIR_CLIENT[..handshake_end].to_vec();
+  client.extend_from_slice(b"( get-file-revs ( 11:trunk/a.bin ( 1 ) ( 1 ) ) ) ");
+  let (answered, _) = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let mut site = super::super::daemon_edge::daemon_site(DAEMON_ROOM);
+      tunnel_awaited(&mut site, &principal(OWNER), &[&client]).await
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (fetched, left) = crate::daemon::observe_first(&daemon, |state| {
+    (
+      state
+        .refusals
+        .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+        .copied()
+        .unwrap_or(0),
+      state.vcs_stores.svn_pieces_held(),
+    )
+  });
+  daemon.stop();
+  let out = &answered.out;
+  let carries = |run: &[u8]| out.windows(run.len()).any(|window| window == run);
+  assert!(
+    out.ends_with(b"0: done ( success ( ) ) "),
+    "{}",
+    String::from_utf8_lossy(out.get(out.len().saturating_sub(600)..).unwrap_or_default())
+  );
+  assert!(
+    carries(&bytes[..1024]),
+    "the text's first KiB is not in the delta"
+  );
+  assert!(
+    carries(&bytes[bytes.len() - 1024..]),
+    "the text's last KiB is not in the delta"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert_eq!(left, 0, "a fetched piece was kept");
+}
+
 /// C2 stage B part 2 (`get-file` reads a text RAM does not hold through the node's changeset store, R6). Do: on a
 /// daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
 /// ([`crate::test_store::a_text_only_the_store_holds`]), ask `get-file` of it at revision 1 through the daemon's `svnserve -t` site. Expect
