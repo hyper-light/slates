@@ -60012,3 +60012,25 @@ Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishmen
   request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
 - Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
   increment a refused verdict leaves is released at the next fold or restart.
+
+### A-836 — A ref may name any object: a tag chain peeled to its end, a ref naming a blob holding no files (2026-11-21, w-git; main's order from w-interop's A/B of record r16; §4.17.1 item 6, §4.17.2; A-654)
+Applied in the same change to:
+- `crates/git/src/object_name.rs`: `empty_tree`.
+- `crates/git/src/receive/works.rs`: `tree_of` peels a chain of tags to its end; a blob gives the empty tree; `NO_TREE`
+  retired.
+- `crates/git/src/store/views.rs`: `PushedObjects::locate` answers the empty tree (`At::EmptyTree`) where nothing holds it.
+- `crates/server/src/git_push.rs`: `ShardGreens::tree_of` peels the same way.
+- GAPS (§4.17).
+
+- **Why.** git/git's push was refused for every ref whose target is neither a commit nor a tree (`junio-gpg-pub`, a
+  blob, and `v1.0rc1` to `v1.0rc6`), so clones of it were short of them; git lets a ref name any object, and stock
+  `git daemon` takes them.
+- **What.** A ref's tree is found as git peels the ref: a chain of annotated tags followed to its end (each a distinct
+  object named by its content, so the chain ends), then a commit's tree or a tree itself. A ref naming a blob (or a tag
+  of one) holds no files: its green's tree is git's empty tree, which git holds as present in every repository whether
+  or not an object stores it (`object-file.c`), and the push's views answer it so. Serving was already git's:
+  `ls-refs` peels through every tag (`upload::refs::peeled`), and a fetch's wants may name any object.
+- **Evidence.** `t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised`: one push of a bare ref to a blob,
+  an annotated tag of it and a tag of a tag of the commit, every command `ok` and each advertised at its object; `ls-refs`
+  with `peel` naming the signed blob's tag peeled to the blob and the tag of a tag peeled to the commit, none for the bare
+  blob; a fetch of the three holding them, the inner tag and the commit. Red before: each refused `ref names no tree`.

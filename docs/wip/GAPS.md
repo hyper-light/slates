@@ -456,6 +456,9 @@
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
+> naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
+> taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
