@@ -71,50 +71,23 @@ fn a_created_repository_is_landed_into_the_store_and_recovered() {
   daemon.bootstrap(true).unwrap();
   let name = "stored".to_owned();
   let partition = usize::from(crate::verbs::owner_of_name(&name, usize::from(SHARDS)));
+  let asked = ("stored", VcsTool::Git, ObjectFormat::Sha1, "main");
   let created = crate::daemon::observe_at(&daemon, partition, move |state| {
-    crate::verbs::dispatch(
-      state,
-      1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: name.clone(),
-        tool: VcsTool::Git,
-        format: ObjectFormat::Sha1,
-        default_branch: "main".to_owned(),
-        green: None,
-      },
-    )
+    routed_create(state, 1, asked)
   });
   assert!(
-    matches!(created, ReplyBody::GreenCreated { .. }),
-    "{created:?}"
+    matches!(created, ReplyBody::Acknowledged),
+    "answered once landed and recorded: {created:?}"
   );
-  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-  loop {
-    let landed = crate::daemon::observe_at(&daemon, partition, |state| {
-      (
-        state
-          .refusals
-          .get(super::CREATION_LANDED)
-          .copied()
-          .unwrap_or(0),
-        state
-          .refusals
-          .get(super::CREATION_UNLANDED)
-          .copied()
-          .unwrap_or(0),
-      )
-    });
-    assert_eq!(landed.1, 0, "the store refused the creation");
-    if landed.0 == 1 {
-      break;
-    }
-    assert!(
-      std::time::Instant::now() < deadline,
-      "the creation never landed"
-    );
-    std::thread::sleep(std::time::Duration::from_millis(5));
-  }
+  wait_for(&daemon, partition, super::CREATION_LANDED, 1);
+  let unlanded = crate::daemon::observe_at(&daemon, partition, |state| {
+    state
+      .refusals
+      .get(super::CREATION_UNLANDED)
+      .copied()
+      .unwrap_or(0)
+  });
+  assert_eq!(unlanded, 0, "the store refused the creation");
   daemon.stop();
   store_owner.stop().unwrap();
 
@@ -173,23 +146,21 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
   let name = "stored-svn".to_owned();
   let partition = usize::from(crate::verbs::owner_of_name(&name, usize::from(SHARDS)));
   let created_name = name.clone();
-  let repository = crate::daemon::observe_at(&daemon, partition, move |state| {
-    let created = crate::verbs::dispatch(
+  let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+    routed_create(
       state,
       1,
-      &owner(),
-      RequestBody::CreateRepository {
-        name: created_name.clone(),
-        tool: VcsTool::Subversion,
-        format: ObjectFormat::Revisions,
-        default_branch: "trunk".to_owned(),
-        green: None,
-      },
-    );
-    assert!(
-      matches!(created, ReplyBody::GreenCreated { .. }),
-      "{created:?}"
-    );
+      (
+        "stored-svn",
+        VcsTool::Subversion,
+        ObjectFormat::Revisions,
+        "trunk",
+      ),
+    )
+  });
+  assert!(matches!(created, ReplyBody::Acknowledged), "{created:?}");
+  wait_for(&daemon, partition, super::CREATION_LANDED, 1);
+  let repository = crate::daemon::observe_at(&daemon, partition, move |state| {
     state
       .db
       .partition()
@@ -279,4 +250,113 @@ fn a_subversion_commit_lands_as_a_changeset_in_the_store() {
       .collect::<Vec<_>>(),
     vec!["/trunk"]
   );
+}
+
+/// Dispatches `CreateRepository` as the verb runner leaves a client's request (its origin, id and reply route), so a
+/// creation that waits for its landing can answer.
+fn routed_create(
+  state: &mut crate::state::ShardState,
+  request: u64,
+  (name, tool, format, default_branch): (&str, VcsTool, ObjectFormat, &str),
+) -> ReplyBody {
+  state.current_request = Some((1, slates_wire::request::RequestId::from_word(request)));
+  state.reply_route = Some(crate::merge_service::ReplyRoute {
+    shard: state.shard,
+    client_index: 0,
+    request,
+    through_work: false,
+  });
+  let reply = crate::verbs::dispatch(
+    state,
+    1,
+    &owner(),
+    RequestBody::CreateRepository {
+      name: name.to_owned(),
+      tool,
+      format,
+      default_branch: default_branch.to_owned(),
+      green: None,
+    },
+  );
+  state.current_request = None;
+  state.reply_route = None;
+  reply
+}
+
+/// Waits until partition `partition`'s counter `counter` reaches `count`.
+fn wait_for(daemon: &Daemon, partition: usize, counter: &'static str, count: u64) {
+  let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+  loop {
+    let now = crate::daemon::observe_at(daemon, partition, move |state| {
+      state.refusals.get(counter).copied().unwrap_or(0)
+    });
+    if now >= count {
+      return;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{counter} never reached {count}"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+  }
+}
+
+/// A-767 item 7, the one landing order (main's order of 2026-11-20, w-svn's finding). Do: create a repository through a
+/// client's request with the daemon killed between its creation's two steps (the landing and the register's record);
+/// look the repository up; create it again (the client's retry); stop and read the store back. Expect: the kill leaves
+/// no repository (nothing the store cannot recover); the retry creates it once; the register's repository is the one
+/// whose creation the store holds at sequence 0. Red before: the register recorded the repository first, so the kill
+/// left one with no creation in the store.
+#[test]
+fn a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once()
+ {
+  let dir = store_directory("kill");
+  let store_owner = StoreOwner::start(root(&dir), sizing(), 16).unwrap();
+  let profile = crate::daemon::test_profile();
+  let instance = format!("vcs-store-kill-{}", std::process::id());
+  let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(SHARDS));
+  config.vcs_disk = Some(store_owner.handle());
+  let daemon = Daemon::start(&profile, config, SegmentSource::Create { name: instance }).unwrap();
+  daemon.bootstrap(true).unwrap();
+  let name = "killed";
+  let partition = usize::from(crate::verbs::owner_of_name(name, usize::from(SHARDS)));
+  let asked = (name, VcsTool::Git, ObjectFormat::Sha1, "main");
+  let first = crate::daemon::observe_at(&daemon, partition, move |state| {
+    super::KILL_BETWEEN_LANDING_AND_RECORD.with(|kill| kill.set(true));
+    routed_create(state, 1, asked)
+  });
+  assert!(!matches!(first, ReplyBody::Refused { .. }), "{first:?}");
+  wait_for(&daemon, partition, super::CREATION_KILLED, 1);
+  let left = crate::daemon::observe_at(&daemon, partition, move |state| {
+    super::KILL_BETWEEN_LANDING_AND_RECORD.with(|kill| kill.set(false));
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .is_some()
+  });
+  assert!(!left, "the kill left a repository the store cannot recover");
+  let retried = crate::daemon::observe_at(&daemon, partition, move |state| {
+    routed_create(state, 2, asked)
+  });
+  assert!(!matches!(retried, ReplyBody::Refused { .. }), "{retried:?}");
+  wait_for(&daemon, partition, super::CREATION_LANDED, 1);
+  let created = crate::daemon::observe_at(&daemon, partition, move |state| {
+    state
+      .db
+      .partition()
+      .repositories()
+      .repository_named(name)
+      .map(|record| record.id)
+  });
+  let created = created.expect("the retry created the repository");
+  daemon.stop();
+  store_owner.stop().unwrap();
+  let mut store = Store::open(root(&dir), sizing()).unwrap();
+  let rows = store
+    .changesets(u128::from_be_bytes(created.bytes), 0, 10)
+    .unwrap();
+  assert_eq!(rows.len(), 1, "the repository's creation, once");
+  assert_eq!(rows[0].sequence, 0);
 }

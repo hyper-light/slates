@@ -184,6 +184,13 @@
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
 > standing-grant kind yet), and its revocation.
+> A creation's one landing order CLOSED (2026-11-20, main's order after w-svn's finding): `repository create` recorded
+> the repository in the register before it landed changeset 0, so a kill between them left a repository its store
+> could not recover. Now `land_then_record` judges the record, reserves its ids (`ShardState::family_reserved_through`),
+> lands changeset 0, and only then records the repository, its root and its completion in one transaction and answers.
+> Held by `a_kill_between_a_creations_landing_and_its_record_leaves_no_repository_and_its_retry_creates_it_once` (red
+> before: the repository left behind). A create with no reply route (forwarded from another node) on a node keeping a
+> store is refused `Unsupported`: owed with the store's fleet half (A-767 item 5).
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
