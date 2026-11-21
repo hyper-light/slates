@@ -23,8 +23,10 @@
 //! merges are bounded by the partition's repositories. Each step is lent every byte the shard could admit now, as an
 //! import's turn is: the merged run's tables are written before the merged runs give theirs back.
 //!
-//! **Which indexes.** Mercurial's (`HgIndex::rows`). Git's repository index is a `slates_vcs::Index` too, behind its
-//! store (`slates_git::store::Repository`), and is owed the same two calls (GAPS).
+//! **Which indexes.** Every tool's that is a `slates_vcs::Index`: Mercurial's (`HgIndex::rows`) and git's repository
+//! index (`slates_git::store::Repository::rows`), each reported from its lend over the store's own index
+//! (`hg_view::lend_in`, `upload::lend_on`). Subversion's records keep their own index (`slates_svn::index::Index`), which
+//! is not this one.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +61,8 @@ fn index_of(stores: &mut VcsStores, id: RepositoryId) -> Option<(&mut ContentSto
   let content = stores.content.as_mut()?;
   match stores.entries.get_mut(&id)? {
     RepositoryStore::Mercurial(store) => Some((content, store.index.rows())),
-    _ => None,
+    RepositoryStore::Git(store) => Some((content, store.repository.rows())),
+    RepositoryStore::Subversion(_) => None,
   }
 }
 
@@ -161,13 +164,13 @@ mod tests {
   use super::*;
   use slates_ipc::protocol::{ObjectFormat as WireFormat, ReplyBody, RequestBody, VcsTool};
 
-  /// Goal 93 perf (main's ruling of 2026-11-21 01:05). Do: create a Mercurial repository on a store-backed shard, give its
-  /// index four runs of its own (rows sealed one batch at a time), mark the index built, and drive the upkeep's slices
-  /// with no budget (one step each). Expect: one merge, made in more steps than one (a table a step and the admitting
-  /// step), one run left, every row read back, and the lookup after it visiting at most the tail and that run.
-  #[test]
-  fn an_index_built_whole_is_merged_a_table_a_step_into_one_run() {
-    crate::test_store::audit_on_stored_shard("upkeep", |state| {
+  /// Goal 93 perf (main's ruling of 2026-11-21 01:05: the merge wired once, for every tool whose index is
+  /// `slates_vcs::Index`). Do: create a repository of `tool` on a store-backed shard, give its index four runs of its own
+  /// (rows sealed one batch at a time), mark the index built, and drive the upkeep's slices with no budget (one step
+  /// each). Expect: one merge (the non-vacuity counter), made in more steps than one, one run left, every row read back,
+  /// each lookup visiting at most the tail and that run.
+  fn an_index_built_whole_is_merged_into_one_run(tool: VcsTool, format: WireFormat) {
+    crate::test_store::audit_on_stored_shard("upkeep", move |state| {
       let owner = slates_db::catalog::Principal::Uid {
         host: slates_db::HostId(0),
         uid: 1234,
@@ -177,8 +180,8 @@ mod tests {
         &owner,
         RequestBody::CreateRepository {
           name: "upkeep".to_owned(),
-          tool: VcsTool::Mercurial,
-          format: WireFormat::Sha1,
+          tool,
+          format,
           default_branch: "branch:default:0".to_owned(),
           green: None,
         },
@@ -197,6 +200,7 @@ mod tests {
       let room = state.store.admittable();
       let runs = within_budget(state, room, |stores| {
         let (content, index) = index_of(stores, id).unwrap();
+        let before = index.run_tables().len();
         for batch in keys.chunks(64) {
           for key in batch {
             index
@@ -212,7 +216,7 @@ mod tests {
           }
           index.seal_all(content).unwrap();
         }
-        index.run_tables().len()
+        index.run_tables().len() - before
       });
       assert_eq!(runs, 4);
       built(state, id);
@@ -237,5 +241,17 @@ mod tests {
         assert!(index.visits().saturating_sub(before) <= 2);
       }
     });
+  }
+
+  /// [`an_index_built_whole_is_merged_into_one_run`] for Mercurial's index.
+  #[test]
+  fn a_mercurial_index_built_whole_is_merged_a_table_a_step_into_one_run() {
+    an_index_built_whole_is_merged_into_one_run(VcsTool::Mercurial, WireFormat::Sha1);
+  }
+
+  /// [`an_index_built_whole_is_merged_into_one_run`] for git's repository index.
+  #[test]
+  fn a_git_index_built_whole_is_merged_a_table_a_step_into_one_run() {
+    an_index_built_whole_is_merged_into_one_run(VcsTool::Git, WireFormat::Sha1);
   }
 }

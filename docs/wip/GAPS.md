@@ -173,8 +173,8 @@
 > whole (an import placed, a replay or rebuild ended) merged a slice at a time, and each lend over the store's own index
 > reporting its lookups to the rule, a due merge begun. (2) A pull whose client holds the history walked every manifest
 > and file row for their links (7.2's `fastpathlinkrev`); BUILT: the link walk only for a clone of every head, a pull
-> made from what it sends. OWED: git's repository index on the same upkeep (behind `slates_git::store::Repository`, an
-> accessor and its lends: w-git); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
+> made from what it sends. Git's repository index on the same upkeep BUILT (`Repository::rows`, `upload::lend_on` reports). OWED: inserts reported
+> to the rule (`inserts_took`, its first price before a merge is timed); the served view rebuilt every turn (`Indexed::new`), held across turns only if it stays
 > a consistent snapshot while a push lands; (3) a stream clone sent every revision whole (4.3 GiB for hg's history); BUILT: each revision as
 > the changeset store keeps it (its `I` row's stored delta against its base, read in place; `render::Streaming` asks
 > the store for a log's rows and its chunks between steps, the edges answer through `StoreHandle`), never a text made
@@ -2663,6 +2663,23 @@
 > landing order, its acceptance deferred until the revision lands (check, the store's land, the register's commit of
 > the version and the revision, the answer), with no remaking at recovery; next piece (the verdict computed pure,
 > `Green::compute`, then committed by position after the land). A creation lands its changeset 0 before the register
+
+> guard, so a drive that waited again for the piece it was just given would fetch it for good; none is known to. Owed in
+> (a): the deltify job; then (b), the records keep history on the store. Stage C,
+> an import as one sliced changeset (today a changeset a record). A submitted version's revision (`svn_made`) takes the
+> one landing order since A-804 (2026-11-21, w-rewrite-ops; main 01:52, the deferred-submit hook, `crate::made_commit`):
+> a recorded submit takes the repository's landing turn before its verdict (or parks for it), the verdict applies in
+> memory, and the made task lands the revision's changeset, then commits the version, the register's entry naming it,
+> the local work's settle and the completion in one step, then answers; a store's refusal gives the accept up (the
+> green made again from its chain, `Overloaded` unrecorded). Held by
+> `a_server_made_commit_is_answered_only_once_its_revision_landed_and_committed`,
+> `a_kill_between_a_made_commits_landing_and_its_commit_recovers_to_before_and_the_retry_lands_once` and
+> `a_submit_meeting_its_repositorys_landing_turn_held_waits_and_lands_once_it_is_given_back` (each red before: answered
+> with the version durable before the landing; a kill left version 1 with no revision). Owed (A-804): (a) the verdict
+> is applied in memory, not computed pure (`Green::compute`) and committed by position after the land, so while the
+> landing runs a read of the green sees the version before it is durable; (b) a submit dispatched outside a recorded
+> request (no answer waits on it) keeps the old path, its revision landed after its step; (c) a Mercurial repository's
+> made changeset (`hg_made`) commits in the submit's step; git's adopts the hook (w-git, removing its version-2 path). A creation lands its changeset 0 before the register
 > records it since w-store's e4cfbd38d; Subversion's creation record is that changeset's second `Record` section.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a

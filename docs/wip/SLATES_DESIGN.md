@@ -58999,3 +58999,32 @@ Applied in the same change to: `crates/server/src/vcs_http/git/receive.rs`, `cra
 - **At the 100k rung** a path's history is short (about 31,000 accepts of four edits over 42,000 hot files, a few
   values a path), so this is not that rung's wall; it is the wall of a long-lived hot file. The fix's design (an
   indirection so a length-preserving change moves only the pieces it overwrote) is with main before it is built.
+
+### A-804 — A server-made commit is answered only after its changeset landed and its version and register entry committed together (2026-11-21, w-rewrite-ops; main 01:52 PST, the deferred-submit hook; main's landing order of inbox/w-svn-from-main-c2-made.md; C2, A-664, A-252)
+Applied in the same change to: `crates/server/src/made_commit.rs` (new: the hook), `crates/server/src/verbs.rs`
+(`AcceptedParts`, `commit_accepted`, the turn taken in `submit`, `owner_judge` and the node's owner verb, `park_on_turn`),
+`crates/server/src/vcs_store/svn_made.rs` (`make_deferred`, module docs), `crates/server/src/repository/svn_commit.rs`
+(`land_made` takes its caller's commit, `MadeEntry`), `crates/server/src/state.rs`, GAPS (C2).
+- **Why.** A version a work submitted to a Subversion repository's green was durable and answered in the submit's step;
+  its revision was landed and named by the register later, by a task. So the client was answered before its revision
+  stood, and a `kill -9` between the two left the version with no revision (every later `svn commit` refused, the green
+  past its records' youngest revision) or, retried, made it twice.
+- **What.** Main's order: check, the store lands, the register commits naming the sequence, the answer. A recorded
+  submit to such a green takes the repository's landing turn before its verdict, or parks until a task holding the turn
+  runs it again (bounded by the shard's client seats, as a whole build's parked submits are). The verdict applies in
+  memory; nothing of the accept is durable in the submit's step. The made task makes the revision, lands it on the store
+  at the register's next sequence, then commits in one transaction the version's chain entry and what goes with it, the
+  register's entry naming the sequence, the local work's settle and the request's completion, and answers on the
+  request's route. A store's refusal gives the accept up: the green is made again from its durable chain and the request
+  is answered `Overloaded`, unrecorded, so its retry runs. A check that refuses the revision commits the version alone,
+  counted `UNMADE`, as before.
+- **A crash.** Before the step's commit the register names no new sequence and no version is durable, so recovery
+  restores the state before; the changeset at the unnamed sequence is the retry's landing place, which replaces it, so
+  the retry lands once.
+- **Red, then green.** `repository::svn_commit::tests`: the submit's own step answered with the green's durable head at 1
+  before the landing (now nothing answered, head 0, then answered with head 1 and the register at two entries); after a
+  kill between the landing and the commit the version stood with no revision (now head 0, revision 0, unanswered; the
+  retry lands revision 1 once); a submit meeting a held turn ran at once (now it waits and lands when the turn is given
+  back).
+- **Owed** (GAPS C2): the verdict computed pure and committed by position after the land, so reads never see the version
+  before it is durable; a bare dispatch's submit; Mercurial's made changeset; git adopts the hook (w-git).

@@ -99,6 +99,7 @@ mod lease_wait;
 mod lfs;
 mod live_hold;
 mod live_ship;
+mod made_commit;
 mod member_task;
 // Version 0 of a green over a base, made, shipped and seeded a slice at a time at `f > 0` (§4.16, A-286).
 mod merge_origin;

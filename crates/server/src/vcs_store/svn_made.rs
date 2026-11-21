@@ -17,12 +17,13 @@
 //! revision properties: `svn:log`, the submit's message, `svn:date`, the owner's instant, and `svn:author`, the
 //! principal's own name its session carries (`crate::identities`), as the svn+ssh edge names a commit's author.
 //!
-//! **Landed as an import's is** (`svn_commit::land_made`; C2 of Ada's close list): the submit takes the repository's
-//! landing turn in its own step where it is free, and a task holding it makes the revision, checks it, lands it on the
-//! node's changeset store and commits it by an entry of the register naming it alone (the version moved the green
-//! already), so no client's commit lands between the version and its revision. Owed (GAPS, C2): a crash between the
-//! submit's commit and the revision's leaves the version without its revision; main's call on making it again at
-//! recovery is open.
+//! **Landed as an import's is** (`svn_commit::land_made`; C2 of Ada's close list), **answered after both** (the
+//! deferred-submit hook, `crate::made_commit`; main's landing order): a recorded submit takes the repository's landing
+//! turn before its verdict (or parks until it is free), so no client's commit lands between the version and its
+//! revision; a task holding it makes the revision ([`make_deferred`]), checks it, lands it on the node's changeset
+//! store, then commits the version and the register's entry naming the sequence in one step and answers. A crash
+//! before that step leaves neither, and the retry lands once. A submit dispatched outside a recorded request ([`make`])
+//! commits its version in its own step and the task lands the revision after it (GAPS).
 //!
 //! **Not made, and counted** ([`UNMADE`]), the version standing: a version not the one after the youngest revision, a
 //! copy in the change (A-586: the index names a copy at its destination alone), a special file or a symbolic link
@@ -54,9 +55,17 @@ use slates_svn::lock::AprTime;
 use slates_svn::migration::Repository as SvnRecords;
 use slates_vfs::clock::Clock;
 
+use crate::made_commit::Pending;
 use crate::repository::svn_commit::landing::{self, Turn};
 use crate::repository::svn_commit::{PROPS, Uncommitted, land_made};
 use crate::state::ShardState;
+
+#[cfg(test)]
+thread_local! {
+  /// A test's kill of a server-made commit's landing task before it commits (as a `kill -9` leaves the register): the
+  /// task ends there, nothing after it run.
+  pub(crate) static KILL_BEFORE_MADE_COMMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Counter: a revision the server made of a submitted version. Format: a counter name in the daemon's status report.
 pub(crate) const MADE: &str = "vcs.svn.revision_made";
@@ -180,11 +189,114 @@ async fn made_landing(
       return;
     }
   };
-  let landed = land_made(turn, repository, move |_| Ok(revision)).await;
+  let landed = land_made(
+    turn,
+    repository,
+    move |_| Ok(revision),
+    |state, entry| entry.commit(state),
+  )
+  .await;
   let _ = crate::state::with_state(|state| match landed {
     Some(Ok(_)) => state.count(MADE, 1),
     Some(Err(refused)) => unmade(state, &Unmade::Step(refused)),
     None => {}
+  });
+}
+
+/// Makes the revision of the version `pending` accepted, of a Subversion repository's green, and commits the two in one
+/// step once the revision has landed (`crate::made_commit`, main's landing order): a task holding the repository's
+/// landing turn, which the submit took before its verdict ([`made_commit_landing`]).
+pub(crate) fn make_deferred(
+  state: &mut ShardState,
+  (repository, turn): (RepositoryId, Turn),
+  pending: Pending,
+  copies: Vec<MadeCopy>,
+) {
+  let request = pending.request();
+  let task = made_commit_landing((repository, turn), pending, copies);
+  if slates_rt::futures::spawn(task)
+    .and_then(slates_rt::futures::detach)
+    .is_err()
+  {
+    // The task could not start (the shard's arena full): nothing of the accept is durable, so it is given up, its
+    // retry run again.
+    unmade(state, &Unmade::Unrun);
+    crate::made_commit::abandon(state, request);
+  }
+}
+
+/// [`make_deferred`]'s task: the revision made of the pending version, landed on the store, then committed with the
+/// version (`made_commit::commit`); a check that refused the revision commits the version alone (counted [`UNMADE`]),
+/// and a store that refused it gives the accept up (`made_commit::abandon`).
+async fn made_commit_landing(
+  (repository, turn): (RepositoryId, Turn),
+  pending: Pending,
+  copies: Vec<MadeCopy>,
+) {
+  let (green, version) = pending.version();
+  let authorship = pending.authorship().clone();
+  let Some(made) = crate::state::with_state(|state| {
+    revision_made(state, (repository, green), version, (&authorship, &copies))
+  }) else {
+    return;
+  };
+  let revision = match made {
+    Ok(Some(revision)) => revision,
+    // Made already, or not made: the version commits alone, the turn held until it has.
+    Ok(None) | Err(_) => {
+      let _ = crate::state::with_state(move |state| {
+        if let Err(why) = &made {
+          unmade(state, why);
+        }
+        let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
+        turn.give_back(state);
+      });
+      return;
+    }
+  };
+  let waiting = std::cell::Cell::new(Some(pending));
+  let killed = std::cell::Cell::new(false);
+  let landed = land_made(
+    turn,
+    repository,
+    move |_| Ok(revision),
+    |state, entry| {
+      #[cfg(test)]
+      if KILL_BEFORE_MADE_COMMIT.with(std::cell::Cell::get) {
+        killed.set(true);
+        return Ok(None);
+      }
+      let pending = waiting.take().ok_or(Uncommitted::NotHeld)?;
+      Ok(crate::made_commit::commit(state, pending, |state| {
+        entry.commit(state)
+      }))
+    },
+  )
+  .await;
+  if killed.get() {
+    // A test's kill between the landing and the commit: nothing after it runs, as after a `kill -9`.
+    return;
+  }
+  let _ = crate::state::with_state(move |state| {
+    match landed {
+      Some(Ok(Some(Ok(_)))) => state.count(MADE, 1),
+      Some(Ok(Some(Err(refused)))) => unmade(state, &Unmade::Step(refused)),
+      Some(Ok(None)) | None => {}
+      Some(Err(refused)) => {
+        let Some(pending) = waiting.take() else {
+          return;
+        };
+        match refused {
+          // The store refused the changeset: nothing of the accept is durable.
+          Uncommitted::Unstored => crate::made_commit::abandon(state, pending.request()),
+          // The check refused the revision: the version stands alone, as one no revision was made of.
+          refused => {
+            unmade(state, &Unmade::Step(refused));
+            let _ = crate::made_commit::commit(state, pending, |_| Ok::<(), Uncommitted>(()));
+          }
+        }
+      }
+    }
   });
 }
 
@@ -217,7 +329,10 @@ fn revision_made(
 }
 
 /// The Subversion repository `green` is the green of: a member of a repository whose tool is Subversion's.
-fn subversion_repository_of(state: &ShardState, green: DbVolumeId) -> Option<RepositoryId> {
+pub(crate) fn subversion_repository_of(
+  state: &ShardState,
+  green: DbVolumeId,
+) -> Option<RepositoryId> {
   let repositories = state.db.partition().repositories();
   let repository = repositories.member(green)?.repository;
   let record = repositories.repository(repository)?;
