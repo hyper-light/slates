@@ -151,3 +151,13 @@ Queue (main's list) done: is_fuse, A-736, A-741. Item 4 waits on Ada's word abou
  Deterministic level LANDED 7c37b6fe via 80081899 (base 159f1c87): learn::Rates measured once a process
     (DaemonConfig::git_rates, logged), in Exchange; Learning clockless; a kind sampled once per repository. Gate test
     red on main -> green; rule-4 held answer byte for byte. A/B is main's run (inbox note). NEXT: item 3 (v0 in turns).
+ ADA'S CLOSE ORDER (16:20): C1 goal 90a vendoring + every platform's build; R2 encode spin.
+ - C1 re-vendor LANDED kiln main 877ab71ea (Slates 8ce3d6152, contract 57, export_engine). macOS: kiln lib
+   workspace::slates+container 68, slates_roles 1, vendored 11, vendor.py check 0 differences. w-k90-containers told.
+   Linux: r26 timed out mid-check (queued on adacachy under strain), r32 queued. Windows: r27 lost (jupiter restart),
+   r31 queued (jupiter link down). Both fetch agents/w-k90-revendor from GitHub (kiln sync failed 4x earlier).
+ - R2 CLOSED: 67dd4ef40 (via 982ea33d); close note inbox/main-from-w-k90-vendor-close.md.
+ - A-745 items 3 (1625570cf) and 4 (7ffddbdf0) landed; A/B in BENCHMARKS (192fa403e via ed77b1d3): even CPU, B one
+   output. GAPS: first-version fragments 34x git's pack; kept_fragments miscounts parts past a window.
+ - Bench branches agents/w-k90-ab-A/B on slates GitHub (bench only, not for main).
+ - Note: running cargo fmt in kiln reformats ~1,100 files (kiln main is not fmt-clean); never run it there.
