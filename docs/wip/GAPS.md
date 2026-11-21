@@ -371,6 +371,13 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-800 (2026-11-21, w-fed-move; goal 86b's lost replies).** BUILT: every place a reply carried home can be lost is
+> counted apart, and the silent ones now resend: a reply task dropped while its shard's state is borrowed, a forwarded
+> reply whose run meets a borrowed state (and one a retention refusal dropped after it was taken, now delivered), a
+> `deliver` that cannot borrow; handed and run are counted at each end of the hop. Open: which site lost the 3,383 at
+> 100k is for main's rerun to name (the counters print from the client node). Leading candidate, fixed since by A-798
+> (`931e52ed`): a lost kick left a reply's control message unseen on a parked shard; handed equal to run confirms it.
+>
 > **A-797 (2026-11-21, w-fed-move; goal 86b, found by use: 100,000 clients over the Linux kernel).** FIXED: the green's
 > owner answers a batch of work asks within its step budget and hands the rest back (one batch had held its shard 1,055
 > ms in one poll; the watchdog killed the primary). Partial evidence, not proof: no `is spinning` and no kill in 3,110 s

@@ -58784,3 +58784,34 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD
 - **First reading** (debug, this Mac, a 32 MiB holder submit): the build step alone took 909 ms of one control-shard
   step. It is the beat's lateness and the reason a size-independent bound refused the submit before a byte was sent
   (main's ruling, items 2 and 3; inbox/main-from-w-shared-lane-plan.md).
+
+### A-800 — Every place a reply carried home can be lost is counted apart, and the silent ones resend (2026-11-21, w-fed-move, goal 86b; main's order 00:30 PST, "the lost replies first"; §4.3 "backpressure, never a drop", CLAUDE.md §2 item 9; A-797's open wall)
+- **Why.** At 100,000 clients the client node answered 9,116,579 forwards on its control shard and delivered 9,113,196
+  to the clients' shards: 3,383 replies lost on one internal hop, with no counter naming where (A-797's run; about
+  2,700 clients waited for good).
+- **The hop's drop sites, read from the code** (control shard's answer to the client shard's waiter):
+  `deliver_owner_forward` -> `xshard::send_reply_home` -> `send_back` -> `carry` (sent at once, kept for room, or
+  refused: counted `xshard.reply_dropped`, `xshard.keep_refused`) -> the client shard's admission (admitted; refused
+  at a full arena or a shutdown, where `RunUnstarted`'s drop runs the reply: `xshard.reply_run_unstarted`) ->
+  `finish_owner_forward` -> `state::deliver` (client gone or slot reused: `fleet.owner_location.client_gone`,
+  `state.reply_undeliverable`). Silent before this change: `RunUnstarted`'s drop on its own shard with the state
+  borrowed (returned, the reply lost); `finish_owner_forward`'s borrow refused (borrowed, fenced, or a retention check
+  refused after the closure ran, which dropped a reply already taken); `deliver`'s borrow refused.
+- **Change.** `crates/server/src/xshard.rs`: the drop with the state borrowed sends the reply home again
+  (`xshard.reply_resent_borrowed`); one dropped where no shard can run it is counted apart (`xshard.reply_orphaned`);
+  each reply is counted handed on its sender (`xshard.reply_home_handed`) and run on its shard (`xshard.reply_home_ran`),
+  so a reply admitted and never run shows as their difference. `crates/server/src/verbs.rs` `finish_owner_forward`
+  holds the reply outside its borrow: a borrowed state sends it home again (`fleet.forward.client.resent_borrowed`), a
+  retention refusal after the closure still delivers it (`fleet.forward.client.delivered_past_retention`), no state or a
+  fenced shard is counted (`fleet.forward.client.unservable`). `crates/server/src/state.rs` `deliver` counts a borrowed
+  state (`state.reply_undelivered_borrowed`). The load harness prints all of these from the client node.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `a_reply_dropped_unrun_while_its_shards_state_is_borrowed_is_resent_not_lost`
+  (the reply's end never ran before); `a_forwarded_reply_that_meets_a_borrowed_state_is_sent_home_again` (red with the
+  resend taken out: `(0, 0)` against `(1, 1)`); `a_reply_carried_home_is_counted_handed_where_sent_and_run_where_it_ran`.
+  `slates-server --lib xshard:: verbs::tests` 72 pass; the fleet's forward tests (24) pass; the harness's own 18 pass.
+- **Not yet shown:** which site lost the 3,383. A reply admitted on the client's shard and never run is not a drop and
+  is now visible only as handed minus run; main's 100,000-client rerun (run-requests.md) reads these counters. The
+  leading candidate is that kind, and A-798 (`931e52ed`, another worker's) has fixed it since: a shard's harvest could
+  take the kick of a control message published just before it looked, so the message stayed unseen while the shard
+  parked, which matches the runs (every daemon idle, the replies never run; `343b741e`, in the range the stalls began).
+  The rerun shows it gone if handed equals run.
