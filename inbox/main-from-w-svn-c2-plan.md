@@ -21,3 +21,14 @@ The change (lands as ONE change, since any half would lose history at a restart)
 
 Waits on: w-store's StoreHandle::sections (or section(&Changeset, kind)). Until it lands I'm on P6 and P7, and I'll
 build items 1 and 2 on a branch.
+
+## Staging (after w-store's answers: sections, read, text, the sliced landing are all on main)
+Each stage lands whole and loses no history:
+- A, history: every svn record kind lands as a changeset (Record section). The register holds the green's head
+  only. Recovery and rebuild replay from the store's changesets and roll the green forward. The arbiter test and the
+  crash test. Texts stay in the content store as today: durable through content_durable, read through HeadTexts.
+- B, texts: Texts and Payload sections in the landing. HeadTexts reads async through the owner (StoreHandle::text),
+  so the svn crate's report, replay, exporter and file-revs drives yield for text pieces instead of reading synchronously
+  (R6: no sync path). This is the largest stage: every svn read drive changes.
+- C, imports: an import lands as ONE sliced changeset (begin / section / part / commit).
+Stage A starts now on agents/w-svn-c2. It needs the no-store decision (inbox main-from-w-svn-c2-no-store.md).
