@@ -398,3 +398,9 @@
   its own clone ~/w-lint-vcs). r31 (Windows) is queued for jupiter. r29 is stopped on main's order; I'll re-queue it
   after w-work-mount lands.
 - VCS suites per platform: none ended yet (Linux r32, Windows r31).
+
+## 2026-11-21 round at 1a35ab091 (landed 348af0b12)
+- Red: server vcs_store/commits.rs mem::forget (w-git's 926b951e6). Replaced with ManuallyDrop::new; vcs_store::commits|made
+  40/40. w-git told. The rest of the wall was clean.
+- VCS lane: Linux r32 running on adacachy2; Windows r31 queued, since jupiter's link is down. r29 waits for w-work-mount,
+  which hasn't landed yet.
