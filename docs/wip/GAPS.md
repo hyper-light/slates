@@ -177,9 +177,20 @@
 > rate belongs; the memtable holds rows, never a landing's bytes, so its size is the engine's unit of work.
 > C5's store side BUILT (2026-11-20, main's split): `crates/server/src/vcs_store/store_packs.rs`, git's `PackSource`
 > over the store's owner (an awaited `fill` of a range into a bounded least-recently-used set of store pieces, the
-> synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6). Owed (w-git): the
-> push landed as a changeset before its entry, recovery of named sequences, the replay through the adapter, and the
-> pack named by the plain BLAKE3 of its `Payload`.
+> synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6).
+> C5's git side, part 1 BUILT (2026-11-20, w-git): a push's names and pack, once homed in the region, land on the node's
+> store as one changeset (`Names`, `Payload`: the bytes the homing hands back, moved in, no further copy) at the
+> repository's next sequence (taken at the landing, so two pushes never share one; the creation is 0), before the
+> register's entry, whose record (version 5, replacing 4) names the sequence; a refused landing refuses the push whole
+> (`PushFailed::Unlanded`). A version-5 record's pack identity is the plain BLAKE3 of the `Payload` (the content
+> store's identity rule), so `piece` takes it as recorded. Recovery reads a version-5 record's changeset from the store
+> before its replay (its row; its `Names` checked against the record's identity; its `Payload` found under the record's
+> pack identity), puts what the content store lacks, and notes the sequence, so the next landing takes the last one
+> named + 1 and a changeset landed past the register's head is overwritten (main's ruling). The one shared test store:
+> `crate::test_store`. Owed (w-git, C5 part 2): a daemon without `--vcs-store` refusing git's creation, typed; versions
+> 2 and 5's sequence 0 removed (no register-held history); git's tests onto the shared store; the replay reading the
+> pack a piece at a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its
+> own buffer and the content store's windows).
 > The store grant's durable record BUILT (2026-11-20): the `G` row, recorded at the store's first open and
 > checkpointed before it serves, found as first recorded after a crash; every landing's header names its id
 > (`StoreHandle::grant`). Owed: the row's audit position in the control partition's audit log (`AuditKind` has no
