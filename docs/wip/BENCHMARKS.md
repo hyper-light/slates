@@ -16447,8 +16447,31 @@ loaded to count. It showed two things to measure on a quiet machine:
   small datagrams.
 - At 64 MiB the sends stopped at the congestion window about 6,800 times. The window, not per-packet cost, bounds the
   lane on loopback.
-The suspect is the UDP receive buffer, left at the OS default (`net.inet.udp.recvspace` 786,896 bytes, about 85
-datagrams). Its drops would read as loss. The before and after, with `netstat -s -p udp` drop counts, belong here.
+The UDP receive buffer was a suspect and is ruled out: over six 64 MiB transfers (about 5 s, load 22) the full-socket-
+buffer drops rose by 8, the rate an idle 20 s showed (32). The "~200 MB/s" was a loaded machine's figure.
+
+**On a quiet Mac, and the per-packet copies removed** (macOS arm64, Studio-1 `adas-mac-studio.local`, 14 cores, the
+command above with `REPLICATION_BENCH_BULK_MIB=64,64,64,64,64,64,64,64` and `replication_bench 20`: eight rows of five
+timed 64 MiB requests after a warm-up, 40 in all; a 6 s `/usr/bin/sample` of the process during them):
+
+| tree | load average | goodput min / median / max (MB/s) | 64 MiB wall p50 range | `memmove` samples | `sendto` | `recvfrom` | AES-GCM enc / dec |
+|---|---|---|---|---|---|---|---|
+| main `55038e0` (before) | 3.70 | 874 / 1,066.5 / 1,131 | 61.9–65.5 ms | 604 | 798 | 344 | 189 / 197 |
+| `e39f4ae` (after: frames encoded in place, packets sealed in one reused buffer) | 3.05 to 2.96 | 961 / 1,103 / 1,217 | 58.9–62.5 ms | 491 | 852 | 356 | 224 / 237 |
+| `6f9261a` (then: stream data carried as spans of the sender's bytes until acknowledged) | 3.33 to 3.14 | 927 / 1,092 / 1,206 | 59.3–63.2 ms | 433 | 811 | 382 | 247 / 233 |
+
+What it means:
+- The lane does about 1.1 GB/s on loopback, one direction, one session, on a quiet Mac.
+- The stops are mostly "nothing queued" (about 8,000 of 7,300 packets' turns), with the window rarely the stop.
+- The step removed a clone of every reliable frame (a stream frame's 9 KB) into each packet, and the allocation of
+  each packet's payload and datagram: `memmove` fell 19% (604 to 491 samples), `realloc` and `RawVec::reserve` left
+  the top of the profile. The median moved 3.4% and the minimum 10%. MEMORY SIZING bans the copies whatever they cost.
+- The second step removed the copy of each stream frame's bytes out of its sender: a packet in flight now names its
+  stream data as a span (stream, offset, length), encoded from the sender's buffer when the packet is built and again
+  if it is resent. `memmove` fell 12% more (491 to 433, 28% from 604). Goodput is level with the first step (median
+  1,103 to 1,092 MB/s, inside run-to-run noise): the copy was banned, not slow.
+- What the profile names now, in order: `sendto` (one syscall a datagram), `recvfrom` (likewise), AES-GCM, and the
+  receiver's copies (the frame decode's and the reassembly's) inside `memmove`.
 
 ## A work over a green costs its divergence: the brief's grid, before and after (w-work-cow P2; Ada's close order; 2026-11-20)
 - **Machine.** Adas-Mac-Studio.local (runner d1323898), macOS arm64, 32 cores, 96 GB, shared with other agents (not
@@ -16880,3 +16903,9 @@ read too (`push.build.turns`, both sides).
 - **Not this change's.** `provision_bench`'s 8-client form hung on both sides (pass 1 and its own timing run): one
   client waits in `Client::round_trip` for a reply that never comes, every shard parked in `kevent`, the main thread
   joining it (reported to main with both stacks).
+
+**85a against its done-when on the landed commit** (origin/main 218256bab, the contract command, release, adas-mac-studio.local-2,
+32 cores, macOS, load 6-10, 2026-11-21 04:59-05:05 UTC). Added at the median; live p999: 186.5 µs, 375 µs; 188.7 µs,
+384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
+and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
+(`do_freezer_trap`) and was stopped unbuilt.

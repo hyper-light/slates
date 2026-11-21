@@ -207,7 +207,7 @@ impl StoreRoot {
       op: "read the store's file system's free space",
       code: errno.raw_os_error(),
     })?;
-    Ok(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
   }
 
   /// Whether the file `name` exists in the directory (without following a symlink).

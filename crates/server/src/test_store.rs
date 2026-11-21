@@ -24,6 +24,7 @@ pub(crate) struct TestStore {
 impl TestStore {
   /// A fresh store for the test `name`: its directory made (emptied first) beside the test binary, and an owner started
   /// over it under the directory's standing grant.
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   pub(crate) fn start(name: &str) -> TestStore {
     let binary = std::env::current_exe().unwrap();
     let dir = binary
@@ -56,9 +57,16 @@ impl TestStore {
       owner.stop().unwrap();
     }
   }
+
+  /// Starts an owner over the same directory again (a node's restart), stopping the one serving first.
+  pub(crate) fn restart(&mut self) {
+    self.stop();
+    self.owner = Some(StoreOwner::start(root(&self.dir), sizing(), WAITING).unwrap());
+  }
 }
 
 impl Drop for TestStore {
+  #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   fn drop(&mut self) {
     if let Some(owner) = self.owner.take() {
       let _ = owner.stop();

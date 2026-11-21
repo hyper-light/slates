@@ -9035,6 +9035,96 @@ fn a_forward_refused_at_admission_answers_its_client() {
   );
 }
 
+/// Shape: the works a forwarded creation test makes through another node, enough that their names hash to every
+/// partition of a two-shard owner.
+const FORWARDED_WORKS: usize = 8;
+
+/// A-794 (goal 86b; §4.8 "Lookup": ids route to owners, A-400: a work lives on the partition that makes it). Do: three
+/// nodes, each its own region, two shards each; on a, a green shared with the fleet; through b's client, which does
+/// not replicate it, `FORWARDED_WORKS` works over it, each then edited through b. Expect: every work is made on the
+/// partition of a its name hashes to (its id names that partition), not the green's, and each takes its edit there,
+/// answered by the first exchange: a verb parked for its green's shard answers its forward when it resumes. Non-vacuous:
+/// at least one name hashes off the green's partition, and the resumes answered forwards (`merge.work.forwarded_answered`). Before, a forwarded creation ran on the green's
+/// own shard: at 100,000 clients over the Linux kernel 76,955 works were made on the primary's one partition, whose
+/// merge budget (373 MB, shared with the green's chain) then refused 60,349 edits, 3,883 rebases and 7,544 accepted
+/// submits `TableAtCapacity`.
+#[test]
+fn a_forwarded_work_creation_is_made_on_the_partition_its_name_hashes_to() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    2,
+    &regions,
+    &std::collections::BTreeMap::new(),
+  );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let ReplyBody::GreenCreated { id: green } = client_a.call(&RequestBody::CreateGreen {
+    name: "spread".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  share_with_fleet(&mut client_a, green, &daemons);
+  let mut client_b = Client::connect(daemons[1].instance());
+  let (routed, last) = poll_status_served(&daemons, &mut client_b, green, COUNCIL_RETIRE_DEADLINE);
+  assert!(routed, "b routes the green to a: {last:?}");
+  let partitions = daemons[0].shards().len();
+  let green_partition = slates_server::verbs::owner_of(green);
+  let works: Vec<String> = (0..FORWARDED_WORKS)
+    .map(|n| format!("spread-work-{n}"))
+    .collect();
+  assert!(
+    works
+      .iter()
+      .any(|name| slates_server::verbs::owner_of_name(name, partitions) != green_partition),
+    "a name hashes off the green's partition {green_partition}"
+  );
+  for name in &works {
+    let created = client_b.call(&RequestBody::CreateWork {
+      green,
+      name: name.clone(),
+    });
+    let ReplyBody::WorkCreated { id: work, .. } = created else {
+      panic!("{name} created through b: {created:?}");
+    };
+    assert_eq!(
+      slates_server::verbs::owner_of(work),
+      slates_server::verbs::owner_of_name(name, partitions),
+      "{name} is made on the partition its name hashes to (the green's is {green_partition})"
+    );
+    edit_work(&mut client_b, work, 0, name);
+  }
+  // Non-vacuous: the creations parked for their green's admission on a's other shard, and their forwarded exchanges were
+  // answered when the verbs resumed, not by a resend.
+  let counters = summed_counters(&daemons[0]);
+  assert!(
+    count_of(&counters, "merge.work.forwarded_answered") > 0,
+    "a forwarded verb parked for its green's shard was answered at its resume: {counters:?}"
+  );
+}
+
 /// The network load test's fault one (GAPS, "The many-client load test over the network": a forwarded `CreateWork`
 /// p50 1.71 s at 300 clients and 4.30 s at 1,000, against 45 µs on the owner's own node). §4.8 "Lookup", §4.10. Do:
 /// three nodes, each its own region, two shards each. On a, create two volumes, `slow` owned by a's non-control
@@ -22828,6 +22918,60 @@ fn a_holders_composed_inputs_are_never_shipped_back_to_it() {
   assert!(
     after_owners > after_holders,
     "A's own version shipped its chunks to B: {after_holders} then {after_owners}"
+  );
+}
+
+/// §4.16 "Commit" (A-286; exit 4 at 64 MiB, main's close list): a version whose inputs cross to a holder in several
+/// shipments is archived once, its chunks cut as views of the chain's bytes, never its whole archive rebuilt and rehashed
+/// a pass at a time. Do: in a two-node `f = 1` fleet, A's work writes a file of four and a half inputs chunks and
+/// submits it. Expect: answered version 2; the version placed at the quorum; its inputs crossed to B in parts, a shipment
+/// each pass (`merge.inputs.partial` moved, more than one shipment); A made the version's inputs manifest exactly once.
+#[test]
+fn a_version_crossing_in_several_shipments_is_archived_once() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let mut owner = Client::connect(&instance_a);
+  let green = bench_green(&mut owner, &daemon_b, "several-shipments");
+  let count = |name: &str| {
+    bench_counters([&daemon_a, &daemon_b])
+      .get(name)
+      .copied()
+      .unwrap_or(0)
+  };
+  // Four and a half of the inputs archive's 1 MiB chunks: a shipment carries at least one, so they cross in five or more.
+  let bytes = 4 * (1 << 20) + (1 << 19);
+  let work = bench_work(&mut owner, green, "several-shipments-work", bytes);
+  let (made_before, partial_before) = (
+    count("merge.inputs.manifest_made"),
+    count("merge.inputs.partial"),
+  );
+  let shipments_before = count("merge.submit.shipments");
+  let submitted = owner.call(&RequestBody::submit(work, Vec::new()));
+  let both = [&daemon_a, &daemon_b];
+  let placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 2)
+  });
+  let made = count("merge.inputs.manifest_made") - made_before;
+  let partial = count("merge.inputs.partial") - partial_before;
+  let shipments = count("merge.submit.shipments") - shipments_before;
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(2),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  assert!(placed, "the version placed at the quorum");
+  assert!(
+    partial >= 1 && shipments > 1,
+    "the inputs crossed in parts: partial {partial}, shipments {shipments}"
+  );
+  assert_eq!(
+    made, 1,
+    "the version's inputs were archived once over {shipments} shipments"
   );
 }
 

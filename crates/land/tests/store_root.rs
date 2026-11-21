@@ -78,6 +78,24 @@ fn a_symlink_in_the_directory_is_not_followed() {
   assert!(!outside.join("victim").exists());
 }
 
+/// A mount point where a file and a symlink lie in `dir` refused `ENOTDIR`, both left as they were (the symlink's
+/// target `elsewhere` untouched).
+fn file_and_link_refused(root: &StoreRoot, dir: &Path, elsewhere: &Path) {
+  for name in ["a-file", "a-link"] {
+    assert!(
+      matches!(root.mount_point(name), Err(StoreRootRefusal::Io { code, .. }) if code == rustix::io::Errno::NOTDIR.raw_os_error()),
+      "{name}"
+    );
+  }
+  assert!(
+    std::fs::symlink_metadata(dir.join("a-link"))
+      .unwrap()
+      .file_type()
+      .is_symlink()
+  );
+  assert_eq!(std::fs::read_dir(elsewhere).unwrap().count(), 0);
+}
+
 /// A-645 (a). Do: make a mount point in a granted directory, make it again, then name one where a file and a symlink
 /// lie, and one with a separator. Expect: the directory made, empty, at the granted path's child, and kept on the second
 /// make; the file and the symlink refused `ENOTDIR` and left as they were (the symlink's target untouched); the
@@ -94,19 +112,7 @@ fn a_mount_point_is_made_in_the_granted_directory_and_nowhere_else() {
   assert_eq!(root.mount_point("project.svn").unwrap(), point);
   drop(root.create("a-file").unwrap());
   std::os::unix::fs::symlink(&elsewhere, dir.join("a-link")).unwrap();
-  for name in ["a-file", "a-link"] {
-    assert!(
-      matches!(root.mount_point(name), Err(StoreRootRefusal::Io { code, .. }) if code == rustix::io::Errno::NOTDIR.raw_os_error()),
-      "{name}"
-    );
-  }
-  assert!(
-    std::fs::symlink_metadata(dir.join("a-link"))
-      .unwrap()
-      .file_type()
-      .is_symlink()
-  );
-  assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+  file_and_link_refused(&root, &dir, &elsewhere);
   assert!(matches!(
     root.mount_point("a/b"),
     Err(StoreRootRefusal::BadName)

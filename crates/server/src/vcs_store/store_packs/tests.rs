@@ -69,7 +69,7 @@ fn a_pack_on_the_store_is_read_forward_a_bounded_set_of_pieces_at_a_time() {
       while (read.len() as u64) < len {
         let at = read.len() as u64;
         let held = packs.piece(&identity, len, at).map(|bytes| {
-          let take = bytes.len().min(step as usize);
+          let take = bytes.len().min(usize::try_from(step).unwrap());
           bytes[..take].to_vec()
         });
         match held {

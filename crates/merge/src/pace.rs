@@ -46,6 +46,7 @@ struct Turn {
 
 /// The engine's unit kinds, each with its own cost estimate (A-783): a build's walk entry, a base path, a unit of the
 /// deriver's composition, a unit of the post-state and one of the identity.
+/// Shape: the five kinds below, each its index.
 pub const KINDS: usize = 5;
 /// A walk's entry ([`KINDS`]).
 pub const WALK: usize = 0;
@@ -54,8 +55,10 @@ pub const BASE: usize = 1;
 /// A unit of the deriver's composition.
 pub const COMPOSE: usize = 2;
 /// A unit of the post-state.
+/// Shape: its index among [`KINDS`].
 pub const POST: usize = 3;
 /// A unit of the identity's hash.
+/// Shape: its index among [`KINDS`].
 pub const HASH: usize = 4;
 
 /// Whether anyone waits, for a pace with no probe of its own ([`Pace::turn`]): always, so it yields at its quantum.

@@ -786,6 +786,11 @@ pub struct ShardState {
   /// The node's version-control store on disk, when the daemon has one (A-767; `DaemonConfig::vcs_disk`): this shard's
   /// handle to its owner thread, through which a repository's landings reach the changeset log.
   pub vcs_disk: Option<slates_store::owner::StoreHandle>,
+  /// The partition's family numbers handed out but not yet recorded (`verbs::fresh_family_id_at` mints from past them):
+  /// a repository's creation reserves its ids when its verb runs and records them once its landing is durable (A-767
+  /// item 7's one landing order), so no id minted meanwhile is its. Never lowered while the process runs, so a number
+  /// whose creation never recorded is a gap, never handed out twice; a restart starts it at the recorded counter.
+  pub(crate) family_reserved_through: u64,
   /// Each of this shard's repositories' usage (A-724 piece 1, `slates_vcs::usage`): its intakes and fetches begun,
   /// answered, stepped and timed, and its principals in a Space-Saving summary of `clients_per_shard` slots. One row a
   /// repository with an event, dropped with the repository ([`crate::vcs_store::free`]), so bounded by the partition's

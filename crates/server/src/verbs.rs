@@ -191,7 +191,9 @@ pub(crate) fn fresh_family_id_at(
   family: Option<u16>,
   offset: u64,
 ) -> Option<DbVolumeId> {
-  let number = state.db.family_number_at(offset)?;
+  // Past every number a creation in flight reserved (`ShardState::family_reserved_through`, A-767 item 7).
+  let base = u64::from(state.db.family_number_at(0)?).max(state.family_reserved_through);
+  let number = u32::try_from(base.checked_add(offset)?).ok()?;
   // Derived: a new family's tag is its number modulo the tags a family id holds, MAX_FAMILY_TAG + 1.
   let tags = u32::from(slates_db::register::MAX_FAMILY_TAG).checked_add(1)?;
   let tag = match family {
@@ -1020,6 +1022,15 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Ok(shard) => shard,
     Err(refusal) => return encode_body(&refusal),
   };
+  // A work over a green is made on the partition its name hashes to (A-794), as a create is placed by its name: the
+  // green's own shard asks only its verdict and its base (A-247), and its partition's merge budget holds the green's
+  // chain, not every forwarded work's log. Run on the green's shard, 76,955 of 100,000 works over the Linux kernel were
+  // made on the primary's one partition, whose budget then refused their edits and the green's own versions.
+  // Whether the green is made yet is still asked of the green's shard, which holds it, before the work is made.
+  let (shard, made_on) = match forward_placement(&body, (control, shard), volume).await {
+    Ok(placed) => placed,
+    Err(refusal) => return encode_body(&*refusal),
+  };
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
@@ -1035,7 +1046,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     forwarded_write(
       (control, shard),
       (origin_host, id),
-      (principal, body, volume),
+      (principal, body, made_on),
       (ack_up_to, ack_owed),
     )
     .await
@@ -1044,6 +1055,30 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
+/// partition its name hashes to (A-794), once the green's own shard has said the green is made (A-247); any other
+/// verb on `shard`, about `volume`. Refused, the answer.
+async fn forward_placement(
+  body: &RequestBody,
+  (control, shard): (u16, u16),
+  volume: VolumeId,
+) -> Result<(u16, Option<VolumeId>), Box<ReplyBody>> {
+  let RequestBody::CreateWork { name, .. } = body else {
+    return Ok((shard, Some(volume)));
+  };
+  let named = match crate::state::try_with_state(|s| {
+    shard_of_partition(s, owner_of_name(name, s.shards.len()))
+  }) {
+    Ok(named) => named.unwrap_or(shard),
+    Err(access) => return Err(Box::new(refusal_of_access(&access, control))),
+  };
+  match call_owner(control, shard, move |s| forwarded_before_made(s, volume)).await {
+    Ok(None) => Ok((named, None)),
+    Ok(Some(refusal)) => Err(Box::new(refusal)),
+    Err(refusal) => Err(refusal),
+  }
 }
 
 /// The work a node's verb is about (A-697: `AdmitWork`, `MoveWorkFloor`, `SubmitComputed`), whose creator alone may send
@@ -1133,17 +1168,18 @@ fn forwarded_before_made(state: &mut ShardState, volume: VolumeId) -> Option<Rep
 }
 
 /// A forwarded write run on its owner `shard` under the origin's request id (§4.8 "Lookup"): refused before any
-/// completion is recorded while the volume is not made here yet; the origin's acknowledged completions pruned first;
-/// answered as [`answer_forwarded_write`] answers it.
+/// completion is recorded while `made_on`, the volume the verb names, is not made here yet (`None` for a work's creation,
+/// whose green its own shard was asked of first, A-794); the origin's acknowledged completions pruned first; answered as
+/// [`answer_forwarded_write`] answers it.
 async fn forwarded_write(
   (control, shard): (u16, u16),
   (origin_host, id): (u64, RequestId),
-  (principal, body, volume): (Principal, RequestBody, VolumeId),
+  (principal, body, made_on): (Principal, RequestBody, Option<VolumeId>),
   (ack_up_to, ack_owed): (Option<u32>, Vec<u32>),
 ) -> ReplyBody {
   let forwarded = call_owner(control, shard, move |s| {
     // Not made here yet: refused before any completion is recorded, so the resend under its id runs it once made.
-    if let Some(refusal) = forwarded_before_made(s, volume) {
+    if let Some(refusal) = made_on.and_then(|volume| forwarded_before_made(s, volume)) {
       return (Some(refusal), None);
     }
     if let Some(up_to) = ack_up_to {
@@ -1291,7 +1327,15 @@ async fn await_deferred_completion(
 ) -> ReplyBody {
   let (call, waiter) = crate::xshard::awaited::<ReplyBody>(shard);
   let attached = call_owner(control, shard, move |s| {
-    crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter))
+    match crate::merge_service::await_forwarded(s, (origin_host, id), (control, waiter)) {
+      // A verb parked at its work's gate (A-794) answers this exchange when its queue resumes it.
+      crate::merge_service::ForwardedAcceptance::Gone
+        if crate::work_home::attach_forwarded(s, (origin_host, id), (control, waiter)) =>
+      {
+        crate::merge_service::ForwardedAcceptance::Waiting
+      }
+      other => other,
+    }
   })
   .await;
   match attached {
@@ -10396,8 +10440,45 @@ type Judged = (
 fn secure_retention(state: &mut ShardState, green_id: DbVolumeId, secured: u64) -> Result<(), u64> {
   let room = usize::try_from(secured).unwrap_or(usize::MAX);
   crate::merge_service::settle_green_retention_leaving(state, green_id, room)?;
-  crate::merge_service::secure_green_retention(state, green_id, secured)
-    .inspect_err(|available| report_first_budget_refusal(state, "retention", secured, *available))
+  crate::merge_service::secure_green_retention(state, green_id, secured).inspect_err(|available| {
+    report_first_budget_refusal(state, "retention", secured, *available);
+    report_first_retention_cap_refusal(state, green_id, (secured, *available));
+  })
+}
+
+/// Logs, once a process, what a green's retention holds when a submit's reservation is first refused at the green's
+/// own cap with room left (A-794 part 2's diagnosis; the debugging protocol's logging first): at 100,000 clients over
+/// the Linux kernel, with A-793's re-anchored history, 64,072 accepted submits were refused `BudgetExceeded` where
+/// [`report_first_budget_refusal`], which logs only a budget with no room at all, wrote nothing. The history's bytes
+/// owned and named as files' blocks tell a block kept whole (another holder keeps it, never cut) from what the changes
+/// overwrote.
+fn report_first_retention_cap_refusal(
+  state: &ShardState,
+  green: DbVolumeId,
+  (secured, available): (u64, u64),
+) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if available == 0 || LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  let Some(engine) = state.greens.get(&green) else {
+    return;
+  };
+  let retained = engine.retained_bytes();
+  slates_machine::log_line!(
+    "slates-server: retention refused at the green's cap (first occurrence): shard={} secured={secured} \
+     available={available} charged={} cap={} head={} folded_below={} floor={} {retained:?} owned={} named={:?} \
+     reanchored={:?}",
+    state.shard,
+    state.green_retention.get(&green).copied().unwrap_or(0),
+    crate::merge_service::rejected_cache_budget(state),
+    engine.head(),
+    engine.folded_below(),
+    crate::merge_service::reachable_floor(state, green),
+    engine.history_owned_bytes(),
+    engine.history_blocks_named(),
+    engine.history_reanchored(),
+  );
 }
 
 /// What answers a submit once its increment and signature are judged, before it merges: an asked merge's verdict for
