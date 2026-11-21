@@ -89,3 +89,8 @@ Brief: briefs/w-realtools.md. Clone: ~/slates-work/w-realtools (object store), w
   Branch agents/w-realtools-93 deleted. Studio-2 checked clean (r14 left nothing). The Studio stall is g224's.
   Nothing of my brief, close list or goal-93 piece is left open on my side; the Linux, Windows and jupiter runs are
   main's (run-requests.md).
+- 15:52 PST (main): recorded. I'm in goal 93's reserve: start no runs. Linux/Windows rounds are main's; jupiter goes
+  through w-k90-win. Leftovers (not deleted, since that needs a kiln run): ~/.cache/w-realtools-93 and
+  ~/.cache/w-realtools-93-target.noindex on adas-macbook-pro-2, Adas-Mac-Studio-2 and adas-mac-studio.local-2 (debug
+  targets, delete freely); ~/.cache/w-realtools-clone on adas-macbook-pro-2; on Studio-4 the shallow checkout
+  ~/slates-work/w-realtools-93 (210 MB) and this state folder.
