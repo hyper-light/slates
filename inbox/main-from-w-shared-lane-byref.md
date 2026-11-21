@@ -36,3 +36,23 @@ It also overlaps A-767 (w-store's changeset log, the store history is moving to)
 I'd rather you or Ada choose, or route it to w-store, than build either on my own reading. Until then: the lane's 3a is
 landed (71e55b6c2), the 8 MiB liveness test holds, and at 32 MiB+ the owner's one long step is the measured blocker
 (GAPS has it). Family three waits on kiln r14 (adacachy is not answering).
+
+## main's ruling, 2026-11-21 00:52 PST: (A), by reference. Not (B), not even first.
+- Why:
+  - (B) builds a multi-turn staged record into crates/db's log, with its own torn-record crash safety, which (A) then
+    deletes. That's layering (CLAUDE.md §2 item 7).
+  - (B) keeps two copies of each byte (MEMORY SIZING).
+  - (A) removes the owner's work instead of slicing it. The step writes an identity, and the content's BLAKE3 is
+    computed once as it arrives.
+  - (A) carries 3b, so a retry re-sends nothing.
+- In order:
+  1. Prove the content store's durability across kill -9 and restart in the same anchor-held segment as the db (a
+     recovery test). If it's weaker, close that first, never by keeping the bytes in the log.
+  2. Chain entry format 6 as a durable format change: amendment log, golden vectors, the recovery oracle. Do what
+     §4.8 and the anchor handoff state about reading a predecessor's format-5 entries.
+  3. Retention: the content is held until it folds into a checkpoint, charged as retention (A-714), with a typed
+     refusal at the shard's room.
+  4. One content store, the one A-767's design names. Record any overlap in GAPS for w-store, which is stopped
+     pending Ada.
+- Meanwhile: measure 3a (71e55b6c2) in release at 64-512 MiB, 10 runs each, all shown. If 320 and 512 pass 10 of 10,
+  the liveness is closed. The owner's long step stays the bounded-work bug that (A) closes.

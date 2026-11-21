@@ -1466,3 +1466,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   RUN: main's 100k rerun is queued as kiln r48 (needs macos,cpus=16,mem=40g,disk=40g; 2 h bound; a fresh clone of main; kernel tree 5f22fb204). kiln refuses a pinned run when the pinned machine lacks room, so it goes unpinned and carries its own tree. kiln's estimate: the big Studio, by about 02:42. Results go to w-fed-move.
   RULING: w-git C5 2b approved. Pushes write version 5 only and are refused when short. Made commits adopt w-svn's deferred-submit hook (one hook); version 2 stays in GAPS until then. A new refusal variant publishes its wire tag in the same commit.
   MEMORY: Studio-4 had 0.3-14 GB free, with swap at 18.6 of 19.5 GB. Most of it is a Virtualization VM up since boot (18 GB resident plus 30 GB compressed), not an agent's. g226 trimmed its worktree: 42 -> 53 GB disk free.
+- 2026-11-21 00:48 PST LANDED (on main):
+  - 71e55b6c2 (w-shared lane 3a): a holder's forward is held to its own progress, and acknowledged bytes count as progress.
+  - 002a7944f (w-svn P8): a 500 MB svn commit on the changeset store took 11.2 s over svn:// and 13.9 s over DAV, peak 4,067 MiB (8x the text, 12x before).
+  - cc917a1bf and 8508a8d52 (w-svn P7): the git-2000 import takes 26.2 s, peak 1,570 MiB (3.6x the dump).
+  - 1bfe51f88: stock svnsync 1.15 measured against a store-backed daemon (A-772).
+  RULING (w-shared, the owner's durable step): (A), by reference, not (B). (B) is a layer that (A) deletes, and it keeps two copies. (A) removes the work and carries 3b. Durability is proven first, then chain entry format 6 as a durable format change, retention until checkpoint, one content store. Meanwhile 3a is measured in release at 64-512 MiB, 10 runs each.
