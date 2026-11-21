@@ -15438,3 +15438,28 @@ to write it whole and P3 hands the stored delta through. Layout is about 0.3 ms 
 first representation, which a delta names its base by). Both stream, so the view's own memory is a megabyte or two over
 the import either way; one P3 run (256 KiB, round 2) peaked 132 MB over its baseline, unexplained, the other four within
 a megabyte. Kept: P3. Rejected: P1's whole texts.
+
+## The fragments' encoder, its level timed per object against chosen from measured rates: even on CPU, one output (main's ruling; A-718; 2026-11-20)
+
+- **The machine and builds.** adas-mac-studio.local-2 (Apple M3 Ultra, 32 cores; placed by kiln, no `on`), release
+  builds of `crates/git/examples/encode_bench.rs` on two branches: A, agents/w-k90-ab-A (slates 8ebf8a1c6, the encoder's
+  zlib level and delta window learned from each sample and trial timed on the clock), B, agents/w-k90-ab-B (7c37b6fee,
+  chosen from the bytes they saved and `learn::Rates` measured once a process), each with `Repository::fragments_len`.
+  Dataset: git/git cut at v2.0.0 (`echo v2.0.0 | git pack-objects --revs --stdout`, 55,872,412 bytes; head
+  e156455ea491), its 2,301,445,716 bytes of objects pushed as one version and its fragments encoded once a process.
+- **The command.** `encode_bench <head> < v2.pack`, A then B, three rounds (kiln run r24; its script in the run). The
+  machine was not quiet: other agents' builds held its load at 22 to 58.
+
+| round | load at its start | A: ns a MiB in | A: fragments | B: ns a MiB in | B: fragments |
+|---|---|---|---|---|---|
+| 1 | 41 / 58 | 114,257,366 (250.8 s) | 1,918,502,639 B | 109,622,545 (240.6 s) | 1,918,502,639 B |
+| 2 | 56 / 55 | 111,023,658 (243.7 s) | 1,914,198,588 B | 64,824,161 (142.3 s) | 1,918,502,639 B |
+| 3 | 22 / 38 | 58,649,771 (128.7 s) | 1,918,502,639 B | 58,563,455 (128.5 s) | 1,918,502,639 B |
+
+- **What it says.** Best of three, the two are even on CPU (128.7 s against 128.5 s, 58.6 ms a MiB of objects; the
+  rest is the load), so the change is not one for speed: a dead-even A/B, kept for its correctness. B wrote the same
+  1,918,502,639 bytes in every round; A wrote 4,304,051 bytes fewer in round 2, its level a timed choice the load moved,
+  which is what main's ruling removed (one input, one output; A-745 rule 4's held answer now byte for byte). Both write
+  fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
+  to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
+  (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.
