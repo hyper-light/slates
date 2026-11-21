@@ -55894,6 +55894,25 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   vcs_ssh::` 162 passed; fmt clean (kiln, adas-mac-studio.local-2). The debug-load rerun is in run-requests.md. Owed:
   the read itself measured per byte and per object (main's push-back: 820 KB should be milliseconds).
 
+### A-722's keepalive on the fetch (2026-11-21, w-perf for UI goal 93; main's piece of 10:39 PST)
+- **Found** (red on main 70dd82623, deterministic at a keepalive interval of none, MacBook idle): a fetch's answer wrote
+  nothing from its `packfile` section's head until its pack's first packet while the pack's objects were chosen over
+  the answer's turns (A-745), and nothing while its source framed nothing new; the push's half was closed by R2
+  (970950081). git's upload-pack writes `0005\1` while `pack-objects` is silent (git 2.50.1's `create_pack_file`,
+  `uploadpack.keepAlive`, five seconds).
+- **Change.** `slates_git::upload::Answer::write_keepalive` writes the empty band-1 packet only where the answer may
+  carry one: inside a banded pack's section, everything before the pack written, its objects still chosen or its source
+  between packets with the pack open (before the section git's client reads it as an empty line where a section's name
+  must stand; v0's bare pack has no band). The HTTP edge's upload exchange (`vcs_http::git::upload`) writes it when a
+  step wrote nothing and the answer has been silent for `git_keepalive_ns` since it last wrote, its head counted as
+  written at once (AtHead).
+- **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
+  (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
+  keepalive, the pack whole after it).
+- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
+  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
+  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
   never main): a push of git/git's v1.5.0 (9.4 MiB, 34,296 objects) holds a transient working set of 16.9 MiB after its

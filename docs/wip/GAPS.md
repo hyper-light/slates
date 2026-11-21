@@ -404,6 +404,10 @@
 > the homing and the store's landing are carried by a task the exchange awaits across its keepalives, and the report is
 > held until the push's records are held at f + 1 with the keepalive written meanwhile. Green 18 of 18 at load 29-33.
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
+> R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
+> fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
+> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
