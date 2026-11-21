@@ -269,3 +269,11 @@ Red: a focused server test landing a large named text: no step past the quantum,
   (old and new) most, content_ref_at (history reconstruction) 30. Options to cut the work, for main: (a) land 1b;
   (b) subtract a key's old entry when a commit first dirties it (no format change; commits pay ~one file hash a key an
   interval); (c) an entry's lanes from a stored 32-byte digest (identity format change: golden vectors, records).
+## 2026-11-21 ~06:00-08:00
+- LANDED A-579 part 1 (5d3733d2c via the MacBook route, main's 05:00 order): the checkpoint identity fold in paced turns
+  with the deadline-sized share; docs (design A-579, §4.16, BENCHMARKS two passes, GAPS measured Z=20 p99 gap); test
+  on a store-backed daemon. w-git and main told.
+- w-svn's post-view ask: already A-805 (w-rewrite-ops, Lineage::preview). My view_after (A-815) withdrawn, not landed;
+  its oracle (copy + identity histories, red-checked) offered to main as a patch.
+- NEXT: (b) subtract a key's old entry at first change; slice the checkpoint's last step (~43 ms) and big single keys;
+  A/B.
