@@ -1443,9 +1443,6 @@ pub(crate) struct SealedPush {
   landed: u64,
 }
 
-}
-
-
 /// Puts a push's names' rows `bytes` into the shard's content store as one content, held for its record (A-724 piece
 /// 8c), lent the room the shard can admit for the step and settled after: its identity; none where refused.
 pub(crate) fn put_names(state: &mut ShardState, bytes: &[u8]) -> Option<slates_vcs::ContentId> {
@@ -1489,7 +1486,6 @@ pub(crate) fn release_names(state: &mut ShardState, identity: &slates_vcs::Conte
   }
   settle(state);
 }
-
 
 impl SealedPush {
   /// The rows of the names the record would write now (A-724 piece 8c): each object the repository lacks, as
