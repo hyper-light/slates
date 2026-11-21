@@ -1,5 +1,20 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~10:10 PST — main 07:30: the held preview LANDED (A-816, main 4b73ba551); A-803 (b) shift layers measured and REJECTED
+- A-816 (A-815 was w-engine's withdrawn entry): `made_commit::hold_preview(state, &mut pending, judged)` keeps the held
+  verdict's preview with the pending accept; `with_held_preview(state, &mut pending, |engine| ..)` lends it each turn
+  for a sliced map build; retired in `made_commit::commit` (the one step) or `give_up`; counted
+  `vcs.made.preview_held_across_turns`. Test: `a_held_verdicts_preview_lives_across_turns_until_its_one_step`. Main's
+  red (first version past a copy answered (false, 0, 0) through a sliced build) is w-git's t_c5b_p3, green with their
+  piece 3. Shape agreed in inbox/w-git-from-w-rewrite-ops-preview.md.
+- A-803 (b), offset-shift layers: built, oracle green, REJECTED on measurement (patch kept at
+  scratch-w-rewrite-ops/a803b-shift-layers-rejected.patch). Reads of version 1 after m alternating changes carry
+  through every shift: 2.9 us / 0.17 / 4.3 / 58 ms at m = 10 / 100 / 1k / 10k (main 0.33 / 1.4 / 4.4 us at 10 / 100 /
+  1k). Bounding the shifts (file length: 11.2 ms at 10k; s^2: 0.54 ms) gives the write win back (s^2: changes
+  0.39 / 3.3 / 14.1 ms, main 0.53 / 3.6 / 17.5). Load 79 while measured. Proposed to main: a persistent piece tree a
+  version (O(log) insert and old read); waiting for the go.
+- NEXT: the go on the piece tree, else the one-value drift (2.6 to 9-10 us over history).
+
 ## ~09:20 PST — svn stage C, the green's side, LANDED (A-814, main a0cdaf94f)
 - `ImportBatch` (a scratch member, staged works, one entry). w-svn has the seam and its side's list.
 - GAPS: A-813's f > 0 limit recorded with main's §4.16 ruling.
