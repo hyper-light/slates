@@ -22,3 +22,18 @@ Grid (1/10/100k files, 1 MB-1 GB, 1/10/100 works) queued in run-requests.md (env
 Next: none in queue. One finding for w-work-mount: a first edit copies the whole file into the work (file-granular CoW,
 WorkFiles::splice), so editing a 1 GB file costs 1 GB; chunk-granular divergence would bound that.
 For main to delete: ~/slates-work/w-work-cow, ~/.cache/w-work-cow-target.noindex once main is done with the grid.
+
+## Piece 2: chunk-grain first edit (A-790) -- in flight, 2026-11-20 ~16:45 PST
+main 15:20: "a one-byte edit to a 1 GB file costs 1 GB; fix at chunk grain; red first; A/B release interleaved best-of-N".
+- Design: a changed file = piece table (work_files.rs `Held`): base ranges of its origin path at the pinned base version +
+  ranges of an append-only written buffer, compacted when dead > live. Edit/rename/unlink read only the base LENGTH
+  (off-owner `Need::Lengths` + `owner_lengths`); off-owner reads of a changed file ask the base span its pieces name;
+  post-state copies each op's range (`copy_range`); restatement written from the rebase's map. mounted_work.rs:91 ->
+  `!work.files.is_empty()` (told w-work-mount, inbox -3).
+- Red (tests/work_edit_cow.rs, release, this Studio): 8 one-byte edits of 64 MiB: +201,490,432 B resident, 2.38 ms.
+  Green: +18,752 B live heap, 0.14 ms.
+- A/B (BENCHMARKS, all N): live heap/work A 1.05 MB / 16.8 MB / 268 MB for 1/16/256 MiB vs B 2.6-2.9 KB; best mean
+  261 us / 455 us / 5.15 ms vs 113 / 132 / 173 us. Note: RSS hides A's copies (allocator reuses freed seed blocks);
+  live heap (slates_mem::heap::stats().in_use) is the meter.
+- Ledger: A-790 (A-788 went to w-sessionlog). Branch agents/w-work-cow local (wip commit under a merge; land as ONE
+  fresh commit from origin/main). Baseline worktree ~/slates-work/w-work-cow-ab (delete after landing).
