@@ -17250,6 +17250,27 @@ and was wrong: on this runner nothing of the daemon hides in the round trip, and
 7 µs of borrow, collect and settle. What 85a's Linux median holds beyond the transport is the build (26.6), the hop to
 the control shard (8-9), the reply (6) and the hop back (4).
 
+**The same A/B on macOS** (adas-mac-studio-2.local, Apple silicon, 14 cores, load 2.9-3.7; kiln r6, 2026-11-21 15:08 UTC;
+the contract command, release, CARGO_BUILD_JOBS=4, five rounds interleaved, order alternating). Microseconds; added p50;
+live p50 / p999:
+
+| round | split (a40c07faa) | split + cache (4949613ae) |
+|---|---|---|
+| 1 | 162.6; 188.2 / 290.1 | 156.9; 182.2 / 399.5 |
+| 2 | 167.2; 193.0 / 484.2 | 162.2; 188.2 / 328.2 |
+| 3 | 171.3; 197.1 / 355.4 | 157.0; 184.8 / 326.2 |
+| 4 | 165.2; 191.3 / 348.6 | 163.4; 189.3 / 335.7 |
+| 5 | 167.1; 192.5 / 325.1 | 162.5; 188.5 / 407.9 |
+
+Per hop, p50 (bucket bounds), both arms: build 18.4-22.5, exchange 98.3-106.5 of which round trip 73.7-81.9 and collect
+24.6-36.9, borrow and settle under 1; a holder's serve 8.2-9.2. No write over 50 ms in any round.
+
+**Reading.** The cache gains here too, in every round, by less (2-14 µs). The live p999 is under 1 ms in all ten rounds
+(290-484 µs), so on this machine 85a's p999 half holds and its median is 3.1-3.4x away. The exchange's collect, about
+30 µs at the median against Linux's 6, is the owner's control shard waking from its park for the answer (A-387 declines
+every hold on macOS: `hold.declined` about 7,700 a run); with the round trip's own two parked wakes, that is the macOS
+excess over Linux.
+
 ## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
 
 - **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
