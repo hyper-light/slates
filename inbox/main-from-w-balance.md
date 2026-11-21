@@ -162,3 +162,17 @@ crates/cli/bench/__pycache__; `git worktree remove` refuses without --force, whi
 before (w-balance, w-balance-docs).
 Still owed (GAPS): run 31's co-location measurement (its runs kept losing placement or memory); learned weights in
 place of one turn a repository; the three-node A/B.
+
+### 2026-11-20 ~17:00: close list, C1 closed; one question on P2 (89a), and P4's state
+- C1 closed: inbox/main-from-w-balance-close.md (08fba4007, e73283fd6; the takeover test, the ten-round A/B).
+- QUESTION (P2, 89a "the 1,000-client A/B (works off the owner shard)"): I find no change of that name on main or in
+  any brief. A-400 (2026-11-18) put each work on its client's shard; GAPS' open item is "the owner's one thread"
+  (a first touch, a verdict, a rebase and a read of the green each cross to the owner). Which change is the A/B's B:
+  (a) a work whose client is on its green's owner shard placed on another shard, so the owner shard runs verdicts
+  alone; (b) an existing branch or commit (name it); or (c) only the measurement, `load_bench` at 1,000 clients,
+  main against main-before-X? Until you answer I am on P4, already built.
+- P4 state: run 31 read (shard-mates explain 4.5 s of the busiest repository's 41.3 s; its own three pushes shared one
+  turn while its shard ran steps 23.2 s of 41.3 s). Fix built, red first, local commit 928df7d1b (not on main yet):
+  a turn an agent (distinct principals holding or waiting) and spare turns (no other repository on the shard holds or
+  waits). Its A/B (run 32, cap 3, three rounds, main 9865bb832 against it) goes to kiln with disk=60g; Studio-2 was at
+  load 32-44 and memory level 4, which refused the run twice. My local targets are deleted (about 15 GB).
