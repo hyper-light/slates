@@ -7985,7 +7985,10 @@ derived from the measured apply rate applies credit backpressure to that volume'
 > the session's own, `slates_cluster::live::Exchanged::round_trips`). A shard answers `Configuration::place` from a
 > cache keyed by everything `place` reads (`crate::placement_cache`, `ShardState::with_placement`), bounded by its
 > placed heads and refilled whole when the configuration moves, so a live write's durability polls allocate no
-> placement (g228, 2026-11-21).
+> placement (g228, 2026-11-21). The build hop is split into its steps (`fleet.live.hop.build.{capture,keys,seal,append,
+> send}`), and the owner keeps each live volume's lineage key and namer between publications (`seal_keys::BodyKeys`),
+> served only while the tenant, lineage and naming records it unwrapped them from are the ones recorded, compared by key
+> id at every use, and bounded by the volumes it ships live: a publication had unwrapped five keys afresh.
 >
 > **A live write parks no shard on its path where a held shard polls (2026-11-18, A-396, g076b).** The round's cost was
 > parked threads, not the cross-shard hop: each shard on a write's path (the owner awaiting the fold, its control shard
@@ -59949,3 +59952,16 @@ Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishmen
 - **Found while testing, not fixed (GAPS):** `slates-bridge-fuse --test handshake
   a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac at its
   `waits >= 1` (handshake.rs:252): the helper answered before the owner's first poll. It predates this change.
+
+### A-826 — A holder's submit names its increment; the owner fetches it by identity (2026-11-21, w-shared, lane (A) 3b; main's rulings 2026-11-20 23:50 and 2026-11-21 00:52; §4.16 "Commit"; A-697, A-825)
+- `SubmitComputed` carries the increment's inputs identity and length (`increment`, `increment_len`), not its bytes:
+  the holder holds its composed increment under that identity (`merge_service::hold_composed_inputs`, lent, refused
+  typed at its room), and the owner's control shard, before the verb runs (`verbs::fetch_named_increment`), fetches
+  what its owner shard lacks from the work's member on the content plane (`fleet::fetch_manifest_into_hold`: hedged,
+  verified, a cut fetch kept for the retry, waiting for a lent session within the live budget), and the owner shard
+  holds it once (`hold_increment`); the verb reads it from its store. Not had whole: `Overloaded`, nothing started.
+- Why: a 320 MiB and larger holder submit crossed the forward lane whole and the lane gave up on silence under load
+  (GAPS). Measured in `fleet` `a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity` (8 MiB: the
+  request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
+  increment a refused verdict leaves is released at the next fold or restart.

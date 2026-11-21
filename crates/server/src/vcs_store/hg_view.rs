@@ -162,94 +162,133 @@ pub(crate) async fn answer_store_wants(
   wants: &mut dyn slates_hg::render::StoreWants,
   id: RepositoryId,
 ) -> bool {
-  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  use slates_hg::render::Want;
   let repository = u128::from_be_bytes(id.bytes);
   while let Some(want) = wants.wants().cloned() {
     let asked_at = slates_rt::futures::now_ns();
     let disk = crate::state::with_state(|state| state.vcs_disk.clone()).flatten();
-    match (want, disk) {
-      (Want::Rows { logs }, Some(disk)) => {
-        let asked = logs
-          .iter()
-          .map(|(log, nodes)| {
-            (
-              log.clone(),
-              nodes.iter().map(|node| node.to_vec()).collect(),
-            )
-          })
-          .collect();
-        let Ok(found) = disk.texts_by_tool(repository, asked).await else {
-          return false;
-        };
-        wants.give_rows(
-          found
-            .into_iter()
-            .map(|log| {
-              log
-                .into_iter()
-                .map(|row| {
-                  row.map(|(text, row)| StoredRevision {
-                    text,
-                    base: row.base,
-                    place: StoredPlace {
-                      payload: row.place.payload,
-                      offset: row.place.offset,
-                      len: row.place.len,
-                    },
-                  })
-                })
-                .collect()
-            })
-            .collect(),
-        );
-      }
-      (Want::Rows { logs }, None) => wants.give_rows(
+    let Some(disk) = disk else {
+      // A daemon holding no store keeps no revision: a rows' want is answered none, any other refused.
+      let Want::Rows { logs } = want else {
+        return false;
+      };
+      wants.give_rows(
         logs
           .iter()
           .map(|(_, nodes)| vec![None; nodes.len()])
           .collect(),
-      ),
-      (Want::Chunks { places }, Some(disk)) => {
-        let asked = places
-          .iter()
-          .map(|place| slates_store::texts::Place {
-            payload: place.payload,
-            offset: place.offset,
-            len: place.len,
-          })
-          .collect();
-        let Ok(chunks) = disk.places(asked).await else {
-          return false;
-        };
-        wants.give_chunks(chunks);
-      }
-      (Want::Chunks { .. }, None) => return false,
-      (Want::Texts { texts, most }, Some(disk)) => {
-        match texts_made(&disk, repository, &texts, most).await {
-          None => return false,
-          Some(MadeTexts::Past) => wants.texts_past(),
-          Some(MadeTexts::Made(made)) => {
-            if !wants.reads_tags() {
-              let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
-              let _ = crate::state::with_state(|state| state.count(PULL_WHOLE_TEXTS, whole));
-            }
-            wants.give_texts(made);
-          }
-        }
-      }
-      (Want::Texts { .. }, None) => return false,
-    }
+      );
+      continue;
+    };
+    let Some(whole) = answer_one(&disk, repository, want, wants).await else {
+      return false;
+    };
     let waited = slates_rt::futures::now_ns().saturating_sub(asked_at);
-    let tags = wants.reads_tags();
+    let (tags, bases) = (wants.reads_tags(), wants.reads_bases());
     let _ = crate::state::with_state(|state| {
       state.count(STORE_ASKS, 1);
       state.count(STORE_WAIT_NS, waited);
       if tags {
         state.count(LOOKUP_STORE_ASKS, 1);
+      } else if bases {
+        state.count(INTAKE_BASE_ASKS, 1);
+      } else {
+        state.count(PULL_WHOLE_TEXTS, whole);
       }
     });
   }
   true
+}
+
+/// Counter: the asks a push's intake (or its replay) made of the node's changeset store for a file delta's base landed
+/// before the push (A-767 C1, main's ruling (b2); `slates_hg::push::intake::Stepped::Store`), each a want of rows or of
+/// texts. Format: a counter name in the status report.
+pub(crate) const INTAKE_BASE_ASKS: &str = "vcs_store.hg_intake_base_asks";
+
+/// [`answer_store_wants`] over `disk` alone, touching no shard state (a recovery's replay holds the state across its
+/// waits): whether every want was answered.
+pub(crate) async fn answer_wants_over(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  wants: &mut dyn slates_hg::render::StoreWants,
+) -> bool {
+  while let Some(want) = wants.wants().cloned() {
+    if answer_one(disk, repository, want, wants).await.is_none() {
+      return false;
+    }
+  }
+  true
+}
+
+/// Answers one `want` of `repository` from `disk` into `wants`: the whole texts it gave (zero for any other want), or
+/// none where the store refused or was gone.
+async fn answer_one(
+  disk: &slates_store::owner::StoreHandle,
+  repository: u128,
+  want: slates_hg::render::Want,
+  wants: &mut dyn slates_hg::render::StoreWants,
+) -> Option<u64> {
+  use slates_hg::render::{StoredPlace, StoredRevision, Want};
+  match want {
+    Want::Rows { logs } => {
+      let asked = logs
+        .iter()
+        .map(|(log, nodes)| {
+          (
+            log.clone(),
+            nodes.iter().map(|node| node.to_vec()).collect(),
+          )
+        })
+        .collect();
+      let found = disk.texts_by_tool(repository, asked).await.ok()?;
+      wants.give_rows(
+        found
+          .into_iter()
+          .map(|log| {
+            log
+              .into_iter()
+              .map(|row| {
+                row.map(|(text, row)| StoredRevision {
+                  text,
+                  base: row.base,
+                  place: StoredPlace {
+                    payload: row.place.payload,
+                    offset: row.place.offset,
+                    len: row.place.len,
+                  },
+                })
+              })
+              .collect()
+          })
+          .collect(),
+      );
+      Some(0)
+    }
+    Want::Chunks { places } => {
+      let asked = places
+        .iter()
+        .map(|place| slates_store::texts::Place {
+          payload: place.payload,
+          offset: place.offset,
+          len: place.len,
+        })
+        .collect();
+      let chunks = disk.places(asked).await.ok()?;
+      wants.give_chunks(chunks);
+      Some(0)
+    }
+    Want::Texts { texts, most } => match texts_made(disk, repository, &texts, most).await? {
+      MadeTexts::Past => {
+        wants.texts_past();
+        Some(0)
+      }
+      MadeTexts::Made(made) => {
+        let whole = u64::try_from(made.len()).unwrap_or(u64::MAX);
+        wants.give_texts(made);
+        Some(whole)
+      }
+    },
+  }
 }
 
 /// The full texts of a [`texts_made`] read: each made, or past the bytes they could hold together.

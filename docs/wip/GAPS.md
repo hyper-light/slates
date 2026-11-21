@@ -6,6 +6,20 @@
 > agents/w-shared-sweep-3 cb2eb2447 = origin/main + family three, whose change in that crate is `mount.rs`'s helper-exit
 > watch only). Main's bridge-fuse changes since the branch: A-795 removed the S3 base from `bridge.rs`/`channel.rs`.
 > The same test on origin/main alone: kiln r29.
+> **Open (w-shared, 2026-11-21): `content_ranges` `a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`
+> fails some runs** (macOS arm64; local at load 20 alone, kiln r28 on the big Studio at load 2 to 7 in the whole lib;
+> passed in r19): no sweep completes on idle time within 10 s, 200,000+ idle slices counted. Untouched by A-825/A-826.
+
+> **Open (w-shared, 2026-11-21; closed by A-826 when it lands): a holder-route submit of 320 MiB and above does not
+> complete under load.** Its `SubmitComputed` carried the whole increment over the forward lane; on a loaded machine
+> the lane hears nothing back while the request crosses, resends it in place on silence (6 to 9 times) and gives up at
+> its bound after 7 to 10 s, and the submit is refused `Overloaded { shard: 0 }` with the owner never having run it.
+> Release, big Studio, load 11.5 to 24: main 6a6e352 0 of 12 at 320, 384, 448 and 512 MiB (kiln r21); interleaved A/B
+> 895b80994 (before A-825) against 545cf46c5 (A-825), 3 rounds: 256 MiB 3 of 3 both, 320 and 512 MiB 0 of 3 both
+> (r23). On a quiet Studio (load 2 to 3.6, r13) 320 MiB passed 9 of 10 and 512 MiB 0 of 10. Not an admission bound a
+> client could split against: the increment's size alone decides it. A-825 took a third off the owner's step at 256
+> MiB (667-681 ms to 437-476 ms) and the late beat from 1.2 s to 0.55 s or none. A-826 (lane 3b) names the increment
+> instead, the owner fetching it by identity on the content plane.
 
 > **Open (w-shared, 2026-11-21, found landing A-825): two A-338/A-349 superseded-owner fleet tests fail on main.**
 > `a_superseded_owners_clients_reach_its_successor` and `a_superseded_owner_ships_nothing_more_of_the_volume_it_lost`
@@ -3022,6 +3036,30 @@
 >     store and verifies clean (0 asks before);
 >   - hg_interop 15/15 against stock hg 7.2.
 > - 1b, BUILT below.
+> **The push intake's file delta bases through the store (A-767 C1, 2026-11-21, w-hg; main's ruling (b2) over (b1)).
+> BUILT.**
+> - A file delta whose base is not the text kept last no longer reads the fork's whole text from the content store
+>   (`Intake::file_base`):
+>   - the push's cache of its own texts (`BaseCache`: each text kept before the last, at most the push's room, let go
+>     as each file group ends), counted `base_hits`;
+>   - else rebuilt from the push's own deltas, walked back through the revisions its group brought to a text in hand,
+>     each rebuilt text cached, counted `base_rebuilds` ((b1), the one source; the cache only saves the rebuild);
+>   - a revision landed before the push is read from the node's changeset store between steps (`Stepped::Store`; the
+>     intake answers `StoreWants`: its rows, then its text within the step's room), counted `base_store_reads`.
+> - Drivers: the push's sliced intake (`hg_push::take_sliced`, `hg_view::answer_store_wants`, counted
+>   `vcs_store.hg_intake_base_asks`) and the recovery's and rebuild's piece replays (`PieceStep::Store`,
+>   `hg_view::answer_wants_over` over the disk alone, since a recovery holds the state). A whole replay cannot wait,
+>   so it is refused typed (`record::Refused::StoreWanted`): no register-held push record remains since e6c3f10cd.
+>   The daemon counts each push's `vcs.hg.push_base_hits`, `_rebuilds` and `_store_reads`.
+> - Held by `push::intake::tests::a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store`
+>   (one file's four revisions, two deltas against a revision before the last: with the cache 2 hits and nothing
+>   rebuilt; with none every base rebuilt and the rows equal; a later push's base landed before, read from the store
+>   once). The tests keep no store: `Intake::answer_from_fork` stands in for it.
+> - OPEN (main's conditions): the A/B of (b1) alone (the cache bounded at zero) against (b2) on a merge-heavy push,
+>   landing (b1) alone if it is within noise. It is a performance piece, deferred under Ada's goal-93 order (complete,
+>   correct, then optimize; briefs/common.md 65ad57c). The red of zero whole-text bytes left in the store after a push
+>   comes with step 2. `push/tree.rs`, `push/made.rs`, `push/verify.rs` and `Indexed::file` still
+>   read whole file texts and block step 2 (main's order, 10:34).
 > **A Mercurial whole's place is its raw text, the store's contract (A-767 C1, 2026-11-21, w-hg; main's ruling). BUILT.**
 > - Found reading lookup's `.hgtags` through the store: `StoreHandle::text` refused `BadRow` for every Mercurial text.
 >   Both writers (the push intake's `KeptText.place`, the import's `Emitter::revision`) kept a revision against the null
@@ -9408,7 +9446,10 @@
 > ruling (c) and the candidate measured and rejected, losing under contention (BENCHMARKS, same section): item 3
 > closed as (a), the cost recorded. The collect's two sleeps themselves are gone by A-829 (a busy shard asks its driver
 > no more often than an empty ask costs): macOS 137.0-141.2 against 164.5-167.7 µs added at the median, no contended
-> condition lost. Still open: 2.2x on Linux;
+> condition lost. A live write's build is split (capture, keys, seal, append, send) and the volume's sealing keys are
+> kept between publications (`seal_keys::BodyKeys`): keys 3.8 to 0.4 µs a write; the daemon's share on ubuntu-latest
+> about 51-58 µs at the median against a transport floor of 50-54 (BENCHMARKS, same section). Next: the seal itself,
+> about 12-13 µs. Still open: 2.2x on Linux;
 > the entry's copies and allocations (134 a write more than a plain write's 34); macOS's parked control shards (one
 > spin primitive with g222's 84a arm C).
 

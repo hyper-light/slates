@@ -1031,6 +1031,24 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     Ok(placed) => placed,
     Err(refusal) => return encode_body(&*refusal),
   };
+  // A holder's submit names its increment (lane (A) 3b): the owner shard holds it, fetched from the asking node by
+  // identity, before the verb runs. Not had is answered retryable, nothing started; a retry asks only for what is lacking.
+  if let RequestBody::SubmitComputed {
+    work,
+    green,
+    increment,
+    increment_len,
+    ..
+  } = &body
+    && let Err(refusal) = fetch_named_increment(
+      (control, shard),
+      ObjectId(work.bytes).creator(),
+      (*green, *increment, *increment_len),
+    )
+    .await
+  {
+    return encode_body(&*refusal);
+  }
   let origin_host = origin.0;
   let id = RequestId::from_word(request);
   let reply = if is_forwardable_read(&body) {
@@ -1055,6 +1073,87 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::remote_attach::serve_unforwardable(control, shard, origin_host, body).await
   };
   encode_body(&named_if_unshared(reply, (control, shard), volume, requester).await)
+}
+
+/// Format: an increment a holder's submit named, fetched from that node by identity onto this owner's content store
+/// (lane (A) 3b), counted with its bytes.
+pub(crate) const INPUTS_FETCHED_FROM_HOLDER: &str = "merge.inputs.fetched_from_holder";
+/// Format: the bytes of [`INPUTS_FETCHED_FROM_HOLDER`]'s increments.
+pub(crate) const INPUTS_FETCHED_FROM_HOLDER_BYTES: &str = "merge.inputs.fetched_from_holder_bytes";
+/// Format: an increment a holder's submit named that the fetch did not get whole this time: the submit is answered
+/// retryable, and the fetch's verified chunks stay staged for the retry.
+pub(crate) const INPUTS_FETCH_SHORT: &str = "merge.inputs.fetch_short";
+
+/// Gives the owner `shard` the increment a holder's `SubmitComputed` names (lane (A) 3b): nothing when the shard holds it
+/// already (a retry, or a version committed before); else fetched from `from`, the member that made the work (its id's
+/// creator, the key of this node's record session to it, where the forward's session names the peer's anchor), which
+/// composed it and holds it
+/// under that identity (`merge_service::hold_composed_inputs`), on the content plane into this control shard's hold
+/// (`fleet::fetch_manifest_into_hold`: hedged, every chunk verified, a cut fetch's chunks kept for the next ask), then held
+/// once on the owner shard for the version it would make (`merge_service::hold_increment`) and released here. Owed: the
+/// fetch staged on the owner shard itself, which a session lent across shards would allow; until then the bytes cross
+/// once between this shard and that, a transient copy of what the forward used to carry. `Overloaded` (not started,
+/// retryable) when it is not had whole.
+async fn fetch_named_increment(
+  (control, shard): (u16, u16),
+  from: HostId,
+  (green, identity, len): (VolumeId, [u8; 32], u64),
+) -> Result<(), Box<ReplyBody>> {
+  let id = to_db_volume(green);
+  let object = ObjectId(green.bytes);
+  let named = slates_merge::chain_entry::Inputs { identity, len };
+  if call_owner(control, shard, move |s| {
+    s.held_content.holds_manifest(object, &identity)
+  })
+  .await?
+  {
+    return Ok(());
+  }
+  // The record session to the asking node may be out on a loan (a shipment, a link's probe): the fetch waits for its
+  // return and asks again, each ask for what the stage still lacks, within one deadline the fleet's live budget derives.
+  let budget = crate::fleet::live_budget();
+  let deadline = slates_machine::clock::monotonic_ns().saturating_add(budget.max_deadline_ns());
+  let whole = loop {
+    if crate::fleet::fetch_manifest_into_hold(object, &[from], |_| 0, identity, budget).await {
+      break true;
+    }
+    let left = deadline.saturating_sub(slates_machine::clock::monotonic_ns());
+    if left == 0 || crate::fleet::session_returned(&[from], left).await != Some(true) {
+      break false;
+    }
+  };
+  let bytes = whole
+    .then(|| {
+      crate::state::with_state(|s| {
+        crate::merge_service::increment_of(s, id, &named).map(std::borrow::Cow::into_owned)
+      })
+      .flatten()
+    })
+    .flatten();
+  let Some(bytes) = bytes else {
+    let _ = crate::state::with_state(|s| s.count(INPUTS_FETCH_SHORT, 1));
+    return Err(Box::new(refused(Refusal::Overloaded { shard: control })));
+  };
+  let held = call_owner(control, shard, move |s| {
+    let next = s.db.partition().green_head(id).saturating_add(1);
+    crate::merge_service::hold_increment(s, id, next, &bytes).map(|_| ())
+  })
+  .await?;
+  let _ = crate::state::with_state(|s| {
+    // Staged here for the move: released once the owner shard holds it, unless this shard is the owner's, whose hold it is.
+    if shard != control {
+      s.held_content.forget_manifest(
+        &mut crate::content_holder::hold_space(&mut s.store),
+        object,
+        &identity,
+      );
+    }
+    if held.is_ok() {
+      s.count(INPUTS_FETCHED_FROM_HOLDER, 1);
+      s.count(INPUTS_FETCHED_FROM_HOLDER_BYTES, len);
+    }
+  });
+  held.map_err(|refusal| Box::new(refused(refusal)))
 }
 
 /// Where a forwarded verb runs, and the volume it is made on (none for a work being made): a work over a green on the
@@ -5417,12 +5516,17 @@ fn dispatch_inner(
       work,
       green,
       increment,
+      increment_len,
       computed,
       carried,
     } => {
       // The owner's whole step for a holder's submit (main's ruling on the lane, 2026-11-20: measured on both ends).
       let start = slates_machine::clock::monotonic_ns();
-      let reply = submit_computed(state, (work, green), (&increment, computed), carried);
+      let named = slates_merge::chain_entry::Inputs {
+        identity: increment,
+        len: increment_len,
+      };
+      let reply = submit_computed(state, (work, green), (named, computed), carried);
       let step_ns = slates_machine::clock::monotonic_ns().saturating_sub(start);
       crate::merge_service::count_phase(state, SUBMIT_OWNER_STEP, step_ns);
       reply
@@ -11985,7 +12089,7 @@ pub(crate) const SUBMIT_OWNER_DECODE: (&str, &str) =
 fn submit_computed(
   state: &mut ShardState,
   (work, green): (VolumeId, VolumeId),
-  (increment, computed): (&[u8], Vec<u8>),
+  (named, computed): (slates_merge::chain_entry::Inputs, Vec<u8>),
   carried: slates_ipc::protocol::ComputedSubmit,
 ) -> ReplyBody {
   let forwarded = state
@@ -11996,8 +12100,15 @@ fn submit_computed(
       feature: "a node's verb from a client".to_owned(),
     });
   }
+  // The increment the request names, which the forward fetched from the asking node into this shard's content store
+  // before this step (lane (A) 3b, `fetch_named_increment`): not held (released since, or the fetch cut short) is
+  // answered retryable, nothing started, and the asking node's retry fetches it again.
+  let Some(increment) = crate::merge_service::increment_of(state, to_db_volume(green), &named)
+  else {
+    return refused(Refusal::Overloaded { shard: state.shard });
+  };
   let decode_start = slates_machine::clock::monotonic_ns();
-  let decoded = slates_merge::engine::Increment::decode(increment);
+  let decoded = slates_merge::engine::Increment::decode(&increment);
   let decode_ns = slates_machine::clock::monotonic_ns().saturating_sub(decode_start);
   crate::merge_service::count_phase(state, SUBMIT_OWNER_DECODE, decode_ns);
   let inc = match decoded {
