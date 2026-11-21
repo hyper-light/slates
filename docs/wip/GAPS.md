@@ -3999,6 +3999,12 @@
 > pressed level. On base ab0344f04 under that pressure: 3 of 3 and 12 of 12 pass, and with the levels reversed 2 and 3
 > fail.
 
+> **`t_a752`'s "more quanta than files" stated the machine's timing, not A-752's rule (2026-11-21; CLOSED by this change,
+> w-bugs; found by w-git: 1 failure in 2 runs at load 12.8, more since 2b2fc8d80's pacing).** A quantum is the shard's
+> live wake estimate, which load and few CPUs raise, so quanta over files is the machine's speed; the rule is a unit a
+> file at least. The pushes' turns now count their units (`push.build.units`) and the test asserts units >= files. Its
+> runs at 1-2 CPUs and loaded, main against the change, are main's (run-requests.md).
+
 > **Killed test daemons leave their macOS socket-route nodes behind, an unbounded set (2026-11-21; OPEN, w-bugs, after
 > its current three; found by main on the MacBook).** `$TMPDIR` (`/var/folders/.../T`) held 1,637 `slates-<hex>.sock`
 > files, the macOS socket route's nodes (`crates/ipc/src/route.rs`, A-161/A-173), new ones as recent as 01:28. The route
