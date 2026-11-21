@@ -661,7 +661,10 @@ fn an_object_longer_than_a_window_is_homed_and_read_back_by_its_blake3() {
         .map(|at| u8::try_from(at % 251).unwrap_or(0))
         .collect();
       let identity = ContentId::of(&bytes);
-      match home_in_region(origin, &shards, bytes.clone(), full).await.outcome {
+      match home_in_region(origin, &shards, bytes.clone(), full)
+        .await
+        .outcome
+      {
         Ok(homed) if homed == identity => {}
         other => outcome.push(format!("not homed under its BLAKE3: {other:?}")),
       }

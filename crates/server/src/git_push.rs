@@ -907,7 +907,10 @@ impl<P> ReceivePack<P> {
     let AnswerState::Deciding(decision) = &mut self.answer else {
       return;
     };
-    match (core::mem::replace(&mut decision.homing, Homing::Done), carried) {
+    match (
+      core::mem::replace(&mut decision.homing, Homing::Done),
+      carried,
+    ) {
       (Homing::Waiting((identity, count)), Carried::Homed(homed)) => {
         if homed.outcome.as_ref().is_ok_and(|homed| *homed == identity) {
           decision.sealed.homed_as((identity, count));

@@ -1531,7 +1531,10 @@ impl SealedPush {
   /// Gives back the holds the homed names and pack took for a record that will never name them (a push refused after
   /// its homing: its changeset unlanded).
   pub(crate) fn release_homed(&mut self, state: &mut ShardState) {
-    for (identity, _) in [self.named.take(), self.packed.take()].into_iter().flatten() {
+    for (identity, _) in [self.named.take(), self.packed.take()]
+      .into_iter()
+      .flatten()
+    {
       release_names(state, &identity);
     }
   }
@@ -2618,7 +2621,8 @@ fn changeset_wanted(
   }
   let (named, packed) = (record.named?, record.packed?);
   let content = state.vcs_stores.content.as_ref();
-  let holds = |identity: &slates_vcs::ContentId| content.is_some_and(|content| content.contains(identity));
+  let holds =
+    |identity: &slates_vcs::ContentId| content.is_some_and(|content| content.contains(identity));
   let wanted = ChangesetWanted {
     repository: u128::from_be_bytes(id.bytes),
     sequence: record.sequence,
@@ -2664,7 +2668,9 @@ async fn read_changeset(
   }
   let names = match &names_at.inline {
     Some(inline) => inline.clone(),
-    None => section_bytes(disk, &names_at.section).await.ok_or_else(unlanded)?,
+    None => section_bytes(disk, &names_at.section)
+      .await
+      .ok_or_else(unlanded)?,
   };
   if slates_vcs::ContentId::of(&names) != wanted.named.0 {
     return Err(unlanded());
@@ -2678,7 +2684,11 @@ async fn read_changeset(
       .ok_or_else(unlanded)?;
     None
   } else {
-    Some(payload_bytes(disk, wanted.packed).await.ok_or_else(unlanded)?)
+    Some(
+      payload_bytes(disk, wanted.packed)
+        .await
+        .ok_or_else(unlanded)?,
+    )
   };
   Ok(ChangesetRead {
     names: (!wanted.names_held).then_some(names),
@@ -2697,7 +2707,10 @@ async fn section_bytes(
   while bytes.len() < len {
     let at = u64::try_from(bytes.len()).ok()?;
     let piece = disk
-      .read(section.offset.checked_add(at)?, section.len.checked_sub(at)?)
+      .read(
+        section.offset.checked_add(at)?,
+        section.len.checked_sub(at)?,
+      )
       .await
       .ok()?;
     if piece.is_empty() {
@@ -3239,7 +3252,8 @@ async fn recover_repository(
             Some(disk) => read_changeset(&disk, &wanted).await,
             None => Err(ReplayRefused::Unlanded),
           };
-          if let Err(refused) = read.and_then(|read| put_changeset(state, record.id, &wanted, read)) {
+          if let Err(refused) = read.and_then(|read| put_changeset(state, record.id, &wanted, read))
+          {
             let _ = replayed(state, record.id, Err(refused));
             break;
           }
@@ -3369,7 +3383,9 @@ async fn rebuild_turns(id: RepositoryId, generation: u64) {
       Some((wanted, state.vcs_disk.clone()?))
     }) {
       let read = read_changeset(&disk, &wanted).await;
-      let _ = crate::state::with_state(|state| read.and_then(|read| put_changeset(state, id, &wanted, read)));
+      let _ = crate::state::with_state(|state| {
+        read.and_then(|read| put_changeset(state, id, &wanted, read))
+      });
     }
     while let Some(Some((origin, shards, identity))) =
       crate::state::with_state(|state| names_to_fetch(state, id, generation))

@@ -1137,7 +1137,7 @@ fn as_version_5(
 /// refused `Names` (missing, to be fetched first), the store left as it was.
 #[test]
 fn t_a767_c5_a_version_5_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them()
-{
+ {
   let mut live = Live::new();
   let (objects, head) = commit_of(&[(b"a".to_vec(), b"bytes".to_vec())], &[], FIRST_DATE);
   live

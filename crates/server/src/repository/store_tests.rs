@@ -55,7 +55,9 @@ fn creation_recovered(dir: &std::path::Path) {
   assert!(record.contains("\nstored\nmain\nGit\n"), "{record}");
   drop(log);
   let mut reopened = Store::open(root(dir), SIZING).unwrap();
-  let rows = reopened.changesets(creation.header.repository, 0, 10).unwrap();
+  let rows = reopened
+    .changesets(creation.header.repository, 0, 10)
+    .unwrap();
   assert_eq!(rows.len(), 1);
   assert_eq!(rows[0].identity, creation.identity);
 }
