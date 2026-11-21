@@ -152,6 +152,11 @@
 > (`tests/owner.rs` `a_changeset_lands_in_parts_alone_and_a_dropped_one_leaves_nothing`). Owed: the log's group commit
 > (concurrent landings sharing one flush, its window from the device's measured flush time), which is where a device
 > rate belongs; the memtable holds rows, never a landing's bytes, so its size is the engine's unit of work.
+> C5's store side BUILT (2026-11-20, main's split): `crates/server/src/vcs_store/store_packs.rs`, git's `PackSource`
+> over the store's owner (an awaited `fill` of a range into a bounded least-recently-used set of store pieces, the
+> synchronous `piece` lending from it alone, a miss the caller's cue to fill; no blocking read, R6). Owed (w-git): the
+> push landed as a changeset before its entry, recovery of named sequences, the replay through the adapter, and the
+> pack named by the plain BLAKE3 of its `Payload`.
 >
 > **A-773 (2026-11-20, w-sessionlog).** BUILT: `slates log [--json]`, the session log naming collided works and landings
 > awaiting a grant first. A-788 serves it over MCP (`slates.log`) and the SDKs' sync clients; owed: their async forms.
