@@ -6903,10 +6903,10 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Finding by observation, not chased: debug `--test mounted_work_cow` was killed once of 4 by the daemon watchdog (shard 0 spun 3.6 s CPU without a step against 3.57 s; load 11.7 on this MacBook) while seeding a 64 MiB green in one submit; work_cow.rs seeds the same. Release runs never tripped it.
 
 ## w-sessionlog (2026-11-20 ~17:45 PST), A-788 / A-782
-- Python SDK: maturin build crates/sdk-python, then `SLATES_DAEMON=<slates binary> python -m unittest crates/sdk-python/tests/test_sdk.py`
+- [DONE by w-sessionlog 16:40, see inbox close note] Python SDK: maturin build crates/sdk-python, then `SLATES_DAEMON=<slates binary> python -m unittest crates/sdk-python/tests/test_sdk.py`
   (macOS + Linux). Red: test_lifecycle_round_trip_over_a_live_daemon fails at the `session_log` block or
   test_module_exposes_the_client_surface lacks `session_log`.
-- Node SDK: build the napi addon, `node --test crates/sdk-node/tests/sdk.test.mjs` (macOS + Linux). Red: `sessionLog` missing
+- [DONE by w-sessionlog 16:40] Node SDK: build the napi addon, `node --test crates/sdk-node/tests/sdk.test.mjs` (macOS + Linux). Red: `sessionLog` missing
   from Client.prototype or the collided-work assertions fail.
 - Cross-platform compile of A-782's touched crates (server, client, api, mcp, sdk-node, sdk-python) on Linux and Windows:
   red = a cfg arm still matching `Submitted`/`Outcome` without `Identical`. Plus clippy on the same crates.
