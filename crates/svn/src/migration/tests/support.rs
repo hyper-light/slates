@@ -93,7 +93,7 @@ pub(super) fn import_with(
         repository.commit_record(*record)?;
       }
       // The records hold every text they name: no base is kept elsewhere.
-      Importing::Base { .. } => return Err(MigrationRefusal::Corrupt.into()),
+      Importing::Base { .. } => return Err(MigrationRefusal::Corrupt),
     }
   }
 }

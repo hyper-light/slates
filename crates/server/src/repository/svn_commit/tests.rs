@@ -1843,3 +1843,68 @@ fn a_refused_made_landing_leaves_nothing_any_reader_saw_and_its_retry_lands_once
     assert_eq!(retried, (1, true, 2), "the retry landed once");
   });
 }
+
+/// C2 stage B part 2 (b), the records' RAM texts retired (main's ruling of 2026-11-21 09:20). Do: in three repositories
+/// commit revision 1 and set its properties (changeset 2); in the second land, as a hostile log, a deltified text's
+/// record (the retired kind) at changeset 2; in the third, revision 1's record with its texts inline (the form logs held
+/// before part 2 (b)) at changeset 1; rebuild each from the node's store. Expect: the first made again whole; the second
+/// refused `SvnRecord(Retired(Deltified))` and the third `SvnTextsInline`, each typed, never a panic or a skip.
+#[test]
+fn a_log_holding_a_retired_record_or_inline_texts_is_refused_typed_at_rebuild() {
+  stored(|| async move {
+    let mut seen = Vec::new();
+    for (name, hostile) in [
+      ("whole", None),
+      ("deltified", Some(2u64)),
+      ("inline", Some(1u64)),
+    ] {
+      let (svn, _) = subversion(name).await;
+      assert_eq!(commit((&owner(), svn), first(), None).await, answered(1));
+      let properties = Record::RevisionProperties {
+        revision: 1,
+        properties: BTreeMap::from([(b"svn:log".to_vec(), b"again".to_vec())]),
+      };
+      assert_eq!(
+        super::land_record((&owner(), svn), properties).await,
+        Some(Ok(()))
+      );
+      if let Some(sequence) = hostile {
+        let bytes = if sequence == 2 {
+          // The retired kind's bytes as a log written before held them: the header, kind 5, a text, no base, a delta.
+          let mut bytes = Record::Locks(Vec::new()).encode();
+          bytes.truncate(9);
+          bytes[8] = 5;
+          bytes.extend_from_slice(&[7u8; 32]);
+          bytes.push(0);
+          bytes.extend_from_slice(&0u64.to_le_bytes());
+          bytes
+        } else {
+          Record::Revision(first()).encode()
+        };
+        let disk = on(|state| state.vcs_disk.clone()).expect("the node's store");
+        let landed = super::landing::land(
+          &disk,
+          (svn, sequence),
+          vec![(slates_store::log::SectionKind::Record, bytes)],
+        )
+        .await;
+        assert_eq!(landed, Ok(()));
+      }
+      rebuild(svn).await;
+      seen.push(on(|state| {
+        state
+          .vcs_stores
+          .unrecovered(svn)
+          .map(|refused| format!("{refused:?}"))
+      }));
+    }
+    assert_eq!(
+      seen,
+      vec![
+        None,
+        Some("SvnRecord(Retired(Deltified))".to_owned()),
+        Some("SvnTextsInline".to_owned())
+      ]
+    );
+  });
+}

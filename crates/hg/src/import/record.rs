@@ -97,6 +97,7 @@ const REFERENCE_VERSION: u32 = 7;
 /// markers in the last segment alone. Its replay appends the rows as they are stored, by identity, with no text rebuilt,
 /// and is not held to an empty index nor checks each changeset's manifest: the run's segments replay in order into the
 /// repository's empty store, and the import checked every manifest before its entry named the run.
+/// Format: the segment record's version, the eighth.
 const SEGMENT_VERSION: u32 = 8;
 /// Format: the version of an import's record in the repository's register once its history is on the changeset log
 /// (A-767 C1 step 3): the head, then the first and the last sequence of the run of segment changesets its import landed
