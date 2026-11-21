@@ -15,7 +15,9 @@
 //!
 //! **Rows** (item 3), keyed so a repository's rows are one contiguous range: `C`, then the repository and the
 //! changeset's sequence (each a big-endian `u64`, so the order of the bytes is the order of the numbers), whose value
-//! is the record's offset and length in the log, its identity, its tool byte and its work. The other tables of item 3
+//! is the record's offset and length in the log, its identity, its tool byte and its work; and `P`, then a payload
+//! section's identity (BLAKE3 of its bytes), whose value is where those bytes are in the log and their length, so a
+//! landed content is read by identity as a staged one is ([`Store::piece`]). The other tables of item 3
 //! (names, versions, object places, derived values) are each tool's, derived from its sections the same way (C4 to C6).
 
 use std::fmt;
@@ -29,7 +31,12 @@ use mantle_engine::store::Config;
 use mantle_engine::trunk::TrunkConfig;
 use slates_land::store_root::{StoreRoot, StoreRootRefusal};
 
-use crate::log::{Appending, ChangesetLog, Header, Located, LogError};
+use std::borrow::Cow;
+
+use crate::log::{
+  Appending, ChangesetLog, Header, Located, LogError, SectionKind, identity_of_range, sections_in,
+};
+use crate::staging::{Identity, Staging};
 
 /// Format: the changeset log's file name in the store's directory.
 pub const LOG_FILE: &str = "changesets";
@@ -37,6 +44,15 @@ pub const LOG_FILE: &str = "changesets";
 pub const ROWS_FILE: &str = "rows";
 /// Format: the changeset table's tag, the first byte of its keys.
 const CHANGESETS: u8 = b'C';
+/// Format: the content table's tag: a payload section's identity to its place in the log.
+const CONTENTS: u8 = b'P';
+/// Format: a content row's key: the tag and the identity.
+const CONTENT_KEY_BYTES: usize = 33;
+/// Format: a content row's value: the bytes' offset in the log and their length.
+const CONTENT_VALUE_BYTES: usize = 16;
+/// Format: the most bytes one [`Store::piece`] reads from the log: the read's unit (a caller walks pieces of any length
+/// until what it needs is whole), not a tuning of the reader.
+const PIECE_BYTES: usize = 1 << 16;
 /// Format: a changeset row's key: the tag, the repository, the sequence.
 const KEY_BYTES: usize = 17;
 /// Format: a changeset row's value: offset 8, length 8, identity 32, tool 1, work 8.
@@ -76,6 +92,8 @@ pub enum StoreError {
   Sizing(&'static str),
   /// A row that does not decode.
   BadRow,
+  /// A section named a staged content that is not staged.
+  NotStaged,
 }
 
 impl fmt::Display for StoreError {
@@ -86,7 +104,8 @@ impl fmt::Display for StoreError {
       Self::Log(error) => write!(f, "{error}"),
       Self::Engine(error) => write!(f, "the store's engine: {error}"),
       Self::Sizing(what) => write!(f, "the store's sizing: {what}"),
-      Self::BadRow => f.write_str("a changeset row that does not decode"),
+      Self::BadRow => f.write_str("a store row that does not decode"),
+      Self::NotStaged => f.write_str("a section named a content that is not staged"),
     }
   }
 }
@@ -115,6 +134,15 @@ impl From<mantle_engine::error::Error> for StoreError {
   fn from(error: mantle_engine::error::Error) -> Self {
     Self::Engine(error)
   }
+}
+
+/// A section's bytes for [`Store::land`]: held by the caller, or a content staged in flight.
+#[derive(Clone, Copy, Debug)]
+pub enum Contents<'a> {
+  /// Bytes the caller holds.
+  Bytes(&'a [u8]),
+  /// A content staged by identity ([`Staging::stage`]).
+  Staged(Identity),
 }
 
 /// A landed changeset as its row names it.
@@ -159,9 +187,18 @@ impl Store {
     };
     let mut replayed = Ok(());
     let mut value = Vec::new();
-    let log = ChangesetLog::recover(log_file, applied, |located| {
+    let mut buffer = Vec::new();
+    let log = ChangesetLog::recover(log_file, applied, |file, located| {
       if replayed.is_ok() {
-        replayed = put_changeset(&mut rows, located, &mut value);
+        replayed = put_changeset(&mut rows, located, &mut value).and_then(|()| {
+          for section in sections_in(file, located)? {
+            if section.kind == SectionKind::Payload {
+              let identity = identity_of_range(file, section.offset, section.len, &mut buffer)?;
+              put_content(&mut rows, &identity, section.offset, section.len)?;
+            }
+          }
+          Ok(())
+        });
       }
     })?;
     replayed?;
@@ -187,6 +224,91 @@ impl Store {
   /// Applies a committed record's rows: the step after [`Appending::commit`], which made the record durable.
   pub fn applied(&mut self, located: &Located) -> Result<(), StoreError> {
     put_changeset(&mut self.rows, located, &mut self.value)
+  }
+
+  /// Lands a changeset whose sections are `sections`, each bytes the caller holds or a content staged in `staging`
+  /// (written from the staged bytes, never copied first): appended, committed (one flush), then its rows applied, a
+  /// `P` row for each payload section, named by its identity. The header's section count is the list's.
+  pub fn land(
+    &mut self,
+    mut header: Header,
+    sections: &[(SectionKind, Contents<'_>)],
+    staging: &Staging,
+  ) -> Result<Located, StoreError> {
+    header.sections = u16::try_from(sections.len())
+      .map_err(|_| StoreError::Sizing("more sections than a record holds"))?;
+    let mut payloads: Vec<Identity> = Vec::new();
+    let located = {
+      let mut record = self.log.begin(header)?;
+      for (kind, contents) in sections {
+        let bytes = match contents {
+          Contents::Bytes(bytes) => *bytes,
+          Contents::Staged(identity) => staging.get(identity).ok_or(StoreError::NotStaged)?,
+        };
+        record.section(
+          *kind,
+          u64::try_from(bytes.len()).map_err(|_| StoreError::Sizing("a section past u64"))?,
+        )?;
+        record.piece(bytes)?;
+        if *kind == SectionKind::Payload {
+          payloads.push(match contents {
+            Contents::Staged(identity) => *identity,
+            Contents::Bytes(bytes) => *blake3::hash(bytes).as_bytes(),
+          });
+        }
+      }
+      record.commit()?
+    };
+    put_changeset(&mut self.rows, &located, &mut self.value)?;
+    let mut payload = payloads.iter();
+    for section in self.log.sections(&located)? {
+      if section.kind == SectionKind::Payload
+        && let Some(identity) = payload.next()
+      {
+        put_content(&mut self.rows, identity, section.offset, section.len)?;
+      }
+    }
+    Ok(located)
+  }
+
+  /// The bytes of the content `identity` (of `len` bytes) from `offset` on, as far as one piece reaches: from `staging`
+  /// while it is in flight (borrowed, no copy), else from the log where it landed (a read of at most [`PIECE_BYTES`]).
+  /// `None` where neither holds it, or `offset` is at or past its end.
+  pub fn piece<'a>(
+    &mut self,
+    staging: &'a Staging,
+    identity: &Identity,
+    len: u64,
+    offset: u64,
+  ) -> Result<Option<Cow<'a, [u8]>>, StoreError> {
+    if let Some(bytes) = staging.get(identity) {
+      let start = usize::try_from(offset).map_err(|_| StoreError::BadRow)?;
+      return Ok(
+        bytes
+          .get(start..)
+          .filter(|rest| !rest.is_empty())
+          .map(Cow::Borrowed),
+      );
+    }
+    let mut key = [0u8; CONTENT_KEY_BYTES];
+    content_key(identity, &mut key);
+    if !self.rows.get(&key, &mut self.value)? {
+      return Ok(None);
+    }
+    let (at, landed_len) = decode_content(&self.value).ok_or(StoreError::BadRow)?;
+    if landed_len != len || offset >= landed_len {
+      return Ok(None);
+    }
+    let left = landed_len.checked_sub(offset).ok_or(StoreError::BadRow)?;
+    let take =
+      usize::try_from(left.min(u64::try_from(PIECE_BYTES).map_err(|_| StoreError::BadRow)?))
+        .map_err(|_| StoreError::BadRow)?;
+    let mut bytes = vec![0u8; take];
+    self.log.read_at(
+      &mut bytes,
+      at.checked_add(offset).ok_or(StoreError::BadRow)?,
+    )?;
+    Ok(Some(Cow::Owned(bytes)))
   }
 
   /// The changeset log, for reading committed records' sections.
@@ -322,6 +444,44 @@ fn put_changeset<F: BlockFile>(
   value.extend_from_slice(&header.work.to_le_bytes());
   rows.put(&changeset_key(header.repository, header.sequence), value)?;
   Ok(())
+}
+
+/// The content row's key of `identity`.
+fn content_key(identity: &Identity, key: &mut [u8; CONTENT_KEY_BYTES]) {
+  if let Some(tag) = key.get_mut(0) {
+    *tag = CONTENTS;
+  }
+  if let Some(slot) = key.get_mut(1..33) {
+    slot.copy_from_slice(identity);
+  }
+}
+
+/// Puts the content row: `identity`'s bytes are `len` bytes at `offset` in the log.
+fn put_content<F: BlockFile>(
+  rows: &mut ShardDb<F>,
+  identity: &Identity,
+  offset: u64,
+  len: u64,
+) -> Result<(), StoreError> {
+  let mut key = [0u8; CONTENT_KEY_BYTES];
+  content_key(identity, &mut key);
+  let mut value = [0u8; CONTENT_VALUE_BYTES];
+  if let Some(slot) = value.get_mut(0..8) {
+    slot.copy_from_slice(&offset.to_le_bytes());
+  }
+  if let Some(slot) = value.get_mut(8..16) {
+    slot.copy_from_slice(&len.to_le_bytes());
+  }
+  rows.put(&key, &value)?;
+  Ok(())
+}
+
+/// A content row's value: the offset and length.
+fn decode_content(value: &[u8]) -> Option<(u64, u64)> {
+  if value.len() != CONTENT_VALUE_BYTES {
+    return None;
+  }
+  Some((u64_at(value, 0)?, u64_at(value, 8)?))
 }
 
 fn tool_byte(tool: crate::log::Tool) -> u8 {
