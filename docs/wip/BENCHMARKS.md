@@ -16880,3 +16880,9 @@ read too (`push.build.turns`, both sides).
 - **Not this change's.** `provision_bench`'s 8-client form hung on both sides (pass 1 and its own timing run): one
   client waits in `Client::round_trip` for a reply that never comes, every shard parked in `kevent`, the main thread
   joining it (reported to main with both stacks).
+
+**85a against its done-when on the landed commit** (origin/main 218256bab, the contract command, release, adas-mac-studio.local-2,
+32 cores, macOS, load 6-10, 2026-11-21 04:59-05:05 UTC). Added at the median; live p999: 186.5 µs, 375 µs; 188.7 µs,
+384 µs; 189.6 µs, 393 µs; 184.5 µs, 2,788 µs; 437.0 µs, 2,484 µs. **Not met:** the median is 3.7-8.7x the 50 µs goal,
+and p999 is under 1 ms in 3 of 5 rounds. Linux was not measured: adacachy's run froze in its cgroup at load 68-71
+(`do_freezer_trap`) and was stopped unbuilt.
