@@ -57559,6 +57559,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `hyper-rt`'s cross-thread channel, whose ring is `unsafe impl Send`/`Sync` (CLAUDE.md §3 forbids it): a decision for
 > main between porting a safe channel into `slates-rt` and driving `ShardDb` inline with no worker pool.
 
+> **Status (2026-11-20, piece C2 step 1: `slates_rt::sync`).** Main's ruling on 2b: no `hyper-rt`, no `unsafe impl
+> Send`/`Sync`; the vendored seams are ported onto `slates_rt`. `crates/rt/src/sync` carries upstream's channel
+> surface (`channel`, `channel_with`, `Sender`, `ChannelReceiver`, `SyncError`) with no `unsafe`: values cross through
+> the standard library's bounded channel, a waiting task's word sits in upstream's generational cell table (ported,
+> safe), sender tasks waiting for room hold places granted in turn (upstream's room, its places cells of that table),
+> and a plain thread blocks inside the standard channel. Tests 11 of 11 (`cargo test -p slates-rt --lib sync::`, macOS
+> arm64, Adas-Mac-Studio-2): thread to thread, task from thread, task waiting for room, closes, cells given back.
+> Next: the issuer, crc, codec, disk, chunk and engine on it (vendor patches), then the land seam for their files.
+
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
 seam; (4) the A/B of item 7; (5) Mercurial onto it (w-hg), (6) git (w-git's B1-B4), (7) Subversion (w-svn), each with
