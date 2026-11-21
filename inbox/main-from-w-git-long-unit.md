@@ -29,3 +29,14 @@ Proposal (asking, since layer 2 is w-engine's):
   almost nothing in its chain, so creates stop filling `green_chains`.
 
 Unless you say otherwise, I start layer 1 now (red first) and ask w-engine when 507110661 lands.
+
+## Layer 1 LANDED (06:20 PST): 4f6242707 on main
+A push's judge now makes the chains room before its append, one member green a turn (`ServerJudge::room_turn`, after
+the command's work is built, sized by `Preparing::entry_bound`). Counters: `git_push.room_checkpointed` for the turns,
+`repository.push.append_checkpointed` for any the append's guard still folds in its step.
+
+Red: `git_push::tests::t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step` (16 creates of
+64-file trees, 64 KiB chains). 73 greens checkpointed inside appends at 30e89672f; none after. Focused on the merged
+tree: server 181/181, git store 116/116.
+
+Next: the path-map wall (derived on first read). Each checkpoint's fold stays whole until w-engine's 507110661 lands.

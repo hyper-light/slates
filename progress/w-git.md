@@ -346,3 +346,6 @@
   vcs_http.rs:1454): name it with a unit-length counter, red, slice it. r42 times each part of a decision step.
   (3) path maps per created ref derived on first read (A-664/A-752), oracle + sliced/memoized + replay flat; red =
   git/git push lands; then the A/B vs stock git. w-engine told (inbox/w-engine-from-w-git-path-maps.md).
+- 06:20 A-238 amended LANDED 4f6242707: a push makes the chains room before its append, a green a turn (red: 73
+  append checkpoints -> 0). The >1 s unit was repository::push::admit folding ~1,000 member greens in one append
+  (r44's stack samples). Each fold whole until w-engine lands 507110661. NEXT: path maps derived on first read.
