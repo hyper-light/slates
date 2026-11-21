@@ -58642,6 +58642,36 @@ C1's, keeps the paths the verb's fetch holds only lengths of), `verbs.rs` (`edit
   `a_directory_s_identity_needs_no_fetch_and_is_the_listed_directory_s`); `-p slates-ipc --test wire_order` and `-p
   slates-db --test wire_order` 2 of 2 each; rustfmt's layout applied.
 
+### §4.16 amended — A version's inputs are archived once for every shipment, their chunks lent from the chain, never rebuilt a pass at a time (2026-11-20, w-shared for UI goal 93; main's close list, exit 4 at 64 MiB; A-286)
+Applied in the same change to: §4.16 "Commit" (inputs past a shipment's bound), GAPS (the sweep's exit 4 line),
+`crates/server/src/merge_service.rs` (`PendingMergeRecord::inputs_manifest`, `make_inputs_manifest`, `InputsSource`,
+`cut_shipments`, `ShipInputs::cut`, `inputs_lent`), `crates/server/src/merge_origin.rs` (`inputs_manifest_archive`,
+`inputs_extents`, `inputs_manifest`, `inputs_archive_of`), `crates/cluster/src/content.rs` (`raw_chunk_request`),
+`crates/server/tests/fleet.rs`.
+- **What was there.** Inputs past a shipment's bound cross in several shipments, one a record-plane pass (A-286). Each
+  pass of a later version copied its increment out of the green's chain (`inputs_of`, `to_vec`), rebuilt its inputs
+  archive whole (every chunk copied again and BLAKE3-hashed), cut one bound's chunks from it and dropped the rest. All of
+  it ran in one owner-shard step. A shipment carries at least one 1 MiB chunk, so a 64 MiB version took at least 64
+  passes, each copying about 128 MB and hashing 64 MB: the inputs' size times their shipments. At 320 MiB one such step
+  nears the watchdog's second of CPU (exit 4).
+- **Change.** The version's archive is made once, at its first shipment that carries inputs, without its chunks
+  (`merge_origin::inputs_manifest_archive`: each chunk's identity hashed over the chain's bytes in place). The pending
+  record keeps it (a manifest of extents, one per 1 MiB of inputs) until the version places. Every shipment offers that
+  manifest and cuts its chunks as views of the bytes the chain already holds (`InputsSource::Lent`). Each chunk request
+  is encoded straight from its slice (`content::raw_chunk_request`), so a pass allocates only the messages it sends.
+  Version 0's origin archive, kept whole while it ships (A-286), is cut as before (`InputsSource::Whole`).
+- **Counter.** `merge.inputs.manifest_made`, once a version.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20).
+  - `slates-server --lib a_shipment_cut_from_lent_bytes_is_the_whole_archives_byte_for_byte`: lent shipments equal a
+    whole archive's (offer, chunk requests in order, wholeness), over bounds of zero, one chunk, two and past the whole,
+    for targets lacking every chunk and only the last, over a short last chunk and a repeated chunk.
+  - `slates-cluster --lib a_lent_raw_chunks_request_is_the_held_chunks_byte_for_byte`.
+  - `slates-server --test fleet a_version_crossing_in_several_shipments_is_archived_once`: a 4.5 MiB version crosses to
+    B in parts over several shipments, its manifest made once. Red, with the manifest made again every pass: made
+    equals the shipments.
+- **Owed.** An RSS-bound measurement of a 64 to 320 MiB version's placement before and after (main's run-requests),
+  and the watchdog's own report from the Studio reruns, to say whether this was exit 4's cause.
+
 ### A-794 — A forwarded work's creation is made on the partition its name hashes to, and a forwarded verb parked at its work's gate answers its exchange when it resumes (2026-11-20, w-fed-move, goal 86b; found by use: 100,000 clients over the Linux kernel; §4.8 "Lookup", §4.16 "Role", A-247, A-400, A-697, AUD-11)
 - **Why.** A work over a green another node owns is made on its client's own partition when that node holds the
   green's replica (A-697); otherwise its creation is forwarded to the owner, where `serve_forward` ran it on the green's

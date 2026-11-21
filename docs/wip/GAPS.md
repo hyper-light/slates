@@ -5258,7 +5258,12 @@
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll
 > interval at a time before). Owed from that sweep: a FUSE mount helper's exit (`fuse.rs`), awaited by its `ExitWatch`; the forward lane's throughput (about 200 MB/s on loopback); and the shared-green
-> bench run's exit 4 at 64 MiB under memory pressure.
+> bench run's exit 4 at 64 MiB under memory pressure. Exit 4 is the watchdog's (`watchdog.rs`, `FAILED_EXIT_CODE`): a
+> shard judged spinning, about 1 s of CPU in one poll. One cause found by reading and fixed on 2026-11-20: a version's
+> inputs were copied out of the chain and their whole archive rebuilt and rehashed on every shipment pass, one owner
+> step each, so N shipments cost N times the inputs (64 MiB: at least 64 passes of 128 MB copied and 64 MB hashed);
+> the archive is now made once, chunks lent (`merge.inputs.manifest_made`). Whether it was exit 4's cause is open,
+> until the 64 to 320 MiB reruns on the Studio report the watchdog's line.
 
 > **Open (perf, 2026-11-09): A-247 step one's verdict tail.** At 3,000 clients on one node the rung takes 4.3–4.6 s against
 > main's 8.0, every edit, read and creation faster and no reply lost, but SubmitAccepted p99 is 56–72 ms against main's
@@ -8624,8 +8629,11 @@
 > tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
 > burst and delays the next message up to half a step quantum per idle slice. Ruled by main (2026-11-20) and built:
 > only a status that asks for the memory report arms the sweep, and the anchor's objects whole come from the kernel's
-> per-mapping figures (§4.14 status "residency only when asked"). Linux not measured: adacachy's runs froze at load
-> 80-89.
+> per-mapping figures (§4.14 status "residency only when asked"): 172-205 µs added against main's 1,353-2,220 µs.
+> **Still open:** on 218256bab the median is 184.5-437.0 µs (3.7-8.7x the goal) and p999 under 1 ms in 3 of 5 rounds at
+> load 6-10 on the 32-core Studio; the round's exchange (about 100 µs, the transport and two control shards' wakes, macOS
+> holds declined by A-387) and the held reply's wake (65-116 µs) remain. Linux not measured: adacachy's runs froze in
+> their cgroup at load 68-89.
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost
