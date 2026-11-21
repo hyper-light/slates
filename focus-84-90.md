@@ -1608,3 +1608,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - LANDED: 6b555466b (w-perf: an index never merged, such as a repository filled by pushes alone, is merged once its lookups are reported, which times the rule's price; red: four runs, no merge). inserts_took stays owed in GAPS for w-hg's and w-git's intakes. The stream A/B restarted on the big Studio (r3).
   - w-fed-move claimed an A-number for the work-log wall ("a work's log is what it wrote").
   - DISK: the MacBook at 29 GB. clean-aggressive freed 0: kiln-opt-target has a file open, so it's in use and kept. The growth is Docker (the kiln-build container's 14 GB layer, freed on exit; images +14 GB) and kiln's agent folders. Ada's. Studio-1's g221 and g223 offline again.
+- 2026-11-21 03:08 PST
+  - LANDED: dc0adee77 (w-fed-move, the work-log wall: a rebase answers each changed file as parts over the head, and a work holds and logs those parts, so its log is what it wrote).
+  - Studio-2 is off kiln again (its 7 agents offline).
+  - DISK: the MacBook at 27 GB. The kiln-build container elated_leakey is still running at 42 min, its layer 14.2 GB, freed when it exits. Docker images are 60 GB (36.6 reclaimable, not ours). w-git's r18 is compiling on the MacBook, non-incremental.
