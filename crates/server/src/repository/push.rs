@@ -348,16 +348,18 @@ pub(crate) const BATCH_APPLY_REFUSED: &str = "repository.import_batch.apply_refu
 
 /// Appends `staged`, a batch of `green`'s versions in order (C2 stage C, `crate::import_batch`), with `parts` as one entry
 /// of `repository`'s register by `principal`, its owner: every version's chain entry and the register's own parts in one
-/// log record, then each version applied to the green as its entry records it (`Green::apply_recorded`, what a recovery
-/// replays) and its merge record enqueued. The batch's retention is secured first and the entry judged by the register's
-/// guard; refused, nothing is applied or recorded. The versions it made, in order.
+/// log record. The batch's retention is secured first and the entry judged by the register's guard; refused, nothing is
+/// applied or recorded. What it answers applies the versions to the green a slice at a time ([`RecordedBatch`]): the
+/// apply is work over a batch's versions, user-scaled, so it runs a slice a turn under the shard's quantum (CLAUDE.md
+/// §3; w-svn for main's ruling of 2026-11-21 12:43: in one step, git-2000's 2,000 versions held the shard past its
+/// liveness window and its watchdog killed the daemon).
 pub(crate) fn append_versions(
   state: &mut ShardState,
   (principal, repository): (&Principal, RepositoryId),
   green: DbVolumeId,
   staged: Vec<crate::import_batch::Staged>,
   parts: EntryParts,
-) -> Result<Vec<u64>, AppendRefused> {
+) -> Result<RecordedBatch, AppendRefused> {
   let record = state
     .db
     .partition()
@@ -446,32 +448,89 @@ pub(crate) fn append_versions(
     let _ = crate::merge_service::settle_green_retention(state, green);
     return Err(refused);
   }
-  let mut made = Vec::with_capacity(staged.len());
-  for (index, step) in staged.into_iter().enumerate() {
-    let version = at(index);
-    let applied = state
-      .greens
-      .get_mut(&green)
-      .map(|mut engine| engine.apply_recorded(&step.increment, &step.applied));
-    if applied != Some(version) {
-      // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
-      state.count(BATCH_APPLY_REFUSED, 1);
-      crate::verbs::reconcile_unpublished_effects(state);
+  Ok(RecordedBatch {
+    green,
+    first: at(0),
+    staged: staged.into(),
+    made: Vec::new(),
+  })
+}
+
+/// Counter: a slice of a recorded batch's apply ([`RecordedBatch::apply_slice`]): more than one a batch shows its apply
+/// was sliced. Format: a counter name in the daemon's status report.
+pub(crate) const BATCH_APPLY_SLICES: &str = "repository.import_batch.apply_slices";
+
+#[cfg(test)]
+thread_local! {
+  /// A test's most versions one slice of a recorded batch's apply takes, so its slices are known (the sliced commit's
+  /// crash test kills between them). None takes as many as the shard's quantum allows.
+  pub(crate) static SLICE_VERSIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A batch of a green's versions recorded in the register and applied to the green a slice at a time
+/// ([`append_versions`]). Its record holds every version, so a kill between slices recovers to the batch's last version,
+/// as any chain replays. Nothing may read the green until the last slice: a Subversion repository serves no session
+/// while it imports.
+pub(crate) struct RecordedBatch {
+  /// The green.
+  green: DbVolumeId,
+  /// The version of the next staged revision.
+  first: u64,
+  /// The versions still to apply, in order.
+  staged: std::collections::VecDeque<crate::import_batch::Staged>,
+  /// The versions applied.
+  made: Vec<u64>,
+}
+
+impl RecordedBatch {
+  /// Applies the next versions until the shard's step budget is spent from now, at least one, each as its entry records
+  /// it (`Green::apply_recorded`, what a recovery replays) with its merge record enqueued; counted. The versions made
+  /// once every one is applied (the green's retention settled and its chain checkpointed then), none while more remain.
+  pub(crate) fn apply_slice(&mut self, state: &mut ShardState) -> Option<Vec<u64>> {
+    let budget = slates_rt::futures::step_budget_ns().unwrap_or(0);
+    let deadline = slates_rt::futures::now_ns().saturating_add(budget);
+    #[cfg(test)]
+    let most = SLICE_VERSIONS
+      .with(std::cell::Cell::get)
+      .unwrap_or(usize::MAX);
+    #[cfg(not(test))]
+    let most = usize::MAX;
+    state.count(BATCH_APPLY_SLICES, 1);
+    let mut taken = 0usize;
+    while let Some(step) = self.staged.pop_front() {
+      let version = self.first;
+      self.first = version.saturating_add(1);
+      let applied = state
+        .greens
+        .get_mut(&self.green)
+        .map(|mut engine| engine.apply_recorded(&step.increment, &step.applied));
+      if applied != Some(version) {
+        // Recorded, and not applied as judged: the green is made again from its chain, which holds every version.
+        state.count(BATCH_APPLY_REFUSED, 1);
+        crate::verbs::reconcile_unpublished_effects(state);
+      }
+      crate::merge_service::enqueue_record(
+        state,
+        self.green,
+        version,
+        step.increment.id,
+        step.increment.base,
+        step.increment.evidence,
+        (None, None),
+      );
+      self.made.push(version);
+      taken = taken.saturating_add(1);
+      if taken >= most || slates_rt::futures::now_ns() >= deadline {
+        break;
+      }
     }
-    crate::merge_service::enqueue_record(
-      state,
-      green,
-      version,
-      step.increment.id,
-      step.increment.base,
-      step.increment.evidence,
-      (None, None),
-    );
-    made.push(version);
+    if !self.staged.is_empty() {
+      return None;
+    }
+    let _ = crate::merge_service::settle_green_retention(state, self.green);
+    crate::merge_service::checkpoint_green(state, self.green);
+    Some(std::mem::take(&mut self.made))
   }
-  let _ = crate::merge_service::settle_green_retention(state, green);
-  crate::merge_service::checkpoint_green(state, green);
-  Ok(made)
 }
 
 /// One move of a git push's store (A-662): the green it names, a new branch's by its name, and its new head, none to

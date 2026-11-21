@@ -21,6 +21,14 @@
 > close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
+> **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):
+> part 1 landed:** the daemon raises its soft `RLIMIT_NOFILE` at start to min(hard, the platform's cap: Linux
+> `fs.nr_open`, macOS `kern.maxfilesperproc`), never lowering it, Windows none; the boot profile's `descriptor_limit`
+> line names before, hard, cap and after (`a837_the_soft_descriptor_limit_is_raised_...`, a re-invoked child raised from
+> 64). **Part 2 landed:** the learned ceiling (`slates_machine::descriptors`): the count held at the first `EMFILE`,
+> `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
+> `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
+> **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
@@ -64,15 +72,7 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open, narrowed (w-fed-faults, A-821, 2026-11-21): the refined submit's one step still holds its commit.** The
-> watchdog's kill at refining.rs:166 (exit 4 in `green_post_state`, debug, a loaded Studio) was not the job's turns
-> (longest 608 µs) but the parked submit, run again in the job's last poll as one 415 ms step: composition 85 ms,
-> verdict 23 ms, encode 11 ms, the commit's history re-anchor 219 ms, the chain's append ~60 ms. A-821 prepares the
-> increment, its verdict and its encoding in the job a bounded slice a turn; the step judges by position and commits.
-> Measured (`merge.submit.longest_step_us`, the 2 MiB re-indent): debug 417.5 to 303.8 ms, release 34.5 to 24.6 ms,
-> against the derived bound of 100 ms (`HEARTBEAT_NS`, the paced ceiling). What stays in the step: the commit's
-> re-anchor (A-818's engine switch, piece 2b, replaces it) and the chain's durable append of a ~5 MB entry. Close once
-> `merge.submit.steps_past_ceiling` reads 0 in a debug build.
+> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release).
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -235,6 +235,9 @@
 >   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
 >   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
 >   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
+>   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
+>   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
@@ -3218,6 +3221,12 @@
 > refusal the wire answers without a Subversion number (`BudgetExceeded`, `ContentUnavailable`, `Format`) does not
 > name what landed; the same dump resumes all the same. Owed: the import's time and peak re-measured on git-2000
 > (main's run), which closes P7's finding (3) or not. The entry below is its history.
+> **A-822's commit held the shard past its watchdog; A-835 slices it (2026-11-21, w-svn; main's ruling of 12:43).**
+> Main's git-2000 run over A-822 had the watchdog kill the anchor twice: the batch's 2,000 versions applied in one step.
+> A-835 applies a recorded batch a slice a turn and folds a recovered Subversion green to its readers (the 434 MB under
+> `GreenReplay::step`). Owed: git-2000 re-measured on the merged tree (main's run), which closes P7's finding (2) or
+> not. Still one step a batch: `append_versions`' loop before the record (each version's increment held, its entry
+> encoded; w-rewrite-ops'), and `follow`, the fold and the texts' release after the last slice.
 > **C2 stage C waits: a Subversion import's per-revision landing, a measured regression (2026-11-21, w-svn; main's
 > ruling of 01:02).** git-2000's import takes 24.5 s against 8.2 s before the store (the real daemon 26.2 s): ~8 ms a
 > revision, one F_FULLFSYNC of the store's owner per landing (BENCHMARKS "Subversion on the changeset store").
@@ -24860,9 +24869,10 @@ in what lands. Branch tips as of 2026-11-10:
 > within its doubling interval (landed for robustness: the whole fold took a 1,124 ms step on w-git's push). MEASURED
 > GAP: at Z = 20 ms (3,500 verdicts/s, the owner saturated) SubmitAccepted's server p99 is worse with it, 5.43-9.73 ms
 > against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
-> kind's p99 is under 1 ms in 5 of 5 rounds. OWED: (b) subtract a key's old entry at its first change (the fold then
-> hashes current bytes only, no history reads); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record
-> 24.4 of 49 MB) and single key folds of up to 13.4 ms.
+> kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
+> the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
+> (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
+> of 49 MB) and single key folds of up to 13.4 ms.
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.

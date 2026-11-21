@@ -1040,7 +1040,7 @@ impl Drop for MadeAfter {
   /// is dropped (a thread-local's drop that reaches itself aborts the process).
   fn drop(&mut self) {
     for (_, turn) in self.jobs.drain(..) {
-      std::mem::forget(turn);
+      let _ = std::mem::ManuallyDrop::new(turn);
     }
   }
 }
