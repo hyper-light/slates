@@ -46,3 +46,18 @@
 - Next: C4-C6 — the store into the server (StoreGrant at repository creation, the store on the owner shard), each
   tool's intake landing through Store::land, replay from Store::changesets, an RSS red test per tool; the derived
   per-file form built in the store with hg (C4).
+
+## 2026-11-20 ~21:30: memtable at both extremes, the sliced landing (71db6d157)
+- Your memtable order: the derivation fix was already on main as bc0677af9. The memtable is one trunk node of extents,
+  fanout × chunk = 512 KiB, with no machine input and no clamp. 71db6d157 adds the red/green test at both extremes:
+  `slates-api` `store_sizing_tests::the_store_lands_on_a_small_and_a_large_machine_alike`. It injects 8 GiB and
+  128 GiB into `facts.memory`, then runs `DaemonConfig::derive` → `start_store` → land → stop. Red at 128 GiB under
+  the old formula (landing `Gone`), green at both. Ran on this Mac (Adas-Mac-Studio-2), debug, 0.75 s.
+- On point 2 (the device's flush rate): the memtable holds rows only. A landing's bytes go to the log, the engine's
+  write-ahead log, so the landing batch never sits in the memtable. The flush rate over the group-commit window is the
+  input for the log's group commit, which is owed (GAPS A-767), not for the memtable. I didn't add a device input there.
+- The section read for w-svn has been on main since ba760f0ef (`StoreHandle::sections` plus `read`), and w-svn was told.
+- New in 71db6d157: the owner's sliced landing (`begin`/`section`/`part`/`commit`, abandoned on drop). Tests:
+  slates-store 20/20 and slates-api store_sizing 1/1. Told w-hg, w-perf and w-svn.
+- Next: C4 with w-hg, rerunning its store test on main; then C5 with w-git; then C6 with w-svn's import over the
+  sliced landing.
