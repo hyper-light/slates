@@ -1,5 +1,10 @@
 # w-store progress (brief: briefs/w-store.md)
 
+## State (2026-11-20 ~23:59 PST)
+- LANDED 174459b36 (merge 9bfcbb9be): restart test (orphan's id minted again, rows give the newest: green, no change);
+  forwarded-create refusal shown unreachable (repository verbs never cross nodes), owed line removed. NEXT: grant
+  AuditKind + revocation.
+
 ## State (2026-11-20 ~23:30 PST)
 - LANDED e4cfbd38d: creation in the one landing order (land seq 0, then record + completion, then answer; ids reserved
   via ShardState::family_reserved_through). Red/green kill test; store_tests 3/3; repository:: 58/62 (the 4 known).
