@@ -1039,7 +1039,7 @@ proptest! {
   #[test]
   fn every_answered_pack_reads_back_as_the_wanted_closure_less_the_clients(sha256 in any::<bool>(), ops in proptest::collection::vec(op(), 1..20), bases in proptest::collection::vec(any::<bool>(), 3), caps in proptest::collection::vec((any::<bool>(), any::<bool>(), 0u8..5, 0u8..3), 1..8)) {
     let format = if sha256 { ObjectFormat::Sha256 } else { ObjectFormat::Sha1 };
-    let mut real = Real { store: store(), repository: Repository::new(format), clock: Ticks(0) };
+    let mut real = Real::new(format);
     let mut model = Model::new(format);
     let half = ops.len() / 2;
     for (at, op) in ops.iter().enumerate() {
