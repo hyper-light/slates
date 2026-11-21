@@ -1,5 +1,19 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~10:45 PST: main's rebase-drop ruling (03:46, resent 06:40 as a goal) -- SETTLED, not landed by main's 10:35 ruling
+- Main's 03:46 ruling (drop a journal op whose result became the head's) reached me only at 06:40; I had already built
+  it, measured it and reported it (inbox/main-from-w-fed-move-drop.md). Main, 10:35: "Don't land the drop ... A ruling
+  never overrides an even A/B; keep it as measured-and-rejected." It is recorded so in the design log under A-817.
+- A/B numbers of the drop (1,000-client stand-in, release, in-process, kernel/, one round, `--per-connection 32`):
+  ops dropped a client at 300 / 100 / 30 / 10 hot files: 0.00 / 0.00 / 0.01 / 0.03. Rebases' file asks a client with the
+  drop: 1.51 / 2.69 / 6.01 / 14.20, the same as without it. Asks a client 14.1 / 17.6 / 27.5 / 49.2 with or without it.
+  At 10 hot files a whole run dropped 31 ops, each an offset-0 overwrite whose file had become the head's while the
+  work's other files still differed (re-run 10:40; the engine's restatement leaves out every other kind).
+- The commit that did the work main expected of it: Slates b7fa83284 (A-817, on origin/main as 351c9e2a): a file's base
+  bytes asked only for a whole replacement of the file's length; file asks 17.2 -> 0 a client, asks 49.2 -> 30.0 at 10
+  hot files (300/100/30/10: 11.1 / 12.9 / 19.1 / 30.0 asks a client after).
+- Patch of the rejected drop: ~/slates-work/w-fed-move-a817-rejected-drop.patch.
+
 ## 2026-11-21 ~05:00 PST: A-817 LANDED 351c9e2a (base bytes only for true whole replacements)
 - Main's identical-op drop: built + oracle, fired 0.03/client, asks unchanged -> NOT landed (dead-even A/B); patch at
   ~/slates-work/w-fed-move-a817-rejected-drop.patch. Real cause: offset-0 overwrite misclassified as whole replacement.
