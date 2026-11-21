@@ -56,6 +56,20 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
   idle_work 1/1; fmt clean.
 - A/B (Studio, load 11-15): added 1,217-1,939 vs main 2,614-3,096 us; p999 2.2-3.7 vs 4.9-9.7 ms; 0 writes > 50 ms.
 
+## LANDED 2026-11-20 ~21:55 PST: origin/main 218256bab (main's ruling on the status-armed sweep, yes to both)
+- 7ac3900ee: DaemonStatus { memory } (wire change, no compat path; frames' schema hash refuses a mismatched build);
+  `slates status --memory`, Client::daemon_memory_status; a plain status does no residency work (red: 50 plain statuses
+  armed one sweep a shard, 398 and 177 steps; green: 0 and 0); the segment and content object whole from per-mapping
+  kernel figures (resident::of_mapping: macOS mach_vm_region top info 0.11 ms vs mincore 30-32 ms on a 32 GiB mapping
+  with 2 GiB written; Linux /proc/self/smaps; Windows the bounded walk only the asking request pays); slates-mem unsafe
+  budget 86 -> 87; the live-shipping measurement's status-burst sibling.
+- 8f1c22d70: BENCHMARKS. A/B (Studio, load 9-11): added 172-205 vs main 1,353-2,220 us; p999 342-445 us vs 2.7-7.1 ms;
+  under a status burst 178-293 vs 1,099-2,815 us; idle daemons 10-30 ms CPU a second vs about a core.
+- Focused tests on the merged tree: server --test daemon a_burst_of_plain_statuses 1/1; content_ranges 2/2; mem
+  resident 3/3; ipc --test status 3/3; cli args 41/41; fmt clean.
+- Run requests for main: the Linux smaps arm (resident::tests::a_mapping_read_whole_agrees_with_its_page_walk on
+  Linux), the Windows build of resident.rs's fallback arm, xtask unsafe (slates-mem 87), clippy.
+
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
 shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).
 Proposed: arm the background sweep only for a request asking for the memory report (a DaemonStatus field: wire change),
