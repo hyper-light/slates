@@ -216,13 +216,14 @@ pub struct ChangesetLog<F: BlockFile> {
 impl<F: BlockFile> ChangesetLog<F> {
   /// Opens the log over `file`, whose committed records run from `from` (a committed offset the caller trusts: the
   /// file's start, or where the engine's checkpoint says it applied to), calling `each` with every committed record
-  /// found after it, in order. The log ends at the first record that does not verify.
-  pub fn recover(file: F, from: u64, mut each: impl FnMut(&Located)) -> Result<Self, LogError> {
+  /// found after it, in order, with the file to read its sections from ([`sections_in`]). The log ends at the first
+  /// record that does not verify.
+  pub fn recover(file: F, from: u64, mut each: impl FnMut(&F, &Located)) -> Result<Self, LogError> {
     let len = file.len()?;
     let mut end = from;
     let mut buffer = Vec::new();
     while let Some(located) = verify_at(&file, end, len, &mut buffer)? {
-      each(&located);
+      each(&file, &located);
       end = located.end();
     }
     Ok(Self { file, end })
@@ -264,21 +265,7 @@ impl<F: BlockFile> ChangesetLog<F> {
 
   /// The sections of the committed record `located`, in order.
   pub fn sections(&self, located: &Located) -> Result<Vec<Section>, LogError> {
-    let mut sections = Vec::new();
-    sections
-      .try_reserve_exact(usize::from(located.header.sections))
-      .map_err(|_| LogError::TooLarge)?;
-    let mut at = offset_after(located.offset, HEADER_BYTES)?;
-    for _ in 0..located.header.sections {
-      let mut head = [0u8; SECTION_HEAD_BYTES];
-      self.file.read_exact_at(&mut head, at)?;
-      let (kind, len, _) =
-        decode_section_head(&head).ok_or(LogError::Corrupt("a section's head"))?;
-      let offset = offset_after(at, SECTION_HEAD_BYTES)?;
-      sections.push(Section { kind, offset, len });
-      at = offset.checked_add(len).ok_or(LogError::TooLarge)?;
-    }
-    Ok(sections)
+    sections_in(&self.file, located)
   }
 
   /// The header of the committed record at `offset` (a row's offset): read and its CRC checked.
@@ -405,6 +392,36 @@ impl<F: BlockFile> Appending<'_, F> {
       len,
     })
   }
+}
+
+/// The sections of the committed record `located` in `file`, in order: each head read for its kind and length.
+pub fn sections_in<F: BlockFile>(file: &F, located: &Located) -> Result<Vec<Section>, LogError> {
+  let mut sections = Vec::new();
+  sections
+    .try_reserve_exact(usize::from(located.header.sections))
+    .map_err(|_| LogError::TooLarge)?;
+  let mut at = offset_after(located.offset, HEADER_BYTES)?;
+  for _ in 0..located.header.sections {
+    let mut head = [0u8; SECTION_HEAD_BYTES];
+    file.read_exact_at(&mut head, at)?;
+    let (kind, len, _) = decode_section_head(&head).ok_or(LogError::Corrupt("a section's head"))?;
+    let offset = offset_after(at, SECTION_HEAD_BYTES)?;
+    sections.push(Section { kind, offset, len });
+    at = offset.checked_add(len).ok_or(LogError::TooLarge)?;
+  }
+  Ok(sections)
+}
+
+/// BLAKE3 of `len` bytes of `file` from `offset`, read `VERIFY_PIECE` at a time into `buffer`.
+pub fn identity_of_range<F: BlockFile>(
+  file: &F,
+  offset: u64,
+  len: u64,
+  buffer: &mut Vec<u8>,
+) -> Result<[u8; 32], LogError> {
+  let mut hasher = blake3::Hasher::new();
+  hash_range(file, &mut hasher, offset, len, buffer)?;
+  Ok(*hasher.finalize().as_bytes())
 }
 
 /// Format: what a section adds to its record's identity before its bytes: its kind and its length.
