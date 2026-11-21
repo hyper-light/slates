@@ -31,6 +31,8 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::task::{Context, Poll};
 
+use crate::error::RtError;
+
 use cell::{CellRef, claim};
 use room::Room;
 
@@ -60,34 +62,6 @@ impl<T> fmt::Display for SyncError<T> {
 
 impl<T: fmt::Debug> std::error::Error for SyncError<T> {}
 
-/// Why a channel could not be made.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SyncRefusal {
-  /// The process-wide cell table is at its bound.
-  Capacity {
-    /// What was bounded.
-    what: &'static str,
-    /// The bound.
-    bound: usize,
-  },
-  /// A capacity or waiter count the channel cannot honour.
-  BadConfig {
-    /// Which value.
-    what: &'static str,
-  },
-}
-
-impl fmt::Display for SyncRefusal {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match self {
-      Self::Capacity { what, bound } => write!(f, "{what}: at the bound of {bound}"),
-      Self::BadConfig { what } => write!(f, "refused: {what}"),
-    }
-  }
-}
-
-impl std::error::Error for SyncRefusal {}
-
 /// Format: the receiver's cell's state bit once the receiver is gone (a send is refused `Closed`).
 const RECEIVER_GONE: u64 = 1;
 
@@ -115,7 +89,7 @@ pub struct ChannelReceiver<T> {
 
 /// A bounded channel of `capacity` values from any number of senders to one receiver, with as many places for
 /// sender tasks waiting at once. Refused `BadConfig` for a zero capacity, `Capacity` at the cell table's bound.
-pub fn channel<T>(capacity: usize) -> Result<(Sender<T>, ChannelReceiver<T>), SyncRefusal> {
+pub fn channel<T>(capacity: usize) -> Result<(Sender<T>, ChannelReceiver<T>), RtError> {
   channel_with(capacity, capacity)
 }
 
@@ -125,9 +99,9 @@ pub fn channel<T>(capacity: usize) -> Result<(Sender<T>, ChannelReceiver<T>), Sy
 pub fn channel_with<T>(
   capacity: usize,
   waiters: usize,
-) -> Result<(Sender<T>, ChannelReceiver<T>), SyncRefusal> {
+) -> Result<(Sender<T>, ChannelReceiver<T>), RtError> {
   if capacity == 0 {
-    return Err(SyncRefusal::BadConfig {
+    return Err(RtError::BadConfig {
       what: "a channel of no capacity",
     });
   }

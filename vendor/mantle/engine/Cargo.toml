@@ -1,0 +1,41 @@
+[package]
+name = "mantle-engine"
+description = "mantle's metadata engine: SplinterDB's size-tiered B-epsilon tree in its own format (vendored at mantle 87ab09e1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/mantle"
+publish = false
+
+[dependencies]
+hyper-block = { path = "../../hyper-raft/hyper-block" }
+mantle-crc = { path = "../crc" }
+# slates: the runtime and the machine facts are slates' own, in hyper-rt's place (vendor/mantle/README.md, local change 1).
+slates-machine = { path = "../../../crates/machine" }
+slates-rt = { path = "../../../crates/rt" }
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "mm", "system", "param", "process", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+[dev-dependencies]
+# The engine's own unit tests run here (vendor/mantle/README.md): the port changed the runtime under them.
+hyper-block = { path = "../../hyper-raft/hyper-block", features = ["sim"] }
+hyper-measure = { path = "../../hyper-raft/hyper-measure" }
+mantle-disk = { path = "../disk" }
+proptest = "1.11"
+tempfile = "3.20"
+twox-hash = { version = "2.1", default-features = false, features = ["std", "xxhash32", "xxhash64", "xxhash3_64", "xxhash3_128"] }
+zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }
+
+[features]
+# Diagnostics upstream's benches set; never on in slates.
+count-allocs = []
+profile-phases = []
+
+# A root of its own: a vendored snapshot of mantle (vendor/mantle/SNAPSHOT), outside slates' workspace.
+[workspace]

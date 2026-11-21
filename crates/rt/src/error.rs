@@ -319,12 +319,3 @@ mod tests {
     );
   }
 }
-
-impl From<crate::sync::SyncRefusal> for RtError {
-  fn from(refusal: crate::sync::SyncRefusal) -> Self {
-    match refusal {
-      crate::sync::SyncRefusal::Capacity { what, bound } => Self::Capacity { what, bound },
-      crate::sync::SyncRefusal::BadConfig { what } => Self::BadConfig { what },
-    }
-  }
-}
