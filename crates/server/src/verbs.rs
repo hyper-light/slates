@@ -10751,21 +10751,25 @@ pub(crate) struct AcceptedParts {
 }
 
 impl AcceptedParts {
-  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test.
+  /// The parts of `increment`'s accept as `version` of `green` by a submit of `work`, for a test: its increment held in
+  /// `state`'s content store as a submit holds it (chain entry format 6).
   #[cfg(test)]
   pub(crate) fn for_test(
+    state: &mut ShardState,
     (green, work, version): (DbVolumeId, DbVolumeId, u64),
     (increment, applied): (
       slates_merge::engine::Increment,
       Vec<slates_merge::chain_entry::Applied>,
     ),
   ) -> AcceptedParts {
-    let increment_bytes = increment.encode();
+    let held_increment =
+      crate::merge_service::hold_increment(state, green, version, &increment.encode())
+        .expect("room for the test's increment");
     AcceptedParts {
       green,
       work,
       version,
-      increment_bytes,
+      held_increment,
       increment,
       applied: Some(applied),
       verification: slates_ipc::protocol::Verification::Unsigned,

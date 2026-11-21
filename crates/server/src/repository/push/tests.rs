@@ -1645,8 +1645,11 @@ fn a_held_verdicts_preview_lives_across_turns_until_its_one_step() {
       slates_merge::engine::Judgment::Accepted(judged) => judged,
       other => panic!("not accepted: {other:?}"),
     };
-    let parts =
-      crate::verbs::AcceptedParts::for_test((main, main, 2), (second, judged.applied().to_vec()));
+    let parts = crate::verbs::AcceptedParts::for_test(
+      state,
+      (main, main, 2),
+      (second, judged.applied().to_vec()),
+    );
     let mut pending = crate::made_commit::Pending::for_test(parts);
     assert!(
       crate::made_commit::hold_preview(state, &mut pending, judged),

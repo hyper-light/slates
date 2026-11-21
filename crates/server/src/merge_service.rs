@@ -2410,8 +2410,8 @@ pub(crate) fn shipped_for_test(
   version: u64,
 ) -> Option<(Vec<u8>, [u8; 32])> {
   let inputs = match version_inputs(state, green, version)? {
-    VersionInputs::Held(held) => increment_of(state, green, &held)?.into_owned(),
-    VersionInputs::Record(bytes) => bytes.to_vec(),
+    InputsAt::Held(held) => increment_of(state, green, &held)?.into_owned(),
+    InputsAt::Record(bytes) => bytes.to_vec(),
   };
   let identity = state.greens.lend_mut(&green)?.head_identity();
   Some((inputs, identity))
@@ -2424,7 +2424,7 @@ pub(crate) fn version_inputs(
   state: &ShardState,
   green: DbVolumeId,
   version: u64,
-) -> Option<VersionInputs<'_>> {
+) -> Option<InputsAt<'_>> {
   if version == 0 {
     // Version 0's inputs, a green's origin, are made a share at a time and kept until placed (`crate::merge_origin`,
     // A-286); a scratch green's version 0 has none.
@@ -2439,29 +2439,29 @@ pub(crate) fn version_inputs(
   let entry = state.db.partition().green_chain(green).get(index)?;
   // A deferred push's version (P2): its record is the inputs, which a holder defers its replica by.
   if slates_merge::push::DeferredPush::is_record(entry) {
-    return Some(VersionInputs::Record(entry));
+    return Some(InputsAt::Record(entry));
   }
   // The record's inputs are the increment a holder judges afresh (§4.16 "Apply on holders"), not what this node resolved.
   slates_merge::chain_entry::inputs(entry)
     .ok()
-    .map(VersionInputs::Held)
+    .map(InputsAt::Held)
 }
 
 /// Where a version's inputs are ([`version_inputs`]).
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum VersionInputs<'a> {
+pub(crate) enum InputsAt<'a> {
   /// A chain entry's increment, which the content store holds (chain entry format 6).
   Held(slates_merge::chain_entry::Inputs),
   /// A deferred push's record (P2), the chain's own bytes.
   Record(&'a [u8]),
 }
 
-impl VersionInputs<'_> {
+impl InputsAt<'_> {
   /// The identity the version's merge record names its inputs by.
   fn identity(&self, page: u32) -> [u8; 32] {
     match self {
-      VersionInputs::Held(inputs) => inputs.identity,
-      VersionInputs::Record(bytes) => MergeShardState::inputs_identity(bytes, page),
+      InputsAt::Held(inputs) => inputs.identity,
+      InputsAt::Record(bytes) => MergeShardState::inputs_identity(bytes, page),
     }
   }
 }
@@ -3286,10 +3286,10 @@ fn cut_shipments(
       .map(|(manifest, inputs)| InputsSource::Lent {
         manifest,
         held: match inputs {
-          VersionInputs::Held(inputs) => {
+          InputsAt::Held(inputs) => {
             LentChunks::Held(HeldChunks::of(state, object, inputs.identity))
           }
-          VersionInputs::Record(bytes) => LentChunks::Bytes(bytes),
+          InputsAt::Record(bytes) => LentChunks::Bytes(bytes),
         },
       })
   };
@@ -3337,14 +3337,12 @@ fn make_inputs_manifest(state: &mut ShardState, object: ObjectId, version: u64) 
   let page = archive_page(state);
   let Some(manifest) = version_inputs(state, DbVolumeId { bytes: object.0 }, version).and_then(
     |inputs| match inputs {
-      VersionInputs::Held(inputs) => {
+      InputsAt::Held(inputs) => {
         state
           .held_content
           .held_manifest(state.store.content.arena(), object, &inputs.identity)
       }
-      VersionInputs::Record(bytes) => {
-        Some(crate::merge_origin::inputs_manifest_archive(bytes, 0, page))
-      }
+      InputsAt::Record(bytes) => Some(crate::merge_origin::inputs_manifest_archive(bytes, 0, page)),
     },
   ) else {
     return;
