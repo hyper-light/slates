@@ -96,3 +96,5 @@ Next when both answer: on jupiter (--on jupiter --no-sync; clone agents/w-work-m
 ~/Projects/w-work-mount-win; CARGO_TARGET_DIR ~/Projects/w-work-mount-win-target, 11 GB warm) build with no warnings,
 then `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`; green -> merge origin/main into the fix,
 push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run is mine too.
+
+- 2026-11-21 02:30 PST: kiln refused every run 08:07-10:30 UTC (10 retries, "did not answer in time"); GitHub back at ~09:00 UTC (state pushed). WinFsp test and the warning fix 0cbef8441 still wait on kiln; nothing else in my queue.
