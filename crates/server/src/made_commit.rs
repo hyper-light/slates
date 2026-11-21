@@ -276,7 +276,7 @@ pub(crate) fn with_held_preview<R>(
 }
 
 /// Gives `pending` up before its step: its preview retired, then [`abandon`].
-#[cfg_attr(not(test), allow(dead_code))] // Its caller outside tests is git's made commit (w-git, C5 2b piece 3).
+#[allow(dead_code)] // No caller yet: its caller is git's made commit (w-git, C5 2b piece 3).
 pub(crate) fn give_up(state: &mut ShardState, mut pending: Pending) {
   pending.preview.retire(state);
   let green = pending.parts.green;
