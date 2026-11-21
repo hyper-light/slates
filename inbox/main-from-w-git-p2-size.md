@@ -44,3 +44,16 @@ Proposal while w-rewrite-ops answers on the engine half: pace my derivation by A
 step ceiling when nobody waits on the shard, yield at the quantum when someone does), as the push build does. Red: the
 turns a derivation of a long history takes, counted, and the clone's time. Encoding's units past budget are A-718's; I'd
 name them in GAPS for their owner unless you want them with this.
+
+## Derivation pacing LANDED (07:55 PST): 2b2fc8d80
+A derivation turn now goes on while nobody waits on the shard, to the step's ceiling (A-783). Red:
+`git_push::tests::t_a614a_a_long_historys_derivation_takes_turns_by_the_shards_pace_not_its_objects` (a 600-commit
+line) took 2,404 turns at ca444739c; green at most 8. Focused on the merged tree: all pass but one.
+
+A finding, not mine: `git_push::tests::t_a752_a_push_over_a_flat_head_builds_its_work_a_unit_at_a_time` (A-783's
+"more quanta than files") flakes under load in the full git set on main without my change too: 1 of 2 at load 12.8
+("953 quanta for 1500 files"). With the paced derivation, which raises the set's load, 2 of 2 failed. It passes 3 of 3
+alone and beside my test. The quanta it counts depend on measured time, so the floor isn't load-proof.
+
+P2: w-rewrite-ops took the engine half with an interface I've answered (`PushObjects` as the tree source,
+`DeferredPush`, `green_ready`). My git half follows their engine piece.
