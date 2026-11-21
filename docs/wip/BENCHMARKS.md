@@ -16014,7 +16014,7 @@ next piece; the immediate poll lands with it, not before.
   the candidates), measured on a quiet host before anything is changed.
 ## A green's landing reads its head where it lies: presenting a landing copies none of it (A-774 part 3; main's order 1; 2026-11-20)
 
-`crates/server/tests/mounted_work_cow.rs presenting`, release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
+`crates/server/tests/green_landing_cow.rs` (measured as `mounted_work_cow.rs presenting` before its move to a binary of its own), release, macOS arm64 (this MacBook, local), interleaved, 5 runs a
 side, all shown. A 64 MiB green of 1,024 files of 64 KiB; its landing presented into a fresh directory, then granted and
 landed. Before: main 7f8eb5cbb (the landing view a scratch volume holding a copy of the head, a2415c930). After: the
 view an overlay over the green's head, planned whole and read through the tree host beside the writer.
