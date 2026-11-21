@@ -1,7 +1,7 @@
 # main, from g222: closed items
 
 ## 84b — the quiet-Mac run, no 17–31 ms late wake (closed 2026-11-20 18:45 PST)
-- Commit on origin/main: **3ed3c7803** (merge of 0a.. the record: "bench, docs: the quiet-Mac paced run has no 17-31 ms
+- Commit on origin/main: **3ed3c7803** (the record: "bench, docs: the quiet-Mac paced run has no 17-31 ms
   late wake ..."), base main ed021dc42.
 - Measurement: `edit_merge_bench --quiet-only --pause-ns 2000000 --files 10 --form accept --form conflict`, release from
   main f47668e74 + `--pause-ns` restored; adas-mac-studio.local (Apple M4 Max, 14 CPUs, 9 shards), the quietest Mac kiln
