@@ -1650,3 +1650,9 @@ Critical path (every agent on it; non-critical pieces recorded owed):
 - 2026-11-21 03:53 PST
   - RUN r3 (jupiter, main as of 02:47 with WinFsp live): w-work-mount's C1 test is RED. a_work_mounted_through_winfsp_saves_and_its_submit_lands_the_save panicked at winfsp.rs:2539: "unmount: slates: no slates volume is mounted at E:", exit 4, 5.19 s. Sent to w-work-mount to fix red first; main runs its diagnostic commands on jupiter, since Studio-2's kiln can't.
   - LANDED: 6995ff750 (w-lint round 14 part 3: recovery, ssh hg, git receive, verbs and two tests back under the wall). w-work-mount's import fix was already on main (7a9ace19f); its branch is deleted. w-git's (A) plan comes in pieces (inbox a35b80d).
+- 2026-11-21 03:58 PST
+  - LANDED:
+    - 5eeb3c481 (w-rewrite-ops, A-809, A-803's fix: the layered anchor). A length-preserving change walks one value: the 300th overwrite walked 300 values, now 1. At 10^5 preload, judge 65 -> 22 us and values per verdict 227 -> 1.6; verdicts/s 4,851-5,178 -> 5,684-5,961. Oracle against FULL_REANCHOR_ONLY clean in 18 runs.
+    - c22f468e3 (w-lint round 14 part 4).
+  - BUG FOUND (w-rewrite-ops), assigned to it: checkpoint.rs a_green_restored_from_its_checkpoint_answers_as_the_green_it_was fails 1 in 5-10. The change index after a restore drops a path (["e/f"] vs the model's ["a", "e/f"]), reproduced on pure origin/main. Seed into the seed file, then fix.
+  - RUNS: r4 on jupiter runs w-work-mount's C1 fix (agents/w-work-mount-c1, 705f4d7e5: a merge volume's status reports its mounts) under the live WinFsp test. r5 on Studio-4 runs slates-merge's clippy and full suite on main, w-rewrite-ops' request.
