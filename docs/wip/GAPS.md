@@ -446,10 +446,24 @@
 > `the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier` fails on main (a green is landable since
 > A-774 part 3), reported to main.
 >
-> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
-> re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
-> judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
-> the 100k rung's wall (a few values a path there). Open: the fix's design, with main.
+> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, then FIXED by A-809 (w-rewrite-ops, main's order
+> of 02:37, w-fed-move's option 1). The verdict's growth with history was the re-anchor, which walked every value of a
+> changed path: 7.9 values a verdict with no preload, 231 with 10^5 versions; judge 24 to 71 µs; compose and secure
+> flat. Counted by `merge.reanchor.values_walked` and `merge.submit.secure`.
+>
+> A-809 gives a path's anchor numbered layers (`history.rs`, "A layered anchor"). An overwrite inside the file copies
+> what it overwrote as the anchor's next layer and walks one value; an insert or delete resolves the layers and
+> re-anchors in full, as before.
+> - Oracle: `the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints`.
+> - Red: `a_length_preserving_change_walks_one_value_however_long_its_history`, 300 values walked, now 1.
+> - A/B (BENCHMARKS, "A length-preserving change walks one value"): at 10^5 versions, judge 65.4 to 22.5 µs and values
+>   228 to 1.6 a verdict.
+>
+> Left, measured, not worked:
+> - (a) A read of an earlier value resolves its anchor's layers. That is O(log + the layers over each piece), so a hot
+>   range overwritten m times since a reader's version costs it m candidates.
+> - (b) A path whose changes alternate overwrites and inserts flattens its layers at each insert. That is O(its history)
+>   per insert, as every change cost before.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three

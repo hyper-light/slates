@@ -17222,3 +17222,40 @@ refinement), timed once each, debug build, this Mac (macOS arm64), 2026-11-21 ~0
 
 Before, each doubling of ops quadrupled the time; after, it doubles. The first step alone (the remap index) gave 50 ms /
 195 ms / 775 ms / 3.22 s, still quadratic, until the union's binary search removed the second scan.
+
+## A length-preserving change walks one value, whatever its path's history: the verdict flat over 10^5 versions (A-809, fixing A-803; 2026-11-21)
+
+w-rewrite-ops, main's order of 02:37 PST (piece 3). A-803 (w-fed-move) named the verdict's growth with history: the
+re-anchor walked every value of a changed path. A-809 gives a path's anchor numbered layers: an overwrite copies the
+bytes it overwrote as a layer and walks one value (`crates/merge/src/history.rs`, "A layered anchor").
+
+- **Command:** `load_bench --tree ~/.cache/w-fed-move-linux/kernel --clients 1000 --rounds 1 --per-connection 32
+  --hot-files 300 --idle-works 1 --preload N`. Release, in-process, over `kernel/` of torvalds v7.4-rc4 (754 files).
+- **Builds:** before is origin/main abd5e7b2 (`git archive`); after is the same plus A-809 (5acf9132b).
+- **Hardware:** adas-mac-studio (Apple M3 Ultra, 96 GiB). 2026-11-21 03:44–03:47 PST, load average 2.3–3.9.
+- **Rounds:** before and after interleaved, three rounds, all runs shown.
+- **Measured:** the run phase, i.e. the owner's counters after the run less after the preload. Judge µs is
+  `merge.submit.judge_ns / merge.submit.judge`; values per verdict is `merge.reanchor.values_walked / merge.submit.judge`.
+- Every run: oracle failures 0, exit 0.
+
+| preload | side | judge µs (r1, r2, r3) | values walked a verdict | verdicts/s |
+|---|---|---|---|---|
+| 0 | before | 22.9, 22.3, 22.2 | 7.8, 7.8, 7.8 | 6,057, 6,352, 6,011 |
+| 0 | after | 21.5, 20.1, 20.2 | 1.6, 1.6, 1.6 | 5,644, 6,382, 5,990 |
+| 10^4 | before | 28.3, 27.5, 27.5 | 29.9, 30.2, 29.9 | 6,191, 5,855, 5,570 |
+| 10^4 | after | 22.1, 21.7, 20.7 | 1.6, 1.6, 1.6 | 5,539, 5,826, 5,995 |
+| 10^5 | before | 66.4, 64.7, 65.2 | 227.6, 227.4, 227.9 | 4,854, 4,851, 5,178 |
+| 10^5 | after | 22.3, 23.1, 22.1 | 1.6, 1.7, 1.6 | 5,684, 5,784, 5,961 |
+
+- **Judge:** grew 2.9 times over 10^5 versions before (22.5 to 65.4 µs, the means); after it stays at 20.6 to 22.5 µs.
+- **Values walked:** went from 7.8 to 228 a verdict before; after it is 1.6 whatever the history. The 1.6 is a
+  verdict's paths that change length (fully re-anchored, as before) mixed with overwrites (one value each).
+- **Verdicts/s:** at 10^5, before is 4,851–5,178 and after is 5,684–5,961. Elsewhere the runs overlap.
+- **The preload's own cost** (each tenth of 10^5 versions, `inject preload`) is flat on both sides: before 292–300 µs a
+  version, after 291–295 µs. Its versions spread over many files, so no one path's history grows there; the growth is
+  the verdicts' over the hot paths.
+- **Unit:** `a_length_preserving_change_walks_one_value_however_long_its_history`. The 300th overwrite of a 16 KiB file
+  walked 300 values before and walks 1 now.
+- **Logs:** `~/.cache/w-rewrite-ops-ab-logs/run-<round>-<preload>-<side>.log` on adas-mac-studio. They are scratch and
+  are deleted after this record.
+

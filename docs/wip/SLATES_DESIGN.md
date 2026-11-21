@@ -59092,3 +59092,39 @@ Applied in the same change to: `crates/server/src/made_commit.rs` (`Tool`, the r
   one step); a submit meeting a held turn ran at once (now it waits and commits once the turn is given back).
 - **Owed** (GAPS C2): the made changeset's record lands in the register's entry, not first on the node's store as a
   push's does (a made reference and its replay, with w-hg), and a client's push takes no landing turn.
+
+### A-809 — A length-preserving change takes its path's anchor through a layer and walks one value (2026-11-21, w-rewrite-ops; main 02:37 PST, piece 3; fixes A-803 by w-fed-move's option 1; A-793, A-787 part 2)
+Applied in the same change to:
+- `crates/merge/src/history.rs`: `Layers`, `Layer`, `Piece::epoch`, `overlay`, `flatten`, `Chunks::resolve_into` and
+  `prune`, and the module docs' "A layered anchor".
+- `crates/merge/src/engine/history_block_tests.rs`: the red test and the oracle.
+- GAPS (A-803) and BENCHMARKS.
+
+- **Why.** A change re-anchored every value of its path's history on the new block (A-793). A path's k-th change cost
+  O(k) while a reader pinned the floor: at 10^5 versions, 228 values walked a verdict and judge 65 µs.
+- **What happens on an overwrite.** A change that only overwrites bytes inside the file, changes some, and keeps some
+  takes the layered path:
+  1. The bytes it overwrote, as they were, are copied into one owned chunk as the anchor's next numbered layer.
+  2. The layer is indexed by offset.
+  3. The anchor chunk names the new block, and the old block is let go.
+  4. The superseded latest value reads the anchor at that layer's number.
+  No other value is walked, so the cost is O(log + the bytes overwritten).
+- **Reading.** A piece at epoch e reads the anchor overlaid by its layers numbered e or later, the lowest covering a
+  byte giving it. A value that becomes history reads its anchor at the anchor's next layer number, so swapping the
+  anchor's block changes only what history reads through layers.
+- **Other changes.** An insert, delete, truncate or extend first resolves the layers into concrete runs, then
+  re-anchors in full as before. So does a change that keeps nothing or changes nothing.
+- **Bounded.** A layer numbered below the least epoch read is dropped, so a fold frees what it no longer reads.
+- **Owned bytes.** The history owns only the overwritten bytes, as A-793's cut did, now even where another holder keeps
+  the old block: the full path keeps such a block whole.
+- **Evidence.**
+  - Red: `a_length_preserving_change_walks_one_value_however_long_its_history`, the 300th overwrite of a 16 KiB file
+    walked 300 values, now 1.
+  - Oracle: `the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints`. Generated overwrites,
+    inserts, deletes, folds and checkpoints run against a twin taking only the full re-anchor; every version reads
+    equal to it and to the model, and the totals stay balanced.
+  - A/B: w-fed-move's `--preload` at 0, 10^4 and 10^5, release, three interleaved rounds (BENCHMARKS). At 10^5, judge
+    65.4 to 22.5 µs, values 228 to 1.6 a verdict, verdicts/s 4,851–5,178 to 5,684–5,961; oracle failures 0 in all 18
+    runs.
+- **Cost moved to reads.** An earlier value's read resolves its anchor's layers (GAPS A-803 (a)).
+

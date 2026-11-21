@@ -46,6 +46,35 @@
 //! *Kept as before.* A whole replace keeps nothing of the earlier value, so the earlier block stays as that version's
 //! bytes; a block another holder keeps (a branch, the identity table) or another path's value names is never cut.
 //!
+//! **A layered anchor (A-809, fixing A-803; main's order of 2026-11-21 02:37, w-fed-move's option 1).** The anchor is
+//! re-anchored in full only by a change that moves bytes (an insert, a delete, a truncate or an extend), and by one that
+//! keeps nothing or changes nothing. A change that only overwrites bytes inside the file keeps the path's anchor chunk
+//! and changes what it names: the bytes it overwrote, as they were, are copied into one owned chunk as the anchor's
+//! next *layer* (numbered, found by an interval index on their offsets), the anchor names the new block, the old block
+//! is let go, and the superseded latest value's one piece reads the anchor at that layer's number (its *epoch*). No
+//! other value is walked: O(log + the bytes overwritten), where the full re-anchor walked every value of the path's
+//! history, which grew with history while a reader pinned the floor (A-803: 7.9 to 231 values a verdict over 10^5
+//! versions).
+//! - *Reading.* A piece at epoch `e` of an anchor reads the anchor's bytes overlaid by its layers numbered `e` or later,
+//!   the lowest number covering a byte giving it (the bytes as they were when its value was its path's latest). A piece
+//!   at [`CURRENT`] reads the chunk as it is; every reader resolves a value's pieces to concrete runs first
+//!   ([`Value::concrete`]), O(log + the layers over each piece).
+//! - *Epochs.* A value that becomes history reads its anchor at the anchor's next layer number: the superseded latest
+//!   at the layer the change makes, and every value a full re-anchor moves to a new anchor at 0. Only the latest value
+//!   reads its own anchor at `CURRENT`, so swapping the anchor's block changes only what history reads through layers.
+//! - *A full re-anchor* first resolves every value's layered pieces into concrete runs naming the anchor and the
+//!   layers' owned chunks ([`flatten`]), then runs as before; the layers no piece reads any more go as the pieces do.
+//! - *Bounded.* A layer numbered below the least epoch any piece reads its anchor at is read by none and dropped
+//!   ([`Chunks::prune`]), so folding the values that read it frees it; an anchor freed frees its layers. A layer costs
+//!   its bytes (owned, as A-793's cut copied them) and its entries ([`LAYER_BYTES`], counted with the chunks, as a
+//!   value's list is).
+//! - *A block another holder keeps* (a branch's map, the identity table) is not named by a layer: the change copies
+//!   what it overwrote and lets its hold go, so the history holds the overwritten bytes whoever else holds the block
+//!   (the full re-anchor keeps such a block whole).
+//! - *The oracle* is the full re-anchor itself: `engine::history_block_tests`'
+//!   `the_layered_anchor_reads_as_the_full_reanchor_through_folds_and_checkpoints` runs generated histories on a green
+//!   taking layers and a twin taking only the full re-anchor (`FULL_REANCHOR_ONLY`, a test's switch).
+//!
 //! **Lifetimes.** The blocks live in the files' arena, which a lineage's greens share and lend ([`crate::dims`], "Arenas
 //! are lent"), while the chunks are the green's own. A lineage member is read and written only while lent, its arenas
 //! then the lineage's, so a block a chunk names is always in the arena at hand; a green made at another's version starts
