@@ -59927,3 +59927,16 @@ expected}`; `release_capture` lets a hold go), `crates/vfs/tests/held_head.rs`.
 - **Measured.** `cargo test -p slates-server --lib bench_a_whole_publications_longest_turn -- --ignored --nocapture`
   (311 inodes, 9 interleaved rounds): debug, Studio-4, the one-turn image and encoding 598 to 849 us against the held
   capture's longest turn 36 to 66 us and its first 6 to 10 us. The release rounds are recorded in BENCHMARKS.
+
+### A-826 — A holder's submit names its increment; the owner fetches it by identity (2026-11-21, w-shared, lane (A) 3b; main's rulings 2026-11-20 23:50 and 2026-11-21 00:52; §4.16 "Commit"; A-697, A-825)
+- `SubmitComputed` carries the increment's inputs identity and length (`increment`, `increment_len`), not its bytes:
+  the holder holds its composed increment under that identity (`merge_service::hold_composed_inputs`, lent, refused
+  typed at its room), and the owner's control shard, before the verb runs (`verbs::fetch_named_increment`), fetches
+  what its owner shard lacks from the work's member on the content plane (`fleet::fetch_manifest_into_hold`: hedged,
+  verified, a cut fetch kept for the retry, waiting for a lent session within the live budget), and the owner shard
+  holds it once (`hold_increment`); the verb reads it from its store. Not had whole: `Overloaded`, nothing started.
+- Why: a 320 MiB and larger holder submit crossed the forward lane whole and the lane gave up on silence under load
+  (GAPS). Measured in `fleet` `a_holders_submit_names_its_increment_and_the_owner_fetches_it_by_identity` (8 MiB: the
+  request under 64 KiB, fetched once); the release bench at 64-512 MiB follows.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today); a fetched
+  increment a refused verdict leaves is released at the next fold or restart.
