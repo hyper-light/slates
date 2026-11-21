@@ -1064,6 +1064,11 @@ impl Daemon {
     // connections, served again on the listener's shard below. Each platform reads the handoff table against every
     // entry its anchor may hold, as the configuration derives the anchor's bounds (A-448, A-460, A-462).
     let handed = crate::anchor_hold::adopt(&config);
+    // The content pool's extents as sections of their own (Windows, A-789): those the anchor held across the restart
+    // placed, and every other the layout names made, before any shard claims one. Only under an anchor that holds
+    // handles (its channel handed over): a daemon with none keeps its extents as ranges of its content object.
+    #[cfg(windows)]
+    crate::content_extents::install_if_anchored(&config, handed.channel.is_some(), handed.extents);
     #[cfg(unix)]
     let mut inherited_devices = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
     // The held copies: the Shards streams' DAX objects (A-365; Windows' sections, A-448), each moved to the shard that
@@ -4686,6 +4691,9 @@ async fn init_shard(
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
   slices.unit_done().await;
   let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
+  // The anchor holds this slice's content extents (Windows, A-789): a task of the shard, so a claim finds them held.
+  #[cfg(windows)]
+  crate::content_extents::spawn_slice_holds(config, partition);
   let headroom = operation_headroom(config, slice_capacity);
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota

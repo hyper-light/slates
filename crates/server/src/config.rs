@@ -777,6 +777,14 @@ impl DaemonConfig {
     usize::from(self.runtime.shards).saturating_mul(self.dax_range_slots())
   }
 
+  /// Derived (A-789): the content pool extents an anchor may hold for this daemon across a restart on Windows, where
+  /// each extent is a section of its own: every extent the layout can name, `partitions × POOL_EXTENTS_PER_PARTITION`
+  /// (at most one per bit of a slice's arena length in units, `content_pool::arena_parts`).
+  pub fn held_extent_bound(&self) -> usize {
+    usize::from(self.geometry.partitions.max(1))
+      .saturating_mul(slates_anchor::layout::POOL_EXTENTS_PER_PARTITION)
+  }
+
   /// Derived (A-365): the slots of each shard's DAX range table, one for each range its fill budget can count: the
   /// shard's reserve over a range, since every range a backing has filled counts a range against the budget (the
   /// identity layout's rule, `slates_bridge_core::dax_backing::filled_charge`), so the ranges filled never outnumber the
