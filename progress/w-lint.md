@@ -238,7 +238,7 @@
 - Host, six cross targets, structural, literals, unsafe, fmt: clean.
 - Windows r54 (on ebd9014c3) still running on jupiter; Linux resubmitted (r56 had no room).
 
-## 2026-11-20 round 10 at d4a5f9f43 (landed 35e4fd7de + merge follow-ups ec..., c968c7e2e; main 5313ab3cb)
+## 2026-11-20 round 10 at d4a5f9f43 (landed 35e4fd7de, merge follow-ups 3b2f12c1d, c968c7e2e; main 5313ab3cb)
 - merge refine.rs (A-787 part 1: 34/30/24/15/13 of 10) split by phase into paced helpers, every charge! kept in place;
   the const byte-class table gone (class() calls classify()). Conflicted with w-rewrite-ops' 95e88882f (C2 renames):
   took their tail, re-split refine_rewrites_paced on it (lent_whole, refined_ops, spliced + others_kept, relaid_plan,
