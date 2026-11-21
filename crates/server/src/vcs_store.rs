@@ -126,7 +126,6 @@ pub(crate) mod referenced;
 #[cfg_attr(not(test), allow(dead_code))]
 // Owed caller: w-git's C5 (the push landed on the store, its replay).
 pub(crate) mod store_packs;
-pub(crate) mod svn_deltify;
 pub(crate) mod svn_import;
 pub(crate) mod svn_made;
 pub(crate) mod svn_presenter;
@@ -224,11 +223,6 @@ pub(crate) struct VcsStores {
   /// The Subversion record read back from the node's store for the record a rebuild or recovery replays next (C2),
   /// by repository, with the register's index it is for: at most one a repository.
   svn_fetched: BTreeMap<RepositoryId, (usize, Vec<u8>)>,
-  /// The stored texts a recovery read back from the node's store into the content store (C2 stage B,
-  /// [`fetch_stored_texts`]), by repository: each written with the hold its replay's end would take, so that end takes
-  /// none more for them ([`hold_svn_stored`]). Bounded by the records' stored texts.
-  svn_fetched_texts:
-    BTreeMap<RepositoryId, std::collections::BTreeSet<slates_svn::index::ContentIdentity>>,
   /// The text pieces read through the node's store for drives waiting on them (C2 stage B part 2,
   /// [`svn_texts::Pieces`]).
   pub(crate) svn_pieces: svn_texts::Pieces,
@@ -263,9 +257,6 @@ pub(crate) struct VcsStores {
   /// Each git green's whole map built in slices after a push, between its slices ([`paths::whole_build`], A-664's live
   /// whole builds): one a green, so bounded by the partition's greens.
   whole_builds: paths::whole_build::Builds,
-  /// Each Subversion repository's deltify job between its slices ([`svn_deltify`]): one a repository, so bounded by the
-  /// partition's repositories.
-  svn_deltifies: svn_deltify::Deltifies,
   /// Each repository's index merge under way between its slices ([`index_upkeep`]): one a repository, so bounded by the
   /// partition's repositories.
   index_upkeep: index_upkeep::Upkeep,
@@ -452,9 +443,6 @@ pub(crate) enum ReplayRefused {
   SvnStep(StepRefusal),
   /// A Subversion record out of its order: a creation once the records are made, or a revision before them.
   SvnOrder,
-  /// A Subversion revision names a text its commit stored that the content store does not hold (§4.17.1 "A push's
-  /// intake": the content is durable before the entry naming it, so a recovery that lacks it lost it).
-  SvnStored,
   /// A Mercurial import's record refused by its replay (A-687): its bytes, a text not its node's, or the import's own
   /// step.
   Mercurial(slates_hg::import::record::Refused),
@@ -902,7 +890,6 @@ pub(crate) fn free(state: &mut ShardState, id: RepositoryId) {
   abandon_git_replay(state, id);
   state.vcs_stores.svn_replays.remove(&id);
   state.vcs_stores.svn_fetched.remove(&id);
-  state.vcs_stores.svn_fetched_texts.remove(&id);
   paths::whole_build::abandon(state, id);
   hg_import::abandon(state, id);
   git_encode::abandon(state, id);
@@ -3238,8 +3225,8 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
     record => {
       let records = store.records.as_mut().ok_or(ReplayRefused::SvnOrder)?;
       records.set_room(room);
-      // The texts a revision stored are held again once the whole log is replayed (`hold_svn_stored`), not here: a later
-      // entry may keep one as a delta, its whole bytes no longer in the store (the deltify job, `svn_deltify`).
+      // A revision's stored texts are its changeset's on the node's store, read through it (C2 stage B part 2 (b)): the
+      // content store holds none of them for the records.
       records
         .commit_record(record)
         .map_err(ReplayRefused::SvnStep)
@@ -3247,152 +3234,11 @@ fn replay_svn(store: &mut SvnStore, bytes: &[u8], room: SvnRoom) -> Result<(), R
   }
 }
 
-/// Holds again, in the content store, every text repository `id`'s records keep stored, as the live landings held them,
-/// once its whole log is replayed (module docs; `svn_deltify`), so a recovery's sweep of unheld content keeps them; then
-/// hands the deltify job the stored texts it may take, so a job a restart cut off goes on. A text the store lacks is
-/// refused `SvnStored`. Nothing for a repository of another tool.
-fn hold_svn_stored(state: &mut ShardState, id: RepositoryId) -> Result<(), ReplayRefused> {
-  // A text read back from the node's store holds the hold its writing took already (`fetch_stored_texts`).
-  let fetched = state
-    .vcs_stores
-    .svn_fetched_texts
-    .remove(&id)
-    .unwrap_or_default();
-  let Some(stored) = state.vcs_stores.subversion_records(id).map(|records| {
-    records
-      .stored_texts()
-      .map(|(identity, _)| *identity)
-      .filter(|identity| !fetched.contains(identity))
-      .collect::<Vec<_>>()
-  }) else {
-    return Ok(());
-  };
-  let held = within_budget(state, 0, |stores| {
-    let content = stores.content_mut().ok_or(ReplayRefused::SvnStored)?;
-    for identity in &stored {
-      content
-        .hold(&slates_vcs::ContentId(*identity))
-        .map_err(|_| ReplayRefused::SvnStored)?;
-    }
-    Ok(())
-  });
-  if held.is_ok() {
-    svn_deltify::resume(state, id);
-  }
-  held
-}
-
-/// Counter: a stored Subversion text a recovery read back from the node's store into the content store (C2 stage B):
-/// the shard's image had not kept it. Format: a counter name in the status report.
-pub(crate) const SVN_TEXT_FETCHED: &str = "vcs_store.svn_text_fetched";
-/// Counter: a stored Subversion text the content store lacked and the node's store could not give back whole; the
-/// replay's end then refuses it `SvnStored`. Format: a counter name.
-pub(crate) const SVN_TEXT_UNFETCHED: &str = "vcs_store.svn_text_unfetched";
-
-/// Reads back from the node's store every text repository `id`'s records keep stored that the content store lacks (C2
-/// stage B: a commit's changeset carries the texts it put, so the store holds each, while the content store holds only
-/// what the shard's last image kept), a piece at a time into the content store, each checked against its identity;
-/// counted. One not whole there is left out, and the replay's end refuses it `SvnStored`.
-async fn fetch_stored_texts(state: &mut ShardState, id: RepositoryId) {
-  let Some(disk) = state.vcs_disk.clone() else {
-    return;
-  };
-  let missing: Vec<(slates_svn::index::ContentIdentity, u64)> = {
-    let content = state.vcs_stores.content.as_ref();
-    state
-      .vcs_stores
-      .subversion_records(id)
-      .map(|records| {
-        records
-          .stored_texts()
-          .filter(|(identity, _)| {
-            !content.is_some_and(|content| content.contains(&slates_vcs::ContentId(**identity)))
-          })
-          .map(|(identity, len)| (*identity, len))
-          .collect()
-      })
-      .unwrap_or_default()
-  };
-  let repository = u128::from_be_bytes(id.bytes);
-  for (identity, len) in missing {
-    let fetched = fetch_text(state, &disk, (repository, identity, len)).await;
-    if fetched {
-      state
-        .vcs_stores
-        .svn_fetched_texts
-        .entry(id)
-        .or_default()
-        .insert(identity);
-    }
-    state.count(
-      if fetched {
-        SVN_TEXT_FETCHED
-      } else {
-        SVN_TEXT_UNFETCHED
-      },
-      1,
-    );
-  }
-}
-
-/// Text `identity` of `len` bytes of repository `repository`, read back from the node's store `disk` a piece at a time
-/// into the content store and made whole there (one hold); whether it was, its bytes its identity's. A busy owner is
-/// asked again after a yield.
-async fn fetch_text(
-  state: &mut ShardState,
-  disk: &slates_store::owner::StoreHandle,
-  (repository, identity, len): (u128, slates_svn::index::ContentIdentity, u64),
-) -> bool {
-  let mut writing = slates_vcs::Writing::default();
-  let mut offset = 0u64;
-  while offset < len {
-    let piece = match disk.text(repository, identity, offset).await {
-      Ok(Some(piece)) if !piece.is_empty() => piece,
-      Err(slates_store::owner::OwnerError::Busy) => {
-        slates_rt::futures::yield_now().await;
-        continue;
-      }
-      _ => break,
-    };
-    let brought = u64::try_from(piece.len()).unwrap_or(u64::MAX);
-    let put = within_budget(state, brought, |stores| {
-      stores
-        .content_mut()
-        .map(|content| content.put_window(&mut writing, &piece).is_ok())
-    });
-    if put != Some(true) {
-      break;
-    }
-    offset = offset.saturating_add(brought);
-  }
-  within_budget(state, 0, |stores| {
-    let Some(content) = stores.content_mut() else {
-      return false;
-    };
-    if offset != len {
-      content.abandon_object(writing);
-      return false;
-    }
-    match content.finish_object(&mut writing) {
-      Ok(made) if made == slates_vcs::ContentId(identity) => true,
-      Ok(made) => {
-        let _ = content.release(&made);
-        false
-      }
-      Err(_) => false,
-    }
-  })
-}
-
-/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]), and its
-/// stored Subversion texts held again ([`hold_svn_stored`]), counted as a record's replay is; whether it was served.
-fn replay_ended(state: &mut ShardState, id: RepositoryId) -> bool {
+/// Replay's end for repository `id`: its index, built whole, merged a slice at a time ([`index_upkeep::built`]). A
+/// Subversion repository's stored texts are not held again: they are its changesets' on the node's store, read through
+/// it (C2 stage B part 2 (b)).
+fn replay_ended(state: &mut ShardState, id: RepositoryId) {
   index_upkeep::built(state, id);
-  let held = hold_svn_stored(state, id);
-  match held {
-    Ok(()) => true,
-    Err(_) => replayed(state, id, held),
-  }
 }
 
 /// The outcome of one record's replay, counted; a refused one leaves repository `id`'s store unserved, given back, with
@@ -3602,9 +3448,6 @@ async fn recover_repository(
       }
     };
     let Some(outcome) = outcome else {
-      // A Subversion text a commit stored, which the shard's image did not keep, is read back from the node's store
-      // first (C2 stage B): its changeset carried it.
-      fetch_stored_texts(state, record.id).await;
       replay_ended(state, record.id);
       break;
     };

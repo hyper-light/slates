@@ -4456,6 +4456,14 @@ pub fn shard_report(state: &mut ShardState, memory: bool) -> ShardReport {
             crate::xshard::run_refused(),
           ),
           (
+            WORK_LOG_PEAK_BYTES,
+            u64::try_from(state.db.partition().work_log_peak().0).unwrap_or(u64::MAX),
+          ),
+          (
+            WORK_LOG_PEAK_ENTRIES,
+            u64::try_from(state.db.partition().work_log_peak().1).unwrap_or(u64::MAX),
+          ),
+          (
             crate::xshard::REPLY_HOME_HANDED,
             crate::xshard::reply_home_counts().handed,
           ),
@@ -10325,6 +10333,12 @@ type Judged = (
   Option<Vec<slates_merge::chain_entry::Applied>>,
 );
 
+/// Format: the largest work log a shard's partition has held, its bytes and its entries then (A-806's measure; a peak,
+/// read as the most over the shards, not their sum).
+const WORK_LOG_PEAK_BYTES: &str = "merge.work.log_peak_bytes";
+/// See [`WORK_LOG_PEAK_BYTES`].
+const WORK_LOG_PEAK_ENTRIES: &str = "merge.work.log_peak_entries";
+
 /// Format: the history values a submit's commit re-anchored (A-803's measure), summed: over `merge.submit.judge`, what a
 /// verdict walks of its paths' histories.
 const REANCHOR_VALUES_WALKED: &str = "merge.reanchor.values_walked";
@@ -11336,25 +11350,25 @@ fn canonical_declaration(
 
 /// A resolution's changes applied over a work rebased onto `head` (A-796), as the work's own edits and declarations
 /// would be: each edit's operations from the file's length alone and its bytes as pieces over the head
-/// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, whole,
-/// as a rebase restates them, and its journal.
+/// (`crate::work_files`), each declaration converted as `declare` converts it. The work's changed files then, as parts
+/// over the head as a rebase restates them (A-806), and its journal.
 fn apply_replacement(
   engine: &slates_merge::engine::Green,
   head: u64,
   (changed, mut journal): (
-    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
     Vec<VolumeOp>,
   ),
   replacement: &[slates_ipc::protocol::WorkChange],
 ) -> Result<
   (
-    std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    std::collections::BTreeMap<String, Option<crate::work_files::HeldParts>>,
     Vec<VolumeOp>,
   ),
   Refusal,
 > {
   use slates_ipc::protocol::WorkChange;
-  let mut files = crate::work_files::WorkFiles::from_changed(changed);
+  let mut files = crate::work_files::WorkFiles::from_parts(changed);
   let base = crate::work_files::Base {
     green: Some(engine),
     fetched: None,
@@ -11398,13 +11412,8 @@ fn apply_replacement(
       }
     }
   }
-  let restated = files
-    .changed_entries(base)
-    .map_err(|_| unknown())?
-    .into_iter()
-    .map(|(path, bytes)| (path.to_owned(), bytes.map(std::borrow::Cow::into_owned)))
-    .collect();
-  Ok((restated, journal))
+  // As parts over the head (A-806), as the rebase answered them: never a file materialized whole.
+  Ok((files.parts(), journal))
 }
 
 /// What `engine`'s rebase of `inc` gives a work over `green_id` (A-247, A-658): the work's new delta and journal over the
@@ -11437,6 +11446,16 @@ fn rebase_answer(
       } else {
         std::collections::BTreeMap::new()
       };
+      // Each changed file as its parts over the head's same path (A-806): what differs is written, the rest names the
+      // head, so neither the work nor its restatement holds the file.
+      let changed = changed
+        .into_iter()
+        .map(|(path, bytes)| {
+          let parts = bytes
+            .map(|bytes| crate::work_files::parts_over_base(&path, engine.content(&path), bytes));
+          (path, parts)
+        })
+        .collect();
       RebaseAnswer::Rebased {
         version,
         changed,
@@ -11497,7 +11516,7 @@ fn settle_rebase(
     crate::work_home::RebaseAnswer::Reply(reply) => return kept_conflict(state, work_id, reply),
   };
   let restated = crate::work_log::WorkLogEntry::restated(version, &changed, &journal);
-  let changed = crate::work_files::WorkFiles::from_changed(changed);
+  let changed = crate::work_files::WorkFiles::from_parts(changed);
   let wanted = crate::work_charge::footprint(&changed, &journal).saturating_add(
     entries
       .iter()

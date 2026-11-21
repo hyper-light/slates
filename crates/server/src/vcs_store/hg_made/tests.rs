@@ -235,3 +235,147 @@ fn t_a731_a_copy_a_work_declares_is_a_copy_in_the_made_changeset() {
     );
   });
 }
+
+/// A work over `green` writing `bytes` at `path`, made by bare dispatches: its id.
+fn hg_work(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  (name, path, bytes): (&str, &str, &[u8]),
+) -> slates_ipc::protocol::VolumeId {
+  let ipc_green = slates_ipc::protocol::VolumeId { bytes: green.bytes };
+  let made = crate::vcs_store::paths::tests::ask(
+    state,
+    RequestBody::CreateWork {
+      green: ipc_green,
+      name: name.to_owned(),
+    },
+  );
+  let ReplyBody::WorkCreated { id: work, .. } = made else {
+    panic!("no work: {made:?}")
+  };
+  let edited = crate::vcs_store::paths::tests::ask(
+    state,
+    RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    },
+  );
+  assert!(!matches!(edited, ReplyBody::Refused { .. }), "{edited:?}");
+  work
+}
+
+/// What a client and a reader see of a Mercurial repository's green after a recorded submit: whether the request is
+/// answered, the green's durable head, its engine's head, and the line's head changeset.
+fn seen(
+  state: &ShardState,
+  green: DbVolumeId,
+  id: slates_wire::request::RequestId,
+) -> (bool, u64, Option<u64>, Option<Node>) {
+  (
+    matches!(
+      state.db.partition().completion(7, id.client, id.sequence),
+      slates_wire::request::Seen::Completed(_)
+    ),
+    state.db.partition().green_head(green),
+    state.greens.get(&green).map(|engine| engine.head()),
+    head_of(state, green),
+  )
+}
+
+/// Polls `daemon`'s first shard until the request `id` is answered, within [`TASK_WAIT`]: what it saw then.
+fn answered(
+  daemon: &crate::daemon::Daemon,
+  green: DbVolumeId,
+  id: slates_wire::request::RequestId,
+) -> (bool, u64, Option<u64>, Option<Node>) {
+  let began = std::time::Instant::now();
+  loop {
+    let now = crate::daemon::observe_first(daemon, move |state| seen(state, green, id));
+    if now.0 || began.elapsed() > TASK_WAIT {
+      return now;
+    }
+  }
+}
+
+/// A-806 (main 02:37, piece 2: Mercurial's made changesets adopt the deferred-submit hook, `crate::made_commit`). Do:
+/// submit a work to a Mercurial repository's green as a client's recorded request, and read it in the submit's own
+/// step; then wait for the answer. Expect: in the submit's step nothing answered, nothing durable, the green's engine at
+/// its old head and no made changeset; then the request answered with the green's durable and engine heads at 1 and the
+/// made changeset the line's head, all from one step. Until the hook, the submit's own step committed and answered.
+#[test]
+fn a_mercurial_made_changeset_is_answered_only_after_its_one_step() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let (green, in_the_step) = crate::daemon::observe_first(&daemon, move |state| {
+    let (_, green) = mercurial(state, "deferred");
+    let work = hg_work(state, green, ("deferred-work", "a.txt", b"alpha\n"));
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, id),
+      &owner(),
+      crate::identities::authored(work, "made"),
+    );
+    (green, seen(state, green, id))
+  });
+  let after = answered(&daemon, green, id);
+  daemon.stop();
+  assert_eq!(
+    in_the_step,
+    (false, 0, Some(0), None),
+    "nothing answered or shown in the submit's step"
+  );
+  assert_eq!(
+    (after.0, after.1, after.2),
+    (true, 1, Some(1)),
+    "answered after the one step"
+  );
+  assert!(after.3.is_some(), "the made changeset is the line's head");
+}
+
+/// A-806 (the turn first). Do: hold a Mercurial repository's landing turn, submit a work to its green as a client's
+/// recorded request, read it, then give the turn back and wait for the answer. Expect: while the turn is held nothing of
+/// the submit ran (engine and durable heads 0, unanswered); once given back the parked submit runs again holding the
+/// turn and is answered with the version and its made changeset. Until the hook a Mercurial submit took no turn.
+#[test]
+fn a_mercurial_submit_meeting_its_repositorys_turn_held_waits_and_commits_once_it_is_given_back() {
+  let (_store, daemon) = crate::test_store::audit_daemon_stored();
+  let id = slates_wire::request::RequestId {
+    client: 7,
+    sequence: 1,
+  };
+  let (green, while_held) = crate::daemon::observe_first(&daemon, move |state| {
+    let (repository, green) = mercurial(state, "turn-held");
+    let work = hg_work(state, green, ("turn-work", "a.txt", b"alpha\n"));
+    let held = crate::repository::svn_commit::landing::Turn::take_now(state, repository);
+    crate::verbs::run_recorded_for_test(
+      state,
+      (7, id),
+      &owner(),
+      crate::identities::authored(work, "made"),
+    );
+    let seen_then = seen(state, green, id);
+    if let Some(turn) = held {
+      turn.give_back(state);
+    }
+    (green, seen_then)
+  });
+  let after = answered(&daemon, green, id);
+  daemon.stop();
+  assert_eq!(
+    while_held,
+    (false, 0, Some(0), None),
+    "nothing ran while the turn was held"
+  );
+  assert_eq!(
+    (after.0, after.1, after.2),
+    (true, 1, Some(1)),
+    "run again holding the turn"
+  );
+  assert!(after.3.is_some(), "the made changeset is the line's head");
+}

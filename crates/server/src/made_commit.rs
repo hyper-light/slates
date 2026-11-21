@@ -36,8 +36,9 @@
 //! (`repository::svn_commit::tests`, the kill between the landing and the commit).
 //!
 //! **Not covered** (GAPS): a submit dispatched outside a recorded request (no answer waits on it) keeps the made task
-//! after its step; a Mercurial repository's green (`vcs_store::hg_made`) commits in the submit's step; git's adopts
-//! this hook (w-git). The verdict's mapped files are made twice, once in the preview and once at the step (owed,
+//! after its step; a Mercurial repository's made changeset (`vcs_store::hg_made`, A-807) takes the hook but lands
+//! nothing on the store before its step (its record is the register's entry), and a client's hg push takes no turn;
+//! git's adopts this hook (w-git). The verdict's mapped files are made twice, once in the preview and once at the step (owed,
 //! performance).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -86,11 +87,32 @@ pub(crate) struct Held {
   /// The work, when the submit runs on its shard (`verbs::submit`); none for the owner's step of a work elsewhere,
   /// whose shard settles it when it is answered.
   local: Option<DbVolumeId>,
+  /// The repository's tool: whose made commit the task makes.
+  tool: Tool,
+}
+
+/// The tools whose made commits take the hook (module docs): git's adopts it (w-git).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tool {
+  /// A Subversion repository's revision (`vcs_store::svn_made`): landed on the node's store, then committed.
+  Subversion,
+  /// A Mercurial repository's changeset (`vcs_store::hg_made`): its record still held in the register's entry (no store
+  /// landing yet; GAPS C2), committed in the one step.
+  Mercurial,
+}
+
+/// The repository `green` is the green of and its tool, where its made commits take the hook.
+fn made_repository_of(state: &ShardState, green: DbVolumeId) -> Option<(RepositoryId, Tool)> {
+  if let Some(repository) = crate::vcs_store::svn_made::subversion_repository_of(state, green) {
+    return Some((repository, Tool::Subversion));
+  }
+  crate::vcs_store::hg_made::mercurial_repository_of(state, green)
+    .map(|repository| (repository, Tool::Mercurial))
 }
 
 /// Whether the running submit took its repository's turn ([`take_turn`]).
 pub(crate) enum Taken {
-  /// No turn is taken: not a Subversion repository's green, or no recorded request runs.
+  /// No turn is taken: not a Subversion or Mercurial repository's green, or no recorded request runs.
   Unhooked,
   /// Taken.
   Held,
@@ -98,7 +120,7 @@ pub(crate) enum Taken {
   Busy(RepositoryId),
 }
 
-/// Takes the landing turn of the Subversion repository `green` is the green of, for the running submit, before its
+/// Takes the landing turn of the Subversion or Mercurial repository `green` is the green of, for the running submit, before its
 /// verdict (module docs, 1): a turn a waiting task took for parked submits first, else the turn where it is free.
 /// `recorded`: whether a recorded request runs, whose answer can wait.
 pub(crate) fn take_turn(
@@ -110,7 +132,7 @@ pub(crate) fn take_turn(
   if !recorded {
     return Taken::Unhooked;
   }
-  let Some(repository) = crate::vcs_store::svn_made::subversion_repository_of(state, green) else {
+  let Some((repository, tool)) = made_repository_of(state, green) else {
     return Taken::Unhooked;
   };
   let turn = match state.made_commits.ready.remove(&repository) {
@@ -123,6 +145,7 @@ pub(crate) fn take_turn(
         repository,
         turn,
         local,
+        tool,
       });
       Taken::Held
     }
@@ -147,14 +170,14 @@ pub(crate) fn take_deferred(state: &mut ShardState) -> bool {
 pub(crate) fn holds(state: &ShardState, green: DbVolumeId) -> bool {
   state.current_request.is_some()
     && state.made_commits.held.as_ref().is_some_and(|held| {
-      crate::vcs_store::svn_made::subversion_repository_of(state, green) == Some(held.repository)
+      made_repository_of(state, green).map(|(repository, _)| repository) == Some(held.repository)
     })
 }
 
 /// The turn the running recorded submit holds for `green`'s repository, taken for its accept.
 pub(crate) fn take_held(state: &mut ShardState, green: DbVolumeId) -> Option<Held> {
   state.current_request?;
-  let repository = crate::vcs_store::svn_made::subversion_repository_of(state, green)?;
+  let (repository, _) = made_repository_of(state, green)?;
   if state
     .made_commits
     .held
@@ -206,12 +229,20 @@ pub(crate) fn defer(
   };
   state.acceptance_deferred = true;
   state.made_commits.deferred = true;
-  crate::vcs_store::svn_made::make_deferred(
-    state,
-    (held.repository, held.turn),
-    pending,
-    (copies, judged),
-  );
+  match held.tool {
+    Tool::Subversion => crate::vcs_store::svn_made::make_deferred(
+      state,
+      (held.repository, held.turn),
+      pending,
+      (copies, judged),
+    ),
+    // Its changeset is made at the one step, from the green the verdict was applied to there: nothing lands before it,
+    // so the held verdict is dropped here (its chain entry's form applies it, `verbs::apply_accepted`).
+    Tool::Mercurial => {
+      drop(judged);
+      crate::vcs_store::hg_made::make_deferred(state, held.turn, pending, copies);
+    }
+  }
   crate::lease_wait::parked_reply()
 }
 
