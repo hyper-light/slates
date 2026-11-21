@@ -204,3 +204,27 @@ Red: a focused server test landing a large named text: no step past the quantum,
   deterministically (names log Some(5), expected Some(2)) since 455fe41fb "wip: push records ride the names log"
   (A-724 piece 8c); a probe with my engine change reverted fails the same.
 - NEXT (main starts it): the pacing item (steps fill the quantum, per-unit-kind EWMA).
+## 2026-11-20 ~16:00-18:10 -- A-783 (pacing) and the close order (C1, C2, P3)
+- A-783 COMMITTED ca496af8a (+ merge 640d1ea87, base cd1261e43), NOT YET LANDED: studio-2 (the push route) draining
+  since ~17:55; kiln "did not answer" once, then "no runner suits". A/B in BENCHMARKS "Paced work yields only when
+  someone waits": pass 1 found the probe blind to the rest of a step's batch (newcomers waited ~100 ms; red test
+  a_task_ready_in_the_same_batch_is_seen_waiting, fixed); pass 3 idle 7 rounds: build turns 3-20x fewer in 6/7, wall
+  best 7.864 -> 6.011 s, newcomer p99 median 2.51 vs 2.53 ms, provision p99 median 176 vs 183 us. Owed in GAPS: the
+  round where every turn yielded at its first ask; a quiet-machine rerun.
+- Interface notes written (inbox/w-git|w-hg|w-svn-from-w-engine-pace-interface-2026-11-20.md) and
+  inbox/main-from-w-engine-a783-2026-11-20.md (also: provision_bench's 8-client form hangs on main, both sides; a .pyc
+  committed on main in 8f286457c). Not pushed yet (state push goes through studio-2 too).
+- C2 A-752 literals: CLOSED (4b6d5c24b on origin/main; verified today). Close note in inbox/main-from-w-engine-close.md.
+- C1 A-760: COMMITTED b1460a5e1, NOT YET LANDED: Green::make_step (files made a slice a step before the commit) and
+  part 2's bug (a moved whole run shifted later runs: wrong bytes, silently; red first). merge lib 246, named 25,
+  server named_objects 1. Close note to add once landed.
+- Finding (GAPS): checkpoint proptest failed once in 10 runs, case not kept; names no runs.
+- NEXT: land both when studio-2 is back (TIP after b1460a5e1); write C1 to the close note; then P3 (89b: A-579 the
+  server's own p99 under load, 9-75 ms at 1,000 clients; the pacing primitive is the lever).
+- Worktree to delete once A-783 lands: /Users/adalundhe/slates-work/w-engine-ab-a; target dirs ~/.cache/w-engine-ab-a,
+  ~/.cache/w-engine-ab-b.
+- 20:xx LANDED both through studio-3 (main's route): origin/main 4a9259ff5 contains ca496af8a (A-783) and b1460a5e1
+  (C1). First push refused (main moved); merged c7e7f3b4c (docs) and pushed. Focused tests at base 4f57efa69: server
+  content_ranges 2/2, git_push 23/23; earlier at 33465d641: pace+rt all, merge lib 248, git receive 49, named_objects 1.
+  content_ranges' sweep test failed on main's own 33465d641 too (grouped, 2 of 2); main's next change fixed it.
+- C1 and C2 CLOSED (inbox/main-from-w-engine-close.md). NEXT: P3 89b (A-579), pacing as the lever.
