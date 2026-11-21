@@ -24912,9 +24912,14 @@ in what lands. Branch tips as of 2026-11-10:
 > against main's 2.48-4.47 (ReadHead 3.09-4.38 against 1.04-1.94), while p999 and max are better; at Z = 50 ms every
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
-> (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB) and single key folds of up to 13.4 ms (slicing inside a key landed and was reverted the same day: a fold of
-> 47.6-52.6 s, design amendment A-579).
+> (does Z = 20 ms p99 return to main's?; main's run, `run-requests.md`, blocked while main's own regression stands:
+> SubmitAccepted server p50 0.29 ms at 4d0ad1674 against 184 ms at 1a35ab091, Z = 50 ms, macOS arm64, not A-579's,
+> window c1449f629..b3f674640 unbisected). DEFERRED past goal 93 (goal 89b's): the checkpoint's last step, ~43 ms
+> (build 5.7, encode 9.5, record 24.4 of 49 MB), plan: slice build and encode under the paced turn budget now, and record
+> by identity in the content store only inside w-shared's chain format 6 (main's 02:06 ruling); and single key folds of
+> up to 13.4 ms, plan: a slice that keeps a hot file's partial short with a guaranteed past-deadline share derived from
+> the latency budget (main's 23:50 ruling), since slicing inside a key landed and was reverted the same day (a fold of
+> 47.6-52.6 s, every past-deadline turn at the 100 ms ceiling; ed4661d40, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.
