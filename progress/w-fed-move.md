@@ -1,5 +1,11 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~01:40 PST: A-801 LANDED slates main 2d079c44 (throughput: name the mechanism first)
+- Owner asks counted by kind and answers timed by kind on the owner; the harness prints the server nodes' merge
+  counters (`server_counter` rows; load_scale passes its servers).
+- 1k in-process over kernel/: 17.5 asks a client (lengths 44%, files 18%), owner 185 ms in all: not the wall at 1k.
+- Waiting on r48's primary rows to pick the throughput mechanism. Small-scale proxies tried: 1k in-process (above).
+
 ## 2026-11-21 ~01:30 PST: A-800 LANDED slates main 9918e6c0 (main's order: the lost replies first)
 - Drop sites on the reply-home hop listed, each counted apart; the silent ones (a reply dropped while its shard's
   state is borrowed, finish_owner_forward's and deliver's refused borrows) now resend or count. Three red/green tests.

@@ -34,3 +34,11 @@ Leading candidate: a reply admitted and never run. That fits the stalls (every d
 and their start between e4c2ad76 and 8a18edcc, where 343b741e landed. A-798 (931e52ed, another worker's) has since
 fixed a lost kick on a parked shard of exactly that kind. If the rerun shows handed equal to ran and no stuck
 `pending` rows, the lost replies are closed by A-798 plus this change.
+
+## Added 2026-11-21 ~01:40 PST: the owner's cost by kind (A-801, Slates 2d079c44)
+If r48 builds main at or after 2d079c44, the harness also prints `server_counter <instance> <counter> <count>` rows
+for the primary and both replicas: asks of the owner by kind (`merge.work.asked_owner.<kind>`) and the owner's
+answering time by kind (`merge.work.answered.<kind>` and `..._ns`).
+- On the primary, the largest `answered.*_ns` row names the 100k throughput wall's mechanism.
+- At 1,000 clients in-process the owner spent only 185 ms answering in all, so it is not the wall at that scale.
+Please send me those rows with the drop-site rows.
