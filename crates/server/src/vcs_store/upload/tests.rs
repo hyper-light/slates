@@ -59,7 +59,7 @@ fn packet(data: &[u8]) -> Vec<u8> {
 }
 
 /// A v2 command request: `command=<command>`, the delimiter, each of `arguments` a line, then the flush.
-fn request(command: &str, arguments: &[String]) -> Vec<u8> {
+pub(crate) fn request(command: &str, arguments: &[String]) -> Vec<u8> {
   let mut bytes = packet(format!("command={command}\n").as_bytes());
   bytes.extend_from_slice(b"0001");
   for argument in arguments {

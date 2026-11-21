@@ -2305,7 +2305,8 @@ threshold; racy window = the base filesystem's timestamp granularity (from a cit
 table keyed by the type `statfs` reports) plus the measured clock resolution; watcher coalescing
 window = measured p50 inter-arrival of event bursts; descriptor budget for large-class copy-ups =
 `RLIMIT_NOFILE` (or the Windows handle budget) minus the daemon's measured steady-state use,
-divided by the measured number of concurrently open large-class files.
+divided by the measured number of concurrently open large-class files; the daemon first raises its soft
+`RLIMIT_NOFILE` to min(hard limit, the platform's cap) at its start (A-837).
 
 **Worked example.** `cargo build` in a clone creates 190k files under `target/`: each create
 touches its directory (mostly current-epoch nodes, mutated in place after the first touch), the
@@ -11780,6 +11781,24 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > (`slates check WORK`, `slates resolve JSON`, the resolution as the tool's JSON object), one JSON shape for both
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
 > (`assert_merge_check_resolves_over_mcp`).
+
+> **Status (2026-11-21, A-840: a conflict resolved in one ask).** `ResolveConflict { work, over, replacement }` gives
+> up the windows a conflict named and resolves at the head as it is: the green's half takes the work's writes out of
+> exactly those windows (an overwrite keeps its bytes outside them; an insertion, deletion, extension or truncation that
+> meets one goes whole; a zero-length window gives up every operation on its path), rebases the rest onto the head,
+> applies the agent's replacement there and restates the work, one recorded step, as `ResolveMerge` does. There is no
+> check and no stamp: nothing is judged at an older head, so nothing can be stale. What is kept and still conflicts
+> answers only its own windows, nothing changed, so the next resolution names those and the ones given up before. Every
+> window given up and every byte written is the agent's declaration (D-27). It is the client's corrective path in the
+> load harness: at 10 hot files in the 1,000-client stand-in, rebase-kind owner asks fell from 20.5-20.9 to 10.4-10.9 a
+> client and all owner asks from 32.7-33.2 to 26.3-27.0 (BENCHMARKS, 2026-11-21). A work's shard that cannot lay its
+> own increment's bytes (a rebased file held as parts over the head, A-806, names a run of the work's own write as the
+> head's, which a work off the green's shard does not hold) hands the owner its journal and files rather than laying
+> zeros, and the owner's answer still carries the work's base entries. Tests: `crates/server/tests/merge_check.rs`
+> (the one-ask history on one shard and on eight; a later write meets the resolved work in every file; a kept slot
+> beside a given-up one; a generated oracle of 24 histories under rival writes, every accepted version holding its
+> work's slots and the green ending as the replay) and `crates/server/tests/works_off_owner.rs`
+> (`a_resolution_the_owner_composed_leaves_the_work_its_entries`).
 
 > **Status (2026-11-19, A-663: a rebased work restates each hard link where the node it names still stands).** The
 > restated journal is the work's own operations over the head, and a volume with real inodes replays it in order, as
@@ -55925,9 +55944,13 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
 - **Tests.** `vcs_http::daemon_edge::tests::a_long_fetchs_answer_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`
   (a 300-commit history fetched at keepalive none: the section's second packet was the pack's first, now git's
   keepalive, the pack whole after it).
-- **Owed.** The SSH edge's upload (`vcs_ssh::git`) writes no keepalive while its answer is silent; and a fetch's wait
-  before its sections (the A-718 encode and A-614's derivations in `body_end`) has no packet git allows there under
-  side-band-64k alone (a band-2 progress packet needs `sideband-all`), so it stays silent.
+- **The SSH edge** (2026-11-21, same day): `vcs_ssh::git`'s upload session writes it the same way, after git's own
+  interval (`GIT_KEEPALIVE_NS`; `ToolServices::with_git_keepalive` gives a site another). Red on main 1a35ab091:
+  `vcs_ssh::tests::receive::a_long_fetchs_answer_over_ssh_is_kept_alive_with_gits_keepalive_while_its_pack_is_chosen`,
+  the section's second packet the pack's first; green after.
+- **Owed.** A fetch's wait before its sections (the A-718 encode and A-614's derivations in `body_end`, the SSH
+  session's encode before its advertisement) has no packet git allows there under side-band-64k alone (a band-2
+  progress packet needs `sideband-all`), so it stays silent.
 
 ### A-722's memory per push, B1 — An object read in place from its held pack (2026-11-20, w-git for UI goal 93; main's ruling B, Ada's MEMORY SIZING and storage rulings)
 - **Measured first** (adas-mac-studio.local-2, release, 2026-11-20; diagnostic test on branch agents/w-git-memdiag,
@@ -58132,6 +58155,43 @@ with a peer still mapping them; BENCHMARKS "Content give-back per platform").
 - Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
   still only leave the footprint.
 
+### A-839 — On macOS a shard's content slice reserves nothing for its arena (2026-11-21, w-sizing; the sweep's conversions, largest first; A-789)
+Applied in the same change to: `crates/server/src/config.rs` (`shard_content_layout`: the stride ends where the arena's
+range would begin on macOS), the test `the_content_object_reserves_nothing_for_the_arena_on_macos`, GAPS.
+
+Status: built 2026-11-21, macOS.
+- Why: since A-789 every pool extent on macOS is an object of its own, so the arena's range in the content object was
+  address space nothing mapped: `reserve_per_shard` a shard, a third of the machine's memory over its shards.
+- Measured (big Studio): a one-shard daemon's content object reserved 139,264 MiB before and 106,496 after.
+- The layout's `arena` still names the arena's capacity, which the pool cuts into its parts. Linux keeps the range (its
+  extents are ranges of one memfd, holes punched), and so does Windows, whose extents are ranges of the object when no
+  anchor holds their sections.
+
+### A-840 — A conflict resolved in one ask (2026-11-21, w-fed-move; goal 86b's owner asks; main's 10:37 ruling, take-head as one verb; §4.16 "Rebase, the only corrective path", D-27, A-796)
+Applied in the same change to: §4.16 (its status), `crates/ipc/src/protocol.rs` (`ResolveConflict`),
+`crates/server/src/verbs.rs` (`resolve_conflict`, `give_up_windows`, `merge_answer`, `lay_ops`/`lay_op`/
+`assemble_post_state` refusing `BaseGone`, `compose_increment`), `crates/server/src/work_home.rs` (`MergeAsk::over`,
+`SealedWork::composes_here`), `crates/server/src/refining.rs` (a sliced build that meets it gives up),
+`crates/client/src/client.rs` (`resolve_conflict`), `crates/client/examples/load_bench.rs` (the resolution, with
+`--resolve rebase` kept for the comparison), GAPS, BENCHMARKS, `docs/bugs/2026-11-21-a-composition-laid-zeros-for-base-bytes-its-shard-did-not-hold.md`.
+- **Why.** After A-817 the work's owner asks were 30.0 a client at 10 hot files, 20.1 of them rebases: 77% of rebases
+  conflicted again. Two cuts that kept a gap between the conflict and the resolution were even (the head's window bytes
+  in the reply; BENCHMARKS): in a closed loop some 50 to 120 verdicts land in either gap. A-796's check and resolution
+  closed the gap (16,035 to 584 repeat conflicts) but cost two asks; the check's stamp is what made the second.
+- **Rule.** The agent names the windows it gives up, never operation indices, so it needs no check: the green's half
+  takes the work's writes out of exactly those windows and resolves at the head as it is. The windows a conflict names
+  are the work's operations' ranges, so a window may span adjacent writes of the work; the agent writes again what it
+  keeps inside one.
+- **Found on the way, by the generated oracle.** A rebased file is held as parts over the head (A-806), a run equal to
+  the head's named as the head's; a work off the green's shard does not hold the head's bytes, so composing its next
+  increment met `BaseGone` and `lay_op` laid zeros into the post-state, which the green took as the work's bytes. A
+  composition now refuses it, the work's shard hands the owner its journal and files, and the owner's answer carries the
+  base entries anyway (`SealedWork::composes_here`; without them every later submit asked the files, 3.9 a client).
+- **Measured.** BENCHMARKS 2026-11-21, three pairs at each of 300/100/30/10 hot files, oracle clean in all 24 runs:
+  rebase-kind asks a client 2.1-2.2/3.7/8.9-9.5/20.5-20.9 to 1.8-1.9/2.6-2.7/5.4-5.7/10.4-10.9; all owner asks
+  11.2-11.3/13.2-13.3/19.5-20.1/32.7-33.2 to 10.9-11.0/12.3-12.5/17.2-17.6/26.3-27.0. Verdict asks rose (5.5-5.7 to
+  9.2-9.5 at 10 hot files): a resolved work submits at once, into the same contention. That is now the largest kind.
+
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
 (`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
@@ -58284,6 +58344,11 @@ wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe
   (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
   as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
   to main's run requests.
+- **Status (2026-11-21).** The acceptance flows by use are `crates/cli/tests/real_tools.rs`. A `#pragma once` compile
+  under clang, gcc and `cc` is held across a snapshot and a SIGKILL takeover; after each event, and under injected
+  memory pressure, `make -q`, `cargo build` and `git status` find nothing moved, and every tracked file's number and
+  times are unchanged. Green on macOS NFS (APFS). The test builds for Linux FUSE and Windows WinFsp, whose runs are
+  main's (run-requests.md).
 
 ### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
 The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
@@ -59629,8 +59694,13 @@ Applied in the same change to:
   a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
   mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
   first). Each key now moves from `identity_since`, its own folded-at version.
-- **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
-  step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms sliced; w-git's member loop in turns on
+- **Slicing inside a key: landed (d4c7e1f42) and reverted the same day.** A paced unit of one BLAKE3 slice within the
+  quantum (a few KB), with a partly hashed file begun again at each change to it, took the fold in turns from about 1-3 s
+  to 47.6-52.6 s at 1,000 clients (hot files change several times a second), past its doubling deadline, where a turn's
+  share is all that is left: steps of up to the ceiling for the rest of the run. Reverted; owed again with a slice that
+  keeps a hot file's partial short and a share past the deadline that stays bounded (main's 23:50 ruling).
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record),
+  its durable form a question for main; single keys of up to 13.4 ms sliced (above); w-git's member loop in turns on
   `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
@@ -59855,8 +59925,17 @@ Applied in the same change to:
   - The store's oracle (`vcs_store::tests`, `Live`) writes and replays version 5 only, a recovery fetching each record's
     names and pack as a region fetch does; the hostile-input test runs over version-5 bytes; the A-664 commit tests make
     their commits through the queue.
-- **Owed** (GAPS, C5 part 2b): the change step over the preview in one turn (bounded by the submit's admission), next
-  in this series.
+- **The map a slice a turn** (2026-11-21, main's order: the change step over the preview is bounded work, part of this
+  series). A made commit's map is put from the held preview a slice a turn within the shard's step quantum
+  (`whole_build::PreviewChange`, owned by the made commit's task, which lends the preview each turn): the change's paths
+  over the map before, as a push's change build puts them from the green, then the change applied and kept; a root's
+  first version's whole put the same way, with no map before. The one-call step over the preview (`step_over_preview`)
+  and the numbering offset `stepped` and `plan` took for it are gone; only `over_preview_step` reads the preview's change
+  index in its own numbering. A build given up gives its holds back. Counted `vcs_commits.made_map_turns`;
+  `t_a824_a_made_commits_map_is_put_a_slice_a_turn_over_the_preview`: with no budget a turn (one path a turn, whatever
+  the machine's load), a root's first version of 8 files and then a change of all 8 each took at least 8 turns, and a
+  stock clone reads the second version's files.
+- **Owed:** none of this series.
 
 ### A-821 — A refined submit's increment, verdict and encoding are prepared by its refinement job a bounded slice a turn, and its step judges by position (2026-11-21, w-fed-faults; main's ruling of 09:25 on the refining.rs:166 kill; §4.3 step budget, §4.16, A-787 part 2, A-697, A-816)
 Applied in the same change to: GAPS (the refining.rs:166 entry narrowed to the commit's step); `crates/server/src/refining.rs`
@@ -60060,3 +60139,33 @@ Applied in the same change to:
 - **Not sliced yet.** `append_versions`' loop before the record (each version's increment held and its entry encoded)
   is still one step a batch: w-rewrite-ops', said in their inbox. The steps after the last slice (`follow`, the fold, the
   release of the batch's texts) are one step each, scaled by the batch's paths.
+- Owed: the fetch staged on the owner shard itself (the bytes cross once from the control shard today, now a chunk a
+  call).
+- **Status (2026-11-21, w-shared): the owner's step halved.** The owner no longer encodes and hashes again an increment
+  it holds by identity (`SealedWork::held`, `merge_service::increment_already_held`, its hold given back on a refused
+  verdict), and the fetched increment reaches the owner shard a chunk a call (`verbs::move_increment`). Release A/B,
+  Mac Studio, load 2-4, 5 rounds (kiln r2, 1a35ab0 vs 0deb19a): owner step 256 MiB 256-267 to 136-144 ms, 320 MiB
+  327-353 to 168-203 ms, 512 MiB 502-594 to 270-299 ms; the late beat 0.52-0.85 s in every 320 and 512 MiB run before,
+  none after; wall 512 MiB 1.98-2.06 to 1.46-1.57 s.
+
+### A-836 — A ref may name any object: a tag chain peeled to its end, a ref naming a blob holding no files (2026-11-21, w-git; main's order from w-interop's A/B of record r16; §4.17.1 item 6, §4.17.2; A-654)
+Applied in the same change to:
+- `crates/git/src/object_name.rs`: `empty_tree`.
+- `crates/git/src/receive/works.rs`: `tree_of` peels a chain of tags to its end; a blob gives the empty tree; `NO_TREE`
+  retired.
+- `crates/git/src/store/views.rs`: `PushedObjects::locate` answers the empty tree (`At::EmptyTree`) where nothing holds it.
+- `crates/server/src/git_push.rs`: `ShardGreens::tree_of` peels the same way.
+- GAPS (§4.17).
+
+- **Why.** git/git's push was refused for every ref whose target is neither a commit nor a tree (`junio-gpg-pub`, a
+  blob, and `v1.0rc1` to `v1.0rc6`), so clones of it were short of them; git lets a ref name any object, and stock
+  `git daemon` takes them.
+- **What.** A ref's tree is found as git peels the ref: a chain of annotated tags followed to its end (each a distinct
+  object named by its content, so the chain ends), then a commit's tree or a tree itself. A ref naming a blob (or a tag
+  of one) holds no files: its green's tree is git's empty tree, which git holds as present in every repository whether
+  or not an object stores it (`object-file.c`), and the push's views answer it so. Serving was already git's:
+  `ls-refs` peels through every tag (`upload::refs::peeled`), and a fetch's wants may name any object.
+- **Evidence.** `t_a836_refs_naming_a_blob_and_tags_of_tags_are_taken_and_advertised`: one push of a bare ref to a blob,
+  an annotated tag of it and a tag of a tag of the commit, every command `ok` and each advertised at its object; `ls-refs`
+  with `peel` naming the signed blob's tag peeled to the blob and the tag of a tag peeled to the commit, none for the bare
+  blob; a fetch of the three holding them, the inner tag and the commit. Red before: each refused `ref names no tree`.

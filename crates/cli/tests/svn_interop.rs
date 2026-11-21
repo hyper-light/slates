@@ -29,6 +29,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
+  clippy::unwrap_in_result,
   clippy::expect_used,
   clippy::panic,
   clippy::indexing_slicing,
@@ -2032,6 +2033,27 @@ impl UseLeg {
   }
 }
 
+/// `text`, an `svn diff`'s answer, with its per-path blocks (each from an `Index: ` line to the next) sorted, and what
+/// comes before the first kept first: the paths a change touches come in the order the server drove the client's
+/// editor, which stock `svnserve` takes from an APR hash's iteration and no server promises. Found by main's first
+/// round (2026-11-21, `diff r4` on every route): stock's blocks `trunk/link`, `trunk/dir/deep.txt`, `trunk/dir` and
+/// slates' `trunk/dir/deep.txt`, `trunk/dir`, `trunk/link`, each block byte for byte the same.
+fn canonical_diff(text: &str) -> String {
+  let mut head = String::new();
+  let mut blocks: Vec<String> = Vec::new();
+  for line in text.split_inclusive('\n') {
+    if line.starts_with("Index: ") {
+      blocks.push(String::new());
+    }
+    match blocks.last_mut() {
+      Some(block) => block.push_str(line),
+      None => head.push_str(line),
+    }
+  }
+  blocks.sort();
+  head + &blocks.concat()
+}
+
 /// `text` with each XML tag's attributes sorted by name and written on one line, the rest of `text` as it was: stock
 /// `svn` writes a tag's attributes from a hash (`svn_xml_make_open_tag_hash`), so their order is no part of an answer
 /// (found by the first run of this test: `svn log -v --xml`'s `<path>` attributes in two orders, the same four values).
@@ -2282,7 +2304,16 @@ fn use_verb_compared(
     "checkout" | "update" | "switch" | "blame" => {
       working_copies_compared(verb, legs, scratch, sampled, failed);
     }
-    "diff" => at_each(failed, &|at| words(&["diff", "-c", at, "{url}"])),
+    "diff" => {
+      // A diff's per-path blocks come in the order the server drove the editor, which no server promises
+      // ([`canonical_diff`]).
+      for at in sampled {
+        let change = at.to_string();
+        let args = ["diff", "-c", change.as_str(), "{url}"];
+        let [a, b] = legs.map(|leg| canonical_diff(&leg.answer(scratch, &args)));
+        compare(failed, verb, &format!("r{at}"), &a, &b);
+      }
+    }
     "revprops" => at_each(failed, &|at| {
       words(&["proplist", "--revprop", "-v", "--xml", "-r", at, "{url}"])
     }),
@@ -2464,6 +2495,64 @@ fn use_writes_logged(leg: &UseLeg, scratch: &str, writes: &[&str]) -> String {
   format!("{said}\n{unstamped}")
 }
 
+/// Slates' leg of the correctness by use on `route` (svn, http, http-v1 or ssh), its daemon `instance` with its issuer
+/// surface and its printed `lines`; None (said) where route ssh has no ssh-keygen here.
+fn use_slates_leg(
+  route: &str,
+  scratch: &Scratch,
+  (instance, issuer): (&str, &[(String, String)]),
+  lines: &[String],
+) -> Option<UseLeg> {
+  Some(match route {
+    "svn" => {
+      let (id, token) = minted_token(instance, issuer);
+      UseLeg {
+        name: "slates over svn://",
+        svn: Svn::new(scratch, "slates", credentials(id, token)),
+        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(lines)),
+      }
+    }
+    "http" | "http-v1" => {
+      let (_, token) = minted_token(instance, issuer);
+      let mut svn = Svn::new(scratch, "slates", credentials(USER.to_owned(), token));
+      if route == "http-v1" {
+        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
+      }
+      UseLeg {
+        name: if route == "http" {
+          "slates over HTTPv2"
+        } else {
+          "slates over HTTPv1"
+        },
+        svn,
+        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(lines)),
+      }
+    }
+    _ => {
+      let Some((key, public)) = ssh_key(scratch) else {
+        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
+        return None;
+      };
+      let (code, out, err) = slates_as_issuer(instance, issuer, &["credential", "key", &public]);
+      assert_eq!(code, 0, "credential key: {out}{err}");
+      let port = port_after(lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
+      let tunnel = format!(
+        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
+       -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
+      );
+      UseLeg {
+        name: "slates over svn+ssh",
+        svn: Svn::new(
+          scratch,
+          "slates",
+          vec!["--config-option".to_owned(), tunnel],
+        ),
+        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
+      }
+    }
+  })
+}
+
 /// Goal 93's Subversion correctness by use (main's lane of 2026-11-21; ignored: main runs its rounds, CLAUDE.md §8).
 /// Do: load the dump `SLATES_SVN_USE_DUMP` names into a stock FSFS repository (`svnadmin load`) served by stock
 /// `svnserve -t`, cut to its first `SLATES_SVN_USE_REVISIONS` revisions where that is set (`svnadmin dump -r`), and
@@ -2538,53 +2627,8 @@ fn a_dump_reads_and_writes_alike_through_slates_and_stock_svnserve() {
     &["repository", "policy", REPOSITORY, "--hook", &given],
   );
   assert_eq!(policy.0, 0, "policy: {policy:?}");
-  let slates_leg = match route.as_str() {
-    "svn" => {
-      let (id, token) = minted_token(&instance, &issuer);
-      UseLeg {
-        name: "slates over svn://",
-        svn: Svn::new(&scratch, "slates", credentials(id, token)),
-        url: format!("svn://127.0.0.1:{}/{REPOSITORY}", svn_listener_port(&lines)),
-      }
-    }
-    "http" | "http-v1" => {
-      let (_, token) = minted_token(&instance, &issuer);
-      let mut svn = Svn::new(&scratch, "slates", credentials(USER.to_owned(), token));
-      if route == "http-v1" {
-        svn.env.push((HTTP_V1_SWITCH.to_owned(), "1".to_owned()));
-      }
-      UseLeg {
-        name: if route == "http" {
-          "slates over HTTPv2"
-        } else {
-          "slates over HTTPv1"
-        },
-        svn,
-        url: format!("http://127.0.0.1:{}/{REPOSITORY}", http_edge_port(&lines)),
-      }
-    }
-    _ => {
-      let Some((key, public)) = ssh_key(&scratch) else {
-        eprintln!("skipping svn correctness by use over svn+ssh: no ssh-keygen here");
-        return;
-      };
-      let (code, out, err) = slates_as_issuer(&instance, &issuer, &["credential", "key", &public]);
-      assert_eq!(code, 0, "credential key: {out}{err}");
-      let port = port_after(&lines, VCS_SSH_LINE).expect("the daemon named its SSH edge's port");
-      let tunnel = format!(
-        "config:tunnels:ssh=ssh -q -F /dev/null -p {port} -i {key} -o IdentitiesOnly=yes -o BatchMode=yes \
-         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null --"
-      );
-      UseLeg {
-        name: "slates over svn+ssh",
-        svn: Svn::new(
-          &scratch,
-          "slates",
-          vec!["--config-option".to_owned(), tunnel],
-        ),
-        url: format!("svn+ssh://{USER}@127.0.0.1/{REPOSITORY}"),
-      }
-    }
+  let Some(slates_leg) = use_slates_leg(&route, &scratch, (&instance, &issuer), &lines) else {
+    return;
   };
   let legs = [&control, &slates_leg];
   let youngest: u64 = control
@@ -2632,4 +2676,19 @@ fn an_xml_tags_attribute_order_is_no_part_of_an_answer() {
     canonical_tags("x <e b=\"two words\" a=\"1\"/> y"),
     "x <e a=\"1\" b=\"two words\"/> y"
   );
+}
+
+/// The comparison's rule for a diff ([`canonical_diff`]). Do: put stock `svnserve`'s and slates' answers to `svn diff
+/// -c 4` over the golden repository (main's round of 2026-11-21), the same three deleted paths in two orders, through
+/// it, and an answer whose blocks differ. Expect the first two one text, and the third still different from them.
+#[test]
+fn a_diffs_path_order_is_no_part_of_an_answer() {
+  let link = "Index: trunk/link\n====\n--- trunk/link\t(revision 3)\n+++ trunk/link\t(nonexistent)\n@@ -1 +0,0 @@\n-link a.txt\n";
+  let deep = "Index: trunk/dir/deep.txt\n====\n--- trunk/dir/deep.txt\t(revision 3)\n+++ trunk/dir/deep.txt\t(nonexistent)\n@@ -1 +0,0 @@\n-deep\n";
+  let dir = "Index: trunk/dir\n====\n--- trunk/dir\t(revision 3)\n+++ trunk/dir\t(nonexistent)\n\nProperty changes on: trunk/dir\nDeleted: custom\n";
+  let stock = format!("{link}{deep}{dir}");
+  let slates = format!("{deep}{dir}{link}");
+  assert_eq!(canonical_diff(&stock), canonical_diff(&slates));
+  let changed = format!("{deep}{dir}{}", link.replace("-link a.txt", "-link b.txt"));
+  assert_ne!(canonical_diff(&stock), canonical_diff(&changed));
 }

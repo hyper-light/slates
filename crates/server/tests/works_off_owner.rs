@@ -1694,3 +1694,80 @@ fn an_overwrite_at_the_start_of_a_longer_file_asks_no_base_bytes() {
     "the submit asked the owner for no file's bytes"
   );
 }
+
+/// A-840 (the 1,000-client stand-in's one-ask arm: 3.9 file asks a client at 10 hot files, every one
+/// `merge.work.base_missing.unentried`). Do: on an eight-shard daemon, a work off its green's shard writes two ranges of
+/// a file of dots; a rival takes the second and the work resolves in one ask, so it holds the file as parts over the
+/// head, its own write's dots named as the head's; a rival takes the second again, and the work's next resolution is
+/// composed by the owner, since the work's shard does not hold those dots. Then the work submits. Expect: that submit
+/// asks the owner for no file's bytes, and the green holds both of the work's ranges. The owner's answer to a work whose
+/// shard composes its own increments carries the base entries whoever composed this one.
+#[test]
+fn a_resolution_the_owner_composed_leaves_the_work_its_entries() {
+  use slates_client::{Rebased, Submitted, WorkChange};
+  let (daemon, instance) = daemon(MANY_SHARDS, "owner-composed");
+  let mut client = connect(&instance);
+  let green = client.create_green("owner-composed-green", false).unwrap();
+  let (seed, _) = client.create_work(green, "owner-composed-seed").unwrap();
+  client.edit(seed, "f", 0, 0, &[b'.'; FILE_BYTES]).unwrap();
+  assert!(submitted(&mut client, seed).starts_with("accepted"));
+  let green_shard = slates_server::verbs::owner_of(green);
+  let (mut worker, work) = (0..64)
+    .map(|n| {
+      let mut other = connect(&instance);
+      let made = other
+        .create_work(green, &format!("owner-composed-work-{n}"))
+        .unwrap()
+        .0;
+      (other, made)
+    })
+    .find(|(_, made)| slates_server::verbs::owner_of(*made) != green_shard)
+    .expect("a work off its green's shard");
+  let mine = b"w4......".to_vec();
+  worker.edit(work, "f", 0, 8, &mine).unwrap();
+  worker.edit(work, "f", 16, 8, &mine).unwrap();
+  let mut give_up_the_second = |client: &mut slates_client::Client, n: usize| {
+    let (rival, _) = client
+      .create_work(green, &format!("owner-composed-rival-{n}"))
+      .unwrap();
+    client
+      .edit(rival, "f", 16, 8, format!("r{n}......").as_bytes())
+      .unwrap();
+    assert!(submitted(client, rival).starts_with("accepted"));
+    let Submitted::Conflict(windows) = worker.submit(work).unwrap() else {
+      panic!("the second range conflicts");
+    };
+    let replacement = vec![WorkChange::Edit {
+      path: "f".to_owned(),
+      at: 16,
+      delete_len: 8,
+      bytes: mine.clone(),
+    }];
+    assert!(matches!(
+      worker.resolve_conflict(work, windows, replacement).unwrap(),
+      Rebased::Rebased(_)
+    ));
+  };
+  give_up_the_second(&mut client, 1);
+  give_up_the_second(&mut client, 2);
+  let before = daemon.refusals_on_every_shard().unwrap();
+  let answer = submitted(&mut worker, work);
+  let after = daemon.refusals_on_every_shard().unwrap();
+  let read = client.read(green, "f", ReadAt::Head).unwrap();
+  drop(worker);
+  drop(client);
+  daemon.stop();
+  let count = |counts: &std::collections::BTreeMap<&'static str, u64>, name: &str| {
+    counts.get(name).copied().unwrap_or(0)
+  };
+  assert!(answer.starts_with("accepted"), "{answer}");
+  assert_eq!(
+    (&read[..8], &read[16..24]),
+    (mine.as_slice(), mine.as_slice())
+  );
+  assert_eq!(
+    count(&after, ASKED_FILES) - count(&before, ASKED_FILES),
+    0,
+    "the submit asked the owner for no file's bytes"
+  );
+}

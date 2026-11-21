@@ -21,6 +21,14 @@
 > close, now that `reacquire` can reopen any of them. (2) The anchor counts a daemon that died before it served as
 > recovered and never backs off. (3) Witnessed descriptors are bounded only by the large-class copies a volume holds.
 > (4) `image()` still `fstat`s every reacquired directory at each publication.
+> **The descriptor backstop, platform half (w-bugs, A-837; Ada 2026-11-21, "a way to avoid descriptor exhaustion"):
+> part 1 landed:** the daemon raises its soft `RLIMIT_NOFILE` at start to min(hard, the platform's cap: Linux
+> `fs.nr_open`, macOS `kern.maxfilesperproc`), never lowering it, Windows none; the boot profile's `descriptor_limit`
+> line names before, hard, cap and after (`a837_the_soft_descriptor_limit_is_raised_...`, a re-invoked child raised from
+> 64). **Part 2 landed:** the learned ceiling (`slates_machine::descriptors`): the count held at the first `EMFILE`,
+> `ENFILE` or Windows handle exhaustion met by a host open, counted without a descriptor (macOS `proc_pidinfo`, Windows
+> `GetProcessHandleCount`, Linux through a spare held from the start); `ceiling()` the lower of it and the rlimit.
+> **Open:** (3) every host open, accept and memfd meeting exhaustion a typed refusal with a counter, and noting it.
 
 > **Open (w-shared, 2026-11-21, found landing family three): `slates-bridge-fuse --test takeover_round` fails 2 of 2 on
 > Linux** (`a_kernel_that_cannot_bump_its_epoch_still_gets_every_inode_and_is_counted`,
@@ -64,15 +72,7 @@
 > (A-787 part 2's park, 2a498b90f). 10 server lib tests (repository, vcs_store paths and commits) failed from that
 > commit on, bisected against its parent 81d8baea5; such a verb now composes unrefined and is answered (6459374).
 
-> **Open, narrowed (w-fed-faults, A-821, 2026-11-21): the refined submit's one step still holds its commit.** The
-> watchdog's kill at refining.rs:166 (exit 4 in `green_post_state`, debug, a loaded Studio) was not the job's turns
-> (longest 608 µs) but the parked submit, run again in the job's last poll as one 415 ms step: composition 85 ms,
-> verdict 23 ms, encode 11 ms, the commit's history re-anchor 219 ms, the chain's append ~60 ms. A-821 prepares the
-> increment, its verdict and its encoding in the job a bounded slice a turn; the step judges by position and commits.
-> Measured (`merge.submit.longest_step_us`, the 2 MiB re-indent): debug 417.5 to 303.8 ms, release 34.5 to 24.6 ms,
-> against the derived bound of 100 ms (`HEARTBEAT_NS`, the paced ceiling). What stays in the step: the commit's
-> re-anchor (A-818's engine switch, piece 2b, replaces it) and the chain's durable append of a ~5 MB entry. Close once
-> `merge.submit.steps_past_ceiling` reads 0 in a debug build.
+> **Open, after goal 93 (w-fed-faults, A-821; main's ruling 2026-11-21 14:23): a refined submit's commit is one step past the bound in debug.** On the 2 MiB re-indent the step is 270-340 ms in debug against 100 ms (release 24.6 ms), the commit's history re-anchor ~219 ms of it (A-821 took composition, verdict and encode off it). The fix, when A-818 2b reopens: build the commit's new history tree off the step on 2b's persistent trees (a slice a turn, `places.change` staged), install it in O(1) in the one step, and fall back in-step when the head moved; 2b's branch as built is slower here (2,011 ms debug, 89 ms release).
 
 > **CLOSED (w-hg, 2026-11-21): five Mercurial tests of `vcs_http::daemon_edge` failed on macOS arm64**
 > (`a_mercurial_repositorys_store_is_served_...`, `a_stock_mercurial_push_...`, the clone, stream clone and push
@@ -185,6 +185,10 @@
 > The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
 > and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
 > memory pressure from a host actually short of memory (the test injects it).
+> Open (found by use 2026-11-21, routed to g224): on Mac Studios (Studio-2 twice, Studio-4) a fresh slates NFS mount's
+> first `opendir` never returns. The client sends GETATTR, LOOKUP, ACCESS and FSSTAT (345 in 30 min) and never
+> READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
+> test now fails in 305 s naming the stall instead of hanging.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -235,6 +239,18 @@
 >   `DaemonConfig::derive`, `slates_mem::budget::region_bytes`). Machine-derived, fixed at boot. Every size below
 >   derives from it. -> Split its two roles: an admission ceiling learned from the work and the device's pressure (the
 >   machine total only a ceiling), and address space reserved by what is stored, not by the ceiling.
+> - **A-839 BUILT (2026-11-21):** on macOS a shard's slice no longer reserves its arena's range (the extents are objects
+>   of their own since A-789): a one-shard daemon's content object 139,264 -> 106,496 MiB of address space. Linux and
+>   Windows keep it (their extents are ranges of the object). The image slots, delta log and write log are next.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the image slots, delta log and write log as growable
+>   objects (w-sizing).** Today, per shard, two image slots take 2R, the delta log R and the write log R/4 of the content
+>   object's address space: on the big Studio (96 GB, 23 shards, R = 1,425 MiB) that is 3.25R = 4,631 MiB a shard and
+>   106,496 MiB for a one-shard daemon, every byte reserved before anything is stored. macOS cannot resize an object it
+>   has sized once (EINVAL), so the ranges cannot grow in place. Plan: each slot and log becomes an object of its own,
+>   named per generation (as A-789's extents are), sized from the image it holds and grown by doubling when a
+>   publication outgrows it; the write log from the writes measured between barriers. This changes the recovery
+>   format (A-68), so it needs a design amendment first. Red first: after a restart a one-shard daemon's content
+>   object reserves less than one image slot's range, and recovery reads back an image grown past its first size.
 > - The content object's address space, per shard (`shard_content_layout`): write log R/4, two image slots 2R, delta
 >   log R, DAX table, arena R; about 4.25R a shard, 1.4 times memory in all (220 GB mapped on the 96 GB Studio, g226;
 >   16 GiB mapped on w-hg's run). -> Image slots and the delta log sized from the image a shard publishes (metadata),
@@ -251,11 +267,26 @@
 > - Device reads: `slates_machine::facts::resident_now` is RSS on macOS, which counts given-back shared pages (above);
 >   the pressure hold's own growth reads it. -> The footprint on macOS; Linux PSI and Windows commit already watched
 >   (A-570). The pressure seam is consulted by admission only; the sizes above don't read it yet.
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:55): the device-pressure seam that sizes consult
+>   (w-sizing).** Today the sampler (A-570) only sets the admission hold. A shard gives free extents back only at its next
+>   idle pass (`release_idle`), and no sizing site reads the device's pressure. Plan: one seam with the same code on a laptop and in a fleet. A pressure report makes every shard
+>   give back what it can at once (the free extents `release_idle` returns, the idle purge). Each sizing site reads the
+>   seam's ceiling before it grows. Past the hold, admission refuses with a typed error before the machine swaps. Red
+>   first: an injected pressure fall frees a deleted volume's extents with no idle pass, and a growth past the ceiling
+>   is refused with the typed error.
 > - Give-back on macOS: `MADV_FREE_REUSABLE` over the shared content object leaves RSS (probe: 513 MiB stays, not
 >   reclaimed in 10 s under pressure); a purgeable Mach memory entry set `VM_PURGABLE_EMPTY` frees at once (513 -> 1
 >   MiB with two mappings), a whole entry at a time. -> Arena extents as purgeable entries handed to the anchor by port.
 > - Allocations on the idle path: the purge's copy of the region order and its per-run piece list removed (2dc414a84);
 >   the reserve's per-pass run list removed with the reserve (A-777).
+> - **PLANNED, deferred until after goal 93 (main 2026-11-21 14:58): NFSv3 replies framed in place (w-sizing).** Today
+>   each v3 request copies its arguments into a Vec and encodes its results into a second one. Then
+>   `bridge-nfs::rpc::reply_record` (from `reply_for` in `crates/server/src/nfs.rs`) allocates a third Vec and copies the
+>   results into it behind the record head. The held reply and `nfs_replay::record` keep further copies. NFSv4 already
+>   encodes after reserved head room and frames in place (`XdrWriter::continuing`, `finish_success_record`). Plan: v3
+>   procedures write after the same head room and `reply_for` frames in place. The held reply and the replay record
+>   keep that one framed buffer, and the arguments are read where they arrive. Red first: a count of allocations per
+>   READ, then per READDIR.
 > - The anchor segment (45.9 GB mapped on the big Studio, 23 shards): each partition's log ring is `table_bytes` and each
 >   of its two snapshot slots twice that, a share of `reserve_per_shard` (`config.rs`), where `Geometry`'s own docs say
 >   "recovery budget x measured replay throughput" and "the measured partition state size x the growth headroom"
@@ -452,10 +483,14 @@
 > the held verdict's preview, its changeset homed and landed, then recorded version 5 with its version in one step
 > (`t_c5b_p3_…`; counter `vcs_commits.made_landed`); a kill between the landing and the step recovers to before and the
 > retry lands once (`t_c5b_p3_a_kill_…`). Part 2 BUILT (A-824): every made commit lands, version 2 is written by no path and
-> refused `Retired` at replay with version 1. Owed (w-git): the change step over the preview in one turn; the replay reading the pack a piece at
+> refused `Retired` at replay with version 1; a made commit's map is put a slice a turn over the preview. Owed (w-git):
+> the replay reading the pack a piece at
 > a time through `StorePacks` rather than whole; the push's pack held twice in RAM until it lands (its own
 > buffer and the content store's windows); a node whose store lacks a record's changeset reading its names from their
 > region homes, held by a test of its own (the rebuild test now reads the node's store).
+> A-836 BUILT (2026-11-21, w-git; w-interop r16): a ref may name any object. A tag chain is peeled to its end and a ref
+> naming a blob holds no files (its green at git's empty tree), so git/git's `junio-gpg-pub` and `v1.0rc1`..`rc6` are
+> taken and served (`t_a836_…`). Owed: w-interop's rerun of git/git's push and clones over it.
 > R2, the load-only edge tests, CLOSED (2026-11-21, w-git): a push's answer under side-band-64k wrote its first
 > keepalive two intervals after its body (`body_end` waited one interval unwritten, then the reply its own before
 > appending it), 10 s, the client's patience, so every push answer past 5 s failed (18 of 18 at load 24, the timing
@@ -465,8 +500,9 @@
 > Owed: the SSH edge's receive carries its homing and landing inline (no keepalive between).
 > R2's fetch half CLOSED (2026-11-21, w-perf; main's piece 10:39 PST, design "A-722's keepalive on the fetch"): a
 > fetch's answer wrote nothing from its `packfile` head until its pack's first packet while the objects were chosen;
-> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence. Owed: the SSH edge's upload
-> writes none; a fetch's wait before its sections (the A-718 encode, A-614's derivations) has no packet git allows.
+> now the HTTP edge writes git's `0005\1` there after `git_keepalive_ns` of silence, and the SSH edge's upload after
+> git's own interval (red/green `a_long_fetchs_answer_over_ssh_…`). Owed: a fetch's wait before its sections (the
+> A-718 encode, A-614's derivations) has no packet git allows.
 > The push cut-off, layer 1 CLOSED (2026-11-21, w-git; main's priority 01:31 PST from w-interop's run: a whole-history
 > push of git/git over the HTTP edge cut off at 57-63 s, curl 18, 6 of 6): the reply's `200` head is out before the
 > push's body is read (A-722), so a refusal after the body was a cut connection with no word of why. Now a push refused
@@ -644,6 +680,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-840 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a conflict is resolved in one ask
+> (`ResolveConflict`: the windows given up, the rest resolved at the head as it is): rebase-kind asks 20.5-20.9 to
+> 10.4-10.9 a client at 10 hot files, all owner asks 32.7-33.2 to 26.3-27.0. Also FIXED, found by its oracle: a work off
+> its green's shard laid zeros for base bytes it did not hold when composing a rebased file (A-806's parts), and the
+> green took them; the composition now goes to the owner. Open: verdict asks are the largest kind (9.2-9.5 a client at
+> 10 hot files); the rebase arm (`--resolve rebase`) is kept only as the comparison's other leg. Main's queue:
+> `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the watchdog in a debug
+> build on a loaded box, on main before this change too (shard spinning 3.6 s in the submit's first poll).
 >
 > **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
 > replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
@@ -24873,7 +24918,8 @@ in what lands. Branch tips as of 2026-11-10:
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB) and single key folds of up to 13.4 ms.
+> of 49 MB) and single key folds of up to 13.4 ms (slicing inside a key landed and was reverted the same day: a fold of
+> 47.6-52.6 s, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.

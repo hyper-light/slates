@@ -702,7 +702,8 @@ impl DaemonConfig {
   /// start. In order: the write log (A-63); the two reserve-sized image slots, the committed recovery image
   /// and the one being written (§4.8); the delta log (A-68); the DAX range table (A-365); and the shard's arena range,
   /// its chunk arena's one region (A-64), the reserve's length, starting on the mapping granule so it can be mapped on
-  /// its own. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
+  /// its own. On macOS the arena's extents are objects of their own (A-789), so the slice (its stride) ends where the
+  /// arena's range would begin; `arena` still names the arena's capacity, which the pool cuts into its parts. The slice's length is a granule multiple too, so every shard's arena starts on one. The slots are sized
   /// as before the arena moved in: an image now carries metadata, not content, and only the pages it reaches are
   /// backed.
   pub fn shard_content_layout(&self) -> ShardContentLayout {
@@ -726,8 +727,12 @@ impl DaemonConfig {
     let arena_start = dax_ranges_end
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
+    // The arena's range is part of the object only where its extents are ranges of it (Linux's memfd, and Windows when
+    // no anchor holds the extents' sections). On macOS every extent is an object of its own (A-789,
+    // `slates_mem::extent_handoff`), so the range would be address space nothing maps: the slice ends where it begins.
+    let arena_in_object = !cfg!(target_os = "macos");
     let stride = arena_start
-      .saturating_add(reserve)
+      .saturating_add(if arena_in_object { reserve } else { 0 })
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
     ShardContentLayout {
