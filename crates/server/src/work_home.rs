@@ -1337,6 +1337,22 @@ fn batch_bound(state: &ShardState) -> usize {
     .max(1)
 }
 
+/// The counter an ask of the owner is counted under by its kind, beside [`ASKED_THE_OWNER`]'s total (A-801's
+/// measure: 10,141,852 asks for 100,000 clients over the Linux kernel, about a hundred a client, named no mechanism).
+fn asked_kind(need: &Need) -> &'static str {
+  match need {
+    Need::Files(_) => "merge.work.asked_owner.files",
+    Need::Lengths(_) => "merge.work.asked_owner.lengths",
+    Need::Page { .. } => "merge.work.asked_owner.page",
+    Need::Sizes => "merge.work.asked_owner.sizes",
+    Need::Verdict { .. } => "merge.work.asked_owner.verdict",
+    Need::Rebase { .. } => "merge.work.asked_owner.rebase",
+    Need::Admit { .. } => "merge.work.asked_owner.admit",
+    Need::ReserveName { .. } => "merge.work.asked_owner.name",
+    Need::Route | Need::Refine(_) => "merge.work.asked_owner.other",
+  }
+}
+
 /// Counts where a verdict's or a rebase's sealed work was composed: on the work's shard, or by the green's owner.
 fn count_composed(state: &mut ShardState, need: &Need) {
   if let Need::Verdict { sealed, .. } | Need::Rebase { sealed } = need {
@@ -1441,6 +1457,7 @@ fn start_ask(
     request: id.word(),
     through_work: true,
   };
+  let asked_kind = asked_kind(&need);
   let outbox = state.work_home.outboxes.entry(owner).or_default();
   outbox.waiting.push_back(AskItem {
     queue,
@@ -1459,6 +1476,7 @@ fn start_ask(
   }
   let out = outbox.out;
   state.count(ASKED_THE_OWNER, 1);
+  state.count(asked_kind, 1);
   if full {
     return true;
   }
@@ -1671,41 +1689,40 @@ fn verdict_over_fleet(
     if staged != Some(true) {
       return;
     }
-    let reply = crate::xshard::task_within(
-      here,
-      control,
-      move || async move {
-        let build_start = slates_machine::clock::monotonic_ns();
-        let built =
-          state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
-        let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
-        state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
-        let forward_start = slates_machine::clock::monotonic_ns();
-        let reply = match built {
-          Some(Ok(request)) => crate::verbs::resolve_and_forward(
-            crate::verbs::to_wire_volume(green),
-            region,
-            None,
-            vec![request],
-          )
-          .await
-          .0
-          .first()
-          .clone(),
-          Some(Err(reply)) => *reply,
-          None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
-        };
-        let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
-        // The work settles on its new base only once this node's replica holds it (A-697 part d).
-        let held = state::with_state(|s| {
-          crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
-          hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
-        })
-        .unwrap_or(false);
-        (reply, held)
-      },
-      deadline,
-    )
+    // Awaited to its end: the forward bounds itself by its own progress (its lane's stall rule, which counts the request's
+    // bytes acknowledged), and the replica's wait by `deadline`. A wall deadline here, the failover delay, refused a
+    // submit whose increment was still crossing, and its retry sent the whole increment again (main's ruling on the
+    // lane, 2026-11-21).
+    let reply = crate::xshard::task_to_its_end(here, control, move || async move {
+      let build_start = slates_machine::clock::monotonic_ns();
+      let built =
+        state::with_state(|s| computed_request(s, (sealed, evidence), (id, principal), carried));
+      let build_ns = slates_machine::clock::monotonic_ns().saturating_sub(build_start);
+      state::with_state(|s| crate::merge_service::count_phase(s, SUBMIT_FORWARD_BUILD, build_ns));
+      let forward_start = slates_machine::clock::monotonic_ns();
+      let reply = match built {
+        Some(Ok(request)) => crate::verbs::resolve_and_forward(
+          crate::verbs::to_wire_volume(green),
+          region,
+          None,
+          vec![request],
+        )
+        .await
+        .0
+        .first()
+        .clone(),
+        Some(Err(reply)) => *reply,
+        None => crate::verbs::refused(Refusal::Overloaded { shard: control }),
+      };
+      let forward_ns = slates_machine::clock::monotonic_ns().saturating_sub(forward_start);
+      // The work settles on its new base only once this node's replica holds it (A-697 part d).
+      let held = state::with_state(|s| {
+        crate::merge_service::count_phase(s, SUBMIT_FORWARD, forward_ns);
+        hold_until_replica(s, (green, &reply), (here, origin, id), deadline)
+      })
+      .unwrap_or(false);
+      (reply, held)
+    })
     .await;
     let _ = state::with_state_counted(|s| match reply {
       Some((_, true)) => defer_oldest(s, queue),
@@ -2250,8 +2267,43 @@ fn staged(state: &ShardState, item: &AskItem) -> bool {
   }
 }
 
-/// One ask answered on the owner's shard.
+/// One ask answered on the owner's shard, its time counted by its kind (`merge.work.answered.<kind>` and `..._ns`, A-801's
+/// measure of where the green's shard spends its time).
 fn answer_on_owner(state: &mut ShardState, item: AskItem) -> Outcome {
+  let kind = answered_kind(&item.need);
+  let started = slates_machine::clock::monotonic_ns();
+  let outcome = answer_ask(state, item);
+  let spent = slates_machine::clock::monotonic_ns().saturating_sub(started);
+  crate::merge_service::count_phase(state, kind, spent);
+  outcome
+}
+
+/// The counters an answered ask is timed under by its kind: its count and its nanoseconds.
+fn answered_kind(need: &Need) -> (&'static str, &'static str) {
+  match need {
+    Need::Files(_) => ("merge.work.answered.files", "merge.work.answered.files_ns"),
+    Need::Lengths(_) => (
+      "merge.work.answered.lengths",
+      "merge.work.answered.lengths_ns",
+    ),
+    Need::Page { .. } => ("merge.work.answered.page", "merge.work.answered.page_ns"),
+    Need::Sizes => ("merge.work.answered.sizes", "merge.work.answered.sizes_ns"),
+    Need::Verdict { .. } => (
+      "merge.work.answered.verdict",
+      "merge.work.answered.verdict_ns",
+    ),
+    Need::Rebase { .. } => (
+      "merge.work.answered.rebase",
+      "merge.work.answered.rebase_ns",
+    ),
+    Need::Admit { .. } => ("merge.work.answered.admit", "merge.work.answered.admit_ns"),
+    Need::ReserveName { .. } => ("merge.work.answered.name", "merge.work.answered.name_ns"),
+    Need::Route | Need::Refine(_) => ("merge.work.answered.other", "merge.work.answered.other_ns"),
+  }
+}
+
+/// [`answer_on_owner`]'s answer.
+fn answer_ask(state: &mut ShardState, item: AskItem) -> Outcome {
   let AskItem {
     need,
     green,

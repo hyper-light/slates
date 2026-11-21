@@ -1119,6 +1119,7 @@ fn assert_read_through_the_green(state: &ShardState, (svn, green): (RepositoryId
     store: None,
     green: Some(&engine),
     records,
+    pieces: None,
   };
   use slates_svn::migration::TextSource;
   assert!(matches!(

@@ -17035,6 +17035,13 @@ is the invocation's median of 3 runs. µs unless marked.
   could hold instead (C2 stage B part 2 would not move it). Next: the green's retained versions for a Subversion green,
   the small heap by owner, and the import's large transients (a revision's whole texts, its record's encoding, the
   reader's buffer) held once (Ada's MEMORY SIZING rule).
+- **Measured and rejected (2026-11-21): folding a Subversion green's history to its readers at each landing.** Sixteen
+  revisions rewriting a 16 KiB file left 246,150 bytes of green history, and the fold
+  (`merge_service::settle_green_retention_leaving` with room for all of it, after each landing) took it under one
+  text; but a copy from an older revision is the green's `Copy` of that version (A-586), so the import of
+  `part2.dump` refused `CopyRefused { case: VersionFolded }` at revision 12 (`svn_export` tests). The green's retained
+  versions are what serve such copies. Freeing them needs a copy's source tree built from the records when the green
+  has folded past it; until then the retention stays.
 
 ## 85a's two named costs, counted and A/B'd: the exchange on the data shard, and the held reply's wake (g228; 2026-11-21)
 
@@ -17092,3 +17099,65 @@ holder's own serve is 8-12. The transport bench makes a 4 KiB write durable on t
 about 30 µs of the Linux exchange is the daemon's own (the lane, the session's borrow and return, the control shards'
 receive), and on macOS the two control shards' parked wakes add about 50 more. The entry's build is next, about 25 µs on
 both. 85a's 50 µs median is 2.2x away on Linux and 3.7x on macOS.
+
+## A Subversion import on the real daemon: the peak against the dump, by kind (P7, A-772's daemon peak; 2026-11-21)
+
+- **Machine, tree, command.** adas-macbook-pro-2.local (18 cores, 128 GB), load 17 to 35. Main 73cd23c63 with this
+  change's measurement. `SLATES_SVN_IMPORT_DUMP=~/.cache/w-svn-gitgit/git-2000.dump cargo test --release -p slates-cli
+  --test svn_interop -- --ignored an_import_measured --nocapture` (`an_import_measured`: an anchor and a two-shard
+  release daemon holding a changeset store, `slates repository create --tool svn`, `slates repository import` of the
+  dump, the daemon's resident bytes sampled by `ps` every pause, then `slates status --memory`). One run read whole (a
+  first run's memory report agreed; its headline line was cut by the command's own `tail`).
+
+| What | Measured |
+|---|---|
+| import of git-2000 (2,000 revisions, 437 MiB dump) | exit 0, 26.2 s |
+| daemon RSS before, at its peak, after | 57 MiB, 1,570 MiB, 1,563 MiB (3.6 times the dump) |
+| segment (the register's log and snapshot), resident | 782 MiB; the log appended 838 MiB during the import, the snapshot's chain entries 39 MiB and checkpoints 44 MiB |
+| content object, resident | 0.8 MiB |
+| the records' texts (in-process run above) | 34.8 MB |
+
+- **What it says.** The daemon's own allocator gives large blocks back, so the test binary's 1.5 GB of freed blocks is
+  not the daemon's. Half the peak is the segment: the green's chain entries carry each revision's file bytes into the
+  register's log, so a Subversion repository's history is held three ways: the records' deltas (35 MB, RAM), the
+  store's changesets (disk, C2), and the green's chain in the register (782 MiB resident). The rest is the heap
+  (~790 MiB). The chain's copy of the texts is the largest; naming texts by identity in a Subversion green's chain,
+  their bytes the store's, is the change that moves it (not svn's alone: the green's chain is the register's).
+
+## A 500 MB Subversion commit, re-measured on the changeset store (P8 of Ada's close list; 2026-11-21)
+
+- **Machine, tree, command.** The big Mac Studio (adas-mac-studio.local-2, 32 cores, 96 GB), stock svn 1.15.0; main
+  73cd23c63 (C2 stage A and B part 1) from an HTTPS clone, kiln r8 (load 8 to 14) and r9 (load 5 to 9). Command as in
+  "A 500 MB Subversion commit over svn:// and DAV" above (`a_large_commit_measured`, release).
+
+| Run | Scheme | Answer | Seconds | Daemon RSS peak | Longest shard step |
+|---|---|---|---|---|---|
+| r9 | `svn://` | Committed revision 1 | 11.2 | 4,067 MiB | 1.91 s |
+| r9 | `http://` (DAV) | Committed revision 1 | 13.9 | 4,066 MiB | 1.91 s |
+| r8 | `http://` (DAV) | E160007 "No such transaction '0-1'": the daemon restarted during the commit | 12.0 | 4,068 MiB | 0.87 s at the recovery's replay |
+
+- **What it says.** Both schemes take the 500 MB text where load leaves the landing's one step room (8 times the text at
+  the peak, 12 times before the intake work and C2). The text is held three times after the commit: the content store's
+  arena (524 MB), and twice in the register's log, the green's chain entry (524 MB) and its checkpoint (524 MB), a 1 GB
+  log tail the recovery replays in one step. The landing's longest step is 1.91 s, the green's apply of the increment
+  in one step: at load 8 to 14 (r8) the daemon restarted within it and the client's transaction was gone. Owed (GAPS):
+  the green's apply a slice at a time (w-engine's 1b) and the chain naming the text by identity rather than carrying
+  it (P7's finding, the register's), each of them outside the Subversion path.
+
+## svnsync from slates over svn://, git-2000 (P7 of Ada's close list, A-772; 2026-11-21)
+
+- **Machine, tree, command.** The big Mac Studio (adas-mac-studio.local-2, 32 cores, 96 GB), load 3 to 7, stock svn
+  1.15.0; main 1bfe51f88 from an HTTPS clone (kiln r11). `SLATES_SVN_SYNC_DUMP=~/.cache/w-svn-replay/git-2000.dump
+  cargo test --release -p slates-cli --test svn_interop -- --ignored an_svnsync_measured --nocapture`
+  (`an_svnsync_measured`: a release anchor and daemon holding a store, the dump imported through the CLI, then stock
+  `svnsync init` and `svnsync sync` into a local FSFS mirror, timed, the daemon's RSS sampled). One run.
+
+| Scheme | Import | svnsync | A revision | Mirror | Daemon RSS before, peak |
+|---|---|---|---|---|---|
+| `svn://` | 13.5 s | 270.7 s, exit 0 | 135.4 ms | r2000 | 1,637 MiB, 1,686 MiB |
+| `http://` | 13.5 s | `svnsync init` refused E200007 (fixed since, 2dafcad02); `sync` needs the DAV `replay-report` (GAPS) | | | |
+
+- **What it says.** w-interop's matrix took 1,068 s over svn:// for the same history (0.54 s a revision); stock
+  svnsync now mirrors it in 270.7 s, a quarter. The server's replay of a revision is 2.4 to 2.8 ms of it (in-process,
+  above), so most of the 135 ms a revision is outside the server's drive (the client's commit into FSFS, the round
+  trips). Over HTTP the mirror cannot run until the DAV site serves `replay-report` (recorded in GAPS, not built).

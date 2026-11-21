@@ -344,15 +344,25 @@ pub(crate) fn land_blocking(
   header: slates_store::log::Header,
   parts: Vec<slates_store::owner::Part>,
 ) -> bool {
+  land_answered_blocking(disk, header, parts).is_ok()
+}
+
+/// [`land_blocking`]'s landing with the store's answer: where it was committed, or why the owner refused it (`Gone` for
+/// a waiting thread that could not run it).
+pub(crate) fn land_answered_blocking(
+  disk: StoreHandle,
+  header: slates_store::log::Header,
+  parts: Vec<slates_store::owner::Part>,
+) -> Result<slates_store::log::Located, slates_store::owner::OwnerError> {
   std::thread::scope(|scope| {
     scope
       .spawn(move || {
         waiting_runtime()
-          .block_on(async move { disk.land(header, parts).await.is_ok() })
-          .unwrap_or(false)
+          .block_on(async move { disk.land(header, parts).await })
+          .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
       })
       .join()
-      .unwrap_or(false)
+      .unwrap_or(Err(slates_store::owner::OwnerError::Gone))
   })
 }
 
@@ -381,13 +391,35 @@ pub(crate) fn audit_on_stored_shard<T: Send + 'static>(
   name: &str,
   history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
 ) -> T {
+  audit_on_stored_shard_configured(name, history, |_| {})
+}
+
+/// [`audit_on_stored_shard`] with the daemon's configuration changed by `configure` first
+/// ([`crate::daemon::audit_on_shard_configured`]).
+pub(crate) fn audit_on_stored_shard_configured<T: Send + 'static>(
+  name: &str,
+  history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  configure: impl FnOnce(&mut crate::DaemonConfig),
+) -> T {
   let store = TestStore::start(name);
   let handle = store.handle();
   let answer = crate::daemon::audit_on_shard_configured(history, move |config| {
     config.vcs_disk = Some(handle);
+    configure(config);
   });
   drop(store);
   answer
+}
+
+/// [`crate::daemon::audit_daemon_of`] holding a fresh store: the store first, so a test binding both as
+/// `let (_store, daemon)` drops the daemon first.
+pub(crate) fn audit_daemon_of_stored(shards: u16) -> (TestStore, crate::Daemon) {
+  let store = TestStore::start("audit-of");
+  let handle = store.handle();
+  let daemon = crate::daemon::audit_daemon_of_configured(shards, move |config| {
+    config.vcs_disk = Some(handle);
+  });
+  (store, daemon)
 }
 
 /// A `CreateRepository` request served in a test's synchronous history on a shard of a node keeping a store, answered

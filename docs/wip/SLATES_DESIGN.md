@@ -11754,10 +11754,13 @@ blocks it. Rejects are non-blocking; the merge task never stalls on a conflict.
 > rebase restates it, one recorded step; refused `StaleMergeView` with nothing changed when the work moved (checked on
 > its shard) or the head did (checked on the green's half, before anything is mapped). Off the green's shard the ask
 > travels with the sealed work (A-247). No merge is inferred: every byte of a resolution is declared (D-27). Ported
-> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli); its `rebase_with`
-> refinement (kept operations that conflict only on a path the replacement re-establishes) is not: such a
-> resolution answers the windows, and the agent retires those operations too. Test: `crates/server/tests/merge_check.rs`
-> (one history on one shard and on eight).
+> from the Codex agent's early-conflict work (work/slates-atomic-conflicts, conflict-cli). Its `rebase_with` rule
+> (AC-6.13) holds too: the work's kept mode and attribute changes on a path the replacement writes, makes or renames
+> onto are judged as on a path the work establishes (`Green::rebase_establishing`), so a mode kept on a file the head
+> removed and the replacement writes anew rebases. A work's revision is seeded from its partition's log position at
+> creation and at rebuild, so a stamp from before a restart never names the work once it changed (the Codex agent's
+> conflict-mutants finding: revisions counted from 0 at every rebuild let one). Test:
+> `crates/server/tests/merge_check.rs` (one history on one shard and on eight; the restart; the kept mode).
 > The same three are MCP tools (`slates.merge.check`, `slates.merge.read_check`, `slates.merge.resolve`) and CLI verbs
 > (`slates check WORK`, `slates resolve JSON`, the resolution as the tool's JSON object), one JSON shape for both
 > (`slates_mcp::merge_check_json`, `resolve_args`; §4.12 schema parity). Test: `crates/mcp/tests/mcp.rs`
@@ -57753,9 +57756,15 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > daemon over a retained segment; the push homed and landed; the daemon stopped with nothing more published; the
 > successor recovers from the store's changeset, `main` at the pushed commit, the next at 2; the log read back from its
 > files holds the creation and the push, `Names` and `Payload`, the payload the record's BLAKE3). The one shared test
-> store is `crate::test_store` (main's ruling 1's helper). Owed (C5 part 2): git's creation refused without
-> `--vcs-store`, versions 2 and a sequence of 0 gone, git's tests on the shared store; the replay's pack read a piece at
-> a time through `StorePacks`.
+> store is `crate::test_store` (main's ruling 1's helper). Part 2a (2026-11-21): a daemon without `--vcs-store`
+> refuses a git repository's creation, `Unsupported` naming the flag, as it refuses Mercurial's and Subversion's (one
+> rule for the three tools), and git's tests run on store-backed daemons through that helper; a rebuild on a node whose
+> store holds the changeset reads it from there, not from the region. Part 2b piece 1 (2026-11-21): a client's push
+> writes version 5 alone, any shortfall of its homing or landing (or names changed since the homing) refusing it
+> `Unlanded` for its client's retry; an append that brings no object names none. Piece 2: an ask no edge takes refuses
+> the push as well, so a client's push never writes version 2. Owed: server-made commits (A-664) still write version 2
+> until they take the deferred submit's landing order (piece 3); the replay's pack read a piece at a time through
+> `StorePacks`.
 
 > **Status (2026-11-20, C2 stage A: Subversion's history on the store; w-svn, main's rulings of 20:30 and 21:05).** The
 > store is a Subversion repository's truth. Each record it takes (creation, revision, lock entries, revision
@@ -57849,6 +57858,27 @@ the pinned commit): about 106,000 lines (the engine 65,687), 54 lines naming `Ar
 > `land_then_record` runs). Recovery applies only the sequences the register names (decision 2), as C4's replay already
 > did. Held by `repository::tests::a_daemon_without_a_store_refuses_mercurial_and_subversion_naming_the_flag` and every
 > hg test on the helper. Git's create follows as its C item lands.
+
+> **Status (2026-11-21, C1: a changeset replayed from its payload a piece at a time; R2's replay half).** A replay
+> holds no payload whole. `slates_hg::framing` is the one walk of a changegroup's chunks (7.2's `changegroup.py`
+> order), over a `Source` that answers a range or `Wanted`: a slice never wants (a push's bundle, a whole decoding,
+> which counts in one walk and builds in a second, charged exactly between), and a `Window` holds a forward run its
+> driver fills. A step reads only from where it began and changes nothing on a want, so the driver lets go of what is
+> before the want and steps again. The intake reads each delta through it (`Stepped::Wanted`; a file group opens in
+> a step of its own, its path kept), and `record::Replay::begin_sectioned` / `step_sectioned` frame a changeset's
+> payload, then take it. The server fills the window from `StoreHandle::piece` (`vcs_store::fill_window`) for both
+> recovery and rebuild. Held by `a_landed_push_replays_from_its_payload_a_piece_at_a_time`: a 789,956-byte payload, 14
+> fills, the window at most 193,859 bytes. The import as changesets is next (its shape asked of main and w-store).
+
+> **Status (2026-11-21, C1 step 3, first part: an import written as a push's changegroup).** `slates_hg::import::emit`:
+> as the import walks a repository's revlogs (changelog, manifest log, each file log: a changegroup's order), it
+> writes each revision as its revlog stores it, the chunk against its delta parent (7.2's `deltaparent`: none for a
+> full snapshot, the base under generaldelta, else the revision before), a full snapshot as its text against the null
+> base, so nothing is diffed or rebuilt to write it. The stream is cut into segments of at least a bound, only between
+> chunks, each naming its texts (identity, length, delta parent's identity, place) as a push's `Texts` section does.
+> The segments concatenated are a changegroup 03 that the push's intake takes into the import's index row for row
+> (all five of 7.2's store formats). The server's landing of the segments as a run of changesets, and the run's
+> replay, follow main's ruling on the record's shape (inbox/main-from-w-hg-c1-import-design.md).
 
 **Pieces, in order.** (1) this design, the prior-art note, and the log format agreed with w-hg, w-git, w-svn; (2) the
 vendored crates under slates' lints; (3) `slates-store`: the changeset log, landing, the `C`/`O`/`V`/`N` rows and the
@@ -58282,6 +58312,17 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
     - This Mac, load 6 to 16: 69 to 79 µs at 2 MiB, 133 to 157 µs at 8 MiB. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
     200 ms at 12 MiB. Turns past the whole quantum: 2 to 4%, past 16 quanta 0.03%. The quantum here is a few µs, the
     shard's measured wake.
+  - **Fixed 2026-11-21 (main's red: `green_post_state` exit 4 in a debug build).** The shard's watchdog ended the
+    daemon on a 3.5 s poll of the job's task. The refinement's own turns were short (34,571 for the 2 MiB test); the
+    long poll was the job's end running the parked submit again, whose re-anchor of the path's history
+    (`history::reanchor`) was O(pieces × runs) twice over:
+    - `Value::remapped` scanned every kept run for each piece; it now uses a sorted index (`KeptIndex`), or the scan
+      when runs overlap, so the result is the scan's either way (property test `the_indexed_remap_is_the_scans`);
+    - `cut_superseded_blocks` scanned the union for each piece; it now binary-searches it.
+    Measured, debug, one path refined whole: 10,000 / 20,000 / 40,000 / 80,000 ops submitted in 0.40 / 1.43 / 5.64 /
+    22.5 s before, 11 / 23 / 44 / 90 ms after. `green_post_state` passes 8 of 8 in 5.2 s.
+  - **A verb outside a recorded request** (a bare dispatch, which no route could answer after the job) composes
+    unrefined and is answered now (645937436, w-fed-faults), as a remote edit-and-submit does.
   - **The remaining tail** follows the largest single buffer freed. Deferring those frees to an idle moment waits on
     A-783's yield-when-someone-waits primitive (GAPS D-O17).
   - **Not refined:** an edit-and-submit of a work off its green's shard. The job reads the writer's bytes from the work,
@@ -58664,6 +58705,11 @@ work, `RebaseAnswer::Checked`), `crates/client/src/client.rs` (`check_merge`, `r
   stamp's revision and base and the green at its head; it retires canonical operations by index, rebases the rest
   onto that head, applies the agent's changes there, and restates the work (A-207's restatement, one recorded step).
   The windows reuse A-267's kept verdict; nothing pages them twice. None of A-255, A-257 or A-263-A-267 is changed.
+- **Metadata and restarts (2026-11-20, finishing the strand at main's routing).** `Green::rebase_establishing` takes
+  the paths a resolution's replacement brings into being; `Resolved::establishes` counts them, so kept metadata on them
+  is judged as on a path the work makes (red: a mode kept on a removed file written anew answered a conflict). A work's
+  revision starts at its partition's `next_seq()` when made or rebuilt (red: a stamp from before a restart named the
+  work after one more edit, `Ok(Rebased(0))`).
 - **Tests.** `crates/server/tests/merge_check.rs` on one shard and on eight (every work off its green's shard): a
   conflicting check names the head and base and changes neither the work's bytes nor the green; a clean check leaves
   the base where it was; the views read both sides; a resolution retiring the work's operations on the file and writing
@@ -58781,3 +58827,81 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`SUBMIT_FORWARD
 - **First reading** (debug, this Mac, a 32 MiB holder submit): the build step alone took 909 ms of one control-shard
   step. It is the beat's lateness and the reason a size-independent bound refused the submit before a byte was sent
   (main's ruling, items 2 and 3; inbox/main-from-w-shared-lane-plan.md).
+
+### A-800 — Every place a reply carried home can be lost is counted apart, and the silent ones resend (2026-11-21, w-fed-move, goal 86b; main's order 00:30 PST, "the lost replies first"; §4.3 "backpressure, never a drop", CLAUDE.md §2 item 9; A-797's open wall)
+- **Why.** At 100,000 clients the client node answered 9,116,579 forwards on its control shard and delivered 9,113,196
+  to the clients' shards: 3,383 replies lost on one internal hop, with no counter naming where (A-797's run; about
+  2,700 clients waited for good).
+- **The hop's drop sites, read from the code** (control shard's answer to the client shard's waiter):
+  `deliver_owner_forward` -> `xshard::send_reply_home` -> `send_back` -> `carry` (sent at once, kept for room, or
+  refused: counted `xshard.reply_dropped`, `xshard.keep_refused`) -> the client shard's admission (admitted; refused
+  at a full arena or a shutdown, where `RunUnstarted`'s drop runs the reply: `xshard.reply_run_unstarted`) ->
+  `finish_owner_forward` -> `state::deliver` (client gone or slot reused: `fleet.owner_location.client_gone`,
+  `state.reply_undeliverable`). Silent before this change: `RunUnstarted`'s drop on its own shard with the state
+  borrowed (returned, the reply lost); `finish_owner_forward`'s borrow refused (borrowed, fenced, or a retention check
+  refused after the closure ran, which dropped a reply already taken); `deliver`'s borrow refused.
+- **Change.** `crates/server/src/xshard.rs`: the drop with the state borrowed sends the reply home again
+  (`xshard.reply_resent_borrowed`); one dropped where no shard can run it is counted apart (`xshard.reply_orphaned`);
+  each reply is counted handed on its sender (`xshard.reply_home_handed`) and run on its shard (`xshard.reply_home_ran`),
+  so a reply admitted and never run shows as their difference. `crates/server/src/verbs.rs` `finish_owner_forward`
+  holds the reply outside its borrow: a borrowed state sends it home again (`fleet.forward.client.resent_borrowed`), a
+  retention refusal after the closure still delivers it (`fleet.forward.client.delivered_past_retention`), no state or a
+  fenced shard is counted (`fleet.forward.client.unservable`). `crates/server/src/state.rs` `deliver` counts a borrowed
+  state (`state.reply_undelivered_borrowed`). The load harness prints all of these from the client node.
+- **Tests** (macOS arm64, Mac Studio, local). Red first: `a_reply_dropped_unrun_while_its_shards_state_is_borrowed_is_resent_not_lost`
+  (the reply's end never ran before); `a_forwarded_reply_that_meets_a_borrowed_state_is_sent_home_again` (red with the
+  resend taken out: `(0, 0)` against `(1, 1)`); `a_reply_carried_home_is_counted_handed_where_sent_and_run_where_it_ran`.
+  `slates-server --lib xshard:: verbs::tests` 72 pass; the fleet's forward tests (24) pass; the harness's own 18 pass.
+- **Not yet shown:** which site lost the 3,383. A reply admitted on the client's shard and never run is not a drop and
+  is now visible only as handed minus run; main's 100,000-client rerun (run-requests.md) reads these counters. The
+  leading candidate is that kind, and A-798 (`931e52ed`, another worker's) has fixed it since: a shard's harvest could
+  take the kick of a control message published just before it looked, so the message stayed unseen while the shard
+  parked, which matches the runs (every daemon idle, the replies never run; `343b741e`, in the range the stalls began).
+  The rerun shows it gone if handed equals run.
+
+### §4.16 amended — A holder's forward is held to its own progress, not to a wall deadline; a request's acknowledged bytes are its progress (2026-11-21, w-shared for UI goal 93; main's ruling on the lane, item 3a)
+Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_fleet`), `crates/server/src/xshard.rs`
+(`task_to_its_end`), `crates/transport/src/connection.rs` (`send_progressed`, `take_send_progressed`),
+`crates/transport/src/endpoint.rs` (`take_progressed`), `crates/server/tests/fleet.rs`, GAPS (the sweep's lane line).
+- **What was there.** A holder's submit waited for its forward under the node's failover delay, a wall deadline of
+  about 3 s that does not grow with the increment and that also ran while the control shard built the request. At the
+  deadline the submit was answered `Overloaded` while the forward still ran, and its retry sent the whole increment
+  again into the same bound: A-697's release bench refused a 320 MiB holder submit in 1 of 2 runs. The forward lane's
+  own stall rule never gives up a forward whose own bytes move, but counted only its reply's bytes, so a forward still
+  sending a large request looked silent until its reply began.
+- **Change.** The holder awaits its forward's task to its end (`xshard::task_to_its_end`). The task bounds itself: its
+  lane gives the forward up, typed as before, once none of its own bytes have moved for a stall budget, and the
+  replica's wait keeps its own bound. The connection now records the send streams some of whose bytes were acknowledged
+  (`take_send_progressed`), and the endpoint reports their exchanges as progressed. So a forward whose request is
+  still being acknowledged counts as moving, and one whose peer stops acknowledging still stalls.
+- **Tests** (macOS arm64, local, debug, load about 25). `slates-server --test fleet a_holders_submit_still_crossing_is_
+  not_refused_by_a_size_independent_bound`: an 8 MiB holder submit with B's failover delay injected at 300 ms (its
+  forward took 1.8 to 6.7 s) is answered version 2, 6 of 6 runs. Red with the fixed deadline put back: refused
+  `Overloaded`, 2 of 2. `slates-transport --lib a_request_still_going_out_progresses_as_its_bytes_are_acknowledged`:
+  red with the acknowledgement left unrecorded. slates-transport 149 of 149 and every integration test; slates-server
+  lib forward_lane, work_home, xshard 28 of 28; fleet `a_holder` and `a_forwarded` 30 of 30.
+- **Measured, not fixed here:** at 32 MiB the same test passes only 1 of 2 to 3 of 4. The owner's step for that
+  submit runs 2.3 to 6.9 s as one step of its control shard: append 1.2 s, and about 1.1 s more around it (the
+  transaction's commit and the publish, writing and checksumming the record that holds the whole increment); decode
+  0, judge 5 ms. While that shard is stuck it reads none of its sessions, so the holder's lane rightly gives the
+  forward up as silent and resends it. Main's item 2 (bounded work) is therefore the next step's prerequisite.
+- **Owed (main's items 2 and 3b, inbox/main-from-w-shared-lane-plan.md):** the owner's step above and the holder's
+  build step (0.2 to 1.9 s) are each one control-shard step, so the beat is late; and a retry after a real stall
+  still re-sends the content. Next: the content placed ahead and stored once by identity, the record naming it rather
+  than holding it, so the owner's durable step is small.
+
+### A-801 — A green owner's asks counted by kind and its answers timed by kind; the load harness reports the server nodes' merge counters (2026-11-21, w-fed-move, goal 86b; main's order 00:48 PST, the throughput walls; A-247, A-797)
+- **Why.** At 100,000 clients on one primary and two replicas the green's owner was asked 10,141,852 times (about a
+  hundred asks a client) and verdicts held at 153 a second, but no counter named which asks or where the owner's time
+  went, and the load harness printed only the client node's counters, while the owner's work is on the primary.
+- **Change.** `crates/server/src/work_home.rs`: every ask is counted by its kind beside the total
+  (`merge.work.asked_owner.<files|lengths|page|sizes|verdict|rebase|admit|name>`), and the owner times each answer by
+  kind (`merge.work.answered.<kind>`, `..._ns`). `crates/client/examples/load_bench.rs`: `--report-instances` prints
+  each named node's merge counters (`server_counter` rows); `crates/cli/tests/load_scale.rs` passes its three servers.
+- **Measured** (release, in-process daemon, this Mac Studio, 2026-11-21 ~01:00, the kernel's `kernel/` directory, 754
+  files, 1,000 clients, one round, `--per-connection 32 --hot-files 300`, oracle clean, 6,040 verdicts a second):
+  17,545 asks, 17.5 a client. By kind: lengths 7,736 (2.6 µs each to answer), files 3,173 (5.1 µs), verdict 2,458
+  (41.2 µs), rebase 2,256 (17.9 µs), admit 968 (1.6 µs), name 954 (5.6 µs). The owner spends about 185 ms answering
+  in all, so at this scale it is not the wall; cutting the length asks (each work asks once per file it first edits,
+  and again after a rebase) would save little here. The 100,000-client wall grows with what scales (base lag, history,
+  works pinning the floor); main's rerun (r48) prints these counters from the primary to name it.

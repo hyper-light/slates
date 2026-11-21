@@ -905,6 +905,39 @@ fn deltav_v1_a_baselines_allprop_is_its_revisions_properties() {
   );
 }
 
+/// HTTPv2's revision resource (`repos.c` `parse_revstub_uri`: `!svn/rev/REV`, a baselined version resource of the
+/// revision, "Clients perform PROPFIND and PROPPATCH against it to read and write revprops"; ra_serf's
+/// `serf__rev_proplist` PROPFINDs `rev-stub/REV` at depth 0). Found by use: stock `svnsync init` over the HTTP edge
+/// refused E200007 "The method 'PROPFIND' is not served here" (P7's measurement on the big Studio, 2026-11-21). Do:
+/// PROPFIND `allprop` of `!svn/rev/6`, the baseline properties of `!svn/rev/3`, and `!svn/rev/99`. Expect revision 6's
+/// properties as its baseline answers them, under the revision resource's own href; revision 3's collection and name;
+/// and "No such revision 99", 404, as a baseline past the youngest is answered.
+#[test]
+fn a_revision_resource_answers_its_revisions_properties_as_its_baseline_does() {
+  let fixture = Fixture::new();
+  let answer = fixture.anonymous("PROPFIND", "/!svn/rev/6", Some("0"), PROPFIND_ALL);
+  let body = text_of(&answer);
+  let baseline = text_of(&fixture.anonymous("PROPFIND", "/!svn/bln/6", Some("0"), PROPFIND_ALL));
+  assert_eq!(
+    (answer.status, body.contains("<S:log>")),
+    (207, true),
+    "{body}"
+  );
+  assert_eq!(
+    body,
+    baseline.replace("/repo/!svn/bln/6", "/repo/!svn/rev/6")
+  );
+  let named = fixture.anonymous("PROPFIND", "/!svn/rev/3", Some("0"), PROPFIND_BASELINE);
+  assert!(
+    text_of(&named).contains("<D:href>/repo/!svn/rev/3</D:href>")
+      && text_of(&named).contains("<lp1:version-name>3</lp1:version-name>"),
+    "{}",
+    text_of(&named)
+  );
+  let past = fixture.anonymous("PROPFIND", "/!svn/rev/99", Some("0"), PROPFIND_ALL);
+  assert_eq!(past.status, 404);
+}
+
 /// DeltaV v1 (`liveprops.c`: `checked-in` is a version-controlled resource's alone): do PROPFIND a version resource,
 /// `!svn/ver/1/trunk/dir/c.bin`, for `checked-in` and `version-name`, and GET it; expect `version-name` 1 found and
 /// `checked-in` not found, and the GET the file's text.

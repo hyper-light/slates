@@ -691,6 +691,9 @@ enum Next {
     /// The bytes taken.
     consumed: usize,
   },
+  /// A drive waits for a text's piece read through the node's changeset store (C2 stage B part 2): fetch it, then
+  /// call again with the same input.
+  Fetch(slates_svn::reads::Wanted),
   /// End the connection.
   End,
 }
@@ -715,6 +718,9 @@ struct Conversation {
   /// ([`Connection::fetching`]; A-749, §4.17.1 "A fetch's answer" rule 4): given back as it ends, and before the
   /// conversation moves to another shard.
   held: Option<SvnHold>,
+  /// The text piece a drive waited for and the conversation fetched (C2 stage B part 2), held until the next call has
+  /// read it.
+  fetched: Option<slates_svn::reads::Wanted>,
 }
 
 /// The repository a conversation opened: its id and name on the owner shard.
@@ -758,6 +764,7 @@ async fn converse(stream: TcpStream, seat: Seat, limits: Limits, bound_ns: u64) 
     principal: None,
     commits: 0,
     held: None,
+    fetched: None,
   };
   go_on(stream, conversation, seat).await;
 }
@@ -786,8 +793,12 @@ async fn go_on(stream: TcpStream, mut conversation: Conversation, seat: Seat) {
       Stepped::Go => {}
       Stepped::End => return,
       Stepped::Elsewhere(found, located) => {
-        // A hold is given back on the shard that holds its records.
+        // A hold is given back on the shard that holds its records, and so is a fetched piece.
         conversation.held = None;
+        if let Some(wanted) = conversation.fetched.take() {
+          let _ =
+            crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+        }
         migrate(Moving {
           stream: stream.into_owned(),
           conversation,
@@ -814,6 +825,10 @@ async fn step(
     let _doing = slates_rt::futures::doing("vcs_svn::answer");
     answer(conversation, out)
   };
+  // The piece the last wait fetched was read by this call (C2 stage B part 2).
+  if let Some(wanted) = conversation.fetched.take() {
+    let _ = crate::state::with_state(|state| crate::vcs_store::svn_texts::let_go(state, wanted));
+  }
   if !out.is_empty() && stream.write_all(out).await.is_err() {
     return Stepped::End;
   }
@@ -840,6 +855,17 @@ async fn follow(
       return Stepped::Go;
     }
     Next::Again => return Stepped::Go,
+    Next::Fetch(wanted) => {
+      let Some(repository) = conversation.opened.as_ref().map(|opened| opened.id) else {
+        return Stepped::End;
+      };
+      // A piece the node's store cannot give ends the conversation: the drive would wait for it again.
+      if !crate::vcs_store::svn_texts::fetch_piece(repository, wanted).await {
+        return Stepped::End;
+      }
+      conversation.fetched = Some(wanted);
+      return Stepped::Go;
+    }
     Next::End => return Stepped::End,
     Next::Challenge(consumed) => {
       consume(conversation, consumed);
@@ -1054,6 +1080,7 @@ fn next_of(
       | Turn::Unserved { consumed, .. },
     ) => Next::Consume(consumed),
     Ok(Turn::Wrote) => Next::Again,
+    Ok(Turn::Waiting(wanted)) => Next::Fetch(wanted),
     Ok(Turn::Opened { open, consumed }) => match find_repository(open.url) {
       Ok(found) => Next::Locate { found, consumed },
       Err(unserved) => {

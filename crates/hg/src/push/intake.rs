@@ -37,7 +37,8 @@ use super::classify::ReadChangeset;
 use super::commit::{Unindexed, keep_one};
 use super::held::IndexHeld;
 use super::verify::{Arrived, Held, LogOf, Unverified, audit};
-use crate::changegroup::{Changegroup, Revision, Version};
+use crate::changegroup::{Revision, Version};
+use crate::framing::{Collect, Framed, Framing, Halt, Source, Wanted};
 use crate::index::{HgIndex, Log, NONE};
 use crate::read::to_u64;
 use crate::{Admission, NULL_NODE, Node, changeset, delta, filerev, manifest, node};
@@ -111,7 +112,7 @@ pub struct KeptText {
   /// The identity of the text its payload delta rests on; none for a delta against the null base (a whole text).
   pub base: Option<[u8; 32]>,
   /// Where its delta lies in the payload (the changegroup as received).
-  pub place: Range<usize>,
+  pub place: Range<u64>,
 }
 
 impl Intaken {
@@ -128,12 +129,15 @@ impl Intaken {
 }
 
 /// Whether there is more to take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stepped {
   /// More units follow.
   More,
   /// Every unit is taken: [`Intake::finish`] gives the fork.
   Done,
+  /// The step needs these bytes of the changegroup, which its source does not hold (`crate::framing`): nothing was
+  /// taken; put them in and step again. A whole changegroup in memory never wants.
+  Wanted(Range<u64>),
 }
 
 /// The unit a step takes next.
@@ -158,121 +162,69 @@ enum Stage {
   Done,
 }
 
-/// One revision of the changegroup, by where its delta lies in the changegroup's bytes.
-#[derive(Clone, Debug)]
-struct RevisionAt {
-  /// The node.
-  node: Node,
-  /// The first parent.
-  p1: Node,
-  /// The second parent.
-  p2: Node,
-  /// Its delta's base.
-  base: Node,
-  /// The changeset it belongs to.
-  link: Node,
-  /// Its revision flags.
-  flags: u16,
-  /// Version 04's delta information.
-  info: Option<crate::changegroup::DeltaInfo>,
-  /// The protocol flags.
-  protocol_flags: u8,
-  /// Where its delta lies in the payload.
-  data: Range<usize>,
-}
-
-/// The changegroup's framing as places in its bytes, so the intake borrows nothing between steps.
+/// The changegroup's framing as places in its bytes (`crate::framing::Framed`), so the intake borrows nothing between
+/// steps.
 #[derive(Clone, Debug, Default)]
-struct Frame {
-  /// Every revision, in stream order.
-  revisions: Vec<RevisionAt>,
-  /// The changelog's revisions.
-  changelog: Range<usize>,
-  /// The manifests'.
-  manifests: Range<usize>,
-  /// Each file group: where its path lies in the payload, and its revisions.
-  files: Vec<(Range<usize>, Range<usize>)>,
-}
+struct Frame(Framed);
 
 impl Frame {
-  /// The framing of `payload`, a changegroup of `version`, within `admission`.
+  /// The framing of `payload`, a whole changegroup of `version` in memory, each plain delta checked, within
+  /// `admission`.
   fn of(payload: &[u8], version: Version, admission: &mut Admission) -> Result<Frame, Refused> {
-    let group =
-      Changegroup::decode(payload, version, admission).map_err(Unverified::Changegroup)?;
-    if !group.trees.is_empty() {
+    let mut framed = Framed::default();
+    let mut framing = Framing::new(version, true);
+    loop {
+      let mut sink = Collect {
+        framed: &mut framed,
+        admission: &mut *admission,
+      };
+      match framing.step(payload, &mut sink) {
+        Ok(true) => {}
+        Ok(false) => break,
+        Err(Halt::Refused(refusal)) => return Err(Unverified::Changegroup(refusal).into()),
+        // A slice holds every byte of itself: a want names bytes past its end, a truncation.
+        Err(Halt::Wanted(wanted)) => {
+          return Err(
+            Unverified::Changegroup(crate::changegroup::Refusal::Truncated(crate::Truncated {
+              what: "changegroup",
+              at: wanted.range.start,
+              needed: wanted.range.end.saturating_sub(wanted.range.start),
+              left: to_u64(payload.len()).saturating_sub(wanted.range.start),
+            }))
+            .into(),
+          );
+        }
+      }
+    }
+    Frame::framed(framed)
+  }
+
+  /// A framing its caller walked (`crate::framing::Framing` over a source read a piece at a time): a changegroup of
+  /// tree manifests refused, as verification refuses one.
+  fn framed(framed: Framed) -> Result<Frame, Refused> {
+    if !framed.trees.is_empty() {
       return Err(Unverified::TreeManifests.into());
     }
-    let start = payload.as_ptr().addr();
-    let place = |bytes: &[u8]| {
-      let at = bytes.as_ptr().addr().saturating_sub(start);
-      at..at.saturating_add(bytes.len())
-    };
-    admission.charge_items::<RevisionAt>(group.revisions.len())?;
-    let revisions = group
-      .revisions
-      .iter()
-      .map(|revision| RevisionAt {
-        node: revision.node,
-        p1: revision.p1,
-        p2: revision.p2,
-        base: revision.base,
-        link: revision.link,
-        flags: revision.flags,
-        info: revision.info,
-        protocol_flags: revision.protocol_flags,
-        data: place(revision.data),
-      })
-      .collect();
-    let files = group
-      .files
-      .iter()
-      .map(|file| (place(file.name), file.revisions.clone()))
-      .collect();
-    Ok(Frame {
-      revisions,
-      changelog: group.changelog,
-      manifests: group.manifests,
-      files,
-    })
+    Ok(Frame(framed))
   }
 
-  /// The revision at `at` of `range`, its delta read from `payload`.
-  /// [`Frame::revision`] with where its delta lies in the payload (A-767 C4: the `Texts` section's place).
-  fn placed<'p>(
+  /// The revision at `at` of `range`, its delta read from `payload`, with where its delta lies there (A-767 C4: the
+  /// `Texts` section's place); none past the group, the bytes `payload` lacks where it holds them not.
+  fn placed<'p, S: Source + ?Sized>(
     &self,
-    payload: &'p [u8],
+    payload: &'p S,
     range: &Range<usize>,
     at: usize,
-  ) -> Option<(Revision<'p>, Range<usize>)> {
-    let revision = self.revision(payload, range, at)?;
-    let index = range.start.checked_add(at)?;
-    let place = self.revisions.get(index)?.data.clone();
-    Some((revision, place))
-  }
-
-  fn revision<'p>(
-    &self,
-    payload: &'p [u8],
-    range: &Range<usize>,
-    at: usize,
-  ) -> Option<Revision<'p>> {
-    let index = range
+  ) -> Result<Option<(Revision<'p>, Range<u64>)>, Wanted> {
+    let Some(found) = range
       .start
       .checked_add(at)
-      .filter(|index| *index < range.end)?;
-    let found = self.revisions.get(index)?;
-    Some(Revision {
-      node: found.node,
-      p1: found.p1,
-      p2: found.p2,
-      base: found.base,
-      link: found.link,
-      flags: found.flags,
-      info: found.info,
-      protocol_flags: found.protocol_flags,
-      data: payload.get(found.data.clone())?,
-      sidedata: None,
-    })
+      .filter(|index| *index < range.end)
+      .and_then(|index| self.0.revisions.get(index))
+    else {
+      return Ok(None);
+    };
+    Ok(Some((found.revision(payload)?, found.data.clone())))
   }
 }
 
@@ -304,6 +256,9 @@ struct Taker {
   last_identity: Option<(Node, [u8; 32])>,
   /// Whether the log being taken has kept a revision yet.
   logged: bool,
+  /// The path of the file group being taken, read at its opening, so each later step reads one range of the
+  /// changegroup (its revision's delta) and a source read forward never wants bytes it let go.
+  path: Option<Vec<u8>>,
   /// What was brought.
   intaken: Intaken,
 }
@@ -318,6 +273,26 @@ impl Intake {
     admission: &mut Admission,
   ) -> Result<Self, Refused> {
     let frame = Frame::of(payload, version, admission)?;
+    Intake::with_frame(frame, index, store)
+  }
+
+  /// Starts taking a changegroup its caller framed (`crate::framing::Framing`, over a source read a piece at a time,
+  /// each revision charged as it was placed) into a fork of `index`; every step is lent the same changegroup's bytes,
+  /// as far as its source holds them ([`Stepped::Wanted`]).
+  pub fn begin_framed(
+    framed: Framed,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Self, Refused> {
+    Intake::with_frame(Frame::framed(framed)?, index, store)
+  }
+
+  /// [`Intake::begin`]'s fork made over `frame`.
+  fn with_frame(
+    frame: Frame,
+    index: &mut HgIndex,
+    store: &mut ContentStore,
+  ) -> Result<Self, Refused> {
     let fork = index.fork(store).map_err(Unindexed::Fork)?;
     Ok(Intake {
       frame,
@@ -330,6 +305,7 @@ impl Intake {
         last: None,
         last_identity: None,
         logged: false,
+        path: None,
         intaken: Intaken::default(),
       },
     })
@@ -337,16 +313,19 @@ impl Intake {
 
   /// Takes the next unit of the changegroup whose bytes are `payload`, the ones it began with (module docs). Refused,
   /// the caller gives the fork back ([`Intake::abandon`]).
-  pub fn step(
+  pub fn step<S: Source + ?Sized>(
     &mut self,
-    payload: &[u8],
+    payload: &S,
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<Stepped, Refused> {
     let Intake { frame, taker } = self;
     match taker.stage {
       Stage::Changelog(at) => {
-        let next = frame.placed(payload, &frame.changelog, at);
+        let next = match frame.placed(payload, &frame.0.changelog, at) {
+          Ok(next) => next,
+          Err(wanted) => return Ok(Stepped::Wanted(wanted.range)),
+        };
         taker.take_or(
           next,
           Log::Changelog,
@@ -355,7 +334,10 @@ impl Intake {
         )
       }
       Stage::Manifests(at) => {
-        let next = frame.placed(payload, &frame.manifests, at);
+        let next = match frame.placed(payload, &frame.0.manifests, at) {
+          Ok(next) => next,
+          Err(wanted) => return Ok(Stepped::Wanted(wanted.range)),
+        };
         let after = Stage::Files { file: 0, at: 0 };
         taker.take_or(next, Log::Manifest, (store, admission), after)
       }
@@ -386,7 +368,7 @@ impl Taker {
   /// Takes `next` of `log`, or moves to `after` where its group has no more.
   fn take_or(
     &mut self,
-    next: Option<(Revision<'_>, Range<usize>)>,
+    next: Option<(Revision<'_>, Range<u64>)>,
     log: Log<'_>,
     (store, admission): (&mut ContentStore, &mut Admission),
     after: Stage,
@@ -404,31 +386,46 @@ impl Taker {
     Ok(Stepped::More)
   }
 
-  /// One step of the file groups: a group's path audited at its first revision, then its revisions; after the last
-  /// group, the checks.
-  fn file_step(
+  /// One step of the file groups: a group opened (its path read, audited and kept, charged to `admission`), then its
+  /// revisions a step each; after the last group, the checks.
+  fn file_step<S: Source + ?Sized>(
     &mut self,
-    (frame, payload): (&Frame, &[u8]),
+    (frame, payload): (&Frame, &S),
     (file, at): (usize, usize),
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<Stepped, Refused> {
-    let Some((name, revisions)) = frame.files.get(file).cloned() else {
+    let Some((name, revisions)) = frame.0.files.get(file).cloned() else {
       self.enter(Stage::ManifestsPresent(0));
       return Ok(Stepped::More);
     };
-    let path = payload.get(name).ok_or(Unverified::TreeManifests)?;
-    if at == 0 {
+    let Some(path) = self.path.take() else {
+      let path = match payload.bytes(name) {
+        Ok(path) => path,
+        Err(wanted) => return Ok(Stepped::Wanted(wanted.range)),
+      };
       audit(path)?;
-    }
-    let Some((revision, place)) = frame.placed(payload, &revisions, at) else {
+      admission.charge(to_u64(path.len()))?;
+      self.path = Some(path.to_vec());
+      return Ok(Stepped::More);
+    };
+    let next = match frame.placed(payload, &revisions, at) {
+      Ok(next) => next,
+      Err(wanted) => {
+        self.path = Some(path);
+        return Ok(Stepped::Wanted(wanted.range));
+      }
+    };
+    let Some((revision, place)) = next else {
       self.enter(Stage::Files {
         file: file.saturating_add(1),
         at: 0,
       });
       return Ok(Stepped::More);
     };
-    self.take(Log::File(path), (&revision, place), store, admission)?;
+    let taken = self.take(Log::File(&path), (&revision, place), store, admission);
+    self.path = Some(path);
+    taken?;
     self.stage = Stage::Files {
       file,
       at: at.saturating_add(1),
@@ -438,6 +435,7 @@ impl Taker {
 
   /// Moves to `stage`, a new log's: what the last one brought is let go.
   fn enter(&mut self, stage: Stage) {
+    self.path = None;
     self.brought.clear();
     self.last = None;
     self.last_identity = None;
@@ -449,7 +447,7 @@ impl Taker {
   fn take(
     &mut self,
     log: Log<'_>,
-    (revision, place): (&Revision<'_>, Range<usize>),
+    (revision, place): (&Revision<'_>, Range<u64>),
     store: &mut ContentStore,
     admission: &mut Admission,
   ) -> Result<(), Refused> {

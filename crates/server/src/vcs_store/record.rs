@@ -60,9 +60,15 @@ const VERSION_INFLATED: u32 = 1;
 /// store). Written only once both contents are durable at `f + 1` homes in the region (`super::homes`), so a replay on
 /// any node can read them, and once the store answered the landing durable, so the register names only a changeset
 /// that is there (main's ruling of 2026-11-20: land first, then the entry naming the sequence). The record so holds no
-/// object and no pack: its append is O(moves).
+/// object and no pack: its append is O(moves). An append that brings no object the repository lacks (a delete, a ref
+/// moved to a commit it holds, a non-atomic push's later appends) names none: the names' and the pack's identities all
+/// zeros with a count and a length of 0, and a sequence of 0 (C5 part 2b).
 /// Format: this version's number on the wire.
 const VERSION_LANDED: u32 = 5;
+
+/// Format: a version-5 record's identity of names or of a pack it does not name (an append that brings no object): all
+/// zeros, which no BLAKE3 output is in practice.
+const NONE: ContentId = ContentId([0; IDENTITY_BYTES]);
 
 /// Format: the bytes of a word: the magic, the version.
 const WORD_BYTES: usize = size_of::<u32>();
@@ -226,8 +232,8 @@ impl RecordWriter {
   /// node's store landed them as (0 for none).
   pub(crate) fn finish_packed(
     (deepest, moves): (u64, &[RecordedMove]),
-    named: (ContentId, u64),
-    packed: (ContentId, u64),
+    named: Option<(ContentId, u64)>,
+    packed: Option<(ContentId, u64)>,
     sequence: u64,
   ) -> Result<Vec<u8>, WriteRefused> {
     let len = record_len(moves, &[], 0)
@@ -239,7 +245,7 @@ impl RecordWriter {
       .try_reserve_exact(len)
       .map_err(|_| WriteRefused::Allocation)?;
     write_head(&mut out, VERSION_LANDED, (deepest, moves));
-    for (identity, count) in [named, packed] {
+    for (identity, count) in [named, packed].map(|named| named.unwrap_or((NONE, 0))) {
       out.extend_from_slice(&identity.0);
       out.extend_from_slice(&count.to_le_bytes());
     }
@@ -453,7 +459,8 @@ impl<'a> Record<'a> {
       for kept in [&mut named, &mut packed] {
         let identity =
           ContentId::from_slice(reader.take(IDENTITY_BYTES)?).ok_or(RecordRefused::Truncated)?;
-        *kept = Some((identity, reader.long()?));
+        let count = reader.long()?;
+        *kept = (identity != NONE).then_some((identity, count));
       }
       sequence = reader.long()?;
       0
