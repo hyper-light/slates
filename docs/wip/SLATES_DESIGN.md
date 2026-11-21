@@ -59571,7 +59571,14 @@ Applied in the same change to:
   - A push reaches greens only through the door. `ShardGreens` lends no owing green and notes the first it met (its
     `lent` and its branch check); the command's turn starts that green's materialization (`green_ready`) and waits a
     turn at a time, not counted as a build turn, until it is made, then judges. A create's turn reaches the ref's own
-    green and the one it would be made at; a delete reaches its own.
+    green and the one it would be made at; a delete reaches its own. The wait is bounded: once a build the command
+    waited for ends without making the green (refused past its room), the command goes on and its verdict declines it
+    in git's words, never starting the build again each turn.
+  - A create is never made from a member other than the default branch that owes its push: it is passed over, and the
+    create owes its own push from the next base (A-654's order). Made from it, the create would make it at the push, as
+    git/git's refs at commits other refs hold would make most of them; a deferred create's chain entry is its push's
+    record whichever base it has, so A-753's bound holds. The default branch, the base every create falls back to, is
+    made first through the door.
   - A `CreateBranch` request made from a green that owes its push parks at the door like any request on such a green.
 - **Evidence.**
   - `t_p2_an_unborn_default_branchs_first_push_owes_its_tree_and_reads_as_its_commit`: 1,500 files; the push takes at
@@ -59582,6 +59589,8 @@ Applied in the same change to:
     push's record byte for byte; made, each holds the second commit's text at version 1.
   - The A-654, A-743, A-753 and A-238 tests read created greens through the door and pass unchanged in what they
     assert; A-238's creates are followed by updates, whose works now fill the chains.
-- **Owed** (GAPS, A-812): a push waiting on a green whose materialization is refused retries it each turn; a replayed
-  owing green made over a restarted node's shares (the restart test); git/git's push landing (the red) and the A/B
-  against stock git's 10.77 s.
+  - The suites' synchronous push drivers hold the shard, so they run its materializations between a push's turns
+    (`carry_blocking`), as their tasks would; A-238's test pushes a poll at a time on a daemon, since its 32 pushes and
+    their makes in one poll met the watchdog's 3.5 s window.
+- **Owed** (GAPS, A-812): a replayed owing green made over a restarted node's shares (the restart test); git/git's push
+  landing (the red) and the A/B against stock git's 10.77 s.

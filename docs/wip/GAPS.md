@@ -536,10 +536,9 @@
 > construction, and requests park until it is made. The full description and tests are in the design entry A-812.
 > Owed:
 > - (a) FIXED by A-820 (w-git, 2026-11-21): git's creates owe their pushes, the unborn default's first push is a deferred
->   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door. Owed from it:
->   a push waiting at the door on a green whose materialization is refused (`merge.green.materialize_over_room`)
->   starts it again each turn rather than refusing the command typed; a replayed owing green has not been made over a
->   restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met
+>   update, `with_owed_push_objects` answers git's objects, and a push reaches greens through the door (a command whose
+>   wait ends with the build refused is declined, not retried). Owed from it: a replayed owing green has not been made
+>   over a restarted node's shares in a test (`verbs::replay_green` alone holds no origin shares, and its build met
 >   `ContentOnMissing`), owed with the f = 1 kill test below; git/git's 611 MB push landing and its A/B against stock
 >   git's 10.77 s (w-git, next).
 > - (b) FIXED by A-813. The owed version goes to holders as any version does. Its push's record is the record's inputs,

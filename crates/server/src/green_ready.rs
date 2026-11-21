@@ -123,6 +123,11 @@ pub(crate) fn green_ready(state: &mut ShardState, green: DbVolumeId) -> GreenRea
   GreenReady::Materializing
 }
 
+/// Whether `green`'s materialization is under way: started by [`green_ready`] and neither made nor refused yet.
+pub(crate) fn is_building(state: &ShardState, green: DbVolumeId) -> bool {
+  state.materializations.building.contains_key(&green)
+}
+
 /// The green owing a push that `body` reaches, if any: its volume when that is such a green, or the green of the work it
 /// names; for a branch made from another, the green it is made from, named by its repository and branch (git's names:
 /// only a git create owes its push).

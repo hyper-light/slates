@@ -321,11 +321,7 @@ fn answered(state: &mut ShardState, push: &mut ReceivePack, request: &[u8]) -> (
   loop {
     match push.answer_step(state, &mut answer).expect("answered") {
       Answering::Answered(received) => return (answer, *received),
-      Answering::Turned => {
-        carry_blocking(state, push);
-        // The shard's materializations run between the push's turns, as their tasks would (P2's door).
-        crate::green_ready::make_building_now(state);
-      }
+      Answering::Turned => carry_blocking(state, push),
       #[cfg(unix)]
       step @ Answering::Hook(_) => panic!("no hook runs where no view is shown: {step:?}"),
     }
@@ -902,36 +898,38 @@ const ROOMY_CREATES: usize = 16;
 /// checkpointed the members themselves, in their steps.
 #[test]
 fn t_a238_a_pushs_append_meeting_the_chains_cap_checkpoints_nothing_in_its_step() {
-  let (refused, in_appends, in_turns) = crate::test_store::audit_on_stored_shard_configured(
-    "git-push",
-    |state| {
-      let repository = git_repository(state, "roomy");
-      let mut refused = Vec::new();
-      for k in 0..ROOMY_CREATES {
-        // A create owes its push (P2), so its update is what builds a work into its green's chain.
-        let (first, objects) = flat_commit(1, &format!("create {k} file"), None);
-        let (second, more) = flat_commit(ROOMY_FILES, &format!("update {k} file"), Some(first));
-        let (first, second) = (first.to_string(), second.to_string());
-        let name = format!("refs/heads/r{k}");
-        let created = [("", first.as_str(), name.as_bytes())];
-        let updated = [(first.as_str(), second.as_str(), name.as_bytes())];
-        for (commands, objects) in [(created, &objects), (updated, &more)] {
-          let pack = pack_of_objects(objects);
-          let received = pushed(state, repository, &request(&commands, CAPABILITIES, &pack));
-          if reasons(&received) != [b"ok".to_vec()] {
-            refused.push(k);
-          }
-        }
+  let (_store, daemon) = crate::test_store::audit_daemon_stored_configured(|config| {
+    config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET;
+  });
+  let repository = crate::daemon::observe_first(&daemon, |state| git_repository(state, "roomy"));
+  let mut refused = Vec::new();
+  for k in 0..ROOMY_CREATES {
+    // A create owes its push (P2), so its update is what builds a work into its green's chain.
+    let (first, objects) = flat_commit(1, &format!("create {k} file"), None);
+    let (second, more) = flat_commit(ROOMY_FILES, &format!("update {k} file"), Some(first));
+    let (first, second) = (first.to_string(), second.to_string());
+    let name = format!("refs/heads/r{k}");
+    let created = [("", first.as_str(), name.as_bytes())];
+    let updated = [(first.as_str(), second.as_str(), name.as_bytes())];
+    for (commands, objects) in [(created, &objects), (updated, &more)] {
+      let pushing = request(&commands, CAPABILITIES, &pack_of_objects(objects));
+      // A push a poll of the shard, as a client's push is its own task.
+      let answered = crate::daemon::observe_first(&daemon, move |state| {
+        reasons(&pushed(state, repository, &pushing))
+      });
+      if answered != [b"ok".to_vec()] {
+        refused.push(k);
       }
-      let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
-      (
-        refused,
-        count(crate::repository::push::APPEND_CHECKPOINTED),
-        count(super::ROOM_CHECKPOINTED),
-      )
-    },
-    |config| config.caps.green_chain_bytes = SMALL_CHAIN_BUDGET,
-  );
+    }
+  }
+  let (in_appends, in_turns) = crate::daemon::observe_first(&daemon, |state| {
+    let count = |name: &str| state.refusals.get(name).copied().unwrap_or(0);
+    (
+      count(crate::repository::push::APPEND_CHECKPOINTED),
+      count(super::ROOM_CHECKPOINTED),
+    )
+  });
+  daemon.stop();
   assert_eq!((refused, in_appends), (Vec::new(), 0));
   assert!(in_turns > 0, "the room made in the turns: {in_turns}");
 }
@@ -1841,6 +1839,9 @@ fn t_a727_a_plain_push_then_its_update_are_made_again_with_the_same_holders() {
 /// real, from a thread of its own (`crate::test_store::land_answered_blocking`). Nothing to do where the push asked
 /// nothing.
 pub(crate) fn carry_blocking<P>(state: &mut ShardState, push: &mut ReceivePack<P>) {
+  // The shard's materializations run between the push's turns, as their tasks would (P2's door): a synchronous driver
+  // holds the shard, so a push waiting at the door for a green would otherwise wait forever.
+  crate::green_ready::make_building_now(state);
   let Some(asked) = push.take_homing() else {
     return;
   };

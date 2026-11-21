@@ -325,6 +325,8 @@ struct DecidingPush {
   /// The repository's member greens still to checkpoint, a green a turn, to make the chains room for the command under
   /// way's entry before its append (A-238 moved off the append's step); none while the chains have room.
   making_room: Option<Vec<DbVolumeId>>,
+  /// The green owing its push that the command under way waits at the door for (P2, [`ServerJudge::door`]).
+  door: Option<DbVolumeId>,
   /// The push's names homed in the region before its record names them (A-724 piece 8c, [`Homing`]).
   homing: Homing,
   /// The push's hooks, `post-receive` due once it is decided; none where no hook runs.
@@ -805,6 +807,7 @@ impl<P> ReceivePack<P> {
       restaging: None,
       preparing: None,
       making_room: None,
+      door: None,
       homing: Homing::Due,
       #[cfg(unix)]
       then: None,
@@ -835,6 +838,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         making_room,
+        door,
         ..
       } = &mut decision;
       let mut judge = ServerJudge {
@@ -848,6 +852,7 @@ impl<P> ReceivePack<P> {
         restaging,
         preparing,
         making_room,
+        door,
       };
       deciding
         .step(None, &mut judge, &mut self.admission)
@@ -1874,6 +1879,8 @@ struct ServerJudge<'j> {
   preparing: &'j mut Option<slates_git::receive::works::Preparing>,
   /// The member greens still to checkpoint before the command under way's append ([`DecidingPush::making_room`]).
   making_room: &'j mut Option<Vec<DbVolumeId>>,
+  /// The green owing its push that the command under way waits at the door for (P2).
+  door: &'j mut Option<DbVolumeId>,
 }
 
 impl Judge for ServerJudge<'_> {
@@ -1893,11 +1900,11 @@ impl Judge for ServerJudge<'_> {
       return match bound(self.state, self.record.id, &command.name)
         .filter(|green| self.state.greens.is_owing(green))
       {
-        Some(green) => {
-          crate::green_ready::green_ready(self.state, green);
-          false
+        Some(green) => self.door(green),
+        None => {
+          *self.door = None;
+          true
         }
-        None => true,
       };
     }
     let repository = self.record.id;
@@ -2068,6 +2075,21 @@ impl ServerJudge<'_> {
     })
   }
 
+  /// P2's door for the command under way, at `green`, which owes its push: whether the command may go on to its verdict.
+  /// The first time, the green's materialization starts (`crate::green_ready`) and the command waits a turn at a time
+  /// while it runs. Once a build it waited for ended without making the green (refused past its room, counted there),
+  /// the command goes on, and its verdict, which lends no owing green, declines it in git's words: never a wait that
+  /// starts the build again every turn.
+  fn door(&mut self, green: DbVolumeId) -> bool {
+    if *self.door == Some(green) && !crate::green_ready::is_building(self.state, green) {
+      *self.door = None;
+      return true;
+    }
+    *self.door = Some(green);
+    crate::green_ready::green_ready(self.state, green);
+    false
+  }
+
   /// A turn of `command`'s work build (A-752), begun at `began` on the shard's clock: units until half the step quantum
   /// is spent, the build kept for the next turn. Whether it is built (or needs none), so this step judges it. The turn
   /// is counted ([`PushTurns`]): one that ran past its budget by more than its longest unit and the scheduler's own
@@ -2119,9 +2141,9 @@ impl ServerJudge<'_> {
     // A green the command reached that owes its push is made first, through the door, and the command waits for it a
     // turn at a time (P2): its verdict reads it. A turn that only found it builds nothing and is not counted.
     if let Some(green) = owing {
-      crate::green_ready::green_ready(state, green);
-      return false;
+      return self.door(green);
     }
+    *self.door = None;
     let ended = slates_rt::futures::now_ns();
     // What the turn may pass its budget by: its opening (the admission's turn and the views set up before its first
     // unit, which always runs), one unit, and what it does after its last ask (the views given back). A turn is those
@@ -2429,17 +2451,21 @@ impl ShardGreens<'_, '_> {
 
   /// The green a create whose first parent is `parent` is made from, and its version (module docs, "A create"): the
   /// newest of the store's versions of a member whose head is `parent`, where a branch can still be made at it, the
-  /// default branch's first, then the members as they joined.
+  /// default branch's first, then the members as they joined. A member other than the default branch that owes its
+  /// push is passed over (P2): a create made from it would make it at the push, as git/git's refs at commits other refs
+  /// hold would make most of them; the create owes its own push from the next base instead, its chain entry the push's
+  /// record either way. The default branch, the base every create falls back to, is made first through the door.
   fn holding(&self, parent: &ObjectId) -> Option<(DbVolumeId, Version)> {
     let (content, git) = self.store;
     let repositories = self.state.db.partition().repositories();
+    let default = self.default_green();
     let members = repositories
       .members_of(self.record.id)
       .map(|member| member.green);
-    self
-      .default_green()
+    default
       .into_iter()
       .chain(members)
+      .filter(|green| Some(*green) == default || !self.state.greens.is_owing(green))
       .find_map(|green| {
         let (number, tree) = git.version_of(content, green_key(green), parent)?;
         self.branchable(green, Version { number, tree })
