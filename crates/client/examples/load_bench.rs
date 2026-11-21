@@ -14,11 +14,13 @@
 //! so a conflict window, the client's range and the intervening range coincide, and the oracle below states the
 //! design's rule exactly.
 //!
-//! **Conflict handling, as a client must do it.** On `Conflict { windows }` the client reads the green's head bytes
-//! of each window's file, writes those bytes into its own work over the window (its edit there now equals the
-//! green's, which pass two accepts as identical), rebases, writes its own bytes over the window again on the new
-//! base, and submits again — at most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved,
-//! never hidden.
+//! **Conflict handling, as a client must do it.** On `Conflict { windows }` the client resolves in one ask
+//! (`ResolveConflict`, A-840): it gives up the windows and writes its own slots in them again at the head as it is, so
+//! the work is based at that head, and submits again. A kept slot a later write met answers its windows, resolved the
+//! same way. `--resolve rebase` keeps the corrective loop it replaced, for the comparison: read the green's head bytes
+//! of each window, write them into the work over the window (its edit there then equals the green's, which pass two
+//! accepts as identical), rebase, write its own bytes over the window again on the new base, and submit. Either way at
+//! most `MAX_RESOLUTIONS` times a round; a client that runs out is counted as starved, never hidden.
 //!
 //! **The oracle (offline, after the run; `support/load_oracle.rs` states it exactly).** Every submit is recorded with
 //! its base, its send and reply instants, its slots and its outcome. The accepted versions must be exactly `1..=V`,
@@ -216,8 +218,17 @@ enum Step {
   ResolveEdit(usize),
   Rebase,
   Reedit(usize),
+  /// A conflict resolved in one ask (A-840, the default; `--resolve rebase` keeps the read-and-rebase loop above): the
+  /// conflict's windows given up, the round's own slots in them written again at the head as it is.
+  ResolveConflict,
   Destroy,
   Done,
+}
+
+/// Whether a conflict is resolved in one ask (A-840), the default, or by reading the head's bytes into the windows and
+/// rebasing (`--resolve rebase`), kept for the comparison.
+fn resolves_in_one_ask() -> bool {
+  arg("--resolve").as_deref() != Some("rebase")
 }
 
 /// One logical client and its script: its own work volume, its own rounds, merges and conflicts, one request in
@@ -706,6 +717,34 @@ impl Agent {
         )
       }
       Step::Rebase => (RequestBody::Rebase { work: work? }, Kind::Rebase),
+      Step::ResolveConflict => {
+        // Every own slot a window meets, written again: the window's other bytes are the head's once it is given up.
+        let replacement = self
+          .slots()
+          .iter()
+          .filter(|slot| {
+            self.windows.iter().any(|window| {
+              window.path == slot.path
+                && slot.at < window.at.saturating_add(window.len.max(1))
+                && window.at < slot.at.saturating_add(SLOT_BYTES)
+            })
+          })
+          .map(|slot| slates_ipc::protocol::WorkChange::Edit {
+            path: slot.path.clone(),
+            at: slot.at,
+            delete_len: SLOT_BYTES,
+            bytes: slot.bytes.clone(),
+          })
+          .collect();
+        (
+          RequestBody::ResolveConflict {
+            work: work?,
+            over: self.windows.clone(),
+            replacement,
+          },
+          Kind::Rebase,
+        )
+      }
       Step::Destroy => (RequestBody::Destroy { volume: work? }, Kind::Destroy),
       Step::Done => return None,
     })
@@ -816,6 +855,37 @@ impl Agent {
       ) => {
         record_split(tally, kind, elapsed, harness);
         self.rebased(version, conflicts, tally);
+      }
+      (
+        Step::ResolveConflict,
+        ReplyBody::Rebased {
+          version, conflicts, ..
+        },
+      ) => {
+        record_split(tally, kind, elapsed, harness);
+        match version {
+          // At the head, the round's own slots in the windows written again by the resolution: it submits.
+          Some(v) => {
+            self.base = v;
+            self.step = Step::Submit;
+          }
+          // A kept slot met a later write: the resolution changed nothing and named only what it kept, so the next
+          // gives up those windows as well as the ones already given up, within the same bound.
+          None => {
+            tally.rebase_conflicts += 1;
+            self.resolutions += 1;
+            if self.resolutions > MAX_RESOLUTIONS || conflicts.is_empty() {
+              tally.starved += 1;
+              self.step = Step::Destroy;
+              return;
+            }
+            for window in conflicts {
+              if !self.windows.contains(&window) {
+                self.windows.push(window);
+              }
+            }
+          }
+        }
       }
       (Step::Reedit(n), ReplyBody::Edited) => {
         record_split(tally, kind, elapsed, harness);
@@ -954,7 +1024,11 @@ impl Agent {
   /// head version, then each window's bytes at that version (a version never changes, so no submit landing meanwhile
   /// can tear the read), each written over its window in the work; then the rebase.
   fn resolve(&mut self) {
-    self.step = Step::ResolveVersion;
+    self.step = if resolves_in_one_ask() {
+      Step::ResolveConflict
+    } else {
+      Step::ResolveVersion
+    };
   }
 
   fn rebased(&mut self, version: Option<u64>, conflicts: Vec<MergeWindow>, tally: &mut Tally) {
@@ -2916,7 +2990,8 @@ mod tests {
   }
 
   /// AC-9.1: a round that meets a conflict and resolves it is every request of it, the resolution's too, and none of
-  /// the pauses: the cycle ends at the first verdict (four requests), the round at the accept (eleven).
+  /// the pauses: the cycle ends at the first verdict (four requests), the round at the accept (six: the resolution is
+  /// one ask, A-840).
   #[test]
   fn a_round_through_a_conflict_counts_its_resolution_and_none_of_its_pauses() {
     const LATENCY_NS: u64 = 100_000;
@@ -2943,23 +3018,13 @@ mod tests {
     );
     assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS]);
     assert!(only(&tally, Kind::Round).is_empty(), "the round is open");
-    let window_bytes = vec![b'g'; usize::try_from(SLOT_BYTES).unwrap()];
+    assert_eq!(agent.step, Step::ResolveConflict, "resolved in one ask");
     exchange(
       &mut agent,
       &mut tally,
       now + PAUSE_NS,
       (LATENCY_NS, PAUSE_NS),
       vec![
-        (ReplyBody::Versions { head: 1 }, Kind::ReadHead),
-        (
-          ReplyBody::ReadPage {
-            bytes: window_bytes,
-            total: SLOT_BYTES,
-            stamp: 0,
-          },
-          Kind::ReadHead,
-        ),
-        (ReplyBody::Edited, Kind::Edit),
         (
           ReplyBody::Rebased {
             version: Some(1),
@@ -2969,13 +3034,11 @@ mod tests {
           },
           Kind::Rebase,
         ),
-        (ReplyBody::Edited, Kind::Edit),
-        (ReplyBody::Edited, Kind::Edit),
         verdict(Some(2), Vec::new()),
       ],
     );
     assert_eq!(only(&tally, Kind::Cycle), vec![4 * LATENCY_NS], "one cycle");
-    assert_eq!(only(&tally, Kind::Round), vec![11 * LATENCY_NS]);
+    assert_eq!(only(&tally, Kind::Round), vec![6 * LATENCY_NS]);
   }
 
   /// AC-9.1: the cycle starts at its first edit's first send, so a refusal for now of that edit and the client's

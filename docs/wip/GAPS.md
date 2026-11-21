@@ -185,6 +185,10 @@
 > The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
 > and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
 > memory pressure from a host actually short of memory (the test injects it).
+> Open (found by use 2026-11-21, routed to g224): on Mac Studios (Studio-2 twice, Studio-4) a fresh slates NFS mount's
+> first `opendir` never returns. The client sends GETATTR, LOOKUP, ACCESS and FSSTAT (345 in 30 min) and never
+> READDIR or CREATE, while the daemon answers every call. The same flows pass on adas-macbook-pro-2. The real-tools
+> test now fails in 305 s naming the stall instead of hanging.
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -676,6 +680,15 @@
 > **A-722 part 4a (2026-11-20, w-git).** BUILT: a git record's pack replayed a turn at a time (read in chunks, objects
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
+>
+> **A-840 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a conflict is resolved in one ask
+> (`ResolveConflict`: the windows given up, the rest resolved at the head as it is): rebase-kind asks 20.5-20.9 to
+> 10.4-10.9 a client at 10 hot files, all owner asks 32.7-33.2 to 26.3-27.0. Also FIXED, found by its oracle: a work off
+> its green's shard laid zeros for base bytes it did not hold when composing a rebased file (A-806's parts), and the
+> green took them; the composition now goes to the owner. Open: verdict asks are the largest kind (9.2-9.5 a client at
+> 10 hot files); the rebase arm (`--resolve rebase`) is kept only as the comparison's other leg. Main's queue:
+> `work_edit_cow`'s `a_one_byte_edit_of_a_large_file_costs_the_byte_not_the_file` is ended by the watchdog in a debug
+> build on a loaded box, on main before this change too (shard spinning 3.6 s in the submit's first poll).
 >
 > **A-817 (2026-11-21, w-fed-move; goal 86b's owner asks).** FIXED: a file's base bytes are asked only for a whole
 > replacement whose declared base length is the file's (an overwrite at offset 0 had asked them at every rebase and
@@ -24900,7 +24913,8 @@ in what lands. Branch tips as of 2026-11-10:
 > kind's p99 is under 1 ms in 5 of 5 rounds. (b) LANDED 2026-11-21 (a key's old entry subtracted at its first change:
 > the fold hashes current bytes only, no history reads), with a fix to a checkpoint's sum taken mid-fold. OWED: (b)'s A/B
 > (does Z = 20 ms p99 return to main's?); slice the checkpoint's last step (~43 ms: build 5.7, encode 9.5, record 24.4
-> of 49 MB). Single key folds sliced inside a key since 2026-11-21 (`fold_identity_slice`).
+> of 49 MB) and single key folds of up to 13.4 ms (slicing inside a key landed and was reverted the same day: a fold of
+> 47.6-52.6 s, design amendment A-579).
 
 > **A-805's preview oracle (2026-11-21, w-engine; main's order):** a held verdict's preview reads as its commit over the
 > copy and identity oracles' generated histories and through `Greens::preview`, red with copy and link effects dropped.

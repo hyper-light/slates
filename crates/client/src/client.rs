@@ -4796,6 +4796,23 @@ impl Client {
       .rebased()
   }
 
+  /// Resolves a conflict in one ask (A-840): retires the work's operations in the windows `over` names, rebases the
+  /// rest onto the head as it is and applies `replacement` there, restating the work at the head. A conflict when what
+  /// is kept still overlaps the head, every window read; never stale, since nothing was judged at an older head.
+  pub fn resolve_conflict(
+    &mut self,
+    work: VolumeId,
+    over: Vec<slates_ipc::protocol::MergeWindow>,
+    replacement: Vec<slates_ipc::protocol::WorkChange>,
+  ) -> Result<Rebased, ClientError> {
+    let reply = self.call(&RequestBody::ResolveConflict {
+      work,
+      over,
+      replacement,
+    })?;
+    self.verdict_of(work, VerdictKind::Rebase, reply)?.rebased()
+  }
+
   /// Clones a snapshot into a new volume; the clone's id.
   pub fn clone_snapshot(
     &mut self,

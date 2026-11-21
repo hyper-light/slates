@@ -66,10 +66,6 @@ proptest! {
       if step.3 % 3 == 1 {
         green.fold_identity_step(1 + usize::from(step.4 % 3));
       }
-      // A-579: and a few bytes alone at others, so a file's entry is part hashed across commits that may change it.
-      if step.3 % 5 == 2 {
-        green.fold_identity_slice(1 + usize::from(step.4 % 4));
-      }
       if step.4 % 3 == 0 {
         prop_assert_eq!(green.head_identity(), green.head_identity_from_scratch(), "after step {} {:?}", index, step);
       }
