@@ -243,3 +243,4 @@ Setup: fanout-state read from a PRIVATE clone ~/.cache/w-k90-containers-fanout (
    w-k90-containers-kiln, /tmp/wkc-exp.*; MacBook ~/.cache/w-k90-containers-{e2e-exp,target}, ~/kiln-work/{w-k90-containers-kiln,
    wkc-push}; jupiter ~/.cache/w-k90-containers-{target,win.log}, ~/kiln-work/w-k90-containers-win; adacachy ~/kiln-work/
    w-k90-containers-lin, ~/.cache/w-k90-containers-{target,tmp,lin.log,live-build.log,live-test.log}. cargo 82510 had exited.
+## 2026-11-21 ~00:25: a re-sent goal (kiln's reminder, not Ada) restarted the Windows leg; main stopped it (00:23). jupiter r17 stopped while cloning; its clone and target deleted; Studio-3 only read (no runs, no scratch). Owed items unchanged: agents/w-k90-containers-export 02f311ec3 + the Mac A/B, to the kiln engine rework. Closed.
