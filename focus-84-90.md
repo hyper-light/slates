@@ -1413,3 +1413,18 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-k90-a520 was interrupted before it ran the bind-vs-export A/B on the MacBook.
   - No other w-* agent holds an open goal except w-k90-pin-2's vendoring CI on every platform.
   RULING: w-k90-win frees kiln's CI lane. It cancels pre-fix run 44867288588 once w-k90-pin-2 confirms it needs nothing from it, then starts one run with the w2/w7 fix (f16212799). w-shared is told to land its exit-4 docs branch, 38 min old.
+- 2026-11-21 00:22 PST
+  - PERF GAP (goal 93): w-interop's hg table, best of 3, the Studio loaded, slates 907c246ac against hg serve, 57,035 changesets:
+    - push of the whole history: 136.4 s vs 22.6 s (6x slower)
+    - clone -U: 24.0 vs 16.4 s (1.5x)
+    - one-changeset push: about even
+    - one-changeset pull: 4.219 vs 0.230 s (18x)
+    - clone --stream: 48.1 vs 0.894 s (54x)
+    - svn is at about parity; git waits on w-git's push fix.
+  - ROUTED:
+    - w-perf (its list done) takes hg's serve side: phase-split the pull and stream clone, design with w-hg on the store-backed path, A/B against hg serve. It uses the kiln CLI from the MacBook, which reached the big Studio at 00:20.
+    - w-hg keeps the push with the unbundle spin.
+    - w-interop starts r7 (svn HTTP v2 rows), then splits svn's slower checkout and update by phase for w-svn.
+    - w-bugs starts the HTTP edge spin while its r5 queues.
+    - w-git declares disk for cold builds; r15's cold build is on the MacBook, which has 43 GB free.
+  - STOPPED: w-k90-containers' Windows container build on jupiter (task started 00:13 from the stale re-sent goal, kiln-work/w-k90-containers-win). Main ended its process tree by exact path: taskkill /T on bash 537332 after checking its command line; cargo 533828 and its rustc children gone; jupiter's idle cores went from 20 to 28 of 32. kiln refuses another agent's run id ("no run"). w-k90-containers' harness hasn't taken main's 00:23 stop yet.
