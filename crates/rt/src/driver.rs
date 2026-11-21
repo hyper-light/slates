@@ -503,7 +503,7 @@ mod tests {
     let kick = crate::registry::with_entry(registration.shard(), |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     let mut out = Vec::new();
-    let shortest = (0..SUB_MILLISECOND_WAITS)
+    let mut took: Vec<u64> = (0..SUB_MILLISECOND_WAITS)
       .map(|_| {
         let started = driver.now_ns();
         driver
@@ -511,12 +511,22 @@ mod tests {
           .unwrap();
         driver.now_ns() - started
       })
-      .min()
-      .unwrap_or(u64::MAX);
+      .collect();
+    took.sort_unstable();
+    let shortest = took.first().copied().unwrap_or(u64::MAX);
     assert!(
       shortest < MILLISECOND_NS,
       "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took at least {shortest} ns every time: it waited for a whole \
        millisecond",
+      driver.kind().name()
+    );
+    // A Windows wait in whole milliseconds may also end before its timeout, on its timer's tick (iocp.rs's `wait`), so a
+    // lucky shortest proves nothing there (windows-11-arm, diag run 44934773181: the shortest under a millisecond with
+    // every wait a millisecond's): half the waits must end before one.
+    let median = took.get(took.len() / 2).copied().unwrap_or(u64::MAX);
+    assert!(
+      !cfg!(windows) || median < MILLISECOND_NS,
+      "{}: a {SUB_MILLISECOND_WAIT_NS} ns timed wait took {median} ns at the median: it waited for whole milliseconds",
       driver.kind().name()
     );
     drop(driver);
