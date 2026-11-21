@@ -59927,3 +59927,25 @@ expected}`; `release_capture` lets a hold go), `crates/vfs/tests/held_head.rs`.
 - **Measured.** `cargo test -p slates-server --lib bench_a_whole_publications_longest_turn -- --ignored --nocapture`
   (311 inodes, 9 interleaved rounds): debug, Studio-4, the one-turn image and encoding 598 to 849 us against the held
   capture's longest turn 36 to 66 us and its first 6 to 10 us. The release rounds are recorded in BENCHMARKS.
+### §4.6 amended — A FUSE helper's exit, mount and unmount alike, is awaited by its exit watch, never polled a tick at a time (2026-11-20, w-shared for UI goal 93; main's sweep after A-697's release bench, family three of three)
+Applied in the same change to: §4.6 "Linux (own /dev/fuse driver)" establishment, GAPS (the sweep's line),
+`crates/bridge-fuse/src/mount.rs` (`PendingMount::helper_pid`, `abort_unwatched`, `PendingExit::helper_pid`,
+`MountError::ExitUnwatched`), `crates/server/src/fuse.rs` (`mount_without_blocking`, `reap`, `mount_errno`),
+`crates/server/tests/fuse_mount.rs`.
+- **What was there.** A mount's helper is awaited on its socket's readiness until it hands the device back, then until
+  it exits (`Awaiting::Exit`). That exit, and the unmount helper's (`reap`, `fusermount3 -u -z`), were polled a heartbeat
+  tick at a time (a tenth of a period), so an exit just after a look waited out the rest of the tick.
+- **Change.** Each helper's exit is awaited by an exit watch on its process (`slates_ipc::exit_watch::ExitWatch`: a
+  pidfd on Linux, readable when the process exits), taken once per helper, within the helper's bound (A-525). A watch
+  the kernel refuses (a descriptor limit) is a typed refusal, never a return to the tick. A mount is refused
+  `MountError::ExitUnwatched` with the kernel's code, its helper killed and reaped. An unmount helper is given up at
+  once, killed and reaped by its guard, and the unmount counted refused. One path, no poll.
+- **Counters.** `fuse.helper_exit.watched`, `fuse.helper_exit.unwatched`, `fuse.unmount_exit.watched`,
+  `fuse.unmount_exit.unwatched`.
+- **Tests** (Linux, kiln run on adacachy, 2026-11-20). `slates-server --test fuse_mount
+  a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount` now also holds every helper's exit watched,
+  mount and unmount (`watched` >= 1, `unwatched` none). Red with the mount's watch never taken: refused. `slates-bridge-fuse`
+  suites (macOS arm64, local).
+- **Found while testing, not fixed (GAPS):** `slates-bridge-fuse --test handshake
+  a_non_blocking_handshake_reports_what_the_blocking_one_does` failed 1 of 4 runs on a loaded Mac at its
+  `waits >= 1` (handshake.rs:252): the helper answered before the owner's first poll. It predates this change.
