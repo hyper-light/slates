@@ -343,3 +343,9 @@
   told in its inbox). Host clippy and literals clean on the merged tree. Windows anchor tests (r23) running on jupiter.
 - Windows A-789: anchor lib 26/26 (r23), handles_windows 9 + 10 ignored (r24) green; CLI extent tests refused for room
   twice (r25, r26), reported in run-requests.md. Stale r10/r13 stopped (not on jupiter).
+
+## 2026-11-21 round at 8b23c6fdd (landed 689b710b8, e62705815; main 3538c014e)
+- hg getbundle (AskedRows, checked divisions, Copy StoredPlace), git works test drop, merge SplitMix64 Format line;
+  then the server reds hg's had hidden: svn restore push_children, commits Before::Landed boxed, svn_commit tests
+  GreenTree + get(). Tests: hg getbundle 20, git works 9, merge byte_places 2, server svn_commit 30, commits 12.
+  Host, fmt, literals, structural, unsafe, the six cross targets clean. real_tools (r29) still queued for jupiter.

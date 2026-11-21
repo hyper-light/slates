@@ -295,3 +295,13 @@
   quanta over files is the machine's speed. The rule is a unit a file at least; the pace report counts units. Change:
   PushTurns counts units (status `push.build.units`), the test asserts units >= files. Red/green at 1 CPU, 2 CPUs and a
   loaded host, main against the branch: kiln r4 (Linux).
+- 2026-11-21 queued 5th (main, found by use; after the current four): daemon::tests::the_pairs_canonical_dialer_keeps_a_
+  peer_that_dialed_it_and_only_it failed once in a 4-thread run on the MacBook (w-git landing fa318e929; not w-git's
+  change, not yet rerun alone). Read: one audit_on_shard closure over shard state, no waits; suspects to test, a clock
+  read inside direct_contact_reason / keeps_direct_contact_with (a window a slow closure crosses), or the role rule over
+  per-boot host ids leaving no member outside the neighbourhood. Plan: reproduce at 1-2 CPUs (taskpolicy), loaded, and
+  in the parallel suite; capture the failing assertion; red first; if the pairing logic, GAPS with the failing order.
+  - 5th, read ahead while runs queue: `direct_contact` is a rule over shard state, no clock read, so timing is the
+    weaker suspect. Stronger: the test's members are `local ^ (n << 16)` from a per-boot random host id, and its first
+    assertion needs one of them outside the role rule at scatter 3, which placement over those ids may not give. To
+    count: run it a few hundred times alone and in the parallel suite, capture which assertion fails.

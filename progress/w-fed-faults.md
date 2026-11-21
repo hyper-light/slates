@@ -82,3 +82,8 @@ Rules: briefs/common.md (FAST LANDING LOOP, NO KILN, OWN TARGET DIR ~/.cache/w-f
   failing "submit refused Overloaded" to 2a498b90f (A-787 part 2); fixed in slates 6459374. Open findings are in GAPS:
   green_post_state's watchdog kill in the refining job, five hg daemon_edge tests, and A-796's unpublished wire tags.
   Close note: inbox/main-from-w-fed-faults-close.md. List done.
+- 2026-11-21: A-821 landed (slates 4b931fe): the refined submit's increment, verdict and encoding prepared by its
+  refinement job a bounded slice a turn; the step judges by position and commits. The submit's longest step went from
+  417.5 to 271.7-303.8 ms in debug and from 34.5 to 24.6 ms in release; the bound is 100 ms. Slices: 34-36k debug,
+  1.5k release; all three parts taken. Still in the step: the commit's re-anchor (A-818 2b) and the chain's append.
+  Goal open until steps_past_ceiling reads 0 in debug.

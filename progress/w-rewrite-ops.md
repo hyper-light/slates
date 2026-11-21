@@ -1,5 +1,18 @@
 # w-rewrite-ops progress (D-O17: a whole-file rewrite becomes the precise edit it was)
 
+## ~12:30 PST — A-818 piece 2a LANDED (bb6a738df, main 945c9ad42); main's 10:35 ruling: option (ii)
+- `crates/merge/src/byte_places.rs`: byte identities given once; a treap of the latest order (rank = offset in the
+  newest block); removed ranges stored once and retired when the floor passes their change; bytes charged and bounded.
+  Main's oracle `history::tests::every_identity_version_reads_as_the_reanchored_history` passes, and mutations fail it.
+- RISK (GAPS): an old read is O(fragments x depth), while today's re-anchor compacts at write time. Main's A/B decides
+  it; the run is queued in run-requests.md (per CLAUDE.md §8, not timed here).
+- w-git's places for UpdateDeferred (A-821) read: nothing breaks the pattern. Theirs to note and mine to fix: a green
+  replayed without origin shares meets ContentOnMissing when its owed push is built (A-812 (a), the restart test).
+  Queued after A-818 unless main orders otherwise.
+- Ops notes: kiln restarted mid-turn. This Mac's LAN address is now 192.168.1.82 (was .88). Main is the kiln agent
+  "Slates" (01a14885...), reached with kiln agents_send; slates-74 is a different session.
+- NEXT: 2b, the engine switch (re-anchor walk deleted, no mode switch).
+
 ## ~11:05 PST — main 09:40: A-803 (c) = A-818; piece 1 LANDED (015d1733c, main cf3389d3d)
 - `crates/merge/src/piece_tree.rs`: a persistent piece tree, with each version a join-based AVL tree of runs over an
   arena with holder counts, and path copying. `rebuild` makes a change's version from the engine's `segments`, at

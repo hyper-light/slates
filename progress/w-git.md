@@ -419,3 +419,26 @@
   * step: made_commit::commit(state, pending, |state| sealed.record (v5) -> check -> super::commit(store) -> mutate).
   * abandon before the step: drop the kept head (paths) so a retry builds again; release homed; sealed.abandon.
   Later sub-pieces: the kill test; removing record_of/v2 and after_submit/staged/owed; t_a614a wall-time bound.
+- 2026-11-21 ~13:30 PST: (1) P2's daemon-test regressions FIXED and LANDED alone (main's order): fa318e929. A git
+  green made through the door derives its map (paths::derive_once_made); t_a727 windows test asserts both halves
+  (records' windows back from the image; main's map back, same version and tree, after first read); A-727 a3b submits
+  its file; new t_p2_a_pushed_creates_object_is_had_by_its_identity_on_first_read_across_a_warm_restart.
+  (2) C5 2b piece 3 part 1 LANDED: 8b23c6fdd, A-822. Recorded git submits take the made_commit hook (Tool::Git):
+  map over the held preview (offset: preview v0 = green head), commit sealed as a pack, homed + landed, v5 record in
+  the one step. Red t_c5b_p3 green; t_a664 parked test now a clone oracle; t_a614a wall-time bound folded in.
+  Focused: daemon::tests verbs merge_service vcs_store made_commit git_push repository green_ready vcs_* identities
+  544/544. Flake seen once: daemon::tests::the_pairs_canonical_dialer_keeps_a_peer_that_dialed_it_and_only_it.
+  NEXT (piece 3 part 2): the kill test between landing and step; remove record_of/v2 with after_submit's owed path,
+  non-recorded submits, push_through; then the change step over the preview sliced. r61 (git/git push) is main's.
+- ~14:30 PST: part 2a (kill test) LANDED 946b60b2d (note: pushed after a merge that touched commits.rs before
+  rerunning; reran after: 276/276 on that main). Part 2b/2c WIP on agents/w-git-p2-part2 (not compiling yet):
+  * commits.rs: make/make_owed enqueue MadeJob on VcsStores.made_after (bounded by client seats; landing turn
+    take_now at enqueue else awaited by driver); drive_made_after -> made_after: sealed_of -> home_and_land (shared
+    sync steps first_ask/next_ask, async via git_push::carry, blocking via git_push::tests::carried_blocking) ->
+    recorded_after (own txn, v5). Test drain: commits::made_after_now (called in paths::tests::version_saying).
+  * vcs_store.rs: SealedPush::record v2 arm -> Err(Unlanded); record_of removed; record.rs finish/finish_as/
+    whole_pack removed. vcs_store tests: appended/push_unsettled land via home_and_land_blocking.
+  * LEFT: vcs_store/tests.rs Live oracle (commit_part uses record_of -> must write v5: names_to_content + pack by
+    identity + finish_packed), hostile-record tests (move to v5 bytes), assert_a_head_nobody_sent (finish -> v5);
+    then reader drops v1/v2 (record.rs decode; Record.objects/pack fields; replay_objects inline branch; git_replay
+    pack_at; stepped()); then compile, focused tests, docs (A-822 + GAPS), land. Then the sliced change step.
