@@ -97,3 +97,20 @@
   by place. It's a multi-landing piece; I'll report each part.
 - The older messages that surfaced on my restart (10:00 restart crash loop, A-713 fetch streaming): the crash loop was
   addressed by this morning's replay in turns. A-713 is queued after v4 unless you say otherwise.
+
+## 2026-11-20 ~17:35 — v4 part B landed: rows by pack place, the store 22x smaller (w-git)
+- **LANDED 92f7a756b.** A landed object is a place in its push's pack, held once as content.
+  - Staging puts the pack in the store a window a unit; the rows carry an offset.
+  - Every reader goes through one `Repository::read_stored` (packed::read); the hook view's reads now take the
+    repository.
+  - The server's own commits are written as a pack of whole objects first, so every record is its push's pack and
+    every replay makes the live store.
+- **v1.5.0** (release): content after landing **309.0 MiB → 14.1 MiB**, content peak 310.3 → 15.4 MiB, process
+  peak RSS 781.8 → 356.6 MiB, replay 1,468 turns with content ≤ 14.1 MiB.
+- Reversed by this change, since nothing is put inflated any more: 47dc24b72's resolution-order puts and
+  ccd07b58c's turned give-back.
+- **Tests:** slates-git 582 passed; slates-server --lib 1,032 passed.
+  - Three daemon-edge tests time out at the Studio's current load (45-51 on 32 cores).
+  - main f47668e74's own build fails the same three at the same load.
+  - **Please rerun them on a quiet machine.**
+- **Next, part A:** record v4 naming the stored pack by identity (homed with the names), the append O(moves).
