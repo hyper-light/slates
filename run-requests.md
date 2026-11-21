@@ -6922,3 +6922,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Linux x86_64 and arm64 measurement: `PROVISION_BENCH_LOAD=2` provision_bench on a many-core Linux box (the 2026-10-20
   x86 host if it exists): the `tail:` lines name daemon vs client part; Linux's epoll_wait(0) does not nap, so its
   1.6 ms is another hop -- report the tail split per run.
+
+## 2026-11-21T01:00Z w-realtools main 7f53665a1 (C2-C4: real tools across a snapshot, a takeover and memory pressure)
+- Linux x86_64 and arm64 (FUSE): `SLATES_TEST_CLI=1 cargo test --locked -p slates-cli --test real_tools -- --test-threads=1 --nocapture` (needs fusermount3, cc, make, cargo, git, mkfifo; mount under $HOME on Ubuntu 26.04's AppArmor). Red: the #pragma once compile failing ("redefinition of 'struct once'"), an untouched file's inode number or times moving, make -q out of date, cargo printing "Compiling", or git status non-empty after a snapshot, the SIGKILL takeover or the injected pressure. Also run once with the base on tmpfs (no birth time on older kernels): A-781's case.
+- Windows x86_64 (WinFsp): the flows are unix-only (FIFO gate, make); the WinFsp port is owed (GAPS): the same identity comparison (file index, LastWriteTime, ChangeTime) plus cargo and git status across a snapshot and a daemon kill. Who: w-realtools.
