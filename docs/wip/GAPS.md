@@ -521,10 +521,17 @@
 >   replacements now.
 > - (b) OPEN, measured: a path alternating overwrites and inserts re-anchors in full at each insert. That is A-793's
 >   cost, unchanged by A-809: 0.53, 3.6 and 17.5 ms a change at history 100, 1,000 and 5,000 (101, 551 and 2,551
->   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. Its design
->   is with main.
-> - Observed, not chased: overwrites and replacements that walk one value still take 2.6 to 9–10 µs a change over
->   history 100 to 5,000. The growth is sublinear and comes from elsewhere in the submit.
+>   values). The fix is layers that carry an offset shift, so an insert or a delete moves no earlier value. It is
+>   queued (main, 04:36): w-rewrite-ops' next piece after stage C, red on the values walked per insert.
+> - OPEN, measured, queued after (b) (main, 04:36): a change that walks one value still grows with its path's history.
+>   Over history 100, 1,000 and 5,000 the cost a change was:
+>
+>   | change | history 100 | history 1,000 | history 5,000 |
+>   |---|---|---|---|
+>   | overwrites | 2,568 ns | 3,607 ns | 9,034 ns |
+>   | SDK replacements | 3,087 ns | 4,270 ns | 10,398 ns |
+>
+>   The growth is sublinear, and the re-anchor is not it: one value is walked. Not yet attributed.
 >
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
