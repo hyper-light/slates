@@ -324,3 +324,7 @@
   post-verdict view (main's routing), w-git builds git's made commits on the same hook. Worktree ~/slates-work/w-svn-c2
   at main 9d792682f, clean. Patches kept: ~/.cache/w-svn-b2a-wait.patch (B2 wait path), ~/.cache/w-svn-fold-attempt.patch
   (rejected fold).
+- 2026-11-21 ~02:10 PST: B2 (a) on main: drives (35786a9dd/b934f9e5b), ra_svn get-file (9061acd6c), DAV GET
+  (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
+  window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
+  and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.
