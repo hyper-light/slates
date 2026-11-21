@@ -57575,6 +57575,15 @@ live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
   read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
   first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
   holds nothing: the overwrite freed the pinned chunk at once).
+- **Deltas too (2026-11-20, main's piece 3).** A delta's content is read in turns the same way: the capture is a span
+  list, each run of [`content_runs`] in its order (a named chunk extent's, the named open extent's, a patched file's
+  clipped to the bytes its writes changed), and `Volume::pin_extents` pins only the extents the record names (a delta's
+  inode image names those within the windows its writes touched). A turn reads a page at least before it reads the
+  quantum's clock, so a publication smaller than a page is made in its own turn whatever its spans. Tests:
+  `live_ship::tests::a_deltas_capture_read_in_turns_reads_the_head_it_began_on` (the oracle against the one-turn read,
+  both files rewritten between turns: 262,144 sealed bytes in 5 turns at a zero quantum) and
+  `a_live_volumes_large_delta_is_read_in_turns` (red with the one-turn delta path: no capture waiting; after: the delta's
+  capture waits as the build and takes 21 turns, nothing refused, no pin left). Still one turn: the whole state's image.
 
 ### A-769 — The export route's judge: whether a container engine mounts a volume's NFS export as a volume of its own, and from where, asked on every host (2026-11-20, w-k90-a520; main's ruling on kiln's export route, Ada's ruling ~09:30 PST; §4.6 A-9, A-520, A-521, A-115, A-184; `CONTRACT` = 57)
 Applied in the same change to: §4.6 (A-520's form through the library: a status line), GAPS (the library's container
