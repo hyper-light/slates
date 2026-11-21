@@ -855,7 +855,7 @@ mod tests {
         state,
         asked,
         request,
-        &slates_ipc::protocol::RequestBody::DaemonStatus,
+        &slates_ipc::protocol::RequestBody::DaemonStatus { memory: false },
       );
       let Some(crate::verbs::Served::Reply(report)) = served else {
         panic!("a one-shard daemon answers its status at once");

@@ -8552,9 +8552,10 @@
 > its own length, and the runtime harvests its driver between idle slices (median 1,217-1,939 against 2,614-3,096 µs,
 > p999 2.2-3.7 against 4.9-9.7 ms at load 11-15). **Open, blocking 85a:** a plain status request still arms a sweep of
 > tens of GiB of address space on every shard, which costs each daemon about a core for a second or more after a status
-> burst and delays the next message up to half a step quantum per idle slice. Proposed (main's decision): arm the
-> background sweep only for a request that asks for the memory report, and read the content object whole from the
-> kernel's per-mapping figures rather than a page walk. Linux not measured: adacachy's runs froze at load 80-89.
+> burst and delays the next message up to half a step quantum per idle slice. Ruled by main (2026-11-20) and built:
+> only a status that asks for the memory report arms the sweep, and the anchor's objects whole come from the kernel's
+> per-mapping figures (§4.14 status "residency only when asked"). Linux not measured: adacachy's runs froze at load
+> 80-89.
 
 > **Replication latency (raft, 2026-11-04): a commit returns at its quorum; live shipping in the daemon: writes durable on a candidate before their reply, takeover serves them.** Every quorum
 > collector in `slates-cluster` slept its whole poll after its quorum had answered, so a cross-node record commit cost

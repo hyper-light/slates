@@ -1424,6 +1424,19 @@ pressure, fragmentation, restart and open/close behavior, not assertions on quot
 > however often status is asked and a report reads figures at most two sweeps old. Counted
 > `content_range.sweep.idle_slices` and `.spaced`; held by
 > `content_ranges::tests::a_status_requests_sweep_runs_on_the_shards_idle_time_and_is_spaced_by_its_length`.
+>
+> **Status (2026-11-20, main's ruling on g228's finding: residency only when asked, and no page walk for an object
+> whole).** A plain `DaemonStatus` does no residency work: the request carries `memory`, and only one that asks
+> (`slates status --memory`, `Client::daemon_memory_status`) advances the A-744 sweep, arms it on idle time and reads
+> the anchor's objects whole; a plain status reports the last figures read. The segment and the content object whole
+> come from the kernel's per-mapping figures (`slates_mem::resident::of_mapping`): macOS `mach_vm_region`'s top
+> information, each VM object's resident pages counted once (no written bytes reported there), Linux `/proc/self/smaps`
+> (`Rss` and the dirty pages); Windows, which has no per-mapping form, keeps the bounded walk only the asking request
+> pays. Measured on a Mac Studio (32 GiB shared mapping, 2 GiB written): 0.11 ms against `mincore`'s 30.0-31.7 ms,
+> agreeing to the page (BENCHMARKS). Counted `content_range.sweep.armed` and `.steps`; held by
+> `a_burst_of_plain_statuses_arms_no_residency_sweep_and_a_memory_status_does` (`crates/server/tests/daemon.rs`; red
+> with every status doing the work: 50 plain statuses armed one sweep a shard and took 398 and 177 steps) and
+> `resident::tests::a_mapping_read_whole_agrees_with_its_page_walk`.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 

@@ -2649,7 +2649,7 @@ mod tests {
           host: slates_db::HostId(0),
           uid: 1234,
         },
-        body: slates_ipc::protocol::RequestBody::DaemonStatus,
+        body: slates_ipc::protocol::RequestBody::DaemonStatus { memory: false },
       },
       fetched: None,
       verdict: None,

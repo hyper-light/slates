@@ -203,7 +203,11 @@ pub(crate) enum Verb {
   /// List.
   List,
   /// The daemon's status (`status` with no volume).
-  DaemonStatus,
+  DaemonStatus {
+    /// `--memory`: the memory report's residency read now, which only such a request costs the daemon (A-744; main's
+    /// ruling on g228's finding).
+    memory: bool,
+  },
   /// Explicitly create a consensus group bound to the daemon's current identity (§4.8, AUD-07).
   Bootstrap {
     /// Also create the root group, exactly once for a new fleet.
@@ -886,6 +890,7 @@ const SWITCHES: &[&str] = &[
   "--write",
   "--admin",
   "--drift",
+  "--memory",
   "--mirror",
   "--session",
   "--require-evidence",
@@ -2322,8 +2327,16 @@ fn parse_on(arguments: &[String], hand_off: HandOffKind) -> Result<Command, Pars
       ))
     }
     ["status"] => {
-      taken.only(&NONE)?;
-      Ok(client(&taken, Verb::DaemonStatus))
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--memory"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::DaemonStatus {
+          memory: taken.switch("--memory"),
+        },
+      ))
     }
     ["bootstrap", "root"] => {
       taken.only(&NONE)?;
@@ -3952,7 +3965,15 @@ mod tests {
       Ok(Command::Client(ClientRequest {
         instance: "run".into(),
         json: false,
-        verb: Verb::DaemonStatus,
+        verb: Verb::DaemonStatus { memory: false },
+      }))
+    );
+    assert_eq!(
+      parse(&args("--instance run status --memory")),
+      Ok(Command::Client(ClientRequest {
+        instance: "run".into(),
+        json: false,
+        verb: Verb::DaemonStatus { memory: true },
       }))
     );
   }

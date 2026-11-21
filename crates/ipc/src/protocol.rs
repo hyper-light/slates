@@ -524,7 +524,13 @@ pub enum RequestBody {
   },
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
-  DaemonStatus,
+  DaemonStatus {
+    /// Whether the memory report's residency is wanted: the anchor's objects whole from the kernel's per-mapping
+    /// figures, and the A-744 sweep of each shard's ranges advanced and armed to completion on idle time. A plain status
+    /// does no residency work at all (main's ruling on g228's finding, 2026-11-20): every plain request armed a sweep of
+    /// tens of GiB of address space on every shard.
+    memory: bool,
+  },
   /// Promote a lost region's declared mirror (§4.8, D-14 — region-loss promotion at operator cadence): the
   /// operator, having judged the region truly lost, proposes `PromoteRegion` on the root group so the lost
   /// region's volumes re-home to the mirror. Issued on the root leader; a follower refuses `NotRootLeader`,
@@ -2478,7 +2484,7 @@ impl RequestBody {
       | RequestBody::Detach { .. }
       | RequestBody::BindMount { .. }
       | RequestBody::List { .. }
-      | RequestBody::DaemonStatus
+      | RequestBody::DaemonStatus { .. }
       | RequestBody::DaemonStatusNext { .. }
       | RequestBody::Bootstrap { .. }
       | RequestBody::RecoveryPlan { .. }

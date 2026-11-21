@@ -42,9 +42,10 @@ pub fn page_capacity(region: &ClientRegion) -> usize {
 /// `capacity`; there is no retry loop or second transport. A daemon refusal stays typed.
 pub fn collect<E: From<IpcError>>(
   capacity: usize,
+  memory: bool,
   mut exchange: impl FnMut(&RequestBody) -> Result<ReplyBody, E>,
 ) -> Result<ReplyBody, E> {
-  let mut request = RequestBody::DaemonStatus;
+  let mut request = RequestBody::DaemonStatus { memory };
   let mut identity = None;
   let mut payload = Vec::new();
   loop {
