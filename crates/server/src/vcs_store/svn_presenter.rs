@@ -24,6 +24,15 @@
 //! budget of node-revisions a call, writes their files, and then rewrites `db/current`, so a reader never sees a
 //! youngest revision whose file is missing. [`Presented::revision_properties_changed`] rewrites one revision's
 //! properties file after a revision property change.
+//!
+//! **A hook's first view.** A hook's `REPOS-PATH` waits for the view to be laid out and its properties refreshed, work
+//! that grows with the repository. So the hook's shard drives it as turns on the owner shard ([`view_turn`]), each at
+//! most the owner's step quantum and each answering how far the view got, and judges the wait on that progress: a turn
+//! that answers has moved the view on; a turn the owner does not answer within the liveness window of its own time, or
+//! one that answers having moved nothing, refuses the hook typed. No bound is set on the whole, whose length is the
+//! repository's. Until 2026-11-21 the whole first view had one liveness budget of the owner's time, so every repository
+//! past what a second lays out refused its hooks (w-interop's svn matrix, git/git's newest 2,000 revisions: "its owner
+//! shard did not answer in time").
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -596,51 +605,91 @@ pub(crate) async fn repos_for_hook(
   let Some((origin, owner)) = place else {
     return Err(format!("{UNSHOWN_WORDS}: its owner shard did not answer"));
   };
+  let mut last = None;
+  let mut refreshed_from = 0;
+  loop {
+    let turn = crate::xshard::task_in_shard_time(
+      origin,
+      owner,
+      move || async move {
+        crate::state::with_state(|state| view_turn(state, id, refreshed_from))
+          .unwrap_or_else(|| Err("no shard".to_owned()))
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+    .unwrap_or_else(|| Err("its owner shard did not answer a turn of its view in time".to_owned()))
+    .map_err(|why| format!("{UNSHOWN_WORDS}: {why}"))?;
+    match turn {
+      ViewTurn::Shown => break,
+      ViewTurn::Refreshing(next) => refreshed_from = next,
+      ViewTurn::Laying(_) => {}
+    }
+    if last == Some(turn) {
+      return Err(format!(
+        "{UNSHOWN_WORDS}: a turn of its view moved nothing ({turn:?})"
+      ));
+    }
+    last = Some(turn);
+  }
+  let name_for_mount = name;
   crate::xshard::task_in_shard_time(
     origin,
     owner,
-    move || shown_at(root, id, name),
+    move || async move { mounted(root, id, &name_for_mount).await },
     crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await
   .unwrap_or_else(|| {
     Err(format!(
-      "{UNSHOWN_WORDS}: its owner shard did not answer in time"
+      "{UNSHOWN_WORDS}: its owner shard did not answer its view's mount in time"
     ))
   })
   .map(|path| path.to_string_lossy().into_owned())
 }
 
-/// The repository's view, presented on this shard (its owner) a revision a turn and mounted in the store's granted
-/// directory `root`: where it is mounted (module docs).
-async fn shown_at(
-  root: &'static slates_land::store_root::StoreRoot,
+/// How far one turn of a hook's view ([`view_turn`]) took it: what the hook's shard judges its wait by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewTurn {
+  /// Laying the view out: this many revisions shown (`Presented::written`), more to show.
+  Laying(Revision),
+  /// Every revision shown; their properties files refreshed up to this revision, more to refresh.
+  Refreshing(Revision),
+  /// Shown and refreshed whole: ready to mount.
+  Shown,
+}
+
+/// One turn of a hook's view, on its owner shard: the view's volume made where there is none, then its next revisions
+/// laid out and written, then its properties files refreshed from `refreshed_from` on, a revision a slice, until the
+/// shard's step quantum is spent (`futures::step_budget_ns`, what any sliced work here runs to) or the view is whole. A
+/// turn always takes one slice, so every answer but a refusal moves the view on.
+fn view_turn(
+  state: &mut crate::state::ShardState,
   id: slates_db::catalog::RepositoryId,
-  name: String,
-) -> Result<std::path::PathBuf, String> {
-  let unshown = |why: String| format!("{UNSHOWN_WORDS}: {why}");
-  let on_shard = |why: &str| format!("{UNSHOWN_WORDS}: {why}");
-  crate::state::with_state(|state| slot_for(state, id))
-    .ok_or_else(|| on_shard("no shard"))?
-    .map_err(unshown)?;
-  loop {
-    let laid = crate::state::with_state(|state| present_slice(state, id))
-      .ok_or_else(|| on_shard("no shard"))?
-      .map_err(unshown)?;
-    if laid == Advance::Done {
-      break;
+  refreshed_from: Revision,
+) -> Result<ViewTurn, String> {
+  slot_for(state, id)?;
+  let quantum = slates_rt::futures::step_budget_ns().unwrap_or(state.config.runtime.step_budget_ns);
+  let began = slates_rt::futures::now_ns();
+  let spent = || slates_rt::futures::now_ns().saturating_sub(began) >= quantum;
+  while present_slice(state, id)? == Advance::More {
+    if spent() {
+      let written = state
+        .svn_views
+        .get(&id)
+        .map(|slot| slot.presented.written())
+        .ok_or("the view is gone")?;
+      return Ok(ViewTurn::Laying(written));
     }
-    slates_rt::futures::yield_now().await;
   }
-  let mut revision = 0;
-  while let Some(next) = crate::state::with_state(|state| refresh_slice(state, id, revision))
-    .ok_or_else(|| on_shard("no shard"))?
-    .map_err(unshown)?
-  {
+  let mut revision = refreshed_from;
+  while let Some(next) = refresh_slice(state, id, revision)? {
     revision = next;
-    slates_rt::futures::yield_now().await;
+    if spent() {
+      return Ok(ViewTurn::Refreshing(revision));
+    }
   }
-  mounted(root, id, &name).await
+  Ok(ViewTurn::Shown)
 }
 
 /// Makes the repository's view volume where this shard has none: a scratch volume owned by the repository's owner,
