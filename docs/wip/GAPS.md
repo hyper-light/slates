@@ -152,7 +152,19 @@
 > daemon held 6,193 MiB: arenas 5,166 MiB (the stored content, w-hg's holdings; to w-store's disk store under
 > STORAGE), segment 229, content object 2, the rest ~796 (~90 of it an idle daemon's). **Found:** `slates status`'s
 > heap row counts allocated, not resident, bytes: ~920-960 MiB on an idle daemon whose RSS is 35-87 MiB (1, 4 and 23
-> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
+> shards), about 900 MB allocated and never touched, constant across shard counts (not yet traced). > **The status memory report's residency FIXED (g226, 2026-11-21, w-sizing's option (a)):** on macOS a memory status
+> read the arenas 0 MiB after a 256 MiB burst, so R3's split came back empty: the sweep walked every range of each
+> shard's slice whole (4 GiB arena region, ~28 GiB of content object and segment a shard on the test daemon) and the
+> arenas' figure waited for it to complete. Now the sweep walks only what can hold pages (the arena's held runs, the
+> written ranges of the write log, image slots and delta log, the rings), the memory report's kinds first: measured on
+> the second look, 75-89 ms, 256 of 256 MiB (`a_memory_status_right_after_a_burst_reports_the_burst_resident_in_the_arenas`).
+> Steps are timed by a nanosecond step clock: on the shard's microsecond clock steps ran up to 15.5 ms against a ~1.6 us
+> budget unseen. **Open:** a fresh daemon's write log and journal cannot know their memories unwritten until their first
+> give-back, so the split (A-744's per-range rows) walks ~28 GiB a shard whole, 13.9 s on a debug audit daemon; the
+> anchor could tell its first daemon the content object is new. Also open: the runtime's look for work between two idle
+> slices (~17 us against ~1.6 us of sweep in each) sets the honest sweep's rate, about 280 K pages a second. Landed on
+> macOS green under the goal-93 focus rule; the Linux run (kiln r8, adacachy) was in flight at landing and is recorded
+> in BENCHMARKS when it ends; Windows' run is with w-lint (run-requests, 2026-11-21T01:10Z). > **A-778 FIXED (found by use):** a `SIGKILL`ed anchor's segment and content object stayed in the kernel on macOS
 > (21 GB held on the big Studio by four with no process alive); its daemon now removes their names as it leaves
 > (`docs/bugs/2026-11-20-a-killed-anchor-left-its-segment-and-content-in-the-kernel.md`). Open: a daemon killed with its
 > anchor still leaves them; harnesses should stop anchors with `SIGTERM`. **Open, by size:**
@@ -205,6 +217,17 @@
 > to hold it); (b) the shared Mac loaded, where main is
 > still slower than before W1 (accept p50 148–398 against 95–110 µs, p99 9.9–20.2 against 7.8–10.3 ms): the submit's
 > ask to the green's owner; (c) the goal's 1 ms loaded p99, met by no arm on either platform.
+>
+> **Goal 93 correctness, crash consistency (2026-11-21, raft-chaos; main's piece of 10:43).** BUILT, NOT YET RUN AS
+> SWEEPS: `crates/cli/tests/vcs_crash.rs` kills the daemon (`kill -9`) at points spread through a stock client's push
+> and clone of git and hg over the HTTP edge, and its commit and checkout of svn over `svn://`, each at `k·T/(N+1)` of
+> a measured reference run (`SLATES_CRASH_POINTS`, default 12), on a fresh repository per point. After the anchor's
+> restart it holds the repository to before or after, integrity to `git fsck --strict`, `hg verify` or `svnadmin verify`
+> of an `svnrdump` load, a success the client saw to be kept, the client to end within its bound, and a retry to
+> succeed. One focused case ran (this Mac, load 67-75, git push at 2 points, debug): both points before-or-after and
+> fsck clean, both retries after; the client killed 8.6 s into a 25.8 s push failed in git's own words after 102 s.
+> Owed: the sweeps at N=12 on each platform with each client (main's run request), each failure a red test to its
+> server's owner.
 >
 > **Goal 93 perf, hg serve (2026-11-21, w-perf; main's order 00:22 and ruling 01:05).** Found by a profile of a
 > one-changeset pull of Mercurial's history (24.95 s) and a stream clone (288 s): (1) every lookup in a
