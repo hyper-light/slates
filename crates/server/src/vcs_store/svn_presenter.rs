@@ -526,6 +526,7 @@ impl ViewSource<'_> {
       green: self.engine.as_deref(),
       store: self.store,
       records: self.records,
+      pieces: None,
     }
   }
 }
@@ -768,6 +769,7 @@ fn present_slice(
         green: engine.as_deref(),
         store: vcs_stores.content(),
         records,
+        pieces: None,
       };
       let source = slates_svn::migration::WithTexts {
         records,
@@ -827,6 +829,7 @@ fn refresh_slice(
     green: engine.as_deref(),
     store: None,
     records,
+    pieces: None,
   };
   let source = slates_svn::migration::WithTexts {
     records,

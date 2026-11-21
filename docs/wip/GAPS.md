@@ -2570,8 +2570,16 @@
 > store holds every text the history names; the commit no longer waits for the shard's image to keep its texts (A-727
 > slice b's barrier, gone for Subversion), and a recovery reads a stored text the image lacks back from the store
 > (`vcs_store::fetch_stored_texts`, counted `svn_text_fetched`). Held by the arbiter's sections and the barrier test
-> (`a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`: the text fetched once). Owed: stage B
-> part 2, the texts read async through the owner (HeadTexts; R6) so the content store need not hold them all; stage C,
+> (`a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`: the text fetched once). Stage B part 2
+> (a), the wait path, BUILT for the report/update and replay drives: a drive that meets a stored text's piece RAM does
+> not hold waits for it (`Next::Waiting`, `Stepped::Waiting`, `Turn::Waiting`, `ReportProgress::Waiting`; a view says
+> such a piece is `fetchable`), its frame and window kept, and the svn://, `svnserve -t` and DAV loops read the piece
+> through the store's owner (`svn_texts::fetch_piece`, a piece cache held by the waiting readers alone) and step it
+> again. Held by `a_drive_that_waits_for_its_texts_pieces_makes_the_same_calls` (slates-svn: the same calls as the
+> drive over a repository holding every text) and `a_checkout_reads_a_text_ram_does_not_hold_through_the_store` (a
+> checkout over the daemon's tunnel of a text neither the green nor the content store holds). Owed in (a): get-file
+> and DAV GET (`reads::file`), file-revs, the exporter, the deltify job; then (b), the records keep history on the
+> store. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
