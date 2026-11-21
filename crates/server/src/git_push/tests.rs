@@ -2181,6 +2181,10 @@ fn t_a767_c5b_a_push_whose_homing_no_edge_takes_is_refused() {
         .copied(),
       Some(1)
     );
-    assert_eq!(records(state, repository), 0, "nothing of the push in the register");
+    assert_eq!(
+      records(state, repository),
+      0,
+      "nothing of the push in the register"
+    );
   });
 }

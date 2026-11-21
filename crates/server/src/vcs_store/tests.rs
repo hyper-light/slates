@@ -2298,7 +2298,12 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
       .map(|at| u8::try_from(at % 251).unwrap_or(u8::MAX))
       .collect();
     let (objects, head) = commit_of(&[(b"large".to_vec(), blob.clone())], &[], FIRST_DATE);
-    push_through(state, (repository, green), &objects, (None, head, tree_of(&objects)));
+    push_through(
+      state,
+      (repository, green),
+      &objects,
+      (None, head, tree_of(&objects)),
+    );
     let identity = ContentId::of(&blob);
     // The root a record before the rule named the file by: the one this store would cut its bytes into (the file is
     // held where it lies in its push's pack now, A-722's record v4, so the store keeps no root of it).

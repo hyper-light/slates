@@ -161,7 +161,10 @@ async fn drive(id: slates_db::catalog::RepositoryId, request: Vec<u8>) -> Driven
       Some(Some(ok)) => break ok,
       Some(None) => {
         slates_rt::futures::yield_now().await;
-        if crate::git_push::tests::carry_awaited(&mut push).await.is_err() {
+        if crate::git_push::tests::carry_awaited(&mut push)
+          .await
+          .is_err()
+        {
           break false;
         }
       }
