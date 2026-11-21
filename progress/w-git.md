@@ -442,3 +442,10 @@
     identity + finish_packed), hostile-record tests (move to v5 bytes), assert_a_head_nobody_sent (finish -> v5);
     then reader drops v1/v2 (record.rs decode; Record.objects/pack fields; replay_objects inline branch; git_replay
     pack_at; stepped()); then compile, focused tests, docs (A-822 + GAPS), land. Then the sliced change step.
+- 2026-11-21 evening: renumbered A-823 (P2 git half) / A-824 (piece 3) by main's ledger, LANDED 010fd1fd3. Part 2
+  LANDED 1a35ab091 (A-824): MadeAfter queue for committed versions' commits; v2 writer gone; v1/v2 refused
+  RecordRefused::Retired at replay (red t_a824_…); oracle on v5; queue turns forgotten on state drop (abort fix);
+  record holds kept through free (release_record_holds test-only until a destroy verb). Focused 557/557 + git 50/50.
+  Main is now kiln agent 01a1ff311fc972a8a0f720e354891538 (agents_send). NEXT (main's order): (1) refs to blobs and tag
+  objects refused (junio-gpg-pub, v1.0rc1..rc6), red first; (2) whole-clone "possible repository corruption"; (3) push
+  50-52 s vs 9.6-10.2 s, shallow clone 3.82 vs 0.90 s, A/B all rounds. Then the sliced change step (A-824 owed).
