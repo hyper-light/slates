@@ -17,7 +17,7 @@ the rebase asks means fewer rebase rounds, which is either a protocol change or 
 
 ## Options (I'd take 1)
 1. **Resolve through A-796's ResolveMerge.** The harness takes the head on a conflict's windows by retiring its own
-   conflicting ops () and re-writing its slots () in one ask. That converges without the read and
+   conflicting ops (`discard`) and re-writing its slots (`replacement`) in one ask. That converges without the read and
    re-rebase race, though a stale stamp can still repeat it. The server is unchanged; the harness's client models the
    documented resolution path, and the oracle's "accepted / identical / conflict" rule is unchanged.
 2. **A conflicting rebase carries the head's window bytes and the version it judged at.** The client writes them and
