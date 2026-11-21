@@ -1394,3 +1394,12 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - g226 unfrozen after 5 h: the status memory report reading 0 MiB for a 256 MiB burst is a defect in R3's split, not new work; option (a), test first.
   - w-reaper: its fix is on main (a51023f57); stop retrying and close.
 - 2026-11-21 00:05 PST MEMORY: the big Studio was swapping 96 GB on 96 GiB of RAM (180-250 MB free). Main sent TERM to w-fed-move's 100,000-client load run (~30 GB, started 22:49; a load run is main's under §8) and to w-k90-containers' release kiln build for the comparison test (23 GB; out of scope since Ada's 21:00 ruling, and its Windows container port is not to land). 28 GB unused after. w-git's C5 run r5 sat at 0% CPU for 70 min, beside an orphan of the run kiln lost. w-git is told to sample it, kill it, merge main (A-798) and rerun with timeout_s and mem needs. common.md gains SHARED MACHINES' MEMORY.
+- 2026-11-21 00:16 PST LANDED (verified on main):
+  - c079819bb (A-797, goal 86b): the green's owner answers a batch of work asks within its step budget and hands the rest back; a 100k run showed no spinning shard or watchdog kill in 3,110 s.
+  - e69375553 (w-svn C2 stage B part 1): a commit's texts land in its changeset in one sliced landing.
+  - e1f246ca8 (g228): each timed live hop publishes per-write p50/p99/p999/max.
+  - f9ddaf1d4 (w-lint): r10's mechanical Windows clippy reds.
+  RULINGS:
+  - g222: land B (park at once) now. It holds R9 at 31.6-37.7 us and takes Linux arm64's loaded p99 from 2.1-3.2 ms to 0.36-0.43 ms; its quiet p50 cost of +10-30 us is recorded. Then C wins that back or goes in as measured-and-rejected. Next, Linux x86_64's one-shard derivation on 4 cores (A/B the shard count), macOS split by hop, then p999.
+  - w-shared's lane plan approved, with step 4 (content by identity) before step 3 (slicing), so the copies step 4 deletes are never sliced.
+  w-engine: deaf a third time, its harness alive but idle and not taking in mail. Main ended that idle harness (pid 14495, checked against its session path) and restarted it (pid 76811, 00:11).
