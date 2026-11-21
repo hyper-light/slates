@@ -2068,6 +2068,16 @@ fn measure_what_live_shipping_adds_to_a_stable_nfs_write() {
     "measure: the owner's live counters {:?}",
     live_counters(owner)
   );
+  // Each candidate's own: its serve of an entry, the publication that keeps it included (`fleet.live.hop.holder`), is
+  // the part of the owner's exchange that no owner counter splits out.
+  for (index, instance) in fleet.instances.iter().enumerate() {
+    if index != owner_index {
+      eprintln!(
+        "measure: candidate {index}'s live counters {:?}",
+        live_counters(instance)
+      );
+    }
+  }
   let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
   drop((plain, live));
   drop(fleet.daemons);
