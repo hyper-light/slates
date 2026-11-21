@@ -30,3 +30,17 @@
   most one step a call, red on the old exporter. Measured: 6.18 ms longest call against a 6.04 ms whole read before.
 - SSH red: b1206d96c. vcs_ssh::svn::tests::the_daemons_ssh_site_serves_svnserve_t_and_lands_a_stock_commit was red
   5/5 and is green after: a landing that put no text waits on no durability barrier.
+
+## R4 recovery replays a revision record whole: sliced -- CLOSED
+- Commit: 25035f50c on origin/main.
+- The change: a Subversion revision record's replay (recovery and rebuild, record_turn -> svn_record_turn) applies
+  its rows once and keeps its texts one row a step, across turns, until the shard's quantum runs (RevisionReplay;
+  counter vcs_store.svn_replay_turns).
+- Tests:
+  - a_replayed_revision_keeps_its_texts_a_row_a_step_as_a_whole_commit_does (svn): the same records as a whole
+    commit, byte for byte.
+  - a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild (server): twelve 50 KiB files over at least twelve turns,
+    with the same records and green.
+- Left in GAPS: one row's text is still deltified whole within its step.
+- C2 status: waiting on w-store's answer about how the server opens a repository's Store (inbox
+  w-store-from-w-svn-stored-form-2026-11-20.md). Next: P6 svn:// update 5.6 s vs 2.7 s.

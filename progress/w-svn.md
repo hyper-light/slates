@@ -282,3 +282,6 @@
   (both landed: 507d722b3, b1206d96c -- write close notes), P6 svn:// update 5.6 vs 2.7 s, P7 svnsync 524/1,068 s
   (A-772: drive 328->1.82 s, tunnel 7.4 ms/rev; daemon peak owed; uncommitted RSS checkpoints in w-svn-next
   vcs_ssh/tests/svn.rs), P8 500 MB commit.
+- CLOSED: C1 3e63bee8d, R3 74beb5600, R4 25035f50c, R5 (507d722b3/2cf1b1d35 + b1206d96c). C2 waits on w-store's
+  server wiring answer. NEXT: P6 svn:// update 5.6 vs 2.7 s, P7 svnsync (A-772 daemon peak; uncommitted RSS
+  checkpoints in w-svn-next vcs_ssh/tests/svn.rs), P8 500 MB commit.

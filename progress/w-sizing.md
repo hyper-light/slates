@@ -97,7 +97,32 @@
   section per extent needed (only close returns commit) -- needs anchor-held per-extent handles; ask main whether R2
   includes Windows. Measurement for the close: r30 (hg history push, before 47dc24b72 vs after 92f7a756b, RSS + status
   split + system free after the anchor's SIGKILL) queued.
-- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md).
+- R2 measured by use, r35 (big Studio, release, hg history push; before 47dc24b72 / after 92f7a756b): RSS after push
+  6,198-6,200 MiB both arms, unchanged at 20 s idle; after SIGKILL system free: after-arm 5,569 -> 11,951 MiB, before-arm
+  stays 732 (leak; 2 names unlinked by the script). R2 status written to inbox/main-from-w-sizing-close.md (macOS +
+  Linux closed; Windows section-per-extent: asked main whether it is inside R2).
+- R3 (peak RSS 145x, with w-hg + w-store): split sent (inbox/w-hg-from-w-sizing-r3.md). Remaining 6.2 GB after an hg
+  history push is held content (w-hg 4,495.5 MiB content store) + register + heap; status split came back empty in r35
+  (g226 is fixing the status residency).
+- 16:46: main asked to land agents/w-sizing-extents: already landed as A-789 362bd8c39 (squashed; branch deleted).
+- Disk (Studio-4): deleted my targets incl. two whose names contained "CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=6" (an
+  `env $E` quoting slip made cargo use the whole string as CARGO_TARGET_DIR; 15 GB + 4.8 GB) and w-sizing-ab-target.
+  Studio-4 now 97 GiB free. Builds go through kiln with needs "macos,disk=60g" from now on.
+- g226: status residency fix choice (a) filed with main (inbox/main-from-g226-close.md); g226 frozen by the close order.
+- Worktree ~/slates-work/w-sizing-a789 (landed; removable). Scripts ~/.cache/w-sizing-logs (hgmem.sh, hgmem-cmd.txt).
+
+## R2 Windows (main 18:40: Windows is inside R2; build it; Windows runs to run-requests, w-lint runs them, jupiter off)
+Plan: a section per pool extent, closed when wholly free; the anchor holds each extent's handle across a daemon restart.
+- anchor/src/handles.rs: new hold kind WHAT_CONTENT_EXTENT = 4 (1 handle, record = extent id), admits(), its own bound
+  class in HoldBounds (partitions x POOL_EXTENTS_PER_PARTITION; condition (c)).
+- server/src/anchor_hold_windows.rs: hold_extent/release_extent (as hold_section/release_section); adopt() collects
+  HandedExtent {id, section, record} for the successor (condition (d)).
+- server/src/content_pool.rs (cfg windows): own slice's extent sections made ahead of need on a background task at
+  shard start and held with the anchor (condition (a): claim only maps from a ready handle); release: drop region,
+  close own handle, release the anchor's hold (section closes -> commit returned, g226), make again in background.
+- Red first, across processes: a cli/server test (Windows) that an extent's section survives a daemon SIGKILL (anchor
+  holds it) and that a released extent's commit goes back. Builds/tests -> run-requests.md (w-lint, jupiter offline).
+- Then R3 with w-hg + w-store.
 
 ## Queue
 2a. (main's input, g226) address space: ~220 GB mapped on the 96 GB Studio. By reading: each shard's content slice =

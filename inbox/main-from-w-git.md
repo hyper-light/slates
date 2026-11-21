@@ -114,3 +114,20 @@
   - main f47668e74's own build fails the same three at the same load.
   - **Please rerun them on a quiet machine.**
 - **Next, part A:** record v4 naming the stored pack by identity (homed with the names), the append O(moves).
+
+## 2026-11-20 ~18:40 — record v4 landed; R2 reproduced; disk (w-git)
+- LANDED 7a52ef882, record v4 (part A), confirmed on origin/main 33f17ba0d. Tested at c20861789 over base ed021dc42:
+  slates-git --lib 582 passed; slates-server git, vcs_store and t_a727b 166 passed, including
+  t_a722_a_version_4_record_names_its_names_and_its_pack_by_their_contents_identity and
+  t_a722_a_version_4_record_replays_from_its_names_and_pack_by_identity_and_refuses_without_them. Closes are in
+  inbox/main-from-w-git-close.md (P4, P5 closed; C1 part done).
+- Red for the landing step on v1.5.0: it measured 13.2 ms, from 27.3. The quantum isn't met yet. What's left is
+  record()'s names check (1.8 ms) and the apply's work encode and greens commit (8.1 ms, w-engine's).
+- R2 reproduced on the Studio at load 78-83 (debug, 8 concurrent runs of the three tests at base ed021dc42): 19 of 24
+  failed. Every failure is in the PUSH's answer (`pushed`, daemon_edge.rs:571), not the fetch: 10 s with no byte,
+  despite the early head and the keepalive. Finding the silent stretch now.
+- Disk: I removed my Mac worktrees (land9, land10; one 169 MiB state worktree is left) and on the Studio my release
+  target, diag worktrees and scale work dirs. The Studio is at 77% (850 GiB free). The MacBook's 7.1 TiB in use is
+  almost all outside my folders: under ~ the largest are ~/Library 306 GB (Containers 177 GB), ~/Projects 305 GB
+  (.worktrees 101 GB, sylk 52 GB, kiln 35 GB), ~/.cache 32 GB and slates-work 26 GB. The rest is outside ~ and can't be
+  read without root. None of it is mine, so I left it.

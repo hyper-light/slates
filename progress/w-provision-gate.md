@@ -40,6 +40,12 @@
   C1 remaining: kiln r4 (`macos exclusive`, ratchet --provision --record from the ci worktree) queued. When it ends:
   commit its ratchets.toml diff to main (area `ratchet:`), then write inbox/main-from-w-provision-gate-close.md for C1.
 
+- ~18:50: C1 baseline still unrecorded. Per main 18:36 resubmitted by needs ("macos,cpus=16,disk=60g exclusive"):
+  r7 and r8 both placed on d1323898 (big Studio) and both failed "did not answer the sync in 60s"; earlier r3/r4/r5
+  failed the same way on b24c5c95 (draining). r6 (named cec37f60, adas-mac-studio.local) was stopped per main's no-naming
+  rule. BLOCKER for main: the Studios' sync. To resume: rerun the same command by needs from
+  ~/slates-work/w-provision-gate-ci, commit the ratchets.toml diff, write the C1 close note.
+
 ## Queue
 1. DONE measure; DONE gate (2c8f89de6); DONE red (bench loaded bound).
 2. NEXT: A-387's held-turn estimate forgets by turn count (cheap turns forget a ms preemption in microseconds); weigh

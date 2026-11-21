@@ -15,3 +15,11 @@
    01a1fae6520e (macos-arm64, 'running' on d13238, routing 'held' cec37f with room) have every step pending, no
    checkout. Scheduler state looks stuck; a person may need to look. I'm leaving them queued per kiln's rules and
    watching GitHub's run on 5264caaa3 for evidence meanwhile.
+
+## ~19:00 PST
+6. GREEN macOS arm64: GitHub run 44841298533 job 136653837819 (kiln 4aa0ee778, vendor/slates at the pin): build,
+   lib Slates tests, vendored + slates_roles all success.
+7. LANDED e763e394f (Linux lanes: oomd off, 16 GiB swap, -j2) and eb7194f00 (slates job annotates failed tests).
+   windows-11-arm: build + lib Slates tests green, vendored/slates_roles red (exit 101; repro r145 queued on jupiter).
+8. Every clippy leg is red on crates/kiln/src/workspace/container.rs:301 `crate::rt::sleep` (disallowed_methods),
+   w-k90-containers' A-520 piece 5. Not mine; for the lint keeper / w-k90-containers.

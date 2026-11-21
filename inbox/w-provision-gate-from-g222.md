@@ -106,3 +106,23 @@ CPU) gets the CPU back only when the tick ends the spinner's slice, where a park
 preemption at once. Testing it now: one binary, `G222_NO_SPIN` (idle window 0, park at once) on and off, interleaved,
 same lane (diag-measurer-g222-6). If the band empties with the shard parked, Linux's fix is the window under
 oversubscription, not the poll.
+
+## 2026-11-20 19:45 PST — finding 6: on Linux the 1 ms band is not the idle spin either (refuted)
+
+CI run 44855722041 (diag-measurer-g222-6), same lane, one binary (bc688cefc), `G222_NO_SPIN` (idle window 0: an idle
+shard parks at once) off and on, interleaved 3 rounds, ring split every request:
+
+| | spin r1 / r2 / r3 | park r1 / r2 / r3 |
+|---|---|---|
+| queued p99 µs | 1,009 / 1,009 / 1,009 | 1,008 / 1,007 / 1,007 |
+| queued p999 µs | 1,038 / 1,024 / 1,091 | 1,081 / 1,021 / 1,067 |
+| accept p50 µs | 192 / 195 / 194 | 92 / 87 / 88 |
+| accept p99 ms (median run) | 6.0 / 4.0 / 4.1 | 4.0 / 5.4 / 4.0 |
+| conflict p50 µs | 162 / 163 / 163 | 61 / 61 / 59 |
+| conflict p99 ms (median run) | 6.0 / 5.0 / 5.0 | 6.0 / 1.8 / 8.0 |
+
+- Parking at once halves the median on two capped CPUs (the spinning shard took a CPU from the client), but the band
+  stays: a request that lands while its shard is not on a CPU, spinning or parked and kicked, is taken at the next
+  1 ms tick. That is the kernel's: no unprivileged raise exists on Linux (R10), and A-224's short slice was rejected.
+- So on Linux I find no daemon lever for the 1 ms; the loaded p99/p999 bound there is the scheduler's, on this lane
+  (2 CPUs, 4 spinners and a writer at the shard's own weight). I'm putting it to main as 84a's Linux question.
