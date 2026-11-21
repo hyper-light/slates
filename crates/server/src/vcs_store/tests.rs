@@ -2281,10 +2281,11 @@ fn t_a722_p4g_a_replayed_records_move_is_admitted_an_object_a_turn() {
 
 /// main's ruling (b) on the identity rule's compatibility shim (banned item 7): a git record that names an object past
 /// one window by this node's root of it, as records did before the rule, is refused, never read as the object. Do:
-/// push a create of `main` whose one file is 1 MiB; take the push's record and name the file by its root in place of
-/// its BLAKE3; replay the record so altered into the repository's store made again empty. Expect: the record as written
-/// replays; the altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by
-/// their BLAKE3, which the record does not name), never accepted.
+/// push a create of `main` whose one file is 1 MiB; take the push's record (version 5, its names a content since C5) and
+/// name the file in its names by its root in place of its BLAKE3, the names put again and the record naming them; replay
+/// the record so altered into the repository's store made again empty. Expect: the record as written replays; the
+/// altered one refused, typed (`ReplayRefused::Diverged`: the objects the replay admits are named by their BLAKE3,
+/// which the record does not name), never accepted.
 #[test]
 fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() {
   crate::test_store::audit_on_stored_shard("vcs", |state| {
@@ -2309,14 +2310,31 @@ fn t_identity_rule_a_record_naming_an_object_by_its_old_root_is_refused_typed() 
     assert_ne!(root, identity, "the file is past one window");
     let written = records(state, repository)
       .into_iter()
-      .find(|record| record.windows(32).any(|at| at == identity.0))
-      .expect("a record naming the file");
-    let at = written
-      .windows(32)
-      .position(|bytes| bytes == identity.0)
-      .unwrap();
-    let mut altered = written.clone();
-    altered[at..at + 32].copy_from_slice(&root.0);
+      .find(|record| {
+        Record::decode(record, FORMAT).is_ok_and(|read| read.named.is_some())
+      })
+      .expect("a record naming its names");
+    let read = Record::decode(&written, FORMAT).unwrap();
+    let (named, count) = read.named.unwrap();
+    let content = state.vcs_stores.content().unwrap();
+    let names = super::record_names::names_from_content(content, &named, count).unwrap();
+    assert!(
+      names.iter().any(|(_, name, _)| *name == identity),
+      "the names name the file"
+    );
+    let renamed: Vec<_> = names
+      .iter()
+      .map(|(kind, name, len)| (*kind, if *name == identity { root } else { *name }, *len))
+      .collect();
+    let rows = super::record_names::encode_names(&renamed).unwrap();
+    let renamed_identity = super::put_names(state, &rows).expect("the altered names put");
+    let altered = RecordWriter::finish_packed(
+      (read.deepest, &read.moves),
+      Some((renamed_identity, count)),
+      read.packed,
+      read.sequence,
+    )
+    .unwrap();
     let record = state
       .db
       .partition()
