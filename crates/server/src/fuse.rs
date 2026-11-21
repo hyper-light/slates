@@ -980,6 +980,8 @@ fn turn_with(s: &mut ShardState, attachment: u64, mount: &mut FuseMount, kind: T
   let kept = next_kept(mount, kind);
   let kept_until = kept.as_ref().map(|kept| kept.until_ns);
   let (dispatched, met) = {
+    // A mounted work whose base moved shows its new base (A-774 R4).
+    crate::mounted_work::refresh(s, mount.volume);
     let ShardState {
       store,
       volumes,

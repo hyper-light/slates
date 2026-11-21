@@ -1,0 +1,21 @@
+[package]
+name = "mantle-disk"
+description = "mantle's device identification and measurement (vendored at mantle 87ab09e1)"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+repository = "https://github.com/hyper-light/mantle"
+publish = false
+
+[dependencies]
+hyper-block = { path = "../../hyper-raft/hyper-block" }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "mm", "system", "param", "process", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Ioctl", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_WindowsProgramming"] }
+
+# A root of its own: a vendored snapshot of mantle (vendor/mantle/SNAPSHOT), outside slates' workspace.
+[workspace]

@@ -117,8 +117,9 @@ fn a_task_waits_for_room_a_thread_makes() {
   let draining = std::thread::spawn(move || {
     for expected in 0..300 {
       assert_eq!(receiver.blocking_recv().unwrap(), expected);
+      // A pause now and then: with one place, the task waits for room either way.
       if expected % 50 == 0 {
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::yield_now();
       }
     }
     receiver
@@ -189,13 +190,10 @@ fn a_channel_gives_its_cells_back() {
 /// value handed back (a shard never blocks).
 #[test]
 fn a_bad_channel_and_a_blocking_call_on_a_shard_are_refused() {
-  assert!(matches!(
-    channel::<u8>(0),
-    Err(SyncRefusal::BadConfig { .. })
-  ));
+  assert!(matches!(channel::<u8>(0), Err(RtError::BadConfig { .. })));
   assert!(matches!(
     channel_with::<u8>(1, 0),
-    Err(SyncRefusal::BadConfig { .. })
+    Err(RtError::BadConfig { .. })
   ));
   let runtime = runtime();
   let (sender, _receiver) = channel::<u8>(1).unwrap();

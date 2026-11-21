@@ -340,7 +340,7 @@ mod tests {
     };
     let waited = std::time::Instant::now();
     while counted(DELTIFIED) == 0 && waited.elapsed() < std::time::Duration::from_secs(60) {
-      std::thread::sleep(std::time::Duration::from_millis(20));
+      std::thread::yield_now();
     }
     assert_eq!(
       (counted(DELTIFIED), counted(WINDOWS), counted(REFUSED)),
@@ -395,7 +395,7 @@ mod tests {
         waited.elapsed() < std::time::Duration::from_secs(60),
         "the rebuild ended"
       );
-      std::thread::sleep(std::time::Duration::from_millis(20));
+      std::thread::yield_now();
     };
     assert_eq!(
       rebuilt,

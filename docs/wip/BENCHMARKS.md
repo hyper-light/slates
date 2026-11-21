@@ -15327,6 +15327,28 @@ over-allocation left. w-hg's account: the import keeps every file revision whole
 115,479 file revisions are 4,296.9 MiB as whole texts; a push of the same history committed 4,495.5 MiB). Ada's
 changeset ruling (changesets the stored unit, per-file deltas derived) replaces that; its A/B is the next section.
 
+### Where import D's 5.7 GB is: the content store's whole texts, 91 % (R2's attribution; main's order of 15:35; 2026-11-20)
+Build: release main 1b63ab896, the same Studio and hg-src (`.hg` 87,836 KiB), one import on a fresh anchor (kiln
+r26, script `~/.cache/w-perf/bench/hgmem.sh`, logs `~/.cache/w-perf/prof/hgmem-20261121T011519/`). The daemon's RSS
+sampled by `ps` each second, its import counters beside it; `footprint` and `vmmap -summary` taken before the import and
+after its landing only. Rejected as instruments, each tried: `MallocStackLogging` (every step slowed past the daemon's 1 s
+liveness window: the anchor killed and restarted it about a hundred times, peak 633 MB, 2,172 s) and `heap` (it
+suspended the daemon for 211 s: 7 restarts). Neither number is the import's.
+
+| Phase (s from the import's start) | RSS |
+|---|---|
+| 0 to 54: the changelog and manifests read | 93 MB -> 967 MB |
+| 54 to 111 | flat, 967 MB -> 1,068 MB |
+| 122 to 311: the file logs, every revision put whole | 1,267 MB -> 5,583 MB |
+| 311 to the landing: the record written, landed | flat, 5,583 MB -> 5,630 MB |
+
+After the landing, `footprint` 5,589 MB (peak 5,648 MB): **shared memory 5.1 GB dirty** (the content store's chunk arena
+in the anchor's content object, A-727), `MALLOC_SMALL` 193 MB, `VM_ALLOCATE` 154 MB, the rest (text, stacks, page
+tables) about 130 MB. So 91 % of the peak is what the import keeps in the content store: Mercurial's 115,479 file
+revisions as whole texts, 4,296.9 MiB by w-hg's count, plus the arena's chunks around them; the heap is 6 %. The cut is
+what the store keeps, not a transient: the changeset as the stored unit with per-file reads derived (Ada's ruling; main's
+ruling of 15:40 for R2), which waits on w-store's slates-store (A-767 piece 3) and hg onto it (w-hg's close item).
+
 ### The lend's swap, release (A-727 slice a2)
 `vcs_store::arena_windows::tests::wperf_swap_cost_probe` (bench-only, not committed) in a release test build of B's
 tree on the same Studio: a `ContentStore::lend_in` and `hand_back` pair costs **38.83 ns** over 10,000,000 pairs after
@@ -15787,6 +15809,24 @@ alone exhausts its budget.
   of `engine.rs` (274 KiB to 300 KiB) takes 10 to 40 ms a process, at line grain and including process start. The
   refiner's p99 save, at token grain, is about 14 ms for that file.
 
+## Content pool extents as objects of their own on macOS (A-789; main's ruling of 2026-11-20 15:20; 2026-11-20)
+- **Give-back, by use:** recovery's `a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`, a one-shard
+  daemon over a held anchor, a 256 MiB burst into a volume of its own, then the volume destroyed. Measured as the
+  anchor's content object's pages in RAM (`mincore` through the anchor's view) plus the process's resident memory, on
+  adas-macbook-pro-2.local (macOS arm64; quiet). Before (961112d0e): 63 MiB, 1,621 MiB with the burst, 1,622 MiB 20 s
+  after the destroy (the object kept 259 MiB, the process 1,362 MiB). After (d0f3199f9): 420 MiB, 1,648 MiB, 123 MiB
+  (the object 0 MiB).
+- **Provisioning, interleaved A/B:** kiln run r26 on Adas-Mac-Studio.local (macOS arm64, 32 cores), release
+  `provision_bench`, A = 1b63ab896 (extents as ranges), B = 3f24e4fea (extents of their own), three rounds A then B,
+  each the median of three runs. The machine ran at load 44 to 79, so every figure is mostly scheduling, and neither arm
+  is near the 50 us floor:
+  - 1 client spinning, p50 (us): A 133.7, 114.4, 96.9; B 101.0, 115.5, 106.7.
+  - 1 client spinning, p99 (us): A 4,323.9, 1,260.8, 2,404.5; B 1,900.5, 861.5, 784.1.
+  - 8 clients spinning, p99 (us): A 3,661.3, 2,928.5, 3,952.5; B 817.4, 2,093.0, 3,664.4.
+  - 1 client parked, p99 (us): A 7,669.4, 5,544.9, 5,272.3; B 5,248.8, 8,701.8, 8,474.4.
+  No arm moved the histogram beyond the noise. A claim still opens and maps one object by name, as before; the extent
+  objects are made at the shard's start and at release. A rerun on a quiet machine is in the run requests.
+
 ## The idle prefault reserve against none (A-777; main's items 1-2 after A-765; 2026-11-20)
 - **The command and machine:** Adas-Mac-Studio.local (macOS arm64, 32 cores), kiln run r6, release, interleaved, three
   rounds: A = main 5518fb2bc (the reserve, A-765's decay), B = agents/w-sizing-noprefault (none).
@@ -15970,6 +16010,34 @@ same two first arms (host load 33-49): p99 1.37 / 2.05 / 1.83 ms on main against
 0.5 µs, and a held shard spinning for milliseconds on a loaded machine costs the p999. The hold rule's estimate is the
 next piece; the immediate poll lands with it, not before.
 
+### R9's loaded p99 on macOS, the candidates (A-786; 2026-11-20 evening, w-provision-gate)
+
+Same MacBook, host load 10-26. `provision_bench` with `PROVISION_BENCH_LOAD=2` (quiet forms, then loaded ones), three
+rounds interleaved. Each cell is the median of the bench's three runs.
+
+The arms:
+- **main:** origin/main's runtime.
+- **time:** kqueue on `kevent64` with `KEVENT_FLAG_IMMEDIATE` for every zero-timeout wait (`agents/w-provision-gate-kqueue`),
+  plus A-387's turn estimate with a memory of spinning time: each turn decays both sums by (H - T)/H, with H the longest
+  hold asked. It is unit-tested: after a 1 ms preemption and 1,000 polling turns, the old estimate read 400 ns.
+- **nap:** the immediate kqueue, A-387 unchanged, and on macOS an idle-spin turn that found nothing sleeps the OS's
+  shortest sleep (`sleep(1 ns)`, about 15 µs), the nap main's `kevent` took. The nap moves to the idle spin, so it never
+  sits between two tasks of a request.
+
+| arm | quiet p50 µs | quiet p99 µs | quiet p999 µs | loaded p99 ms | loaded p999 ms | quiet CPU, cores |
+|---|---|---|---|---|---|---|
+| main | 41.9 / 42.4 / 42.8 | 111 / 103 / 99 | 147 / 136 / 138 | 1.30 / 1.34 / 1.06 | 2.47 / 2.46 / 2.12 | 1.66-1.72 |
+| time | 16.7 / 14.0 / 15.2 | 36 / 28 / 43 | 65 / 51 / 103 | 0.44 / 0.32 / 0.25 | 10.3 / 5.6 / 6.0 | 7.3-10.0 |
+| nap | 19.2 / 18.2 / 18.5 | 40 / 39 / 38 | 55 / 50 / 48 | 0.33 / 0.33 / 0.46 | 16.1 / 10.1 / 23.4 | 3.3-4.2 |
+
+The loaded bound (the loaded spinning p99 against the loaded parked p99 and the quiet spinning p99): main fails 3 of 3,
+time and nap pass 6 of 6. An earlier round of time alone (host load 34-50) read loaded p99 2.00 -> 0.46 ms and loaded
+p999 13.0 -> 37.3 ms.
+
+**Measured, not landed.** Both arms meet R9's floor quiet at nine shards, which main never has, and cut the loaded p99
+3-5x. Both lose the loaded p999 and spend 2-6x the quiet CPU. Under the data rule neither lands. The loaded p999 is the
+open item; its hop is still to be named.
+
 ## Three nodes: a version-3 push's homing at f + 1, and coalescing homings measured and rejected (A-724 piece 8c; main's order of 2026-11-20; 2026-11-20)
 
 - **The bench:** `crates/cli/bench/three_node_push.py SOURCE 'v1.0.0^{commit}' ROUNDS BUILD...`: for each build each round,
@@ -16109,6 +16177,23 @@ Kept: A-787.
   fragments 34 times the pack git made of the same objects (1.92 GB against 55.9 MB): a first version has no earlier tree
   to name bases from and the learned window starts at one candidate in an order by size, so an import finds few deltas
   (GAPS, A-718's entry); an earlier debug run over v1.0.0 measured 40.7 MB against git's 3.4 MB.
+
+## A push's objects landed where they lie in its pack: the store 22 times smaller (A-722's record v4, part B; main's pack-homing ruling; 2026-11-20)
+- **The command and machine:** adas-mac-studio.local-2, release; B1's diagnostic (one push driven by phase on a
+  daemon's shard, then its repository's store made again from the log, each replay turn 1 ms) over git/git's v1.5.0
+  (9.4 MiB of pack, 34,296 objects). Before: main 5c6327b8e (its run in "A push read where it lies in its pack while
+  it is judged" and the replay section's); after: the change.
+
+| | content after input | content peak | content after the landing | process peak RSS | replay: turns, content peak |
+|---|---|---|---|---|---|
+| before | 0.0 MiB | 310.3 MiB | 309.0 MiB | 781.8 MiB | 1,921, 309.0 MiB |
+| after | 0.0 MiB | 15.4 MiB | 14.1 MiB | 356.6 MiB | 1,468, 14.1 MiB |
+
+- **What it says.** A landed object is a place in its push's pack, held once as content (9.4 MiB), and its row; the
+  rest of the 14.1 MiB is the index's tables, the reach values and the landing map. The store's bytes a push are now
+  about 1.5 times its pack (33 times before). The longest step is the landing's entry apply, the record still
+  carrying the pack (part A).
+
 
 ## The quiet-Mac paced run: no 17–31 ms late wake of a kicked, parked shard (goal 84b; g222; 2026-11-20)
 

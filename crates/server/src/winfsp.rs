@@ -1113,7 +1113,21 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
   // A round's gather runs a slice a turn (A-562), timed against the shard's live quantum as every clock-bounded slice is.
   let slice_ns = s.config.copy_slice_ns();
   let turned = {
-    let ShardState { store, volumes, .. } = &mut *s;
+    // A mounted work whose base moved shows its new base (A-774 R4).
+    crate::mounted_work::refresh(s, mount.volume);
+    let ShardState {
+      store,
+      volumes,
+      greens,
+      merge,
+      ..
+    } = &mut *s;
+    // A mounted work's base is its green at its pin, lent with the slot's tree host (A-774, C1).
+    let lent_green = crate::mounted_work::source(greens, &merge.mounted, mount.volume);
+    let green_tree = lent_green
+      .as_ref()
+      .map(|(green, version)| crate::green_tree::GreenTree::at(green, *version));
+    let mut tree_lens = None;
     volumes.get_mut(handle).ok().map(|slot| {
       let WinFspMount {
         handles,
@@ -1136,7 +1150,10 @@ fn turn_with(s: &mut ShardState, mount: &mut WinFspMount) -> Turned {
         &mut slot.volume,
         store,
         handles,
-        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+        slot
+          .host
+          .as_mut()
+          .map(|host| crate::mounted_work::lend(host, green_tree.as_ref(), &mut tree_lens)),
       );
       let delivered = deliver_owed(
         &mut bridge,
