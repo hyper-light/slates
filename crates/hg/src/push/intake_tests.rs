@@ -64,6 +64,8 @@ fn intake(
   loop {
     steps += 1;
     match intake.step(&part.payload, store, admission) {
+      // A test keeps no changeset store: the fork's own texts stand in for it.
+      Ok(Stepped::Store) => intake.answer_from_fork(store),
       Ok(stepped) if more(&stepped) => {}
       Ok(_) => break,
       Err(refused) => {
@@ -83,6 +85,7 @@ fn more(stepped: &Stepped) -> bool {
     Stepped::More => true,
     Stepped::Done => false,
     Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+    Stepped::Store => panic!("a base asked of the store where none is kept"),
   }
 }
 
@@ -533,6 +536,7 @@ fn a_pushs_sectioned_record_and_payload_replay_as_its_whole_record_does() {
       record::Progress::More => {}
       record::Progress::Done => break,
       record::Progress::Wanted(range) => panic!("a whole payload wanted {range:?}"),
+      record::Progress::Store => replay.answer_from_fork(&store),
     }
   }
   replay.finish(&mut by_sections, &mut store).unwrap();
@@ -629,12 +633,13 @@ fn intake_from_pieces(
       Err(Halt::Refused(refusal)) => panic!("{refusal:?}"),
     }
   }
-  let mut intake = Intake::begin_framed(framed, index, store).unwrap();
+  let mut intake = Intake::begin_framed(framed, index, store, u64::MAX).unwrap();
   loop {
     match intake.step(&window, store, &mut room()).unwrap() {
       Stepped::More => {}
       Stepped::Done => break,
       Stepped::Wanted(range) => fill(&mut window, range, &mut wants, &mut most),
+      Stepped::Store => intake.answer_from_fork(store),
     }
   }
   let (fork, intaken) = intake.finish().ok().unwrap();
@@ -702,6 +707,7 @@ fn a_pushs_changeset_replays_from_its_payload_a_piece_at_a_time() {
     {
       Progress::More => {}
       Progress::Done => break,
+      Progress::Store => replay.answer_from_fork(&store),
       Progress::Wanted(range) => {
         wants += 1;
         window.keep_from(range.start);
@@ -812,5 +818,168 @@ fn a_manifest_naming_a_file_revision_nobody_holds_is_refused() {
       Some(Refused::Unverified(Unverified::MissingFile { .. }))
     ),
     "{refused:?}"
+  );
+}
+
+/// One file `f` whose revisions are pushed as `deltas` name them (each its text and the revision it is a delta against,
+/// none for the null base), each in a changeset of its own on one line of changesets after `parent` (`after`: the
+/// changeset, manifest and file revisions before them, empty for a first push): the changegroup in version 03, and the
+/// line's last changeset, manifest and each file revision's node, for a push after it.
+fn file_push(
+  texts: &[(&[u8], Option<usize>)],
+  after: (Node, Node, &[(Node, Vec<u8>)]),
+) -> (Vec<u8>, (Node, Node, Vec<(Node, Vec<u8>)>)) {
+  use crate::changegroup::{self as cg, Revision, Version};
+  use crate::{NULL_NODE, delta, node};
+  let hex = |node: &Node| {
+    let mut out = Vec::new();
+    crate::pushkey::encode_hex(node, &mut out);
+    out
+  };
+  let (mut changeset, mut manifest, before) = after;
+  let mut files: Vec<(Node, Vec<u8>)> = before.to_vec();
+  let mut changesets = Vec::new();
+  let mut manifests = Vec::new();
+  let mut revisions = Vec::new();
+  for (text, base) in texts {
+    let p1 = files.last().map_or(NULL_NODE, |(node, _)| *node);
+    let file = node::compute(&p1, &NULL_NODE, text).unwrap();
+    let manifest_text = [&b"f\0"[..], &hex(&file), b"\n"].concat();
+    let manifest_node = node::compute(&manifest, &NULL_NODE, &manifest_text).unwrap();
+    let changeset_text = [&hex(&manifest_node)[..], b"\ntest\n0 0\nf\n\nchange"].concat();
+    let changeset_node = node::compute(&changeset, &NULL_NODE, &changeset_text).unwrap();
+    changesets.push((changeset_node, changeset, changeset_text));
+    manifests.push((manifest_node, manifest, manifest_text, changeset_node));
+    let base = base.map(|at| files[at].clone());
+    revisions.push((file, p1, text.to_vec(), base, changeset_node));
+    files.push((file, text.to_vec()));
+    (changeset, manifest) = (changeset_node, manifest_node);
+  }
+  let whole = |(node, p1, link): (Node, Node, Node), text: &[u8], out: &mut Vec<u8>| {
+    let revision = Revision {
+      node,
+      p1,
+      p2: NULL_NODE,
+      base: NULL_NODE,
+      link,
+      flags: 0,
+      info: None,
+      protocol_flags: 0,
+      data: text,
+      sidedata: None,
+    };
+    cg::put_revision_whole(&revision, Version::V03, out).unwrap();
+  };
+  let mut out = Vec::new();
+  for (node, p1, text) in &changesets {
+    whole((*node, *p1, *node), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  for (node, p1, text, link) in &manifests {
+    whole((*node, *p1, *link), text, &mut out);
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  cg::put_name(b"f", &mut out).unwrap();
+  for (node, p1, text, base, link) in &revisions {
+    match base {
+      None => whole((*node, *p1, *link), text, &mut out),
+      Some((base, base_text)) => {
+        let mut data = Vec::new();
+        delta::encode_lines(base_text, text, &mut data).unwrap();
+        let revision = Revision {
+          node: *node,
+          p1: *p1,
+          p2: NULL_NODE,
+          base: *base,
+          link: *link,
+          flags: 0,
+          info: None,
+          protocol_flags: 0,
+          data: &data,
+          sidedata: None,
+        };
+        cg::put_revision(&revision, Version::V03, &mut out).unwrap();
+      }
+    }
+  }
+  cg::put_end(&mut out);
+  cg::put_end(&mut out);
+  (out, (changeset, manifest, files))
+}
+
+/// Takes `payload`, a changegroup of version 03, into a fork of `index`, the intake's cache bounded at `cache` bytes
+/// where given, each store want answered from the fork's own texts (the tests keep no changeset store): the fork, what
+/// was brought, and how many times the store was asked.
+fn taken_counting(
+  payload: &[u8],
+  index: &mut HgIndex,
+  store: &mut ContentStore,
+  cache: Option<u64>,
+) -> (HgIndex, Intaken, u64) {
+  let mut intake = Intake::begin(
+    (crate::changegroup::Version::V03, payload),
+    index,
+    store,
+    &mut room(),
+  )
+  .unwrap();
+  if let Some(bound) = cache {
+    intake = intake.with_base_cache(bound);
+  }
+  let mut asked = 0;
+  loop {
+    match intake.step(payload, store, &mut room()).unwrap() {
+      Stepped::More => {}
+      Stepped::Done => break,
+      Stepped::Wanted(range) => panic!("a whole changegroup wanted {range:?}"),
+      Stepped::Store => {
+        asked += 1;
+        intake.answer_from_fork(store);
+      }
+    }
+  }
+  let (fork, intaken) = intake.finish().ok().unwrap();
+  (fork, intaken, asked)
+}
+
+/// A-767 C1 (main's ruling (b2) over (b1): a file delta's base the intake does not hold as the text kept last). Do: push
+/// one file's four revisions, the third and the fourth each a delta against a revision before the one kept last (a
+/// merge's base, as generaldelta sends one), once with the push's cache and once with none; then push a fifth revision
+/// as a delta against the first, which the first push landed. Expect every text kept as stock 7.2 would make it (the
+/// rows of both takes equal); with the cache, both bases found in it and nothing rebuilt; with none, each rebuilt from
+/// the push's own deltas; and the landed base read from the store, asked once.
+#[test]
+fn a_file_delta_base_before_the_last_text_comes_from_the_cache_the_push_or_the_store() {
+  let texts: [(&[u8], Option<usize>); 4] = [
+    (b"a\n", None),
+    (b"a\nb\n", Some(0)),
+    (b"a\nc\n", Some(0)),
+    (b"a\nb\nd\n", Some(1)),
+  ];
+  let (payload, after) = file_push(&texts, (crate::NULL_NODE, crate::NULL_NODE, &[]));
+  let mut store = store();
+  let (mut cached_fork, cached, cached_asks) =
+    taken_counting(&payload, &mut HgIndex::new(), &mut store, None);
+  let (mut rebuilt_fork, rebuilt, rebuilt_asks) =
+    taken_counting(&payload, &mut HgIndex::new(), &mut store, Some(0));
+  assert_eq!(
+    rows(&mut cached_fork, &store),
+    rows(&mut rebuilt_fork, &store)
+  );
+  assert_eq!(
+    (cached.base_hits, cached.base_rebuilds, cached_asks),
+    (2, 0, 0),
+    "the cache held both bases"
+  );
+  assert_eq!(rebuilt.base_hits, 0);
+  assert!(rebuilt.base_rebuilds >= 2, "{rebuilt:?}");
+  assert_eq!(rebuilt_asks, 0);
+  let (second, _) = file_push(&[(b"a\ne\n", Some(0))], (after.0, after.1, &after.2));
+  let (_, landed, landed_asks) = taken_counting(&second, &mut cached_fork, &mut store, None);
+  assert_eq!(
+    (landed.kept, landed.base_store_reads, landed_asks),
+    (3, 1, 1),
+    "the landed base read from the store, asked once"
   );
 }

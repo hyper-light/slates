@@ -2715,6 +2715,9 @@ enum PieceStep {
   /// The step needs these bytes of the payload: the replay under way, the window to be filled
   /// ([`fill_window`]).
   Wanted(slates_hg::import::record::Replay, core::ops::Range<u64>),
+  /// The step needs a file delta's base from the node's changeset store (A-767 C1): the replay under way, its wants to
+  /// be answered ([`crate::vcs_store::hg_view::answer_wants_over`]).
+  Store(slates_hg::import::record::Replay),
   /// The changeset is replayed into the store.
   Done,
 }
@@ -2769,6 +2772,7 @@ fn hg_piece_in(
       Ok(Progress::More) if slates_rt::futures::now_ns() < deadline_ns => {}
       Ok(Progress::More) => return Ok(PieceStep::More(replay)),
       Ok(Progress::Wanted(range)) => return Ok(PieceStep::Wanted(replay, range)),
+      Ok(Progress::Store) => return Ok(PieceStep::Store(replay)),
       Ok(Progress::Done) => {
         let replayed = replay
           .finish(&mut store.index, content)
@@ -3059,6 +3063,18 @@ async fn replay_hg_referenced(
           return Err(ReplayRefused::Unlanded);
         }
         count_fill(state, &window);
+        replay = Some(more);
+      }
+      PieceStep::Store(mut more) => {
+        let repository = u128::from_be_bytes(id.bytes);
+        let answered = match more.store_wants() {
+          Some(wants) => hg_view::answer_wants_over(&disk, repository, wants).await,
+          None => false,
+        };
+        if !answered {
+          let _ = with_released(state, more);
+          return Err(ReplayRefused::Unlanded);
+        }
         replay = Some(more);
       }
       PieceStep::Done => return Ok(()),
@@ -4437,6 +4453,22 @@ async fn sectioned_unit(
         return Unit::Refused(ReplayRefused::Unlanded);
       }
       crate::state::with_state(|state| count_fill(state, window)).unwrap_or_default();
+      *replay = Some(more);
+      Unit::More
+    }
+    Some(Ok(PieceStep::Store(mut more))) => {
+      let repository = u128::from_be_bytes(id.bytes);
+      let answered = match more.store_wants() {
+        Some(wants) => hg_view::answer_wants_over(disk, repository, wants).await,
+        None => false,
+      };
+      if !answered {
+        crate::state::with_state(|state| {
+          let _ = with_released(state, more);
+        })
+        .unwrap_or_default();
+        return Unit::Refused(ReplayRefused::Unlanded);
+      }
       *replay = Some(more);
       Unit::More
     }

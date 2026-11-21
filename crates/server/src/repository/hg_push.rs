@@ -1682,8 +1682,8 @@ async fn rebase_sliced(
           .flatten()
           .map(Ok);
       }
-      // A re-base reads the fork's rows, never the changegroup's bytes.
-      Ok(Stepped::Wanted(_)) => {
+      // A re-base reads the fork's rows, never the changegroup's bytes nor the store.
+      Ok(Stepped::Wanted(_) | Stepped::Store) => {
         return Some(Err(PushOutcome::refused(&abort(REBASE_WANTED.to_vec()))));
       }
       Err(refused) => return Some(Err(PushOutcome::refused(&abort(unindexed_words(&refused))))),
@@ -1847,12 +1847,41 @@ async fn take_sliced(
     let sliced = crate::state::with_state(|state| taking.slice(state, lend, room));
     match sliced.flatten()? {
       Ok(Stepped::More) => slates_rt::futures::yield_now().await,
-      Ok(Stepped::Done) => return taking.finish().map(Ok),
+      Ok(Stepped::Done) => {
+        let forked = taking.finish()?;
+        let _ = crate::state::with_state(|state| count_bases(state, &forked.intaken));
+        return Some(Ok(forked));
+      }
+      // A file delta's base landed before the push, read from the node's changeset store between slices (A-767 C1).
+      Ok(Stepped::Store) => {
+        let intake = taking.intake.as_mut()?;
+        if !vcs_store::hg_view::answer_store_wants(intake, repository).await {
+          return None;
+        }
+      }
       // The slice answers a whole changegroup's want as its truncation; none reaches here.
       Ok(Stepped::Wanted(range)) => return Some(Err(intake_outcome(&whole_wanted(&[], range)))),
       Err(refused) => return Some(Err(intake_outcome(&refused))),
     }
   }
+}
+
+/// Counter: a push's file delta bases found in its cache of its own texts (A-767 C1, main's ruling (b2)). Format: a
+/// counter name in the status report.
+pub(crate) const BASE_HITS: &str = "vcs.hg.push_base_hits";
+/// Counter: a push's file revisions rebuilt from its own deltas to make a base its cache did not hold ((b1)). Format: a
+/// counter name in the status report.
+pub(crate) const BASE_REBUILDS: &str = "vcs.hg.push_base_rebuilds";
+/// Counter: a push's file delta bases read from the node's changeset store: revisions landed before it. Format: a
+/// counter name in the status report.
+pub(crate) const BASE_STORE_READS: &str = "vcs.hg.push_base_store_reads";
+
+/// Counts what a push's intake did to find its file delta bases ([`BASE_HITS`], [`BASE_REBUILDS`],
+/// [`BASE_STORE_READS`]).
+fn count_bases(state: &mut ShardState, intaken: &slates_hg::push::intake::Intaken) {
+  state.count(BASE_HITS, intaken.base_hits);
+  state.count(BASE_REBUILDS, intaken.base_rebuilds);
+  state.count(BASE_STORE_READS, intaken.base_store_reads);
 }
 
 /// Format: slates' words for a re-base that asked for a changegroup's bytes, which none reads.
@@ -1891,6 +1920,12 @@ pub(crate) fn take_whole(
     match taking.slice(state, lend, room) {
       Some(Ok(Stepped::More)) => {}
       Some(Ok(Stepped::Done)) => return taking.finish().map(Ok),
+      Some(Ok(Stepped::Store)) => {
+        if !stored_now(state, repository, &mut taking) {
+          taking.abandon_in(state);
+          return None;
+        }
+      }
       Some(Ok(Stepped::Wanted(range))) => {
         let refused = match taking.changegroup.as_ref() {
           Some((_, payload)) => whole_wanted(payload, range),
@@ -1909,6 +1944,24 @@ pub(crate) fn take_whole(
       }
     }
   }
+}
+
+/// Answers the intake's want of the node's changeset store at once, for a caller that holds the shard's state and so
+/// cannot wait between steps: a test's, from the store on a thread of its own (`test_store::answer_wants_blocking`).
+/// Whether it was answered.
+#[cfg(test)]
+fn stored_now(state: &mut ShardState, repository: RepositoryId, taking: &mut Taking) -> bool {
+  let (Some(disk), Some(intake)) = (state.vcs_disk.clone(), taking.intake.as_mut()) else {
+    return false;
+  };
+  crate::test_store::answer_wants_blocking(&disk, u128::from_be_bytes(repository.bytes), intake)
+}
+
+/// The intake's want of the store, met by a caller that cannot wait between steps: a made changeset's, which sends
+/// every revision whole (`slates_hg::push::made::changegroup`), so never asks; unanswered.
+#[cfg(not(test))]
+fn stored_now(_state: &mut ShardState, _repository: RepositoryId, _taking: &mut Taking) -> bool {
+  false
 }
 
 /// A prepared push landed as the driver lands it once its intake is done (A-720 part 2b): a fork another push made stale
@@ -1933,7 +1986,7 @@ pub(crate) fn land_in(
         match rebasing.slice(state)? {
           Ok(Stepped::More) => {}
           Ok(Stepped::Done) => break,
-          Ok(Stepped::Wanted(_)) => {
+          Ok(Stepped::Wanted(_) | Stepped::Store) => {
             return Some(PushOutcome::refused(&abort(REBASE_WANTED.to_vec())));
           }
           Err(refused) => return Some(PushOutcome::refused(&abort(unindexed_words(&refused)))),
