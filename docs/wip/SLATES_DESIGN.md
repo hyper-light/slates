@@ -74,8 +74,11 @@ the two cross-cutting sections keep their numbers.
 > `provision_bench` alone, every gated row (spinning and parked p50, p99, p999; max informational) held to its machine's
 > ceilings, which only tighten, every run's rows kept (`target/provision-histogram.tsv`); the bench itself fails past the
 > 50 µs floor and, run with `PROVISION_BENCH_LOAD=<n>`, past a loaded bound derived from the quiet run and the load (the
-> load may add to the spinning 1-client p99 at most what it adds to the parked p99). Wiring the lane into CI on a
-> reference machine is a run request (w-lint, main). **Open, in flight:** the loaded p99 misses its bound on main
+> load may add to the spinning 1-client p99 at most what it adds to the parked p99). The lane always runs the loaded
+> form (two spinners a logical CPU). **Wired (2026-11-20):** kiln's `provision-gate-linux` and `provision-gate-macos`
+> take a bare-metal machine whole (`exclusive`) on every push and nightly and fail on a regression or on the bench's
+> gates where the machine has a baseline; a machine without one, and GitHub's shared runners
+> (`provision-histogram`), measure and keep the histogram as the artifact, the gates reported. **Open, in flight:** the loaded p99 misses its bound on main
 > (macOS arm64: 1.62 ms against 0.87 ms; GAPS 8a-r9-gate), measured to macOS's zero-timeout `kevent` in the shard's busy
 > harvest.
 
@@ -11232,7 +11235,12 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > served through a tree host (`slates_vfs::host::tree`) lent with the green for each NFS or FUSE request
 > (`crates/server/src/green_tree.rs`); a submit declares the overlay's diverged set. 8 mounts over a 64 MiB green add
 > 1.5 MB resident (548 MB when each copied the green) and a mount is made in 1.3 ms (34 ms), against 0.6 ms over a
-> 16-file green (`crates/server/tests/mounted_work_cow.rs`). Owed: the green's landing view still copies its head.
+> 16-file green (`crates/server/tests/mounted_work_cow.rs`). A green's landing view is the same overlay over the
+> green at its head, its tree loaded (inodes, no bytes) (A-774 part 3): the landing plans its whole tree as created,
+> judged by content (`slates_land::manifest::PlanWalk::materializing`), and copies each file from the green a window at
+> a time through the tree host lent beside the target's writer (`Beginning::unit_over`, `LandingRun::step_over`).
+> Owed: a green landed again into a directory holding an earlier landing plans every file again (identical ones are
+> skipped by content; a changed one conflicts, since the plan holds no witness of the earlier landing).
 
 > **Status (2026-11-20, A-774).** A work mounts like any volume and a green lands under a grant
 > (`crates/server/src/mounted_work.rs`; GAP-A9-14): a work's first attach or mount makes a slot under its own id
@@ -11602,8 +11610,14 @@ writer made, the minimal token-grain ranges in which the file it wrote differs f
 alone runs out of its budget, anchors on tokens unique to both files with Myers between them; the cost bounded linear
 in the file). It compares the writer's own two states, never a third: no other agent's bytes are read and nothing is
 merged, the ranges are judged by the same verdict, two edits to one token still conflict, and applying them to the
-base yields the writer's file byte for byte (the property test). A path with namespace ops, node-exclusive flags, or a
-base the sealing shard cannot read keeps its whole replacement. The same journal yields the
+base yields the writer's file byte for byte (the property test). A file renamed over a path carries content relative to the rename's
+source (A-547), so it is refined against the source's base bytes, the `Rename` kept as it was (close item C2); only a
+path's content ops are replaced, its rename, mode and attributes kept (until 2026-11-20 a refined path lost them). A path
+with other namespace ops or node-exclusive flags keeps its whole replacement. A work off its green's shard asks the owner for the base bytes of every path its composition replaces
+whole, as it asks for those of files it does not hold, so it refines them too (A-776, close item C1, 2026-11-20). The refinement runs a unit at a time under its
+owner's turns (A-787): every piece of its work is metered and asks for the next unit at `refine::WORK_PER_TICK` of it, so
+its longest step stays tens of microseconds whatever the file's size. The submit still calls it in one step until
+A-787 part 2 drives it over the shard's turns. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -12401,6 +12415,10 @@ rules, which git's, Mercurial's and Subversion's intakes cite:
 > Subversion's (A-761): the commit drive streams texts a window at a time into the connection's sink (part 1); the
 > landing puts them into the content store a copy slice a turn, waits on `vcs_store::content_durable`, then appends a
 > revision naming each by (identity, length) (part 2). Owed: the green's one-step apply (w-engine's 1b).
+> A stored text a later revision moves past is deltified (A-761's deltify job, main's ruling, form (A)): made a skip-delta
+> svndiff a window a slice (`vcs_store::svn_deltify`), landed as its own entry (`Record::Deltified`, the delta held by the
+> records as every other text is), then its store hold given back; a replay holds the texts still stored after its
+> whole log.
 > The dump exporter reads a text a bounded step a call (A-762, `TextSource::read_step`): a delta chain a window a step.
 
 **A fetch's answer (the rule for every tool's clone, pull and fetch; A-745, main's ruling 2026-11-20, Ada's push rule
@@ -55965,6 +55983,27 @@ back a step at a time); §4.16's status; GAPS (§4.17, A-723).
   (six captured pushes, their packs held in 64-byte windows, thin bases among them) and
   `an_entry_whose_base_is_held_nowhere_or_past_the_room_is_refused_typed`; 2 passed; fmt clean (kiln, macOS arm64).
 
+### A-722 part 3's partial clone — a walk reads no row for a type or an unread size (2026-11-20, w-git for UI goal 93; main's order 1, w-perf's A/B)
+- **Found by use.** w-perf's A/B of A-722 part 3 (BENCHMARKS 8ce3d6152): `git clone --filter=blob:none` of git/git
+  cut at v1.0.0 1.4-1.5 times slower in every round (0.62-0.72 s before, 0.93-1.04 s after). Part 3 has each landing
+  adopt its index fork sealed into tables, where the rows had stayed in the index's tail; a row read is now a search of
+  each run, newest first.
+- **The profile** (`sample` of the daemon during the partial clone, release, main ab760dc65): the answer's object walk
+  (`Negotiating::step`) was `Index::get` and `ContentStore::get` under `StoreGraph::kind` (two rows an object: the id
+  by position, then its row) and under the tree entries' positions; and each blob's size was read (two rows more) for
+  a filter that sends no blob whatever its size.
+- **Change.** A blob's size is read only where the filter reads sizes (`Filter::reads_size`: `blob:limit`, alone or
+  combined; the object walk and the runs' carried objects). A position's type is read from its landing's runs
+  (`Repository::kind_at`): a landing gives positions by type, then id (A-639), so staging records each type's run
+  (`Staged::kinds`) and the landing keeps it (four runs at most a landing, charged with the landing map), and
+  `StoreGraph::kind` reads no row.
+- **Tests.** `slates-git` `negotiation::tests::a_filter_that_reads_no_size_asks_none` (red before: 40 sizes asked
+  under `blob:none`) and `store::repository::graph::tests::a_type_is_read_from_its_landing_with_no_row_read` (red
+  before: 24 index visits for 12 objects); `slates-git --lib` 582 passed; `slates-server --lib -- git vcs_store vcs_http` 220 passed.
+- **By use** (adas-mac-studio.local-2, release, w-perf's `git_scale.sh` on git/git cut at v1.0.0 with ten partial
+  clones each against one daemon after its steps, load 33-36): the daemon's CPU a partial clone 700-760 ms on main
+  (ab760dc65) and 250-360 ms after; wall 0.96-1.05 s and 0.49-0.63 s, under the 0.62-0.72 s before part 3.
+
 ### A-722's replay in place — a record's replay reads its pack as a live push does (2026-11-20, w-git for UI goal 93; B2's other side)
 - **Why.** A version-2 record's replay (`vcs_store::git_replay`) read its pack into git's reader whole
   (`Reader::read`, `finish_with` into `Unpacked`), so every object was held inflated in the reader while each was put in
@@ -57620,6 +57659,15 @@ live let a capture's pins go), `crates/vfs/tests/pinned_chunks.rs`.
   read in one turn: 1 turn), `a_whole_capture_in_turns_queues_what_publishes_behind_it_and_lets_its_pins_go` (red: the
   first turn `Done`), `a_capture_dropped_or_forgotten_leaks_no_pin`; `slates-vfs` `pinned_chunks` (red with a pin that
   holds nothing: the overwrite freed the pinned chunk at once).
+- **Deltas too (2026-11-20, main's piece 3).** A delta's content is read in turns the same way: the capture is a span
+  list, each run of [`content_runs`] in its order (a named chunk extent's, the named open extent's, a patched file's
+  clipped to the bytes its writes changed), and `Volume::pin_extents` pins only the extents the record names (a delta's
+  inode image names those within the windows its writes touched). A turn reads a page at least before it reads the
+  quantum's clock, so a publication smaller than a page is made in its own turn whatever its spans. Tests:
+  `live_ship::tests::a_deltas_capture_read_in_turns_reads_the_head_it_began_on` (the oracle against the one-turn read,
+  both files rewritten between turns: 262,144 sealed bytes in 5 turns at a zero quantum) and
+  `a_live_volumes_large_delta_is_read_in_turns` (red with the one-turn delta path: no capture waiting; after: the delta's
+  capture waits as the build and takes 21 turns, nothing refused, no pin left). Still one turn: the whole state's image.
 
 ### A-769 — The export route's judge: whether a container engine mounts a volume's NFS export as a volume of its own, and from where, asked on every host (2026-11-20, w-k90-a520; main's ruling on kiln's export route, Ada's ruling ~09:30 PST; §4.6 A-9, A-520, A-521, A-115, A-184; `CONTRACT` = 57)
 Applied in the same change to: §4.6 (A-520's form through the library: a status line), GAPS (the library's container
@@ -57894,3 +57942,95 @@ Applied in the same change to: §4.16 (A-773's status line), GAPS, `crates/mcp` 
 Evidence: `cargo test --locked -p slates-mcp --test mcp` red with the tool's dispatch removed, green with it; `-p
 slates-mcp --lib` 19; `-p slates-cli --bin slates log_view` 3; workspace `cargo check --tests --examples` clean (macOS
 arm64, this Mac, local). The SDK tests need a built wheel and addon with a daemon: run requested from main.
+
+### A-697 (1) — A holder's composed increment crosses once: the inputs it composed are never shipped back to it (2026-11-20, w-shared for UI goal 93; main's ruling after A-697's release bench)
+Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), GAPS (A-247's step two),
+`crates/server/src/work_home.rs` (`computed_request`), `crates/server/src/merge_service.rs` (`hold_composed_inputs`,
+`inputs_held_by`, the chunk count in `ship_version`), `crates/server/src/verbs.rs` (`judge_submission`),
+`crates/server/tests/fleet.rs`.
+- **What was measured.** A-697's release bench (BENCHMARKS, 2026-11-20): a holder's 64 MiB version took three input
+  shipments to place, a local one one. The holder had composed the increment and sent it to the owner, and the owner's
+  record plane then shipped the same bytes back to it as the version's inputs, chunk by chunk, before the record.
+- **Change.** The inputs a record names are the increment's own bytes (`inputs_of`: `chain_entry::increment_bytes`), and
+  the archive's identity is the bytes' alone, so the holder can hold exactly what the owner will name before the owner
+  judges. `computed_request` encodes the increment once and holds it as the archive of the green's next version in the
+  node's held content (`hold_composed_inputs`; the owner's offer refreshes the placement to the version it commits),
+  then forwards the same bytes. The owner, committing a verdict a holder computed, marks that holder (the work id's
+  creator, which the node-verb authority guarantees sent it) as lacking none of the inputs (`inputs_held_by`), so its
+  shipment carries the offer and no chunk, which the holder acknowledges from its hold, with the record. A hold the
+  content plane refused (no room) is counted, and the holder's answer to the offer names what it lacks, which the next
+  shipment carries: the ordinary path.
+- **Memory.** One held copy of the inputs on the holder, where before the owner's chunks made the same copy after a
+  round trip; the encoded increment is made once, for the hold and the forward both. The archive builder's own
+  chunking is the owner's as well (owed with the record plane's per-pass archive build, below).
+- **Counters.** `merge.inputs.held_at_compose`, `merge.inputs.held_by_composer`, `merge.inputs.chunks_shipped` (the
+  test's red), `merge.inputs.held_at_compose_refused`.
+- **Owed (found reading).** The owner's record plane builds a version's inputs archive afresh at every pass that ships
+  chunks (`cut_shipments` → `inputs_of` → `inputs_archive`: every byte hashed and chunked again) to ship one shipment's
+  bound of it: work of the order of the size squared over the bound for a large increment. Main's lane-throughput
+  item.
+
+### A-787 — A whole-file rewrite's refinement sliced under its owner's turns (2026-11-20, w-rewrite-ops; main's pushback on A-776 at 15:20 PST, item 1; §4.3's step budget, CLAUDE.md §3 "Bounded work everywhere", A-752, A-776)
+
+- **The gap.** A-776's refinement ran in one step. Measured release on an Apple M4 Max: 14 ms for a 300 KiB source file
+  re-indented, 47 to 52 ms at 4 MiB and 166 to 211 ms at 12 MiB, against a shard's quantum of its measured wake.
+- **The change (part 1, `slates_merge::refine`).**
+  - **Metered work.** Every piece of work is charged to a meter that asks the owner's turn for the next unit
+    (`pace::Ticks`) every `WORK_PER_TICK` (4,096) of it: a byte scanned or compared, a diagonal visited, a word hashed.
+    The hot loops run synchronously up to the unit's room and await only between units. `Refiner::refine_paced` and
+    `refine_rewrites_paced` are the paced forms; the sync forms run the same code under no turn.
+  - **No single charge past a unit.** A token is cut at 4,096 bytes. No vector doubles in one step: units are counted,
+    then laid; ranges sit in chunks that double from 64 to 4,096. No hash table rehashes: the anchors are a paced
+    least-significant-digit radix sort of 32-bit hashes of word units. A base-to-writer map is zeroed in order. The
+    relaid post-state's sort and the document's order are the paced ones.
+- **Rejected, measured.**
+  - A heapsort in place for the anchors: 12 times slower on a 1 MiB rewrite.
+  - A hash table: its rehash is one step that grows with the file.
+  - Hashing blank and punctuation units: about double the sort for anchors that almost never exist.
+- **A/B** (BENCHMARKS "A rewrite's refinement sliced"). Release, interleaved with A-776 (561c655a3), three runs of five
+  rounds, all shown there.
+  - Longest step: the whole save before; after, 10 to 46 µs on the crate's sources and 31 to 99 µs at 1 and 4 MiB. At
+    12 MiB it is typically 40 to 300 µs, but 3 of 15 rounds had one unit of 1.8 to 2.8 ms, not yet explained.
+  - Per-save time: 1.45 to 1.5 times A-776's on sources and at 1 MiB, 1.35 times at 4 MiB, 1.15 times at 12 MiB. The
+    search's steps are identical (2,365,669 for `engine.rs`), so the cost is the meter's per-comparison bookkeeping.
+  - The corpus verdicts are unchanged: 0 of 720 false conflicts, 240 of 240 one-token clashes still conflicting.
+- **Tests.** `a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time`: a 3.1 MiB rewrite driven a turn at a time
+  spans many turns, no unit does more than three units' work or a 64th of the file's, and the document and plan equal
+  the unpaced refinement's. Red with the asks disabled (one unit did all the work), green with them. Plus A-776's
+  eight. macOS arm64, this Mac, local.
+- **Part 2 (next, in flight):** the submit drives `refine_rewrites_paced` over the shard's turns. Today
+  `verbs::compose_increment` runs it in one step. Shape proposed: the work's gate parks a submit whose journal replaces
+  a file whole, local green or not; a task of the work's shard refines copies of the two files, a turn at a time; the
+  verb resumes with the ranges, as an owner's answer resumes it (A-247). To use A-783's pacing primitive once it lands.
+- **Applied in the same change to:** §4.16 "Composition at seal"; GAPS D-O17; BENCHMARKS; `crates/merge/src/refine.rs`,
+  its tests, `examples/rewrite_slices.rs` (new), `examples/rewrite_ab.rs`.
+
+### A-784 — A planned move is prepared unfrozen and frozen only once ready to hand over; its hops are logged (2026-11-20, w-fed-move, kiln goal 91; main's piece; found by use: kiln's live move, most first asks refused `Unplaced`, every ask for five minutes once; §4.10 "Ownership follows the writer"; A-291, A-525, A-544)
+- **Why.** A move froze its volume at its ask and was refused `Unplaced` once unreported for the failover delay (A-525),
+  so the bound counted the preparation: a captured clone's capture carried on its head (A-544) and the head placed on
+  `f + 1` members besides its owner (the handoff), each seconds of sliced seal work that ran on after the refusal.
+  Measured with the hops now logged (release, kiln's lab, three runners on one Mac, the agent's workspace): ask 1 refused
+  at 3,293 ms (bound 3,200 ms) before its carry; ask 2 at 3,187 ms, carried at 38 ms, placed at 141 ms, its handoff
+  not begun (a seal job running); ask 3 at 3,190 ms, its handoff begun at 142 ms; ask 4 reported at 120 ms, the work the
+  refused asks began done meanwhile. The forward lanes' floor was 0 ms there.
+- **Change.** The ask records the move unfrozen (`MoveOut::frozen_ns` zero): the volume takes writes while the move is
+  prepared (`moves::frozen` is false; `moves::moving` true, which the healer passes by as it passes a frozen copy). Once
+  ready to hand over, the control shard's step is `Freeze` (`moves::freeze`, on the owner shard): what the ask judged
+  judged again (`moves::unmovable_after`: attachments, lease, clones, the target), snapshots only those taken after the
+  move's own head (`MoveOut::own_since`), since a head the move took leaves the one before it as an older snapshot; the
+  head taken for the move again (`verbs::head_for_move`), frozen when it is the head prepared, or
+  prepared again on a new head when written to meanwhile (`fleet.move.prepared_again`). The failover bound runs from the
+  freeze; a prepared move is overdue once its mover has not asked for a failover delay (`MoveOut::asked_ns`), or at once
+  when its carry was refused (`carry::refused_for_head`). Each move's hops (carried, records placed, held off this node,
+  handoff begun, frozen) are logged with its bound and the widest forward-lane floor when it is reported or refused
+  (`moves::log_hops`).
+- **Tests** (macOS arm64, Mac Studio, local). `slates-server --test fleet
+  a_moves_first_ask_is_not_refused_while_its_head_is_carried_and_placed_off_its_owner` (a captured clone with the
+  agent's changes and about 780 KB more, asked once): red before (refused `Unplaced` at 3,214 ms of a 3,200 ms bound),
+  green after (reported at 87.2 s in this debug build, frozen 0.1 s). `--lib moves::` 6 passed, among them
+  `a_move_prepared_unfrozen_lasts_while_its_mover_asks_and_a_frozen_one_is_bound_from_its_freeze`; the fleet's eight
+  move tests pass (`a_volume_moved_to_another_member_is_served_there_and_its_old_owner_forwards` found the healer
+  re-placing a prepared volume, now passed by). By use, release, kiln's lab: the first ask reported at 24.6 s (carried
+  12.3 s, held off its owner 24.5 s), the whole live move 49.5 s against 112 s before.
+- **Open.** The preparation is paced by the seal periods: the carry and the handoff took about 12 s each for under
+  1 MB.

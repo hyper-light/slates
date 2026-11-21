@@ -1,8 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **KILN ON A LOADED KVM HOST (w-k90-kvm, 2026-11-20; kiln goal 90d/90f, closed at kiln c0f576eb3; findings recorded,
+> not worked, per the close order).** Seen on adacachy (load 60-85, io some avg10 ~10%) in kiln's `slates_e2e microvm::`
+> drive: (1) an agent's act asked while its runner's link to the server is down is refused at once (`reach/node.rs`
+> `on_local`, deliberate per `reach/tests.rs`), so a link blip fails an agent's landing; (2) a session start sent just
+> before a link drop can be lost, and the server marks the session crashed ("the runner doesn't hold it") for a person to
+> resume; (3) a runner's sqlite stores took 48-96 s to open under that I/O pressure. The link itself drops when a
+> starved process misses the transport's 10 s idle timeout (`net::limits`): run such drives at the default CPU weight.
+
 > **R9'S PROVISIONING GATE AND ITS LOADED P99 (w-provision-gate, 2026-11-20; A-786; 8a-r9-gate below).** BUILT: the
-> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included. Its CI wiring is a
-> run request. **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
+> gate's lane (`cargo xtask ratchet --provision`) and its assertions, the loaded form's bound included; WIRED into kiln CI
+> and nightly (exclusive bare-metal Linux and macOS legs) and GitHub's CI (informational, the histogram kept). **Open, fix in flight:** the loaded 1-client p99 misses its bound on main (1.62 ms against 0.87 ms, macOS
 > arm64, M4 Max, 2 spinners a logical CPU), measured to the shard's busy-loop harvest (a zero-timeout `kevent` sleeps and
 > switches between a forwarded reply's two tasks); the A/B and the next step are in 8a-r9-gate.
 
@@ -11,8 +19,9 @@
 > `crates/cli/tests/real_tools.rs` (a `#pragma once` compile held across the events, `make -q`, `cargo build` a no-op,
 > `git status` clean, every tracked file's inode number and times compared) across a snapshot, a SIGKILL takeover by
 > the anchor's next daemon and memory pressure (an injected hold and stall); green on adas-macbook-pro-2 (APFS).
-> Open: the same flows over Linux FUSE and Windows WinFsp (the test is macOS-only; run-requests.md), and memory
-> pressure from a host actually short of memory (the test injects it).
+> The flows build for Linux FUSE and Windows WinFsp too (Windows: the file index, last-write and change times, cargo
+> and git status; the held compile and `make` are Unix's). Open: their Linux and Windows runs (run-requests.md), and
+> memory pressure from a host actually short of memory (the test injects it).
 
 > **MEMORY SIZING (Ada 2026-11-20: the daemon held 7.1 GB resident after an 84 MB Mercurial push; w-sizing).** Every
 > buffer, region, reserve and prefault is sized from the work, learned, decays and is given back; a machine total is
@@ -200,6 +209,14 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-784 (2026-11-20, w-fed-move; main's piece, found by use: kiln's live move, goal 91).** FIXED: a planned move
+> (A-291) is prepared unfrozen and frozen only once ready to hand over, so its first ask is no longer refused
+> `Unplaced` while its head is carried and placed off its owner: the failover bound runs from the freeze; preparing, the
+> volume takes writes and the move lasts while its mover asks (refused at once when its carry is refused). Each move logs
+> its hops when reported or refused. Measured, release, kiln's lab, three runners on one Mac: before, asks 1-3 refused at
+> 3.2 s and ask 4 reported 120 ms after it; after, ask 1 reported at 24.6 s (carried 12.3 s, held off its owner 24.5 s),
+> frozen 0.1 s. Open: preparation is paced by the seal periods (the carry and the handoff, about 12 s each for under 1 MB).
+>
 > **A-756 (2026-11-20, w-fed-move; BUG found by use: kiln's live move, goal 91).** FIXED: a volume a node made by
 > materialization (moved there, or taken over) is found there by its name: the node claims the alias its name's
 > partition holds for it (A-236), as a clone made under another partition's name does; the old owner releases its own.
@@ -329,8 +346,35 @@
 > text), the replay's and the live push's alike. The intake now hands each append the text it kept last
 > (`HgIndex::append_revisions_after`, borrowed, no copy); a predecessor is rebuilt only where the caller holds none.
 > Red first: `push::intake::tests::the_intake_hands_each_manifest_its_predecessors_text_never_rebuilding_it` (6
-> rebuilds of stock 7.2's bundle before, 0 after). Owed: the restart's replay of hg's history measured again, its
-> longest step against the quantum and the per-step lend and settle (0.5 ms a slice).
+> rebuilds of stock 7.2's bundle before, 0 after). Part 5 FIXED: a recovery unit, and a rebuild's turn, takes the
+> record's steps under one lend of the stores and one settle of the charge until its slice's budget (the step quantum)
+> is spent, where every revision was a unit of its own (259,321 for hg's history). Counted as
+> `vcs_store.hg_replay_turns`. Red first: `vcs_store::hg_import::tests::a_recovery_unit_replays_as_many_revisions_as_
+> its_slice_allows` (31 units for 15 revisions before; fewer units than revisions after, the 1 ns slices' test still a
+> revision a unit). `revision_text` applies a chain into two swapped buffers (dc59ef2a1). Owed: the restart of hg's
+> history measured again, release, its slices and longest step (the Studios' network and adacachy's room permitting).
+> **Item 6, reading (a): a forced new head on a moved line, held to stock 7.2's `push -f` (2026-11-20, w-hg).**
+> PROVEN by use, no change needed. `crates/cli/tests/hg_interop.rs`
+> `stock_hg_forces_a_new_head_on_a_moved_line_and_every_client_sees_both` runs over the HTTP edge with stock 7.2:
+> - A pushes, B clones, commits and pushes, which moves the line, then A commits on the old head;
+> - A's plain push is refused in 7.2's own words (`abort: push creates new remote head`, exit 255);
+> - `push --force` lands, as a line made (§4.17.3 decision 1);
+> - a fresh clone holds three changesets and both heads on `default`;
+> - B's pull brings A's head.
+> Passes on its first run (local macOS, 49 s with the HTTP round trip). Reading (b), the forced push judged as a work
+> and made over the moved head (the lock-free rebase, beyond stock), waits on main's ruling
+> (inbox/main-from-w-hg-2026-11-20-item6-question.md).
+> **A clone sends a manifest kept as a delta as that delta (2026-11-20, w-hg; Ada's no-allocation rule, goal 93's
+> clone; found in the code).** A clone sent every revision as its whole text against the null base. For hg's own
+> history that's about 57,000 manifests of up to 179 KB, each rebuilt from its chain on the server and diffed again
+> by the client. FIXED for manifests: `getbundle::Store::manifest_delta` lends a manifest's stored delta in place
+> (`Indexed`, A-729's rows), and the walk sends it against its base where that base went just before it in the same
+> answer (every one after the first in a clone). Otherwise it sends the whole text, as before. Red first:
+> `serve::indexed::tests::a_clone_sends_a_manifest_kept_as_a_delta_as_that_delta` ("every manifest was sent whole"
+> before; each text rebuilt from its base and checked against its node after). Every stock hg 7.2 interop test passes
+> through it (clone over HTTP and SSH, round trips, forced heads). Owed: file revisions, which the store keeps whole,
+> go the same way once the changeset shape keeps them as Mercurial's deltas. And the clone's time against stock's
+> 283 s, measured again, release.
 > **A-745 (2026-11-20, w-hg; main's ruling, found by use by w-interop: no clone of Mercurial's own 57,035-revision
 > history was admitted, HTTP, SSH and stream).** RED: §4.17.1 "A fetch's answer" written; the by-use test (a clone of
 > one changeset whose file is twice a request's room, `ERROR:ABORT PastAdmission { asked: 557056, left: 277336 }`)
@@ -418,8 +462,13 @@
 > held again at a recovery. c2 BUILT 14215b0c3: the records keep texts as skip-delta svndiffs. c3 BUILT: `HeadTexts`
 > reads a head text from the green and any other from the one place the records say it is kept (the content store for
 > a stored text, A-761 p2; the records' delta for an imported or made one), no arm tried after another. a3b BUILT
-> 9b9d8dec6 (lists and names in the shard image). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); the
-> background deltify of a superseded stored text (main's ruling on A-761); (d) replication.
+> 9b9d8dec6 (lists and names in the shard image). The deltify job BUILT (main's ruling on A-761, form (A) of 16:10): a
+> stored text a later revision moved past is made a skip-delta svndiff a window a slice (`vcs_store::svn_deltify`), landed
+> as its own entry (`Record::Deltified`, the delta held by the records as c2 holds every other text: one form, one read
+> path), and only then its store hold given back; a replay holds the texts the records still keep stored after its whole
+> log, so a text a later entry deltified is never asked of the store. Held by
+> `a_stored_text_its_node_moved_past_is_kept_as_a_delta_and_its_whole_bytes_released` (red: nothing deltified, the
+> whole text held). OWED: (b) git v3 (w-balance's names, on main's f+1 ruling); (d) replication.
 >
 > **A-723 (2026-11-20, w-perf, UI goal 93; content once, a push a work):** S1 BUILT: a git entry records its objects by
 > name and the pack as sent (version 2), not inflated; replay reads them through git's reader. OWED: a pack past an
@@ -476,8 +525,11 @@
 > charged; a pair of trees read whole and the parts' record in one unit. Each other unit is a window's work at most
 > (w-k90-vendor, 2026-11-20: the 56 MB git/git v2.0.0 push's encoding had spun the shard 3.5 s in one object's unit).
 > The level and the window are chosen from the bytes saved and the machine's rates measured once a process
-> (`learn::Rates`), not timed per object: one input, one output. OWED: the release A/B on git/git; a deployment's rates
-> shared by its nodes.
+> (`learn::Rates`), not timed per object: one input, one output; its release A/B even on CPU (BENCHMARKS.md). FOUND
+> (2026-11-20, w-k90-vendor, not in a queue): a first version's fragments are 34 times git's pack of the same objects
+> (git/git v2.0.0: 1.92 GB against 55.9 MB; a first version names no bases and the learned window starts at one
+> candidate), so a clone of an imported repository sends that much; and `Repository::kept_fragments` counts a part
+> past a window as its root list's bytes, not its own, so A-724's relief under-counts large fragments.
 >
 > **A-654 (2026-11-19, g258; git's push end to end).** Part 1 BUILT (slates-git): a create made at its first parent's version (else the default branch's head; empty only while the default branch is unborn); a green lent to the judge by closure; receive-pack's `Session` owning its advertisement and hidden refs; `Verdicts` judging without an append beside `Works`; `Unappended::Refused` and git's words for an append's own refusal (`append_declined`, `atomic_declined`). Part 2 BUILT: the server's driver `crates/server/src/git_push.rs`, one entry point for both edges (`ReceivePack::start`, `input`, `end`, `answer`, each one step on the owner shard): the advertisement of each branch whose green holds a git head (namespace name `N` is `refs/heads/N`, a name beginning `refs/` is itself), a ref the pusher may not read under A-622's policy hidden; input and end over A-638's index view lent the shard's room (`vcs_store::with_room`); a configured git hook refusing every command `hook not run` until A-665 part 2's view; the checked objects admitted to A-662's quarantine and sealed; each command asked of A-622's policy through A-644 part 2's check point (`git_protect`: the right its change needs, then a protected name's linear history and signed commits on what it brings) before its work is built, refused in git's words; A-654 part 1's verdicts over the shard's greens, a ref's base its green's head alone, held at the append by compare and swap; `push_sealed` per entry, or once for all under `atomic`; git's report. Part 3 BUILT: git's HTTP site serves receive-pack through the driver (`vcs_http::git::receive`: each service from its own half, each step lent the state of the shard the connection moved to, a failure before any reply a status, a command's refusal the report's), proven by stock git's `create` push over loopback TLS to a daemon. The SSH site's call BUILT (A-683: `vcs_ssh::receive`, each step lent the shard's state through the HTTP site's seam, `ShardLender`). OWED: the live `git push` over HTTPS and over SSH with stock git's binary (main's runs); the hooks run over A-665 part 2's view (`pre-receive`, `update`, `post-receive`); a push based on an older version than its green's head, refused as a ref that moved until A-664's server-made commits; a principal the policy allows who is not the owner, whom A-635's append refuses `Forbidden`; push options; review requests (`refs/for/`); the new versions' pack fragments encoded off the answer's path (§4.17.2 "A push" item 8); a tag of a tag; a create while the default branch is unborn and holds files no commit names (A-664's).
 >
@@ -2241,8 +2293,8 @@
 > (`svn_commit::land_work`, `store_step`); the revision names each by (identity, length) (`Revision::stored`, record
 > version 2) and the records keep the reference, no bytes; the entry is appended only once the store answers the texts
 > durable (`vcs_store::content_durable`, A-727 slice b), a refusal giving every put text back (`NotDurable`); reads
-> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity and
-> refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
+> find a stored text green, then store, then records (`svn_texts::HeadTexts`); replay holds each stored identity the records
+> still keep stored once its whole log is applied, and refuses one the store lacks (`ReplayRefused::SvnStored`). Held by `a_subversion_commits_stored_text_survives_a_crash_right_after_its_entry`.
 > Owed: the green's one-step apply of the landing (w-engine's 1b), and the 500 MB commit measured again. **The export's text
 > read sliced (A-762, same day, w-svn, main's item 2; found by reading):** the exporter rebuilt a text through its whole delta
 > chain in one call (512 KiB, a chain of 6: the longest call 6.18 ms against a whole read of 6.04 ms, debug). Now a text
@@ -2259,16 +2311,24 @@
 > **A-772, svnsync's replay (2026-11-20, w-svn; main's order after w-interop's matrix r10: 0.54 s a revision of
 > git-2000.dump, 2,511 MiB peak against the 447 MiB dump):** the drive's share measured and fixed by w-perf's per-reader
 > `WindowCache` (b51f908f2): `replay_bench` 328 s to 1.82 s for r1..r2000 (BENCHMARKS), held by
-> `a_replay_makes_each_delta_window_a_bounded_number_of_times`. Owed: the server's per-turn cost (~960 one-step turns a
-> revision) and the peak against the dump, measured through the daemon's SSH site next.
+> `a_replay_makes_each_delta_window_a_bounded_number_of_times`. Through the daemon's SSH site (release): r1..r300 in
+> 2.22 s, 7.4 ms a revision (`measure_svnsync_replay_range_over_the_tunnel`, BENCHMARKS): the one-step turns are no gap.
+> Owed: the daemon's peak against the dump (the matrix's 2,511 MiB against 447 MiB), on a release daemon.
 > **A-766, DeltaV v1 (2026-11-20, w-svn; clients without HTTPv2: svn before 1.7, and 1.7+ where OPTIONS has no v2
 > headers):** part 1 BUILT, the read side as `mod_dav_svn` 1.14.x answers it: `!svn/vcc/default` (its `checked-in` the
 > youngest baseline; the v1 update-report's target, its hrefs version resources), `!svn/bln/REV` (`D:baseline`, its
 > collection `!svn/bc/REV/`, `version-name`, its revision's properties as dead properties), `!svn/ver/REV/PATH` (the
-> node in REV, no `checked-in`). Owed: part 2 the commit verbs (MKACTIVITY, CHECKOUT, the working baseline's PROPPATCH,
-> `wrk`, MERGE and DELETE of the activity) over DavCommit, part 3 the server site, part 4 by-use; the PROPFIND
-> writer's per-property strings rewritten into the connection's buffer (MEMORY SIZING; its subjects now lend their
-> properties).
+> node in REV, no `checked-in`). Part 2 BUILT (with part 3, the server site): MKACTIVITY begins a transaction with
+> the author alone and runs start-commit, as `dav_svn__create_txn` does, naming it the activity; CHECKOUT of the VCC (or
+> the youngest baseline) answers the working baseline `!svn/wbl/ID/REV`, of `!svn/ver/REV/PATH` the working resource
+> `!svn/wrk/ID/PATH`, its revision kept as the base later requests are judged against (`DavCommit::check_out`); the
+> working baseline's PROPPATCH sets the revision properties (`DavCommit::proppatch_revision_properties`); PUT, MKCOL,
+> DELETE, COPY and PROPPATCH on working resources run as on `!svn/txr/`; MERGE of the activity commits; DELETE of it
+> aborts or answers `204`; `201`s as `mod_dav`'s `dav_created` writes them (`dav::response::created`). Held by
+> `a_deltav_v1_commit_lands_as_mod_dav_svn_lands_it` (the daemon's edge, ra_serf 1.14's requests) and
+> `dav::activity` tests. Departures, each stated: a MERGE answers HTTPv2's short form (no per-path `D:response`s a
+> working copy's wc-props take), `Location` is the path alone, a CHECKOUT's out-of-date check is the drive's at the
+> next request. Owed: part 4 by-use (stock svn 1.15 against an OPTIONS with no v2 headers, on a host with svn).
 > request sent again refuses a stream that starts before the revision after the youngest); the CLI's and the SDKs'
 > words for both verbs; main's: clippy and `xtask` over the modules. Found by it and fixed by
 > A-652 (2026-11-19, g264): the
@@ -3225,8 +3285,8 @@
 >   whole record 19 to 22 ms (A-377's memcpy a byte); forwarded verbs 64 to 73 ms of wall. **A-763 (2026-11-20):** a live write ships the
 >   bytes it changed, not every window it touched (64 page writes on a 3 MiB file: 20,063,216 bytes shipped before,
 >   309,760 after). **A-768 (2026-11-20):** a whole publication's content is read in turns from pinned chunks, a quantum a
->   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug; its image's 2.0 to
->   3.0 ms is still one turn). **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
+>   turn, the publications made meanwhile queued behind it (before: 4.5 to 6 ms of its turn, debug), and a delta's the
+>   same way (before: 3.3 ms for 1.25 MB); a whole state's image (2.0 to 3.0 ms, debug) is still one turn. **A-771 (2026-11-20):** a takeover's rebuild applies a payload, and hashes its archive's
 >   content, in steps of a page (before, debug: a whole entry's open 56 to 59 ms of one turn, the archive's hashing 93 to
 >   99 ms of another). **A-775 (2026-11-20):** a taken-over volume given up while its log's holder (or its catalog's or
 >   content's cohort) was away, or a green given up while the holder of its inputs was, is judged afresh once that member is
@@ -5029,7 +5089,8 @@
 > holder's submit committed by the verdict its replica computed, taken by position at the owner, `SubmitComputed`);
 > part d built (the submit settles once the holder's replica holds the version); part e built (a holder's work comes
 > back from its log over the holder's replica after a restart); a holder work's rebase and copies built over the
-> replica; a creation a restart caught releases its floor at the owner (part e2); the increment carried by reference
+> replica; a creation a restart caught releases its floor at the owner (part e2); a holder's composed inputs never shipped
+> back to it (A-697 (1), 2026-11-20); the increment carried by reference
 > to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
 > that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
@@ -8466,7 +8527,12 @@ was the stopped `FSYNC` answered `0` above is not shown: that run printed no log
 > the real-process runs of both faults are main's (run-requests.md): the store-destroyed flows exist, and the client
 > killed mid-write is `a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover` (`live_chaos.rs`,
 > 2026-11-19: its write killed between sent and answered by the owner's `fleet.live.awaited`, the owner then lost, the
-> next owner judged by every invariant). The owner's `put_wal` is its `Local` records,
+> next owner judged by every invariant). **Run green across real processes (2026-11-20, w-fed-faults, goal 85c):**
+> macOS arm64, Mac Studio, over slates main d4a5f9f43, `SLATES_TEST_CLI=1 cargo test -p slates-cli --test live_chaos --
+> --exact a_client_killed_mid_write_leaves_its_write_whole_or_absent_through_a_takeover`, 1 passed in 9.3 s: the
+> client's write reached the owner and parked there before the kill, the successor served from 2.6 s after the owner's
+> loss, every acknowledged write whole and the killed client's absent or whole (NoLoss), its first head 21 past the
+> last durable 19 under epoch 2 (Continuity), and every survivor's reads its own bytes (ReadSafety). The owner's `put_wal` is its `Local` records,
 > resumed by the record period after a warm restart (2026-11-17, g230; §4.8 "Recovery" status,
 > `a_seal_its_owner_had_not_placed_at_a_warm_restart_places_after_it`); the loss-window report is unbuilt; a head still
 > waits up to the 100 ms record period before its commit starts.
@@ -9416,7 +9482,7 @@ them rather than renumbering or weakening the original gates.
 - D-O14 (opened 2026-09-04) FUSE passthrough for untouched base files — CLOSED 2026-09-04: not used; slates never requires `CAP_SYS_ADMIN` or root beyond the OS-provided brokers installed once (`fusermount3`/user namespaces, the FSKit extension, the WinFsp driver); the daemon copy path is the only base read path.
 - D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window until 2026-09-29; since A-43 the old entry moves aside and the new one in by renames that replace nothing, the name's absent window reported) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
 - D-O16 (opened 2026-09-04) Landing filters — DECIDED 2026-09-04: the confirmation surface offers suggestions the human toggles (ignore-file-aware); the agent's filter stays explicit; a toggle produces a new manifest hash (§4.15 step 2). Phase 5 builds it.
-- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict.
+- D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations — CLOSED 2026-11-20 by A-776: the seal recovers a whole-file rewrite (editor write-and-rename, formatter, codemod) as the token-grain edit it was (`slates_merge::refine`), so it merges as precisely as a declared edit; measured on 1,920 rewrite pairs (`crates/merge/examples/rewrite_ab.rs`): 0 false conflicts on different lines, different tokens of one line, or a formatter beside an edit (whole-file: 720 of 720), every one-token clash still a conflict. The refinement is sliced (A-787 part 1: longest unit tens of µs whatever the size, against the whole save in one step); the submit still runs it in one step until A-787 part 2 (in flight, w-rewrite-ops). A work off its green's shard refines too: it fetches the base bytes of the paths it replaced whole (C1, `whole_file_rewrites_on_works_off_the_greens_shard_merge_as_their_edits`). A file renamed over another is refined against the rename's source (C2). Found 2026-11-20, not worked (close order): the backup-then-recreate save (rename `f` to `f~`, create `f`, write it: vim's and Emacs's default with a backup) is refused by the deriver, `DeriveError::Unsupported("f")`, before any refinement, so such a save cannot be submitted at all (w-rewrite-ops, by a composition probe; GAPS §8f's rename onto a consumed base path).
 - D-O18 (opened 2026-09-04) Merge proposer authority: slates departs from hecate's leader-fused proposer (one shared pointer group; partitioned execution) and uses a consensus-issued lease with an epoch check at commit; CLOSED 2026-09-04 by A-6: the owner is the distinguished proposer of its own registers under its host epoch, so no leader-versus-leaseholder split can exist; a resumed stale owner is refused at the first holder (model-checked as StaleNeverCommits and Continuity).
 
 ## 3. Undesigned (charter only)
@@ -10749,8 +10815,14 @@ and parked p50/p99/p999; max informational) to the machine's recorded ceilings, 
 machine with no baseline, and appends every run's rows to `target/provision-histogram.tsv` for CI to keep. The bench
 fails past R9's floor and, with `PROVISION_BENCH_LOAD=<n>` (n busy processes a logical CPU, started after the quiet forms),
 past the loaded bound: the load may add to the spinning 1-client p99 at most what it adds to the parked one. Each
-1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`). CI wiring on
-a reference runner: run request (w-lint, main).
+1-client run prints its tail split by A-559's stamps (daemon's part, client's part; `Client::reply_stamp`).
+**Wired (2026-11-20, C1):** `.kiln/ci.yaml` and `.kiln/nightly.yaml` run the lane as `provision-gate-linux` and
+`provision-gate-macos`, each taking a bare-metal machine whole (`exclusive: true`); GitHub's `provision-histogram` runs it
+on ubuntu-latest and macos-latest. The lane always includes the loaded form (`PROVISION_BENCH_LOAD=2`). Where the machine
+has a baseline, a regression or a failed bench gate fails the job; elsewhere it measures and keeps the histogram
+(`target/provision-histogram.tsv`, the job's artifact) and reports the gates. The Linux bare-metal machine (adacachy,
+32 cores) stood at load 90-104 when its baseline was tried, so it has none yet; it records at its first quiet exclusive
+run.
 
 **The loaded p99, measured (macOS arm64, Apple M4 Max 14 CPUs, this MacBook, host load 4-54 from other agents, release,
 9 shards).** Red on main: 1.62 ms against the bound 0.87 ms (quiet 616 µs, parked 683 -> 939 µs under the load). By the
@@ -12441,7 +12513,7 @@ or executable regression was performed by this docs change.
 | GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
 | GAP-A9-12 | Closed registry, distinct identities with type-enforced causation, and typed loss/absence markers built and proven by use single-node (`e18619a`); open: cross-node trace propagation and the fleet/archive emitters (§4.8/§4.10 integration). (Was: signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven.) | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
 | GAP-A9-13 | **Built single-node (2026-09-14, `docs/wip/clean-digest.md`):** verified current digest only (`Overlay::digest`, the `Digest` verb on the wire/CLI/MCP); invalidated before any mutation (`copy_up`, `base_forget`, listing refresh); bounded cache discovery (`Store.digests`, `digest_capacity`, typed counted `DigestCacheFull`); watcher hints backed by revalidation, overflow drops all. Owed: cooperative slicing of the hash, sealed-content digests, SDK exposure. (Was: clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content.) | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
-| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: the slot and unsubmitted mount writes are lost at a restart, a mount is not refreshed when its work's base moves, a work over a green on another shard mounts nothing, the green's landing view copies its head (fix in flight, A-774 part 3), a work with declared changes is refused a mount, only the NFS and FUSE bridges lend the green to a mount's base, several spans a file (D-O17), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
+| GAP-A9-14 | Service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation **built** (2026-09-13, `docs/wip/merge-service.md`). **Mounted work and green landing built** (2026-11-20, A-774, `crates/server/src/mounted_work.rs`): a work mounts like any volume (a slot under its id, seeded over its base), its mount's journal is declared into it at submit, and a green's head lands under a grant; ten editors by use (`crates/server/tests/mounted_work.rs`). A mount reads its green's pinned version where it lies (2026-11-20, A-774 part 2: 8 mounts over 64 MiB add 1.5 MB, 548 MB before; `tests/mounted_work_cow.rs`). Remain: the slot and unsubmitted mount writes are lost at a restart, a mount is not refreshed when its work's base moves, a work over a green on another shard mounts nothing, a green landed again into a directory holding its earlier landing conflicts on every changed file (part 3 lands its head without a copy, but the plan holds no witness of the earlier landing; incremental landing owed), the landing view's tree is loaded in one step (slicing owed), a work with declared changes is refused a mount, only the NFS and FUSE bridges lend the green to a mount's base, several spans a file (D-O17), the extent-backed chain. A work over a green costs its divergence, not the green (2026-11-20, `tests/work_cow.rs`: 16 works over 64 MiB add 1.2 MB, 975 MB with a copy per work; the 1 to 100 k files, 1 MB to 1 GB, 1 to 100 works grid is in run-requests). (Was: pure merge core lacked service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation.) | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
 | GAP-A9-15 | Evidence surface built (2026-09-14, `docs/wip/conformance.md`): a typed record per transport × suite rendered as a doc-truth matrix, with `cargo xtask conformance` driving the real binary over a real mount and a CI `conformance` lane; on macOS NFS fsx and fsstress pass, the workloads differ by two declared NFS limits (AppleDouble sidecars, SQLite WAL) and pjdfstest ran unprivileged (3,348/3,331/2,007) with its failures categorized, none reviewed as expected; Linux runs as a LIMITED root-NFS adapter, Windows/virtio-fs/OCI and the pressure/failure suites are typed skips. Historical overstatement is closed by construction; the transport guarantees themselves remain open. (Was: native/guest POSIX, strict RAM residency and grant-only disk effects lack complete transport-specific evidence; historical stages overstate coverage.) | §4.6, Part 6 and EQUIVALENCE.md: explicit semantics/boundaries; report skipped lanes and limited adapters honestly. | AC-9.7/T-9.1 plus original conformance/workload gates; Phase 9, prerequisite gates run in their owning phase. |
 
 **Additional decisions/evidence owed.** Phase 4 must establish the supported VMM/device seam,
@@ -23689,3 +23761,12 @@ runs on the box at load average 74 to 93, and never alone.
   (A-63), and the successor gives it back in its place (§4.6, "A `FORGET` after the last publication is logged").
   Through a FUSE mount kept across a `SIGKILL`, the file the kernel let go is freed (diag-slabs-37, run 42483804268, the
   CLI flow 93); with the logging taken out its 1,048,576 bytes stay referenced (diag-slabs-38, run 42483804055). Record: `docs/bugs/2026-11-08-a-forget-after-the-last-publication-leaked-its-lookup-reference.md`.
+
+### 2026-11-20: a live whole entry built in turns refused writes made meanwhile under load — open (w-forming's finding, not worked: Ada's close order)
+`cargo test -p slates-server --test fleet a_live_whole_entry_is_sealed_in_turns_and_writes_made_meanwhile_follow_it`
+failed on main's own code twice of two on Adas-Mac-Studio-4 at load ~39 (base 621cb6ce6 + w-forming's delta capture
+reverse-applied): 4 of the 8 writes made while the whole entry sealed were answered, the rest refused
+`DurabilityPending` after ~4.5 s; 6 whole builds where a quiet run makes 2, `fleet.live.refused.no_credit` 1,
+`fleet.live.build_waited` 16-20. An earlier run of the same code on the same machine passed (8 of 8, 2 builds). The
+shape: under the injected zero seal quantum, a delta queued behind the build is refused for credit, the volume then
+owes a whole state, and each owed whole state is another 3 MiB build the writes wait behind. Not chased.
