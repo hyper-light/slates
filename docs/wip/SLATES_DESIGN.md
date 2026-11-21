@@ -59620,9 +59620,18 @@ Applied in the same change to:
   5 of 5 rounds (main at most 2), SubmitAccepted p999 64.7-89.5 → 1.4-9.2 ms; at Z = 20 ms p999 and max better, p50
   equal, **p99 worse** (SubmitAccepted 2.48-4.47 → 5.43-9.73 ms): the owner is saturated there, so the fold's work costs
   wherever it lands. Recorded in GAPS as a measured gap; landed for robustness by main's order.
-- **Owed:** (b) a key's old entry subtracted at its first change, so the fold hashes only current bytes and reads no
-  history; the checkpoint's remaining one step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms
-  sliced; w-git's member loop in turns on `fold_identity_step`.
+- **(b), built after (main's 05:00 order):** `Green::mark_dirty` takes a file key's entry out of the sum when a commit
+  first changes it, on a green with no copy record (a copy's entry may stand for the entries it brought, A-586; such a
+  green keeps the whole move); the fold then adds the head's entry and gives back what a copy since gave it
+  (`identity_out`), so it hashes current bytes once and reads no history. Counted `identities_taken_at_change`; the
+  identity oracle (partial folds) asserts it moved, and fails with an entry marked out but not taken out.
+- **A bug in the part above, fixed with (b):** `copy_checkpoint::sum_at` moved every dirty key from `identity_version`, so
+  a key folded alone and changed again was moved from the wrong version, and a checkpoint carrying a copy's sum taken
+  mid-fold (`Doubling::Now` at the cap) carried a wrong sum (`a_checkpoints_sum_taken_mid_fold_is_the_whole_folds`, red
+  first). Each key now moves from `identity_since`, its own folded-at version.
+- **Owed:** (b)'s A/B at Z = 20 and 50 ms (a run was cut at 16 of 20 by kiln's restart); the checkpoint's remaining one
+  step (~43 ms: build, encode, a 49 MB record) and single keys of up to 13.4 ms sliced; w-git's member loop in turns on
+  `fold_identity_step`.
 - **Applied in the same change to** `crates/merge` (`engine`: `fold_identity_step`, `identity_backlog`,
   `identity_folded`; `tests/identity.rs`), `crates/server` (`merge_service`, `git_push`: `shard_pace_env`;
   `repository` tests), §4.16, GAPS, BENCHMARKS.md.
