@@ -13,6 +13,11 @@ use slates_store::store::Sizing;
 /// Shape: the owner's waiting requests, as the daemon's (`slates daemon --vcs-store`) holds them.
 const WAITING: usize = 16;
 
+/// Derived: how long a test waits for its store's owner to stop once it stops it: ten liveness budgets, the patience the
+/// daemon's tests give an answer. The owner ends only when every handle is gone, so a handle something kept past its
+/// daemon's stop would hold it forever; past this the test fails naming that, never hangs.
+const STOP_PATIENCE_NS: u64 = 10 * crate::daemon::LIVENESS_BUDGET_NS;
+
 /// A test's store: its directory and the owner serving it, stopped and the directory removed on drop.
 pub(crate) struct TestStore {
   /// The directory.
@@ -55,7 +60,12 @@ impl TestStore {
   /// daemon holding one stopped), or the owner never ends.
   pub(crate) fn stop_owner(&mut self) {
     if let Some(owner) = self.owner.take() {
-      owner.stop().unwrap();
+      match stop_within(owner) {
+        Some(stopped) => stopped.unwrap(),
+        None => panic!(
+          "the store's owner did not stop within {STOP_PATIENCE_NS} ns: a store handle outlived its daemon"
+        ),
+      }
     }
   }
 
@@ -70,10 +80,22 @@ impl Drop for TestStore {
   #[allow(clippy::disallowed_methods)] // test code: its own scratch directory
   fn drop(&mut self) {
     if let Some(owner) = self.owner.take() {
-      let _ = owner.stop();
+      let _ = stop_within(owner);
     }
     let _ = std::fs::remove_dir_all(&self.dir);
   }
+}
+
+/// Stops `owner` on a thread of its own, waiting at most [`STOP_PATIENCE_NS`]: its answer, or none where it never
+/// stopped (the thread is left to the process's end, which a test's failure brings).
+fn stop_within(owner: StoreOwner) -> Option<Result<(), slates_store::owner::OwnerError>> {
+  let (sent, stopped) = std::sync::mpsc::channel();
+  std::thread::spawn(move || {
+    let _ = sent.send(owner.stop());
+  });
+  stopped
+    .recv_timeout(std::time::Duration::from_nanos(STOP_PATIENCE_NS))
+    .ok()
 }
 
 /// The store root over `dir`, opened under the directory's standing grant.
