@@ -90,6 +90,10 @@ fn main() {
   let root = std::path::PathBuf::from(&arguments[0]);
   let store_dir = std::path::PathBuf::from(&arguments[1]);
   let samples: usize = arguments[2].parse().unwrap();
+  // The changesets to land, from the first: all of them unless a fourth argument bounds them (a quick run).
+  let landing: usize = arguments
+    .get(3)
+    .map_or(usize::MAX, |count| count.parse().unwrap());
   let requires = std::fs::read_to_string(root.join(".hg/requires")).unwrap_or_default();
   let source = Source {
     dotencode: requires.lines().any(|line| line == "dotencode"),
@@ -133,11 +137,6 @@ fn main() {
     .iter()
     .map(|r| ((r.path, r.rev), (r.text, r.len)))
     .collect();
-  let index_of: HashMap<(usize, u32), usize> = read
-    .iter()
-    .enumerate()
-    .map(|(at, r)| ((r.path, r.rev), at))
-    .collect();
   println!(
     "source: {} paths, {} file revisions, {:.1} MiB of chunks, read in {:.1} s",
     paths.len(),
@@ -172,7 +171,14 @@ fn main() {
   let staging = Staging::new(0);
   let started = Instant::now();
   let mut sequence_of: Vec<u64> = vec![0; read.len()];
-  for (sequence, (_, members)) in (1u64..).zip(by_link.iter()) {
+  let mut landed: Vec<usize> = Vec::new();
+  // Each text's first landing: the row the store keeps for it (a text that comes back is made as it first was).
+  let mut first: HashMap<[u8; 32], usize> = HashMap::new();
+  for (sequence, (_, members)) in (1u64..).zip(by_link.iter().take(landing)) {
+    landed.extend_from_slice(members);
+    for at in members {
+      first.entry(read[*at].text).or_insert(*at);
+    }
     let mut payload = Vec::new();
     let mut places = Vec::with_capacity(members.len());
     for at in members {
@@ -225,7 +231,7 @@ fn main() {
   }
   println!(
     "landed {} changesets in {:.1} s",
-    by_link.len(),
+    by_link.len().min(landing),
     started.elapsed().as_secs_f64()
   );
 
@@ -237,40 +243,47 @@ fn main() {
     rng ^= rng << 17;
     rng
   };
-  let mut micros = Vec::with_capacity(samples);
-  let mut opened = Vec::with_capacity(samples);
-  let mut outside = 0usize;
-  for _ in 0..samples {
-    let at = (next() % read.len() as u64) as usize;
-    let r = &read[at];
-    let mut cache = TextCache::new(CACHE_BYTES);
-    let started = Instant::now();
-    let bytes = store
-      .text_at(&staging, 1, &r.text, 0, &mut cache)
-      .unwrap()
-      .expect("a landed text");
-    let elapsed = started.elapsed().as_secs_f64() * 1e6;
-    assert_eq!(*blake3::hash(bytes).as_bytes(), r.text);
-    micros.push(elapsed);
-    opened.push(cache.changesets.len() as f64);
-    // The chain by Mercurial's own bases: every changeset a read opened must hold one of its versions.
-    let mut chain = std::collections::BTreeSet::new();
-    let mut link = Some(r.rev);
-    while let Some(rev) = link {
-      let index = index_of[&(r.path, rev)];
-      chain.insert(sequence_of[index]);
-      link = read[index].base;
+  let picks: Vec<usize> = (0..samples)
+    .map(|_| landed[(next() % landed.len() as u64) as usize])
+    .collect();
+  for round in 1..=3 {
+    let mut micros = Vec::with_capacity(samples);
+    let mut opened = Vec::with_capacity(samples);
+    let mut outside = 0usize;
+    for at in &picks {
+      let r = &read[*at];
+      let mut cache = TextCache::new(CACHE_BYTES);
+      let started = Instant::now();
+      let bytes = store
+        .text_at(&staging, 1, &r.text, 0, &mut cache)
+        .unwrap()
+        .expect("a landed text");
+      let elapsed = started.elapsed().as_secs_f64() * 1e6;
+      assert_eq!(*blake3::hash(bytes).as_bytes(), r.text);
+      micros.push(elapsed);
+      opened.push(cache.changesets.len() as f64);
+      // The chain the store keeps for the text: from its first landing down its bases' first landings. Every changeset
+      // a read opened must be one of them.
+      let mut chain = std::collections::BTreeSet::new();
+      let mut identity = Some(r.text);
+      while let Some(text) = identity {
+        let index = first[&text];
+        chain.insert(sequence_of[index]);
+        identity = read[index]
+          .base
+          .map(|base| text_of[&(read[index].path, base)].0);
+      }
+      if !cache.changesets.is_subset(&chain) {
+        outside += 1;
+      }
     }
-    if !cache.changesets.is_subset(&chain) {
-      outside += 1;
-    }
+    println!(
+      "round {round}: old reads ({samples}, cold cache): µs p50 {:.0} p99 {:.0} max {:.0}; changesets opened p50 {:.0} p99 {:.0}; reads that opened a changeset outside their chain: {outside}",
+      percentile(&mut micros.clone(), 0.5),
+      percentile(&mut micros.clone(), 0.99),
+      percentile(&mut micros, 1.0),
+      percentile(&mut opened.clone(), 0.5),
+      percentile(&mut opened, 0.99),
+    );
   }
-  println!(
-    "old reads ({samples}, cold cache): µs p50 {:.0} p99 {:.0} max {:.0}; changesets opened p50 {:.0} p99 {:.0}; reads that opened a changeset outside their chain: {outside}",
-    percentile(&mut micros.clone(), 0.5),
-    percentile(&mut micros.clone(), 0.99),
-    percentile(&mut micros, 1.0),
-    percentile(&mut opened.clone(), 0.5),
-    percentile(&mut opened, 0.99),
-  );
 }
