@@ -101,3 +101,9 @@ Pin + no-CLI clauses hold (w-k90-pin's audit). Left: CI evidence per platform at
 - State per platform (GitHub ci.yml `slates` job): macOS arm64 GREEN (44841298533/136653837819), Linux x86-64 GREEN
   (44851246181/136703754443; again 44867288588/136745995680). Linux arm64: lld link fix 482bd01f8 awaiting a run.
   Windows arm64: CRLF fix 60c0b27c5 awaiting a run. Windows x86-64: w-k90-win (2 Unix-path tests in workspace::tests).
+
+## ~03:10 PST 11-21 (11:10Z)
+- Run 44887857088 (kiln a0d114abb: contains 08f1a434's pin, 482bd01f8 lld, 60c0b27c5 CRLF, w-k90-win's f16212799):
+  GREEN Windows x86-64 `windows (Slates tests)` 136804151233 (w-k90-win's job); GREEN Linux arm64 `ubuntu-24.04-arm
+  (Slates build and tests)` 136804151244 (lld link; build 37 min). ubuntu-latest lost its hosted runner (infra; Linux
+  x86-64 already green twice). windows-11-arm in lib tests; macos-latest still building.
