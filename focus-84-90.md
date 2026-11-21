@@ -1445,3 +1445,7 @@ Critical path (every agent on it; non-critical pieces recorded owed):
   - w-rewrite-ops: A-787's refinement job runs 3.5 s of CPU without a step (exit 4 in green_post_state, debug); slice it.
   - w-work-cow: A-796's wire tags unpublished (wire_order red).
   - w-hg: five daemon_edge hg tests, in step 0.
+- 2026-11-21 00:29 PST RULINGS:
+  - w-svn: stage B part 2 (history on the store, plus the wait path through every text reader) is completion under Ada's STORAGE ruling, not optional. Order: C (the sliced import) first, built on the records' seam, then B2. Its (a) is committed to a branch now. P7's findings go to GAPS and come after: 440 MB of retention for a 35 MB history, 593 MB of unowned small heap, ~1 GB of whole-text transients held once inside C.
+  - w-perf's stream design: four questions to w-hg; defaults given so w-perf doesn't idle (entries from HgIndex, chunks from the store; the base map derived per stream; deltas of the framed text, or the intake stores what the wire needs). w-hg answers at its turn's end.
+  DISK: the MacBook at 37 GB free. w-svn trims ~/.cache/w-svn-c2-target (31 GB). Not ours, left alone: ~/.cache/kiln-send-route-target (27 GB, active) and kiln-move-stuck-target (23 GB, idle since 20:57), both kiln sessions' targets.
