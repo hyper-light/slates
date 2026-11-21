@@ -7438,3 +7438,6 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 - Owner: the runner path (kiln / adacachy2's link), not a slates test. What I need: a working clone on a Linux x86_64
   runner, or sync that completes. Next try: next round, from a fetch into a fixed path, with --depth 1.
 - Windows r31 dropped before it started (jupiter stopped answering); I resubmitted it once as r33, which is queued.
+- Windows, second failure: r33 (the one resubmit of r31) ended with "f766f09294f2... no longer has this run (its runner
+  restarted)". jupiter has no vcs-windows.log, and ~/w-lint-win is still at 02874580e, so the run died before its
+  fetch finished. No test ran. Owner: jupiter's runner link (the R2 tunnel), not a slates test. Next try is next round.

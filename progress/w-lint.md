@@ -415,3 +415,5 @@
 - VCS lane: Linux r32 still running (adacachy2); Windows r31 queued, jupiter's link down. r29 waits for w-work-mount.
 - VCS lane, round at d4c7e1f42: Linux didn't run (r30 sync stuck, r32 clone broke after 66 min; in run-requests.md).
   Windows: r31 dropped, resubmitted as r33, queued. No platform has a pass/fail count yet.
+- VCS lane, Windows: r31 dropped and its resubmit r33 died when jupiter's runner restarted (in run-requests.md).
+  No platform has a pass/fail count this round.
