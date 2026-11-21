@@ -5096,7 +5096,9 @@
 > back to it (A-697 (1), 2026-11-20); the increment carried by reference
 > to placed content, one copy of each byte (main's ruling: the forward carries a 4 MiB increment, but at f = 1 a 4 MiB
 > holder submit took 3.5-4.8 s and a local one 2.8-3.4 s in a debug build, with the inputs shipped back to the holder
-> that composed them; release measurements owed before and after), and part f (takeover and the routing flip) are open.
+> that composed them; release measurements owed before and after) is open. Part f built (2026-11-20): the rule
+> "replicated here" replaces the test hook, so production routing serves a green's works on every node that replicates
+> it; the green's successor takes a holder work's asks after a takeover.
 > A forwarded write's deferred acceptance is answered by its commit since 2026-11-20 (it was polled a heartbeat at a
 > time). A borrower waiting for a lent record session is woken by its return since 2026-11-20 (it slept a
 > pace between looks). A dispatch's stragglers are waited for by their reports' wakes since 2026-11-20 (a tick or a poll

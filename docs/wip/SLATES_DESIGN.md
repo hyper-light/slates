@@ -11817,8 +11817,8 @@ never the whole work. A verdict crosses from the copy that computed it to the ow
 `Computed::encode`): the units in the order the work's are visited, each its effects as the chain entry records them
 (content by reference to the increment's post-state), its windows and where its content ops stood; the owner reads it
 back against the increment it judged (`Green::computed_from`), each effect rebuilt as a replay rebuilds it, a splice left
-unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, behind A-697's test hook until its last
-piece): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
+unmade for the commit to make. Its route (A-658 part 3b, built by A-697 part c, in force since A-697 part f put the rule
+"replicated here" in its test hook's place): a holder's work composes its increment, the holder's replica computes its verdict, and `SubmitComputed`
 carries both to the owner, which commits it by `Green::submit_computed` (`judge_computed`, then `commit_judged` at once)
 inside the submit's own step.
 
@@ -22976,11 +22976,12 @@ named below, BENCHMARKS, GAPS.
 
 Status: accepted 2026-11-07. Step one (one node, the shards) built 2026-11-08 on agents/perf-w1, on main since
 2026-11-17 (g231). Step two (a work on the creating client's node, with the forward lanes of
-`crates/server/src/forward_lane.rs`) is being built by A-697, with production routing unchanged until its last piece: a
-`CreateWork` forwarded from another node still places the work on the green's shard. Part a1 (2026-11-20): the green's
+`crates/server/src/forward_lane.rs`) is built by A-697 and in force since its part f (2026-11-20), which put the rule
+"replicated here" in the test hook's place: a node that replicates a green another node owns serves the green's works
+itself, and a `CreateWork` from a node that does not is forwarded to the green's owner, which places the work there. Part a1 (2026-11-20): the green's
 owner admits a work another node will hold by `AdmitWork`, a forwarded verb, judging the relayed principal's rights from
 its green's record and recording the work's floor at the head (`verbs::admit_work`, `verbs::owner_admit`). Part a2
-(2026-11-20, behind the test hook `Daemon::serve_works_on_holders`): a holder makes the work on its client's partition,
+(2026-11-20, then behind a test hook that part f deleted): a holder makes the work on its client's partition,
 asks `AdmitWork` over the fleet (`work_home::admit_over_fleet`), and answers its base reads from its replica. Part b
 (2026-11-20): the holder moves and drops the work's floor at the owner by `MoveWorkFloor` (`work_home::tell_floor_over_fleet`,
 `verbs::move_work_floor`). Part c (2026-11-20): a holder's submit is committed by the verdict its replica computed,
@@ -23007,16 +23008,17 @@ the work's shard, were measured and rejected and removed whole on 2026-11-19 (A-
     answered there with no hop between shards; only what needs the green crosses to the owner. Its name is held at the
     partition the name hashes to, as every name is: by an alias of the work's id when that is another partition
     (A-236's reservation, asked before the green's admission, confirmed once the creation commits). A creation
-    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (being built;
-    in force behind a test hook until its last piece): a node holding the green's replica makes the work itself, on
+    forwarded from another node is served on the green's owner, which places it there. Amended by A-697 (in force
+    since its part f, 2026-11-20: the rule "replicated here"): a node holding the green's replica makes the work itself, on
     its client's partition, so the work's id names that node; the green's owner admits it by `AdmitWork`, forwarded,
     judging the rights from its green's record and holding the base by the work's floor; and the work's base reads are
     answered by the node's replica, byte for byte the owner's; the node moves and drops the work's floor at the owner
     by `MoveWorkFloor`, forwarded, monotone and idempotent there; and its submit's verdict is computed on the node's
     replica and committed by the owner by position (`SubmitComputed`, A-658 part 3b), the submit answered once the
     node's replica holds the version it made; after a restart it comes back from its log over the node's replica; it
-    rebases over the replica, and a copy it declares is composed over the replica. Takeover follows in A-697's last
-    part. Until A-400 a work was placed on
+    rebases over the replica, and a copy it declares is composed over the replica. A node that does not replicate the
+    green forwards the creation to its owner. When the owner dies the green's successor takes the work's asks: the
+    node's forwards resolve the green's owner afresh, and a node that adopts the green serves its works as its own. Until A-400 a work was placed on
     the partition its name hashes to, so a client's every work verb crossed from its shard to the work's and back:
     measured, that cost an edit about 40% at the median and half its p99 at 1,000 clients (BENCHMARKS, 2026-11-18),
     and slowed a single client's edit and merge on every daemon of more than one shard (BENCHMARKS, the same day). The
@@ -58095,3 +58097,37 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
   12.3 s, held off its owner 24.5 s), the whole live move 49.5 s against 112 s before.
 - **Open.** The preparation is paced by the seal periods: the carry and the handoff took about 12 s each for under
   1 MB.
+
+### A-697 part f — A node that replicates a green serves its works; the test hook is gone, and the green's successor takes the works' asks after a takeover (2026-11-20, w-shared for UI goal 93; main's plan for A-697, its last piece)
+Applied in the same change to: §4.16 (A-247's rule, "Where a work lives", and its status), §4.16 A-658's route, GAPS
+(A-247's step two), `crates/server/src/work_home.rs`, `crates/server/src/fleet.rs`, `crates/server/src/verbs.rs`,
+`crates/server/src/daemon.rs`, `crates/server/tests/fleet.rs`.
+- **Change: the rule "replicated here" in the test hook's place, one path.** `Daemon::serve_works_on_holders` and
+  `WorkHome::on_holders` are deleted. A node serves a green's works itself when another node owns the green and this
+  node holds its replica (`work_home::green_elsewhere`). A `CreateWork` over such a green is made on its client's
+  partition and admitted by the owner over the fleet, as parts a to e built. One over a green the node does not
+  replicate is forwarded to the owner, as before A-697. Every holder step (admission, base reads, floors, verdict,
+  rebase, copies, settling) asks the same predicate.
+- **Where each shard learns it.** The control shard holds the replicas (`merge.replicas`) and reads them directly.
+  Every other shard reads `WorkHome::holding`: the greens this node replicates, each with its owner as the control
+  shard's routing names it. The control shard fans that list with the period's configuration fan
+  (`fleet::fan_configs_to_shards`, `Fanned::observe_holding`), version-gated by a generation. An unchanged list, the
+  usual period, is compared in place and copies nothing. When a replica the last fanned list lacks takes its first
+  version, the list is also fanned at once (`fleet::fan_holding_at_once`, from `work_home::replica_reached`). So a
+  creation is served on the holder from the replica's first version, not a period later. A shard whose channel refuses
+  the list gets it with the period's fan. `owned_elsewhere` reads the fanned owner when this shard's own routing holds
+  no copy of the green, so a takeover's new owner reaches the work's shard too.
+- **Takeover.** When the owner dies, a survivor takes the green over (§4.8). A holder's forwards (`AdmitWork`,
+  `SubmitComputed`, `MoveWorkFloor`) resolve the green's owner afresh (`verbs::resolve_and_forward`), so they reach the
+  successor. A holder that adopts the green itself holds no replica of it any more: its works are then served through
+  the green on this node, as any of its own greens' works are.
+- **Counters.** `fleet.holding_fan.sent`, `fleet.holding_fan.refused`.
+- **Tests** (macOS arm64, this Mac, local, own target, 2026-11-20).
+  - `slates-server --test fleet a_holders_work_is_committed_by_its_greens_successor_after_the_owner_dies`: three nodes
+    at `f = 1`. The survivor that does not take A's green over makes a work as the green's holder and edits it; A dies.
+    Expect: the holder's submit answered version 2, computed on its replica and taken by position at the successor
+    (both counters moved); the successor's green reads "hello world".
+  - `a_holders_work_is_committed_by_the_verdict_its_replica_computed_taken_by_position_at_the_owner` is now the two-node
+    `f = 1` end-to-end test on production routing, with `merge.verdict.taken_by_position` as its counter.
+  - Every holder test runs with no hook. Each waits until B replicates the green before B's creation, since B's
+    creations are A's until then.
