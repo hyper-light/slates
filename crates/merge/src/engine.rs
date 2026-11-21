@@ -342,6 +342,13 @@ pub enum Outcome {
     /// The committed version.
     version: u64,
   },
+  /// The increment was accepted and changed nothing: every operation it declared was already at the head, the same edit
+  /// or a convergent one (D-27's "identical" verdict, A-782). It is committed as the next version, as an accept is, so a
+  /// retry and the chain's replay answer alike; the version's effects are empty. Appended.
+  Identical {
+    /// The committed version.
+    version: u64,
+  },
   /// The increment conflicts; the windows to rebase against.
   Conflict {
     /// The conflicting windows.
@@ -5239,8 +5246,15 @@ impl Green {
   ) -> (Outcome, Option<Vec<crate::chain_entry::Applied>>) {
     match judgment {
       Judgment::Accepted(judged) => {
+        // Nothing to apply: every operation was already at the head (pass two's identical spans, an identical create).
+        let identical = judged.effects.is_empty();
         let (version, applied) = self.commit_held(judged);
-        (Outcome::Accepted { version }, Some(applied))
+        let outcome = if identical {
+          Outcome::Identical { version }
+        } else {
+          Outcome::Accepted { version }
+        };
+        (outcome, Some(applied))
       }
       Judgment::AcceptedBefore { version } => (Outcome::Accepted { version }, None),
       Judgment::Conflict { windows } => (Outcome::Conflict { windows }, None),
@@ -5609,6 +5623,17 @@ impl Green {
   /// How the signature of the submit that committed `version` was judged, if that submit carried one (A-321).
   pub fn signature(&self, version: u64) -> Option<crate::chain_entry::Signature> {
     self.signatures.get(&version).copied()
+  }
+
+  /// Whether committed version `version` changed nothing (A-782: an identical increment's version, [`Outcome::Identical`]),
+  /// read from the change index, which holds an entry for every version that changed a path. `None` where that can no
+  /// longer be told: version 0 (the origin), a version past the head, or one at or below the floor the index was folded
+  /// or restored to, where entries of versions whose paths changed again are gone. One lookup.
+  pub fn changed_nothing_at(&self, version: u64) -> Option<bool> {
+    if version == 0 || version > self.head() || version <= self.folded_below {
+      return None;
+    }
+    Some(!self.changes.contains_key(&version))
   }
 
   /// The effect a chain entry's resolved form stands for, its bytes read from the head and the increment's post-state.

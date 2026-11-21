@@ -53,6 +53,9 @@ use crate::error::ClientError;
 pub enum Submitted {
   /// The increment merged; the green's new head version.
   Accepted(u64),
+  /// The increment was accepted and changed nothing: every operation it declared was already at the head (D-27's
+  /// identical verdict, A-782). The green's new head version, which commits nothing new.
+  Identical(u64),
   /// The increment conflicts; the windows to rebase against.
   Conflict(Vec<MergeWindow>),
   /// An ask write policy holds the merge for approval (A-285): nothing merged. [`Client::submit_approved`] with this
@@ -757,7 +760,7 @@ impl VerdictChain {
   /// The verdict's own reply: its outcome, or `None` when it counted windows it could not carry.
   fn take_verdict(&mut self, body: ReplyBody) -> Result<Option<VerdictOutcome>, ClientError> {
     let verb = self.kind.verb();
-    let (version, conflicts, elided, verdict) = match (self.kind, resolved(body)?) {
+    let (version, conflicts, elided, verdict, identical) = match (self.kind, resolved(body)?) {
       (
         VerdictKind::Submit,
         ReplyBody::Submitted {
@@ -765,9 +768,10 @@ impl VerdictChain {
           conflicts,
           conflicts_elided,
           verdict,
+          identical,
         },
-      )
-      | (
+      ) => (version, conflicts, conflicts_elided, verdict, identical),
+      (
         VerdictKind::Rebase,
         ReplyBody::Rebased {
           version,
@@ -775,7 +779,7 @@ impl VerdictChain {
           conflicts_elided,
           verdict,
         },
-      ) => (version, conflicts, conflicts_elided, verdict),
+      ) => (version, conflicts, conflicts_elided, verdict, false),
       // A signed submit's verdict, or an accept a signed submit made first (A-321): the same, judged.
       (
         VerdictKind::Submit,
@@ -785,10 +789,11 @@ impl VerdictChain {
           conflicts_elided,
           verdict,
           verification,
+          identical,
         },
       ) => {
         self.verification = verification;
-        (version, conflicts, conflicts_elided, verdict)
+        (version, conflicts, conflicts_elided, verdict, identical)
       }
       (
         VerdictKind::Submit,
@@ -807,7 +812,7 @@ impl VerdictChain {
       _ => return Err(ClientError::UnexpectedReply { verb }),
     };
     if let Some(version) = version {
-      return Ok(Some(self.kind.accepted(version)));
+      return Ok(Some(self.kind.accepted(version, identical)));
     }
     if elided == 0 {
       return Ok(Some(self.kind.conflicted(conflicts)));
@@ -840,8 +845,9 @@ impl VerdictKind {
     }
   }
 
-  fn accepted(self, version: u64) -> VerdictOutcome {
+  fn accepted(self, version: u64, identical: bool) -> VerdictOutcome {
     match self {
+      VerdictKind::Submit if identical => VerdictOutcome::Submitted(Submitted::Identical(version)),
       VerdictKind::Submit => VerdictOutcome::Submitted(Submitted::Accepted(version)),
       VerdictKind::Rebase => VerdictOutcome::Rebased(Rebased::Rebased(version)),
     }

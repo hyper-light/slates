@@ -192,7 +192,7 @@ fn verdict_as_expected(editor: usize, verdict: &Submitted) -> bool {
     }
     7 => {
       assert!(
-        matches!(verdict, Submitted::Accepted(_)),
+        matches!(verdict, Submitted::Identical(_)),
         "editor 7's identical save: {verdict:?}"
       );
       false
