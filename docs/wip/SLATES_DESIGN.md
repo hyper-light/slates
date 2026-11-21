@@ -57736,6 +57736,27 @@ one waiting landing: exactly two named; the landing gone once granted and run); 
 every_recovery` 2 passed; `-p slates-client --lib session_log` 1 passed; `-p slates-cli --bin slates log_view` 2 and
 `args` 41 passed; `-p slates-ipc --test wire_order` 2 passed (macOS arm64, this Mac, local).
 
+### A-789 — On macOS each content pool extent is an object of its own, made ahead of need and given back whole (2026-11-20, w-sizing; main's ruling of 15:20, "content as extents made on demand", piece 1; §4.2, A-98, A-110)
+Applied in the same change to: `crates/mem/src/shared.rs` (`extent_handoff`, `make_extent`), `crates/server/src/content_pool.rs`
+(`make_own_extents`, `map`, `give_back`), `crates/api/src/role/daemon.rs` (the extents released with the anchor's
+objects, A-778), the tests (`a_bursts_extents_go_back_to_the_system_once_its_volume_is_gone`,
+`a_given_back_extent_is_made_again_empty_and_its_old_pages_go_with_its_name`, the killed anchor's extents), BENCHMARKS,
+GAPS.
+
+Status: built 2026-11-20, macOS. Linux keeps one memfd with holes punched and Windows needs a section per extent (g226's
+measurements, BENCHMARKS "Content give-back per platform").
+- Why: a released extent was a range of the anchor's one content object. Its pages stayed in the object: a page given
+  back with `MADV_FREE_REUSABLE` only leaves the footprint, and stayed resident 10 s under pressure. A 256 MiB burst's
+  volume destroyed left the object at 259 MiB and the process at 1,362 MiB (adas-macbook-pro-2).
+- The rule: an extent is named from the content object's name and its id. Its owner shard makes its slice's extents at
+  its start, and a release makes the extent again, so a claim only opens and maps one, never makes it on the
+  provisioning path. A release unmaps the extent and removes its name, which gives every page back, then makes it
+  again empty. A successor adopts held extents by name. A daemon whose anchor is gone removes every extent's name.
+  Counts are bounded: at most `POOL_EXTENTS_PER_PARTITION` (64) a partition, one name each.
+- After: the same burst's volume destroyed left the object at 0 MiB and the process at 123 MiB.
+- Open: the content object still reserves each slice's arena range of address space; free pages inside a held extent
+  still only leave the footprint.
+
 ### A-778 — A daemon whose anchor is gone removes the anchor's object names (2026-11-20, w-sizing; found by use; §4.7, A-178)
 Applied in the same change to: `crates/mem/src/shared.rs` (`unlink_handoff`), `crates/api/src/role/daemon.rs`
 (`release_the_anchors_objects`), `crates/cli/tests/cli.rs` (`a_killed_anchors_segment_and_content_go_with_its_daemon`),
