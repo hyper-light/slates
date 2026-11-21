@@ -486,7 +486,8 @@ pub struct DaemonConfig {
   /// The version-control servers' HTTP edge (§4.17.2 "Transports" item 1; A-625 part 3), when the operator starts one:
   /// none from [`DaemonConfig::derive`].
   pub vcs_http: Option<VcsHttpConfig>,
-  /// How long a git push's answer over the HTTP edge may write nothing before the edge writes git's keepalive (A-722):
+  /// How long a git push's or fetch's answer over the HTTP edge may write nothing before the edge writes git's keepalive
+  /// (A-722; a fetch's only inside its pack's section):
   /// [`GIT_KEEPALIVE_NS`] from [`DaemonConfig::derive`].
   pub git_keepalive_ns: u64,
   /// The version-control servers' SSH edge (§4.17.2 "Transports" item 2; A-684), when the operator starts one: none from
