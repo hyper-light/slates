@@ -58279,6 +58279,11 @@ wire_order` 2; `-p slates-ipc --test wire_order` 2; `-p slates-api --lib observe
   (the guard: two saves give the number back, and the lookup is a new inode); A-151's renumbering test, now documented
   as covering whole-second stamps. Real-tool runs over a kernel mount (macOS NFS, Linux FUSE, Windows WinFsp) are owed
   to main's run requests.
+- **Status (2026-11-21).** The acceptance flows by use are `crates/cli/tests/real_tools.rs`. A `#pragma once` compile
+  under clang, gcc and `cc` is held across a snapshot and a SIGKILL takeover; after each event, and under injected
+  memory pressure, `make -q`, `cargo build` and `git status` find nothing moved, and every tracked file's number and
+  times are unchanged. Green on macOS NFS (APFS). The test builds for Linux FUSE and Windows WinFsp, whose runs are
+  main's (run-requests.md).
 
 ### A-782 — Identical is told from accepted: one typed outcome from the engine to every surface (2026-11-20, w-sessionlog; main's order 15:20 PST, item 2; D-27, §4.16; A-773)
 The engine committed an identical increment as a version and answered `Accepted`, so nothing told "already there" from
