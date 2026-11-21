@@ -11621,8 +11621,15 @@ path's content ops are replaced, its rename, mode and attributes kept (until 202
 with other namespace ops or node-exclusive flags keeps its whole replacement. A work off its green's shard asks the owner for the base bytes of every path its composition replaces
 whole, as it asks for those of files it does not hold, so it refines them too (A-776, close item C1, 2026-11-20). The refinement runs a unit at a time under its
 owner's turns (A-787): every piece of its work is metered and asks for the next unit at `refine::WORK_PER_TICK` of it, so
-its longest step stays tens of microseconds whatever the file's size. The submit still calls it in one step until
-A-787 part 2 drives it over the shard's turns. The same journal yields the
+a unit is about a microsecond of its work. It never runs inside the verb that submits or rebases (A-787 part 2, close
+item R3, `crates/server/src/refining.rs`). A verb whose composition replaces a file whole parks, and a job of the work's
+shard does the work:
+- it copies the two files a slice a turn;
+- it refines them a pace turn at a time, each turn held to half the shard's step quantum;
+- it frees what it held a buffer a turn.
+
+The verb then runs again and composes with the kept result. A local verb parks on the job's own list; a work off its
+green's shard parks at its gate. The same journal yields the
 same ops document on every platform (its identity is the test). Paths under the work volume's
 excluded subtrees are left out; the filter id is part of the increment identity. The composition
 needs every record since the base: when the journal's retention has dropped any of them, the
@@ -58132,12 +58139,38 @@ Applied in the same change to: §4.16 "Commit" (the record's inputs shipment), G
   spans many turns, no unit does more than three units' work or a 64th of the file's, and the document and plan equal
   the unpaced refinement's. Red with the asks disabled (one unit did all the work), green with them. Plus A-776's
   eight. macOS arm64, this Mac, local.
-- **Part 2 (next, in flight):** the submit drives `refine_rewrites_paced` over the shard's turns. Today
-  `verbs::compose_increment` runs it in one step. Shape proposed: the work's gate parks a submit whose journal replaces
-  a file whole, local green or not; a task of the work's shard refines copies of the two files, a turn at a time; the
-  verb resumes with the ranges, as an owner's answer resumes it (A-247). To use A-783's pacing primitive once it lands.
+- **Part 2 (landed 2026-11-20, close item R3): the refinement runs off the verb.** `crates/server/src/refining.rs`.
+  - **Who parks.** A submit or rebase whose composition replaces a file whole parks: a local one on the job's own
+    list, run again through `verbs::resume_all`; one on a work off its green's shard at its gate, on `Need::Refine`,
+    resolved as an owner's answer is.
+  - **The job.** A task of the shard copies the two files a slice a turn, re-borrowed through the shard's state
+    (`state::with_state`), since a borrow cannot cross a turn. It drives `refine_rewrites_paced` a `Pace` turn at a time
+    (each turn's budget half the step quantum) and frees what it held a buffer a turn.
+  - **The result** is kept under the work's base version and journal length, and `compose_increment` composes with it,
+    never refining inline.
+  - **Changed to bound it.**
+    - The meter asks every 256 units of work, about a microsecond: at 4,096 a unit took 10 to 46 µs, past a quantum of a
+      few µs. Tokens stay cut at 4,096 bytes (`UNIT_BYTES`).
+    - A refined document is built in canonical order and its post-state relaid through a map, with no sort:
+      `pace::sort_by` grows its runs by doubling, and one push of that growth copied every op before it.
+    - The output sits in fixed chunks freed one at a time.
+  - **Measured** (`a_large_rewrite_is_refined_over_many_turns_off_the_submit`, release, three runs a size):
+    - adas-mac-studio-4 (M4 Max), load 3 to 4: a 2 MiB re-indent refines over 25,402 to 38,061 turns, its longest 54
+      to 69 µs; at 8 MiB over 134,477 to 154,504 turns, longest 109 to 311 µs.
+    - This Mac, load 6 to 16: 69 to 79 µs at 2 MiB, 133 to 157 µs at 8 MiB. Before this, the whole refinement ran inside the submit's step: 14 ms for a 300 KiB file, about
+    200 ms at 12 MiB. Turns past the whole quantum: 2 to 4%, past 16 quanta 0.03%. The quantum here is a few µs, the
+    shard's measured wake.
+  - **The remaining tail** follows the largest single buffer freed. Deferring those frees to an idle moment waits on
+    A-783's yield-when-someone-waits primitive (GAPS D-O17).
+  - **Not refined:** an edit-and-submit of a work off its green's shard. The job reads the writer's bytes from the work,
+    and that verb's edit is applied only to the copy it seals.
+  - **Rejected, measured:**
+    - Shrinking a buffer in steps to free it in slices: the allocator may copy on each shrink, which made it quadratic
+      (an 8 MiB run past ten minutes).
+    - One free of everything at the end: a millisecond in one step at 2 MiB.
 - **Applied in the same change to:** §4.16 "Composition at seal"; GAPS D-O17; BENCHMARKS; `crates/merge/src/refine.rs`,
-  its tests, `examples/rewrite_slices.rs` (new), `examples/rewrite_ab.rs`.
+  its tests, `examples/rewrite_slices.rs` (new), `examples/rewrite_ab.rs`. Part 2: `crates/server/src/refining.rs`
+  (new), `verbs.rs`, `work_home.rs`, `state.rs`, `daemon.rs`, `crates/server/tests/green_post_state.rs`.
 
 ### A-784 — A planned move is prepared unfrozen and frozen only once ready to hand over; its hops are logged (2026-11-20, w-fed-move, kiln goal 91; main's piece; found by use: kiln's live move, most first asks refused `Unplaced`, every ask for five minutes once; §4.10 "Ownership follows the writer"; A-291, A-525, A-544)
 - **Why.** A move froze its volume at its ask and was refused `Unplaced` once unreported for the failover delay (A-525),

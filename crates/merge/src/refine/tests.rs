@@ -463,7 +463,7 @@ fn reformatted(lines: usize) -> (Vec<u8>, Vec<u8>) {
 
 /// A-787 (§4.3's step budget; CLAUDE.md §3 "Bounded work everywhere"). Do: refine a 3 MiB whole-file replacement (every
 /// line re-indented, every hundredth line's call renamed) driven by a pace whose turns end after a few asks, a turn at a
-/// time. Expect: it spans many turns, no unit does more than a unit's work (three times `WORK_PER_TICK` at most: the
+/// time. Expect: it spans many turns, no unit does more than a unit's work (a tick's work and one token's comparison at most: the
 /// last charge before an ask is at most a unit's work itself), and the document and plan equal the unpaced
 /// refinement's. Unsliced, the whole refinement was one unit.
 #[test]
@@ -519,8 +519,9 @@ fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
   };
   drop(work);
   assert!(turns > 100, "turns {turns}");
+  // A unit: under a tick's work, then at most its last charge, one comparison of the longest token.
   assert!(
-    done.longest_unit_work <= 3 * super::WORK_PER_TICK,
+    done.longest_unit_work <= 2 * super::WORK_PER_TICK + super::UNIT_BYTES,
     "{done:?}"
   );
   // And absolutely, whatever the constant: no unit does a 64th of the file's work (unsliced, one unit did it all).
@@ -530,6 +531,10 @@ fn a_several_mib_rewrite_is_refined_a_bounded_unit_at_a_time() {
     (unpaced.paths, unpaced.refined_bytes)
   );
   assert_eq!(sliced.ops, whole.ops);
+  // Built in the canonical order, with no sort of its own: the document is as canonicalizing it leaves it.
+  let mut canonical = sliced.clone();
+  canonical.canonicalize();
+  assert_eq!(canonical.ops, sliced.ops);
   assert_eq!(sliced_plan, whole_plan);
 }
 
@@ -608,6 +613,9 @@ fn a_rewrite_renamed_over_another_file_is_refined_against_its_source() {
         },
       );
       assert_eq!(done.paths, 1, "{done:?}");
+      let mut canonical = doc.clone();
+      canonical.canonicalize();
+      assert_eq!(canonical.ops, doc.ops, "the refined document is canonical");
     }
     let post_state = laid(&doc.ops, &plan, first.as_bytes());
     green.submit(&Increment {
@@ -669,6 +677,9 @@ fn a_refined_rewrite_keeps_its_paths_other_operations() {
     ))
   });
   assert_eq!(done.paths, 1, "{done:?}");
+  let mut canonical = doc.clone();
+  canonical.canonicalize();
+  assert_eq!(canonical.ops, doc.ops, "the refined document is canonical");
   let post_state = laid(&doc.ops, &plan, post.as_bytes());
   let outcome = green.submit(&Increment {
     id: [7; 32],
