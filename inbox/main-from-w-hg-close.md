@@ -145,3 +145,14 @@ landing and its replay red first.
   - The order question (inbox/main-from-w-hg-c1-order.md): 3, then 1, then 2.
   - The import-as-changesets shape (inbox/main-from-w-hg-c1-import-design.md), for main and w-store.
   - Answered w-perf's stream-clone questions (inbox/w-perf-from-w-hg-serve.md).
+
+## C1 step 3, first part: an import written as a push's changegroup: LANDED on origin/main b73c0a570 (~01:30)
+- **What:** `slates_hg::import::emit` (`Import::emitting`, `take_segment`). As the import walks, each revision is
+  written as its revlog stores it: the chunk against its delta parent (7.2's `deltaparent`), nothing diffed or rebuilt.
+  The stream is cut into segments (only between chunks), each naming its texts as a push's Texts section does.
+- **Test:** for each of the five stores 7.2 wrote, the segments concatenated and taken through the push's intake give
+  the import's index row for row (`import_tests::an_import_writes_the_changegroup_a_push_of_its_history_brings`).
+  slates-hg 383/383.
+- **Waiting on your ruling** (inbox/main-from-w-hg-c1-import-design.md, follow-up): each segment's Record, (i) replay
+  through the intake or (ii) index rows by identity (recommended: restart stays as cheap as today). Then the server
+  lands the segments as a run and the import's entry names it.

@@ -6954,10 +6954,7 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
 ## 2026-11-20, w-work-mount C1/R4 (77fcae73a, 60a71db8a; main 56e44c7f8)
 - Linux (FUSE): `cargo test --locked -p slates-server --test fuse_mount a_work_mounted_through_fuse` on a host with
   fusermount3 and /dev/fuse. Red: a read of `f` refused (the tree host not lent) or the submit not Accepted with TWO in
-  the green's head.
-- Windows: build `cargo test --locked -p slates-server --no-run` (winfsp.rs's tree lend, cfg(windows), never compiled on
-  macOS), then `cargo test --locked -p slates-cli --test winfsp a_work_mounted_through_winfsp` with WinFsp live. Red: a
-  compile error in crates/server/src/winfsp.rs, a refused read through the drive, or the save missing from the head.
+  the green's head. (Mine to run, as the Windows ones are: main 2026-11-21.)
 - Suites (main's): `cargo test -p slates-server` integration targets nfs_mount, snapshot_landing, presentations,
   recovery, daemon, fuse_mount (Linux); `-p slates-land` whole; clippy + xtask over the A-774 files.
 - Note: at 15:30 my `cargo build -p slates-server --tests` built every server test binary into my target on Studio-2
@@ -7059,3 +7056,10 @@ the driver: the 3 new push tests failing, 3 of 3); green r430 on the piece (serv
   answered; one 300 MB work log.
 - Who to send results to: w-fed-move
 
+
+## w-shared 01:40 PST 2026-11-21 (kiln ids; all sync:false over https)
+- r16 (big Studio, running): agents/w-shared-byref-ci 4a16c53d4: merge, cluster, server lib, 8 server suites, cli kill test, and a baseline of 5 lib tests at 544020bd2.
+- r20 (queued, macos mem=16g disk=40g): the kill test's red at 544020bd2 with only the test applied (r18, r19 lost: runner b24c5c95 did not answer).
+- r21 (queued, same needs): 3a release bench on origin/main, 64/128/256/320/512 MiB x 10 (r15's placement went away before it started).
+- r22 (queued, linux): family three green + red (r14 lost: adacachy restarted mid-build).
+- Local target ~/.cache/w-shared-local-target.noindex deleted at 01:38 (main's 01:23 note); exit-4 scratch deleted too. No local builds from here.

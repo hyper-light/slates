@@ -87,7 +87,22 @@ the hypothesis (the fold's tail held the reply) is NOT confirmed; added median 2
 - Exchange p50 57-61 (Linux) / 107-115 (macOS), holder's serve 8-12; build ~25; to control 8-9 / 25-31; reply 7-8 / 8-21.
 - Next: split the exchange's ~30 us of daemon overhead (Linux) against the transport bench's 23-27 us; then the build.
 
-## For main to delete (diagnostics): remote branches diag-g228-live-1..9 once main has read their results.
+## 2026-11-21 ~01:40 PST: main's 00:30 order, items 1-3 (branch agents/g228-exchange-split, not landed)
+- Item 1, exchange split (a40c07faa): per-write hops exchange.borrow / round_trip / collect / settle. Diag run 11
+  (ubuntu-latest): borrow 0.6, round_trip 98.3, collect 7.7-13.3, settle 0.5 us at p50; a holder's serve 12-15 us. The
+  lane's own tasks are small; the round trip is the transport plus the holder's control shard. Run 13 (pushed) adds the
+  transport bench (`replication_bench 1000 0`, "live ship" rows) on the same runner each round, as the reference.
+- Item 2, the entry's build: placement cache + zero-alloc acks (4949613ae): 250 -> 134 extra allocator calls a 2 KiB
+  write on its owner (plain 34). A/B pending: diag run 12 (ubuntu-latest) and Studio r3 (d1323898), split vs cache.
+  Next cut in the worktree (unlanded, tests running r5): the payload was copied four times a holder (entry encode,
+  exchange `to_vec`, `Endpoint::begin` `to_vec`, `open_exchange` `to_vec`); now moved whole to the stream
+  (`begin_owned`/`request_owned`, `request_within(Vec)`, `exchange` by value), one copy a holder; the record commit,
+  prepare and content dispatch lose a copy each too.
+- Item 3: inbox/g222-from-g228-spin.md sent (one slates-rt primitive; g222 builds it as arm C or I build to its spec).
+- Disk: Studio-4 was at 26 GiB free; my ~/.cache/g228-local-target (18.8 GiB, debug only) removed with `cargo clean`.
+  Builds go to kiln runners with disk=50g since.
+
+## For main to delete (diagnostics): remote branches diag-g228-live-1..13 once main has read their results.
 
 ## 85a STILL OPEN -- blocked on main's decision (sent): a plain status request arms a tens-of-GiB mincore sweep on every
 shard (about a core per daemon for >1 s after a status burst; up to half a quantum per idle slice on the next message).

@@ -88,3 +88,13 @@ Lessons: never build two worktrees into one target dir (poisoned release artifac
 C1 77fcae73a (FUSE+WinFsp tests written, runs in run-requests), C2 1b0f5679c, R3 9d73a77c6, R4 60a71db8a, P5 f6660f0ab +
 f401f798c. Close notes: inbox/main-from-w-work-mount-close.md. Queue empty; new findings go to GAPS only.
 Target on Studio-2 kept at ~3 GB (focused tests, CARGO_PROFILE_TEST_DEBUG=0).
+
+## 2026-11-21 ~01:00 PST — C1 Windows runs, blocked on infrastructure
+Build GREEN on jupiter (e4cfbd38d, 31m47s), one unused-import warning -> fix 0cbef8441 on agents/w-work-mount-win.
+WinFsp test pending: kiln server unresponsive since 08:07 UTC; GitHub fetch "early EOF" from this Mac (SSH and HTTPS).
+Next when both answer: on jupiter (--on jupiter --no-sync; clone agents/w-work-mount-win with retries into
+~/Projects/w-work-mount-win; CARGO_TARGET_DIR ~/Projects/w-work-mount-win-target, 11 GB warm) build with no warnings,
+then `cargo test -p slates-cli --test winfsp a_work_mounted_through_winfsp`; green -> merge origin/main into the fix,
+push HEAD:main, add to the close note; red -> red-first fix. The Linux FUSE run is mine too.
+
+- 2026-11-21 02:30 PST: kiln refused every run 08:07-10:30 UTC (10 retries, "did not answer in time"); GitHub back at ~09:00 UTC (state pushed). WinFsp test and the warning fix 0cbef8441 still wait on kiln; nothing else in my queue.

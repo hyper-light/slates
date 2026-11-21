@@ -34,3 +34,23 @@ Leading candidate: a reply admitted and never run. That fits the stalls (every d
 and their start between e4c2ad76 and 8a18edcc, where 343b741e landed. A-798 (931e52ed, another worker's) has since
 fixed a lost kick on a parked shard of exactly that kind. If the rerun shows handed equal to ran and no stuck
 `pending` rows, the lost replies are closed by A-798 plus this change.
+
+## Added 2026-11-21 ~01:40 PST: the owner's cost by kind (A-801, Slates 2d079c44)
+If r48 builds main at or after 2d079c44, the harness also prints `server_counter <instance> <counter> <count>` rows
+for the primary and both replicas: asks of the owner by kind (`merge.work.asked_owner.<kind>`) and the owner's
+answering time by kind (`merge.work.answered.<kind>` and `..._ns`).
+- On the primary, the largest `answered.*_ns` row names the 100k throughput wall's mechanism.
+- At 1,000 clients in-process the owner spent only 185 ms answering in all, so it is not the wall at that scale.
+Please send me those rows with the drop-site rows.
+
+## Added 2026-11-21 ~02:30 PST: the scale injections (A-802, Slates fd0dd8eb)
+Each injection ran in the 1,000-client stand-in: release, in-process, kernel/ (754 files), one round.
+- (a) Bases 10 to 1,000 versions behind: the verdict stayed flat, 23 to 29 µs.
+- (b) Long history: 10^4 unfolded gives a 46.7 µs verdict; 10^5 unfolded gives 89.5 µs. Only the verdict grows,
+  about 2x.
+- (c) Idle works pinning the floor, 10^3 to 10^4: every kind of answer was 2 to 3x slower, and verdicts fell from
+  6,513 to 2,506/s.
+(c) was the wall. A destroy collected every volume record of its partition to decide whether to erase its tenant's
+key; a per-tenant count now answers that. A/B at 10^4 idle works: 2,506 to 5,956 verdicts/s, verdict 84 to 44 µs,
+cycle p99 501 to 212 ms. Red test: `a_destroys_cost_does_not_grow_with_the_partitions_other_volumes`.
+If r48 starts from fd0dd8eb or later it includes this fix. Next: (b)'s verdict growth with history.

@@ -1,5 +1,23 @@
 # w-fed-move — progress (relaunched on the Mac Studio 2026-11-19 ~21:35 PST; supervisor slates-7a via kiln)
 
+## 2026-11-21 ~02:50 PST: A-803 LANDED slates main 081542c5 ((b) named: the re-anchor walks every value)
+- Counters: merge.reanchor.values_walked, merge.submit.secure. Values per verdict 7.9 -> 231 over 10^5 versions,
+  judge 24 -> 71 µs, compose and secure flat. Not the 100k wall (a few values a path there).
+- Design options sent to main: inbox/main-from-w-fed-move-b-design.md (I recommend waiting for r48, then the anchor
+  indirection). Waiting on main's call and r48's rows.
+
+## 2026-11-21 ~02:30 PST: A-802 LANDED slates main fd0dd8eb (injections; the destroy's O(volumes) scan)
+- Harness injections: --idle-works M, --preload V, --lagged-submit; the owner's per-kind counters printed after each
+  phase. Results: (a) flat; (b) verdict about 2x at 10^5; (c) 10^4 idle works cut 6,513 to 2,506 verdicts/s, which
+  was a destroy collecting every volume record (erase_volume_keys) -> per-tenant count. A/B: 2,506 -> 5,956/s.
+- Next: (b) the verdict's growth with history (41 -> 90 us over 10^5 versions).
+
+## 2026-11-21 ~01:40 PST: A-801 LANDED slates main 2d079c44 (throughput: name the mechanism first)
+- Owner asks counted by kind and answers timed by kind on the owner; the harness prints the server nodes' merge
+  counters (`server_counter` rows; load_scale passes its servers).
+- 1k in-process over kernel/: 17.5 asks a client (lengths 44%, files 18%), owner 185 ms in all: not the wall at 1k.
+- Waiting on r48's primary rows to pick the throughput mechanism. Small-scale proxies tried: 1k in-process (above).
+
 ## 2026-11-21 ~01:30 PST: A-800 LANDED slates main 9918e6c0 (main's order: the lost replies first)
 - Drop sites on the reply-home hop listed, each counted apart; the silent ones (a reply dropped while its shard's
   state is borrowed, finish_owner_forward's and deliver's refused borrows) now resend or count. Three red/green tests.

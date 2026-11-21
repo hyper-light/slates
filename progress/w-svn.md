@@ -317,3 +317,18 @@
   measurement landed (1bfe51f88) and running on the big Studio (kiln r10). Stock legs pass on the Studio (r8).
   Open: C2 B2 (main to decide, inbox stage-b2-value), svn_made (w-work-cow's view), C. B2a wait-path patch kept at
   ~/.cache/w-svn-b2a-wait.patch.
+- 2026-11-21 ~01:20 PST state: CLOSED C1 R3 R4 R5 P6 P8. P7 measured (svn:// svnsync 270.7 s vs 1,068; real daemon peak
+  1,570 MiB / 437 MiB dump, half the green's chain in the segment; HTTP svnsync init fixed 2dafcad02, replay-report
+  absent -> GAPS), awaiting main's close. C2: stage A (72576cb1f) and B part 1 (40c3f8d1e) on main; B part 2 and C sent
+  to main with sizing (inbox stage-b2-value, stage-c-analysis), awaiting the call; svn_made waits for w-work-cow's
+  post-verdict view (main's routing), w-git builds git's made commits on the same hook. Worktree ~/slates-work/w-svn-c2
+  at main 9d792682f, clean. Patches kept: ~/.cache/w-svn-b2a-wait.patch (B2 wait path), ~/.cache/w-svn-fold-attempt.patch
+  (rejected fold).
+- 2026-11-21 ~02:10 PST: B2 (a) on main: drives (35786a9dd/b934f9e5b), ra_svn get-file (9061acd6c), DAV GET
+  (dd31d7597, base origin/main dc04e1a7d). Each held by a store test, red without its wait. Owed in (a): file-revs'
+  window_unit, the exporter, the deltify job; then (b). Target trimmed by exact path 24 GB -> 3.9 GB (debug/incremental
+  and 37,242 leftover deps/*.rcgu.o); building with CARGO_INCREMENTAL=0, one profile (debug) from now on.
+- 2026-11-21 ~02:45 PST: B2 (a) COMPLETE on main: get-file-revs (560ebad9f), export (99ff3b8cb), deltify job
+  (d31502d48, base origin/main at merge). Every reader of a stored text reads one RAM does not hold through the store,
+  each held by a store test red without its wait. New finding (GAPS only): the svn://, svnserve -t and DAV loops have no
+  guard against a drive waiting again for the piece just fetched (the export and deltify jobs have one). Next: B2 (b).
