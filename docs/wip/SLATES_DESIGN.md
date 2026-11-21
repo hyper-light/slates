@@ -58935,3 +58935,19 @@ Applied in the same change to: `crates/server/src/work_home.rs` (`verdict_over_f
 - **A/B by use** (same stand-in, 10^4 idle works): verdicts 2,506 to 5,956 a second, verdict 84.0 to 44.2 µs, rebase
   32.9 to 20.3 µs, lengths 6.9 to 3.2 µs, cycle p99 501 to 212 ms; 10^3 idle works after: 5,697/s. Flat in M now. The
   history's verdict growth (b) is the next candidate; main's rerun (r48) confirms on the topology.
+
+### A-803 — The verdict's growth with history named: the re-anchor walks every value of a changed path (2026-11-21, w-fed-move, goal 86b; main's order 02:11 PST, injection (b); A-793, A-802)
+- **Why.** Injection (b) of A-802 (a long history ahead of the 1,000-client stand-in, held unfolded by one idle work)
+  doubled the owner's verdict over 10^5 versions. `2c32af2b5` (A-787 part 2, the re-anchor's remap indexed) was in
+  the build measured, so it is not that scan.
+- **Change.** Counters only: `merge.reanchor.values_walked` (the history values a submit's commit re-anchored,
+  `Green::history_reanchored_values`) and `merge.submit.secure` / `_ns` (the retention a submit secures before its
+  verdict, timed); the load harness prints them after each phase.
+- **Measured** (release, in-process, this Mac Studio, 2026-11-21 ~02:40, `kernel/` (754 files), 1,000 clients, one
+  round, `--per-connection 32 --hot-files 300 --idle-works 1`): preload 0, 10^4, 10^5 versions: judge 24.0, 31.7, 70.9
+  µs; values re-anchored a verdict 7.9, 30.2, 231.4; compose 57.1, 54.3, 50.3 µs; secure 1.0, 1.3, 1.0 µs; append
+  about 5 µs. The growing step is the re-anchor (about 0.2 µs a value walked): a change rewrites every value of its
+  path's history (A-793), so a path's k-th change costs O(k) while a reader pins the floor.
+- **At the 100k rung** a path's history is short (about 31,000 accepts of four edits over 42,000 hot files, a few
+  values a path), so this is not that rung's wall; it is the wall of a long-lived hot file. The fix's design (an
+  indirection so a length-preserving change moves only the pieces it overwrote) is with main before it is built.

@@ -418,6 +418,11 @@
 > admitted one a unit) in a rebuild and a recovery. Owed: the thin pack's resolve, the seal's staging, the moves'
 > admission and the landing's whole passes sliced; a stale restage sliced.
 >
+> **A-803 (2026-11-21, w-fed-move; goal 86b, injection (b)).** NAMED, not fixed: the verdict's growth with history is the
+> re-anchor, which walks every value of a changed path (7.9 values a verdict with no preload, 231 with 10^5 versions;
+> judge 24 to 71 µs; compose and secure flat). Counted (`merge.reanchor.values_walked`, `merge.submit.secure`). Not
+> the 100k rung's wall (a few values a path there). Open: the fix's design, with main.
+>
 > **A-802 (2026-11-21, w-fed-move; goal 86b's throughput, found by injection).** FIXED: a destroy no longer collects
 > every volume record to ask whether its tenant has one left (a per-tenant count, kept with the records). Of the three
 > injections into the 1,000-client stand-in (bases behind, long history, works pinning the floor) the last grew: 10^4
