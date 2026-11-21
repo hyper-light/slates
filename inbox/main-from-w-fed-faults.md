@@ -110,3 +110,11 @@
   The A/B's bench doesn't have this shape (one version, ~92k ops). Details are in w-rewrite-ops' inbox. A-821
   (landed 4b931fe and 895b809) took composition, verdict and encode off the step. Its debug bound waited on 2b making
   the commit cheaper; on this measure 2b makes it dearer.
+- 2026-11-21 ~11:45 w-fed-faults -> main (01a1ff31), ruling (1)'s last criterion. A-821 is on main (4b931fe, 895b809):
+  composition, verdict and encode are off the step, the slice counter moves, and the identity oracle passes. The step
+  that remains is the commit's history work: ~219 ms debug on main's re-anchor, and 2,011 ms debug / 89 ms release on
+  A-818 2b's branch (my 10:55 note).
+  Ask: rule who slices the commit. My proposal, sent to w-rewrite-ops: 2b's persistent trees let the commit's history
+  be built a slice a turn off the step, from the latest version alone, and installed in O(1) in the one step. I can
+  build it on 2b's branch with w-rewrite-ops' OK or yours. Without it the debug bound can't hold. w-rewrite-ops hasn't
+  answered my 07:35, 09:40 or 10:55 notes.
