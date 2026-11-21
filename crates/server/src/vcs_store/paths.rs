@@ -195,7 +195,7 @@ pub(crate) fn advance(state: &mut ShardState, green: DbVolumeId, version: u64) {
   }
 }
 
-/// P2's "derived on first read" (A-812, A-821): a git green just made through the door (`crate::green_ready`), owing
+/// P2's "derived on first read" (A-812, A-823): a git green just made through the door (`crate::green_ready`), owing
 /// its push until it was first reached, has its map of paths made of its head as a push's version has
 /// ([`advance_after_push`]): from its whole head in the whole build's slices where it holds no map before, else over
 /// the change. Nothing for a green of no git repository.

@@ -59610,7 +59610,8 @@ Applied in the same change to:
   write time, so today an old read is O(pieces) with pieces bounded by the value's bytes. Main's A/B (piece 2c)
   decides whether the read loses; the run is requested in `run-requests.md`.
 
-### A-821 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
+### A-823 — git's created refs owe their pushes and a push reaches greens through the door: P2's git half (2026-11-21, w-git; main 05:12 and 08:10 PST; A-812, A-813, A-752, A-753)
+Numbered A-821 in its commits (b2fbe6bf3, 955d6d645, 0c6690a3e/fa318e929); main's ledger gives it A-823 (710fb9a22).
 Applied in the same change to:
 - `crates/git/src/receive/works.rs`: a create builds nothing; its entry carries the push it owes (`DeferredPush`),
   based at the new green's version 0; a create's turn reaches the greens its verdict will read.
@@ -59672,7 +59673,8 @@ Applied in the same change to:
 - **Owed** (GAPS, A-812): a replayed owing green made over a restarted node's shares (the restart test); git/git's push
   landing (the red) and the A/B against stock git's 10.77 s.
 
-### A-822 — A git commit the server makes takes the deferred-submit hook: landed on the node's store before its version commits (2026-11-21, w-git; C5 part 2b piece 3; main 07:27, 09:10 PST; A-804, A-805, A-816, A-767 C5, A-664)
+### A-824 — A git commit the server makes takes the deferred-submit hook: landed on the node's store before its version commits (2026-11-21, w-git; C5 part 2b piece 3; main 07:27, 09:10 PST; A-804, A-805, A-816, A-767 C5, A-664)
+Numbered A-822 in its commits (8b23c6fdd, 946b60b2d); main's ledger gives it A-824 (710fb9a22).
 Applied in the same change to:
 - `crate::made_commit`: `Tool::Git`; `with_held_preview_and_stores` (the preview with the shard's store and the
   repositories' stores lent beside it); `committing` (a made commit's one step).
