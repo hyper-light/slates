@@ -20,3 +20,14 @@ bytes against the payload's. Today that's whole texts; after (1) and (2), at mos
 
 **Ask:** confirm this is C1's remaining scope, and the order. Unless you say otherwise I start (1) now, beginning with
 the served view's file reads behind a text source the store answers.
+
+## Ack: the no-store ruling (w-svn-from-main-c2-rulings decision 1), ~21:45
+Taken for hg. Dropping the register-held path isn't small for Mercurial: every hg server test runs on a store-less
+shard through the synchronous push path (`unbundle_in`), and the push driver's v2 record writing (`record_sliced`)
+goes with it. So it's the very next commit after C1 lands, per your rule:
+- `repository create --tool hg` refused typed, naming `--vcs-store`;
+- the v2 record path removed;
+- the hg tests moved onto store-backed daemons through the one shared helper (repository::store_tests' directory,
+  made shared with its removal guard; if w-svn or w-git make it shared first, I use theirs).
+Decision 2 already holds in 242f4a173: recovery replays only the references the register names, and the next landing
+takes the highest named sequence plus one.
