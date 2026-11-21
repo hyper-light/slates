@@ -1260,3 +1260,70 @@ fn a_revision_record_is_replayed_a_turn_a_file_at_a_rebuild() {
     assert!(taken >= 12, "the revision replayed in {taken} turns");
   });
 }
+
+/// C2 stage B part 2 (b), P1 (a commit's green increment reads a stored text the content store let go through the
+/// node's changeset store). Do: on a daemon whose revision 1 adds `/trunk/a.bin`, every hold RAM has on its text let go
+/// (`crate::test_store::a_text_only_the_store_holds`), commit revision 2 adding `/trunk/b.bin` with the same text, as a
+/// copy or a revert names one the records hold already. Expect revision 2 committed, the green's `trunk/b.bin` the text
+/// whole, read through the store (`vcs_store.svn_texts.piece_fetched` at least once), and the content store holding
+/// nothing of it after (the commit gave back what it brought). Before, the increment found no bytes and the commit was
+/// refused `Corrupt`.
+#[test]
+fn a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment() {
+  let bytes = crate::test_store::noise(200 << 10);
+  let (_store, daemon, id) =
+    crate::test_store::a_text_only_the_store_holds(&owner(), "copied", &bytes);
+  let named = text(&bytes);
+  let landed = crate::test_store::run_on_first(
+    &daemon,
+    move || async move {
+      let work = Work {
+        head: 1,
+        record: RevisionRecord {
+          transaction: "1-2".to_owned(),
+          changes: vec![ChangedPath {
+            path: "/trunk/b.bin".to_owned(),
+            action: Action::Add,
+            kind: NodeKind::File,
+            copy_from: None,
+            text: Some(named),
+            properties: None,
+            mergeinfo_modified: false,
+          }],
+        },
+        lock_entries: Vec::new(),
+        revision_properties: vec![(b"svn:log".to_vec(), b"the same".to_vec())],
+        texts: std::iter::once(named.identity).collect(),
+        property_lists: BTreeMap::new(),
+        locks: CommitLocks::default(),
+      };
+      let sink = slates_svn::commit::drive::HeldTexts::new();
+      super::land_work((&owner(), id), work, &sink)
+        .await
+        .map(|landed| landed.map(|committed| committed.revision))
+    },
+    std::time::Duration::from_secs(60),
+  );
+  let (file, kept, fetched) = crate::daemon::observe_first(&daemon, move |state| {
+    let green = super::green_of(state, id).ok();
+    let file = green.and_then(|green| green_file(state, green, "trunk/b.bin"));
+    let kept = state
+      .vcs_stores
+      .content()
+      .is_some_and(|content| content.contains(&slates_vcs::ContentId(named.identity)));
+    let fetched = state
+      .refusals
+      .get(crate::vcs_store::svn_texts::PIECE_FETCHED)
+      .copied()
+      .unwrap_or(0);
+    (file, kept, fetched)
+  });
+  daemon.stop();
+  assert!(matches!(landed, Some(Ok(2))), "{landed:?}");
+  assert!(
+    file.as_deref() == Some(bytes.as_slice()),
+    "the green's file is not the text"
+  );
+  assert!(fetched >= 1, "no piece read through the store");
+  assert!(!kept, "the content store kept what the commit brought");
+}

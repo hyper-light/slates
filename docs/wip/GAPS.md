@@ -2648,8 +2648,15 @@
 > deltify job BUILT too: a window's target piece the content store does not hold is fetched through the node's store
 > between slices, the target read so far kept, a text whose piece cannot be given passed over; held by
 > `a_stored_text_the_content_store_let_go_is_deltified_through_the_store` (red without it: passed over, left stored
-> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. Owed: (b), the
-> records keep history on the store. Stage C,
+> whole). (a) is complete: every reader of a stored text reads one RAM does not hold through the store. (b), the
+> records keep history on the store (w-svn's plan, inbox b2b-plan-corrected: the store holds every text whole already,
+> a commit's in its Payload and an import's in its Record, so the records' RAM deltas and the deltify job go): P1 BUILT,
+> a commit's green increment brings back whole a stored text the content store let go (a copy, a revert;
+> `svn_texts::bring_whole`), given back after its step; held by
+> `a_commit_naming_a_stored_text_ram_let_go_brings_it_back_for_the_greens_increment` (red without it: `Corrupt`).
+> Owed: P2 the hook view brings an evicted stored text back before it holds it; P3 the content store lets go a
+> commit's texts once its changeset lands, recovery stops reading them back; P4 imports land texts as Payload with
+> Texts rows, the records keep none in RAM, the deltify job retired. Stage C,
 > an import as one sliced changeset (today a changeset a record); and a submitted version's revision (`svn_made`), which
 > today lands from a task holding the landing turn the submit took, after the submit committed its version, so a crash
 > between leaves the version without its revision. Main's ruling (inbox w-svn-from-main-c2-made): the submit takes the one
